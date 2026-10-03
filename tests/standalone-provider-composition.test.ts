@@ -2,13 +2,17 @@ import { describe, expect, test } from "bun:test";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { createProviderFormAvailability } from "../src/provider-driver.ts";
 import { PROVISIONER_PATH } from "../src/providers/remote.ts";
+import { MAX_SELFHOST_CRON_OWNERS } from "../src/providers/selfhost.ts";
 import { createProvisionerEndpoint } from "../src/provisioner-endpoint.ts";
 import {
+  createSelfhostCronOwnerReader,
   createStandaloneProviderComposition,
   RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN,
   resolveStandaloneProviderMode,
 } from "../src/standalone-provider-composition.ts";
 import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
+import type { RelatedResource, TakoformStore } from "../src/takoform/store.ts";
+import type { InstalledTakoformForm } from "../src/takoform/types.ts";
 import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
 
 const runtime: WorkerdRuntime = {
@@ -60,6 +64,150 @@ async function compose(
 }
 
 describe("the standalone Bun provider composition", () => {
+  test("projects exact same-expression Cron owners only from the requested Host scope", async () => {
+    const edge = await buildEdgeForms();
+    const cronForm = edge.forms.find((form) => form.identity.formRef.kind === "WorkerCronTrigger");
+    const workerForm = edge.forms.find((form) => form.identity.formRef.kind === "ModuleWorker");
+    if (!cronForm || !workerForm) throw new Error("released Cron and Worker Forms are required");
+    const queries: Parameters<TakoformStore["resourcesByRelation"]>[0][] = [];
+    const inventory: Pick<TakoformStore, "resourcesByRelation"> = {
+      async resourcesByRelation(query) {
+        queries.push(query);
+        return [
+          cronOwner(edge.forms, "uid-cron-a", "0 * * * *", "space-a", "worker-a"),
+          cronOwner(edge.forms, "uid-cron-b", "0 * * * *", "space-a", "worker-a"),
+        ];
+      },
+    };
+    const listCronOwners = createSelfhostCronOwnerReader({ inventory, forms: edge.forms });
+
+    const result = await listCronOwners({
+      tenantRef: "tenant-a",
+      space: "space-a",
+      workerResourceUid: "worker-a",
+      form: cronForm.identity.formRef,
+      limit: MAX_SELFHOST_CRON_OWNERS + 1,
+    });
+
+    expect(result).toEqual({
+      complete: true,
+      owners: [
+        { resourceUid: "uid-cron-a", cron: "0 * * * *" },
+        { resourceUid: "uid-cron-b", cron: "0 * * * *" },
+      ],
+    });
+    expect(queries).toEqual([
+      {
+        tenantId: "tenant-a",
+        space: "space-a",
+        sourceApiVersion: cronForm.identity.formRef.apiVersion,
+        sourceKind: cronForm.identity.formRef.kind,
+        relation: "/worker",
+        targetUid: "worker-a",
+        limit: MAX_SELFHOST_CRON_OWNERS + 1,
+      },
+    ]);
+  });
+
+  test("refuses incomplete, mismatched, or truncated canonical Cron projections", async () => {
+    const edge = await buildEdgeForms();
+    const cronForm = edge.forms.find((form) => form.identity.formRef.kind === "WorkerCronTrigger");
+    if (!cronForm) throw new Error("released Cron Form is required");
+    const validOwner = cronOwner(edge.forms, "uid-cron-a", "0 * * * *", "space-a", "worker-a");
+    const mismatchCases: readonly RelatedResource[] = [
+      cronOwner(edge.forms, "uid-other-space", "0 * * * *", "space-b", "worker-a"),
+      cronOwner(edge.forms, "uid-other-worker", "0 * * * *", "space-a", "worker-b"),
+      cronOwner(edge.forms, "uid-wrong-form", "0 * * * *", "space-a", "worker-a", {
+        schemaDigest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      }),
+    ];
+
+    for (const mismatched of mismatchCases) {
+      const listCronOwners = createSelfhostCronOwnerReader({
+        forms: edge.forms,
+        inventory: {
+          async resourcesByRelation() {
+            return [validOwner, mismatched];
+          },
+        },
+      });
+      await expect(
+        listCronOwners({
+          tenantRef: "tenant-a",
+          space: "space-a",
+          workerResourceUid: "worker-a",
+          form: cronForm.identity.formRef,
+          limit: MAX_SELFHOST_CRON_OWNERS + 1,
+        }),
+      ).resolves.toEqual({ complete: false });
+    }
+
+    const truncated = createSelfhostCronOwnerReader({
+      forms: edge.forms,
+      inventory: {
+        async resourcesByRelation() {
+          return Array.from({ length: MAX_SELFHOST_CRON_OWNERS + 1 }, (_, index) =>
+            cronOwner(edge.forms, `uid-cron-${index}`, "0 * * * *", "space-a", "worker-a"),
+          );
+        },
+      },
+    });
+    await expect(
+      truncated({
+        tenantRef: "tenant-a",
+        space: "space-a",
+        workerResourceUid: "worker-a",
+        form: cronForm.identity.formRef,
+        limit: MAX_SELFHOST_CRON_OWNERS + 1,
+      }),
+    ).resolves.toEqual({ complete: false });
+
+    const unreadable = createSelfhostCronOwnerReader({
+      forms: edge.forms,
+      inventory: {
+        async resourcesByRelation() {
+          throw new Error("inventory unavailable");
+        },
+      },
+    });
+    await expect(
+      unreadable({
+        tenantRef: "tenant-a",
+        space: "space-a",
+        workerResourceUid: "worker-a",
+        form: cronForm.identity.formRef,
+        limit: MAX_SELFHOST_CRON_OWNERS + 1,
+      }),
+    ).resolves.toEqual({ complete: false });
+  });
+
+  test("refuses lookup when the requested Cron Form is not the exact installed identity", async () => {
+    const edge = await buildEdgeForms();
+    const cronForm = edge.forms.find((form) => form.identity.formRef.kind === "WorkerCronTrigger");
+    if (!cronForm) throw new Error("released Cron Form is required");
+    let queried = false;
+    const listCronOwners = createSelfhostCronOwnerReader({
+      forms: edge.forms,
+      inventory: {
+        async resourcesByRelation() {
+          queried = true;
+          return [];
+        },
+      },
+    });
+
+    await expect(
+      listCronOwners({
+        tenantRef: "tenant-a",
+        space: "space-a",
+        workerResourceUid: "worker-a",
+        form: { ...cronForm.identity.formRef, schemaDigest: "sha256:unknown" },
+        limit: MAX_SELFHOST_CRON_OWNERS + 1,
+      }),
+    ).resolves.toEqual({ complete: false });
+    expect(queried).toBe(false);
+  });
+
   test("generic Cloudflare storage credentials do not switch off stable Provider3 execution", async () => {
     const withoutAccount = resolveStandaloneProviderMode({});
     const withAccount = resolveStandaloneProviderMode({
@@ -265,3 +413,43 @@ describe("the standalone Bun provider composition", () => {
     ).toThrow("stable self-host provider settings");
   });
 });
+
+function cronOwner(
+  forms: readonly InstalledTakoformForm[],
+  uid: string,
+  cron: string,
+  space: string,
+  workerUid: string,
+  formRefOverrides: { readonly schemaDigest?: `sha256:${string}` } = {},
+): RelatedResource {
+  const cronForm = forms.find((form) => form.identity.formRef.kind === "WorkerCronTrigger");
+  const workerForm = forms.find((form) => form.identity.formRef.kind === "ModuleWorker");
+  if (!cronForm || !workerForm) throw new Error("released Cron and Worker Forms are required");
+  return {
+    resource: {
+      apiVersion: cronForm.identity.formRef.apiVersion,
+      kind: cronForm.identity.formRef.kind,
+      form: {
+        ...cronForm.identity,
+        formRef: {
+          ...cronForm.identity.formRef,
+          ...formRefOverrides,
+        },
+      },
+      metadata: { name: uid, space, uid, generation: "1", revision: "1" },
+      spec: { cron },
+      status: { observedGeneration: "1", conditions: [] },
+    },
+    relations: [
+      {
+        pointer: "/worker",
+        relation: "/worker",
+        targetApiVersion: workerForm.identity.formRef.apiVersion,
+        targetKind: workerForm.identity.formRef.kind,
+        targetName: "worker",
+        targetUid: workerUid,
+        targetFormRef: workerForm.identity.formRef,
+      },
+    ],
+  };
+}

@@ -102,6 +102,7 @@ import {
 import {
   createSelfhostScriptStateStore,
   isSelfhostPortableQueueName,
+  type SelfhostCronOwner,
   type SelfhostQueueConsumerAttachment,
   type SelfhostQueueTarget,
   type SelfhostScriptState,
@@ -215,6 +216,8 @@ const WORKER_VERSION_VAR_NAME = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/u;
 const MAX_WORKER_VERSION_DATA_BINDINGS = 64;
 const DATA_BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
 const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u;
+/** Bounded owner entries fit the script-state file and legacy Cron projection. */
+export const MAX_SELFHOST_CRON_OWNERS = 64;
 const VECTOR_NATIVE_PREFIX = "selfhost-vector";
 const VECTOR_NATIVE_SEGMENT = /^tvi-[0-9a-f]{64}$/u;
 /** Exact candidate Binding accepted by the forward WorkerVersion Form. */
@@ -345,6 +348,24 @@ export interface SelfhostProviderOptions {
   readonly vectorIndexStore?: VectorIndexStore;
   /** Exact technical relation authorities for post-delete native readback. */
   readonly nativeReadbackAuthorities?: readonly ProviderNativeReadbackAuthority[];
+  /**
+   * Complete canonical projection used once to qualify legacy Cron state.
+   * The callback is not a mutation hook: provider state remains the durable
+   * owner projection after qualification.
+   */
+  readonly listCronOwners?: (input: {
+    readonly tenantRef: string;
+    readonly space: string;
+    readonly workerResourceUid: string;
+    readonly form: ProviderOffering["form"];
+    readonly limit: number;
+  }) => Promise<
+    | {
+        readonly complete: true;
+        readonly owners: readonly { readonly resourceUid: string; readonly cron: string }[];
+      }
+    | { readonly complete: false }
+  >;
   /** Where databases, materialized versions, and script state live. */
   readonly dataRoot: string;
   /** The runtime deployments publish into. */
@@ -566,6 +587,12 @@ export interface SelfhostEventTargets {
   select(script: string): Promise<SelfhostEventSelection | null>;
 }
 
+/** Scheduler-only claim authority; queue readers need no Cron mutation lock. */
+export interface SelfhostCronClaimTargets extends SelfhostEventTargets {
+  /** Runs a short SQL seed/claim only while this exact Cron is still attached. */
+  withCurrentCron<T>(script: string, cron: string, claim: () => Promise<T>): Promise<T | null>;
+}
+
 export function createSelfhostEventTargets(
   dataRoot: string,
   options: {
@@ -573,7 +600,7 @@ export function createSelfhostEventTargets(
     /** Testable serving-authority seam; production reads the runtime pointer. */
     readonly activeDeployment?: (script: string) => Promise<WorkerdActiveDeployment | null>;
   } = {},
-): SelfhostEventTargets {
+): SelfhostCronClaimTargets {
   const scriptStates = createSelfhostScriptStateStore({ root: selfhostScriptStateRoot(dataRoot) });
   const bindings = createSelfhostVersionBindingStore({
     root: selfhostVersionBindingsRoot(dataRoot),
@@ -581,6 +608,19 @@ export function createSelfhostEventTargets(
   const activeDeployment =
     options.activeDeployment ?? ((script: string) => readWorkerdActiveDeployment(dataRoot, script));
   return {
+    async withCurrentCron(script, cron, claim) {
+      const release = await acquireSelfhostWorkerMutation(
+        selfhostScriptStateRoot(dataRoot),
+        script,
+      );
+      try {
+        const current = await scriptStates.read(script).catch(() => null);
+        if (!current?.state.crons?.includes(cron)) return null;
+        return await claim();
+      } finally {
+        release();
+      }
+    },
     async list() {
       const entries = await readdir(selfhostScriptStateRoot(dataRoot)).catch(() => []);
       const targets: SelfhostEventTarget[] = [];
@@ -729,6 +769,24 @@ class SelfhostFailure extends Error {
 // by the script store. It is not a cross-process lock or a recovery ledger.
 const SELFHOST_WORKER_MUTATIONS = new Map<string, Promise<void>>();
 
+async function acquireSelfhostWorkerMutation(
+  scriptsRoot: string,
+  script: string,
+): Promise<() => void> {
+  const key = `${resolve(scriptsRoot)}\0${script}`;
+  const previous = SELFHOST_WORKER_MUTATIONS.get(key);
+  let release!: () => void;
+  const current = new Promise<void>((resolvePromise) => {
+    release = resolvePromise;
+  });
+  SELFHOST_WORKER_MUTATIONS.set(key, current);
+  if (previous) await previous;
+  return () => {
+    release();
+    if (SELFHOST_WORKER_MUTATIONS.get(key) === current) SELFHOST_WORKER_MUTATIONS.delete(key);
+  };
+}
+
 export function createSelfhostProvider(options: SelfhostProviderOptions): Provider {
   const id = options.id ?? "local";
   const { runtime, artifacts, dataRoot } = options;
@@ -866,18 +924,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // Unrelated resource kinds never enter this per-Worker queue.
     if (!worker) return () => {};
     const script = await scriptOf(input.identity.tenantRef, worker);
-    const key = `${resolve(scriptsRoot)}\0${script}`;
-    const previous = SELFHOST_WORKER_MUTATIONS.get(key);
-    let release!: () => void;
-    const current = new Promise<void>((resolvePromise) => {
-      release = resolvePromise;
-    });
-    SELFHOST_WORKER_MUTATIONS.set(key, current);
-    if (previous) await previous;
-    return () => {
-      release();
-      if (SELFHOST_WORKER_MUTATIONS.get(key) === current) SELFHOST_WORKER_MUTATIONS.delete(key);
-    };
+    return await acquireSelfhostWorkerMutation(scriptsRoot, script);
   };
 
   const versionIdOf = (
@@ -3314,10 +3361,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   /** Rewrites one script's attachments and republishes what workerd serves. */
   const rewriteAttachments = async (
     script: string,
-    change: (state: SelfhostScriptState) => SelfhostScriptState,
-  ): Promise<void> => {
+    change: (state: SelfhostScriptState) => SelfhostScriptState | Promise<SelfhostScriptState>,
+  ): Promise<SelfhostScriptState> => {
     const current = await readScriptState(script);
-    const next = change(current.state);
+    const next = await change(current.state);
     await preflightDeploymentAssets(script, next);
     // Read the active Version's record BEFORE anything durable moves. A Version
     // published before this Host recorded handlers has neither a handler list
@@ -3354,12 +3401,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
     const moved = JSON.stringify(next) !== JSON.stringify(current.state);
     const written = moved ? await writeScriptState(script, current, next) : current;
-    if (!hasDeployment(next)) return;
+    if (!hasDeployment(next)) return next;
     try {
       // Always, even when the desired state was already this: a committed
       // attachment is not proof that the runtime accepted the gate it needs,
       // and the publication is what puts that gate in front of the Worker.
       await publishScript(script);
+      return next;
     } catch (error) {
       // A definite refusal means this declaration cannot be served at all, so
       // the attachment must not stay behind refusing every later republish of
@@ -3375,7 +3423,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const applyWorkerCronTrigger = async (input: ApplyInput): Promise<ProviderTicket> => {
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
     const cron = typeof input.spec.cron === "string" ? input.spec.cron : null;
-    if (!worker || !cron) return failed("invalid_spec", "the cron trigger is incomplete");
+    const resourceUid = input.identity.uid;
+    if (!worker || !cron || !resourceUid || !RESOURCE_UID.test(resourceUid)) {
+      return failed("invalid_spec", "the cron trigger is incomplete");
+    }
+    if (!isReleasedSelfhostCronForm(input.offering.form)) {
+      return failed("denied", "this self-host provider does not own this Cron Form");
+    }
     // Parsed here rather than at the first tick, because a schedule this Host
     // cannot read is a trigger that would be recorded and never fire.
     if (!parseWorkerCron(cron)) {
@@ -3385,20 +3439,124 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       );
     }
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-    await rewriteAttachments(script, (state) => ({
-      ...state,
-      crons: [...new Set([...(state.crons ?? []), cron])].sort(),
-    }));
-    const { state } = await readScriptState(script);
+    if (
+      input.previous !== undefined &&
+      (parseSelfhostNativeId("WorkerCronTrigger", input.previous.nativeId, input.previous.spec)
+        ?.script !== script ||
+        typeof input.previous.spec.cron !== "string")
+    ) {
+      return failed("invalid_spec", "the Cron Trigger cannot change its Worker binding");
+    }
+    let retiredCron: string | undefined;
+    const next = await rewriteAttachments(script, async (state) => {
+      const owners = await cronOwnersForMutation(state, input, worker);
+      const previousOwner = owners.find((owner) => owner.resourceUid === resourceUid);
+      if (input.previous !== undefined) {
+        if (previousOwner?.cron === cron) return state;
+        if (!previousOwner || previousOwner.cron !== input.previous.spec.cron) {
+          throw new SelfhostFailure(failed("conflict", "the Cron Trigger owner state changed"));
+        }
+        retiredCron = previousOwner.cron;
+      } else if (previousOwner) {
+        if (previousOwner.cron === cron) return state;
+        throw new SelfhostFailure(
+          failed("conflict", "the Cron Trigger Resource is already attached"),
+        );
+      }
+      const nextOwners = [
+        ...owners.filter((owner) => owner.resourceUid !== resourceUid),
+        { resourceUid, cron },
+      ].sort((left, right) => (left.resourceUid < right.resourceUid ? -1 : 1));
+      if (nextOwners.length > MAX_SELFHOST_CRON_OWNERS) {
+        throw new SelfhostFailure(failed("quota", "the Worker has reached its Cron Trigger limit"));
+      }
+      // A previous last-owner delete may have committed the owner removal but
+      // failed to delete the scheduler row. A new first owner must start at its
+      // own next future match, not inherit that old row's pending minute.
+      // This runs before the new owner is persisted, under the Worker mutation
+      // lock; a cleanup failure therefore leaves the new apply uncommitted.
+      if (!owners.some((owner) => owner.cron === cron)) {
+        await options.events?.forgetSchedules(script, cron);
+      }
+      return { ...state, cronOwners: nextOwners, crons: cronExpressions(nextOwners) };
+    });
+    if (retiredCron && retiredCron !== cron && !next.crons?.includes(retiredCron)) {
+      await options.events?.forgetSchedules(script, retiredCron);
+    }
     return succeeded({
       nativeId: nativeId(input, `selfhost-cron:${script}`),
       observed: {
         cron,
         scriptName: script,
-        scheduled: await eventsDeliverable(script, state),
+        scheduled: await eventsDeliverable(script, next),
       },
       outputs: {},
     });
+  };
+
+  const cronOwnersForMutation = async (
+    state: SelfhostScriptState,
+    input: { readonly identity: ResourceIdentity; readonly offering: ProviderOffering },
+    worker: NonNullable<ReturnType<typeof relationResource>>,
+  ): Promise<readonly SelfhostCronOwner[]> => {
+    if (state.cronOwners !== undefined) return state.cronOwners;
+    const listCronOwners = options.listCronOwners;
+    if (!listCronOwners || !RESOURCE_UID.test(worker.metadata.uid)) {
+      throw new SelfhostFailure(
+        failed("unavailable", "canonical Cron ownership is unavailable", true),
+      );
+    }
+    let projection: Awaited<ReturnType<NonNullable<typeof listCronOwners>>>;
+    try {
+      projection = await listCronOwners({
+        tenantRef: input.identity.tenantRef,
+        space: input.identity.space,
+        workerResourceUid: worker.metadata.uid,
+        form: input.offering.form,
+        limit: MAX_SELFHOST_CRON_OWNERS + 1,
+      });
+    } catch {
+      throw new SelfhostFailure(
+        failed("unavailable", "canonical Cron ownership is unavailable", true),
+      );
+    }
+    if (
+      projection?.complete !== true ||
+      Object.keys(projection).sort().join(",") !== "complete,owners" ||
+      !Array.isArray(projection.owners) ||
+      projection.owners.length > MAX_SELFHOST_CRON_OWNERS
+    ) {
+      throw new SelfhostFailure(
+        failed("unavailable", "canonical Cron ownership is incomplete", true),
+      );
+    }
+    const owners: SelfhostCronOwner[] = [];
+    const seen = new Set<string>();
+    for (const owner of projection.owners) {
+      if (
+        !isJsonObject(owner) ||
+        Object.keys(owner).some((key) => key !== "resourceUid" && key !== "cron") ||
+        typeof owner.resourceUid !== "string" ||
+        !RESOURCE_UID.test(owner.resourceUid) ||
+        typeof owner.cron !== "string" ||
+        !parseWorkerCron(owner.cron) ||
+        seen.has(owner.resourceUid)
+      ) {
+        throw new SelfhostFailure(
+          failed("unavailable", "canonical Cron ownership is unusable", true),
+        );
+      }
+      seen.add(owner.resourceUid);
+      owners.push({ resourceUid: owner.resourceUid, cron: owner.cron });
+    }
+    owners.sort((left, right) => (left.resourceUid < right.resourceUid ? -1 : 1));
+    const canonicalCrons = cronExpressions(owners);
+    if (JSON.stringify(canonicalCrons) !== JSON.stringify(state.crons ?? [])) {
+      throw new SelfhostFailure(
+        failed("conflict", "legacy Cron schedules do not match canonical owners"),
+      );
+    }
+    return owners;
   };
 
   const applyQueueConsumer = async (input: ApplyInput): Promise<ProviderTicket> => {
@@ -4118,10 +4276,22 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }
       const parsed = parseSelfhostNativeId(kind, input.nativeId, input.spec, input.relations);
       if (!parsed) throw new ProviderReadbackDescriptorError();
+      const resourceUid = input.identity.uid;
+      if (kind === "WorkerCronTrigger") {
+        if (
+          !isReleasedSelfhostCronForm(input.offering.form) ||
+          !resourceUid ||
+          !RESOURCE_UID.test(resourceUid)
+        ) {
+          throw new ProviderReadbackDescriptorError();
+        }
+      }
       const data =
         kind === "WorkerEndpoint" && parsed.script && parsed.hostname
           ? { ...parsed.data, hostname: parsed.hostname }
-          : parsed.data;
+          : kind === "WorkerCronTrigger"
+            ? { ...parsed.data, resourceUid: resourceUid ?? "" }
+            : parsed.data;
       return {
         apiVersion: PROVIDER_READBACK_API_VERSION,
         provider: id,
@@ -4318,12 +4488,26 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           // An attachment is durable state now rather than a bare declaration,
           // so its absence is something this Host can read rather than assert.
           case "WorkerCronTrigger": {
+            if (!isReleasedSelfhostCronForm(input.offering.form)) {
+              return selfhostUnknown("authority_unavailable", false);
+            }
             if (!parsed.script) return selfhostUnknown("malformed", false);
             const cron = optionalSafeString(parsed.data.cron);
-            if (!cron) return selfhostUnknown("malformed", false);
+            const resourceUid = optionalSafeString(parsed.data.resourceUid);
+            if (
+              !cron ||
+              !resourceUid ||
+              !RESOURCE_UID.test(resourceUid) ||
+              input.target?.resourceUid !== resourceUid
+            ) {
+              return selfhostUnknown("malformed", false);
+            }
             const state = await readSelfhostState(selfhostScriptStateRoot(dataRoot), parsed.script);
+            if (!state.cronOwners) return selfhostUnknown("authority_unavailable", true);
             return selfhostAbsence(
-              state.crons.includes(cron) ? "present" : "absent",
+              state.cronOwners.some((owner) => owner.resourceUid === resourceUid)
+                ? "present"
+                : "absent",
               input.descriptor,
               kind,
               id,
@@ -4760,13 +4944,36 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             });
           }
           case "WorkerCronTrigger": {
+            if (!isReleasedSelfhostCronForm(input.offering.form)) {
+              return failed("denied", "this self-host provider does not own this Cron Form");
+            }
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
-            const cron = typeof input.spec.cron === "string" ? input.spec.cron : null;
-            if (!cron) return failed("not_found", "the cron trigger records no expression");
+            const cron = typeof input.spec?.cron === "string" ? input.spec.cron : null;
+            const resourceUid = input.identity.uid;
+            if (!cron || !resourceUid || !RESOURCE_UID.test(resourceUid)) {
+              return failed("not_found", "the cron trigger records no exact owner");
+            }
             if (!worker) return failed("not_found", "the cron trigger has no worker relation");
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+            if (
+              parseSelfhostNativeId(
+                "WorkerCronTrigger",
+                input.nativeId,
+                input.spec,
+                input.relations,
+              )?.script !== script
+            ) {
+              return failed(
+                "not_found",
+                "the Cron Trigger native identity does not match its Worker",
+              );
+            }
             const { state } = await readScriptState(script);
-            if (!(state.crons ?? []).includes(cron)) {
+            if (
+              !state.cronOwners?.some(
+                (owner) => owner.resourceUid === resourceUid && owner.cron === cron,
+              )
+            ) {
               return failed("not_found", "the cron trigger is not durably attached");
             }
             return succeeded({
@@ -5004,12 +5211,46 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           case "WorkerCronTrigger": {
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
             const cron = typeof input.spec?.cron === "string" ? input.spec.cron : null;
-            if (worker && cron) {
-              const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-              await rewriteAttachments(script, (state) => ({
-                ...state,
-                crons: (state.crons ?? []).filter((entry) => entry !== cron),
-              }));
+            const resourceUid = input.identity.uid;
+            if (!worker || !cron || !resourceUid || !RESOURCE_UID.test(resourceUid)) {
+              throw new SelfhostFailure(
+                failed("invalid_spec", "the Cron Trigger identity is incomplete"),
+              );
+            }
+            if (!isReleasedSelfhostCronForm(input.offering.form)) {
+              throw new SelfhostFailure(
+                failed("denied", "this self-host provider does not own this Cron Form"),
+              );
+            }
+            const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+            if (
+              parseSelfhostNativeId(
+                "WorkerCronTrigger",
+                input.nativeId,
+                input.spec,
+                input.relations,
+              )?.script !== script
+            ) {
+              throw new SelfhostFailure(
+                failed("invalid_spec", "the Cron Trigger cannot change its Worker binding"),
+              );
+            }
+            const next = await rewriteAttachments(script, async (state) => {
+              const owners = await cronOwnersForMutation(state, input, worker);
+              const owner = owners.find((entry) => entry.resourceUid === resourceUid);
+              if (!owner) return state;
+              if (owner.cron !== cron) {
+                throw new SelfhostFailure(
+                  failed("conflict", "the Cron Trigger owner state changed"),
+                );
+              }
+              const nextOwners = owners.filter((entry) => entry.resourceUid !== resourceUid);
+              return { ...state, cronOwners: nextOwners, crons: cronExpressions(nextOwners) };
+            });
+            // A previous attempt may have committed owner removal and then
+            // failed to clear the scheduler row. Retrying the same delete may
+            // clear that orphan, but never a row still shared by another owner.
+            if (!next.crons?.includes(cron)) {
               await options.events?.forgetSchedules(script, cron);
             }
             return done();
@@ -5267,6 +5508,43 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               ? done()
               : uncertain();
           }
+          case "WorkerCronTrigger": {
+            if (!isReleasedSelfhostCronForm(input.offering.form)) return uncertain();
+            const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+            const resourceUid = input.identity.uid;
+            const cron = typeof input.spec?.cron === "string" ? input.spec.cron : null;
+            if (
+              !worker ||
+              !resourceUid ||
+              !RESOURCE_UID.test(resourceUid) ||
+              !cron ||
+              !parseWorkerCron(cron)
+            ) {
+              return uncertain();
+            }
+            const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+            if (
+              parseSelfhostNativeId(
+                "WorkerCronTrigger",
+                input.nativeId,
+                input.spec,
+                input.relations,
+              )?.script !== script
+            ) {
+              return uncertain();
+            }
+            let state: ReadonlyScriptState;
+            try {
+              state = await readSelfhostState(selfhostScriptStateRoot(dataRoot), script);
+            } catch {
+              return uncertain();
+            }
+            if (!state.exists) return done();
+            if (!state.cronOwners) return uncertain();
+            return state.cronOwners.some((owner) => owner.resourceUid === resourceUid)
+              ? uncertain()
+              : done();
+          }
           case "SQLiteDatabase":
           case "sql_database": {
             const name = selfhostNamespaceName("selfhost-sqlite", input.nativeId);
@@ -5283,6 +5561,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         }
       } catch (error) {
         if (error instanceof SelfhostFailure) return error.ticket;
+        if (error instanceof SelfhostReadbackMalformed) return uncertain();
         throw error;
       }
     },
@@ -5457,6 +5736,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async adopt(input): Promise<ProviderTicket> {
+      if (isReleasedSelfhostCronForm(input.offering.form)) {
+        return failed("denied", "Cron Trigger import is not supported by this self-host provider");
+      }
       if (input.operationMode === "recovery" && !input.providerHandle) {
         return failed("unavailable", "provider mutation recovery requires an opaque handle", true);
       }
@@ -5912,8 +6194,17 @@ function parseSelfhostNativeId(
     }
     case "WorkerCronTrigger": {
       const cron = optionalSafeString(spec?.cron);
-      return parts[0] === "selfhost-cron" && script && cron
-        ? { script, data: { scriptName: script, cron } }
+      const resourceUid = optionalSafeString(spec?.resourceUid);
+      return parts.length === 3 &&
+        parts[0] === "selfhost-cron" &&
+        script &&
+        safeSegment(parts[2]) &&
+        cron
+        ? {
+            script,
+            ...(resourceUid && RESOURCE_UID.test(resourceUid) ? { resourceUid } : {}),
+            data: { scriptName: script, cron, ...(resourceUid ? { resourceUid } : {}) },
+          }
         : null;
     }
     case "QueueConsumer": {
@@ -6112,6 +6403,34 @@ function selfhostDataMatches(expected: JsonObject, actual: JsonObject): boolean 
 
 class SelfhostReadbackMalformed extends Error {}
 
+function isCronExpressionList(value: unknown): value is readonly string[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (cron: unknown) => typeof cron === "string" && optionalSafeString(cron) !== undefined,
+    )
+  );
+}
+
+function isCronOwnerList(value: unknown): value is readonly SelfhostCronOwner[] {
+  if (!Array.isArray(value) || value.length > MAX_SELFHOST_CRON_OWNERS) return false;
+  const seen = new Set<string>();
+  for (const owner of value) {
+    if (
+      !isJsonObject(owner) ||
+      Object.keys(owner).some((key) => key !== "resourceUid" && key !== "cron") ||
+      typeof owner.resourceUid !== "string" ||
+      !RESOURCE_UID.test(owner.resourceUid) ||
+      typeof owner.cron !== "string" ||
+      !parseWorkerCron(owner.cron) ||
+      seen.has(owner.resourceUid)
+    )
+      return false;
+    seen.add(owner.resourceUid);
+  }
+  return true;
+}
+
 interface ReadonlyScriptState {
   readonly exists: boolean;
   readonly activeVersion?: string;
@@ -6121,6 +6440,7 @@ interface ReadonlyScriptState {
   /** Native queue ids this script drains, in whatever order it was written. */
   readonly consumers: readonly string[];
   readonly crons: readonly string[];
+  readonly cronOwners?: readonly SelfhostCronOwner[];
 }
 
 async function readSelfhostState(root: string, script: string): Promise<ReadonlyScriptState> {
@@ -6146,15 +6466,19 @@ async function readSelfhostState(root: string, script: string): Promise<Readonly
   const endpointHostname = parsed.endpointHostname;
   const domains = parsed.domains;
   const consumers = parsed.consumers ?? [];
-  const crons = parsed.crons ?? [];
+  const crons: unknown = parsed.crons ?? [];
+  const cronOwners: unknown = parsed.cronOwners;
   if (
     (activeVersion !== undefined && !safeSegment(activeVersion)) ||
     (activeVersion !== undefined && rawDeployment !== undefined) ||
     (endpointHostname !== undefined && !normalizedHostname(endpointHostname)) ||
     domains.some((value) => !normalizedHostname(value)) ||
     !Array.isArray(consumers) ||
-    !Array.isArray(crons) ||
-    crons.some((value) => !optionalSafeString(value)) ||
+    !isCronExpressionList(crons) ||
+    (cronOwners !== undefined &&
+      (!isCronOwnerList(cronOwners) ||
+        JSON.stringify([...new Set(cronOwners.map((owner) => owner.cron))].sort()) !==
+          JSON.stringify([...new Set(crons)].sort()))) ||
     consumers.some((value) => !isJsonObject(value) || !safeSegment(value.queue)) ||
     Object.keys(parsed).some(
       (key) =>
@@ -6163,7 +6487,8 @@ async function readSelfhostState(root: string, script: string): Promise<Readonly
         key !== "endpointHostname" &&
         key !== "domains" &&
         key !== "consumers" &&
-        key !== "crons",
+        key !== "crons" &&
+        key !== "cronOwners",
     )
   ) {
     throw new SelfhostReadbackMalformed();
@@ -6185,7 +6510,12 @@ async function readSelfhostState(root: string, script: string): Promise<Readonly
     // Only the queue each consumer drains: the limits are the pump's business,
     // and a readback answers "is this attachment there", not "what is it".
     consumers: consumers.map((value) => String((value as JsonObject).queue)),
-    crons: crons.filter((value): value is string => typeof value === "string"),
+    crons,
+    ...(cronOwners === undefined
+      ? {}
+      : {
+          cronOwners,
+        }),
   };
 }
 
@@ -6448,6 +6778,19 @@ function normalizedHostname(value: unknown): string | undefined {
   if (typeof value !== "string" || value.length < 1 || value.length > 255) return undefined;
   const hostname = value.toLowerCase().replace(/\.$/u, "");
   return /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u.test(hostname) ? hostname : undefined;
+}
+
+function isReleasedSelfhostCronForm(form: ProviderOffering["form"]): boolean {
+  return (
+    form.apiVersion === "edge.forms.takoform.com/v1beta1" &&
+    form.kind === "WorkerCronTrigger" &&
+    form.definitionVersion === "0.1.0" &&
+    form.schemaDigest === "sha256:ef4fdfc91638154766db821c97ef3d097619c610a5c3784888541ce307c82b8a"
+  );
+}
+
+function cronExpressions(owners: readonly SelfhostCronOwner[]): readonly string[] {
+  return [...new Set(owners.map((owner) => owner.cron))].sort();
 }
 
 function errorCode(error: unknown): string | undefined {

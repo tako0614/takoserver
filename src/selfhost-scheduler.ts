@@ -1,9 +1,9 @@
 import { parseWorkerCron, type WorkerCronSchedule } from "./cron.ts";
 import type { Sql } from "./ports.ts";
 import type {
+  SelfhostCronClaimTargets,
   SelfhostEventSelection,
   SelfhostEventTarget,
-  SelfhostEventTargets,
 } from "./providers/selfhost.ts";
 import {
   SELFHOST_WORKER_EVENT_CONTENT_TYPE,
@@ -63,7 +63,7 @@ export interface SelfhostWorkerSchedulerOptions {
   /** Control storage; the next-fire state lives here under migration 0040. */
   readonly sql: Sql;
   readonly runtime: WorkerdRuntime;
-  readonly targets: SelfhostEventTargets;
+  readonly targets: SelfhostCronClaimTargets;
   readonly clock?: () => Date;
   readonly leaseMillis?: number;
   readonly invocationTimeoutMillis?: number;
@@ -161,47 +161,46 @@ export function createSelfhostWorkerScheduler(
           // apply refuses one, so reaching here means the record predates that
           // refusal or was edited outside this process.
           if (!schedule) continue;
-          const millis = now().getTime();
-          const state = await due(target.script, schedule, millis);
-          if (!state || state.running || state.nextFireAtMillis > millis) continue;
-          const next = schedule.nextAfter(millis);
-          if (next === null) continue;
-          // Too late to be this match's minute: step over it and record the
-          // next one. A backlog is exactly what the Form says never to build.
-          if (millis - state.nextFireAtMillis >= MATCH_TOLERANCE_MILLIS) {
-            await sql.run(
-              "UPDATE selfhost_worker_schedules SET next_fire_at_ms = ? " +
-                "WHERE script = ? AND cron = ? AND next_fire_at_ms = ?",
-              [next, target.script, cron, state.nextFireAtMillis],
+          // list() is only a hint. The exact owner check, SQL seed/claim and
+          // dispatch start share the provider's per-Worker mutation queue.
+          const claimed = await options.targets.withCurrentCron(target.script, cron, async () => {
+            const millis = now().getTime();
+            const state = await due(target.script, schedule, millis);
+            if (!state || state.running || state.nextFireAtMillis > millis) return null;
+            const next = schedule.nextAfter(millis);
+            if (next === null) return null;
+            if (millis - state.nextFireAtMillis >= MATCH_TOLERANCE_MILLIS) {
+              await sql.run(
+                "UPDATE selfhost_worker_schedules SET next_fire_at_ms = ? " +
+                  "WHERE script = ? AND cron = ? AND next_fire_at_ms = ?",
+                [next, target.script, cron, state.nextFireAtMillis],
+              );
+              return null;
+            }
+            const lease = millis + leaseMillis;
+            const claim = await sql.run(
+              "UPDATE selfhost_worker_schedules SET running_until_ms = ?, next_fire_at_ms = ? " +
+                "WHERE script = ? AND cron = ? AND next_fire_at_ms = ? " +
+                "AND (running_until_ms IS NULL OR running_until_ms <= ?)",
+              [lease, next, target.script, cron, state.nextFireAtMillis, millis],
             );
-            continue;
-          }
-          // The claim and the advance are one statement, fenced on the exact
-          // instant this pass read: two passes cannot both own the minute, and
-          // a lease that is still live is what makes the second one skip.
-          const lease = millis + leaseMillis;
-          const claim = await sql.run(
-            "UPDATE selfhost_worker_schedules SET running_until_ms = ?, next_fire_at_ms = ? " +
-              "WHERE script = ? AND cron = ? AND next_fire_at_ms = ? " +
-              "AND (running_until_ms IS NULL OR running_until_ms <= ?)",
-            [lease, next, target.script, cron, state.nextFireAtMillis, millis],
-          );
-          if (claim.changes !== 1) continue;
-          // Select exactly once for this claimed cron invocation. Selection is
-          // deliberately after the claim: entropy is not spent for a future or
-          // already-owned minute, and a readback failure is the same no-answer
-          // outcome as a runtime restart. There is no cross-Version fallback.
-          let selected: SelfhostEventSelection | null = null;
-          try {
-            selected = await options.targets.select(target.script);
-          } catch {
-            // Durable readback and private entropy are Host work. A failure
-            // cannot be attributed to a tenant handler.
-          }
-          const acknowledged =
-            selected?.handlers.includes("scheduled") === true
-              ? await invoke(target, selected, cron, state.nextFireAtMillis)
-              : false;
+            if (claim.changes !== 1) return null;
+            let selected: SelfhostEventSelection | null = null;
+            try {
+              selected = await options.targets.select(target.script);
+            } catch {
+              // Durable readback and private entropy are Host work.
+            }
+            // Begin invocation under the lock, but never await its response
+            // there: a handler can take up to a minute to return.
+            const outcome =
+              selected?.handlers.includes("scheduled") === true
+                ? invoke(target, selected, cron, state.nextFireAtMillis)
+                : Promise.resolve(false);
+            return { scheduledTime: state.nextFireAtMillis, lease, outcome };
+          });
+          if (!claimed) continue;
+          const acknowledged = await claimed.outcome;
           // Fenced on the exact lease this pass wrote, because the CAS above is
           // the only thing enforcing single flight and a release that did not
           // match it would clear a lease another pass had taken. And
@@ -212,8 +211,8 @@ export function createSelfhostWorkerScheduler(
               (acknowledged ? ", last_fired_at_ms = ?" : "") +
               " WHERE script = ? AND cron = ? AND running_until_ms = ?",
             acknowledged
-              ? [state.nextFireAtMillis, target.script, cron, lease]
-              : [target.script, cron, lease],
+              ? [claimed.scheduledTime, target.script, cron, claimed.lease]
+              : [target.script, cron, claimed.lease],
           );
           // A failed invocation is a failed invocation, not a retry: the Form
           // says a match is not retried within its minute.

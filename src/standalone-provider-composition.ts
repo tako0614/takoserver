@@ -11,7 +11,9 @@ import type {
   SelfhostArtifacts,
   SelfhostDataPlaneMaintenance,
   SelfhostEventRuntime,
+  SelfhostProviderOptions,
 } from "./providers/selfhost.ts";
+import { MAX_SELFHOST_CRON_OWNERS } from "./providers/selfhost.ts";
 import type {
   SelfhostContainerEndpointHttpsIngressPort,
   SelfhostContainerEndpointIngressCapability,
@@ -19,6 +21,7 @@ import type {
 import type { SelfhostContainerCapability } from "./providers/selfhost-container-lifecycle.ts";
 import type { SelfhostActorPublicRuntime } from "./selfhost-actor-public-runtime.ts";
 import { createSelfhostComposition } from "./selfhost-composition.ts";
+import type { TakoformStore } from "./takoform/store.ts";
 import type { InstalledTakoformBinding, InstalledTakoformForm } from "./takoform/types.ts";
 import type { WorkerdRuntime } from "./workerd-runtime.ts";
 
@@ -111,6 +114,118 @@ export interface StandaloneProviderComposition {
   readonly containerEndpointIngress?: SelfhostContainerEndpointIngressCapability;
 }
 
+/**
+ * Reads the complete, current Cron owner projection from the same canonical
+ * resource inventory used by the Host. The self-host provider uses this only
+ * to rehydrate pre-owner-map script state; it is never a second ledger.
+ */
+export function createSelfhostCronOwnerReader(input: {
+  readonly inventory: Pick<TakoformStore, "resourcesByRelation">;
+  /** Exact installed Forms available to this composition, including the released Cron Form. */
+  readonly forms: readonly InstalledTakoformForm[];
+}): NonNullable<SelfhostProviderOptions["listCronOwners"]> {
+  const cronForms = input.forms.filter(
+    (form) =>
+      form.identity.formRef.apiVersion === "edge.forms.takoform.com/v1beta1" &&
+      form.identity.formRef.kind === "WorkerCronTrigger",
+  );
+  const workerForms = input.forms.filter(
+    (form) =>
+      form.identity.formRef.apiVersion === "edge.forms.takoform.com/v1beta1" &&
+      form.identity.formRef.kind === "ModuleWorker",
+  );
+  const cronForm = cronForms.length === 1 ? cronForms[0] : undefined;
+  const workerForm = workerForms.length === 1 ? workerForms[0] : undefined;
+
+  return async ({ tenantRef, space, workerResourceUid, form, limit }) => {
+    if (
+      !cronForm ||
+      !workerForm ||
+      !tenantRef.trim() ||
+      !space.trim() ||
+      !workerResourceUid.trim() ||
+      !sameCronFormRef(form, cronForm.identity.formRef) ||
+      !Number.isSafeInteger(limit) ||
+      limit !== MAX_SELFHOST_CRON_OWNERS + 1
+    ) {
+      return { complete: false };
+    }
+
+    try {
+      const related = await input.inventory.resourcesByRelation({
+        tenantId: tenantRef,
+        space,
+        sourceApiVersion: cronForm.identity.formRef.apiVersion,
+        sourceKind: cronForm.identity.formRef.kind,
+        relation: "/worker",
+        targetUid: workerResourceUid,
+        limit,
+      });
+      // A full page may have hidden another owner. Do not mistake it for a
+      // complete projection, even when the result happens to contain 65 rows.
+      if (related.length >= limit) return { complete: false };
+
+      const owners: { resourceUid: string; cron: string }[] = [];
+      const seenUids = new Set<string>();
+      for (const entry of related) {
+        const resource = entry.resource;
+        const workerRelations = entry.relations.filter(
+          (relation) => relation.pointer === "/worker" || relation.relation === "/worker",
+        );
+        const relation = workerRelations[0];
+        const uid = resource.metadata.uid;
+        const cron = resource.spec.cron;
+        if (
+          resource.apiVersion !== cronForm.identity.formRef.apiVersion ||
+          resource.kind !== cronForm.identity.formRef.kind ||
+          resource.form.formRef.apiVersion !== cronForm.identity.formRef.apiVersion ||
+          resource.form.formRef.kind !== cronForm.identity.formRef.kind ||
+          resource.form.formRef.definitionVersion !== cronForm.identity.formRef.definitionVersion ||
+          resource.form.formRef.schemaDigest !== cronForm.identity.formRef.schemaDigest ||
+          resource.form.packageDigest !== cronForm.identity.packageDigest ||
+          resource.form.implementationDigest !== cronForm.identity.implementationDigest ||
+          resource.metadata.space !== space ||
+          typeof uid !== "string" ||
+          !uid.trim() ||
+          seenUids.has(uid) ||
+          typeof cron !== "string" ||
+          workerRelations.length !== 1 ||
+          !relation ||
+          relation.pointer !== "/worker" ||
+          relation.relation !== "/worker" ||
+          relation.targetUid !== workerResourceUid ||
+          relation.targetApiVersion !== workerForm.identity.formRef.apiVersion ||
+          relation.targetKind !== workerForm.identity.formRef.kind ||
+          relation.targetFormRef.apiVersion !== workerForm.identity.formRef.apiVersion ||
+          relation.targetFormRef.kind !== workerForm.identity.formRef.kind ||
+          relation.targetFormRef.definitionVersion !==
+            workerForm.identity.formRef.definitionVersion ||
+          relation.targetFormRef.schemaDigest !== workerForm.identity.formRef.schemaDigest
+        ) {
+          return { complete: false };
+        }
+        seenUids.add(uid);
+        owners.push({ resourceUid: uid, cron });
+      }
+      return { complete: true, owners };
+    } catch {
+      return { complete: false };
+    }
+  };
+}
+
+function sameCronFormRef(
+  actual: Parameters<NonNullable<SelfhostProviderOptions["listCronOwners"]>>[0]["form"],
+  expected: InstalledTakoformForm["identity"]["formRef"],
+): boolean {
+  return (
+    actual.apiVersion === expected.apiVersion &&
+    actual.kind === expected.kind &&
+    actual.definitionVersion === expected.definitionVersion &&
+    actual.schemaDigest === expected.schemaDigest
+  );
+}
+
 export function createStandaloneProviderComposition(input: {
   readonly mode: StandaloneProviderMode;
   readonly stableForms: readonly InstalledTakoformForm[];
@@ -139,6 +254,8 @@ export function createStandaloneProviderComposition(input: {
   readonly dataPlaneMaintenance?: SelfhostDataPlaneMaintenance;
   /** The pump and the scheduler, when this entry runs them. */
   readonly events?: SelfhostEventRuntime;
+  /** One-time rehydration from canonical Host resource ownership for legacy Cron state. */
+  readonly listCronOwners?: SelfhostProviderOptions["listCronOwners"];
   readonly now: Date;
   readonly retiredCloudflare?: Omit<CloudflareProviderOptions, "offerings">;
 }): StandaloneProviderComposition {
@@ -174,6 +291,7 @@ export function createStandaloneProviderComposition(input: {
       ...(input.dataPlaneAddress ? { dataPlaneAddress: input.dataPlaneAddress } : {}),
       ...(input.dataPlaneMaintenance ? { dataPlaneMaintenance: input.dataPlaneMaintenance } : {}),
       ...(input.events ? { events: input.events } : {}),
+      ...(input.listCronOwners ? { listCronOwners: input.listCronOwners } : {}),
       now: input.now,
     });
     return {

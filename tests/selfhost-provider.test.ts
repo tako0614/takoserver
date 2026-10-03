@@ -31,6 +31,7 @@ import {
   createSelfhostEventTargets,
   createSelfhostProvider,
   type SelfhostDataPlaneMaintenance,
+  type SelfhostProviderOptions,
   selfhostDatabasePath,
 } from "../src/providers/selfhost.ts";
 import { SELFHOST_WORKER_EVENT_PROTOCOL } from "../src/providers/selfhost-events.ts";
@@ -79,7 +80,10 @@ function offering(kind: string): ProviderOffering {
       apiVersion: EDGE_API,
       kind,
       definitionVersion: "0.1.0",
-      schemaDigest: `sha256:${"a".repeat(64)}`,
+      schemaDigest:
+        kind === "WorkerCronTrigger"
+          ? "sha256:ef4fdfc91638154766db821c97ef3d097619c610a5c3784888541ce307c82b8a"
+          : `sha256:${"a".repeat(64)}`,
     },
     providedInterfaces: [],
     bindingRefs: [],
@@ -249,6 +253,7 @@ interface ProviderCase {
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
   readonly dataPlaneMaintenance?: SelfhostDataPlaneMaintenance;
   readonly standardServiceIntegrations?: readonly SelfhostStandardServiceIntegration[];
+  readonly listCronOwners?: SelfhostProviderOptions["listCronOwners"];
 }
 
 const SECRET_VALUE = "placeholder-encryption-value";
@@ -580,6 +585,8 @@ function provider(options: ProviderCase = {}) {
       ? { standardServiceIntegrations: options.standardServiceIntegrations }
       : {}),
     ...(options.events ? { events: options.events } : {}),
+    listCronOwners:
+      options.listCronOwners ?? (async () => ({ complete: true, owners: [] as const })),
     artifacts: {
       async manifest(_tenant, digest) {
         if (digest === "sha256:worker") {
@@ -840,7 +847,7 @@ describe("publishing a Worker through the Edge Family", () => {
     const trigger = await local.apply({
       operationId: "op_failed_weighted_cron",
       offering: offering("WorkerCronTrigger"),
-      identity: identity("hello-cron"),
+      identity: { ...identity("hello-cron"), uid: "uid-hello-cron" },
       spec: {
         worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
         cron: "* * * * *",
@@ -911,6 +918,7 @@ describe("publishing a Worker through the Edge Family", () => {
     let selections = 0;
     const countedTargets = {
       list: () => targets.list(),
+      withCurrentCron: targets.withCurrentCron,
       async select(selectedScript: string) {
         selections += 1;
         return await targets.select(selectedScript);
@@ -1147,7 +1155,7 @@ describe("publishing a Worker through the Edge Family", () => {
       local.apply({
         operationId: "op_cron_race",
         offering: offering("WorkerCronTrigger"),
-        identity: identity("hello-cron"),
+        identity: { ...identity("hello-cron"), uid: "uid-hello-cron" },
         spec: {
           worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
           cron: "0 * * * *",
@@ -2966,7 +2974,7 @@ describe("publishing a Worker through the Edge Family", () => {
     const trigger = await local.apply({
       operationId: "op_cron_legacy_assets",
       offering: offering("WorkerCronTrigger"),
-      identity: identity("hello-cron"),
+      identity: { ...identity("hello-cron"), uid: "uid-hello-cron" },
       spec: {
         worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
         cron: "0 * * * *",
@@ -5666,10 +5674,727 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
     local.apply({
       operationId: "op_cron",
       offering: offering("WorkerCronTrigger"),
-      identity: identity("hello-cron"),
+      identity: { ...identity("hello-cron"), uid: "uid-hello-cron" },
       spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" }, cron },
       relations: [relation("/worker", "ModuleWorker", "hello")],
     });
+
+  const cronSpec = (cron: string) => ({
+    worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+    cron,
+  });
+
+  const applyOwnedCron = (
+    local: ReturnType<typeof provider>,
+    input: {
+      readonly operationId: string;
+      readonly name: string;
+      readonly uid: string;
+      readonly cron: string;
+      readonly previous?: { readonly nativeId: string; readonly spec: ReturnType<typeof cronSpec> };
+    },
+  ) =>
+    local.apply({
+      operationId: input.operationId,
+      offering: offering("WorkerCronTrigger"),
+      identity: { ...identity(input.name), uid: input.uid },
+      spec: cronSpec(input.cron),
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+      ...(input.previous === undefined ? {} : { previous: input.previous }),
+    });
+
+  const deleteOwnedCron = (
+    local: ReturnType<typeof provider>,
+    input: {
+      readonly operationId: string;
+      readonly name: string;
+      readonly uid: string;
+      readonly nativeId: string;
+      readonly cron: string;
+    },
+  ) =>
+    local.delete({
+      operationId: input.operationId,
+      offering: offering("WorkerCronTrigger"),
+      identity: { ...identity(input.name), uid: input.uid },
+      nativeId: input.nativeId,
+      spec: cronSpec(input.cron),
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+
+  const writeLegacyCronState = async (script: string, crons: readonly string[]) => {
+    const path = join(root, "selfhost", "scripts", `${script}.json`);
+    const state = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    delete state.cronOwners;
+    state.crons = [...crons];
+    await writeFile(path, JSON.stringify(state), "utf8");
+  };
+
+  test("direct Cron adoption cannot borrow another Resource UID's native schedule", async () => {
+    const runtime = servingRuntime();
+    const local = provider({ runtime: runtime.runtime, events: EVENTS });
+    const script = await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    const cron = "0 * * * *";
+    const owner = await applyOwnedCron(local, {
+      operationId: "op_existing_cron_owner",
+      name: "existing-cron-owner",
+      uid: "uid-existing-cron-owner",
+      cron,
+    });
+    if (owner.phase !== "succeeded" || !local.adopt) {
+      throw new Error("Cron owner setup failed");
+    }
+    const statePath = join(root, "selfhost", "scripts", `${script}.json`);
+    const before = readFileSync(statePath, "utf8");
+
+    const adoption = await local.adopt({
+      operationId: "op_new_cron_owner_adopt",
+      offering: offering("WorkerCronTrigger"),
+      nativeId: owner.result.nativeId,
+      identity: { ...identity("new-cron-owner"), uid: "uid-new-cron-owner" },
+      spec: cronSpec(cron),
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+
+    expect(adoption).toMatchObject({
+      phase: "failed",
+      failure: { code: "denied", retryable: false },
+    });
+    expect(readFileSync(statePath, "utf8")).toBe(before);
+  });
+
+  test("updates one Cron Resource from A to B without retaining A across replay or restart", async () => {
+    const runtime = servingRuntime();
+    const forgotten: string[] = [];
+    const local = provider({
+      runtime: runtime.runtime,
+      events: {
+        async forgetSchedules(_script, cron) {
+          if (cron !== undefined) forgotten.push(cron);
+        },
+      },
+    });
+    await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    const scheduleA = "0 * * * *";
+    const scheduleB = "15 * * * *";
+    const created = await applyOwnedCron(local, {
+      operationId: "op_cron_resource_a_create",
+      name: "hello-cron-a",
+      uid: "uid-cron-a",
+      cron: scheduleA,
+    });
+    if (created.phase !== "succeeded") throw new Error("Cron Resource A did not attach");
+
+    const updateInput = {
+      operationId: "op_cron_resource_a_update",
+      offering: offering("WorkerCronTrigger"),
+      identity: { ...identity("hello-cron-a"), uid: "uid-cron-a" },
+      spec: cronSpec(scheduleB),
+      previous: { nativeId: created.result.nativeId, spec: cronSpec(scheduleA) },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    };
+    const updated = await local.apply(updateInput);
+    expect(updated).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: created.result.nativeId },
+    });
+
+    const replayed = await local.apply(updateInput);
+    expect(replayed).toEqual(updated);
+    const afterReplay = createSelfhostEventTargets(root, {
+      activeDeployment: async () => ({ generation: "active", versions: [], events: true }),
+    });
+    expect((await afterReplay.list())[0]?.crons).toEqual([scheduleB]);
+    expect(forgotten).toContain(scheduleA);
+
+    // A fresh target reader is what a reconstructed Host uses after restart.
+    const afterRestart = createSelfhostEventTargets(root, {
+      activeDeployment: async () => ({ generation: "active", versions: [], events: true }),
+    });
+    expect((await afterRestart.list())[0]?.crons).toEqual([scheduleB]);
+    const restartedLocal = provider({
+      runtime: runtime.runtime,
+      events: {
+        async forgetSchedules(_script, cron) {
+          if (cron !== undefined) forgotten.push(cron);
+        },
+      },
+    });
+    expect(
+      await restartedLocal.observe({
+        offering: offering("WorkerCronTrigger"),
+        identity: { ...identity("hello-cron-a"), uid: "uid-cron-a" },
+        nativeId: created.result.nativeId,
+        spec: cronSpec(scheduleB),
+        relations: [relation("/worker", "ModuleWorker", "hello")],
+      }),
+    ).toMatchObject({ phase: "succeeded", result: { observed: { cron: scheduleB } } });
+
+    expect(
+      await deleteOwnedCron(restartedLocal, {
+        operationId: "op_cron_resource_a_delete",
+        name: "hello-cron-a",
+        uid: "uid-cron-a",
+        nativeId: created.result.nativeId,
+        cron: scheduleB,
+      }),
+    ).toMatchObject({ phase: "succeeded" });
+    expect((await afterRestart.list())[0]?.crons ?? []).toEqual([]);
+    expect(forgotten).toContain(scheduleB);
+  });
+
+  test("retains a shared Cron expression until its last Resource owner is deleted", async () => {
+    const forgotten: string[] = [];
+    const local = provider({
+      runtime: servingRuntime().runtime,
+      events: {
+        async forgetSchedules(_script, cron) {
+          if (cron) forgotten.push(cron);
+        },
+      },
+    });
+    await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    const shared = "0 * * * *";
+    const first = await applyOwnedCron(local, {
+      operationId: "op_shared_cron_a_create",
+      name: "hello-cron-a",
+      uid: "uid-cron-a",
+      cron: shared,
+    });
+    if (first.phase !== "succeeded") throw new Error("first shared Cron did not attach");
+    const second = await applyOwnedCron(local, {
+      operationId: "op_shared_cron_b_create",
+      name: "hello-cron-b",
+      uid: "uid-cron-b",
+      cron: shared,
+    });
+    if (second.phase !== "succeeded") throw new Error("second shared Cron did not attach");
+    expect(forgotten).toEqual([shared]);
+
+    const targets = createSelfhostEventTargets(root, {
+      activeDeployment: async () => ({ generation: "active", versions: [], events: true }),
+    });
+    expect((await targets.list())[0]?.crons).toEqual([shared]);
+    expect(forgotten).toEqual([shared]);
+    for (const owner of [
+      { name: "hello-cron-a", uid: "uid-cron-a", nativeId: first.result.nativeId },
+      { name: "hello-cron-b", uid: "uid-cron-b", nativeId: second.result.nativeId },
+    ]) {
+      expect(
+        await local.observe({
+          offering: offering("WorkerCronTrigger"),
+          identity: { ...identity(owner.name), uid: owner.uid },
+          nativeId: owner.nativeId,
+          spec: cronSpec(shared),
+          relations: [relation("/worker", "ModuleWorker", "hello")],
+        }),
+      ).toMatchObject({ phase: "succeeded", result: { observed: { cron: shared } } });
+    }
+    expect(
+      await local.observe({
+        offering: offering("WorkerCronTrigger"),
+        identity: { ...identity("hello-cron-a"), uid: "uid-cron-not-an-owner" },
+        nativeId: first.result.nativeId,
+        spec: cronSpec(shared),
+        relations: [relation("/worker", "ModuleWorker", "hello")],
+      }),
+    ).toMatchObject({ phase: "failed", failure: { code: "not_found" } });
+    expect(
+      await deleteOwnedCron(local, {
+        operationId: "op_shared_cron_a_delete",
+        name: "hello-cron-a",
+        uid: "uid-cron-a",
+        nativeId: first.result.nativeId,
+        cron: shared,
+      }),
+    ).toMatchObject({ phase: "succeeded" });
+    expect((await targets.list())[0]?.crons).toEqual([shared]);
+
+    expect(
+      await deleteOwnedCron(local, {
+        operationId: "op_shared_cron_b_delete",
+        name: "hello-cron-b",
+        uid: "uid-cron-b",
+        nativeId: second.result.nativeId,
+        cron: shared,
+      }),
+    ).toMatchObject({ phase: "succeeded" });
+    expect((await targets.list())[0]?.crons ?? []).toEqual([]);
+    expect(forgotten).toEqual([shared, shared]);
+  });
+
+  test("a new Cron owner cannot inherit a row left by failed last-owner cleanup", async () => {
+    const cron = "0 * * * *";
+    const sql = createEphemeralSql();
+    let now = Date.UTC(2026, 8, 2, 12, 30, 0);
+    let refuseCleanup = false;
+    const runtime = servingRuntime();
+    const targets = createSelfhostEventTargets(root, {
+      activeDeployment: async () => ({ generation: "active", versions: [], events: true }),
+    });
+    const scheduler = createSelfhostWorkerScheduler({
+      sql,
+      runtime: runtime.runtime,
+      targets,
+      clock: () => new Date(now),
+    });
+    const local = provider({
+      runtime: runtime.runtime,
+      events: {
+        async forgetSchedules(script, expression) {
+          if (refuseCleanup) throw new Error("schedule store unavailable");
+          await scheduler.forgetSchedules(script, expression);
+        },
+      },
+    });
+    const script = await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    const first = await applyOwnedCron(local, {
+      operationId: "op_old_cron_owner",
+      name: "old-cron-owner",
+      uid: "uid-old-cron-owner",
+      cron,
+    });
+    if (first.phase !== "succeeded" || !local.recoverDelete) {
+      throw new Error("old Cron owner did not attach");
+    }
+    expect(await scheduler.tick()).toBe(0);
+    expect(
+      await sql.query(
+        "SELECT next_fire_at_ms FROM selfhost_worker_schedules WHERE script = ? AND cron = ?",
+        [script, cron],
+      ),
+    ).toMatchObject([{ next_fire_at_ms: Date.UTC(2026, 8, 2, 13, 0, 0) }]);
+
+    const deletion = {
+      operationId: "op_old_cron_delete",
+      offering: offering("WorkerCronTrigger"),
+      identity: { ...identity("old-cron-owner"), uid: "uid-old-cron-owner" },
+      nativeId: first.result.nativeId,
+      spec: cronSpec(cron),
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    };
+    refuseCleanup = true;
+    await expect(local.delete(deletion)).rejects.toThrow("schedule store unavailable");
+    expect(await local.recoverDelete(deletion)).toMatchObject({ phase: "succeeded" });
+    now = Date.UTC(2026, 8, 2, 13, 0, 5);
+    const statePath = join(root, "selfhost", "scripts", `${script}.json`);
+    const before = readFileSync(statePath, "utf8");
+    await expect(
+      applyOwnedCron(local, {
+        operationId: "op_new_cron_owner",
+        name: "new-cron-owner",
+        uid: "uid-new-cron-owner",
+        cron,
+      }),
+    ).rejects.toThrow("schedule store unavailable");
+    expect(readFileSync(statePath, "utf8")).toBe(before);
+    refuseCleanup = false;
+    const second = await applyOwnedCron(local, {
+      operationId: "op_new_cron_owner",
+      name: "new-cron-owner",
+      uid: "uid-new-cron-owner",
+      cron,
+    });
+    if (second.phase !== "succeeded") throw new Error("new Cron owner did not attach");
+    expect(
+      await sql.query(
+        "SELECT next_fire_at_ms FROM selfhost_worker_schedules WHERE script = ? AND cron = ?",
+        [script, cron],
+      ),
+    ).toEqual([]);
+    expect(await scheduler.tick()).toBe(0);
+    expect(
+      await sql.query(
+        "SELECT next_fire_at_ms FROM selfhost_worker_schedules WHERE script = ? AND cron = ?",
+        [script, cron],
+      ),
+    ).toMatchObject([{ next_fire_at_ms: Date.UTC(2026, 8, 2, 14, 0, 0) }]);
+    // Retrying the old deletion must not clear the new owner's live row.
+    expect(await local.delete(deletion)).toMatchObject({ phase: "succeeded" });
+    expect(
+      await sql.query(
+        "SELECT next_fire_at_ms FROM selfhost_worker_schedules WHERE script = ? AND cron = ?",
+        [script, cron],
+      ),
+    ).toMatchObject([{ next_fire_at_ms: Date.UTC(2026, 8, 2, 14, 0, 0) }]);
+    const secondDeletion = {
+      ...deletion,
+      operationId: "op_new_cron_delete",
+      identity: { ...identity("new-cron-owner"), uid: "uid-new-cron-owner" },
+      nativeId: second.result.nativeId,
+    };
+    refuseCleanup = true;
+    await expect(local.delete(secondDeletion)).rejects.toThrow("schedule store unavailable");
+    refuseCleanup = false;
+    expect(await local.delete(secondDeletion)).toMatchObject({ phase: "succeeded" });
+    expect(
+      await sql.query(
+        "SELECT next_fire_at_ms FROM selfhost_worker_schedules WHERE script = ? AND cron = ?",
+        [script, cron],
+      ),
+    ).toEqual([]);
+  });
+
+  test("a stale scheduler snapshot cannot seed the old minute between reset and first-owner commit", async () => {
+    const cron = "0 * * * *";
+    const underlyingSql = createEphemeralSql();
+    let insertedAfterReset = () => {};
+    let observeInsert = false;
+    const inserted = new Promise<void>((resolve) => {
+      insertedAfterReset = resolve;
+    });
+    const sql = {
+      ...underlyingSql,
+      async run(statement: string, params?: Parameters<typeof underlyingSql.run>[1]) {
+        const result = await underlyingSql.run(statement, params);
+        if (
+          observeInsert &&
+          statement.startsWith("INSERT OR IGNORE INTO selfhost_worker_schedules")
+        ) {
+          insertedAfterReset();
+        }
+        return result;
+      },
+    };
+    let now = Date.UTC(2026, 8, 2, 12, 30, 0);
+    let holdSnapshot = false;
+    let releaseSnapshot = () => {};
+    const snapshotReleased = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    let snapshotReady = () => {};
+    const snapshotTaken = new Promise<void>((resolve) => {
+      snapshotReady = resolve;
+    });
+    const actualTargets = createSelfhostEventTargets(root, {
+      activeDeployment: async () => ({ generation: "active", versions: [], events: true }),
+    });
+    const targets = {
+      list: async () => {
+        const entries = await actualTargets.list();
+        if (holdSnapshot) {
+          snapshotReady();
+          await snapshotReleased;
+        }
+        return entries;
+      },
+      select: (script: string) => actualTargets.select(script),
+      withCurrentCron: actualTargets.withCurrentCron,
+    };
+    const runtime = servingRuntime();
+    const scheduler = createSelfhostWorkerScheduler({
+      sql,
+      runtime: runtime.runtime,
+      targets,
+      clock: () => new Date(now),
+    });
+    let holdFirstOwnerReset = false;
+    let resetReady = () => {};
+    const resetDone = new Promise<void>((resolve) => {
+      resetReady = resolve;
+    });
+    let releaseCommit = () => {};
+    const commitReleased = new Promise<void>((resolve) => {
+      releaseCommit = resolve;
+    });
+    const local = provider({
+      runtime: runtime.runtime,
+      events: {
+        async forgetSchedules(script, expression) {
+          await scheduler.forgetSchedules(script, expression);
+          if (holdFirstOwnerReset) {
+            resetReady();
+            await commitReleased;
+          }
+        },
+      },
+    });
+    const script = await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    const first = await applyOwnedCron(local, {
+      operationId: "op_stale_cron_first",
+      name: "stale-cron-first",
+      uid: "uid-stale-cron-first",
+      cron,
+    });
+    if (first.phase !== "succeeded") throw new Error("first Cron owner did not attach");
+    expect(await scheduler.tick()).toBe(0);
+    holdSnapshot = true;
+    now = Date.UTC(2026, 8, 2, 12, 59, 58);
+    const staleTick = scheduler.tick();
+    await snapshotTaken;
+    expect(
+      await deleteOwnedCron(local, {
+        operationId: "op_stale_cron_delete",
+        name: "stale-cron-first",
+        uid: "uid-stale-cron-first",
+        nativeId: first.result.nativeId,
+        cron,
+      }),
+    ).toMatchObject({ phase: "succeeded" });
+    holdFirstOwnerReset = true;
+    const secondApply = applyOwnedCron(local, {
+      operationId: "op_stale_cron_second",
+      name: "stale-cron-second",
+      uid: "uid-stale-cron-second",
+      cron,
+    });
+    await resetDone;
+    observeInsert = true;
+    releaseSnapshot();
+    // In the broken path the old snapshot inserts 13:00 before the new owner
+    // commits; the fixed path waits for that owner's critical section.
+    await Promise.race([inserted, Bun.sleep(100)]);
+    now = Date.UTC(2026, 8, 2, 13, 0, 5);
+    releaseCommit();
+    expect(await secondApply).toMatchObject({ phase: "succeeded" });
+    expect(await staleTick).toBe(0);
+    expect(
+      await underlyingSql.query(
+        "SELECT next_fire_at_ms FROM selfhost_worker_schedules WHERE script = ? AND cron = ?",
+        [script, cron],
+      ),
+    ).toMatchObject([{ next_fire_at_ms: Date.UTC(2026, 8, 2, 14, 0, 0) }]);
+  });
+
+  test("Cron delete recovery needs exact identity and durable owner absence", async () => {
+    const runtime = servingRuntime();
+    const local = provider({ runtime: runtime.runtime, events: EVENTS });
+    const script = await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    const cron = "0 * * * *";
+    const applied = await applyOwnedCron(local, {
+      operationId: "op_recovery_cron",
+      name: "hello-cron-a",
+      uid: "uid-cron-a",
+      cron,
+    });
+    if (applied.phase !== "succeeded" || !local.recoverDelete) {
+      throw new Error("Cron recovery setup failed");
+    }
+    const input = {
+      operationId: "op_recovery_cron_delete",
+      offering: offering("WorkerCronTrigger"),
+      identity: { ...identity("hello-cron-a"), uid: "uid-cron-a" },
+      nativeId: applied.result.nativeId,
+      spec: cronSpec(cron),
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    };
+    const statePath = join(root, "selfhost", "scripts", `${script}.json`);
+    const before = readFileSync(statePath, "utf8");
+    const runtimeBefore = [...runtime.state.log];
+    expect(await local.recoverDelete(input)).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(
+      await local.recoverDelete({ ...input, nativeId: "selfhost-cron:other-worker:old" }),
+    ).toMatchObject({
+      phase: "failed",
+    });
+    expect(readFileSync(statePath, "utf8")).toBe(before);
+    expect(runtime.state.log).toEqual(runtimeBefore);
+    expect(
+      await deleteOwnedCron(local, {
+        operationId: "op_recovery_cron_delete",
+        name: "hello-cron-a",
+        uid: "uid-cron-a",
+        nativeId: applied.result.nativeId,
+        cron,
+      }),
+    ).toMatchObject({ phase: "succeeded" });
+    expect(await local.recoverDelete(input)).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { deleted: true } },
+    });
+    await writeLegacyCronState(script, [cron]);
+    expect(await local.recoverDelete(input)).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+  });
+
+  test("Cron observation cannot claim another Worker's native identity", async () => {
+    const local = provider({ runtime: servingRuntime().runtime, events: EVENTS });
+    await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    const applied = await applyOwnedCron(local, {
+      operationId: "op_observe_cron",
+      name: "hello-cron-a",
+      uid: "uid-cron-a",
+      cron: "0 * * * *",
+    });
+    if (applied.phase !== "succeeded") throw new Error("Cron observation setup failed");
+    const observed = await local.observe({
+      offering: offering("WorkerCronTrigger"),
+      identity: { ...identity("hello-cron-a"), uid: "uid-cron-a" },
+      nativeId: "selfhost-cron:other-worker:old",
+      spec: cronSpec("0 * * * *"),
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    expect(observed).toMatchObject({ phase: "failed" });
+  });
+
+  test("a 65th Cron owner is refused as quota before changing the Worker", async () => {
+    const cron = "0 * * * *";
+    const owners = Array.from({ length: 64 }, (_, index) => ({
+      resourceUid: `uid-cron-${index}`,
+      cron,
+    }));
+    const runtime = servingRuntime();
+    const local = provider({
+      runtime: runtime.runtime,
+      events: EVENTS,
+      listCronOwners: async () => ({ complete: true, owners }),
+    });
+    const script = await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    await writeLegacyCronState(script, [cron]);
+    const path = join(root, "selfhost", "scripts", `${script}.json`);
+    const before = readFileSync(path, "utf8");
+    const runtimeBefore = [...runtime.state.log];
+    expect(
+      await applyOwnedCron(local, {
+        operationId: "op_cron_65",
+        name: "hello-cron-65",
+        uid: "uid-cron-65",
+        cron,
+      }),
+    ).toMatchObject({ phase: "failed", failure: { code: "quota", retryable: false } });
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(runtime.state.log).toEqual(runtimeBefore);
+  });
+
+  test("serializes pending sibling Cron updates into one durable owner union", async () => {
+    let projectionCalls = 0;
+    const local = provider({
+      runtime: servingRuntime().runtime,
+      events: EVENTS,
+      listCronOwners: async () => {
+        projectionCalls += 1;
+        return { complete: true, owners: [] };
+      },
+    });
+    await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    const pending = [
+      {
+        operationId: "op_pending_cron_a",
+        name: "hello-cron-a",
+        uid: "uid-cron-a",
+        cron: "0 * * * *",
+      },
+      {
+        operationId: "op_pending_cron_b",
+        name: "hello-cron-b",
+        uid: "uid-cron-b",
+        cron: "15 * * * *",
+      },
+    ];
+    const results = await Promise.all(pending.map((input) => applyOwnedCron(local, input)));
+    expect(results.every((result) => result.phase === "succeeded")).toBe(true);
+    expect(projectionCalls).toBe(1);
+    const targets = createSelfhostEventTargets(root, {
+      activeDeployment: async () => ({ generation: "active", versions: [], events: true }),
+    });
+    expect((await targets.list())[0]?.crons).toEqual(["0 * * * *", "15 * * * *"]);
+  });
+
+  test("rehydrates legacy schedules only from a complete exact owner projection", async () => {
+    const callbackInputs: unknown[] = [];
+    const local = provider({
+      runtime: servingRuntime().runtime,
+      events: EVENTS,
+      listCronOwners: async (input) => {
+        callbackInputs.push(input);
+        return {
+          complete: true,
+          owners: [{ resourceUid: "uid-cron-a", cron: "0 * * * *" }],
+        };
+      },
+    });
+    const script = await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    await writeLegacyCronState(script, ["0 * * * *"]);
+
+    const updated = await local.apply({
+      operationId: "op_legacy_cron_update",
+      offering: offering("WorkerCronTrigger"),
+      identity: { ...identity("hello-cron-a"), uid: "uid-cron-a" },
+      spec: cronSpec("15 * * * *"),
+      previous: {
+        nativeId: `selfhost-cron:${script}:legacy`,
+        spec: cronSpec("0 * * * *"),
+      },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    expect(updated).toMatchObject({ phase: "succeeded" });
+    expect(callbackInputs).toEqual([
+      {
+        tenantRef: "org_demo",
+        space: "default",
+        workerResourceUid: "uid-ModuleWorker-hello",
+        form: offering("WorkerCronTrigger").form,
+        limit: 65,
+      },
+    ]);
+    const persisted = JSON.parse(
+      readFileSync(join(root, "selfhost", "scripts", `${script}.json`), "utf8"),
+    ) as {
+      cronOwners?: readonly { resourceUid: string; cron: string }[];
+      crons?: readonly string[];
+    };
+    expect(persisted.cronOwners).toEqual([{ resourceUid: "uid-cron-a", cron: "15 * * * *" }]);
+    expect(persisted.crons).toEqual(["15 * * * *"]);
+  });
+
+  test("refuses incomplete legacy Cron ownership before changing native state", async () => {
+    const runtime = servingRuntime();
+    const local = provider({
+      runtime: runtime.runtime,
+      events: EVENTS,
+      listCronOwners: async () => ({ complete: false }),
+    });
+    const script = await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    await writeLegacyCronState(script, ["0 * * * *"]);
+    const runtimeBefore = [...runtime.state.log];
+    const before = readFileSync(join(root, "selfhost", "scripts", `${script}.json`), "utf8");
+    const result = await local.apply({
+      operationId: "op_legacy_cron_refused_incomplete",
+      offering: offering("WorkerCronTrigger"),
+      identity: { ...identity("hello-cron-a"), uid: "uid-cron-a" },
+      spec: cronSpec("15 * * * *"),
+      previous: {
+        nativeId: `selfhost-cron:${script}:legacy`,
+        spec: cronSpec("0 * * * *"),
+      },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    expect(result).toMatchObject({ phase: "failed" });
+    expect(readFileSync(join(root, "selfhost", "scripts", `${script}.json`), "utf8")).toBe(before);
+    expect(runtime.state.log).toEqual(runtimeBefore);
+  });
+
+  test("refuses orphaned legacy Cron expressions without deleting unknown schedules", async () => {
+    const runtime = servingRuntime();
+    const local = provider({
+      runtime: runtime.runtime,
+      events: EVENTS,
+      listCronOwners: async () => ({ complete: true, owners: [] }),
+    });
+    const script = await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    await writeLegacyCronState(script, ["0 * * * *"]);
+    const runtimeBefore = [...runtime.state.log];
+    const before = readFileSync(join(root, "selfhost", "scripts", `${script}.json`), "utf8");
+    const result = await local.apply({
+      operationId: "op_legacy_cron_refused_orphan",
+      offering: offering("WorkerCronTrigger"),
+      identity: { ...identity("hello-cron-a"), uid: "uid-cron-a" },
+      spec: cronSpec("15 * * * *"),
+      previous: {
+        nativeId: `selfhost-cron:${script}:legacy`,
+        spec: cronSpec("0 * * * *"),
+      },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    expect(result).toMatchObject({ phase: "failed" });
+    expect(readFileSync(join(root, "selfhost", "scripts", `${script}.json`), "utf8")).toBe(before);
+    expect(runtime.state.log).toEqual(runtimeBefore);
+  });
 
   test("persists logical queue names separately from native routing ids", async () => {
     const local = provider({ events: EVENTS });
@@ -6182,13 +6907,15 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
     await publish(local);
     const applied = await applyCron(local, "0 * * * *");
     if (applied.phase !== "succeeded") throw new Error("the cron trigger did not attach");
+    expect(forgotten).toEqual(["0 * * * *"]);
+    forgotten.length = 0;
     if (!local.createNativeReadbackDescriptor || !local.verifyNativeAbsence) {
       throw new Error("selfhost provider must expose native absence readback");
     }
     const descriptor = local.createNativeReadbackDescriptor({
       offering: offering("WorkerCronTrigger"),
       nativeId: applied.result.nativeId,
-      identity: identity("hello-cron"),
+      identity: { ...identity("hello-cron"), uid: "uid-hello-cron" },
       spec: { cron: "0 * * * *" },
       relations: [relation("/worker", "ModuleWorker", "hello")],
     });
@@ -6206,7 +6933,7 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
         await local.delete({
           operationId: "op_delete_cron",
           offering: offering("WorkerCronTrigger"),
-          identity: identity("hello-cron"),
+          identity: { ...identity("hello-cron"), uid: "uid-hello-cron" },
           nativeId: applied.result.nativeId,
           spec: {
             worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },

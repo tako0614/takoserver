@@ -19,7 +19,10 @@ function offering(kind: string): ProviderOffering {
       apiVersion: EDGE_API,
       kind,
       definitionVersion: "0.1.0",
-      schemaDigest: `sha256:${"a".repeat(64)}`,
+      schemaDigest:
+        kind === "WorkerCronTrigger"
+          ? "sha256:ef4fdfc91638154766db821c97ef3d097619c610a5c3784888541ce307c82b8a"
+          : `sha256:${"a".repeat(64)}`,
     },
     providedInterfaces: [],
     bindingRefs: [],
@@ -157,6 +160,7 @@ function createProvider(runtime: WorkerdRuntime) {
     offerings: [],
     dataRoot: root,
     runtime,
+    listCronOwners: async () => ({ complete: true, owners: [] }),
     artifacts: {
       async manifest(_tenantRef, digest) {
         if (digest !== "sha256:worker") return null;
@@ -243,7 +247,7 @@ function applyCron(
   return local.apply({
     operationId,
     offering: offering("WorkerCronTrigger"),
-    identity: identity("hello-cron"),
+    identity: cronIdentity(operationId),
     spec: {
       worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
       cron,
@@ -252,12 +256,22 @@ function applyCron(
   });
 }
 
-function deleteCron(local: ReturnType<typeof createProvider>, operationId: string, cron: string) {
+function cronIdentity(operationId: string) {
+  return { ...identity(`hello-cron-${operationId}`), uid: `uid-cron-${operationId}` };
+}
+
+function deleteCron(
+  local: ReturnType<typeof createProvider>,
+  operationId: string,
+  cron: string,
+  ownerOperationId: string,
+  nativeId: string,
+) {
   return local.delete({
     operationId,
     offering: offering("WorkerCronTrigger"),
-    identity: identity("hello-cron"),
-    nativeId: "selfhost-cron:retained",
+    identity: cronIdentity(ownerOperationId),
+    nativeId,
     spec: {
       worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
       cron,
@@ -382,14 +396,14 @@ describe("self-host Worker script CAS", () => {
     expect(await applyCron(local, "op_cron_keep", "0 1 * * *")).toMatchObject({
       phase: "succeeded",
     });
-    expect(await applyCron(local, "op_cron_remove", "0 * * * *")).toMatchObject({
-      phase: "succeeded",
-    });
+    const removable = await applyCron(local, "op_cron_remove", "0 * * * *");
+    expect(removable).toMatchObject({ phase: "succeeded" });
+    if (removable.phase !== "succeeded") throw new Error("removable Cron did not attach");
 
     barrier.arm();
     const [endpoint, removed] = await Promise.all([
       applyEndpoint(local, script, "op_endpoint_with_delete"),
-      deleteCron(local, "op_delete_cron", "0 * * * *"),
+      deleteCron(local, "op_delete_cron", "0 * * * *", "op_cron_remove", removable.result.nativeId),
     ]);
     expect(endpoint).toMatchObject({ phase: "succeeded" });
     expect(removed).toMatchObject({ phase: "succeeded" });
