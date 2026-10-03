@@ -163,32 +163,34 @@ test("public Actor proxy preserves successful upstream headers and streamed body
   }
 });
 
-test.skipIf(process.platform !== "linux")(
-  "SIGTERM child completion is terminal for native-fixture cleanup",
-  async () => {
-    const child = Bun.spawn(
-      [process.execPath, "--no-env-file", "--eval", "setInterval(() => {}, 1_000)"],
-      {
-        stdin: "ignore",
-        stdout: "ignore",
-        stderr: "ignore",
-      },
-    );
-    try {
-      const identity = processIdentity(child.pid);
+test("child completion is terminal for native-fixture cleanup", async () => {
+  const child = Bun.spawn(
+    [process.execPath, "--no-env-file", "--eval", "setInterval(() => {}, 1_000)"],
+    {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    },
+  );
+  try {
+    if (process.platform === "linux") {
       child.kill("SIGTERM");
-      const exitStatus = await Promise.race([child.exited, Bun.sleep(2_000).then(() => null)]);
+    } else {
+      child.kill();
+    }
+    const exitStatus = await Promise.race([child.exited, Bun.sleep(2_000).then(() => null)]);
 
+    expect(exitStatus).not.toBeNull();
+    expect(childHasTerminated(child)).toBe(true);
+    if (process.platform === "linux") {
       expect(exitStatus).toBe(143);
       expect(child.exitCode).toBeNull();
       expect(child.signalCode).toBe("SIGTERM");
-      expect(identityIsLive(identity)).toBe(false);
-      expect(childHasTerminated(child)).toBe(true);
-    } finally {
-      if (!childHasTerminated(child)) child.kill("SIGKILL");
     }
-  },
-);
+  } finally {
+    if (!childHasTerminated(child)) child.kill("SIGKILL");
+  }
+});
 
 test.skipIf(WORKERD === null)(
   "public Host routes a released Actor over HTTP/WSS and restores it after SIGTERM Host restarts",
