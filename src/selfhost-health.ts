@@ -27,6 +27,16 @@ export type SelfhostHealthHandler = (request: Request) => Promise<Response | und
 
 const DEFAULT_DATABASE_CHECK_TIMEOUT_MS = 1_000;
 
+/** Release the unused body of a readiness-only response without waiting on it. */
+export function discardSelfhostReadinessProbeBody(response: Response): void {
+  try {
+    const cancellation = response.body?.cancel();
+    if (cancellation) void cancellation.catch(() => undefined);
+  } catch {
+    // Body disposal is best-effort and must not affect the readiness result.
+  }
+}
+
 async function databaseIsReadable(sql: Pick<Sql, "query">, timeoutMs: number): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<boolean>((resolve) => {

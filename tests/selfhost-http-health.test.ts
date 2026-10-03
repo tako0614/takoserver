@@ -3,6 +3,7 @@ import type { Sql } from "../src/ports.ts";
 import {
   createSelfhostBunFetchHandler,
   createSelfhostHealthHandler,
+  discardSelfhostReadinessProbeBody,
 } from "../src/selfhost-health.ts";
 import { createWorkerdSupervisor, type WorkerdProcess } from "../src/workerd-supervisor.ts";
 
@@ -14,6 +15,22 @@ function healthBody(response: Response): Promise<{
 }> {
   return response.json();
 }
+
+test("readiness probe response bodies are discarded without waiting or leaking disposal errors", async () => {
+  let cancelled = false;
+  const response = {
+    body: {
+      cancel() {
+        cancelled = true;
+        return Promise.reject(new Error("private body disposal detail"));
+      },
+    },
+  } as unknown as Response;
+
+  expect(discardSelfhostReadinessProbeBody(response)).toBeUndefined();
+  expect(cancelled).toBe(true);
+  await Promise.resolve();
+});
 
 test("Bun HTTP dispatch serves local liveness and ready no-workload states before product routes", async () => {
   let queryCount = 0;

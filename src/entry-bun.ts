@@ -50,6 +50,7 @@ import { serveSelfhostDataPlanes } from "./selfhost-data-planes.ts";
 import {
   createSelfhostBunFetchHandler,
   createSelfhostHealthHandler,
+  discardSelfhostReadinessProbeBody,
   type SelfhostStartupRestoreOutcome,
 } from "./selfhost-health.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
@@ -336,6 +337,7 @@ const workerd = createWorkerdSupervisor({
             signal: AbortSignal.timeout(250),
           },
         );
+        discardSelfhostReadinessProbeBody(response);
         if (
           response.status >= 100 &&
           (await workerPortOwnership(workerdPort, child.pid)) === "owned"
