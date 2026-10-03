@@ -177,6 +177,65 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
     },
   },
   {
+    id: "worker-endpoint-public-create-diagnostic",
+    label: "self-host public WorkerEndpoint create and deferred Operation receipt diagnostic",
+    environment: "TAKOSERVER_NATIVE_WORKER_ENDPOINT_PUBLIC_CREATE",
+    companionEnvironment: ["TAKOSERVER_WORKERD_BINARY"],
+    proves:
+      "one released-Core-backed public Host WorkerEndpoint create, its 201 or deferred 202 receipt, exact-Operation readback when accepted, terminal Resource UID and public Resource readback; it does not prove ObjectBucket access, Resource update/delete, process restart, delivery durability or production readiness",
+    enable:
+      "TAKOSERVER_NATIVE_WORKER_ENDPOINT_PUBLIC_CREATE=1 and TAKOSERVER_WORKERD_BINARY set to the exact pinned closed-graph artifact",
+    inspect: (configured, environment, probe) => {
+      if (configured === undefined || configured.trim() === "") {
+        return {
+          state: "unconfigured",
+          detail:
+            "TAKOSERVER_NATIVE_WORKER_ENDPOINT_PUBLIC_CREATE is not configured; the bounded public WorkerEndpoint create diagnostic remains unproven",
+        };
+      }
+      if (configured !== "1") {
+        return {
+          state: "invalid",
+          detail: "TAKOSERVER_NATIVE_WORKER_ENDPOINT_PUBLIC_CREATE must be exactly 1",
+        };
+      }
+      const binary = environment.TAKOSERVER_WORKERD_BINARY;
+      if (binary === undefined || binary.trim() === "") {
+        return {
+          state: "invalid",
+          detail: "the WorkerEndpoint public-create diagnostic requires TAKOSERVER_WORKERD_BINARY",
+        };
+      }
+      const unusable = missingOrUnusable(binary, probe);
+      if (unusable) return unusable;
+      if (
+        process.platform !== WORKERD_CLOSED_GRAPH_ARTIFACT.platform ||
+        process.arch !== WORKERD_CLOSED_GRAPH_ARTIFACT.arch
+      ) {
+        return {
+          state: "invalid",
+          detail: `the pinned artifact supports ${WORKERD_CLOSED_GRAPH_ARTIFACT.platform}/${WORKERD_CLOSED_GRAPH_ARTIFACT.arch}, this host is ${process.platform}/${process.arch}`,
+        };
+      }
+      const digest = probe.sha256(binary);
+      if (digest === null) {
+        return { state: "invalid", detail: "the configured path could not be hashed" };
+      }
+      if (digest !== WORKERD_CLOSED_GRAPH_ARTIFACT.sha256) {
+        return {
+          state: "invalid",
+          detail: `the configured bytes are ${digest}; the pinned artifact is ${WORKERD_CLOSED_GRAPH_ARTIFACT.sha256}`,
+        };
+      }
+      return {
+        state: "ready",
+        detail:
+          "the exact diagnostic opt-in and pinned workerd artifact are configured; only the gated public Host WorkerEndpoint request can establish operation evidence",
+        readinessOnly: true,
+      };
+    },
+  },
+  {
     id: "object-bucket-host-restart",
     label: "self-host ObjectBucket public Host API and process restart",
     environment: "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART",
