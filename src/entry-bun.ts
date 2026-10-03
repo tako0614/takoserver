@@ -69,6 +69,7 @@ import {
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import {
+  createSelfhostCronOwnerReader,
   createStandaloneProviderComposition,
   RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN,
   resolveStandaloneProviderMode,
@@ -664,6 +665,14 @@ const providerComposition = createStandaloneProviderComposition({
     ? { dataPlaneAddress: dataPlanes.address, dataPlaneMaintenance: dataPlanes.maintenance }
     : {}),
   ...(selfhostEvents ? { events: selfhostEvents } : {}),
+  ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+    ? {}
+    : {
+        listCronOwners: createSelfhostCronOwnerReader({
+          inventory: resourceStores.inventory,
+          forms: edge.forms,
+        }),
+      }),
   now: clock(),
   ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
     ? {

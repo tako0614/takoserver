@@ -8,10 +8,16 @@ import { createProviderDriver, createProviderFormAvailability } from "../src/pro
 import type { Provider, ProviderRelation } from "../src/provider-port.ts";
 import { resolveRuntimeBindingMaterialRoute } from "../src/provider-runtime-bindings.ts";
 import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
+import { derivedProviderResourceName } from "../src/provider-worker-endpoint-origin.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
-import { SELFHOST_ACTOR_BINDING_REF } from "../src/providers/selfhost.ts";
+import {
+  SELFHOST_ACTOR_BINDING_REF,
+  type SelfhostProviderOptions,
+  selfhostScriptStateRoot,
+} from "../src/providers/selfhost.ts";
 import type { SelfhostContainerCapability } from "../src/providers/selfhost-container-lifecycle.ts";
 import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-runtime-bindings.ts";
+import { createSelfhostScriptStateStore } from "../src/providers/selfhost-script-state.ts";
 import { openSelfhostActorPublicRuntime } from "../src/selfhost-actor-public-runtime.ts";
 import { createSelfhostComposition } from "../src/selfhost-composition.ts";
 import { SELFHOST_ACTOR_MATERIAL_KIND } from "../src/selfhost-runtime-binding-materializer.ts";
@@ -59,11 +65,13 @@ async function compose(
   stableForms = stableProductionTakoformCatalog().forms,
   runtimeOverride?: WorkerdRuntime,
   container?: SelfhostContainerCapability,
+  dataRoot = "/tmp/unused",
+  listCronOwners?: SelfhostProviderOptions["listCronOwners"],
 ) {
   return createSelfhostComposition({
     edge: await buildEdgeForms(),
     stableForms,
-    dataRoot: "/tmp/unused",
+    dataRoot,
     runtime: runtimeOverride ?? runtime,
     artifacts: {
       async manifest() {
@@ -75,6 +83,7 @@ async function compose(
     },
     edgeForms,
     ...(container ? { container } : {}),
+    ...(listCronOwners ? { listCronOwners } : {}),
     ...(runtimeInputs ? { runtimeInputs } : {}),
     ...(workerRuntimeAvailable === undefined ? {} : { workerRuntimeAvailable }),
     now: new Date("2026-06-01T00:00:00.000Z"),
@@ -480,6 +489,101 @@ describe("the self-host catalog", () => {
         spec: {},
       }),
     ).toMatchObject({ phase: "succeeded" });
+  });
+
+  test("forwards legacy Cron rehydration through the self-host composition", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "selfhost-cron-composition-"));
+    try {
+      const tenantRef = "tenant-cron-composition";
+      const space = "main";
+      const workerName = "worker";
+      const workerUid = "uid-worker-composition";
+      const legacyOwner = { resourceUid: "uid-legacy-cron", cron: "0 * * * *" } as const;
+      const script = await derivedProviderResourceName("sw", {
+        tenantRef,
+        space,
+        name: workerName,
+      });
+      const stateStore = createSelfhostScriptStateStore({
+        root: selfhostScriptStateRoot(dataRoot),
+      });
+      await stateStore.write(script, null, { domains: [], crons: [legacyOwner.cron] });
+
+      const lookups: Parameters<NonNullable<SelfhostProviderOptions["listCronOwners"]>>[0][] = [];
+      const composition = await compose(
+        true,
+        undefined,
+        undefined,
+        stableProductionTakoformCatalog().forms,
+        undefined,
+        undefined,
+        dataRoot,
+        async (input) => {
+          lookups.push(input);
+          return { complete: true, owners: [legacyOwner] };
+        },
+      );
+      const edge = await buildEdgeForms();
+      const offering = composition.provider.offerings.find(
+        (candidate) =>
+          candidate.form.apiVersion === "edge.forms.takoform.com/v1beta1" &&
+          candidate.form.kind === "WorkerCronTrigger",
+      );
+      const workerForm = edge.forms.find((form) => form.identity.formRef.kind === "ModuleWorker");
+      if (!offering || !workerForm)
+        throw new Error("released self-host Cron capability is required");
+
+      const result = await composition.provider.apply({
+        operationId: "op_composed_legacy_cron_rehydrate",
+        offering,
+        identity: {
+          tenantRef,
+          space,
+          name: "cron-new",
+          uid: "uid-new-cron",
+        },
+        spec: { cron: "15 * * * *" },
+        relations: [
+          {
+            pointer: "/worker",
+            relation: "/worker",
+            targetUid: workerUid,
+            resource: {
+              apiVersion: workerForm.identity.formRef.apiVersion,
+              kind: workerForm.identity.formRef.kind,
+              form: { formRef: workerForm.identity.formRef },
+              metadata: {
+                name: workerName,
+                space,
+                uid: workerUid,
+                generation: "1",
+                revision: "1",
+              },
+              spec: {},
+            },
+          },
+        ],
+      });
+
+      // The fixture has no event-capable Deployment, so provider mutation is
+      // refused after the read-only rehydration lookup and the legacy bytes stay.
+      expect(result).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+      expect(lookups).toEqual([
+        {
+          tenantRef,
+          space,
+          workerResourceUid: workerUid,
+          form: offering.form,
+          limit: 65,
+        },
+      ]);
+      expect((await stateStore.read(script)).state).toEqual({
+        domains: [],
+        crons: [legacyOwner.cron],
+      });
+    } finally {
+      await rm(dataRoot, { recursive: true, force: true });
+    }
   });
 
   test("advertises only the exact stable Forms the local composition executes", async () => {

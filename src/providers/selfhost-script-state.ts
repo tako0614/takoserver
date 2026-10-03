@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { parseWorkerCron } from "../cron.ts";
 import {
   canonicalSelfhostWeightedVersions,
   persistedSelfhostWeightedDeployment,
@@ -73,6 +74,16 @@ export interface SelfhostScriptState {
   readonly consumers?: readonly SelfhostQueueConsumerAttachment[];
   /** Cron expressions attached to this Worker, exactly as written. */
   readonly crons?: readonly string[];
+  /**
+   * Qualified ownership for Cron expressions. Presence, including an empty
+   * array, distinguishes this projection from legacy `crons`-only state.
+   */
+  readonly cronOwners?: readonly SelfhostCronOwner[];
+}
+
+export interface SelfhostCronOwner {
+  readonly resourceUid: string;
+  readonly cron: string;
 }
 
 export interface SelfhostScriptStateSnapshot {
@@ -314,7 +325,8 @@ function persistedState(value: unknown, requireCanonicalDeployment: boolean): Se
         key !== "endpointHostname" &&
         key !== "domains" &&
         key !== "consumers" &&
-        key !== "crons",
+        key !== "crons" &&
+        key !== "cronOwners",
     ) ||
     !Array.isArray(parsed.domains) ||
     parsed.domains.some((entry) => typeof entry !== "string") ||
@@ -325,7 +337,14 @@ function persistedState(value: unknown, requireCanonicalDeployment: boolean): Se
     throw new SelfhostScriptStateStoreError("corrupt");
   }
   const consumers = persistedConsumers(parsed.consumers);
-  const crons = persistedCrons(parsed.crons);
+  const cronOwners = parsed.cronOwners === undefined ? undefined : persistedCronOwners(parsed.cronOwners);
+  const crons = cronOwners === undefined ? persistedCrons(parsed.crons) : cronExpressions(cronOwners);
+  if (cronOwners !== undefined && parsed.crons !== undefined) {
+    const serializedCrons = persistedCrons(parsed.crons);
+    if (JSON.stringify(serializedCrons) !== JSON.stringify(crons)) {
+      throw new SelfhostScriptStateStoreError("corrupt");
+    }
+  }
   let deployment: SelfhostWeightedDeployment | undefined;
   if (parsed.deployment !== undefined) {
     try {
@@ -349,7 +368,41 @@ function persistedState(value: unknown, requireCanonicalDeployment: boolean): Se
     domains: [...(parsed.domains as readonly string[])],
     ...(consumers.length > 0 ? { consumers } : {}),
     ...(crons.length > 0 ? { crons } : {}),
+    ...(cronOwners === undefined ? {} : { cronOwners }),
   };
+}
+
+function persistedCronOwners(value: unknown): readonly SelfhostCronOwner[] {
+  if (!Array.isArray(value) || value.length > 64) {
+    throw new SelfhostScriptStateStoreError("corrupt");
+  }
+  const owners = value.map((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new SelfhostScriptStateStoreError("corrupt");
+    }
+    const record = entry as Record<string, unknown>;
+    if (
+      Object.keys(record).some((key) => key !== "resourceUid" && key !== "cron") ||
+      typeof record.resourceUid !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u.test(record.resourceUid) ||
+      typeof record.cron !== "string" ||
+      record.cron.length < 1 ||
+      record.cron.length > 64 ||
+      !parseWorkerCron(record.cron)
+    ) {
+      throw new SelfhostScriptStateStoreError("corrupt");
+    }
+    return { resourceUid: record.resourceUid, cron: record.cron };
+  });
+  owners.sort((left, right) => (left.resourceUid < right.resourceUid ? -1 : 1));
+  if (new Set(owners.map((owner) => owner.resourceUid)).size !== owners.length) {
+    throw new SelfhostScriptStateStoreError("corrupt");
+  }
+  return owners;
+}
+
+function cronExpressions(owners: readonly SelfhostCronOwner[]): readonly string[] {
+  return [...new Set(owners.map((owner) => owner.cron))].sort();
 }
 
 /** Attachments, in queue order, with every limit inside its Form's range. */

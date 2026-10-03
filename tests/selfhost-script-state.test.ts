@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -127,6 +127,50 @@ describe("self-host Worker script state", () => {
         },
       },
     ]);
+  });
+
+  test("round-trips qualified Cron owners and derives the deduplicated schedule set", async () => {
+    const firstProcess = createSelfhostScriptStateStore({ root });
+    const empty = await firstProcess.write("script-empty", null, {
+      domains: [],
+      cronOwners: [],
+    });
+    expect(empty.state.cronOwners).toEqual([]);
+    expect(readFileSync(join(root, "script-empty.json"), "utf8")).toContain('"cronOwners":[]');
+    const written = await firstProcess.write("script-one", null, {
+      domains: [],
+      cronOwners: [
+        { resourceUid: "uid-cron-b", cron: "0 * * * *" },
+        { resourceUid: "uid-cron-a", cron: "0 * * * *" },
+      ],
+    });
+    expect(written.state.cronOwners).toEqual([
+      { resourceUid: "uid-cron-a", cron: "0 * * * *" },
+      { resourceUid: "uid-cron-b", cron: "0 * * * *" },
+    ]);
+    expect(written.state.crons).toEqual(["0 * * * *"]);
+    expect(readFileSync(join(root, "script-one.json"), "utf8")).toContain('"cronOwners"');
+
+    const restarted = await createSelfhostScriptStateStore({ root }).read("script-one");
+    expect(restarted.state.cronOwners).toEqual(written.state.cronOwners);
+    expect(restarted.state.crons).toEqual(["0 * * * *"]);
+
+    await expect(
+      firstProcess.write("script-one", restarted.revision, {
+        domains: [],
+        crons: ["0 * * * *"],
+        cronOwners: [{ resourceUid: "uid-cron-a", cron: "15 * * * *" }],
+      }),
+    ).rejects.toMatchObject({ code: "corrupt" });
+    await expect(
+      firstProcess.write("script-one", restarted.revision, {
+        domains: [],
+        cronOwners: [
+          { resourceUid: "uid-cron-a", cron: "0 * * * *" },
+          { resourceUid: "uid-cron-a", cron: "15 * * * *" },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "corrupt" });
   });
 
   test("fails closed without replacing a malformed existing state", async () => {

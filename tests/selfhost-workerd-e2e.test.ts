@@ -2043,6 +2043,7 @@ test.skipIf(WORKERD === null)(
     let selections = 0;
     const countedTargets: typeof targets = {
       list: () => targets.list(),
+      withCurrentCron: targets.withCurrentCron,
       async select(script) {
         selections += 1;
         return targets.select(script);

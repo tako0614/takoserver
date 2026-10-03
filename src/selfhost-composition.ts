@@ -213,6 +213,8 @@ export interface SelfhostCompositionOptions {
    * reported as not delivering and not firing.
    */
   readonly events?: SelfhostEventRuntime;
+  /** One-time, bounded canonical owner lookup for legacy native Cron state. */
+  readonly listCronOwners?: SelfhostProviderOptions["listCronOwners"];
   readonly now: Date;
 }
 
@@ -444,6 +446,7 @@ export function createSelfhostComposition(
     ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
     ...(options.dataPlaneMaintenance ? { dataPlaneMaintenance: options.dataPlaneMaintenance } : {}),
     ...(options.events ? { events: options.events } : {}),
+    ...(options.listCronOwners ? { listCronOwners: options.listCronOwners } : {}),
   } satisfies SelfhostProviderOptions);
 
   const supplyContract: SupplyContract = {

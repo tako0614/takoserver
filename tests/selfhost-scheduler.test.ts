@@ -3,9 +3,9 @@ import { createEphemeralSql } from "../src/compat.ts";
 import { parseWorkerCron } from "../src/cron.ts";
 import type { Sql } from "../src/ports.ts";
 import type {
+  SelfhostCronClaimTargets,
   SelfhostEventSelection,
   SelfhostEventTarget,
-  SelfhostEventTargets,
 } from "../src/providers/selfhost.ts";
 import {
   SELFHOST_WORKER_EVENT_PROTOCOL,
@@ -84,9 +84,12 @@ function recordingRuntime(): {
 
 function targets(
   overrides: Partial<SelfhostEventTarget & SelfhostEventSelection> = {},
-): SelfhostEventTargets {
+): SelfhostCronClaimTargets {
   const { versionId, workerVersionUid, eventToken, handlers, ...target } = overrides;
   return {
+    async withCurrentCron(script, cron, claim) {
+      return script === SCRIPT && (target.crons ?? [CRON]).includes(cron) ? await claim() : null;
+    },
     async list() {
       return [
         {
