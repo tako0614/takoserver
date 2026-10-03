@@ -670,7 +670,7 @@ const providerComposition = createStandaloneProviderComposition({
     : {
         listCronOwners: createSelfhostCronOwnerReader({
           inventory: resourceStores.inventory,
-          forms: edge.forms,
+          forms: [...currentCandidates.forms, ...edge.forms],
         }),
       }),
   now: clock(),

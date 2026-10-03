@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import type { TakoformV1Alpha3FormRef } from "../src/form-ref.ts";
 import { STABLE_PRODUCTION_TAKOFORM_CATALOG } from "../src/generated/takoform-stable-v1-catalog.ts";
@@ -13,6 +15,7 @@ import {
 } from "../src/index.ts";
 import { canonicalJson } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import type { Sql } from "../src/ports.ts";
 import { createProviderDriver } from "../src/provider-driver.ts";
 import type { NoncommercialPlacementComposition } from "../src/provider-placement.ts";
 import type { ApplyInput, Provider, ProviderOffering } from "../src/provider-port.ts";
@@ -25,8 +28,9 @@ import type {
   TakoformAuthorityGrant,
   TakoformHostAuthority,
 } from "../src/takoform/host-authority.ts";
+import type { DeferredOperationsConfiguration } from "../src/takoform/operations.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
-import type { InstalledTakoformForm } from "../src/takoform/types.ts";
+import type { InstalledTakoformForm, TakoformHostPrincipal } from "../src/takoform/types.ts";
 import { createWorkerEndpointOriginReservationBindingHandle } from "../src/worker-endpoint-origin-reservations.ts";
 import { applyWithSelection } from "./helpers/apply-with-selection.ts";
 
@@ -54,10 +58,19 @@ const RESERVATION_V2_MIGRATION = readFileSync(
   "utf8",
 );
 
-function createReservationV2Sql() {
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS) database.exec(migration.sql);
-  if (!MIGRATIONS.some((migration) => migration.name === RESERVATION_V2_MIGRATION_NAME)) {
+function createReservationV2Sql(database = new Database(":memory:")) {
+  const initialized = database
+    .query("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'tf_resources'")
+    .get();
+  if (!initialized) {
+    for (const migration of MIGRATIONS) database.exec(migration.sql);
+  }
+  const reservationSchema = database
+    .query(
+      "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'worker_endpoint_origin_reservations'",
+    )
+    .get();
+  if (!reservationSchema) {
     database.exec(RESERVATION_V2_MIGRATION);
   }
   return createSqliteSql(database);
@@ -193,6 +206,7 @@ function fixture(
     /** `false` removes the capability; a string is the label it derives. */
     readonly hostMintedSubdomain?: string | false;
     readonly sql?: ReturnType<typeof createReservationV2Sql>;
+    readonly clock?: () => Date;
     /** Replaces the fake provider's mutation, for driver-level cases. */
     readonly apply?: (input: ApplyInput) => ReturnType<Provider["apply"]>;
     readonly noncommercialResolve?: NoncommercialPlacementComposition["resolve"];
@@ -201,6 +215,7 @@ function fixture(
 ) {
   const sql = input.sql ?? createReservationV2Sql();
   let current = new Date("2026-08-31T12:00:00.000Z");
+  const clock = input.clock ?? (() => current);
   const deriveCalls: { readonly tenantRef: string; readonly requestedSubdomain: string }[] = [];
   const base = new FakeProvider({ id: "fake", offerings: input.technical ?? [technical()] });
   const provider = Object.assign(base, {
@@ -254,11 +269,11 @@ function fixture(
     : undefined;
   const authority = createWorkerEndpointOriginReservations({
     sql,
-    clock: () => current,
+    clock,
     catalog,
     providers: [provider],
-    resources: createTakoformStore(sql, () => current),
-    deployments: createResourceDeploymentStore(sql, () => current),
+    resources: createTakoformStore(sql, clock),
+    deployments: createResourceDeploymentStore(sql, clock),
     ...(noncommercialPlacement
       ? {
           noncommercialPlacement: {
@@ -274,12 +289,73 @@ function fixture(
     catalog,
     provider,
     noncommercialPlacement,
-    clock: () => current,
+    clock,
     deriveCalls,
     advance(milliseconds: number) {
       current = new Date(current.getTime() + milliseconds);
     },
   };
+}
+
+function createEndpointHost(input: {
+  readonly harness: ReturnType<typeof fixture>;
+  readonly forms: readonly InstalledTakoformForm[];
+  readonly originReservations?: ReturnType<typeof fixture>["authority"];
+  readonly authenticate?: (request: Request) => Promise<TakoformHostPrincipal | null>;
+  readonly deferredOperations?: DeferredOperationsConfiguration;
+}) {
+  const { harness, forms } = input;
+  const driver = createProviderDriver({
+    providers: [harness.provider],
+    catalog: harness.catalog,
+    ledger: createLedger(harness.sql, harness.clock),
+    deployments: createResourceDeploymentStore(harness.sql, harness.clock),
+    originReservations: input.originReservations ?? harness.authority,
+    ...(harness.noncommercialPlacement
+      ? { noncommercialPlacement: harness.noncommercialPlacement }
+      : {}),
+  });
+  const authority: TakoformHostAuthority = {
+    async catalog() {
+      return {
+        forms: forms.map((form) => ({
+          form,
+          availability: { executable: true, activated: true, availableToPrincipal: true },
+          supported: true,
+          headDigest: `sha256:${"a".repeat(64)}` as const,
+        })),
+        bindings: [],
+      };
+    },
+    async supportCatalog(input) {
+      return await this.catalog({ ...input, space: "default" });
+    },
+    async authorizeMutation(request) {
+      const form = forms.find(
+        (candidate) =>
+          JSON.stringify(candidate.identity.formRef) === JSON.stringify(request.formRef),
+      );
+      if (!form) throw new Error("unknown Form");
+      return { form } as unknown as TakoformAuthorityGrant;
+    },
+    async authorizeRetained(request) {
+      const form = forms.find(
+        (candidate) => JSON.stringify(candidate.identity) === JSON.stringify(request.resource.form),
+      );
+      if (!form) throw new Error("unknown retained Form");
+      return { form } as unknown as Awaited<ReturnType<TakoformHostAuthority["authorizeRetained"]>>;
+    },
+  };
+  return createTakoformHost({
+    sql: harness.sql,
+    objects: createMemoryObjectStore(),
+    clock: harness.clock,
+    authenticate: input.authenticate ?? (async () => ({ tenantId: "org_01", principalId: "test" })),
+    forms,
+    driver,
+    authority,
+    ...(input.deferredOperations ? { deferredOperations: input.deferredOperations } : {}),
+  });
 }
 
 test("reserves one exact future Worker endpoint origin without manufacturing a Resource identity", async () => {
@@ -529,6 +605,409 @@ test("creates a WorkerEndpoint on a self-host that terminates TLS on the default
       endpoint_resource_uid: "uid-endpoint-01",
     },
   ]);
+});
+
+test("repairs a saved WorkerEndpoint receipt after same-process Host/SQLite reopen", async () => {
+  const root = mkdtempSync(join(tmpdir(), "takoserver-endpoint-repair-"));
+  const databasePath = join(root, "control.sqlite");
+  const origin = "https://sw-community.e2e.selfhost.test";
+  const now = { value: Date.parse("2026-08-31T12:00:00.000Z") };
+  const clock = () => new Date(now.value);
+  const applied: ApplyInput[] = [];
+  const reservations = { minted: 0, assigned: 0, activated: 0 };
+  let observeCommitFault = false;
+  let commitFaultStatementAttempts = 0;
+  let commitFaultAborts = 0;
+  const workerFormBase = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ModuleWorker",
+  );
+  const endpointFormBase = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
+    (candidate) => candidate.identity.formRef.kind === "WorkerEndpoint",
+  );
+  if (!workerFormBase || !endpointFormBase) throw new Error("stable Worker Forms are missing");
+  const workerForm = {
+    ...workerFormBase,
+    identity: {
+      ...workerFormBase.identity,
+      implementationDigest: `sha256:${"a".repeat(64)}` as const,
+    },
+  };
+  const endpointForm = {
+    ...endpointFormBase,
+    identity: {
+      ...endpointFormBase.identity,
+      implementationDigest: `sha256:${"b".repeat(64)}` as const,
+    },
+  };
+  const forms = [workerForm, endpointForm];
+  const resolve: NoncommercialPlacementComposition["resolve"] = async (input) => ({
+    ...input,
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+    offeringId: "worker.module.technical",
+  });
+
+  const openProcess = (database: Database) => {
+    const baseSql = createReservationV2Sql(database);
+    const sql: Sql = {
+      query: (statement, params) => baseSql.query(statement, params),
+      run: (statement, params) => baseSql.run(statement, params),
+      async batch(statements) {
+        const commitDeletesSaga =
+          observeCommitFault &&
+          statements.some(({ sql: statement }) =>
+            statement
+              .replace(/\s+/gu, " ")
+              .toLowerCase()
+              .includes(
+                "delete from tf_provider_mutation_sagas_selection_v1 where operation_id = ? and tenant_id = ? and receipt_json = ?",
+              ),
+          );
+        if (!commitDeletesSaga) return await baseSql.batch(statements);
+        commitFaultStatementAttempts += 1;
+        try {
+          return await baseSql.batch(statements);
+        } catch (error) {
+          if (error instanceof Error && error.message.includes("test_endpoint_commit_fault")) {
+            commitFaultAborts += 1;
+          }
+          throw error;
+        }
+      },
+    };
+    const harness = fixture({
+      sql,
+      clock,
+      offerings: [],
+      technical: [
+        technical("worker.module.technical", workerForm.identity.formRef),
+        technicalEndpointOffering("worker.endpoint.technical", endpointForm.identity.formRef),
+      ],
+      noncommercialResolve: resolve,
+      installedForms: forms,
+      fixedOrigin: origin,
+      hostMintedSubdomain: "sw-community",
+      apply: async (input) => {
+        applied.push(input);
+        return succeeded({
+          nativeId: `endpoint:${input.identity.uid}`,
+          observed: { assigned: true },
+          outputs: { hostname: new URL(origin).hostname, url: `${origin}/` },
+        });
+      },
+    });
+    const originReservations = {
+      ...harness.authority,
+      async mintForWorker(input: Parameters<typeof harness.authority.mintForWorker>[0]) {
+        reservations.minted += 1;
+        return await harness.authority.mintForWorker(input);
+      },
+      async assignEndpoint(input: Parameters<typeof harness.authority.assignEndpoint>[0]) {
+        reservations.assigned += 1;
+        return await harness.authority.assignEndpoint(input);
+      },
+      async activateEndpointAssignment(
+        input: Parameters<typeof harness.authority.activateEndpointAssignment>[0],
+      ) {
+        reservations.activated += 1;
+        return await harness.authority.activateEndpointAssignment(input);
+      },
+    };
+    const host = createEndpointHost({
+      harness,
+      forms,
+      originReservations,
+      authenticate: async (request) => {
+        if (request.headers.get("authorization") === "Bearer endpoint-operator") {
+          return { tenantId: "org_01", principalId: "operator" };
+        }
+        if (request.headers.get("authorization") === "Bearer endpoint-other") {
+          return { tenantId: "org_01", principalId: "other" };
+        }
+        return null;
+      },
+      deferredOperations: {
+        shouldDefer: () => true,
+        pollsBeforeCommit: 1,
+        retryAfterSeconds: 0,
+        leaseMilliseconds: 1_000,
+        executeOnAccept: true,
+      },
+    });
+    return {
+      database,
+      host,
+      sql,
+      originAuthority: harness.authority,
+      close: () => database.close(),
+    };
+  };
+
+  let first: ReturnType<typeof openProcess> | undefined;
+  let restarted: ReturnType<typeof openProcess> | undefined;
+  let releaseCommitFailure: (() => void) | undefined;
+  try {
+    first = openProcess(new Database(databasePath));
+    await seedWorker(first.sql, undefined, workerForm.identity);
+    await first.sql.run(
+      `UPDATE tf_resource_deployments SET offering_id = ? WHERE tenant_id = ? AND resource_uid = ?`,
+      ["worker.module.technical", "org_01", "uid-worker-01"],
+    );
+
+    const desired = {
+      apiVersion: endpointForm.identity.formRef.apiVersion,
+      kind: "WorkerEndpoint",
+      form: { formRef: endpointForm.identity.formRef },
+      metadata: { name: TARGET.endpointName, space: TARGET.space },
+      spec: {
+        worker: {
+          apiVersion: workerForm.identity.formRef.apiVersion,
+          kind: "ModuleWorker",
+          name: TARGET.workerName,
+        },
+      },
+    };
+    const lane = "/apis/forms.takoform.com/v1";
+    const send = (
+      host: ReturnType<typeof createTakoformHost>,
+      path: string,
+      init: RequestInit = {},
+    ) =>
+      host.handle(
+        new Request(`https://host.test${path}`, {
+          ...init,
+          headers: {
+            authorization: "Bearer endpoint-operator",
+            ...(init.body ? { "content-type": "application/json" } : {}),
+            ...init.headers,
+          },
+        }),
+      );
+    const prepared = await send(first.host, `${lane}/resources/prepare`, {
+      method: "POST",
+      body: JSON.stringify(desired),
+    });
+    expect(prepared?.status).toBe(200);
+    if (!prepared) throw new Error("Host did not answer Endpoint prepare");
+    const review = ((await prepared.json()) as { review: unknown }).review;
+    const body = JSON.stringify({ ...desired, review });
+    const createPath = `${lane}/resources/${endpointForm.identity.formRef.apiVersion}/WorkerEndpoint/${TARGET.endpointName}`;
+    const create = (host: ReturnType<typeof createTakoformHost>) =>
+      send(host, createPath, {
+        method: "PUT",
+        headers: { "if-none-match": "*", "idempotency-key": "endpoint-receipt-repair-0001" },
+        body,
+      });
+
+    const endpointReadPath = `${createPath}?${new URLSearchParams({
+      space: TARGET.space,
+      definitionVersion: endpointForm.identity.formRef.definitionVersion,
+      schemaDigest: endpointForm.identity.formRef.schemaDigest,
+    })}`;
+    const releaseFault = () => {
+      first?.database.exec("DROP TRIGGER IF EXISTS fail_next_provider_saga_commit");
+      releaseCommitFailure = undefined;
+    };
+    first.database.exec(`
+      CREATE TRIGGER fail_next_provider_saga_commit
+      BEFORE DELETE ON tf_provider_mutation_sagas_selection_v1
+      BEGIN
+        SELECT RAISE(ABORT, 'test_endpoint_commit_fault');
+      END;
+    `);
+    releaseCommitFailure = releaseFault;
+    observeCommitFault = true;
+    const accepted = await create(first.host);
+    observeCommitFault = false;
+    expect(accepted?.status).toBe(202);
+    if (!accepted) throw new Error("Endpoint create returned no response");
+    const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
+    expect(commitFaultStatementAttempts).toBe(1);
+    expect(commitFaultAborts).toBe(1);
+    expect(applied).toHaveLength(1);
+    expect(reservations).toEqual({ minted: 1, assigned: 1, activated: 1 });
+    const saga = first.database
+      .query(
+        `SELECT tenant_id, resource_uid, target_space, target_kind, target_name, phase, receipt_json
+         FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
+      )
+      .get(operationId) as {
+      tenant_id: string;
+      resource_uid: string;
+      target_space: string;
+      target_kind: string;
+      target_name: string;
+      phase: string;
+      receipt_json: string | null;
+    } | null;
+    expect(saga).toMatchObject({
+      tenant_id: "org_01",
+      target_space: TARGET.space,
+      target_kind: "WorkerEndpoint",
+      target_name: TARGET.endpointName,
+      phase: "executed",
+      receipt_json: expect.any(String),
+    });
+    if (!saga?.receipt_json) throw new Error("saved Endpoint receipt is missing");
+    expect(
+      first.database
+        .query(`SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?`)
+        .get(operationId),
+    ).toEqual({ phase: "committing" });
+    expect(
+      first.database
+        .query(
+          `SELECT COUNT(*) AS count FROM tf_resources
+           WHERE tenant_id = ? AND kind = 'WorkerEndpoint' AND name = ?`,
+        )
+        .get("org_01", TARGET.endpointName),
+    ).toEqual({ count: 0 });
+    expect(
+      first.database
+        .query(
+          `SELECT COUNT(*) AS count FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ count: 0 });
+    const initialReservation = first.database
+      .query(
+        `SELECT reservation_id, state, endpoint_resource_uid FROM worker_endpoint_origin_reservations`,
+      )
+      .all() as Array<{
+      reservation_id: string;
+      state: string;
+      endpoint_resource_uid: string | null;
+    }>;
+    expect(initialReservation).toEqual([
+      {
+        reservation_id: expect.stringMatching(/^hostmint-[0-9a-f]{40}$/u),
+        state: "activated",
+        endpoint_resource_uid: saga.resource_uid,
+      },
+    ]);
+    const reservationId = initialReservation[0]?.reservation_id;
+    if (!reservationId) throw new Error("Endpoint reservation witness is missing");
+    expect(
+      (
+        await send(first.host, `${lane}/operations/${operationId}`, {
+          headers: { authorization: "Bearer endpoint-other" },
+        })
+      )?.status,
+    ).toBe(404);
+
+    releaseCommitFailure();
+    // Reopen the Host and SQLite handle in this process; this does not model an OS restart.
+    first.close();
+    first = undefined;
+    now.value += 8 * 24 * 60 * 60_000;
+    restarted = openProcess(new Database(databasePath));
+    expect(await restarted.host.maintenance?.drainProviderRepairs(8)).toEqual({
+      candidates: 1,
+      acquired: 1,
+      settled: 1,
+      pending: 0,
+    });
+
+    const operationResponse = await send(restarted.host, `${lane}/operations/${operationId}`);
+    expect(operationResponse?.status).toBe(200);
+    const terminal = (await operationResponse?.json()) as {
+      id: string;
+      done: boolean;
+      result: { resource: { metadata: { uid: string } } };
+    };
+    expect(terminal).toMatchObject({
+      id: operationId,
+      done: true,
+      result: { resource: { metadata: { uid: saga.resource_uid } } },
+    });
+    const resourceResponse = await send(restarted.host, endpointReadPath);
+    expect(resourceResponse?.status).toBe(200);
+    const resource = (await resourceResponse?.json()) as { metadata: { uid: string } };
+    expect(resource.metadata.uid).toBe(saga.resource_uid);
+    expect((await create(restarted.host))?.status).toBe(201);
+    expect(
+      await restarted.originAuthority.inspectBound({
+        organizationId: "org_01",
+        reservationId,
+        space: TARGET.space,
+        workerName: TARGET.workerName,
+        workerResourceUid: "uid-worker-01",
+      }),
+    ).toMatchObject({ reservationId, status: "activated" });
+    expect(
+      await restarted.originAuthority.endpointAssignment("org_01", saga.resource_uid),
+    ).toMatchObject({
+      reservationId,
+      canonicalPublicOrigin: origin,
+      endpoint: {
+        space: TARGET.space,
+        name: TARGET.endpointName,
+        uid: saga.resource_uid,
+        revision: "1",
+      },
+      worker: { name: TARGET.workerName, uid: "uid-worker-01" },
+    });
+    const effects = restarted.database
+      .query(
+        `SELECT resource_uid, phase FROM tf_resource_provider_effects WHERE effect_id = ? ORDER BY event_id`,
+      )
+      .all(operationId) as Array<{ resource_uid: string; phase: string }>;
+    expect(effects.length).toBeGreaterThan(0);
+    expect(effects.every((effect) => effect.resource_uid === saga.resource_uid)).toBe(true);
+    expect(effects.filter((effect) => effect.phase === "succeeded")).toHaveLength(1);
+    expect(
+      restarted.database
+        .query(
+          `SELECT COUNT(*) AS count FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toEqual({ count: 0 });
+    expect(applied).toHaveLength(1);
+    expect(reservations).toEqual({ minted: 1, assigned: 1, activated: 1 });
+    expect(
+      restarted.database
+        .query(
+          `SELECT reservation_id, state, endpoint_resource_uid FROM worker_endpoint_origin_reservations`,
+        )
+        .all(),
+    ).toEqual([
+      {
+        reservation_id: expect.stringMatching(/^hostmint-[0-9a-f]{40}$/u),
+        state: "activated",
+        endpoint_resource_uid: saga.resource_uid,
+      },
+    ]);
+    expect(
+      restarted.database
+        .query(
+          `SELECT COUNT(*) AS count FROM tf_resources
+           WHERE tenant_id = ? AND kind = 'WorkerEndpoint' AND name = ?`,
+        )
+        .get("org_01", TARGET.endpointName),
+    ).toEqual({ count: 1 });
+    expect(await restarted.host.maintenance?.drainProviderRepairs(8)).toEqual({
+      candidates: 0,
+      acquired: 0,
+      settled: 0,
+      pending: 0,
+    });
+  } finally {
+    try {
+      releaseCommitFailure?.();
+    } finally {
+      try {
+        first?.close();
+      } finally {
+        try {
+          restarted?.close();
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      }
+    }
+  }
 });
 
 test("accepts exactly one lowercase DNS label", async () => {
@@ -2349,60 +2828,8 @@ for (const candidate of ["published", "actor-forward"] as const) {
       `UPDATE tf_resource_deployments SET offering_id = ? WHERE tenant_id = ? AND resource_uid = ?`,
       ["worker.module.technical", "org_01", "uid-worker-01"],
     );
-    const driver = createProviderDriver({
-      providers: [harness.provider],
-      catalog: harness.catalog,
-      ledger: createLedger(harness.sql, harness.clock),
-      deployments: createResourceDeploymentStore(harness.sql, harness.clock),
-      originReservations: harness.authority,
-      ...(harness.noncommercialPlacement
-        ? { noncommercialPlacement: harness.noncommercialPlacement }
-        : {}),
-    });
     const forms = [workerForm, endpointForm];
-    // Admission is independently tested; this fixture grants only these exact installed Forms.
-    const authority: TakoformHostAuthority = {
-      async catalog() {
-        return {
-          forms: forms.map((form) => ({
-            form,
-            availability: { executable: true, activated: true, availableToPrincipal: true },
-            supported: true,
-            headDigest: `sha256:${"a".repeat(64)}` as const,
-          })),
-          bindings: [],
-        };
-      },
-      async supportCatalog() {
-        return await this.catalog({ tenantId: "org_01", principalId: "test", space: "default" });
-      },
-      async authorizeMutation(input) {
-        const form = forms.find(
-          (candidate) =>
-            JSON.stringify(candidate.identity.formRef) === JSON.stringify(input.formRef),
-        );
-        if (!form) throw new Error("unknown Form");
-        return { form } as unknown as TakoformAuthorityGrant;
-      },
-      async authorizeRetained(input) {
-        const form = forms.find(
-          (candidate) => JSON.stringify(candidate.identity) === JSON.stringify(input.resource.form),
-        );
-        if (!form) throw new Error("unknown retained Form");
-        return { form } as unknown as Awaited<
-          ReturnType<TakoformHostAuthority["authorizeRetained"]>
-        >;
-      },
-    };
-    const host = createTakoformHost({
-      sql: harness.sql,
-      objects: createMemoryObjectStore(),
-      clock: harness.clock,
-      authenticate: async () => ({ tenantId: "org_01", principalId: "test" }),
-      forms,
-      driver,
-      authority,
-    });
+    const host = createEndpointHost({ harness, forms });
     const desired = {
       apiVersion: endpointForm.identity.formRef.apiVersion,
       kind: "WorkerEndpoint",
