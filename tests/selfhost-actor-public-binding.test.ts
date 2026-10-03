@@ -430,3 +430,40 @@ test("owner refuses to delete a namespace while canonical graph authority remain
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("delete recovery proves a failed lease-unlink ACK durably absent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-lease-sync-"));
+  const scope = { tenantId: "tenant-one", namespaceResourceUid: "uid-actor-sync-delete" };
+  const options = {
+    runtimeRoot: join(root, "runtime"),
+    storageRoot: join(root, "actor"),
+    binary: "/unused/workerd",
+    graph: async () => null,
+    deployments: { active: async () => null },
+    providerPackRef: "local.pack",
+    providerInstallationRef: "local.primary",
+  } as const;
+  const first = createSelfhostActorExecutionHost({
+    ...options,
+    async afterLeaseUnlinkBeforeSync() {
+      throw new Error("lease sync interrupted");
+    },
+  });
+  try {
+    await first.ready;
+    await first.registerNamespace(scope);
+    await expect(first.forgetNamespace(scope)).rejects.toThrow("lease sync interrupted");
+    expect(await first.namespaceAbsent(scope)).toBe(false);
+    await first.close();
+    const recovery = createSelfhostActorExecutionHost(options);
+    try {
+      await recovery.ready;
+      expect(await recovery.namespaceAbsent(scope)).toBe(true);
+    } finally {
+      await recovery.close();
+    }
+  } finally {
+    await first.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

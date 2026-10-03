@@ -86,6 +86,8 @@ export function createSelfhostActorExecutionHost(options: {
   readonly afterRegistrationLinkBeforeSync?: () => Promise<void>;
   /** Fault injection only: deletion retains the lease until native data is gone. */
   readonly beforeNamespaceStorageDelete?: () => Promise<void>;
+  /** Fault injection only: emulate an unknown lease-unlink durability ACK. */
+  readonly afterLeaseUnlinkBeforeSync?: () => Promise<void>;
 }) {
   if (!isAbsolute(options.runtimeRoot) || !isAbsolute(options.storageRoot))
     throw new Error("Actor owner roots must be absolute");
@@ -726,6 +728,25 @@ export function createSelfhostActorExecutionHost(options: {
       const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
       const owner = owners.get(key);
       if (owner?.session || owner?.locked) return false;
+      const absent = !(
+        (await pathExists(registrationPath(key))) ||
+        (await pathExists(join(options.storageRoot, "namespaces", key))) ||
+        (await pathExists(join(options.storageRoot, "leases", key)))
+      );
+      if (!absent) return false;
+      // A failed delete may have unlinked a lease without durably publishing
+      // that directory change. Recovery must not ACK page-cache absence.
+      for (const directory of [
+        registrations,
+        join(options.storageRoot, "namespaces"),
+        join(options.storageRoot, "leases"),
+      ]) {
+        try {
+          await syncDirectory(directory);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
       return !(
         (await pathExists(registrationPath(key))) ||
         (await pathExists(join(options.storageRoot, "namespaces", key))) ||
@@ -777,6 +798,7 @@ export function createSelfhostActorExecutionHost(options: {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
         await rm(join(options.storageRoot, "leases", key), { recursive: true });
+        await options.afterLeaseUnlinkBeforeSync?.();
         await syncDirectory(join(options.storageRoot, "leases"));
         if (owner) owner.locked = false;
         coldStartFailures.delete(key);

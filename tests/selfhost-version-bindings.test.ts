@@ -78,7 +78,7 @@ test("Actor metadata is a strict new private Version record and cannot adopt an 
   expect(() =>
     normalizeSelfhostVersionBindingSet({
       ...actor,
-      actorBindings: [{ ...actor.actorBindings[0], name: "LANE" }],
+      actorBindings: actor.actorBindings.map((binding) => ({ ...binding, name: "LANE" })),
     }),
   ).toThrow();
 });
