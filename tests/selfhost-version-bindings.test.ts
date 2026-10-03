@@ -48,6 +48,41 @@ const MARKER = {
   generation: "abcdefghijklmnop",
 } as const;
 
+test("Actor metadata is a strict new private Version record and cannot adopt an older token", async () => {
+  const actor = {
+    ...SET,
+    sensitiveVars: [],
+    workerVersionResourceUid: "uid-WorkerVersion-actor",
+    actorBindings: [
+      {
+        name: "COUNTER",
+        tenantId: "tenant-a",
+        namespaceResourceUid: "uid-ActorNamespace-counter",
+        workerResourceUid: "uid-ModuleWorker-counter",
+        className: "Counter",
+      },
+    ],
+  };
+  const stored = await store.write("sw-actor", "v-actor", actor);
+  expect(stored.actorBindings).toEqual(actor.actorBindings);
+  expect(stored.workerVersionResourceUid).toBe(actor.workerVersionResourceUid);
+  const path = join(root, "sw-actor", "v-actor.json");
+  const bytes = await readFile(path, "utf8");
+  expect(JSON.parse(bytes).format).toBe("takoserver.selfhost-version-bindings@v8");
+  expect((await store.write("sw-actor", "v-actor", actor)).eventToken).toBe(stored.eventToken);
+  await store.write("sw-old", "v-old", SET);
+  const oldBytes = await readFile(join(root, "sw-old", "v-old.json"), "utf8");
+  expect((await store.read("sw-old", "v-old"))?.actorBindings).toBeUndefined();
+  await expect(store.write("sw-old", "v-old", actor)).rejects.toThrow();
+  expect(await readFile(join(root, "sw-old", "v-old.json"), "utf8")).toBe(oldBytes);
+  expect(() =>
+    normalizeSelfhostVersionBindingSet({
+      ...actor,
+      actorBindings: [{ ...actor.actorBindings[0], name: "LANE" }],
+    }),
+  ).toThrow();
+});
+
 test("complete external binding envelope is bounded before a runtime write", () => {
   const value = JSON.stringify({ value: "a".repeat(3 * 1024 * 1024) });
   expect(() =>
