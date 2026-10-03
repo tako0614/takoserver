@@ -89,6 +89,11 @@ const PROVIDER_OFFERING: ProviderOffering = {
   capabilities: ["create", "update", "delete", "observe"],
 };
 
+const IMPORT_PROVIDER_OFFERING: ProviderOffering = {
+  ...PROVIDER_OFFERING,
+  capabilities: [...PROVIDER_OFFERING.capabilities, "import"],
+};
+
 const RETAINED_FORM_REF = {
   ...FORM_REF,
   apiVersion: "edge.forms.takoform.com/v1beta1",
@@ -1243,7 +1248,7 @@ describe("Takoform apply on a real backend", () => {
     let recoveryCalls = 0;
     const provider: Provider = {
       id: "fake-initial",
-      offerings: [PROVIDER_OFFERING],
+      offerings: [IMPORT_PROVIDER_OFFERING],
       ...fakeReadback,
       async apply() {
         throw new Error("not an apply");
@@ -1345,7 +1350,7 @@ describe("Takoform apply on a real backend", () => {
     let providerCalls = 0;
     const provider: Provider = {
       id: "fake",
-      offerings: [PROVIDER_OFFERING],
+      offerings: [IMPORT_PROVIDER_OFFERING],
       ...fakeReadback,
       async apply() {
         throw new Error("not an apply");
@@ -1795,7 +1800,7 @@ describe("Takoform apply on a real backend", () => {
     };
     const provider: Provider = {
       id: "fake",
-      offerings: [PROVIDER_OFFERING],
+      offerings: [IMPORT_PROVIDER_OFFERING],
       async apply() {
         return failed("not_found", "not used");
       },
