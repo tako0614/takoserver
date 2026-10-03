@@ -311,6 +311,171 @@ describe("internal Workflow execution coordinator", () => {
     });
   });
 
+  test("v3 concurrent senders settle one parked wait and retain the other event in FIFO order", async () => {
+    const bothReadWait = latch<void>();
+    const releaseWaitReads = latch<void>();
+    let waitReads = 0;
+    const f = fixture(
+      (sql) => ({
+        ...sql,
+        async query(statement, params) {
+          const rows = await sql.query(statement, params);
+          if (
+            statement.includes("SELECT step.name, step.wait_type, step.timeout_at, step.revision") &&
+            rows.length > 0
+          ) {
+            waitReads += 1;
+            if (waitReads === 2) bothReadWait.resolve();
+            if (waitReads <= 2) await releaseWaitReads.promise;
+          }
+          return rows;
+        },
+      }),
+      [],
+      WORKFLOW_V3_REF,
+    );
+    await f.create();
+    f.hooks.application = async (step) => {
+      const first = await step.waitForEvent(
+        () => "first-approval",
+        () => ({ type: "approval", timeoutSeconds: 60 }),
+      );
+      const second = await step.waitForEvent(
+        () => "second-approval",
+        () => ({ type: "approval", timeoutSeconds: 60 }),
+      );
+      return { first: first?.sequence ?? null, second: second?.sequence ?? null };
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+
+    const acceptedOrder: number[] = [];
+    const firstSend = f.runtime.instances
+      .sendEvent(SCOPE, "instance", {
+        type: "approval",
+        payload: { sequence: 1 },
+      })
+      .then(() => acceptedOrder.push(1));
+    const secondSend = f.runtime.instances
+      .sendEvent(SCOPE, "instance", {
+        type: "approval",
+        payload: { sequence: 2 },
+      })
+      .then(() => acceptedOrder.push(2));
+    await bothReadWait.promise;
+    releaseWaitReads.resolve();
+    await Promise.all([firstSend, secondSend]);
+
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "complete",
+      output: { first: acceptedOrder[0], second: acceptedOrder[1] },
+    });
+  });
+
+  test.each([
+    { admission: "direct wait result", type: "approval" },
+    { admission: "queued event", type: "other" },
+  ])("v3 termination winning a $admission race refuses acceptance", async ({ type }) => {
+    const admissionSeen = latch<void>();
+    const releaseAdmission = latch<void>();
+    let pauseAdmission = true;
+    const f = fixture(
+      (sql) => ({
+        ...sql,
+        async batch(statements) {
+          if (
+            pauseAdmission &&
+            statements.some((statement) =>
+              statement.sql.includes("INSERT INTO tf_workflow_events"),
+            )
+          ) {
+            pauseAdmission = false;
+            admissionSeen.resolve();
+            await releaseAdmission.promise;
+          }
+          return sql.batch(statements);
+        },
+      }),
+      [],
+      WORKFLOW_V3_REF,
+    );
+    await f.create();
+    f.hooks.application = async (step) => {
+      await step.waitForEvent(
+        () => "approval",
+        () => ({ type: "approval", timeoutSeconds: 60 }),
+      );
+      return { resumed: true };
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+
+    const send = f.runtime.instances.sendEvent(SCOPE, "instance", { type });
+    await admissionSeen.promise;
+    await f.runtime.instances.terminate(SCOPE, "instance");
+    releaseAdmission.resolve();
+    await expect(send).rejects.toMatchObject({ code: "instance_terminal" });
+    expect(await f.runtime.instances.status(SCOPE, "instance")).toEqual({ status: "terminated" });
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "terminal",
+      status: "terminated",
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_events").get()).toEqual({
+      count: 0,
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_steps").get()).toEqual({
+      count: 0,
+    });
+  });
+
+  test.each([
+    { admission: "direct wait result", type: "approval" },
+    { admission: "queued event", type: "other" },
+  ])("v3 accepted $admission is safely purged when termination follows", async ({ type }) => {
+    const terminationSeen = latch<void>();
+    const releaseTermination = latch<void>();
+    let pauseTermination = true;
+    const f = fixture(
+      (sql) => ({
+        ...sql,
+        async run(statement, params) {
+          if (pauseTermination && statement.includes("SET termination_requested = 1")) {
+            pauseTermination = false;
+            terminationSeen.resolve();
+            await releaseTermination.promise;
+          }
+          return sql.run(statement, params);
+        },
+      }),
+      [],
+      WORKFLOW_V3_REF,
+    );
+    await f.create();
+    f.hooks.application = async (step) => {
+      await step.waitForEvent(
+        () => "approval",
+        () => ({ type: "approval", timeoutSeconds: 60 }),
+      );
+      return { resumed: true };
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+
+    const termination = f.runtime.instances.terminate(SCOPE, "instance");
+    await terminationSeen.promise;
+    await f.runtime.instances.sendEvent(SCOPE, "instance", { type });
+    releaseTermination.resolve();
+    await termination;
+    expect(await f.runtime.instances.status(SCOPE, "instance")).toEqual({ status: "terminated" });
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "terminal",
+      status: "terminated",
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_events").get()).toEqual({
+      count: 0,
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_steps").get()).toEqual({
+      count: 0,
+    });
+  });
+
   test("v3 event byte limit includes the canonical envelope and rejects without acceptance", async () => {
     const f = fixture(undefined, [], WORKFLOW_V3_REF);
     await f.create();
