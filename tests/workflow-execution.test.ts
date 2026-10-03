@@ -321,7 +321,9 @@ describe("internal Workflow execution coordinator", () => {
         async query(statement, params) {
           const rows = await sql.query(statement, params);
           if (
-            statement.includes("SELECT step.name, step.wait_type, step.timeout_at, step.revision") &&
+            statement.includes(
+              "SELECT step.name, step.wait_type, step.timeout_at, step.revision",
+            ) &&
             rows.length > 0
           ) {
             waitReads += 1;
@@ -384,9 +386,7 @@ describe("internal Workflow execution coordinator", () => {
         async batch(statements) {
           if (
             pauseAdmission &&
-            statements.some((statement) =>
-              statement.sql.includes("INSERT INTO tf_workflow_events"),
-            )
+            statements.some((statement) => statement.sql.includes("INSERT INTO tf_workflow_events"))
           ) {
             pauseAdmission = false;
             admissionSeen.resolve();
