@@ -70,7 +70,11 @@ export async function openSelfhostActorForwardBrokers(options: {
       await Promise.all([upgrade.retire(), http.retire()]);
     },
     async close() {
-      await Promise.all([upgrade.close(), http.close()]);
+      // The native owner must remain alive until *both* private listeners
+      // finish teardown, even when one transport reports uncertainty first.
+      const results = await Promise.allSettled([upgrade.close(), http.close()]);
+      if (results.some((result) => result.status === "rejected"))
+        throw new Error("Actor forward broker close incomplete");
     },
   });
 }

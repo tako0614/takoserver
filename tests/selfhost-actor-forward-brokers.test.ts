@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
+import { once } from "node:events";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
-import { request as httpRequest } from "node:http";
+import { Server as HttpServer, request as httpRequest } from "node:http";
+import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSelfhostActorForwardBrokers } from "../src/selfhost-actor-forward-brokers.ts";
@@ -31,6 +34,7 @@ test("Actor forward brokers bind exact Host scope and reject unauthenticated cal
       expect(brokers.socketMapping).toEqual({
         tenantId: options.tenantId,
         namespaceResourceUid: options.namespaceResourceUid,
+        token,
         httpSocketPath: options.httpSocketPath,
         upgradeSocketPath: options.upgradeSocketPath,
       });
@@ -130,6 +134,146 @@ test("Actor HTTP broker preserves repeated Set-Cookie response fields", async ()
       await brokers.close();
     }
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("pair close waits for both transports when a provisional upgrade settlement fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-forward-close-"));
+  const token = "d".repeat(64);
+  const bearer = "e".repeat(64);
+  const peers = new Set<Socket>();
+  const upstreamPath = join(root, "upstream.sock");
+  const upstream = createServer((socket) => {
+    peers.add(socket);
+    socket.once("close", () => peers.delete(socket));
+    socket.once("data", () => {
+      socket.write(
+        `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nx-takoserver-private-actor-reservation: ${bearer}\r\n\r\n`,
+      );
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    upstream.once("error", reject);
+    upstream.listen(upstreamPath, resolve);
+  });
+  let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const brokers = await openSelfhostActorForwardBrokers({
+    tenantId: "tenant-one",
+    namespaceResourceUid: "uid-actor-namespace-one",
+    token,
+    httpSocketPath: join(root, "http.sock"),
+    upgradeSocketPath: join(root, "upgrade.sock"),
+    executionHost: {
+      async fetch() {
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              bodyController = controller;
+              controller.enqueue(Buffer.from("first chunk"));
+            },
+          }),
+        );
+      },
+      async reserveDuplex() {
+        return {
+          target: { socketPath: upstreamPath, headers: {} },
+          async commitTransport() {},
+          async abandonTransport() {
+            throw new Error("fixture provisional settlement failure");
+          },
+          abandon() {},
+        };
+      },
+    },
+  });
+  const httpCloseStarted = Promise.withResolvers<void>();
+  const allowHttpClose = Promise.withResolvers<void>();
+  const originalServerClose = HttpServer.prototype.close;
+  HttpServer.prototype.close = function (this: HttpServer, callback?: (error?: Error) => void) {
+    if (this.address() !== brokers.socketMapping.httpSocketPath)
+      return originalServerClose.call(this, callback);
+    // Delay only this real Unix HTTP listener's close, leaving it bound until
+    // the pair has observed the independent upgrade-settlement failure.
+    httpCloseStarted.resolve();
+    void allowHttpClose.promise.then(() => originalServerClose.call(this, callback));
+    return this;
+  } as typeof HttpServer.prototype.close;
+  const exchange = (path: string, control = false): Promise<{ head: string; socket: Socket }> =>
+    new Promise((resolve, reject) => {
+      const socket = createConnection({ path: brokers.socketMapping.upgradeSocketPath });
+      peers.add(socket);
+      socket.once("close", () => peers.delete(socket));
+      socket.once("error", reject);
+      let head = "";
+      const onData = (bytes: Buffer) => {
+        head += bytes.toString("latin1");
+        const end = head.indexOf("\r\n\r\n");
+        if (end < 0) return;
+        socket.off("data", onData);
+        resolve({ head: head.slice(0, end), socket });
+      };
+      socket.on("data", onData);
+      socket.once("connect", () =>
+        socket.write(
+          `${control ? "POST" : "GET"} ${path} HTTP/1.1\r\nHost: actor.invalid\r\nx-takoserver-private-broker-token: ${token}\r\n${control ? "Content-Length: 0\r\n" : "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nx-takoserver-private-broker-actor-id: room\r\n"}\r\n`,
+        ),
+      );
+    });
+  try {
+    const httpResponse = await new Promise<import("node:http").IncomingMessage>(
+      (resolve, reject) => {
+        const request = httpRequest(
+          {
+            socketPath: brokers.socketMapping.httpSocketPath,
+            path: "/held",
+            headers: {
+              "x-takoserver-private-broker-token": token,
+              "x-takoserver-private-broker-actor-id": "room",
+            },
+          },
+          resolve,
+        );
+        request.once("error", reject);
+        request.end();
+      },
+    );
+    const firstChunk = once(httpResponse, "data");
+    expect(Buffer.from((await firstChunk)[0]).toString()).toBe("first chunk");
+    const upgrade = await exchange("/socket");
+    expect(upgrade.head).toContain("HTTP/1.1 101 ");
+    const reservation = /^x-takoserver-private-broker-reservation: ([a-f0-9-]{36})$/mu.exec(
+      upgrade.head,
+    )?.[1];
+    expect(reservation).toBeDefined();
+    const control = await exchange(`/__broker/abandon/${reservation}`, true);
+    expect(control.head).toContain("HTTP/1.1 204 ");
+    httpResponse.on("error", () => {});
+    const httpClosed = new Promise<void>((resolve) => httpResponse.once("close", resolve));
+    const closing = brokers.close().then(
+      () => "resolved",
+      () => "rejected",
+    );
+    await httpCloseStarted.promise;
+    expect(existsSync(brokers.socketMapping.httpSocketPath)).toBe(true);
+    expect(await Promise.race([closing, Bun.sleep(20).then(() => "pending")])).toBe("pending");
+    allowHttpClose.resolve();
+    expect(await closing).toBe("rejected");
+    expect(existsSync(brokers.socketMapping.httpSocketPath)).toBe(false);
+    await httpClosed;
+    expect(httpResponse.destroyed).toBe(true);
+    await expect(brokers.close()).rejects.toThrow();
+  } finally {
+    HttpServer.prototype.close = originalServerClose;
+    allowHttpClose.resolve();
+    try {
+      bodyController?.close();
+    } catch {
+      // Hard-close cancels the response stream before fixture cleanup.
+    }
+    for (const peer of peers) peer.destroy();
+    await brokers.close().catch(() => {});
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
   }
 });
