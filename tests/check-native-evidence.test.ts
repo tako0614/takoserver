@@ -17,6 +17,7 @@ import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 const WORKERD_DIGEST = WORKERD_CLOSED_GRAPH_ARTIFACT.sha256;
 const DOCKER_LIFECYCLE_ENV = "TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE";
 const OBJECT_BUCKET_HOST_RESTART_ENV = "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART";
+const WORKER_ENDPOINT_PUBLIC_CREATE_ENV = "TAKOSERVER_NATIVE_WORKER_ENDPOINT_PUBLIC_CREATE";
 const SELFHOST_ARTIFACT_UPLOAD_ENV = "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE";
 const QUEUE_HTTPS_DIAGNOSTIC_ENV = "TAKOSERVER_SELFHOST_QUEUE_HTTPS_DIAGNOSTIC_NATIVE";
 const WORKERD_PARENT_LIFETIME_ENV = "TAKOSERVER_NATIVE_WORKERD_PARENT_LIFETIME";
@@ -198,6 +199,63 @@ test("requires exact ObjectBucket opt-in and pinned workerd without claiming tes
       probe({ digests: { "/native/workerd": "0".repeat(64) } }),
     ).state,
   ).toBe("invalid");
+});
+
+test("classifies the public Host WorkerEndpoint create diagnostic separately from ObjectBucket", () => {
+  const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));
+  const diagnostic = gates.filter(
+    (gate) =>
+      gate.file === "tests/selfhost-worker-endpoint-public-native.test.ts" &&
+      gate.environments.includes(WORKER_ENDPOINT_PUBLIC_CREATE_ENV),
+  );
+
+  expect(diagnostic).toHaveLength(1);
+  expect(diagnostic[0]?.environments).toEqual([
+    WORKER_ENDPOINT_PUBLIC_CREATE_ENV,
+    "TAKOSERVER_WORKERD_BINARY",
+  ]);
+  expect(diagnostic[0]?.capabilities).toEqual(["worker-endpoint-public-create-diagnostic"]);
+  expect(diagnostic[0]?.capability).toBe("worker-endpoint-public-create-diagnostic");
+  expect(gates.every((gate) => gate.capability !== null)).toBe(true);
+});
+
+test("validates exact WorkerEndpoint diagnostic opt-in and pinned workerd readiness only", () => {
+  const capability = NATIVE_EVIDENCE_CAPABILITIES.find(
+    (entry) => entry.id === "worker-endpoint-public-create-diagnostic",
+  );
+  if (!capability) throw new Error("worker endpoint diagnostic capability missing");
+
+  expect(capability.environment).toBe(WORKER_ENDPOINT_PUBLIC_CREATE_ENV);
+  expect(capability.companionEnvironment).toEqual(["TAKOSERVER_WORKERD_BINARY"]);
+  expect(capability.inspect(undefined, {}, probe()).state).toBe("unconfigured");
+  expect(capability.inspect("true", {}, probe()).state).toBe("invalid");
+  expect(capability.inspect("1", {}, probe()).state).toBe("invalid");
+
+  const workerd = "/native/workerd";
+  expect(capability.inspect("1", { TAKOSERVER_WORKERD_BINARY: workerd }, probe()).state).toBe(
+    "invalid",
+  );
+  expect(
+    capability.inspect(
+      "1",
+      { TAKOSERVER_WORKERD_BINARY: workerd },
+      probe({ digests: { [workerd]: "0".repeat(64) } }),
+    ).state,
+  ).toBe("invalid");
+  const ready = capability.inspect(
+    "1",
+    { TAKOSERVER_WORKERD_BINARY: workerd },
+    probe({ digests: { [workerd]: WORKERD_DIGEST } }),
+  );
+  const supportedPlatform =
+    process.platform === WORKERD_CLOSED_GRAPH_ARTIFACT.platform &&
+    process.arch === WORKERD_CLOSED_GRAPH_ARTIFACT.arch;
+  expect(ready).toMatchObject({
+    state: supportedPlatform ? "ready" : "invalid",
+    ...(supportedPlatform ? { readinessOnly: true } : {}),
+  });
+  expect(capability.proves).toContain("exact-Operation readback");
+  expect(capability.proves).toContain("does not prove ObjectBucket access, Resource update/delete");
 });
 
 test("classifies the public Host artifact upload gate without adding a workerd dependency", async () => {
