@@ -1,16 +1,7 @@
 import { createHash, randomBytes, randomInt } from "node:crypto";
-import {
-  link,
-  lstat,
-  mkdir,
-  mkdtemp,
-  readdir,
-  readFile,
-  rm,
-  unlink,
-  writeFile,
-} from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { link, lstat, mkdir, mkdtemp, open, readdir, readFile, rm, unlink } from "node:fs/promises";
+import { dirname, isAbsolute, join } from "node:path";
 import type { ActorResourceGraph, ActorResourceGraphReader } from "./actor-resource-graph.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
 import {
@@ -91,10 +82,13 @@ export function createSelfhostActorExecutionHost(options: {
   readonly providerPackRef: string;
   readonly providerInstallationRef: string;
   readonly basisPoint?: () => number;
+  /** Fault injection only: an unknown registration ACK must be retryable from exact bytes. */
+  readonly afterRegistrationLinkBeforeSync?: () => Promise<void>;
 }) {
   if (!isAbsolute(options.runtimeRoot) || !isAbsolute(options.storageRoot))
     throw new Error("Actor owner roots must be absolute");
   const owners = new Map<string, Owner>();
+  const revoked = new Set<string>();
   const coldStartFailures = new Map<string, ActorColdStartFailure>();
   let stopped = false;
   let stopping: Promise<void> | undefined;
@@ -111,8 +105,31 @@ export function createSelfhostActorExecutionHost(options: {
     typeof scope.namespaceResourceUid === "string" &&
     /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u.test(scope.namespaceResourceUid);
   const registrationPath = (key: string): string => join(registrations, `${key}.json`);
+  const syncDirectory = async (path: string): Promise<void> => {
+    const handle = await open(
+      path,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  };
+  const pathExists = async (path: string): Promise<boolean> => {
+    try {
+      await lstat(path);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  };
   const persistScope = async (key: string, scope: ActorScope): Promise<void> => {
+    await mkdir(options.storageRoot, { recursive: true, mode: 0o700 });
+    await syncDirectory(dirname(options.storageRoot));
     await mkdir(registrations, { recursive: true, mode: 0o700 });
+    await syncDirectory(options.storageRoot);
     const path = registrationPath(key);
     const bytes = JSON.stringify({
       tenantId: scope.tenantId,
@@ -123,7 +140,17 @@ export function createSelfhostActorExecutionHost(options: {
     const temporary = await mkdtemp(join(options.storageRoot, "registration-"));
     try {
       const source = join(temporary, "entry.json");
-      await writeFile(source, bytes, { flag: "wx", mode: 0o600 });
+      const file = await open(
+        source,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        await file.writeFile(bytes);
+        await file.sync();
+      } finally {
+        await file.close();
+      }
       try {
         await link(source, path);
       } catch (error) {
@@ -131,8 +158,11 @@ export function createSelfhostActorExecutionHost(options: {
         if ((await readFile(path, "utf8")) !== bytes)
           throw new Error("Actor namespace registration changed");
       }
+      await options.afterRegistrationLinkBeforeSync?.();
+      await syncDirectory(registrations);
     } finally {
       await rm(temporary, { recursive: true, force: true });
+      await syncDirectory(options.storageRoot);
     }
   };
   const exclusive = <T>(owner: Owner, callback: () => Promise<T>): Promise<T> => {
@@ -232,6 +262,7 @@ export function createSelfhostActorExecutionHost(options: {
     if (stopped || !identity.tenantId || !identity.namespaceResourceUid)
       throw new Error("Actor namespace unavailable");
     const key = keyOf(identity.tenantId, identity.namespaceResourceUid);
+    if (revoked.has(key)) throw new Error("Actor namespace revoked");
     let owner = owners.get(key);
     if (!owner) {
       owner = { tail: Promise.resolve(), locked: false };
@@ -241,7 +272,7 @@ export function createSelfhostActorExecutionHost(options: {
     // Only lifecycle selection is queued here. Individual IDs run under
     // native input gates, not a second generic application scheduler.
     const session = await exclusive(current, async () => {
-      if (stopped || current.revoked) throw new Error("Actor owner stopped");
+      if (stopped || current.revoked || revoked.has(key)) throw new Error("Actor owner stopped");
       const graph = await options.graph(identity, signal);
       if (
         !graph ||
@@ -282,6 +313,7 @@ export function createSelfhostActorExecutionHost(options: {
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
       signal.throwIfAborted();
+      if (revoked.has(key)) throw new ActorAuthorityUnavailable("Actor namespace revoked");
       const selection = JSON.stringify([
         graph,
         deployment,
@@ -295,6 +327,7 @@ export function createSelfhostActorExecutionHost(options: {
       ]);
       if (current.session?.selection !== selection || current.session.dead) {
         await retire(current);
+        if (revoked.has(key)) throw new ActorAuthorityUnavailable("Actor namespace revoked");
         if (register) await persistScope(key, identity);
         if (!current.locked) {
           await mkdir(join(options.storageRoot, "leases"), { recursive: true, mode: 0o700 });
@@ -401,6 +434,7 @@ export function createSelfhostActorExecutionHost(options: {
           };
         };
         try {
+          if (revoked.has(key)) throw new ActorAuthorityUnavailable("Actor namespace revoked");
           process = await openWorkerdActorNamespace(options.binary, {
             namespaceKey: key,
             storagePath: join(options.storageRoot, "namespaces", key),
@@ -629,7 +663,11 @@ export function createSelfhostActorExecutionHost(options: {
       [...coldStartFailures.values()].map((failure) => ({ ...failure })),
     async registerNamespace(scope: ActorScope): Promise<void> {
       await ready;
-      if (stopped || !validScope(scope)) {
+      if (
+        stopped ||
+        !validScope(scope) ||
+        revoked.has(keyOf(scope.tenantId, scope.namespaceResourceUid))
+      ) {
         throw new Error("Actor namespace unavailable");
       }
       const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
@@ -639,7 +677,7 @@ export function createSelfhostActorExecutionHost(options: {
         owners.set(key, owner);
       }
       await exclusive(owner, async () => {
-        if (stopped || owner.revoked) throw new Error("Actor owner stopped");
+        if (stopped || owner.revoked || revoked.has(key)) throw new Error("Actor owner stopped");
         await persistScope(key, { ...scope });
       });
     },
@@ -665,16 +703,30 @@ export function createSelfhostActorExecutionHost(options: {
       }
       return true;
     },
+    async namespaceAbsent(scope: ActorScope): Promise<boolean> {
+      await ready;
+      if (!validScope(scope)) return false;
+      const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
+      const owner = owners.get(key);
+      if (owner?.session || owner?.locked) return false;
+      return !(
+        (await pathExists(registrationPath(key))) ||
+        (await pathExists(join(options.storageRoot, "namespaces", key))) ||
+        (await pathExists(join(options.storageRoot, "leases", key)))
+      );
+    },
     async forgetNamespace(scope: ActorScope): Promise<void> {
       await ready;
       if (stopped || !validScope(scope)) {
         throw new Error("Actor namespace unavailable");
       }
       const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
+      revoked.add(key);
       const owner = owners.get(key);
       const forget = async (): Promise<void> => {
         if (stopped) throw new Error("Actor owner stopped");
         if (owner?.session && owner.session.active > 0 && !owner.session.dead) {
+          revoked.delete(key);
           throw new Error("Actor namespace has active executions");
         }
         if (owner) owner.revoked = true;
@@ -690,6 +742,7 @@ export function createSelfhostActorExecutionHost(options: {
         }
         if (owner?.locked) {
           await rm(join(options.storageRoot, "leases", key), { recursive: true });
+          await syncDirectory(join(options.storageRoot, "leases"));
           owner.locked = false;
         }
         let registered = false;
@@ -710,8 +763,14 @@ export function createSelfhostActorExecutionHost(options: {
         }
         if (registered) {
           await unlink(registrationPath(key));
+          await syncDirectory(registrations);
         }
         await rm(join(options.storageRoot, "namespaces", key), { recursive: true, force: true });
+        try {
+          await syncDirectory(join(options.storageRoot, "namespaces"));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
         coldStartFailures.delete(key);
         owners.delete(key);
       };
