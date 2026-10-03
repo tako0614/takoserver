@@ -15,8 +15,14 @@ import { connect as connectTcp } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { takoformCoreVerifierArtifactDigest } from "../scripts/deploy/form-authority.ts";
+import { createStaticTestTakoformHost } from "../src/app.ts";
+import { createEphemeralSql } from "../src/compat.ts";
 import { bytesDigest } from "../src/json.ts";
+import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
+import { derivedProviderResourceIncarnationName } from "../src/provider-worker-endpoint-origin.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
+import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { assertIsolatedSelfhostNativeEnvironment } from "./helpers/isolated-selfhost-native.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
@@ -42,9 +48,362 @@ const BUCKETS = [
   ["ObjectBucket", "host-restart-media"],
   ["ObjectBucket", "host-restart-other"],
 ] as const;
+const MAX_API_ERROR_BYTES = 4_096;
+const MAX_API_ERROR_READ_MS = 1_000;
+type JourneyFailureRecord = { primary?: unknown; cleanup?: unknown };
+const privateJourneyFailureRecords = new WeakMap<object, JourneyFailureRecord>();
+
+function journeyFailureRecord(error: unknown): JourneyFailureRecord | undefined {
+  return typeof error === "object" && error !== null
+    ? privateJourneyFailureRecords.get(error)
+    : undefined;
+}
+
+function journeyFailureChain(error: unknown): JourneyFailureRecord[] {
+  const chain: JourneyFailureRecord[] = [];
+  const seen = new Set<object>();
+  let current = error;
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    seen.add(current);
+    const record = privateJourneyFailureRecords.get(current);
+    if (!record) break;
+    chain.push(record);
+    current = record.primary;
+  }
+  return chain;
+}
+
+function safeJourneyCause(error: unknown, depth = 0): Error {
+  if (depth >= 8) return new Error("selfhost_object_bucket_cause_chain_truncated");
+  const label =
+    error instanceof JourneyApiFailure
+      ? `selfhost_object_bucket_api_${error.method.toLowerCase()}_${error.status ?? "none"}_${error.apiCode ?? error.kind}`
+      : `selfhost_object_bucket_primary_${safeJourneyErrorClass(error)}`;
+  const cause = journeyFailureRecord(error)?.primary;
+  return new Error(
+    label,
+    cause === undefined ? undefined : { cause: safeJourneyCause(cause, depth + 1) },
+  );
+}
+
+function observeJourneyDiagnostic(
+  message: string,
+  observer: (message: string) => void = (line) => console.info(line),
+): void {
+  try {
+    observer(message);
+  } catch {
+    // Diagnostics must never change the operation or cleanup outcome.
+  }
+}
+
+async function runObservedOperation<T>(
+  phase: JourneyPhase,
+  operation: Exclude<JourneyDiagnosticOperation, "request">,
+  run: () => Promise<T> | T,
+  observer?: (message: string) => void,
+): Promise<T> {
+  observeJourneyDiagnostic(
+    `[selfhost-object-bucket-host-restart] phase=${phase} operation=${operation} outcome=start`,
+    observer,
+  );
+  try {
+    const result = await run();
+    observeJourneyDiagnostic(
+      `[selfhost-object-bucket-host-restart] phase=${phase} operation=${operation} outcome=ok`,
+      observer,
+    );
+    return result;
+  } catch (error) {
+    observeJourneyDiagnostic(
+      `[selfhost-object-bucket-host-restart] phase=${phase} operation=${operation} outcome=failed`,
+      observer,
+    );
+    throw error;
+  }
+}
+
+function attemptOwnedCleanup(cleanup: () => void): unknown | undefined {
+  try {
+    cleanup();
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+}
+
+function createSafeJourneyFailure(
+  phase: JourneyPhase,
+  operation: JourneyDiagnosticOperation,
+  error: unknown,
+): Error {
+  const detail =
+    error instanceof JourneyApiFailure
+      ? `${error.method.toLowerCase()}_${error.status ?? "none"}_${error.apiCode ?? error.kind}`
+      : safeJourneyErrorClass(error);
+  const failure = new Error(
+    `selfhost_object_bucket_journey_failed_phase_${phase}_operation_${operation}_${detail}`,
+    { cause: safeJourneyCause(error) },
+  );
+  privateJourneyFailureRecords.set(failure, { primary: error });
+  return failure;
+}
+
+function createSafeCleanupFailure(
+  labels: readonly string[],
+  primaryFailure: unknown,
+  cleanupFailure: unknown,
+): Error {
+  const safeCauses: Error[] = [];
+  if (primaryFailure !== undefined) safeCauses.push(safeJourneyCause(primaryFailure));
+  if (cleanupFailure !== undefined) safeCauses.push(safeJourneyCause(cleanupFailure));
+  const cause =
+    safeCauses.length > 1
+      ? new AggregateError(safeCauses, "selfhost_object_bucket_primary_and_cleanup_failures")
+      : safeCauses[0];
+  const failure = new Error(`selfhost_object_bucket_cleanup_unconfirmed_${labels.join("_")}`, {
+    ...(cause === undefined ? {} : { cause }),
+  });
+  const primary = journeyFailureChain(primaryFailure)[0]?.primary ?? primaryFailure;
+  privateJourneyFailureRecords.set(failure, {
+    ...(primary === undefined ? {} : { primary }),
+    ...(cleanupFailure === undefined ? {} : { cleanup: cleanupFailure }),
+  });
+  return failure;
+}
+
+test("the current public ObjectBucket Resource omits undeclared provider outputs", async () => {
+  const form = currentTakoformCandidates().forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ObjectBucket",
+  );
+  if (!form) throw new Error("selfhost_object_bucket_current_form_missing");
+
+  const inMemory = new InMemoryTakoformResourceDriver();
+  const driver = new (class extends InMemoryTakoformResourceDriver {
+    override async apply(input: Parameters<typeof inMemory.apply>[0]) {
+      return {
+        ...(await inMemory.apply(input)),
+        outputs: { bucketName: "provider-private-test-name" },
+      };
+    }
+  })();
+  const host = createStaticTestTakoformHost({
+    sql: createEphemeralSql(),
+    objects: createMemoryObjectStore(),
+    forms: [form],
+    driver,
+    authenticate: async (request) =>
+      request.headers.get("authorization") === "Bearer current-object-bucket-test"
+        ? {
+            tenantId: "tenant_object_bucket_test",
+            principalId: "principal_object_bucket_test",
+          }
+        : null,
+  });
+  const formRef = form.identity.formRef;
+  const desired = {
+    apiVersion: formRef.apiVersion,
+    kind: formRef.kind,
+    form: { formRef },
+    metadata: { space: "default", name: "projection" },
+    spec: {},
+  };
+  const authorization = { authorization: "Bearer current-object-bucket-test" };
+  const hostFetch: HostApiFetch = async (request) =>
+    (await host.handle(request)) ?? new Response(null, { status: 404 });
+  const prepared = await api<Json>(
+    "POST",
+    `${LANE}/resources/prepare`,
+    200,
+    desired,
+    authorization,
+    "prepare",
+    hostFetch,
+  );
+
+  const query = new URLSearchParams({
+    space: desired.metadata.space,
+    definitionVersion: formRef.definitionVersion,
+    schemaDigest: formRef.schemaDigest,
+  });
+  const resource = await api<Json>(
+    "PUT",
+    `${LANE}/resources/${formRef.apiVersion}/${formRef.kind}/${desired.metadata.name}?${query}`,
+    201,
+    { ...desired, review: prepared.review },
+    {
+      ...authorization,
+      "idempotency-key": "current-object-bucket-projection",
+      "if-none-match": "*",
+    },
+    "put",
+    hostFetch,
+  );
+  expect(form.identity.formRef).toMatchObject({
+    apiVersion: "edge.forms.takoform.com",
+    definitionVersion: "0.1.0",
+    kind: "ObjectBucket",
+    schemaDigest: "sha256:154e2dcf100b1278f3badb7f7f2f25bba8c6bcf387c75fb6b9abc5ede1cbd557",
+  });
+  expect(form.outputSchema).toBeUndefined();
+  expect((objectAt(resource, "status").outputs as Json | undefined)?.bucketName).toBeUndefined();
+
+  let classifiedFailure: unknown;
+  try {
+    await api<Json>(
+      "POST",
+      `${LANE}/resources/prepare`,
+      200,
+      {},
+      authorization,
+      "prepare",
+      hostFetch,
+    );
+  } catch (error) {
+    classifiedFailure = error;
+  }
+  expect(classifiedFailure).toBeInstanceOf(JourneyApiFailure);
+  expect(classifiedFailure).toMatchObject({
+    operation: "prepare",
+    method: "POST",
+    status: 400,
+    expectedStatus: 200,
+  });
+  expect((classifiedFailure as JourneyApiFailure).apiCode).toMatch(/^[a-z][a-z0-9_]{0,63}$/u);
+});
+
+test("journey diagnostics and cleanup preserve primary failures", async () => {
+  const throwingObserver = () => {
+    throw new Error("observer_failure_must_not_escape");
+  };
+  let operationRan = false;
+  await expect(
+    runObservedOperation(
+      "object_bucket_creation",
+      "prepare",
+      () => {
+        operationRan = true;
+        return "completed";
+      },
+      throwingObserver,
+    ),
+  ).resolves.toBe("completed");
+  expect(operationRan).toBe(true);
+
+  const primaryFailure = new Error("primary_operation_failure");
+  await expect(
+    runObservedOperation(
+      "object_bucket_creation",
+      "put",
+      () => {
+        throw primaryFailure;
+      },
+      throwingObserver,
+    ),
+  ).rejects.toBe(primaryFailure);
+
+  const sanitizedFailure = createSafeJourneyFailure(
+    "object_bucket_creation",
+    "put",
+    primaryFailure,
+  );
+  const cleanupFailure = new Error("fixture_cleanup_failure");
+  expect(
+    attemptOwnedCleanup(() => {
+      throw cleanupFailure;
+    }),
+  ).toBe(cleanupFailure);
+  const combinedFailure = createSafeCleanupFailure(["fixture"], sanitizedFailure, cleanupFailure);
+  expect(journeyFailureRecord(combinedFailure)).toEqual({
+    primary: primaryFailure,
+    cleanup: cleanupFailure,
+  });
+  expect(journeyFailureChain(combinedFailure)).toEqual([
+    { primary: primaryFailure, cleanup: cleanupFailure },
+  ]);
+  expect(combinedFailure.cause).toBeInstanceOf(AggregateError);
+  expect(
+    (combinedFailure.cause as AggregateError).errors.map((cause) => (cause as Error).message),
+  ).toEqual([
+    "selfhost_object_bucket_primary_operation",
+    "selfhost_object_bucket_primary_operation",
+  ]);
+  expect(combinedFailure.message).not.toContain(primaryFailure.message);
+  expect(combinedFailure.message).not.toContain(cleanupFailure.message);
+});
+
+test("journey API error classification bounds stalled response reads", async () => {
+  const response = new Response(
+    new ReadableStream<Uint8Array>({
+      pull: () => new Promise<void>(() => undefined),
+    }),
+    { status: 400 },
+  );
+  await expect(boundedApiErrorCode(response)).resolves.toBe("unknown");
+
+  let canceled = false;
+  let chunks = 0;
+  const slowDrip = new Response(
+    new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (chunks >= 2) return new Promise<void>(() => undefined);
+        return new Promise<void>((resolve) => {
+          setTimeout(() => {
+            if (!canceled) {
+              chunks += 1;
+              controller.enqueue(new Uint8Array([0x20]));
+            }
+            resolve();
+          }, 400);
+        });
+      },
+      cancel() {
+        canceled = true;
+      },
+    }),
+    { status: 400 },
+  );
+  const startedAt = performance.now();
+  await expect(boundedApiErrorCode(slowDrip)).resolves.toBe("unknown");
+  expect(performance.now() - startedAt).toBeLessThan(MAX_API_ERROR_READ_MS + 500);
+  expect(canceled).toBe(true);
+});
 
 type Json = Record<string, unknown>;
 type Host = ReturnType<typeof Bun.spawn>;
+type JourneyDiagnosticOperation = "prepare" | "put" | "output" | "private_readback" | "request";
+type JourneyHttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+type HostApiFetch = (request: Request) => Promise<Response>;
+type JourneyPhase =
+  | "core_verifier_startup"
+  | "initial_host_management"
+  | "form_admission"
+  | "admitted_host_restart"
+  | "form_discovery"
+  | "object_bucket_creation"
+  | "worker_artifact_upload"
+  | "worker_resource_creation"
+  | "initial_object_data"
+  | "host_process_restart"
+  | "post_restart_object_read"
+  | "object_update_delete"
+  | "resource_deletion";
+
+class JourneyApiFailure extends Error {
+  constructor(
+    readonly operation: JourneyDiagnosticOperation,
+    readonly method: JourneyHttpMethod,
+    readonly kind: "http_status" | "transport" | "response_json",
+    readonly status?: number,
+    readonly expectedStatus?: number,
+    readonly apiCode?: string,
+    cause?: unknown,
+  ) {
+    super("selfhost_object_bucket_api_failure");
+    if (cause !== undefined) privateJourneyFailureRecords.set(this, { primary: cause });
+    this.name = "JourneyApiFailure";
+  }
+}
 
 const WORKER_MODULE = (bindingName: string) => `export default {
   async fetch(request, env) {
@@ -83,6 +442,9 @@ test.skipIf(
     await assertIsolatedSelfhostNativeEnvironment({
       fixedPorts: [API_PORT, CORE_VERIFIER_PORT, 443],
     });
+    observeJourneyDiagnostic(
+      "[selfhost-object-bucket-host-restart] phase=isolation_preflight outcome=ok",
+    );
 
     // This is a real local Host journey: released publisher closure, real Core,
     // and the repository admission CLI. Do not replace that authority path with
@@ -118,9 +480,37 @@ test.skipIf(
     let verifier: ReturnType<typeof Bun.spawn> | undefined;
     let admission: ReturnType<typeof Bun.spawn> | undefined;
     const cleanupFailures: string[] = [];
+    let cleanupCause: unknown;
     let caughtFailure = false;
     let testFailure: unknown;
+    let currentPhase: JourneyPhase = "core_verifier_startup";
+    let phaseStarted = false;
+    let failedOperation: JourneyDiagnosticOperation | undefined;
+    const phase = (next: JourneyPhase): void => {
+      if (phaseStarted) {
+        observeJourneyDiagnostic(
+          `[selfhost-object-bucket-host-restart] phase=${currentPhase} outcome=ok`,
+        );
+      }
+      currentPhase = next;
+      phaseStarted = true;
+      observeJourneyDiagnostic(`[selfhost-object-bucket-host-restart] phase=${next} outcome=start`);
+    };
+    const operationStep = async <T>(
+      operation: Exclude<JourneyDiagnosticOperation, "request">,
+      run: () => Promise<T> | T,
+    ): Promise<T> => {
+      failedOperation = undefined;
+      const phaseAtStart = currentPhase;
+      try {
+        return await runObservedOperation(phaseAtStart, operation, run);
+      } catch (error) {
+        failedOperation = operation;
+        throw error;
+      }
+    };
     try {
+      phase("core_verifier_startup");
       await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [CORE_VERIFIER_PORT] });
       const coreVerifierBinary = buildRealCoreVerifier(join(fixture, "core-verifier"));
       verifier = Bun.spawn([coreVerifierBinary], {
@@ -137,6 +527,7 @@ test.skipIf(
       await waitForCoreVerifier(verifier, coreVerifierArtifactDigest);
       await createTls(tlsDirectory);
 
+      phase("initial_host_management");
       await assertIsolatedSelfhostNativeEnvironment({
         fixedPorts: [API_PORT, 443],
         ownedChild: verifier,
@@ -191,6 +582,7 @@ test.skipIf(
 
       await stopHost(host);
       host = undefined;
+      phase("form_admission");
       await verifyAndAdmitForms(
         {
           organizationId,
@@ -203,6 +595,7 @@ test.skipIf(
         },
       );
       admission = undefined;
+      phase("admitted_host_restart");
       await assertIsolatedSelfhostNativeEnvironment({
         fixedPorts: [API_PORT, 443],
         ownedChild: verifier,
@@ -212,6 +605,7 @@ test.skipIf(
       await waitForHost(host);
       const firstHostPid = host.pid;
 
+      phase("form_discovery");
       const forms = await discoverForms(auth);
       const reference = (kind: string, name: string) => ({
         apiVersion: stringAt(forms.get(kind) as Json, "apiVersion"),
@@ -228,30 +622,41 @@ test.skipIf(
           metadata: { name, space: SPACE },
           spec,
         };
-        const prepared = await api<Json>("POST", `${LANE}/resources/prepare`, 200, desired, auth);
+        const prepared = await operationStep("prepare", () =>
+          api<Json>("POST", `${LANE}/resources/prepare`, 200, desired, auth, "prepare"),
+        );
         const query = formQuery(formRef);
-        return await api<Json>(
-          "PUT",
-          `${LANE}/resources/${stringAt(formRef, "apiVersion")}/${kind}/${name}?${query}`,
-          201,
-          { ...desired, review: objectAt(prepared, "review") },
-          { ...auth, "idempotency-key": `create-${kind}-${name}`, "if-none-match": "*" },
+        return await operationStep("put", () =>
+          api<Json>(
+            "PUT",
+            `${LANE}/resources/${stringAt(formRef, "apiVersion")}/${kind}/${name}?${query}`,
+            201,
+            { ...desired, review: objectAt(prepared, "review") },
+            { ...auth, "idempotency-key": `create-${kind}-${name}`, "if-none-match": "*" },
+            "put",
+          ),
         );
       };
 
+      phase("object_bucket_creation");
       const buckets = new Map<string, Json>();
       for (const [kind, name] of BUCKETS) buckets.set(name, await apply(kind, name, {}));
-      const bucketNames = new Map<string, string>(
-        [...buckets].map(([name, resource]) => [name, output(resource, "bucketName")]),
-      );
-      const bucketPaths = new Map(
-        [...bucketNames].map(([name, bucketName]) => [
+      const bucketPaths = new Map<string, string>();
+      for (const [name, resource] of buckets) {
+        const uid = stringAt(objectAt(resource, "metadata"), "uid");
+        // This derived path is private fixture custody only; it is not a
+        // public ObjectBucket output or part of Resource status.
+        const bucketId = await derivedProviderResourceIncarnationName("tsb", {
+          tenantRef: organizationId,
+          space: SPACE,
           name,
-          join(dataRoot, "selfhost", "objects", bucketName),
-        ]),
-      );
+          uid,
+        });
+        bucketPaths.set(name, join(dataRoot, "selfhost", "objects", bucketId));
+      }
 
       const publishModuleArtifact = async (source: string, id: string): Promise<string> => {
+        phase("worker_artifact_upload");
         const moduleBytes = new TextEncoder().encode(source);
         const moduleDigest = await bytesDigest(moduleBytes);
         const upload = await api<Json>(
@@ -316,6 +721,7 @@ test.skipIf(
       const appResources = new Map<string, Json>();
       for (const app of apps) {
         const bundleDigest = await publishModuleArtifact(WORKER_MODULE(app.binding), app.worker);
+        phase("worker_resource_creation");
         const moduleWorker = await apply("ModuleWorker", app.worker, {});
         const workerBundle = await apply("WorkerBundle", app.bundle, {
           manifestDigest: bundleDigest,
@@ -345,7 +751,7 @@ test.skipIf(
       for (const app of apps) {
         const resource = appResources.get(app.endpoint);
         if (!resource) throw new Error("selfhost_object_bucket_endpoint_missing");
-        const url = new URL(output(resource, "url"));
+        const url = new URL(await operationStep("output", () => output(resource, "url")));
         if (url.protocol !== "https:" || url.port !== "") {
           throw new Error("selfhost_object_bucket_endpoint_not_canonical_https");
         }
@@ -356,6 +762,7 @@ test.skipIf(
       if (!mediaHost || !otherHost) throw new Error("selfhost_object_bucket_endpoint_missing");
       const certificate = join(tlsDirectory, "worker-cert.pem");
 
+      phase("initial_object_data");
       expect(await workerRequest(mediaHost, certificate, "POST", "/write", LOCAL_SECRET)).toEqual({
         status: 200,
         body: LOCAL_SECRET,
@@ -381,9 +788,12 @@ test.skipIf(
       const otherBucketPath = bucketPaths.get("host-restart-other");
       if (!mediaBucketPath || !otherBucketPath)
         throw new Error("selfhost_object_bucket_path_missing");
-      expect(existsSync(mediaBucketPath)).toBe(true);
-      expect(existsSync(otherBucketPath)).toBe(true);
+      await operationStep("private_readback", () => {
+        expect(existsSync(mediaBucketPath)).toBe(true);
+        expect(existsSync(otherBucketPath)).toBe(true);
+      });
 
+      phase("host_process_restart");
       await stopHost(host);
       host = undefined;
       await assertIsolatedSelfhostNativeEnvironment({
@@ -396,9 +806,12 @@ test.skipIf(
       await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: host });
       await waitForHost(host);
       const retainedBucket = await readResource(auth, forms, "ObjectBucket", "host-restart-media");
-      const expectedMediaBucketName = bucketNames.get("host-restart-media");
-      if (!expectedMediaBucketName) throw new Error("selfhost_object_bucket_name_missing");
-      expect(output(retainedBucket, "bucketName")).toBe(expectedMediaBucketName);
+      const createdMediaBucket = buckets.get("host-restart-media");
+      if (!createdMediaBucket) throw new Error("selfhost_object_bucket_resource_missing");
+      expect(stringAt(objectAt(retainedBucket, "metadata"), "uid")).toBe(
+        stringAt(objectAt(createdMediaBucket, "metadata"), "uid"),
+      );
+      phase("post_restart_object_read");
       expect(
         await workerRequest(mediaHost, certificate, "GET", `/get?key=${encodeURIComponent(KEY)}`),
       ).toEqual({
@@ -427,6 +840,7 @@ test.skipIf(
         status: 200,
         body: JSON.stringify({ found: false }),
       });
+      phase("object_update_delete");
       expect(
         await workerRequest(otherHost, certificate, "POST", "/delete", undefined, FOREIGN_KEY),
       ).toEqual({
@@ -460,8 +874,11 @@ test.skipIf(
         status: 200,
         body: JSON.stringify({ found: false }),
       });
-      expect(countRegularFiles(mediaBucketPath)).toBe(0);
+      await operationStep("private_readback", () => {
+        expect(countRegularFiles(mediaBucketPath)).toBe(0);
+      });
 
+      phase("resource_deletion");
       for (const app of [...apps].reverse()) {
         for (const [kind, name] of [
           ["WorkerEndpoint", app.endpoint],
@@ -492,45 +909,64 @@ test.skipIf(
           stringAt(objectAt(bucket, "metadata"), "uid"),
         );
       }
-      expect(existsSync(mediaBucketPath)).toBe(false);
-      expect(existsSync(otherBucketPath)).toBe(false);
+      await operationStep("private_readback", () => {
+        expect(existsSync(mediaBucketPath)).toBe(false);
+        expect(existsSync(otherBucketPath)).toBe(false);
+      });
       expect(statSync(join(dataRoot, "selfhost", "objects")).isDirectory()).toBe(true);
+      observeJourneyDiagnostic(
+        `[selfhost-object-bucket-host-restart] phase=${currentPhase} outcome=ok`,
+      );
     } catch (error) {
       caughtFailure = true;
-      testFailure = error;
+      const operation =
+        error instanceof JourneyApiFailure ? error.operation : (failedOperation ?? "request");
+      const safeApiDetail =
+        error instanceof JourneyApiFailure
+          ? ` method=${error.method.toLowerCase()} status=${error.status ?? "none"} expected=${error.expectedStatus ?? "none"} api_code=${error.apiCode ?? error.kind}`
+          : ` class=${safeJourneyErrorClass(error)}`;
+      observeJourneyDiagnostic(
+        `[selfhost-object-bucket-host-restart] phase=${currentPhase} operation=${operation} outcome=failed${safeApiDetail}`,
+      );
+      testFailure = createSafeJourneyFailure(currentPhase, operation, error);
     } finally {
       if (admission) {
         try {
           await stopChild(admission, "selfhost_object_bucket_admission");
           admission = undefined;
-        } catch {
+        } catch (error) {
           cleanupFailures.push("admission");
+          cleanupCause ??= error;
         }
       }
       if (host) {
         try {
           await stopHost(host);
           host = undefined;
-        } catch {
+        } catch (error) {
           cleanupFailures.push("host");
+          cleanupCause ??= error;
         }
       }
       if (verifier) {
         try {
           await stopChild(verifier, "selfhost_object_bucket_core");
           verifier = undefined;
-        } catch {
+        } catch (error) {
           cleanupFailures.push("core");
+          cleanupCause ??= error;
         }
       }
-      if (cleanupFailures.length === 0) rmSync(fixture, { recursive: true, force: true });
+      if (cleanupFailures.length === 0) {
+        cleanupCause = attemptOwnedCleanup(() => rmSync(fixture, { recursive: true, force: true }));
+        if (cleanupCause !== undefined) cleanupFailures.push("fixture");
+      }
     }
     if (cleanupFailures.length > 0) {
-      throw new Error(
-        `selfhost_object_bucket_cleanup_unconfirmed_${cleanupFailures.join("_")}_${fixture}`,
-        {
-          cause: caughtFailure ? testFailure : undefined,
-        },
+      throw createSafeCleanupFailure(
+        cleanupFailures,
+        caughtFailure ? testFailure : undefined,
+        cleanupCause,
       );
     }
     if (caughtFailure) throw testFailure;
@@ -816,38 +1252,140 @@ function formQuery(formRef: Json): string {
 }
 
 async function api<T = Json>(
-  method: string,
+  method: JourneyHttpMethod,
   path: string,
   expectedStatus: number,
   body?: unknown,
   headers: Record<string, string> = {},
+  operation: JourneyDiagnosticOperation = "request",
+  fetchRequest: HostApiFetch = (request) => fetch(request),
 ): Promise<T> {
-  const response = await fetch(`${HOST_ORIGIN}${path}`, {
-    method,
-    headers: { ...(body === undefined ? {} : { "content-type": "application/json" }), ...headers },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    signal: AbortSignal.timeout(10_000),
-  });
+  let response: Response;
+  try {
+    response = await fetchRequest(
+      new Request(`${HOST_ORIGIN}${path}`, {
+        method,
+        headers: {
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+          ...headers,
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        signal: AbortSignal.timeout(10_000),
+      }),
+    );
+  } catch (cause) {
+    throw new JourneyApiFailure(
+      operation,
+      method,
+      "transport",
+      undefined,
+      expectedStatus,
+      undefined,
+      cause,
+    );
+  }
   if (response.status !== expectedStatus) {
-    let code = "unknown";
-    try {
-      const payload = (await response.json()) as Json;
-      const envelope = payload.error;
-      if (typeof envelope === "object" && envelope !== null && !Array.isArray(envelope)) {
-        const candidate = (envelope as Json).code;
-        if (typeof candidate === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(candidate))
-          code = candidate;
-      }
-    } catch {
-      // Keep only the stable classification; never forward response bodies.
-    }
-    await response.arrayBuffer().catch(() => undefined);
-    throw new Error(
-      `selfhost_object_bucket_api_${method.toLowerCase()}_${response.status}_expected_${expectedStatus}_${code}`,
+    const code = await boundedApiErrorCode(response);
+    throw new JourneyApiFailure(
+      operation,
+      method,
+      "http_status",
+      response.status,
+      expectedStatus,
+      code,
     );
   }
   if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  try {
+    return (await response.json()) as T;
+  } catch (cause) {
+    throw new JourneyApiFailure(
+      operation,
+      method,
+      "response_json",
+      response.status,
+      expectedStatus,
+      undefined,
+      cause,
+    );
+  }
+}
+
+async function boundedApiErrorCode(response: Response): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return "unknown";
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  const deadline = performance.now() + MAX_API_ERROR_READ_MS;
+  try {
+    while (byteLength <= MAX_API_ERROR_BYTES) {
+      const remainingMs = deadline - performance.now();
+      if (remainingMs <= 0) {
+        void reader.cancel().catch(() => undefined);
+        return "unknown";
+      }
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = new Promise<null>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(null), remainingMs);
+      });
+      let next: Awaited<ReturnType<typeof reader.read>> | null;
+      try {
+        next = await Promise.race([reader.read(), timedOut]);
+      } finally {
+        if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+      }
+      if (next === null) {
+        void reader.cancel().catch(() => undefined);
+        return "unknown";
+      }
+      const { done, value } = next;
+      if (done) break;
+      const remaining = MAX_API_ERROR_BYTES + 1 - byteLength;
+      const bounded = value.subarray(0, remaining);
+      chunks.push(bounded);
+      byteLength += bounded.byteLength;
+      if (byteLength > MAX_API_ERROR_BYTES) {
+        void reader.cancel().catch(() => undefined);
+        return "unknown";
+      }
+    }
+  } catch {
+    return "unknown";
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // A timed-out read may still be settling while cancellation propagates.
+    }
+  }
+
+  try {
+    const bytes = new Uint8Array(byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const payload = JSON.parse(new TextDecoder().decode(bytes)) as Json;
+    const envelope = payload.error;
+    if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope))
+      return "unknown";
+    const candidate = (envelope as Json).code;
+    return typeof candidate === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(candidate)
+      ? candidate
+      : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function safeJourneyErrorClass(error: unknown): "timeout" | "type" | "syntax" | "operation" {
+  if (error instanceof DOMException && error.name === "TimeoutError") return "timeout";
+  if (!(error instanceof Error)) return "operation";
+  if (error.name === "TimeoutError" || error.name === "AbortError") return "timeout";
+  if (error.name === "TypeError") return "type";
+  if (error.name === "SyntaxError") return "syntax";
+  return "operation";
 }
 
 function workerRequest(
