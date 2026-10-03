@@ -314,11 +314,12 @@ const workerd = createWorkerdSupervisor({
   spawn: (command) =>
     spawnWorkerdWithParentDeath(command, { stdout: "inherit", stderr: "inherit" }),
   log: (message) => process.stdout.write(`${message}\n`),
-  readiness: async (_configPath, child) => {
+  readiness: async (_configPath, child, mode) => {
     // HTTP alone can be answered by an orphan or a foreign listener. Require
     // the kernel listener inode to be held by this exact spawned PID both
     // before and after the response.
-    for (let attempt = 0; attempt < 20; attempt += 1) {
+    const attempts = mode === "startup" ? 20 : 1;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
       try {
         const before = await workerPortOwnership(workerdPort, child.pid);
         if (before === "foreign") return false;
@@ -344,7 +345,9 @@ const workerd = createWorkerdSupervisor({
         // The child may still be starting, or /proc may be unavailable. The
         // latter must never turn an unrelated HTTP listener into readiness.
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      if (mode === "startup") {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      }
     }
     return false;
   },

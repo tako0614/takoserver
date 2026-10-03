@@ -61,13 +61,13 @@ function healthResponse(body: SelfhostHealthResponse, status: number): Response 
 
 /**
  * Read-only Bun self-host health routes. Runtime recovery remains owned by the
- * supervisor and startup restore; these requests only observe their current
- * states and issue one bounded SQL read.
+ * supervisor and startup restore; these requests only issue one bounded SQL
+ * read and one bounded observation of the accepted child listener.
  */
 export function createSelfhostHealthHandler(input: {
   readonly sql: Pick<Sql, "query">;
   readonly startupRestore: SelfhostStartupRestoreOutcome;
-  readonly supervisor: Pick<WorkerdSupervisor, "snapshot">;
+  readonly supervisor: Pick<WorkerdSupervisor, "snapshot" | "probeReadiness">;
   readonly databaseCheckTimeoutMs?: number;
 }): SelfhostHealthHandler {
   const timeoutMs = input.databaseCheckTimeoutMs ?? DEFAULT_DATABASE_CHECK_TIMEOUT_MS;
@@ -84,10 +84,17 @@ export function createSelfhostHealthHandler(input: {
     if (path !== SELFHOST_HEALTH_PATHS.ready) return undefined;
 
     const databaseReady = await databaseIsReadable(input.sql, timeoutMs);
-    // Snapshot only after the SQL read so the runtime phase is as current as
-    // possible at the point this response is formed.
-    const snapshot = input.supervisor.snapshot();
-    const runtime = runtimeHealth(input.startupRestore, snapshot.state);
+    // Probe only after the SQL read so the runtime phase is as current as
+    // possible at the point this response is formed. The probe is observational
+    // and never changes process lifecycle state.
+    const observation = await input.supervisor.probeReadiness();
+    const snapshot = observation.snapshot;
+    const runtime =
+      snapshot.state === "serving" &&
+      observation.listenerReady === false &&
+      input.startupRestore !== "failed"
+        ? "unavailable"
+        : runtimeHealth(input.startupRestore, snapshot.state);
     const ready = databaseReady && (runtime === "not-required" || runtime === "serving");
     return healthResponse(
       {

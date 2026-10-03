@@ -31,6 +31,8 @@ export interface WorkerdSupervisor {
   isReady(): boolean;
   /** A fresh read-only view of the child lifecycle; it does not start recovery. */
   snapshot(): WorkerdSupervisorSnapshot;
+  /** Probe the exact accepted child once without changing its lifecycle. */
+  probeReadiness(): Promise<WorkerdSupervisorReadinessObservation>;
   /** Refuse to rewrite a watched config while an unknown process owns its port. */
   assertMayRender(): Promise<void>;
   stop(): void;
@@ -42,8 +44,15 @@ export interface WorkerdSupervisorSnapshot {
   readonly state: WorkerdSupervisorState;
 }
 
+export interface WorkerdSupervisorReadinessObservation {
+  readonly snapshot: WorkerdSupervisorSnapshot;
+  /** Null means there was no accepted ready child to probe in this turn. */
+  readonly listenerReady: boolean | null;
+}
+
 type CancelScheduledRestart = () => void;
 type ScheduleRestart = (run: () => void, delayMs: number) => CancelScheduledRestart;
+export type WorkerdReadinessMode = "startup" | "observation";
 
 type RuntimeEntry = {
   readonly process: WorkerdProcess;
@@ -70,6 +79,7 @@ type PendingRestart = {
 
 const RESTART_INITIAL_DELAY_MS = 100;
 const RESTART_MAX_DELAY_MS = 5_000;
+const OBSERVATION_PROBE_TIMEOUT_MS = 500;
 
 /** Where a workerd binary is normally found beside this package. */
 export function findWorkerd(repositoryRoot: string): string | null {
@@ -85,7 +95,11 @@ export function createWorkerdSupervisor(options: {
   readonly spawn: (command: readonly string[]) => WorkerdProcess;
   readonly listenerPort?: number;
   /** A real listener/readiness check supplied by the serving composition. */
-  readonly readiness?: (configPath: string, child: WorkerdProcess) => Promise<boolean>;
+  readonly readiness?: (
+    configPath: string,
+    child: WorkerdProcess,
+    mode: WorkerdReadinessMode,
+  ) => Promise<boolean>;
   readonly log?: (message: string) => void;
   /** Internal clock seam for deterministic recovery tests. */
   readonly scheduleRestart?: ScheduleRestart;
@@ -225,7 +239,7 @@ export function createWorkerdSupervisor(options: {
 
   const awaitReadiness = async (entry: RuntimeEntry): Promise<boolean> => {
     const readiness = Promise.resolve().then(() =>
-      options.readiness?.(entry.configPath, entry.process),
+      options.readiness?.(entry.configPath, entry.process, "startup"),
     );
     const exited = entry.process.exited;
     if (!exited) return (await readiness) ?? false;
@@ -316,6 +330,16 @@ export function createWorkerdSupervisor(options: {
     return promise;
   };
 
+  const snapshot = (): WorkerdSupervisorSnapshot => {
+    let state: WorkerdSupervisorState;
+    if (running?.ready) state = "serving";
+    else if (starting) state = desired ? "recovering" : "starting";
+    else if (pendingRestart) state = "recovering";
+    else if (desired || firstStartFailed || stoppedAfterRequiredRuntime) state = "unavailable";
+    else state = "idle";
+    return Object.freeze({ state });
+  };
+
   return {
     async ensure(configPath) {
       if (running?.ready) return;
@@ -340,13 +364,34 @@ export function createWorkerdSupervisor(options: {
     },
 
     snapshot() {
-      let state: WorkerdSupervisorState;
-      if (running?.ready) state = "serving";
-      else if (starting) state = desired ? "recovering" : "starting";
-      else if (pendingRestart) state = "recovering";
-      else if (desired || firstStartFailed || stoppedAfterRequiredRuntime) state = "unavailable";
-      else state = "idle";
-      return Object.freeze({ state });
+      return snapshot();
+    },
+
+    async probeReadiness() {
+      const entry = running;
+      if (!entry?.ready) return Object.freeze({ snapshot: snapshot(), listenerReady: null });
+
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const probe = Promise.resolve()
+        .then(() => options.readiness?.(entry.configPath, entry.process, "observation"))
+        .then((result) => result === true)
+        .catch(() => false);
+      const timeout = new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), OBSERVATION_PROBE_TIMEOUT_MS);
+      });
+      let ready = false;
+      try {
+        ready = await Promise.race([probe, timeout]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+
+      // The probe is observational. If this child stopped or was replaced
+      // while awaiting I/O, its result must not describe the newer lifecycle.
+      if (running !== entry || !entry.ready) {
+        return Object.freeze({ snapshot: snapshot(), listenerReady: false });
+      }
+      return Object.freeze({ snapshot: snapshot(), listenerReady: ready });
     },
 
     async assertMayRender() {

@@ -34,6 +34,10 @@ test("Bun HTTP dispatch serves local liveness and ready no-workload states befor
         snapshotCount++;
         return { state: "idle" as const };
       },
+      async probeReadiness() {
+        snapshotCount++;
+        return { snapshot: { state: "idle" as const }, listenerReady: null };
+      },
     },
   });
   const fetchHandler = createSelfhostBunFetchHandler({
@@ -78,6 +82,157 @@ test("Bun HTTP dispatch serves local liveness and ready no-workload states befor
     expect(appCalls).toBe(1);
   } finally {
     server.stop(true);
+  }
+});
+
+test("ready HTTP reflects a live child's current listener without changing its lifecycle", async () => {
+  let listenerAvailable = true;
+  let readinessThrows = false;
+  let spawnCount = 0;
+  let killCount = 0;
+  const restarts: Array<() => void> = [];
+  const supervisor = createWorkerdSupervisor({
+    binary: "/usr/bin/workerd",
+    spawn: () => {
+      spawnCount++;
+      return {
+        kill() {
+          killCount++;
+        },
+      };
+    },
+    readiness: async (_configPath, _child, mode) => {
+      expect(mode).toBeOneOf(["startup", "observation"]);
+      if (readinessThrows) throw new Error("private listener detail");
+      return listenerAvailable;
+    },
+    scheduleRestart: (run) => {
+      restarts.push(run);
+      return () => undefined;
+    },
+  });
+  const health = createSelfhostHealthHandler({
+    sql: {
+      async query() {
+        return [{ selfhost_health: 1 }];
+      },
+    },
+    startupRestore: "restored",
+    supervisor,
+  });
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: createSelfhostBunFetchHandler({
+      health,
+      async provision() {
+        return undefined;
+      },
+      async appFetch() {
+        return new Response("app");
+      },
+    }),
+  });
+  try {
+    await supervisor.ensure("/operator-private/workerd.capnp");
+    const firstReady = await fetch(new URL("/_takoserver/health/ready", server.url));
+    expect(firstReady.status).toBe(200);
+    expect((await healthBody(firstReady)).workerRuntime).toBe("serving");
+
+    listenerAvailable = false;
+    const unavailable = await fetch(new URL("/_takoserver/health/ready", server.url));
+    expect(unavailable.status).toBe(503);
+    expect(await healthBody(unavailable)).toEqual({
+      status: "not_ready",
+      database: "readable",
+      workerRuntime: "unavailable",
+      supervisor: "serving",
+    });
+    // Health is an observation: the retained child state is not rewritten and
+    // the GET neither tears down nor schedules a replacement process.
+    expect(supervisor.snapshot()).toEqual({ state: "serving" });
+    expect(supervisor.isReady()).toBe(true);
+    expect(spawnCount).toBe(1);
+    expect(killCount).toBe(0);
+    expect(restarts).toHaveLength(0);
+
+    readinessThrows = true;
+    const failedProbe = await fetch(new URL("/_takoserver/health/ready", server.url));
+    expect(failedProbe.status).toBe(503);
+    expect(await failedProbe.text()).not.toContain("private listener detail");
+    readinessThrows = false;
+
+    listenerAvailable = true;
+    const recovered = await fetch(new URL("/_takoserver/health/ready", server.url));
+    expect(recovered.status).toBe(200);
+    expect((await healthBody(recovered)).workerRuntime).toBe("serving");
+    expect(spawnCount).toBe(1);
+    expect(killCount).toBe(0);
+    expect(restarts).toHaveLength(0);
+  } finally {
+    supervisor.stop();
+    server.stop(true);
+  }
+});
+
+test("a readiness observation is discarded when its accepted child exits in flight", async () => {
+  let resolveExit!: (code: number) => void;
+  let resolveObservation!: (ready: boolean) => void;
+  let observationStarted!: () => void;
+  let cancelRestart: (() => void) | undefined;
+  const supervisor = createWorkerdSupervisor({
+    binary: "/usr/bin/workerd",
+    spawn: () => ({
+      kill() {},
+      exited: new Promise<number>((resolve) => {
+        resolveExit = resolve;
+      }),
+    }),
+    readiness: async (_configPath, _child, mode) => {
+      if (mode === "startup") return true;
+      observationStarted();
+      return await new Promise<boolean>((resolve) => {
+        resolveObservation = resolve;
+      });
+    },
+    scheduleRestart: (_run) => {
+      cancelRestart = () => undefined;
+      return cancelRestart;
+    },
+  });
+  const health = createSelfhostHealthHandler({
+    sql: {
+      async query() {
+        return [{ selfhost_health: 1 }];
+      },
+    },
+    startupRestore: "restored",
+    supervisor,
+  });
+
+  try {
+    await supervisor.ensure("/operator-private/workerd.capnp");
+    const started = new Promise<void>((resolve) => {
+      observationStarted = resolve;
+    });
+    const responsePromise = health(new Request("http://127.0.0.1/_takoserver/health/ready"));
+    await started;
+    resolveExit(1);
+    for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+    resolveObservation(true);
+
+    const response = await responsePromise;
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toEqual({
+      status: "not_ready",
+      database: "readable",
+      workerRuntime: "recovering",
+      supervisor: "recovering",
+    });
+    expect(supervisor.snapshot()).toEqual({ state: "recovering" });
+    expect(cancelRestart).toBeDefined();
+  } finally {
+    supervisor.stop();
   }
 });
 
@@ -234,7 +389,10 @@ test("readiness database query is read-only, bounded, retryable, and sanitized",
   const health = createSelfhostHealthHandler({
     sql,
     startupRestore: "empty",
-    supervisor: { snapshot: () => ({ state: "idle" }) },
+    supervisor: {
+      snapshot: () => ({ state: "idle" }),
+      probeReadiness: async () => ({ snapshot: { state: "idle" }, listenerReady: null }),
+    },
     databaseCheckTimeoutMs: 5,
   });
   const request = new Request("http://127.0.0.1/_takoserver/health/ready");
@@ -266,7 +424,10 @@ test("database errors never put paths, secrets, or raw details in the public res
       },
     },
     startupRestore: "empty",
-    supervisor: { snapshot: () => ({ state: "idle" }) },
+    supervisor: {
+      snapshot: () => ({ state: "idle" }),
+      probeReadiness: async () => ({ snapshot: { state: "idle" }, listenerReady: null }),
+    },
   });
 
   const response = await health(new Request("http://127.0.0.1/_takoserver/health/ready"));
