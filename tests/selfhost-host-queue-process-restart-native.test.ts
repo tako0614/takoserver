@@ -28,6 +28,7 @@ import { createTakoformArtifacts } from "../src/takoform/artifacts.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 import {
+  createQueueEventProxy,
   isAcknowledgedQueueResponse,
   readQueueEventMessages,
   shouldInterceptQueueEvent,
@@ -119,6 +120,25 @@ interface WorkerEndpointFacts {
   readonly wildcardSanMatch: boolean;
 }
 
+function queueProxyRequest(messageId: string): Request {
+  return new Request(`http://127.0.0.1${EVENT_PATH}`, {
+    method: "POST",
+    headers: {
+      host: "queue-restart-worker.selfhost-events.invalid",
+      "content-type": "application/vnd.takoserver.managed-worker-event.v1+json",
+    },
+    body: JSON.stringify({ messages: [{ messageId, attempts: 1 }] }),
+  });
+}
+
+function queueAcknowledgement(messageId: string): Response {
+  return Response.json({
+    protocol: "takoserver.managed-worker-event@v1",
+    kind: "queue",
+    decisions: [{ messageId, outcome: "ack" }],
+  });
+}
+
 test("the queue response-loss fixture selects only the exact local Workerd event POST", () => {
   const target = {
     origin: "https://127.0.0.1",
@@ -157,6 +177,179 @@ test("the response-loss fixture records only a real ACK for the requested Queue 
   expect(isAcknowledgedQueueResponse(200, ack, id)).toBe(true);
   expect(isAcknowledgedQueueResponse(200, ack, "other")).toBe(false);
   expect(isAcknowledgedQueueResponse(204, ack, id)).toBe(false);
+});
+
+test("Queue event proxy records receipt before a pending upstream response", async () => {
+  const messageId = "queue-proxy-pending";
+  let announceUpstream: (() => void) | undefined;
+  const upstreamStarted = new Promise<void>((resolve) => {
+    announceUpstream = resolve;
+  });
+  let resolveUpstream: ((response: Response) => void) | undefined;
+  const upstreamResponse = new Promise<Response>((resolve) => {
+    resolveUpstream = resolve;
+  });
+  const proxy = createQueueEventProxy({
+    upstreamOrigin: "https://127.0.0.1:443",
+    upstreamCa: "unused-local-test-ca",
+    withholdFirstAcknowledgement: false,
+    upstreamFetch: async () => {
+      announceUpstream?.();
+      return await upstreamResponse;
+    },
+  });
+
+  const response = proxy.handle(queueProxyRequest(messageId));
+  await upstreamStarted;
+  const status = await proxy.handle(new Request(`http://127.0.0.1/__test/status`));
+  expect(status.status).toBe(200);
+  expect(await status.json()).toEqual({ receivedCount: 1, observations: [] });
+
+  resolveUpstream?.(queueAcknowledgement(messageId));
+  const completed = await response;
+  expect(completed.status).toBe(200);
+  expect(proxy.snapshot()).toEqual({
+    receivedCount: 1,
+    observations: [{ messageId, attempts: 1, status: 200, acknowledged: true, withheld: false }],
+  });
+});
+
+test("Queue event proxy separates a received upstream refusal from no receipt", async () => {
+  const messageId = "queue-proxy-rejected";
+  const proxy = createQueueEventProxy({
+    upstreamOrigin: "https://127.0.0.1:443",
+    upstreamCa: "unused-local-test-ca",
+    withholdFirstAcknowledgement: false,
+    upstreamFetch: async () => new Response("upstream refusal", { status: 503 }),
+  });
+
+  const response = await proxy.handle(queueProxyRequest(messageId));
+  expect(response.status).toBe(503);
+  expect(proxy.snapshot()).toEqual({
+    receivedCount: 1,
+    observations: [{ messageId, attempts: 1, status: 503, acknowledged: false, withheld: false }],
+  });
+});
+
+test("Queue event proxy leaves nonmatching requests out of its receipt and ACK counts", async () => {
+  let upstreamCalls = 0;
+  const proxy = createQueueEventProxy({
+    upstreamOrigin: "https://127.0.0.1:443",
+    upstreamCa: "unused-local-test-ca",
+    upstreamFetch: async () => {
+      upstreamCalls += 1;
+      return queueAcknowledgement("queue-proxy-foreign");
+    },
+  });
+
+  const response = await proxy.handle(
+    new Request(`http://127.0.0.1${EVENT_PATH}`, {
+      method: "POST",
+      headers: { host: "queue-worker.foreign.test" },
+      body: JSON.stringify({ messages: [{ messageId: "queue-proxy-foreign", attempts: 1 }] }),
+    }),
+  );
+  expect(response.status).toBe(404);
+  expect(upstreamCalls).toBe(0);
+  expect(proxy.snapshot()).toEqual({ receivedCount: 0, observations: [] });
+});
+
+test("Queue event proxy forwards the exact event over verified local TLS", async () => {
+  const fixture = mkdtempSync(join(tmpdir(), "queue-proxy-upstream-tls-"));
+  let stopUpstream: (() => void | Promise<void>) | undefined;
+  try {
+    chmodSync(fixture, 0o700);
+    const tls = await createTls(fixture);
+    const upstreamHosts: string[] = [];
+    let upstreamCalls = 0;
+    const upstream = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      tls: { cert: tls.certificateChain, key: tls.privateKey },
+      async fetch(request) {
+        upstreamCalls += 1;
+        upstreamHosts.push(request.headers.get("host") ?? "");
+        const event = (await request.json()) as {
+          readonly messages: readonly { readonly messageId: string }[];
+        };
+        const messageId = event.messages[0]?.messageId;
+        if (!messageId) return new Response(null, { status: 400 });
+        return queueAcknowledgement(messageId);
+      },
+    });
+    stopUpstream = () => upstream.stop(true);
+    const port = upstream.port;
+    if (port === undefined) throw new Error("queue_proxy_tls_upstream_unbound");
+    const proxy = createQueueEventProxy({
+      upstreamOrigin: `https://127.0.0.1:${port}`,
+      upstreamCa: tls.certificateChain,
+      withholdFirstAcknowledgement: false,
+    });
+    const messageId = "queue-proxy-real-tls";
+    const response = await proxy.handle(queueProxyRequest(messageId));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      protocol: "takoserver.managed-worker-event@v1",
+      kind: "queue",
+      decisions: [{ messageId, outcome: "ack" }],
+    });
+    expect(upstreamCalls).toBe(1);
+    expect(upstreamHosts[0]).toBe("queue-restart-worker.selfhost-events.invalid");
+    expect(proxy.snapshot()).toEqual({
+      receivedCount: 1,
+      observations: [{ messageId, attempts: 1, status: 200, acknowledged: true, withheld: false }],
+    });
+  } finally {
+    try {
+      await stopUpstream?.();
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Queue event proxy rejects an untrusted upstream certificate", async () => {
+  const fixture = mkdtempSync(join(tmpdir(), "queue-proxy-untrusted-tls-"));
+  let stopUpstream: (() => void | Promise<void>) | undefined;
+  try {
+    chmodSync(fixture, 0o700);
+    const serverDirectory = join(fixture, "server");
+    const wrongCaDirectory = join(fixture, "wrong-ca");
+    mkdirSync(serverDirectory, { mode: 0o700 });
+    mkdirSync(wrongCaDirectory, { mode: 0o700 });
+    const serverTls = await createTls(serverDirectory);
+    const wrongCa = await createTls(wrongCaDirectory);
+    const upstream = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      tls: { cert: serverTls.certificateChain, key: serverTls.privateKey },
+      fetch: () => Response.json({ accepted: true }),
+    });
+    stopUpstream = () => upstream.stop(true);
+    const port = upstream.port;
+    if (port === undefined) throw new Error("queue_proxy_untrusted_tls_upstream_unbound");
+    const proxy = createQueueEventProxy({
+      upstreamOrigin: `https://127.0.0.1:${port}`,
+      upstreamCa: wrongCa.certificateChain,
+      withholdFirstAcknowledgement: false,
+    });
+    let failure: unknown;
+    try {
+      await proxy.handle(queueProxyRequest("queue-proxy-untrusted-tls"));
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(proxy.snapshot()).toEqual({ receivedCount: 1, observations: [] });
+  } finally {
+    try {
+      await stopUpstream?.();
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
 });
 
 test("the exact released Core admission request contains the Queue and Worker Forms", async () => {
@@ -1598,14 +1791,33 @@ async function proxyObservations(
   proxyOrigin: string,
   owner: ReturnType<typeof Bun.spawn>,
 ): Promise<readonly ProxyObservation[]> {
+  return (await proxyStatus(proxyOrigin, owner)).observations;
+}
+
+async function proxyStatus(
+  proxyOrigin: string,
+  owner: ReturnType<typeof Bun.spawn>,
+): Promise<{ readonly receivedCount: number; readonly observations: readonly ProxyObservation[] }> {
   if (owner.exitCode !== null) throw new Error("queue_proxy_child_exited");
   const response = await fetch(`${proxyOrigin}/__test/status`, {
     signal: AbortSignal.timeout(1_000),
   });
   if (response.status !== 200) throw new Error("queue_proxy_status_unavailable");
-  const body = (await response.json()) as { readonly observations?: unknown };
-  if (!Array.isArray(body.observations)) throw new Error("queue_proxy_status_shape_invalid");
-  return body.observations as ProxyObservation[];
+  const body = (await response.json()) as {
+    readonly receivedCount?: unknown;
+    readonly observations?: unknown;
+  };
+  if (
+    !Number.isSafeInteger(body.receivedCount) ||
+    (body.receivedCount as number) < 0 ||
+    !Array.isArray(body.observations)
+  ) {
+    throw new Error("queue_proxy_status_shape_invalid");
+  }
+  return {
+    receivedCount: body.receivedCount as number,
+    observations: body.observations as ProxyObservation[],
+  };
 }
 
 async function waitForProxyObservation(
@@ -1615,12 +1827,16 @@ async function waitForProxyObservation(
   timeoutMillis = 15_000,
 ): Promise<ProxyObservation> {
   const deadline = Date.now() + timeoutMillis;
+  let receivedCount = 0;
   while (Date.now() < deadline) {
-    const observations = await proxyObservations(proxyOrigin, owner);
-    if (observations.length >= count) return observations[count - 1] as ProxyObservation;
+    const status = await proxyStatus(proxyOrigin, owner);
+    receivedCount = status.receivedCount;
+    if (status.observations.length >= count) {
+      return status.observations[count - 1] as ProxyObservation;
+    }
     await Bun.sleep(25);
   }
-  throw new Error(`queue_proxy_observation_timeout_${count}`);
+  throw new Error(`queue_proxy_observation_timeout_${count}_after_receipt_${receivedCount}`);
 }
 
 async function createTls(directory: string): Promise<{
