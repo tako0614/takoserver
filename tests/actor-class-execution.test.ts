@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { inspectActorClassV2Candidate } from "../src/actor-class-candidate-inspection.ts";
 import {
   ActorExecutionError,
   ActorRuntimeError,
@@ -152,6 +153,262 @@ describe("private Actor ordinary-class execution seam", () => {
       ),
     ).toBeInstanceOf(Response);
     expect(getterCalls).toBe(0);
+  });
+
+  test("candidate inspection requires five prototype handlers without constructing the class", () => {
+    let constructions = 0;
+    const inherited = {
+      socketError() {},
+    };
+    class CandidateActor {
+      constructor() {
+        constructions += 1;
+      }
+      fetch() {
+        return new Response("ok");
+      }
+      alarm() {}
+      socketMessage() {}
+      socketClose() {}
+    }
+    Object.setPrototypeOf(CandidateActor.prototype, inherited);
+
+    const inspection = inspectActorClassV2Candidate({ CandidateActor }, "CandidateActor");
+
+    expect(inspection.handlers.socketError).toBeTypeOf("function");
+    expect(constructions).toBe(0);
+  });
+
+  test("candidate inspection captures inherited handlers and returns an immutable result", () => {
+    const inherited = {
+      fetch() {
+        return new Response("ok");
+      },
+      alarm() {},
+      socketMessage() {},
+      socketClose() {},
+      socketError() {},
+      start() {},
+    };
+    class CandidateActor {}
+    Object.setPrototypeOf(CandidateActor.prototype, inherited);
+
+    const inspection = inspectActorClassV2Candidate({ CandidateActor }, "CandidateActor");
+
+    for (const name of [
+      "fetch",
+      "alarm",
+      "socketMessage",
+      "socketClose",
+      "socketError",
+      "start",
+    ] as const) {
+      expect(inspection.handlers[name]).toBe(inherited[name]);
+    }
+    expect(Object.getPrototypeOf(inspection)).toBeNull();
+    expect(Object.getPrototypeOf(inspection.handlers)).toBeNull();
+    expect(Object.isFrozen(inspection)).toBe(true);
+    expect(Object.isFrozen(inspection.handlers)).toBe(true);
+  });
+
+  test("candidate inspection admits finite 129-link inheritance without start", () => {
+    const inherited = {
+      fetch() {
+        return new Response("inherited");
+      },
+      alarm() {},
+      socketMessage() {},
+      socketClose() {},
+      socketError() {},
+    };
+    let prototype: object = inherited;
+    for (let depth = 0; depth < 129; depth += 1) prototype = Object.create(prototype);
+    class DeepInheritedActor {}
+    Object.setPrototypeOf(DeepInheritedActor.prototype, prototype);
+
+    const inspection = inspectActorClassV2Candidate({ DeepInheritedActor }, "DeepInheritedActor");
+
+    expect(inspection.handlers.fetch).toBe(inherited.fetch);
+    expect(inspection.handlers.socketError).toBe(inherited.socketError);
+    expect(inspection.handlers.start).toBeUndefined();
+  });
+
+  test("candidate inspection refuses missing, noncallable or accessor socketError", () => {
+    class MissingSocketError {
+      fetch() {
+        return new Response("ok");
+      }
+      alarm() {}
+      socketMessage() {}
+      socketClose() {}
+    }
+    expect(() =>
+      inspectActorClassV2Candidate({ MissingSocketError }, "MissingSocketError"),
+    ).toThrow(ActorRuntimeError);
+
+    let getterCalls = 0;
+    class AccessorSocketError {
+      fetch() {
+        return new Response("ok");
+      }
+      alarm() {}
+      socketMessage() {}
+      socketClose() {}
+      get socketError() {
+        getterCalls += 1;
+        throw new Error("untrusted candidate getter must not run");
+      }
+    }
+    expect(() =>
+      inspectActorClassV2Candidate({ AccessorSocketError }, "AccessorSocketError"),
+    ).toThrow(ActorRuntimeError);
+    expect(getterCalls).toBe(0);
+
+    class NonCallableSocketError {
+      fetch() {
+        return new Response("ok");
+      }
+      alarm() {}
+      socketMessage() {}
+      socketClose() {}
+    }
+    Object.defineProperty(NonCallableSocketError.prototype, "socketError", {
+      value: "not a method",
+    });
+    expect(() =>
+      inspectActorClassV2Candidate({ NonCallableSocketError }, "NonCallableSocketError"),
+    ).toThrow(ActorRuntimeError);
+  });
+
+  test("candidate inspection refuses accessors without invoking them", () => {
+    let getterCalls = 0;
+    class CandidateActor {
+      get fetch(): () => Response {
+        getterCalls += 1;
+        return () => new Response("unexpected");
+      }
+      alarm() {}
+      socketMessage() {}
+      socketClose() {}
+      socketError() {}
+    }
+    expect(() => inspectActorClassV2Candidate({ CandidateActor }, "CandidateActor")).toThrow(
+      ActorRuntimeError,
+    );
+    expect(getterCalls).toBe(0);
+
+    class AccessorStart {
+      fetch() {
+        return new Response("ok");
+      }
+      alarm() {}
+      socketMessage() {}
+      socketClose() {}
+      socketError() {}
+      get start(): () => void {
+        getterCalls += 1;
+        return () => {};
+      }
+    }
+    expect(() => inspectActorClassV2Candidate({ AccessorStart }, "AccessorStart")).toThrow(
+      ActorRuntimeError,
+    );
+    expect(getterCalls).toBe(0);
+  });
+
+  test("candidate inspection refuses cyclic and changing prototype chains", async () => {
+    const moduleUrl = new URL("../src/actor-class-candidate-inspection.ts", import.meta.url).href;
+    const script = `
+      import { inspectActorClassV2Candidate } from ${JSON.stringify(moduleUrl)};
+      let failures = 0;
+      let cycle;
+      cycle = new Proxy({}, { getPrototypeOf() { return cycle; } });
+      class Actor {
+        fetch() {}
+        alarm() {}
+        socketMessage() {}
+        socketClose() {}
+        socketError() {}
+      }
+      Object.setPrototypeOf(Actor.prototype, cycle);
+      try {
+        inspectActorClassV2Candidate({ Actor }, "Actor");
+        failures += 1;
+      } catch (error) {
+        if (error?.code !== "backend_unavailable") failures += 1;
+      }
+
+      let chainReads = 0;
+      const changing = {
+        getPrototypeOf() {
+          chainReads += 1;
+          return chainReads === 1 ? null : { socketError() {} };
+        },
+      };
+      class ChangingActor {
+        fetch() {}
+        alarm() {}
+        socketMessage() {}
+        socketClose() {}
+      }
+      Object.setPrototypeOf(ChangingActor.prototype, new Proxy({}, changing));
+      try {
+        inspectActorClassV2Candidate({ ChangingActor }, "ChangingActor");
+        failures += 1;
+      } catch (error) {
+        if (error?.code !== "backend_unavailable") failures += 1;
+      }
+      if (chainReads !== 1) failures += 1;
+      process.exitCode = failures === 0 ? 0 : 2;
+    `;
+    const child = Bun.spawn([process.execPath, "-e", script], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, 1_000);
+    const exitCode = await child.exited;
+    clearTimeout(timeout);
+
+    expect(timedOut).toBe(false);
+    expect(exitCode).toBe(0);
+  });
+
+  test("an unbounded candidate inspection is killable outside the Host process", async () => {
+    const moduleUrl = new URL("../src/actor-class-candidate-inspection.ts", import.meta.url).href;
+    const script = `
+      import { inspectActorClassV2Candidate } from ${JSON.stringify(moduleUrl)};
+      const chain = { getPrototypeOf() { return new Proxy({}, chain); } };
+      class Actor {
+        fetch() {}
+        alarm() {}
+        socketMessage() {}
+        socketClose() {}
+        socketError() {}
+      }
+      Object.setPrototypeOf(Actor.prototype, new Proxy({}, chain));
+      process.stdout.write("started\\n");
+      inspectActorClassV2Candidate({ Actor }, "Actor");
+    `;
+    const child = Bun.spawn([process.execPath, "-e", script], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const output = new Response(child.stdout).text();
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, 1_000);
+    const exitCode = await child.exited;
+    clearTimeout(timeout);
+
+    expect(timedOut).toBe(true);
+    expect(exitCode).not.toBe(0);
+    expect(await output).toBe("started\n");
   });
 
   test("refuses a class missing any one of the four required handlers", () => {
