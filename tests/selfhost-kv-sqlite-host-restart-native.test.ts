@@ -37,6 +37,7 @@ const OPERATION_API_VERSION = "operations.takoform.com/v1alpha1";
 const OPERATION_ID_PATTERN = /^op_[A-Za-z0-9][A-Za-z0-9._-]{0,124}$/u;
 const API_ERROR_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/u;
 const API_REQUEST_TIMEOUT_MS = 15_000;
+const MUTATION_OPERATION_REQUEST_TIMEOUT_MS = 30_000;
 const NATIVE_CASE_TIMEOUT_MS = 300_000;
 const OPERATION_CLEANUP_MARGIN_MS = 5_000;
 const MAX_OPERATION_POLL_ATTEMPTS = NATIVE_CASE_TIMEOUT_MS / 1_000;
@@ -178,6 +179,7 @@ type MutationPhases = {
 
 type MutationRuntime = {
   readonly transport?: MutationTransport;
+  readonly origin?: string;
   readonly deadlineAt: number;
   readonly now?: () => number;
   readonly sleep?: (milliseconds: number) => Promise<void>;
@@ -215,12 +217,13 @@ function nativeMutationTransport(
   path: string,
   body: unknown,
   headers: Record<string, string>,
+  origin = HOST_ORIGIN,
 ): Promise<Response> {
-  return fetch(`${HOST_ORIGIN}${path}`, {
+  return fetch(`${origin}${path}`, {
     method,
     headers: { ...(body === undefined ? {} : { "content-type": "application/json" }), ...headers },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    signal: AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(MUTATION_OPERATION_REQUEST_TIMEOUT_MS),
   });
 }
 
@@ -241,12 +244,19 @@ async function applyResourceMutation(
   },
   runtime: MutationRuntime,
 ): Promise<Json> {
-  const transport = runtime.transport ?? nativeMutationTransport;
+  const transport =
+    runtime.transport ??
+    ((method, path, body, headers) =>
+      nativeMutationTransport(method, path, body, headers, runtime.origin));
   const now = runtime.now ?? Date.now;
   const sleep = runtime.sleep ?? Bun.sleep;
   const random = runtime.random ?? Math.random;
   const submission = await withOptionalJourneyPhase(runtime.phases?.submit, async () => {
-    assertRequestFitsOperationDeadline(runtime.deadlineAt, now);
+    assertRequestFitsOperationDeadline(
+      runtime.deadlineAt,
+      now,
+      MUTATION_OPERATION_REQUEST_TIMEOUT_MS,
+    );
     const response = await transport("PUT", input.path, input.body, input.mutationHeaders);
     if (response.status !== input.expectedStatus && response.status !== 202) {
       await throwUnexpectedApiResponse(response, "put", input.expectedStatus);
@@ -265,15 +275,19 @@ async function applyResourceMutation(
   for (let attempt = 0; attempt < MAX_OPERATION_POLL_ATTEMPTS; attempt += 1) {
     const remainingMilliseconds = runtime.deadlineAt - now();
     if (
-      remainingMilliseconds <= API_REQUEST_TIMEOUT_MS ||
-      delayMilliseconds + API_REQUEST_TIMEOUT_MS >= remainingMilliseconds
+      remainingMilliseconds <= MUTATION_OPERATION_REQUEST_TIMEOUT_MS ||
+      delayMilliseconds + MUTATION_OPERATION_REQUEST_TIMEOUT_MS >= remainingMilliseconds
     ) {
       throw new Error("selfhost_operation_wait_deadline_exceeded");
     }
     if (delayMilliseconds > 0) await sleep(delayMilliseconds);
 
     const poll = await withOptionalJourneyPhase(runtime.phases?.poll, async () => {
-      assertRequestFitsOperationDeadline(runtime.deadlineAt, now);
+      assertRequestFitsOperationDeadline(
+        runtime.deadlineAt,
+        now,
+        MUTATION_OPERATION_REQUEST_TIMEOUT_MS,
+      );
       const response = await transport("GET", operationPath, undefined, input.operationHeaders);
       if (response.status !== 200) await throwUnexpectedApiResponse(response, "get", 200);
       return {
@@ -301,8 +315,12 @@ async function applyResourceMutation(
   throw new Error("selfhost_operation_poll_limit_exceeded");
 }
 
-function assertRequestFitsOperationDeadline(deadlineAt: number, now: () => number): void {
-  if (deadlineAt - now() <= API_REQUEST_TIMEOUT_MS) {
+function assertRequestFitsOperationDeadline(
+  deadlineAt: number,
+  now: () => number,
+  requestTimeoutMilliseconds: number,
+): void {
+  if (deadlineAt - now() <= requestTimeoutMilliseconds) {
     throw new Error("selfhost_operation_wait_deadline_exceeded");
   }
 }
@@ -545,6 +563,109 @@ test("public apply follows one accepted operation without replaying the mutation
   expect(calls.slice(1).every((call) => call.method === "GET")).toBe(true);
 });
 
+test("public apply accepts a legal deferred response and polls the same operation over HTTP", async () => {
+  const operationId = "op_local_deferred_deadline_001";
+  const resource: Json = {
+    apiVersion: "workers.takoform.com",
+    kind: "WorkerBundle",
+    metadata: { name: "local-deferred-deadline", space: SPACE, uid: "bundle-local-uid" },
+  };
+  const input = {
+    path: `${LANE}/resources/workers.takoform.com/WorkerBundle/local-deferred-deadline`,
+    expectedStatus: 201 as const,
+    body: { apiVersion: "workers.takoform.com", kind: "WorkerBundle" },
+    mutationHeaders: {
+      authorization: "test-principal",
+      "idempotency-key": "local-deferred-deadline-create",
+    },
+    operationHeaders: { authorization: "test-principal" },
+    expectedIdentity: {
+      apiVersion: "workers.takoform.com",
+      kind: "WorkerBundle",
+      name: "local-deferred-deadline",
+      space: SPACE,
+    },
+  };
+  const calls: Array<{
+    readonly method: string;
+    readonly path: string;
+    readonly authorization: string | null;
+    readonly idempotencyKey: string | null;
+  }> = [];
+  let server: ReturnType<typeof Bun.serve> | undefined;
+  let serverAccepted = false;
+  try {
+    server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: async (request) => {
+        const url = new URL(request.url);
+        calls.push({
+          method: request.method,
+          path: url.pathname,
+          authorization: request.headers.get("authorization"),
+          idempotencyKey: request.headers.get("idempotency-key"),
+        });
+        if (request.method === "PUT" && url.pathname === input.path.split("?")[0]) {
+          await Bun.sleep(15_100);
+          serverAccepted = true;
+          return Response.json(
+            {
+              operation: {
+                apiVersion: OPERATION_API_VERSION,
+                kind: "Operation",
+                id: operationId,
+                done: false,
+              },
+            },
+            { status: 202, headers: { "retry-after": "0" } },
+          );
+        }
+        if (request.method === "GET" && url.pathname === `${LANE}/operations/${operationId}`) {
+          return Response.json({
+            apiVersion: OPERATION_API_VERSION,
+            kind: "Operation",
+            id: operationId,
+            done: true,
+            result: { resource },
+          });
+        }
+        return new Response(null, { status: 404 });
+      },
+    });
+    const startedAt = performance.now();
+    let applied: Json | undefined;
+    let applyFailure: unknown;
+    try {
+      applied = await applyResourceMutation(input, {
+        deadlineAt: Date.now() + 60_000,
+        origin: server.url.origin,
+        random: () => 0,
+      });
+    } catch (error) {
+      applyFailure = error;
+    }
+    console.info(
+      `[selfhost-operation-request-budget] phase=mutation outcome=${applyFailure === undefined ? "completed" : safeErrorClass(applyFailure)} server_accepted=${serverAccepted} elapsed_ms=${elapsedMilliseconds(startedAt)}`,
+    );
+    if (applyFailure !== undefined) throw applyFailure;
+    if (!applied) throw new Error("selfhost_deferred_mutation_result_missing");
+
+    expect(applied).toEqual(resource);
+    expect(calls.map(({ method, path }) => [method, path])).toEqual([
+      ["PUT", input.path],
+      ["GET", `${LANE}/operations/${operationId}`],
+    ]);
+    expect(calls[0]).toMatchObject({
+      authorization: "test-principal",
+      idempotencyKey: "local-deferred-deadline-create",
+    });
+    expect(calls[1]).toMatchObject({ authorization: "test-principal", idempotencyKey: null });
+  } finally {
+    server?.stop(true);
+  }
+});
+
 test.each([
   { expectedStatus: 201 as const, expectedUid: undefined },
   { expectedStatus: 200 as const, expectedUid: "worker-version-uid" },
@@ -732,7 +853,7 @@ test("public apply fails terminal operation errors and bounds Retry-After", asyn
   const methods: string[] = [];
   await expect(
     applyResourceMutation(input, {
-      deadlineAt: 20_000,
+      deadlineAt: 32_000,
       now: () => now,
       sleep: async (milliseconds) => {
         now += milliseconds;
@@ -775,7 +896,7 @@ test("public apply does not poll after sleeping past the shared operation deadli
   const methods: string[] = [];
   await expect(
     applyResourceMutation(input, {
-      deadlineAt: 18_000,
+      deadlineAt: 33_000,
       now: () => now,
       sleep: async (milliseconds) => {
         now += milliseconds + 2_000;
@@ -838,7 +959,7 @@ test.skipIf(WORKERD === null)(
   async () => {
     const journeyDeadlineAt = Date.now() + NATIVE_CASE_TIMEOUT_MS;
     const operationPollDeadlineAt =
-      journeyDeadlineAt - API_REQUEST_TIMEOUT_MS - OPERATION_CLEANUP_MARGIN_MS;
+      journeyDeadlineAt - MUTATION_OPERATION_REQUEST_TIMEOUT_MS - OPERATION_CLEANUP_MARGIN_MS;
     const fixture = join(tmpdir(), `takoserver-kv-sqlite-host-restart-${crypto.randomUUID()}`);
     const sourceRoot = join(fixture, "data");
     const controlDirectory = join(fixture, "control-db");
