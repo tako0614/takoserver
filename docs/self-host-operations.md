@@ -198,7 +198,9 @@ A listener restored by that same child is not bounced. For a still-vacant
 listener, the supervisor signals only the accepted child and waits for its actual
 exit and a vacant port before starting a replacement from its retained desired
 config path. A foreign listener, failed socket-ownership observation, or
-unconfirmed child exit refuses replacement; no health GET initiates it.
+unconfirmed child exit refuses replacement. A failed replacement startup or
+stop also retains custody of its signalled child until exit and port vacancy
+are proven; no health GET initiates recovery.
 
 ## Update and code rollback
 

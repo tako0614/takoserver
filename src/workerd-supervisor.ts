@@ -152,6 +152,17 @@ export function createWorkerdSupervisor(options: {
     }
   };
 
+  const retire = (entry: RuntimeEntry): void => {
+    // The normal Host has a listener port. A signalled child keeps custody
+    // until its own exit and that port's vacancy are both proven; neither a
+    // failed readiness check nor stop() is proof that kill has completed.
+    if (options.listenerPort !== undefined && (retiring === null || retiring === entry)) {
+      retiring = entry;
+    }
+    if (running === entry) running = null;
+    kill(entry);
+  };
+
   const cancelPendingRestart = (): void => {
     const pending = pendingRestart;
     pendingRestart = null;
@@ -192,7 +203,14 @@ export function createWorkerdSupervisor(options: {
         void currentStarting.promise.then(launch, launch);
         return;
       }
-      const promise = beginStart(configPath, epoch, true);
+      const currentCheck = checking;
+      if (currentCheck) {
+        void currentCheck.then(launch, launch);
+        return;
+      }
+      const promise = retiring
+        ? trackCheck(replaceRetired(retiring, configPath, epoch, true))
+        : beginStart(configPath, epoch, true);
       void promise.catch((error: unknown) => {
         if (!isDesiredEpoch(epoch)) return;
         const message = error instanceof Error ? error.message : String(error);
@@ -323,8 +341,7 @@ export function createWorkerdSupervisor(options: {
       }
     } catch (error) {
       if (entry) {
-        kill(entry);
-        if (running === entry) running = null;
+        retire(entry);
       }
       if (!recovery) firstStartFailed = true;
       throw error;
@@ -457,9 +474,7 @@ export function createWorkerdSupervisor(options: {
 
             // Invalidate the old watcher before signaling the exact captured
             // child. Its expected exit cannot schedule a second replacement.
-            running = null;
-            retiring = entry;
-            kill(entry);
+            retire(entry);
             await replaceRetired(entry, desired?.configPath ?? configPath, entry.epoch, true);
           })(),
         );
@@ -539,17 +554,10 @@ export function createWorkerdSupervisor(options: {
       nextEpoch += 1;
       desired = null;
       firstStartFailed = false;
-      const wasChecking = checking !== null;
       checking = null;
       cancelPendingRestart();
       const entry = running;
-      running = null;
-      if (entry) {
-        // A concurrent ownership check may still resolve after stop. Preserve
-        // the exact signalled child until a later ensure can prove its exit.
-        if (wasChecking && entry.ready && options.listenerPort !== undefined) retiring = entry;
-        kill(entry);
-      }
+      if (entry) retire(entry);
       // Invalidate the in-flight promise as well. Its readiness completion may
       // still arrive later, but it can no longer replace a subsequent ensure.
       starting = null;

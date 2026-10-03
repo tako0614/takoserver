@@ -430,6 +430,7 @@ describe("keeping workerd running", () => {
         commands.push([...command]);
         const child = testChild();
         children.push(child);
+        if (children.length === 3) listener = "owned";
         return child.process;
       },
       readiness: async () => children.length !== 2,
@@ -448,8 +449,49 @@ describe("keeping workerd running", () => {
     expect(restarts).toHaveLength(1);
     restarts[0]?.();
     await settle();
+    expect(children).toHaveLength(2);
+    children[1]?.exit(0);
+    await settle();
+    await supervisor.ensure("/data/accepted.capnp");
     expect(commands[2]).toEqual(["/usr/bin/workerd", "serve", "--watch", "/data/accepted.capnp"]);
     expect(supervisor.snapshot()).toEqual({ state: "serving" });
+  });
+
+  test("stop during replacement startup waits for that signalled child before a later ensure", async () => {
+    const children: TestChild[] = [];
+    const secondReadiness = deferred<boolean>();
+    let listener: "owned" | "vacant" = "owned";
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => listener,
+      spawn: () => {
+        const child = testChild();
+        children.push(child);
+        return child.process;
+      },
+      readiness: async () => {
+        if (children.length === 2) return await secondReadiness.promise;
+        return true;
+      },
+    });
+    await supervisor.ensure("/data/accepted.capnp");
+    listener = "vacant";
+    const replacing = supervisor.ensure("/data/unaccepted.capnp");
+    await settle();
+    children[0]?.exit(0);
+    await settle();
+    expect(children).toHaveLength(2);
+
+    supervisor.stop();
+    secondReadiness.resolve(true);
+    await expect(replacing).rejects.toThrow("cancelled");
+    const next = supervisor.ensure("/data/new.capnp");
+    await settle();
+    expect(children).toHaveLength(2);
+    children[1]?.exit(0);
+    await next;
+    expect(children).toHaveLength(3);
   });
 
   test("recovers a ready runtime after its child exits", async () => {
