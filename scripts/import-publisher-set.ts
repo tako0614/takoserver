@@ -9,6 +9,7 @@ import type {
   InstalledTakoformForm,
   TakoformOperation,
 } from "../src/takoform/types.ts";
+import { projectPublisherWorkerClassRuntime } from "./publisher-class-runtime-projection.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
 const OUTPUT = resolve(ROOT, "src/generated/takoform-stable-v1-catalog.ts");
@@ -526,7 +527,7 @@ function installedForm(
       : {}),
     operations: operations as TakoformOperation[],
     ...artifactRequirement(string(ref.kind)),
-    ...workerClassRuntime(string(ref.kind), definition),
+    ...projectPublisherWorkerClassRuntime(string(ref.kind), definition),
   };
 }
 
@@ -543,37 +544,6 @@ function artifactRequirement(
     return { artifactRequirement: { specField: "manifestDigest", kind: "MigrationBundle" } };
   }
   return {};
-}
-
-function workerClassRuntime(
-  kind: string,
-  definition: Record<string, unknown>,
-): Pick<InstalledTakoformForm, "workerClassRuntime"> | object {
-  const interfaceName =
-    kind === "ActorNamespace"
-      ? "worker.actor"
-      : kind === "DurableWorkflow"
-        ? "worker.workflow"
-        : undefined;
-  if (!interfaceName) return {};
-  if (
-    !array(definition.providedInterfaces).some(
-      (candidate) => record(candidate) && candidate.name === interfaceName,
-    )
-  ) {
-    invalid();
-  }
-  return {
-    workerClassRuntime: {
-      providedInterface: interfaceName,
-      className: "/className",
-      workerRelation: "/worker",
-      deploymentForm: { apiVersion: FAMILY, kind: "WorkerDeployment" },
-      deploymentWorkerRelation: "/worker",
-      deploymentVersionRelation: "/versions/*/workerVersion",
-      versionBundleRelation: "/bundle",
-    },
-  };
 }
 
 function requiredFlag(name: string): string {
