@@ -93,6 +93,8 @@ import {
  */
 
 export interface AppPorts {
+  /** The exact inventory/deployment stores precomposed for native startup. */
+  readonly resourceStores?: AppResourceStoreBundle;
   /** Host-only optional data-plane factory, built against these same canonical ledgers. */
   readonly selfhostEndpointIngressFactory?: (context: {
     readonly store: TakoformStore;
@@ -172,6 +174,23 @@ export interface AppPorts {
   readonly randomId?: () => string;
 }
 
+export interface AppResourceStoreBundle {
+  readonly inventory: TakoformStore;
+  readonly deployments: ResourceDeploymentStore;
+}
+
+const resourceStoreOrigins = new WeakMap<AppResourceStoreBundle, { sql: Sql; clock: Clock }>();
+
+/** Constructs the one canonical resource ledger pair for an entry and this app. */
+export function createAppResourceStoreBundle(sql: Sql, clock: Clock): AppResourceStoreBundle {
+  const bundle = Object.freeze({
+    inventory: createTakoformStore(sql, clock),
+    deployments: createResourceDeploymentStore(sql, clock),
+  });
+  resourceStoreOrigins.set(bundle, { sql, clock });
+  return bundle;
+}
+
 export interface App {
   readonly fetch: Router;
   /** Typed operator seam; no maintenance route is mounted on public HTTP. */
@@ -243,6 +262,14 @@ export function buildApp(ports: AppPorts): App {
     );
   }
   const clock = ports.clock ?? (() => new Date());
+  const origin = ports.resourceStores && resourceStoreOrigins.get(ports.resourceStores);
+  if (
+    ports.resourceStores &&
+    (!origin || origin.sql !== ports.sql || origin.clock !== ports.clock)
+  ) {
+    throw new TypeError("precomposed resource stores do not belong to this app SQL and clock");
+  }
+  const resourceStores = ports.resourceStores ?? createAppResourceStoreBundle(ports.sql, clock);
   const randomId = ports.randomId ?? (() => crypto.randomUUID().replaceAll("-", ""));
   const artifactReconciler = createTakoformArtifactReconciler({
     sql: ports.sql,
@@ -279,8 +306,7 @@ export function buildApp(ports: AppPorts): App {
     : null;
   const ledger = createLedger(ports.sql, clock);
   const catalog = createCatalog(ports.offerings);
-  const deployments = createResourceDeploymentStore(ports.sql, clock);
-  const inventory = createTakoformStore(ports.sql, clock);
+  const { deployments, inventory } = resourceStores;
   const originReservations =
     ports.originReservations ??
     ((ports.providers?.length ?? 0) > 0

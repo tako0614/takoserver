@@ -1,4 +1,5 @@
 import { canonicalDigest, canonicalJson, isSha256Digest } from "../json.ts";
+import { currentTakoformCandidates } from "./current-candidates.ts";
 import { validateFormRef } from "./forms.ts";
 import type { InstalledTakoformForm, TakoformOperation } from "./types.ts";
 
@@ -182,6 +183,34 @@ export function yurucommuLifecycleCapabilityManifest(
         return [kind, OPERATION_ORDER.filter((operation) => narrowed.has(operation))];
       }),
     ),
+  };
+}
+
+/**
+ * The self-host-only Actor widening. The caller must obtain `actorForm` from
+ * a composed owned native runtime; this pure projection independently proves
+ * the exact released package and never changes the Yurucommu/Hosted manifest.
+ */
+export function selfhostLifecycleCapabilityManifest(
+  identityKinds: readonly YurucommuIdentityCapabilityKind[],
+  actorForm?: InstalledTakoformForm,
+): TakoformLifecycleCapabilityManifest {
+  const base = yurucommuLifecycleCapabilityManifest(identityKinds);
+  if (!actorForm) return base;
+  const pinned = currentTakoformCandidates().forms.filter(
+    (form) => form.identity.formRef.kind === "ActorNamespace",
+  );
+  if (pinned.length !== 1 || canonicalJson(pinned[0]) !== canonicalJson(actorForm))
+    throw new TypeError("exact released self-host Actor Form unavailable");
+  const operations = OPERATION_ORDER.filter((operation) =>
+    actorForm.operations.includes(operation),
+  );
+  if (operations.join(",") !== "create,read,delete,import,observe" || actorForm.role !== "identity")
+    throw new TypeError("exact released self-host Actor lifecycle unavailable");
+  return {
+    apiVersion: base.apiVersion,
+    implementation: `${base.implementation}:selfhost-actor@v1`,
+    forms: { ...base.forms, ActorNamespace: operations },
   };
 }
 

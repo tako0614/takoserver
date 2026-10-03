@@ -58,6 +58,15 @@ it has no Actor resource-class, metering, or price-plan contract. `ActorNamespac
 remains an identity Form, not a relation that inherits a Worker's commercial
 Offering.
 
+Separately, the stable self-host composition may offer the exact released
+`ActorNamespace@0.1.0` as local `compute.actor` through its owned Provider Pack
+and `local.primary` installation. Its local plan prices namespace identity
+creation at zero and defines no usage meters; this is not a Hosted tariff, an
+unlimited-capacity promise, or evidence that a particular namespace is Ready.
+The Offering is absent without the owned native Actor runtime and full exact
+Form/Binding closure. The default no-Actor entry remains fail-closed. Hosted
+Actor supply parsing and metering are unchanged.
+
 This opt-in is source qualification, not publication or production admission.
 Native owner allocation or a technical proxy route alone does not prove that
 every weighted active Worker version exports the required class or that the
@@ -343,13 +352,28 @@ workerd evidence does not qualify a managed runtime.
 Class-backed Actor/Workflow capabilities without an executable provider
 implementation remain unsupported on both discovery and mutation paths.
 
-The self-host provider does not project `actorBindings` or `workflowBindings`
-into a Worker Version. A nonempty declaration is refused with a non-retryable provider
-`denied` result before artifact materialization or sensitive-input dispatch,
-including apply recovery. Observation and import also refuse it rather than
-claiming that a retained Version satisfies the declaration. Omitted or empty
-lists keep the existing behavior; a non-array value is `invalid_spec`. This
-does not enable Actor/Workflow execution or change the published Form contract.
+The default self-host provider does not project `actorBindings` or
+`workflowBindings` into a Worker Version. A nonempty declaration is refused
+with a non-retryable provider `denied` result before artifact materialization
+or sensitive-input dispatch, including apply recovery. An Actor declaration
+is accepted only when the ordinary Bun entry has restored its owned native
+Actor owner, the exact released Actor/Worker/Binding closure is installed,
+and the relation resolves to a same-tenant registered namespace, current
+class-holder Worker Deployment, and immutable caller Version. The Version
+retains private exact Actor metadata; old records without it are never
+inferred into Actor support. The private forwarding credential and sockets are
+not tenant bindings or Resource output. `workflowBindings` remain refused.
+The released Worker Version permits up to 64 Actor bindings. The private v8
+record, wrapper, and workerd graph use that same per-Version bound; the local
+owner permits at most 128 simultaneously retained broker pairs across all
+weighted active Versions and in-flight retired transports. A proposed
+Deployment that would exceed that finite installation capacity is refused
+before its durable desired-state write. This is an execution capacity limit,
+not a narrower Form schema or an unlimited local Offering.
+Observation and import do not treat a retained unsupported Version as satisfying
+the declaration. Omitted or empty lists keep existing behavior; a non-array
+value is `invalid_spec`. No Form/API/schema identity changes with this source
+projection.
 An apply-side refusal carries operation-bound no-mutation proof so the driver
 can close an initial refusal. During recovery the same proof covers only the
 current invocation, never an older operation's uncertain side effects.
@@ -724,7 +748,7 @@ Each gated test file also prints one line per capability per process when the
 capability is not configured, so
 `bun test tests/workerd-native-facets.test.ts` explains its own `(skip)`.
 
-The unadmitted self-host Actor execution path also has a development-only
+The separately qualified self-host Actor execution path also has a development-only
 alarm slice. Its native per-ID owner stores a pending time separately from an
 unsettled delivery, uses a native Durable Object alarm as a wake/watchdog, and
 dispatches the class alarm handler under the same owner queue as HTTP bodies.
@@ -738,7 +762,7 @@ delivery while the self-host runtime is stopped: the execution process is
 opened on demand, so a pending alarm cannot wake an absent process. Weighted
 Version reselection for alarms, namespace deletion/retention, producer-tail
 retirement, sockets and managed WfP execution also remain unqualified. This
-slice does not enable Actor admission or change a published contract.
+alarm slice alone does not establish Actor admission or change a published contract.
 
 Two additional opt-in fixtures investigate code handoff, separately from that
 capability check:

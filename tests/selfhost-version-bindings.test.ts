@@ -48,6 +48,78 @@ const MARKER = {
   generation: "abcdefghijklmnop",
 } as const;
 
+test("Actor metadata is a strict new private Version record and cannot adopt an older token", async () => {
+  const actor = {
+    ...SET,
+    sensitiveVars: [],
+    workerVersionResourceUid: "uid-WorkerVersion-actor",
+    actorBindings: [
+      {
+        name: "COUNTER",
+        tenantId: "tenant-a",
+        namespaceResourceUid: "uid-ActorNamespace-counter",
+        workerResourceUid: "uid-ModuleWorker-counter",
+        className: "Counter",
+      },
+    ],
+  };
+  const stored = await store.write("sw-actor", "v-actor", actor);
+  expect(stored.actorBindings).toEqual(actor.actorBindings);
+  expect(stored.workerVersionResourceUid).toBe(actor.workerVersionResourceUid);
+  const path = join(root, "sw-actor", "v-actor.json");
+  const bytes = await readFile(path, "utf8");
+  expect(JSON.parse(bytes).format).toBe("takoserver.selfhost-version-bindings@v8");
+  expect((await store.write("sw-actor", "v-actor", actor)).eventToken).toBe(stored.eventToken);
+  await store.write("sw-old", "v-old", SET);
+  const oldBytes = await readFile(join(root, "sw-old", "v-old.json"), "utf8");
+  expect((await store.read("sw-old", "v-old"))?.actorBindings).toBeUndefined();
+  await expect(store.write("sw-old", "v-old", actor)).rejects.toThrow();
+  expect(await readFile(join(root, "sw-old", "v-old.json"), "utf8")).toBe(oldBytes);
+  expect(() =>
+    normalizeSelfhostVersionBindingSet({
+      ...actor,
+      actorBindings: actor.actorBindings.map((binding) => ({ ...binding, name: "LANE" })),
+    }),
+  ).toThrow();
+  await expect(
+    store.write("sw-unreadable", "v-unreadable", {
+      ...actor,
+      sensitiveVars: SET.sensitiveVars,
+    }),
+  ).rejects.toThrow();
+  expect(existsSync(join(root, "sw-unreadable", "v-unreadable.json"))).toBe(false);
+});
+
+test("private v8 Actor metadata preserves the published 64-binding bound exactly", async () => {
+  const bindings = Array.from({ length: 64 }, (_, index) => ({
+    name: `ACTOR_${index}`,
+    tenantId: "tenant-a",
+    namespaceResourceUid: "uid-ActorNamespace-counter",
+    workerResourceUid: "uid-ModuleWorker-counter",
+    className: "Counter",
+  }));
+  const candidate = {
+    ...SET,
+    vars: [],
+    sensitiveVars: [],
+    workerVersionResourceUid: "uid-WorkerVersion-sixty-four",
+    actorBindings: bindings,
+  };
+  expect(
+    (await store.write("sw-sixty-four", "v-sixty-four", candidate)).actorBindings,
+  ).toHaveLength(64);
+  expect((await store.read("sw-sixty-four", "v-sixty-four"))?.actorBindings).toHaveLength(64);
+  const first = bindings[0];
+  if (!first) throw new Error("Actor binding fixture unavailable");
+  await expect(
+    store.write("sw-sixty-five", "v-sixty-five", {
+      ...candidate,
+      actorBindings: [...bindings, { ...first, name: "ACTOR_64" }],
+    }),
+  ).rejects.toThrow();
+  expect(existsSync(join(root, "sw-sixty-five", "v-sixty-five.json"))).toBe(false);
+});
+
 test("complete external binding envelope is bounded before a runtime write", () => {
   const value = JSON.stringify({ value: "a".repeat(3 * 1024 * 1024) });
   expect(() =>

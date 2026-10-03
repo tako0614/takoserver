@@ -2,7 +2,8 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { buildApp } from "./app.ts";
+import { createActorResourceGraphReader } from "./actor-resource-graph.ts";
+import { buildApp, createAppResourceStoreBundle } from "./app.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import { migrateSqlite } from "./migrate-sqlite.ts";
@@ -27,6 +28,10 @@ import {
   runtimeInputCanonicalOriginSupported,
 } from "./runtime-input-preparations.ts";
 import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
+import {
+  openSelfhostActorPublicRuntime,
+  type SelfhostActorPublicRuntime,
+} from "./selfhost-actor-public-runtime.ts";
 import {
   hasExactLocalContainerEndpointCandidatePair,
   SELFHOST_TLS_ENVIRONMENT,
@@ -363,6 +368,8 @@ const objects =
     ? createMemoryObjectStore()
     : createFileObjectStore({ root: dataRoot });
 const clock = () => new Date();
+// Native startup and the application share these exact canonical ledgers.
+const resourceStores = createAppResourceStoreBundle(sql, clock);
 const edge = await buildEdgeForms();
 const currentCandidates = currentTakoformCandidates();
 let selfhostContainerEndpointHttps: SelfhostContainerEndpointHttpsListener | undefined;
@@ -508,6 +515,35 @@ const providerArtifacts = {
  * reconstructs historical observation/deletion authority and publishes no
  * current Offering.
  */
+let actorRuntime: SelfhostActorPublicRuntime | undefined;
+const installedActorForm = currentCandidates.forms.find(
+  (form) => form.identity.formRef.kind === "ActorNamespace",
+);
+if (
+  providerMode !== RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN &&
+  workerdBinary &&
+  installedActorForm
+) {
+  try {
+    actorRuntime = await openSelfhostActorPublicRuntime({
+      dataRoot,
+      runtimeRoot: dataRoot,
+      socketParent: join(dataRoot, "actor-forward-sockets"),
+      binary: workerdBinary,
+      graph: createActorResourceGraphReader({
+        store: resourceStores.inventory,
+        form: installedActorForm,
+      }),
+      deployments: resourceStores.deployments,
+      providerPackRef: "local",
+      providerInstallationRef: "local.primary",
+    });
+  } catch (error) {
+    process.stderr.write(
+      `the Actor owner could not restore: ${error instanceof Error ? error.message : "unknown error"}; Actor admission remains unavailable.\n`,
+    );
+  }
+}
 const workerdRuntime = createWorkerdRuntime({
   root: dataRoot,
   binary: workerdBinary,
@@ -516,6 +552,12 @@ const workerdRuntime = createWorkerdRuntime({
   // Host transport from this process, not a Version's saved ephemeral port.
   ...(dataPlanes ? { dataPlaneAddress: dataPlanes.address } : {}),
   ...(workerdTls ? { tls: workerdTls } : {}),
+  ...(actorRuntime
+    ? {
+        actorForwardSockets: () => actorRuntime?.actorForwardSockets() ?? [],
+        actorForwardLifecycle: actorRuntime.actorForwardLifecycle,
+      }
+    : {}),
   beforeRender: () => workerd.assertMayRender(),
   isReady: () => workerd.isReady(),
   async onReload(configPath) {
@@ -527,6 +569,28 @@ const workerdRuntime = createWorkerdRuntime({
     await workerd.ensure(configPath);
   },
 });
+
+// Restore the exact native socket graph before composing any Actor capability
+// or opening the public listener. A failed restore is diagnosis, never proof of
+// executable Actor admission.
+let startupRestore: SelfhostStartupRestoreOutcome;
+try {
+  const restored = await workerdRuntime.restore();
+  startupRestore = restored.length === 0 ? "empty" : "restored";
+  if (restored.length > 0) {
+    console.log(`restored ${restored.length} published Worker(s): ${restored.join(", ")}`);
+  }
+} catch (error) {
+  startupRestore = "failed";
+  actorRuntime?.actorForwardLifecycle.uncertain();
+  await actorRuntime?.close();
+  actorRuntime = undefined;
+  process.stderr.write(
+    `the Worker runtime could not be restored at boot: ${
+      error instanceof Error ? error.message : "unknown error"
+    }. Published Workers will not answer until the next publication.\n`,
+  );
+}
 
 /**
  * The half of the Edge Family that is a clock rather than a request.
@@ -565,8 +629,10 @@ const providerComposition = createStandaloneProviderComposition({
   mode: providerMode,
   edge,
   stableForms: currentCandidates.forms,
+  stableBindings: currentCandidates.bindings,
   dataRoot,
   runtime: workerdRuntime,
+  ...(actorRuntime ? { actorRuntime } : {}),
   workerRuntimeAvailable: workerdBinary !== null,
   artifacts: providerArtifacts,
   ...(process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
@@ -746,6 +812,7 @@ const configuredAi = aiGateway();
 let selfhostEndpointIngressFetch: ((request: Request) => Promise<Response | null>) | undefined;
 const app = buildApp({
   sql,
+  resourceStores,
   objects,
   ...(signingKey ? { signingKey } : {}),
   identity: identity.verifier,
@@ -915,7 +982,17 @@ const handleSelfhostShutdown = () => {
     .catch(() => {
       process.stderr.write("the self-host Container HTTPS listener did not close cleanly\n");
     })
-    .finally(handleContainerAndWorkerdShutdown);
+    .finally(async () => {
+      // Stop serving first, then close the same Actor owner that supplied its
+      // socket graph. No second native namespace lifecycle is created.
+      workerd.stop();
+      try {
+        await actorRuntime?.close();
+      } catch {
+        process.stderr.write("the self-host Actor owner did not close cleanly\n");
+      }
+      await handleContainerAndWorkerdShutdown();
+    });
 };
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(signal, handleSelfhostShutdown);
@@ -942,22 +1019,6 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
  * operator would diagnose it, and `has()` already fails closed, so nothing is
  * observed Ready on a runtime that is not running.
  */
-let startupRestore: SelfhostStartupRestoreOutcome;
-try {
-  const restored = await workerdRuntime.restore();
-  startupRestore = restored.length === 0 ? "empty" : "restored";
-  if (restored.length > 0) {
-    console.log(`restored ${restored.length} published Worker(s): ${restored.join(", ")}`);
-  }
-} catch (error) {
-  startupRestore = "failed";
-  process.stderr.write(
-    `the Worker runtime could not be restored at boot: ${
-      error instanceof Error ? error.message : "unknown error"
-    }. Published Workers will not answer until the next publication.\n`,
-  );
-}
-
 const selfhostHealth = createSelfhostHealthHandler({
   sql,
   startupRestore,

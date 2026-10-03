@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, constants as fsConstants, lstatSync } from "node:fs";
 import { mkdir, open, readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import type { ActorResourceGraph } from "../actor-resource-graph.ts";
 import { parseWorkerCron } from "../cron.ts";
 import { bytesDigest, canonicalJson } from "../json.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
@@ -46,6 +47,7 @@ import {
   derivedProviderResourceIncarnationName,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
+import { deriveSelfhostActorForwardToken } from "../selfhost-actor-public-runtime.ts";
 import {
   canonicalSelfhostWeightedVersions,
   persistedSelfhostWeightedDeployment,
@@ -119,6 +121,7 @@ import {
   SELFHOST_WORKER_HANDLER_NAMES,
   type SelfhostRuntimeInputMarker,
   type SelfhostRuntimeInputMarkerIdentity,
+  type SelfhostVersionActorBinding,
   type SelfhostVersionBinding,
   type SelfhostVersionBindingSet,
   SelfhostVersionBindingStoreError,
@@ -234,6 +237,18 @@ const SELFHOST_SERVICE_BINDING_REF = Object.freeze({
   version: "1.0.0",
   schemaDigest: "sha256:79c3a23e506ffc4607ea2921e3dbe76c7d44b20c76e6181e65c611239b9c51aa",
 });
+export const SELFHOST_ACTOR_BINDING_REF = Object.freeze({
+  apiVersion: "bindings.takoform.com/v1alpha2",
+  name: "module-worker.actor",
+  version: "1.0.0",
+  schemaDigest: "sha256:51f447536158b393b0afb61850d69567db8de91e3a82fa9b9ebc5ab6f87f2c5d",
+});
+const SELFHOST_ACTOR_INTERFACE_REF = Object.freeze({
+  apiVersion: "interfaces.takoform.com/v1alpha1",
+  name: "worker.actor",
+  version: "1.0.0",
+  schemaDigest: "sha256:f5428fb587de80261dd7363dc5b8a3f4aab7e469fa1b5fce8441ad9acbec8218",
+});
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
 /**
  * How long a ledger statement waits for a tenant's lock, in milliseconds.
@@ -296,6 +311,32 @@ export interface SelfhostArtifacts {
 export interface SelfhostProviderOptions {
   readonly id?: string;
   readonly offerings: readonly ProviderOffering[];
+  /** The existing Host-owned Actor namespace registration lifecycle, if composed. */
+  readonly actorNamespace?: {
+    readCurrentGraph(
+      scope: {
+        readonly tenantId: string;
+        readonly namespaceResourceUid: string;
+      },
+      signal: AbortSignal,
+    ): Promise<ActorResourceGraph | null>;
+    registerNamespace(scope: {
+      readonly tenantId: string;
+      readonly namespaceResourceUid: string;
+    }): Promise<void>;
+    hasNamespace(scope: {
+      readonly tenantId: string;
+      readonly namespaceResourceUid: string;
+    }): Promise<boolean>;
+    namespaceAbsent(scope: {
+      readonly tenantId: string;
+      readonly namespaceResourceUid: string;
+    }): Promise<boolean>;
+    forgetNamespace(scope: {
+      readonly tenantId: string;
+      readonly namespaceResourceUid: string;
+    }): Promise<void>;
+  };
   /** Explicit native runtime for an independently installed Container Form. */
   readonly container?: SelfhostContainerCapability;
   /** Local unpublished Endpoint attachment; no route exists outside committed Host state. */
@@ -1253,6 +1294,25 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         .update(binding.targetResourceUid, "utf8")
         .digest("hex"),
     }));
+    const actorBindings = bindings.actorBindings ?? [];
+    if (
+      actorBindings.length > 0 &&
+      (!bindings.eventToken || !bindings.workerVersionResourceUid || !options.actorNamespace)
+    ) {
+      throw new SelfhostFailure(
+        failed("unavailable", "the Actor Version forwarding owner is unavailable", true),
+      );
+    }
+    const actorForward = actorBindings.map((binding) => ({
+      publicName: binding.name,
+      tenantId: binding.tenantId,
+      namespaceResourceUid: binding.namespaceResourceUid,
+      token: deriveSelfhostActorForwardToken({
+        eventToken: bindings.eventToken as string,
+        workerVersionResourceUid: bindings.workerVersionResourceUid as string,
+        binding,
+      }),
+    }));
     try {
       const graph = compileWorkerdVersionGraph({
         directory: script,
@@ -1269,6 +1329,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         declaredHandlers: bindings.handlers,
         readiness: { publication: readinessPublication, probeHostname: internalHostname(script) },
         serviceBindings: resolvedServices,
+        ...(actorForward.length > 0 ? { actorForward } : {}),
         ...(meta.assets && assets
           ? {
               assets: {
@@ -1616,7 +1677,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       .sort((left, right) => (left.name < right.name ? -1 : 1));
   };
 
-  /** Actor and workflow bindings are publisher-valid but unsupported by this provider. */
+  /** Workflow remains unavailable; Actor needs the explicit owned runtime. */
   const assertSupportedClassBindings = (spec: JsonObject, operationId?: string): void => {
     // Keep workflow first: its refusal predates the actor guard and remains the
     // result when a malformed or unsupported Version declares both fields.
@@ -1626,6 +1687,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     ] as const) {
       const declared = spec[field];
       if (declared === undefined || (Array.isArray(declared) && declared.length === 0)) continue;
+      if (field === "actorBindings" && options.actorNamespace && Array.isArray(declared)) continue;
       const code = Array.isArray(declared) ? "denied" : "invalid_spec";
       const message = Array.isArray(declared)
         ? `the Worker Version ${label} bindings are not supported by this provider`
@@ -2131,6 +2193,144 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     return bindings;
   };
 
+  const declaredActorBindings = async (
+    input: WorkerVersionDeclarationInput & Pick<ApplyInput, "offering">,
+    callerScript: string,
+    reserved: ReadonlySet<string>,
+  ): Promise<readonly SelfhostVersionActorBinding[]> => {
+    const invalid = (): never => {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version Actor bindings are invalid"),
+      );
+    };
+    const raw = input.spec.actorBindings;
+    if (raw === undefined || (Array.isArray(raw) && raw.length === 0)) return [];
+    const actorNamespace = options.actorNamespace;
+    if (
+      !Array.isArray(raw) ||
+      raw.length > 64 ||
+      !actorNamespace ||
+      input.offering.bindingRefs.filter(
+        (ref) => canonicalJson(ref) === canonicalJson(SELFHOST_ACTOR_BINDING_REF),
+      ).length !== 1
+    )
+      invalid();
+    const declaredBindings = raw as readonly JsonValue[];
+    const namespaceRuntime = actorNamespace as NonNullable<typeof actorNamespace>;
+    const caller = input.relations?.find((candidate) => candidate.pointer === "/worker");
+    const callerDeployment = caller?.deployment;
+    if (
+      !caller ||
+      !callerDeployment ||
+      caller.resource.kind !== "ModuleWorker" ||
+      caller.targetUid !== caller.resource.metadata.uid ||
+      caller.resource.metadata.space !== input.identity.space ||
+      callerDeployment.state !== "active" ||
+      callerDeployment.tenantId !== input.identity.tenantRef ||
+      callerDeployment.resourceUid !== caller.targetUid ||
+      callerDeployment.providerPackRef !== id ||
+      callerDeployment.providerInstallationRef !== "local.primary" ||
+      parseSelfhostNativeId("ModuleWorker", callerDeployment.nativeId)?.script !== callerScript ||
+      callerDeployment.outputs.scriptName !== callerScript
+    )
+      invalid();
+    const activeCaller = callerDeployment as NonNullable<typeof callerDeployment>;
+    const names = new Set(reserved);
+    const bindings: SelfhostVersionActorBinding[] = [];
+    for (let index = 0; index < declaredBindings.length; index += 1) {
+      const declared = isJsonObject(declaredBindings[index])
+        ? (declaredBindings[index] as JsonObject)
+        : null;
+      const resource = isJsonObject(declared?.resource) ? declared.resource : null;
+      const name = typeof declared?.name === "string" ? declared.name : null;
+      const relations =
+        input.relations?.filter(
+          (candidate) => candidate.pointer === `/actorBindings/${index}/resource`,
+        ) ?? [];
+      const relation = relations.length === 1 ? relations[0] : undefined;
+      const deployment = relation?.deployment;
+      const offering = deployment
+        ? options.offerings.find((candidate) => candidate.id === deployment.offeringId)
+        : undefined;
+      if (
+        !name ||
+        name.length > 64 ||
+        !DATA_BINDING_NAME.test(name) ||
+        name.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX) ||
+        names.has(name) ||
+        !resource ||
+        !relation ||
+        relation.relation !== "/actorBindings/*/resource" ||
+        canonicalJson(relation.bindingRef) !== canonicalJson(SELFHOST_ACTOR_BINDING_REF) ||
+        relation.resource.kind !== "ActorNamespace" ||
+        relation.resource.apiVersion !== "edge.forms.takoform.com" ||
+        relation.resource.metadata.space !== input.identity.space ||
+        relation.targetUid !== relation.resource.metadata.uid ||
+        !RESOURCE_UID.test(relation.targetUid) ||
+        resource.apiVersion !== relation.resource.apiVersion ||
+        resource.kind !== relation.resource.kind ||
+        resource.name !== relation.resource.metadata.name ||
+        !deployment ||
+        deployment.state !== "active" ||
+        deployment.tenantId !== input.identity.tenantRef ||
+        deployment.resourceUid !== relation.targetUid ||
+        deployment.providerPackRef !== activeCaller.providerPackRef ||
+        deployment.providerInstallationRef !== activeCaller.providerInstallationRef ||
+        deployment.nativeId !== `selfhost-actor:${relation.targetUid}` ||
+        !offering ||
+        offering.form.kind !== "ActorNamespace" ||
+        !sameSelfhostFormRef(offering.form, relation.resource.form.formRef) ||
+        offering.providedInterfaces.length !== 1 ||
+        canonicalJson(offering.providedInterfaces[0]) !==
+          canonicalJson(SELFHOST_ACTOR_INTERFACE_REF)
+      )
+        invalid();
+      const target = relation as NonNullable<typeof relation>;
+      const publicName = name as string;
+      const scope = {
+        tenantId: input.identity.tenantRef,
+        namespaceResourceUid: target.targetUid,
+      };
+      let graph: ActorResourceGraph | null;
+      let registered: boolean;
+      try {
+        graph = await namespaceRuntime.readCurrentGraph(scope, AbortSignal.timeout(30_000));
+        registered = await namespaceRuntime.hasNamespace(scope);
+      } catch {
+        throw new SelfhostFailure(
+          failed("unavailable", "the Actor namespace authority is unavailable", true),
+        );
+      }
+      if (
+        !registered ||
+        !graph ||
+        graph.tenantId !== scope.tenantId ||
+        graph.namespace.uid !== target.targetUid ||
+        graph.namespace.address.space !== input.identity.space ||
+        graph.namespace.address.name !== target.resource.metadata.name ||
+        graph.namespace.className !== target.resource.spec.className ||
+        !DATA_BINDING_NAME.test(graph.namespace.className) ||
+        graph.worker.address.space !== input.identity.space ||
+        graph.worker.address.apiVersion !==
+          (target.resource.spec.worker as JsonObject | undefined)?.apiVersion ||
+        graph.worker.address.kind !==
+          (target.resource.spec.worker as JsonObject | undefined)?.kind ||
+        graph.worker.address.name !== (target.resource.spec.worker as JsonObject | undefined)?.name
+      )
+        invalid();
+      const currentGraph = graph as ActorResourceGraph;
+      names.add(publicName);
+      bindings.push({
+        name: publicName,
+        tenantId: scope.tenantId,
+        namespaceResourceUid: scope.namespaceResourceUid,
+        workerResourceUid: currentGraph.worker.uid,
+        className: currentGraph.namespace.className,
+      });
+    }
+    return bindings;
+  };
+
   /**
    * The events the version says its module answers.
    *
@@ -2319,6 +2519,29 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         ...dataBindings.map((binding) => binding.name),
       ]),
     );
+    const actorBindings = await declaredActorBindings(
+      input,
+      script,
+      new Set([
+        ...vars.map((binding) => binding.name),
+        ...requiredSensitive,
+        ...dataBindings.map((binding) => binding.name),
+        ...serviceBindings.map((binding) => binding.name),
+      ]),
+    );
+    if (
+      actorBindings.length > 0 &&
+      (!input.identity.uid || !RESOURCE_UID.test(input.identity.uid))
+    ) {
+      return failed("invalid_spec", "the Worker Version has no exact Resource UID");
+    }
+    if (actorBindings.length > 0 && (!runtime.publish || !runtime.publishActorDeployment)) {
+      return failed(
+        "unavailable",
+        "the Actor Version needs a capacity-qualified weighted runtime",
+        true,
+      );
+    }
     if (dataBindings.length > 0 && !options.dataPlaneAddress) {
       return failed(
         "denied",
@@ -2362,17 +2585,20 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           ...requiredSensitive,
           ...dataBindings.map(({ name }) => name),
           ...serviceBindings.map(({ name }) => name),
+          ...actorBindings.map(({ name }) => name),
         ]),
       );
     } catch (error) {
       if (error instanceof SelfhostStandardServiceError) return failed("denied", error.message);
       throw error;
     }
-    if (serviceBindings.length > 0) {
+    if (serviceBindings.length > 0 || actorBindings.length > 0) {
       const existing = await readVersionBindings(script, versionId);
       if (
         existing &&
-        (existing.workerResourceUid === undefined || existing.serviceBindings === undefined)
+        (existing.workerResourceUid === undefined ||
+          existing.serviceBindings === undefined ||
+          (actorBindings.length > 0 && !existing.actorBindings))
       ) {
         return failed(
           "invalid_spec",
@@ -2432,6 +2658,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         sensitiveVars,
         ...(lease ? { runtimeInputGeneration: lease.preparation.generation } : {}),
         serviceBindings,
+        ...(actorBindings.length > 0
+          ? { workerVersionResourceUid: input.identity.uid, actorBindings }
+          : {}),
         ...(externalServices.length > 0 ? { externalServices } : {}),
         ...(dataPlane ? { dataPlane } : {}),
       });
@@ -2511,11 +2740,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       !sameVersionDeclaration(
         recorded,
         worker.metadata.uid,
+        input.identity.uid,
         handlers,
         vars,
         requiredSensitive,
         dataBindings,
         serviceBindings,
+        actorBindings,
         input.spec,
       ) ||
       (lease && recorded?.runtimeInputGeneration !== lease.preparation.generation)
@@ -2610,6 +2841,16 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         ...vars.map((binding) => binding.name),
         ...requiredSensitive,
         ...dataBindings.map((binding) => binding.name),
+      ]),
+    );
+    const actorBindings = await declaredActorBindings(
+      input,
+      script,
+      new Set([
+        ...vars.map((binding) => binding.name),
+        ...requiredSensitive,
+        ...dataBindings.map((binding) => binding.name),
+        ...serviceBindings.map((binding) => binding.name),
       ]),
     );
     if (dataBindings.length > 0 && !options.dataPlaneAddress) {
@@ -2747,11 +2988,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       !sameVersionDeclaration(
         recorded,
         worker.metadata.uid,
+        input.identity.uid,
         handlers,
         vars,
         requiredSensitive,
         dataBindings,
         serviceBindings,
+        actorBindings,
         input.spec,
       ) ||
       (recoveryLease && recorded?.runtimeInputGeneration !== recoveryLease.preparation.generation)
@@ -2883,8 +3126,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     };
     // Full materialization, bindings, module inspection, event gates, and
     // service UID fencing are prepared before durable activation state moves.
-    const preparedWorkerResourceUid = runtime.publish
-      ? (await prepareWeightedRuntimePublication(script, next)).workerResourceUid
+    const preparedPublication = runtime.publish
+      ? await prepareWeightedRuntimePublication(script, next)
+      : null;
+    const preparedWorkerResourceUid = preparedPublication
+      ? preparedPublication.workerResourceUid
       : (
           await prepareRuntimeVersion(
             script,
@@ -2897,9 +3143,32 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (preparedWorkerResourceUid !== desired.workerResourceUid) {
       return failed("invalid_spec", "the deployed Versions do not belong to this Worker");
     }
-    await writeScriptState(script, current, next);
+    const actorDeployment =
+      preparedPublication?.versions.some((version) => version.site.actorForward !== undefined) ??
+      false;
+    const publishActorDeployment = runtime.publishActorDeployment?.bind(runtime);
+    if (actorDeployment && (!publishActorDeployment || !preparedPublication)) {
+      return failed("unavailable", "the Actor deployment capacity owner is unavailable", true);
+    }
     try {
-      await publishScript(script);
+      if (actorDeployment && preparedPublication && publishActorDeployment) {
+        // The runtime owns one activation queue from complete-graph reservation
+        // through this Provider-owned CAS and pointer publication. Capacity
+        // refusal happens before any desired-state write; later reload failure
+        // retains the ordinary recoverable desired-state semantics.
+        await runtimeOperation(() =>
+          publishActorDeployment(script, preparedPublication, async () => {
+            await writeScriptState(script, current, next);
+          }),
+        );
+        await probeReadiness(
+          script,
+          createHash("sha256").update(preparedPublication.generation, "utf8").digest("hex"),
+        );
+      } else {
+        await writeScriptState(script, current, next);
+        await publishScript(script);
+      }
     } catch (error) {
       if (error instanceof SelfhostFailure) return error.ticket;
       throw error;
@@ -3336,6 +3605,99 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     return offering.kind;
   };
 
+  const actorScope = (
+    input: Pick<ApplyInput, "identity" | "spec" | "relations">,
+  ): {
+    readonly tenantId: string;
+    readonly namespaceResourceUid: string;
+    readonly className: string;
+  } | null => {
+    const uid = input.identity.uid;
+    const className = input.spec.className;
+    const declaredWorker = input.spec.worker;
+    const workerRelations = input.relations?.filter((entry) => entry.pointer === "/worker") ?? [];
+    const relation = workerRelations.length === 1 ? workerRelations[0] : undefined;
+    const deployment = relation?.deployment;
+    if (
+      !options.actorNamespace ||
+      !uid ||
+      !RESOURCE_UID.test(uid) ||
+      typeof className !== "string" ||
+      !DATA_BINDING_NAME.test(className) ||
+      typeof declaredWorker !== "object" ||
+      declaredWorker === null ||
+      Array.isArray(declaredWorker) ||
+      !relation ||
+      relation.relation !== "/worker" ||
+      relation.resource.kind !== "ModuleWorker" ||
+      relation.resource.apiVersion !== "edge.forms.takoform.com" ||
+      relation.resource.form.formRef.kind !== "ModuleWorker" ||
+      relation.resource.form.formRef.apiVersion !== relation.resource.apiVersion ||
+      relation.resource.metadata.space !== input.identity.space ||
+      relation.targetUid !== relation.resource.metadata.uid ||
+      !RESOURCE_UID.test(relation.targetUid) ||
+      !deployment ||
+      deployment.state !== "active" ||
+      deployment.tenantId !== input.identity.tenantRef ||
+      deployment.resourceUid !== relation.targetUid ||
+      deployment.providerPackRef !== id ||
+      deployment.providerInstallationRef !== "local.primary" ||
+      deployment.nativeId.split(":").length !== 3 ||
+      parseSelfhostNativeId("ModuleWorker", deployment.nativeId)?.script !==
+        deployment.outputs.scriptName ||
+      (declaredWorker as JsonObject).apiVersion !== relation.resource.apiVersion ||
+      (declaredWorker as JsonObject).kind !== relation.resource.kind ||
+      (declaredWorker as JsonObject).name !== relation.resource.metadata.name
+    )
+      return null;
+    return { tenantId: input.identity.tenantRef, namespaceResourceUid: uid, className };
+  };
+
+  const applyActorNamespace = async (input: ApplyInput): Promise<ProviderTicket> => {
+    if (
+      !options.offerings.some(
+        (candidate) =>
+          candidate.id === input.offering.id &&
+          sameSelfhostFormRef(candidate.form, input.offering.form) &&
+          candidate.form.kind === "ActorNamespace",
+      )
+    ) {
+      return failedWithoutProviderMutation(
+        input.operationId,
+        "denied",
+        "the Actor namespace Offering is not installed",
+      );
+    }
+    const scope = actorScope(input);
+    if (!scope)
+      return failedWithoutProviderMutation(
+        input.operationId,
+        "denied",
+        "the Actor namespace runtime or exact Worker relation is unavailable",
+      );
+    const native = `selfhost-actor:${scope.namespaceResourceUid}`;
+    if (input.previous && input.previous.nativeId !== native) {
+      return failedWithoutProviderMutation(
+        input.operationId,
+        "conflict",
+        "the Actor namespace UID changed",
+      );
+    }
+    try {
+      await options.actorNamespace?.registerNamespace({
+        tenantId: scope.tenantId,
+        namespaceResourceUid: scope.namespaceResourceUid,
+      });
+    } catch {
+      return failed("unavailable", "the Actor namespace registration did not settle", true);
+    }
+    return succeeded({
+      nativeId: native,
+      observed: { className: scope.className, ready: false },
+      outputs: {},
+    });
+  };
+
   const isConfiguredContainerOffering = (offering: ProviderOffering): boolean =>
     containerLifecycle !== null &&
     offering.form.apiVersion === "edge.forms.takoform.com" &&
@@ -3674,6 +4036,24 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     createNativeReadbackDescriptor(
       input: ProviderNativeReadbackInput,
     ): ProviderNativeReadbackDescriptor {
+      if (dispatchKind(input.offering) === "ActorNamespace") {
+        const uid = input.identity.uid;
+        if (
+          !options.actorNamespace ||
+          !uid ||
+          !RESOURCE_UID.test(uid) ||
+          input.nativeId !== `selfhost-actor:${uid}`
+        ) {
+          throw new ProviderReadbackDescriptorError();
+        }
+        return {
+          apiVersion: PROVIDER_READBACK_API_VERSION,
+          provider: id,
+          kind: "ActorNamespace",
+          nativeId: input.nativeId,
+          data: { resourceUid: uid },
+        };
+      }
       if (isConfiguredContainerEndpointOffering(input.offering)) {
         const native = parseSelfhostContainerEndpointNativeId(input.nativeId);
         if (
@@ -3762,6 +4142,31 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       descriptor: ProviderNativeReadbackDescriptor;
       target?: ProviderReadAuthorityTarget;
     }): Promise<ProviderNativeAbsence> {
+      if (dispatchKind(input.offering) === "ActorNamespace") {
+        const target = input.target;
+        const descriptor = input.descriptor;
+        if (
+          !options.actorNamespace ||
+          !target ||
+          !RESOURCE_UID.test(target.resourceUid) ||
+          descriptor.apiVersion !== PROVIDER_READBACK_API_VERSION ||
+          descriptor.provider !== id ||
+          descriptor.kind !== "ActorNamespace" ||
+          descriptor.nativeId !== `selfhost-actor:${target.resourceUid}` ||
+          Object.keys(descriptor.data).sort().join(",") !== "resourceUid" ||
+          descriptor.data.resourceUid !== target.resourceUid
+        )
+          return selfhostUnknown("malformed", false);
+        try {
+          const absent = await options.actorNamespace.namespaceAbsent({
+            tenantId: target.tenantId,
+            namespaceResourceUid: target.resourceUid,
+          });
+          return selfhostAbsence(absent ? "absent" : "present", descriptor, "ActorNamespace", id);
+        } catch {
+          return selfhostUnknown("transport", true);
+        }
+      }
       if (isConfiguredContainerEndpointOffering(input.offering)) {
         const native = parseSelfhostContainerEndpointNativeId(input.descriptor.nativeId);
         const { descriptor, target } = input;
@@ -4073,6 +4478,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             ? await containerEndpointLifecycle.apply(input)
             : failed("unavailable", "the local Container endpoint ingress is not installed");
         switch (dispatchKind(input.offering)) {
+          case "ActorNamespace":
+            return await applyActorNamespace(input);
           case "ModuleWorker":
             return await applyModuleWorker(input);
           case "WorkerVersion":
@@ -4115,6 +4522,29 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
 
     async observe(input): Promise<ProviderTicket> {
       try {
+        if (dispatchKind(input.offering) === "ActorNamespace") {
+          const scope = actorScope(input);
+          if (!scope || input.nativeId !== `selfhost-actor:${scope.namespaceResourceUid}`) {
+            return failed("not_found", "the Actor namespace identity is malformed");
+          }
+          try {
+            if (
+              !(await options.actorNamespace?.hasNamespace({
+                tenantId: scope.tenantId,
+                namespaceResourceUid: scope.namespaceResourceUid,
+              }))
+            ) {
+              return failed("not_found", "the Actor namespace registration is absent");
+            }
+          } catch {
+            return failed("unavailable", "the Actor namespace registration cannot be read", true);
+          }
+          return succeeded({
+            nativeId: input.nativeId,
+            observed: { className: scope.className, ready: false },
+            outputs: {},
+          });
+        }
         if (isConfiguredVectorIndexOffering(input.offering)) return await vectorObserve(input);
         if (dispatchKind(input.offering) === "ContainerService")
           return containerLifecycle && isConfiguredContainerOffering(input.offering)
@@ -4196,8 +4626,14 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             // only the immutable ownership edge added by worker.service here;
             // apply/recovery remain responsible for the full data projection.
             const serviceBindings = await declaredServiceBindings(input, script, new Set());
+            const actorBindings = await declaredActorBindings(
+              input,
+              script,
+              new Set(serviceBindings.map((binding) => binding.name)),
+            );
             if (
               !sameVersionAuthority(bindings, worker.metadata.uid, serviceBindings) ||
+              !sameActorBindingAuthority(bindings, input.identity.uid, actorBindings) ||
               !sameSelfhostStandardServiceDeclaration(input.spec, bindings.externalServices)
             ) {
               return failed(
@@ -4398,6 +4834,30 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async delete(input): Promise<ProviderTicket> {
+      if (dispatchKind(input.offering) === "ActorNamespace") {
+        if (input.operationMode === "recovery" || input.providerHandle) {
+          return failed("unavailable", "Actor namespace deletion needs read-only recovery", true);
+        }
+        const uid = input.identity.uid;
+        if (
+          !uid ||
+          !RESOURCE_UID.test(uid) ||
+          input.nativeId !== `selfhost-actor:${uid}` ||
+          !options.actorNamespace
+        ) {
+          return failed("not_found", "the Actor namespace identity is malformed");
+        }
+        const scope = { tenantId: input.identity.tenantRef, namespaceResourceUid: uid };
+        try {
+          await options.actorNamespace.forgetNamespace(scope);
+          if (!(await options.actorNamespace.namespaceAbsent(scope))) {
+            return failed("unavailable", "the Actor namespace delete did not settle", true);
+          }
+        } catch {
+          return failed("unavailable", "the Actor namespace delete did not settle", true);
+        }
+        return succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
+      }
       if (dispatchKind(input.offering) === "ContainerEndpoint")
         return containerEndpointLifecycle && isConfiguredContainerEndpointOffering(input.offering)
           ? await containerEndpointLifecycle.delete(input)
@@ -4641,6 +5101,27 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
      * truth; it never calls `remove`, rewrites desired state, or reloads.
      */
     async recoverDelete(input): Promise<ProviderTicket> {
+      if (dispatchKind(input.offering) === "ActorNamespace") {
+        const uid = input.identity.uid;
+        if (
+          !uid ||
+          !RESOURCE_UID.test(uid) ||
+          input.nativeId !== `selfhost-actor:${uid}` ||
+          !options.actorNamespace
+        ) {
+          return failed("not_found", "the Actor namespace identity is malformed");
+        }
+        try {
+          return (await options.actorNamespace.namespaceAbsent({
+            tenantId: input.identity.tenantRef,
+            namespaceResourceUid: uid,
+          }))
+            ? succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} })
+            : failed("unavailable", "the Actor namespace delete outcome is not proven", true);
+        } catch {
+          return failed("unavailable", "the Actor namespace delete outcome is not proven", true);
+        }
+      }
       if (dispatchKind(input.offering) === "ContainerEndpoint")
         return containerEndpointLifecycle && isConfiguredContainerEndpointOffering(input.offering)
           ? await containerEndpointLifecycle.delete(input)
@@ -6100,17 +6581,20 @@ async function versionRuntimeInputReceiptDigest(input: {
 function sameVersionDeclaration(
   recorded: StoredSelfhostVersionBindings | null,
   workerResourceUid: string,
+  workerVersionResourceUid: string | undefined,
   handlers: readonly SelfhostWorkerHandlerName[],
   vars: readonly SelfhostVersionBinding[],
   sensitiveNames: readonly string[],
   dataBindings: readonly SelfhostVersionDataBinding[],
   serviceBindings: readonly SelfhostVersionServiceBinding[],
+  actorBindings: readonly SelfhostVersionActorBinding[],
   spec: JsonObject,
 ): boolean {
   if (
     !recorded?.handlers ||
     !sameStrings(recorded.handlers, handlers) ||
     !sameVersionAuthority(recorded, workerResourceUid, serviceBindings) ||
+    !sameActorBindingAuthority(recorded, workerVersionResourceUid, actorBindings) ||
     !sameSelfhostStandardServiceDeclaration(spec, recorded.externalServices)
   ) {
     return false;
@@ -6147,6 +6631,20 @@ function sameVersionDeclaration(
     JSON.stringify(expectedSensitive) === JSON.stringify(observedSensitive) &&
     canonicalData(dataBindings) === canonicalData(recorded?.dataPlane?.bindings ?? [])
   );
+}
+
+function sameActorBindingAuthority(
+  recorded: StoredSelfhostVersionBindings | null,
+  workerVersionResourceUid: string | undefined,
+  actorBindings: readonly SelfhostVersionActorBinding[],
+): boolean {
+  if (!recorded) return false;
+  if (actorBindings.length === 0)
+    return recorded.actorBindings === undefined && recorded.workerVersionResourceUid === undefined;
+  if (recorded.workerVersionResourceUid !== workerVersionResourceUid) return false;
+  const canonical = (bindings: readonly SelfhostVersionActorBinding[]) =>
+    JSON.stringify([...bindings].sort((a, b) => a.name.localeCompare(b.name)));
+  return canonical(recorded.actorBindings ?? []) === canonical(actorBindings);
 }
 
 /**

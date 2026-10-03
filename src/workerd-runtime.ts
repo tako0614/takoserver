@@ -111,8 +111,19 @@ export interface WorkerdActorForward {
 export interface WorkerdActorForwardSocket {
   readonly tenantId: string;
   readonly namespaceResourceUid: string;
+  /** Present for exact per-Version brokers; absent only on legacy static mappings. */
+  readonly token?: string;
   readonly httpSocketPath: string;
   readonly upgradeSocketPath: string;
+}
+
+/** Exact immutable publication identities handed to the Host-private Actor owner. */
+export interface WorkerdActorForwardPublication {
+  readonly script: string;
+  readonly workerResourceUid: string;
+  readonly versionId: string;
+  readonly workerVersionResourceUid: string;
+  readonly bindings: readonly WorkerdActorForwardBinding[];
 }
 
 interface WorkerdAssetManifest {
@@ -301,6 +312,12 @@ export interface WorkerdRuntime {
    * absent; a provider may then refuse weighted publication before mutation.
    */
   publish?(name: string, publication: WorkerdDeploymentPublication | null): Promise<void>;
+  /** Atomically reserves Actor capacity, commits Provider state, and publishes. */
+  publishActorDeployment?(
+    name: string,
+    publication: WorkerdDeploymentPublication,
+    commitDesiredState: () => Promise<void>,
+  ): Promise<void>;
   /** Makes a published script's files present, replacing whatever was there. */
   write(
     name: string,
@@ -444,8 +461,21 @@ export interface WorkerdRuntimeOptions {
    * Requires immutable weighted publish(); legacy write()/remove() are refused.
    */
   readonly serviceBindingSocketDirectory?: string;
-  /** Current Host broker listeners, matched by exact tenant and Actor namespace UID. */
-  readonly actorForwardSockets?: readonly WorkerdActorForwardSocket[];
+  /** Static legacy snapshot or live owner graph, sampled once per render. */
+  readonly actorForwardSockets?:
+    | readonly WorkerdActorForwardSocket[]
+    | (() => readonly WorkerdActorForwardSocket[]);
+  /** Prepare sockets against the same closed graph this activation will render. */
+  readonly actorForwardLifecycle?: {
+    prepare(publications: readonly WorkerdActorForwardPublication[]): Promise<void>;
+    reserve?(publications: readonly WorkerdActorForwardPublication[]): Promise<{
+      release(): Promise<void>;
+    }>;
+    /** Called only after the exact activation marker is committed. Must not throw. */
+    activated(publications: readonly WorkerdActorForwardPublication[]): void;
+    /** An unproved activation cannot authorize any new Actor calls. Must not throw. */
+    uncertain(): void;
+  };
   /**
    * Terminates TLS on that port with this keypair. Absent means the socket is
    * plain HTTP, which is what the Host must then publish as the endpoint
@@ -582,7 +612,16 @@ function privateRuntimeToken(): string {
 }
 
 export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWorkerdRuntime {
-  const actorForwardSockets = validActorForwardSockets(options.actorForwardSockets);
+  const dynamicActorForwardSockets =
+    typeof options.actorForwardSockets === "function" ? options.actorForwardSockets : undefined;
+  const staticActorForwardSockets = dynamicActorForwardSockets
+    ? undefined
+    : validActorForwardSockets(
+        options.actorForwardSockets as readonly WorkerdActorForwardSocket[] | undefined,
+      );
+  const actorForwardSockets = (): ReadonlyMap<string, WorkerdActorForwardSocket> =>
+    staticActorForwardSockets ?? validActorForwardSockets(dynamicActorForwardSockets?.());
+  const exactActorSockets = dynamicActorForwardSockets !== undefined;
   const serviceSocketDirectory = options.serviceBindingSocketDirectory;
   if (serviceSocketDirectory !== undefined) {
     validPrivateSocketDirectory(serviceSocketDirectory);
@@ -653,6 +692,32 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         "worker runtime activation could not be cleared",
       );
     }
+  };
+
+  const clearFailedActorActivation = async (failure: unknown): Promise<void> => {
+    // Revoke admission first. Clearing the durable marker may itself fail, and
+    // that failure must not leave private Actor brokers accepting old tokens.
+    let notificationFailure: unknown;
+    try {
+      options.actorForwardLifecycle?.uncertain();
+    } catch (error) {
+      notificationFailure = error;
+    }
+    try {
+      await clearFailedActivation(failure);
+    } catch (clearFailure) {
+      if (notificationFailure !== undefined)
+        throw new AggregateError(
+          [failure, notificationFailure, clearFailure],
+          "worker runtime Actor admission and activation could not be cleared",
+        );
+      throw clearFailure;
+    }
+    if (notificationFailure !== undefined)
+      throw new AggregateError(
+        [failure, notificationFailure],
+        "worker runtime Actor admission could not be cleared",
+      );
   };
 
   const requireSocketRoot = async (): Promise<void> => {
@@ -757,6 +822,8 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
    */
   const writeRendered = async (published: readonly PublishedDeployment[]): Promise<void> => {
     await options.beforeRender?.();
+    await options.actorForwardLifecycle?.prepare(actorForwardPublications(published));
+    const actorSockets = actorForwardSockets();
     if (serviceSocketDirectory !== undefined) {
       await requireSocketRoot();
     }
@@ -810,7 +877,8 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         internalReadinessCapability,
         dataPlaneAddress,
         privateServiceGraph(published),
-        actorForwardSockets,
+        actorSockets,
+        exactActorSockets,
       ),
       "utf8",
       () => transitionPrivateSockets(published),
@@ -821,10 +889,12 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     Object.fromEntries(published.map((entry) => [entry.name, entry.generation ?? null]));
 
   const renderedConfirmed = async (published: readonly PublishedDeployment[]): Promise<boolean> => {
+    const actorSockets = actorForwardSockets();
     const expected = publishedGraphIdentity(
       published,
       privateServiceGraph(published),
-      actorForwardSockets,
+      actorSockets,
+      exactActorSockets,
     );
     let confirmed = false;
     try {
@@ -912,6 +982,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       // Its absence must not precede a marker write that could still fail.
       if (pointer?.commitAfterActivation) await pointer.commit();
       retainRenderedRouters(published);
+      options.actorForwardLifecycle?.activated(actorForwardPublications(published));
     } catch (failure) {
       if (
         serviceSocketDirectory !== undefined &&
@@ -920,7 +991,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         // Preflight failed before any socket unlink or config rename. Do not
         // disrupt the old listeners by trying a second render of an unknown
         // filesystem. No pointer commit has happened; refuse serving claims.
-        await clearFailedActivation(failure);
+        await clearFailedActorActivation(failure);
         throw failure;
       }
       if (serviceSocketDirectory !== undefined && !graphProved) {
@@ -928,7 +999,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         // catch. Only external stop/reap and a fresh runtime/socket directory
         // can recover it; do not race that process with a rollback sweep.
         privateSocketUncertain = true;
-        await clearFailedActivation(failure);
+        await clearFailedActorActivation(failure);
         throw failure;
       }
       try {
@@ -945,6 +1016,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         // marker commit, especially during boot restore.
         await writeActivation(activationPath, activated(previous));
         retainRenderedRouters(previous);
+        options.actorForwardLifecycle?.activated(actorForwardPublications(previous));
       } catch (rollbackFailure) {
         // The child may now be serving either graph. No per-script marker is
         // trustworthy across a failed process boundary, so fail closed for
@@ -954,7 +1026,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           [failure, rollbackFailure],
           "worker runtime activation state is unknown",
         );
-        await clearFailedActivation(unknownState);
+        await clearFailedActorActivation(unknownState);
         throw unknownState;
       }
       throw failure;
@@ -1215,9 +1287,15 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         );
       });
     },
-    async publish(name, publication) {
+    async publish(name, publication, commitDesiredState?: () => Promise<void>) {
       requireCertainRuntime();
       const directory = scriptDirectory(name);
+      if (
+        commitDesiredState &&
+        (publication === null ||
+          !publication.versions.some((version) => version.site.actorForward !== undefined))
+      )
+        throw new Error("Actor-qualified publication has no Actor binding");
       const pointerPath = join(directory, MANIFEST);
       const removePointer = async (): Promise<void> => {
         await rm(pointerPath, { force: true });
@@ -1235,82 +1313,124 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       // always serialized so two valid publishes cannot each render a graph
       // missing the other. Private staging also shares the uncertainty fence.
       const concurrentStaged =
-        publication === null || serviceSocketDirectory !== undefined
+        publication === null || serviceSocketDirectory !== undefined || commitDesiredState
           ? null
           : await stageDeployment(name, publication);
       await exclusiveActivation(async () => {
         requireCertainRuntime();
-        // Private publication staging shares the uncertain-state fence. It
-        // cannot keep writing after another activation invalidates this Host.
-        const staged =
-          serviceSocketDirectory !== undefined && publication !== null
-            ? await stageDeployment(name, publication)
-            : concurrentStaged;
         const previous = await readPublished(scriptsRoot, assetsRoot);
-        const beforePointer = await readFile(pointerPath, "utf8").catch(() => null);
-        const next = (
-          staged === null
-            ? previous.filter((entry) => entry.name !== name)
-            : [...previous.filter((entry) => entry.name !== name), staged.deployment]
-        ).sort((left, right) => left.name.localeCompare(right.name));
-        const pointerContents = staged === null ? null : JSON.stringify(staged.pointer);
-        const retiringScalar =
-          staged === null && previous.some((entry) => entry.name === name && !entry.weighted);
-        let retiredCarrier: string | undefined;
-        if (retiringScalar) {
-          // Only the fully validated runtime publication authorizes this move.
-          // Provider desired state may already have cleared its legacy scalar.
-          // Retain the modules for recovery; legacy assets keep their old path
-          // so an in-flight request can still read them after graph replacement.
-          const retainedRoot = join(scriptsRoot, ".retired");
-          await privateDirectory(retainedRoot);
-          retiredCarrier = join(await mkdtemp(join(retainedRoot, `${name}-`)), "publication");
+        let reservation: { release(): Promise<void> } | undefined;
+        if (commitDesiredState && publication) {
+          if (!options.actorForwardLifecycle?.reserve)
+            throw new Error("Actor forward capacity reservation unavailable");
+          const proposed = publication.versions.flatMap((version) =>
+            version.site.actorForward === undefined
+              ? []
+              : [
+                  {
+                    script: name,
+                    workerResourceUid: publication.workerResourceUid,
+                    versionId: version.versionId,
+                    workerVersionResourceUid: version.workerVersionUid,
+                    bindings: validActorForward(version.site.actorForward).bindings,
+                  },
+                ],
+          );
+          // The queue stays held from this complete-graph capacity proof
+          // through Provider CAS and exact publication. A competing Actor
+          // Deployment cannot replace the graph between qualification and
+          // desired-state mutation, and a failed proof writes no state.
+          reservation = await options.actorForwardLifecycle.reserve([
+            ...actorForwardPublications(previous).filter((item) => item.script !== name),
+            ...proposed,
+          ]);
         }
-        let retirementCommitted = false;
         try {
-          await activate(next, previous, {
-            ...(retiredCarrier === undefined ? {} : { commitAfterActivation: true }),
-            commit: async () => {
-              if (retiredCarrier !== undefined) {
-                await rename(directory, retiredCarrier);
-                retirementCommitted = true;
-                return;
-              }
-              if (pointerContents === null) {
-                await removePointer();
-              } else {
-                await privateDirectory(directory);
-                await writePrivate(pointerPath, pointerContents, "utf8");
-              }
-            },
-            rollback: async () => {
-              // A failed scalar retirement leaves its original carrier in place;
-              // no operation follows a successful rename that could need rollback.
-              if (retiredCarrier !== undefined) return;
-              if (beforePointer === null) {
-                await removePointer();
-              } else {
-                await privateDirectory(directory);
-                await writePrivate(pointerPath, beforePointer, "utf8");
-              }
-            },
-          });
-        } catch (failure) {
-          if (retiredCarrier !== undefined && !retirementCommitted) {
-            // This operation created the private staging parent. Failed
-            // attempts must not accumulate it; committed recovery bytes stay.
-            try {
-              await rm(dirname(retiredCarrier), { recursive: true, force: true });
-            } catch (cleanupFailure) {
-              throw new AggregateError(
-                [failure, cleanupFailure],
-                "worker retirement staging cleanup failed",
-              );
-            }
+          await commitDesiredState?.();
+          // Private publication staging shares the uncertain-state fence. It
+          // cannot keep writing after another activation invalidates this Host.
+          const staged =
+            (serviceSocketDirectory !== undefined || commitDesiredState) && publication !== null
+              ? await stageDeployment(name, publication)
+              : concurrentStaged;
+          const beforePointer = await readFile(pointerPath, "utf8").catch(() => null);
+          const next = (
+            staged === null
+              ? previous.filter((entry) => entry.name !== name)
+              : [...previous.filter((entry) => entry.name !== name), staged.deployment]
+          ).sort((left, right) => left.name.localeCompare(right.name));
+          const pointerContents = staged === null ? null : JSON.stringify(staged.pointer);
+          const retiringScalar =
+            staged === null && previous.some((entry) => entry.name === name && !entry.weighted);
+          let retiredCarrier: string | undefined;
+          if (retiringScalar) {
+            // Only the fully validated runtime publication authorizes this move.
+            // Provider desired state may already have cleared its legacy scalar.
+            // Retain the modules for recovery; legacy assets keep their old path
+            // so an in-flight request can still read them after graph replacement.
+            const retainedRoot = join(scriptsRoot, ".retired");
+            await privateDirectory(retainedRoot);
+            retiredCarrier = join(await mkdtemp(join(retainedRoot, `${name}-`)), "publication");
           }
-          throw failure;
+          let retirementCommitted = false;
+          try {
+            await activate(next, previous, {
+              ...(retiredCarrier === undefined ? {} : { commitAfterActivation: true }),
+              commit: async () => {
+                if (retiredCarrier !== undefined) {
+                  await rename(directory, retiredCarrier);
+                  retirementCommitted = true;
+                  return;
+                }
+                if (pointerContents === null) {
+                  await removePointer();
+                } else {
+                  await privateDirectory(directory);
+                  await writePrivate(pointerPath, pointerContents, "utf8");
+                }
+              },
+              rollback: async () => {
+                // A failed scalar retirement leaves its original carrier in place;
+                // no operation follows a successful rename that could need rollback.
+                if (retiredCarrier !== undefined) return;
+                if (beforePointer === null) {
+                  await removePointer();
+                } else {
+                  await privateDirectory(directory);
+                  await writePrivate(pointerPath, beforePointer, "utf8");
+                }
+              },
+            });
+          } catch (failure) {
+            if (retiredCarrier !== undefined && !retirementCommitted) {
+              // This operation created the private staging parent. Failed
+              // attempts must not accumulate it; committed recovery bytes stay.
+              try {
+                await rm(dirname(retiredCarrier), { recursive: true, force: true });
+              } catch (cleanupFailure) {
+                throw new AggregateError(
+                  [failure, cleanupFailure],
+                  "worker retirement staging cleanup failed",
+                );
+              }
+            }
+            throw failure;
+          }
+        } finally {
+          await reservation?.release();
         }
       });
+    },
+    async publishActorDeployment(name, publication, commitDesiredState) {
+      // The ordinary publish entry remains the same two-argument public port;
+      // only this qualified method can supply the private commit callback.
+      await (
+        this.publish as (
+          name: string,
+          publication: WorkerdDeploymentPublication,
+          commit: () => Promise<void>,
+        ) => Promise<void>
+      )(name, publication, commitDesiredState);
     },
     async write(name, site, modules, assets, hostModules) {
       requireCertainRuntime();
@@ -1575,11 +1695,22 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       // asked for, which is exactly what deferring the start to the first
       // publish was avoiding.
       return await exclusiveActivation(async () => {
-        requireCertainRuntime();
-        const published = await readPublished(scriptsRoot, assetsRoot);
-        if (published.length === 0) return [];
-        await activate(published, published);
-        return published.map((entry) => entry.name);
+        try {
+          requireCertainRuntime();
+          const published = await readPublished(scriptsRoot, assetsRoot);
+          if (published.length === 0) {
+            // Empty boot has no workerd process, but the owned Actor broker
+            // graph has still been reconstructed and proven empty. This is a
+            // successful immutable restore, not a serving-readiness signal.
+            options.actorForwardLifecycle?.activated([]);
+            return [];
+          }
+          await activate(published, published);
+          return published.map((entry) => entry.name);
+        } catch (error) {
+          options.actorForwardLifecycle?.uncertain();
+          throw error;
+        }
       });
     },
 
@@ -1705,8 +1836,16 @@ function actorForwardServiceName(kind: "HTTP" | "UPGRADE", index: number): strin
   return `__TAKOSERVER_ACTOR_${kind}_${index.toString(10).padStart(5, "0")}`;
 }
 
-function actorForwardIdentity(tenantId: string, namespaceResourceUid: string): string {
-  return JSON.stringify([tenantId, namespaceResourceUid]);
+function actorForwardIdentity(
+  tenantId: string,
+  namespaceResourceUid: string,
+  token?: string,
+): string {
+  return JSON.stringify(
+    token === undefined
+      ? [tenantId, namespaceResourceUid]
+      : [tenantId, namespaceResourceUid, token],
+  );
 }
 
 function validActorForward(value: unknown): WorkerdActorForward {
@@ -1722,7 +1861,7 @@ function validActorForward(value: unknown): WorkerdActorForward {
     candidate.schema !== ACTOR_FORWARD_SCHEMA ||
     !Array.isArray(candidate.bindings) ||
     candidate.bindings.length === 0 ||
-    candidate.bindings.length > 32
+    candidate.bindings.length > 64
   )
     throw new Error("unusable Actor forward graph");
   const names = new Set<string>();
@@ -1758,7 +1897,7 @@ function validActorForward(value: unknown): WorkerdActorForward {
 }
 
 function validActorForwardSockets(
-  value: WorkerdRuntimeOptions["actorForwardSockets"],
+  value: readonly WorkerdActorForwardSocket[] | undefined,
 ): ReadonlyMap<string, WorkerdActorForwardSocket> {
   if (value === undefined) return new Map();
   if (!Array.isArray(value) || value.length > 128)
@@ -1770,14 +1909,18 @@ function validActorForwardSockets(
       typeof candidate !== "object" ||
       candidate === null ||
       Array.isArray(candidate) ||
-      Object.keys(candidate).sort().join(",") !==
-        "httpSocketPath,namespaceResourceUid,tenantId,upgradeSocketPath" ||
+      (Object.keys(candidate).sort().join(",") !==
+        "httpSocketPath,namespaceResourceUid,tenantId,upgradeSocketPath" &&
+        Object.keys(candidate).sort().join(",") !==
+          "httpSocketPath,namespaceResourceUid,tenantId,token,upgradeSocketPath") ||
       typeof candidate.tenantId !== "string" ||
       candidate.tenantId.length === 0 ||
       candidate.tenantId.length > 256 ||
       candidate.tenantId.includes("\u0000") ||
       typeof candidate.namespaceResourceUid !== "string" ||
-      !RESOURCE_UID.test(candidate.namespaceResourceUid)
+      !RESOURCE_UID.test(candidate.namespaceResourceUid) ||
+      (candidate.token !== undefined &&
+        (typeof candidate.token !== "string" || !ACTOR_FORWARD_TOKEN.test(candidate.token)))
     )
       throw new Error("unusable Actor forward socket graph");
     for (const path of [candidate.httpSocketPath, candidate.upgradeSocketPath]) {
@@ -1792,7 +1935,11 @@ function validActorForwardSockets(
         throw new Error("unusable Actor forward socket graph");
       paths.add(path);
     }
-    const identity = actorForwardIdentity(candidate.tenantId, candidate.namespaceResourceUid);
+    const identity = actorForwardIdentity(
+      candidate.tenantId,
+      candidate.namespaceResourceUid,
+      candidate.token,
+    );
     if (selected.has(identity)) throw new Error("unusable Actor forward socket graph");
     selected.set(identity, { ...candidate });
   }
@@ -3897,18 +4044,49 @@ interface ResolvedActorForwardService {
   readonly upgradeSocketPath: string;
 }
 
+function actorForwardPublications(
+  published: readonly PublishedDeployment[],
+): readonly WorkerdActorForwardPublication[] {
+  return published.flatMap((deployment) =>
+    deployment.variants.flatMap((variant) => {
+      if (variant.manifest.actorForward === undefined) return [];
+      if (
+        !deployment.weighted ||
+        !deployment.workerResourceUid ||
+        !variant.versionId ||
+        !variant.workerVersionUid
+      )
+        throw new Error("Actor forward requires an immutable weighted Version");
+      return [
+        {
+          script: deployment.name,
+          workerResourceUid: deployment.workerResourceUid,
+          versionId: variant.versionId,
+          workerVersionResourceUid: variant.workerVersionUid,
+          bindings: validActorForward(variant.manifest.actorForward).bindings,
+        },
+      ];
+    }),
+  );
+}
+
 function resolveActorForwardServices(
   published: readonly PublishedDeployment[],
   sockets: ReadonlyMap<string, WorkerdActorForwardSocket>,
+  exactSockets = false,
 ): ReadonlyMap<string, readonly ResolvedActorForwardService[]> {
   const resolved = new Map<string, readonly ResolvedActorForwardService[]>();
   for (const variant of published.flatMap((deployment) => deployment.variants)) {
     if (variant.manifest.actorForward === undefined) continue;
     const actorForward = validActorForward(variant.manifest.actorForward);
     const services = actorForward.bindings.map((binding, index) => {
-      const current = sockets.get(
-        actorForwardIdentity(binding.tenantId, binding.namespaceResourceUid),
-      );
+      const current =
+        sockets.get(
+          actorForwardIdentity(binding.tenantId, binding.namespaceResourceUid, binding.token),
+        ) ??
+        (exactSockets
+          ? undefined
+          : sockets.get(actorForwardIdentity(binding.tenantId, binding.namespaceResourceUid)));
       if (!current) throw new Error("Actor forward Host socket unavailable");
       return {
         httpBinding: binding.httpService,
@@ -3928,6 +4106,7 @@ function publishedGraphIdentity(
   published: readonly PublishedDeployment[],
   privateServices?: PrivateServiceGraph,
   actorForwardSockets: ReadonlyMap<string, WorkerdActorForwardSocket> = new Map(),
+  exactActorSockets = false,
 ): string {
   const hash = createHash("sha256").update(
     JSON.stringify(
@@ -3960,7 +4139,11 @@ function publishedGraphIdentity(
       }),
     );
   }
-  const actorServices = resolveActorForwardServices(published, actorForwardSockets);
+  const actorServices = resolveActorForwardServices(
+    published,
+    actorForwardSockets,
+    exactActorSockets,
+  );
   if (actorServices.size > 0) {
     hash
       .update("\u0000actor-forward-sockets\u0000")
@@ -4023,10 +4206,20 @@ function renderConfig(
   dataPlaneAddress?: string,
   privateServices?: PrivateServiceGraph,
   actorForwardSockets: ReadonlyMap<string, WorkerdActorForwardSocket> = new Map(),
+  exactActorSockets = false,
 ): string {
   const variants = published.flatMap((deployment) => deployment.variants);
-  const actorServices = resolveActorForwardServices(published, actorForwardSockets);
-  const graphIdentity = publishedGraphIdentity(published, privateServices, actorForwardSockets);
+  const actorServices = resolveActorForwardServices(
+    published,
+    actorForwardSockets,
+    exactActorSockets,
+  );
+  const graphIdentity = publishedGraphIdentity(
+    published,
+    privateServices,
+    actorForwardSockets,
+    exactActorSockets,
+  );
   const services = variants
     .map((entry) => {
       const bindings = [

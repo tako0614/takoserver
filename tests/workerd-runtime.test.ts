@@ -1564,6 +1564,336 @@ test("persists an opt-in Actor forward graph and rejects unmapped Host sockets",
   );
 });
 
+test("live Actor socket graph requires exact per-Version token for weighted callers", async () => {
+  const publication = weightedPublication("site", "generation-actor-exact");
+  const tokens = ["a".repeat(64), "b".repeat(64)];
+  const withActors = {
+    ...publication,
+    versions: publication.versions.map((version, index) => ({
+      ...version,
+      site: {
+        ...version.site,
+        actorForward: {
+          schema: "takoserver.selfhost-actor-forward@v1" as const,
+          bindings: [
+            {
+              publicName: "ROOM",
+              tenantId: "tenant-1",
+              namespaceResourceUid: "uid-actor-namespace-1",
+              httpService: "__TAKOSERVER_ACTOR_HTTP_00000",
+              upgradeService: "__TAKOSERVER_ACTOR_UPGRADE_00000",
+              token: tokens[index] as string,
+            },
+          ],
+        },
+      },
+    })),
+  };
+  const sockets = tokens.map((token, index) => ({
+    tenantId: "tenant-1",
+    namespaceResourceUid: "uid-actor-namespace-1",
+    token,
+    httpSocketPath: join(root, `actor-http-${index}.sock`),
+    upgradeSocketPath: join(root, `actor-upgrade-${index}.sock`),
+  }));
+  const tokensByVersion = new Map(
+    withActors.versions.map((version) => [
+      version.workerVersionUid,
+      version.site.actorForward.bindings[0]?.token,
+    ]),
+  );
+  let current = sockets;
+  const prepared: string[][] = [];
+  const activated: string[][] = [];
+  const runtime = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    actorForwardSockets: () => current,
+    actorForwardLifecycle: {
+      async prepare(publications) {
+        prepared.push(publications.map((item) => item.workerVersionResourceUid));
+        for (const item of publications) {
+          expect(item.bindings[0]?.token).toBe(tokensByVersion.get(item.workerVersionResourceUid));
+        }
+      },
+      activated(publications) {
+        activated.push(publications.map((item) => item.workerVersionResourceUid));
+      },
+      uncertain() {},
+    },
+  });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+  await runtime.publish("site", withActors);
+  expect(prepared).toHaveLength(1);
+  expect(new Set(prepared[0])).toEqual(
+    new Set(["uid-WorkerVersion-site-a", "uid-WorkerVersion-site-b"]),
+  );
+  expect(activated).toEqual(prepared);
+  const rendered = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  for (const socket of sockets) {
+    expect(rendered).toContain(`unix:${socket.httpSocketPath}`);
+    expect(rendered).toContain(`unix:${socket.upgradeSocketPath}`);
+  }
+  const firstSocket = sockets[0];
+  if (!firstSocket) throw new Error("Actor socket fixture unavailable");
+  current = [firstSocket];
+  await expect(
+    runtime.publish("site", {
+      ...withActors,
+      generation: "generation-actor-next",
+      versions: withActors.versions.map((version) => ({
+        ...version,
+        site: { ...version.site, generation: "generation-actor-next" },
+      })),
+    }),
+  ).rejects.toThrow("worker runtime activation state is unknown");
+  const wrong = createWorkerdRuntime({
+    root: join(root, "wrong-token"),
+    isReady: () => true,
+    actorForwardSockets: () => [{ ...firstSocket, token: "c".repeat(64) }],
+  });
+  if (!wrong.publish) throw new Error("weighted publication unavailable");
+  await expect(wrong.publish("site", withActors)).rejects.toThrow(
+    "Actor forward Host socket unavailable",
+  );
+});
+
+test("Actor-qualified publish refuses a 129-socket candidate before Provider mutation", async () => {
+  const base = weightedPublication("site", "generation-actor-capacity");
+  const first = base.versions[0];
+  if (!first) throw new Error("weighted fixture missing");
+  let prepared = 0;
+  const runtime = createWorkerdRuntime({
+    root,
+    actorForwardLifecycle: {
+      async prepare() {},
+      async reserve(publications) {
+        prepared = publications.reduce((sum, item) => sum + item.bindings.length, 0);
+        if (prepared > 128) throw new Error("Actor forward socket capacity exceeded");
+        return { async release() {} };
+      },
+      activated() {},
+      uncertain() {},
+    },
+  });
+  if (!runtime.publishActorDeployment) throw new Error("Actor-qualified publish unavailable");
+  const publication: WorkerdDeploymentPublication = {
+    ...base,
+    versions: Array.from({ length: 5 }, (_, versionIndex) => ({
+      ...first,
+      versionId: `version-${versionIndex}`,
+      workerVersionUid: `uid-version-${versionIndex}`,
+      site: {
+        ...first.site,
+        actorForward: {
+          schema: "takoserver.selfhost-actor-forward@v1" as const,
+          bindings: Array.from({ length: versionIndex === 4 ? 1 : 32 }, (_, bindingIndex) => ({
+            publicName: `ACTOR_${bindingIndex}`,
+            tenantId: "tenant-1",
+            namespaceResourceUid: "uid-actor-namespace-1",
+            httpService: `__TAKOSERVER_ACTOR_HTTP_${bindingIndex.toString().padStart(5, "0")}`,
+            upgradeService: `__TAKOSERVER_ACTOR_UPGRADE_${bindingIndex.toString().padStart(5, "0")}`,
+            token: (versionIndex * 32 + bindingIndex + 1).toString(16).padStart(64, "0"),
+          })),
+        },
+      },
+    })),
+  };
+  let committed = false;
+  await expect(
+    runtime.publishActorDeployment("site", publication, async () => {
+      committed = true;
+    }),
+  ).rejects.toThrow("Actor forward socket capacity exceeded");
+  expect(prepared).toBe(129);
+  expect(committed).toBe(false);
+  await expect(readFile(join(root, "workers", "workerd.capnp"), "utf8")).rejects.toThrow();
+  await expect(
+    readFile(join(root, "workers", "site", "takoserver-site.json"), "utf8"),
+  ).rejects.toThrow();
+});
+
+test("weighted workerd graph accepts 64 Actor bindings on one Version and refuses 65", async () => {
+  const base = weightedPublication("site", "generation-actor-sixty-four");
+  const bindings = Array.from({ length: 64 }, (_, index) => ({
+    publicName: `ROOM_${index}`,
+    tenantId: "tenant-1",
+    namespaceResourceUid: "uid-actor-namespace-1",
+    httpService: `__TAKOSERVER_ACTOR_HTTP_${index.toString().padStart(5, "0")}`,
+    upgradeService: `__TAKOSERVER_ACTOR_UPGRADE_${index.toString().padStart(5, "0")}`,
+    token: (index + 1).toString(16).padStart(64, "0"),
+  }));
+  const sockets = bindings.map((binding, index) => ({
+    tenantId: binding.tenantId,
+    namespaceResourceUid: binding.namespaceResourceUid,
+    token: binding.token,
+    httpSocketPath: join(root, `actor-${index}.http.sock`),
+    upgradeSocketPath: join(root, `actor-${index}.upgrade.sock`),
+  }));
+  const publication: WorkerdDeploymentPublication = {
+    ...base,
+    versions: base.versions.map((version, index) =>
+      index === 0
+        ? {
+            ...version,
+            site: {
+              ...version.site,
+              actorForward: { schema: "takoserver.selfhost-actor-forward@v1", bindings },
+            },
+          }
+        : version,
+    ),
+  };
+  const runtime = createWorkerdRuntime({ root, actorForwardSockets: sockets });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+  await runtime.publish("site", publication);
+  const pointer = await readFile(join(root, "workers", "site", "takoserver-site.json"), "utf8");
+  const version = publication.versions[0];
+  const first = bindings[0];
+  if (!version || !first) throw new Error("Actor fixture unavailable");
+  await expect(
+    runtime.publish("site", {
+      ...publication,
+      generation: "generation-actor-sixty-five",
+      versions: publication.versions.map((item, index) => ({
+        ...item,
+        site: {
+          ...item.site,
+          generation: "generation-actor-sixty-five",
+          ...(index === 0
+            ? {
+                actorForward: {
+                  schema: "takoserver.selfhost-actor-forward@v1" as const,
+                  bindings: [...bindings, { ...first, publicName: "ROOM_64" }],
+                },
+              }
+            : {}),
+        },
+      })),
+    }),
+  ).rejects.toThrow("unusable Actor forward graph");
+  expect(await readFile(join(root, "workers", "site", "takoserver-site.json"), "utf8")).toBe(
+    pointer,
+  );
+});
+
+test("Actor-qualified publish holds one activation fence across reserve, Provider CAS, and publish", async () => {
+  const names = ["actor-a", "actor-b", "actor-c", "actor-d"] as const;
+  const publications = new Map(
+    names.map((name, scriptIndex) => {
+      const base = weightedPublication(name, `generation-${name}`);
+      return [
+        name,
+        {
+          ...base,
+          versions: base.versions.map((version, versionIndex) => ({
+            ...version,
+            site: {
+              ...version.site,
+              actorForward: {
+                schema: "takoserver.selfhost-actor-forward@v1" as const,
+                bindings: [
+                  {
+                    publicName: "ROOM",
+                    tenantId: "tenant-1",
+                    namespaceResourceUid: "uid-actor-namespace-1",
+                    httpService: "__TAKOSERVER_ACTOR_HTTP_00000",
+                    upgradeService: "__TAKOSERVER_ACTOR_UPGRADE_00000",
+                    token: (scriptIndex * 2 + versionIndex + 1).toString(16).padStart(64, "0"),
+                  },
+                ],
+              },
+            },
+          })),
+        },
+      ] as const;
+    }),
+  );
+  const sockets = [...publications.values()].flatMap((publication) =>
+    publication.versions.map((version) => {
+      const binding = version.site.actorForward.bindings[0];
+      if (!binding) throw new Error("Actor fixture binding unavailable");
+      return {
+        tenantId: "tenant-1",
+        namespaceResourceUid: "uid-actor-namespace-1",
+        token: binding.token,
+        httpSocketPath: join(root, `${version.versionId}.http.sock`),
+        upgradeSocketPath: join(root, `${version.versionId}.upgrade.sock`),
+      };
+    }),
+  );
+  const requiredPublication = (name: (typeof names)[number]) => {
+    const publication = publications.get(name);
+    if (!publication) throw new Error("Actor fixture publication unavailable");
+    return publication;
+  };
+  const reserved: string[][] = [];
+  let released = 0;
+  const runtime = createWorkerdRuntime({
+    root,
+    actorForwardSockets: sockets,
+    actorForwardLifecycle: {
+      async prepare() {},
+      async reserve(publications) {
+        reserved.push(publications.map((item) => item.script));
+        return {
+          async release() {
+            released += 1;
+          },
+        };
+      },
+      activated() {},
+      uncertain() {},
+    },
+  });
+  if (!runtime.publishActorDeployment) throw new Error("Actor-qualified publish unavailable");
+  const enteredA = deferred();
+  const continueA = deferred();
+  let committedB = false;
+  const a = runtime.publishActorDeployment("actor-a", requiredPublication("actor-a"), async () => {
+    enteredA.resolve();
+    await continueA.promise;
+    await writeFile(join(root, "actor-a-desired"), "committed");
+  });
+  await enteredA.promise;
+  const b = runtime.publishActorDeployment("actor-b", requiredPublication("actor-b"), async () => {
+    committedB = true;
+    await writeFile(join(root, "actor-b-desired"), "committed");
+  });
+  await Bun.sleep(20);
+  expect(committedB).toBe(false);
+  expect(reserved).toHaveLength(1);
+  await expect(readFile(join(root, "actor-b-desired"), "utf8")).rejects.toThrow();
+  continueA.resolve();
+  await Promise.all([a, b]);
+  expect(committedB).toBe(true);
+  expect((await readWorkerdActiveDeployment(root, "actor-a"))?.versions.length).toBe(2);
+  expect(reserved[1]).toEqual(["actor-a", "actor-a", "actor-b", "actor-b"]);
+  expect(released).toBe(2);
+  const enteredC = deferred();
+  const continueC = deferred();
+  let committedD = false;
+  const c = runtime.publishActorDeployment("actor-c", requiredPublication("actor-c"), async () => {
+    enteredC.resolve();
+    await continueC.promise;
+    throw new Error("synthetic Provider CAS refusal");
+  });
+  await enteredC.promise;
+  const d = runtime.publishActorDeployment("actor-d", requiredPublication("actor-d"), async () => {
+    committedD = true;
+  });
+  await Bun.sleep(20);
+  expect(committedD).toBe(false);
+  continueC.resolve();
+  await expect(c).rejects.toThrow("synthetic Provider CAS refusal");
+  await d;
+  expect(committedD).toBe(true);
+  expect(released).toBe(4);
+  expect(await readFile(join(root, "workers", "workerd.capnp"), "utf8")).toContain(
+    "actor-d.localhost",
+  );
+});
+
 test("restore rejects unknown legacy fields and malformed Actor forward authority", async () => {
   const actorForward = {
     schema: "takoserver.selfhost-actor-forward@v1",
@@ -1745,6 +2075,48 @@ test("clears activation truth when neither the forward nor rollback graph is pro
     ).toEqual({});
     expect(await runtime.has("site", "generation-1")).toBe(false);
     expect(await runtime.has("site", "generation-2")).toBe(false);
+  } finally {
+    probe.stop();
+  }
+});
+
+test("revokes Actor broker admission even when clearing a failed activation marker fails", async () => {
+  const probe = createConfigProbe();
+  const markerPath = join(root, "workers", ".takoserver-active.json");
+  let admitted = false;
+  let uncertainCalls = 0;
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+      actorForwardLifecycle: {
+        async prepare() {},
+        activated() {
+          admitted = true;
+        },
+        uncertain() {
+          uncertainCalls += 1;
+          admitted = false;
+        },
+      },
+    });
+    if (!runtime.publish) throw new Error("weighted publication is unavailable");
+    await runtime.publish("site", weightedPublication("site", "generation-actor-marker-one"));
+    expect(admitted).toBe(true);
+    probe.behavior = async (_config, invocation) => {
+      if (invocation === 2) {
+        rmSync(markerPath);
+        await mkdir(markerPath);
+      }
+      throw new Error("watcher did not confirm graph");
+    };
+    await expect(
+      runtime.publish("site", weightedPublication("site", "generation-actor-marker-two")),
+    ).rejects.toThrow("worker runtime activation could not be cleared");
+    expect(uncertainCalls).toBe(1);
+    expect(admitted).toBe(false);
   } finally {
     probe.stop();
   }
