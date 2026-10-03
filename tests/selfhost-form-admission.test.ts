@@ -398,22 +398,63 @@ describe("self-host Form admission", () => {
       expect(await fixture.sql.query("SELECT count(*) AS c FROM tf_form_support_events")).toEqual([
         { c: IMPLEMENTED + 1 },
       ]);
-      // A later source profile without an executable Actor owner must record
-      // the narrower implementation instead of leaving the old support live.
-      const reconverged = await runSelfhostFormAdmission({
+      const contracted = {
         organizationId: "org_actor_source",
         space: "default",
         hostId: "http://localhost:8787",
         coreVerifierUrl: "http://127.0.0.1:1",
-        apply: true,
         sql: fixture.sql,
         objects: fixture.objects,
         provider,
         fetch: verifier.fetch,
+      };
+      // Ordinary admission never treats a missing owner as permission to
+      // deactivate an already active Form or silently write a new profile.
+      await expect(runSelfhostFormAdmission({ ...contracted, apply: true })).rejects.toMatchObject({
+        code: "authority_state_conflict",
       });
       expect(
+        await fixture.sql.query("SELECT count(*) AS c FROM tf_form_activation_events"),
+      ).toEqual([{ c: IMPLEMENTED + 1 }]);
+      const dryDeactivation = await runSelfhostFormAdmission({
+        ...contracted,
+        organizationId: "org_other_source",
+        deactivate: true,
+        apply: false,
+      });
+      expect(dryDeactivation.plan.request.activation).toEqual({
+        kind: "space",
+        tenantId: "org_other_source",
+        space: "default",
+        desiredActive: false,
+      });
+      expect(dryDeactivation.applied).toBeNull();
+      expect(
+        await fixture.sql.query("SELECT count(*) AS c FROM tf_form_activation_events"),
+      ).toEqual([{ c: IMPLEMENTED + 1 }]);
+      const deactivation = await runSelfhostFormAdmission({
+        ...contracted,
+        deactivate: true,
+        apply: true,
+      });
+      expect(deactivation.plan.request.activation.desiredActive).toBe(false);
+      expect(
+        deactivation.applied?.readback.forms.find((form) => form.formRef.kind === "ActorNamespace"),
+      ).toMatchObject({ activationHead: { active: false } });
+      const repeatedDeactivation = await runSelfhostFormAdmission({
+        ...contracted,
+        deactivate: true,
+        apply: true,
+      });
+      expect(repeatedDeactivation.plan.commands).toEqual([]);
+      // Only after the selected Space is explicitly inactive can a separate
+      // ordinary admission re-plan against the narrower base profile.
+      const reconverged = await runSelfhostFormAdmission({ ...contracted, apply: true });
+      expect(
         reconverged.applied?.readback.forms.find((form) => form.formRef.kind === "ActorNamespace"),
-      ).toMatchObject({ installed: true, supported: false });
+      ).toMatchObject({ installed: true, supported: false, activationHead: { active: false } });
+      const repeated = await runSelfhostFormAdmission({ ...contracted, apply: true });
+      expect(repeated.plan.commands).toEqual([]);
     } finally {
       await owner?.close();
       fixture.close();

@@ -573,6 +573,14 @@ rewrite of old heads. The Hosted/public Worker catalog and its historical
 digests are unchanged; the Hosted Actor supply parser still refuses Actor
 pricing and metering configuration.
 
+When a previously active Actor implementation becomes unavailable, ordinary
+admission refuses before writing. Stop the server and run the same command for
+the exact organization and Space with `--deactivate` first: without `--apply`
+it plans only, and with `--apply` it appends the inactive activation transition
+only. Then run ordinary admission separately to converge the narrower base
+catalog. This explicit two-command order uses the existing authority chain;
+`--apply` alone never implicitly deactivates a whole Space.
+
 ## Integration cutover order
 
 There are two distinct starting states. Do not use the existing-Worker

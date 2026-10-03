@@ -34,7 +34,6 @@ import type {
   FormAuthorityPlan,
   FormAuthorityPlanRequest,
 } from "../src/takoform/host-admission-coordinator.ts";
-import { HostAdmissionCoordinatorError } from "../src/takoform/host-admission-coordinator.ts";
 import {
   createSelfhostProductionFormAuthorityComposition,
   deriveSelfhostFormAuthorityCatalog,
@@ -75,6 +74,8 @@ export interface SelfhostFormAdmissionOptions {
   readonly hostId: string;
   readonly coreVerifierUrl: string;
   readonly apply: boolean;
+  /** Explicitly deactivate the selected Space before contracting support. */
+  readonly deactivate?: boolean;
   readonly sql: Sql;
   readonly objects: ObjectStore;
   /**
@@ -195,38 +196,15 @@ export async function runSelfhostFormAdmission(
       kind: "space",
       tenantId: options.organizationId,
       space: options.space,
-      desiredActive: true,
+      desiredActive: options.deactivate !== true,
     },
     evidence: closure.evidence,
     actor: "takoserver-selfhost-operator",
-    reason: `self-host admission of ${closure.identity.setTag} for ${options.organizationId}/${options.space}`,
+    reason: options.deactivate
+      ? `self-host deactivation of ${closure.identity.setTag} for ${options.organizationId}/${options.space}`
+      : `self-host admission of ${closure.identity.setTag} for ${options.organizationId}/${options.space}`,
   };
-  let plan: FormAuthorityPlan;
-  try {
-    plan = await composition.endpoint.plan(request);
-  } catch (error) {
-    if (
-      options.actorRuntime ||
-      !(error instanceof HostAdmissionCoordinatorError) ||
-      error.code !== "authority_state_conflict" ||
-      error.message !==
-        "active Form package has no current implementation entry; explicitly deactivate it before removal"
-    )
-      throw error;
-    // The coordinator intentionally requires an explicit inactive transition
-    // before a previously active Form disappears from the implementation.
-    // A dry run reports that transition; an authorized apply completes it
-    // before planning the narrower active profile. If the latter fails, the
-    // authority remains inactive rather than serving stale Actor support.
-    const deactivate = await composition.endpoint.plan({
-      ...request,
-      activation: { ...request.activation, desiredActive: false },
-      reason: `self-host implementation contraction for ${options.organizationId}/${options.space}`,
-    });
-    if (!options.apply) return { plan: deactivate, applied: null };
-    await composition.endpoint.apply(deactivate);
-    plan = await composition.endpoint.plan(request);
-  }
+  const plan = await composition.endpoint.plan(request);
   if (!options.apply) return { plan, applied: null };
   const applied = await composition.endpoint.apply(plan);
   return { plan, applied };
@@ -251,7 +229,7 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
   const [organizationId, space] = positional;
   if (!organizationId || !space) {
     process.stderr.write(
-      "usage: selfhost-form-admission.ts <organizationId> <space> [--apply] [--data-root DIR] [--host-id ORIGIN] [--core-verifier URL]\n",
+      "usage: selfhost-form-admission.ts <organizationId> <space> [--apply] [--deactivate] [--data-root DIR] [--host-id ORIGIN] [--core-verifier URL]\n",
     );
     process.exit(2);
   }
@@ -433,6 +411,7 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
       hostId: flag("host-id") ?? process.env.TAKOSERVER_PUBLIC_ORIGIN ?? "http://localhost:8787",
       coreVerifierUrl: flag("core-verifier") ?? "http://127.0.0.1:8080",
       apply: args.includes("--apply"),
+      deactivate: args.includes("--deactivate"),
       sql,
       objects,
       provider,
