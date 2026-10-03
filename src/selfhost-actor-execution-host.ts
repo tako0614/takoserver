@@ -1,5 +1,15 @@
 import { createHash, randomBytes, randomInt } from "node:crypto";
-import { link, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type { ActorResourceGraph, ActorResourceGraphReader } from "./actor-resource-graph.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
@@ -92,6 +102,13 @@ export function createSelfhostActorExecutionHost(options: {
     createHash("sha256")
       .update(JSON.stringify([tenantId, uid]))
       .digest("hex");
+  const validScope = (scope: ActorScope): boolean =>
+    typeof scope.tenantId === "string" &&
+    scope.tenantId.length > 0 &&
+    scope.tenantId.length <= 256 &&
+    !scope.tenantId.includes("\u0000") &&
+    typeof scope.namespaceResourceUid === "string" &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u.test(scope.namespaceResourceUid);
   const registrationPath = (key: string): string => join(registrations, `${key}.json`);
   const persistScope = async (key: string, scope: ActorScope): Promise<void> => {
     await mkdir(registrations, { recursive: true, mode: 0o700 });
@@ -609,6 +626,92 @@ export function createSelfhostActorExecutionHost(options: {
     ready,
     coldStartFailures: (): readonly ActorColdStartFailure[] =>
       [...coldStartFailures.values()].map((failure) => ({ ...failure })),
+    async registerNamespace(scope: ActorScope): Promise<void> {
+      await ready;
+      if (stopped || !validScope(scope)) {
+        throw new Error("Actor namespace unavailable");
+      }
+      const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
+      let owner = owners.get(key);
+      if (!owner) {
+        owner = { tail: Promise.resolve(), locked: false };
+        owners.set(key, owner);
+      }
+      await exclusive(owner, async () => {
+        if (stopped) throw new Error("Actor owner stopped");
+        await persistScope(key, { ...scope });
+      });
+    },
+    async hasNamespace(scope: ActorScope): Promise<boolean> {
+      await ready;
+      if (!validScope(scope)) return false;
+      const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
+      let raw: string;
+      try {
+        raw = await readFile(registrationPath(key), "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+      if (
+        raw !==
+        JSON.stringify({
+          tenantId: scope.tenantId,
+          namespaceResourceUid: scope.namespaceResourceUid,
+        })
+      ) {
+        throw new Error("Actor namespace registration changed");
+      }
+      return true;
+    },
+    async forgetNamespace(scope: ActorScope): Promise<void> {
+      await ready;
+      if (stopped || !validScope(scope)) {
+        throw new Error("Actor namespace unavailable");
+      }
+      const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
+      const owner = owners.get(key);
+      const forget = async (): Promise<void> => {
+        if (owner) await retire(owner);
+        // A lease left by another Host process is not permission to destroy its data.
+        if (!owner?.locked) {
+          try {
+            await lstat(join(options.storageRoot, "leases", key));
+            throw new Error("Actor namespace lease unavailable");
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+        }
+        if (owner?.locked) {
+          await rm(join(options.storageRoot, "leases", key), { recursive: true });
+          owner.locked = false;
+        }
+        let registered = false;
+        try {
+          const raw = await readFile(registrationPath(key), "utf8");
+          if (
+            raw !==
+            JSON.stringify({
+              tenantId: scope.tenantId,
+              namespaceResourceUid: scope.namespaceResourceUid,
+            })
+          ) {
+            throw new Error("Actor namespace registration changed");
+          }
+          registered = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        if (registered) {
+          await unlink(registrationPath(key));
+        }
+        await rm(join(options.storageRoot, "namespaces", key), { recursive: true, force: true });
+        coldStartFailures.delete(key);
+        owners.delete(key);
+      };
+      if (owner) await exclusive(owner, forget);
+      else await forget();
+    },
     async fetch(scope: ActorScope & { readonly id: string }, request: Request): Promise<Response> {
       if (!scope.id || scope.id.includes("\u0000")) throw new Error("Actor namespace unavailable");
       await ready;
