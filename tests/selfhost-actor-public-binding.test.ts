@@ -248,6 +248,7 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
   const versionOffering = offering("WorkerVersion");
   const tenantId = "tenant-one";
   const workerUid = "uid-worker-caller-one";
+  const actorWorkerUid = "uid-worker-class-holder-one";
   const actorUid = "uid-actor-counter-one";
   const versionUid = "uid-version-caller-one";
   const address = (kind: string, name: string) => ({
@@ -279,8 +280,8 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
       className: "Counter",
     },
     worker: {
-      ...metadata(workerUid, "caller"),
-      address: address("ModuleWorker", "caller"),
+      ...metadata(actorWorkerUid, "class-holder"),
+      address: address("ModuleWorker", "class-holder"),
       formRef: workerForm.identity.formRef,
     },
   };
@@ -341,6 +342,13 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
     spec: {},
   });
   if (worker.phase !== "succeeded") throw new Error("Worker creation failed");
+  const holder = await provider.apply({
+    operationId: "op-actor-class-holder",
+    offering: offering("ModuleWorker"),
+    identity: { tenantRef: tenantId, space: "default", name: "class-holder", uid: actorWorkerUid },
+    spec: {},
+  });
+  if (holder.phase !== "succeeded") throw new Error("Actor class-holder creation failed");
   const script = String(worker.result.outputs.scriptName);
   const workerRelation = {
     pointer: "/worker",
@@ -364,7 +372,7 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
     bindingRef: actorBindingRef,
     resource: resource("ActorNamespace", actorUid, "counter", {
       className: "Counter",
-      worker: { apiVersion: "edge.forms.takoform.com", kind: "ModuleWorker", name: "caller" },
+      worker: { apiVersion: "edge.forms.takoform.com", kind: "ModuleWorker", name: "class-holder" },
     }),
     deployment: deployed(actorUid, "ActorNamespace", `selfhost-actor:${actorUid}`, {}),
   };
@@ -434,7 +442,7 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
         name: "COUNTER",
         tenantId,
         namespaceResourceUid: actorUid,
-        workerResourceUid: workerUid,
+        workerResourceUid: actorWorkerUid,
         className: "Counter",
       },
     ]);
@@ -448,6 +456,20 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
     });
     expect(token).toMatch(/^[0-9a-f]{64}$/u);
     expect(token).not.toBe(raw.eventToken);
+    expect(
+      deriveSelfhostActorForwardToken({
+        eventToken: String(raw.eventToken),
+        workerVersionResourceUid: versionUid,
+        binding: { ...actorBinding, workerResourceUid: workerUid },
+      }),
+    ).not.toBe(token);
+    expect(
+      deriveSelfhostActorForwardToken({
+        eventToken: String(raw.eventToken),
+        workerVersionResourceUid: versionUid,
+        binding: { ...actorBinding, className: "Other" },
+      }),
+    ).not.toBe(token);
     expect(
       deriveSelfhostActorForwardToken({
         eventToken: String(raw.eventToken),

@@ -30,6 +30,8 @@ export function deriveSelfhostActorForwardToken(input: {
     input.workerVersionResourceUid,
     binding.namespaceResourceUid,
     binding.name,
+    binding.workerResourceUid,
+    binding.className,
   ]);
   return createHmac("sha256", key).update(message, "utf8").digest("hex");
 }
