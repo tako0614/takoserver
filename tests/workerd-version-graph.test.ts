@@ -208,6 +208,34 @@ test("compiles the opt-in Actor forward outer Host entrypoint without changing t
   expect(source(graph.hostModules.get(innerModule))).toContain('"name":"ROOM","type":"json"');
 });
 
+test("compiles the released maximum of 64 distinct Actor forward bindings", () => {
+  const actorForward = Array.from({ length: 64 }, (_, index) => ({
+    publicName: `ROOM_${index}`,
+    tenantId: "tenant-actor-1",
+    namespaceResourceUid: `actor-namespace-${index.toString().padStart(3, "0")}`,
+    token: SERVICE_TOKEN,
+  }));
+
+  const graph = compileWorkerdVersionGraph(graphInput({ actorForward }));
+
+  expect(graph.site.actorForward?.bindings).toHaveLength(64);
+  expect(() =>
+    compileWorkerdVersionGraph(
+      graphInput({
+        actorForward: [
+          ...actorForward,
+          {
+            publicName: "ROOM_64",
+            tenantId: "tenant-actor-1",
+            namespaceResourceUid: "actor-namespace-064",
+            token: SERVICE_TOKEN,
+          },
+        ],
+      }),
+    ),
+  ).toThrow(TypeError);
+});
+
 test("rejects malformed and colliding Actor forward projections", () => {
   const binding = {
     publicName: "ROOM",
@@ -223,7 +251,7 @@ test("rejects malformed and colliding Actor forward projections", () => {
     { actorForward: [{ ...binding, token: "not-a-token" }] },
     { actorForward: [{ ...binding }, { ...binding }] },
     {
-      actorForward: Array.from({ length: 33 }, (_, index) => ({
+      actorForward: Array.from({ length: 65 }, (_, index) => ({
         ...binding,
         publicName: `ROOM_${index}`,
         namespaceResourceUid: `actor-namespace-${index.toString().padStart(3, "0")}`,

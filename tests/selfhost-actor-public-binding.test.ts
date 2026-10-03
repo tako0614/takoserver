@@ -566,6 +566,95 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
         ).text(),
       ),
     ).toEqual(raw);
+    const publishedBindings = Array.from({ length: 64 }, (_, index) => ({
+      name: `COUNTER_${index}`,
+      resource: {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "ActorNamespace",
+        name: "counter",
+      },
+    }));
+    const many = {
+      ...request,
+      operationId: "op-actor-version-sixty-four",
+      identity: {
+        ...request.identity,
+        name: "caller-v64",
+        uid: "uid-version-sixty-four",
+      },
+      spec: { ...request.spec, actorBindings: publishedBindings },
+      relations: [
+        workerRelation,
+        bundleRelation,
+        ...publishedBindings.map((_, index) => ({
+          ...actorRelation,
+          pointer: `/actorBindings/${index}/resource`,
+        })),
+      ],
+    };
+    const acceptedBound = await provider.apply(many);
+    expect(acceptedBound).toMatchObject({ phase: "succeeded" });
+    if (acceptedBound.phase !== "succeeded") throw new Error("64 Actor bindings not materialized");
+    const acceptedVersionId = String(acceptedBound.result.outputs.versionId);
+    const acceptedBytes = JSON.parse(
+      await Bun.file(join(bindingPath, `${acceptedVersionId}.json`)).text(),
+    ) as Record<string, unknown>;
+    expect((acceptedBytes.actorBindings as unknown[]).length).toBe(64);
+    const boundDeployment = await provider.apply({
+      ...deploymentRequest,
+      operationId: "op-actor-deployment-sixty-four",
+      identity: {
+        ...deploymentRequest.identity,
+        name: "caller-deployment-v64",
+        uid: "uid-caller-deployment-sixty-four",
+      },
+      spec: {
+        ...deploymentRequest.spec,
+        versions: [
+          {
+            workerVersion: {
+              apiVersion: "edge.forms.takoform.com",
+              kind: "WorkerVersion",
+              name: "caller-v64",
+            },
+            weight: 10000,
+          },
+        ],
+      },
+      relations: [
+        workerRelation,
+        {
+          pointer: "/versions/0/workerVersion",
+          relation: "/versions/*/workerVersion",
+          targetUid: many.identity.uid,
+          resource: resource("WorkerVersion", many.identity.uid, many.identity.name, many.spec),
+          deployment: deployed(
+            many.identity.uid,
+            "WorkerVersion",
+            acceptedBound.result.nativeId,
+            acceptedBound.result.outputs,
+          ),
+        },
+      ],
+    });
+    expect(boundDeployment).toMatchObject({ phase: "succeeded" });
+    expect((await scriptState.read(script)).state.deployment?.versions).toEqual([
+      { versionId: acceptedVersionId, weight: 10000, workerVersionUid: many.identity.uid },
+    ]);
+    const beforeOverbound = await readdir(bindingPath);
+    expect(
+      await provider.apply({
+        ...many,
+        operationId: "op-actor-version-sixty-five",
+        identity: { ...many.identity, name: "caller-v65", uid: "uid-version-sixty-five" },
+        spec: {
+          ...many.spec,
+          actorBindings: [...publishedBindings, { ...publishedBindings[0], name: "COUNTER_64" }],
+        },
+        relations: [...many.relations, { ...actorRelation, pointer: "/actorBindings/64/resource" }],
+      }),
+    ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+    expect(await readdir(bindingPath)).toEqual(beforeOverbound);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

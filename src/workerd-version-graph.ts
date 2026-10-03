@@ -393,7 +393,7 @@ function projectActorForward(
   actorForward: WorkerdVersionGraphInput["actorForward"],
 ): WorkerdActorForward | undefined {
   if (actorForward === undefined) return undefined;
-  if (!Array.isArray(actorForward) || actorForward.length === 0 || actorForward.length > 32)
+  if (!Array.isArray(actorForward) || actorForward.length === 0 || actorForward.length > 64)
     invalid();
   const names = new Set<string>();
   const bindings: WorkerdActorForwardBinding[] = actorForward.map((binding, index) => {
