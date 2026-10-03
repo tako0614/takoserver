@@ -35,6 +35,36 @@ export interface QueueEventMessage {
   readonly attempts: number;
 }
 
+export interface QueueEventProxyObservation {
+  readonly messageId: string;
+  readonly attempts: number;
+  readonly status: number;
+  readonly acknowledged: boolean;
+  readonly withheld: boolean;
+}
+
+export interface QueueEventProxySnapshot {
+  readonly receivedCount: number;
+  readonly observations: readonly QueueEventProxyObservation[];
+}
+
+export interface QueueEventProxyOptions {
+  readonly upstreamOrigin: string;
+  readonly upstreamCa: string;
+  readonly upstreamFetch?: QueueEventProxyFetch;
+  readonly withholdFirstAcknowledgement?: boolean;
+}
+
+export type QueueEventProxyFetch = (
+  input: RequestInfo | URL,
+  init?: BunFetchRequestInit,
+) => Promise<Response>;
+
+export interface QueueEventProxy {
+  handle(request: Request): Promise<Response>;
+  snapshot(): QueueEventProxySnapshot;
+}
+
 export function readQueueEventMessages(body: string): readonly QueueEventMessage[] {
   if (body.length > 1_048_576) return [];
   let parsed: unknown;
@@ -89,6 +119,88 @@ export function isAcknowledgedQueueResponse(
     decision.outcome === "ack" &&
     Object.keys(decision).length === 2
   );
+}
+
+/**
+ * The response-loss fixture's exact event forwarding seam.
+ *
+ * Receipt and completed-response observations are intentionally separate:
+ * the former proves the exact route matched, while the latter proves upstream
+ * TLS, handler completion, and ACK parsing all returned.
+ */
+export function createQueueEventProxy(options: QueueEventProxyOptions): QueueEventProxy {
+  const upstreamFetch =
+    options.upstreamFetch ?? (globalThis.fetch.bind(globalThis) as QueueEventProxyFetch);
+  const upstreamServerName = new URL(options.upstreamOrigin).hostname;
+  const withholdFirstAcknowledgement = options.withholdFirstAcknowledgement !== false;
+  const observations: QueueEventProxyObservation[] = [];
+  let receivedCount = 0;
+  let firstAcknowledgementWithheld = false;
+
+  return {
+    async handle(request) {
+      const url = new URL(request.url);
+      if (request.method === "GET" && url.pathname === "/__test/status") {
+        return Response.json({ receivedCount, observations });
+      }
+      if (
+        request.method !== "POST" ||
+        url.pathname !== SELFHOST_QUEUE_EVENT_PATH ||
+        !isWorkerEventsHost(request.headers.get("host"))
+      ) {
+        return new Response(null, { status: 404 });
+      }
+      receivedCount += 1;
+      const bodyBytes = await request.arrayBuffer();
+      const body = new TextDecoder().decode(bodyBytes);
+      const [message] = readQueueEventMessages(body);
+      if (!message) return new Response(null, { status: 400 });
+      const response = await upstreamFetch(
+        `${options.upstreamOrigin}${url.pathname}${url.search}`,
+        {
+          method: "POST",
+          headers: request.headers,
+          body: bodyBytes,
+          tls: {
+            ca: options.upstreamCa,
+            rejectUnauthorized: true,
+            serverName: upstreamServerName,
+          },
+        },
+      );
+      const responseBody = await response.text();
+      const acknowledged = isAcknowledgedQueueResponse(
+        response.status,
+        responseBody,
+        message.messageId,
+      );
+      const withheld =
+        withholdFirstAcknowledgement && acknowledged && !firstAcknowledgementWithheld;
+      observations.push({
+        messageId: message.messageId,
+        attempts: message.attempts,
+        status: response.status,
+        acknowledged,
+        withheld,
+      });
+      if (withheld) {
+        firstAcknowledgementWithheld = true;
+        // The test stops the Host process while its HTTP response is still
+        // pending. It never fabricates an ACK or writes queue state itself.
+        await new Promise<void>(() => {});
+      }
+      return new Response(responseBody, {
+        status: response.status,
+        headers: { "content-type": response.headers.get("content-type") ?? "application/json" },
+      });
+    },
+    snapshot() {
+      return {
+        receivedCount,
+        observations: observations.map((observation) => ({ ...observation })),
+      };
+    },
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -147,68 +259,14 @@ if (mode === "proxy") {
   ) {
     throw new Error("queue response-loss proxy fixture configuration is invalid");
   }
-  const nativeFetch = globalThis.fetch.bind(globalThis);
-  const observations: {
-    readonly messageId: string;
-    readonly attempts: number;
-    readonly status: number;
-    readonly acknowledged: boolean;
-    readonly withheld: boolean;
-  }[] = [];
-  let firstAcknowledgementWithheld = false;
+  const proxy = createQueueEventProxy({
+    upstreamOrigin,
+    upstreamCa: readFileSync(upstreamCaFile, "utf8"),
+  });
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    async fetch(request) {
-      const url = new URL(request.url);
-      if (request.method === "GET" && url.pathname === "/__test/status") {
-        return Response.json({ observations });
-      }
-      if (
-        request.method !== "POST" ||
-        url.pathname !== SELFHOST_QUEUE_EVENT_PATH ||
-        !isWorkerEventsHost(request.headers.get("host"))
-      ) {
-        return new Response(null, { status: 404 });
-      }
-      const bodyBytes = await request.arrayBuffer();
-      const body = new TextDecoder().decode(bodyBytes);
-      const [message] = readQueueEventMessages(body);
-      if (!message) return new Response(null, { status: 400 });
-      const response = await nativeFetch(`${upstreamOrigin}${url.pathname}${url.search}`, {
-        method: "POST",
-        headers: request.headers,
-        body: bodyBytes,
-        tls: {
-          ca: readFileSync(upstreamCaFile, "utf8"),
-          rejectUnauthorized: true,
-        },
-      });
-      const responseBody = await response.text();
-      const acknowledged = isAcknowledgedQueueResponse(
-        response.status,
-        responseBody,
-        message.messageId,
-      );
-      const withheld = acknowledged && !firstAcknowledgementWithheld;
-      observations.push({
-        messageId: message.messageId,
-        attempts: message.attempts,
-        status: response.status,
-        acknowledged,
-        withheld,
-      });
-      if (withheld) {
-        firstAcknowledgementWithheld = true;
-        // The test stops the Host process while its HTTP response is still
-        // pending. It never fabricates an ACK or writes queue state itself.
-        await new Promise<void>(() => {});
-      }
-      return new Response(responseBody, {
-        status: response.status,
-        headers: { "content-type": response.headers.get("content-type") ?? "application/json" },
-      });
-    },
+    fetch: (request) => proxy.handle(request),
   });
   writeFileSync(readyFile, String(server.port), { mode: 0o600 });
   process.on("SIGTERM", () => {
