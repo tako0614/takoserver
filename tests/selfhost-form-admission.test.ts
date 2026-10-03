@@ -17,7 +17,10 @@ import {
   openSelfhostActorPublicRuntime,
   type SelfhostActorPublicRuntime,
 } from "../src/selfhost-actor-public-runtime.ts";
-import { SELFHOST_IDENTITY_CAPABILITY_KINDS } from "../src/selfhost-composition.ts";
+import {
+  hasExactSelfhostActorClosure,
+  SELFHOST_IDENTITY_CAPABILITY_KINDS,
+} from "../src/selfhost-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStandaloneProviderComposition } from "../src/standalone-provider-composition.ts";
 import { createTakoformArtifacts } from "../src/takoform/artifacts.ts";
@@ -239,6 +242,40 @@ function countDistinctFormRefs(database: Database, table: string): number {
 }
 
 describe("self-host Form admission", () => {
+  test("a partial released Actor closure selects the base support profile before owner construction", () => {
+    const released = currentTakoformCandidates();
+    expect(
+      hasExactSelfhostActorClosure({
+        stableForms: released.forms,
+        stableBindings: released.bindings,
+      }),
+    ).toBe(true);
+    expect(
+      hasExactSelfhostActorClosure({
+        stableForms: released.forms.filter(
+          (form) => form.identity.formRef.kind !== "WorkerVersion",
+        ),
+        stableBindings: released.bindings,
+      }),
+    ).toBe(false);
+    expect(
+      hasExactSelfhostActorClosure({
+        stableForms: released.forms,
+        stableBindings: released.bindings.map((binding) =>
+          canonicalJson(binding.bindingRef) === canonicalJson(SELFHOST_ACTOR_BINDING_REF)
+            ? {
+                ...binding,
+                bindingRef: {
+                  ...binding.bindingRef,
+                  schemaDigest: `sha256:${"0".repeat(64)}` as const,
+                },
+              }
+            : binding,
+        ),
+      }),
+    ).toBe(false);
+  });
+
   test("a restored local Actor owner admits the exact released namespace lifecycle", async () => {
     const fixture = dataRoot();
     let owner: SelfhostActorPublicRuntime | undefined;
@@ -361,6 +398,22 @@ describe("self-host Form admission", () => {
       expect(await fixture.sql.query("SELECT count(*) AS c FROM tf_form_support_events")).toEqual([
         { c: IMPLEMENTED + 1 },
       ]);
+      // A later source profile without an executable Actor owner must record
+      // the narrower implementation instead of leaving the old support live.
+      const reconverged = await runSelfhostFormAdmission({
+        organizationId: "org_actor_source",
+        space: "default",
+        hostId: "http://localhost:8787",
+        coreVerifierUrl: "http://127.0.0.1:1",
+        apply: true,
+        sql: fixture.sql,
+        objects: fixture.objects,
+        provider,
+        fetch: verifier.fetch,
+      });
+      expect(
+        reconverged.applied?.readback.forms.find((form) => form.formRef.kind === "ActorNamespace"),
+      ).toMatchObject({ installed: true, supported: false });
     } finally {
       await owner?.close();
       fixture.close();
