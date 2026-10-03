@@ -366,10 +366,11 @@ describe("internal Workflow execution coordinator", () => {
     await bothReadWait.promise;
     releaseWaitReads.resolve();
     await Promise.all([firstSend, secondSend]);
+    expect(acceptedOrder).toHaveLength(2);
 
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
       kind: "complete",
-      output: { first: acceptedOrder[0], second: acceptedOrder[1] },
+      output: { first: acceptedOrder[0] ?? null, second: acceptedOrder[1] ?? null },
     });
   });
 
