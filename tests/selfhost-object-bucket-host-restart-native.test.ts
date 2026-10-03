@@ -100,6 +100,10 @@ function observeJourneyDiagnostic(
   }
 }
 
+function elapsedMilliseconds(startedAt: number): number {
+  return Math.max(0, Math.round(performance.now() - startedAt));
+}
+
 async function runObservedOperation<T>(
   phase: JourneyPhase,
   operation: Exclude<JourneyDiagnosticOperation, "request">,
