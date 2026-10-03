@@ -99,6 +99,26 @@ interface ProxyObservation {
   readonly withheld: boolean;
 }
 
+type WorkerRequestStage =
+  | "request_started"
+  | "tcp_connected"
+  | "tls_connected"
+  | "response_headers"
+  | "response_complete";
+
+interface WorkerRequestObservation {
+  readonly phase: WorkerRequestStage | "request_timeout" | "transport_error";
+  readonly lastReachedPhase: WorkerRequestStage;
+  readonly elapsedMs: number;
+}
+
+interface WorkerEndpointFacts {
+  readonly https: boolean;
+  readonly configuredPort: boolean;
+  readonly suffixMatch: boolean;
+  readonly wildcardSanMatch: boolean;
+}
+
 test("the queue response-loss fixture selects only the exact local Workerd event POST", () => {
   const target = {
     origin: "https://127.0.0.1",
@@ -274,6 +294,128 @@ test("API failure diagnostics expose only bounded stable error codes", async () 
     ),
   ).toBe("invalid_argument");
   expect(await boundedApiErrorCode(new Response(new Uint8Array(4_097).fill(65)))).toBe("unknown");
+});
+
+test("worker HTTPS request observations are bounded, fail-open, and use a real local TLS call", async () => {
+  const fixture = mkdtempSync(join(tmpdir(), "queue-worker-request-observation-"));
+  let stopServer: (() => void | Promise<void>) | undefined;
+  try {
+    chmodSync(fixture, 0o700);
+    const tls = await createTls(fixture);
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      tls: { cert: tls.certificateChain, key: tls.privateKey },
+      fetch: () => new Response("ready"),
+    });
+    stopServer = () => server.stop(true);
+    const port = server.port;
+    if (port === undefined) throw new Error("queue_worker_request_tls_fixture_unbound");
+    const hostname = `queue-worker.${WORKER_SUFFIX}`;
+    expect(workerEndpointFacts(new URL(`https://${hostname}/`), WORKER_SUFFIX)).toEqual({
+      https: true,
+      configuredPort: true,
+      suffixMatch: true,
+      wildcardSanMatch: true,
+    });
+    const observations: WorkerRequestObservation[] = [];
+    const response = await workerRequest(
+      hostname,
+      "/",
+      tls.certificateChain,
+      "GET",
+      port,
+      (observation) => {
+        observations.push(observation);
+        throw new Error("observer_failure_must_be_ignored");
+      },
+    );
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("ready");
+    expect(observations.map((entry) => entry.phase)).toEqual([
+      "request_started",
+      "tcp_connected",
+      "tls_connected",
+      "response_headers",
+      "response_complete",
+    ]);
+    expect(observations.map((entry) => entry.lastReachedPhase)).toEqual([
+      "request_started",
+      "tcp_connected",
+      "tls_connected",
+      "response_headers",
+      "response_complete",
+    ]);
+    expect(observations.every((entry) => entry.elapsedMs >= 0 && entry.elapsedMs <= 60_000)).toBe(
+      true,
+    );
+    expect(JSON.stringify(observations)).not.toContain(hostname);
+    expect(JSON.stringify(observations)).not.toContain("ready");
+  } finally {
+    try {
+      await stopServer?.();
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
+});
+
+test("worker HTTPS timeout records the last real TLS phase without leaking transport detail", async () => {
+  const fixture = mkdtempSync(join(tmpdir(), "queue-worker-request-timeout-"));
+  let stopServer: (() => void | Promise<void>) | undefined;
+  try {
+    chmodSync(fixture, 0o700);
+    const tls = await createTls(fixture);
+    let requestArrived = false;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      tls: { cert: tls.certificateChain, key: tls.privateKey },
+      fetch: () => {
+        requestArrived = true;
+        return new Promise<Response>(() => {});
+      },
+    });
+    stopServer = () => server.stop(true);
+    const port = server.port;
+    if (port === undefined) throw new Error("queue_worker_request_timeout_tls_fixture_unbound");
+    const hostname = `queue-worker.${WORKER_SUFFIX}`;
+    const observations: WorkerRequestObservation[] = [];
+    let failure: unknown;
+    try {
+      await workerRequest(hostname, "/", tls.certificateChain, "GET", port, (observation) => {
+        observations.push(observation);
+        throw new Error("observer_failure_must_be_ignored");
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(requestArrived).toBe(true);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("worker_https_request_timeout");
+    expect(observations.map((entry) => entry.phase)).toEqual([
+      "request_started",
+      "tcp_connected",
+      "tls_connected",
+      "request_timeout",
+    ]);
+    expect(observations.at(-1)).toMatchObject({
+      phase: "request_timeout",
+      lastReachedPhase: "tls_connected",
+    });
+    expect(observations.every((entry) => entry.elapsedMs >= 0 && entry.elapsedMs <= 60_000)).toBe(
+      true,
+    );
+    expect(JSON.stringify(observations)).not.toContain(hostname);
+    expect(JSON.stringify(observations)).not.toContain("observer_failure");
+  } finally {
+    try {
+      await stopServer?.();
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
 });
 
 // Native-only: fixed loopback 8787/8080/443 belong in an isolated network namespace.
@@ -546,11 +688,19 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
         retryDelaySeconds: 1,
       });
       const endpointUrl = new URL(outputAt(endpoint, "url"));
+      reportWorkerEndpointFacts(workerEndpointFacts(endpointUrl, WORKER_SUFFIX));
       expect(endpointUrl.protocol).toBe("https:");
       expect(endpointUrl.port).toBe("");
       const hostname = endpointUrl.hostname;
       const requestWorker = (path: string, method = "GET") =>
-        workerRequest(hostname, path, tls.certificateChain, method);
+        workerRequest(
+          hostname,
+          path,
+          tls.certificateChain,
+          method,
+          WORKERD_PORT,
+          path === "/" ? reportWorkerRequestObservation : undefined,
+        );
       const ready = await requestWorker("/");
       expect(ready.status).toBe(200);
       await ready.arrayBuffer();
@@ -1296,12 +1446,51 @@ async function workerRequest(
   path: string,
   ca: string,
   method = "GET",
+  port = WORKERD_PORT,
+  observe?: (observation: WorkerRequestObservation) => void,
 ): Promise<Response> {
   return new Promise((resolve, reject) => {
+    const startedAt = performance.now();
+    let lastReachedPhase: WorkerRequestStage = "request_started";
+    let observations = 0;
+    let terminal = false;
+    const record = (phase: WorkerRequestObservation["phase"]): void => {
+      if (!observe || terminal || observations >= 6) return;
+      observations += 1;
+      if (
+        phase === "tcp_connected" ||
+        phase === "tls_connected" ||
+        phase === "response_headers" ||
+        phase === "response_complete"
+      ) {
+        lastReachedPhase = phase;
+      }
+      const elapsed = performance.now() - startedAt;
+      const observation: WorkerRequestObservation = {
+        phase,
+        lastReachedPhase,
+        elapsedMs: Number.isFinite(elapsed)
+          ? Math.min(60_000, Math.max(0, Math.round(elapsed)))
+          : 0,
+      };
+      try {
+        observe(observation);
+      } catch {
+        // Request-stage diagnostics are best-effort and never affect the request.
+      }
+      if (
+        phase === "response_complete" ||
+        phase === "request_timeout" ||
+        phase === "transport_error"
+      ) {
+        terminal = true;
+      }
+    };
+    record("request_started");
     const request = httpsRequest(
       {
         hostname: "127.0.0.1",
-        port: WORKERD_PORT,
+        port,
         servername: hostname,
         path,
         method,
@@ -1309,18 +1498,68 @@ async function workerRequest(
         headers: { host: hostname },
       },
       (response) => {
+        record("response_headers");
         const chunks: Buffer[] = [];
         response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-        response.on("error", reject);
-        response.on("end", () =>
-          resolve(new Response(Buffer.concat(chunks), { status: response.statusCode ?? 500 })),
-        );
+        response.on("error", (error) => {
+          record("transport_error");
+          reject(error);
+        });
+        response.on("end", () => {
+          record("response_complete");
+          resolve(new Response(Buffer.concat(chunks), { status: response.statusCode ?? 500 }));
+        });
       },
     );
-    request.setTimeout(2_000, () => request.destroy(new Error("worker_https_request_timeout")));
-    request.on("error", reject);
+    request.once("socket", (socket) => {
+      socket.once("connect", () => record("tcp_connected"));
+      socket.once("secureConnect", () => record("tls_connected"));
+    });
+    request.setTimeout(2_000, () => {
+      record("request_timeout");
+      request.destroy(new Error("worker_https_request_timeout"));
+    });
+    request.on("error", (error) => {
+      record("transport_error");
+      reject(error);
+    });
     request.end();
   });
+}
+
+function workerEndpointFacts(endpoint: URL, suffix: string): WorkerEndpointFacts {
+  const hostname = endpoint.hostname.toLowerCase();
+  const normalizedSuffix = suffix.toLowerCase();
+  const suffixMatch = hostname === normalizedSuffix || hostname.endsWith(`.${normalizedSuffix}`);
+  const prefix = hostname.endsWith(`.${normalizedSuffix}`)
+    ? hostname.slice(0, -(normalizedSuffix.length + 1))
+    : "";
+  return {
+    https: endpoint.protocol === "https:",
+    configuredPort: endpoint.port === "" || endpoint.port === String(WORKERD_PORT),
+    suffixMatch,
+    wildcardSanMatch: prefix.length > 0 && !prefix.includes("."),
+  };
+}
+
+function reportWorkerEndpointFacts(facts: WorkerEndpointFacts): void {
+  try {
+    console.log(
+      `[selfhost-queue-endpoint] https=${facts.https} configured_port=${facts.configuredPort} suffix_match=${facts.suffixMatch} wildcard_san_match=${facts.wildcardSanMatch}`,
+    );
+  } catch {
+    // Endpoint diagnostics are best-effort and never affect the journey.
+  }
+}
+
+function reportWorkerRequestObservation(observation: WorkerRequestObservation): void {
+  try {
+    console.log(
+      `[selfhost-queue-worker-request] phase=${observation.phase} last_reached=${observation.lastReachedPhase} elapsed_ms=${observation.elapsedMs}`,
+    );
+  } catch {
+    // Request-stage diagnostics are best-effort and never affect the request.
+  }
 }
 
 async function readSeen(
