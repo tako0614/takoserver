@@ -337,8 +337,10 @@ function persistedState(value: unknown, requireCanonicalDeployment: boolean): Se
     throw new SelfhostScriptStateStoreError("corrupt");
   }
   const consumers = persistedConsumers(parsed.consumers);
-  const cronOwners = parsed.cronOwners === undefined ? undefined : persistedCronOwners(parsed.cronOwners);
-  const crons = cronOwners === undefined ? persistedCrons(parsed.crons) : cronExpressions(cronOwners);
+  const cronOwners =
+    parsed.cronOwners === undefined ? undefined : persistedCronOwners(parsed.cronOwners);
+  const crons =
+    cronOwners === undefined ? persistedCrons(parsed.crons) : cronExpressions(cronOwners);
   if (cronOwners !== undefined && parsed.crons !== undefined) {
     const serializedCrons = persistedCrons(parsed.crons);
     if (JSON.stringify(serializedCrons) !== JSON.stringify(crons)) {
