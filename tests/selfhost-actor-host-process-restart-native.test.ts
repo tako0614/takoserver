@@ -163,6 +163,33 @@ test("public Actor proxy preserves successful upstream headers and streamed body
   }
 });
 
+test.skipIf(process.platform !== "linux")(
+  "SIGTERM child completion is terminal for native-fixture cleanup",
+  async () => {
+    const child = Bun.spawn(
+      [process.execPath, "--no-env-file", "--eval", "setInterval(() => {}, 1_000)"],
+      {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      },
+    );
+    try {
+      const identity = processIdentity(child.pid);
+      child.kill("SIGTERM");
+      const exitStatus = await Promise.race([child.exited, Bun.sleep(2_000).then(() => null)]);
+
+      expect(exitStatus).toBe(143);
+      expect(child.exitCode).toBeNull();
+      expect(child.signalCode).toBe("SIGTERM");
+      expect(identityIsLive(identity)).toBe(false);
+      expect(childHasTerminated(child)).toBe(true);
+    } finally {
+      if (!childHasTerminated(child)) child.kill("SIGKILL");
+    }
+  },
+);
+
 test.skipIf(WORKERD === null)(
   "public Host routes a released Actor over HTTP/WSS and restores it after SIGTERM Host restarts",
   async () => {
@@ -651,17 +678,17 @@ test.skipIf(WORKERD === null)(
           cleanupFailures.push(label);
         }
       };
-      if (admission && admission.exitCode === null)
+      if (admission && !childHasTerminated(admission))
         await attemptCleanup("admission", () => stopOwnedWithIdentity(admission as Child));
-      if (host && host.exitCode === null)
+      if (host && !childHasTerminated(host))
         await attemptCleanup("host", () => stopOwnedWithIdentity(host as Child));
-      if (verifier && verifier.exitCode === null)
+      if (verifier && !childHasTerminated(verifier))
         await attemptCleanup("verifier", () => stopOwnedWithIdentity(verifier as Child));
       if (proxy) await attemptCleanup("proxy", () => closePublicApiProxy(proxy as PublicApiProxy));
       if (hostOutput)
         await attemptCleanup("host_output", () => (hostOutput as HostOutputObservation).drained);
       const childrenExited = [admission, host, verifier].every(
-        (child) => child === undefined || child.exitCode !== null,
+        (child) => child === undefined || childHasTerminated(child),
       );
       if (childrenExited) {
         try {
@@ -689,6 +716,10 @@ test.skipIf(WORKERD === null)(
             childExitCodes: {
               host: host?.exitCode ?? null,
               verifier: verifier?.exitCode ?? null,
+            },
+            childSignalCodes: {
+              host: host?.signalCode ?? null,
+              verifier: verifier?.signalCode ?? null,
             },
             hostIdentityStillLive: diagnosticHostIdentity
               ? identityIsLive(diagnosticHostIdentity)
@@ -1002,7 +1033,7 @@ function isTakoformDiscoveryBody(bytes: Uint8Array): boolean {
 }
 
 async function stopOwned(child: Child): Promise<void> {
-  if (child.exitCode !== null) return;
+  if (childHasTerminated(child)) return;
   child.kill("SIGTERM");
   const status = await Promise.race([child.exited, Bun.sleep(10_000).then(() => null)]);
   if (status === null) {
@@ -1010,6 +1041,11 @@ async function stopOwned(child: Child): Promise<void> {
     const killed = await Promise.race([child.exited, Bun.sleep(3_000).then(() => null)]);
     if (killed === null) throw new Error("actor_owned_process_did_not_exit");
   }
+  if (!childHasTerminated(child)) throw new Error("actor_owned_process_exit_status_missing");
+}
+
+function childHasTerminated(child: Child): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
 }
 
 async function stopOwnedWithIdentity(child: Child): Promise<void> {
