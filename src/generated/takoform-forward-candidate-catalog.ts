@@ -5,17 +5,17 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
   provenance: {
     classification: "unpublished-source-candidate",
     repository: "https://github.com/tako0614/takoform-forms.git",
-    repositoryCommit: "43b31a73e9255974b2bd06f0907d8cb5be17c3da",
-    sourceCommit: "43b31a73e9255974b2bd06f0907d8cb5be17c3da",
+    repositoryCommit: "41e4907c4d90d8c2b0a6a8e0fdcebc9e457e0212",
+    sourceCommit: "41e4907c4d90d8c2b0a6a8e0fdcebc9e457e0212",
     publicationStatus: "unpublished",
-    sourceTreeDigest: "sha256:b65d3d36899d4aa076c79b2100be650ec606b6d37ab5877a70c2684c30f23fce",
-    familyIndexSha256: "sha256:9f0cb14889cd20eaa856744bd0558649ae4c8a03be78ac2f25446cec2e6e02ed",
+    sourceTreeDigest: "sha256:1618a49cb6801eb0a5b347b2ea5c877021132b3cf10ec51d731d94926114bdf8",
+    familyIndexSha256: "sha256:c0d5273f24061a1c8c4627748d67c2accdd4f66e7e40deb27bd8d9fd1ec57917",
     familyCandidateSetSha256:
-      "sha256:d832cf5ba9e72df77e25a0d8d315fa56d88e28d1005ec0371e2b2afa6369718d",
+      "sha256:a87fc4cd6fcf243a9349ac3f8ea6676e9ad8c7ffb7e9ceff214f6d26186f0493",
     interfaceCandidateSetSha256:
-      "sha256:8a558115651e02a7d9b6d67895860482fe81ec992f6fbb404e81c286d9b463f0",
+      "sha256:cdeb55829ad662642ecd941f06df4d9674976f994296175583d4a2d9dc0af800",
     bindingCandidateSetSha256:
-      "sha256:472df4ef0d21b97e305a51ef4f42a83db31b1d76c9a32a00f5b387ef55922101",
+      "sha256:424a41be080ccd881274cb6da7ded7301484551c573c720d5c20f73507f49c56",
     familyCount: 1,
     formCount: 17,
     interfaceCount: 8,
@@ -28,21 +28,21 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
           apiVersion: "edge.forms.takoform.com",
           kind: "ModuleWorker",
           definitionVersion: "0.2.0",
-          schemaDigest: "sha256:f47672eaddb821c6c9c8fae88ebd6e683858afc2026c047ec3e509221cb2e3aa",
+          schemaDigest: "sha256:761180705a6f2a75fa0bc0061794a269342fafe0309c26ecd7530f12fcda1399",
         },
-        packageDigest: "sha256:e7970edea5206845a0f780c829c40d3af2451b019ffb11861602e676725ddcdf",
+        packageDigest: "sha256:a9909dd1ffb28a860c36b4d5bd35bcea89f233b926aa7a691fe2f8bca9dcddde",
       },
       displayName: "Module Worker",
       description:
-        "Long-lived logical identity of one ES Module Worker application. The Form fixes the ES Module Worker ABI by identity, and states it exactly: the runtime contract worker.runtime@1.2.0 in this Form's providedInterfaces fixes the module's default-export shape, the fetch, scheduled, and queue handler signatures, the binding environment, ctx.waitUntil, exception handling, body streaming, the minimum Web API surface, and module loading. A host supporting this Form implements that exact digest; a runtime that behaves differently is a different contract version and a different Form version, never a compatibility date. Code, configuration, and bindings live on Worker Version revisions; traffic selection lives on Worker Deployments.",
+        "Unpublished forward ModuleWorker whose exact worker.runtime@2.0.0 candidate ABI includes the existing default-object handler runtime and the Actor class/context extension. The worker identity remains the target of one active deployment; published ModuleWorker definitions retain their existing runtime contract and bytes.",
       requiresHostApi: "forms.takoform.com/v1",
       role: "identity",
       providedInterfaces: [
         {
           apiVersion: "interfaces.takoform.com/v1alpha1",
           name: "worker.runtime",
-          version: "1.2.0",
-          schemaDigest: "sha256:a3852fd29d798359e2c5ba53926875a195e8b6788f90f54fe14f19385b251d7f",
+          version: "2.0.0",
+          schemaDigest: "sha256:8c3fbdef49053c7522c55b9a540d03672c688b617404f23fa29e23b8dd57f37c",
         },
         {
           apiVersion: "interfaces.takoform.com/v1alpha1",
@@ -55,7 +55,7 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
         $schema: "https://json-schema.org/draft/2020-12/schema",
         additionalProperties: false,
         description:
-          "Long-lived logical identity of one ES Module Worker application. The Form fixes the ES Module Worker ABI by identity, and states it exactly: the runtime contract worker.runtime@1.2.0 in this Form's providedInterfaces fixes the module's default-export shape, the fetch, scheduled, and queue handler signatures, the binding environment, ctx.waitUntil, exception handling, body streaming, the minimum Web API surface, and module loading. A host supporting this Form implements that exact digest; a runtime that behaves differently is a different contract version and a different Form version, never a compatibility date. Code, configuration, and bindings live on Worker Version revisions; traffic selection lives on Worker Deployments.",
+          "Unpublished forward ModuleWorker whose exact worker.runtime@2.0.0 candidate ABI includes the existing default-object handler runtime and the Actor class/context extension. The worker identity remains the target of one active deployment; published ModuleWorker definitions retain their existing runtime contract and bytes.",
         properties: {},
         title: "Module Worker desired state",
         type: "object",
@@ -144,13 +144,13 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
           apiVersion: "edge.forms.takoform.com",
           kind: "WorkerVersion",
           definitionVersion: "0.4.0",
-          schemaDigest: "sha256:ca02670b227821d6640583803d5b7cbb7d6ae5639c70a2b277c4885f8cfa4c18",
+          schemaDigest: "sha256:ba59a72fb2c12aa6e9d09173943eb4bb8d2eadac25840d87356a25286007354b",
         },
-        packageDigest: "sha256:dea6963b0d86743c302e17c4437980aabb94180961109aade2ff35338921b600",
+        packageDigest: "sha256:d3a91e9567124c95794855fc73050354822486692d7b5debe7df794cf7a27565",
       },
       displayName: "Worker Version",
       description:
-        "Immutable executable snapshot of one Module Worker: a bundle, the handlers its module exports, non-secret vars, and the typed capability bindings the code may use. A change is a new Worker Version; traffic moves only through Worker Deployments. The runtime this code runs on is not a field of this Form: it is fixed by the worker.runtime@1.2.0 contract the Module Worker identity provides, so a version carries no compatibility date and no compatibility flag (decision 0019).",
+        "Immutable executable snapshot of one Module Worker: a bundle, the handlers its module exports, non-secret vars, and the typed capability bindings the code may use. A change is a new Worker Version; traffic moves only through Worker Deployments. The runtime this code runs on is not a field of this Form: it is fixed by the worker.runtime@2.0.0 contract the Module Worker identity provides, so a version carries no compatibility date and no compatibility flag (decision 0019).",
       requiresHostApi: "forms.takoform.com/v1",
       role: "revision",
       acceptedBindings: [
@@ -187,14 +187,14 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
         {
           apiVersion: "bindings.takoform.com/v1alpha2",
           name: "module-worker.workflow",
-          version: "1.0.0",
-          schemaDigest: "sha256:208349ee6f07981bde09e4b9ee2020b86a76887540965657ed07590bc2ad5a0e",
+          version: "3.0.0",
+          schemaDigest: "sha256:2b8df3ba036b2781ee3ea8af6603b3de5f09226f4eb1f3385565211cdacc854b",
         },
         {
           apiVersion: "bindings.takoform.com/v1alpha2",
           name: "module-worker.actor",
           version: "2.0.0",
-          schemaDigest: "sha256:299f450ffe08d78419ab639064c513a166498e203764678bdb39e9bfaee5e7a0",
+          schemaDigest: "sha256:1ffc205ba1790251a91c47f1f54f8ea46a8f2563bb77806072d58553aeda3ca3",
         },
       ],
       desiredSchema: {
@@ -326,7 +326,7 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
         $schema: "https://json-schema.org/draft/2020-12/schema",
         additionalProperties: false,
         description:
-          "Immutable executable snapshot of one Module Worker: a bundle, the handlers its module exports, non-secret vars, and the typed capability bindings the code may use. A change is a new Worker Version; traffic moves only through Worker Deployments. The runtime this code runs on is not a field of this Form: it is fixed by the worker.runtime@1.2.0 contract the Module Worker identity provides, so a version carries no compatibility date and no compatibility flag (decision 0019).",
+          "Immutable executable snapshot of one Module Worker: a bundle, the handlers its module exports, non-secret vars, and the typed capability bindings the code may use. A change is a new Worker Version; traffic moves only through Worker Deployments. The runtime this code runs on is not a field of this Form: it is fixed by the worker.runtime@2.0.0 contract the Module Worker identity provides, so a version carries no compatibility date and no compatibility flag (decision 0019).",
         properties: {
           actorBindings: {
             default: [],
@@ -364,7 +364,7 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
                     apiVersion: "interfaces.takoform.com/v1alpha1",
                     name: "worker.actor",
                     schemaDigest:
-                      "sha256:907b3168365945cc3d03419755110a12547218774d0c56d8af4477c6a88fb638",
+                      "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
                     version: "2.0.0",
                   },
                 },
@@ -554,7 +554,7 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
           },
           handlers: {
             description:
-              "Module event handlers this version exports, from the closed vocabulary the worker.runtime@1.2.0 contract defines. A host rejects a handler that contract does not define, and rejects an attachment whose event kind is not declared here.",
+              "Module event handlers this version exports, from the closed vocabulary the worker.runtime@2.0.0 contract defines. A host rejects a handler that contract does not define, and rejects an attachment whose event kind is not declared here.",
             items: {
               enum: ["fetch", "scheduled", "queue"],
               type: "string",
@@ -810,8 +810,8 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
               apiVersion: "interfaces.takoform.com/v1alpha1",
               name: "worker.runtime",
               schemaDigest:
-                "sha256:a3852fd29d798359e2c5ba53926875a195e8b6788f90f54fe14f19385b251d7f",
-              version: "1.2.0",
+                "sha256:8c3fbdef49053c7522c55b9a540d03672c688b617404f23fa29e23b8dd57f37c",
+              version: "2.0.0",
             },
           },
           workflowBindings: {
@@ -850,8 +850,8 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
                     apiVersion: "interfaces.takoform.com/v1alpha1",
                     name: "worker.workflow",
                     schemaDigest:
-                      "sha256:6b652dd311975da84469a5ec44f48acbc6db2097d1473988bd5424a85fda4294",
-                    version: "1.0.0",
+                      "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
+                    version: "3.0.0",
                   },
                 },
               },
@@ -876,13 +876,13 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
           apiVersion: "edge.forms.takoform.com",
           kind: "WorkerDeployment",
           definitionVersion: "0.3.0",
-          schemaDigest: "sha256:a0407a5794e5de124bac14d2d6540bb2672a66e2608aaca1ff575ba3072b76e7",
+          schemaDigest: "sha256:2a76710c71ca5ead3052213472c43c9a652b6a63f3a423b8b684dc1663258ad0",
         },
-        packageDigest: "sha256:84989967ea0f42ba6dcce221e4195ef1fe3fa721a6640d4f3e2f361cbf1c1197",
+        packageDigest: "sha256:9b6ddd08f31234ec1f86ce5a4bc837afe224e47d53b2128e426aabb90885d02b",
       },
       displayName: "Worker Deployment",
       description:
-        "Selects which Worker Versions of one Module Worker serve traffic and in what proportion. Weights are basis points and must sum to exactly 10000 across entries; the sum is host-validated semantics because a schema cannot add weights. Rollback is re-weighting, never mutating a revision.",
+        "Unpublished aggregate WorkerDeployment selecting the one Actor+Workflow WorkerVersion candidate. Its exact worker and version relations pin the forward ModuleWorker and shared WorkerVersion Definitions; current deployment bytes remain unchanged.",
       requiresHostApi: "forms.takoform.com/v1",
       role: "deployment",
       constraints: [
@@ -901,7 +901,7 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
         $schema: "https://json-schema.org/draft/2020-12/schema",
         additionalProperties: false,
         description:
-          "Selects which Worker Versions of one Module Worker serve traffic and in what proportion. Weights are basis points and must sum to exactly 10000 across entries; the sum is host-validated semantics because a schema cannot add weights. Rollback is re-weighting, never mutating a revision.",
+          "Unpublished aggregate WorkerDeployment selecting the one Actor+Workflow WorkerVersion candidate. Its exact worker and version relations pin the forward ModuleWorker and shared WorkerVersion Definitions; current deployment bytes remain unchanged.",
         properties: {
           versions: {
             description:
@@ -942,7 +942,7 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
                       definitionVersion: "0.4.0",
                       kind: "WorkerVersion",
                       schemaDigest:
-                        "sha256:ca02670b227821d6640583803d5b7cbb7d6ae5639c70a2b277c4885f8cfa4c18",
+                        "sha256:ba59a72fb2c12aa6e9d09173943eb4bb8d2eadac25840d87356a25286007354b",
                     },
                   ],
                 },
@@ -982,7 +982,7 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
                 definitionVersion: "0.2.0",
                 kind: "ModuleWorker",
                 schemaDigest:
-                  "sha256:f47672eaddb821c6c9c8fae88ebd6e683858afc2026c047ec3e509221cb2e3aa",
+                  "sha256:761180705a6f2a75fa0bc0061794a269342fafe0309c26ecd7530f12fcda1399",
               },
             ],
           },
@@ -999,9 +999,9 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
           apiVersion: "edge.forms.takoform.com",
           kind: "WorkerCustomDomain",
           definitionVersion: "0.2.0",
-          schemaDigest: "sha256:5a9d4651ede71339af3d3cf6ee51e3e4a91edbecb87424ed828263015b7351a5",
+          schemaDigest: "sha256:dcd899ba2083ccbfb902fbb51d521ad64214cce062c65884a2077ad376e4b8ef",
         },
-        packageDigest: "sha256:c360c20f0e0dc8b1a9756f7315cc9197205271df264c27fffaf6d73452c51c45",
+        packageDigest: "sha256:a955daff79d7e360733e13081a3716821a07374254d15c4b836b086bd813a374",
       },
       displayName: "Worker Custom Domain",
       description:
@@ -1054,8 +1054,8 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
               apiVersion: "interfaces.takoform.com/v1alpha1",
               name: "worker.runtime",
               schemaDigest:
-                "sha256:a3852fd29d798359e2c5ba53926875a195e8b6788f90f54fe14f19385b251d7f",
-              version: "1.2.0",
+                "sha256:8c3fbdef49053c7522c55b9a540d03672c688b617404f23fa29e23b8dd57f37c",
+              version: "2.0.0",
             },
           },
         },
@@ -1071,9 +1071,9 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
           apiVersion: "edge.forms.takoform.com",
           kind: "WorkerEndpoint",
           definitionVersion: "0.2.0",
-          schemaDigest: "sha256:9b2e3a5e5b60b3804b9940d4ebace94b8c6a403bfbf619a6e888b2afa5930234",
+          schemaDigest: "sha256:7ce5d6b1ad1f05a6bb3cb50446b36211864b3357899ba13a574209303fa435cb",
         },
-        packageDigest: "sha256:90fe29313203e153b2803e0681aa8fd587a0338603720945b3f8270228bbbbca",
+        packageDigest: "sha256:cdf26eb7cdac0fe5a6422af565750c7f71f99079c520866961af26b671047df6",
       },
       displayName: "Worker Endpoint",
       description:
@@ -1123,8 +1123,8 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
               apiVersion: "interfaces.takoform.com/v1alpha1",
               name: "worker.runtime",
               schemaDigest:
-                "sha256:a3852fd29d798359e2c5ba53926875a195e8b6788f90f54fe14f19385b251d7f",
-              version: "1.2.0",
+                "sha256:8c3fbdef49053c7522c55b9a540d03672c688b617404f23fa29e23b8dd57f37c",
+              version: "2.0.0",
             },
           },
         },
@@ -1167,9 +1167,9 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
           apiVersion: "edge.forms.takoform.com",
           kind: "WorkerCronTrigger",
           definitionVersion: "0.2.0",
-          schemaDigest: "sha256:055abd3e6d0ca1a3da7f864349d33b0c9f6fe855ddec03a3e26689a0966b73fc",
+          schemaDigest: "sha256:8a859ef2d89e80163bab2ee88d28eeb29615e7fa8e10578c28b08125f50a1ccf",
         },
-        packageDigest: "sha256:41e3ee7b05d9959b19de4b2234794e9c1371a1369861906ddf6029b813d5b8b8",
+        packageDigest: "sha256:57161d3e0d95ccba28cbd35d6a977b5fc0be7a510991fe339126dabf2a567bf0",
       },
       displayName: "Worker Cron Trigger",
       description:
@@ -1216,8 +1216,8 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
               apiVersion: "interfaces.takoform.com/v1alpha1",
               name: "worker.runtime",
               schemaDigest:
-                "sha256:a3852fd29d798359e2c5ba53926875a195e8b6788f90f54fe14f19385b251d7f",
-              version: "1.2.0",
+                "sha256:8c3fbdef49053c7522c55b9a540d03672c688b617404f23fa29e23b8dd57f37c",
+              version: "2.0.0",
             },
           },
         },
@@ -1522,9 +1522,9 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
           apiVersion: "edge.forms.takoform.com",
           kind: "QueueConsumer",
           definitionVersion: "0.2.0",
-          schemaDigest: "sha256:c2c4bcbf31323cb5580eb5bd42696aa89ddcde5c7cacda67486ba55dd80969f4",
+          schemaDigest: "sha256:c8fce91ae31c1e8466bcd37237ec59935660dd08b628a298fef62433c9837425",
         },
-        packageDigest: "sha256:79b9812f126b4fd2abae1ff14710a0120ecf92e7628e119f2d7c7c41d6470a63",
+        packageDigest: "sha256:8b12457b5e4f13d48f09ef7c5d6811bcea6151976715e388d232a35cb9b7db9e",
       },
       displayName: "Queue Consumer",
       description:
@@ -1661,8 +1661,8 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
               apiVersion: "interfaces.takoform.com/v1alpha1",
               name: "worker.runtime",
               schemaDigest:
-                "sha256:a3852fd29d798359e2c5ba53926875a195e8b6788f90f54fe14f19385b251d7f",
-              version: "1.2.0",
+                "sha256:8c3fbdef49053c7522c55b9a540d03672c688b617404f23fa29e23b8dd57f37c",
+              version: "2.0.0",
             },
           },
         },
@@ -1686,13 +1686,13 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
           apiVersion: "edge.forms.takoform.com",
           kind: "DurableWorkflow",
           definitionVersion: "0.2.0",
-          schemaDigest: "sha256:cafe3b22a3660382c22be598ec330568a3edb6e4688271005f605dc691975e6f",
+          schemaDigest: "sha256:a58c885bed4431fbdc6b923059fe3b3bf98f7727578914d2d212552ae97fdc65",
         },
-        packageDigest: "sha256:214ee0255ad27595c2dfc32db8419a669d494a034e72d7af2596a425d911f995",
+        packageDigest: "sha256:413ace0438404389cd34e84e61c100412c54da74b226779a07840ff0ab344a3a",
       },
       displayName: "Durable Workflow",
       description:
-        "Long-lived identity of one code-defined durable workflow: a class the worker's active deployment serves, whose instances survive process death. The Form fixes the execution model by identity — the worker.workflow@1.0.0 contract in its providedInterfaces states memoized replay, at-least-once step execution, the closed status vocabulary, and the two bounds that keep an instance finite. It carries NO implementation snapshot: which code answers is whatever the worker's active Worker Deployment selects, so behavior upgrades and rollback ride the deployment like any other traffic change. Instances are runtime data reached through module-worker.workflow bindings, never Resources. One worker carries at most one Durable Workflow per class name.",
+        "Unpublished aggregate DurableWorkflow with the exact reviewed worker.workflow@3.0.0 class/replay contract and the aggregate worker.runtime@2.0.0 requirement. Instances remain runtime data, and code comes from the active deployment's weighted WorkerVersion. Generic DELETE is a side-effect-free refusal before mutation: a live Binding or any queued/running/sleeping/waiting instance returns dependency_in_use (409). These active instances are dependent execution identities under this Workflow UID; an execution owner/continuation that could still commit also keeps DELETE refused with dependency_in_use (409), preserving instance state/history. The failure detail identifies whether a live Binding or an active execution identity is the dependency; resource_busy is reserved for bounded transient concurrent mutation or index maintenance, never this long-lived refusal. Only when every instance is terminal, no Binding remains, and all owners are stopped and fenced may DELETE succeed and purge terminal histories and unmatched queued events. maxTerminalRetentionSeconds=2592000 bounds retention only while this DurableWorkflow UID lives; successful DELETE is the sole early-purge exception. Recreate has a new Host UID, starts empty, and old owner tokens cannot commit. This identity has no update: className and worker remain immutable. Code/weight promotion is through WorkerDeployment only. Each execution context pins one exact WorkerVersion; retry/wake selects the current weighted deployment anew. History is never migrated or rewritten; promoted Versions must be step-history compatible, or the deployment/workflow stays not Ready rather than silently migrating.",
       requiresHostApi: "forms.takoform.com/v1",
       role: "identity",
       constraints: [
@@ -1706,19 +1706,19 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
         {
           apiVersion: "interfaces.takoform.com/v1alpha1",
           name: "worker.workflow",
-          version: "1.0.0",
-          schemaDigest: "sha256:6b652dd311975da84469a5ec44f48acbc6db2097d1473988bd5424a85fda4294",
+          version: "3.0.0",
+          schemaDigest: "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
         },
       ],
       desiredSchema: {
         $schema: "https://json-schema.org/draft/2020-12/schema",
         additionalProperties: false,
         description:
-          "Long-lived identity of one code-defined durable workflow: a class the worker's active deployment serves, whose instances survive process death. The Form fixes the execution model by identity — the worker.workflow@1.0.0 contract in its providedInterfaces states memoized replay, at-least-once step execution, the closed status vocabulary, and the two bounds that keep an instance finite. It carries NO implementation snapshot: which code answers is whatever the worker's active Worker Deployment selects, so behavior upgrades and rollback ride the deployment like any other traffic change. Instances are runtime data reached through module-worker.workflow bindings, never Resources. One worker carries at most one Durable Workflow per class name.",
+          "Unpublished aggregate DurableWorkflow with the exact reviewed worker.workflow@3.0.0 class/replay contract and the aggregate worker.runtime@2.0.0 requirement. Instances remain runtime data, and code comes from the active deployment's weighted WorkerVersion. Generic DELETE is a side-effect-free refusal before mutation: a live Binding or any queued/running/sleeping/waiting instance returns dependency_in_use (409). These active instances are dependent execution identities under this Workflow UID; an execution owner/continuation that could still commit also keeps DELETE refused with dependency_in_use (409), preserving instance state/history. The failure detail identifies whether a live Binding or an active execution identity is the dependency; resource_busy is reserved for bounded transient concurrent mutation or index maintenance, never this long-lived refusal. Only when every instance is terminal, no Binding remains, and all owners are stopped and fenced may DELETE succeed and purge terminal histories and unmatched queued events. maxTerminalRetentionSeconds=2592000 bounds retention only while this DurableWorkflow UID lives; successful DELETE is the sole early-purge exception. Recreate has a new Host UID, starts empty, and old owner tokens cannot commit. This identity has no update: className and worker remain immutable. Code/weight promotion is through WorkerDeployment only. Each execution context pins one exact WorkerVersion; retry/wake selects the current weighted deployment anew. History is never migrated or rewritten; promoted Versions must be step-history compatible, or the deployment/workflow stays not Ready rather than silently migrating.",
         properties: {
           className: {
             description:
-              "Class export name the serving module provides, in the JavaScript identifier grammar. Every weighted version of the active deployment must export it; one that does not keeps this workflow from becoming Ready, and creating an instance against it is refused rather than queued.",
+              "Immutable named class export in the serving main ES module. Each weighted version must export a constructible class with callable prototype run; absence or incompatibility keeps the workflow from Ready.",
             pattern: "^[A-Za-z_$][A-Za-z0-9_$]*$",
             type: "string",
           },
@@ -1748,8 +1748,8 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
               apiVersion: "interfaces.takoform.com/v1alpha1",
               name: "worker.runtime",
               schemaDigest:
-                "sha256:a3852fd29d798359e2c5ba53926875a195e8b6788f90f54fe14f19385b251d7f",
-              version: "1.2.0",
+                "sha256:8c3fbdef49053c7522c55b9a540d03672c688b617404f23fa29e23b8dd57f37c",
+              version: "2.0.0",
             },
           },
         },
@@ -1762,8 +1762,8 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
         runtimeClassRef: {
           apiVersion: "interfaces.takoform.com/v1alpha1",
           name: "worker.workflow",
-          version: "1.0.0",
-          schemaDigest: "sha256:6b652dd311975da84469a5ec44f48acbc6db2097d1473988bd5424a85fda4294",
+          version: "3.0.0",
+          schemaDigest: "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
         },
         providedInterface: "worker.workflow",
         className: "/className",
@@ -1783,13 +1783,13 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
           apiVersion: "edge.forms.takoform.com",
           kind: "ActorNamespace",
           definitionVersion: "0.2.0",
-          schemaDigest: "sha256:41bdb4fe8366c59187429911b2edd5c26b3b57696b2b08b88cbe858bf6508fdd",
+          schemaDigest: "sha256:b6ec73cf24508af3dbd784b411bea4c60808e244f3a79c1c43b72597dd29ca20",
         },
-        packageDigest: "sha256:6d5fc0a54df0dcf6cf3998b34ef5f3ca63347874c5d103eb56bde9fdc3c5e217",
+        packageDigest: "sha256:c2cb82ff5b58edad24726d414c80de1f1fcada5713e8e202e1dc6b0c5aba7700",
       },
       displayName: "Actor Namespace",
       description:
-        "Long-lived identity of one addressable-actor id space: a class the worker's active deployment serves, with at most one live execution context per actor id, private durable storage per id, and one alarm per id. The Form fixes that model by identity through the worker.actor@2.0.0 contract in its providedInterfaces; it carries no implementation snapshot, so which code answers is whatever the worker's active Worker Deployment selects. Actors are runtime data reached through module-worker.actor bindings, never Resources: every id addresses an actor and the first delivery is its creation. One worker carries at most one Actor Namespace per class name, because two namespaces over one class would give that class two disjoint id spaces.",
+        "Unpublished forward ActorNamespace with the exact worker.actor@2.0.0 class, context, alarm, private SQL, serialized invocation and Host-owned socket contract. The namespace retains its durable identity and active deployment code selection; actors are runtime data, not Resources. Existing ActorNamespace definitions retain their exact earlier contracts.",
       requiresHostApi: "forms.takoform.com/v1",
       role: "identity",
       constraints: [
@@ -1804,18 +1804,18 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
           apiVersion: "interfaces.takoform.com/v1alpha1",
           name: "worker.actor",
           version: "2.0.0",
-          schemaDigest: "sha256:907b3168365945cc3d03419755110a12547218774d0c56d8af4477c6a88fb638",
+          schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
         },
       ],
       desiredSchema: {
         $schema: "https://json-schema.org/draft/2020-12/schema",
         additionalProperties: false,
         description:
-          "Long-lived identity of one addressable-actor id space: a class the worker's active deployment serves, with at most one live execution context per actor id, private durable storage per id, and one alarm per id. The Form fixes that model by identity through the worker.actor@2.0.0 contract in its providedInterfaces; it carries no implementation snapshot, so which code answers is whatever the worker's active Worker Deployment selects. Actors are runtime data reached through module-worker.actor bindings, never Resources: every id addresses an actor and the first delivery is its creation. One worker carries at most one Actor Namespace per class name, because two namespaces over one class would give that class two disjoint id spaces.",
+          "Unpublished forward ActorNamespace with the exact worker.actor@2.0.0 class, context, alarm, private SQL, serialized invocation and Host-owned socket contract. The namespace retains its durable identity and active deployment code selection; actors are runtime data, not Resources. Existing ActorNamespace definitions retain their exact earlier contracts.",
         properties: {
           className: {
             description:
-              "Class export name the serving module provides, in the JavaScript identifier grammar. Every weighted version of the active deployment must export it; one that does not keeps this namespace from becoming Ready, and invoking a stub of it is refused rather than queued.",
+              "Immutable named actor class export in the serving main ES module. Every weighted version must provide callable prototype start (when present), fetch, alarm, socketMessage, socketClose and socketError methods with constructor(context, env); an incompatible export keeps the namespace from Ready and invocation is refused rather than queued.",
             pattern: "^[A-Za-z_$][A-Za-z0-9_$]*$",
             type: "string",
           },
@@ -1845,8 +1845,8 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
               apiVersion: "interfaces.takoform.com/v1alpha1",
               name: "worker.runtime",
               schemaDigest:
-                "sha256:a3852fd29d798359e2c5ba53926875a195e8b6788f90f54fe14f19385b251d7f",
-              version: "1.2.0",
+                "sha256:8c3fbdef49053c7522c55b9a540d03672c688b617404f23fa29e23b8dd57f37c",
+              version: "2.0.0",
             },
           },
         },
@@ -1860,7 +1860,7 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
           apiVersion: "interfaces.takoform.com/v1alpha1",
           name: "worker.actor",
           version: "2.0.0",
-          schemaDigest: "sha256:907b3168365945cc3d03419755110a12547218774d0c56d8af4477c6a88fb638",
+          schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
         },
         providedInterface: "worker.actor",
         className: "/className",
@@ -1881,14 +1881,14 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
         apiVersion: "bindings.takoform.com/v1alpha2",
         name: "module-worker.actor",
         version: "2.0.0",
-        schemaDigest: "sha256:299f450ffe08d78419ab639064c513a166498e203764678bdb39e9bfaee5e7a0",
+        schemaDigest: "sha256:1ffc205ba1790251a91c47f1f54f8ea46a8f2563bb77806072d58553aeda3ca3",
       },
       sourceRole: "revision",
       targetInterface: {
         apiVersion: "interfaces.takoform.com/v1alpha1",
         name: "worker.actor",
         version: "2.0.0",
-        schemaDigest: "sha256:907b3168365945cc3d03419755110a12547218774d0c56d8af4477c6a88fb638",
+        schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
       },
       allowedTargetForms: [
         {
@@ -2006,15 +2006,15 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
       bindingRef: {
         apiVersion: "bindings.takoform.com/v1alpha2",
         name: "module-worker.workflow",
-        version: "1.0.0",
-        schemaDigest: "sha256:208349ee6f07981bde09e4b9ee2020b86a76887540965657ed07590bc2ad5a0e",
+        version: "3.0.0",
+        schemaDigest: "sha256:2b8df3ba036b2781ee3ea8af6603b3de5f09226f4eb1f3385565211cdacc854b",
       },
       sourceRole: "revision",
       targetInterface: {
         apiVersion: "interfaces.takoform.com/v1alpha1",
         name: "worker.workflow",
-        version: "1.0.0",
-        schemaDigest: "sha256:6b652dd311975da84469a5ec44f48acbc6db2097d1473988bd5424a85fda4294",
+        version: "3.0.0",
+        schemaDigest: "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
       },
       allowedTargetForms: [
         {
