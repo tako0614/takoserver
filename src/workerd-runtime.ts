@@ -685,6 +685,32 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     }
   };
 
+  const clearFailedActorActivation = async (failure: unknown): Promise<void> => {
+    // Revoke admission first. Clearing the durable marker may itself fail, and
+    // that failure must not leave private Actor brokers accepting old tokens.
+    let notificationFailure: unknown;
+    try {
+      options.actorForwardLifecycle?.uncertain();
+    } catch (error) {
+      notificationFailure = error;
+    }
+    try {
+      await clearFailedActivation(failure);
+    } catch (clearFailure) {
+      if (notificationFailure !== undefined)
+        throw new AggregateError(
+          [failure, notificationFailure, clearFailure],
+          "worker runtime Actor admission and activation could not be cleared",
+        );
+      throw clearFailure;
+    }
+    if (notificationFailure !== undefined)
+      throw new AggregateError(
+        [failure, notificationFailure],
+        "worker runtime Actor admission could not be cleared",
+      );
+  };
+
   const requireSocketRoot = async (): Promise<void> => {
     if (serviceSocketDirectory === undefined) return;
     requireCertainRuntime();
@@ -956,8 +982,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         // Preflight failed before any socket unlink or config rename. Do not
         // disrupt the old listeners by trying a second render of an unknown
         // filesystem. No pointer commit has happened; refuse serving claims.
-        await clearFailedActivation(failure);
-        options.actorForwardLifecycle?.uncertain();
+        await clearFailedActorActivation(failure);
         throw failure;
       }
       if (serviceSocketDirectory !== undefined && !graphProved) {
@@ -965,8 +990,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         // catch. Only external stop/reap and a fresh runtime/socket directory
         // can recover it; do not race that process with a rollback sweep.
         privateSocketUncertain = true;
-        await clearFailedActivation(failure);
-        options.actorForwardLifecycle?.uncertain();
+        await clearFailedActorActivation(failure);
         throw failure;
       }
       try {
@@ -993,8 +1017,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           [failure, rollbackFailure],
           "worker runtime activation state is unknown",
         );
-        await clearFailedActivation(unknownState);
-        options.actorForwardLifecycle?.uncertain();
+        await clearFailedActorActivation(unknownState);
         throw unknownState;
       }
       throw failure;

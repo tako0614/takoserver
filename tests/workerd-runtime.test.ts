@@ -1844,6 +1844,48 @@ test("clears activation truth when neither the forward nor rollback graph is pro
   }
 });
 
+test("revokes Actor broker admission even when clearing a failed activation marker fails", async () => {
+  const probe = createConfigProbe();
+  const markerPath = join(root, "workers", ".takoserver-active.json");
+  let admitted = false;
+  let uncertainCalls = 0;
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+      actorForwardLifecycle: {
+        async prepare() {},
+        activated() {
+          admitted = true;
+        },
+        uncertain() {
+          uncertainCalls += 1;
+          admitted = false;
+        },
+      },
+    });
+    if (!runtime.publish) throw new Error("weighted publication is unavailable");
+    await runtime.publish("site", weightedPublication("site", "generation-actor-marker-one"));
+    expect(admitted).toBe(true);
+    probe.behavior = async (_config, invocation) => {
+      if (invocation === 2) {
+        rmSync(markerPath);
+        await mkdir(markerPath);
+      }
+      throw new Error("watcher did not confirm graph");
+    };
+    await expect(
+      runtime.publish("site", weightedPublication("site", "generation-actor-marker-two")),
+    ).rejects.toThrow("worker runtime activation could not be cleared");
+    expect(uncertainCalls).toBe(1);
+    expect(admitted).toBe(false);
+  } finally {
+    probe.stop();
+  }
+});
+
 test("cannot turn an uncertain private socket activation into absence", async () => {
   const probe = createConfigProbe();
   const socketDirectory = mkdtempSync(join(tmpdir(), "ws-"));
