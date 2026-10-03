@@ -453,6 +453,8 @@ export interface WorkerdRuntimeOptions {
    * address nothing answers on.
    */
   readonly tls?: WorkerdTlsKeypair;
+  /** Refuse an unknown listener before touching any watched runtime file. */
+  readonly beforeRender?: () => Promise<void>;
   /** Called after the config is rewritten, to make workerd read it. */
   readonly onReload?: (configPath: string) => Promise<void>;
   /** Runtime liveness/readiness truth for serving observations. */
@@ -754,6 +756,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
    * asset shim and the socket are decided.
    */
   const writeRendered = async (published: readonly PublishedDeployment[]): Promise<void> => {
+    await options.beforeRender?.();
     if (serviceSocketDirectory !== undefined) {
       await requireSocketRoot();
     }

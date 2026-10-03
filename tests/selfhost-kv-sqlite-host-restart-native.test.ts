@@ -33,6 +33,13 @@ const CORE_VERIFIER_PORT = 8080;
 const CORE_VERIFIER_ORIGIN = `http://127.0.0.1:${CORE_VERIFIER_PORT}`;
 const WORKER_SUFFIX = "apps.selfhost.test";
 const LANE = "/apis/forms.takoform.com/v1";
+const OPERATION_API_VERSION = "operations.takoform.com/v1alpha1";
+const OPERATION_ID_PATTERN = /^op_[A-Za-z0-9][A-Za-z0-9._-]{0,124}$/u;
+const API_ERROR_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/u;
+const API_REQUEST_TIMEOUT_MS = 15_000;
+const NATIVE_CASE_TIMEOUT_MS = 300_000;
+const OPERATION_CLEANUP_MARGIN_MS = 5_000;
+const MAX_OPERATION_POLL_ATTEMPTS = NATIVE_CASE_TIMEOUT_MS / 1_000;
 const SPACE = "default";
 const TABLE = "restart_notes";
 const KEY = "os-restart-note";
@@ -87,6 +94,12 @@ type JourneyPhase =
   | "v2_artifact_upload"
   | "v1_worker_version_create"
   | "v2_worker_version_create"
+  | "v2_bundle_prepare"
+  | "v2_bundle_submit"
+  | "v2_bundle_operation_poll"
+  | "v2_worker_version_prepare"
+  | "v2_worker_version_submit"
+  | "v2_worker_version_operation_poll"
   | "initial_deployment"
   | "endpoint_create"
   | "v1_data_write_readback"
@@ -94,6 +107,11 @@ type JourneyPhase =
   | "pre_restart_resource_readback"
   | "host_exit_restart"
   | "v2_read_after_restart"
+  | "pre_parent_sigkill_storage_readback"
+  | "host_parent_sigkill"
+  | "host_foreign_listener_refusal"
+  | "host_parent_sigkill_recovery"
+  | "post_parent_sigkill_resource_readback"
   | "dependency_delete_and_absence"
   | "owned_process_and_fixture_cleanup";
 type ProcessIdentity = {
@@ -143,6 +161,257 @@ function elapsedMilliseconds(startedAt: number): number {
 
 function safeErrorClass(error: unknown): "timeout" | "operation" {
   return error instanceof DOMException && error.name === "TimeoutError" ? "timeout" : "operation";
+}
+
+type MutationTransport = (
+  method: string,
+  path: string,
+  body: unknown,
+  headers: Record<string, string>,
+) => Promise<Response>;
+
+type MutationPhases = {
+  readonly prepare: JourneyPhase;
+  readonly submit: JourneyPhase;
+  readonly poll: JourneyPhase;
+};
+
+type MutationRuntime = {
+  readonly transport?: MutationTransport;
+  readonly deadlineAt: number;
+  readonly now?: () => number;
+  readonly sleep?: (milliseconds: number) => Promise<void>;
+  readonly random?: () => number;
+  readonly phases?: MutationPhases;
+};
+
+function v2MutationPhases(name: string): MutationPhases | undefined {
+  if (name === "journey-bundle-v2") {
+    return {
+      prepare: "v2_bundle_prepare",
+      submit: "v2_bundle_submit",
+      poll: "v2_bundle_operation_poll",
+    };
+  }
+  if (name === "journey-version-v2") {
+    return {
+      prepare: "v2_worker_version_prepare",
+      submit: "v2_worker_version_submit",
+      poll: "v2_worker_version_operation_poll",
+    };
+  }
+  return undefined;
+}
+
+async function withOptionalJourneyPhase<T>(
+  phase: JourneyPhase | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return phase ? withJourneyPhase(phase, operation) : operation();
+}
+
+function nativeMutationTransport(
+  method: string,
+  path: string,
+  body: unknown,
+  headers: Record<string, string>,
+): Promise<Response> {
+  return fetch(`${HOST_ORIGIN}${path}`, {
+    method,
+    headers: { ...(body === undefined ? {} : { "content-type": "application/json" }), ...headers },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    signal: AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
+  });
+}
+
+async function applyResourceMutation(
+  input: {
+    readonly path: string;
+    readonly expectedStatus: 200 | 201;
+    readonly body: Json;
+    readonly mutationHeaders: Record<string, string>;
+    readonly operationHeaders: Record<string, string>;
+    readonly expectedIdentity: {
+      readonly apiVersion: string;
+      readonly kind: string;
+      readonly name: string;
+      readonly space: string;
+    };
+    readonly expectedUid?: string;
+  },
+  runtime: MutationRuntime,
+): Promise<Json> {
+  const transport = runtime.transport ?? nativeMutationTransport;
+  const now = runtime.now ?? Date.now;
+  const sleep = runtime.sleep ?? Bun.sleep;
+  const random = runtime.random ?? Math.random;
+  const submission = await withOptionalJourneyPhase(runtime.phases?.submit, async () => {
+    assertRequestFitsOperationDeadline(runtime.deadlineAt, now);
+    const response = await transport("PUT", input.path, input.body, input.mutationHeaders);
+    if (response.status !== input.expectedStatus && response.status !== 202) {
+      await throwUnexpectedApiResponse(response, "put", input.expectedStatus);
+    }
+    return { response, payload: await responseJson(response) };
+  });
+
+  if (submission.response.status === input.expectedStatus) {
+    return validateMutationResource(submission.payload, input);
+  }
+
+  const acceptedOperation = operationAt(submission.payload, "operation", undefined);
+  let delayMilliseconds = retryAfterDelayMilliseconds(submission.response.headers, 0, random);
+  const operationPath = `${LANE}/operations/${encodeURIComponent(acceptedOperation.id)}`;
+
+  for (let attempt = 0; attempt < MAX_OPERATION_POLL_ATTEMPTS; attempt += 1) {
+    const remainingMilliseconds = runtime.deadlineAt - now();
+    if (
+      remainingMilliseconds <= API_REQUEST_TIMEOUT_MS ||
+      delayMilliseconds + API_REQUEST_TIMEOUT_MS >= remainingMilliseconds
+    ) {
+      throw new Error("selfhost_operation_wait_deadline_exceeded");
+    }
+    if (delayMilliseconds > 0) await sleep(delayMilliseconds);
+
+    const poll = await withOptionalJourneyPhase(runtime.phases?.poll, async () => {
+      assertRequestFitsOperationDeadline(runtime.deadlineAt, now);
+      const response = await transport("GET", operationPath, undefined, input.operationHeaders);
+      if (response.status !== 200) await throwUnexpectedApiResponse(response, "get", 200);
+      return {
+        response,
+        operation: operationAt(await responseJson(response), undefined, acceptedOperation.id),
+      };
+    });
+    const operation = poll.operation;
+    if (operation.done) {
+      if (operation.error !== undefined) {
+        const error = isRecord(operation.error) ? operation.error : undefined;
+        const code = safeApiErrorCode(error?.code);
+        throw new Error(`selfhost_operation_failed_${code}`);
+      }
+      const result = operation.result;
+      if (!isRecord(result) || !isRecord(result.resource)) {
+        throw new Error("selfhost_operation_result_invalid");
+      }
+      return validateMutationResource(result.resource, input);
+    }
+    if (attempt + 1 >= MAX_OPERATION_POLL_ATTEMPTS) break;
+    delayMilliseconds = retryAfterDelayMilliseconds(poll.response.headers, attempt + 1, random);
+  }
+
+  throw new Error("selfhost_operation_poll_limit_exceeded");
+}
+
+function assertRequestFitsOperationDeadline(deadlineAt: number, now: () => number): void {
+  if (deadlineAt - now() <= API_REQUEST_TIMEOUT_MS) {
+    throw new Error("selfhost_operation_wait_deadline_exceeded");
+  }
+}
+
+async function responseJson(response: Response): Promise<Json> {
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error("selfhost_api_response_invalid_json");
+  }
+  if (!isRecord(payload)) throw new Error("selfhost_api_response_invalid_object");
+  return payload;
+}
+
+async function throwUnexpectedApiResponse(
+  response: Response,
+  method: string,
+  expectedStatus: number,
+): Promise<never> {
+  let code = "unknown";
+  try {
+    const payload = await response.json();
+    if (isRecord(payload) && isRecord(payload.error)) {
+      code = safeApiErrorCode(payload.error.code);
+    }
+  } catch {
+    // Preserve only the stable classification in the failure.
+  }
+  throw new Error(`selfhost_api_${method}_${response.status}_expected_${expectedStatus}_${code}`);
+}
+
+function safeApiErrorCode(value: unknown): string {
+  return typeof value === "string" && API_ERROR_CODE_PATTERN.test(value) ? value : "unknown";
+}
+
+function operationAt(
+  payload: Json,
+  envelopeKey: "operation" | undefined,
+  expectedId: string | undefined,
+): Json & { readonly id: string; readonly done: boolean } {
+  const operation = envelopeKey === undefined ? payload : payload[envelopeKey];
+  if (
+    !isRecord(operation) ||
+    operation.apiVersion !== OPERATION_API_VERSION ||
+    operation.kind !== "Operation" ||
+    typeof operation.id !== "string" ||
+    !OPERATION_ID_PATTERN.test(operation.id) ||
+    (expectedId !== undefined && operation.id !== expectedId) ||
+    typeof operation.done !== "boolean"
+  ) {
+    throw new Error("selfhost_operation_response_invalid");
+  }
+  if (envelopeKey !== undefined && operation.done !== false) {
+    throw new Error("selfhost_operation_acceptance_invalid");
+  }
+  return operation as Json & { readonly id: string; readonly done: boolean };
+}
+
+function retryAfterDelayMilliseconds(
+  headers: Headers,
+  attempt: number,
+  random: () => number,
+): number {
+  const header = headers.get("retry-after");
+  if (header === null) {
+    const ceiling = Math.min(1_000, 100 * 2 ** Math.min(attempt, 3));
+    return Math.floor(random() * ceiling);
+  }
+  if (!/^(0|[1-9][0-9]*)$/u.test(header)) {
+    throw new Error("selfhost_operation_retry_after_invalid");
+  }
+  const milliseconds = Number(header) * 1_000;
+  if (!Number.isSafeInteger(milliseconds)) {
+    throw new Error("selfhost_operation_retry_after_invalid");
+  }
+  return milliseconds;
+}
+
+function validateMutationResource(
+  resource: Json,
+  input: {
+    readonly expectedIdentity: {
+      readonly apiVersion: string;
+      readonly kind: string;
+      readonly name: string;
+      readonly space: string;
+    };
+    readonly expectedUid?: string;
+  },
+): Json {
+  const metadata = isRecord(resource.metadata) ? resource.metadata : undefined;
+  if (
+    resource.apiVersion !== input.expectedIdentity.apiVersion ||
+    resource.kind !== input.expectedIdentity.kind ||
+    !metadata ||
+    metadata.name !== input.expectedIdentity.name ||
+    metadata.space !== input.expectedIdentity.space ||
+    typeof metadata.uid !== "string" ||
+    metadata.uid.length === 0 ||
+    (input.expectedUid !== undefined && metadata.uid !== input.expectedUid)
+  ) {
+    throw new Error("selfhost_operation_resource_identity_mismatch");
+  }
+  return resource;
+}
+
+function isRecord(value: unknown): value is Json {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 test("self-host journey diagnostics classify safely and preserve the original failure", async () => {
@@ -201,6 +470,342 @@ test("self-host journey diagnostics classify safely and preserve the original fa
   expect(diagnostics.join("\n")).not.toContain(timeoutFailure.message);
 });
 
+test("public apply follows one accepted operation without replaying the mutation", async () => {
+  const operationId = "op_native_worker_bundle_001";
+  const resource: Json = {
+    apiVersion: "workers.takoform.com",
+    kind: "WorkerBundle",
+    metadata: { name: "journey-bundle-v2", space: SPACE, uid: "bundle-uid-v2" },
+  };
+  const input = {
+    path: `${LANE}/resources/workers.takoform.com/WorkerBundle/journey-bundle-v2`,
+    expectedStatus: 201 as const,
+    body: { apiVersion: "workers.takoform.com", kind: "WorkerBundle" },
+    mutationHeaders: {
+      authorization: "test-principal",
+      "idempotency-key": "bundle-v2-create",
+    },
+    operationHeaders: { authorization: "test-principal" },
+    expectedIdentity: {
+      apiVersion: "workers.takoform.com",
+      kind: "WorkerBundle",
+      name: "journey-bundle-v2",
+      space: SPACE,
+    },
+  };
+  const calls: Array<{ method: string; path: string; headers: Record<string, string> }> = [];
+  const responses = [
+    Response.json(
+      {
+        operation: {
+          apiVersion: OPERATION_API_VERSION,
+          kind: "Operation",
+          id: operationId,
+          done: false,
+        },
+      },
+      { status: 202, headers: { "retry-after": "0" } },
+    ),
+    Response.json(
+      { apiVersion: OPERATION_API_VERSION, kind: "Operation", id: operationId, done: false },
+      { headers: { "retry-after": "0" } },
+    ),
+    Response.json({
+      apiVersion: OPERATION_API_VERSION,
+      kind: "Operation",
+      id: operationId,
+      done: true,
+      result: { resource },
+    }),
+  ];
+
+  const result = await applyResourceMutation(input, {
+    deadlineAt: 1_000_000,
+    now: () => 1_000,
+    sleep: async () => undefined,
+    transport: async (method, path, _body, headers) => {
+      calls.push({ method, path, headers });
+      const response = responses.shift();
+      if (!response) throw new Error("test_mutation_response_exhausted");
+      return response;
+    },
+  });
+
+  expect(result).toEqual(resource);
+  expect(calls.map((call) => [call.method, call.path])).toEqual([
+    ["PUT", input.path],
+    ["GET", `${LANE}/operations/${operationId}`],
+    ["GET", `${LANE}/operations/${operationId}`],
+  ]);
+  expect(calls[0]?.headers["idempotency-key"]).toBe("bundle-v2-create");
+  expect(calls.slice(1).map((call) => call.headers)).toEqual([
+    input.operationHeaders,
+    input.operationHeaders,
+  ]);
+  expect(calls.slice(1).every((call) => call.method === "GET")).toBe(true);
+});
+
+test.each([
+  { expectedStatus: 201 as const, expectedUid: undefined },
+  { expectedStatus: 200 as const, expectedUid: "worker-version-uid" },
+])(
+  "public apply preserves immediate HTTP $expectedStatus results",
+  async ({ expectedStatus, expectedUid }) => {
+    const resource: Json = {
+      apiVersion: "workers.takoform.com",
+      kind: "WorkerVersion",
+      metadata: {
+        name: "journey-version-v2",
+        space: SPACE,
+        uid: "worker-version-uid",
+      },
+    };
+    const mutationRequests: string[] = [];
+    const result = await applyResourceMutation(
+      {
+        path: `${LANE}/resources/workers.takoform.com/WorkerVersion/journey-version-v2`,
+        expectedStatus,
+        body: { apiVersion: "workers.takoform.com", kind: "WorkerVersion" },
+        mutationHeaders: { authorization: "test-principal", "idempotency-key": "version-v2" },
+        operationHeaders: { authorization: "test-principal" },
+        expectedIdentity: {
+          apiVersion: "workers.takoform.com",
+          kind: "WorkerVersion",
+          name: "journey-version-v2",
+          space: SPACE,
+        },
+        ...(expectedUid === undefined ? {} : { expectedUid }),
+      },
+      {
+        deadlineAt: Date.now() + 60_000,
+        transport: async (method) => {
+          mutationRequests.push(method);
+          return Response.json(resource, { status: expectedStatus });
+        },
+      },
+    );
+
+    expect(result).toEqual(resource);
+    expect(mutationRequests).toEqual(["PUT"]);
+  },
+);
+
+test("public apply rejects malformed operation handles and foreign poll IDs", async () => {
+  const baseInput = {
+    path: `${LANE}/resources/workers.takoform.com/WorkerBundle/journey-bundle-v2`,
+    expectedStatus: 201 as const,
+    body: { apiVersion: "workers.takoform.com", kind: "WorkerBundle" },
+    mutationHeaders: { authorization: "test-principal", "idempotency-key": "bundle-v2-create" },
+    operationHeaders: { authorization: "test-principal" },
+    expectedIdentity: {
+      apiVersion: "workers.takoform.com",
+      kind: "WorkerBundle",
+      name: "journey-bundle-v2",
+      space: SPACE,
+    },
+  };
+  const malformedResponse = Response.json(
+    {
+      operation: {
+        apiVersion: OPERATION_API_VERSION,
+        kind: "Operation",
+        id: "not-an-operation-id",
+        done: false,
+      },
+    },
+    { status: 202, headers: { "retry-after": "0" } },
+  );
+  await expect(
+    applyResourceMutation(baseInput, {
+      deadlineAt: Date.now() + 60_000,
+      transport: async () => malformedResponse,
+    }),
+  ).rejects.toThrow("selfhost_operation_response_invalid");
+
+  const acceptedId = "op_native_worker_bundle_002";
+  let requestCount = 0;
+  await expect(
+    applyResourceMutation(baseInput, {
+      deadlineAt: Date.now() + 60_000,
+      transport: async () => {
+        requestCount += 1;
+        return requestCount === 1
+          ? Response.json(
+              {
+                operation: {
+                  apiVersion: OPERATION_API_VERSION,
+                  kind: "Operation",
+                  id: acceptedId,
+                  done: false,
+                },
+              },
+              { status: 202, headers: { "retry-after": "0" } },
+            )
+          : Response.json({
+              apiVersion: OPERATION_API_VERSION,
+              kind: "Operation",
+              id: "op_native_worker_bundle_foreign",
+              done: false,
+            });
+      },
+    }),
+  ).rejects.toThrow("selfhost_operation_response_invalid");
+  expect(requestCount).toBe(2);
+});
+
+test("public apply consumes the original unexpected HTTP response body", async () => {
+  const response = Response.json({ error: { code: "backend_unavailable" } }, { status: 503 });
+  await expect(
+    applyResourceMutation(
+      {
+        path: `${LANE}/resources/workers.takoform.com/WorkerBundle/journey-bundle-v2`,
+        expectedStatus: 201,
+        body: { apiVersion: "workers.takoform.com", kind: "WorkerBundle" },
+        mutationHeaders: { authorization: "test-principal", "idempotency-key": "single-put" },
+        operationHeaders: { authorization: "test-principal" },
+        expectedIdentity: {
+          apiVersion: "workers.takoform.com",
+          kind: "WorkerBundle",
+          name: "journey-bundle-v2",
+          space: SPACE,
+        },
+      },
+      {
+        deadlineAt: Date.now() + 60_000,
+        transport: async () => response,
+      },
+    ),
+  ).rejects.toThrow("selfhost_api_put_503_expected_201_backend_unavailable");
+  expect(response.bodyUsed).toBe(true);
+});
+
+test("public apply fails terminal operation errors and bounds Retry-After", async () => {
+  const operationId = "op_native_worker_bundle_003";
+  const input = {
+    path: `${LANE}/resources/workers.takoform.com/WorkerBundle/journey-bundle-v2`,
+    expectedStatus: 201 as const,
+    body: { apiVersion: "workers.takoform.com", kind: "WorkerBundle" },
+    mutationHeaders: { authorization: "test-principal", "idempotency-key": "bundle-v2-create" },
+    operationHeaders: { authorization: "test-principal" },
+    expectedIdentity: {
+      apiVersion: "workers.takoform.com",
+      kind: "WorkerBundle",
+      name: "journey-bundle-v2",
+      space: SPACE,
+    },
+  };
+  let terminalCall = 0;
+  let terminalFailureMessage: string | undefined;
+  try {
+    await applyResourceMutation(input, {
+      deadlineAt: Date.now() + 60_000,
+      transport: async () => {
+        terminalCall += 1;
+        return terminalCall === 1
+          ? Response.json(
+              {
+                operation: {
+                  apiVersion: OPERATION_API_VERSION,
+                  kind: "Operation",
+                  id: operationId,
+                  done: false,
+                },
+              },
+              { status: 202, headers: { "retry-after": "0" } },
+            )
+          : Response.json({
+              apiVersion: OPERATION_API_VERSION,
+              kind: "Operation",
+              id: operationId,
+              done: true,
+              error: { code: "backend_unavailable\nsecret-like-details" },
+            });
+      },
+    });
+  } catch (error) {
+    terminalFailureMessage = error instanceof Error ? error.message : "non_error_failure";
+  }
+  expect(terminalFailureMessage).toBe("selfhost_operation_failed_unknown");
+  expect(terminalFailureMessage).not.toContain("secret-like-details");
+
+  let now = 1_000;
+  const methods: string[] = [];
+  await expect(
+    applyResourceMutation(input, {
+      deadlineAt: 20_000,
+      now: () => now,
+      sleep: async (milliseconds) => {
+        now += milliseconds;
+      },
+      transport: async (method) => {
+        methods.push(method);
+        return Response.json(
+          {
+            operation: {
+              apiVersion: OPERATION_API_VERSION,
+              kind: "Operation",
+              id: operationId,
+              done: false,
+            },
+          },
+          { status: 202, headers: { "retry-after": "6" } },
+        );
+      },
+    }),
+  ).rejects.toThrow("selfhost_operation_wait_deadline_exceeded");
+  expect(methods).toEqual(["PUT"]);
+});
+
+test("public apply does not poll after sleeping past the shared operation deadline", async () => {
+  const operationId = "op_native_worker_bundle_004";
+  const input = {
+    path: `${LANE}/resources/workers.takoform.com/WorkerBundle/journey-bundle-v2`,
+    expectedStatus: 201 as const,
+    body: { apiVersion: "workers.takoform.com", kind: "WorkerBundle" },
+    mutationHeaders: { authorization: "test-principal", "idempotency-key": "bundle-v2-create" },
+    operationHeaders: { authorization: "test-principal" },
+    expectedIdentity: {
+      apiVersion: "workers.takoform.com",
+      kind: "WorkerBundle",
+      name: "journey-bundle-v2",
+      space: SPACE,
+    },
+  };
+  let now = 1_000;
+  const methods: string[] = [];
+  await expect(
+    applyResourceMutation(input, {
+      deadlineAt: 18_000,
+      now: () => now,
+      sleep: async (milliseconds) => {
+        now += milliseconds + 2_000;
+      },
+      transport: async (method) => {
+        methods.push(method);
+        return method === "PUT"
+          ? Response.json(
+              {
+                operation: {
+                  apiVersion: OPERATION_API_VERSION,
+                  kind: "Operation",
+                  id: operationId,
+                  done: false,
+                },
+              },
+              { status: 202, headers: { "retry-after": "1" } },
+            )
+          : Response.json({
+              apiVersion: OPERATION_API_VERSION,
+              kind: "Operation",
+              id: operationId,
+              done: false,
+            });
+      },
+    }),
+  ).rejects.toThrow("selfhost_operation_wait_deadline_exceeded");
+  expect(methods).toEqual(["PUT"]);
+});
+
 const resources = [
   ["ModuleWorker", "journey-worker"],
   ["EdgeKVNamespace", "journey-kv"],
@@ -231,6 +836,9 @@ const deleteOrder = [
 test.skipIf(WORKERD === null)(
   "public self-host KV and SQLite data survive a Worker update and a new Host OS process",
   async () => {
+    const journeyDeadlineAt = Date.now() + NATIVE_CASE_TIMEOUT_MS;
+    const operationPollDeadlineAt =
+      journeyDeadlineAt - API_REQUEST_TIMEOUT_MS - OPERATION_CLEANUP_MARGIN_MS;
     const fixture = join(tmpdir(), `takoserver-kv-sqlite-host-restart-${crypto.randomUUID()}`);
     const sourceRoot = join(fixture, "data");
     const controlDirectory = join(fixture, "control-db");
@@ -262,6 +870,8 @@ test.skipIf(WORKERD === null)(
     let verifier: ReturnType<typeof Bun.spawn> | undefined;
     let admission: ReturnType<typeof Bun.spawn> | undefined;
     let host: Host | undefined;
+    let foreignWorkerListener: ReturnType<typeof Bun.serve> | undefined;
+    const parentKilledWorkerds: ProcessIdentity[] = [];
     let primaryFailure: unknown;
     let hasPrimaryFailure = false;
     let cleanupFailed = false;
@@ -440,6 +1050,7 @@ test.skipIf(WORKERD === null)(
         spec: Json,
         update?: { readonly current: Json },
       ): Promise<Json> => {
+        const diagnosticPhases = v2MutationPhases(name);
         const formRef = forms.get(kind);
         if (!formRef) throw new Error(`selfhost_released_form_missing_${kind}`);
         const desired = {
@@ -450,32 +1061,47 @@ test.skipIf(WORKERD === null)(
           spec,
         };
         const currentMetadata = update ? objectAt(update.current, "metadata") : undefined;
-        const prepared = await api<Json>("POST", `${LANE}/resources/prepare`, 200, desired, {
-          ...auth,
-          ...(currentMetadata
-            ? { "takoform-expected-generation": stringAt(currentMetadata, "generation") }
-            : {}),
-        });
+        const prepareRequest = () =>
+          api<Json>("POST", `${LANE}/resources/prepare`, 200, desired, {
+            ...auth,
+            ...(currentMetadata
+              ? { "takoform-expected-generation": stringAt(currentMetadata, "generation") }
+              : {}),
+          });
+        const prepared = await withOptionalJourneyPhase(diagnosticPhases?.prepare, prepareRequest);
         const review = objectAt(prepared, "review");
         const query = new URLSearchParams({
           space: SPACE,
           definitionVersion: stringAt(formRef, "definitionVersion"),
           schemaDigest: stringAt(formRef, "schemaDigest"),
         });
-        return api<Json>(
-          "PUT",
-          `${LANE}/resources/${stringAt(formRef, "apiVersion")}/${kind}/${name}?${query}`,
-          update ? 200 : 201,
-          { ...desired, review },
+        return applyResourceMutation(
           {
-            ...auth,
-            "idempotency-key": `${kind}-${name}-${update ? "update" : "create"}`,
-            ...(currentMetadata
-              ? {
-                  "if-match": `"${stringAt(currentMetadata, "revision")}"`,
-                  "takoform-expected-generation": stringAt(currentMetadata, "generation"),
-                }
-              : { "if-none-match": "*" }),
+            path: `${LANE}/resources/${stringAt(formRef, "apiVersion")}/${kind}/${name}?${query}`,
+            expectedStatus: update ? 200 : 201,
+            body: { ...desired, review },
+            mutationHeaders: {
+              ...auth,
+              "idempotency-key": `${kind}-${name}-${update ? "update" : "create"}`,
+              ...(currentMetadata
+                ? {
+                    "if-match": `"${stringAt(currentMetadata, "revision")}"`,
+                    "takoform-expected-generation": stringAt(currentMetadata, "generation"),
+                  }
+                : { "if-none-match": "*" }),
+            },
+            operationHeaders: auth,
+            expectedIdentity: {
+              apiVersion: stringAt(formRef, "apiVersion"),
+              kind,
+              name,
+              space: SPACE,
+            },
+            ...(currentMetadata ? { expectedUid: stringAt(currentMetadata, "uid") } : {}),
+          },
+          {
+            deadlineAt: operationPollDeadlineAt,
+            ...(diagnosticPhases ? { phases: diagnosticPhases } : {}),
           },
         );
       };
@@ -766,6 +1392,151 @@ test.skipIf(WORKERD === null)(
         expect(identityIsLive(restartIdentities.newHostIdentity)).toBe(true);
       });
 
+      await withJourneyPhase("pre_parent_sigkill_storage_readback", async () => {
+        const body = JSON.parse(await workerRequest(hostname, cert, "/read")) as Json;
+        expect(body).toMatchObject({
+          version: "v2",
+          value: VALUE,
+          rows: [{ id: "kept", body: VALUE }],
+        });
+      });
+
+      const parentCrashIdentities = await withJourneyPhase("host_parent_sigkill", async () => {
+        const currentHost = host;
+        if (!currentHost) throw new Error("selfhost_pre_parent_sigkill_host_missing");
+        rememberDescendants(currentHost);
+        const oldHostIdentity = processIdentity(currentHost.pid);
+        const acceptedWorkerd = acceptedWorkerdPath(sourceRoot);
+        if (!existsSync(acceptedWorkerd)) throw new Error("accepted_workerd_snapshot_missing");
+        const oldWorkerd = uniqueWorkerd(currentHost, acceptedWorkerd);
+
+        currentHost.kill("SIGKILL");
+        const exitCode = await Promise.race([
+          currentHost.exited,
+          Bun.sleep(5_000).then(() => null),
+        ]);
+        if (exitCode === null) throw new Error("selfhost_host_sigkill_timeout");
+        host = undefined;
+        parentKilledWorkerds.push(oldWorkerd);
+        expect<string | null>(currentHost.signalCode).toBe("SIGKILL");
+        expect(identityIsLive(oldHostIdentity)).toBe(false);
+
+        // Recovery must observe the kernel's parent-death cleanup. Do not
+        // signal the Workerd child here; exact-identity cleanup is finalizer-only.
+        await waitForProcessIdentitiesGone([oldWorkerd]);
+        await waitForPortClosed(API_PORT);
+        await waitForPortClosed(443);
+        expect(identityIsLive(oldWorkerd)).toBe(false);
+        return { oldHostIdentity, oldWorkerd, acceptedWorkerd };
+      });
+
+      const foreignAttempt = await withJourneyPhase("host_foreign_listener_refusal", async () => {
+        const configPath = join(sourceRoot, "workers", "workerd.capnp");
+        const configBeforeForeignListener = readFileSync(configPath);
+        const certificate = readFileSync(cert, "utf8");
+        const privateKey = readFileSync(join(tlsDirectory, "worker-key.pem"), "utf8");
+        foreignWorkerListener = Bun.serve({
+          hostname: "127.0.0.1",
+          port: 443,
+          tls: { cert: certificate, key: privateKey },
+          fetch: () => new Response("foreign-listener-marker"),
+        });
+        expect(foreignWorkerListener.port).toBe(443);
+        expect(await workerRequest(hostname, cert, "/")).toBe("foreign-listener-marker");
+
+        host = startHost(hostEnvironment);
+        await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
+        rememberDescendants(host);
+        const failedRestoreHost = host;
+        const failedRestoreHostIdentity = processIdentity(failedRestoreHost.pid);
+        const live = await fetch(`${HOST_ORIGIN}/_takoserver/health/live`, {
+          signal: AbortSignal.timeout(1_000),
+        });
+        expect(live.status).toBe(200);
+        expect(await live.json()).toEqual({ status: "live" });
+        const ready = await fetch(`${HOST_ORIGIN}/_takoserver/health/ready`, {
+          signal: AbortSignal.timeout(1_000),
+        });
+        expect(ready.status).toBe(503);
+        expect(await ready.json()).toMatchObject({
+          status: "not_ready",
+          database: "readable",
+          workerRuntime: "restore-failed",
+          supervisor: "unavailable",
+        });
+        expect(readFileSync(configPath)).toEqual(configBeforeForeignListener);
+        expect(await workerRequest(hostname, cert, "/")).toBe("foreign-listener-marker");
+        expect(identityIsLive(failedRestoreHostIdentity)).toBe(true);
+        expect(
+          [...(observedDescendants.get(failedRestoreHost)?.values() ?? [])].filter(
+            (identity) =>
+              identity.executable === parentCrashIdentities.acceptedWorkerd &&
+              identityIsLive(identity),
+          ),
+        ).toHaveLength(0);
+
+        await stopHostWhileWorkerPortForeign(failedRestoreHost);
+        host = undefined;
+        expect(identityIsLive(failedRestoreHostIdentity)).toBe(false);
+        expect(await workerRequest(hostname, cert, "/")).toBe("foreign-listener-marker");
+        foreignWorkerListener.stop(true);
+        foreignWorkerListener = undefined;
+        await waitForPortClosed(443);
+        return { failedRestoreHostIdentity };
+      });
+
+      const parentCrashRecovery = await withJourneyPhase(
+        "host_parent_sigkill_recovery",
+        async () => {
+          host = startHost(hostEnvironment);
+          await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
+          const recoveredHost = host;
+          const newHostIdentity = processIdentity(recoveredHost.pid);
+          expect(newHostIdentity.pid).not.toBe(parentCrashIdentities.oldHostIdentity.pid);
+          expect(newHostIdentity.startTicks).not.toBe(
+            parentCrashIdentities.oldHostIdentity.startTicks,
+          );
+          expect(newHostIdentity.pid).not.toBe(foreignAttempt.failedRestoreHostIdentity.pid);
+          expect(newHostIdentity.startTicks).not.toBe(
+            foreignAttempt.failedRestoreHostIdentity.startTicks,
+          );
+          expect(newHostIdentity.executable).toBe(parentCrashIdentities.oldHostIdentity.executable);
+
+          const ready = await fetch(`${HOST_ORIGIN}/_takoserver/health/ready`, {
+            signal: AbortSignal.timeout(1_000),
+          });
+          expect(ready.status).toBe(200);
+          expect(await ready.json()).toMatchObject({
+            status: "ready",
+            database: "readable",
+            workerRuntime: "serving",
+          });
+          return { newHostIdentity };
+        },
+      );
+
+      await withJourneyPhase("post_parent_sigkill_resource_readback", async () => {
+        const restored = await resourceGraph(auth, forms, resources);
+        expect(restored).toEqual(beforeRestart);
+        const body = JSON.parse(await workerRequest(hostname, cert, "/read")) as Json;
+        expect(body).toMatchObject({
+          version: "v2",
+          value: VALUE,
+          rows: [{ id: "kept", body: VALUE }],
+        });
+        expect(await workerRequest(hostname, cert, "/")).toBe("v2");
+
+        const currentHost = host;
+        if (!currentHost) throw new Error("selfhost_post_parent_sigkill_host_missing");
+        rememberDescendants(currentHost);
+        const restoredWorkerd = uniqueWorkerd(currentHost, parentCrashIdentities.acceptedWorkerd);
+        expect(restoredWorkerd.pid).not.toBe(parentCrashIdentities.oldWorkerd.pid);
+        expect(restoredWorkerd.startTicks).not.toBe(parentCrashIdentities.oldWorkerd.startTicks);
+        expect(restoredWorkerd.executable).toBe(parentCrashIdentities.acceptedWorkerd);
+        expect(identityIsLive(restoredWorkerd)).toBe(true);
+        expect(identityIsLive(parentCrashRecovery.newHostIdentity)).toBe(true);
+      });
+
       await withJourneyPhase("dependency_delete_and_absence", async () => {
         for (const [kind, name] of deleteOrder) {
           await deleteResource(auth, forms, kind, name);
@@ -791,10 +1562,33 @@ test.skipIf(WORKERD === null)(
               cleanupFailed = true;
             }
           }
+          if (host && foreignWorkerListener) {
+            try {
+              await stopHostWhileWorkerPortForeign(host);
+              host = undefined;
+            } catch {
+              cleanupFailed = true;
+            }
+          }
+          if (foreignWorkerListener) {
+            try {
+              foreignWorkerListener.stop(true);
+              foreignWorkerListener = undefined;
+            } catch {
+              cleanupFailed = true;
+            }
+          }
           if (host) {
             try {
               await stopHost(host);
               host = undefined;
+            } catch {
+              cleanupFailed = true;
+            }
+          }
+          for (const identity of parentKilledWorkerds) {
+            try {
+              await stopOwnedIdentityAfterFailure(identity);
             } catch {
               cleanupFailed = true;
             }
@@ -818,7 +1612,7 @@ test.skipIf(WORKERD === null)(
     if (hasPrimaryFailure) throw primaryFailure;
     if (cleanupFailed) throw new Error("selfhost_kv_sqlite_restart_cleanup_failed");
   },
-  300_000,
+  NATIVE_CASE_TIMEOUT_MS,
 );
 
 function childEnvironment(home: string): Record<string, string> {
@@ -904,7 +1698,7 @@ async function api<T = Json>(
     method,
     headers: { ...(body === undefined ? {} : { "content-type": "application/json" }), ...headers },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
   });
   if (response.status !== expectedStatus) {
     let code = "unknown";
@@ -1089,6 +1883,38 @@ async function stopHost(host: Host): Promise<void> {
   await waitForProcessIdentitiesGone(descendants.values());
   await waitForPortClosed(API_PORT);
   await waitForPortClosed(443);
+}
+
+async function stopHostWhileWorkerPortForeign(host: Host): Promise<void> {
+  rememberDescendants(host);
+  const descendants = observedDescendants.get(host) ?? new Map<string, ProcessIdentity>();
+  if (host.exitCode !== null || host.signalCode !== null) {
+    throw new Error("selfhost_host_exited_before_foreign_listener_stop");
+  }
+  const expectedHost = processIdentity(host.pid);
+  host.kill("SIGTERM");
+  const exitCode = await Promise.race([host.exited, Bun.sleep(5_000).then(() => null)]);
+  if (exitCode === null) throw new Error("selfhost_host_foreign_listener_stop_timeout");
+  if (exitCode !== 0) throw new Error("selfhost_host_foreign_listener_stop_failed");
+  expect(identityIsLive(expectedHost)).toBe(false);
+  await waitForProcessIdentitiesGone(descendants.values());
+  await waitForPortClosed(API_PORT);
+}
+
+async function stopOwnedIdentityAfterFailure(identity: ProcessIdentity): Promise<void> {
+  if (!identityIsLive(identity)) return;
+  const current = processIdentity(identity.pid);
+  if (current.startTicks !== identity.startTicks || current.executable !== identity.executable) {
+    throw new Error("selfhost_cleanup_process_identity_changed");
+  }
+  try {
+    process.kill(identity.pid, "SIGKILL");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+      throw new Error("selfhost_owned_process_cleanup_failed");
+    }
+  }
+  await waitForProcessIdentitiesGone([identity]);
 }
 
 async function stopOwnedProcess(child: ReturnType<typeof Bun.spawn>): Promise<void> {

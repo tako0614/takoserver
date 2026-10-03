@@ -56,7 +56,12 @@ claim GA status.
    binary for `TAKOSERVER_WORKERD_BINARY`: Worker execution requires the exact
    currently reviewed, accepted workerd artifact and source configuration.
    Without that artifact, worker-backed execution is unavailable rather than
-   silently selecting npm's binary.
+   silently selecting npm's binary. This Linux/x64 Worker lane also requires
+   `/usr/bin/setpriv`, `/bin/sh`, and mounted Linux `/proc`. The Host uses them
+   to bind its workerd child to the Host process and verify that the configured
+   Worker TCP port belongs to that child. Missing support disables Worker
+   serving rather than falling back to an unbound child; SQLite and storage
+   remain independent.
 
 4. Stop the Bun Host through the supervisor actually used for this installation
    and wait for its child `workerd` and all other writers to exit. Then run the
@@ -115,25 +120,32 @@ outside the Host API v1 and the shared OpenAPI route table:
 - `GET /_takoserver/health/live` returns `200` while the Bun HTTP handler is
   responding. It does not query SQLite or the Worker runtime.
 - `GET /_takoserver/health/ready` performs one read-only `SELECT 1` query with
-  a one-second response deadline, then samples the current workerd supervisor
-  state. It returns `200` only when SQLite answered and the required runtime is
-  either currently serving or not required; otherwise it returns `503`.
+  a one-second response deadline, then makes one bounded, read-only listener
+  observation of the accepted workerd child. It returns `200` only when SQLite
+  answered and the required runtime's listener is currently reachable or the
+  runtime is not required; otherwise it returns `503`.
 
 The readiness body contains only fixed state labels: `database` is `readable`
 or `unavailable`; `workerRuntime` is `not-required`, `starting`, `serving`,
 `recovering`, `restore-failed`, or `unavailable`; and `supervisor` is the
 current child lifecycle state (`idle`, `starting`, `serving`, `recovering`, or
-`unavailable`). An empty successful boot restore with no published Workers is
+`unavailable`). If the accepted child is still alive but its listener probe
+fails, `workerRuntime` is `unavailable` while `supervisor` remains `serving`;
+the fields distinguish observed service availability from process lifecycle.
+An empty successful boot restore with no published Workers is
 `not-required`, not a failure. A failed boot restore remains `restore-failed`
 for this process even if a later child passes its listener check: that check
 does not prove the entire durable published graph was restored. A process
 restart performs the authoritative boot restore again.
 
 These probes are observational only: they do not call restore, spawn or ensure
-workerd, or run a product/provisioner route. The response contains no raw
-errors, paths, organization or Resource identifiers, workload counts, or
-secrets. A `serving` result means this Host's current workerd child passed the
-Host-owned listener readiness check; it is not a claim that every Form,
+workerd, stop the child, or run a product/provisioner route. The ready probe
+checks the exact accepted listener around one loopback HTTP request (250 ms
+request bound, 500 ms total observation bound); it does not schedule recovery.
+The response contains no raw errors, paths, organization or Resource
+identifiers, workload counts, or secrets. A `serving` result means this Host's
+current workerd child passed the Host-owned listener readiness check; it is
+not a claim that every Form,
 provider, or tenant Worker application is ready. In particular,
 Host/control-plane readiness and application-level health remain distinct.
 `GET /healthz` on the Cloudflare Worker entry is a separate runtime surface;
@@ -176,6 +188,19 @@ captured startup/runtime logs (including `workerd runtime child exited`,
 restart scheduling, and recovery-success diagnostics), then perform an
 authenticated functional readback. These probes and signals do not constitute
 a monitoring or alerting service.
+
+An explicit Worker publish/delete reload calls the serving supervisor's
+`ensure` path. If an accepted child remains alive but has lost its listener,
+that path may replace the child in this Host process. It first verifies the
+listener is vacant, gives the existing bounded startup readiness probe a
+chance to observe a watch-mode reload settling, then verifies ownership again.
+A listener restored by that same child is not bounced. For a still-vacant
+listener, the supervisor signals only the accepted child and waits for its actual
+exit and a vacant port before starting a replacement from its retained desired
+config path. A foreign listener, failed socket-ownership observation, or
+unconfirmed child exit refuses replacement. A failed replacement startup or
+stop also retains custody of its signalled child until exit and port vacancy
+are proven; no health GET initiates recovery.
 
 ## Update and code rollback
 

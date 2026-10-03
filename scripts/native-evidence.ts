@@ -138,6 +138,45 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
     },
   },
   {
+    id: "workerd-parent-lifetime",
+    label: "Linux workerd parent lifetime and listener ownership",
+    environment: "TAKOSERVER_NATIVE_WORKERD_PARENT_LIFETIME",
+    companionEnvironment: [],
+    proves:
+      "a guarded local child exits after its Host parent is SIGKILLed and foreign TCP listeners cannot rewrite the watched config; this does not prove the pinned workerd or public Host journey",
+    enable:
+      "TAKOSERVER_NATIVE_WORKERD_PARENT_LIFETIME=1 on Linux with /usr/bin/setpriv, /bin/sh, and /proc",
+    inspect: (configured, _environment, probe) => {
+      if (configured === undefined || configured.trim() === "") {
+        return {
+          state: "unconfigured",
+          detail:
+            "TAKOSERVER_NATIVE_WORKERD_PARENT_LIFETIME is not configured; process lifetime evidence is disabled",
+        };
+      }
+      if (configured !== "1") {
+        return {
+          state: "invalid",
+          detail: "TAKOSERVER_NATIVE_WORKERD_PARENT_LIFETIME must be exactly 1",
+        };
+      }
+      if (process.platform !== "linux") {
+        return { state: "invalid", detail: "workerd parent lifetime evidence requires Linux" };
+      }
+      for (const path of ["/usr/bin/setpriv", "/bin/sh", "/bin/sleep"]) {
+        if (!probe.isExecutableFile(path)) {
+          return { state: "invalid", detail: `${path} is not a readable executable file` };
+        }
+      }
+      return {
+        state: "ready",
+        detail:
+          "Linux launch tools are present; the opted-in process test must still prove /proc and parent-death behavior",
+        readinessOnly: true,
+      };
+    },
+  },
+  {
     id: "object-bucket-host-restart",
     label: "self-host ObjectBucket public Host API and process restart",
     environment: "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART",

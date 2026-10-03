@@ -148,6 +148,352 @@ describe("keeping workerd running", () => {
     expect(started[0]).toEqual(["/usr/bin/workerd", "serve", "--watch", "/data/workerd.capnp"]);
   });
 
+  test("replaces an accepted live child only after its lost listener and exit are proven", async () => {
+    const children: TestChild[] = [];
+    const said: string[] = [];
+    let listener: "owned" | "vacant" = "owned";
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => listener,
+      spawn: () => {
+        const child = testChild();
+        children.push(child);
+        return child.process;
+      },
+      readiness: async () => true,
+      log: (message) => said.push(message),
+    });
+
+    await supervisor.ensure("/data/workerd.capnp");
+    await supervisor.ensure("/data/workerd.capnp");
+    expect(children).toHaveLength(1);
+    expect(children[0]?.killed).toBe(0);
+
+    listener = "vacant";
+    const first = supervisor.ensure("/data/workerd.capnp");
+    const second = supervisor.ensure("/data/workerd.capnp");
+    await settle();
+    expect(children[0]?.killed).toBe(1);
+    expect(children).toHaveLength(1);
+    expect(supervisor.snapshot()).toEqual({ state: "recovering" });
+
+    children[0]?.exit(0);
+    await Promise.all([first, second]);
+    expect(children).toHaveLength(2);
+    expect(supervisor.snapshot()).toEqual({ state: "serving" });
+    expect(said).toContain("workerd runtime recovered after listener replacement");
+  });
+
+  test("does not bounce a watch-mode child whose listener returns during bounded reload settle", async () => {
+    const children: TestChild[] = [];
+    let listener: "owned" | "vacant" = "owned";
+    let reloading = false;
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => listener,
+      spawn: () => {
+        const child = testChild();
+        children.push(child);
+        return {
+          ...child.process,
+          kill() {
+            child.process.kill();
+            child.exit(0);
+          },
+        };
+      },
+      readiness: async () => {
+        if (reloading) listener = "owned";
+        return true;
+      },
+    });
+
+    await supervisor.ensure("/data/workerd.capnp");
+    listener = "vacant";
+    reloading = true;
+    await supervisor.ensure("/data/workerd.capnp");
+    expect(children).toHaveLength(1);
+    expect(children[0]?.killed).toBe(0);
+    expect(supervisor.snapshot()).toEqual({ state: "serving" });
+  });
+
+  test("refuses a foreign listener or failed kernel observation without killing the accepted child", async () => {
+    const child = testChild();
+    let ownership: "owned" | "foreign" = "owned";
+    let probeError = false;
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => {
+        if (probeError) throw new Error("proc unavailable");
+        return ownership;
+      },
+      spawn: () => child.process,
+      readiness: async () => true,
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+
+    ownership = "foreign";
+    await expect(supervisor.ensure("/data/workerd.capnp")).rejects.toThrow("not owned");
+    expect(child.killed).toBe(0);
+    expect(supervisor.isReady()).toBe(true);
+
+    probeError = true;
+    await expect(supervisor.ensure("/data/workerd.capnp")).rejects.toThrow("proc unavailable");
+    expect(child.killed).toBe(0);
+    expect(supervisor.isReady()).toBe(true);
+  });
+
+  test("refuses a foreign listener or proc error discovered after vacancy settle", async () => {
+    for (const finalObservation of ["foreign", "error"] as const) {
+      const child = testChild();
+      let observations = 0;
+      const supervisor = createWorkerdSupervisor({
+        binary: "/usr/bin/workerd",
+        listenerPort: 28788,
+        listenerOwnership: async () => {
+          observations += 1;
+          if (observations === 1) return "vacant";
+          if (finalObservation === "error") throw new Error("proc unavailable");
+          return "foreign";
+        },
+        spawn: () => child.process,
+        readiness: async () => true,
+      });
+      await supervisor.ensure("/data/workerd.capnp");
+      await expect(supervisor.ensure("/data/workerd.capnp")).rejects.toThrow(
+        finalObservation === "error" ? "proc unavailable" : "not owned",
+      );
+      expect(child.killed).toBe(0);
+      expect(observations).toBe(2);
+    }
+  });
+
+  test("keeps accepted desired config unavailable if the child has no exit proof", async () => {
+    let spawned = 0;
+    let killed = 0;
+    let listener: "owned" | "vacant" = "owned";
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => listener,
+      spawn: () => {
+        spawned += 1;
+        return { kill: () => killed++ };
+      },
+      readiness: async () => true,
+    });
+    await supervisor.ensure("/data/accepted.capnp");
+    listener = "vacant";
+    await expect(supervisor.ensure("/data/new.capnp")).rejects.toThrow("exit cannot be confirmed");
+    expect(killed).toBe(1);
+    expect(spawned).toBe(1);
+    expect(supervisor.snapshot()).toEqual({ state: "unavailable" });
+    await expect(supervisor.ensure("/data/new.capnp")).rejects.toThrow("exit cannot be confirmed");
+    expect(spawned).toBe(1);
+  });
+
+  test("times out uncertain exit without a replacement or duplicate automatic restart", async () => {
+    const children: TestChild[] = [];
+    let listener: "owned" | "vacant" = "owned";
+    let scheduled = 0;
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => listener,
+      spawn: () => {
+        const child = testChild();
+        children.push(child);
+        return child.process;
+      },
+      readiness: async () => true,
+      scheduleRestart: () => {
+        scheduled += 1;
+        return () => undefined;
+      },
+    });
+    await supervisor.ensure("/data/accepted.capnp");
+    listener = "vacant";
+    await expect(supervisor.ensure("/data/unaccepted.capnp")).rejects.toThrow(
+      "exit was not confirmed in time",
+    );
+    expect(children).toHaveLength(1);
+    expect(children[0]?.killed).toBe(1);
+    expect(supervisor.snapshot()).toEqual({ state: "unavailable" });
+
+    children[0]?.exit(0);
+    await settle();
+    expect(scheduled).toBe(0);
+    await supervisor.ensure("/data/unaccepted.capnp");
+    expect(children).toHaveLength(2);
+  });
+
+  test("does not spawn until the retired child port is vacant, then retries the accepted config", async () => {
+    const children: TestChild[] = [];
+    let ownership: "owned" | "vacant" | "foreign" = "owned";
+    const commands: string[][] = [];
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => ownership,
+      spawn: (command) => {
+        commands.push([...command]);
+        const child = testChild();
+        children.push(child);
+        return child.process;
+      },
+      readiness: async () => true,
+    });
+    await supervisor.ensure("/data/accepted.capnp");
+    ownership = "vacant";
+    const first = supervisor.ensure("/data/unaccepted.capnp");
+    await settle();
+    ownership = "foreign";
+    children[0]?.exit(0);
+    await expect(first).rejects.toThrow("occupied after child exit");
+    expect(children).toHaveLength(1);
+    expect(supervisor.snapshot()).toEqual({ state: "unavailable" });
+
+    ownership = "vacant";
+    await supervisor.ensure("/data/unaccepted.capnp");
+    expect(commands[1]).toEqual(["/usr/bin/workerd", "serve", "--watch", "/data/accepted.capnp"]);
+    expect(supervisor.snapshot()).toEqual({ state: "serving" });
+  });
+
+  test("stop during live-child replacement prevents a late spawn", async () => {
+    const children: TestChild[] = [];
+    let listener: "owned" | "vacant" = "owned";
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => listener,
+      spawn: () => {
+        const child = testChild();
+        children.push(child);
+        return child.process;
+      },
+      readiness: async () => true,
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+    listener = "vacant";
+    const replacing = supervisor.ensure("/data/workerd.capnp");
+    await settle();
+    supervisor.stop();
+    children[0]?.exit(0);
+    await expect(replacing).rejects.toThrow("cancelled");
+    expect(children).toHaveLength(1);
+    expect(supervisor.snapshot()).toEqual({ state: "unavailable" });
+  });
+
+  test("stop while listener ownership is being read cannot signal or replace the old child", async () => {
+    const children: TestChild[] = [];
+    const ownership = deferred<"vacant">();
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => await ownership.promise,
+      spawn: () => {
+        const child = testChild();
+        children.push(child);
+        return child.process;
+      },
+      readiness: async () => true,
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+    const checking = supervisor.ensure("/data/workerd.capnp");
+    supervisor.stop();
+    ownership.resolve("vacant");
+    await expect(checking).rejects.toThrow("cancelled");
+    expect(children[0]?.killed).toBe(1);
+    expect(supervisor.snapshot()).toEqual({ state: "unavailable" });
+
+    const next = supervisor.ensure("/data/workerd.capnp");
+    await settle();
+    expect(children).toHaveLength(1);
+    children[0]?.exit(0);
+    await next;
+    expect(children).toHaveLength(2);
+  });
+
+  test("a failed replacement startup retains the accepted config for normal recovery", async () => {
+    const children: TestChild[] = [];
+    const commands: string[][] = [];
+    const restarts: Array<() => void> = [];
+    let listener: "owned" | "vacant" = "owned";
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => listener,
+      spawn: (command) => {
+        commands.push([...command]);
+        const child = testChild();
+        children.push(child);
+        if (children.length === 3) listener = "owned";
+        return child.process;
+      },
+      readiness: async () => children.length !== 2,
+      scheduleRestart: (run) => {
+        restarts.push(run);
+        return () => undefined;
+      },
+    });
+    await supervisor.ensure("/data/accepted.capnp");
+    listener = "vacant";
+    const replacing = supervisor.ensure("/data/unaccepted.capnp");
+    await settle();
+    children[0]?.exit(0);
+    await expect(replacing).rejects.toThrow("readiness");
+    await settle();
+    expect(restarts).toHaveLength(1);
+    restarts[0]?.();
+    await settle();
+    expect(children).toHaveLength(2);
+    children[1]?.exit(0);
+    await settle();
+    await supervisor.ensure("/data/accepted.capnp");
+    expect(commands[2]).toEqual(["/usr/bin/workerd", "serve", "--watch", "/data/accepted.capnp"]);
+    expect(supervisor.snapshot()).toEqual({ state: "serving" });
+  });
+
+  test("stop during replacement startup waits for that signalled child before a later ensure", async () => {
+    const children: TestChild[] = [];
+    const secondReadiness = deferred<boolean>();
+    let listener: "owned" | "vacant" = "owned";
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => listener,
+      spawn: () => {
+        const child = testChild();
+        children.push(child);
+        return child.process;
+      },
+      readiness: async () => {
+        if (children.length === 2) return await secondReadiness.promise;
+        return true;
+      },
+    });
+    await supervisor.ensure("/data/accepted.capnp");
+    listener = "vacant";
+    const replacing = supervisor.ensure("/data/unaccepted.capnp");
+    await settle();
+    children[0]?.exit(0);
+    await settle();
+    expect(children).toHaveLength(2);
+
+    supervisor.stop();
+    secondReadiness.resolve(true);
+    await expect(replacing).rejects.toThrow("cancelled");
+    const next = supervisor.ensure("/data/new.capnp");
+    await settle();
+    expect(children).toHaveLength(2);
+    children[1]?.exit(0);
+    await next;
+    expect(children).toHaveLength(3);
+  });
+
   test("recovers a ready runtime after its child exits", async () => {
     const children: TestChild[] = [];
     const said: string[] = [];

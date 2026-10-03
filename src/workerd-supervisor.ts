@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { workerPortOwnership } from "./workerd-linux-process.ts";
 
 /**
  * Keeping workerd running.
@@ -18,6 +19,7 @@ import { join } from "node:path";
 
 export interface WorkerdProcess {
   kill(): void;
+  readonly pid?: number;
   /** Bun exposes this promise; test doubles may omit it. */
   readonly exited?: Promise<number>;
 }
@@ -29,6 +31,10 @@ export interface WorkerdSupervisor {
   isReady(): boolean;
   /** A fresh read-only view of the child lifecycle; it does not start recovery. */
   snapshot(): WorkerdSupervisorSnapshot;
+  /** Probe the exact accepted child once without changing its lifecycle. */
+  probeReadiness(): Promise<WorkerdSupervisorReadinessObservation>;
+  /** Refuse to rewrite a watched config while an unknown process owns its port. */
+  assertMayRender(): Promise<void>;
   stop(): void;
 }
 
@@ -38,8 +44,15 @@ export interface WorkerdSupervisorSnapshot {
   readonly state: WorkerdSupervisorState;
 }
 
+export interface WorkerdSupervisorReadinessObservation {
+  readonly snapshot: WorkerdSupervisorSnapshot;
+  /** Null means there was no accepted ready child to probe in this turn. */
+  readonly listenerReady: boolean | null;
+}
+
 type CancelScheduledRestart = () => void;
 type ScheduleRestart = (run: () => void, delayMs: number) => CancelScheduledRestart;
+export type WorkerdReadinessMode = "startup" | "observation";
 
 type RuntimeEntry = {
   readonly process: WorkerdProcess;
@@ -66,6 +79,8 @@ type PendingRestart = {
 
 const RESTART_INITIAL_DELAY_MS = 100;
 const RESTART_MAX_DELAY_MS = 5_000;
+const OBSERVATION_PROBE_TIMEOUT_MS = 500;
+const RETIRED_CHILD_EXIT_TIMEOUT_MS = 1_000;
 
 /** Where a workerd binary is normally found beside this package. */
 export function findWorkerd(repositoryRoot: string): string | null {
@@ -79,8 +94,15 @@ export function findWorkerd(repositoryRoot: string): string | null {
 export function createWorkerdSupervisor(options: {
   readonly binary: string | null;
   readonly spawn: (command: readonly string[]) => WorkerdProcess;
+  readonly listenerPort?: number;
+  /** Kernel listener ownership; injectable only at the OS observation boundary. */
+  readonly listenerOwnership?: typeof workerPortOwnership;
   /** A real listener/readiness check supplied by the serving composition. */
-  readonly readiness?: (configPath: string) => Promise<boolean>;
+  readonly readiness?: (
+    configPath: string,
+    child: WorkerdProcess,
+    mode: WorkerdReadinessMode,
+  ) => Promise<boolean>;
   readonly log?: (message: string) => void;
   /** Internal clock seam for deterministic recovery tests. */
   readonly scheduleRestart?: ScheduleRestart;
@@ -94,6 +116,10 @@ export function createWorkerdSupervisor(options: {
 
   let running: RuntimeEntry | null = null;
   let starting: StartingRuntime | null = null;
+  let checking: Promise<void> | null = null;
+  // A signalled child is not safe to replace until its own exit and a vacant
+  // listener have both been observed. Keep it after an uncertain timeout.
+  let retiring: RuntimeEntry | null = null;
   // Desired state is committed only after readiness. A failed first start
   // therefore rejects once and cannot turn into an unbounded background loop.
   let desired: DesiredRuntime | null = null;
@@ -102,6 +128,7 @@ export function createWorkerdSupervisor(options: {
   let stoppedAfterRequiredRuntime = false;
   let nextEpoch = 0;
   let nextRestartId = 0;
+  const listenerOwnership = options.listenerOwnership ?? workerPortOwnership;
 
   const logRecoveryDiagnostic = (message: string): void => {
     try {
@@ -123,6 +150,17 @@ export function createWorkerdSupervisor(options: {
       const message = error instanceof Error ? error.message : String(error);
       options.log?.(`workerd runtime child could not be stopped: ${message}`);
     }
+  };
+
+  const retire = (entry: RuntimeEntry): void => {
+    // The normal Host has a listener port. A signalled child keeps custody
+    // until its own exit and that port's vacancy are both proven; neither a
+    // failed readiness check nor stop() is proof that kill has completed.
+    if (options.listenerPort !== undefined && (retiring === null || retiring === entry)) {
+      retiring = entry;
+    }
+    if (running === entry) running = null;
+    kill(entry);
   };
 
   const cancelPendingRestart = (): void => {
@@ -165,7 +203,14 @@ export function createWorkerdSupervisor(options: {
         void currentStarting.promise.then(launch, launch);
         return;
       }
-      const promise = beginStart(configPath, epoch, true);
+      const currentCheck = checking;
+      if (currentCheck) {
+        void currentCheck.then(launch, launch);
+        return;
+      }
+      const promise = retiring
+        ? trackCheck(replaceRetired(retiring, configPath, epoch, true))
+        : beginStart(configPath, epoch, true);
       void promise.catch((error: unknown) => {
         if (!isDesiredEpoch(epoch)) return;
         const message = error instanceof Error ? error.message : String(error);
@@ -219,7 +264,9 @@ export function createWorkerdSupervisor(options: {
   };
 
   const awaitReadiness = async (entry: RuntimeEntry): Promise<boolean> => {
-    const readiness = Promise.resolve().then(() => options.readiness?.(entry.configPath));
+    const readiness = Promise.resolve().then(() =>
+      options.readiness?.(entry.configPath, entry.process, "startup"),
+    );
     const exited = entry.process.exited;
     if (!exited) return (await readiness) ?? false;
 
@@ -234,7 +281,12 @@ export function createWorkerdSupervisor(options: {
     return (await Promise.race([readiness, exitedBeforeReadiness])) ?? false;
   };
 
-  const start = async (configPath: string, epoch: number, recovery: boolean): Promise<void> => {
+  const start = async (
+    configPath: string,
+    epoch: number,
+    recovery: boolean,
+    explicitReplacement = false,
+  ): Promise<void> => {
     let entry: RuntimeEntry | null = null;
     try {
       const binary = options.binary;
@@ -279,22 +331,30 @@ export function createWorkerdSupervisor(options: {
         desired = { configPath, epoch, restartAttempt: 0 };
       }
       if (recovery) {
-        logRecoveryDiagnostic("workerd runtime recovered after automatic restart");
+        logRecoveryDiagnostic(
+          explicitReplacement
+            ? "workerd runtime recovered after listener replacement"
+            : "workerd runtime recovered after automatic restart",
+        );
       } else {
         options.log?.(`workerd started against ${configPath}`);
       }
     } catch (error) {
       if (entry) {
-        kill(entry);
-        if (running === entry) running = null;
+        retire(entry);
       }
       if (!recovery) firstStartFailed = true;
       throw error;
     }
   };
 
-  const beginStart = (configPath: string, epoch: number, recovery: boolean): Promise<void> => {
-    const promise = start(configPath, epoch, recovery);
+  const beginStart = (
+    configPath: string,
+    epoch: number,
+    recovery: boolean,
+    explicitReplacement = false,
+  ): Promise<void> => {
+    const promise = start(configPath, epoch, recovery, explicitReplacement);
     const attempt: StartingRuntime = { promise };
     starting = attempt;
     void promise.then(
@@ -309,23 +369,136 @@ export function createWorkerdSupervisor(options: {
     return promise;
   };
 
+  const waitForExit = async (entry: RuntimeEntry): Promise<void> => {
+    const exited = entry.process.exited;
+    if (!exited) throw new Error("workerd runtime child exit cannot be confirmed");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        exited.then(() => undefined),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("workerd runtime child exit was not confirmed in time")),
+            RETIRED_CHILD_EXIT_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+
+  const replaceRetired = async (
+    entry: RuntimeEntry,
+    configPath: string,
+    epoch: number,
+    recovery: boolean,
+  ): Promise<void> => {
+    const port = options.listenerPort;
+    if (port === undefined) throw new Error("workerd listener port is required for replacement");
+    await waitForExit(entry);
+    if (retiring !== entry || nextEpoch !== epoch) {
+      throw new Error("workerd runtime replacement was cancelled");
+    }
+    const ownership = await listenerOwnership(port, undefined);
+    if (retiring !== entry || nextEpoch !== epoch) {
+      throw new Error("workerd runtime replacement was cancelled");
+    }
+    if (ownership !== "vacant") {
+      throw new Error("workerd listener port is occupied after child exit");
+    }
+    retiring = null;
+    cancelPendingRestart();
+    await beginStart(configPath, epoch, recovery, recovery);
+  };
+
+  const trackCheck = (promise: Promise<void>): Promise<void> => {
+    checking = promise;
+    void promise.then(
+      () => {
+        if (checking === promise) checking = null;
+      },
+      () => {
+        if (checking === promise) checking = null;
+      },
+    );
+    return promise;
+  };
+
+  const snapshot = (): WorkerdSupervisorSnapshot => {
+    let state: WorkerdSupervisorState;
+    if (running?.ready) state = "serving";
+    else if (starting || checking) state = desired ? "recovering" : "starting";
+    else if (pendingRestart) state = "recovering";
+    else if (desired || firstStartFailed || stoppedAfterRequiredRuntime) state = "unavailable";
+    else state = "idle";
+    return Object.freeze({ state });
+  };
+
   return {
-    async ensure(configPath) {
-      if (running?.ready) return;
-      if (starting) return await starting.promise;
+    ensure(configPath) {
+      if (checking) return checking;
+      if (starting) return starting.promise;
+      if (running?.ready) {
+        const entry = running;
+        const port = options.listenerPort;
+        if (port === undefined) return Promise.resolve();
+        return trackCheck(
+          (async () => {
+            const assertCurrent = (): void => {
+              if (running !== entry || nextEpoch !== entry.epoch) {
+                throw new Error("workerd runtime listener check was cancelled");
+              }
+            };
+            let ownership = await listenerOwnership(port, entry.process.pid);
+            assertCurrent();
+            if (ownership === "vacant") {
+              // Watch-mode reload can briefly release the accepted listener.
+              // Its existing bounded startup probe waits for the exact child
+              // to resume; the final kernel read alone decides ownership.
+              try {
+                await options.readiness?.(entry.configPath, entry.process, "startup");
+              } catch {
+                // A readiness failure is not socket-ownership evidence.
+              }
+              assertCurrent();
+              ownership = await listenerOwnership(port, entry.process.pid);
+              assertCurrent();
+            }
+            if (ownership === "owned") return;
+            if (ownership === "foreign") {
+              throw new Error(
+                "workerd listener port is occupied by a process not owned by this Host",
+              );
+            }
+
+            // Invalidate the old watcher before signaling the exact captured
+            // child. Its expected exit cannot schedule a second replacement.
+            retire(entry);
+            await replaceRetired(entry, desired?.configPath ?? configPath, entry.epoch, true);
+          })(),
+        );
+      }
       if (!options.binary) {
         firstStartFailed = true;
-        throw new Error("workerd runtime binary is required to activate Worker serving");
+        return Promise.reject(
+          new Error("workerd runtime binary is required to activate Worker serving"),
+        );
       }
       if (!options.readiness) {
         firstStartFailed = true;
-        throw new Error("workerd runtime readiness probe is required to activate Worker serving");
+        return Promise.reject(
+          new Error("workerd runtime readiness probe is required to activate Worker serving"),
+        );
       }
 
       cancelPendingRestart();
       const epoch = desired?.epoch ?? ++nextEpoch;
       const targetConfigPath = desired?.configPath ?? configPath;
-      await beginStart(targetConfigPath, epoch, desired !== null);
+      if (retiring) {
+        return trackCheck(replaceRetired(retiring, targetConfigPath, epoch, desired !== null));
+      }
+      return beginStart(targetConfigPath, epoch, desired !== null);
     },
 
     isReady() {
@@ -333,13 +506,42 @@ export function createWorkerdSupervisor(options: {
     },
 
     snapshot() {
-      let state: WorkerdSupervisorState;
-      if (running?.ready) state = "serving";
-      else if (starting) state = desired ? "recovering" : "starting";
-      else if (pendingRestart) state = "recovering";
-      else if (desired || firstStartFailed || stoppedAfterRequiredRuntime) state = "unavailable";
-      else state = "idle";
-      return Object.freeze({ state });
+      return snapshot();
+    },
+
+    async probeReadiness() {
+      const entry = running;
+      if (!entry?.ready) return Object.freeze({ snapshot: snapshot(), listenerReady: null });
+
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const probe = Promise.resolve()
+        .then(() => options.readiness?.(entry.configPath, entry.process, "observation"))
+        .then((result) => result === true)
+        .catch(() => false);
+      const timeout = new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), OBSERVATION_PROBE_TIMEOUT_MS);
+      });
+      let ready = false;
+      try {
+        ready = await Promise.race([probe, timeout]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+
+      // The probe is observational. If this child stopped or was replaced
+      // while awaiting I/O, its result must not describe the newer lifecycle.
+      if (running !== entry || !entry.ready) {
+        return Object.freeze({ snapshot: snapshot(), listenerReady: false });
+      }
+      return Object.freeze({ snapshot: snapshot(), listenerReady: ready });
+    },
+
+    async assertMayRender() {
+      if (options.listenerPort === undefined) return;
+      const ownership = await listenerOwnership(options.listenerPort, running?.process.pid);
+      if (ownership === "foreign") {
+        throw new Error("workerd listener port is occupied by a process not owned by this Host");
+      }
     },
 
     stop() {
@@ -352,10 +554,10 @@ export function createWorkerdSupervisor(options: {
       nextEpoch += 1;
       desired = null;
       firstStartFailed = false;
+      checking = null;
       cancelPendingRestart();
       const entry = running;
-      running = null;
-      if (entry) kill(entry);
+      if (entry) retire(entry);
       // Invalidate the in-flight promise as well. Its readiness completion may
       // still arrive later, but it can no longer replace a subsequent ensure.
       starting = null;

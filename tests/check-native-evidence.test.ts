@@ -19,6 +19,36 @@ const DOCKER_LIFECYCLE_ENV = "TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE";
 const OBJECT_BUCKET_HOST_RESTART_ENV = "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART";
 const SELFHOST_ARTIFACT_UPLOAD_ENV = "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE";
 const QUEUE_HTTPS_DIAGNOSTIC_ENV = "TAKOSERVER_SELFHOST_QUEUE_HTTPS_DIAGNOSTIC_NATIVE";
+const WORKERD_PARENT_LIFETIME_ENV = "TAKOSERVER_NATIVE_WORKERD_PARENT_LIFETIME";
+
+test("classifies the opt-in Linux parent lifetime suite and rejects invalid enablement", () => {
+  const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));
+  const own = gates.filter((gate) => gate.file === "tests/workerd-linux-parent-lifetime.test.ts");
+  expect(own).toHaveLength(4);
+  expect(own.every((gate) => gate.capability === "workerd-parent-lifetime")).toBe(true);
+  expect(own.every((gate) => gate.environments.includes(WORKERD_PARENT_LIFETIME_ENV))).toBe(true);
+
+  const capability = NATIVE_EVIDENCE_CAPABILITIES.find(
+    (entry) => entry.id === "workerd-parent-lifetime",
+  );
+  if (!capability) throw new Error("workerd parent lifetime capability missing");
+  expect(capability.inspect(undefined, {}, probe()).state).toBe("unconfigured");
+  expect(capability.inspect("true", {}, probe()).state).toBe("invalid");
+  expect(
+    capability.inspect(
+      "1",
+      {},
+      {
+        isExecutableFile: (path) => path !== "/usr/bin/setpriv",
+        sha256: () => null,
+      },
+    ).state,
+  ).toBe("invalid");
+  expect(capability.inspect("1", {}, probe())).toMatchObject({
+    state: process.platform === "linux" ? "ready" : "invalid",
+    ...(process.platform === "linux" ? { readinessOnly: true } : {}),
+  });
+});
 
 const DOCKER_FIXTURE_ENVIRONMENT = {
   TAKOSERVER_NATIVE_CONTAINER_IMAGE_A: `registry.example.test/takoserver/a@sha256:${"a".repeat(64)}`,
