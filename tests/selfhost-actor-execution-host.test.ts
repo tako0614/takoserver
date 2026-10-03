@@ -63,6 +63,7 @@ test("Actor owner rejects persisted relation/deployment gaps before native alloc
     await owner.ready;
     await owner.registerNamespace(scope);
     await owner.registerNamespace({ ...scope, tenantId: "other" });
+    expect(await owner.readCurrentGraph(scope, AbortSignal.timeout(1_000))).toBeNull();
     await expect(owner.fetch({ ...scope, id: "a" }, request())).rejects.toThrow(
       "realization unavailable",
     );

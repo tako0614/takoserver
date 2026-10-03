@@ -702,7 +702,12 @@ export function createSelfhostActorExecutionHost(options: {
     ): Promise<ActorResourceGraph | null> {
       await ready;
       if (stopped || !validScope(scope)) return null;
-      return options.graph({ ...scope }, signal);
+      const identity = { ...scope };
+      const graph = await options.graph(identity, signal);
+      if (!graph || !(await hasCurrentRealization(graph, identity))) return null;
+      const again = await options.graph(identity, signal);
+      signal.throwIfAborted();
+      return sameGraph(graph, again) ? graph : null;
     },
     async registerNamespace(scope: ActorScope): Promise<void> {
       await ready;
