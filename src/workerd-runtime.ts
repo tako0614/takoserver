@@ -17,6 +17,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { parseActorAbiRef } from "./actor-abi-ref.ts";
+import type { TakoformInterfaceRef } from "./interface-ref.ts";
 import { bytesDigest } from "./json.ts";
 import {
   canonicalSelfhostWeightedVersions,
@@ -101,6 +103,8 @@ export interface WorkerdActorForwardBinding {
   readonly upgradeService: string;
   /** Host-private bearer already embedded in the generated outer wrapper. */
   readonly token: string;
+  /** Host-selected full ABI identity; omission retains the released Actor profile. */
+  readonly runtimeClassRef?: TakoformInterfaceRef;
 }
 
 export interface WorkerdActorForward {
@@ -1866,12 +1870,17 @@ function validActorForward(value: unknown): WorkerdActorForward {
     throw new Error("unusable Actor forward graph");
   const names = new Set<string>();
   const bindings = candidate.bindings.map((binding, index) => {
+    const fields =
+      typeof binding === "object" && binding !== null && !Array.isArray(binding)
+        ? Object.keys(binding).sort().join(",")
+        : "";
     if (
       typeof binding !== "object" ||
       binding === null ||
       Array.isArray(binding) ||
-      Object.keys(binding).sort().join(",") !==
-        "httpService,namespaceResourceUid,publicName,tenantId,token,upgradeService" ||
+      (fields !== "httpService,namespaceResourceUid,publicName,tenantId,token,upgradeService" &&
+        fields !==
+          "httpService,namespaceResourceUid,publicName,runtimeClassRef,tenantId,token,upgradeService") ||
       typeof binding.publicName !== "string" ||
       !ACTOR_FORWARD_PUBLIC_NAME.test(binding.publicName) ||
       names.has(binding.publicName) ||
@@ -1891,7 +1900,15 @@ function validActorForward(value: unknown): WorkerdActorForward {
     capnpText(binding.publicName);
     capnpText(binding.tenantId);
     capnpText(binding.namespaceResourceUid);
-    return { ...binding };
+    const declaredRef = binding.runtimeClassRef;
+    if (fields === "httpService,namespaceResourceUid,publicName,tenantId,token,upgradeService")
+      return { ...binding };
+    const selected = parseActorAbiRef(declaredRef);
+    if (selected?.kind !== "v2") throw new Error("unusable Actor forward graph");
+    return {
+      ...binding,
+      runtimeClassRef: selected.ref,
+    };
   });
   return { schema: ACTOR_FORWARD_SCHEMA, bindings };
 }

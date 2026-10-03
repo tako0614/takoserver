@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, constants as fsConstants, lstatSync } from "node:fs";
 import { mkdir, open, readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { parseActorAbiRef } from "../actor-abi-ref.ts";
 import { parseWorkerCron } from "../cron.ts";
 import { bytesDigest, canonicalJson } from "../json.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
@@ -1354,6 +1355,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       publicName: binding.name,
       tenantId: binding.tenantId,
       namespaceResourceUid: binding.namespaceResourceUid,
+      ...(binding.runtimeClassRef === undefined
+        ? {}
+        : { runtimeClassRef: binding.runtimeClassRef }),
       token: deriveSelfhostActorForwardToken({
         eventToken: bindings.eventToken as string,
         workerVersionResourceUid: bindings.workerVersionResourceUid as string,
@@ -2327,9 +2331,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         !offering ||
         offering.form.kind !== "ActorNamespace" ||
         !sameSelfhostFormRef(offering.form, relation.resource.form.formRef) ||
-        offering.providedInterfaces.length !== 1 ||
-        canonicalJson(offering.providedInterfaces[0]) !==
-          canonicalJson(SELFHOST_ACTOR_INTERFACE_REF)
+        offering.providedInterfaces.length !== 1
       )
         invalid();
       const target = relation as NonNullable<typeof relation>;
@@ -2355,6 +2357,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         graph.namespace.uid !== target.targetUid ||
         graph.namespace.address.space !== input.identity.space ||
         graph.namespace.address.name !== target.resource.metadata.name ||
+        !offering ||
+        !sameSelfhostFormRef(graph.namespace.formRef, offering.form) ||
         graph.namespace.className !== target.resource.spec.className ||
         !DATA_BINDING_NAME.test(graph.namespace.className) ||
         graph.worker.address.space !== input.identity.space ||
@@ -2366,6 +2370,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       )
         invalid();
       const currentGraph = graph as ActorResourceGraph;
+      const graphRef = currentGraph.runtimeClassRef;
+      const graphAbi = graphRef === undefined ? null : parseActorAbiRef(graphRef);
+      const offeredRef = offering?.providedInterfaces[0];
+      if (
+        offeredRef === undefined ||
+        (graphRef !== undefined && graphAbi?.kind !== "v2") ||
+        canonicalJson(offeredRef) !== canonicalJson(graphAbi?.ref ?? SELFHOST_ACTOR_INTERFACE_REF)
+      )
+        invalid();
       names.add(publicName);
       bindings.push({
         name: publicName,
@@ -2373,6 +2386,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         namespaceResourceUid: scope.namespaceResourceUid,
         workerResourceUid: currentGraph.worker.uid,
         className: currentGraph.namespace.className,
+        ...(graphAbi === null ? {} : { runtimeClassRef: graphAbi.ref }),
       });
     }
     return bindings;

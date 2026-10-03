@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { createActorResourceGraphReader } from "../src/actor-resource-graph.ts";
+import { selectTakoformCandidates } from "../src/takoform/forward-candidates.ts";
 import type { InstalledTakoformForm, TakoformStoredResource } from "../src/takoform/types.ts";
 import {
   actorForm,
@@ -196,6 +197,52 @@ test("validates and snapshots supplied Actor vocabulary, without implicit catalo
     (await createActorResourceGraphReader({ store: f.store, form: newer })(scope, signal()))
       ?.namespace.formRef.definitionVersion,
   ).toBe("99.0.0");
+});
+
+test("projects only the installed forward Actor Form's exact runtime InterfaceRef", async () => {
+  const selected = selectTakoformCandidates("actor-forward").forms.find(
+    (form) => form.identity.formRef.kind === "ActorNamespace",
+  );
+  if (!selected?.workerClassRuntime?.runtimeClassRef)
+    throw new Error("forward Actor Form missing runtime InterfaceRef");
+  const f = fixture();
+  Object.assign(f.source.form, structuredClone(selected.identity));
+  f.database
+    .query("UPDATE tf_resources SET resource_json = ? WHERE uid = ?")
+    .run(JSON.stringify(f.source), scope.namespaceResourceUid);
+  f.database
+    .query("UPDATE tf_resource_deletion_attestations SET form_ref_json = ? WHERE resource_uid = ?")
+    .run(JSON.stringify(selected.identity.formRef), scope.namespaceResourceUid);
+  const read = createActorResourceGraphReader({ store: f.store, form: selected });
+  expect((await read(scope, signal()))?.runtimeClassRef).toEqual(
+    selected.workerClassRuntime.runtimeClassRef,
+  );
+
+  for (const form of [
+    {
+      ...selected,
+      workerClassRuntime: {
+        ...selected.workerClassRuntime,
+        runtimeClassRef: {
+          ...selected.workerClassRuntime.runtimeClassRef,
+          schemaDigest: `sha256:${"f".repeat(64)}`,
+        },
+      },
+    },
+    {
+      ...selected,
+      providedInterfaces: [
+        {
+          ...selected.workerClassRuntime.runtimeClassRef,
+          version: "1.0.0",
+        },
+      ],
+    },
+  ]) {
+    expect(() =>
+      createActorResourceGraphReader({ store: f.store, form: form as InstalledTakoformForm }),
+    ).toThrow();
+  }
 });
 
 test("captures scope, detaches returned facts, propagates failures, and honors cancellation", async () => {

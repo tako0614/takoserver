@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { bytesDigest } from "../src/json.ts";
+import { forwardTakoformCandidates } from "../src/takoform/forward-candidates.ts";
 import {
   ASSET_ROUTER_SOURCE,
   ASSETS_SOURCE,
@@ -1562,6 +1563,95 @@ test("persists an opt-in Actor forward graph and rejects unmapped Host sockets",
   await expect(withoutHostSockets.publish("site", withActors)).rejects.toThrow(
     "Actor forward Host socket unavailable",
   );
+});
+
+test("persists and restores an exact private Actor v2 ref, refusing a wrong digest", async () => {
+  const ref = forwardTakoformCandidates().forms.find(
+    (form) => form.identity.formRef.kind === "ActorNamespace",
+  )?.workerClassRuntime?.runtimeClassRef;
+  if (!ref) throw new Error("forward Actor runtime InterfaceRef unavailable");
+  const actorForward = {
+    schema: "takoserver.selfhost-actor-forward@v1" as const,
+    bindings: [
+      {
+        publicName: "ROOM",
+        tenantId: "tenant-1",
+        namespaceResourceUid: "uid-actor-namespace-1",
+        httpService: "__TAKOSERVER_ACTOR_HTTP_00000",
+        upgradeService: "__TAKOSERVER_ACTOR_UPGRADE_00000",
+        token: "a".repeat(64),
+        runtimeClassRef: ref,
+      },
+    ],
+  };
+  const firstActorBinding = actorForward.bindings[0];
+  if (!firstActorBinding) throw new Error("Actor forward binding unavailable");
+  const base = weightedPublication("site", "generation-actor-v2");
+  const withActors = {
+    ...base,
+    versions: base.versions.map((version) => ({
+      ...version,
+      site: { ...version.site, actorForward },
+    })),
+  };
+  const runtime = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    actorForwardSockets: [
+      {
+        tenantId: "tenant-1",
+        namespaceResourceUid: "uid-actor-namespace-1",
+        httpSocketPath: join(root, "actor-http.sock"),
+        upgradeSocketPath: join(root, "actor-upgrade.sock"),
+      },
+    ],
+  });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+  await runtime.publish("site", withActors);
+  expect(
+    (
+      await readWorkerdSelectedActiveVersion(root, "site", {
+        expectedWorkerResourceUid: base.workerResourceUid,
+        basisPoint: 0,
+      })
+    )?.site.actorForward?.bindings[0]?.runtimeClassRef,
+  ).toEqual(ref);
+  expect(await runtime.restore()).toEqual(["site"]);
+  await expect(
+    runtime.publish("wrong", {
+      ...withActors,
+      versions: withActors.versions.map((version) => ({
+        ...version,
+        site: {
+          ...version.site,
+          actorForward: {
+            ...actorForward,
+            bindings: [
+              {
+                ...firstActorBinding,
+                runtimeClassRef: { ...ref, schemaDigest: `sha256:${"f".repeat(64)}` },
+              },
+            ],
+          },
+        },
+      })),
+    }),
+  ).rejects.toThrow("unusable Actor forward graph");
+  await expect(
+    runtime.publish("undefined-ref", {
+      ...withActors,
+      versions: withActors.versions.map((version) => ({
+        ...version,
+        site: {
+          ...version.site,
+          actorForward: {
+            ...actorForward,
+            bindings: [{ ...firstActorBinding, runtimeClassRef: undefined as never }],
+          },
+        },
+      })),
+    }),
+  ).rejects.toThrow("unusable Actor forward graph");
 });
 
 test("live Actor socket graph requires exact per-Version token for weighted callers", async () => {

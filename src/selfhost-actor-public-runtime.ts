@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import { parseActorAbiRef } from "./actor-abi-ref.ts";
 import { selfhostVersionBindingsRoot } from "./providers/selfhost.ts";
 import {
   createSelfhostVersionBindingStore,
@@ -137,9 +138,16 @@ export async function openSelfhostActorPublicRuntime(options: {
     for (const binding of publication.bindings) {
       const exact = stored.actorBindings.filter((item) => item.name === binding.publicName);
       const target = exact[0];
+      const storedRef = target?.runtimeClassRef;
+      const publishedRef = binding.runtimeClassRef;
+      const storedAbi = storedRef === undefined ? null : parseActorAbiRef(storedRef);
+      const publishedAbi = publishedRef === undefined ? null : parseActorAbiRef(publishedRef);
       if (
         exact.length !== 1 ||
         !target ||
+        (storedRef !== undefined && storedAbi?.kind !== "v2") ||
+        (publishedRef !== undefined && publishedAbi?.kind !== "v2") ||
+        storedAbi?.ref !== publishedAbi?.ref ||
         target.tenantId !== binding.tenantId ||
         target.namespaceResourceUid !== binding.namespaceResourceUid ||
         deriveSelfhostActorForwardToken({
@@ -154,8 +162,12 @@ export async function openSelfhostActorPublicRuntime(options: {
         namespaceResourceUid: target.namespaceResourceUid,
       };
       const graph = await host.readCurrentGraph(scope, AbortSignal.timeout(30_000));
+      const graphRef = graph?.runtimeClassRef;
+      const graphAbi = graphRef === undefined ? null : parseActorAbiRef(graphRef);
       if (
         !graph ||
+        (graphRef !== undefined && graphAbi?.kind !== "v2") ||
+        storedAbi?.ref !== graphAbi?.ref ||
         graph.worker.uid !== target.workerResourceUid ||
         graph.namespace.className !== target.className ||
         !(await host.hasNamespace(scope))
