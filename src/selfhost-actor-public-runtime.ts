@@ -153,6 +153,7 @@ export async function openSelfhostActorPublicRuntime(options: {
   let uncertain = false;
   let brokerOrdinal = 0;
   let brokerTail: Promise<void> = Promise.resolve();
+  let closing: Promise<void> | undefined;
   const exclusiveBroker = <T>(operation: () => Promise<T>): Promise<T> => {
     const next = brokerTail.then(operation, operation);
     brokerTail = next.then(
@@ -368,19 +369,31 @@ export async function openSelfhostActorPublicRuntime(options: {
       closed ? [] : [...brokers.values()].map((pair) => pair.socketMapping),
     isOpen: () => !closed,
     isRestored: () => !closed && restored,
-    async close(): Promise<void> {
-      if (closed) return;
-      closed = true;
-      restored = false;
-      admitted = new Set();
-      await brokerTail;
-      await Promise.all(
-        [...brokers.values(), ...[...draining].map((entry) => entry.pair)].map((pair) =>
-          pair.close(),
-        ),
-      );
-      await host.close();
-      await rm(socketDirectory, { recursive: true, force: true });
+    close(): Promise<void> {
+      if (!closing) {
+        closed = true;
+        restored = false;
+        admitted = new Set();
+        closing = (async () => {
+          await brokerTail;
+          const pairs = new Set([...brokers.values(), ...[...draining].map((entry) => entry.pair)]);
+          // A failed provisional settlement must not skip the exact native
+          // owner's shutdown, nor turn a later close into a false success.
+          const brokerResults = await Promise.allSettled(
+            [...pairs].map((pair) => Promise.resolve().then(() => pair.close())),
+          );
+          // A provisional transport may need the native owner alive while its
+          // broker settles. Still attempt owner shutdown after any broker error.
+          const hostResult = await Promise.allSettled([Promise.resolve().then(() => host.close())]);
+          if (
+            brokerResults.some((result) => result.status === "rejected") ||
+            hostResult[0]?.status === "rejected"
+          )
+            throw new Error("Actor owner shutdown incomplete");
+          await rm(socketDirectory, { recursive: true, force: true });
+        })();
+      }
+      return closing;
     },
   });
 }

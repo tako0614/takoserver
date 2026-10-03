@@ -302,6 +302,23 @@ test("Actor reservations release failed attempts and reuse bounded broker slots 
       "Actor forward socket capacity exceeded",
     );
     expect(owner.actorForwardSockets()).toEqual([]);
+    const second = publications[1];
+    if (!second) throw new Error("second Actor publication unavailable");
+    const rollback = await owner.actorForwardLifecycle.reserve([first, second]);
+    owner.actorForwardLifecycle.activated([second]);
+    const releasing = rollback.release();
+    // The first never-admitted pair is removed from the visible map before
+    // its real Unix listener close completes. Inject uncertainty while that
+    // close is in flight, before cleanup can examine the accepted second pair.
+    for (let attempt = 0; attempt < 100 && owner.actorForwardSockets().length !== 1; attempt += 1)
+      await Promise.resolve();
+    expect(owner.actorForwardSockets()).toHaveLength(1);
+    owner.actorForwardLifecycle.uncertain();
+    await releasing;
+    expect(owner.actorForwardSockets().map((socket) => socket.token)).toEqual([
+      second.bindings[0]?.token,
+    ]);
+    expect(owner.isRestored()).toBe(false);
   } finally {
     await owner.close();
     f.database.close();

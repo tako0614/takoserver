@@ -147,17 +147,25 @@ export async function openSelfhostActorUpgradeBroker(
   await mkdir(dirname(options.socketPath), { recursive: true, mode: 0o700 });
   const pending = new Map<string, Pending>();
   const sockets = new Set<Socket>();
+  const settling = new Set<Promise<void>>();
   let admitting = 0;
   let retiring = false;
-  let stopping: Promise<void> | undefined;
+  let settlementFailed = false;
+  let stopping = false;
   let resolveRetirement: (() => void) | undefined;
+  let rejectRetirement: ((error: Error) => void) | undefined;
   let retirement: Promise<void> | undefined;
   const stopAccepting = (): void => {
-    stopping ??= new Promise<void>((resolve) => server.close(() => resolve()));
-    void stopping.then(() => resolveRetirement?.());
+    if (stopping) return;
+    stopping = true;
+    server.close((error) => {
+      if (error || settlementFailed)
+        rejectRetirement?.(new Error("Actor broker provisional settlement unproved"));
+      else resolveRetirement?.();
+    });
   };
   const maybeStopAccepting = (): void => {
-    if (retiring && pending.size === 0 && admitting === 0) stopAccepting();
+    if (retiring && pending.size === 0 && admitting === 0 && settling.size === 0) stopAccepting();
   };
   const abandon = (id: string): void => {
     const entry = pending.get(id);
@@ -165,15 +173,28 @@ export async function openSelfhostActorUpgradeBroker(
     entry.state = "abandoned";
     clearTimeout(entry.timer);
     pending.delete(id);
+    let settlement!: Promise<void>;
+    settlement = (async () => {
+      try {
+        await Promise.resolve().then(() => entry.lease.abandonTransport(entry.ownerBearer));
+      } catch {
+        // A local lease release is not proof that the native provisional
+        // transport settled. Do not report this broker as cleanly retired.
+        settlementFailed = true;
+        try {
+          entry.lease.abandon();
+        } catch {
+          /* The Host lease also expires independently. */
+        }
+      } finally {
+        settling.delete(settlement);
+        maybeStopAccepting();
+      }
+    })();
+    settling.add(settlement);
+    entry.upstream.destroy();
+    entry.client.destroy();
     maybeStopAccepting();
-    try {
-      void entry.lease.abandonTransport(entry.ownerBearer).catch(() => entry.lease.abandon());
-    } catch {
-      /* The Host lease also expires independently. */
-    } finally {
-      entry.upstream.destroy();
-      entry.client.destroy();
-    }
   };
   const server: Server = createServer((client) => {
     sockets.add(client);
@@ -340,9 +361,14 @@ export async function openSelfhostActorUpgradeBroker(
         if (id) abandon(id);
         else {
           try {
-            if (lease && ownerBearer)
-              await lease.abandonTransport(ownerBearer).catch(() => lease?.abandon());
-            else lease?.abandon();
+            if (lease && ownerBearer) {
+              try {
+                await lease.abandonTransport(ownerBearer);
+              } catch {
+                settlementFailed = true;
+                lease.abandon();
+              }
+            } else lease?.abandon();
           } catch {
             /* Broker expiry and caller disconnect remain independent. */
           }
@@ -354,6 +380,16 @@ export async function openSelfhostActorUpgradeBroker(
       }
     })();
   });
+  const beginRetirement = (): Promise<void> => {
+    if (!retirement)
+      retirement = new Promise<void>((resolve, reject) => {
+        resolveRetirement = resolve;
+        rejectRetirement = reject;
+      });
+    retiring = true;
+    maybeStopAccepting();
+    return retirement;
+  };
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(options.socketPath, () => {
@@ -363,23 +399,12 @@ export async function openSelfhostActorUpgradeBroker(
   });
   return Object.freeze({
     socketPath: options.socketPath,
-    retire(): Promise<void> {
-      if (!retirement) {
-        retirement = new Promise<void>((resolve) => {
-          resolveRetirement = resolve;
-        });
-        if (stopping) void stopping.then(() => resolveRetirement?.());
-      }
-      retiring = true;
-      maybeStopAccepting();
-      return retirement;
-    },
+    retire: beginRetirement,
     async close(): Promise<void> {
+      const drained = beginRetirement();
       for (const id of pending.keys()) abandon(id);
       for (const socket of sockets) socket.destroy();
-      retiring = true;
-      stopAccepting();
-      await stopping;
+      await drained;
     },
   });
 }
