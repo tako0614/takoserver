@@ -18,19 +18,49 @@ claim GA status.
    ```
 
    The first boot initializes SQLite under `TAKOSERVER_DATA_ROOT` (default
-   `.takoserver`), creates signing keys, and, when no identity provider is
-   configured, prints a short-lived operator sign-in assertion valid for ten
-   minutes. Open the exact `/console` URL printed by the process and paste the
-   assertion. Treat the operator key under the data root and the printed
-   assertion as credentials; keep them out of shell history, shared logs, and
-   this repository. To create later assertions, use the printed command
+   `.takoserver`) and creates signing keys. When no identity provider is
+   configured, it prints an operator sign-in assertion valid for ten minutes.
+   If `TAKOSERVER_CONSOLE_ORIGIN` is set, open the exact external console origin
+   named by the process and paste the assertion there. It is a separate console;
+   the Bun Host does not serve a `/console` page. Treat the operator key under
+   the data root and the printed assertion as credentials; keep them out of
+   shell history, shared logs, and this repository. To create later assertions,
+   use the printed command
    `bun scripts/operator-key.ts sign-in google operator operator@localhost Operator`
    with `TAKOSERVER_OPERATOR_KEY` set to that installation's key path.
 
-2. In the console, create or select the organization that will own Resources
-   and choose the exact stable Space identifier. Record the organization ID
-   from the Host; the admission command does not create either one. A fresh
-   Bun Host intentionally serves no Forms before this step's explicit
+   When `TAKOSERVER_CONSOLE_ORIGIN` is unset, the Host serves its landing page
+   and API, not a console. The process prints the Host origin and its
+   `/openapi.json` URL. For the default operator-assertion sign-in, a manual
+   client can exchange the printed assertion for a session:
+
+   ```http
+   POST {host-origin}/v1/sessions
+   Content-Type: application/json
+
+   {"provider":"google","method":"operator-assertion","assertion":"<printed assertion>"}
+   ```
+
+   Use the returned `sessionToken` as `Authorization: Bearer <sessionToken>`
+   for the manual API calls below. If an identity provider is configured,
+   complete that provider's sign-in flow instead; the printed operator
+   assertion is only available when the operator-assertion path is active.
+
+2. Using the configured external console/client or the authenticated API, find
+   the organization that will own Resources. A manual client can call
+   `GET {host-origin}/v1/me` to see its organizations; if it needs to create
+   one, call `POST {host-origin}/v1/organizations` with the session bearer and
+   JSON body `{"name":"<organization name>"}`. Record the resulting
+   organization ID. Choose the exact stable Space identifier for admission;
+   the admission command does not create either the organization or Space. If
+   a manual resource client needs an organization API key, create one with
+   `POST {host-origin}/v1/organizations/{organizationId}/api-keys`, using the
+   session bearer as an organization owner and a JSON object with exactly
+   `name`, `scopes`, and `expiresInSeconds`. Choose only the scopes the client
+   needs. The response's
+   key secret is shown only once; keep it out of logs and this repository and
+   store it with the installation's other credentials. A fresh Bun Host
+   intentionally serves no Forms before this step's explicit
    admission. Confirm that the normal self-host Provider3 mode is selected;
    the retired Cloudflare ObjectBucket drain mode cannot be used for admission.
 

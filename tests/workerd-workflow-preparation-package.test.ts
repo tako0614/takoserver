@@ -141,6 +141,10 @@ async function preparedSources(rootPath: string, directory: string): Promise<str
   return sources.join("\n");
 }
 
+function configuredAddresses(config: string): string[] {
+  return Array.from(config.matchAll(/\baddress\s*=\s*"([^"]+)"/gu), (match) => match[1] ?? "");
+}
+
 test("workerd package surface exports only graph compilation, preparation, and concrete factory", () => {
   expect(Object.keys(workerdRuntime).sort()).toEqual([
     "compileWorkerdVersionGraph",
@@ -186,12 +190,27 @@ test("package compiler feeds preparation without provider stores or tenant evalu
     expect(config).toContain('APP_VALUE", text = "compiler-original"');
     expect(config).toContain("opaque-host-resolved-capability");
     expect(config).toContain(`address = "${CURRENT_DATA_PLANE}"`);
-    expect(config).not.toContain(PERSISTED_DATA_PLANE);
+    expect(configuredAddresses(config)).not.toContain(PERSISTED_DATA_PLANE);
     expect(compiled.site.generation).toBeUndefined();
   } finally {
     await disposePrepared(prepared);
   }
   expect(await readdir(temporaryRoot)).toEqual([]);
+});
+
+test("package preparation does not reject a configured address that extends a persisted address", async () => {
+  const companionAddress = `${PERSISTED_DATA_PLANE}1`;
+  const prepared = await workerdRuntime.prepareWorkerdWorkflowExecution(
+    preparationOptions({ dataPlaneAddress: () => companionAddress }),
+  );
+  try {
+    const config = await readFile(prepared.configPath, "utf8");
+    expect(config).toContain(`address = "${companionAddress}"`);
+    expect(configuredAddresses(config)).toContain(companionAddress);
+    expect(configuredAddresses(config)).not.toContain(PERSISTED_DATA_PLANE);
+  } finally {
+    await disposePrepared(prepared);
+  }
 });
 
 test("package preparation materializes a selected graph privately without app evaluation", async () => {
@@ -207,7 +226,7 @@ test("package preparation materializes a selected graph privately without app ev
     expect(config).toContain('APP_VALUE", text = "app-original"');
     expect(config).toContain('DATA_TOKEN", text = "data-original"');
     expect(config).toContain(`address = "${CURRENT_DATA_PLANE}"`);
-    expect(config).not.toContain(PERSISTED_DATA_PLANE);
+    expect(configuredAddresses(config)).not.toContain(PERSISTED_DATA_PLANE);
     expect(hostPrivate).toContain("wrapper-original");
     expect(hostPrivate).toContain("data-original");
     for (const forbidden of [

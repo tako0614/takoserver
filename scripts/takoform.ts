@@ -9,6 +9,7 @@
  *   bun scripts/takoform.ts apply  <origin> <apiKey> <kind> <space> <name> <specJson>
  *   bun scripts/takoform.ts get    <origin> <apiKey> <kind> <space> <name>
  *   bun scripts/takoform.ts delete <origin> <apiKey> <kind> <space> <name>
+ *   bun scripts/takoform.ts operation <origin> <apiKey> <operationId> [--wait]
  *
  * The Form is resolved from the server's own catalog, so the exact schema
  * digest never has to be typed by hand — and cannot be typed wrongly.
@@ -17,10 +18,22 @@
 export {};
 
 const [command, rawOrigin, rawApiKey, rawKind, rawSpace, rawName, specJson] = process.argv.slice(2);
+const operationCommand = command === "operation";
 
-if (!command || !rawOrigin || !rawApiKey || !rawKind || !rawSpace || !rawName) {
+if (
+  !command ||
+  !rawOrigin ||
+  !rawApiKey ||
+  !rawKind ||
+  (operationCommand
+    ? (rawSpace !== undefined && rawSpace !== "--wait") ||
+      rawName !== undefined ||
+      specJson !== undefined
+    : !rawSpace || !rawName)
+) {
   process.stderr.write(
-    "usage: takoform.ts apply|get|delete <origin> <apiKey> <kind> <space> <name> [specJson]\n",
+    "usage: takoform.ts apply|get|delete <origin> <apiKey> <kind> <space> <name> [specJson]\n" +
+      "       takoform.ts operation <origin> <apiKey> <operationId> [--wait]\n",
   );
   process.exit(2);
 }
@@ -30,8 +43,8 @@ if (!command || !rawOrigin || !rawApiKey || !rawKind || !rawSpace || !rawName) {
 const origin: string = rawOrigin;
 const apiKey: string = rawApiKey;
 const kind: string = rawKind;
-const space: string = rawSpace;
-const name: string = rawName;
+const space: string = rawSpace ?? "";
+const name: string = rawName ?? "";
 
 const LANE = "/apis/forms.takoform.com/v1";
 const conditionTypes = new Set([
@@ -68,6 +81,28 @@ interface FormRef {
 interface ResourceReadback {
   readonly body: string;
   readonly generation: string;
+  readonly uid: string;
+  readonly document: Record<string, unknown>;
+}
+
+interface OperationResult {
+  readonly done: boolean;
+  readonly result?: Record<string, unknown>;
+  readonly errorCode?: string;
+}
+
+const OPERATION_API_VERSION = "operations.takoform.com/v1alpha1";
+const OPERATION_ID_PATTERN = /^op_[A-Za-z0-9][A-Za-z0-9._-]{0,124}$/u;
+const MAX_OPERATION_POLLS = 30;
+const MAX_OPERATION_WAIT_MS = 60_000;
+const DEFAULT_RETRY_AFTER_MS = 1_000;
+
+if (operationCommand) {
+  if (!OPERATION_ID_PATTERN.test(kind)) fail("operation ID is invalid");
+  const operation =
+    rawSpace === "--wait" ? await waitForOperation(kind, "0") : await readOperationOnce(kind);
+  process.stdout.write(`${JSON.stringify(operationStatus(kind, operation))}\n`);
+  process.exit(rawSpace === "--wait" && operation.errorCode ? 1 : 0);
 }
 
 // A kind usually has several installed definitions: the current one and the
@@ -120,6 +155,18 @@ if (command === "delete") {
     "idempotency-key": `cli-delete-${name}-${Date.now()}`,
     "takoform-expected-generation": generation,
   });
+  if (response.status === 202) {
+    const operationId = await acceptedOperationId(response);
+    const operation = await waitForOperation(operationId, response.headers.get("retry-after"));
+    if (operation.errorCode) fail(`operation ${operationId} failed: ${operation.errorCode}`);
+    if (operation.result?.deleted !== true) {
+      fail(`operation ${operationId} completed without a delete result`);
+    }
+    const remaining = await readResource(found.path, found.ref);
+    if (remaining) fail(`operation ${operationId} completed but the resource is still present`);
+    process.stdout.write(`deleted ${operationId}\n`);
+    process.exit(0);
+  }
   process.stdout.write(`${response.status} ${await response.text()}\n`);
   process.exit(response.ok ? 0 : 1);
 }
@@ -176,14 +223,237 @@ const applied = await call(
     ...(generation ? { "takoform-expected-generation": generation } : { "if-none-match": "*" }),
   },
 );
+if (applied.status === 202) {
+  const operationId = await acceptedOperationId(applied);
+  const operation = await waitForOperation(operationId, applied.headers.get("retry-after"));
+  if (operation.errorCode) fail(`operation ${operationId} failed: ${operation.errorCode}`);
+  const terminalResource = operation.result?.resource;
+  if (!isRecord(terminalResource)) {
+    fail(`operation ${operationId} completed without a resource result`);
+  }
+  const terminalReadback = parseResourceReadback(JSON.stringify(terminalResource), formRef);
+  if (!terminalReadback) fail(`operation ${operationId} returned an invalid resource result`);
+  if (existing && terminalReadback.uid !== existing.uid) {
+    fail(`operation ${operationId} changed the resource UID during update`);
+  }
+
+  const current = await readResource(resourcePath, formRef);
+  if (!current) fail(`operation ${operationId} completed but the resource is absent`);
+  if (
+    current.uid !== terminalReadback.uid ||
+    current.generation !== terminalReadback.generation ||
+    !sameJson(current.document.spec, terminalReadback.document.spec)
+  ) {
+    fail(`operation ${operationId} result does not match the current resource readback`);
+  }
+  process.stdout.write(`${current.body}\n`);
+  process.exit(0);
+}
 process.stdout.write(`${applied.status} ${await applied.text()}\n`);
 process.exit(applied.ok ? 0 : 1);
+
+async function acceptedOperationId(response: Response): Promise<string> {
+  const body = await response.text();
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    fail("Host accepted an operation without a valid operation handle");
+  }
+  const operation = isRecord(value) ? value.operation : undefined;
+  if (
+    !isRecord(operation) ||
+    operation.apiVersion !== OPERATION_API_VERSION ||
+    operation.kind !== "Operation" ||
+    typeof operation.id !== "string" ||
+    !OPERATION_ID_PATTERN.test(operation.id) ||
+    operation.done !== false ||
+    "result" in operation ||
+    "error" in operation
+  ) {
+    fail("Host accepted an operation with an invalid operation handle");
+  }
+  return operation.id;
+}
+
+async function waitForOperation(
+  operationId: string,
+  initialRetryAfter: string | null,
+): Promise<OperationResult> {
+  const deadline = performance.now() + MAX_OPERATION_WAIT_MS;
+  let retryAfter = retryAfterMilliseconds(initialRetryAfter);
+  const operationPath = `${LANE}/operations/${operationId}`;
+
+  for (let attempt = 0; attempt < MAX_OPERATION_POLLS; attempt += 1) {
+    let remaining = deadline - performance.now();
+    if (remaining <= 0) break;
+    if (retryAfter > 0) await sleep(Math.min(retryAfter, remaining));
+    remaining = deadline - performance.now();
+    if (remaining <= 0) break;
+
+    const controller = new AbortController();
+    const pollTimeout = setTimeout(() => controller.abort(), Math.max(1, remaining));
+    let response: Response | undefined;
+    let body: string | undefined;
+    let readFailed = false;
+    try {
+      response = await call("GET", operationPath, undefined, {}, controller.signal);
+      if (response.status === 200) body = await response.text();
+    } catch {
+      readFailed = true;
+    } finally {
+      clearTimeout(pollTimeout);
+    }
+    if (controller.signal.aborted || performance.now() >= deadline) {
+      fail(
+        `operation ${operationId} did not finish within the CLI polling budget; outcome unresolved`,
+      );
+    }
+    if (readFailed || !response) {
+      fail(`could not read operation ${operationId}; its outcome remains unresolved`);
+    }
+    if (response.status !== 200) {
+      fail(`operation ${operationId} read failed: ${response.status}`);
+    }
+    if (body === undefined) {
+      fail(`could not read operation ${operationId}; its outcome remains unresolved`);
+    }
+    const operation = parseOperation(body, operationId);
+    if (!operation) fail(`operation ${operationId} returned an invalid response`);
+    if (operation.done) {
+      if (operation.errorCode) return { done: true, errorCode: operation.errorCode };
+      if (operation.result) return { done: true, result: operation.result };
+      fail(`operation ${operationId} completed without a result`);
+    }
+    retryAfter = retryAfterMilliseconds(response.headers.get("retry-after"));
+  }
+  fail(`operation ${operationId} did not finish within the CLI polling budget`);
+}
+
+async function readOperationOnce(operationId: string): Promise<OperationResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MAX_OPERATION_WAIT_MS);
+  let response: Response | undefined;
+  let body: string | undefined;
+  let readFailed = false;
+  try {
+    response = await call(
+      "GET",
+      `${LANE}/operations/${operationId}`,
+      undefined,
+      {},
+      controller.signal,
+    );
+    if (response.status === 200) body = await response.text();
+  } catch {
+    readFailed = true;
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (controller.signal.aborted) {
+    fail(`operation ${operationId} read exceeded the CLI request budget`);
+  }
+  if (readFailed || !response) fail(`could not read operation ${operationId}`);
+  if (response.status !== 200) fail(`operation ${operationId} read failed: ${response.status}`);
+  if (body === undefined) fail(`could not read operation ${operationId}`);
+  const operation = parseOperation(body, operationId);
+  if (!operation) fail(`operation ${operationId} returned an invalid response`);
+  return operation;
+}
+
+function operationStatus(operationId: string, operation: OperationResult): Record<string, unknown> {
+  return {
+    apiVersion: OPERATION_API_VERSION,
+    kind: "Operation",
+    id: operationId,
+    done: operation.done,
+    ...(operation.errorCode === undefined
+      ? operation.result === undefined
+        ? {}
+        : { result: operation.result }
+      : { error: { code: operation.errorCode } }),
+  };
+}
+
+function parseOperation(
+  body: string,
+  expectedId: string,
+): {
+  readonly done: boolean;
+  readonly result?: Record<string, unknown>;
+  readonly errorCode?: string;
+} | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (
+    !isRecord(value) ||
+    value.apiVersion !== OPERATION_API_VERSION ||
+    value.kind !== "Operation" ||
+    value.id !== expectedId ||
+    typeof value.done !== "boolean"
+  ) {
+    return null;
+  }
+  if (!value.done) {
+    return "result" in value || "error" in value ? null : { done: false };
+  }
+
+  const hasResult = "result" in value;
+  const hasError = "error" in value;
+  if (hasResult === hasError) return null;
+  if (hasResult) return isRecord(value.result) ? { done: true, result: value.result } : null;
+
+  if (
+    !isRecord(value.error) ||
+    typeof value.error.code !== "string" ||
+    !/^[a-z][a-z0-9_]{0,63}$/u.test(value.error.code) ||
+    typeof value.error.retryable !== "boolean" ||
+    typeof value.error.requestId !== "string"
+  ) {
+    return null;
+  }
+  return { done: true, errorCode: value.error.code };
+}
+
+function retryAfterMilliseconds(value: string | null): number {
+  if (value === null || !/^(0|[1-9][0-9]{0,3})$/u.test(value)) return DEFAULT_RETRY_AFTER_MS;
+  return Math.min(Number(value) * 1_000, MAX_OPERATION_WAIT_MS);
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  const sort = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(sort);
+    if (isRecord(value)) {
+      return Object.fromEntries(
+        Object.keys(value)
+          .sort()
+          .map((key) => [key, sort(value[key])]),
+      );
+    }
+    return value;
+  };
+  return JSON.stringify(sort(left)) === JSON.stringify(sort(right));
+}
+
+function fail(message: string): never {
+  process.stderr.write(`${message}\n`);
+  process.exit(1);
+}
 
 async function call(
   method: string,
   path: string,
   body?: unknown,
   headers: Record<string, string> = {},
+  signal?: AbortSignal,
 ): Promise<Response> {
   return await fetch(`${origin}${path}`, {
     method,
@@ -193,6 +463,7 @@ async function call(
       ...headers,
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    ...(signal === undefined ? {} : { signal }),
   });
 }
 
@@ -202,7 +473,14 @@ async function readResource(path: string, ref: FormRef): Promise<ResourceReadbac
   const body = await response.text();
   if (response.ok) {
     const resource = parseResourceReadback(body, ref);
-    if (resource) return { body, generation: resource.generation };
+    if (resource) {
+      return {
+        body,
+        generation: resource.generation,
+        uid: resource.uid,
+        document: resource.document,
+      };
+    }
     process.stderr.write(
       `resource read returned an invalid Takoform resource: ${response.status}\n`,
     );
@@ -222,7 +500,14 @@ async function readResource(path: string, ref: FormRef): Promise<ResourceReadbac
 }
 
 /** Validates the stored-resource envelope and fences before accepting a readback. */
-function parseResourceReadback(body: string, ref: FormRef): { readonly generation: string } | null {
+function parseResourceReadback(
+  body: string,
+  ref: FormRef,
+): {
+  readonly generation: string;
+  readonly uid: string;
+  readonly document: Record<string, unknown>;
+} | null {
   let value: unknown;
   try {
     value = JSON.parse(body);
@@ -258,7 +543,7 @@ function parseResourceReadback(body: string, ref: FormRef): { readonly generatio
   ) {
     return null;
   }
-  return { generation: metadata.generation };
+  return { generation: metadata.generation, uid: metadata.uid, document: value };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -58,14 +58,18 @@ bun src/entry-bun.ts
 ```
 
 This starts the local Host; it does not by itself make a fresh Host ready to
-provision Takoform Resources. Startup creates the local schema, generates the
-operator key when no identity provider is configured, prints a 10-minute
-sign-in assertion, and starts serving. Sign in at the printed `/console` URL,
-create or select the organization that will own resources, and choose its
-stable Space identifier. Then perform the explicit publisher-set admission
-while the Bun process is stopped, restart it, and verify the published Forms
-before creating a Resource. The complete operator sequence, including exact
-Core-verifier identity, is in [Self-host operations](docs/self-host-operations.md).
+provision Takoform Resources. Startup creates the local schema and starts
+serving. When no identity provider is configured, it generates the operator key
+and prints a 10-minute sign-in assertion. Use the exact external console origin
+if `TAKOSERVER_CONSOLE_ORIGIN` is configured; otherwise the Host also prints its
+origin, API documentation URL, and manual session/API onboarding instructions.
+The Bun Host itself does not serve a `/console` page. If an identity provider is
+configured, use that provider's sign-in flow. Create or select the organization
+that will own resources and choose its stable Space identifier. Then perform
+the explicit publisher-set admission while the Bun process is stopped, restart
+it, and verify the published Forms before creating a Resource. The complete
+operator sequence, including exact Core-verifier identity, is in
+[Self-host operations](docs/self-host-operations.md).
 
 Ordinary Bun always keeps the stable self-host Provider3 execution pack.
 `CLOUDFLARE_ACCOUNT_ID` may separately back an explicitly reviewed ObjectBucket
