@@ -189,6 +189,17 @@ restart scheduling, and recovery-success diagnostics), then perform an
 authenticated functional readback. These probes and signals do not constitute
 a monitoring or alerting service.
 
+An explicit Worker publish/delete reload calls the serving supervisor's
+`ensure` path. If an accepted child remains alive but has lost its listener,
+that path may replace the child in this Host process. It first verifies the
+listener is vacant, gives the existing bounded startup readiness probe a
+chance to observe a watch-mode reload settling, then verifies ownership again.
+A listener restored by that same child is not bounced. For a still-vacant
+listener, the supervisor signals only the accepted child and waits for its actual
+exit and a vacant port before starting a replacement from its retained desired
+config path. A foreign listener, failed socket-ownership observation, or
+unconfirmed child exit refuses replacement; no health GET initiates it.
+
 ## Update and code rollback
 
 Treat an update as selecting a new exact source commit, not as `git pull` on a
