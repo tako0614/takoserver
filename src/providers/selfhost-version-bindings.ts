@@ -829,6 +829,9 @@ function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet
   const serviceBindings = normalizeServiceBindings(set.serviceBindings);
   const externalServices = normalizeExternalServices(set.externalServices);
   const actorBindings = normalizeActorBindings(set.actorBindings, set.workerVersionResourceUid);
+  if (actorBindings && sensitiveVars.length > 0 && !set.runtimeInputGeneration) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
   const names = new Set<string>();
   for (const name of [
     ...vars.map((binding) => binding.name),

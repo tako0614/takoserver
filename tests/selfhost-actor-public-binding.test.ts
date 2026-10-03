@@ -1,10 +1,13 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { JsonObject } from "../src/ports.ts";
 import { createSelfhostProvider } from "../src/providers/selfhost.ts";
+import type { SelfhostVersionActorBinding } from "../src/providers/selfhost-version-bindings.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
+import { deriveSelfhostActorForwardToken } from "../src/selfhost-actor-public-runtime.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
 
@@ -51,6 +54,9 @@ test("self-host Actor identity allocates only for a same-tenant pinned Worker re
       },
     },
     actorNamespace: {
+      async readCurrentGraph() {
+        return null;
+      },
       async registerNamespace(scope) {
         scopes.push(JSON.stringify(scope));
         registrations.add(JSON.stringify(scope));
@@ -207,6 +213,262 @@ test("self-host Actor identity allocates only for a same-tenant pinned Worker re
         relations: [relation],
       }),
     ).toMatchObject({ phase: "succeeded" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Worker Version pins an exact Actor relation in private v8 and projects only a derived facade token", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-version-provider-"));
+  const candidates = currentTakoformCandidates().forms;
+  const form = (kind: string) => {
+    const found = candidates.find((candidate) => candidate.identity.formRef.kind === kind);
+    if (!found) throw new Error(`missing released ${kind} Form`);
+    return found;
+  };
+  const workerForm = form("ModuleWorker");
+  const versionForm = form("WorkerVersion");
+  const actorBindingRef = versionForm.acceptedBindings?.find(
+    (binding) => binding.name === "module-worker.actor",
+  );
+  if (!actorBindingRef) throw new Error("released Actor Binding missing");
+  const offering = (kind: string) => {
+    const selected = form(kind);
+    return {
+      id: `selfhost.edge.${kind.toLowerCase()}`,
+      kind: `takoform.${kind}`,
+      displayName: kind,
+      form: selected.identity.formRef,
+      providedInterfaces: selected.providedInterfaces ?? [],
+      bindingRefs: kind === "WorkerVersion" ? [actorBindingRef] : [],
+      capabilities: ["create", "delete", "import", "observe"] as const,
+    };
+  };
+  const actorOffering = offering("ActorNamespace");
+  const versionOffering = offering("WorkerVersion");
+  const tenantId = "tenant-one";
+  const workerUid = "uid-worker-caller-one";
+  const actorUid = "uid-actor-counter-one";
+  const versionUid = "uid-version-caller-one";
+  const address = (kind: string, name: string) => ({
+    apiVersion: "edge.forms.takoform.com",
+    kind,
+    name,
+    space: "default",
+  });
+  const metadata = (uid: string, name: string) => ({
+    uid,
+    name,
+    space: "default",
+    generation: "1",
+    revision: "1",
+  });
+  const resource = (kind: string, uid: string, name: string, spec: JsonObject = {}) => ({
+    apiVersion: "edge.forms.takoform.com",
+    kind,
+    form: { formRef: form(kind).identity.formRef },
+    metadata: metadata(uid, name),
+    spec,
+  });
+  const graph = {
+    tenantId,
+    namespace: {
+      ...metadata(actorUid, "counter"),
+      address: address("ActorNamespace", "counter"),
+      formRef: actorForm.identity.formRef,
+      className: "Counter",
+    },
+    worker: {
+      ...metadata(workerUid, "caller"),
+      address: address("ModuleWorker", "caller"),
+      formRef: workerForm.identity.formRef,
+    },
+  };
+  const deployed = (uid: string, kind: string, nativeId: string, outputs: JsonObject) => ({
+    tenantId,
+    id: `dep-${uid}`,
+    resourceUid: uid,
+    offeringId: `selfhost.edge.${kind.toLowerCase()}`,
+    providerPackRef: "local.pack",
+    providerInstallationRef: "local.primary",
+    nativeId,
+    state: "active" as const,
+    observed: {},
+    outputs,
+    createdAt: "2026-10-03T00:00:00.000Z",
+    updatedAt: "2026-10-03T00:00:00.000Z",
+  });
+  let ownerGraph: typeof graph | null = graph;
+  const provider = createSelfhostProvider({
+    id: "local.pack",
+    offerings: [actorOffering, versionOffering],
+    dataRoot: root,
+    runtime,
+    actorNamespace: {
+      async readCurrentGraph() {
+        return ownerGraph;
+      },
+      async registerNamespace() {},
+      async hasNamespace() {
+        return true;
+      },
+      async namespaceAbsent() {
+        return false;
+      },
+      async forgetNamespace() {},
+    },
+    artifacts: {
+      async manifest(_tenant, digest) {
+        return digest === "sha256:worker"
+          ? {
+              kind: "WorkerBundle",
+              mainModule: "index.js",
+              modules: [{ name: "index.js", digest: "sha256:index.js" }],
+            }
+          : null;
+      },
+      async blob(digest) {
+        return digest === "sha256:index.js"
+          ? new TextEncoder().encode("export default { fetch() { return new Response('ok') } };")
+          : null;
+      },
+    },
+  });
+  const worker = await provider.apply({
+    operationId: "op-actor-worker",
+    offering: offering("ModuleWorker"),
+    identity: { tenantRef: tenantId, space: "default", name: "caller", uid: workerUid },
+    spec: {},
+  });
+  if (worker.phase !== "succeeded") throw new Error("Worker creation failed");
+  const script = String(worker.result.outputs.scriptName);
+  const workerRelation = {
+    pointer: "/worker",
+    relation: "/worker",
+    targetUid: workerUid,
+    resource: resource("ModuleWorker", workerUid, "caller"),
+    deployment: deployed(workerUid, "ModuleWorker", worker.result.nativeId, worker.result.outputs),
+  };
+  const bundleRelation = {
+    pointer: "/bundle",
+    relation: "/bundle",
+    targetUid: "uid-bundle-caller-one",
+    resource: resource("WorkerBundle", "uid-bundle-caller-one", "bundle", {
+      manifestDigest: "sha256:worker",
+    }),
+  };
+  const actorRelation = {
+    pointer: "/actorBindings/0/resource",
+    relation: "/actorBindings/*/resource",
+    targetUid: actorUid,
+    bindingRef: actorBindingRef,
+    resource: resource("ActorNamespace", actorUid, "counter", {
+      className: "Counter",
+      worker: { apiVersion: "edge.forms.takoform.com", kind: "ModuleWorker", name: "caller" },
+    }),
+    deployment: deployed(actorUid, "ActorNamespace", `selfhost-actor:${actorUid}`, {}),
+  };
+  const request = {
+    operationId: "op-actor-version",
+    offering: versionOffering,
+    identity: { tenantRef: tenantId, space: "default", name: "caller-v1", uid: versionUid },
+    spec: {
+      bundle: { apiVersion: "edge.forms.takoform.com", kind: "WorkerBundle", name: "bundle" },
+      worker: { apiVersion: "edge.forms.takoform.com", kind: "ModuleWorker", name: "caller" },
+      handlers: ["fetch"],
+      actorBindings: [
+        {
+          name: "COUNTER",
+          resource: {
+            apiVersion: "edge.forms.takoform.com",
+            kind: "ActorNamespace",
+            name: "counter",
+          },
+        },
+      ],
+    },
+    relations: [workerRelation, bundleRelation, actorRelation],
+  };
+  try {
+    const bindingPath = join(root, "selfhost", "version-bindings", script);
+    ownerGraph = null;
+    expect(await provider.apply(request)).toMatchObject({ phase: "failed" });
+    expect(await readdir(bindingPath).catch(() => [])).toEqual([]);
+    ownerGraph = {
+      ...graph,
+      namespace: { ...graph.namespace, className: "Other" },
+    };
+    expect(await provider.apply({ ...request, operationId: "op-wrong-class" })).toMatchObject({
+      phase: "failed",
+    });
+    expect(await readdir(bindingPath).catch(() => [])).toEqual([]);
+    ownerGraph = graph;
+    expect(
+      await provider.apply({
+        ...request,
+        operationId: "op-wrong-tenant",
+        relations: [
+          workerRelation,
+          bundleRelation,
+          {
+            ...actorRelation,
+            deployment: { ...actorRelation.deployment, tenantId: "tenant-two" },
+          },
+        ],
+      }),
+    ).toMatchObject({ phase: "failed" });
+    expect(await readdir(bindingPath).catch(() => [])).toEqual([]);
+    const applied = await provider.apply(request);
+    expect(applied).toMatchObject({ phase: "succeeded" });
+    if (applied.phase !== "succeeded") throw new Error("Actor Version did not apply");
+    expect(JSON.stringify(applied.result)).not.toMatch(/token|socket|tenant-one/u);
+    const versionId = String(applied.result.outputs.versionId);
+    const raw = JSON.parse(
+      await Bun.file(
+        join(root, "selfhost", "version-bindings", script, `${versionId}.json`),
+      ).text(),
+    ) as Record<string, unknown>;
+    expect(raw.format).toBe("takoserver.selfhost-version-bindings@v8");
+    expect(raw.actorBindings).toEqual([
+      {
+        name: "COUNTER",
+        tenantId,
+        namespaceResourceUid: actorUid,
+        workerResourceUid: workerUid,
+        className: "Counter",
+      },
+    ]);
+    expect(raw.workerVersionResourceUid).toBe(versionUid);
+    const actorBinding = (raw.actorBindings as SelfhostVersionActorBinding[])[0];
+    if (!actorBinding) throw new Error("stored Actor relation missing");
+    const token = deriveSelfhostActorForwardToken({
+      eventToken: String(raw.eventToken),
+      workerVersionResourceUid: versionUid,
+      binding: actorBinding,
+    });
+    expect(token).toMatch(/^[0-9a-f]{64}$/u);
+    expect(token).not.toBe(raw.eventToken);
+    expect(
+      deriveSelfhostActorForwardToken({
+        eventToken: String(raw.eventToken),
+        workerVersionResourceUid: "uid-version-caller-two",
+        binding: actorBinding,
+      }),
+    ).not.toBe(token);
+    expect(
+      await provider.apply({
+        ...request,
+        operationId: "op-reused-version-address",
+        identity: { ...request.identity, uid: "uid-version-replacement" },
+      }),
+    ).toMatchObject({ phase: "failed" });
+    expect(
+      JSON.parse(
+        await Bun.file(
+          join(root, "selfhost", "version-bindings", script, `${versionId}.json`),
+        ).text(),
+      ),
+    ).toEqual(raw);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -696,6 +696,14 @@ export function createSelfhostActorExecutionHost(options: {
     ready,
     coldStartFailures: (): readonly ActorColdStartFailure[] =>
       [...coldStartFailures.values()].map((failure) => ({ ...failure })),
+    async readCurrentGraph(
+      scope: ActorScope,
+      signal: AbortSignal,
+    ): Promise<ActorResourceGraph | null> {
+      await ready;
+      if (stopped || !validScope(scope)) return null;
+      return options.graph({ ...scope }, signal);
+    },
     async registerNamespace(scope: ActorScope): Promise<void> {
       await ready;
       if (

@@ -81,6 +81,13 @@ test("Actor metadata is a strict new private Version record and cannot adopt an 
       actorBindings: actor.actorBindings.map((binding) => ({ ...binding, name: "LANE" })),
     }),
   ).toThrow();
+  await expect(
+    store.write("sw-unreadable", "v-unreadable", {
+      ...actor,
+      sensitiveVars: SET.sensitiveVars,
+    }),
+  ).rejects.toThrow();
+  expect(existsSync(join(root, "sw-unreadable", "v-unreadable.json"))).toBe(false);
 });
 
 test("complete external binding envelope is bounded before a runtime write", () => {
