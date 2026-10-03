@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { resolveActorAbiProfile } from "../src/actor-class-execution.ts";
 import {
   type ActorSqlValue,
   createActorNativeUpgradeHeaders,
@@ -7,6 +8,7 @@ import {
   type NativeActorSqlFacade,
   type NativeActorStorage,
 } from "../src/actor-native-class-execution.ts";
+import { createActorNativeSocketPort } from "../src/actor-native-owner-worker.ts";
 import { installActorResponseRuntime } from "../src/actor-upgrade-handoff.ts";
 
 function storage(database: Database): NativeActorStorage {
@@ -25,6 +27,129 @@ function storage(database: Database): NativeActorStorage {
     transactionSync: (callback) => database.transaction(callback)(),
   };
 }
+
+test("forward native adapter delivers socketError separately and accepts a 16 KiB attachment", async () => {
+  const db = new Database(":memory:");
+  const calls: string[] = [];
+  const profile = resolveActorAbiProfile({
+    apiVersion: "interfaces.takoform.com/v1alpha1",
+    name: "worker.actor",
+    version: "2.0.0",
+    schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+  });
+  class Actor {
+    fetch() {
+      return new Response("ok");
+    }
+    alarm() {}
+    async socketMessage(socket: {
+      getAttachment(): Promise<Uint8Array | null>;
+      setAttachment(value: Uint8Array): Promise<void>;
+      send(value: Uint8Array): Promise<void>;
+    }) {
+      const attachment = await socket.getAttachment();
+      expect(attachment?.byteLength).toBe(12_000);
+      if (attachment) await socket.setAttachment(attachment);
+      await socket.send(new Uint8Array(8_388_609));
+      await expect(socket.send(new Uint8Array(33_554_433))).rejects.toMatchObject({
+        code: "message_too_large",
+      });
+    }
+    socketClose() {
+      calls.push("close");
+    }
+    socketError(_socket: object, event: { code: string }) {
+      calls.push(event.code);
+    }
+  }
+  try {
+    const actor = createNativeActorExecution({
+      namespace: { Actor },
+      exportName: "Actor",
+      profile,
+      id: "actor-v2",
+      env: {},
+      storage: storage(db),
+      alarm: {
+        async set() {},
+        async get() {
+          return null;
+        },
+        async clear() {},
+      },
+      socketPort: (nonce) =>
+        createActorNativeSocketPort(
+          {
+            async fetch(request) {
+              expect(request.headers.get("x-takoserver-private-actor-abi")).toBe(
+                profile.schemaDigest,
+              );
+              const action = request.headers.get("x-takoserver-private-actor-socket-action");
+              if (action === "get-attachment") return new Response(new Uint8Array(12_000));
+              if (action === "set-attachment") {
+                expect((await request.arrayBuffer()).byteLength).toBe(12_000);
+                return new Response(null, { status: 204 });
+              }
+              if (action === "send") {
+                expect((await request.arrayBuffer()).byteLength).toBe(8_388_609);
+                return new Response(null, { status: 204 });
+              }
+              return new Response(null, { status: 204 });
+            },
+          },
+          undefined,
+          "actor-v2",
+          nonce,
+          profile,
+        ),
+    });
+    await actor.socketError(
+      "socket-1",
+      { code: "transport_error" },
+      new AbortController().signal,
+      "nonce",
+    );
+    expect(calls).toEqual(["transport_error"]);
+    // The existing native port must not apply the legacy 8 KiB cap in v2.
+    await actor.socketMessage("socket-1", "message", new AbortController().signal, "nonce");
+    const mismatched = createNativeActorExecution({
+      namespace: { Actor },
+      exportName: "Actor",
+      profile,
+      id: "actor-v2",
+      env: {},
+      storage: storage(db),
+      alarm: {
+        async set() {},
+        async get() {
+          return null;
+        },
+        async clear() {},
+      },
+      socketPort: (nonce) =>
+        createActorNativeSocketPort(
+          {
+            async fetch() {
+              throw new Error("mismatched port must not call owner");
+            },
+          },
+          undefined,
+          "actor-v2",
+          nonce,
+        ),
+    });
+    await expect(
+      mismatched.socketError(
+        "socket-1",
+        { code: "transport_error" },
+        new AbortController().signal,
+        "nonce",
+      ),
+    ).rejects.toMatchObject({ code: "backend_unavailable" });
+  } finally {
+    db.close();
+  }
+});
 
 test("accept returns Response and transfers a reconstructed alias once with public headers", async () => {
   const NativeResponse = Response;

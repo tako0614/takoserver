@@ -8,11 +8,15 @@
  * the returned response lifetime. It is not wired into production admission.
  */
 import {
+  type ActorAbiProfile,
   ActorRuntimeError,
+  actorAbiProfile,
   createActorClassExecution,
   createActorContext,
   createActorTurn,
+  prepareActorClassInspection,
 } from "./actor-class-execution.ts";
+import { actorNativeSocketPortProfile } from "./actor-native-owner-worker.ts";
 import {
   actorUpgradeResponseSource,
   createActorUpgradeResponse,
@@ -42,8 +46,6 @@ const SafeTextEncoder = TextEncoder;
 const SafeTextEncode = TextEncoder.prototype.encode;
 const SafeRegExpTest = RegExp.prototype.test;
 const SOCKET_PROTOCOL = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/u;
-const MAX_SOCKET_MESSAGE_BYTES = 8_388_608;
-const MAX_ATTACHMENT_BYTES = 8_192;
 
 export interface NativeActorSocketPort {
   accept(protocol?: string, attachment?: Uint8Array): Promise<string>;
@@ -407,6 +409,8 @@ export interface NativeActorExecutionOptions {
   readonly sockets?: Readonly<Record<string, unknown>>;
   /** Per-event Host-private broker port. Never projected to Actor code. */
   readonly socketPort?: (nonce: string) => NativeActorSocketPort;
+  /** Exact Host-selected ABI; omission preserves the released behavior. */
+  readonly profile?: ActorAbiProfile;
 }
 
 export interface NativeActorExecutionResult {
@@ -425,11 +429,18 @@ export interface NativeActorExecutionResult {
     signal: AbortSignal,
     socketNonce?: string,
   ): Promise<void>;
+  socketError(
+    socket: object | string,
+    event: { readonly code: "transport_error" },
+    signal: AbortSignal,
+    socketNonce?: string,
+  ): Promise<void>;
 }
 
 export function createNativeActorExecution(
   options: NativeActorExecutionOptions,
 ): NativeActorExecutionResult {
+  const profile = actorAbiProfile(options.profile);
   const unavailable = async (): Promise<never> => {
     throw new ActorRuntimeError("backend_unavailable");
   };
@@ -459,7 +470,7 @@ export function createNativeActorExecution(
     },
   });
   type SocketTurn = {
-    readonly kind: "fetch" | "message" | "close";
+    readonly kind: "fetch" | "message" | "close" | "error";
     readonly nonce: string;
     readonly port: NativeActorSocketPort;
   };
@@ -469,17 +480,18 @@ export function createNativeActorExecution(
     throw new ActorRuntimeError("backend_unavailable");
   };
   const activePort = (): NativeActorSocketPort => socketTurn?.port ?? socketUnavailable();
-  const copyBytes = (value: Uint8Array, maximum: number): Uint8Array => {
+  const copyBytes = (
+    value: Uint8Array,
+    maximum: number,
+    code: "attachment_too_large" | "message_too_large",
+  ): Uint8Array => {
     let copy: Uint8Array;
     try {
       copy = SafeReflectApply(SafeUint8ArraySlice, value, []) as Uint8Array;
     } catch {
       throw new TypeError("Actor socket bytes must be Uint8Array");
     }
-    if (copy.byteLength > maximum)
-      throw new ActorRuntimeError(
-        maximum === MAX_ATTACHMENT_BYTES ? "attachment_too_large" : "message_too_large",
-      );
+    if (copy.byteLength > maximum) throw new ActorRuntimeError(code);
     return copy;
   };
   const handle = (id: string): object =>
@@ -490,9 +502,13 @@ export function createNativeActorExecution(
           const size = (
             SafeReflectApply(SafeTextEncode, new SafeTextEncoder(), [value]) as Uint8Array
           ).byteLength;
-          if (size > MAX_SOCKET_MESSAGE_BYTES) throw new ActorRuntimeError("message_too_large");
+          if (size > profile.socketMessageBytes) throw new ActorRuntimeError("message_too_large");
           await activePort().send(id, value);
-        } else await activePort().send(id, copyBytes(value, MAX_SOCKET_MESSAGE_BYTES));
+        } else
+          await activePort().send(
+            id,
+            copyBytes(value, profile.socketMessageBytes, "message_too_large"),
+          );
       },
       async close(code?: number, reason?: string): Promise<void> {
         if (
@@ -511,12 +527,16 @@ export function createNativeActorExecution(
       },
       async getAttachment(): Promise<Uint8Array | null> {
         const value = await activePort().getAttachment(id);
-        return value === null ? null : copyBytes(value, MAX_ATTACHMENT_BYTES);
+        return value === null
+          ? null
+          : copyBytes(value, profile.socketAttachmentBytes, "attachment_too_large");
       },
       async setAttachment(value: Uint8Array | null): Promise<void> {
         await activePort().setAttachment(
           id,
-          value === null ? null : copyBytes(value, MAX_ATTACHMENT_BYTES),
+          value === null
+            ? null
+            : copyBytes(value, profile.socketAttachmentBytes, "attachment_too_large"),
         );
       },
     });
@@ -565,10 +585,15 @@ export function createNativeActorExecution(
           const attachment =
             acceptedOptions?.attachment === undefined
               ? undefined
-              : copyBytes(acceptedOptions.attachment, MAX_ATTACHMENT_BYTES);
+              : copyBytes(
+                  acceptedOptions.attachment,
+                  profile.socketAttachmentBytes,
+                  "attachment_too_large",
+                );
           const socketId = await turn.port.accept(protocol, attachment);
           const outcome = createActorUpgradeResponse(
             new SafeHeaders(protocol ? { "sec-websocket-protocol": protocol } : undefined),
+            profile,
           );
           SafeReflectApply(SafeWeakMapSet, upgrades, [
             outcome,
@@ -599,9 +624,15 @@ export function createNativeActorExecution(
     nonce: string | undefined,
     callback: () => Promise<T>,
   ): Promise<T> => {
-    if (!options.socketPort || nonce === undefined) return callback();
+    if (!options.socketPort || nonce === undefined) {
+      if (profile.kind === "v2" && kind !== "fetch") return socketUnavailable();
+      return callback();
+    }
     if (socketTurn) return socketUnavailable();
     const turn: SocketTurn = { kind, nonce, port: options.socketPort(nonce) };
+    const portProfile = actorNativeSocketPortProfile(turn.port);
+    if ((profile.kind === "v2" || portProfile !== undefined) && portProfile !== profile)
+      return socketUnavailable();
     socketTurn = turn;
     try {
       return await callback();
@@ -620,7 +651,18 @@ export function createNativeActorExecution(
       sockets,
     }),
   };
-  const execution = createActorClassExecution(classOptions);
+  const inspection =
+    profile.kind === "v2"
+      ? prepareActorClassInspection({
+          namespace: options.namespace,
+          exportName: options.exportName,
+          profile,
+        })
+      : undefined;
+  const execution = createActorClassExecution({
+    ...classOptions,
+    ...(inspection ? { profile, inspection } : {}),
+  });
   return SafeObjectFreeze({
     async fetch(request: Request, socketNonce?: string): Promise<Response> {
       return withSocketTurn("fetch", socketNonce, async () => {
@@ -686,6 +728,24 @@ export function createNativeActorExecution(
         await execution.dispatch(
           {
             kind: "socketClose",
+            socket: typeof socket === "string" ? handle(socket) : socket,
+            event,
+          },
+          createActorTurn(signal),
+        );
+      });
+    },
+    async socketError(
+      socket: object | string,
+      event: { readonly code: "transport_error" },
+      signal: AbortSignal,
+      socketNonce?: string,
+    ): Promise<void> {
+      if (profile.kind !== "v2") throw new ActorRuntimeError("backend_unavailable");
+      await withSocketTurn("error", socketNonce, async () => {
+        await execution.dispatch(
+          {
+            kind: "socketError",
             socket: typeof socket === "string" ? handle(socket) : socket,
             event,
           },

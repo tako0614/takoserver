@@ -14,6 +14,8 @@
  * does not claim to prove it.
  */
 
+import { inspectActorClassV2Candidate } from "./actor-class-candidate-inspection.ts";
+
 const SafeArrayIsArray = Array.isArray;
 const SafeError = Error;
 const SafeObjectCreate = Object.create;
@@ -46,6 +48,9 @@ function inertConstructTarget(): object {
 const SafeWeakSet = WeakSet;
 const SafeWeakSetAdd = WeakSet.prototype.add;
 const SafeWeakSetHas = WeakSet.prototype.has;
+const SafeWeakMap = WeakMap;
+const SafeWeakMapGet = WeakMap.prototype.get;
+const SafeWeakMapSet = WeakMap.prototype.set;
 
 const runtimeErrors = new SafeWeakSet<object>();
 
@@ -235,8 +240,95 @@ export interface ActorClassInspection {
     readonly alarm: Handler;
     readonly socketMessage: Handler;
     readonly socketClose: Handler;
+    readonly socketError?: Handler;
     readonly start?: Handler;
   }>;
+}
+
+/** Internal executable profile, selected only by a complete publisher InterfaceRef. */
+export interface ActorAbiProfile {
+  readonly kind: "legacy" | "v2";
+  readonly schemaDigest: string;
+  readonly socketMessageBytes: number;
+  readonly socketAttachmentBytes: number;
+  readonly socketOutboundQueueBytes: number;
+  readonly socketInboundBytes: number;
+  readonly actorInboundBytes: number;
+}
+
+const LEGACY_PROFILE: ActorAbiProfile = SafeObjectFreeze({
+  kind: "legacy",
+  schemaDigest: "sha256:f5428fb587de80261dd7363dc5b8a3f4aab7e469fa1b5fce8441ad9acbec8218",
+  socketMessageBytes: 8_388_608,
+  socketAttachmentBytes: 8_192,
+  socketOutboundQueueBytes: 8_388_608,
+  socketInboundBytes: 8_388_608,
+  actorInboundBytes: 16_777_216,
+});
+const V2_PROFILE: ActorAbiProfile = SafeObjectFreeze({
+  kind: "v2",
+  schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+  socketMessageBytes: 33_554_432,
+  socketAttachmentBytes: 16_384,
+  socketOutboundQueueBytes: 33_554_432,
+  socketInboundBytes: 33_554_432,
+  actorInboundBytes: 67_108_864,
+});
+const actorProfiles = new SafeWeakSet<object>();
+remember(actorProfiles, LEGACY_PROFILE);
+remember(actorProfiles, V2_PROFILE);
+
+export function actorAbiProfile(value: ActorAbiProfile | undefined): ActorAbiProfile {
+  const selected = value ?? LEGACY_PROFILE;
+  if (!remembered(actorProfiles, selected)) throw unavailable("Actor ABI profile is unavailable");
+  return selected;
+}
+
+/** No name-only, version-only or unknown-digest fallback. */
+export function resolveActorAbiProfile(ref: unknown): ActorAbiProfile {
+  try {
+    const value = closedRecord(
+      ref,
+      ["apiVersion", "name", "version", "schemaDigest"],
+      "Actor runtime InterfaceRef",
+    );
+    if (value.apiVersion === "interfaces.takoform.com/v1alpha1" && value.name === "worker.actor") {
+      if (value.version === "1.0.0" && value.schemaDigest === LEGACY_PROFILE.schemaDigest)
+        return LEGACY_PROFILE;
+      if (value.version === "2.0.0" && value.schemaDigest === V2_PROFILE.schemaDigest)
+        return V2_PROFILE;
+    }
+  } catch {
+    // An accessor or malformed ref cannot select an ABI.
+  }
+  throw unavailable("Actor runtime InterfaceRef is unavailable");
+}
+
+type PreparedInspection = {
+  readonly namespace: object;
+  readonly exportName: string;
+  readonly constructor: ActorClassInspection["constructor"];
+  readonly profile: ActorAbiProfile;
+};
+const preparedInspections = new SafeWeakMap<object, PreparedInspection>();
+
+/** Runs only in an OS-killable child; the returned object is branded to its exact input. */
+export function prepareActorClassInspection(options: {
+  readonly namespace: Readonly<Record<string, unknown>>;
+  readonly exportName: string;
+  readonly profile: ActorAbiProfile;
+}): ActorClassInspection {
+  if (actorAbiProfile(options.profile) !== V2_PROFILE)
+    throw unavailable("forward Actor inspection needs its exact ABI profile");
+  const inspection = inspectActorClassV2Candidate(options.namespace, options.exportName);
+  const prepared: PreparedInspection = {
+    namespace: options.namespace,
+    exportName: options.exportName,
+    constructor: inspection.constructor,
+    profile: options.profile,
+  };
+  SafeReflectApply(SafeWeakMapSet, preparedInspections, [inspection, prepared]);
+  return inspection;
 }
 
 const REQUIRED_HANDLERS: readonly HandlerName[] = [
@@ -324,6 +416,10 @@ export interface ActorClassExecutionOptions {
   readonly env: Readonly<Record<string, unknown>>;
   /** Host-created closed context for this fresh child execution. */
   readonly context: ActorContext;
+  /** Omitted means the exact existing four-handler behavior. */
+  readonly profile?: ActorAbiProfile;
+  /** Required for v2; must come from prepareActorClassInspection in this child. */
+  readonly inspection?: ActorClassInspection;
 }
 
 export interface ActorClassExecution {
@@ -348,7 +444,30 @@ export interface ActorClassExecution {
 export function createActorClassExecution(
   options: ActorClassExecutionOptions,
 ): ActorClassExecution {
-  const inspection = inspectActorClass(options.namespace, options.exportName);
+  const profile = actorAbiProfile(options.profile);
+  let inspection: ActorClassInspection;
+  if (profile === V2_PROFILE) {
+    const supplied = options.inspection;
+    const prepared =
+      supplied && isObject(supplied)
+        ? (SafeReflectApply(SafeWeakMapGet, preparedInspections, [supplied]) as
+            | PreparedInspection
+            | undefined)
+        : undefined;
+    if (
+      !supplied ||
+      !prepared ||
+      prepared.profile !== profile ||
+      prepared.namespace !== options.namespace ||
+      prepared.exportName !== options.exportName ||
+      prepared.constructor !== supplied.constructor
+    )
+      throw unavailable("forward Actor inspection is unavailable");
+    inspection = supplied;
+  } else {
+    if (options.inspection !== undefined) throw unavailable("legacy Actor inspection mismatch");
+    inspection = inspectActorClass(options.namespace, options.exportName);
+  }
   const context = normalizeContext(options.context);
   const env = normalizeEnvironment(options.env);
 
@@ -363,7 +482,7 @@ export function createActorClassExecution(
     let created: unknown;
     try {
       created = SafeReflectConstruct(inspection.constructor, [context, env]);
-      validateInstance(created, inspection.prototype);
+      validateInstance(created, inspection.prototype, profile);
       instance = created;
       const start = inspection.handlers.start;
       if (start !== undefined) {
@@ -396,7 +515,7 @@ export function createActorClassExecution(
     event: ActorEvent | ActorTransportFailureEvent,
     turnInput: ActorTurn,
   ): Promise<Response | undefined> {
-    const normalizedEvent = normalizeEvent(event);
+    const normalizedEvent = normalizeEvent(event, profile);
     const turn = normalizeTurn(turnInput);
     const handlerName = normalizedEvent.kind;
 
@@ -412,7 +531,9 @@ export function createActorClassExecution(
 
     const args = eventArguments(normalizedEvent, turn);
     try {
-      const result = await SafeReflectApply(inspection.handlers[handlerName], instance, args);
+      const handler = inspection.handlers[handlerName];
+      if (typeof handler !== "function") throw unavailable("Actor handler is unavailable");
+      const result = await SafeReflectApply(handler, instance, args);
       if (handlerName === "fetch") {
         if (result instanceof SafeResponse) return result;
         throw new SafeTypeError("Actor fetch must return a Response");
@@ -469,7 +590,11 @@ function findOptionalPrototypeMethod(prototype: object, name: "start"): Handler 
   return undefined;
 }
 
-function validateInstance(value: unknown, prototype: object): asserts value is object {
+function validateInstance(
+  value: unknown,
+  prototype: object,
+  profile: ActorAbiProfile,
+): asserts value is object {
   if (!isObject(value)) throw new SafeTypeError("Actor constructor did not create an object");
   let current: object | null = value;
   let hasExpectedPrototype = false;
@@ -483,7 +608,9 @@ function validateInstance(value: unknown, prototype: object): asserts value is o
   if (!hasExpectedPrototype) {
     throw new SafeTypeError("Actor constructor returned an incompatible object");
   }
-  for (const name of ["start", ...REQUIRED_HANDLERS]) {
+  for (const name of profile === V2_PROFILE
+    ? ["start", ...REQUIRED_HANDLERS, "socketError"]
+    : ["start", ...REQUIRED_HANDLERS]) {
     const descriptor = SafeObjectGetOwnPropertyDescriptor(value, name);
     if (descriptor !== undefined) {
       // A per-instance replacement is rejected without reading an accessor.
@@ -517,7 +644,10 @@ export class ActorExecutionError extends SafeError {
   }
 }
 
-function failureResult(kind: ActorEvent["kind"], failure: unknown): Response | undefined {
+function failureResult(
+  kind: ActorEvent["kind"] | "socketError",
+  failure: unknown,
+): Response | undefined {
   if (kind === "fetch") return new SafeResponse("Internal Server Error", { status: 500 });
   throw failure;
 }
@@ -545,7 +675,10 @@ function normalizeTurn(value: unknown): ActorTurn {
   }
 }
 
-function normalizeEvent(value: unknown): ActorEvent {
+function normalizeEvent(
+  value: unknown,
+  profile: ActorAbiProfile,
+): ActorEvent | ActorTransportFailureEvent {
   try {
     if (!isObject(value) || SafeArrayIsArray(value)) throw new SafeTypeError("Actor event invalid");
     const kindDescriptor = SafeObjectGetOwnPropertyDescriptor(value, "kind");
@@ -591,6 +724,13 @@ function normalizeEvent(value: unknown): ActorEvent {
         if (!isObject(record.socket)) throw new SafeTypeError("Actor socket invalid");
         const event = closedRecord(record.event, ["code"], "Actor socket error event");
         if (event.code !== "transport_error") throw new SafeTypeError("Actor socket error invalid");
+        if (profile === V2_PROFILE) {
+          return {
+            kind: "socketError",
+            socket: record.socket,
+            event: record.event as { code: "transport_error" },
+          };
+        }
         return {
           kind: "socketClose",
           socket: record.socket,
@@ -635,7 +775,10 @@ function normalizeCloseEvent(value: unknown): ActorSocketCloseEvent {
   return value as ActorSocketCloseEvent;
 }
 
-function eventArguments(event: ActorEvent, turn: ActorTurn): readonly unknown[] {
+function eventArguments(
+  event: ActorEvent | ActorTransportFailureEvent,
+  turn: ActorTurn,
+): readonly unknown[] {
   switch (event.kind) {
     case "fetch":
       return [event.request, turn];
@@ -644,6 +787,8 @@ function eventArguments(event: ActorEvent, turn: ActorTurn): readonly unknown[] 
     case "socketMessage":
       return [event.socket, event.data, turn];
     case "socketClose":
+      return [event.socket, event.event, turn];
+    case "socketError":
       return [event.socket, event.event, turn];
   }
 }

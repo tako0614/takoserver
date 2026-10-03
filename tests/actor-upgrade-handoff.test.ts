@@ -1,15 +1,79 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { resolveActorAbiProfile } from "../src/actor-class-execution.ts";
 import {
   createActorUpgradeHandoff,
+  createActorUpgradeResponse,
   installActorResponseRuntime,
 } from "../src/actor-upgrade-handoff.ts";
 
 const NativeResponse = Response;
+const v2Profile = resolveActorAbiProfile({
+  apiVersion: "interfaces.takoform.com/v1alpha1",
+  name: "worker.actor",
+  version: "2.0.0",
+  schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+});
 beforeEach(() => installActorResponseRuntime());
 afterEach(() => {
   globalThis.Response = NativeResponse;
+});
+test("v2 branded 101 cannot be cloned but constructor aliases preserve its source", () => {
+  const response = createActorUpgradeResponse(new Headers(), v2Profile);
+  expect(response.status).toBe(101);
+  expect(() => response.clone()).toThrow(TypeError);
+  const alias = new Response(null, response);
+  expect(alias.status).toBe(101);
+  expect(() => alias.clone()).toThrow(TypeError);
+  const legacy = createActorUpgradeResponse(new Headers());
+  expect(legacy.clone().status).toBe(101);
+});
+
+test("v2 handoff preserves 101 clone refusal through a real reservation", async () => {
+  const handoff = createActorUpgradeHandoff(
+    request(),
+    {
+      async open() {
+        return {
+          response: new NativeResponse(null, { status: 101 }),
+          commit() {},
+          abandon() {},
+        };
+      },
+    },
+    30_000,
+    v2Profile,
+  );
+  try {
+    const response = await handoff.actor.fetch(request());
+    expect(() => response.clone()).toThrow(TypeError);
+    const alias = new Response(null, response);
+    expect((await handoff.finish(alias)).status).toBe(101);
+  } finally {
+    await handoff.abandon();
+  }
+});
+
+test("handoffs do not commit a reserved response from a different ABI scope", async () => {
+  const transport = {
+    async open() {
+      return {
+        response: new NativeResponse(null, { status: 101 }),
+        commit() {},
+        abandon() {},
+      };
+    },
+  };
+  const forward = createActorUpgradeHandoff(request(), transport, 30_000, v2Profile);
+  const legacy = createActorUpgradeHandoff(request(), transport);
+  try {
+    const response = await forward.actor.fetch(request());
+    expect((await legacy.finish(response)).status).toBe(503);
+    expect((await forward.finish(response)).status).toBe(101);
+  } finally {
+    await Promise.all([forward.abandon(), legacy.abandon()]);
+  }
 });
 function request(): Request {
   return new Request("http://worker.invalid/socket", {
