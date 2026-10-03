@@ -296,6 +296,25 @@ export interface SelfhostArtifacts {
 export interface SelfhostProviderOptions {
   readonly id?: string;
   readonly offerings: readonly ProviderOffering[];
+  /** The existing Host-owned Actor namespace registration lifecycle, if composed. */
+  readonly actorNamespace?: {
+    registerNamespace(scope: {
+      readonly tenantId: string;
+      readonly namespaceResourceUid: string;
+    }): Promise<void>;
+    hasNamespace(scope: {
+      readonly tenantId: string;
+      readonly namespaceResourceUid: string;
+    }): Promise<boolean>;
+    namespaceAbsent(scope: {
+      readonly tenantId: string;
+      readonly namespaceResourceUid: string;
+    }): Promise<boolean>;
+    forgetNamespace(scope: {
+      readonly tenantId: string;
+      readonly namespaceResourceUid: string;
+    }): Promise<void>;
+  };
   /** Explicit native runtime for an independently installed Container Form. */
   readonly container?: SelfhostContainerCapability;
   /** Local unpublished Endpoint attachment; no route exists outside committed Host state. */
@@ -3336,6 +3355,99 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     return offering.kind;
   };
 
+  const actorScope = (
+    input: Pick<ApplyInput, "identity" | "spec" | "relations">,
+  ): {
+    readonly tenantId: string;
+    readonly namespaceResourceUid: string;
+    readonly className: string;
+  } | null => {
+    const uid = input.identity.uid;
+    const className = input.spec.className;
+    const declaredWorker = input.spec.worker;
+    const workerRelations = input.relations?.filter((entry) => entry.pointer === "/worker") ?? [];
+    const relation = workerRelations.length === 1 ? workerRelations[0] : undefined;
+    const deployment = relation?.deployment;
+    if (
+      !options.actorNamespace ||
+      !uid ||
+      !RESOURCE_UID.test(uid) ||
+      typeof className !== "string" ||
+      !DATA_BINDING_NAME.test(className) ||
+      typeof declaredWorker !== "object" ||
+      declaredWorker === null ||
+      Array.isArray(declaredWorker) ||
+      !relation ||
+      relation.relation !== "/worker" ||
+      relation.resource.kind !== "ModuleWorker" ||
+      relation.resource.apiVersion !== "edge.forms.takoform.com" ||
+      relation.resource.form.formRef.kind !== "ModuleWorker" ||
+      relation.resource.form.formRef.apiVersion !== relation.resource.apiVersion ||
+      relation.resource.metadata.space !== input.identity.space ||
+      relation.targetUid !== relation.resource.metadata.uid ||
+      !RESOURCE_UID.test(relation.targetUid) ||
+      !deployment ||
+      deployment.state !== "active" ||
+      deployment.tenantId !== input.identity.tenantRef ||
+      deployment.resourceUid !== relation.targetUid ||
+      deployment.providerPackRef !== id ||
+      deployment.providerInstallationRef !== "local.primary" ||
+      deployment.nativeId.split(":").length !== 3 ||
+      parseSelfhostNativeId("ModuleWorker", deployment.nativeId)?.script !==
+        deployment.outputs.scriptName ||
+      (declaredWorker as JsonObject).apiVersion !== relation.resource.apiVersion ||
+      (declaredWorker as JsonObject).kind !== relation.resource.kind ||
+      (declaredWorker as JsonObject).name !== relation.resource.metadata.name
+    )
+      return null;
+    return { tenantId: input.identity.tenantRef, namespaceResourceUid: uid, className };
+  };
+
+  const applyActorNamespace = async (input: ApplyInput): Promise<ProviderTicket> => {
+    if (
+      !options.offerings.some(
+        (candidate) =>
+          candidate.id === input.offering.id &&
+          sameSelfhostFormRef(candidate.form, input.offering.form) &&
+          candidate.form.kind === "ActorNamespace",
+      )
+    ) {
+      return failedWithoutProviderMutation(
+        input.operationId,
+        "denied",
+        "the Actor namespace Offering is not installed",
+      );
+    }
+    const scope = actorScope(input);
+    if (!scope)
+      return failedWithoutProviderMutation(
+        input.operationId,
+        "denied",
+        "the Actor namespace runtime or exact Worker relation is unavailable",
+      );
+    const native = `selfhost-actor:${scope.namespaceResourceUid}`;
+    if (input.previous && input.previous.nativeId !== native) {
+      return failedWithoutProviderMutation(
+        input.operationId,
+        "conflict",
+        "the Actor namespace UID changed",
+      );
+    }
+    try {
+      await options.actorNamespace?.registerNamespace({
+        tenantId: scope.tenantId,
+        namespaceResourceUid: scope.namespaceResourceUid,
+      });
+    } catch {
+      return failed("unavailable", "the Actor namespace registration did not settle", true);
+    }
+    return succeeded({
+      nativeId: native,
+      observed: { className: scope.className, ready: false },
+      outputs: {},
+    });
+  };
+
   const isConfiguredContainerOffering = (offering: ProviderOffering): boolean =>
     containerLifecycle !== null &&
     offering.form.apiVersion === "edge.forms.takoform.com" &&
@@ -3674,6 +3786,24 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     createNativeReadbackDescriptor(
       input: ProviderNativeReadbackInput,
     ): ProviderNativeReadbackDescriptor {
+      if (dispatchKind(input.offering) === "ActorNamespace") {
+        const uid = input.identity.uid;
+        if (
+          !options.actorNamespace ||
+          !uid ||
+          !RESOURCE_UID.test(uid) ||
+          input.nativeId !== `selfhost-actor:${uid}`
+        ) {
+          throw new ProviderReadbackDescriptorError();
+        }
+        return {
+          apiVersion: PROVIDER_READBACK_API_VERSION,
+          provider: id,
+          kind: "ActorNamespace",
+          nativeId: input.nativeId,
+          data: { resourceUid: uid },
+        };
+      }
       if (isConfiguredContainerEndpointOffering(input.offering)) {
         const native = parseSelfhostContainerEndpointNativeId(input.nativeId);
         if (
@@ -3762,6 +3892,31 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       descriptor: ProviderNativeReadbackDescriptor;
       target?: ProviderReadAuthorityTarget;
     }): Promise<ProviderNativeAbsence> {
+      if (dispatchKind(input.offering) === "ActorNamespace") {
+        const target = input.target;
+        const descriptor = input.descriptor;
+        if (
+          !options.actorNamespace ||
+          !target ||
+          !RESOURCE_UID.test(target.resourceUid) ||
+          descriptor.apiVersion !== PROVIDER_READBACK_API_VERSION ||
+          descriptor.provider !== id ||
+          descriptor.kind !== "ActorNamespace" ||
+          descriptor.nativeId !== `selfhost-actor:${target.resourceUid}` ||
+          Object.keys(descriptor.data).sort().join(",") !== "resourceUid" ||
+          descriptor.data.resourceUid !== target.resourceUid
+        )
+          return selfhostUnknown("malformed", false);
+        try {
+          const absent = await options.actorNamespace.namespaceAbsent({
+            tenantId: target.tenantId,
+            namespaceResourceUid: target.resourceUid,
+          });
+          return selfhostAbsence(absent ? "absent" : "present", descriptor, "ActorNamespace", id);
+        } catch {
+          return selfhostUnknown("transport", true);
+        }
+      }
       if (isConfiguredContainerEndpointOffering(input.offering)) {
         const native = parseSelfhostContainerEndpointNativeId(input.descriptor.nativeId);
         const { descriptor, target } = input;
@@ -4073,6 +4228,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             ? await containerEndpointLifecycle.apply(input)
             : failed("unavailable", "the local Container endpoint ingress is not installed");
         switch (dispatchKind(input.offering)) {
+          case "ActorNamespace":
+            return await applyActorNamespace(input);
           case "ModuleWorker":
             return await applyModuleWorker(input);
           case "WorkerVersion":
@@ -4115,6 +4272,29 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
 
     async observe(input): Promise<ProviderTicket> {
       try {
+        if (dispatchKind(input.offering) === "ActorNamespace") {
+          const scope = actorScope(input);
+          if (!scope || input.nativeId !== `selfhost-actor:${scope.namespaceResourceUid}`) {
+            return failed("not_found", "the Actor namespace identity is malformed");
+          }
+          try {
+            if (
+              !(await options.actorNamespace?.hasNamespace({
+                tenantId: scope.tenantId,
+                namespaceResourceUid: scope.namespaceResourceUid,
+              }))
+            ) {
+              return failed("not_found", "the Actor namespace registration is absent");
+            }
+          } catch {
+            return failed("unavailable", "the Actor namespace registration cannot be read", true);
+          }
+          return succeeded({
+            nativeId: input.nativeId,
+            observed: { className: scope.className, ready: false },
+            outputs: {},
+          });
+        }
         if (isConfiguredVectorIndexOffering(input.offering)) return await vectorObserve(input);
         if (dispatchKind(input.offering) === "ContainerService")
           return containerLifecycle && isConfiguredContainerOffering(input.offering)
@@ -4398,6 +4578,30 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async delete(input): Promise<ProviderTicket> {
+      if (dispatchKind(input.offering) === "ActorNamespace") {
+        if (input.operationMode === "recovery" || input.providerHandle) {
+          return failed("unavailable", "Actor namespace deletion needs read-only recovery", true);
+        }
+        const uid = input.identity.uid;
+        if (
+          !uid ||
+          !RESOURCE_UID.test(uid) ||
+          input.nativeId !== `selfhost-actor:${uid}` ||
+          !options.actorNamespace
+        ) {
+          return failed("not_found", "the Actor namespace identity is malformed");
+        }
+        const scope = { tenantId: input.identity.tenantRef, namespaceResourceUid: uid };
+        try {
+          await options.actorNamespace.forgetNamespace(scope);
+          if (!(await options.actorNamespace.namespaceAbsent(scope))) {
+            return failed("unavailable", "the Actor namespace delete did not settle", true);
+          }
+        } catch {
+          return failed("unavailable", "the Actor namespace delete did not settle", true);
+        }
+        return succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
+      }
       if (dispatchKind(input.offering) === "ContainerEndpoint")
         return containerEndpointLifecycle && isConfiguredContainerEndpointOffering(input.offering)
           ? await containerEndpointLifecycle.delete(input)
@@ -4641,6 +4845,27 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
      * truth; it never calls `remove`, rewrites desired state, or reloads.
      */
     async recoverDelete(input): Promise<ProviderTicket> {
+      if (dispatchKind(input.offering) === "ActorNamespace") {
+        const uid = input.identity.uid;
+        if (
+          !uid ||
+          !RESOURCE_UID.test(uid) ||
+          input.nativeId !== `selfhost-actor:${uid}` ||
+          !options.actorNamespace
+        ) {
+          return failed("not_found", "the Actor namespace identity is malformed");
+        }
+        try {
+          return (await options.actorNamespace.namespaceAbsent({
+            tenantId: input.identity.tenantRef,
+            namespaceResourceUid: uid,
+          }))
+            ? succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} })
+            : failed("unavailable", "the Actor namespace delete outcome is not proven", true);
+        } catch {
+          return failed("unavailable", "the Actor namespace delete outcome is not proven", true);
+        }
+      }
       if (dispatchKind(input.offering) === "ContainerEndpoint")
         return containerEndpointLifecycle && isConfiguredContainerEndpointOffering(input.offering)
           ? await containerEndpointLifecycle.delete(input)
