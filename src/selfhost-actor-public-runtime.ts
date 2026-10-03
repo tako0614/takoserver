@@ -273,6 +273,11 @@ export async function openSelfhostActorPublicRuntime(options: {
   const cleanupInactive = async (): Promise<void> => {
     if (uncertain || closed) return;
     for (const [key, pair] of brokers) {
+      // `uncertain()` can arrive while an earlier never-admitted pair's
+      // hard-close is awaiting its listener. Preserve every remaining pair
+      // for exact rollback instead of interpreting revoked admission as a
+      // request to retire the rest of the old graph.
+      if (uncertain || closed) return;
       if (admitted.has(key) || (reservations.get(key) ?? 0) > 0) continue;
       brokers.delete(key);
       const entry = { key, pair };
