@@ -80,12 +80,17 @@ test("Actor broker owner restores exact v8 Version tokens for two callers of one
   };
   const first = await publication("a");
   const second = await publication("b");
+  let graphReads = 0;
+  let failFrom = Number.POSITIVE_INFINITY;
   const owner = await openSelfhostActorPublicRuntime({
     dataRoot: root,
     runtimeRoot: root,
     socketParent: join(root, "sockets"),
     binary: "/never-execute",
-    graph: f.read,
+    graph: async (...args) => {
+      graphReads += 1;
+      return graphReads >= failFrom ? null : f.read(...args);
+    },
     deployments: f.deployments,
     providerPackRef: "selfhost",
     providerInstallationRef: "local.primary",
@@ -160,6 +165,14 @@ test("Actor broker owner restores exact v8 Version tokens for two callers of one
       owner.actorForwardLifecycle.prepare([{ ...first, versionId: "version-legacy" }]),
     ).rejects.toThrow("Actor immutable Version authority unavailable");
     expect(owner.actorForwardSockets()).toEqual([]);
+    failFrom = graphReads + 3;
+    await expect(owner.actorForwardLifecycle.prepare([first])).rejects.toThrow(
+      "Actor namespace authority unavailable",
+    );
+    expect(owner.actorForwardSockets()).toEqual([]);
+    failFrom = Number.POSITIVE_INFINITY;
+    // The failed reproof closed and unlinked its real local brokers; retrying
+    // the same deterministic paths must work in this Bun incarnation.
     await owner.actorForwardLifecycle.prepare([first, second]);
     expect(owner.actorForwardSockets()).toHaveLength(2);
     expect(new Set(owner.actorForwardSockets().map((item) => item.token))).toEqual(
