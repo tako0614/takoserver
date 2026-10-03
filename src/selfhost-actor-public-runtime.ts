@@ -33,7 +33,12 @@ export function deriveSelfhostActorForwardToken(input: {
     !binding ||
     typeof binding.name !== "string" ||
     typeof binding.tenantId !== "string" ||
-    typeof binding.namespaceResourceUid !== "string"
+    typeof binding.namespaceResourceUid !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u.test(binding.workerResourceUid) ||
+    typeof binding.className !== "string" ||
+    binding.className.length === 0 ||
+    binding.className.length > 255 ||
+    binding.className.includes("\0")
   )
     throw new Error("Actor Version relation unavailable");
   // JSON arrays are length-delimited by the encoding and preserve field
@@ -180,7 +185,10 @@ export async function openSelfhostActorPublicRuntime(options: {
 
   const lifecycle = Object.freeze({
     async prepare(publications: readonly WorkerdActorForwardPublication[]): Promise<void> {
-      if (closed) throw new Error("Actor owner closed");
+      if (closed) {
+        if (publications.length === 0) return;
+        throw new Error("Actor owner closed");
+      }
       const requested = new Map<string, (typeof publications)[number]["bindings"][number]>();
       for (const publication of publications) {
         await prove(publication);
@@ -251,7 +259,8 @@ export async function openSelfhostActorPublicRuntime(options: {
     [OWNED_ACTOR_RUNTIME]: true as const,
     actorNamespace: host,
     actorForwardLifecycle: lifecycle,
-    actorForwardSockets: () => [...brokers.values()].map((pair) => pair.socketMapping),
+    actorForwardSockets: () =>
+      closed ? [] : [...brokers.values()].map((pair) => pair.socketMapping),
     async close(): Promise<void> {
       if (closed) return;
       closed = true;
