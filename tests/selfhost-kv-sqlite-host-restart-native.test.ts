@@ -1583,7 +1583,7 @@ test.skipIf(WORKERD === null)(
           status: "not_ready",
           database: "readable",
           workerRuntime: "restore-failed",
-          supervisor: "unavailable",
+          supervisor: "idle",
         });
         expect(readFileSync(configPath)).toEqual(configBeforeForeignListener);
         expect(await workerRequest(hostname, cert, "/")).toBe("foreign-listener-marker");
