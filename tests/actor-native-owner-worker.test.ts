@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { type ActorAbiProfile, resolveActorAbiProfile } from "../src/actor-class-execution.ts";
 import {
   createActorNativeAlarmPort,
   createActorNativeIngress,
@@ -8,9 +9,17 @@ import {
   signActorNativeUpgradeDecision,
 } from "../src/actor-native-owner-worker.ts";
 
+const v2Profile = resolveActorAbiProfile({
+  apiVersion: "interfaces.takoform.com/v1alpha1",
+  name: "worker.actor",
+  version: "2.0.0",
+  schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+});
+
 function inboundFixture(
   callback?: (request: Request) => Promise<Response>,
   admissionFetch?: (request: Request) => Promise<Response>,
+  profile?: ActorAbiProfile,
 ) {
   type Socket = Parameters<
     InstanceType<ReturnType<typeof createActorNativeOwner>>["webSocketMessage"]
@@ -20,11 +29,19 @@ function inboundFixture(
   const delivered: string[] = [];
   const retained: Promise<unknown>[] = [];
   let producer!: ReadableStreamDefaultController<Uint8Array>;
-  const Owner = createActorNativeOwner("a".repeat(64), "c".repeat(64), {
-    generationKey: "d".repeat(64),
-    epoch: "epoch-1",
-    variantKeys: ["default"],
-  });
+  const Owner = createActorNativeOwner(
+    "a".repeat(64),
+    "c".repeat(64),
+    {
+      generationKey: "d".repeat(64),
+      epoch: "epoch-1",
+      variantKeys: ["default"],
+    },
+    undefined,
+    undefined,
+    undefined,
+    profile,
+  );
   const owner = new Owner(
     {
       facets: {
@@ -126,6 +143,217 @@ function inboundFixture(
     },
   };
 }
+
+test("v2 socket error is a distinct terminal callback", async () => {
+  const actions: string[] = [];
+  const f = inboundFixture(
+    async (request) => {
+      actions.push(request.headers.get("x-takoserver-private-actor-socket-action") ?? "missing");
+      expect(await request.json()).toEqual({ code: "transport_error" });
+      return new Response(null, { status: 204 });
+    },
+    undefined,
+    v2Profile,
+  );
+  const socket = f.socket("error-socket");
+  await f.owner.webSocketError(socket);
+  await f.owner.webSocketClose(socket, 1006, "late close", false);
+  expect(actions).toEqual(["callback-error"]);
+  expect(f.cachedSocketIds()).toEqual([]);
+  expect(f.accounting().count).toBe(0);
+});
+
+for (const terminal of ["error", "close"] as const)
+  for (const cache of ["warm", "cold"] as const)
+    test(`v2 ${cache} ${terminal} callback hides connection but can read attachment until settlement`, async () => {
+      const observations: unknown[] = [];
+      let f!: ReturnType<typeof inboundFixture>;
+      f = inboundFixture(
+        async (request) => {
+          const nonce = request.headers.get("x-takoserver-private-actor-socket-nonce") as string;
+          const control = (action: string, socketId?: string, body?: Uint8Array) =>
+            f.owner.fetch(
+              new Request("http://actor.invalid/", {
+                method: "POST",
+                headers: {
+                  "x-takoserver-private-actor-id": "inbound-owner",
+                  "x-takoserver-private-actor-socket-action": action,
+                  "x-takoserver-private-actor-abi": v2Profile.schemaDigest,
+                  "x-takoserver-private-actor-socket-nonce": nonce,
+                  ...(socketId ? { "x-takoserver-private-actor-socket-id": socketId } : {}),
+                  ...(body ? { "x-takoserver-private-actor-socket-kind": "binary" } : {}),
+                },
+                ...(body ? { body: body.slice().buffer as ArrayBuffer } : {}),
+              }),
+            );
+          observations.push(await (await control("list")).json());
+          observations.push(await (await control("get", "terminal")).json());
+          observations.push((await control("send", "terminal", new Uint8Array([1]))).status);
+          observations.push((await control("close", "terminal")).status);
+          observations.push(
+            (await control("set-attachment", "terminal", new Uint8Array([2]))).status,
+          );
+          observations.push(
+            new Uint8Array(await (await control("get-attachment", "terminal")).arrayBuffer()),
+          );
+          return new Response(null, { status: 204 });
+        },
+        undefined,
+        v2Profile,
+      );
+      const socket = f.socket("terminal");
+      if (cache === "warm") {
+        const record = {
+          socketId: "terminal",
+          actorId: "inbound-owner",
+          nonce: "",
+          protocol: "",
+          attachment: new Uint8Array([7]),
+          queued: [],
+          queuedBytes: 0,
+          status: "live",
+          socket,
+        };
+        (f.owner as unknown as { sockets: Map<string, unknown> }).sockets.set("terminal", record);
+      } else f.forgetNativeSocket(socket);
+      if (terminal === "error") await f.owner.webSocketError(socket);
+      else await f.owner.webSocketClose(socket, 1000, "done", true);
+      expect(observations).toEqual([
+        [],
+        { exists: false },
+        404,
+        404,
+        404,
+        new Uint8Array(cache === "warm" ? [7] : []),
+      ]);
+      expect(f.cachedSocketIds()).toEqual([]);
+    });
+
+test("v2 provisional queues are per connection, and live backlog is bounded", async () => {
+  const f = inboundFixture(undefined, undefined, v2Profile);
+  const state = f.owner as unknown as {
+    activeSocketInvocation?: { actorId: string; nonce: string; kind: "fetch"; accepting: boolean };
+    sockets: Map<
+      string,
+      {
+        socketId?: string;
+        actorId: string;
+        nonce: string;
+        status: string;
+        queued: Uint8Array[];
+        queuedBytes: number;
+        socket?: { send(value: Uint8Array): void };
+      }
+    >;
+  };
+  state.activeSocketInvocation = {
+    actorId: "inbound-owner",
+    nonce: "n",
+    kind: "fetch",
+    accepting: true,
+  };
+  const send = (id: string, bytes: number, digest = v2Profile.schemaDigest) =>
+    f.owner.fetch(
+      new Request("http://actor.invalid/", {
+        method: "POST",
+        headers: {
+          "x-takoserver-private-actor-id": "inbound-owner",
+          "x-takoserver-private-actor-socket-action": "send",
+          "x-takoserver-private-actor-abi": digest,
+          "x-takoserver-private-actor-socket-nonce": "n",
+          "x-takoserver-private-actor-socket-id": id,
+          "x-takoserver-private-actor-socket-kind": "binary",
+        },
+        body: new Uint8Array(bytes).buffer as ArrayBuffer,
+      }),
+    );
+  for (const id of ["a", "b", "c"])
+    state.sockets.set(id, {
+      actorId: "inbound-owner",
+      nonce: "n",
+      status: "provisional",
+      queued: [],
+      queuedBytes: 30 * 1024 * 1024,
+    });
+  expect((await send("c", 1)).status).toBe(204);
+  expect(
+    (await send("c", 1, "sha256:f5428fb587de80261dd7363dc5b8a3f4aab7e469fa1b5fce8441ad9acbec8218"))
+      .status,
+  ).toBe(409);
+  expect(state.sockets.get("c")?.queuedBytes).toBe(30 * 1024 * 1024 + 1);
+  expect((await send("c", 2 * 1024 * 1024 + 1)).status).toBe(429);
+  expect(state.sockets.get("c")?.queuedBytes).toBe(30 * 1024 * 1024 + 1);
+  const sent: number[] = [];
+  state.sockets.set("live", {
+    socketId: "live",
+    actorId: "inbound-owner",
+    nonce: "n",
+    status: "live",
+    queued: [],
+    queuedBytes: 33_554_431,
+    socket: {
+      send(value) {
+        sent.push(value.byteLength);
+        expect(state.sockets.get("live")?.queuedBytes).toBe(2);
+      },
+    },
+  });
+  expect((await send("live", 2)).status).toBe(429);
+  expect(sent).toEqual([]);
+  const live = state.sockets.get("live");
+  if (!live) throw new Error("live socket missing");
+  live.queuedBytes = 0;
+  expect((await send("live", 2)).status).toBe(204);
+  expect(sent).toEqual([2]);
+  expect(state.sockets.get("live")?.queuedBytes).toBe(0);
+  live.socket = {
+    send() {
+      throw new Error("transport failed");
+    },
+  };
+  await expect(send("live", 3)).rejects.toThrow("transport failed");
+  expect(state.sockets.get("live")?.queuedBytes).toBe(0);
+  for (const id of ["z", "d"])
+    state.sockets.set(id, {
+      socketId: id,
+      actorId: "inbound-owner",
+      nonce: "n",
+      status: "live",
+      queued: [],
+      queuedBytes: 0,
+      socket: { send() {} },
+    });
+  const port = createActorNativeSocketPort(
+    { fetch: (request) => f.owner.fetch(request) },
+    undefined,
+    "inbound-owner",
+    "n",
+    v2Profile,
+  );
+  expect(await port.list()).toEqual(["d", "live", "z"]);
+  const legacy = inboundFixture();
+  (legacy.owner as unknown as { activeSocketInvocation: unknown }).activeSocketInvocation = {
+    actorId: "inbound-owner",
+    nonce: "n",
+    kind: "fetch",
+    accepting: true,
+  };
+  expect(
+    (
+      await legacy.owner.fetch(
+        new Request("http://actor.invalid/", {
+          method: "POST",
+          headers: {
+            "x-takoserver-private-actor-id": "inbound-owner",
+            "x-takoserver-private-actor-socket-action": "get",
+            "x-takoserver-private-actor-socket-nonce": "n",
+            "x-takoserver-private-actor-abi": v2Profile.schemaDigest,
+          },
+        }),
+      )
+    ).status,
+  ).toBe(409);
+});
 
 function hostSocketGrants() {
   const active = new Set<string>();
@@ -451,6 +679,19 @@ test("native inbound oversize remains 1009 and unknown native close still receiv
   await f.owner.webSocketClose(unknown, 1000, "native closed", true);
   await f.owner.webSocketClose(unknown, 1000, "duplicate", true);
   expect(f.delivered).toEqual(["unknown"]);
+});
+
+test("v2 native inbound accepts beyond legacy frame size and enforces 32 MiB", async () => {
+  const f = inboundFixture(undefined, undefined, v2Profile);
+  const drain = await f.holdProducer();
+  const accepted = f.owner.webSocketMessage(f.socket("accepted"), new ArrayBuffer(8_388_609));
+  expect(f.accounting().bytes).toBe(8_388_609);
+  const oversize = f.socket("oversize");
+  await f.owner.webSocketMessage(oversize, new ArrayBuffer(33_554_433));
+  expect(f.closes).toEqual([["oversize", 1009]]);
+  await drain();
+  await accepted;
+  expect(f.accounting().bytes).toBe(0);
 });
 
 test("native inbound batches do not overtake an intervening whole HTTP producer turn", async () => {
@@ -1035,6 +1276,36 @@ test("private socket port preserves closed application error names", async () =>
   });
   await expect(port.accept(undefined, new Uint8Array(8_193))).rejects.toMatchObject({
     name: "attachment_too_large",
+    code: "attachment_too_large",
+  });
+});
+
+test("v2 socket port maps congestion errors and admits 16 KiB attachments", async () => {
+  let status = 429;
+  const port = createActorNativeSocketPort(
+    {
+      async fetch() {
+        return status === 200
+          ? Response.json({ socketId: "socket" })
+          : new Response(null, { status });
+      },
+    },
+    "b".repeat(64),
+    "id",
+    crypto.randomUUID(),
+    v2Profile,
+  );
+  await expect(port.accept()).rejects.toMatchObject({
+    name: "connection_limit_exceeded",
+    code: "connection_limit_exceeded",
+  });
+  await expect(port.send("socket", "message")).rejects.toMatchObject({
+    name: "transport_overloaded",
+    code: "transport_overloaded",
+  });
+  status = 200;
+  expect(await port.accept(undefined, new Uint8Array(16_384))).toBe("socket");
+  await expect(port.accept(undefined, new Uint8Array(16_385))).rejects.toMatchObject({
     code: "attachment_too_large",
   });
 });

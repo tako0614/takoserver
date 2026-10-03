@@ -1,4 +1,6 @@
 /** Host-private native owner. No public admission or namespace API is installed here. */
+import { type ActorAbiProfile, actorAbiProfile } from "./actor-class-execution.ts";
+
 interface NativeActorWebSocket extends WebSocket {
   serializeAttachment(value: unknown): void;
   deserializeAttachment(): unknown;
@@ -41,6 +43,8 @@ const SOCKET_ACTION_HEADER = "x-takoserver-private-actor-socket-action";
 const SOCKET_NONCE_HEADER = "x-takoserver-private-actor-socket-nonce";
 const SOCKET_ID_HEADER = "x-takoserver-private-actor-socket-id";
 const SOCKET_KIND_HEADER = "x-takoserver-private-actor-socket-kind";
+// Profile consistency only; the separate alarm bearer remains the control authority.
+const SOCKET_ABI_HEADER = "x-takoserver-private-actor-abi";
 const UPGRADE_NONCE_HEADER = "x-takoserver-private-actor-upgrade-nonce";
 const UPGRADE_DECISION_HEADER = "x-takoserver-private-actor-upgrade-decision";
 const UPGRADE_SOCKET_ID_HEADER = "x-takoserver-private-actor-upgrade-socket-id";
@@ -48,14 +52,10 @@ const EVENT_SECRET_HEADER = "x-takoserver-private-actor-event-secret";
 const RESERVATION_HEADER = "x-takoserver-private-actor-reservation";
 const RESERVATION_ACTION_HEADER = "x-takoserver-private-actor-reservation-action";
 const RESERVATION_MS = 30_000;
-const SOCKET_MESSAGE_LIMIT = 8 * 1024 * 1024;
 // Host-owned inbound policy, not portable capacity or a native transport bound.
 // Count empty messages too, and retain charges through callback settlement.
 const SOCKET_INBOUND_COUNT = 64;
-const SOCKET_INBOUND_BYTES = 8 * 1024 * 1024;
 const ACTOR_INBOUND_COUNT = 256;
-const ACTOR_INBOUND_BYTES = 16 * 1024 * 1024;
-const SOCKET_ATTACHMENT_LIMIT = 8_192;
 const SOCKET_ID_LIMIT = 10_000;
 const ALARM_RETRY_MS = 1_000;
 const ALARM_WATCHDOG_MS = 35_000;
@@ -77,7 +77,11 @@ const SafeString = String;
 const SafeHasOwn = Object.hasOwn;
 const SafeArrayIsArray = Array.isArray;
 const SafeArrayIndexOf = Array.prototype.indexOf;
+const SafeArraySort = Array.prototype.sort;
 const SafeObjectFreeze = Object.freeze;
+const SafeWeakMap = WeakMap;
+const SafeWeakMapGet = WeakMap.prototype.get;
+const SafeWeakMapSet = WeakMap.prototype.set;
 const SafeIsSafeInteger = Number.isSafeInteger;
 const SafeSubtle = crypto.subtle;
 const SafeSubtleImportKey = crypto.subtle.importKey;
@@ -231,6 +235,7 @@ function validActorOwnerGraph(value: ActorOwnerGraph | undefined): value is Acto
 
 type SocketEvent =
   | { readonly kind: "message"; readonly data: string | ArrayBuffer }
+  | { readonly kind: "error" }
   | {
       readonly kind: "close";
       readonly code: number;
@@ -255,7 +260,7 @@ interface SocketRecord {
   attachment: Uint8Array | null;
   readonly queued: (string | Uint8Array)[];
   queuedBytes: number;
-  status: "provisional" | "transport-pending" | "live" | "closed";
+  status: "provisional" | "transport-pending" | "live" | "terminal" | "closed";
   reservationBearer?: string | undefined;
   reservationExpiresAt?: number | undefined;
   reservationGenerationKey?: string | undefined;
@@ -320,6 +325,8 @@ type SocketPortErrorCode =
   | "socket_limit_exceeded"
   | "attachment_too_large"
   | "socket_overloaded"
+  | "connection_limit_exceeded"
+  | "transport_overloaded"
   | "socket_closed"
   | "message_too_large"
   | "backend_unavailable";
@@ -334,6 +341,14 @@ function socketPortError(
 
 function alarmTime(value: unknown): value is number {
   return typeof value === "number" && SafeIsSafeInteger(value) && value >= 0;
+}
+
+const socketPortProfiles = new SafeWeakMap<object, ActorAbiProfile>();
+/** Child-private identity check for native adapter/port composition. */
+export function actorNativeSocketPortProfile(port: unknown): ActorAbiProfile | undefined {
+  return (typeof port === "object" && port !== null) || typeof port === "function"
+    ? (SafeReflectApply(SafeWeakMapGet, socketPortProfiles, [port]) as ActorAbiProfile | undefined)
+    : undefined;
 }
 
 /** Private owner transport; the actor cannot choose another namespace or ID. */
@@ -387,7 +402,9 @@ export function createActorNativeSocketPort(
   secret: string | undefined,
   id: string,
   nonce: string,
+  selected?: ActorAbiProfile,
 ) {
+  const profile = actorAbiProfile(selected);
   const fetch = service.fetch;
   const encodedId = SafeEncodeURIComponent(id);
   const bearer = secret === undefined ? undefined : actorAlarmBearer(secret)(encodedId);
@@ -401,6 +418,7 @@ export function createActorNativeSocketPort(
       [ID_HEADER]: encodedId,
       [SOCKET_ACTION_HEADER]: action,
       [SOCKET_NONCE_HEADER]: nonce,
+      [SOCKET_ABI_HEADER]: profile.schemaDigest,
     });
     if (bearer !== undefined)
       SafeReflectApply(SafeHeadersSet, headers, [TOKEN_HEADER, await bearer]);
@@ -419,7 +437,15 @@ export function createActorNativeSocketPort(
       const status = SafeResponseStatus ? SafeReflectApply(SafeResponseStatus, response, []) : 503;
       if (status === 404 && action !== "accept") throw socketPortError("socket_closed");
       if (status === 429)
-        throw socketPortError(action === "accept" ? "socket_limit_exceeded" : "socket_overloaded");
+        throw socketPortError(
+          action === "accept"
+            ? profile.kind === "v2"
+              ? "connection_limit_exceeded"
+              : "socket_limit_exceeded"
+            : profile.kind === "v2"
+              ? "transport_overloaded"
+              : "socket_overloaded",
+        );
       if (status === 413)
         throw socketPortError(action === "send" ? "message_too_large" : "attachment_too_large");
       if (status === 400 && action === "accept") throw socketPortError("invalid_upgrade");
@@ -427,9 +453,9 @@ export function createActorNativeSocketPort(
     }
     return response;
   };
-  return Object.freeze({
+  const port = Object.freeze({
     async accept(protocol?: string, attachment?: Uint8Array): Promise<string> {
-      if (attachment && attachment.byteLength > SOCKET_ATTACHMENT_LIMIT)
+      if (attachment && attachment.byteLength > profile.socketAttachmentBytes)
         throw socketPortError("attachment_too_large");
       const response = await call(
         "accept",
@@ -484,6 +510,8 @@ export function createActorNativeSocketPort(
       return new SafeUint8Array(await response.arrayBuffer());
     },
   });
+  SafeReflectApply(SafeWeakMapSet, socketPortProfiles, [port, profile]);
+  return port;
 }
 
 // Bun currently retains the original headers when cloning a Request with an
@@ -525,7 +553,9 @@ export function createActorNativeOwner(
     },
   ) => Promise<unknown>,
   readCurrentGraph?: (env: Record<string, unknown>) => Promise<ActorOwnerGraph>,
+  selected?: ActorAbiProfile,
 ) {
+  const profile = actorAbiProfile(selected);
   if (
     (deliveryToken !== undefined && !/^[a-f0-9]{64}$/u.test(deliveryToken)) ||
     (admissionToken !== undefined && !/^[a-f0-9]{64}$/u.test(admissionToken))
@@ -765,7 +795,19 @@ export function createActorNativeOwner(
     }
     private liveSocket(socketId: string): SocketRecord | undefined {
       const cached = this.sockets.get(socketId);
-      if ((cached?.status === "live" || cached?.status === "transport-pending") && cached.socket)
+      if (
+        cached?.socket &&
+        profile.kind === "v2" &&
+        this.closingInbound.has(cached.socket) &&
+        cached.status === "live"
+      )
+        cached.status = "terminal";
+      if (
+        (cached?.status === "live" ||
+          cached?.status === "terminal" ||
+          cached?.status === "transport-pending") &&
+        cached.socket
+      )
         return cached;
       for (const socket of this.state.getWebSockets?.() ?? []) {
         if (this.suppressedCloses.has(socket)) continue;
@@ -779,7 +821,12 @@ export function createActorNativeOwner(
           attachment: decodeAttachment(metadata.attachment),
           queued: [],
           queuedBytes: 0,
-          status: metadata.reservationBearer === undefined ? "live" : "transport-pending",
+          status:
+            metadata.reservationBearer === undefined
+              ? profile.kind === "v2" && this.closingInbound.has(socket)
+                ? "terminal"
+                : "live"
+              : "transport-pending",
           reservationBearer: metadata.reservationBearer,
           reservationExpiresAt: metadata.reservationExpiresAt,
           reservationGenerationKey: metadata.reservationGenerationKey,
@@ -966,6 +1013,12 @@ export function createActorNativeOwner(
         decodeURIComponent(encodedId) !== active.actorId
       )
         return new Response(null, { status: 404 });
+      const suppliedAbi = request.headers.get(SOCKET_ABI_HEADER);
+      if (
+        suppliedAbi !== profile.schemaDigest &&
+        !(profile.kind === "legacy" && suppliedAbi === null)
+      )
+        return new Response(null, { status: 409 });
       const socketId = request.headers.get(SOCKET_ID_HEADER);
       if (action === "accept") {
         if (active.kind !== "fetch" || !active.accepting || !active.request)
@@ -990,7 +1043,8 @@ export function createActorNativeOwner(
         }
         if (openIds.size >= SOCKET_ID_LIMIT) return new Response(null, { status: 429 });
         const body = await request.text();
-        if (body.length > 12_000) return new Response(null, { status: 413 });
+        if (body.length > (profile.kind === "v2" ? 23_000 : 12_000))
+          return new Response(null, { status: 413 });
         let value: unknown;
         try {
           value = JSON.parse(body);
@@ -1012,14 +1066,17 @@ export function createActorNativeOwner(
           return new Response(null, { status: 400 });
         let attachment: Uint8Array | null = null;
         if (options.attachment !== undefined && options.attachment !== null) {
-          if (typeof options.attachment !== "string" || options.attachment.length > 11_000)
+          if (
+            typeof options.attachment !== "string" ||
+            options.attachment.length > (profile.kind === "v2" ? 22_000 : 11_000)
+          )
             return new Response(null, { status: 413 });
           try {
             attachment = decodeAttachment(options.attachment);
           } catch {
             return new Response(null, { status: 400 });
           }
-          if (!attachment || attachment.byteLength > SOCKET_ATTACHMENT_LIMIT)
+          if (!attachment || attachment.byteLength > profile.socketAttachmentBytes)
             return new Response(null, { status: 413 });
         }
         if (this.activeSocketInvocation !== active || !active.accepting)
@@ -1040,13 +1097,20 @@ export function createActorNativeOwner(
       if (action === "list") {
         const ids = new Set<string>();
         for (const socket of this.state.getWebSockets?.() ?? []) {
+          if (profile.kind === "v2" && this.closingInbound.has(socket)) continue;
           const metadata = socketMetadata(socket);
           if (metadata?.actorId === active.actorId) ids.add(metadata.socketId);
         }
         for (const record of this.sockets.values())
-          if (record.status === "live" && record.actorId === active.actorId)
+          if (
+            record.status === "live" &&
+            record.actorId === active.actorId &&
+            !(profile.kind === "v2" && record.socket && this.closingInbound.has(record.socket))
+          )
             ids.add(record.socketId);
-        return Response.json([...ids]);
+        const result = [...ids];
+        if (profile.kind === "v2") SafeReflectApply(SafeArraySort, result, []);
+        return Response.json(result);
       }
       if (!socketId) return new Response(null, { status: 400 });
       const record = this.sockets.get(socketId) ?? this.liveSocket(socketId);
@@ -1058,6 +1122,14 @@ export function createActorNativeOwner(
         return action === "get"
           ? Response.json({ exists: false })
           : new Response(null, { status: 404 });
+      if (record.status === "terminal" && profile.kind === "v2")
+        return action === "get"
+          ? Response.json({ exists: false })
+          : action === "get-attachment"
+            ? record.attachment === null
+              ? new Response(null, { status: 204 })
+              : new Response(record.attachment.slice())
+            : new Response(null, { status: 404 });
       if (record.status === "provisional" && (active.kind !== "fetch" || record.nonce !== nonce))
         return new Response(null, { status: 404 });
       if (action === "get") return Response.json({ exists: record.status === "live" });
@@ -1070,7 +1142,7 @@ export function createActorNativeOwner(
           record.attachment = null;
         } else {
           const bytes = new Uint8Array(await request.arrayBuffer());
-          if (bytes.byteLength > SOCKET_ATTACHMENT_LIMIT)
+          if (bytes.byteLength > profile.socketAttachmentBytes)
             return new Response(null, { status: 413 });
           if (this.activeSocketInvocation !== active) return new Response(null, { status: 404 });
           record.attachment = bytes;
@@ -1082,7 +1154,8 @@ export function createActorNativeOwner(
         const kind = request.headers.get(SOCKET_KIND_HEADER);
         if (kind !== "text" && kind !== "binary") return new Response(null, { status: 400 });
         const bytes = new Uint8Array(await request.arrayBuffer());
-        if (bytes.byteLength > SOCKET_MESSAGE_LIMIT) return new Response(null, { status: 413 });
+        if (bytes.byteLength > profile.socketMessageBytes)
+          return new Response(null, { status: 413 });
         if (this.activeSocketInvocation !== active) return new Response(null, { status: 404 });
         const data =
           kind === "text" ? new TextDecoder("utf-8", { fatal: true }).decode(bytes) : bytes;
@@ -1092,17 +1165,34 @@ export function createActorNativeOwner(
             if (pending.actorId === active.actorId && pending.status === "provisional")
               pendingForActor += pending.queuedBytes;
           if (
-            record.queuedBytes + bytes.byteLength > SOCKET_MESSAGE_LIMIT ||
-            pendingForActor + bytes.byteLength > 64 * 1024 * 1024
+            record.queuedBytes + bytes.byteLength > profile.socketOutboundQueueBytes ||
+            (profile.kind === "legacy" && pendingForActor + bytes.byteLength > 64 * 1024 * 1024)
           ) {
-            record.status = "closed";
-            this.sockets.delete(socketId);
+            if (profile.kind === "legacy") {
+              record.status = "closed";
+              this.sockets.delete(socketId);
+            }
             return new Response(null, { status: 429 });
           }
           record.queued.push(data);
           record.queuedBytes += bytes.byteLength;
         } else {
-          record.socket?.send(data);
+          if (profile.kind === "v2") {
+            // The broker charges the complete frame until the synchronous
+            // native transport handoff returns. Workerd exposes no reliable
+            // bufferedAmount/drain signal for its own opaque network queue.
+            if (!record.socket) return new Response(null, { status: 404 });
+            if (record.queuedBytes + bytes.byteLength > profile.socketOutboundQueueBytes)
+              return new Response(null, { status: 429 });
+            record.queuedBytes += bytes.byteLength;
+            try {
+              record.socket.send(data);
+            } finally {
+              record.queuedBytes -= bytes.byteLength;
+            }
+          } else {
+            record.socket?.send(data);
+          }
         }
         return new Response(null, { status: 204 });
       }
@@ -1486,12 +1576,12 @@ export function createActorNativeOwner(
       };
       if (
         connection.events.size >= SOCKET_INBOUND_COUNT ||
-        connection.bytes + bytes > SOCKET_INBOUND_BYTES ||
+        connection.bytes + bytes > profile.socketInboundBytes ||
         this.inboundCount >= ACTOR_INBOUND_COUNT ||
-        this.inboundBytes + bytes > ACTOR_INBOUND_BYTES
+        this.inboundBytes + bytes > profile.actorInboundBytes
       ) {
         this.discardInbound(socket);
-        if (event.kind === "close") {
+        if (event.kind !== "message") {
           this.suppressedCloses.add(socket);
           // No later callback will retire this observed terminal connection.
           // Keep the separate in-flight inbound charge until settlement.
@@ -1508,7 +1598,7 @@ export function createActorNativeOwner(
         }
         return Promise.resolve();
       }
-      if (event.kind === "close") this.closingInbound.add(socket);
+      if (event.kind !== "message") this.closingInbound.add(socket);
       if (!this.socketBatch) {
         const batch = new Set<InboundSocketEvent>();
         this.socketBatch = batch;
@@ -1554,7 +1644,7 @@ export function createActorNativeOwner(
       if (!metadata) throw new Error("Actor socket metadata unavailable");
       const socketId = metadata.socketId;
       const actorId = metadata.actorId;
-      if (event.kind === "close" && this.suppressedCloses.has(socket)) return;
+      if (event.kind !== "message" && this.suppressedCloses.has(socket)) return;
       if (metadata.reservationBearer !== undefined) {
         const pending = this.liveSocket(socketId);
         if (pending?.status === "transport-pending") this.discardPending(pending);
@@ -1562,7 +1652,7 @@ export function createActorNativeOwner(
         return;
       }
       let record = this.liveSocket(socketId);
-      if (!record && event.kind === "close") {
+      if (!record && event.kind !== "message") {
         record = {
           socketId,
           actorId,
@@ -1571,7 +1661,7 @@ export function createActorNativeOwner(
           attachment: decodeAttachment(metadata.attachment),
           queued: [],
           queuedBytes: 0,
-          status: "live",
+          status: profile.kind === "v2" ? "terminal" : "live",
           socket,
         };
         this.sockets.set(socketId, record);
@@ -1608,14 +1698,21 @@ export function createActorNativeOwner(
         const body =
           event.kind === "message"
             ? event.data
-            : SafeJsonStringify({
-                code: event.code,
-                reason: event.reason,
-                wasClean: event.wasClean,
-              });
+            : event.kind === "error"
+              ? SafeJsonStringify({ code: "transport_error" })
+              : SafeJsonStringify({
+                  code: event.code,
+                  reason: event.reason,
+                  wasClean: event.wasClean,
+                });
         const headers = new SafeHeaders({
           [DELIVERY_HEADER]: deliveryForEvent(),
-          [SOCKET_ACTION_HEADER]: event.kind === "message" ? "callback-message" : "callback-close",
+          [SOCKET_ACTION_HEADER]:
+            event.kind === "message"
+              ? "callback-message"
+              : event.kind === "error"
+                ? "callback-error"
+                : "callback-close",
           [SOCKET_NONCE_HEADER]: nonce,
           [SOCKET_ID_HEADER]: socketId,
         });
@@ -1686,13 +1783,13 @@ export function createActorNativeOwner(
           completionError = error;
         }
       }
-      if (failed || event.kind === "close") {
+      if (failed || event.kind !== "message") {
         const alreadyStopped = this.stoppedInbound.has(socket);
         this.discardInbound(socket);
         record.status = "closed";
         this.sockets.delete(socketId);
         this.suppressedCloses.add(socket);
-        if (failed && event.kind !== "close" && !alreadyStopped) {
+        if (failed && event.kind === "message" && !alreadyStopped) {
           try {
             socket.close(1011, "actor callback failed");
           } catch {
@@ -1711,7 +1808,7 @@ export function createActorNativeOwner(
         return Promise.resolve();
       const bytes =
         typeof data === "string" ? new TextEncoder().encode(data).byteLength : data.byteLength;
-      if (bytes > SOCKET_MESSAGE_LIMIT) {
+      if (bytes > profile.socketMessageBytes) {
         this.discardInbound(socket);
         socket.close(1009, "message too large");
         return Promise.resolve();
@@ -1731,6 +1828,7 @@ export function createActorNativeOwner(
       );
     }
     webSocketError(socket: NativeActorWebSocket): Promise<void> {
+      if (profile.kind === "v2") return this.socketEvent(socket, { kind: "error" });
       return this.webSocketClose(socket, 1006, "transport_error", false);
     }
     fetch(request: Request): Promise<Response> {
@@ -1774,6 +1872,7 @@ export function createActorNativeOwner(
         headers.delete(VARIANT_HEADER);
         for (const name of [
           SOCKET_ACTION_HEADER,
+          SOCKET_ABI_HEADER,
           SOCKET_NONCE_HEADER,
           SOCKET_ID_HEADER,
           SOCKET_KIND_HEADER,
@@ -2062,6 +2161,7 @@ export function createActorNativeIngress(token: string, alarmSecret?: string) {
         headers.delete(DELIVERY_HEADER);
         for (const name of [
           SOCKET_ACTION_HEADER,
+          SOCKET_ABI_HEADER,
           SOCKET_NONCE_HEADER,
           SOCKET_ID_HEADER,
           SOCKET_KIND_HEADER,

@@ -3,6 +3,8 @@
  * This module must load before untrusted Worker code. It never projects the
  * native 101 Response, WebSocket, reservation ID, or broker control methods.
  */
+import { type ActorAbiProfile, actorAbiProfile } from "./actor-class-execution.ts";
+
 const NativeResponse = Response;
 const NativeResponseStatus = Object.getOwnPropertyDescriptor(Response.prototype, "status")?.get;
 const NativeResponseHeaders = Object.getOwnPropertyDescriptor(Response.prototype, "headers")?.get;
@@ -49,6 +51,8 @@ const NativeClearTimeout = clearTimeout;
 export interface NativeActorUpgradeReservation {
   /** Native 101 stays only in the Host-private wrapper. */
   readonly response: Response;
+  /** Host-selected per-binding ABI. Never sourced from application headers. */
+  readonly profile?: ActorAbiProfile;
   /** Marks Host transport acceptance, not network receipt of the client head. */
   commit(): void | Promise<void>;
   /** Idempotently discards a provisional connection. */
@@ -81,6 +85,7 @@ export interface NativeActorUpgradeTransport {
 
 type Slot = {
   readonly owner: object;
+  readonly profile: ActorAbiProfile;
   readonly reservation: NativeActorUpgradeReservation;
   readonly handshake: Headers;
   timer: ReturnType<typeof setTimeout> | undefined;
@@ -89,6 +94,7 @@ type Slot = {
 
 // Never expose this map, its values or a constructor parameter that can mint a slot.
 const responseSlots = new NativeWeakMap<object, Response>();
+const responseProfiles = new NativeWeakMap<object, ActorAbiProfile>();
 /** Host-only alias resolution. Application modules cannot import this module. */
 export function actorUpgradeResponseSource(value: unknown): Response | undefined {
   return (typeof value === "object" && value !== null) || typeof value === "function"
@@ -129,6 +135,10 @@ class ActorResponse extends NativeResponse {
         headers: copyHeaders(responseHeaders(init as Response)),
       });
       NativeReflectApply(NativeWeakMapSet, responseSlots, [this, slot]);
+      NativeReflectApply(NativeWeakMapSet, responseProfiles, [
+        this,
+        NativeReflectApply(NativeWeakMapGet, responseProfiles, [slot]) as ActorAbiProfile,
+      ]);
     } else {
       super(body, init);
       // Let the native constructor perform WebIDL coercion/getter reads once.
@@ -183,16 +193,25 @@ class ActorResponse extends NativeResponse {
         ) as string);
   }
   override clone(): Response {
-    return actorUpgradeResponseSource(this)
-      ? new ActorResponse(null, this)
-      : (NativeReflectApply(NativeResponseClone, this, []) as Response);
+    const source = actorUpgradeResponseSource(this);
+    if (source) {
+      const profile = NativeReflectApply(NativeWeakMapGet, responseProfiles, [source]) as
+        | ActorAbiProfile
+        | undefined;
+      if (profile?.kind === "v2")
+        throw new NativeTypeError("Actor upgrade response cannot be cloned");
+      return new ActorResponse(null, this);
+    }
+    return NativeReflectApply(NativeResponseClone, this, []) as Response;
   }
 }
 
 /** Host-only mint, called only after the broker accepts. No token is stored on the Response. */
-export function createActorUpgradeResponse(headers: Headers): Response {
+export function createActorUpgradeResponse(headers: Headers, selected?: ActorAbiProfile): Response {
+  const profile = actorAbiProfile(selected);
   const response = new ActorResponse(null, { headers: copyHeaders(headers) });
   NativeReflectApply(NativeWeakMapSet, responseSlots, [response, response]);
+  NativeReflectApply(NativeWeakMapSet, responseProfiles, [response, profile]);
   return response;
 }
 
@@ -238,6 +257,7 @@ export function createActorUpgradeHandoff(
   original: Request,
   transport: NativeActorUpgradeTransport,
   reservationMs = 30_000,
+  selectedProfile?: ActorAbiProfile,
 ): {
   readonly actor: Readonly<{ fetch(request: Request): Promise<Response> }>;
   finish(value: unknown): Promise<Response>;
@@ -254,6 +274,7 @@ export function createActorUpgradeHandoff(
     reservationMs <= 0
   )
     throw new Error("Actor upgrade handoff unavailable");
+  const fixedProfile = actorAbiProfile(selectedProfile);
   const signal = NativeReflectApply(NativeRequestSignal, original, []) as AbortSignal;
   const ingressHeaders = NativeReflectApply(NativeRequestHeaders, original, []) as Headers;
   const ingressGet = (name: string): string | null =>
@@ -307,6 +328,16 @@ export function createActorUpgradeHandoff(
       )
         throw new Error("invalid_upgrade");
       const reservation = await transport.open(request, ingress);
+      let profile: ActorAbiProfile;
+      try {
+        const selected = reservation.profile;
+        profile = selected === undefined ? fixedProfile : actorAbiProfile(selected);
+        if (selectedProfile !== undefined && profile !== fixedProfile)
+          throw new Error("Actor upgrade ABI mismatch");
+      } catch {
+        await reservation.abandon();
+        throw new Error("backend_unavailable");
+      }
       let status: number;
       let selected: string | null;
       try {
@@ -346,8 +377,15 @@ export function createActorUpgradeHandoff(
         throw new Error("request_aborted");
       }
       const handshake = copyHeaders(responseHeaders(reservation.response));
-      const outcome = createActorUpgradeResponse(handshake);
-      const slot: Slot = { owner, handshake, reservation, state: "provisional", timer: undefined };
+      const outcome = createActorUpgradeResponse(handshake, profile);
+      const slot: Slot = {
+        owner,
+        profile,
+        handshake,
+        reservation,
+        state: "provisional",
+        timer: undefined,
+      };
       NativeReflectApply(NativeWeakMapSet, slots, [outcome, slot]);
       NativeReflectApply(NativeSetAdd, open, [slot]);
       slot.timer = NativeSetTimeout(() => {
@@ -366,7 +404,16 @@ export function createActorUpgradeHandoff(
       const slot = source
         ? (NativeReflectApply(NativeWeakMapGet, slots, [source]) as Slot | undefined)
         : undefined;
-      if (alreadyClosed || slot?.owner !== owner || slot.state !== "provisional" || aborted()) {
+      const sourceProfile = source
+        ? NativeReflectApply(NativeWeakMapGet, responseProfiles, [source])
+        : undefined;
+      if (
+        alreadyClosed ||
+        slot?.owner !== owner ||
+        slot.state !== "provisional" ||
+        (source !== undefined && sourceProfile !== slot.profile) ||
+        aborted()
+      ) {
         await abandonOpen();
         NativeReflectApply(NativeAbortRemove, signal, ["abort", abortListener]);
         if (alreadyClosed || source || aborted()) return unavailable();
