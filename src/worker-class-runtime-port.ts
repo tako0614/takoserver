@@ -1,6 +1,31 @@
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { TakoformInterfaceRef } from "./interface-ref.ts";
 
+/** Persisted Actor Resource facts, independent of Host admission or execution. */
+export interface ActorResourceFacts {
+  readonly address: {
+    readonly space: string;
+    readonly apiVersion: string;
+    readonly kind: string;
+    readonly name: string;
+  };
+  readonly uid: string;
+  readonly generation: string;
+  readonly revision: string;
+  readonly formRef: TakoformV1Alpha3FormRef;
+}
+
+export interface ActorResourceGraph {
+  readonly tenantId: string;
+  readonly namespace: ActorResourceFacts & { readonly className: string };
+  readonly worker: ActorResourceFacts;
+}
+
+export type ActorResourceGraphReader = (
+  scope: { readonly tenantId: string; readonly namespaceResourceUid: string },
+  signal: AbortSignal,
+) => Promise<ActorResourceGraph | null>;
+
 /** Exact software capability; neither an Offering nor a support/activation grant. */
 export interface WorkerClassRuntimeContract {
   readonly formRef: TakoformV1Alpha3FormRef;

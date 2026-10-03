@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createSelfhostVersionBindingStore,
+  deriveSelfhostActorForwardToken,
   normalizeSelfhostVersionBindingSet,
   type SelfhostVersionBindingStore,
 } from "../src/providers/selfhost-version-bindings.ts";
@@ -47,6 +48,22 @@ const MARKER = {
   bundleName: "bundle",
   generation: "abcdefghijklmnop",
 } as const;
+
+test("Actor token derivation preserves the exact immutable Version credential bytes", () => {
+  expect(
+    deriveSelfhostActorForwardToken({
+      eventToken: Buffer.alloc(32, 1).toString("base64url"),
+      workerVersionResourceUid: "uid-version-caller",
+      binding: {
+        name: "ROOMS",
+        tenantId: "tenant-one",
+        namespaceResourceUid: "uid-namespace-one",
+        workerResourceUid: "uid-worker-holder",
+        className: "Counter",
+      },
+    }),
+  ).toBe("129b7349e463ec89882fb19658998f79bfcf2d4252bb6f48a319ccbb70c5e5a2");
+});
 
 test("Actor metadata is a strict new private Version record and cannot adopt an older token", async () => {
   const actor = {

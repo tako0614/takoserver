@@ -6,11 +6,11 @@ import {
   SELFHOST_ACTOR_BINDING_REF,
   selfhostVersionBindingsRoot,
 } from "../src/providers/selfhost.ts";
-import { createSelfhostVersionBindingStore } from "../src/providers/selfhost-version-bindings.ts";
 import {
+  createSelfhostVersionBindingStore,
   deriveSelfhostActorForwardToken,
-  openSelfhostActorPublicRuntime,
-} from "../src/selfhost-actor-public-runtime.ts";
+} from "../src/providers/selfhost-version-bindings.ts";
+import { openSelfhostActorPublicRuntime } from "../src/selfhost-actor-public-runtime.ts";
 import {
   createSelfhostRuntimeBindingMaterializer,
   SELFHOST_ACTOR_MATERIAL_KIND,

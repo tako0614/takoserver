@@ -6,9 +6,11 @@ import { join } from "node:path";
 import type { JsonObject } from "../src/ports.ts";
 import { createSelfhostProvider } from "../src/providers/selfhost.ts";
 import { createSelfhostScriptStateStore } from "../src/providers/selfhost-script-state.ts";
-import type { SelfhostVersionActorBinding } from "../src/providers/selfhost-version-bindings.ts";
+import {
+  deriveSelfhostActorForwardToken,
+  type SelfhostVersionActorBinding,
+} from "../src/providers/selfhost-version-bindings.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
-import { deriveSelfhostActorForwardToken } from "../src/selfhost-actor-public-runtime.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
 

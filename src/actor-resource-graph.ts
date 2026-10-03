@@ -4,31 +4,13 @@ import { validateRelationSchema } from "./takoform/relations.ts";
 import { validateDesired } from "./takoform/schema.ts";
 import type { ResourceListing, TakoformStore } from "./takoform/store.ts";
 import type { InstalledTakoformForm, TakoformV1Alpha3FormRef } from "./takoform/types.ts";
+import type { ActorResourceFacts, ActorResourceGraphReader } from "./worker-class-runtime-port.ts";
 
-export interface ActorResourceFacts {
-  readonly address: {
-    readonly space: string;
-    readonly apiVersion: string;
-    readonly kind: string;
-    readonly name: string;
-  };
-  readonly uid: string;
-  readonly generation: string;
-  readonly revision: string;
-  readonly formRef: TakoformV1Alpha3FormRef;
-}
-
-/** Persisted facts only: no admission, readiness, executable, or runtime authority. */
-export interface ActorResourceGraph {
-  readonly tenantId: string;
-  readonly namespace: ActorResourceFacts & { readonly className: string };
-  readonly worker: ActorResourceFacts;
-}
-
-export type ActorResourceGraphReader = (
-  scope: { readonly tenantId: string; readonly namespaceResourceUid: string },
-  signal: AbortSignal,
-) => Promise<ActorResourceGraph | null>;
+export type {
+  ActorResourceFacts,
+  ActorResourceGraph,
+  ActorResourceGraphReader,
+} from "./worker-class-runtime-port.ts";
 
 export interface ActorResourceGraphReaderOptions {
   readonly store: Pick<TakoformStore, "resourceWithRelationTargetByUid">;

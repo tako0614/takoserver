@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes as nodeRandomBytes } from "node:crypto";
 import { existsSync, constants as fsConstants } from "node:fs";
 import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -166,6 +166,46 @@ export interface SelfhostVersionActorBinding {
   readonly namespaceResourceUid: string;
   readonly workerResourceUid: string;
   readonly className: string;
+}
+
+/** Derives one private facade credential from an immutable Version secret. */
+export function deriveSelfhostActorForwardToken(input: {
+  readonly eventToken: string;
+  readonly workerVersionResourceUid: string;
+  readonly binding: SelfhostVersionActorBinding;
+}): string {
+  const key = Buffer.from(input.eventToken, "base64url");
+  if (
+    key.length !== 32 ||
+    key.toString("base64url") !== input.eventToken ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u.test(input.workerVersionResourceUid)
+  )
+    throw new Error("Actor Version credential unavailable");
+  const binding = input.binding;
+  if (
+    !binding ||
+    typeof binding.name !== "string" ||
+    typeof binding.tenantId !== "string" ||
+    typeof binding.namespaceResourceUid !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u.test(binding.workerResourceUid) ||
+    typeof binding.className !== "string" ||
+    binding.className.length === 0 ||
+    binding.className.length > 255 ||
+    binding.className.includes("\0")
+  )
+    throw new Error("Actor Version relation unavailable");
+  // JSON arrays are length-delimited by the encoding and preserve field
+  // boundaries even when tenant or binding names contain punctuation.
+  const message = JSON.stringify([
+    "takoserver.selfhost-actor-forward-token@v1",
+    binding.tenantId,
+    input.workerVersionResourceUid,
+    binding.namespaceResourceUid,
+    binding.name,
+    binding.workerResourceUid,
+    binding.className,
+  ]);
+  return createHmac("sha256", key).update(message, "utf8").digest("hex");
 }
 
 /** One stable external service slot and its optional runtime-only JSON value. */

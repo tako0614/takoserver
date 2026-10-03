@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import { existsSync, constants as fsConstants, lstatSync } from "node:fs";
 import { mkdir, open, readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type { ActorResourceGraph } from "../actor-resource-graph.ts";
 import { parseWorkerCron } from "../cron.ts";
 import { bytesDigest, canonicalJson } from "../json.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
@@ -47,7 +46,6 @@ import {
   derivedProviderResourceIncarnationName,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
-import { deriveSelfhostActorForwardToken } from "../selfhost-actor-public-runtime.ts";
 import {
   canonicalSelfhostWeightedVersions,
   persistedSelfhostWeightedDeployment,
@@ -71,6 +69,7 @@ import {
   type VectorIndexStore,
   VectorIndexStoreError,
 } from "../vector-index-store.ts";
+import type { ActorResourceGraph } from "../worker-class-runtime-port.ts";
 import {
   internalHostname,
   readWorkerdActiveDeployment,
@@ -117,6 +116,7 @@ import {
 } from "./selfhost-standard-services.ts";
 import {
   createSelfhostVersionBindingStore,
+  deriveSelfhostActorForwardToken,
   normalizeSelfhostVersionBindingSet,
   SELFHOST_WORKER_HANDLER_NAMES,
   type SelfhostRuntimeInputMarker,
