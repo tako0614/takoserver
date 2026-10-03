@@ -60,6 +60,7 @@ import {
 } from "./selfhost-health.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
+import { renderSelfhostOperatorSignInInstructions } from "./selfhost-startup-instructions.ts";
 import {
   assertActiveSelfhostTenantRunCredentialSigningKey,
   assertSelfhostTenantRunCredentialKeyConfiguration,
@@ -1068,10 +1069,14 @@ if (identity.providers.some((provider) => provider.method === "operator-assertio
       lifetimeSeconds: 600,
     });
     console.log(
-      `\nno identity provider is configured, so this deployment signs you in as its operator.\n` +
-        `open ${publicOrigin}/console and paste this (valid 10 minutes):\n\n${assertion}\n\n` +
-        `later ones: bun scripts/operator-key.ts sign-in google operator operator@localhost Operator\n` +
-        `  (with TAKOSERVER_OPERATOR_KEY=${operatorKeyPath})`,
+      renderSelfhostOperatorSignInInstructions({
+        publicOrigin,
+        ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
+          ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
+          : {}),
+        assertion,
+        operatorKeyPath,
+      }),
     );
   }
 }
