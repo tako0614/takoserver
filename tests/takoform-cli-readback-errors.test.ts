@@ -280,6 +280,120 @@ test("waits for an accepted apply and verifies the resulting resource readback",
   expect(requests.at(-1)?.method).toBe("GET");
 });
 
+test("reads a pending operation by ID in a fresh read-only CLI invocation", async () => {
+  const requests: RequestRecord[] = [];
+  const server = startServer({ operationResponse: () => pendingOperation() }, requests);
+
+  const result = await runOperationCli(server.url, operationId);
+
+  expect(result.exitCode).toBe(0);
+  expect(result.stderr).toBe("");
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    apiVersion: operationVersion,
+    kind: "Operation",
+    id: operationId,
+    done: false,
+  });
+  expect(requests).toHaveLength(1);
+  expect(requests[0]?.method).toBe("GET");
+  expect(requests[0]?.pathname).toBe(`${LANE}/operations/${operationId}`);
+  expect(requests[0]?.headers.get("authorization")).toBe("Bearer test-api-key");
+});
+
+test("waits for the same operation without labeling it as application readiness", async () => {
+  const requests: RequestRecord[] = [];
+  let polls = 0;
+  const server = startServer(
+    {
+      operationResponse: () => {
+        polls += 1;
+        return polls === 1
+          ? pendingOperation()
+          : terminalOperation({
+              result: {
+                resource: {
+                  apiVersion: currentForm.apiVersion,
+                  kind: currentForm.kind,
+                  status: { conditions: [{ type: "Ready", status: "True" }] },
+                },
+              },
+            });
+      },
+    },
+    requests,
+  );
+
+  const result = await runOperationCli(server.url, operationId, true);
+
+  const status = JSON.parse(result.stdout) as Record<string, unknown>;
+  expect(result.exitCode).toBe(0);
+  expect(status).toMatchObject({ id: operationId, done: true });
+  expect(status).not.toHaveProperty("appReady");
+  expect(requests).toHaveLength(2);
+  expect(
+    requests.every(
+      ({ method, pathname }) =>
+        method === "GET" && pathname === `${LANE}/operations/${operationId}`,
+    ),
+  ).toBe(true);
+});
+
+test("exits unsuccessfully when waiting for an operation that reached a Host error", async () => {
+  const requests: RequestRecord[] = [];
+  const server = startServer(
+    {
+      operationResponse: () =>
+        terminalOperation({
+          error: {
+            code: "backend_unavailable",
+            message: "private provider detail must not be printed",
+            requestId: "req_cli-async-0002",
+            retryable: false,
+          },
+        }),
+    },
+    requests,
+  );
+
+  const result = await runOperationCli(server.url, operationId, true);
+
+  expect(result.exitCode).not.toBe(0);
+  expect(result.stdout).toContain("backend_unavailable");
+  expect(result.stdout).not.toContain("private provider detail");
+  expect(requests).toHaveLength(1);
+  expect(requests[0]?.method).toBe("GET");
+});
+
+test("successfully inspects a terminal operation error without exposing its message", async () => {
+  const requests: RequestRecord[] = [];
+  const server = startServer(
+    {
+      operationResponse: () =>
+        terminalOperation({
+          error: {
+            code: "backend_unavailable",
+            message: "private provider detail must not be printed",
+            requestId: "req_cli-async-0003",
+            retryable: false,
+          },
+        }),
+    },
+    requests,
+  );
+
+  const result = await runOperationCli(server.url, operationId);
+
+  expect(result.exitCode).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    id: operationId,
+    done: true,
+    error: { code: "backend_unavailable" },
+  });
+  expect(result.stdout).not.toContain("private provider detail");
+  expect(requests).toHaveLength(1);
+  expect(requests[0]?.method).toBe("GET");
+});
+
 test("preserves the existing generation fence for an accepted async update", async () => {
   const requests: RequestRecord[] = [];
   const existing = JSON.parse(resourceBody()) as Record<string, unknown>;
@@ -716,6 +830,42 @@ async function runCli(
   ]);
   if (watchdog !== undefined) clearTimeout(watchdog);
   return { exitCode, stdout, stderr, watchdogExpired };
+}
+
+async function runOperationCli(
+  origin: string,
+  id: string,
+  wait = false,
+): Promise<{
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}> {
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      "--no-env-file",
+      CLI,
+      "operation",
+      origin,
+      "test-api-key",
+      id,
+      ...(wait ? ["--wait"] : []),
+    ],
+    {
+      cwd: REPOSITORY,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { HOME: process.env.HOME ?? "/tmp", PATH: dirname(process.execPath) },
+    },
+  );
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
 }
 
 function acceleratedTimerPreload(): { readonly preload: string; readonly timeoutLog: string } {
