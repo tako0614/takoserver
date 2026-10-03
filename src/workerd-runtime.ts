@@ -111,6 +111,8 @@ export interface WorkerdActorForward {
 export interface WorkerdActorForwardSocket {
   readonly tenantId: string;
   readonly namespaceResourceUid: string;
+  /** Present for exact per-Version brokers; absent only on legacy static mappings. */
+  readonly token?: string;
   readonly httpSocketPath: string;
   readonly upgradeSocketPath: string;
 }
@@ -444,8 +446,10 @@ export interface WorkerdRuntimeOptions {
    * Requires immutable weighted publish(); legacy write()/remove() are refused.
    */
   readonly serviceBindingSocketDirectory?: string;
-  /** Current Host broker listeners, matched by exact tenant and Actor namespace UID. */
-  readonly actorForwardSockets?: readonly WorkerdActorForwardSocket[];
+  /** Static legacy snapshot or live owner graph, sampled once per render. */
+  readonly actorForwardSockets?:
+    | readonly WorkerdActorForwardSocket[]
+    | (() => readonly WorkerdActorForwardSocket[]);
   /**
    * Terminates TLS on that port with this keypair. Absent means the socket is
    * plain HTTP, which is what the Host must then publish as the endpoint
@@ -582,7 +586,16 @@ function privateRuntimeToken(): string {
 }
 
 export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWorkerdRuntime {
-  const actorForwardSockets = validActorForwardSockets(options.actorForwardSockets);
+  const dynamicActorForwardSockets =
+    typeof options.actorForwardSockets === "function" ? options.actorForwardSockets : undefined;
+  const staticActorForwardSockets = dynamicActorForwardSockets
+    ? undefined
+    : validActorForwardSockets(
+        options.actorForwardSockets as readonly WorkerdActorForwardSocket[] | undefined,
+      );
+  const actorForwardSockets = (): ReadonlyMap<string, WorkerdActorForwardSocket> =>
+    staticActorForwardSockets ?? validActorForwardSockets(dynamicActorForwardSockets?.());
+  const exactActorSockets = dynamicActorForwardSockets !== undefined;
   const serviceSocketDirectory = options.serviceBindingSocketDirectory;
   if (serviceSocketDirectory !== undefined) {
     validPrivateSocketDirectory(serviceSocketDirectory);
@@ -757,6 +770,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
    */
   const writeRendered = async (published: readonly PublishedDeployment[]): Promise<void> => {
     await options.beforeRender?.();
+    const actorSockets = actorForwardSockets();
     if (serviceSocketDirectory !== undefined) {
       await requireSocketRoot();
     }
@@ -810,7 +824,8 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         internalReadinessCapability,
         dataPlaneAddress,
         privateServiceGraph(published),
-        actorForwardSockets,
+        actorSockets,
+        exactActorSockets,
       ),
       "utf8",
       () => transitionPrivateSockets(published),
@@ -821,10 +836,12 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     Object.fromEntries(published.map((entry) => [entry.name, entry.generation ?? null]));
 
   const renderedConfirmed = async (published: readonly PublishedDeployment[]): Promise<boolean> => {
+    const actorSockets = actorForwardSockets();
     const expected = publishedGraphIdentity(
       published,
       privateServiceGraph(published),
-      actorForwardSockets,
+      actorSockets,
+      exactActorSockets,
     );
     let confirmed = false;
     try {
@@ -1705,8 +1722,16 @@ function actorForwardServiceName(kind: "HTTP" | "UPGRADE", index: number): strin
   return `__TAKOSERVER_ACTOR_${kind}_${index.toString(10).padStart(5, "0")}`;
 }
 
-function actorForwardIdentity(tenantId: string, namespaceResourceUid: string): string {
-  return JSON.stringify([tenantId, namespaceResourceUid]);
+function actorForwardIdentity(
+  tenantId: string,
+  namespaceResourceUid: string,
+  token?: string,
+): string {
+  return JSON.stringify(
+    token === undefined
+      ? [tenantId, namespaceResourceUid]
+      : [tenantId, namespaceResourceUid, token],
+  );
 }
 
 function validActorForward(value: unknown): WorkerdActorForward {
@@ -1758,7 +1783,7 @@ function validActorForward(value: unknown): WorkerdActorForward {
 }
 
 function validActorForwardSockets(
-  value: WorkerdRuntimeOptions["actorForwardSockets"],
+  value: readonly WorkerdActorForwardSocket[] | undefined,
 ): ReadonlyMap<string, WorkerdActorForwardSocket> {
   if (value === undefined) return new Map();
   if (!Array.isArray(value) || value.length > 128)
@@ -1770,14 +1795,18 @@ function validActorForwardSockets(
       typeof candidate !== "object" ||
       candidate === null ||
       Array.isArray(candidate) ||
-      Object.keys(candidate).sort().join(",") !==
-        "httpSocketPath,namespaceResourceUid,tenantId,upgradeSocketPath" ||
+      (Object.keys(candidate).sort().join(",") !==
+        "httpSocketPath,namespaceResourceUid,tenantId,upgradeSocketPath" &&
+        Object.keys(candidate).sort().join(",") !==
+          "httpSocketPath,namespaceResourceUid,tenantId,token,upgradeSocketPath") ||
       typeof candidate.tenantId !== "string" ||
       candidate.tenantId.length === 0 ||
       candidate.tenantId.length > 256 ||
       candidate.tenantId.includes("\u0000") ||
       typeof candidate.namespaceResourceUid !== "string" ||
-      !RESOURCE_UID.test(candidate.namespaceResourceUid)
+      !RESOURCE_UID.test(candidate.namespaceResourceUid) ||
+      (candidate.token !== undefined &&
+        (typeof candidate.token !== "string" || !ACTOR_FORWARD_TOKEN.test(candidate.token)))
     )
       throw new Error("unusable Actor forward socket graph");
     for (const path of [candidate.httpSocketPath, candidate.upgradeSocketPath]) {
@@ -1792,7 +1821,11 @@ function validActorForwardSockets(
         throw new Error("unusable Actor forward socket graph");
       paths.add(path);
     }
-    const identity = actorForwardIdentity(candidate.tenantId, candidate.namespaceResourceUid);
+    const identity = actorForwardIdentity(
+      candidate.tenantId,
+      candidate.namespaceResourceUid,
+      candidate.token,
+    );
     if (selected.has(identity)) throw new Error("unusable Actor forward socket graph");
     selected.set(identity, { ...candidate });
   }
@@ -3900,15 +3933,20 @@ interface ResolvedActorForwardService {
 function resolveActorForwardServices(
   published: readonly PublishedDeployment[],
   sockets: ReadonlyMap<string, WorkerdActorForwardSocket>,
+  exactSockets = false,
 ): ReadonlyMap<string, readonly ResolvedActorForwardService[]> {
   const resolved = new Map<string, readonly ResolvedActorForwardService[]>();
   for (const variant of published.flatMap((deployment) => deployment.variants)) {
     if (variant.manifest.actorForward === undefined) continue;
     const actorForward = validActorForward(variant.manifest.actorForward);
     const services = actorForward.bindings.map((binding, index) => {
-      const current = sockets.get(
-        actorForwardIdentity(binding.tenantId, binding.namespaceResourceUid),
-      );
+      const current =
+        sockets.get(
+          actorForwardIdentity(binding.tenantId, binding.namespaceResourceUid, binding.token),
+        ) ??
+        (exactSockets
+          ? undefined
+          : sockets.get(actorForwardIdentity(binding.tenantId, binding.namespaceResourceUid)));
       if (!current) throw new Error("Actor forward Host socket unavailable");
       return {
         httpBinding: binding.httpService,
@@ -3928,6 +3966,7 @@ function publishedGraphIdentity(
   published: readonly PublishedDeployment[],
   privateServices?: PrivateServiceGraph,
   actorForwardSockets: ReadonlyMap<string, WorkerdActorForwardSocket> = new Map(),
+  exactActorSockets = false,
 ): string {
   const hash = createHash("sha256").update(
     JSON.stringify(
@@ -3960,7 +3999,11 @@ function publishedGraphIdentity(
       }),
     );
   }
-  const actorServices = resolveActorForwardServices(published, actorForwardSockets);
+  const actorServices = resolveActorForwardServices(
+    published,
+    actorForwardSockets,
+    exactActorSockets,
+  );
   if (actorServices.size > 0) {
     hash
       .update("\u0000actor-forward-sockets\u0000")
@@ -4023,10 +4066,20 @@ function renderConfig(
   dataPlaneAddress?: string,
   privateServices?: PrivateServiceGraph,
   actorForwardSockets: ReadonlyMap<string, WorkerdActorForwardSocket> = new Map(),
+  exactActorSockets = false,
 ): string {
   const variants = published.flatMap((deployment) => deployment.variants);
-  const actorServices = resolveActorForwardServices(published, actorForwardSockets);
-  const graphIdentity = publishedGraphIdentity(published, privateServices, actorForwardSockets);
+  const actorServices = resolveActorForwardServices(
+    published,
+    actorForwardSockets,
+    exactActorSockets,
+  );
+  const graphIdentity = publishedGraphIdentity(
+    published,
+    privateServices,
+    actorForwardSockets,
+    exactActorSockets,
+  );
   const services = variants
     .map((entry) => {
       const bindings = [

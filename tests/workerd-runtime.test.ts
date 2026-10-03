@@ -1564,6 +1564,75 @@ test("persists an opt-in Actor forward graph and rejects unmapped Host sockets",
   );
 });
 
+test("live Actor socket graph requires exact per-Version token for weighted callers", async () => {
+  const publication = weightedPublication("site", "generation-actor-exact");
+  const tokens = ["a".repeat(64), "b".repeat(64)];
+  const withActors = {
+    ...publication,
+    versions: publication.versions.map((version, index) => ({
+      ...version,
+      site: {
+        ...version.site,
+        actorForward: {
+          schema: "takoserver.selfhost-actor-forward@v1" as const,
+          bindings: [
+            {
+              publicName: "ROOM",
+              tenantId: "tenant-1",
+              namespaceResourceUid: "uid-actor-namespace-1",
+              httpService: "__TAKOSERVER_ACTOR_HTTP_00000",
+              upgradeService: "__TAKOSERVER_ACTOR_UPGRADE_00000",
+              token: tokens[index] as string,
+            },
+          ],
+        },
+      },
+    })),
+  };
+  const sockets = tokens.map((token, index) => ({
+    tenantId: "tenant-1",
+    namespaceResourceUid: "uid-actor-namespace-1",
+    token,
+    httpSocketPath: join(root, `actor-http-${index}.sock`),
+    upgradeSocketPath: join(root, `actor-upgrade-${index}.sock`),
+  }));
+  let current = sockets;
+  const runtime = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    actorForwardSockets: () => current,
+  });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+  await runtime.publish("site", withActors);
+  const rendered = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  for (const socket of sockets) {
+    expect(rendered).toContain(`unix:${socket.httpSocketPath}`);
+    expect(rendered).toContain(`unix:${socket.upgradeSocketPath}`);
+  }
+  const firstSocket = sockets[0];
+  if (!firstSocket) throw new Error("Actor socket fixture unavailable");
+  current = [firstSocket];
+  await expect(
+    runtime.publish("site", {
+      ...withActors,
+      generation: "generation-actor-next",
+      versions: withActors.versions.map((version) => ({
+        ...version,
+        site: { ...version.site, generation: "generation-actor-next" },
+      })),
+    }),
+  ).rejects.toThrow("worker runtime activation state is unknown");
+  const wrong = createWorkerdRuntime({
+    root: join(root, "wrong-token"),
+    isReady: () => true,
+    actorForwardSockets: () => [{ ...firstSocket, token: "c".repeat(64) }],
+  });
+  if (!wrong.publish) throw new Error("weighted publication unavailable");
+  await expect(wrong.publish("site", withActors)).rejects.toThrow(
+    "Actor forward Host socket unavailable",
+  );
+});
+
 test("restore rejects unknown legacy fields and malformed Actor forward authority", async () => {
   const actorForward = {
     schema: "takoserver.selfhost-actor-forward@v1",

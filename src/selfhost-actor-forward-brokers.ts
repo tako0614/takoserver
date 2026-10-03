@@ -61,6 +61,7 @@ export async function openSelfhostActorForwardBrokers(options: {
     socketMapping: Object.freeze({
       tenantId,
       namespaceResourceUid,
+      token: options.token,
       httpSocketPath: http.socketPath,
       upgradeSocketPath: upgrade.socketPath,
     }),
