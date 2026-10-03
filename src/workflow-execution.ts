@@ -1,3 +1,4 @@
+import type { TakoformInterfaceRef } from "./interface-ref.ts";
 import type { Clock, JsonObject, Row, Sql, SqlParam } from "./ports.ts";
 import {
   addDuration,
@@ -20,6 +21,7 @@ import {
 } from "./workflow-driver.ts";
 import {
   createWorkflowInstances,
+  isExactWorkflowV3InterfaceRef,
   WORKFLOW_MAX_TERMINAL_RETENTION_SECONDS,
   type WorkflowErrorReason,
   WorkflowInstanceError,
@@ -103,6 +105,8 @@ export interface WorkflowRuntimeOptions {
   readonly waitUntil: (epochMs: number, signal: AbortSignal) => Promise<void>;
   readonly host: WorkflowExecutionHost;
   readonly leaseMs?: number;
+  /** Exact opt-in to the unpublished worker.workflow@3.0.0 contract. */
+  readonly workflowInterfaceRef?: TakoformInterfaceRef;
 }
 
 export type WorkflowRunOutcome =
@@ -136,7 +140,9 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     leaseMs > 86_400_000 ||
     typeof options.waitUntil !== "function" ||
     typeof options.host?.openPaused !== "function" ||
-    typeof options.host?.stop !== "function"
+    typeof options.host?.stop !== "function" ||
+    (options.workflowInterfaceRef !== undefined &&
+      !isExactWorkflowV3InterfaceRef(options.workflowInterfaceRef))
   ) {
     throw new WorkflowRuntimeError("invalid_runtime_input");
   }
@@ -156,6 +162,9 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     sql: options.sql,
     clock: options.clock,
     randomId: options.randomId,
+    ...(options.workflowInterfaceRef === undefined
+      ? {}
+      : { workflowInterfaceRef: options.workflowInterfaceRef }),
   });
   const now = (): number => {
     const value = options.clock().getTime();

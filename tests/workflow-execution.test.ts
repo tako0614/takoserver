@@ -1,8 +1,10 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import type { TakoformInterfaceRef } from "../src/interface-ref.ts";
 import type { JsonObject, Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { encodeDocument } from "../src/workflow-data.ts";
 import {
   createWorkflowRuntime,
   type WorkflowApplicationOutcome,
@@ -19,6 +21,12 @@ import {
 
 const START = Date.UTC(2026, 0, 1);
 const SCOPE = { tenantId: "tenant", workflowResourceUid: "workflow" };
+const WORKFLOW_V3_REF = {
+  apiVersion: "interfaces.takoform.com/v1alpha1",
+  name: "worker.workflow",
+  version: "3.0.0",
+  schemaDigest: "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
+} as const satisfies TakoformInterfaceRef;
 const MIGRATIONS = [
   "0050_workflow_instances.sql",
   "0051_workflow_execution.sql",
@@ -46,7 +54,11 @@ async function flush() {
 }
 
 /** A protocol double, not evidence of workerd or WfP hard cancellation. */
-function fixture(decorateSql: (sql: Sql) => Sql = (sql) => sql, randomIds: string[] = []) {
+function fixture(
+  decorateSql: (sql: Sql) => Sql = (sql) => sql,
+  randomIds: string[] = [],
+  workflowInterfaceRef?: TakoformInterfaceRef,
+) {
   const db = new Database(":memory:");
   db.exec(MIGRATIONS);
   databases.push(db);
@@ -143,6 +155,7 @@ function fixture(decorateSql: (sql: Sql) => Sql = (sql) => sql, randomIds: strin
         timers.add(timer);
         signal.addEventListener("abort", timer.done, { once: true });
       }),
+    ...(workflowInterfaceRef === undefined ? {} : { workflowInterfaceRef }),
   });
   return {
     db,
@@ -150,8 +163,8 @@ function fixture(decorateSql: (sql: Sql) => Sql = (sql) => sql, randomIds: strin
     runtime,
     hooks,
     calls,
-    async create() {
-      await runtime.instances.create(SCOPE, { id: "instance" });
+    async create(id = "instance") {
+      await runtime.instances.create(SCOPE, { id });
     },
     async advance(ms: number) {
       timestamp = START + ms;
@@ -173,6 +186,390 @@ function fixture(decorateSql: (sql: Sql) => Sql = (sql) => sql, randomIds: strin
 }
 
 describe("internal Workflow execution coordinator", () => {
+  test("v3 event retention is bounded, FIFO, byte-canonical, and leaves the 1.0 default alone", async () => {
+    const candidate = fixture(undefined, [], WORKFLOW_V3_REF);
+    await candidate.create();
+    for (let index = 0; index < 1_024; index += 1) {
+      await candidate.runtime.instances.sendEvent(SCOPE, "instance", {
+        type: "noise",
+        payload: { index },
+      });
+    }
+    await expect(
+      candidate.runtime.instances.sendEvent(SCOPE, "instance", {
+        type: "noise",
+        payload: { rejected: true },
+      }),
+    ).rejects.toMatchObject({ name: "event_queue_full", code: "event_queue_full" });
+    expect(
+      candidate.db.query("SELECT count(*) AS count FROM tf_workflow_events").get(),
+    ).toMatchObject({ count: 1_024 });
+
+    const byteFixture = fixture(undefined, [], WORKFLOW_V3_REF);
+    await byteFixture.create();
+    const eventTypes = ['quote"slash\\', "control\u0001\n", "é/水😀", "omitted-payload"];
+    for (const type of eventTypes) {
+      await byteFixture.runtime.instances.sendEvent(SCOPE, "instance", {
+        type,
+        ...(type === "omitted-payload" ? {} : { payload: { value: type } }),
+      });
+    }
+    const encodedRows = byteFixture.db
+      .query("SELECT type, payload_json FROM tf_workflow_events WHERE type <> 'noise'")
+      .all() as { type: string; payload_json: string | null }[];
+    expect(encodedRows).toHaveLength(eventTypes.length);
+    const canonicalBytes = encodedRows.reduce((total, row) => {
+      const envelope =
+        row.payload_json === null
+          ? { type: row.type }
+          : { type: row.type, payload: JSON.parse(row.payload_json) as JsonObject };
+      return total + new TextEncoder().encode(encodeDocument(envelope)).byteLength;
+    }, 0);
+    const storedBytes = byteFixture.db
+      .query(
+        `SELECT coalesce(sum(
+          CASE WHEN payload_json IS NULL
+            THEN 9 + length(CAST(json_quote(type) AS BLOB))
+            ELSE 20 + length(CAST(payload_json AS BLOB)) + length(CAST(json_quote(type) AS BLOB))
+          END
+        ), 0) AS bytes FROM tf_workflow_events WHERE type <> 'noise'`,
+      )
+      .get() as { bytes: number };
+    expect(storedBytes.bytes).toBe(canonicalBytes);
+
+    const legacy = fixture();
+    await legacy.create();
+    for (let index = 0; index < 1_025; index += 1) {
+      await legacy.runtime.instances.sendEvent(SCOPE, "instance", { type: "legacy" });
+    }
+    expect(legacy.db.query("SELECT count(*) AS count FROM tf_workflow_events").get()).toMatchObject(
+      {
+        count: 1_025,
+      },
+    );
+  });
+
+  test("v3 directly settles an already parked wait at its equal deadline without queue capacity", async () => {
+    const f = fixture(undefined, [], WORKFLOW_V3_REF);
+    await f.create();
+    for (let index = 0; index < 1_024; index += 1) {
+      await f.runtime.instances.sendEvent(SCOPE, "instance", {
+        type: "unrelated",
+        payload: { index },
+      });
+    }
+    f.hooks.application = async (step) => {
+      const event = await step.waitForEvent(
+        () => "approval",
+        () => ({ type: "approval", timeoutSeconds: 60 }),
+      );
+      return event === undefined ? { accepted: false } : { accepted: event.approved === true };
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+    await f.advance(60_000);
+    await f.runtime.instances.sendEvent(SCOPE, "instance", {
+      type: "approval",
+      payload: { approved: true },
+    });
+    expect(f.db.query("SELECT count(*) AS count FROM tf_workflow_events").get()).toMatchObject({
+      count: 1_024,
+    });
+    expect(
+      f.db.query("SELECT state, result_json FROM tf_workflow_steps WHERE name = 'approval'").get(),
+    ).toMatchObject({ state: "complete", result_json: '{"approved":true}' });
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "complete",
+      output: { accepted: true },
+    });
+  });
+
+  test("v3 queued waits consume oldest matching events and preserve their acceptance order", async () => {
+    const f = fixture(undefined, [], WORKFLOW_V3_REF);
+    await f.create();
+    await f.runtime.instances.sendEvent(SCOPE, "instance", {
+      type: "approval",
+      payload: { sequence: 1 },
+    });
+    await f.runtime.instances.sendEvent(SCOPE, "instance", {
+      type: "approval",
+      payload: { sequence: 2 },
+    });
+    f.hooks.application = async (step) => {
+      const first = await step.waitForEvent(
+        () => "first-approval",
+        () => ({ type: "approval", timeoutSeconds: 60 }),
+      );
+      const second = await step.waitForEvent(
+        () => "second-approval",
+        () => ({ type: "approval", timeoutSeconds: 60 }),
+      );
+      return { first: first?.sequence ?? null, second: second?.sequence ?? null };
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "complete",
+      output: { first: 1, second: 2 },
+    });
+  });
+
+  test("v3 concurrent senders settle one parked wait and retain the other event in FIFO order", async () => {
+    const bothReadWait = latch<void>();
+    const releaseWaitReads = latch<void>();
+    let waitReads = 0;
+    const f = fixture(
+      (sql) => ({
+        ...sql,
+        async query(statement, params) {
+          const rows = await sql.query(statement, params);
+          if (
+            statement.includes(
+              "SELECT step.name, step.wait_type, step.timeout_at, step.revision",
+            ) &&
+            rows.length > 0
+          ) {
+            waitReads += 1;
+            if (waitReads === 2) bothReadWait.resolve();
+            if (waitReads <= 2) await releaseWaitReads.promise;
+          }
+          return rows;
+        },
+      }),
+      [],
+      WORKFLOW_V3_REF,
+    );
+    await f.create();
+    f.hooks.application = async (step) => {
+      const first = await step.waitForEvent(
+        () => "first-approval",
+        () => ({ type: "approval", timeoutSeconds: 60 }),
+      );
+      const second = await step.waitForEvent(
+        () => "second-approval",
+        () => ({ type: "approval", timeoutSeconds: 60 }),
+      );
+      return { first: first?.sequence ?? null, second: second?.sequence ?? null };
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+
+    const acceptedOrder: number[] = [];
+    const firstSend = f.runtime.instances
+      .sendEvent(SCOPE, "instance", {
+        type: "approval",
+        payload: { sequence: 1 },
+      })
+      .then(() => acceptedOrder.push(1));
+    const secondSend = f.runtime.instances
+      .sendEvent(SCOPE, "instance", {
+        type: "approval",
+        payload: { sequence: 2 },
+      })
+      .then(() => acceptedOrder.push(2));
+    await bothReadWait.promise;
+    releaseWaitReads.resolve();
+    await Promise.all([firstSend, secondSend]);
+    expect(acceptedOrder).toHaveLength(2);
+
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "complete",
+      output: { first: acceptedOrder[0] ?? null, second: acceptedOrder[1] ?? null },
+    });
+  });
+
+  test.each([
+    { admission: "direct wait result", type: "approval" },
+    { admission: "queued event", type: "other" },
+  ])("v3 termination winning a $admission race refuses acceptance", async ({ type }) => {
+    const admissionSeen = latch<void>();
+    const releaseAdmission = latch<void>();
+    let pauseAdmission = true;
+    const f = fixture(
+      (sql) => ({
+        ...sql,
+        async batch(statements) {
+          if (
+            pauseAdmission &&
+            statements.some((statement) => statement.sql.includes("INSERT INTO tf_workflow_events"))
+          ) {
+            pauseAdmission = false;
+            admissionSeen.resolve();
+            await releaseAdmission.promise;
+          }
+          return sql.batch(statements);
+        },
+      }),
+      [],
+      WORKFLOW_V3_REF,
+    );
+    await f.create();
+    f.hooks.application = async (step) => {
+      await step.waitForEvent(
+        () => "approval",
+        () => ({ type: "approval", timeoutSeconds: 60 }),
+      );
+      return { resumed: true };
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+
+    const send = f.runtime.instances.sendEvent(SCOPE, "instance", { type });
+    await admissionSeen.promise;
+    await f.runtime.instances.terminate(SCOPE, "instance");
+    releaseAdmission.resolve();
+    await expect(send).rejects.toMatchObject({ code: "instance_terminal" });
+    expect(await f.runtime.instances.status(SCOPE, "instance")).toEqual({ status: "terminated" });
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "terminal",
+      status: "terminated",
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_events").get()).toEqual({
+      count: 0,
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_steps").get()).toEqual({
+      count: 0,
+    });
+  });
+
+  test.each([
+    { admission: "direct wait result", type: "approval" },
+    { admission: "queued event", type: "other" },
+  ])("v3 accepted $admission is safely purged when termination follows", async ({ type }) => {
+    const terminationSeen = latch<void>();
+    const releaseTermination = latch<void>();
+    let pauseTermination = true;
+    const f = fixture(
+      (sql) => ({
+        ...sql,
+        async run(statement, params) {
+          if (pauseTermination && statement.includes("SET termination_requested = 1")) {
+            pauseTermination = false;
+            terminationSeen.resolve();
+            await releaseTermination.promise;
+          }
+          return sql.run(statement, params);
+        },
+      }),
+      [],
+      WORKFLOW_V3_REF,
+    );
+    await f.create();
+    f.hooks.application = async (step) => {
+      await step.waitForEvent(
+        () => "approval",
+        () => ({ type: "approval", timeoutSeconds: 60 }),
+      );
+      return { resumed: true };
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+
+    const termination = f.runtime.instances.terminate(SCOPE, "instance");
+    await terminationSeen.promise;
+    await f.runtime.instances.sendEvent(SCOPE, "instance", { type });
+    releaseTermination.resolve();
+    await termination;
+    expect(await f.runtime.instances.status(SCOPE, "instance")).toEqual({ status: "terminated" });
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "terminal",
+      status: "terminated",
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_events").get()).toEqual({
+      count: 0,
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_steps").get()).toEqual({
+      count: 0,
+    });
+  });
+
+  test("v3 event byte limit includes the canonical envelope and rejects without acceptance", async () => {
+    const f = fixture(undefined, [], WORKFLOW_V3_REF);
+    await f.create();
+    const exactEnvelopeBytes = 1_048_576;
+    const type = "large";
+    const payloadPrefixBytes = new TextEncoder().encode('{"value":"').byteLength;
+    const payloadSuffixBytes = new TextEncoder().encode('"}').byteLength;
+    const envelopeOverhead = 20 + new TextEncoder().encode(JSON.stringify(type)).byteLength;
+    const valueLength =
+      exactEnvelopeBytes - envelopeOverhead - payloadPrefixBytes - payloadSuffixBytes;
+    await f.runtime.instances.sendEvent(SCOPE, "instance", {
+      type,
+      payload: { value: "x".repeat(valueLength) },
+    });
+    const result = f.db
+      .query(
+        `SELECT sum(20 + length(CAST(payload_json AS BLOB)) + length(CAST(json_quote(type) AS BLOB))) AS bytes
+         FROM tf_workflow_events`,
+      )
+      .get() as { bytes: number };
+    expect(result.bytes).toBe(exactEnvelopeBytes);
+    await expect(
+      f.runtime.instances.sendEvent(SCOPE, "instance", { type: "small" }),
+    ).rejects.toMatchObject({ name: "event_queue_full", code: "event_queue_full" });
+    expect(f.db.query("SELECT count(*) AS count FROM tf_workflow_events").get()).toMatchObject({
+      count: 1,
+    });
+  });
+
+  test("v3 full-queue refusal retries against a wait that parks during the send race", async () => {
+    const visibleRead = latch<void>();
+    const releaseVisibleRead = latch<void>();
+    let pauseVisibleRead = false;
+    const f = fixture(
+      (sql) => ({
+        ...sql,
+        async query(statement, params) {
+          const rows = await sql.query(statement, params);
+          if (
+            pauseVisibleRead &&
+            statement.includes(
+              "SELECT execution_id, status, output_json, error_json, created_at, revision",
+            )
+          ) {
+            pauseVisibleRead = false;
+            visibleRead.resolve();
+            await releaseVisibleRead.promise;
+          }
+          return rows;
+        },
+      }),
+      [],
+      WORKFLOW_V3_REF,
+    );
+    await f.create();
+    for (let index = 0; index < 1_024; index += 1) {
+      await f.runtime.instances.sendEvent(SCOPE, "instance", {
+        type: "unrelated",
+        payload: { index },
+      });
+    }
+    const stopping = latch<void>();
+    const proceed = latch<void>();
+    f.hooks.application = async (step) => {
+      const event = await step.waitForEvent(
+        () => "approval",
+        () => ({ type: "approval", timeoutSeconds: 60 }),
+      );
+      return event === undefined ? { accepted: false } : { accepted: true };
+    };
+    f.hooks.beforeStop = async () => {
+      stopping.resolve();
+      await proceed.promise;
+    };
+    const running = f.runtime.runOne(SCOPE, "instance");
+    await stopping.promise;
+    pauseVisibleRead = true;
+    const send = f.runtime.instances.sendEvent(SCOPE, "instance", {
+      type: "approval",
+      payload: { accepted: true },
+    });
+    await visibleRead.promise;
+    proceed.resolve();
+    expect(await running).toEqual({ kind: "parked" });
+    releaseVisibleRead.resolve();
+    await send;
+    f.hooks.beforeStop = async () => undefined;
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "complete",
+      output: { accepted: true },
+    });
+  });
+
   test.each(["lifetime_exceeded", "step_limit_exceeded"])(
     "a host cannot fabricate the core-owned %s terminal outcome",
     async (reason) => {

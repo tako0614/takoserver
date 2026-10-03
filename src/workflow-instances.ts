@@ -1,3 +1,4 @@
+import type { TakoformInterfaceRef } from "./interface-ref.ts";
 import { type Clock, type JsonObject, type Row, type Sql, SqlError } from "./ports.ts";
 import {
   addDuration,
@@ -79,6 +80,7 @@ export type WorkflowInstanceErrorCode =
   | "document_too_large"
   | "unknown_instance"
   | "instance_terminal"
+  | "event_queue_full"
   | "backend_unavailable";
 
 /**
@@ -99,6 +101,8 @@ export interface WorkflowInstancesOptions {
   readonly sql: Sql;
   readonly clock: Clock;
   readonly randomId: () => string;
+  /** Opt into the exact unpublished v3 event-retention contract. */
+  readonly workflowInterfaceRef?: TakoformInterfaceRef;
 }
 
 export interface WorkflowInstances {
@@ -114,6 +118,47 @@ export interface WorkflowInstances {
 /** Bounds are kept in seconds in the published contract; storage uses ms. */
 export const WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS = 31_536_000;
 export const WORKFLOW_MAX_TERMINAL_RETENTION_SECONDS = 2_592_000;
+const WORKFLOW_MAX_PENDING_EVENT_COUNT = 1_024;
+const WORKFLOW_MAX_PENDING_EVENT_BYTES = 1_048_576;
+
+const WORKFLOW_V3_INTERFACE_REF = {
+  apiVersion: "interfaces.takoform.com/v1alpha1",
+  name: "worker.workflow",
+  version: "3.0.0",
+  schemaDigest: "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
+} as const satisfies TakoformInterfaceRef;
+
+export function isExactWorkflowV3InterfaceRef(value: unknown): value is TakoformInterfaceRef {
+  try {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const candidate = value as Record<string, unknown>;
+    const prototype = Object.getPrototypeOf(candidate);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    const keys = Reflect.ownKeys(candidate);
+    if (
+      keys.length !== 4 ||
+      keys.some(
+        (key) =>
+          key !== "apiVersion" && key !== "name" && key !== "version" && key !== "schemaDigest",
+      )
+    ) {
+      return false;
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(candidate);
+    return (
+      ["apiVersion", "name", "version", "schemaDigest"].every((key) => {
+        const descriptor = descriptors[key];
+        return descriptor?.enumerable && "value" in descriptor;
+      }) &&
+      candidate.apiVersion === WORKFLOW_V3_INTERFACE_REF.apiVersion &&
+      candidate.name === WORKFLOW_V3_INTERFACE_REF.name &&
+      candidate.version === WORKFLOW_V3_INTERFACE_REF.version &&
+      candidate.schemaDigest === WORKFLOW_V3_INTERFACE_REF.schemaDigest
+    );
+  } catch {
+    return false;
+  }
+}
 
 const MAX_SWEEP_ROWS = 64;
 const NON_TERMINAL_SQL = "'queued', 'running', 'sleeping', 'waiting'";
@@ -142,8 +187,9 @@ const LIFETIME_ERROR_JSON = '{"reason":"lifetime_exceeded"}';
 /**
  * Durable state for one workflow class.  This module deliberately does not
  * inspect a Worker Deployment or execute a class; that capability check is a
- * caller-owned boundary.  It only owns instance identity, status, events and
- * the two finite lifetime bounds.
+ * caller-owned boundary.  It owns instance identity, status, events and the
+ * two finite lifetime bounds.  The exact v3 profile additionally settles an
+ * already-parked wait in the existing execution journal.
  */
 export function createWorkflowInstances(options: WorkflowInstancesOptions): WorkflowInstances {
   if (typeof options.clock !== "function") {
@@ -152,6 +198,13 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
   if (typeof options.randomId !== "function") {
     throw new TypeError("a workflow instance randomId function is required");
   }
+  if (
+    options.workflowInterfaceRef !== undefined &&
+    !isExactWorkflowV3InterfaceRef(options.workflowInterfaceRef)
+  ) {
+    throw new TypeError("unsupported workflow interface reference");
+  }
+  const workflowV3Enabled = options.workflowInterfaceRef !== undefined;
 
   const randomId = options.randomId;
   const now = (): number => {
@@ -310,6 +363,10 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
         if (!current) throw new WorkflowInstanceError("unknown_instance");
         if (TERMINAL_STATUSES.has(current.status)) {
           throw new WorkflowInstanceError("instance_terminal");
+        }
+        if (workflowV3Enabled) {
+          await sendV3Event(normalizedScope, normalizedId, current, event, timestamp);
+          return;
         }
         const results = await options.sql.batch([
           {
@@ -531,6 +588,275 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
     },
   };
 
+  async function sendV3Event(
+    scope: WorkflowScope,
+    instanceId: string,
+    current: StoredWorkflowInstance,
+    event: PreparedWorkflowEvent,
+    timestamp: number,
+  ): Promise<void> {
+    let attempt = current;
+    for (let retry = 0; retry < 8; retry += 1) {
+      if (TERMINAL_STATUSES.has(attempt.status)) {
+        throw new WorkflowInstanceError("instance_terminal");
+      }
+      const directWait =
+        attempt.status === "waiting"
+          ? await readPendingWait(scope, instanceId, attempt, event.type, timestamp)
+          : null;
+      const statements = directWait
+        ? [
+            {
+              sql: `UPDATE tf_workflow_steps
+                  SET state = 'complete', result_json = ?, error_json = NULL,
+                      wake_at = NULL, updated_at = ?, revision = revision + 1
+                  WHERE execution_id = ? AND execution_created_at = ? AND name = ?
+                    AND kind = 'wait' AND state = 'waiting' AND wait_type = ?
+                    AND timeout_at = ? AND revision = ?
+                    AND EXISTS (
+                      SELECT 1 FROM tf_workflow_instances AS instance
+                      WHERE instance.tenant_id = ? AND instance.workflow_resource_uid = ?
+                        AND instance.instance_id = ? AND instance.execution_id = ?
+                        AND instance.created_at = ? AND instance.revision = ?
+                        AND instance.status = 'waiting' AND instance.pending_step_name = ?
+                        AND instance.run_owner IS NULL AND instance.run_lease_until IS NULL
+                        AND instance.termination_requested = 0
+                        AND instance.deadline_at > ? AND instance.retention_until > ?
+                    )
+                    AND NOT EXISTS (
+                      SELECT 1 FROM tf_workflow_events AS event
+                      WHERE event.tenant_id = ? AND event.workflow_resource_uid = ?
+                        AND event.instance_id = ? AND event.execution_id = ?
+                        AND event.type = ? AND event.created_at <= ?
+                    )`,
+              params: [
+                event.payloadJson,
+                timestamp,
+                attempt.executionId,
+                attempt.createdAt,
+                directWait.name,
+                event.type,
+                directWait.timeoutAt,
+                directWait.revision,
+                scope.tenantId,
+                scope.workflowResourceUid,
+                instanceId,
+                attempt.executionId,
+                attempt.createdAt,
+                attempt.revision,
+                directWait.name,
+                timestamp,
+                timestamp,
+                scope.tenantId,
+                scope.workflowResourceUid,
+                instanceId,
+                attempt.executionId,
+                event.type,
+                directWait.timeoutAt,
+              ],
+            },
+            {
+              sql: `UPDATE tf_workflow_instances
+                  SET wake_at = ?, updated_at = ?, revision = revision + 1
+                  WHERE tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ?
+                    AND execution_id = ? AND created_at = ? AND revision = ?
+                    AND status = 'waiting' AND pending_step_name = ?
+                    AND run_owner IS NULL AND run_lease_until IS NULL
+                    AND termination_requested = 0
+                    AND deadline_at > ? AND retention_until > ?
+                    AND EXISTS (
+                      SELECT 1 FROM tf_workflow_steps AS step
+                      WHERE step.execution_id = tf_workflow_instances.execution_id
+                        AND step.execution_created_at = tf_workflow_instances.created_at
+                        AND step.name = ? AND step.kind = 'wait' AND step.state = 'complete'
+                        AND step.wait_type = ? AND step.timeout_at = ?
+                        AND step.revision = ? AND step.updated_at = ?
+                        AND step.result_json IS ?
+                    )`,
+              params: [
+                timestamp,
+                timestamp,
+                scope.tenantId,
+                scope.workflowResourceUid,
+                instanceId,
+                attempt.executionId,
+                attempt.createdAt,
+                attempt.revision,
+                directWait.name,
+                timestamp,
+                timestamp,
+                directWait.name,
+                event.type,
+                directWait.timeoutAt,
+                directWait.revision + 1,
+                timestamp,
+                event.payloadJson,
+              ],
+            },
+            queueInsertStatement(scope, instanceId, attempt, event, timestamp),
+          ]
+        : [queueInsertStatement(scope, instanceId, attempt, event, timestamp)];
+      const results = await options.sql.batch(statements);
+      if (results.length !== statements.length) {
+        throw new Error("workflow v3 event admission batch was truncated");
+      }
+      if (directWait !== null) {
+        const stepChanged = results[0]?.changes === 1;
+        const instanceChanged = results[1]?.changes === 1;
+        if (stepChanged !== instanceChanged) {
+          throw new Error("workflow v3 direct delivery lost its instance fence");
+        }
+        if (stepChanged) return;
+      }
+      const insertResult = results[directWait === null ? 0 : 2];
+      if (insertResult?.changes === 1) return;
+
+      const after = await visibleInstance(scope, instanceId, timestamp);
+      if (!after) throw new WorkflowInstanceError("unknown_instance");
+      if (after.executionId !== attempt.executionId || after.createdAt !== attempt.createdAt) {
+        throw new Error("workflow event execution fence changed");
+      }
+      if (TERMINAL_STATUSES.has(after.status)) {
+        throw new WorkflowInstanceError("instance_terminal");
+      }
+      if (after.revision === attempt.revision) {
+        const termination = await options.sql.query(
+          `SELECT termination_requested FROM tf_workflow_instances
+           WHERE tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ?
+             AND execution_id = ? AND created_at = ? AND revision = ?`,
+          [
+            scope.tenantId,
+            scope.workflowResourceUid,
+            instanceId,
+            attempt.executionId,
+            attempt.createdAt,
+            attempt.revision,
+          ],
+        );
+        if (rowValue(termination[0] ?? {}, "termination_requested") === 1) {
+          throw new WorkflowInstanceError("instance_terminal");
+        }
+        throw new WorkflowInstanceError("event_queue_full");
+      }
+      attempt = after;
+    }
+    throw new Error("workflow event admission lost repeated state races");
+  }
+
+  async function readPendingWait(
+    scope: WorkflowScope,
+    instanceId: string,
+    current: StoredWorkflowInstance,
+    eventType: string,
+    timestamp: number,
+  ): Promise<PendingWorkflowWait | null> {
+    const rows = await options.sql.query(
+      `SELECT step.name, step.wait_type, step.timeout_at, step.revision
+       FROM tf_workflow_steps AS step
+       JOIN tf_workflow_instances AS instance
+         ON instance.execution_id = step.execution_id
+        AND instance.created_at = step.execution_created_at
+       WHERE instance.tenant_id = ? AND instance.workflow_resource_uid = ?
+         AND instance.instance_id = ? AND instance.execution_id = ? AND instance.created_at = ?
+         AND instance.revision = ? AND instance.status = 'waiting'
+         AND instance.pending_step_name = step.name
+         AND instance.run_owner IS NULL AND instance.run_lease_until IS NULL
+         AND instance.termination_requested = 0
+         AND instance.deadline_at > ? AND instance.retention_until > ?
+         AND step.kind = 'wait' AND step.state = 'waiting' AND step.wait_type = ?
+       LIMIT 2`,
+      [
+        scope.tenantId,
+        scope.workflowResourceUid,
+        instanceId,
+        current.executionId,
+        current.createdAt,
+        current.revision,
+        timestamp,
+        timestamp,
+        eventType,
+      ],
+    );
+    if (rows.length > 1) throw new Error("workflow pending wait is ambiguous");
+    const row = rows[0];
+    if (!row) return null;
+    const name = rowValue(row, "name");
+    const waitType = rowValue(row, "wait_type");
+    const timeoutAt = rowValue(row, "timeout_at");
+    const revision = rowValue(row, "revision");
+    if (
+      typeof name !== "string" ||
+      typeof waitType !== "string" ||
+      !Number.isSafeInteger(timeoutAt) ||
+      (timeoutAt as number) < timestamp ||
+      !Number.isSafeInteger(revision) ||
+      (revision as number) < 1
+    ) {
+      return null;
+    }
+    return {
+      name,
+      timeoutAt: timeoutAt as number,
+      revision: revision as number,
+    };
+  }
+
+  function queueInsertStatement(
+    scope: WorkflowScope,
+    instanceId: string,
+    current: StoredWorkflowInstance,
+    event: PreparedWorkflowEvent,
+    timestamp: number,
+  ) {
+    return {
+      sql: `INSERT INTO tf_workflow_events
+              (tenant_id, workflow_resource_uid, instance_id, execution_id,
+               type, payload_json, created_at)
+            SELECT instance.tenant_id, instance.workflow_resource_uid,
+                   instance.instance_id, instance.execution_id, ?, ?, ?
+            FROM tf_workflow_instances AS instance
+            WHERE instance.tenant_id = ? AND instance.workflow_resource_uid = ?
+              AND instance.instance_id = ? AND instance.execution_id = ?
+              AND instance.created_at = ? AND instance.revision = ?
+              AND instance.retention_until > ? AND instance.deadline_at > ?
+              AND instance.status IN ('queued', 'running', 'sleeping', 'waiting')
+              AND instance.termination_requested = 0
+              AND (SELECT count(*) FROM tf_workflow_events AS existing
+                   WHERE existing.tenant_id = instance.tenant_id
+                     AND existing.workflow_resource_uid = instance.workflow_resource_uid
+                     AND existing.instance_id = instance.instance_id
+                     AND existing.execution_id = instance.execution_id) < ?
+              AND (SELECT coalesce(sum(
+                     CASE WHEN existing.payload_json IS NULL
+                       THEN 9 + length(CAST(json_quote(existing.type) AS BLOB))
+                       ELSE 20 + length(CAST(existing.payload_json AS BLOB))
+                         + length(CAST(json_quote(existing.type) AS BLOB))
+                     END
+                   ), 0)
+                   FROM tf_workflow_events AS existing
+                   WHERE existing.tenant_id = instance.tenant_id
+                     AND existing.workflow_resource_uid = instance.workflow_resource_uid
+                     AND existing.instance_id = instance.instance_id
+                     AND existing.execution_id = instance.execution_id) + ? <= ?`,
+      params: [
+        event.type,
+        event.payloadJson,
+        timestamp,
+        scope.tenantId,
+        scope.workflowResourceUid,
+        instanceId,
+        current.executionId,
+        current.createdAt,
+        current.revision,
+        timestamp,
+        timestamp,
+        WORKFLOW_MAX_PENDING_EVENT_COUNT,
+        event.documentBytes,
+        WORKFLOW_MAX_PENDING_EVENT_BYTES,
+      ],
+    };
+  }
+
   async function settleExpired(
     scope: WorkflowScope,
     instanceId: string,
@@ -590,7 +916,7 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
     timestamp: number,
   ): Promise<StoredWorkflowInstance | null> {
     const rows = await options.sql.query(
-      `SELECT execution_id, status, output_json, error_json, created_at
+      `SELECT execution_id, status, output_json, error_json, created_at, revision
        FROM tf_workflow_instances
        WHERE tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ?
          AND retention_until > ?
@@ -609,6 +935,19 @@ interface StoredWorkflowInstance {
   readonly status: WorkflowInstanceStatus;
   readonly outputJson: string | null;
   readonly errorJson: string | null;
+  readonly revision: number;
+}
+
+interface PendingWorkflowWait {
+  readonly name: string;
+  readonly timeoutAt: number;
+  readonly revision: number;
+}
+
+interface PreparedWorkflowEvent {
+  readonly type: string;
+  readonly payloadJson: string | null;
+  readonly documentBytes: number;
 }
 
 function prepareCreateInput(value: unknown): {
@@ -650,10 +989,7 @@ function prepareCreateInput(value: unknown): {
   return { ...(id === undefined ? {} : { id }), paramsJson };
 }
 
-function prepareEventInput(value: unknown): {
-  readonly type: string;
-  readonly payloadJson: string | null;
-} {
+function prepareEventInput(value: unknown): PreparedWorkflowEvent {
   const record = plainInputRecord(value, "workflow event input");
   for (const key of Object.keys(record)) {
     if (key !== "type" && key !== "payload") {
@@ -678,7 +1014,60 @@ function prepareEventInput(value: unknown): {
       throw new WorkflowInputError("workflow event payload must be data-only JSON");
     }
   }
-  return { type, payloadJson };
+  const documentBytes =
+    payloadJson === null
+      ? 9 + canonicalJsonStringBytes(type)
+      : 20 + utf8ByteLength(payloadJson) + canonicalJsonStringBytes(type);
+  return { type, payloadJson, documentBytes };
+}
+
+function canonicalJsonStringBytes(value: string): number {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (
+      code === 0x22 ||
+      code === 0x5c ||
+      code === 0x08 ||
+      code === 0x09 ||
+      code === 0x0a ||
+      code === 0x0c ||
+      code === 0x0d
+    ) {
+      bytes += 2;
+    } else if (code < 0x20) {
+      bytes += 6;
+    } else if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      // inputIdentifier has already rejected unpaired surrogates.
+      bytes += 4;
+      index += 1;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      bytes += 4;
+      index += 1;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
 }
 
 function normalizeSweep(input: WorkflowSweepOptions): {
@@ -737,12 +1126,17 @@ function parseStoredInstance(row: Row): StoredWorkflowInstance {
   }
   const outputJson = nullableString(row, "output_json");
   const errorJson = nullableString(row, "error_json");
+  const revision = rowValue(row, "revision");
+  if (!Number.isSafeInteger(revision) || (revision as number) < 1) {
+    throw new Error("workflow instance revision is invalid");
+  }
   return {
     executionId,
     createdAt: createdAt as number,
     status: rawStatus as WorkflowInstanceStatus,
     outputJson,
     errorJson,
+    revision: revision as number,
   };
 }
 
