@@ -5736,6 +5736,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async adopt(input): Promise<ProviderTicket> {
+      if (isReleasedSelfhostCronForm(input.offering.form)) {
+        return failed("denied", "Cron Trigger import is not supported by this self-host provider");
+      }
       if (input.operationMode === "recovery" && !input.providerHandle) {
         return failed("unavailable", "provider mutation recovery requires an opaque handle", true);
       }

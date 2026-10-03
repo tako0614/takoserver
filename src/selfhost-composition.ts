@@ -383,9 +383,11 @@ export function createSelfhostComposition(
       ) {
         continue;
       }
-      const offering = edgeProviderOffering(form, {
-        id: `selfhost.edge.stable-v1.${kind.toLowerCase()}`,
-      });
+      const offering = withoutSelfhostCronImport(
+        edgeProviderOffering(form, {
+          id: `selfhost.edge.stable-v1.${kind.toLowerCase()}`,
+        }),
+      );
       technicalOfferings.push(offering);
       technicalRelationOfferings.push(offering);
     }
@@ -408,9 +410,11 @@ export function createSelfhostComposition(
       // The relation-owned Forms are provider capabilities, not retail items.
       // Exactly one technical projection per exact Form, so the provider
       // driver can inherit it from the identity Deployment.
-      const offering = edgeProviderOffering(form, {
-        id: `selfhost.edge.${kind.toLowerCase()}`,
-      });
+      const offering = withoutSelfhostCronImport(
+        edgeProviderOffering(form, {
+          id: `selfhost.edge.${kind.toLowerCase()}`,
+        }),
+      );
       technicalOfferings.push(offering);
       technicalRelationOfferings.push(offering);
     }
@@ -586,6 +590,16 @@ const SELFHOST_EDGE_RELATION_KINDS = new Set([
   "QueueConsumer",
   "ContainerEndpoint",
 ]);
+
+/** The local scheduler owns Cron application, not transfer of native schedules. */
+function withoutSelfhostCronImport(offering: ProviderOffering): ProviderOffering {
+  return offering.form.kind === "WorkerCronTrigger"
+    ? {
+        ...offering,
+        capabilities: offering.capabilities.filter((capability) => capability !== "import"),
+      }
+    : offering;
+}
 
 const SELFHOST_RELATION_READBACK_ANCHORS: Readonly<Record<string, readonly string[]>> = {
   WorkerVersion: ["ModuleWorker"],

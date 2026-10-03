@@ -5730,6 +5730,39 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
     await writeFile(path, JSON.stringify(state), "utf8");
   };
 
+  test("direct Cron adoption cannot borrow another Resource UID's native schedule", async () => {
+    const runtime = servingRuntime();
+    const local = provider({ runtime: runtime.runtime, events: EVENTS });
+    const script = await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    const cron = "0 * * * *";
+    const owner = await applyOwnedCron(local, {
+      operationId: "op_existing_cron_owner",
+      name: "existing-cron-owner",
+      uid: "uid-existing-cron-owner",
+      cron,
+    });
+    if (owner.phase !== "succeeded" || !local.adopt) {
+      throw new Error("Cron owner setup failed");
+    }
+    const statePath = join(root, "selfhost", "scripts", `${script}.json`);
+    const before = readFileSync(statePath, "utf8");
+
+    const adoption = await local.adopt({
+      operationId: "op_new_cron_owner_adopt",
+      offering: offering("WorkerCronTrigger"),
+      nativeId: owner.result.nativeId,
+      identity: { ...identity("new-cron-owner"), uid: "uid-new-cron-owner" },
+      spec: cronSpec(cron),
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+
+    expect(adoption).toMatchObject({
+      phase: "failed",
+      failure: { code: "denied", retryable: false },
+    });
+    expect(readFileSync(statePath, "utf8")).toBe(before);
+  });
+
   test("updates one Cron Resource from A to B without retaining A across replay or restart", async () => {
     const runtime = servingRuntime();
     const forgotten: string[] = [];

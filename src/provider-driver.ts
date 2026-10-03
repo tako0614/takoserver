@@ -852,6 +852,9 @@ export function createProviderDriver(
     if (!provider || !offering || !providerInstallationRef || !provider.adopt) {
       throw new TakoformHostError("unsupported_capability", 422);
     }
+    if (!offering.capabilities.includes("import")) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
 
     const claim = await deployments.findNativeClaim(providerInstallationRef, input.nativeId);
     if (

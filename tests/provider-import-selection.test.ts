@@ -69,6 +69,35 @@ type ImportInput = Parameters<NonNullable<TakoformResourceDriver["import"]>>[0];
 type ImportSelectionInput = Omit<ImportInput, "selection" | "operationId" | "operationMode">;
 
 describe("provider-driver import selection", () => {
+  test("refuses import when the selected technical offering does not advertise it", async () => {
+    const context = createContext();
+    const base = importInput();
+    const retainedSelection = await context.driver.selectImport?.(base);
+    if (retainedSelection?.kind !== "provider") {
+      throw new Error("provider selection was not returned");
+    }
+    context.offerings[0] = {
+      ...technicalOffering,
+      capabilities: technicalOffering.capabilities.filter((capability) => capability !== "import"),
+    };
+
+    await expect(context.driver.selectImport?.(base)).rejects.toMatchObject({
+      code: "unsupported_capability",
+      status: 422,
+    });
+    await expect(
+      context.driver.import?.({
+        ...base,
+        operationId: "import-selection-capability-drift",
+        operationMode: "initial",
+        selection: retainedSelection,
+      }),
+    ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
+
+    expect(context.adoptCalls).toHaveLength(0);
+    expect(await context.deployments.forResource(tenantId, base.resourceUid)).toEqual([]);
+  });
+
   test("persists and executes the exact catalog destination", async () => {
     const context = createContext();
     const base = importInput();

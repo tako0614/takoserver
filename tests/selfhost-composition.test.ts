@@ -620,6 +620,22 @@ describe("the self-host catalog", () => {
     ]);
   });
 
+  test("self-host Cron technical offerings do not advertise native import", async () => {
+    const composition = await compose(true);
+    const cronOfferings = composition.provider.offerings.filter(
+      (offering) => offering.form.kind === "WorkerCronTrigger",
+    );
+
+    expect(cronOfferings).toHaveLength(2);
+    expect(cronOfferings.map((offering) => offering.form.apiVersion).sort()).toEqual([
+      "edge.forms.takoform.com",
+      "edge.forms.takoform.com/v1beta1",
+    ]);
+    for (const offering of cronOfferings) {
+      expect(offering.capabilities).not.toContain("import");
+    }
+  });
+
   test("advertises a runtime-input ceiling only when a sealed lease port exists", async () => {
     const unconfigured = await compose(true);
     expect(unconfigured.provider.runtimeInputCapabilities).toBeUndefined();
