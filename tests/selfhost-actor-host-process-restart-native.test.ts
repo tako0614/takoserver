@@ -4,6 +4,7 @@ import {
   chmodSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -82,12 +83,12 @@ type FormMap = Map<string, Json>;
 test.skipIf(WORKERD === null)(
   "public Host routes a released Actor over HTTP/WSS and restores it after SIGTERM Host restarts",
   async () => {
-    const fixture = join(tmpdir(), `takoserver-actor-host-restart-${crypto.randomUUID()}`);
+    const coreDigest = takoformCoreVerifierArtifactDigest();
+    const fixture = mkdtempSync(join(tmpdir(), "a-"));
     const dataRoot = join(fixture, "data");
     const home = join(fixture, "home");
     const tlsDirectory = join(fixture, "tls");
     const controlDatabase = join(fixture, "control.sqlite");
-    const coreDigest = takoformCoreVerifierArtifactDigest();
     let verifier: Child | undefined;
     let host: Child | undefined;
     let admission: Child | undefined;
@@ -95,11 +96,17 @@ test.skipIf(WORKERD === null)(
     let primaryFailure: unknown;
     let hasPrimaryFailure = false;
     try {
-      mkdirSync(fixture, { recursive: true, mode: 0o700 });
       mkdirSync(dataRoot, { recursive: true, mode: 0o700 });
       mkdirSync(home, { recursive: true, mode: 0o700 });
       mkdirSync(tlsDirectory, { recursive: true, mode: 0o700 });
       chmodSync(fixture, 0o700);
+      const worstCaseUpgradeSocket = join(
+        dataRoot,
+        "actor-forward-sockets",
+        `actor-${"x".repeat(6)}`,
+        `${"0".repeat(20)}.u.sock`,
+      );
+      expect(Buffer.byteLength(worstCaseUpgradeSocket)).toBeLessThan(100);
       await assertIsolatedSelfhostNativeEnvironment({
         fixedPorts: [HOST_PORT, PUBLIC_PROXY_PORT, CORE_PORT, WORKER_PORT],
       });
