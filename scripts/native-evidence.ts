@@ -3,9 +3,10 @@
  *
  * Tests in `tests/` exercise optional native capabilities including the pinned
  * closed-graph `workerd` build, an unqualified Actor qualification candidate,
- * public Host ObjectBucket and artifact-upload journeys, and local Docker
- * lifecycle fixtures. Binary-backed capabilities gate on operator-supplied
- * paths; Docker capabilities gate on explicit opt-ins and bounded fixtures.
+ * public Host ObjectBucket and artifact-upload journeys, a Queue HTTPS first-root
+ * diagnostic, and local Docker lifecycle fixtures. Binary-backed capabilities
+ * gate on operator-supplied paths; Docker capabilities gate on explicit opt-ins
+ * and bounded fixtures.
  *
  * That choice is correct — `selectClosedGraphWorkerd` refuses to substitute a
  * package binary for the pinned bytes — but it used to be invisible. This module
@@ -227,6 +228,57 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
         state: "ready",
         detail:
           "the exact opt-in and Linux prerequisite are present; only the gated public Host artifact upload test can establish lifecycle evidence",
+        readinessOnly: true,
+      };
+    },
+  },
+  {
+    id: "queue-https-diagnostic",
+    label: "self-host Queue HTTPS first-root diagnostic",
+    environment: "TAKOSERVER_SELFHOST_QUEUE_HTTPS_DIAGNOSTIC_NATIVE",
+    companionEnvironment: ["TAKOSERVER_WORKERD_BINARY"],
+    proves:
+      "the first-root Provider-to-workerd HTTPS diagnostic for the original Queue Worker graph; it does not prove Host/Core admission, Queue delivery, process restart, or recovery",
+    enable:
+      "TAKOSERVER_SELFHOST_QUEUE_HTTPS_DIAGNOSTIC_NATIVE=1 and TAKOSERVER_WORKERD_BINARY set to the exact pinned closed-graph artifact",
+    inspect: (configured, environment, probe) => {
+      if (configured === undefined || configured.trim() === "") {
+        return {
+          state: "unconfigured",
+          detail:
+            "TAKOSERVER_SELFHOST_QUEUE_HTTPS_DIAGNOSTIC_NATIVE is not configured; the first-root HTTPS diagnostic is disabled",
+        };
+      }
+      if (configured !== "1") {
+        return {
+          state: "invalid",
+          detail: "TAKOSERVER_SELFHOST_QUEUE_HTTPS_DIAGNOSTIC_NATIVE must be exactly 1",
+        };
+      }
+      if (process.platform !== "linux") {
+        return {
+          state: "invalid",
+          detail: "the Queue HTTPS first-root diagnostic requires Linux",
+        };
+      }
+      const workerd = NATIVE_EVIDENCE_CAPABILITIES.find((entry) => entry.id === "workerd-artifact");
+      if (!workerd) {
+        return {
+          state: "invalid",
+          detail: "the pinned workerd capability is unavailable",
+        };
+      }
+      const status = workerd.inspect(environment.TAKOSERVER_WORKERD_BINARY, environment, probe);
+      if (status.state !== "ready") {
+        return {
+          state: "invalid",
+          detail: `the Queue HTTPS diagnostic requires the pinned workerd artifact: ${status.detail}`,
+        };
+      }
+      return {
+        state: "ready",
+        detail:
+          "the exact opt-in and pinned workerd artifact are configured; only the gated first-root HTTPS diagnostic can establish evidence",
         readinessOnly: true,
       };
     },

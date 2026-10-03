@@ -18,6 +18,7 @@ const WORKERD_DIGEST = WORKERD_CLOSED_GRAPH_ARTIFACT.sha256;
 const DOCKER_LIFECYCLE_ENV = "TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE";
 const OBJECT_BUCKET_HOST_RESTART_ENV = "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART";
 const SELFHOST_ARTIFACT_UPLOAD_ENV = "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE";
+const QUEUE_HTTPS_DIAGNOSTIC_ENV = "TAKOSERVER_SELFHOST_QUEUE_HTTPS_DIAGNOSTIC_NATIVE";
 
 const DOCKER_FIXTURE_ENVIRONMENT = {
   TAKOSERVER_NATIVE_CONTAINER_IMAGE_A: `registry.example.test/takoserver/a@sha256:${"a".repeat(64)}`,
@@ -205,6 +206,60 @@ test("validates the artifact upload opt-in as readiness only", () => {
   expect(capability.proves).toContain("V1 upload start/blob/commit followed by V2 upload start");
   expect(capability.proves).toContain("without Form admission");
   expect(capability.proves).not.toContain("Cloudflare");
+});
+
+test("classifies the Queue HTTPS diagnostic gate as its own pinned-workerd capability", () => {
+  const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));
+  const diagnostic = gates.filter(
+    (gate) =>
+      gate.file === "tests/selfhost-workerd-e2e.test.ts" &&
+      gate.environments.includes(QUEUE_HTTPS_DIAGNOSTIC_ENV),
+  );
+
+  expect(diagnostic).toHaveLength(1);
+  expect(diagnostic[0]?.capabilities).toEqual(["queue-https-diagnostic"]);
+  expect(diagnostic[0]?.capability).toBe("queue-https-diagnostic");
+  expect(gates.every((gate) => gate.capability !== null)).toBe(true);
+});
+
+test("validates the Queue HTTPS diagnostic opt-in and pinned workerd readiness only", () => {
+  const capability = NATIVE_EVIDENCE_CAPABILITIES.find(
+    (entry) => entry.id === "queue-https-diagnostic",
+  );
+  if (!capability) throw new Error("queue HTTPS diagnostic capability missing");
+
+  expect(capability.environment).toBe(QUEUE_HTTPS_DIAGNOSTIC_ENV);
+  expect(capability.companionEnvironment).toEqual(["TAKOSERVER_WORKERD_BINARY"]);
+  expect(capability.inspect(undefined, {}, probe()).state).toBe("unconfigured");
+  expect(capability.inspect("0", {}, probe()).state).toBe("invalid");
+  const missingWorkerd = capability.inspect("1", {}, probe());
+  expect(missingWorkerd.state).toBe("invalid");
+  expect(missingWorkerd.detail).toContain(
+    process.platform === "linux" ? "requires the pinned workerd artifact" : "requires Linux",
+  );
+  expect(
+    capability.inspect("1", { TAKOSERVER_WORKERD_BINARY: "relative/workerd" }, probe()).state,
+  ).toBe("invalid");
+
+  const ready = capability.inspect(
+    "1",
+    { TAKOSERVER_WORKERD_BINARY: "/native/workerd" },
+    probe({ digests: { "/native/workerd": WORKERD_DIGEST } }),
+  );
+  expect(ready.state).toBe(process.platform === "linux" ? "ready" : "invalid");
+  if (process.platform === "linux") expect(ready.readinessOnly).toBe(true);
+
+  expect(
+    capability.inspect(
+      "1",
+      { TAKOSERVER_WORKERD_BINARY: "/native/workerd" },
+      probe({ digests: { "/native/workerd": "0".repeat(64) } }),
+    ).state,
+  ).toBe("invalid");
+  expect(capability.proves).toContain("first-root Provider-to-workerd HTTPS diagnostic");
+  expect(capability.proves).toContain("does not prove Host/Core admission");
+  expect(capability.proves).toContain("does not prove Host/Core admission, Queue delivery");
+  expect(capability.proves).toContain("process restart, or recovery");
 });
 
 test("registers the Docker lifecycle gate's exact eleven fixture inputs as companions", () => {

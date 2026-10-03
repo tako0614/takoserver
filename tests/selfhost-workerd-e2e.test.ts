@@ -1,9 +1,20 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { connect as connectTcp } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough, type Readable } from "node:stream";
 import { createEphemeralSql } from "../src/compat.ts";
 import type { JsonObject } from "../src/ports.ts";
 import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
@@ -19,7 +30,12 @@ import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
 import { createSelfhostObjectStore } from "../src/selfhost-object-store.ts";
 import { createSelfhostQueuePump } from "../src/selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "../src/selfhost-scheduler.ts";
-import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
+import {
+  createWorkerdRuntime,
+  type HostedWorkerdRuntime,
+  type WorkerdTlsKeypair,
+} from "../src/workerd-runtime.ts";
+import { assertIsolatedSelfhostNativeEnvironment } from "./helpers/isolated-selfhost-native.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 /**
@@ -62,6 +78,42 @@ const MODULE_WORKER_SERVICE_BINDING_REF = {
 // This suite is serving evidence only for the pinned native runtime. Falling
 // back to the npm workerd would exercise the known-open resolver instead.
 const WORKERD = nativeEvidenceBinary("workerd-artifact") ?? null;
+const QUEUE_HTTPS_DIAGNOSTIC = nativeEvidenceBinary("queue-https-diagnostic") ?? null;
+const QUEUE_RESTART_HOSTNAME = "queue-worker.apps.queue-process-restart.test";
+const QUEUE_RESTART_SUFFIX = "apps.queue-process-restart.test";
+const QUEUE_RESTART_BUCKET_ID = `tsb-${"b".repeat(40)}`;
+
+const QUEUE_RESTART_WORKER_SOURCE = `async function seen(env) {
+  const value = await env.KV.get("seen");
+  return value === null ? [] : JSON.parse(new TextDecoder().decode(value));
+}
+export default {
+  async fetch(request, env) {
+    const path = new URL(request.url).pathname;
+    if (path === "/send" && request.method === "POST") {
+      return Response.json({ id: await env.QUEUE.send("host-process-restart") });
+    }
+    if (path === "/seen") return Response.json({ seen: await seen(env) });
+    if (path === "/object") {
+      const object = await env.BUCKET.get("queue-recovery/effect");
+      return object === null ? new Response(null, { status: 404 }) : new Response(object.body);
+    }
+    return Response.json({ ready: true });
+  },
+  async queue(batch, env) {
+    const observed = await seen(env);
+    for (const message of batch.messages) {
+      observed.push({ id: message.id, attempts: message.attempts });
+      if (message.attempts === 1) {
+        await env.BUCKET.put("queue-recovery/effect", "persisted-before-unknown-ack");
+      } else if (await env.BUCKET.get("queue-recovery/effect") === null) {
+        throw new Error("object did not survive Host restart");
+      }
+    }
+    await env.KV.put("seen", JSON.stringify(observed));
+    for (const message of batch.messages) message.acknowledge();
+  },
+};`;
 
 const TENANT_MODULE = `export default {
   async fetch(request, env) {
@@ -349,9 +401,11 @@ const identity = (name: string) => ({ tenantRef: "org_demo", space: "default", n
 let root: string;
 let planeServer: { stop(closeActive?: boolean): void } | undefined;
 let workerd: ReturnType<typeof Bun.spawn> | undefined;
+let preserveRootForOwnedChild = false;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-e2e-"));
+  preserveRootForOwnedChild = false;
 });
 
 afterEach(async () => {
@@ -366,7 +420,7 @@ afterEach(async () => {
   }
   planeServer?.stop(true);
   planeServer = undefined;
-  rmSync(root, { recursive: true, force: true });
+  if (!preserveRootForOwnedChild) rmSync(root, { recursive: true, force: true });
 });
 
 async function reachable(url: string, attempts = 80): Promise<boolean> {
@@ -1175,6 +1229,33 @@ interface EventVersionFixture {
   readonly module: string;
   readonly weight: number;
   readonly vars?: JsonObject;
+  readonly objectBucket?: boolean;
+  readonly handlers?: readonly ("fetch" | "queue" | "scheduled")[];
+}
+
+type SelfhostProvider = ReturnType<typeof createSelfhostProvider>;
+
+async function attachEventQueueConsumer(local: SelfhostProvider) {
+  return local.apply({
+    operationId: "op_consumer",
+    offering: offering("QueueConsumer"),
+    identity: identity("hello-consumer"),
+    spec: {
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      queue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: QUEUE_NAME },
+      deadLetterQueue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery-dlq" },
+      maxBatchSize: 10,
+      maxBatchTimeoutSeconds: 0,
+      maxRetries: 3,
+      retryDelaySeconds: 60,
+      maxConcurrency: 4,
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", "hello"),
+      queueRelation("/queue", QUEUE_NAME, QUEUE_ID),
+      queueRelation("/deadLetterQueue", "delivery-dlq", DLQ_ID),
+    ],
+  });
 }
 
 /** Publishes a Worker that produces, consumes, and is scheduled, then boots it. */
@@ -1182,13 +1263,29 @@ async function bootEvents(
   versions: readonly EventVersionFixture[] = [
     { name: "hello-v1", module: EVENT_MODULE, weight: 10_000 },
   ],
+  options: {
+    readonly watchConfig?: boolean;
+    readonly attachQueueConsumer?: boolean;
+    readonly attachCron?: boolean;
+    readonly workerPort?: number;
+    readonly tls?: WorkerdTlsKeypair;
+    readonly endpointHostname?: string;
+    readonly endpointSuffix?: string;
+    readonly providerSetupOnly?: boolean;
+    readonly runtime?: HostedWorkerdRuntime;
+    readonly onPhase?: (phase: string) => void;
+  } = {},
 ): Promise<{
   readonly origin: string;
+  readonly endpointOrigin: string;
+  readonly firstHttpsResponse?: { readonly status: number; readonly body: unknown };
   readonly script: string;
   readonly workerdPort: number;
   readonly sql: ReturnType<typeof createEphemeralSql>;
+  readonly local: SelfhostProvider;
   readonly runtime: ReturnType<typeof createWorkerdRuntime>;
   readonly targets: ReturnType<typeof createSelfhostEventTargets>;
+  readonly reloadCount: () => number;
 }> {
   const sql = createEphemeralSql();
   const access = createSelfhostDataPlaneAccess(root);
@@ -1200,22 +1297,42 @@ async function bootEvents(
   });
   planeServer = served;
 
-  const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
-  const workerdPort = Number(reserved.port);
-  reserved.stop(true);
+  const workerdPort =
+    options.workerPort ??
+    (() => {
+      const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+      const port = Number(reserved.port);
+      reserved.stop(true);
+      return port;
+    })();
   const origin = `http://127.0.0.1:${workerdPort}`;
-  const runtime = createWorkerdRuntime({
-    root,
-    binary: WORKERD,
-    port: workerdPort,
-    isReady: () => true,
-  });
+  const endpointHostname = options.endpointHostname ?? HOSTNAME;
+  let reloads = 0;
+  const start = async (): Promise<void> => {
+    reloads += 1;
+    if (workerd) return;
+    workerd = Bun.spawn(
+      [WORKERD as string, "serve", "--watch", join(root, "workers", "workerd.capnp")],
+      { env: {}, stdout: "ignore", stderr: "ignore" },
+    );
+    expect(await reachable(`${origin}/`), "workerd initial watched readiness").toBe(true);
+  };
+  const runtime =
+    options.runtime ??
+    createWorkerdRuntime({
+      root,
+      binary: WORKERD,
+      port: workerdPort,
+      ...(options.tls === undefined ? {} : { tls: options.tls }),
+      isReady: () => true,
+      ...(options.watchConfig ? { onReload: start } : {}),
+    });
   const local = createSelfhostProvider({
     offerings: [],
     dataRoot: root,
     runtime,
     dataPlaneAddress: served.address,
-    suffixes: ["localhost"],
+    suffixes: [options.endpointSuffix ?? "localhost"],
     events: { async forgetSchedules() {} },
     artifacts: {
       async manifest(_tenant, digest) {
@@ -1245,13 +1362,25 @@ async function bootEvents(
   const script = worker.phase === "succeeded" ? String(worker.result.outputs.scriptName) : "";
 
   for (const fixture of versions) {
+    const bucketBinding = fixture.objectBucket
+      ? {
+          ...deployed(
+            "/bucketBindings/0/resource",
+            "ObjectBucket",
+            "queue-restart-bucket",
+            `selfhost-bucket:${QUEUE_RESTART_BUCKET_ID}`,
+            { bucketName: QUEUE_RESTART_BUCKET_ID },
+          ),
+          bindingRef: EDGE_OBJECTS_BINDING_REF,
+        }
+      : undefined;
     const version = await local.apply({
       operationId: `op_version_${fixture.name}`,
       offering: offering("WorkerVersion"),
       identity: identity(fixture.name),
       spec: {
         bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: `bundle-${fixture.name}` },
-        handlers: ["fetch", "queue", "scheduled"],
+        handlers: fixture.handlers ?? ["fetch", "queue", "scheduled"],
         worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
         ...(fixture.vars === undefined ? {} : { vars: fixture.vars }),
         kvBindings: [
@@ -1266,9 +1395,27 @@ async function bootEvents(
             resource: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: QUEUE_NAME },
           },
         ],
+        ...(bucketBinding
+          ? {
+              bucketBindings: [
+                {
+                  name: "BUCKET",
+                  resource: {
+                    apiVersion: EDGE_API,
+                    kind: "ObjectBucket",
+                    name: "queue-restart-bucket",
+                  },
+                },
+              ],
+            }
+          : {}),
       },
       relations: [
-        relation("/worker", "ModuleWorker", "hello"),
+        fixture.objectBucket
+          ? deployed("/worker", "ModuleWorker", "hello", `selfhost-worker:${script}`, {
+              scriptName: script,
+            })
+          : relation("/worker", "ModuleWorker", "hello"),
         relation("/bundle", "WorkerBundle", `bundle-${fixture.name}`, {
           manifestDigest: `sha256:event-bundle-${fixture.name}`,
         }),
@@ -1280,8 +1427,31 @@ async function bootEvents(
           { namespaceId: KV_NAMESPACE },
         ),
         queueRelation("/queueProducerBindings/0/resource", QUEUE_NAME, QUEUE_ID),
+        ...(bucketBinding ? [bucketBinding] : []),
       ],
+      ...(bucketBinding
+        ? {
+            runtimeBindings: [
+              {
+                name: "BUCKET",
+                targetUid: bucketBinding.targetUid,
+                bindingRef: EDGE_OBJECTS_BINDING_REF,
+                material: {
+                  kind: SELFHOST_EDGE_OBJECTS_MATERIAL_KIND,
+                  bucketId: QUEUE_RESTART_BUCKET_ID,
+                },
+              },
+            ],
+          }
+        : {}),
     });
+    if (options.onPhase) {
+      options.onPhase(
+        version.phase === "failed"
+          ? `provider_worker_version_failed_${version.failure.code}`
+          : `provider_worker_version_${version.phase}`,
+      );
+    }
     expect(version.phase).toBe("succeeded");
   }
 
@@ -1312,61 +1482,499 @@ async function bootEvents(
     spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
     relations: [relation("/worker", "ModuleWorker", "hello")],
     workerEndpointOriginAssignment: {
-      canonicalPublicOrigin: `https://${HOSTNAME}`,
+      canonicalPublicOrigin: `https://${endpointHostname}`,
       assignmentDigest: `sha256:${"e".repeat(64)}`,
     },
   });
   expect(endpoint.phase).toBe("succeeded");
+  const endpointOrigin = endpoint.phase === "succeeded" ? String(endpoint.result.outputs.url) : "";
+  options.onPhase?.("provider_published");
 
-  const consumer = await local.apply({
-    operationId: "op_consumer",
-    offering: offering("QueueConsumer"),
-    identity: identity("hello-consumer"),
-    spec: {
-      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
-      queue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: QUEUE_NAME },
-      deadLetterQueue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery-dlq" },
-      maxBatchSize: 10,
-      maxBatchTimeoutSeconds: 0,
-      maxRetries: 3,
-      retryDelaySeconds: 60,
-      maxConcurrency: 4,
-    },
-    relations: [
-      relation("/worker", "ModuleWorker", "hello"),
-      queueRelation("/queue", QUEUE_NAME, QUEUE_ID),
-      queueRelation("/deadLetterQueue", "delivery-dlq", DLQ_ID),
-    ],
-  });
-  expect(consumer).toMatchObject({
-    phase: "succeeded",
-    result: { observed: { delivering: true } },
-  });
+  if (options.providerSetupOnly) {
+    return {
+      origin,
+      endpointOrigin,
+      script,
+      workerdPort,
+      sql,
+      local,
+      runtime,
+      targets: createSelfhostEventTargets(root),
+      reloadCount: () => reloads,
+    };
+  }
 
-  const trigger = await local.apply({
-    operationId: "op_cron",
-    offering: offering("WorkerCronTrigger"),
-    identity: identity("hello-cron"),
-    spec: {
-      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
-      cron: CRON,
-    },
-    relations: [relation("/worker", "ModuleWorker", "hello")],
-  });
-  expect(trigger).toMatchObject({
-    phase: "succeeded",
-    result: { observed: { scheduled: true } },
-  });
+  if (options.attachQueueConsumer ?? true) {
+    const consumer = await attachEventQueueConsumer(local);
+    expect(consumer).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { delivering: true } },
+    });
+    options.onPhase?.("queue_consumer_attached");
+  }
 
-  workerd = Bun.spawn([WORKERD as string, "serve", join(root, "workers", "workerd.capnp")], {
-    env: {},
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  expect(await reachable(`${origin}/`)).toBe(true);
+  if (options.attachCron ?? true) {
+    const trigger = await local.apply({
+      operationId: "op_cron",
+      offering: offering("WorkerCronTrigger"),
+      identity: identity("hello-cron"),
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        cron: CRON,
+      },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    expect(trigger).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { scheduled: true } },
+    });
+  }
 
-  return { origin, script, workerdPort, sql, runtime, targets: createSelfhostEventTargets(root) };
+  if (!options.watchConfig) {
+    workerd = Bun.spawn([WORKERD as string, "serve", join(root, "workers", "workerd.capnp")], {
+      env: {},
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+  }
+  options.onPhase?.("workerd_spawned");
+  let firstHttpsResponse: { readonly status: number; readonly body: unknown } | undefined;
+  if (options.tls) {
+    await waitForTcpListener(workerdPort);
+    options.onPhase?.("workerd_tcp_ready");
+    firstHttpsResponse = await requestQueueDiagnosticRoot(
+      endpointHostname,
+      options.tls.certificateChain,
+      (phase) => options.onPhase?.(phase),
+    );
+    expect(firstHttpsResponse.status, "workerd first HTTPS root response").toBe(200);
+    expect(firstHttpsResponse.body, "workerd first HTTPS root body").toEqual({ ready: true });
+  } else {
+    expect(await reachable(`${origin}/`), "workerd published root readiness").toBe(true);
+  }
+  options.onPhase?.("workerd_ready");
+
+  return {
+    origin,
+    endpointOrigin,
+    ...(firstHttpsResponse === undefined ? {} : { firstHttpsResponse }),
+    script,
+    workerdPort,
+    sql,
+    local,
+    runtime,
+    targets: createSelfhostEventTargets(root),
+    reloadCount: () => reloads,
+  };
 }
+
+function providerSetupRuntime(): HostedWorkerdRuntime {
+  return {
+    inspectModule: async () => ({ outcome: "valid", exportedHandlers: ["fetch", "queue"] }),
+    async write() {},
+    async remove() {},
+    async reload() {},
+    async has() {
+      return true;
+    },
+    async restore() {
+      return [];
+    },
+    async acquirePrivateServiceBindings() {
+      throw new Error("unexpected private service binding acquisition");
+    },
+  };
+}
+
+test("Queue EventVersion with ObjectBucket validates its worker installation relation", async () => {
+  const phases: string[] = [];
+  let endpointOrigin: string | undefined;
+  try {
+    const fixture = await bootEvents(
+      [
+        {
+          name: "queue-restart-version",
+          module: QUEUE_RESTART_WORKER_SOURCE,
+          weight: 10_000,
+          objectBucket: true,
+          handlers: ["fetch", "queue"],
+        },
+      ],
+      {
+        attachQueueConsumer: false,
+        attachCron: false,
+        providerSetupOnly: true,
+        runtime: providerSetupRuntime(),
+        onPhase: (phase) => phases.push(phase),
+      },
+    );
+    endpointOrigin = fixture.endpointOrigin;
+  } catch {
+    // Provider setup diagnostics intentionally retain only a closed step/code marker.
+  }
+  expect(phases).toContain("provider_worker_version_succeeded");
+  expect(phases).toContain("provider_published");
+  expect(endpointOrigin).toBe(new URL(`https://${HOSTNAME}`).href);
+});
+
+test.skipIf(WORKERD === null)(
+  "attaching a QueueConsumer republishes a live Worker without breaking its root route",
+  async () => {
+    const { origin, script, local, reloadCount } = await bootEvents(undefined, {
+      watchConfig: true,
+      attachQueueConsumer: false,
+      attachCron: false,
+    });
+    const assertDefaultRoot = async (phase: string): Promise<void> => {
+      const response = await fetch(`${origin}/`, {
+        headers: { host: HOSTNAME },
+        signal: AbortSignal.timeout(2_000),
+      });
+      expect(response.status, `${phase}: root GET status`).toBe(200);
+      expect(await response.json(), `${phase}: root GET body`).toEqual({ ok: true });
+    };
+
+    await assertDefaultRoot("before QueueConsumer attachment");
+    const renderedEventGate = () =>
+      readFileSync(join(root, "workers", "workerd.capnp"), "utf8").includes(
+        `${script}-selfhost-events`,
+      );
+    expect(renderedEventGate(), "pre-attachment rendered event gate").toBe(false);
+    const reloadsBeforeAttachment = reloadCount();
+    const consumer = await attachEventQueueConsumer(local);
+    expect(consumer).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { delivering: true } },
+    });
+    expect(reloadCount(), "QueueConsumer attachment publication reload").toBeGreaterThan(
+      reloadsBeforeAttachment,
+    );
+    expect(renderedEventGate(), "post-attachment rendered event gate").toBe(true);
+    await assertDefaultRoot("after QueueConsumer attachment and publication reload");
+  },
+  60_000,
+);
+
+// This is a local Provider→workerd first-root diagnostic, not Host/Core
+// admission, external API, queue delivery, or restart evidence. No queue is sent.
+test.skipIf(QUEUE_HTTPS_DIAGNOSTIC === null)(
+  "diagnoses the original Queue Worker graph through its claimed HTTPS endpoint",
+  async () => {
+    if (QUEUE_HTTPS_DIAGNOSTIC !== "1") {
+      throw new Error("queue_https_diagnostic_opt_in_must_be_exactly_1");
+    }
+    if (!WORKERD) throw new Error("pinned_workerd_artifact_required");
+    await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [443] });
+    const tlsDirectory = join(root, "queue-https-tls");
+    mkdirSync(tlsDirectory, { recursive: true, mode: 0o700 });
+    const tls = await createQueueDiagnosticTls(tlsDirectory);
+    const phases: string[] = [];
+    let fixture: Awaited<ReturnType<typeof bootEvents>>;
+    try {
+      fixture = await bootEvents(
+        [
+          {
+            name: "queue-restart-version",
+            module: QUEUE_RESTART_WORKER_SOURCE,
+            weight: 10_000,
+            objectBucket: true,
+            handlers: ["fetch", "queue"],
+          },
+        ],
+        {
+          attachQueueConsumer: true,
+          attachCron: false,
+          endpointHostname: QUEUE_RESTART_HOSTNAME,
+          endpointSuffix: QUEUE_RESTART_SUFFIX,
+          workerPort: 443,
+          tls,
+          onPhase: (phase) => phases.push(phase),
+        },
+      );
+    } catch {
+      throw new Error(`queue_https_diagnostic_failed_after_${phases.at(-1) ?? "fixture_setup"}`);
+    }
+
+    if (!workerd) throw new Error("queue_https_diagnostic_workerd_not_started");
+    await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: workerd });
+    expect(fixture.endpointOrigin).toBe(new URL(`https://${QUEUE_RESTART_HOSTNAME}`).href);
+    expect(fixture.firstHttpsResponse).toEqual({ status: 200, body: { ready: true } });
+
+    expect(phases).toEqual([
+      "provider_worker_version_succeeded",
+      "provider_published",
+      "queue_consumer_attached",
+      "workerd_spawned",
+      "workerd_tcp_ready",
+      "tcp_connected",
+      "tls_connected",
+      "response_headers",
+      "response_complete",
+      "workerd_ready",
+    ]);
+  },
+  60_000,
+);
+
+async function createQueueDiagnosticTls(directory: string): Promise<WorkerdTlsKeypair> {
+  const keyPath = join(directory, "worker-key.pem");
+  const certificatePath = join(directory, "worker-cert.pem");
+  const generated = Bun.spawn(
+    [
+      "openssl",
+      "req",
+      "-x509",
+      "-newkey",
+      "rsa:2048",
+      "-nodes",
+      "-keyout",
+      keyPath,
+      "-out",
+      certificatePath,
+      "-days",
+      "1",
+      "-subj",
+      "/CN=queue-process-restart-diagnostic",
+      "-addext",
+      `subjectAltName=DNS:*.${QUEUE_RESTART_SUFFIX},IP:127.0.0.1`,
+    ],
+    { stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+  );
+  const exit = await waitForOwnedChild(generated, 10_000);
+  if (exit === null) {
+    const stopped = await stopAndReapOwnedChild(generated);
+    if (!stopped) {
+      preserveRootForOwnedChild = true;
+      throw new Error("queue_diagnostic_certificate_child_unreaped");
+    }
+    throw new Error("queue_diagnostic_certificate_generation_timeout");
+  }
+  if (exit !== 0) throw new Error("queue_diagnostic_certificate_generation_failed");
+  chmodSync(keyPath, 0o600);
+  chmodSync(certificatePath, 0o600);
+  return {
+    privateKey: readFileSync(keyPath, "utf8"),
+    certificateChain: readFileSync(certificatePath, "utf8"),
+  };
+}
+
+async function waitForOwnedChild(
+  child: ReturnType<typeof Bun.spawn>,
+  timeoutMs: number,
+): Promise<number | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const result = await Promise.race([
+    child.exited.then((exitCode) => ({ exitCode })),
+    new Promise<{ readonly exitCode: null }>((resolve) => {
+      timer = setTimeout(() => resolve({ exitCode: null }), timeoutMs);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  return result.exitCode;
+}
+
+async function stopAndReapOwnedChild(child: ReturnType<typeof Bun.spawn>): Promise<boolean> {
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    // Reaping below is the authority; signal errors remain private.
+  }
+  if ((await waitForOwnedChild(child, 1_000)) !== null) return true;
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // Reaping below is the authority; signal errors remain private.
+  }
+  return (await waitForOwnedChild(child, 1_000)) !== null;
+}
+
+function requestQueueDiagnosticRoot(
+  hostname: string,
+  ca: string,
+  onPhase: (phase: string) => void,
+): Promise<{ readonly status: number; readonly body: unknown }> {
+  return new Promise((resolve, reject) => {
+    let phase = "tcp_connect";
+    let settled = false;
+    let cancelWallDeadline = (): void => {};
+    let responseStream: Readable | undefined;
+    const fail = (diagnostic: string): void => {
+      if (settled) return;
+      settled = true;
+      cancelWallDeadline();
+      reject(new Error(diagnostic));
+    };
+    const request = httpsRequest(
+      {
+        hostname: "127.0.0.1",
+        port: 443,
+        servername: hostname,
+        path: "/",
+        method: "GET",
+        ca,
+        headers: { host: hostname },
+      },
+      (response) => {
+        phase = "response_body";
+        responseStream = response;
+        onPhase("response_headers");
+        void readQueueDiagnosticBody(response).then(
+          (bodyBytes) => {
+            if (settled) return;
+            let body: unknown;
+            try {
+              body = JSON.parse(bodyBytes.toString("utf8"));
+            } catch {
+              fail("queue_https_response_body_invalid");
+              return;
+            }
+            settled = true;
+            cancelWallDeadline();
+            onPhase("response_complete");
+            resolve({ status: response.statusCode ?? 500, body });
+          },
+          (error: unknown) => {
+            const diagnostic =
+              error instanceof Error && error.message === "queue_https_response_body_exceeded"
+                ? "queue_https_response_body_exceeded"
+                : "queue_https_response_body_failed";
+            fail(diagnostic);
+            request.destroy();
+            response.destroy();
+          },
+        );
+      },
+    );
+    request.on("socket", (socket) => {
+      socket.once("connect", () => {
+        phase = "tls_handshake";
+        onPhase("tcp_connected");
+      });
+      socket.once("secureConnect", () => {
+        phase = "response_headers";
+        onPhase("tls_connected");
+      });
+    });
+    request.setTimeout(2_000, () => {
+      fail(`queue_https_${phase}_idle_timeout`);
+      responseStream?.destroy();
+      request.destroy();
+    });
+    request.on("error", () => fail(`queue_https_${phase}_failed`));
+    cancelWallDeadline = scheduleQueueDiagnosticWallDeadline(2_000, () => {
+      fail(`queue_https_${phase}_wall_timeout`);
+      responseStream?.destroy();
+      request.destroy();
+    });
+    request.end();
+  });
+}
+
+function scheduleQueueDiagnosticWallDeadline(timeoutMs: number, onExpire: () => void): () => void {
+  let active = true;
+  const timer = setTimeout(() => {
+    if (!active) return;
+    active = false;
+    onExpire();
+  }, timeoutMs);
+  return () => {
+    if (!active) return;
+    active = false;
+    clearTimeout(timer);
+  };
+}
+
+function readQueueDiagnosticBody(response: Readable): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const fail = (code: string): void => {
+      if (settled) return;
+      settled = true;
+      response.destroy();
+      reject(new Error(code));
+    };
+    response.on("data", (chunk: Buffer | string) => {
+      const chunkBytes = typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength;
+      if (bytes + chunkBytes > 4_096) {
+        fail("queue_https_response_body_exceeded");
+        return;
+      }
+      const boundedChunk = Buffer.from(chunk);
+      bytes += chunkBytes;
+      chunks.push(boundedChunk);
+    });
+    response.on("error", () => fail("queue_https_response_body_failed"));
+    response.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks, bytes));
+    });
+  });
+}
+
+test("Queue HTTPS diagnostic cancels its absolute deadline after completion", async () => {
+  let expired = false;
+  const cancel = scheduleQueueDiagnosticWallDeadline(20, () => {
+    expired = true;
+  });
+  cancel();
+  await new Promise<void>((resolve) => setTimeout(resolve, 30));
+  expect(expired).toBe(false);
+});
+
+async function waitForTcpListener(port: number, attempts = 80): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const connected = await new Promise<boolean>((resolve) => {
+      const socket = connectTcp({ host: "127.0.0.1", port });
+      let settled = false;
+      const finish = (result: boolean): void => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolve(result);
+      };
+      socket.once("connect", () => finish(true));
+      socket.once("error", () => finish(false));
+      socket.setTimeout(250, () => finish(false));
+    });
+    if (connected) return;
+    await new Promise<void>((wake) => setTimeout(wake, 50));
+  }
+  throw new Error("workerd_tcp_readiness_timeout");
+}
+
+test("Queue HTTPS diagnostic wall deadline is absolute under trickled activity", async () => {
+  const response = new PassThrough();
+  let timedOut = false;
+  let requestDestroyed = false;
+  const request = {
+    destroy() {
+      requestDestroyed = true;
+      response.destroy();
+      return request;
+    },
+  };
+  const cancel = scheduleQueueDiagnosticWallDeadline(30, () => {
+    timedOut = true;
+    request.destroy();
+  });
+  const activity = setInterval(() => response.write("x"), 5);
+  await new Promise<void>((resolve) => response.once("close", resolve));
+  clearInterval(activity);
+  cancel();
+  expect(timedOut).toBe(true);
+  expect(requestDestroyed).toBe(true);
+});
+
+test("Queue HTTPS diagnostic body rejects before buffering beyond 4KiB", async () => {
+  const response = new PassThrough();
+  const pending = readQueueDiagnosticBody(response);
+  response.write(Buffer.alloc(4_097));
+  await expect(pending).rejects.toThrow("queue_https_response_body_exceeded");
+  expect(response.destroyed).toBe(true);
+});
 
 test.skipIf(WORKERD === null)(
   "a Worker sends into its own queue, the pump delivers the batch, and the handler acks",
