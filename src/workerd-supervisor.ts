@@ -38,6 +38,12 @@ export interface WorkerdSupervisor {
   stop(): void;
 }
 
+/** The concrete supervisor owned by a Host composition, including terminal teardown. */
+export interface WorkerdSupervisorLifecycle extends WorkerdSupervisor {
+  /** Signal the captured child and prove its exit and listener vacancy. */
+  shutdown(): Promise<void>;
+}
+
 export type WorkerdSupervisorState = "idle" | "starting" | "serving" | "recovering" | "unavailable";
 
 export interface WorkerdSupervisorSnapshot {
@@ -106,7 +112,7 @@ export function createWorkerdSupervisor(options: {
   readonly log?: (message: string) => void;
   /** Internal clock seam for deterministic recovery tests. */
   readonly scheduleRestart?: ScheduleRestart;
-}): WorkerdSupervisor {
+}): WorkerdSupervisorLifecycle {
   const scheduleRestart =
     options.scheduleRestart ??
     ((run, delayMs) => {
@@ -128,6 +134,8 @@ export function createWorkerdSupervisor(options: {
   let stoppedAfterRequiredRuntime = false;
   let nextEpoch = 0;
   let nextRestartId = 0;
+  let shutdownRequested = false;
+  let shutdownPromise: Promise<void> | null = null;
   const listenerOwnership = options.listenerOwnership ?? workerPortOwnership;
 
   const logRecoveryDiagnostic = (message: string): void => {
@@ -246,6 +254,9 @@ export function createWorkerdSupervisor(options: {
     if (running !== entry) return;
     const shouldRecover = entry.ready && isDesiredEpoch(entry.epoch);
     running = null;
+    // A rejected exited promise is not evidence that the child died, even if
+    // the port is currently empty. Keep its identity for awaited shutdown.
+    if (code === null && options.listenerPort !== undefined) retiring = entry;
     if (!shouldRecover) return;
 
     const safeCode =
@@ -375,7 +386,12 @@ export function createWorkerdSupervisor(options: {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        exited.then(() => undefined),
+        exited.then(
+          () => undefined,
+          () => {
+            throw new Error("workerd runtime child exit cannot be confirmed");
+          },
+        ),
         new Promise<never>((_resolve, reject) => {
           timer = setTimeout(
             () => reject(new Error("workerd runtime child exit was not confirmed in time")),
@@ -435,8 +451,53 @@ export function createWorkerdSupervisor(options: {
     return Object.freeze({ state });
   };
 
+  const stopRuntime = (): void => {
+    stoppedAfterRequiredRuntime =
+      desired !== null ||
+      running !== null ||
+      starting !== null ||
+      retiring !== null ||
+      pendingRestart !== null ||
+      firstStartFailed ||
+      stoppedAfterRequiredRuntime;
+    nextEpoch += 1;
+    desired = null;
+    firstStartFailed = false;
+    checking = null;
+    cancelPendingRestart();
+    const entry = running;
+    if (entry) retire(entry);
+    // An in-flight readiness completion cannot revive this child.
+    starting = null;
+  };
+
+  const proveShutdown = async (): Promise<void> => {
+    const required =
+      running !== null ||
+      retiring !== null ||
+      desired !== null ||
+      starting !== null ||
+      pendingRestart !== null ||
+      firstStartFailed ||
+      stoppedAfterRequiredRuntime;
+    stopRuntime();
+    const entry = retiring;
+    if (entry) {
+      kill(entry);
+      await waitForExit(entry);
+    }
+    if (!required) return;
+    const port = options.listenerPort;
+    if (port === undefined)
+      throw new Error("workerd listener port is required to confirm shutdown");
+    if ((await listenerOwnership(port, undefined)) !== "vacant") {
+      throw new Error("workerd listener port is occupied after shutdown");
+    }
+  };
+
   return {
     ensure(configPath) {
+      if (shutdownRequested) return Promise.reject(new Error("workerd runtime has been shut down"));
       if (checking) return checking;
       if (starting) return starting.promise;
       if (running?.ready) {
@@ -545,22 +606,26 @@ export function createWorkerdSupervisor(options: {
     },
 
     stop() {
-      stoppedAfterRequiredRuntime =
-        desired !== null ||
-        running !== null ||
-        starting !== null ||
-        pendingRestart !== null ||
-        firstStartFailed;
-      nextEpoch += 1;
-      desired = null;
-      firstStartFailed = false;
-      checking = null;
-      cancelPendingRestart();
-      const entry = running;
-      if (entry) retire(entry);
-      // Invalidate the in-flight promise as well. Its readiness completion may
-      // still arrive later, but it can no longer replace a subsequent ensure.
-      starting = null;
+      stopRuntime();
+    },
+
+    shutdown() {
+      if (shutdownPromise) return shutdownPromise;
+      shutdownRequested = true;
+      // Publish the single flight before synchronous cancellation callbacks can
+      // reenter, then fence queued restart callbacks before this turn yields.
+      let resolve!: () => void;
+      let reject!: (reason: unknown) => void;
+      const promise = new Promise<void>((ok, fail) => {
+        resolve = ok;
+        reject = fail;
+      });
+      shutdownPromise = promise;
+      void proveShutdown().then(resolve, reject);
+      void promise.then(undefined, () => {
+        if (shutdownPromise === promise) shutdownPromise = null;
+      });
+      return promise;
     },
   };
 }

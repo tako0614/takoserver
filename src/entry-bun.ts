@@ -53,6 +53,10 @@ import {
 import { createSelfhostContainerEndpointIngress } from "./selfhost-container-endpoint-ingress.ts";
 import { serveSelfhostDataPlanes } from "./selfhost-data-planes.ts";
 import {
+  closeSelfhostEntryOwnedResources,
+  createSelfhostEntryShutdown,
+} from "./selfhost-entry-shutdown.ts";
+import {
   createSelfhostBunFetchHandler,
   createSelfhostHealthHandler,
   discardSelfhostReadinessProbeBody,
@@ -257,20 +261,18 @@ if (databasePath !== ":memory:") mkdirSync(dirname(databasePath), { recursive: t
 // The Bun control plane always uses local SQLite. Shared D1 is not accepted
 // here because its HTTP API cannot provide the atomic batch capability the app
 // requires; the guard above runs before this database is opened or migrated.
-const sql = (() => {
-  const database = new Database(databasePath);
-  // A self-hosted deployment starts with an empty file, so it is brought up
-  // to this build's schema here. Forward only and recorded, so running it
-  // again applies nothing and a database from a newer build is refused
-  // rather than repaired.
-  const migrated = migrateSqlite(database);
-  if (migrated.applied.length > 0) {
-    process.stdout.write(
-      `applied ${migrated.applied.length} migration(s): ${migrated.applied.join(", ")}\n`,
-    );
-  }
-  return createSqliteSql(database);
-})();
+const controlDatabase = new Database(databasePath);
+// A self-hosted deployment starts with an empty file, so it is brought up
+// to this build's schema here. Forward only and recorded, so running it
+// again applies nothing and a database from a newer build is refused
+// rather than repaired.
+const migrated = migrateSqlite(controlDatabase);
+if (migrated.applied.length > 0) {
+  process.stdout.write(
+    `applied ${migrated.applied.length} migration(s): ${migrated.applied.join(", ")}\n`,
+  );
+}
+const sql = createSqliteSql(controlDatabase);
 /**
  * The port a published Worker endpoint address carries.
  *
@@ -890,124 +892,6 @@ if (selfhostContainerEndpointHttps) {
   );
 }
 
-// Background settlement. One pass at a time: overlapping ticks would compete
-// for the same rows and waste the claim they cannot win.
-let ticking = false;
-setInterval(() => {
-  if (ticking) return;
-  ticking = true;
-  app
-    .tick()
-    // Expired KV rows are reclaimed on the same pass. A `get` reclaims the row
-    // it reads and a `list` skips it, so a key nobody asks for again would
-    // otherwise be stored until the file was deleted — and the expiry index
-    // that exists for exactly this would only cost writes.
-    .then(async () => {
-      if (dataPlanes) {
-        await dataPlanes.maintenance.sweepExpiredKv();
-        // A multipart upload nobody can finish any more, for a reason no other
-        // sweep covers: the upload id lived in the isolate that started it, no
-        // operation the Binding declares enumerates open uploads, and durable
-        // receipts are exactly what would otherwise keep an abandoned one for
-        // the life of the machine.
-        await dataPlanes.maintenance.sweepExpiredObjectUploads();
-        // And the files no row names: a crash between publishing a body and
-        // writing the row that names it leaves bytes nothing can ever reach.
-        // Bounded and resumable, so a bucket holding a million objects costs a
-        // batch a tick rather than a tick.
-        await dataPlanes.maintenance.reconcileOrphanObjectFiles();
-      }
-      // A message nobody asked for again is reclaimed on the same pass, for the
-      // same reason: retention is a promise about how long it is kept, not
-      // about when somebody notices.
-      if (queuePump) await queuePump.sweep();
-    })
-    .catch((error: unknown) => console.error("tick failed", error))
-    .finally(() => {
-      ticking = false;
-    });
-}, 30_000);
-
-// The event clock, separate from settlement and much faster. A consumer may ask
-// for a one-second batch timeout, and a tick every thirty seconds would make
-// that number mean nothing. One pass at a time, because two would compete for
-// the same rows and only one can win the lease.
-let pumping = false;
-if (queuePump) {
-  setInterval(() => {
-    if (pumping) return;
-    pumping = true;
-    queuePump
-      .tick()
-      .catch((error: unknown) => console.error("queue pump failed", error))
-      .finally(() => {
-        pumping = false;
-      });
-  }, 1_000);
-}
-
-// The finest field of a cron expression is the minute, and a match is fired
-// only inside the minute it belongs to, so five seconds is plenty of margin and
-// far less work than one.
-let scheduling = false;
-if (workerScheduler) {
-  setInterval(() => {
-    if (scheduling) return;
-    scheduling = true;
-    workerScheduler
-      .tick()
-      .catch((error: unknown) => console.error("worker scheduler failed", error))
-      .finally(() => {
-        scheduling = false;
-      });
-  }, 5_000);
-}
-
-/**
- * The runtime is this process's child, and it dies with it.
- *
- * `workerd serve --watch` is spawned here and, without this, survives its
- * parent: it is re-parented to init and keeps the serving port. The next
- * Takoserver's workerd then fails to bind, Worker serving is silently broken,
- * and the control plane reports healthy the whole time. A signal handler
- * replaces the default disposition, so each one ends the process itself after
- * the child is gone.
- */
-process.on("exit", () => {
-  workerd.stop();
-});
-const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
-  selfhostContainer,
-  () => {
-    process.stderr.write("the self-host Container runtime did not close cleanly\n");
-  },
-  () => workerd.stop(),
-  () => process.exit(0),
-);
-const handleSelfhostShutdown = () => {
-  const closeIngress = selfhostContainerEndpointHttps
-    ? selfhostContainerEndpointHttps.close()
-    : Promise.resolve();
-  return closeIngress
-    .catch(() => {
-      process.stderr.write("the self-host Container HTTPS listener did not close cleanly\n");
-    })
-    .finally(async () => {
-      // Stop serving first, then close the same Actor owner that supplied its
-      // socket graph. No second native namespace lifecycle is created.
-      workerd.stop();
-      try {
-        await actorRuntime?.close();
-      } catch {
-        process.stderr.write("the self-host Actor owner did not close cleanly\n");
-      }
-      await handleContainerAndWorkerdShutdown();
-    });
-};
-for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-  process.on(signal, handleSelfhostShutdown);
-}
-
 /**
  * Bring the runtime back for the Workers this machine already published.
  *
@@ -1035,17 +919,141 @@ const selfhostHealth = createSelfhostHealthHandler({
   supervisor: workerd,
 });
 
-Bun.serve({
+const bunFetch = createSelfhostBunFetchHandler({
+  health: selfhostHealth,
+  provision,
+  appFetch: (request) => app.fetch(request),
+});
+let bunServer: ReturnType<typeof Bun.serve> | undefined;
+let shutdownClean = true;
+let closeSequenceFinished = false;
+const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
+  selfhostContainer,
+  () => {
+    shutdownClean = false;
+    process.stderr.write("self-host shutdown failed at container-close\n");
+  },
+  async () => {
+    // `shutdown()` is the concrete supervisor's terminal, awaited lifecycle;
+    // the public WorkerdSupervisor port remains unchanged for runtime clients.
+    shutdownClean =
+      (await closeSelfhostEntryOwnedResources({
+        workerdShutdown: () => workerd.shutdown(),
+        mayCloseDependents: () => shutdownClean,
+        actorClose: async () => {
+          await actorRuntime?.close();
+        },
+        dataPlanesStop: async () => {
+          await dataPlanes?.stop(false);
+        },
+        controlDatabaseClose: () => controlDatabase.close(),
+        onFailure: (stage) => {
+          shutdownClean = false;
+          process.stderr.write(`self-host shutdown failed at ${stage}\n`);
+        },
+      })) && shutdownClean;
+  },
+  () => {
+    // The entry lifecycle calls process.exit only after this ordered sequence
+    // and its ingress/request/pass drain have both been proved.
+    closeSequenceFinished = true;
+  },
+);
+const entryShutdown = createSelfhostEntryShutdown({
+  stopIngress: async () => {
+    let endpointClosing: Promise<void> = Promise.resolve();
+    if (selfhostContainerEndpointHttps) {
+      try {
+        endpointClosing = selfhostContainerEndpointHttps.close(false);
+      } catch {
+        endpointClosing = Promise.reject(new Error("endpoint ingress close failed"));
+      }
+    }
+
+    let serverStopping: Promise<void> = Promise.resolve();
+    try {
+      const stopped = bunServer?.stop(false);
+      serverStopping = Promise.resolve(stopped);
+    } catch {
+      serverStopping = Promise.reject(new Error("Bun ingress stop failed"));
+    }
+
+    const stopped = await Promise.allSettled([endpointClosing, serverStopping]);
+    if (stopped.some((result) => result.status === "rejected")) {
+      throw new Error("one or more self-host ingress listeners did not stop cleanly");
+    }
+  },
+  finishShutdown: async () => {
+    await handleContainerAndWorkerdShutdown();
+    if (!closeSequenceFinished || !shutdownClean) {
+      throw new Error("self-host owned resources did not close cleanly");
+    }
+  },
+  onFailure: (stage) => {
+    process.exitCode = 1;
+    process.stderr.write(`self-host shutdown incomplete at ${stage}\n`);
+  },
+  onSuccess: () => process.exit(0),
+});
+
+/**
+ * Keep an idempotent best-effort child stop registered before listener startup:
+ * restore may have started Workerd even if Bun.serve cannot bind.
+ * This is not a substitute for the awaited shutdown proof above.
+ */
+process.on("exit", () => {
+  workerd.stop();
+});
+
+bunServer = Bun.serve({
   port,
   // Longer than the default, because publishing a site means uploading its
   // files and a request that is doing real work is not an idle one.
   idleTimeout: 120,
-  fetch: createSelfhostBunFetchHandler({
-    health: selfhostHealth,
-    provision,
-    appFetch: (request) => app.fetch(request),
-  }),
+  fetch: (request) => entryShutdown.fetch(request, bunFetch),
 });
+
+// Background settlement. The shutdown owner retains each timer and each pass
+// promise, so no new work starts past the signal fence and accepted work drains.
+entryShutdown.startInterval(
+  "settlement",
+  30_000,
+  async () => {
+    await app.tick();
+    if (dataPlanes) {
+      await dataPlanes.maintenance.sweepExpiredKv();
+      await dataPlanes.maintenance.sweepExpiredObjectUploads();
+      await dataPlanes.maintenance.reconcileOrphanObjectFiles();
+    }
+    if (queuePump) await queuePump.sweep();
+  },
+  (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
+);
+entryShutdown.startInterval(
+  "queue-pump",
+  1_000,
+  async () => {
+    await queuePump?.tick();
+  },
+  (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
+);
+entryShutdown.startInterval(
+  "worker-scheduler",
+  5_000,
+  async () => {
+    await workerScheduler?.tick();
+  },
+  (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
+);
+
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  process.on(signal, () => {
+    // Until the terminal shutdown proof completes, a natural event-loop exit
+    // must not be reported as a clean stop.
+    process.exitCode = 1;
+    void entryShutdown.shutdown();
+  });
+}
 if (dataPlanes) {
   // Recorded, because an operator debugging a Worker's storage needs to know
   // which port to look at and the kernel usually chose it.

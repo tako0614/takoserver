@@ -494,6 +494,303 @@ describe("keeping workerd running", () => {
     expect(children).toHaveLength(3);
   });
 
+  test("awaited shutdown joins callers and waits for the accepted child exit and vacant listener", async () => {
+    const child = testChild();
+    let listener: "owned" | "vacant" = "owned";
+    let scheduled = 0;
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => listener,
+      spawn: () => child.process,
+      readiness: async () => true,
+      scheduleRestart: () => {
+        scheduled += 1;
+        return () => undefined;
+      },
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+
+    const first = supervisor.shutdown();
+    const second = supervisor.shutdown();
+    expect(first).toBe(second);
+    let completed = false;
+    void first.then(() => {
+      completed = true;
+    });
+    await settle();
+    expect(child.killed).toBe(1);
+    expect(completed).toBe(false);
+
+    listener = "vacant";
+    child.exit(0);
+    await first;
+    expect(completed).toBe(true);
+    expect(scheduled).toBe(0);
+    await expect(supervisor.ensure("/data/workerd.capnp")).rejects.toThrow("shut down");
+    expect(supervisor.shutdown()).toBe(first);
+  });
+
+  test("awaited shutdown needs no child proof on an untouched Host", async () => {
+    let observed = 0;
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => {
+        observed += 1;
+        return "foreign";
+      },
+      spawn: () => {
+        throw new Error("untouched Host must not spawn");
+      },
+      readiness: async () => true,
+    });
+    await supervisor.shutdown();
+    expect(observed).toBe(0);
+    await expect(supervisor.ensure("/data/workerd.capnp")).rejects.toThrow("shut down");
+  });
+
+  test("awaited shutdown still checks the port after a naturally exited child", async () => {
+    const child = testChild();
+    let port: "foreign" | "vacant" = "foreign";
+    let cancelled = 0;
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => port,
+      spawn: () => child.process,
+      readiness: async () => true,
+      scheduleRestart: () => () => {
+        cancelled += 1;
+      },
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+    child.exit(0);
+    await settle();
+    await expect(supervisor.shutdown()).rejects.toThrow("occupied after shutdown");
+    expect(cancelled).toBe(1);
+    port = "vacant";
+    await supervisor.shutdown();
+  });
+
+  test("awaited shutdown remains single-flight if timer cancellation reenters it", async () => {
+    const child = testChild();
+    let nested: Promise<void> | undefined;
+    let supervisor: ReturnType<typeof createWorkerdSupervisor>;
+    supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => "vacant",
+      spawn: () => child.process,
+      readiness: async () => true,
+      scheduleRestart: () => () => {
+        nested = supervisor.shutdown();
+      },
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+    child.exit(0);
+    await settle();
+
+    const first = supervisor.shutdown();
+    await settle();
+    expect(nested).toBe(first);
+    await first;
+  });
+
+  test("awaited shutdown fences a queued restart before it can spawn another child", async () => {
+    const children: TestChild[] = [];
+    const restarts: Array<() => void> = [];
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => "vacant",
+      spawn: () => {
+        const child = testChild();
+        children.push(child);
+        return {
+          ...child.process,
+          kill() {
+            child.process.kill();
+            child.exit(0);
+          },
+        };
+      },
+      readiness: async () => true,
+      scheduleRestart: (run) => {
+        restarts.push(run);
+        return () => undefined;
+      },
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+    children[0]?.exit(0);
+    await settle();
+    void Promise.resolve().then(() => restarts[0]?.());
+
+    await supervisor.shutdown();
+    expect(children).toHaveLength(1);
+  });
+
+  test("awaited shutdown refuses a rejected child exit even if the port looks vacant", async () => {
+    const exited = deferred<number>();
+    let scheduled = 0;
+    let killed = 0;
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => "vacant",
+      spawn: () => ({ kill: () => killed++, exited: exited.promise }),
+      readiness: async () => true,
+      scheduleRestart: () => {
+        scheduled += 1;
+        return () => undefined;
+      },
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+    exited.reject(new Error("untrusted child exit /private/config/path"));
+    await settle();
+    const first = supervisor.shutdown();
+    await expect(first).rejects.toThrow("exit cannot be confirmed");
+    await expect(first).rejects.not.toThrow("/private/config/path");
+    expect(killed).toBe(1);
+    expect(scheduled).toBe(1);
+    await expect(supervisor.shutdown()).rejects.toThrow("exit cannot be confirmed");
+    expect(killed).toBe(1);
+    await expect(supervisor.ensure("/data/workerd.capnp")).rejects.toThrow("shut down");
+  });
+
+  test("awaited shutdown refuses a missing child exit promise without losing custody", async () => {
+    let killed = 0;
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => "vacant",
+      spawn: () => ({ kill: () => killed++ }),
+      readiness: async () => true,
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+    await expect(supervisor.shutdown()).rejects.toThrow("exit cannot be confirmed");
+    await expect(supervisor.shutdown()).rejects.toThrow("exit cannot be confirmed");
+    expect(killed).toBe(1);
+    expect(supervisor.snapshot()).toEqual({ state: "unavailable" });
+  });
+
+  test("awaited shutdown can re-prove the same exited child after a transient occupied port", async () => {
+    const child = testChild();
+    let port: "owned" | "foreign" | "vacant" = "owned";
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => port,
+      spawn: () => child.process,
+      readiness: async () => true,
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+    const first = supervisor.shutdown();
+    port = "foreign";
+    child.exit(0);
+    await expect(first).rejects.toThrow("occupied after shutdown");
+    expect(child.killed).toBe(1);
+
+    port = "vacant";
+    await supervisor.shutdown();
+    expect(child.killed).toBe(1);
+    await expect(supervisor.ensure("/data/workerd.capnp")).rejects.toThrow("shut down");
+  });
+
+  test("awaited shutdown refuses a failed port observation and can retry without another kill", async () => {
+    const child = testChild();
+    let failObservation = true;
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => {
+        if (failObservation) throw new Error("proc unavailable");
+        return "vacant";
+      },
+      spawn: () => child.process,
+      readiness: async () => true,
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+    const first = supervisor.shutdown();
+    child.exit(0);
+    await expect(first).rejects.toThrow("proc unavailable");
+    expect(child.killed).toBe(1);
+
+    failObservation = false;
+    await supervisor.shutdown();
+    expect(child.killed).toBe(1);
+  });
+
+  test("awaited shutdown times out an unconfirmed exit but can prove that child later", async () => {
+    const child = testChild();
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => "vacant",
+      spawn: () => child.process,
+      readiness: async () => true,
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+    await expect(supervisor.shutdown()).rejects.toThrow("exit was not confirmed in time");
+    expect(child.killed).toBe(1);
+    child.exit(0);
+    await supervisor.shutdown();
+    expect(child.killed).toBe(1);
+  });
+
+  test("awaited shutdown fences an in-flight first readiness before another spawn", async () => {
+    const child = testChild();
+    const readiness = deferred<boolean>();
+    let spawned = 0;
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => "vacant",
+      spawn: () => {
+        spawned += 1;
+        return child.process;
+      },
+      readiness: async () => await readiness.promise,
+    });
+    const starting = supervisor.ensure("/data/workerd.capnp");
+    await settle();
+    const shutdown = supervisor.shutdown();
+    await expect(supervisor.ensure("/data/workerd.capnp")).rejects.toThrow("shut down");
+    expect(child.killed).toBe(1);
+    expect(spawned).toBe(1);
+
+    child.exit(0);
+    await shutdown;
+    await expect(starting).rejects.toThrow("exited before its serving readiness check");
+    expect(spawned).toBe(1);
+  });
+
+  test("awaited shutdown cancels an in-flight live-child replacement without a second spawn", async () => {
+    const children: TestChild[] = [];
+    let listener: "owned" | "vacant" = "owned";
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      listenerPort: 28788,
+      listenerOwnership: async () => listener,
+      spawn: () => {
+        const child = testChild();
+        children.push(child);
+        return child.process;
+      },
+      readiness: async () => true,
+    });
+    await supervisor.ensure("/data/workerd.capnp");
+    listener = "vacant";
+    const replacing = supervisor.ensure("/data/workerd.capnp");
+    await settle();
+    expect(children[0]?.killed).toBe(1);
+    const shutdown = supervisor.shutdown();
+    children[0]?.exit(0);
+    await shutdown;
+    await expect(replacing).rejects.toThrow("cancelled");
+    expect(children).toHaveLength(1);
+  });
+
   test("recovers a ready runtime after its child exits", async () => {
     const children: TestChild[] = [];
     const said: string[] = [];

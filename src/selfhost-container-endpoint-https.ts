@@ -18,7 +18,7 @@ export interface SelfhostContainerEndpointHttpsConfiguration {
 export interface SelfhostContainerEndpointHttpsListener {
   readonly ingress: SelfhostContainerEndpointHttpsIngressPort;
   installEndpointFetch(fetch: (request: Request) => Response | Promise<Response>): void;
-  close(): Promise<void>;
+  close(closeActiveConnections?: boolean): Promise<void>;
 }
 
 interface ListenerServer {
@@ -226,18 +226,70 @@ export async function createSelfhostContainerEndpointHttpsListener(input: {
   const factories = input.factories ?? defaultFactories;
   let endpointFetch: ((request: Request) => Response | Promise<Response>) | undefined;
   let active = false;
+  let inFlightResponses = 0;
+  const drainWaiters = new Set<() => void>();
+  const responseDrained = () => {
+    inFlightResponses--;
+    if (inFlightResponses === 0) {
+      for (const resolve of drainWaiters) resolve();
+      drainWaiters.clear();
+    }
+  };
+  const waitForResponsesToDrain = () =>
+    inFlightResponses === 0
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => drainWaiters.add(resolve));
   const server = factories.serve({
     port: 443,
     hostname: "0.0.0.0",
     tls: { cert: input.certificateChain, key: input.privateKey },
-    fetch: (request) => {
+    fetch: async (request) => {
       if (!active || !endpointFetch)
         return new Response(null, { status: 503, headers: NO_STORE_HEADERS });
+      inFlightResponses++;
+      let responseReleased = false;
+      const releaseResponse = () => {
+        if (responseReleased) return;
+        responseReleased = true;
+        responseDrained();
+      };
       try {
-        return Promise.resolve(endpointFetch(request)).catch(
-          () => new Response(null, { status: 503, headers: NO_STORE_HEADERS }),
-        );
+        const response = await endpointFetch(request);
+        if (!response.body) {
+          releaseResponse();
+          return response;
+        }
+        const reader = response.body.getReader();
+        const body = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            try {
+              const result = await reader.read();
+              if (result.done) {
+                controller.close();
+                releaseResponse();
+              } else {
+                controller.enqueue(result.value);
+              }
+            } catch {
+              controller.error(new Error("Container HTTPS response body failed"));
+              releaseResponse();
+            }
+          },
+          async cancel(reason) {
+            try {
+              await reader.cancel(reason);
+            } finally {
+              releaseResponse();
+            }
+          },
+        });
+        return new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
       } catch {
+        releaseResponse();
         return new Response(null, { status: 503, headers: NO_STORE_HEADERS });
       }
     },
@@ -271,6 +323,56 @@ export async function createSelfhostContainerEndpointHttpsListener(input: {
     },
   } satisfies SelfhostContainerEndpointHttpsIngressPort);
   let closed = false;
+  let closePromise: Promise<void> | undefined;
+  let closeResolve: (() => void) | undefined;
+  let closeReject: ((error: unknown) => void) | undefined;
+  let closeMode: "force" | "graceful" | undefined;
+  let gracefulStopCompleted = false;
+  let closeCompletionRequested = false;
+  let closeSettled = false;
+
+  const beginClose = (closeActiveConnections: boolean) => {
+    gracefulStopCompleted = false;
+    closeCompletionRequested = false;
+    closeSettled = false;
+    closeMode = closeActiveConnections ? "force" : "graceful";
+    const completion = new Promise<void>((resolve, reject) => {
+      closeResolve = resolve;
+      closeReject = reject;
+    });
+    closePromise = completion;
+    void completion.then(
+      () => {
+        if (closePromise === completion) closeSettled = true;
+      },
+      () => {
+        if (closePromise !== completion) return;
+        closePromise = undefined;
+        closeResolve = undefined;
+        closeReject = undefined;
+        closeMode = undefined;
+        gracefulStopCompleted = false;
+        closeCompletionRequested = false;
+        closeSettled = false;
+      },
+    );
+    return completion;
+  };
+
+  const stop = (closeActiveConnections: boolean) => {
+    try {
+      return Promise.resolve(server.stop(closeActiveConnections));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  };
+
+  const finishGracefulClose = () => {
+    if (closeMode !== "graceful" || !gracefulStopCompleted || inFlightResponses !== 0) return;
+    closeCompletionRequested = true;
+    closeResolve?.();
+  };
+
   return {
     ingress,
     installEndpointFetch(fetch) {
@@ -279,11 +381,52 @@ export async function createSelfhostContainerEndpointHttpsListener(input: {
         throw new Error("Container Endpoint HTTPS fetch handler is already installed");
       endpointFetch = fetch;
     },
-    async close() {
-      if (closed) return;
+    close(closeActiveConnections = true) {
       closed = true;
       active = false;
-      await server.stop(true);
+      if (closePromise) {
+        if (
+          closeActiveConnections &&
+          closeMode === "graceful" &&
+          !closeSettled &&
+          !closeCompletionRequested
+        ) {
+          closeMode = "force";
+          void stop(true).then(
+            () => {
+              closeCompletionRequested = true;
+              closeResolve?.();
+            },
+            (error) => closeReject?.(error),
+          );
+        }
+        return closePromise;
+      }
+
+      const completion = beginClose(closeActiveConnections);
+      if (closeActiveConnections) {
+        void stop(true).then(
+          () => {
+            closeCompletionRequested = true;
+            closeResolve?.();
+          },
+          (error) => closeReject?.(error),
+        );
+      } else {
+        void stop(false).then(
+          () => {
+            if (closeMode !== "graceful") return;
+            gracefulStopCompleted = true;
+            void waitForResponsesToDrain().then(finishGracefulClose, (error) =>
+              closeReject?.(error),
+            );
+          },
+          (error) => {
+            if (closeMode === "graceful") closeReject?.(error);
+          },
+        );
+      }
+      return completion;
     },
   };
 }

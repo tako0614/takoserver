@@ -100,7 +100,8 @@ test("the Bun entry has no shared-D1 or dead signing-key branches", async () => 
   expect(source).not.toContain("sharedDatabaseId");
   expect(source).toContain("TAKOSERVER_D1_DATABASE_ID");
   expect(source).toContain("TAKOSERVER_R2_BUCKET");
-  expect(source).toContain("return createSqliteSql(database);");
+  expect(source).toContain("const controlDatabase = new Database(databasePath);");
+  expect(source).toContain("const sql = createSqliteSql(controlDatabase);");
   expect(source.indexOf("TAKOSERVER_D1_DATABASE_ID")).toBeLessThan(
     source.indexOf("const dataRoot"),
   );
