@@ -19,6 +19,7 @@ import {
   type WorkerdDeploymentPublication,
   type WorkerdWorkflowForward,
   type WorkerdWorkflowForwardBinding,
+  type WorkerdWorkflowForwardPublication,
 } from "../src/workerd-runtime.ts";
 
 /**
@@ -1634,11 +1635,13 @@ test("persists an opt-in Actor forward graph and rejects unmapped Host sockets",
 test("renders exact Workflow broker sockets for weighted Versions and restores them", async () => {
   const { publication, withWorkflow, forwards, sockets } = workflowForwardPublication(root);
   let socketLookups = 0;
+  let requestedSocketGraph: readonly WorkerdWorkflowForwardPublication[] | undefined;
   const runtime = createWorkerdRuntime({
     root,
     isReady: () => true,
-    workflowForwardSockets: () => {
+    workflowForwardSockets: (publications) => {
       socketLookups += 1;
+      requestedSocketGraph = publications;
       return sockets;
     },
   });
@@ -1646,6 +1649,27 @@ test("renders exact Workflow broker sockets for weighted Versions and restores t
 
   await runtime.publish("workflow-site", withWorkflow);
   expect(socketLookups).toBe(1);
+  const expectedBindingsA = forwards.get("workflow-site-v-a")?.bindings;
+  const expectedBindingsB = forwards.get("workflow-site-v-b")?.bindings;
+  if (!expectedBindingsA || !expectedBindingsB) throw new Error("Workflow fixture missing");
+  expect(requestedSocketGraph).toEqual([
+    {
+      script: "workflow-site",
+      workerResourceUid: publication.workerResourceUid,
+      versionId: "workflow-site-v-a",
+      workerVersionResourceUid: "uid-WorkerVersion-workflow-site-a",
+      snapshotDigest: `sha256:${"c".repeat(64)}`,
+      bindings: expectedBindingsA,
+    },
+    {
+      script: "workflow-site",
+      workerResourceUid: publication.workerResourceUid,
+      versionId: "workflow-site-v-b",
+      workerVersionResourceUid: "uid-WorkerVersion-workflow-site-b",
+      snapshotDigest: `sha256:${"d".repeat(64)}`,
+      bindings: expectedBindingsB,
+    },
+  ]);
   const firstConfig = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
   for (const socket of sockets) {
     expect(firstConfig).toContain('name = "__TAKOSERVER_WORKFLOW_BINDING_00000"');
@@ -1669,6 +1693,769 @@ test("renders exact Workflow broker sockets for weighted Versions and restores t
   expect(socketLookups).toBe(2);
   const restoredConfig = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
   for (const socket of sockets) expect(restoredConfig).toContain(`unix:${socket.socketPath}`);
+});
+
+test("reserves the complete Workflow graph before Actor desired-state commit", async () => {
+  const probe = createConfigProbe();
+  const { withWorkflow, sockets } = workflowForwardPublication(root);
+  const tokens = ["e".repeat(64), "f".repeat(64)];
+  const publication = {
+    ...withWorkflow,
+    versions: withWorkflow.versions.map((version, index) => ({
+      ...version,
+      site: {
+        ...version.site,
+        actorForward: {
+          schema: "takoserver.selfhost-actor-forward@v1" as const,
+          bindings: [
+            {
+              publicName: "ROOM",
+              tenantId: "tenant-actor-1",
+              namespaceResourceUid: "uid-actor-namespace-1",
+              httpService: "__TAKOSERVER_ACTOR_HTTP_00000",
+              upgradeService: "__TAKOSERVER_ACTOR_UPGRADE_00000",
+              token: tokens[index] as string,
+            },
+          ],
+        },
+      },
+    })),
+  };
+  const actorSockets = tokens.map((token, index) => ({
+    tenantId: "tenant-actor-1",
+    namespaceResourceUid: "uid-actor-namespace-1",
+    token,
+    httpSocketPath: join(root, `actor-http-${index}.sock`),
+    upgradeSocketPath: join(root, `actor-upgrade-${index}.sock`),
+  }));
+  const calls: string[] = [];
+  const runtime = createWorkerdRuntime({
+    root,
+    port: probe.port,
+    isReady: () => true,
+    onReload: probe.onReload,
+    actorForwardSockets: actorSockets,
+    actorForwardLifecycle: {
+      async prepare() {
+        calls.push("actor-prepare");
+      },
+      async reserve() {
+        calls.push("actor-reserve");
+        return {
+          async release() {
+            calls.push("actor-release");
+          },
+        };
+      },
+      activated() {
+        calls.push("actor-activated");
+      },
+      uncertain() {
+        calls.push("actor-uncertain");
+      },
+    },
+    workflowForwardSockets: (requested) => {
+      calls.push("workflow-sockets");
+      expect(requested).toHaveLength(2);
+      return sockets;
+    },
+    workflowForwardLifecycle: {
+      async reserve(requested) {
+        calls.push("workflow-reserve");
+        expect(requested).toHaveLength(2);
+        return {
+          async release() {
+            calls.push("workflow-release");
+          },
+        };
+      },
+      activated(requested) {
+        calls.push("workflow-activated");
+        expect(requested).toHaveLength(2);
+        return true;
+      },
+      isRestored() {
+        return true;
+      },
+      uncertain() {
+        calls.push("workflow-uncertain");
+      },
+    },
+  });
+  if (!runtime.publishActorDeployment) throw new Error("Actor-qualified publish unavailable");
+
+  try {
+    await runtime.publishActorDeployment("workflow-site", publication, async () => {
+      calls.push("provider-commit");
+    });
+
+    expect(calls.indexOf("workflow-reserve")).toBeLessThan(calls.indexOf("workflow-sockets"));
+    expect(calls.indexOf("workflow-sockets")).toBeLessThan(calls.indexOf("actor-reserve"));
+    expect(calls.indexOf("actor-reserve")).toBeLessThan(calls.indexOf("provider-commit"));
+    expect(calls.indexOf("provider-commit")).toBeLessThan(calls.indexOf("workflow-activated"));
+    expect(calls.indexOf("workflow-activated")).toBeLessThan(calls.indexOf("workflow-release"));
+    expect(calls).not.toContain("workflow-uncertain");
+  } finally {
+    probe.stop();
+  }
+});
+
+test("admits and releases the empty Workflow graph on an empty restore", async () => {
+  const calls: string[] = [];
+  const runtime = createWorkerdRuntime({
+    root,
+    workflowForwardSockets(publications) {
+      calls.push("sockets");
+      expect(publications).toEqual([]);
+      return [];
+    },
+    workflowForwardLifecycle: {
+      async reserve(publications) {
+        calls.push("reserve");
+        expect(publications).toEqual([]);
+        return {
+          async release() {
+            calls.push("release");
+          },
+        };
+      },
+      activated(publications) {
+        calls.push("activated");
+        expect(publications).toEqual([]);
+        return true;
+      },
+      isRestored() {
+        return true;
+      },
+      uncertain() {
+        calls.push("uncertain");
+      },
+    },
+  });
+
+  await expect(runtime.restore()).resolves.toEqual([]);
+  expect(calls).toEqual(["reserve", "sockets", "activated", "release"]);
+});
+
+test("reconstructs the exact Workflow reservation from durable readback", async () => {
+  const probe = createConfigProbe();
+  const { withWorkflow, sockets } = workflowForwardPublication(root);
+  const reserved: WorkerdWorkflowForwardPublication[][] = [];
+  let releases = 0;
+  let activations = 0;
+  const options = {
+    root,
+    port: probe.port,
+    isReady: () => true,
+    onReload: probe.onReload,
+    workflowForwardSockets: () => sockets,
+    workflowForwardLifecycle: {
+      async reserve(publications: readonly WorkerdWorkflowForwardPublication[]) {
+        reserved.push(publications.map((publication) => ({ ...publication })));
+        return {
+          async release() {
+            releases += 1;
+          },
+        };
+      },
+      activated() {
+        activations += 1;
+        return true;
+      },
+      isRestored() {
+        return true;
+      },
+      uncertain() {},
+    },
+  };
+  const runtime = createWorkerdRuntime(options);
+  try {
+    await runtime.publish?.("workflow-site", withWorkflow);
+    const restored = createWorkerdRuntime(options);
+
+    await expect(restored.restore()).resolves.toEqual(["workflow-site"]);
+    expect(reserved).toHaveLength(2);
+    expect(reserved[1]).toEqual(reserved[0]);
+    expect(activations).toBe(2);
+    expect(releases).toBe(2);
+  } finally {
+    probe.stop();
+  }
+});
+
+test("marks Workflow admission uncertain when durable restore preflight fails", async () => {
+  const { withWorkflow, sockets } = workflowForwardPublication(root);
+  const seeded = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    workflowForwardSockets: () => sockets,
+  });
+  await seeded.publish?.("workflow-site", withWorkflow);
+  const probe = createConfigProbe();
+  let uncertain = 0;
+  const restored = createWorkerdRuntime({
+    root,
+    port: probe.port,
+    isReady: () => true,
+    onReload: probe.onReload,
+    workflowForwardSockets: () => sockets,
+    workflowForwardLifecycle: {
+      async reserve() {
+        throw new Error("Workflow reservation unavailable");
+      },
+      activated() {
+        return true;
+      },
+      isRestored() {
+        return true;
+      },
+      uncertain() {
+        uncertain += 1;
+      },
+    },
+  });
+
+  try {
+    await expect(restored.restore()).rejects.toThrow("Workflow reservation unavailable");
+    expect(uncertain).toBe(1);
+  } finally {
+    probe.stop();
+  }
+});
+
+test("fails closed when Workflow lifecycle refuses the committed graph", async () => {
+  const probe = createConfigProbe();
+  const { withWorkflow, sockets } = workflowForwardPublication(root);
+  let uncertain = 0;
+  let released = 0;
+  const runtime = createWorkerdRuntime({
+    root,
+    port: probe.port,
+    isReady: () => true,
+    onReload: probe.onReload,
+    workflowForwardSockets: () => sockets,
+    workflowForwardLifecycle: {
+      async reserve() {
+        return {
+          async release() {
+            released += 1;
+          },
+        };
+      },
+      activated() {
+        return false;
+      },
+      isRestored() {
+        return true;
+      },
+      uncertain() {
+        uncertain += 1;
+      },
+    },
+  });
+  if (!runtime.publish || !runtime.has) throw new Error("weighted runtime unavailable");
+
+  try {
+    await expect(runtime.publish("workflow-site", withWorkflow)).rejects.toThrow(
+      "Workflow forward graph could not be admitted",
+    );
+    expect(uncertain).toBeGreaterThan(0);
+    expect(released).toBe(1);
+    await expect(runtime.has("workflow-site", "generation-workflow")).resolves.toBe(false);
+    const pointer = JSON.parse(
+      await readFile(join(root, "workers", "workflow-site", "takoserver-site.json"), "utf8"),
+    ) as { generation: string };
+    expect(pointer.generation).toBe("generation-workflow");
+  } finally {
+    probe.stop();
+  }
+});
+
+test("requires a literal true Workflow activation acknowledgement", async () => {
+  const probe = createConfigProbe();
+  const { withWorkflow, sockets } = workflowForwardPublication(root);
+  const runtime = createWorkerdRuntime({
+    root,
+    port: probe.port,
+    isReady: () => true,
+    onReload: probe.onReload,
+    workflowForwardSockets: () => sockets,
+    workflowForwardLifecycle: {
+      async reserve() {
+        return { async release() {} };
+      },
+      activated() {
+        return "ok" as unknown as boolean;
+      },
+      isRestored() {
+        return true;
+      },
+      uncertain() {},
+    },
+  });
+  if (!runtime.publish || !runtime.has) throw new Error("weighted runtime unavailable");
+
+  try {
+    await expect(runtime.publish("workflow-site", withWorkflow)).rejects.toThrow(
+      "Workflow forward graph could not be admitted",
+    );
+    await expect(runtime.has("workflow-site", "generation-workflow")).resolves.toBe(false);
+    await expect(
+      readFile(join(root, "workers", ".takoserver-active.json"), "utf8").then((contents) =>
+        JSON.parse(contents),
+      ),
+    ).resolves.toEqual({});
+  } finally {
+    probe.stop();
+  }
+});
+
+test("does not retain a serving claim when Workflow admission rejects the rendered candidate", async () => {
+  const probe = createConfigProbe();
+  const before = workflowForwardPublication(root, "workflow-site", "tenant-before");
+  const after = workflowForwardPublication(root, "workflow-site", "tenant-after");
+  let activations = 0;
+  let uncertain = 0;
+  const runtime = createWorkerdRuntime({
+    root,
+    port: probe.port,
+    isReady: () => true,
+    onReload: probe.onReload,
+    workflowForwardSockets: (publications) =>
+      publications[0]?.bindings[0]?.tenantId === "tenant-after" ? after.sockets : before.sockets,
+    workflowForwardLifecycle: {
+      async reserve() {
+        return { async release() {} };
+      },
+      activated() {
+        activations += 1;
+        return activations === 1;
+      },
+      isRestored() {
+        return true;
+      },
+      uncertain() {
+        uncertain += 1;
+      },
+    },
+  });
+  if (!runtime.publish || !runtime.has) throw new Error("workflow runtime unavailable");
+
+  try {
+    await runtime.publish("workflow-site", before.withWorkflow);
+    const candidate = {
+      ...after.withWorkflow,
+      generation: "generation-workflow-next",
+      versions: after.withWorkflow.versions.map((version) => ({
+        ...version,
+        site: { ...version.site, generation: "generation-workflow-next" },
+      })),
+    };
+    await expect(runtime.publish("workflow-site", candidate)).rejects.toThrow(
+      "Workflow forward graph could not be admitted",
+    );
+
+    expect(activations).toBe(2);
+    expect(uncertain).toBeGreaterThan(0);
+    await expect(runtime.has("workflow-site", "generation-workflow")).resolves.toBe(false);
+    await expect(runtime.has("workflow-site", "generation-workflow-next")).resolves.toBe(false);
+    await expect(
+      readFile(join(root, "workers", ".takoserver-active.json"), "utf8").then((contents) =>
+        JSON.parse(contents),
+      ),
+    ).resolves.toEqual({});
+    await expect(readWorkerdActiveDeployment(root, "workflow-site")).resolves.toBeNull();
+  } finally {
+    probe.stop();
+  }
+});
+
+test("keeps the old Workflow graph admitted when candidate preflight fails", async () => {
+  const probe = createConfigProbe();
+  const before = workflowForwardPublication(root, "workflow-site", "tenant-before");
+  const after = workflowForwardPublication(root, "workflow-site", "tenant-after");
+  let sockets = before.sockets;
+  let reservations = 0;
+  let releases = 0;
+  let activations = 0;
+  let uncertain = 0;
+  const runtime = createWorkerdRuntime({
+    root,
+    port: probe.port,
+    isReady: () => true,
+    onReload: probe.onReload,
+    workflowForwardSockets: () => sockets,
+    workflowForwardLifecycle: {
+      async reserve() {
+        reservations += 1;
+        return {
+          async release() {
+            releases += 1;
+          },
+        };
+      },
+      activated() {
+        activations += 1;
+        return true;
+      },
+      isRestored() {
+        return true;
+      },
+      uncertain() {
+        uncertain += 1;
+      },
+    },
+  });
+  if (!runtime.publish || !runtime.has) throw new Error("workflow runtime contract missing");
+
+  try {
+    await runtime.publish("workflow-site", before.withWorkflow);
+    const markerBefore = await readFile(join(root, "workers", ".takoserver-active.json"), "utf8");
+    const configBefore = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    const pointerBefore = await readFile(
+      join(root, "workers", "workflow-site", "takoserver-site.json"),
+      "utf8",
+    );
+    sockets = before.sockets;
+
+    await expect(runtime.publish("workflow-site", after.withWorkflow)).rejects.toThrow(
+      "Workflow forward Host socket unavailable",
+    );
+
+    expect(reservations).toBe(2);
+    expect(releases).toBe(2);
+    expect(activations).toBe(1);
+    expect(uncertain).toBe(0);
+    await expect(runtime.has("workflow-site", "generation-workflow")).resolves.toBe(true);
+    await expect(readFile(join(root, "workers", ".takoserver-active.json"), "utf8")).resolves.toBe(
+      markerBefore,
+    );
+    await expect(readFile(join(root, "workers", "workerd.capnp"), "utf8")).resolves.toBe(
+      configBefore,
+    );
+    await expect(
+      readFile(join(root, "workers", "workflow-site", "takoserver-site.json"), "utf8"),
+    ).resolves.toBe(pointerBefore);
+  } finally {
+    probe.stop();
+  }
+});
+
+test("does not report a marked Workflow generation ready after reservation revokes its broker", async () => {
+  const probe = createConfigProbe();
+  const before = workflowForwardPublication(root, "workflow-site", "tenant-before");
+  const after = workflowForwardPublication(root, "workflow-site", "tenant-after");
+  let reservationCount = 0;
+  let restored = true;
+  const lifecycle = {
+    async reserve() {
+      reservationCount += 1;
+      if (reservationCount > 1) {
+        restored = false;
+        throw new Error("candidate broker cleanup is uncertain");
+      }
+      return { async release() {} };
+    },
+    activated() {
+      return true;
+    },
+    isRestored() {
+      return restored;
+    },
+    uncertain() {
+      restored = false;
+    },
+  };
+  const runtime = createWorkerdRuntime({
+    root,
+    port: probe.port,
+    isReady: () => true,
+    onReload: probe.onReload,
+    workflowForwardSockets: (publications) =>
+      publications[0]?.bindings[0]?.tenantId === "tenant-after" ? after.sockets : before.sockets,
+    workflowForwardLifecycle: lifecycle,
+  });
+  if (!runtime.publish || !runtime.has) throw new Error("workflow runtime unavailable");
+
+  try {
+    await runtime.publish("workflow-site", before.withWorkflow);
+    await expect(runtime.has("workflow-site", "generation-workflow")).resolves.toBe(true);
+    await expect(runtime.publish("workflow-site", after.withWorkflow)).rejects.toThrow(
+      "candidate broker cleanup is uncertain",
+    );
+    await expect(runtime.has("workflow-site", "generation-workflow")).resolves.toBe(false);
+    await expect(
+      readFile(join(root, "workers", ".takoserver-active.json"), "utf8").then((contents) =>
+        JSON.parse(contents),
+      ),
+    ).resolves.toEqual({});
+  } finally {
+    probe.stop();
+  }
+});
+
+test("preserves the old Workflow serving claim after a deterministic reservation refusal", async () => {
+  const probe = createConfigProbe();
+  const before = workflowForwardPublication(root, "workflow-site", "tenant-before");
+  const after = workflowForwardPublication(root, "workflow-site", "tenant-after");
+  let reservationCount = 0;
+  const runtime = createWorkerdRuntime({
+    root,
+    port: probe.port,
+    isReady: () => true,
+    onReload: probe.onReload,
+    workflowForwardSockets: (publications) =>
+      publications[0]?.bindings[0]?.tenantId === "tenant-after" ? after.sockets : before.sockets,
+    workflowForwardLifecycle: {
+      async reserve() {
+        reservationCount += 1;
+        if (reservationCount > 1) throw new Error("Workflow capacity unavailable");
+        return { async release() {} };
+      },
+      activated() {
+        return true;
+      },
+      isRestored() {
+        return true;
+      },
+      uncertain() {},
+    },
+  });
+  if (!runtime.publish || !runtime.has) throw new Error("workflow runtime unavailable");
+
+  try {
+    await runtime.publish("workflow-site", before.withWorkflow);
+    await expect(runtime.publish("workflow-site", after.withWorkflow)).rejects.toThrow(
+      "Workflow capacity unavailable",
+    );
+    await expect(runtime.has("workflow-site", "generation-workflow")).resolves.toBe(true);
+    await expect(readWorkerdActiveDeployment(root, "workflow-site")).resolves.toMatchObject({
+      generation: "generation-workflow",
+    });
+  } finally {
+    probe.stop();
+  }
+});
+
+test("fails closed when Workflow restoration status cannot be read", async () => {
+  const probe = createConfigProbe();
+  const { withWorkflow, sockets } = workflowForwardPublication(root);
+  let statusUnavailable = false;
+  const runtime = createWorkerdRuntime({
+    root,
+    port: probe.port,
+    isReady: () => true,
+    onReload: probe.onReload,
+    workflowForwardSockets: () => sockets,
+    workflowForwardLifecycle: {
+      async reserve() {
+        return { async release() {} };
+      },
+      activated() {
+        return true;
+      },
+      isRestored() {
+        if (statusUnavailable) throw new Error("Workflow status unavailable");
+        return true;
+      },
+      uncertain() {},
+    },
+  });
+  if (!runtime.publish || !runtime.has) throw new Error("workflow runtime unavailable");
+
+  try {
+    await runtime.publish("workflow-site", withWorkflow);
+    statusUnavailable = true;
+    await expect(runtime.has("workflow-site", "generation-workflow")).resolves.toBe(false);
+    await expect(
+      readFile(join(root, "workers", ".takoserver-active.json"), "utf8").then((contents) =>
+        JSON.parse(contents),
+      ),
+    ).resolves.toEqual({});
+  } finally {
+    probe.stop();
+  }
+});
+
+test("keeps Workflow grants independent from generation-specific renderer names", async () => {
+  const probe = createConfigProbe();
+  const first = workflowForwardPublication(root);
+  const nextGeneration = "generation-workflow-next";
+  const next = {
+    ...first.withWorkflow,
+    generation: nextGeneration,
+    versions: first.withWorkflow.versions.map((version) => ({
+      ...version,
+      site: { ...version.site, generation: nextGeneration },
+    })),
+  };
+  const graphs: (readonly WorkerdWorkflowForwardPublication[])[] = [];
+  const runtime = createWorkerdRuntime({
+    root,
+    port: probe.port,
+    isReady: () => true,
+    onReload: probe.onReload,
+    workflowForwardSockets: () => first.sockets,
+    workflowForwardLifecycle: {
+      async reserve(publications) {
+        graphs.push(publications);
+        return { async release() {} };
+      },
+      activated() {
+        return true;
+      },
+      isRestored() {
+        return true;
+      },
+      uncertain() {},
+    },
+  });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+
+  try {
+    await runtime.publish("workflow-site", first.withWorkflow);
+    const firstConfig = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    await runtime.publish("workflow-site", next);
+    const nextConfig = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+
+    expect(graphs).toHaveLength(2);
+    expect(graphs[1]).toEqual(graphs[0]);
+    expect(nextConfig).not.toBe(firstConfig);
+    for (const socket of first.sockets) expect(nextConfig).toContain(`unix:${socket.socketPath}`);
+  } finally {
+    probe.stop();
+  }
+});
+
+test("re-reserves and reactivates the prior Workflow graph after a proved rollback", async () => {
+  const probe = createConfigProbe();
+  const before = workflowForwardPublication(root, "workflow-site", "tenant-before");
+  const after = workflowForwardPublication(root, "workflow-site", "tenant-after");
+  const reservations: string[] = [];
+  const activations: string[] = [];
+  let releases = 0;
+  let uncertain = 0;
+  probe.behavior = (_config, invocation) => {
+    if (invocation === 2) throw new Error("injected reload failure");
+  };
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+      workflowForwardSockets: (publications) =>
+        publications[0]?.bindings[0]?.tenantId === "tenant-after" ? after.sockets : before.sockets,
+      workflowForwardLifecycle: {
+        async reserve(publications) {
+          reservations.push(publications[0]?.bindings[0]?.tenantId ?? "empty");
+          return {
+            async release() {
+              releases += 1;
+            },
+          };
+        },
+        activated(publications) {
+          activations.push(publications[0]?.bindings[0]?.tenantId ?? "empty");
+          return true;
+        },
+        isRestored() {
+          return true;
+        },
+        uncertain() {
+          uncertain += 1;
+        },
+      },
+    });
+    if (!runtime.publish || !runtime.has) throw new Error("workflow runtime unavailable");
+
+    await runtime.publish("workflow-site", before.withWorkflow);
+    const candidate = {
+      ...after.withWorkflow,
+      generation: "generation-workflow-next",
+      versions: after.withWorkflow.versions.map((version) => ({
+        ...version,
+        site: { ...version.site, generation: "generation-workflow-next" },
+      })),
+    };
+    await expect(runtime.publish("workflow-site", candidate)).rejects.toThrow(
+      "injected reload failure",
+    );
+
+    expect(reservations).toEqual(["tenant-before", "tenant-after", "tenant-before"]);
+    expect(activations).toEqual(["tenant-before", "tenant-before"]);
+    expect(releases).toBe(3);
+    expect(uncertain).toBe(0);
+    await expect(runtime.has("workflow-site", "generation-workflow")).resolves.toBe(true);
+    await expect(readWorkerdActiveDeployment(root, "workflow-site")).resolves.toMatchObject({
+      generation: "generation-workflow",
+    });
+  } finally {
+    probe.stop();
+  }
+});
+
+test("clears Workflow serving truth when the prior graph cannot be re-admitted on rollback", async () => {
+  const probe = createConfigProbe();
+  const before = workflowForwardPublication(root, "workflow-site", "tenant-before");
+  const after = workflowForwardPublication(root, "workflow-site", "tenant-after");
+  let activations = 0;
+  let uncertain = 0;
+  probe.behavior = (_config, invocation) => {
+    if (invocation === 2) throw new Error("injected candidate reload failure");
+  };
+  const runtime = createWorkerdRuntime({
+    root,
+    port: probe.port,
+    isReady: () => true,
+    onReload: probe.onReload,
+    workflowForwardSockets: (publications) =>
+      publications[0]?.bindings[0]?.tenantId === "tenant-after" ? after.sockets : before.sockets,
+    workflowForwardLifecycle: {
+      async reserve() {
+        return { async release() {} };
+      },
+      activated() {
+        activations += 1;
+        return activations === 1;
+      },
+      isRestored() {
+        return true;
+      },
+      uncertain() {
+        uncertain += 1;
+      },
+    },
+  });
+  if (!runtime.publish || !runtime.has) throw new Error("workflow runtime unavailable");
+
+  try {
+    await runtime.publish("workflow-site", before.withWorkflow);
+    const candidate = {
+      ...after.withWorkflow,
+      generation: "generation-workflow-next",
+      versions: after.withWorkflow.versions.map((version) => ({
+        ...version,
+        site: { ...version.site, generation: "generation-workflow-next" },
+      })),
+    };
+    await expect(runtime.publish("workflow-site", candidate)).rejects.toThrow(
+      "worker runtime activation state is unknown",
+    );
+
+    expect(activations).toBe(2);
+    expect(uncertain).toBeGreaterThan(0);
+    await expect(runtime.has("workflow-site", "generation-workflow")).resolves.toBe(false);
+    await expect(runtime.has("workflow-site", "generation-workflow-next")).resolves.toBe(false);
+    await expect(
+      readFile(join(root, "workers", ".takoserver-active.json"), "utf8").then((contents) =>
+        JSON.parse(contents),
+      ),
+    ).resolves.toEqual({});
+    await expect(readWorkerdActiveDeployment(root, "workflow-site")).resolves.toBeNull();
+  } finally {
+    probe.stop();
+  }
 });
 
 test("owns the Workflow socket snapshot across asynchronous lifecycle hooks", async () => {
@@ -1888,6 +2675,24 @@ test("refuses missing or mismatched Workflow sockets and malformed later Version
     "unusable Workflow forward graph",
   );
   await expect(readWorkerdActiveDeployment(malformedRoot, "workflow-site")).resolves.toBeNull();
+});
+
+test("rejects an unrequested Workflow socket when the graph has no Workflow bindings", async () => {
+  const { sockets } = workflowForwardPublication(join(root, "unexpected"));
+  const runtime = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    workflowForwardSockets: (publications) => {
+      expect(publications).toEqual([]);
+      return sockets;
+    },
+  });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+
+  await expect(
+    runtime.publish("site", weightedPublication("site", "generation-without-workflow")),
+  ).rejects.toThrow("Workflow forward Host socket unavailable");
+  await expect(readWorkerdActiveDeployment(root, "site")).resolves.toBeNull();
 });
 
 test("does not restore a self-consistent snapshot with a noncanonical Workflow ref", async () => {
