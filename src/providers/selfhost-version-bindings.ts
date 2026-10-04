@@ -4,7 +4,8 @@ import { existsSync, constants as fsConstants } from "node:fs";
 import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { parseActorAbiRef } from "../actor-abi-ref.ts";
-import type { TakoformInterfaceRef } from "../interface-ref.ts";
+import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
+import type { TakoformBindingRef, TakoformInterfaceRef } from "../interface-ref.ts";
 import { isJsonObject } from "../json.ts";
 import { isStableStandardServiceProtocol } from "../standard-service-port.ts";
 import { parseStrictJson } from "../strict-json.ts";
@@ -81,6 +82,26 @@ const FORMAT_V7 = "takoserver.selfhost-version-bindings@v7";
 const FORMAT_V8 = "takoserver.selfhost-version-bindings@v8";
 /** Adds the exact selected Actor runtime InterfaceRef to selected bindings. */
 const FORMAT_V9 = "takoserver.selfhost-version-bindings@v9";
+/** Adds exact Workflow authority snapshots to immutable Worker Versions. */
+const FORMAT_V10 = "takoserver.selfhost-version-bindings@v10";
+const WORKFLOW_FORM_REF: TakoformV1Alpha3FormRef = {
+  apiVersion: "edge.forms.takoform.com",
+  kind: "DurableWorkflow",
+  definitionVersion: "0.2.0",
+  schemaDigest: "sha256:a58c885bed4431fbdc6b923059fe3b3bf98f7727578914d2d212552ae97fdc65",
+};
+const WORKFLOW_BINDING_REF: TakoformBindingRef = {
+  apiVersion: "bindings.takoform.com/v1alpha2",
+  name: "module-worker.workflow",
+  version: "3.0.0",
+  schemaDigest: "sha256:2b8df3ba036b2781ee3ea8af6603b3de5f09226f4eb1f3385565211cdacc854b",
+};
+const WORKFLOW_RUNTIME_CLASS_REF: TakoformInterfaceRef = {
+  apiVersion: "interfaces.takoform.com/v1alpha1",
+  name: "worker.workflow",
+  version: "3.0.0",
+  schemaDigest: "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
+};
 const LEASE_GENERATION = /^[A-Za-z0-9_-]{16}$/u;
 
 export const SELFHOST_VERSION_DATA_BINDING_KINDS = [
@@ -174,6 +195,54 @@ export interface SelfhostVersionActorBinding {
   readonly runtimeClassRef?: TakoformInterfaceRef;
 }
 
+/** Exact private snapshot of one selected module-worker.workflow relation. */
+export interface SelfhostVersionWorkflowBinding {
+  readonly name: string;
+  readonly tenantId: string;
+  readonly workflowResourceUid: string;
+  readonly workflowFormRef: TakoformV1Alpha3FormRef;
+  readonly bindingRef: TakoformBindingRef;
+  readonly runtimeClassRef: TakoformInterfaceRef;
+}
+
+/** Derives the caller-facing credential for one exact Workflow relation. */
+export function deriveSelfhostWorkflowBindingToken(input: {
+  readonly eventToken: string;
+  readonly workerVersionResourceUid: string;
+  readonly binding: SelfhostVersionWorkflowBinding;
+}): string {
+  const key = Buffer.from(input.eventToken, "base64url");
+  if (
+    key.length !== EVENT_TOKEN_BYTES ||
+    key.toString("base64url") !== input.eventToken ||
+    !RESOURCE_UID.test(input.workerVersionResourceUid)
+  ) {
+    throw new Error("Workflow Version credential unavailable");
+  }
+  const binding = normalizeWorkflowBindings([input.binding])?.[0];
+  if (!binding) throw new Error("Workflow Version relation unavailable");
+  const message = JSON.stringify([
+    "takoserver.selfhost-workflow-binding-token@v1",
+    binding.tenantId,
+    input.workerVersionResourceUid,
+    binding.workflowResourceUid,
+    binding.name,
+    binding.workflowFormRef.apiVersion,
+    binding.workflowFormRef.kind,
+    binding.workflowFormRef.definitionVersion,
+    binding.workflowFormRef.schemaDigest,
+    binding.bindingRef.apiVersion,
+    binding.bindingRef.name,
+    binding.bindingRef.version,
+    binding.bindingRef.schemaDigest,
+    binding.runtimeClassRef.apiVersion,
+    binding.runtimeClassRef.name,
+    binding.runtimeClassRef.version,
+    binding.runtimeClassRef.schemaDigest,
+  ]);
+  return createHmac("sha256", key).update(message, "utf8").digest("hex");
+}
+
 /** Derives one private facade credential from an immutable Version secret. */
 export function deriveSelfhostActorForwardToken(input: {
   readonly eventToken: string;
@@ -261,6 +330,8 @@ export interface SelfhostVersionBindingSet {
   readonly serviceBindings: readonly SelfhostVersionServiceBinding[];
   readonly workerVersionResourceUid?: string;
   readonly actorBindings?: readonly SelfhostVersionActorBinding[];
+  /** Absent when the Version declares no typed Workflow consumer bindings. */
+  readonly workflowBindings?: readonly SelfhostVersionWorkflowBinding[];
   /** Stable external service declarations and optional runtime JSON values. */
   readonly externalServices?: readonly SelfhostVersionExternalService[];
   /** Absent when the version binds no namespace, queue, or database. */
@@ -300,6 +371,7 @@ export interface StoredSelfhostVersionBindings {
   readonly serviceBindings?: readonly SelfhostVersionServiceBinding[];
   readonly workerVersionResourceUid?: string;
   readonly actorBindings?: readonly SelfhostVersionActorBinding[];
+  readonly workflowBindings?: readonly SelfhostVersionWorkflowBinding[];
   /** Absent on @v1-@v4 records and on versions with no external services. */
   readonly externalServices?: readonly SelfhostVersionExternalService[];
   readonly dataPlane?: SelfhostVersionDataPlane;
@@ -665,6 +737,12 @@ export function createSelfhostVersionBindingStore(options: {
             throw new SelfhostVersionBindingStoreError("corrupt");
           }
           if (current && sameBindings(current, normalized)) return current;
+          // Workflow authority is a fact of the immutable Version. A retry may
+          // adopt the exact snapshot above, but neither adding nor removing a
+          // binding may reinterpret an already-written event token.
+          if (current && (normalized.workflowBindings || current.workflowBindings)) {
+            throw new SelfhostVersionBindingStoreError("corrupt");
+          }
           // A historical Version's serving token is immutable. Adding Actor
           // authority to that Version would either rotate it or reinterpret a
           // token that never committed to this relation.
@@ -874,7 +952,32 @@ function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet
   const dataPlane = set.dataPlane === undefined ? undefined : normalizeDataPlane(set.dataPlane);
   const serviceBindings = normalizeServiceBindings(set.serviceBindings);
   const externalServices = normalizeExternalServices(set.externalServices);
-  const actorBindings = normalizeActorBindings(set.actorBindings, set.workerVersionResourceUid);
+  const workflowBindings = normalizeWorkflowBindings(set.workflowBindings);
+  if (
+    set.workerVersionResourceUid !== undefined &&
+    (typeof set.workerVersionResourceUid !== "string" ||
+      !RESOURCE_UID.test(set.workerVersionResourceUid))
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  if (
+    workflowBindings &&
+    (typeof set.workerVersionResourceUid !== "string" ||
+      !RESOURCE_UID.test(set.workerVersionResourceUid))
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  if (
+    !workflowBindings &&
+    set.actorBindings === undefined &&
+    set.workerVersionResourceUid !== undefined
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  const actorBindings = normalizeActorBindings(
+    set.actorBindings,
+    set.actorBindings === undefined ? undefined : set.workerVersionResourceUid,
+  );
   if (actorBindings && sensitiveVars.length > 0 && !set.runtimeInputGeneration) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
@@ -885,6 +988,7 @@ function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet
     ...(dataPlane?.bindings ?? []).map((binding) => binding.name),
     ...serviceBindings.map((binding) => binding.name),
     ...(actorBindings ?? []).map((binding) => binding.name),
+    ...(workflowBindings ?? []).map((binding) => binding.name),
     ...(externalServices ?? []).map((binding) => binding.name),
   ]) {
     if (names.has(name)) throw new SelfhostVersionBindingStoreError("corrupt");
@@ -900,9 +1004,105 @@ function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet
     ...(actorBindings
       ? { workerVersionResourceUid: set.workerVersionResourceUid, actorBindings }
       : {}),
+    ...(workflowBindings
+      ? { workerVersionResourceUid: set.workerVersionResourceUid, workflowBindings }
+      : {}),
     ...(externalServices ? { externalServices } : {}),
     ...(dataPlane ? { dataPlane } : {}),
   };
+}
+
+function normalizeWorkflowBindings(
+  bindings: readonly SelfhostVersionWorkflowBinding[] | undefined,
+): readonly SelfhostVersionWorkflowBinding[] | undefined {
+  if (bindings === undefined) return undefined;
+  if (!Array.isArray(bindings)) throw new SelfhostVersionBindingStoreError("corrupt");
+  if (bindings.length === 0) return undefined;
+  if (bindings.length > 64) throw new SelfhostVersionBindingStoreError("corrupt");
+  const normalized = bindings
+    .map((candidate) => {
+      const binding = ownDataRecord(candidate, [
+        "bindingRef",
+        "name",
+        "runtimeClassRef",
+        "tenantId",
+        "workflowFormRef",
+        "workflowResourceUid",
+      ]);
+      if (
+        !binding ||
+        typeof binding.name !== "string" ||
+        binding.name.length > 64 ||
+        !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(binding.name) ||
+        typeof binding.tenantId !== "string" ||
+        !boundedCodePointString(binding.tenantId, 1, 255) ||
+        binding.tenantId.includes("\u0000") ||
+        typeof binding.workflowResourceUid !== "string" ||
+        !RESOURCE_UID.test(binding.workflowResourceUid)
+      ) {
+        throw new SelfhostVersionBindingStoreError("corrupt");
+      }
+      const workflowFormRef = exactWorkflowFormRef(binding.workflowFormRef);
+      const bindingRef = exactWorkflowBindingRef(binding.bindingRef);
+      const runtimeClassRef = exactWorkflowRuntimeClassRef(binding.runtimeClassRef);
+      return {
+        name: binding.name,
+        tenantId: binding.tenantId,
+        workflowResourceUid: binding.workflowResourceUid,
+        workflowFormRef,
+        bindingRef,
+        runtimeClassRef,
+      } satisfies SelfhostVersionWorkflowBinding;
+    })
+    .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+  for (let index = 1; index < normalized.length; index += 1) {
+    if (normalized[index - 1]?.name === normalized[index]?.name) {
+      throw new SelfhostVersionBindingStoreError("corrupt");
+    }
+  }
+  return normalized;
+}
+
+function exactWorkflowFormRef(value: unknown): TakoformV1Alpha3FormRef {
+  const ref = ownDataRecord(value, ["apiVersion", "definitionVersion", "kind", "schemaDigest"]);
+  if (
+    !ref ||
+    ref.apiVersion !== WORKFLOW_FORM_REF.apiVersion ||
+    ref.kind !== WORKFLOW_FORM_REF.kind ||
+    ref.definitionVersion !== WORKFLOW_FORM_REF.definitionVersion ||
+    ref.schemaDigest !== WORKFLOW_FORM_REF.schemaDigest
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  return Object.freeze({ ...WORKFLOW_FORM_REF });
+}
+
+function exactWorkflowBindingRef(value: unknown): TakoformBindingRef {
+  const ref = ownDataRecord(value, ["apiVersion", "name", "schemaDigest", "version"]);
+  if (
+    !ref ||
+    ref.apiVersion !== WORKFLOW_BINDING_REF.apiVersion ||
+    ref.name !== WORKFLOW_BINDING_REF.name ||
+    ref.version !== WORKFLOW_BINDING_REF.version ||
+    ref.schemaDigest !== WORKFLOW_BINDING_REF.schemaDigest
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  return Object.freeze({ ...WORKFLOW_BINDING_REF });
+}
+
+function exactWorkflowRuntimeClassRef(value: unknown): TakoformInterfaceRef {
+  const ref = ownDataRecord(value, ["apiVersion", "name", "schemaDigest", "version"]);
+  if (
+    !ref ||
+    ref.apiVersion !== WORKFLOW_RUNTIME_CLASS_REF.apiVersion ||
+    ref.name !== WORKFLOW_RUNTIME_CLASS_REF.name ||
+    ref.version !== WORKFLOW_RUNTIME_CLASS_REF.version ||
+    ref.schemaDigest !== WORKFLOW_RUNTIME_CLASS_REF.schemaDigest
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  return Object.freeze({ ...WORKFLOW_RUNTIME_CLASS_REF });
 }
 
 /**
@@ -1327,7 +1527,8 @@ function sameBindings(
   if (left.runtimeInputGeneration !== right.runtimeInputGeneration) return false;
   if (
     left.workerVersionResourceUid !== right.workerVersionResourceUid ||
-    JSON.stringify(left.actorBindings ?? null) !== JSON.stringify(right.actorBindings ?? null)
+    JSON.stringify(left.actorBindings ?? null) !== JSON.stringify(right.actorBindings ?? null) ||
+    JSON.stringify(left.workflowBindings ?? null) !== JSON.stringify(right.workflowBindings ?? null)
   )
     return false;
   // A retained pre-v4 record stays byte-for-byte valid for a Version that did
@@ -1369,6 +1570,7 @@ function sameBindings(
         ? { workerVersionResourceUid: left.workerVersionResourceUid }
         : {}),
       ...(left.actorBindings ? { actorBindings: left.actorBindings } : {}),
+      ...(left.workflowBindings ? { workflowBindings: left.workflowBindings } : {}),
       ...(left.externalServices ? { externalServices: left.externalServices } : {}),
       ...(left.dataPlane ? { dataPlane: left.dataPlane } : {}),
     }) === canonicalBindings(right)
@@ -1385,6 +1587,7 @@ function canonicalBindings(set: SelfhostVersionBindingSet): string {
     serviceBindings: set.serviceBindings,
     workerVersionResourceUid: set.workerVersionResourceUid ?? null,
     actorBindings: set.actorBindings ?? null,
+    ...(set.workflowBindings ? { workflowBindings: set.workflowBindings } : {}),
     externalServices: set.externalServices ?? null,
     dataPlane: set.dataPlane ?? null,
   });
@@ -1399,7 +1602,8 @@ type SelfhostVersionBindingFormat =
   | typeof FORMAT_V6
   | typeof FORMAT_V7
   | typeof FORMAT_V8
-  | typeof FORMAT_V9;
+  | typeof FORMAT_V9
+  | typeof FORMAT_V10;
 
 function formatForSet(
   set: SelfhostVersionBindingSet,
@@ -1409,7 +1613,9 @@ function formatForSet(
   | typeof FORMAT_V6
   | typeof FORMAT_V7
   | typeof FORMAT_V8
-  | typeof FORMAT_V9 {
+  | typeof FORMAT_V9
+  | typeof FORMAT_V10 {
+  if (set.workflowBindings?.length) return FORMAT_V10;
   if (set.actorBindings?.some((binding) => binding.runtimeClassRef !== undefined)) return FORMAT_V9;
   if (set.actorBindings?.length) return FORMAT_V8;
   if (set.runtimeInputGeneration) return FORMAT_V7;
@@ -1446,7 +1652,8 @@ function canonicalRecord(
               format !== FORMAT_V6 &&
               format !== FORMAT_V7 &&
               format !== FORMAT_V8 &&
-              format !== FORMAT_V9
+              format !== FORMAT_V9 &&
+              format !== FORMAT_V10
             ) {
               throw new SelfhostVersionBindingStoreError("corrupt");
             }
@@ -1535,6 +1742,27 @@ function canonicalRecord(
       eventToken,
     });
   }
+  if (format === FORMAT_V10) {
+    return JSON.stringify({
+      format: FORMAT_V10,
+      salt,
+      ...(current.runtimeInputGeneration
+        ? { runtimeInputGeneration: current.runtimeInputGeneration }
+        : {}),
+      workerResourceUid: current.workerResourceUid,
+      workerVersionResourceUid: current.workerVersionResourceUid,
+      ...(current.actorBindings ? { actorBindings: current.actorBindings } : {}),
+      workflowBindings: current.workflowBindings,
+      handlers: current.handlers,
+      vars: current.vars,
+      sensitiveVars: current.sensitiveVars,
+      serviceBindings: current.serviceBindings,
+      externalServices: current.externalServices ?? [],
+      ...(plane ? { dataPlane: plane } : {}),
+      ...(planeToken === undefined ? {} : { planeToken }),
+      eventToken,
+    });
+  }
   return JSON.stringify({
     format,
     salt,
@@ -1566,6 +1794,7 @@ interface LegacySet {
   readonly workerResourceUid?: string;
   readonly workerVersionResourceUid?: string;
   readonly actorBindings?: readonly SelfhostVersionActorBinding[];
+  readonly workflowBindings?: readonly SelfhostVersionWorkflowBinding[];
   readonly handlers?: readonly SelfhostWorkerHandlerName[];
   readonly vars: readonly SelfhostVersionBinding[];
   readonly sensitiveVars: readonly SelfhostVersionBinding[];
@@ -1592,6 +1821,10 @@ function digestOf(
 }
 
 function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
+  // The file has no independently pinned expected digest. Canonical parsing
+  // rejects malformed or unselected refs, while a valid scope substitution
+  // necessarily produces a new digest and derived relation token; this is not
+  // an authentication check for canonical file tampering.
   let parsed: unknown;
   try {
     parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
@@ -1623,7 +1856,9 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
                     ? FORMAT_V8
                     : record.format === FORMAT_V9 && isVersion9Keys(keys)
                       ? FORMAT_V9
-                      : null;
+                      : record.format === FORMAT_V10 && isVersion10Keys(keys)
+                        ? FORMAT_V10
+                        : null;
   if (
     format === null ||
     typeof record.salt !== "string" ||
@@ -1639,7 +1874,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
       format === FORMAT_V6 ||
       format === FORMAT_V7 ||
       format === FORMAT_V8 ||
-      format === FORMAT_V9) &&
+      format === FORMAT_V9 ||
+      format === FORMAT_V10) &&
       "dataPlane" in record);
   const planeToken = format === FORMAT_V1 ? undefined : (record.planeToken as unknown);
   if (
@@ -1655,7 +1891,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     format === FORMAT_V6 ||
     format === FORMAT_V7 ||
     format === FORMAT_V8 ||
-    format === FORMAT_V9
+    format === FORMAT_V9 ||
+    format === FORMAT_V10
       ? record.eventToken
       : undefined;
   if (
@@ -1665,7 +1902,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
       format === FORMAT_V6 ||
       format === FORMAT_V7 ||
       format === FORMAT_V8 ||
-      format === FORMAT_V9) &&
+      format === FORMAT_V9 ||
+      format === FORMAT_V10) &&
     (typeof eventToken !== "string" || decodedLength(eventToken) !== EVENT_TOKEN_BYTES)
   ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
@@ -1680,7 +1918,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     format === FORMAT_V6 ||
     format === FORMAT_V7 ||
     format === FORMAT_V8 ||
-    format === FORMAT_V9
+    format === FORMAT_V9 ||
+    format === FORMAT_V10
       ? normalizeHandlers(parsedHandlers(record.handlers))
       : legacyPlane
         ? normalizeHandlers(legacyPlane.handlers)
@@ -1691,7 +1930,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     format === FORMAT_V6 ||
     format === FORMAT_V7 ||
     format === FORMAT_V8 ||
-    format === FORMAT_V9
+    format === FORMAT_V9 ||
+    format === FORMAT_V10
       ? {
           workerResourceUid: parsedResourceUid(record.workerResourceUid),
           serviceBindings: parsedServiceBindings(record.serviceBindings),
@@ -1703,10 +1943,22 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
           actorBindings: parsedActorBindings(record.actorBindings, format === FORMAT_V9),
         }
       : {}),
+    ...(format === FORMAT_V10
+      ? {
+          workerVersionResourceUid: parsedResourceUid(record.workerVersionResourceUid),
+          ...(record.actorBindings === undefined
+            ? {}
+            : { actorBindings: parsedActorBindings(record.actorBindings, true) }),
+          workflowBindings: parsedWorkflowBindings(record.workflowBindings),
+        }
+      : {}),
     ...(handlers ? { handlers } : {}),
     vars: parsedBindings(record.vars),
     sensitiveVars: parsedBindings(record.sensitiveVars),
-    ...((format === FORMAT_V7 || format === FORMAT_V8 || format === FORMAT_V9) &&
+    ...((format === FORMAT_V7 ||
+      format === FORMAT_V8 ||
+      format === FORMAT_V9 ||
+      format === FORMAT_V10) &&
     record.runtimeInputGeneration !== undefined
       ? { runtimeInputGeneration: parsedRuntimeInputGeneration(record.runtimeInputGeneration) }
       : {}),
@@ -1717,7 +1969,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
             format === FORMAT_V6 ||
               format === FORMAT_V7 ||
               format === FORMAT_V8 ||
-              format === FORMAT_V9,
+              format === FORMAT_V9 ||
+              format === FORMAT_V10,
           ),
         }
       : {}),
@@ -1725,7 +1978,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     format === FORMAT_V6 ||
     format === FORMAT_V7 ||
     format === FORMAT_V8 ||
-    format === FORMAT_V9
+    format === FORMAT_V9 ||
+    format === FORMAT_V10
       ? { externalServices: parsedExternalServices(record.externalServices) }
       : {}),
   });
@@ -1853,6 +2107,36 @@ function isVersion9Keys(keys: string): boolean {
   return isVersion8Keys(keys);
 }
 
+function isVersion10Keys(keys: string): boolean {
+  const required = [
+    "eventToken",
+    "externalServices",
+    "format",
+    "handlers",
+    "salt",
+    "sensitiveVars",
+    "serviceBindings",
+    "vars",
+    "workerResourceUid",
+    "workerVersionResourceUid",
+    "workflowBindings",
+  ];
+  for (const runtimeInput of [false, true]) {
+    for (const actorBindings of [false, true]) {
+      for (const plane of [false, true]) {
+        const expected = [
+          ...required,
+          ...(runtimeInput ? ["runtimeInputGeneration"] : []),
+          ...(actorBindings ? ["actorBindings"] : []),
+          ...(plane ? ["dataPlane", "planeToken"] : []),
+        ];
+        if (keys === expected.sort().join(",")) return true;
+      }
+    }
+  }
+  return false;
+}
+
 function parsedRuntimeInputGeneration(value: unknown): string {
   if (typeof value !== "string" || !LEASE_GENERATION.test(value)) {
     throw new SelfhostVersionBindingStoreError("corrupt");
@@ -1904,6 +2188,13 @@ function parsedActorBindings(
   return value as readonly SelfhostVersionActorBinding[];
 }
 
+function parsedWorkflowBindings(value: unknown): readonly SelfhostVersionWorkflowBinding[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  return value as readonly SelfhostVersionWorkflowBinding[];
+}
+
 function parsedExternalServices(value: unknown): readonly SelfhostVersionExternalService[] {
   if (!Array.isArray(value)) throw new SelfhostVersionBindingStoreError("corrupt");
   return value as readonly SelfhostVersionExternalService[];
@@ -1925,7 +2216,21 @@ function normalizeSetOrLegacy(set: LegacySet): LegacySet {
   const dataPlane = set.dataPlane === undefined ? undefined : normalizeDataPlane(set.dataPlane);
   const serviceBindings =
     set.serviceBindings === undefined ? undefined : normalizeServiceBindings(set.serviceBindings);
-  const actorBindings = normalizeActorBindings(set.actorBindings, set.workerVersionResourceUid);
+  const workflowBindings = normalizeWorkflowBindings(set.workflowBindings);
+  if (
+    set.workerVersionResourceUid !== undefined &&
+    (typeof set.workerVersionResourceUid !== "string" ||
+      !RESOURCE_UID.test(set.workerVersionResourceUid))
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  if (workflowBindings && !set.workerVersionResourceUid) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  const actorBindings = normalizeActorBindings(
+    set.actorBindings,
+    set.actorBindings === undefined ? undefined : set.workerVersionResourceUid,
+  );
   const externalServices = normalizeExternalServices(set.externalServices);
   if (
     set.workerResourceUid !== undefined &&
@@ -1940,6 +2245,7 @@ function normalizeSetOrLegacy(set: LegacySet): LegacySet {
     ...(dataPlane?.bindings ?? []).map((binding) => binding.name),
     ...(serviceBindings ?? []).map((binding) => binding.name),
     ...(actorBindings ?? []).map((binding) => binding.name),
+    ...(workflowBindings ?? []).map((binding) => binding.name),
     ...(externalServices ?? []).map((binding) => binding.name),
   ]) {
     if (names.has(name)) throw new SelfhostVersionBindingStoreError("corrupt");
@@ -1956,6 +2262,9 @@ function normalizeSetOrLegacy(set: LegacySet): LegacySet {
     ...(serviceBindings ? { serviceBindings } : {}),
     ...(actorBindings
       ? { workerVersionResourceUid: set.workerVersionResourceUid, actorBindings }
+      : {}),
+    ...(workflowBindings
+      ? { workerVersionResourceUid: set.workerVersionResourceUid, workflowBindings }
       : {}),
     ...(externalServices ? { externalServices } : {}),
     ...(dataPlane ? { dataPlane } : {}),

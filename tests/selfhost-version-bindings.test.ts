@@ -7,6 +7,7 @@ import type { TakoformInterfaceRef } from "../src/interface-ref.ts";
 import {
   createSelfhostVersionBindingStore,
   deriveSelfhostActorForwardToken,
+  deriveSelfhostWorkflowBindingToken,
   normalizeSelfhostVersionBindingSet,
   type SelfhostVersionBindingSet,
   type SelfhostVersionBindingStore,
@@ -371,6 +372,282 @@ const VECTOR_SET = {
     ],
   },
 };
+
+const WORKFLOW_BINDING = {
+  name: "FULFILLMENT",
+  tenantId: "tenant-a",
+  workflowResourceUid: "uid-DurableWorkflow-orders",
+  workflowFormRef: {
+    apiVersion: "edge.forms.takoform.com",
+    kind: "DurableWorkflow",
+    definitionVersion: "0.2.0",
+    schemaDigest: "sha256:a58c885bed4431fbdc6b923059fe3b3bf98f7727578914d2d212552ae97fdc65",
+  },
+  bindingRef: {
+    apiVersion: "bindings.takoform.com/v1alpha2",
+    name: "module-worker.workflow",
+    version: "3.0.0",
+    schemaDigest: "sha256:2b8df3ba036b2781ee3ea8af6603b3de5f09226f4eb1f3385565211cdacc854b",
+  },
+  runtimeClassRef: {
+    apiVersion: "interfaces.takoform.com/v1alpha1",
+    name: "worker.workflow",
+    version: "3.0.0",
+    schemaDigest: "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
+  },
+} as const;
+
+const WORKFLOW_SET = {
+  ...SET,
+  sensitiveVars: [],
+  workerVersionResourceUid: "uid-WorkerVersion-workflows",
+  workflowBindings: [WORKFLOW_BINDING],
+};
+
+test("stores an immutable V10 Workflow scope with the exact selected refs", async () => {
+  const written = await store.write("sw-workflow", "v-workflow", WORKFLOW_SET);
+  const path = join(root, "sw-workflow", "v-workflow.json");
+  const before = await readFile(path, "utf8");
+  expect(JSON.parse(before).format).toBe("takoserver.selfhost-version-bindings@v10");
+  expect(written.workflowBindings).toEqual([WORKFLOW_BINDING]);
+  expect(written.workerVersionResourceUid).toBe(WORKFLOW_SET.workerVersionResourceUid);
+  expect(Object.isFrozen(written.workflowBindings?.[0]?.workflowFormRef)).toBe(true);
+  expect(Object.isFrozen(written.workflowBindings?.[0]?.bindingRef)).toBe(true);
+  expect(Object.isFrozen(written.workflowBindings?.[0]?.runtimeClassRef)).toBe(true);
+  expect(await store.read("sw-workflow", "v-workflow")).toEqual(written);
+  expect(await store.write("sw-workflow", "v-workflow", WORKFLOW_SET)).toEqual(written);
+  expect(await readFile(path, "utf8")).toBe(before);
+
+  const mutableInput = structuredClone(WORKFLOW_SET);
+  const pending = store.write("sw-workflow-clone", "v-1", mutableInput);
+  const inputBinding = mutableInput.workflowBindings[0];
+  if (!inputBinding) throw new Error("Workflow fixture is missing");
+  Reflect.set(inputBinding, "tenantId", "mutated-after-call");
+  expect((await pending).workflowBindings?.[0]?.tenantId).toBe("tenant-a");
+});
+
+test("V10 retains existing Actor, Vector, service, and external service projections", async () => {
+  const combined = {
+    ...WORKFLOW_SET,
+    serviceBindings: [
+      {
+        name: "WORKER",
+        target: "worker-target",
+        targetResourceUid: "uid-ModuleWorker-target",
+      },
+    ],
+    actorBindings: [
+      {
+        name: "COUNTER",
+        tenantId: "tenant-a",
+        namespaceResourceUid: "uid-ActorNamespace-counter",
+        workerResourceUid: "uid-ModuleWorker-counter",
+        className: "Counter",
+        runtimeClassRef: {
+          apiVersion: "interfaces.takoform.com/v1alpha1" as const,
+          name: "worker.actor",
+          version: "2.0.0",
+          schemaDigest:
+            "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51" as const,
+        },
+      },
+    ],
+    externalServices: EXTERNAL_SERVICES,
+    dataPlane: VECTOR_SET.dataPlane,
+  };
+  const written = await store.write("sw-workflow-combined", "v-1", combined);
+  const raw = JSON.parse(
+    await readFile(join(root, "sw-workflow-combined", "v-1.json"), "utf8"),
+  ) as Record<string, unknown>;
+  expect(raw.format).toBe("takoserver.selfhost-version-bindings@v10");
+  expect(raw).toHaveProperty("actorBindings");
+  expect(raw).toHaveProperty("dataPlane");
+  expect(raw).toHaveProperty("serviceBindings");
+  expect(raw).toHaveProperty("externalServices");
+  expect(await store.read("sw-workflow-combined", "v-1")).toEqual(written);
+});
+
+test("Workflow token derivation pins every selected scope and reference tuple field", () => {
+  expect(
+    deriveSelfhostWorkflowBindingToken({
+      eventToken: Buffer.alloc(32, 1).toString("base64url"),
+      workerVersionResourceUid: "uid-WorkerVersion-workflows",
+      binding: WORKFLOW_BINDING,
+    }),
+  ).toBe("7cc744a236659c6e1470358c1f47c0b2c797ffbaf815dcc7f6d0cca6ec9c4099");
+});
+
+test("Workflow names are unique across all immutable binding kinds and remain bounded", async () => {
+  const collisionSets = [
+    { ...WORKFLOW_SET, vars: [{ name: "FULFILLMENT", value: "x", kind: "text" as const }] },
+    {
+      ...WORKFLOW_SET,
+      serviceBindings: [{ name: "FULFILLMENT", target: "worker", targetResourceUid: "uid-worker" }],
+    },
+    {
+      ...WORKFLOW_SET,
+      actorBindings: [
+        {
+          name: "FULFILLMENT",
+          tenantId: "tenant-a",
+          namespaceResourceUid: "uid-ActorNamespace-a",
+          workerResourceUid: "uid-ModuleWorker-a",
+          className: "Counter",
+        },
+      ],
+    },
+    {
+      ...WORKFLOW_SET,
+      dataPlane: { bindings: [{ kind: "edge.kv" as const, name: "FULFILLMENT", target: "ns" }] },
+    },
+    {
+      ...WORKFLOW_SET,
+      workflowBindings: [{ ...WORKFLOW_BINDING, name: "ARCHIVE" }],
+      externalServices: EXTERNAL_SERVICES,
+    },
+  ];
+  for (const [index, candidate] of collisionSets.entries()) {
+    await expect(
+      store.write(`sw-workflow-collision-${index}`, "v-1", candidate),
+    ).rejects.toMatchObject({
+      code: "corrupt",
+    });
+  }
+  await expect(
+    store.write("sw-workflow-name-bound", "v-1", {
+      ...WORKFLOW_SET,
+      workflowBindings: [{ ...WORKFLOW_BINDING, name: "1invalid" }],
+    }),
+  ).rejects.toMatchObject({ code: "corrupt" });
+  await expect(
+    store.write("sw-workflow-tenant-bound", "v-1", {
+      ...WORKFLOW_SET,
+      workflowBindings: [{ ...WORKFLOW_BINDING, tenantId: "t".repeat(256) }],
+    }),
+  ).rejects.toMatchObject({ code: "corrupt" });
+  await expect(
+    store.write("sw-workflow-uid-bound", "v-1", {
+      ...WORKFLOW_SET,
+      workflowBindings: [{ ...WORKFLOW_BINDING, workflowResourceUid: "ab" }],
+    }),
+  ).rejects.toMatchObject({ code: "corrupt" });
+  await expect(
+    store.write("sw-workflow-count-bound", "v-1", {
+      ...WORKFLOW_SET,
+      workflowBindings: Array.from({ length: 65 }, (_, index) => ({
+        ...WORKFLOW_BINDING,
+        name: `WORKFLOW_${index}`,
+      })),
+    }),
+  ).rejects.toMatchObject({ code: "corrupt" });
+});
+
+test("Workflow snapshots refuse unselected and non-plain reference tuples before writing", async () => {
+  const candidates = [
+    {
+      ...WORKFLOW_BINDING,
+      workflowFormRef: { ...WORKFLOW_BINDING.workflowFormRef, kind: "Worker" },
+    },
+    {
+      ...WORKFLOW_BINDING,
+      bindingRef: { ...WORKFLOW_BINDING.bindingRef, schemaDigest: `sha256:${"a".repeat(64)}` },
+    },
+    {
+      ...WORKFLOW_BINDING,
+      runtimeClassRef: { ...WORKFLOW_BINDING.runtimeClassRef, version: "2.0.0" },
+    },
+    { ...WORKFLOW_BINDING, bindingRef: { ...WORKFLOW_BINDING.bindingRef, extra: true } },
+  ];
+  for (const [index, workflowBinding] of candidates.entries()) {
+    await expect(
+      store.write(`sw-workflow-invalid-${index}`, "v-1", {
+        ...WORKFLOW_SET,
+        workflowBindings: [workflowBinding],
+      } as unknown as SelfhostVersionBindingSet),
+    ).rejects.toMatchObject({ code: "corrupt" });
+    expect(existsSync(join(root, `sw-workflow-invalid-${index}`, "v-1.json"))).toBe(false);
+  }
+  const missingVersionUid = { ...WORKFLOW_SET } as Record<string, unknown>;
+  delete missingVersionUid.workerVersionResourceUid;
+  await expect(
+    store.write(
+      "sw-workflow-no-version-uid",
+      "v-1",
+      missingVersionUid as unknown as SelfhostVersionBindingSet,
+    ),
+  ).rejects.toMatchObject({ code: "corrupt" });
+});
+
+test("a stored Workflow record with an unselected reference is corrupt", async () => {
+  await store.write("sw-workflow-tampered-ref", "v-1", WORKFLOW_SET);
+  const path = join(root, "sw-workflow-tampered-ref", "v-1.json");
+  const raw = JSON.parse(await readFile(path, "utf8")) as {
+    workflowBindings: Array<{ runtimeClassRef: { version: string } }>;
+  };
+  const workflowBinding = raw.workflowBindings[0];
+  if (!workflowBinding) throw new Error("stored Workflow binding is missing");
+  workflowBinding.runtimeClassRef.version = "2.0.0";
+  await writeFile(path, JSON.stringify(raw), "utf8");
+  await expect(store.read("sw-workflow-tampered-ref", "v-1")).rejects.toMatchObject({
+    code: "corrupt",
+  });
+});
+
+test("refuses any Workflow authority rewrite on an immutable Version", async () => {
+  const first = await store.write("sw-workflow", "v-workflow", WORKFLOW_SET);
+  const path = join(root, "sw-workflow", "v-workflow.json");
+  const before = await readFile(path, "utf8");
+  for (const workflowBindings of [
+    [],
+    [{ ...WORKFLOW_BINDING, workflowResourceUid: "uid-DurableWorkflow-replacement" }],
+    [{ ...WORKFLOW_BINDING, bindingRef: { ...WORKFLOW_BINDING.bindingRef, version: "3.0.1" } }],
+  ]) {
+    await expect(
+      store.write("sw-workflow", "v-workflow", { ...WORKFLOW_SET, workflowBindings }),
+    ).rejects.toMatchObject({ code: "corrupt" });
+    expect(await readFile(path, "utf8")).toBe(before);
+  }
+  expect(await store.read("sw-workflow", "v-workflow")).toEqual(first);
+
+  const legacyPath = join(root, "sw-add-workflow", "v-old.json");
+  await store.write("sw-add-workflow", "v-old", SET);
+  const legacyBytes = await readFile(legacyPath, "utf8");
+  await expect(store.write("sw-add-workflow", "v-old", WORKFLOW_SET)).rejects.toMatchObject({
+    code: "corrupt",
+  });
+  expect(await readFile(legacyPath, "utf8")).toBe(legacyBytes);
+});
+
+test("a canonical Workflow scope substitution reads with a new commitment but cannot be rewritten", async () => {
+  const first = await store.write("sw-workflow", "v-workflow", WORKFLOW_SET);
+  const path = join(root, "sw-workflow", "v-workflow.json");
+  const raw = JSON.parse(await readFile(path, "utf8")) as {
+    workflowBindings: Array<{ workflowResourceUid: string }>;
+  };
+  const substitutedBinding = raw.workflowBindings[0];
+  if (!substitutedBinding) throw new Error("stored Workflow binding is missing");
+  substitutedBinding.workflowResourceUid = "uid-DurableWorkflow-substituted";
+  await writeFile(path, JSON.stringify(raw), "utf8");
+  const substituted = await store.read("sw-workflow", "v-workflow");
+  expect(substituted?.digest).not.toBe(first.digest);
+  expect(substituted?.eventToken).toBe(first.eventToken);
+  const eventToken = first.eventToken;
+  if (!eventToken) throw new Error("stored event token is missing");
+  const oldWorkflowToken = deriveSelfhostWorkflowBindingToken({
+    eventToken,
+    workerVersionResourceUid: WORKFLOW_SET.workerVersionResourceUid,
+    binding: WORKFLOW_BINDING,
+  });
+  const substitutedWorkflowToken = deriveSelfhostWorkflowBindingToken({
+    eventToken,
+    workerVersionResourceUid: WORKFLOW_SET.workerVersionResourceUid,
+    binding: { ...WORKFLOW_BINDING, workflowResourceUid: "uid-DurableWorkflow-substituted" },
+  });
+  expect(substitutedWorkflowToken).not.toBe(oldWorkflowToken);
+  await expect(store.write("sw-workflow", "v-workflow", WORKFLOW_SET)).rejects.toMatchObject({
+    code: "corrupt",
+  });
+});
 
 test("stores and returns one version's bindings", async () => {
   expect(await store.read("sw-a", "v-1")).toBeNull();
