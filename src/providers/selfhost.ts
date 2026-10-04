@@ -256,13 +256,13 @@ const SELFHOST_ACTOR_INTERFACE_REF = Object.freeze({
   version: "1.0.0",
   schemaDigest: "sha256:f5428fb587de80261dd7363dc5b8a3f4aab7e469fa1b5fce8441ad9acbec8218",
 });
-const SELFHOST_WORKFLOW_VERSION_FORM_REF = Object.freeze({
+export const SELFHOST_WORKFLOW_VERSION_FORM_REF = Object.freeze({
   apiVersion: "edge.forms.takoform.com",
   kind: "WorkerVersion",
   definitionVersion: "0.4.0",
   schemaDigest: "sha256:ba59a72fb2c12aa6e9d09173943eb4bb8d2eadac25840d87356a25286007354b",
 });
-const SELFHOST_WORKFLOW_WORKER_FORM_REF = Object.freeze({
+export const SELFHOST_WORKFLOW_WORKER_FORM_REF = Object.freeze({
   apiVersion: "edge.forms.takoform.com",
   kind: "ModuleWorker",
   definitionVersion: "0.2.0",
