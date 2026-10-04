@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applicationSchemaMatches } from "../scripts/deploy/application-schema-shape.ts";
+import { DEPLOY_CONTRACT } from "../scripts/deploy/contract.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import type {
   IntegrationStorageD1Database,
@@ -209,6 +210,14 @@ async function rejected(operation: Promise<unknown>): Promise<DeployError> {
 }
 
 describe("production D1 fresh init", () => {
+  test("declares the kernel lease tool needed before its create boundary", () => {
+    const surface = DEPLOY_CONTRACT.surfaces.find(
+      ({ surface }) => surface === PRODUCTION_D1_FRESH_INIT_SURFACE,
+    );
+    expect(surface?.requiresTools).toContain("flock");
+    expect(surface?.covers).toContain("scripts/deploy/wrangler-state.ts");
+  });
+
   test("the fresh D1 application shape equals a fresh self-host SQLite bootstrap", () => {
     const database = new Database(":memory:");
     try {

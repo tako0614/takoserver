@@ -1084,6 +1084,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/contract.ts",
         "scripts/deploy/production-d1-fresh-init.ts",
         "scripts/deploy/production-d1-fresh-init-custody.ts",
+        "scripts/deploy/wrangler-state.ts",
         "scripts/deploy/integration-storage-generation.ts",
         "scripts/deploy/d1-migration-import.ts",
         "scripts/deploy/application-schema-shape.ts",
@@ -1096,7 +1097,7 @@ export const DEPLOY_CONTRACT = {
         "docs/deploy.md",
       ],
       requiresScripts: ["check:migrations"],
-      requiresTools: ["bun", "wrangler"],
+      requiresTools: ["bun", "wrangler", "flock"],
       requiresEnv: [
         "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
         "CLOUDFLARE_API_TOKEN",
