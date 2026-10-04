@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { API_KEY_SCOPES, type ApiKeyScope } from "../../src/auth.ts";
 import { mutationError, preflightError, verificationError } from "./errors.ts";
@@ -474,6 +474,15 @@ function ownedSecretDirectory(path: string): string {
     (status.mode & 0o7777) !== 0o700 ||
     (typeof process.getuid === "function" && status.uid !== process.getuid())
   ) {
+    throw preflightError(`${OUTPUT_DIRECTORY_ENV} must be an owned exact 0700 link-free directory`);
+  }
+  let physical: string;
+  try {
+    physical = realpathSync(normalized);
+  } catch {
+    throw preflightError(`${OUTPUT_DIRECTORY_ENV} is unavailable`);
+  }
+  if (physical !== normalized) {
     throw preflightError(`${OUTPUT_DIRECTORY_ENV} must be an owned exact 0700 link-free directory`);
   }
   for (let cursor = normalized; ; cursor = dirname(cursor)) {

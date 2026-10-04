@@ -6,10 +6,12 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEPLOY_CONTRACT } from "../scripts/deploy/contract.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import {
   MAX_ORG_API_KEY_EXPIRY_DAYS,
@@ -279,6 +281,61 @@ function optionsFor(input: Owned, live: Host, review?: string): OrgApiKeyOptions
 }
 
 describe("durable organization API key surface", () => {
+  test("declares the operator authority helper in its covered source", () => {
+    const surface = DEPLOY_CONTRACT.surfaces.find(
+      ({ surface }) => surface === "takoserver-org-api-key",
+    );
+    expect(surface?.covers).toContain("scripts/deploy/operator-authority.ts");
+  });
+
+  test("refuses an output path through a symlink into this Git worktree before Host access", async () => {
+    const input = await owned();
+    const physicalRoot = mkdtempSync(join(import.meta.dir, ".org-api-key-output-checkout-"));
+    const physicalParent = join(physicalRoot, "nested");
+    const physicalOutput = join(physicalParent, "secrets");
+    const aliasRoot = mkdtempSync(join(tmpdir(), "takoserver-org-api-key-alias-"));
+    const linkedParent = join(aliasRoot, "checkout");
+    try {
+      mkdirSync(physicalParent, { mode: 0o700 });
+      mkdirSync(physicalOutput, { mode: 0o700 });
+      chmodSync(physicalParent, 0o700);
+      chmodSync(physicalOutput, 0o700);
+      symlinkSync(physicalParent, linkedParent, "dir");
+
+      const live = host();
+      const refusal = await runOrgApiKey(
+        {
+          surface: "takoserver-org-api-key",
+          action: "mint",
+          environment: "integration",
+          commit: COMMIT,
+          organizationId: ORGANIZATION,
+          keyName: "wfp-normal-smoke-20261004",
+          scopes: ["resources:write"],
+          expiresInDays: 90,
+        },
+        targetFor(input),
+        {
+          ...optionsFor(input, live, "independent-reviewer"),
+          outputDirectory: join(linkedParent, "secrets"),
+        },
+      ).catch((error: unknown) => error);
+
+      expect(refusal).toBeInstanceOf(DeployError);
+      expect((refusal as DeployError).phase).toBe("preflight");
+      expect((refusal as DeployError).message).toContain("link-free");
+      expect(live.calls).toEqual([]);
+      expect(live.keys.size).toBe(0);
+      expect(
+        existsSync(join(physicalOutput, `${ORGANIZATION}.wfp-normal-smoke-20261004.secret`)),
+      ).toBe(false);
+    } finally {
+      rmSync(input.root, { recursive: true, force: true });
+      rmSync(physicalRoot, { recursive: true, force: true });
+      rmSync(aliasRoot, { recursive: true, force: true });
+    }
+  });
+
   test("mints a bounded key, keeps its secret off every output, and names its own reversal", async () => {
     const input = await owned();
     try {
