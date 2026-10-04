@@ -1,4 +1,8 @@
 import type { Clock, ObjectStoreAccess, Sql } from "../ports.ts";
+import {
+  requireWorkflowResourceDeletionContribution,
+  type WorkflowResourceDeletionContribution,
+} from "../workflow-resource-lifecycle.ts";
 import { createTakoformArtifacts, type TakoformArtifactTransport } from "./artifacts.ts";
 import { installedBindings } from "./bindings.ts";
 import { createTakoformEngine } from "./engine.ts";
@@ -52,9 +56,14 @@ export interface CreateTakoformHostOptions {
     tenantId: string,
     resourceUid: string,
   ) => Promise<readonly string[]>;
+  /** Source-only exact DurableWorkflow lifecycle; absent in shipped composition. */
+  readonly workflowResourceDeletion?: WorkflowResourceDeletionContribution;
 }
 
 export function createTakoformHost(options: CreateTakoformHostOptions): TakoformHost {
+  if (options.workflowResourceDeletion) {
+    requireWorkflowResourceDeletionContribution(options.workflowResourceDeletion, options.sql);
+  }
   const clock = options.clock ?? (() => new Date());
   const randomId = options.randomId ?? (() => crypto.randomUUID());
   // Public and production assembly has exactly one route identity. Historical
@@ -63,7 +72,7 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
   const routes = DEFAULT_TAKOFORM_ROUTES;
   const forms = installedForms(options.forms, routes.hostApiVersion);
   const bindings = installedBindings(options.bindings ?? []);
-  const store = createTakoformStore(options.sql, clock);
+  const store = createTakoformStore(options.sql, clock, options.workflowResourceDeletion);
   const artifacts =
     options.artifacts ??
     createTakoformArtifacts({
@@ -87,6 +96,9 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
       ? { providerMutationLeaseMilliseconds: options.deferredOperations.leaseMilliseconds }
       : {}),
     ...(options.blockingRelations ? { blockingRelations: options.blockingRelations } : {}),
+    ...(options.workflowResourceDeletion
+      ? { workflowResourceDeletion: options.workflowResourceDeletion }
+      : {}),
     ...(options.standardServiceResolver
       ? { standardServiceResolver: options.standardServiceResolver }
       : {}),

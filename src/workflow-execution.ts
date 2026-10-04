@@ -29,6 +29,11 @@ import {
   type WorkflowInstances,
   type WorkflowScope,
 } from "./workflow-instances.ts";
+import {
+  requireWorkflowResourceDeletionContribution,
+  type WorkflowResourceDeletionContribution,
+  workflowResourceLiveSql,
+} from "./workflow-resource-lifecycle.ts";
 
 export {
   type WorkflowApplicationOutcome,
@@ -107,6 +112,8 @@ export interface WorkflowRuntimeOptions {
   readonly leaseMs?: number;
   /** Exact opt-in to the unpublished worker.workflow@3.0.0 contract. */
   readonly workflowInterfaceRef?: TakoformInterfaceRef;
+  /** Source-only Resource admission on the same durable Sql as this runtime. */
+  readonly workflowResourceDeletion?: WorkflowResourceDeletionContribution;
 }
 
 export type WorkflowRunOutcome =
@@ -128,9 +135,8 @@ const MAX_STEPS = 1_024;
 const MAX_SECONDS = 31_536_000;
 const CLAIM_ID =
   "tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ? AND execution_id = ? AND created_at = ? AND run_epoch = ? AND run_owner = ?";
-const RUNNABLE = `${CLAIM_ID} AND termination_requested = 0 AND status = 'running' AND run_lease_until > ? AND deadline_at > ? AND retention_until > ?`;
+const RUNNABLE_BASE = `${CLAIM_ID} AND termination_requested = 0 AND status = 'running' AND run_lease_until > ? AND deadline_at > ? AND retention_until > ?`;
 const STEP_ID = "execution_id = ? AND execution_created_at = ? AND name = ?";
-const RUN_EXISTS = `EXISTS (SELECT 1 FROM tf_workflow_instances WHERE ${RUNNABLE})`;
 
 export function createWorkflowRuntime(options: WorkflowRuntimeOptions): WorkflowRuntime {
   const leaseMs = options.leaseMs ?? 30_000;
@@ -146,6 +152,20 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
   ) {
     throw new WorkflowRuntimeError("invalid_runtime_input");
   }
+  if (options.workflowResourceDeletion) {
+    if (options.workflowInterfaceRef === undefined) {
+      throw new WorkflowRuntimeError("invalid_runtime_input");
+    }
+    requireWorkflowResourceDeletionContribution(options.workflowResourceDeletion, options.sql);
+  }
+  const liveInstance = options.workflowResourceDeletion
+    ? workflowResourceLiveSql(
+        "tf_workflow_instances.tenant_id",
+        "tf_workflow_instances.workflow_resource_uid",
+      )
+    : "1 = 1";
+  const RUNNABLE = `${RUNNABLE_BASE} AND ${liveInstance}`;
+  const RUN_EXISTS = `EXISTS (SELECT 1 FROM tf_workflow_instances WHERE ${RUNNABLE})`;
   const sql: Sql = {
     query: (statement, params) => backend(() => options.sql.query(statement, params)),
     run: (statement, params) => backend(() => options.sql.run(statement, params)),
@@ -165,6 +185,9 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     ...(options.workflowInterfaceRef === undefined
       ? {}
       : { workflowInterfaceRef: options.workflowInterfaceRef }),
+    ...(options.workflowResourceDeletion === undefined
+      ? {}
+      : { workflowResourceDeletion: options.workflowResourceDeletion }),
   });
   const now = (): number => {
     const value = options.clock().getTime();
@@ -520,7 +543,8 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
         ACTIVE +
         ") AND deadline_at > ? AND retention_until > ? " +
         "AND termination_requested = 0 " +
-        "AND (run_owner IS NULL OR run_lease_until <= ?) AND (wake_at IS NULL OR wake_at <= ?)",
+        "AND (run_owner IS NULL OR run_lease_until <= ?) AND (wake_at IS NULL OR wake_at <= ?)" +
+        ` AND ${liveInstance}`,
       [
         owner,
         leaseUntil,
@@ -582,7 +606,8 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
       ")" +
       (expired
         ? " AND deadline_at <= ?"
-        : " AND status = 'running' AND run_lease_until > ? AND deadline_at > ?");
+        : " AND status = 'running' AND run_lease_until > ? AND deadline_at > ?") +
+      ` AND ${liveInstance}`;
     const terminalParams = [...claimParams(identity), timestamp, ...(expired ? [] : [timestamp])];
     const cleanupGuard =
       "EXISTS (SELECT 1 FROM tf_workflow_instances WHERE " +

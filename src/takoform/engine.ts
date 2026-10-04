@@ -12,6 +12,11 @@ import {
 } from "../provider-driver.ts";
 import type { RequestLifetime } from "../request-lifetime.ts";
 import {
+  assertWorkflowResourceDeletionReady,
+  isSelectedWorkflowResourceFormRef,
+  type WorkflowResourceDeletionContribution,
+} from "../workflow-resource-lifecycle.ts";
+import {
   type AcceptedAuthoritySummary,
   assertAcceptedAuthorityGrant,
 } from "./accepted-authority.ts";
@@ -297,6 +302,8 @@ export interface CreateTakoformEngineOptions {
     tenantId: string,
     resourceUid: string,
   ) => Promise<readonly string[]>;
+  /** Exact unpublished DurableWorkflow Resource lifecycle, bound to this Host's Sql. */
+  readonly workflowResourceDeletion?: WorkflowResourceDeletionContribution;
 }
 
 export function createTakoformEngine(options: CreateTakoformEngineOptions): TakoformEngine {
@@ -2783,6 +2790,28 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (!form.operations.includes("delete")) {
         throw new TakoformHostError("unsupported_capability", 422);
       }
+      // A dependency refusal must leave even derived Resource rendering alone.
+      // The store repeats both checks atomically before arming the tombstone.
+      const selectedWorkflow =
+        options.workflowResourceDeletion &&
+        isSelectedWorkflowResourceFormRef(form.identity.formRef);
+      if (selectedWorkflow && options.workflowResourceDeletion) {
+        const storedHolders = await store.relationHolders(context.tenantId, current.metadata.uid);
+        const externalHolders = options.blockingRelations
+          ? await options.blockingRelations(context.tenantId, current.metadata.uid)
+          : [];
+        if (storedHolders.length > 0 || externalHolders.length > 0) {
+          throw new TakoformHostError("dependency_in_use", 409, {
+            dependencyKind: storedHolders.length > 0 ? "workflow_binding" : "resource_relation",
+            holder: storedHolders[0] ?? externalHolders[0],
+          });
+        }
+        await assertWorkflowResourceDeletionReady(options.workflowResourceDeletion, {
+          tenantId: context.tenantId,
+          resourceUid: current.metadata.uid,
+          now: clock().getTime(),
+        });
+      }
       const currentRelations = await store.readRelations(address);
       const drift = await relationDrift({
         tenantId: context.tenantId,
@@ -2812,12 +2841,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (ifMatch && ifMatch !== `"${current.metadata.revision}"`) {
         throw new TakoformHostError("revision_conflict", 412);
       }
-      const storedHolders = await store.relationHolders(context.tenantId, current.metadata.uid);
-      const externalHolders = options.blockingRelations
-        ? await options.blockingRelations(context.tenantId, current.metadata.uid)
-        : [];
-      if (storedHolders.length > 0 || externalHolders.length > 0) {
-        throw new TakoformHostError("dependency_in_use", 409);
+      if (!selectedWorkflow) {
+        const storedHolders = await store.relationHolders(context.tenantId, current.metadata.uid);
+        const externalHolders = options.blockingRelations
+          ? await options.blockingRelations(context.tenantId, current.metadata.uid)
+          : [];
+        if (storedHolders.length > 0 || externalHolders.length > 0) {
+          throw new TakoformHostError("dependency_in_use", 409);
+        }
       }
       await validateWorkerDeploymentRemoval({
         tenantId: context.tenantId,
