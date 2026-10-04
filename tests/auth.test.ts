@@ -136,6 +136,31 @@ describe("accounts", () => {
     expect(other.principal.id).not.toBe(first.principal.id);
   });
 
+  test("issues a 60-second session from one clock instant even when time advances", async () => {
+    let tick = 0;
+    const advancing = createAccounts({
+      sql,
+      identity,
+      clock: () => new Date(Date.UTC(2026, 8, 3, 12, 0, 0) + tick++ * 250),
+    });
+    const signedIn = await advancing.signIn({
+      provider: "google",
+      assertion: "advancing-clock-owner",
+      sessionTtlSeconds: 60,
+    });
+    const sessions = await sql.query(
+      "SELECT created_at, expires_at FROM auth_tokens WHERE kind = 'session'",
+    );
+    expect(sessions).toEqual([
+      {
+        created_at: "2026-09-03T12:00:00.250Z",
+        expires_at: "2026-09-03T12:01:00.250Z",
+      },
+    ]);
+    await advancing.revokeSession(`Bearer ${signedIn.sessionToken}`);
+    expect(await advancing.authenticate(`Bearer ${signedIn.sessionToken}`)).toBeNull();
+  });
+
   test("projects Takos ID legal Organizations and will not mint a second one", async () => {
     let organizations = [{ id: "org_legal", name: "Legal Ltd.", role: "owner" as const }];
     const externalAccounts = createAccounts({

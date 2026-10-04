@@ -8,6 +8,7 @@ import {
 } from "./deployment-composition.ts";
 import { type EdgeFormBundle, edgeProviderOffering } from "./edge-forms.ts";
 import { HOSTED_EDGE_IDENTITY_CLASSES } from "./hosted-edge-supplies.ts";
+import { canonicalJson } from "./json.ts";
 import type {
   Provider,
   ProviderNativeReadbackAuthority,
@@ -42,6 +43,7 @@ import {
   type SelfhostActorPublicRuntime,
 } from "./selfhost-actor-public-runtime.ts";
 import { createSelfhostRuntimeBindingMaterializer } from "./selfhost-runtime-binding-materializer.ts";
+import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 import {
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
   type YurucommuIdentityCapabilityKind,
@@ -172,6 +174,9 @@ export interface SelfhostCompositionOptions {
   /** Current stable Definitions; only the exact supported Edge subset executes locally. */
   readonly stableForms: readonly InstalledTakoformForm[];
   readonly stableBindings?: readonly InstalledTakoformBinding[];
+  /** Displaced exact published Forms, retained only for recorded lifecycle recovery. */
+  readonly retainedForms?: readonly InstalledTakoformForm[];
+  readonly retainedBindings?: readonly InstalledTakoformBinding[];
   /** Retained beta catalog used only for observation/deletion of recorded Deployments. */
   readonly edge: EdgeFormBundle;
   readonly dataRoot: string;
@@ -229,6 +234,44 @@ export interface SelfhostComposition extends DeploymentComposition {
 export function createSelfhostComposition(
   options: SelfhostCompositionOptions,
 ): SelfhostComposition {
+  const retainedForms = options.retainedForms ?? [];
+  const retainedBindings = options.retainedBindings ?? [];
+  if (retainedForms.length > 0 || retainedBindings.length > 0) {
+    const published = currentTakoformCandidates();
+    const retainedKinds = new Set(retainedForms.map((form) => form.identity.formRef.kind));
+    const expectedForms = published.forms.filter((form) =>
+      retainedKinds.has(form.identity.formRef.kind),
+    );
+    const retainedBindingRefs = new Set(
+      retainedForms.flatMap((form) =>
+        (form.acceptedBindings ?? []).map((binding) => canonicalJson(binding)),
+      ),
+    );
+    const selectedBindingRefs = new Set(
+      (options.stableBindings ?? []).map((binding) => canonicalJson(binding.bindingRef)),
+    );
+    const expectedBindings = published.bindings.filter(
+      (binding) =>
+        retainedBindingRefs.has(canonicalJson(binding.bindingRef)) &&
+        !selectedBindingRefs.has(canonicalJson(binding.bindingRef)),
+    );
+    if (
+      canonicalJson(retainedForms) !== canonicalJson(expectedForms) ||
+      canonicalJson(retainedBindings) !== canonicalJson(expectedBindings) ||
+      retainedForms.some(
+        (retained) =>
+          options.stableForms.filter(
+            (current) => current.identity.formRef.kind === retained.identity.formRef.kind,
+          ).length !== 1 ||
+          options.stableForms.some(
+            (current) =>
+              canonicalJson(current.identity.formRef) === canonicalJson(retained.identity.formRef),
+          ),
+      )
+    ) {
+      throw new TypeError("retained current Form source is not exact or displaced");
+    }
+  }
   const workerRuntimeAvailable = options.workerRuntimeAvailable !== false;
   const actorRuntime = isOwnedSelfhostActorPublicRuntime(options.actorRuntime)
     ? options.actorRuntime
@@ -248,6 +291,7 @@ export function createSelfhostComposition(
   const identityOfferings: { offering: ProviderOffering; resourceClass: string }[] = [];
   const technicalOfferings: ProviderOffering[] = [objectBucketOffering];
   const technicalRelationOfferings: ProviderOffering[] = [];
+  const recoveryOfferings: ProviderOffering[] = [];
 
   // The ordinary released set has no ContainerService. Configuration alone
   // therefore cannot advertise one; only a caller-supplied, already-verified
@@ -326,6 +370,37 @@ export function createSelfhostComposition(
   }
 
   if (options.edgeForms) {
+    // Keep the old current family out of both the current Provider catalog and
+    // the sellable composition. Only a recorded exact Deployment may resolve it.
+    for (const form of retainedForms) {
+      const kind = form.identity.formRef.kind;
+      if (form.role === "identity") {
+        // Released Actor v1 had no class execution Offering. Do not mint one.
+        if (!(kind in SELFHOST_IDENTITY_CLASSES)) continue;
+        if (!workerRuntimeAvailable && (kind === "ModuleWorker" || kind === "ObjectBucket"))
+          continue;
+        const resourceClass =
+          SELFHOST_IDENTITY_CLASSES[kind as keyof typeof SELFHOST_IDENTITY_CLASSES];
+        recoveryOfferings.push(
+          edgeProviderOffering(form, {
+            id: `${resourceClass}.stable-v1.standard`,
+            regions: ["global"],
+          }),
+        );
+      } else if (
+        !HOST_INTRINSIC.has(kind) &&
+        SELFHOST_EDGE_RELATION_KINDS.has(kind) &&
+        workerRuntimeAvailable
+      ) {
+        recoveryOfferings.push(
+          withoutSelfhostCronImport(
+            edgeProviderOffering(form, {
+              id: `selfhost.edge.stable-v1.${kind.toLowerCase()}`,
+            }),
+          ),
+        );
+      }
+    }
     for (const form of options.stableForms) {
       if (form.identity.formRef.apiVersion !== "edge.forms.takoform.com") continue;
       const kind = form.identity.formRef.kind;
@@ -407,6 +482,7 @@ export function createSelfhostComposition(
 
   const provider = createSelfhostProvider({
     offerings: technicalOfferings,
+    ...(recoveryOfferings.length ? { recoveryOfferings } : {}),
     nativeReadbackAuthorities,
     dataRoot: options.dataRoot,
     runtime: options.runtime,

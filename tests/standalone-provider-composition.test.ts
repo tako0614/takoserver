@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { createProviderFormAvailability } from "../src/provider-driver.ts";
 import { PROVISIONER_PATH } from "../src/providers/remote.ts";
 import { MAX_SELFHOST_CRON_OWNERS } from "../src/providers/selfhost.ts";
 import { createProvisionerEndpoint } from "../src/provisioner-endpoint.ts";
+import { selectPublicHostFormSource } from "../src/public-host-form-source.ts";
+import { openSelfhostActorPublicRuntime } from "../src/selfhost-actor-public-runtime.ts";
 import {
   createSelfhostCronOwnerReader,
   createStandaloneProviderComposition,
@@ -64,6 +69,120 @@ async function compose(
 }
 
 describe("the standalone Bun provider composition", () => {
+  test("an explicit source-selected Actor has the exact class registration at the provider seam", async () => {
+    const root = await mkdtemp(join(tmpdir(), "actor-source-standalone-"));
+    const selected = selectPublicHostFormSource("actor-forward");
+    const actorRuntime = await openSelfhostActorPublicRuntime({
+      dataRoot: root,
+      runtimeRoot: root,
+      socketParent: join(root, "sockets"),
+      binary: "/never-execute",
+      graph: async () => null,
+      deployments: { active: async () => null },
+      providerPackRef: "local",
+      providerInstallationRef: "local.primary",
+    });
+    try {
+      const options = {
+        mode: "stable-selfhost",
+        edge: await buildEdgeForms(),
+        stableForms: selected.forms,
+        stableBindings: selected.bindings,
+        retainedForms: selected.retainedForms,
+        retainedBindings: selected.retainedBindings,
+        workerClassRuntimeContracts: selected.workerClassRuntimeContracts,
+        actorRuntime,
+        dataRoot: root,
+        runtime,
+        artifacts,
+        now: new Date("2026-10-04T00:00:00.000Z"),
+      } as const;
+      const composition = createStandaloneProviderComposition(options);
+      expect(
+        composition.offerings
+          .filter((offering) => offering.form.kind === "ActorNamespace")
+          .map((offering) => offering.form),
+      ).toEqual([
+        {
+          apiVersion: "edge.forms.takoform.com",
+          kind: "ActorNamespace",
+          definitionVersion: "0.2.0",
+          schemaDigest: "sha256:466b335132b6534da2013d104f88a0b50e665ddbd1e566bd6ae1ba814096038f",
+        },
+      ]);
+      expect(composition.providers[0]?.workerClassRuntime?.contracts).toEqual(
+        selected.workerClassRuntimeContracts,
+      );
+      const retainedWorker = selected.retainedForms.find(
+        (form) => form.identity.formRef.kind === "ModuleWorker",
+      );
+      expect(
+        composition.providers[0]?.recoveryOfferings?.find(
+          (offering) => offering.form.kind === "ModuleWorker",
+        )?.form,
+      ).toEqual(retainedWorker?.identity.formRef);
+      expect(
+        composition.offerings.some(
+          (offering) =>
+            offering.form.schemaDigest === retainedWorker?.identity.formRef.schemaDigest,
+        ),
+      ).toBe(false);
+      expect(
+        composition.providers[0]?.offerings.some(
+          (offering) => offering.form.apiVersion === "edge.forms.takoform.com/v1beta1",
+        ),
+      ).toBe(true);
+      if (!retainedWorker) throw new Error("retained ModuleWorker is missing");
+      expect(() =>
+        createStandaloneProviderComposition({
+          ...options,
+          retainedForms: selected.retainedForms.map((form) =>
+            form === retainedWorker
+              ? {
+                  ...form,
+                  identity: {
+                    ...form.identity,
+                    formRef: {
+                      ...form.identity.formRef,
+                      schemaDigest: `sha256:${"0".repeat(64)}`,
+                    },
+                  },
+                }
+              : form,
+          ),
+        }),
+      ).toThrow("retained current Form source is not exact or displaced");
+      const retainedBinding = selected.retainedBindings[0];
+      if (!retainedBinding) throw new Error("retained binding is missing");
+      expect(() =>
+        createStandaloneProviderComposition({
+          ...options,
+          retainedBindings: [
+            {
+              ...retainedBinding,
+              bindingRef: {
+                ...retainedBinding.bindingRef,
+                schemaDigest: `sha256:${"0".repeat(64)}`,
+              },
+            },
+            ...selected.retainedBindings.slice(1),
+          ],
+        }),
+      ).toThrow("retained current Form source is not exact or displaced");
+      const contract = selected.workerClassRuntimeContracts[0];
+      if (!contract) throw new Error("source Actor contract is missing");
+      expect(() =>
+        createStandaloneProviderComposition({
+          ...options,
+          workerClassRuntimeContracts: [{ ...contract, packageDigest: `sha256:${"0".repeat(64)}` }],
+        }),
+      ).toThrow("self-host Actor closure or native Worker runtime unavailable");
+    } finally {
+      await actorRuntime.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rehydrates current and retained Cron owners from their exact Form families", async () => {
     const edge = await buildEdgeForms();
     const currentForms = stableProductionTakoformCatalog().forms;
@@ -355,6 +474,7 @@ describe("the standalone Bun provider composition", () => {
     expect(withAccount).toBe(withoutAccount);
 
     const composition = await compose(withAccount);
+    expect(composition.providers[0]?.recoveryOfferings).toBeUndefined();
     const availability = createProviderFormAvailability(composition.providers);
     const executable: string[] = [];
     for (const form of stableProductionTakoformCatalog().forms) {

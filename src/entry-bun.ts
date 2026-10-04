@@ -23,6 +23,7 @@ import {
   selfhostObjectsRoot,
 } from "./providers/selfhost.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
+import { selectPublicHostFormSource } from "./public-host-form-source.ts";
 import {
   createRuntimeInputAuthority,
   runtimeInputCanonicalOriginSupported,
@@ -79,7 +80,6 @@ import {
   resolveStandaloneProviderMode,
 } from "./standalone-provider-composition.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
-import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 import { selectClosedGraphWorkerd } from "./workerd-artifact.ts";
 import { spawnWorkerdWithParentDeath, workerPortOwnership } from "./workerd-linux-process.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
@@ -243,6 +243,7 @@ const providerMode = resolveStandaloneProviderMode({
   suffixes: process.env.TAKOSERVER_SUFFIXES,
   workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
 });
+const currentCandidates = selectPublicHostFormSource(process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE);
 const selfhostContainer = createSelfhostContainerBootstrap({
   environment: process.env,
   dataRoot,
@@ -375,7 +376,6 @@ const clock = () => new Date();
 // Native startup and the application share these exact canonical ledgers.
 const resourceStores = createAppResourceStoreBundle(sql, clock);
 const edge = await buildEdgeForms();
-const currentCandidates = currentTakoformCandidates();
 let selfhostContainerEndpointHttps: SelfhostContainerEndpointHttpsListener | undefined;
 if (containerEndpointHttpsConfiguration) {
   // The listener itself proves its port and certificate after binding; it is
@@ -634,6 +634,9 @@ const providerComposition = createStandaloneProviderComposition({
   edge,
   stableForms: currentCandidates.forms,
   stableBindings: currentCandidates.bindings,
+  retainedForms: currentCandidates.retainedForms,
+  retainedBindings: currentCandidates.retainedBindings,
+  workerClassRuntimeContracts: currentCandidates.workerClassRuntimeContracts,
   dataRoot,
   runtime: workerdRuntime,
   ...(actorRuntime ? { actorRuntime } : {}),
@@ -672,7 +675,7 @@ const providerComposition = createStandaloneProviderComposition({
     : {
         listCronOwners: createSelfhostCronOwnerReader({
           inventory: resourceStores.inventory,
-          forms: [...currentCandidates.forms, ...edge.forms],
+          forms: [...currentCandidates.forms, ...currentCandidates.retainedForms, ...edge.forms],
         }),
       }),
   now: clock(),
