@@ -5,8 +5,8 @@ export const TAKOFORM_FORWARD_CANDIDATE_CATALOG = {
   provenance: {
     classification: "unpublished-source-candidate",
     repository: "https://github.com/tako0614/takoform-forms.git",
-    repositoryCommit: "0d8e5b7aaf9e07652eb6c895709efed8ad03e721",
-    sourceCommit: "0d8e5b7aaf9e07652eb6c895709efed8ad03e721",
+    repositoryCommit: "32dd4f177685e9da28d54369cfa196ba5ed67da6",
+    sourceCommit: "32dd4f177685e9da28d54369cfa196ba5ed67da6",
     publicationStatus: "unpublished",
     sourceTreeDigest: "sha256:89bafe36bad46cec51592350f4bbf855698042e90d078d7b1fee86d51afafddd",
     familyIndexSha256: "sha256:9635bcd8188cf0951988fe7cbdd4f5d05f9932c031f19b836fa8173d0c1b8fd0",
