@@ -5,9 +5,26 @@
 The instance store and execution coordinator are internal parts of a durable
 workflow runtime. They are not an activated `DurableWorkflow` implementation. Discovery and
 activation remain unsupported until the complete selected contract can run.
-The self-host provider refuses nonempty WorkerVersion `workflowBindings`
-instead of accepting a declaration it cannot project; see
-[the provisioner](provisioner.md).
+The default self-host provider still refuses nonempty WorkerVersion
+`workflowBindings`. A private, source-only composition can now validate and
+project the exact unpublished WorkerVersion and Workflow contract; it does not
+enable published Form support. See [the provisioner](provisioner.md).
+
+That composition persists an immutable V10 binding snapshot. Its expected
+digest is pinned in the canonical WorkerVersion Deployment's observed state,
+not adopted from whichever sidecar is present during a refresh or restart.
+Creating the first Version requires the live canonical ModuleWorker and
+Workflow relation, not a WorkerDeployment that cannot yet exist. Later
+deployment, recovery and observation compare the same pin, Resource UIDs,
+full contract references and derived private token before projection.
+
+The generated consumer facade, Unix-socket broker and per-Version runtime
+projection are implemented. Tests connect the actual generated environment
+wrapper to the broker and private owner, and separately connect a real SQLite
+Resource graph and Deployment store to the provider. Runtime socket tests use
+injected native ports. None of these tests establishes ordinary serving-entry
+composition, actual workerd execution, OS-process restart or public Host
+admission. Those remain prerequisites for advertising support.
 
 The selected `worker.workflow@1.0.0` Interface already defines instance
 creation, status, durable event delivery, terminal retention and lifetime.

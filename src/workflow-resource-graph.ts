@@ -15,38 +15,20 @@ import type {
   TakoformStoredResource,
   TakoformV1Alpha3FormRef,
 } from "./takoform/types.ts";
+import type {
+  WorkflowResourceAddress,
+  WorkflowResourceGraph,
+  WorkflowResourceGraphReader,
+} from "./worker-class-runtime-port.ts";
 import { isSelectedWorkflowResourceFormRef } from "./workflow-resource-lifecycle.ts";
 
-/** The address facts needed by a private Workflow caller. */
-export interface WorkflowResourceAddress {
-  readonly space: string;
-  readonly apiVersion: string;
-  readonly kind: string;
-  readonly name: string;
-}
-
-/** One persisted Resource incarnation, without status or execution authority. */
-export interface WorkflowResourceFacts {
-  readonly address: WorkflowResourceAddress;
-  readonly uid: string;
-  readonly generation: string;
-  readonly revision: string;
-  readonly formRef: TakoformV1Alpha3FormRef;
-}
-
-/** Factual graph for one DurableWorkflow Resource and its ModuleWorker target. */
-export interface WorkflowResourceGraph {
-  readonly tenantId: string;
-  readonly workflow: WorkflowResourceFacts & { readonly className: string };
-  readonly worker: WorkflowResourceFacts;
-  /** Only the exact selected source projects its full execution ABI; legacy remains factual. */
-  readonly runtimeClassRef?: TakoformInterfaceRef;
-}
-
-export type WorkflowResourceGraphReader = (
-  scope: { readonly tenantId: string; readonly workflowResourceUid: string },
-  signal: AbortSignal,
-) => Promise<WorkflowResourceGraph | null>;
+/** Preserve the original domain import path without defining a second graph. */
+export type {
+  WorkflowResourceAddress,
+  WorkflowResourceFacts,
+  WorkflowResourceGraph,
+  WorkflowResourceGraphReader,
+} from "./worker-class-runtime-port.ts";
 
 export interface WorkflowResourceGraphReaderOptions {
   readonly store: Pick<TakoformStore, "resourceWithRelationTargetByUid">;

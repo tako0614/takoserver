@@ -362,7 +362,15 @@ and the relation resolves to a same-tenant registered namespace, current
 class-holder Worker Deployment, and immutable caller Version. The Version
 retains private exact Actor metadata; old records without it are never
 inferred into Actor support. The private forwarding credential and sockets are
-not tenant bindings or Resource output. `workflowBindings` remain refused.
+not tenant bindings or Resource output. Published Worker Versions with nonempty
+`workflowBindings` remain refused. A source-only composition may instead select
+the exact unpublished WorkerVersion 0.4.0, ModuleWorker 0.2.0 and
+DurableWorkflow 0.2.0 closure with `module-worker.workflow@3.0.0`. It requires
+the canonical live Resource relation and pins the immutable V10 snapshot digest
+in the WorkerVersion Deployment's observed state. Deployment, recovery and
+observation compare that pin and the full binding identities; a sidecar readback
+alone is not authority. This private path is not composed into ordinary serving
+entrypoints, and does not advertise an Offering or published Form support.
 The released Worker Version permits up to 64 Actor bindings. The private v8
 record, wrapper, and workerd graph use that same per-Version bound; the local
 owner permits at most 128 simultaneously retained broker pairs across all

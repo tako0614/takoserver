@@ -24,6 +24,7 @@ export function selfhostActorForwardEntrypointSource(input: {
   readonly queue?: boolean;
   readonly scheduled?: boolean;
   readonly events?: boolean;
+  readonly projectEnvironment?: boolean;
 }): string {
   if (
     !MODULE.test(input.runtimeModule) ||
@@ -34,7 +35,8 @@ export function selfhostActorForwardEntrypointSource(input: {
     input.bindings.length > 64 ||
     (input.queue !== undefined && typeof input.queue !== "boolean") ||
     (input.scheduled !== undefined && typeof input.scheduled !== "boolean") ||
-    (input.events !== undefined && typeof input.events !== "boolean")
+    (input.events !== undefined && typeof input.events !== "boolean") ||
+    (input.projectEnvironment !== undefined && typeof input.projectEnvironment !== "boolean")
   )
     throw new TypeError("Actor forward wrapper configuration invalid");
   const names = new Set<string>();
@@ -85,6 +87,9 @@ export function selfhostActorForwardEntrypointSource(input: {
         ]
       : []),
   ].join("\n");
+  const projectEnvironmentExport = input.projectEnvironment
+    ? `\nexport function __takoserverSelfhostProjectEnv(rawEnv) {\n  const context = createSelfhostActorForwardContext({rawEnv, bindings:BINDINGS});\n  const projectEnv = Inner.__takoserverSelfhostProjectEnv;\n  if (typeof projectEnv !== "function") throw new Error("Actor project environment unavailable");\n  return projectEnv(context.rawEnv);\n}`
+    : "";
   return `import { createSelfhostActorForwardContext } from ${JSON.stringify(`./${input.runtimeModule}`)};
 import * as Inner from ${JSON.stringify(`./${input.innerModule}`)};
 const BINDINGS = ${JSON.stringify(bindings)};
@@ -107,8 +112,8 @@ ${
     const context = createSelfhostActorForwardContext({rawEnv, bindings:BINDINGS});
     return await Inner.takoserverSelfhostEvents.fetch(request, context.rawEnv, rawContext);
   }
-};`
-    : ""
+};${projectEnvironmentExport}`
+    : projectEnvironmentExport
 }
 `;
 }

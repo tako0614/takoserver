@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
-import { chmod, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -16,6 +17,8 @@ import {
   readWorkerdSelectedActiveVersion,
   type WorkerdBinding,
   type WorkerdDeploymentPublication,
+  type WorkerdWorkflowForward,
+  type WorkerdWorkflowForwardBinding,
 } from "../src/workerd-runtime.ts";
 
 /**
@@ -77,6 +80,69 @@ function weightedPublication(
     // and routing table must use the one shared WorkerVersion UID comparator.
     versions: [version("b", weights[1]), version("a", weights[0])],
   };
+}
+
+function workflowForwardPublication(
+  rootPath: string,
+  name = "workflow-site",
+  tenantId = "tenant-workflow-1",
+) {
+  const publication = weightedPublication(name, "generation-workflow");
+  const forwards = new Map<string, WorkerdWorkflowForward>();
+  const withWorkflow = {
+    ...publication,
+    versions: publication.versions.map((version) => {
+      const binding: WorkerdWorkflowForwardBinding = {
+        publicName: "ORDERS",
+        serviceName: "__TAKOSERVER_WORKFLOW_BINDING_00000",
+        tenantId,
+        workflowResourceUid: "uid-DurableWorkflow-orders",
+        workflowFormRef: {
+          apiVersion: "edge.forms.takoform.com",
+          kind: "DurableWorkflow",
+          definitionVersion: "0.2.0",
+          schemaDigest: "sha256:a58c885bed4431fbdc6b923059fe3b3bf98f7727578914d2d212552ae97fdc65",
+        },
+        bindingRef: {
+          apiVersion: "bindings.takoform.com/v1alpha2",
+          name: "module-worker.workflow",
+          version: "3.0.0",
+          schemaDigest: "sha256:2b8df3ba036b2781ee3ea8af6603b3de5f09226f4eb1f3385565211cdacc854b",
+        },
+        runtimeClassRef: {
+          apiVersion: "interfaces.takoform.com/v1alpha1",
+          name: "worker.workflow",
+          version: "3.0.0",
+          schemaDigest: "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
+        },
+        token: version.versionId.endsWith("-a") ? "a".repeat(64) : "b".repeat(64),
+      };
+      const workflowForward: WorkerdWorkflowForward = {
+        schema: "takoserver.selfhost-workflow-binding-forward@v1",
+        snapshotDigest: version.versionId.endsWith("-a")
+          ? `sha256:${"c".repeat(64)}`
+          : `sha256:${"d".repeat(64)}`,
+        bindings: [binding],
+      };
+      forwards.set(version.versionId, workflowForward);
+      return { ...version, site: { ...version.site, workflowForward } };
+    }),
+  };
+  const sockets = withWorkflow.versions.map((version) => {
+    const workflowForward = forwards.get(version.versionId);
+    const binding = workflowForward?.bindings[0];
+    if (!workflowForward || !binding) throw new Error("Workflow Version fixture unavailable");
+    return {
+      script: name,
+      workerResourceUid: publication.workerResourceUid,
+      versionId: version.versionId,
+      workerVersionResourceUid: version.workerVersionUid,
+      snapshotDigest: workflowForward.snapshotDigest,
+      binding,
+      socketPath: join(rootPath, `${version.versionId}-workflow.sock`),
+    };
+  });
+  return { publication, withWorkflow, forwards, sockets };
 }
 
 function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
@@ -1565,6 +1631,355 @@ test("persists an opt-in Actor forward graph and rejects unmapped Host sockets",
   );
 });
 
+test("renders exact Workflow broker sockets for weighted Versions and restores them", async () => {
+  const { publication, withWorkflow, forwards, sockets } = workflowForwardPublication(root);
+  let socketLookups = 0;
+  const runtime = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    workflowForwardSockets: () => {
+      socketLookups += 1;
+      return sockets;
+    },
+  });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+
+  await runtime.publish("workflow-site", withWorkflow);
+  expect(socketLookups).toBe(1);
+  const firstConfig = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  for (const socket of sockets) {
+    expect(firstConfig).toContain('name = "__TAKOSERVER_WORKFLOW_BINDING_00000"');
+    expect(firstConfig).toContain(`unix:${socket.socketPath}`);
+  }
+  const selected = await readWorkerdSelectedActiveVersion(root, "workflow-site", {
+    expectedWorkerResourceUid: publication.workerResourceUid,
+    basisPoint: 0,
+  });
+  expect(selected?.site.workflowForward).toEqual(forwards.get("workflow-site-v-a"));
+
+  const restarted = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    workflowForwardSockets: () => {
+      socketLookups += 1;
+      return sockets;
+    },
+  });
+  await expect(restarted.restore()).resolves.toEqual(["workflow-site"]);
+  expect(socketLookups).toBe(2);
+  const restoredConfig = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  for (const socket of sockets) expect(restoredConfig).toContain(`unix:${socket.socketPath}`);
+});
+
+test("owns the Workflow socket snapshot across asynchronous lifecycle hooks", async () => {
+  const { withWorkflow, sockets } = workflowForwardPublication(root);
+  const suppliedSockets = sockets.map((socket) => ({
+    ...socket,
+    binding: {
+      ...socket.binding,
+      workflowFormRef: { ...socket.binding.workflowFormRef },
+      bindingRef: { ...socket.binding.bindingRef },
+      runtimeClassRef: { ...socket.binding.runtimeClassRef },
+    },
+  }));
+  const originalSockets = [...suppliedSockets];
+  const prepareEntered = deferred();
+  const resumePrepare = deferred();
+  const runtime = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    workflowForwardSockets: () => suppliedSockets,
+    actorForwardLifecycle: {
+      async prepare() {
+        prepareEntered.resolve();
+        await resumePrepare.promise;
+      },
+      activated() {},
+      uncertain() {},
+    },
+  });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+
+  let publishing: Promise<void> | undefined;
+  try {
+    publishing = runtime.publish("workflow-site", withWorkflow);
+    await prepareEntered.promise;
+
+    suppliedSockets.splice(0, suppliedSockets.length);
+    const first = originalSockets[0];
+    const second = originalSockets[1];
+    if (!first || !second) throw new Error("Workflow socket fixtures unavailable");
+    first.socketPath = join(root, "mutated-workflow.sock");
+    second.binding.workflowFormRef.schemaDigest = `sha256:${"f".repeat(64)}`;
+    resumePrepare.resolve();
+    await publishing;
+
+    const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    for (const socket of sockets) expect(config).toContain(`unix:${socket.socketPath}`);
+    expect(config).not.toContain(`unix:${first.socketPath}`);
+  } finally {
+    resumePrepare.resolve();
+    await publishing?.catch(() => {});
+  }
+});
+
+test("accepts the V10 Unicode scalar tenant limit for Workflow bindings", async () => {
+  const { publication, withWorkflow, sockets } = workflowForwardPublication(
+    root,
+    "workflow-site",
+    "😀".repeat(200),
+  );
+  const runtime = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    workflowForwardSockets: () => sockets,
+  });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+
+  await runtime.publish("workflow-site", withWorkflow);
+  const selected = await readWorkerdSelectedActiveVersion(root, "workflow-site", {
+    expectedWorkerResourceUid: publication.workerResourceUid,
+    basisPoint: 0,
+  });
+  expect(selected?.site.workflowForward?.bindings[0]?.tenantId).toBe("😀".repeat(200));
+});
+
+test("rejects Workflow binding names in the complete Host-reserved namespace", async () => {
+  const { withWorkflow, sockets } = workflowForwardPublication(root);
+  const reserved = {
+    ...withWorkflow,
+    versions: withWorkflow.versions.map((version) => {
+      const forward = version.site.workflowForward;
+      if (!forward) throw new Error("Workflow forward fixture unavailable");
+      return {
+        ...version,
+        site: {
+          ...version.site,
+          workflowForward: {
+            ...forward,
+            bindings: forward.bindings.map((binding) => ({
+              ...binding,
+              publicName: "__TAKOSERVER_SELFHOST_EVENT_TARGET",
+            })),
+          },
+        },
+      };
+    }),
+  };
+  const reservedSockets = sockets.map((socket) => ({
+    ...socket,
+    binding: { ...socket.binding, publicName: "__TAKOSERVER_SELFHOST_EVENT_TARGET" },
+  }));
+  const runtime = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    workflowForwardSockets: () => reservedSockets,
+  });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+
+  await expect(runtime.publish("workflow-site", reserved)).rejects.toThrow(
+    "unusable Workflow forward graph",
+  );
+  await expect(readWorkerdActiveDeployment(root, "workflow-site")).resolves.toBeNull();
+});
+
+test("keeps the active graph when Workflow socket preflight rejects an update", async () => {
+  const probe = createConfigProbe();
+  const socketDirectory = mkdtempSync(join(tmpdir(), "ws-"));
+  const sockets: ReturnType<typeof workflowForwardPublication>["sockets"] = [];
+  let socketLookups = 0;
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+      serviceBindingSocketDirectory: socketDirectory,
+      workflowForwardSockets: () => {
+        socketLookups += 1;
+        return sockets;
+      },
+    });
+    if (!runtime.publish || !runtime.observePublication)
+      throw new Error("runtime contract missing");
+    await runtime.publish("workflow-site", weightedPublication("workflow-site", "before-workflow"));
+    const markerBefore = await readFile(join(root, "workers", ".takoserver-active.json"), "utf8");
+    const configBefore = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    socketLookups = 0;
+    const candidate = workflowForwardPublication(join(root, "candidate"));
+
+    await expect(runtime.publish("workflow-site", candidate.withWorkflow)).rejects.toThrow(
+      "Workflow forward Host socket unavailable",
+    );
+
+    expect(socketLookups).toBe(1);
+    await expect(runtime.has("workflow-site", "before-workflow")).resolves.toBe(true);
+    await expect(runtime.observePublication("workflow-site")).resolves.toBe("present");
+    await expect(readFile(join(root, "workers", ".takoserver-active.json"), "utf8")).resolves.toBe(
+      markerBefore,
+    );
+    await expect(readFile(join(root, "workers", "workerd.capnp"), "utf8")).resolves.toBe(
+      configBefore,
+    );
+    await expect(readWorkerdActiveDeployment(root, "workflow-site")).resolves.toMatchObject({
+      generation: "before-workflow",
+    });
+  } finally {
+    probe.stop();
+    rmSync(socketDirectory, { recursive: true, force: true });
+  }
+});
+
+test("refuses missing or mismatched Workflow sockets and malformed later Versions", async () => {
+  const { withWorkflow, sockets } = workflowForwardPublication(join(root, "sockets"));
+  const missingRoot = join(root, "missing");
+  const missing = createWorkerdRuntime({ root: missingRoot, isReady: () => true });
+  if (!missing.publish) throw new Error("weighted publication unavailable");
+  await expect(missing.publish("workflow-site", withWorkflow)).rejects.toThrow(
+    "Workflow forward Host socket unavailable",
+  );
+  await expect(readWorkerdActiveDeployment(missingRoot, "workflow-site")).resolves.toBeNull();
+
+  const mismatchedRoot = join(root, "mismatched");
+  const mismatchedSockets = sockets.map((socket, index) =>
+    index === 0 ? { ...socket, binding: { ...socket.binding, token: "f".repeat(64) } } : socket,
+  );
+  const mismatched = createWorkerdRuntime({
+    root: mismatchedRoot,
+    isReady: () => true,
+    workflowForwardSockets: () => mismatchedSockets,
+  });
+  if (!mismatched.publish) throw new Error("weighted publication unavailable");
+  await expect(mismatched.publish("workflow-site", withWorkflow)).rejects.toThrow(
+    "Workflow forward Host socket unavailable",
+  );
+  await expect(readWorkerdActiveDeployment(mismatchedRoot, "workflow-site")).resolves.toBeNull();
+
+  const malformedRoot = join(root, "malformed");
+  const malformedLaterVersion: WorkerdDeploymentPublication = {
+    ...withWorkflow,
+    versions: withWorkflow.versions.map((version) => {
+      if (!version.versionId.endsWith("-b")) return version;
+      const forward = version.site.workflowForward;
+      if (!forward) throw new Error("Workflow forward fixture unavailable");
+      const malformedBindings = forward.bindings.map((binding) => ({
+        ...binding,
+        bindingRef: { ...binding.bindingRef, schemaDigest: "not-a-digest" },
+      })) as unknown as WorkerdWorkflowForwardBinding[];
+      return {
+        ...version,
+        site: {
+          ...version.site,
+          workflowForward: {
+            ...forward,
+            bindings: malformedBindings,
+          },
+        },
+      };
+    }),
+  };
+  const malformed = createWorkerdRuntime({
+    root: malformedRoot,
+    isReady: () => true,
+    workflowForwardSockets: () => sockets,
+  });
+  if (!malformed.publish) throw new Error("weighted publication unavailable");
+  await expect(malformed.publish("workflow-site", malformedLaterVersion)).rejects.toThrow(
+    "unusable Workflow forward graph",
+  );
+  await expect(readWorkerdActiveDeployment(malformedRoot, "workflow-site")).resolves.toBeNull();
+});
+
+test("does not restore a self-consistent snapshot with a noncanonical Workflow ref", async () => {
+  const restoreRoot = join(root, "restore");
+  const { withWorkflow, sockets } = workflowForwardPublication(restoreRoot);
+  const runtime = createWorkerdRuntime({
+    root: restoreRoot,
+    isReady: () => true,
+    workflowForwardSockets: () => sockets,
+  });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+  await runtime.publish("workflow-site", withWorkflow);
+  const beforeTamper = await readFile(join(restoreRoot, "workers", "workerd.capnp"), "utf8");
+
+  const pointerPath = join(restoreRoot, "workers", "workflow-site", "takoserver-site.json");
+  const pointer = JSON.parse(await readFile(pointerPath, "utf8")) as { generationKey: string };
+  const deploymentPath = join(
+    restoreRoot,
+    "workers",
+    ".publications",
+    "workflow-site",
+    pointer.generationKey,
+    "deployment.json",
+  );
+  const deployment = JSON.parse(await readFile(deploymentPath, "utf8")) as {
+    versions: Array<{
+      manifest: {
+        workflowForward: { bindings: Array<{ workflowFormRef: { schemaDigest: string } }> };
+      };
+    }>;
+  };
+  const storedVersion = deployment.versions[1];
+  if (!storedVersion) throw new Error("Workflow stored Version fixture unavailable");
+  const binding = storedVersion.manifest.workflowForward.bindings[0];
+  if (!binding) throw new Error("Workflow forward manifest fixture unavailable");
+  binding.workflowFormRef.schemaDigest = `sha256:${"f".repeat(64)}`;
+  const manifestJson = JSON.stringify(deployment);
+  const nextGenerationKey = createHash("sha256").update(manifestJson, "utf8").digest("hex");
+  const generationRoot = join(restoreRoot, "workers", ".publications", "workflow-site");
+  await writeFile(deploymentPath, manifestJson);
+  await rename(
+    join(generationRoot, pointer.generationKey),
+    join(generationRoot, nextGenerationKey),
+  );
+  pointer.generationKey = nextGenerationKey;
+  await writeFile(pointerPath, JSON.stringify(pointer));
+
+  const restarted = createWorkerdRuntime({
+    root: restoreRoot,
+    isReady: () => true,
+    workflowForwardSockets: () => sockets,
+  });
+  await expect(restarted.restore()).rejects.toThrow("unusable Workflow forward graph");
+  await expect(readFile(join(restoreRoot, "workers", "workerd.capnp"), "utf8")).resolves.toBe(
+    beforeTamper,
+  );
+});
+
+test("skips a scalar Workflow projection without blocking other restored sites", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+  await runtime.publish("healthy", weightedPublication("healthy", "generation-healthy"));
+
+  const scalar = weightedPublication("legacy", "generation-legacy").versions[0];
+  const projection = workflowForwardPublication(root, "legacy").withWorkflow.versions[0]?.site
+    .workflowForward;
+  if (!scalar || !projection) throw new Error("scalar Workflow fixture unavailable");
+  await runtime.write(
+    "legacy",
+    { ...scalar.site, directory: "legacy" },
+    scalar.modules,
+    undefined,
+    scalar.hostModules,
+  );
+  const scalarManifestPath = join(root, "workers", "legacy", "takoserver-site.json");
+  const scalarManifest = JSON.parse(await readFile(scalarManifestPath, "utf8")) as Record<
+    string,
+    unknown
+  >;
+  await writeFile(
+    scalarManifestPath,
+    JSON.stringify({ ...scalarManifest, workflowForward: projection }),
+  );
+
+  const restarted = createWorkerdRuntime({ root, isReady: () => true });
+  await expect(restarted.restore()).resolves.toEqual(["healthy"]);
+  await expect(readWorkerdActiveDeployment(root, "healthy")).resolves.toMatchObject({
+    generation: "generation-healthy",
+  });
+  await expect(readWorkerdActiveDeployment(root, "legacy")).resolves.toBeNull();
+});
+
 test("persists and restores an exact private Actor v2 ref, refusing a wrong digest", async () => {
   const ref = forwardTakoformCandidates().forms.find(
     (form) => form.identity.formRef.kind === "ActorNamespace",
@@ -2739,8 +3154,14 @@ test("returns an owned logical graph with frozen bytes, vars, and namespaces", a
   const mutableApplication = snapshot.modules.get(sharedName);
   if (!mutableApplication) throw new Error("application bytes are unavailable");
   mutableApplication.fill(0);
-  (snapshot.site.vars as Array<{ name: string; value: string; kind: "text" | "json" }>)[0]!.value =
-    "caller-mutated";
+  const mutableVars = snapshot.site.vars as Array<{
+    name: string;
+    value: string;
+    kind: "text" | "json";
+  }>;
+  const mutableVar = mutableVars[0];
+  if (!mutableVar) throw new Error("mutable binding fixture unavailable");
+  mutableVar.value = "caller-mutated";
   const sameGeneration = await readWorkerdSelectedActiveVersion(root, "site", {
     expectedWorkerResourceUid: "uid-ModuleWorker-site",
     basisPoint: 0,

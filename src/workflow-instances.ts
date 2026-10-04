@@ -86,6 +86,7 @@ export type WorkflowInstanceErrorCode =
   | "unknown_instance"
   | "instance_terminal"
   | "event_queue_full"
+  | "unsupported_capability"
   | "backend_unavailable";
 
 /**
