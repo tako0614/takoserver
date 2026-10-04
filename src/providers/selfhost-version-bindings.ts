@@ -1012,7 +1012,7 @@ function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet
   };
 }
 
-function normalizeWorkflowBindings(
+export function normalizeWorkflowBindings(
   bindings: readonly SelfhostVersionWorkflowBinding[] | undefined,
 ): readonly SelfhostVersionWorkflowBinding[] | undefined {
   if (bindings === undefined) return undefined;
