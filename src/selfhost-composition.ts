@@ -8,7 +8,6 @@ import {
 } from "./deployment-composition.ts";
 import { type EdgeFormBundle, edgeProviderOffering } from "./edge-forms.ts";
 import { HOSTED_EDGE_IDENTITY_CLASSES } from "./hosted-edge-supplies.ts";
-import { canonicalJson } from "./json.ts";
 import type {
   Provider,
   ProviderNativeReadbackAuthority,
@@ -22,7 +21,6 @@ import {
 } from "./provider-worker-endpoint-origin.ts";
 import {
   createSelfhostProvider,
-  SELFHOST_ACTOR_BINDING_REF,
   type SelfhostArtifacts,
   type SelfhostDataPlaneMaintenance,
   type SelfhostEventRuntime,
@@ -38,18 +36,21 @@ import {
 import type { SelfhostContainerCapability } from "./providers/selfhost-container-lifecycle.ts";
 import { SELFHOST_EDGE_OBJECTS_BINDING_REF } from "./providers/selfhost-runtime-bindings.ts";
 import type { SelfhostStandardServiceIntegration } from "./providers/selfhost-standard-services.ts";
+import { resolveSelfhostActorContractClosure } from "./selfhost-actor-contract-closure.ts";
 import {
   isOwnedSelfhostActorPublicRuntime,
   type SelfhostActorPublicRuntime,
 } from "./selfhost-actor-public-runtime.ts";
 import { createSelfhostRuntimeBindingMaterializer } from "./selfhost-runtime-binding-materializer.ts";
-import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 import {
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
   type YurucommuIdentityCapabilityKind,
 } from "./takoform/implementation-catalog.ts";
 import type { InstalledTakoformBinding, InstalledTakoformForm } from "./takoform/types.ts";
+import type { WorkerClassRuntimeContract } from "./worker-class-runtime-port.ts";
 import type { WorkerdRuntime } from "./workerd-runtime.ts";
+
+export { hasExactSelfhostActorClosure } from "./selfhost-actor-contract-closure.ts";
 
 /**
  * Composes what a machine standing on its own can still drain and execute.
@@ -177,6 +178,8 @@ export interface SelfhostCompositionOptions {
   readonly runtime: WorkerdRuntime;
   /** Completed, exact native owner and broker graph; no boolean availability hint. */
   readonly actorRuntime?: SelfhostActorPublicRuntime;
+  /** Exact source-selected Actor class ABI registrations; never inferred from owner presence. */
+  readonly workerClassRuntimeContracts?: readonly WorkerClassRuntimeContract[];
   /** Explicit local native backend; an installed exact Form is required separately. */
   readonly container?: SelfhostContainerCapability;
   /** Explicit proof-backed public HTTPS 443 ingress; absence advertises no Endpoint. */
@@ -223,35 +226,6 @@ export interface SelfhostComposition extends DeploymentComposition {
   readonly containerEndpointIngress?: SelfhostContainerEndpointIngressCapability;
 }
 
-/** Exact released local closure, not a name-based Actor capability switch. */
-export function hasExactSelfhostActorClosure(options: {
-  readonly stableForms: readonly InstalledTakoformForm[];
-  readonly stableBindings?: readonly InstalledTakoformBinding[];
-}): boolean {
-  const pinned = currentTakoformCandidates();
-  for (const kind of ["ActorNamespace", "ModuleWorker", "WorkerVersion", "WorkerDeployment"]) {
-    const expected = pinned.forms.filter((item) => item.identity.formRef.kind === kind);
-    const installed = options.stableForms.filter((item) => item.identity.formRef.kind === kind);
-    if (
-      expected.length !== 1 ||
-      installed.length !== 1 ||
-      canonicalJson(expected[0]) !== canonicalJson(installed[0])
-    )
-      return false;
-  }
-  const expectedBinding = pinned.bindings.filter(
-    (item) => canonicalJson(item.bindingRef) === canonicalJson(SELFHOST_ACTOR_BINDING_REF),
-  );
-  const installedBinding = (options.stableBindings ?? []).filter(
-    (item) => canonicalJson(item.bindingRef) === canonicalJson(SELFHOST_ACTOR_BINDING_REF),
-  );
-  return (
-    expectedBinding.length === 1 &&
-    installedBinding.length === 1 &&
-    canonicalJson(expectedBinding[0]) === canonicalJson(installedBinding[0])
-  );
-}
-
 export function createSelfhostComposition(
   options: SelfhostCompositionOptions,
 ): SelfhostComposition {
@@ -259,9 +233,12 @@ export function createSelfhostComposition(
   const actorRuntime = isOwnedSelfhostActorPublicRuntime(options.actorRuntime)
     ? options.actorRuntime
     : undefined;
-  if (actorRuntime && (!workerRuntimeAvailable || !hasExactSelfhostActorClosure(options))) {
+  const actorClosure = resolveSelfhostActorContractClosure(options);
+  if (actorRuntime && (!workerRuntimeAvailable || !actorClosure)) {
     throw new TypeError("self-host Actor closure or native Worker runtime unavailable");
   }
+  const actorClassContracts =
+    actorRuntime && actorClosure?.selection === "unpublished-source" ? actorClosure.contracts : [];
   const objectBucketOffering = edgeProviderOffering(options.edge.objectBucket.form, {
     id: "storage.object.standard",
     displayName: "Object bucket",
@@ -353,7 +330,7 @@ export function createSelfhostComposition(
       if (form.identity.formRef.apiVersion !== "edge.forms.takoform.com") continue;
       const kind = form.identity.formRef.kind;
       if (form.role === "identity") {
-        if (kind === "ActorNamespace" && actorRuntime) {
+        if (kind === "ActorNamespace" && actorRuntime && actorClassContracts.length === 1) {
           const offering = edgeProviderOffering(form, {
             id: "compute.actor.stable-v1.standard",
             regions: ["global"],
@@ -435,6 +412,16 @@ export function createSelfhostComposition(
     runtime: options.runtime,
     artifacts: options.artifacts,
     ...(actorRuntime ? { actorNamespace: actorRuntime.actorNamespace } : {}),
+    ...(actorRuntime && actorClosure?.providerBinding && actorClassContracts.length === 1
+      ? {
+          actorClassRuntime: {
+            providerInstallationRef: PROVIDER_INSTALLATION_REF,
+            contracts: actorClassContracts,
+            binding: actorClosure.providerBinding,
+            inspect: actorRuntime.inspectWorkerClass,
+          },
+        }
+      : {}),
     ...(options.container ? { container: options.container } : {}),
     ...(endpointIngress ? { containerEndpointIngress: endpointIngress } : {}),
     ...(options.workerEndpointSuffix ? { workerEndpointSuffix: options.workerEndpointSuffix } : {}),
@@ -495,6 +482,7 @@ export function createSelfhostComposition(
       runtimeBindingMaterializer: createSelfhostRuntimeBindingMaterializer(
         provider.id,
         actorRuntime,
+        actorClassContracts.length === 1 ? actorClosure?.binding : undefined,
       ),
     },
   });
@@ -551,11 +539,11 @@ export function createSelfhostComposition(
   const actorOffering = identityOfferings.find(
     ({ offering }) => offering.form.kind === "ActorNamespace",
   );
-  if (actorOffering) {
+  if (actorOffering && actorClosure) {
     runtimeBindingRelations.push({
       targetOfferingId: actorOffering.offering.id,
       consumerProviderPackRef: pack.id,
-      bindingRef: SELFHOST_ACTOR_BINDING_REF,
+      bindingRef: actorClosure.binding.bindingRef,
     });
   }
 

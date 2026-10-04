@@ -2758,17 +2758,17 @@ for (const candidate of ["published", "actor-forward"] as const) {
     if (candidate === "actor-forward") {
       expect(workerFormBase.identity.formRef.definitionVersion).toBe("0.2.0");
       expect(workerFormBase.identity.formRef.schemaDigest).toBe(
-        "sha256:761180705a6f2a75fa0bc0061794a269342fafe0309c26ecd7530f12fcda1399",
+        "sha256:e3cd4e8c18b9511286e5b5f824c4eaf1bdac7d78fc8d20a87c9cbe4cb6f2255c",
       );
       expect(workerFormBase.identity.packageDigest).toBe(
-        "sha256:a9909dd1ffb28a860c36b4d5bd35bcea89f233b926aa7a691fe2f8bca9dcddde",
+        "sha256:0bdbadf2c3006a18e49db09b36507ff9608076f5f1900e865cb518ddc174001e",
       );
       expect(endpointFormBase.identity.formRef.definitionVersion).toBe("0.2.0");
       expect(endpointFormBase.identity.formRef.schemaDigest).toBe(
-        "sha256:7ce5d6b1ad1f05a6bb3cb50446b36211864b3357899ba13a574209303fa435cb",
+        "sha256:33063cb04a726db7f245307581071f5173a9a987e2dc99a0415df9217489ad56",
       );
       expect(endpointFormBase.identity.packageDigest).toBe(
-        "sha256:cdf26eb7cdac0fe5a6422af565750c7f71f99079c520866961af26b671047df6",
+        "sha256:919eb6f18efceb3708cbcb3cef3db333f4d93db81c0df262b4baea5e7c70a402",
       );
     }
     const endpointForm = {

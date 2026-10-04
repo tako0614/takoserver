@@ -11,7 +11,6 @@ import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-inpu
 import { derivedProviderResourceName } from "../src/provider-worker-endpoint-origin.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
 import {
-  SELFHOST_ACTOR_BINDING_REF,
   type SelfhostProviderOptions,
   selfhostScriptStateRoot,
 } from "../src/providers/selfhost.ts";
@@ -20,7 +19,6 @@ import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-r
 import { createSelfhostScriptStateStore } from "../src/providers/selfhost-script-state.ts";
 import { openSelfhostActorPublicRuntime } from "../src/selfhost-actor-public-runtime.ts";
 import { createSelfhostComposition } from "../src/selfhost-composition.ts";
-import { SELFHOST_ACTOR_MATERIAL_KIND } from "../src/selfhost-runtime-binding-materializer.ts";
 import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
 import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
 import { loadVerifiedLocalContainerCandidate } from "./fixtures/selfhost-container-host-authority.ts";
@@ -138,7 +136,7 @@ function bucketRelation(
 }
 
 describe("the self-host catalog", () => {
-  test("adds local Actor only with an owned runtime and exact released closure", async () => {
+  test("does not offer released Actor without an exact forward class runtime", async () => {
     const root = await mkdtemp(join(tmpdir(), "actor-composition-"));
     const released = stableProductionTakoformCatalog();
     const actorRuntime = await openSelfhostActorPublicRuntime({
@@ -162,35 +160,32 @@ describe("the self-host catalog", () => {
       now: new Date("2026-10-03T00:00:00.000Z"),
     };
     try {
+      const actorForm = released.forms.find(
+        (item) => item.identity.formRef.kind === "ActorNamespace",
+      );
+      expect(actorForm?.workerClassRuntime).toBeDefined();
+      const legacyRuntimeRef = actorForm?.workerClassRuntime?.runtimeClassRef;
+      const legacyPackageDigest = actorForm?.identity.packageDigest;
+      if (!actorForm || !legacyRuntimeRef || !legacyPackageDigest) {
+        throw new Error("released Actor class identity missing");
+      }
+      const legacyContract = {
+        formRef: actorForm.identity.formRef,
+        packageDigest: legacyPackageDigest,
+        runtimeClassRef: legacyRuntimeRef,
+      };
       expect(
         createSelfhostComposition(options).offerings.some(
           (item) => item.form.kind === "ActorNamespace",
         ),
       ).toBe(false);
-      const composed = createSelfhostComposition({ ...options, actorRuntime });
-      const actor = composed.offerings.find((item) => item.form.kind === "ActorNamespace");
-      expect(actor).toMatchObject({
-        id: "compute.actor.stable-v1.standard",
-        resourceClass: "compute.actor",
-        providerPackRef: "local",
-        providerInstallationRef: "local.primary",
-        pricePlan: {
-          currency: "USD",
-          provisioning: { meter: "resource.create", amountMinor: 0 },
-          meters: [],
-        },
+      const composed = createSelfhostComposition({
+        ...options,
+        actorRuntime,
+        workerClassRuntimeContracts: [legacyContract],
       });
-      expect(actor?.pricePlan?.meters).toEqual([]);
-      expect(
-        resolveRuntimeBindingMaterialRoute({
-          bindingRef: SELFHOST_ACTOR_BINDING_REF,
-          consumer: composed.providerPacks[0]?.runtimeBindingMaterializer,
-          target: composed.providerPacks[0]?.runtimeBindingMaterializer,
-        }),
-      ).toEqual({
-        bindingRef: SELFHOST_ACTOR_BINDING_REF,
-        materialKind: SELFHOST_ACTOR_MATERIAL_KIND,
-      });
+      expect(composed.offerings.some((item) => item.form.kind === "ActorNamespace")).toBe(false);
+      expect(composed.provider.workerClassRuntime).toBeUndefined();
       const tampered = released.forms.map((item) =>
         item.identity.formRef.kind === "ActorNamespace"
           ? {

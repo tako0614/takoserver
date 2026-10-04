@@ -116,7 +116,7 @@ test("Actor runtime InterfaceRefs are retained only in a new immutable V9 bindin
     name: "worker.actor",
     version: "2.0.0",
     schemaDigest:
-      "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51" as const,
+      "sha256:f4d70bb6d63c436e43b2e6cc50069fa6ed68eca68aea2fbc10a77969738db156" as const,
   };
   const legacy = {
     ...SET,
@@ -166,7 +166,7 @@ test("Actor runtime InterfaceRefs are retained only in a new immutable V9 bindin
     apiVersion: "interfaces.takoform.com/v1alpha1",
     name: "worker.actor",
     version: "2.0.0",
-    schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+    schemaDigest: "sha256:f4d70bb6d63c436e43b2e6cc50069fa6ed68eca68aea2fbc10a77969738db156",
   });
   expect(Object.isFrozen(stored.actorBindings?.[1]?.runtimeClassRef)).toBe(true);
 
@@ -182,7 +182,7 @@ test("Actor runtime InterfaceRefs reject unknown tuples, extra fields, and acces
     apiVersion: "interfaces.takoform.com/v1alpha1" as const,
     name: "worker.actor",
     version: "2.0.0",
-    schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+    schemaDigest: "sha256:f4d70bb6d63c436e43b2e6cc50069fa6ed68eca68aea2fbc10a77969738db156",
   };
   const candidates = [
     { ...validRef, schemaDigest: `sha256:${"a".repeat(64)}` as `sha256:${string}` },
@@ -274,7 +274,7 @@ test("V8 refuses nested runtime InterfaceRefs and an unknown future format stays
       apiVersion: "interfaces.takoform.com/v1alpha1",
       name: "worker.actor",
       version: "2.0.0",
-      schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+      schemaDigest: "sha256:f4d70bb6d63c436e43b2e6cc50069fa6ed68eca68aea2fbc10a77969738db156",
     },
   };
   await writeFile(v8Path, JSON.stringify(v8), "utf8");
@@ -381,7 +381,7 @@ const WORKFLOW_BINDING = {
     apiVersion: "edge.forms.takoform.com",
     kind: "DurableWorkflow",
     definitionVersion: "0.2.0",
-    schemaDigest: "sha256:a58c885bed4431fbdc6b923059fe3b3bf98f7727578914d2d212552ae97fdc65",
+    schemaDigest: "sha256:21b0c5cfd9722d58ca669297cf856120cf8443aa8f653a36f13d452ddf8e5585",
   },
   bindingRef: {
     apiVersion: "bindings.takoform.com/v1alpha2",
@@ -448,7 +448,7 @@ test("V10 retains existing Actor, Vector, service, and external service projecti
           name: "worker.actor",
           version: "2.0.0",
           schemaDigest:
-            "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51" as const,
+            "sha256:f4d70bb6d63c436e43b2e6cc50069fa6ed68eca68aea2fbc10a77969738db156" as const,
         },
       },
     ],
@@ -474,7 +474,7 @@ test("Workflow token derivation pins every selected scope and reference tuple fi
       workerVersionResourceUid: "uid-WorkerVersion-workflows",
       binding: WORKFLOW_BINDING,
     }),
-  ).toBe("7cc744a236659c6e1470358c1f47c0b2c797ffbaf815dcc7f6d0cca6ec9c4099");
+  ).toBe("7810541089d8d0cecbce59c7b85da3f23b76e2f05dbcb67cc44c724bf13f1152");
 });
 
 test("Workflow names are unique across all immutable binding kinds and remain bounded", async () => {

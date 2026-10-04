@@ -5,7 +5,7 @@ import { TakoformHostError, type TakoformV1Alpha3FormRef } from "./takoform/type
 /**
  * The exact, unpublished joint Actor+Workflow source selection, not the
  * published DurableWorkflow Form or the worker.workflow Interface identity.
- * Rendered from takoform-forms source 41e4907, tree 850e1c4, with the
+ * Rendered from takoform-forms source 0d8e5b7, tree 83d2467, with the
  * publisher's RFC 8785 Form digest command. This source-only contribution
  * neither installs the Form nor activates a Workflow runtime.
  */
@@ -13,7 +13,7 @@ const SELECTED_DURABLE_WORKFLOW_FORM_REF = Object.freeze({
   apiVersion: "edge.forms.takoform.com",
   kind: "DurableWorkflow",
   definitionVersion: "0.2.0",
-  schemaDigest: "sha256:a58c885bed4431fbdc6b923059fe3b3bf98f7727578914d2d212552ae97fdc65",
+  schemaDigest: "sha256:21b0c5cfd9722d58ca669297cf856120cf8443aa8f653a36f13d452ddf8e5585",
 }) satisfies TakoformV1Alpha3FormRef;
 
 /** Named opt-in; possession is tied to the very Sql object shared by Host and runtime. */

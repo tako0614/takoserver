@@ -3,7 +3,7 @@ import { canonicalJson } from "../json.ts";
 import { currentTakoformCandidates } from "./current-candidates.ts";
 import type { InstalledTakoformBinding, InstalledTakoformForm } from "./types.ts";
 
-const SOURCE_COMMIT = "41e4907c4d90d8c2b0a6a8e0fdcebc9e457e0212";
+const SOURCE_COMMIT = "0d8e5b7aaf9e07652eb6c895709efed8ad03e721";
 
 export interface ForwardTakoformCandidates {
   readonly provenance: {

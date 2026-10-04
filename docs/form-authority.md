@@ -543,35 +543,32 @@ and the actual handler set. It has no separately sealed Worker payload.
 Re-running the command re-plans from the durable heads and converges with zero
 commands when nothing changed.
 
-### Conditional local Actor source support
+### Released Actor management and unpublished source qualification
 
-The self-host-only Actor candidate extends that base catalog only when its
-closed-graph workerd artifact was selected, the owned Actor namespace/broker
-runtime opened, the exact released `ActorNamespace@0.1.0`, `ModuleWorker@0.1.0`,
-`WorkerVersion@0.3.0`, `WorkerDeployment@0.2.0`, and
-`module-worker.actor@1.0.0` BindingDefinition are installed, and immutable
-Worker publications were restored against that same owner. A fresh Host with
-no published Worker can pass an exact empty restore; an already-created Actor
-is not a prerequisite for publishing its Form support. Missing owner, closure,
-or failed restore keeps the Actor Form installed but unsupported.
+The admission command verifies the unchanged released 17-package closure.
+It installs `ActorNamespace@0.1.0` but does not grant that historical class ABI
+executable support or new namespace admission. An owned namespace/broker
+runtime alone cannot widen this profile: the stable composition exposes no
+Actor Offering or class registration for the released closure. Management of
+retained state is separate from offering new capacity.
 
-The self-host admission command runs against a stopped server, so its Actor
-support event records an implemented source capability, **not** a live
-`Ready` assertion. The serving entry independently restores the real broker
-and Worker graph before opening its listener; resource observation and
-execution readiness still depend on current class-holder Deployment and
-namespace state. Source-only synthetic tests do not qualify native HTTP,
-WebSocket, alarms, quotas, crash recovery, or OS-process restart.
+The explicit unpublished-source composition uses the exact
+`ActorNamespace@0.2.0`, `ModuleWorker@0.2.0`, `WorkerVersion@0.4.0`, and
+`WorkerDeployment@0.3.0` closure with `module-worker.actor@2.0.0`, its complete
+BindingDefinition, and an exact registered class contract. This is a separate
+source qualification lane, not an input that the production admission command
+substitutes into the released publisher set. Existing signed package identities
+and Host API v1 bytes are unchanged. Publisher review, immutable publication,
+and subsequent Host qualification remain separate prerequisites before that
+successor can enter released production admission.
 
-This conditional widening adds only the Form's declared `create`, `read`,
-`delete`, `import`, and `observe` operations, never `update`. It rotates the
-self-host capability and implementation digests while preserving the previous
-no-Actor catalog and all published Form/API/schema identities. Reconvergence
-is a new append-only support/activation event using the new exact
-implementation identity under the existing admission policy, not a silent
-rewrite of old heads. The Hosted/public Worker catalog and its historical
-digests are unchanged; the Hosted Actor supply parser still refuses Actor
-pricing and metering configuration.
+Class inspection is not execution readiness. Current class-holder Deployment,
+artifact bytes, namespace state, and the restored Worker/broker graph must
+agree before a Resource can report Ready. Source-only tests do not qualify
+native HTTP, WebSocket, alarms, quotas, crash recovery, or OS-process restart.
+The Hosted/public Worker catalog and its historical digests are unchanged;
+the Hosted Actor supply parser still refuses Actor pricing and metering
+configuration.
 
 When a previously active Actor implementation becomes unavailable, ordinary
 admission refuses before writing. Stop the server and run the same command for

@@ -42,19 +42,19 @@ const SELECTED_WORKER_FORM_REF = {
   apiVersion: "edge.forms.takoform.com",
   kind: "ModuleWorker",
   definitionVersion: "0.2.0",
-  schemaDigest: "sha256:761180705a6f2a75fa0bc0061794a269342fafe0309c26ecd7530f12fcda1399",
+  schemaDigest: "sha256:e3cd4e8c18b9511286e5b5f824c4eaf1bdac7d78fc8d20a87c9cbe4cb6f2255c",
 } as const;
 const SELECTED_VERSION_FORM_REF = {
   apiVersion: "edge.forms.takoform.com",
   kind: "WorkerVersion",
   definitionVersion: "0.4.0",
-  schemaDigest: "sha256:ba59a72fb2c12aa6e9d09173943eb4bb8d2eadac25840d87356a25286007354b",
+  schemaDigest: "sha256:9d2dd1cc902105ff979f7949bc08febfe85f519421e04875bc46b4f59a410c71",
 } as const;
 const SELECTED_WORKER_RUNTIME_REF = {
   apiVersion: "interfaces.takoform.com/v1alpha1",
   name: "worker.runtime",
   version: "2.0.0",
-  schemaDigest: "sha256:8c3fbdef49053c7522c55b9a540d03672c688b617404f23fa29e23b8dd57f37c",
+  schemaDigest: "sha256:05dfb41739f5de6495389ec2669e8b055372210dd44928cb882cdcf19616850a",
 } as const;
 const SELECTED_WORKFLOW_BINDING_REF = {
   apiVersion: "bindings.takoform.com/v1alpha2",

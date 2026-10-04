@@ -102,7 +102,7 @@ function workflowForwardPublication(
           apiVersion: "edge.forms.takoform.com",
           kind: "DurableWorkflow",
           definitionVersion: "0.2.0",
-          schemaDigest: "sha256:a58c885bed4431fbdc6b923059fe3b3bf98f7727578914d2d212552ae97fdc65",
+          schemaDigest: "sha256:21b0c5cfd9722d58ca669297cf856120cf8443aa8f653a36f13d452ddf8e5585",
         },
         bindingRef: {
           apiVersion: "bindings.takoform.com/v1alpha2",

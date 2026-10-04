@@ -1,3 +1,6 @@
+import { parseActorAbiRef } from "../actor-abi-ref.ts";
+import type { TakoformInterfaceRef } from "../interface-ref.ts";
+
 /**
  * Provider-side worker.runtime@1.1.0 module-load inspection.
  *
@@ -42,6 +45,25 @@ export interface WorkerModuleInspectionInput {
   readonly declaredHandlers: readonly WorkerModuleHandlerName[];
 }
 
+/** Exact forward Actor class contract evaluated only by the disposable Workerd inspector. */
+export interface WorkerActorClassInspectionInput {
+  readonly mainModule: string;
+  readonly modules: readonly WorkerModuleInspectionModule[];
+  readonly className: string;
+  readonly runtimeClassRef: TakoformInterfaceRef;
+}
+
+/** Canonical Worker Version module graph used to fence active Workerd bytes. */
+export interface WorkerActorClassExpectedGraph {
+  readonly mainModule: string;
+  readonly modules: readonly WorkerModuleInspectionModule[];
+}
+
+export type WorkerActorClassInspectionResult =
+  | { readonly outcome: "valid" }
+  | { readonly outcome: "invalid"; readonly error: "actor_class_invalid" }
+  | { readonly outcome: "unavailable"; readonly retryable: true };
+
 export type WorkerModuleLoadError =
   | "module_not_found"
   | "unsupported_media_type"
@@ -70,6 +92,33 @@ export type WorkerModuleInspectionResult =
 
 export interface WorkerModuleSemanticInspector {
   inspect(input: WorkerModuleInspectionInput): Promise<WorkerModuleInspectionResult>;
+  inspectActorClass(
+    input: WorkerActorClassInspectionInput,
+  ): Promise<WorkerActorClassInspectionResult>;
+}
+
+/** Copy the complete class graph synchronously before any native-process await. */
+export function snapshotWorkerActorClassInspectionInput(
+  input: WorkerActorClassInspectionInput,
+): WorkerActorClassInspectionInput {
+  if (
+    typeof input.className !== "string" ||
+    !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(input.className) ||
+    parseActorAbiRef(input.runtimeClassRef)?.kind !== "v2"
+  ) {
+    throw new TypeError("Actor class inspection contract is unavailable");
+  }
+  const snapshot = snapshotWorkerModuleInspectionInput({
+    mainModule: input.mainModule,
+    modules: input.modules,
+    declaredHandlers: [],
+  });
+  return Object.freeze({
+    mainModule: snapshot.mainModule,
+    modules: snapshot.modules,
+    className: input.className,
+    runtimeClassRef: structuredClone(input.runtimeClassRef),
+  });
 }
 
 /**
@@ -83,13 +132,31 @@ export interface WorkerModuleSemanticInspector {
 export function snapshotWorkerModuleInspectionInput(
   input: WorkerModuleInspectionInput,
 ): WorkerModuleInspectionInput {
-  if (!Array.isArray(input.modules) || input.modules.length > 1_024) {
+  const modules = snapshotWorkerModuleInspectionModules(input.modules);
+  return Object.freeze({
+    mainModule: input.mainModule,
+    modules: Object.freeze(modules),
+    declaredHandlers: Object.freeze([...input.declaredHandlers]),
+  });
+}
+
+/** Copy a caller-owned module graph before the first asynchronous authority read. */
+export function snapshotWorkerModuleInspectionModules(
+  entries: readonly WorkerModuleInspectionModule[],
+): readonly WorkerModuleInspectionModule[] {
+  if (!Array.isArray(entries) || entries.length > 1_024) {
     throw new TypeError("worker module inspection snapshot is too large");
   }
   let totalBytes = 0;
-  const modules = input.modules.map((entry) => {
-    if (!(entry.bytes instanceof Uint8Array)) {
-      throw new TypeError("worker module inspection bytes are invalid");
+  const modules = entries.map((entry) => {
+    if (
+      !entry ||
+      typeof entry.name !== "string" ||
+      typeof entry.digest !== "string" ||
+      typeof entry.mediaType !== "string" ||
+      !(entry.bytes instanceof Uint8Array)
+    ) {
+      throw new TypeError("worker module inspection entry is invalid");
     }
     totalBytes += entry.bytes.byteLength;
     if (!Number.isSafeInteger(totalBytes) || totalBytes > 10_485_760) {
@@ -97,16 +164,33 @@ export function snapshotWorkerModuleInspectionInput(
     }
     return Object.freeze({
       name: entry.name,
-      digest: entry.digest,
+      digest: entry.digest as `sha256:${string}`,
       mediaType: entry.mediaType,
       bytes: new Uint8Array(entry.bytes),
     });
   });
+  return Object.freeze(modules);
+}
+
+export function snapshotWorkerActorClassExpectedGraph(
+  input: WorkerActorClassExpectedGraph,
+): WorkerActorClassExpectedGraph {
+  if (!usableExpectedModuleName(input.mainModule)) {
+    throw new TypeError("Actor class inspection entry module is invalid");
+  }
   return Object.freeze({
     mainModule: input.mainModule,
-    modules: Object.freeze(modules),
-    declaredHandlers: Object.freeze([...input.declaredHandlers]),
+    modules: snapshotWorkerModuleInspectionModules(input.modules),
   });
+}
+
+function usableExpectedModuleName(value: string): boolean {
+  if (typeof value !== "string" || value.length === 0 || value.length > 1_024) return false;
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code === 0 || (code >= 0xd800 && code <= 0xdfff)) return false;
+  }
+  return true;
 }
 
 export interface SemanticInspectionPreludeSourceInput {

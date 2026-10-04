@@ -1,5 +1,5 @@
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
-import type { TakoformInterfaceRef } from "./interface-ref.ts";
+import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 
 /** Persisted Actor Resource facts, independent of Host admission or execution. */
 export interface ActorResourceFacts {
@@ -61,6 +61,18 @@ export interface WorkerClassRuntimeContract {
   readonly formRef: TakoformV1Alpha3FormRef;
   readonly packageDigest: `sha256:${string}`;
   readonly runtimeClassRef: TakoformInterfaceRef;
+}
+
+/**
+ * Composition-selected technical facts for one class Binding. These facts
+ * do not verify a publisher or grant support; the domain owns that selection.
+ * An adapter captures them and fences its actual Offering/Resource graph.
+ */
+export interface WorkerClassBindingSelection {
+  readonly bindingRef: TakoformBindingRef;
+  readonly contract: WorkerClassRuntimeContract;
+  readonly workerFormRef: TakoformV1Alpha3FormRef;
+  readonly versionFormRef: TakoformV1Alpha3FormRef;
 }
 
 export interface WorkerClassResourceIdentity {

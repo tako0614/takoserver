@@ -58,14 +58,23 @@ it has no Actor resource-class, metering, or price-plan contract. `ActorNamespac
 remains an identity Form, not a relation that inherits a Worker's commercial
 Offering.
 
-Separately, the stable self-host composition may offer the exact released
-`ActorNamespace@0.1.0` as local `compute.actor` through its owned Provider Pack
-and `local.primary` installation. Its local plan prices namespace identity
-creation at zero and defines no usage meters; this is not a Hosted tariff, an
-unlimited-capacity promise, or evidence that a particular namespace is Ready.
-The Offering is absent without the owned native Actor runtime and full exact
-Form/Binding closure. The default no-Actor entry remains fail-closed. Hosted
-Actor supply parsing and metering are unchanged.
+The released `ActorNamespace@0.1.0` closure remains installed for management;
+its historical Interface does not define the full executable class ABI. The
+stable self-host composition therefore registers no executable class contract
+and offers no new namespace identity for that closure, even when its owned
+Actor runtime is present. The runtime's presence is not a support grant.
+
+An explicit unpublished-source composition can instead connect the exact
+`ActorNamespace@0.2.0`, `ModuleWorker@0.2.0`, `WorkerVersion@0.4.0`, and
+`WorkerDeployment@0.3.0` closure, the complete `module-worker.actor@2.0.0`
+BindingDefinition, and its matching class runtime contract. It may project a
+local `compute.actor` Offering through its owned Provider Pack and
+`local.primary` installation. The local plan prices namespace identity
+creation at zero and defines no usage meters. This is neither a Hosted tariff
+nor an unlimited-capacity or Resource readiness claim. A missing or mismatched
+closure refuses the connection; default published-source composition cannot
+infer this opt-in from runtime graph metadata. Hosted Actor supply parsing and
+metering are unchanged.
 
 This opt-in is source qualification, not publication or production admission.
 Native owner allocation or a technical proxy route alone does not prove that

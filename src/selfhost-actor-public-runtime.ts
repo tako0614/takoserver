@@ -2,24 +2,39 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { parseActorAbiRef } from "./actor-abi-ref.ts";
+import { canonicalJson, isSha256Digest } from "./json.ts";
 import { selfhostVersionBindingsRoot } from "./providers/selfhost.ts";
 import {
   createSelfhostVersionBindingStore,
   deriveSelfhostActorForwardToken,
 } from "./providers/selfhost-version-bindings.ts";
+import {
+  snapshotWorkerActorClassExpectedGraph,
+  type WorkerActorClassExpectedGraph,
+  type WorkerModuleInspectionModule,
+} from "./providers/worker-module-semantic-inspection.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
 import { createSelfhostActorExecutionHost } from "./selfhost-actor-execution-host.ts";
 import { openSelfhostActorForwardBrokers } from "./selfhost-actor-forward-brokers.ts";
-import type { ActorResourceGraphReader } from "./worker-class-runtime-port.ts";
+import type {
+  ActorResourceGraphReader,
+  ProviderWorkerClassRuntime,
+  WorkerClassInspectionInput,
+  WorkerClassInspectionVerdict,
+} from "./worker-class-runtime-port.ts";
 import type {
   WorkerdActorForwardPublication,
   WorkerdActorForwardSocket,
 } from "./workerd-runtime.ts";
+import { readWorkerdActiveActorGraph } from "./workerd-runtime.ts";
+import { createWorkerdWorkerModuleInspector } from "./workerd-worker-module-inspector.ts";
 
 const OWNED_ACTOR_RUNTIME = Symbol("owned self-host Actor runtime");
 const MAX_SOCKET_PAIRS = 128;
 
 type ExecutionHost = ReturnType<typeof createSelfhostActorExecutionHost>;
+type ActiveWorkerDeployment = Awaited<ReturnType<ResourceDeploymentStore["active"]>>;
+type SelfhostActorClassInspectionInput = Parameters<ProviderWorkerClassRuntime["inspect"]>[0];
 type ForwardBrokers = Awaited<ReturnType<typeof openSelfhostActorForwardBrokers>>;
 
 export interface SelfhostActorPublicRuntime {
@@ -32,6 +47,10 @@ export interface SelfhostActorPublicRuntime {
     | "namespaceAbsent"
     | "forgetNamespace"
   >;
+  readonly inspectWorkerClass: (
+    input: SelfhostActorClassInspectionInput,
+    expectedGraph: WorkerActorClassExpectedGraph,
+  ) => Promise<WorkerClassInspectionVerdict>;
   readonly actorForwardLifecycle: {
     prepare(publications: readonly WorkerdActorForwardPublication[]): Promise<void>;
     reserve(publications: readonly WorkerdActorForwardPublication[]): Promise<{
@@ -59,6 +78,160 @@ function brokerKey(binding: {
   readonly token: string;
 }): string {
   return JSON.stringify([binding.tenantId, binding.namespaceResourceUid, binding.token]);
+}
+
+function validActorClassInspectionInput(
+  input: SelfhostActorClassInspectionInput,
+  providerInstallationRef: string,
+): boolean {
+  if (
+    input.providerInstallationRef !== providerInstallationRef ||
+    input.contract.formRef.apiVersion !== "edge.forms.takoform.com" ||
+    input.contract.formRef.kind !== "ActorNamespace" ||
+    !isSha256Digest(input.contract.packageDigest) ||
+    parseActorAbiRef(input.contract.runtimeClassRef)?.kind !== "v2" ||
+    input.holderNativeId !== `selfhost-actor:${input.holder.uid}` ||
+    !parseSelfhostVersionNativeId(input.versionNativeId) ||
+    input.holder.formRef.apiVersion !== input.contract.formRef.apiVersion ||
+    input.holder.formRef.kind !== input.contract.formRef.kind ||
+    input.holder.formRef.definitionVersion !== input.contract.formRef.definitionVersion ||
+    input.holder.formRef.schemaDigest !== input.contract.formRef.schemaDigest ||
+    input.worker.formRef.kind !== "ModuleWorker" ||
+    input.deployment.formRef.kind !== "WorkerDeployment" ||
+    input.version.formRef.kind !== "WorkerVersion" ||
+    input.bundle.formRef.kind !== "WorkerBundle" ||
+    !isSha256Digest(input.bundle.manifestDigest) ||
+    !Number.isSafeInteger(input.weight) ||
+    input.weight !== 10_000 ||
+    typeof input.className !== "string" ||
+    !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(input.className) ||
+    !input.tenantId ||
+    !input.space
+  )
+    return false;
+  return [input.holder, input.worker, input.deployment, input.version, input.bundle].every(
+    (identity) =>
+      /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u.test(identity.uid) &&
+      Boolean(identity.generation) &&
+      Boolean(identity.revision),
+  );
+}
+
+function parseSelfhostVersionNativeId(
+  value: string,
+): { readonly script: string; readonly versionId: string } | null {
+  if (typeof value !== "string" || value.length > 4_096) return null;
+  const parts = value.split(":");
+  if (
+    parts.length !== 4 ||
+    parts[0] !== "selfhost-version" ||
+    !parts[1] ||
+    !/^[a-z0-9][a-z0-9_-]{0,127}$/u.test(parts[1]) ||
+    !parts[2] ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(parts[2]) ||
+    !parts[3] ||
+    parts[3].includes("\0")
+  )
+    return null;
+  return { script: parts[1], versionId: parts[2] };
+}
+
+function matchesActorClassGraph(
+  input: WorkerClassInspectionInput,
+  graph: Awaited<ReturnType<ExecutionHost["readCurrentGraph"]>>,
+): boolean {
+  return Boolean(
+    graph &&
+      graph.tenantId === input.tenantId &&
+      graph.namespace.uid === input.holder.uid &&
+      graph.namespace.generation === input.holder.generation &&
+      graph.namespace.revision === input.holder.revision &&
+      graph.namespace.address.space === input.space &&
+      graph.namespace.className === input.className &&
+      sameFormRef(graph.namespace.formRef, input.holder.formRef) &&
+      graph.worker.uid === input.worker.uid &&
+      graph.worker.generation === input.worker.generation &&
+      graph.worker.revision === input.worker.revision &&
+      sameFormRef(graph.worker.formRef, input.worker.formRef) &&
+      graph.runtimeClassRef !== undefined &&
+      canonicalJson(graph.runtimeClassRef) === canonicalJson(input.contract.runtimeClassRef),
+  );
+}
+
+function matchesActorClassDeployment(
+  deployment: ActiveWorkerDeployment,
+  input: WorkerClassInspectionInput,
+  script: string,
+  options: {
+    readonly providerPackRef: string;
+    readonly providerInstallationRef: string;
+  },
+): boolean {
+  return Boolean(
+    deployment &&
+      deployment.tenantId === input.tenantId &&
+      deployment.resourceUid === input.worker.uid &&
+      deployment.state === "active" &&
+      deployment.providerPackRef === options.providerPackRef &&
+      deployment.providerInstallationRef === options.providerInstallationRef &&
+      deployment.nativeId.startsWith(`selfhost-worker:${script}:`) &&
+      deployment.nativeId !== `selfhost-worker:${script}:` &&
+      deployment.observed.scriptName === script &&
+      deployment.outputs.scriptName === script,
+  );
+}
+
+function sameFormRef(left: unknown, right: unknown): boolean {
+  try {
+    return canonicalJson(left) === canonicalJson(right);
+  } catch {
+    return false;
+  }
+}
+
+function sameWorkerdActorGraph(
+  left: Awaited<ReturnType<typeof readWorkerdActiveActorGraph>>,
+  right: Awaited<ReturnType<typeof readWorkerdActiveActorGraph>>,
+): boolean {
+  if (
+    !left ||
+    !right ||
+    left.generation !== right.generation ||
+    left.generationKey !== right.generationKey ||
+    left.workerResourceUid !== right.workerResourceUid ||
+    left.versions.length !== right.versions.length
+  )
+    return false;
+  return left.versions.every((version, index) => {
+    const other = right.versions[index];
+    return Boolean(
+      other &&
+        version.versionId === other.versionId &&
+        version.workerVersionUid === other.workerVersionUid &&
+        version.weight === other.weight &&
+        version.variantKey === other.variantKey &&
+        version.site.mainModule === other.site.mainModule &&
+        canonicalJson(version.site.moduleMediaTypes ?? {}) ===
+          canonicalJson(other.site.moduleMediaTypes ?? {}) &&
+        sameByteMap(version.modules, other.modules) &&
+        sameByteMap(version.hostModules, other.hostModules),
+    );
+  });
+}
+
+function sameByteMap(
+  left: ReadonlyMap<string, Uint8Array>,
+  right: ReadonlyMap<string, Uint8Array>,
+): boolean {
+  if (left.size !== right.size) return false;
+  for (const [name, bytes] of left) {
+    const other = right.get(name);
+    if (!other || bytes.byteLength !== other.byteLength) return false;
+    for (let index = 0; index < bytes.byteLength; index += 1) {
+      if (bytes[index] !== other[index]) return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -101,6 +274,98 @@ export async function openSelfhostActorPublicRuntime(options: {
     await rm(socketDirectory, { recursive: true, force: true });
     throw error;
   }
+  const classInspector = createWorkerdWorkerModuleInspector({
+    binary: options.binary,
+    temporaryRoot: join(options.dataRoot, "selfhost", "actor-class-inspection"),
+  });
+  const inspectWorkerClass: SelfhostActorPublicRuntime["inspectWorkerClass"] = async (
+    untrusted,
+    untrustedExpectedGraph,
+  ) => {
+    try {
+      const input = structuredClone(untrusted) as SelfhostActorClassInspectionInput;
+      const expectedGraph = snapshotWorkerActorClassExpectedGraph(untrustedExpectedGraph);
+      if (!validActorClassInspectionInput(input, options.providerInstallationRef))
+        return "unavailable";
+      const native = parseSelfhostVersionNativeId(input.versionNativeId);
+      if (!native) return "unavailable";
+      const scope = {
+        tenantId: input.tenantId,
+        namespaceResourceUid: input.holder.uid,
+      };
+      const actorGraph = await host.readCurrentGraph(scope, AbortSignal.timeout(30_000));
+      if (!actorGraph || !matchesActorClassGraph(input, actorGraph)) return "unavailable";
+      const deployment = await options.deployments.active(input.tenantId, input.worker.uid);
+      if (!matchesActorClassDeployment(deployment, input, native.script, options))
+        return "unavailable";
+      const active = await readWorkerdActiveActorGraph(
+        options.runtimeRoot,
+        native.script,
+        input.worker.uid,
+      );
+      const selected = active?.versions.find(
+        (version) =>
+          version.versionId === native.versionId &&
+          version.workerVersionUid === input.version.uid &&
+          version.weight === input.weight,
+      );
+      // Until the class port carries a complete weighted Version set, never
+      // claim one class inspection qualifies an additional active Version.
+      if (active?.versions.length !== 1 || !selected) return "unavailable";
+      if (
+        !sameExpectedModules(
+          selected.modules,
+          expectedGraph.modules,
+          selected.site.moduleMediaTypes ?? {},
+        )
+      )
+        return "unavailable";
+      if (selected.site.mainModule !== expectedGraph.mainModule) return "unavailable";
+      const moduleEntries = [...selected.modules].map(([name, bytes]) => {
+        const mediaType = selected.site.moduleMediaTypes?.[name] ?? "application/javascript+module";
+        return {
+          name,
+          bytes: new Uint8Array(bytes),
+          mediaType,
+          digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}` as const,
+        };
+      });
+      let verdict: WorkerClassInspectionVerdict;
+      try {
+        const result = await classInspector.inspectActorClass({
+          mainModule: selected.site.mainModule,
+          modules: moduleEntries,
+          className: input.className,
+          runtimeClassRef: input.contract.runtimeClassRef,
+        });
+        verdict =
+          result.outcome === "valid"
+            ? "valid"
+            : result.outcome === "invalid"
+              ? "invalid"
+              : "unavailable";
+      } catch {
+        return "unavailable";
+      }
+      const [afterGraph, afterDeployment, afterActive] = await Promise.all([
+        host.readCurrentGraph(scope, AbortSignal.timeout(30_000)),
+        options.deployments.active(input.tenantId, input.worker.uid),
+        readWorkerdActiveActorGraph(options.runtimeRoot, native.script, input.worker.uid),
+      ]);
+      if (
+        !afterGraph ||
+        !matchesActorClassGraph(input, afterGraph) ||
+        !matchesActorClassDeployment(afterDeployment, input, native.script, options) ||
+        JSON.stringify(deployment) !== JSON.stringify(afterDeployment) ||
+        !sameWorkerdActorGraph(active, afterActive)
+      )
+        return "unavailable";
+      return verdict;
+    } catch {
+      return "unavailable";
+    }
+  };
+  const actorNamespace = host;
   const versionBindings = createSelfhostVersionBindingStore({
     root: selfhostVersionBindingsRoot(options.dataRoot),
   });
@@ -335,7 +600,8 @@ export async function openSelfhostActorPublicRuntime(options: {
 
   return Object.freeze({
     [OWNED_ACTOR_RUNTIME]: true as const,
-    actorNamespace: host,
+    actorNamespace,
+    inspectWorkerClass,
     actorForwardLifecycle: lifecycle,
     actorForwardSockets: () =>
       closed ? [] : [...brokers.values()].map((pair) => pair.socketMapping),
@@ -368,4 +634,24 @@ export async function openSelfhostActorPublicRuntime(options: {
       return closing;
     },
   });
+}
+
+function sameExpectedModules(
+  actual: ReadonlyMap<string, Uint8Array>,
+  expected: readonly WorkerModuleInspectionModule[],
+  actualMediaTypes: Readonly<Record<string, string>>,
+): boolean {
+  if (expected.length === 0 || actual.size !== expected.length) return false;
+  const seen = new Set<string>();
+  for (const entry of expected) {
+    if (seen.has(entry.name)) return false;
+    seen.add(entry.name);
+    const bytes = actual.get(entry.name);
+    if (!bytes || bytes.byteLength !== entry.bytes.byteLength) return false;
+    if ((actualMediaTypes[entry.name] ?? "application/javascript+module") !== entry.mediaType)
+      return false;
+    if (`sha256:${createHash("sha256").update(bytes).digest("hex")}` !== entry.digest) return false;
+    if (entry.bytes.some((byte, index) => byte !== bytes[index])) return false;
+  }
+  return true;
 }
