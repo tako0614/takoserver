@@ -32,17 +32,19 @@ import {
   runCommand,
 } from "./process.ts";
 import {
+  type FreshD1AttemptBinding,
+  type FreshD1Custody,
+  openFreshD1Custody,
+} from "./production-d1-fresh-init-custody.ts";
+import {
   type DeployEnvironment,
   qualifySource,
   sealDirectory,
   unsealDirectory,
 } from "./qualification.ts";
-import {
-  projectApplyQualifiedMigrationArtifact,
-  readCurrentAuditedMigrationSourceArtifact,
-  readSealedApplyQualifiedMigrationArtifact,
-} from "./schema.ts";
+import { readCurrentAuditedMigrationSourceArtifact } from "./schema.ts";
 import type { DeployTarget } from "./target.ts";
+import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 
 const ACCOUNT_ID = /^[0-9a-f]{32}$/u;
 const GENERATION = /^[0-9a-f]{32}$/u;
@@ -83,6 +85,8 @@ export interface ProductionD1FreshInitOptions extends IntegrationStorageGenerate
   readonly review?: string;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly outputDirectory?: string;
+  /** Test seam; the real operator supplies the required preexisting private directory. */
+  readonly custodyDirectory?: string;
   /** Test-only source seam; production callers use the repository migrations. */
   readonly migrationDirectory?: string;
   /** Narrow provider seam used by tests and local contract simulations. */
@@ -102,7 +106,7 @@ interface IncumbentProductionD1 {
 
 /**
  * Creates one brand-new empty **production** D1 and applies the complete
- * audited local `0001-0066` lineage to it, in one reviewed command.
+ * audited local `0001-0069` lineage to it, in one reviewed command.
  *
  * The protected 0023+ wave lane exists to move one production-shaped durable
  * predecessor forward; it can never invent the durable state a brand-new
@@ -125,15 +129,34 @@ export async function runProductionD1FreshInit(
   options: ProductionD1FreshInitOptions = {},
 ): Promise<Record<string, unknown>> {
   const names = validateInvocation(invocation, target);
-  const sourceArtifact = projectApplyQualifiedMigrationArtifact(
-    readCurrentAuditedMigrationSourceArtifact(
-      options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
-    ),
+  const sourceArtifact = readCurrentAuditedMigrationSourceArtifact(
+    options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
   );
   const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
   const expectedApplicationShapeDigest = `sha256:${createHash("sha256")
     .update(expectedApplicationShape)
     .digest("hex")}`;
+  const sourceImport = buildD1MigrationImport(sourceArtifact.files, { freshLedger: true });
+  const custody = openFreshD1Custody(
+    options.custodyDirectory ?? requireEnvironment("TAKOSERVER_D1_FRESH_INIT_CUSTODY_DIRECTORY"),
+    target.accountId,
+    invocation.generation,
+  );
+  const binding: FreshD1AttemptBinding = {
+    accountId: target.accountId,
+    generation: invocation.generation,
+    databaseName: names.databaseName,
+    incumbentDatabaseName: target.d1.databaseName,
+    incumbentDatabaseId: target.d1.databaseId,
+    incumbentBucketName: target.r2.bucketName,
+    workerName: target.workerName,
+    sourceCommit: invocation.commit,
+    migrationDigest: sourceArtifact.digest,
+    migrationBytes: sourceArtifact.bytes,
+    importDigest: sourceImport.digest,
+    importBytes: sourceImport.bytes,
+    applicationShapeDigest: expectedApplicationShapeDigest,
+  };
   const incumbent: IncumbentProductionD1 = {
     databaseName: target.d1.databaseName,
     databaseId: target.d1.databaseId,
@@ -141,9 +164,18 @@ export async function runProductionD1FreshInit(
   };
 
   if (invocation.action === "status") {
-    const { provider } = await resolveProvider(target, options);
-    const inventory = await readInventory(provider, names, "preflight");
-    const present = inventory.length === 1 ? inventory[0] : null;
+    const { provider, environment } = await resolveProvider(target, options);
+    const observed = await inspectFreshD1Attempt({
+      provider,
+      environment,
+      names,
+      target,
+      sourceArtifact,
+      expectedApplicationShape,
+      options,
+      custody,
+      binding,
+    });
     return {
       kind: "takoserver.production-d1-fresh-init-status@v1",
       surface: PRODUCTION_D1_FRESH_INIT_SURFACE,
@@ -152,8 +184,8 @@ export async function runProductionD1FreshInit(
       generation: invocation.generation,
       d1: {
         databaseName: names.databaseName,
-        databaseId: present?.uuid ?? null,
-        present: present !== null,
+        databaseId: observed.databaseId,
+        present: observed.present,
       },
       incumbent,
       migrationDigest: sourceArtifact.digest,
@@ -161,10 +193,17 @@ export async function runProductionD1FreshInit(
       migrationCount: sourceArtifact.names.length,
       throughMigration: sourceArtifact.names[sourceArtifact.names.length - 1] ?? null,
       expectedApplicationShapeDigest,
-      readyForApply: present === null,
+      readyForApply: observed.readyForApply,
+      attemptState: observed.attemptState,
       adoption: "an existing D1 is never adopted, reset or re-migrated by this surface",
       targetBinding: "this surface never writes the deploy target; repointing is operator-owned",
     };
+  }
+
+  if (custody.read(binding) !== null) {
+    throw preflightError(
+      "fresh D1 generation has a retained attempt; use status, never redispatch",
+    );
   }
 
   return await applyFreshProductionD1(
@@ -175,8 +214,112 @@ export async function runProductionD1FreshInit(
     expectedApplicationShape,
     expectedApplicationShapeDigest,
     incumbent,
+    custody,
+    binding,
     options,
   );
+}
+
+interface FreshAttemptObservation {
+  readonly databaseId: string | null;
+  readonly present: boolean;
+  readonly readyForApply: boolean;
+  readonly attemptState: "absent" | "pending" | "identified" | "complete";
+}
+
+/** Reopen custody and provider state only; this never creates or imports a D1. */
+async function inspectFreshD1Attempt(input: {
+  readonly provider: ProductionD1FreshInitProvider;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly names: FreshD1Names;
+  readonly target: DeployTarget;
+  readonly sourceArtifact: ReturnType<typeof readCurrentAuditedMigrationSourceArtifact>;
+  readonly expectedApplicationShape: string;
+  readonly options: ProductionD1FreshInitOptions;
+  readonly custody: FreshD1Custody;
+  readonly binding: FreshD1AttemptBinding;
+}): Promise<FreshAttemptObservation> {
+  const attempt = input.custody.read(input.binding);
+  const inventory = await readInventory(input.provider, input.names, "preflight");
+  input.custody.assertContinuity();
+  const present = inventory[0] ?? null;
+  if (attempt === null) {
+    return {
+      databaseId: present?.uuid ?? null,
+      present: present !== null,
+      readyForApply: present === null,
+      attemptState: "absent",
+    };
+  }
+  const base = {
+    databaseId: present?.uuid ?? null,
+    present: present !== null,
+    readyForApply: false,
+  };
+  if (present === null || attempt.identified === null) {
+    return { ...base, attemptState: "pending" };
+  }
+  if (present.uuid !== attempt.identified.databaseId) {
+    throw mutationError("fresh D1 attempt observed a different database identity; retain custody");
+  }
+  const readback = await providerCall(
+    "preflight",
+    "fresh D1 attempt identity readback failed",
+    () => input.provider.getD1(present.uuid),
+  );
+  input.custody.assertContinuity();
+  let exactReadback: IntegrationStorageD1Database;
+  try {
+    exactReadback = validateD1Summary(readback, "fresh D1 attempt identity readback");
+  } catch {
+    throw mutationError("fresh D1 attempt identity readback is malformed; retain custody");
+  }
+  if (exactReadback.uuid !== present.uuid || exactReadback.name !== input.names.databaseName) {
+    throw mutationError("fresh D1 attempt identity readback changed; retain custody");
+  }
+  if (attempt.importDispatched === null) {
+    return { ...base, attemptState: "identified" };
+  }
+  const directory = mkdtempSync(join(tmpdir(), "takoserver-fresh-d1-readback-"));
+  try {
+    const configPath = join(directory, "wrangler.jsonc");
+    mkdirSync(join(directory, "payload", "migrations"), { recursive: true, mode: 0o700 });
+    const generatedTarget: GeneratedD1Target = {
+      accountId: input.target.accountId,
+      databaseName: input.names.databaseName,
+      databaseId: present.uuid,
+    };
+    writeFreshInitConfig(
+      configPath,
+      generatedTarget.accountId,
+      generatedTarget.databaseName,
+      generatedTarget.databaseId,
+    );
+    try {
+      const state = await readGeneratedState(
+        "preflight",
+        configPath,
+        generatedTarget,
+        input.environment,
+        input.options.run ?? runCommand,
+        input.options,
+      );
+      input.custody.assertContinuity();
+      assertCompleteDatabase(
+        state,
+        input.sourceArtifact.names,
+        input.sourceArtifact.digest,
+        input.expectedApplicationShape,
+        present.uuid,
+        "preflight",
+      );
+      return { ...base, attemptState: "complete" };
+    } catch {
+      return { ...base, attemptState: "pending" };
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 function validateInvocation(
@@ -264,6 +407,8 @@ async function applyFreshProductionD1(
   expectedApplicationShape: string,
   expectedApplicationShapeDigest: string,
   incumbent: IncumbentProductionD1,
+  custody: FreshD1Custody,
+  binding: FreshD1AttemptBinding,
   options: ProductionD1FreshInitOptions,
 ): Promise<Record<string, unknown>> {
   const run = options.run ?? runCommand;
@@ -292,6 +437,7 @@ async function applyFreshProductionD1(
   mkdirSync(migrationOutput, { recursive: true, mode: 0o700 });
   let sealed: ReturnType<typeof sealDirectory> | null = null;
   let migrationSeal: ReturnType<typeof sealDirectory> | null = null;
+  let lease: Awaited<ReturnType<typeof acquireWranglerVersionPublicationLease>> | null = null;
   let mutationStarted = false;
   let knownDatabaseId: string | null = null;
   let result: Record<string, unknown> | undefined;
@@ -301,7 +447,7 @@ async function applyFreshProductionD1(
     for (const file of sourceArtifact.files) {
       copyFileSync(file.path, join(migrationOutput, file.name));
     }
-    const sealedArtifact = readSealedApplyQualifiedMigrationArtifact(migrationOutput);
+    const sealedArtifact = readCurrentAuditedMigrationSourceArtifact(migrationOutput);
     if (
       sealedArtifact.digest !== sourceArtifact.digest ||
       JSON.stringify(sealedArtifact.names) !== JSON.stringify(sourceArtifact.names)
@@ -311,6 +457,12 @@ async function applyFreshProductionD1(
     // The frozen 0047 trigger body defeats D1 /query parsing, so the exact
     // migration bytes travel through the /import transport, unchanged.
     const migrationImport = buildD1MigrationImport(sealedArtifact.files, { freshLedger: true });
+    if (
+      migrationImport.digest !== binding.importDigest ||
+      migrationImport.bytes !== binding.importBytes
+    ) {
+      throw preflightError("sealed fresh D1 import differs from the bound source");
+    }
     const importPath = join(payload, "migration-import.sql");
     writeFileSync(importPath, migrationImport.sql, { mode: 0o600, flag: "wx" });
     migrationSeal = sealDirectory(payload, [
@@ -320,11 +472,24 @@ async function applyFreshProductionD1(
     const configPath = join(release, "wrangler.jsonc");
 
     const { provider, environment: providerEnvironment } = await resolveProvider(target, options);
+    lease = await acquireWranglerVersionPublicationLease({
+      accountId: target.accountId,
+      workerName: names.databaseName,
+      root: custody.root,
+      createRoot: false,
+    });
+    custody.assertContinuity();
+    if (custody.read(binding) !== null) {
+      throw preflightError(
+        "fresh D1 generation has a retained attempt; use status, never redispatch",
+      );
+    }
     const initial = await readInventory(provider, names, "preflight");
     assertAbsent(initial, "initial fresh production D1 name inventory");
     const fenced = await readInventory(provider, names, "preflight");
     assertAbsent(fenced, "immediate precreate fresh production D1 absence fence");
     migrationSeal.assertUnchanged();
+    custody.persistIntent(binding);
 
     // Set before the provider boundary: a lost acknowledgement can mean
     // Cloudflare created the database even though no identity returned.
@@ -347,6 +512,7 @@ async function applyFreshProductionD1(
         `databaseId=${databaseId}`,
       );
     }
+    custody.persistIdentified(binding, databaseId);
 
     const generatedTarget: GeneratedD1Target = {
       accountId: target.accountId,
@@ -385,6 +551,7 @@ async function applyFreshProductionD1(
       );
     }
     assertEmptyDatabase(preMigration, databaseId);
+    custody.persistImportDispatched(binding);
 
     const migration = await applySealedMigrations(
       configPath,
@@ -417,6 +584,7 @@ async function applyFreshProductionD1(
       );
     }
     sealed.assertUnchanged();
+    custody.persistComplete(binding);
 
     result = {
       kind: "takoserver.production-d1-fresh-init-apply@v1",
@@ -461,6 +629,12 @@ async function applyFreshProductionD1(
   } catch (error) {
     cleanupFailed = true;
     cleanupFailure = error;
+  }
+  try {
+    if (lease !== null) await lease.release();
+  } catch (error) {
+    cleanupFailed = true;
+    cleanupFailure ??= error;
   }
 
   // Cleanup stays outside a finally block: an unwinding cleanup error must

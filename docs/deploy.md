@@ -180,10 +180,33 @@ the expected canonical application-schema digest, and reports the incumbent as
 untouched. `--apply` additionally requires an explicit
 `CLOUDFLARE_API_TOKEN` and `TAKOSERVER_INDEPENDENT_REVIEW`, qualifies one clean
 production commit, runs the migration gate once, seals the fixed audited
-0001–0066 names and bytes, proves the fresh name absent twice, creates one D1,
+0001–0069 names and bytes, proves the fresh name absent twice, creates one D1,
 proves the empty canonical shape, applies the lineage through one sealed
 `wrangler d1 execute --file` import, and verifies the exact lineage and
-application schema afterwards.
+application schema afterwards. This is a fresh-empty-target source path only:
+it selects the same current source lineage as an empty self-host SQLite boot,
+without raising the existing-target or protected migration-wave ceiling. The
+0067–0069 source selection and local SQLite stand-in checks are not evidence
+that the import has passed a native remote D1 or Hosted rollout qualification.
+
+Both actions require `TAKOSERVER_D1_FRESH_INIT_CUSTODY_DIRECTORY`: an existing,
+owner-owned `0700` absolute directory outside every Git checkout, with no
+symlinked path component. The command neither creates nor deletes it. Before
+the first D1 create, apply writes and fsyncs an exclusive account/generation
+intent bound to the incumbent target, selected source and import digests.
+Acknowledged identity, import dispatch and completion add linked immutable
+records. The existing same-host kernel lease serializes applies but is not
+Cloudflare completion evidence. Status reopens these records and authoritative
+D1 state as `absent`, `pending`, `identified` or `complete`; an existing attempt
+always has `readyForApply: false`. A second apply of the same generation never
+redispatches create or import, even if a name inventory is temporarily absent.
+After a lost acknowledgement, retain the exact generation and custody for
+read-only reconciliation, then use a distinct generation for a new attempt.
+The directory itself is operator custody: deletion, replacement, another host
+without the same directory, or a direct Cloudflare mutation cannot be ruled
+out by this source. Such loss is not proof that a prior create did not happen;
+keep unknown resources quarantined rather than recreating the root or retrying
+the same generation.
 
 An existing database, even an empty one, is never adopted, reset or re-migrated.
 The whole provider capability this surface holds is D1 inventory, create and
@@ -1224,8 +1247,11 @@ managed customer runtime.
   selected integration lane projects only the audited through-prefix, with
   apply and remote D1 qualification still capped at 0066. The source-only 0067
   Container Endpoint index, 0068 future provider-invocation custody schema and
-  0069 future delete-ack proof projection are source-only: they are not new
-  protected waves or D1 apply authority. Migration 0068 initializes its
+  0069 future delete-ack proof projection are source-only for existing-target
+  waves: they are not new protected waves or in-place D1 apply authority. The
+  separately selected fresh-empty production D1 path uses the full audited
+  source, without qualifying a live remote D1 import or existing-data upgrade.
+  Migration 0068 initializes its
   admission epoch closed and does not activate an invocation writer; 0069 does
   not qualify a live delete or migration apply. The apply-qualified ceiling
   remains 0066, and the protected 0058 evidence gate is unchanged.
