@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
 import type { JsonObject } from "../src/ports.ts";
 import { createSelfhostProvider } from "../src/providers/selfhost.ts";
 import { createSelfhostScriptStateStore } from "../src/providers/selfhost-script-state.ts";
@@ -12,6 +13,8 @@ import {
 } from "../src/providers/selfhost-version-bindings.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
+import { forwardTakoformCandidates } from "../src/takoform/forward-candidates.ts";
+import type { ActorResourceGraph } from "../src/worker-class-runtime-port.ts";
 import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
 
 const actorForm = currentTakoformCandidates().forms.find(
@@ -227,7 +230,7 @@ test("self-host Actor identity allocates only for a same-tenant pinned Worker re
   }
 });
 
-test("Worker Version pins an exact Actor relation in private v8 and projects only a derived facade token", async () => {
+test("Worker Version pins legacy v8 and forward v9 Actor relations from Host graph", async () => {
   const root = await mkdtemp(join(tmpdir(), "actor-version-provider-"));
   const candidates = currentTakoformCandidates().forms;
   const form = (kind: string) => {
@@ -254,6 +257,22 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
     };
   };
   const actorOffering = offering("ActorNamespace");
+  const forwardActorForm = forwardTakoformCandidates().forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ActorNamespace",
+  );
+  if (!forwardActorForm?.workerClassRuntime?.runtimeClassRef)
+    throw new Error("forward Actor Form runtime ref missing");
+  const forwardActorOffering = {
+    ...actorOffering,
+    id: "selfhost.edge.actornamespace.forward",
+    form: forwardActorForm.identity.formRef,
+    providedInterfaces: forwardActorForm.providedInterfaces ?? [],
+  };
+  const wrongForwardOffering = {
+    ...forwardActorOffering,
+    id: "selfhost.edge.actornamespace.wrong-interface",
+    providedInterfaces: [ACTOR_ABI_INTERFACE_REFS.legacy],
+  };
   const versionOffering = offering("WorkerVersion");
   const deploymentOffering = offering("WorkerDeployment");
   const tenantId = "tenant-one";
@@ -309,12 +328,18 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
     createdAt: "2026-10-03T00:00:00.000Z",
     updatedAt: "2026-10-03T00:00:00.000Z",
   });
-  let ownerGraph: typeof graph | null = graph;
+  let ownerGraph: ActorResourceGraph | null = graph;
   let rejectDeploymentPreflight = false;
   let deploymentPreflightCalls = 0;
   const provider = createSelfhostProvider({
     id: "local.pack",
-    offerings: [actorOffering, versionOffering, deploymentOffering],
+    offerings: [
+      actorOffering,
+      forwardActorOffering,
+      wrongForwardOffering,
+      versionOffering,
+      deploymentOffering,
+    ],
     dataRoot: root,
     runtime: {
       ...runtime,
@@ -466,6 +491,82 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
       },
     ]);
     expect(raw.workerVersionResourceUid).toBe(versionUid);
+    const forwardRef = forwardActorForm.workerClassRuntime.runtimeClassRef;
+    const forwardActorRelation = {
+      ...actorRelation,
+      resource: {
+        ...actorRelation.resource,
+        form: { formRef: forwardActorForm.identity.formRef },
+      },
+      deployment: {
+        ...actorRelation.deployment,
+        offeringId: forwardActorOffering.id,
+      },
+    };
+    const forwardRequest = {
+      ...request,
+      operationId: "op-forward-actor-version",
+      identity: { ...request.identity, name: "caller-v2", uid: "uid-version-caller-v2" },
+      relations: [workerRelation, bundleRelation, forwardActorRelation],
+    };
+    ownerGraph = {
+      ...graph,
+      namespace: { ...graph.namespace, formRef: forwardActorForm.identity.formRef },
+      runtimeClassRef: {
+        ...forwardRef,
+        schemaDigest: ACTOR_ABI_INTERFACE_REFS.legacy.schemaDigest,
+      },
+    };
+    const beforeForward = await readdir(bindingPath);
+    expect(await provider.apply(forwardRequest)).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec" },
+    });
+    expect(await readdir(bindingPath)).toEqual(beforeForward);
+    ownerGraph = {
+      ...graph,
+      namespace: { ...graph.namespace, formRef: forwardActorForm.identity.formRef },
+      runtimeClassRef: forwardRef,
+    };
+    expect(
+      await provider.apply({
+        ...forwardRequest,
+        operationId: "op-wrong-forward-interface",
+        relations: [
+          workerRelation,
+          bundleRelation,
+          {
+            ...forwardActorRelation,
+            deployment: {
+              ...actorRelation.deployment,
+              offeringId: wrongForwardOffering.id,
+            },
+          },
+        ],
+      }),
+    ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+    expect(await readdir(bindingPath)).toEqual(beforeForward);
+    const forwardApplied = await provider.apply(forwardRequest);
+    expect(forwardApplied).toMatchObject({ phase: "succeeded" });
+    if (forwardApplied.phase !== "succeeded")
+      throw new Error("forward Actor Version did not apply");
+    const forwardRaw = JSON.parse(
+      await Bun.file(
+        join(bindingPath, `${String(forwardApplied.result.outputs.versionId)}.json`),
+      ).text(),
+    ) as Record<string, unknown>;
+    expect(forwardRaw.format).toBe("takoserver.selfhost-version-bindings@v9");
+    expect(forwardRaw.actorBindings).toEqual([
+      {
+        name: "COUNTER",
+        tenantId,
+        namespaceResourceUid: actorUid,
+        workerResourceUid: actorWorkerUid,
+        className: "Counter",
+        runtimeClassRef: forwardRef,
+      },
+    ]);
+    ownerGraph = graph;
     const actorBinding = (raw.actorBindings as SelfhostVersionActorBinding[])[0];
     if (!actorBinding) throw new Error("stored Actor relation missing");
     const token = deriveSelfhostActorForwardToken({

@@ -3,10 +3,12 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { TakoformInterfaceRef } from "../src/interface-ref.ts";
 import {
   createSelfhostVersionBindingStore,
   deriveSelfhostActorForwardToken,
   normalizeSelfhostVersionBindingSet,
+  type SelfhostVersionBindingSet,
   type SelfhostVersionBindingStore,
 } from "../src/providers/selfhost-version-bindings.ts";
 
@@ -105,6 +107,188 @@ test("Actor metadata is a strict new private Version record and cannot adopt an 
     }),
   ).rejects.toThrow();
   expect(existsSync(join(root, "sw-unreadable", "v-unreadable.json"))).toBe(false);
+});
+
+test("Actor runtime InterfaceRefs are retained only in a new immutable V9 binding snapshot", async () => {
+  const runtimeClassRef = {
+    apiVersion: "interfaces.takoform.com/v1alpha1" as const,
+    name: "worker.actor",
+    version: "2.0.0",
+    schemaDigest:
+      "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51" as const,
+  };
+  const legacy = {
+    ...SET,
+    sensitiveVars: [],
+    workerVersionResourceUid: "uid-WorkerVersion-legacy-actor",
+    actorBindings: [
+      {
+        name: "LEGACY",
+        tenantId: "tenant-a",
+        namespaceResourceUid: "uid-ActorNamespace-legacy",
+        workerResourceUid: "uid-ModuleWorker-legacy",
+        className: "LegacyActor",
+      },
+    ],
+  };
+  const legacyStored = await store.write("sw-legacy-actor", "v-1", legacy);
+  const legacyPath = join(root, "sw-legacy-actor", "v-1.json");
+  const legacyBytes = await readFile(legacyPath, "utf8");
+  expect(JSON.parse(legacyBytes).format).toBe("takoserver.selfhost-version-bindings@v8");
+  expect(legacyStored.actorBindings?.[0]).not.toHaveProperty("runtimeClassRef");
+  expect(await store.read("sw-legacy-actor", "v-1")).toEqual(legacyStored);
+  expect(await store.write("sw-legacy-actor", "v-1", legacy)).toEqual(legacyStored);
+  expect(await readFile(legacyPath, "utf8")).toBe(legacyBytes);
+
+  const candidate = {
+    ...SET,
+    sensitiveVars: [],
+    workerVersionResourceUid: "uid-WorkerVersion-v2-actor",
+    actorBindings: [
+      ...legacy.actorBindings,
+      {
+        name: "V2",
+        tenantId: "tenant-a",
+        namespaceResourceUid: "uid-ActorNamespace-v2",
+        workerResourceUid: "uid-ModuleWorker-v2",
+        className: "V2Actor",
+        runtimeClassRef,
+      },
+    ],
+  };
+  const stored = await store.write("sw-v2-actor", "v-1", candidate);
+  const path = join(root, "sw-v2-actor", "v-1.json");
+  const bytes = await readFile(path, "utf8");
+  expect(JSON.parse(bytes).format).toBe("takoserver.selfhost-version-bindings@v9");
+  expect(stored.actorBindings?.[0]).not.toHaveProperty("runtimeClassRef");
+  expect(stored.actorBindings?.[1]?.runtimeClassRef).toEqual({
+    apiVersion: "interfaces.takoform.com/v1alpha1",
+    name: "worker.actor",
+    version: "2.0.0",
+    schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+  });
+  expect(Object.isFrozen(stored.actorBindings?.[1]?.runtimeClassRef)).toBe(true);
+
+  runtimeClassRef.version = "changed-after-write";
+  expect(
+    (await store.read("sw-v2-actor", "v-1"))?.actorBindings?.[1]?.runtimeClassRef?.version,
+  ).toBe("2.0.0");
+  expect(await readFile(path, "utf8")).toBe(bytes);
+});
+
+test("Actor runtime InterfaceRefs reject unknown tuples, extra fields, and accessors before writing", async () => {
+  const validRef: TakoformInterfaceRef = {
+    apiVersion: "interfaces.takoform.com/v1alpha1" as const,
+    name: "worker.actor",
+    version: "2.0.0",
+    schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+  };
+  const candidates = [
+    { ...validRef, schemaDigest: `sha256:${"a".repeat(64)}` as `sha256:${string}` },
+    { ...validRef, version: "2.0.1" },
+    { ...validRef, extra: true },
+  ];
+  for (const [index, runtimeClassRef] of candidates.entries()) {
+    const path = join(root, `sw-invalid-ref-${index}`, "v-1.json");
+    await expect(
+      store.write(`sw-invalid-ref-${index}`, "v-1", {
+        ...SET,
+        sensitiveVars: [],
+        workerVersionResourceUid: `uid-WorkerVersion-invalid-${index}`,
+        actorBindings: [
+          {
+            name: "ACTOR",
+            tenantId: "tenant-a",
+            namespaceResourceUid: "uid-ActorNamespace-a",
+            workerResourceUid: "uid-ModuleWorker-a",
+            className: "Actor",
+            runtimeClassRef,
+          },
+        ],
+      } as unknown as SelfhostVersionBindingSet),
+    ).rejects.toMatchObject({ code: "corrupt" });
+    expect(existsSync(path)).toBe(false);
+  }
+
+  let getterCalls = 0;
+  const accessorRef = Object.defineProperties(
+    {},
+    {
+      apiVersion: { enumerable: true, value: validRef.apiVersion },
+      name: { enumerable: true, value: validRef.name },
+      version: { enumerable: true, value: validRef.version },
+      schemaDigest: {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return validRef.schemaDigest;
+        },
+      },
+    },
+  ) as unknown as TakoformInterfaceRef;
+  await expect(
+    store.write("sw-accessor-ref", "v-1", {
+      ...SET,
+      sensitiveVars: [],
+      workerVersionResourceUid: "uid-WorkerVersion-accessor",
+      actorBindings: [
+        {
+          name: "ACTOR",
+          tenantId: "tenant-a",
+          namespaceResourceUid: "uid-ActorNamespace-a",
+          workerResourceUid: "uid-ModuleWorker-a",
+          className: "Actor",
+          runtimeClassRef: accessorRef,
+        },
+      ],
+    }),
+  ).rejects.toMatchObject({ code: "corrupt" });
+  expect(getterCalls).toBe(0);
+  expect(existsSync(join(root, "sw-accessor-ref", "v-1.json"))).toBe(false);
+});
+
+test("V8 refuses nested runtime InterfaceRefs and an unknown future format stays untouched", async () => {
+  const actor = {
+    ...SET,
+    sensitiveVars: [],
+    workerVersionResourceUid: "uid-WorkerVersion-v8-closed",
+    actorBindings: [
+      {
+        name: "ACTOR",
+        tenantId: "tenant-a",
+        namespaceResourceUid: "uid-ActorNamespace-a",
+        workerResourceUid: "uid-ModuleWorker-a",
+        className: "Actor",
+      },
+    ],
+  };
+  await store.write("sw-v8-closed", "v-1", actor);
+  const v8Path = join(root, "sw-v8-closed", "v-1.json");
+  const v8 = JSON.parse(await readFile(v8Path, "utf8")) as {
+    actorBindings: Array<Record<string, unknown>>;
+  };
+  v8.actorBindings[0] = {
+    ...v8.actorBindings[0],
+    runtimeClassRef: {
+      apiVersion: "interfaces.takoform.com/v1alpha1",
+      name: "worker.actor",
+      version: "2.0.0",
+      schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+    },
+  };
+  await writeFile(v8Path, JSON.stringify(v8), "utf8");
+  await expect(store.read("sw-v8-closed", "v-1")).rejects.toMatchObject({ code: "corrupt" });
+
+  const futurePath = join(root, "sw-future-format", "v-1.json");
+  await store.write("sw-future-format", "v-1", actor);
+  const future = JSON.parse(await readFile(futurePath, "utf8")) as Record<string, unknown>;
+  future.format = "takoserver.selfhost-version-bindings@v10";
+  await writeFile(futurePath, JSON.stringify(future), "utf8");
+  const before = await readFile(futurePath, "utf8");
+  await expect(store.write("sw-future-format", "v-1", actor)).rejects.toMatchObject({
+    code: "corrupt",
+  });
+  expect(await readFile(futurePath, "utf8")).toBe(before);
 });
 
 test("private v8 Actor metadata preserves the published 64-binding bound exactly", async () => {

@@ -474,6 +474,9 @@ export function createSelfhostActorExecutionHost(options: {
             namespaceKey: key,
             storagePath: join(options.storageRoot, "namespaces", key),
             className: graph.namespace.className,
+            ...(graph.runtimeClassRef === undefined
+              ? {}
+              : { runtimeClassRef: graph.runtimeClassRef }),
             graph: residentGraph,
             signal,
             admitAlarm: (id, nonce, gateSignal) => admitEvent("alarm", id, nonce, gateSignal),

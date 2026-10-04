@@ -1,3 +1,4 @@
+import { parseActorAbiRef } from "./actor-abi-ref.ts";
 import {
   SELFHOST_WORKER_DATA_SERVICE_MODULE,
   selfhostDataServiceSource,
@@ -95,6 +96,7 @@ export interface WorkerdVersionGraphInput {
     readonly tenantId: string;
     readonly namespaceResourceUid: string;
     readonly token: string;
+    readonly runtimeClassRef?: WorkerdActorForwardBinding["runtimeClassRef"];
   }[];
   readonly hostnames: readonly string[];
   readonly generation?: string;
@@ -414,6 +416,13 @@ function projectActorForward(
       invalid();
     }
     names.add(binding.publicName);
+    const declaredRef = binding.runtimeClassRef;
+    let runtimeClassRef: WorkerdActorForwardBinding["runtimeClassRef"];
+    if (declaredRef !== undefined) {
+      const selected = parseActorAbiRef(declaredRef);
+      if (selected?.kind !== "v2") invalid();
+      runtimeClassRef = selected.ref;
+    }
     return {
       publicName: binding.publicName,
       tenantId: binding.tenantId,
@@ -421,6 +430,7 @@ function projectActorForward(
       httpService: `__TAKOSERVER_ACTOR_HTTP_${index.toString(10).padStart(5, "0")}`,
       upgradeService: `__TAKOSERVER_ACTOR_UPGRADE_${index.toString(10).padStart(5, "0")}`,
       token: binding.token,
+      ...(runtimeClassRef === undefined ? {} : { runtimeClassRef }),
     };
   });
   return { schema: "takoserver.selfhost-actor-forward@v1", bindings };

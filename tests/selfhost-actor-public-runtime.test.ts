@@ -2,6 +2,8 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
+import type { TakoformInterfaceRef } from "../src/interface-ref.ts";
 import {
   SELFHOST_ACTOR_BINDING_REF,
   selfhostVersionBindingsRoot,
@@ -191,6 +193,106 @@ test("Actor broker owner restores exact v8 Version tokens for two callers of one
     // Uncertainty revokes admission; sockets remain pinned for in-flight
     // transports and for exact rollback. No new authority is inferred here.
     expect(owner.actorForwardSockets()).toHaveLength(2);
+  } finally {
+    await owner.close();
+    f.database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Actor v9 publication proves the stored, published, and current full ABI ref", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-public-v9-"));
+  const f = fixture();
+  const selectedRef = ACTOR_ABI_INTERFACE_REFS.v2;
+  let currentRef: TakoformInterfaceRef = selectedRef;
+  const bindings = createSelfhostVersionBindingStore({ root: selfhostVersionBindingsRoot(root) });
+  const actorBinding = {
+    name: "COUNTER",
+    tenantId: scope.tenantId,
+    namespaceResourceUid: scope.namespaceResourceUid,
+    workerResourceUid: f.target.metadata.uid,
+    className: "Counter",
+    runtimeClassRef: selectedRef,
+  };
+  const versionId = "version-v9";
+  const workerVersionResourceUid = "uid-version-v9";
+  const stored = await bindings.write("caller", versionId, {
+    workerResourceUid: "uid-caller-worker",
+    workerVersionResourceUid,
+    handlers: ["fetch"],
+    vars: [],
+    sensitiveVars: [],
+    serviceBindings: [],
+    actorBindings: [actorBinding],
+  });
+  if (!stored.eventToken) throw new Error("event token unavailable");
+  const publication: WorkerdActorForwardPublication = {
+    script: "caller",
+    workerResourceUid: "uid-caller-worker",
+    workerVersionResourceUid,
+    versionId,
+    bindings: [
+      {
+        publicName: actorBinding.name,
+        tenantId: actorBinding.tenantId,
+        namespaceResourceUid: actorBinding.namespaceResourceUid,
+        runtimeClassRef: selectedRef,
+        httpService: "__TAKOSERVER_ACTOR_HTTP_00000",
+        upgradeService: "__TAKOSERVER_ACTOR_UPGRADE_00000",
+        token: deriveSelfhostActorForwardToken({
+          eventToken: stored.eventToken,
+          workerVersionResourceUid,
+          binding: actorBinding,
+        }),
+      },
+    ],
+  };
+  const owner = await openSelfhostActorPublicRuntime({
+    dataRoot: root,
+    runtimeRoot: root,
+    socketParent: join(root, "sockets"),
+    binary: "/never-execute",
+    graph: async (...args) => {
+      const graph = await f.read(...args);
+      return graph ? { ...graph, runtimeClassRef: currentRef } : null;
+    },
+    deployments: f.deployments,
+    providerPackRef: "selfhost",
+    providerInstallationRef: "local.primary",
+  });
+  try {
+    await f.deployments.create({
+      tenantId: scope.tenantId,
+      id: "deployment-holder",
+      resourceUid: f.target.metadata.uid,
+      offeringId: "worker-local",
+      providerPackRef: "selfhost",
+      providerInstallationRef: "local.primary",
+      nativeId: "selfhost-worker:worker:operation-1",
+      state: "active",
+      observed: {},
+      outputs: { scriptName: "worker" },
+    });
+    await owner.actorNamespace.registerNamespace(scope);
+    await expect(
+      owner.actorForwardLifecycle.prepare([
+        {
+          ...publication,
+          bindings: publication.bindings.map(
+            ({ runtimeClassRef: _omitted, ...binding }) => binding,
+          ),
+        },
+      ]),
+    ).rejects.toThrow("Actor immutable Version relation changed");
+    expect(owner.actorForwardSockets()).toEqual([]);
+    currentRef = ACTOR_ABI_INTERFACE_REFS.legacy;
+    await expect(owner.actorForwardLifecycle.prepare([publication])).rejects.toThrow(
+      "Actor namespace authority unavailable",
+    );
+    expect(owner.actorForwardSockets()).toEqual([]);
+    currentRef = selectedRef;
+    await owner.actorForwardLifecycle.prepare([publication]);
+    expect(owner.actorForwardSockets()).toHaveLength(1);
   } finally {
     await owner.close();
     f.database.close();

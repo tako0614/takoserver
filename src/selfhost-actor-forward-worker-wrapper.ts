@@ -1,9 +1,10 @@
+import { parseActorAbiRef } from "./actor-abi-ref.ts";
 import { SELFHOST_ACTOR_FORWARD_RUNTIME_SOURCE } from "./generated/selfhost-actor-forward-runtime-source.ts";
 import type { WorkerdActorForwardBinding } from "./workerd-runtime.ts";
 
 type SelfhostActorForwardBinding = Pick<
   WorkerdActorForwardBinding,
-  "publicName" | "httpService" | "upgradeService" | "token"
+  "publicName" | "httpService" | "upgradeService" | "token" | "runtimeClassRef"
 >;
 
 const MODULE = /^[A-Za-z0-9_.][A-Za-z0-9._-]*$/u;
@@ -54,12 +55,18 @@ export function selfhostActorForwardEntrypointSource(input: {
     services.add(binding.httpService);
     services.add(binding.upgradeService);
   }
-  const bindings = input.bindings.map((binding) => ({
-    publicName: binding.publicName,
-    httpService: binding.httpService,
-    upgradeService: binding.upgradeService,
-    token: binding.token,
-  }));
+  const bindings = input.bindings.map((binding) => {
+    const declaredRef = binding.runtimeClassRef;
+    return {
+      publicName: binding.publicName,
+      httpService: binding.httpService,
+      upgradeService: binding.upgradeService,
+      token: binding.token,
+      ...(declaredRef === undefined
+        ? {}
+        : { runtimeClassRef: exactForwardRuntimeClassRef(declaredRef) }),
+    };
+  });
   const eventMethods = [
     ...(input.queue
       ? [
@@ -104,4 +111,12 @@ ${
     : ""
 }
 `;
+}
+
+function exactForwardRuntimeClassRef(
+  ref: NonNullable<SelfhostActorForwardBinding["runtimeClassRef"]>,
+): NonNullable<SelfhostActorForwardBinding["runtimeClassRef"]> {
+  const selected = parseActorAbiRef(ref);
+  if (selected?.kind !== "v2") throw new TypeError("Actor forward wrapper configuration invalid");
+  return selected.ref;
 }

@@ -3,6 +3,7 @@ import {
   renderSelfhostActorForwardRuntimeModuleSource,
   selfhostActorForwardEntrypointSource,
 } from "../src/selfhost-actor-forward-worker-wrapper.ts";
+import { forwardTakoformCandidates } from "../src/takoform/forward-candidates.ts";
 
 const binding = {
   publicName: "ROOM",
@@ -72,6 +73,41 @@ test("forward Actor wrapper admits the published 64-binding bound but not 65", (
     selfhostActorForwardEntrypointSource({
       ...options,
       bindings: [...bindings, { ...binding, publicName: "ROOM_64" }],
+    }),
+  ).toThrow("Actor forward wrapper configuration invalid");
+});
+
+test("forward Actor wrapper serializes only the exact Host-selected v2 ref", () => {
+  const ref = forwardTakoformCandidates().forms.find(
+    (form) => form.identity.formRef.kind === "ActorNamespace",
+  )?.workerClassRuntime?.runtimeClassRef;
+  if (!ref) throw new Error("forward Actor runtime InterfaceRef unavailable");
+  const base = { runtimeModule: "runtime.mjs", innerModule: "inner.mjs" };
+  const legacy = selfhostActorForwardEntrypointSource({ ...base, bindings: [binding] });
+  expect(legacy).not.toContain("runtimeClassRef");
+  const forward = selfhostActorForwardEntrypointSource({
+    ...base,
+    bindings: [{ ...binding, runtimeClassRef: ref }],
+  });
+  expect(forward).toContain(`"runtimeClassRef":${JSON.stringify(ref)}`);
+  let reads = 0;
+  const changing = {
+    ...binding,
+    get runtimeClassRef() {
+      reads += 1;
+      return reads === 1 ? ref : (undefined as never);
+    },
+  };
+  expect(selfhostActorForwardEntrypointSource({ ...base, bindings: [changing] })).toContain(
+    `"runtimeClassRef":${JSON.stringify(ref)}`,
+  );
+  expect(reads).toBe(1);
+  expect(() =>
+    selfhostActorForwardEntrypointSource({
+      ...base,
+      bindings: [
+        { ...binding, runtimeClassRef: { ...ref, schemaDigest: `sha256:${"f".repeat(64)}` } },
+      ],
     }),
   ).toThrow("Actor forward wrapper configuration invalid");
 });

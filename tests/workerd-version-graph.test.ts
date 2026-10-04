@@ -28,6 +28,7 @@ import {
   renderSelfhostActorForwardRuntimeModuleSource,
   selfhostActorForwardEntrypointSource,
 } from "../src/selfhost-actor-forward-worker-wrapper.ts";
+import { forwardTakoformCandidates } from "../src/takoform/forward-candidates.ts";
 import {
   compileWorkerdVersionGraph,
   type WorkerdVersionGraph,
@@ -234,6 +235,41 @@ test("compiles the released maximum of 64 distinct Actor forward bindings", () =
       }),
     ),
   ).toThrow(TypeError);
+});
+
+test("carries the exact forward Actor InterfaceRef into only its private manifest and wrapper", () => {
+  const ref = forwardTakoformCandidates().forms.find(
+    (form) => form.identity.formRef.kind === "ActorNamespace",
+  )?.workerClassRuntime?.runtimeClassRef;
+  if (!ref) throw new Error("forward Actor runtime InterfaceRef unavailable");
+  const binding = {
+    publicName: "ROOM",
+    tenantId: "tenant-actor-1",
+    namespaceResourceUid: "actor-namespace-001",
+    token: SERVICE_TOKEN,
+  };
+  const legacy = compileWorkerdVersionGraph(graphInput({ actorForward: [binding] }));
+  expect(legacy.site.actorForward?.bindings[0]).not.toHaveProperty("runtimeClassRef");
+  const forward = compileWorkerdVersionGraph(
+    graphInput({ actorForward: [{ ...binding, runtimeClassRef: ref }] }),
+  );
+  expect(forward.site.actorForward?.bindings[0]?.runtimeClassRef).toEqual(ref);
+  const wrapper = source(
+    forward.hostModules.get("__takoserver-selfhost-actor-forward-entrypoint.js"),
+  );
+  expect(wrapper).toContain(`"runtimeClassRef":${JSON.stringify(ref)}`);
+  expect(() =>
+    compileWorkerdVersionGraph(
+      graphInput({
+        actorForward: [
+          {
+            ...binding,
+            runtimeClassRef: { ...ref, schemaDigest: `sha256:${"f".repeat(64)}` },
+          },
+        ],
+      }),
+    ),
+  ).toThrow();
 });
 
 test("rejects malformed and colliding Actor forward projections", () => {

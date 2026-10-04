@@ -19,6 +19,8 @@ export interface ActorResourceGraph {
   readonly tenantId: string;
   readonly namespace: ActorResourceFacts & { readonly className: string };
   readonly worker: ActorResourceFacts;
+  /** Host-selected installed Form metadata; absent for the released legacy adapter. */
+  readonly runtimeClassRef?: TakoformInterfaceRef;
 }
 
 export type ActorResourceGraphReader = (

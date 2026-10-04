@@ -1,3 +1,5 @@
+import { parseActorAbiRef } from "./actor-abi-ref.ts";
+import type { TakoformInterfaceRef } from "./interface-ref.ts";
 import { isJsonObject, isSha256Digest } from "./json.ts";
 import { sameFormRef, validateFormRef } from "./takoform/forms.ts";
 import { validateRelationSchema } from "./takoform/relations.ts";
@@ -29,7 +31,7 @@ export function createActorResourceGraphReader(
     throw new TypeError("Actor graph reader requires relation-target storage");
   }
   const form = snapshotForm(options.form);
-  const workerApiVersion = validateActorForm(form);
+  const { workerApiVersion, runtimeClassRef } = validateActorForm(form);
   const store = options.store;
   return async (scope, signal) => {
     if (!record(scope) || !text(scope.tenantId) || !text(scope.namespaceResourceUid)) return null;
@@ -97,6 +99,9 @@ export function createActorResourceGraphReader(
       tenantId,
       namespace: { ...facts(source), className: spec.className },
       worker: facts(target),
+      ...(runtimeClassRef === undefined
+        ? {}
+        : { runtimeClassRef: structuredClone(runtimeClassRef) }),
     };
   };
 }
@@ -114,7 +119,10 @@ function snapshotForm(input: InstalledTakoformForm): InstalledTakoformForm {
   }
 }
 
-function validateActorForm(form: InstalledTakoformForm): string {
+function validateActorForm(form: InstalledTakoformForm): {
+  readonly workerApiVersion: string;
+  readonly runtimeClassRef?: TakoformInterfaceRef;
+} {
   const runtime = form.workerClassRuntime;
   if (
     !record(form.identity) ||
@@ -141,6 +149,17 @@ function validateActorForm(form: InstalledTakoformForm): string {
     !isSha256Digest(actor.schemaDigest)
   )
     throw new TypeError("Actor Form must declare the exact worker.actor interface");
+  const runtimeClassRef = runtime.runtimeClassRef;
+  let projectedRuntimeClassRef: TakoformInterfaceRef | undefined;
+  if (runtimeClassRef !== undefined) {
+    const selected = parseActorAbiRef(runtimeClassRef);
+    if (!selected || selected.ref !== parseActorAbiRef(actor)?.ref) {
+      throw new TypeError("Actor Form runtime InterfaceRef differs from its provided Interface");
+    }
+    if (selected.kind === "v2") {
+      projectedRuntimeClassRef = selected.ref;
+    }
+  }
   // This deliberately supports the installed ActorNamespace shape rather than
   // introducing another generic Form-pointer interpreter.
   const schema = form.desiredSchema;
@@ -169,7 +188,12 @@ function validateActorForm(form: InstalledTakoformForm): string {
   )
     throw new TypeError("invalid Actor Form class or worker schema");
   validateRelationSchema(form);
-  return worker.properties.apiVersion.const;
+  return {
+    workerApiVersion: worker.properties.apiVersion.const,
+    ...(projectedRuntimeClassRef === undefined
+      ? {}
+      : { runtimeClassRef: projectedRuntimeClassRef }),
+  };
 }
 
 function validListing(value: unknown): value is ResourceListing {
