@@ -1,3 +1,4 @@
+import type { TakoformInterfaceRef } from "./interface-ref.ts";
 import { isJsonObject, isSha256Digest } from "./json.ts";
 import type { JsonObject } from "./ports.ts";
 import { sameFormRef, validateFormRef } from "./takoform/forms.ts";
@@ -14,6 +15,7 @@ import type {
   TakoformStoredResource,
   TakoformV1Alpha3FormRef,
 } from "./takoform/types.ts";
+import { isSelectedWorkflowResourceFormRef } from "./workflow-resource-lifecycle.ts";
 
 /** The address facts needed by a private Workflow caller. */
 export interface WorkflowResourceAddress {
@@ -37,6 +39,8 @@ export interface WorkflowResourceGraph {
   readonly tenantId: string;
   readonly workflow: WorkflowResourceFacts & { readonly className: string };
   readonly worker: WorkflowResourceFacts;
+  /** Only the exact selected source projects its full execution ABI; legacy remains factual. */
+  readonly runtimeClassRef?: TakoformInterfaceRef;
 }
 
 export type WorkflowResourceGraphReader = (
@@ -70,7 +74,7 @@ export function createWorkflowResourceGraphReader(
 
   const form = snapshotWorkflowForm(options.form);
   const definition = validateWorkflowForm(form);
-  const { runtime, workerTarget } = definition;
+  const { runtime, workerTarget, runtimeClassRef } = definition;
   const store = options.store;
 
   return async (scope, signal): Promise<WorkflowResourceGraph | null> => {
@@ -99,7 +103,14 @@ export function createWorkflowResourceGraphReader(
     } catch {
       return null;
     }
-    const graph = resolveSnapshot(snapshot, capturedScope, form, runtime, workerTarget);
+    const graph = resolveSnapshot(
+      snapshot,
+      capturedScope,
+      form,
+      runtime,
+      workerTarget,
+      runtimeClassRef,
+    );
     signal.throwIfAborted();
     return graph;
   };
@@ -135,6 +146,7 @@ function snapshotWorkflowForm(input: InstalledTakoformForm): InstalledTakoformFo
 function validateWorkflowForm(form: InstalledTakoformForm): {
   readonly runtime: NonNullable<InstalledTakoformForm["workerClassRuntime"]>;
   readonly workerTarget: { readonly apiVersion: string; readonly kind: string };
+  readonly runtimeClassRef?: TakoformInterfaceRef;
 } {
   const identity = form.identity;
   if (!isRecord(identity) || !isRecord(identity.formRef)) {
@@ -188,6 +200,15 @@ function validateWorkflowForm(form: InstalledTakoformForm): {
   if (matching.length !== 1 || !isInterface(matching[0])) {
     throw new TypeError("Workflow Form does not declare the exact worker.workflow interface");
   }
+  if (
+    !isInterface(runtime.runtimeClassRef) ||
+    runtime.runtimeClassRef.apiVersion !== matching[0].apiVersion ||
+    runtime.runtimeClassRef.name !== matching[0].name ||
+    runtime.runtimeClassRef.version !== matching[0].version ||
+    runtime.runtimeClassRef.schemaDigest !== matching[0].schemaDigest
+  ) {
+    throw new TypeError("Workflow Form runtime InterfaceRef differs from its provided Interface");
+  }
 
   // This validates every relation declaration once at construction. It does
   // not resolve a target or consult Host support.
@@ -199,7 +220,13 @@ function validateWorkflowForm(form: InstalledTakoformForm): {
   }
   const workerTarget = referenceShape(workerSchema);
   if (!workerTarget) throw new TypeError("Workflow Form worker relation is not a reference");
-  return { runtime, workerTarget };
+  return {
+    runtime,
+    workerTarget,
+    ...(isSelectedWorkflowResourceFormRef(form.identity.formRef)
+      ? { runtimeClassRef: structuredClone(runtime.runtimeClassRef) }
+      : {}),
+  };
 }
 
 function resolveSnapshot(
@@ -208,6 +235,7 @@ function resolveSnapshot(
   form: InstalledTakoformForm,
   runtime: NonNullable<InstalledTakoformForm["workerClassRuntime"]>,
   workerTarget: { readonly apiVersion: string; readonly kind: string },
+  runtimeClassRef: TakoformInterfaceRef | undefined,
 ): WorkflowResourceGraph | null {
   if (!isRecord(snapshot)) return null;
   const source = snapshot.source;
@@ -274,6 +302,7 @@ function resolveSnapshot(
 
   return {
     tenantId: scope.tenantId,
+    ...(runtimeClassRef === undefined ? {} : { runtimeClassRef: structuredClone(runtimeClassRef) }),
     workflow: {
       address: addressOf(source),
       uid: source.uid,

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { SelfhostWorkflowTarget } from "../src/selfhost-workflow-preparation.ts";
+import { selectTakoformCandidates } from "../src/takoform/forward-candidates.ts";
 import type { TakoformStoredRelation } from "../src/takoform/relations.ts";
 import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
 import type {
@@ -21,6 +22,12 @@ function requiredForm(kind: string): InstalledTakoformForm {
 }
 const workflowForm = requiredForm("DurableWorkflow");
 const workerForm = requiredForm("ModuleWorker");
+const selectedForms = selectTakoformCandidates("actor-forward").forms;
+function selectedForm(kind: string): InstalledTakoformForm {
+  const form = selectedForms.find((candidate) => candidate.identity.formRef.kind === kind);
+  if (!form) throw new Error(`selected ${kind} vocabulary is unavailable`);
+  return form;
+}
 
 const tenantId = "tenant-1";
 const workflowUid = "uid-workflow";
@@ -164,6 +171,36 @@ test("resolves a factual nested graph without readiness or execution fields", as
   expect(fixture.calls).toEqual([{ tenantId, uid: workflowUid, pointer: "/worker" }]);
 });
 
+test("selected Workflow graph carries its exact declared runtime InterfaceRef", async () => {
+  const selectedWorkflow = selectedForm("DurableWorkflow");
+  const selectedWorker = selectedForm("ModuleWorker");
+  const snapshot = baseSnapshot();
+  const source = listing({
+    ...snapshot.source.resource,
+    form: structuredClone(selectedWorkflow.identity),
+  });
+  const target = listing({
+    ...snapshot.target.resource,
+    form: structuredClone(selectedWorker.identity),
+  });
+  const graph = await reader(
+    {
+      source,
+      target,
+      relation: { ...snapshot.relation, targetFormRef: selectedWorker.identity.formRef },
+    },
+    selectedWorkflow,
+  ).read(scope, new AbortController().signal);
+  expect(graph).toMatchObject({
+    runtimeClassRef: {
+      apiVersion: "interfaces.takoform.com/v1alpha1",
+      name: "worker.workflow",
+      version: "3.0.0",
+      schemaDigest: "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
+    },
+  });
+});
+
 test("a published v1 graph is not a bootstrap target", () => {
   const graph = null as unknown as WorkflowResourceGraph;
   // @ts-expect-error A factual graph must not authorize self-host bootstrap.
@@ -181,7 +218,25 @@ test("rejects a malformed duplicate of the supplied Workflow interface", () => {
   );
 });
 
+test("rejects a class runtime that names the same Interface but has a different full digest", () => {
+  const form = structuredClone(selectedForm("DurableWorkflow"));
+  const runtime = form.workerClassRuntime;
+  if (!runtime?.runtimeClassRef) throw new Error("selected class runtime is unavailable");
+  const mismatched: InstalledTakoformForm = {
+    ...form,
+    workerClassRuntime: {
+      ...runtime,
+      runtimeClassRef: { ...runtime.runtimeClassRef, schemaDigest: `sha256:${"0".repeat(64)}` },
+    },
+  };
+  expect(() => reader(baseSnapshot(), mismatched)).toThrow(
+    "Workflow Form runtime InterfaceRef differs from its provided Interface",
+  );
+});
+
 test("uses supplied parsing vocabulary without an implicit catalog version pin", async () => {
+  const publishedRuntime = workflowForm.workerClassRuntime;
+  if (!publishedRuntime) throw new Error("published runtime vocabulary is unavailable");
   const form: InstalledTakoformForm = {
     ...workflowForm,
     identity: {
@@ -200,6 +255,15 @@ test("uses supplied parsing vocabulary without an implicit catalog version pin",
         schemaDigest: `sha256:${"f".repeat(64)}`,
       },
     ],
+    workerClassRuntime: {
+      ...publishedRuntime,
+      runtimeClassRef: {
+        apiVersion: "interfaces.takoform.com/v1alpha1",
+        name: "worker.workflow",
+        version: "99.0.0",
+        schemaDigest: `sha256:${"f".repeat(64)}`,
+      },
+    },
   };
   const snapshot = baseSnapshot();
   const source = listing({ ...snapshot.source.resource, form: form.identity });

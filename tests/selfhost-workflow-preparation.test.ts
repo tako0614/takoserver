@@ -26,6 +26,12 @@ const persistedDataPlaneAddress = "127.0.0.1:4555";
 const DATA_MODULE = "__data.js";
 const EVENT_MODULE = "__events.js";
 const HOST_ENTRYPOINT = "__host.js";
+const WORKFLOW_V3_RUNTIME_REF = Object.freeze({
+  apiVersion: "interfaces.takoform.com/v1alpha1",
+  name: "worker.workflow",
+  version: "3.0.0",
+  schemaDigest: "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
+});
 
 const identity: WorkflowRunIdentity = {
   scope: { tenantId: "tenant-1", workflowResourceUid: "workflow-1" },
@@ -193,6 +199,10 @@ function preparation(
   options: {
     readonly dataPlaneAddress?: () => string;
     readonly onResolve?: (value: WorkflowRunIdentity) => void;
+    readonly basisPoint?: () => number;
+    readonly verifySelected?: Parameters<
+      typeof createSelfhostWorkflowPreparation
+    >[0]["verifySelected"];
     readonly serviceRuntime?: {
       readonly acquirePrivateServiceBindings: (
         identity: WorkerdSelectedVersionIdentity,
@@ -207,6 +217,8 @@ function preparation(
     ...(options.dataPlaneAddress === undefined
       ? {}
       : { dataPlaneAddress: options.dataPlaneAddress }),
+    ...(options.basisPoint === undefined ? {} : { basisPoint: options.basisPoint }),
+    ...(options.verifySelected === undefined ? {} : { verifySelected: options.verifySelected }),
     ...(options.serviceRuntime === undefined ? {} : { serviceRuntime: options.serviceRuntime }),
     resolveTarget: async (value) => {
       options.onResolve?.(value);
@@ -531,12 +543,24 @@ test("aborted preparation and renderer failure remove every temporary execution 
     },
   });
   const pendingAbort = new AbortController();
+  const pendingAbortReason = new Error("resolver query aborted");
   const pendingRun = pending(identity, undefined, pendingAbort.signal, channel());
   await lookupEntered;
-  pendingAbort.abort();
-  await expect(pendingRun).rejects.toBe(pendingAbort.signal.reason);
+  let pendingSettled = false;
+  void pendingRun.then(
+    () => {
+      pendingSettled = true;
+    },
+    () => {
+      pendingSettled = true;
+    },
+  );
+  pendingAbort.abort(pendingAbortReason);
+  await Promise.resolve();
+  expect(pendingSettled).toBe(false);
   expect(resolverSignal.aborted).toBe(true);
   releaseTarget(target());
+  await expect(pendingRun).rejects.toBe(pendingAbortReason);
   expect(await readdir(temporaryRoot)).toEqual([]);
 
   const alreadyAborted = new AbortController();
@@ -556,5 +580,106 @@ test("aborted preparation and renderer failure remove every temporary execution 
   });
   await expect(partial(identity, undefined, abortDuringRender.signal, channel())).rejects.toThrow();
   expect(callbackCalls).toBe(1);
+  expect(await readdir(temporaryRoot)).toEqual([]);
+});
+
+test("verifies one frozen selection, joins callback queries after abort, and races filesystem selection", async () => {
+  await publish();
+  let captured: unknown;
+  const verified = preparation(target({ runtimeClassRef: WORKFLOW_V3_RUNTIME_REF }), {
+    dataPlaneAddress: () => currentDataPlaneAddress,
+    verifySelected: async (_runIdentity, resolved, selectedIdentity) => {
+      captured = selectedIdentity;
+      expect(resolved.runtimeClassRef).toEqual(WORKFLOW_V3_RUNTIME_REF);
+      expect(Object.isFrozen(resolved.runtimeClassRef)).toBe(true);
+      expect(Object.isFrozen(selectedIdentity)).toBe(true);
+      expect(selectedIdentity).toEqual({
+        script: resolved.script,
+        generation: "generation-1",
+        generationKey: expect.any(String),
+        workerResourceUid: "uid-ModuleWorker-site",
+        versionId: "site-v-a",
+        workerVersionUid: "uid-WorkerVersion-site-a",
+      });
+    },
+  });
+  const prepared = await verified(identity, undefined, new AbortController().signal, channel());
+  expect(captured).toBeDefined();
+  await disposePrepared(prepared);
+  expect(await readdir(temporaryRoot)).toEqual([]);
+
+  const selectionAbort = new AbortController();
+  const selectionAbortReason = new Error("selection read aborted");
+  let selectionStarted = false;
+  const abortSelectionRead = preparation(target(), {
+    basisPoint: () => {
+      selectionStarted = true;
+      selectionAbort.abort(selectionAbortReason);
+      return 0;
+    },
+  });
+  await expect(
+    abortSelectionRead(identity, undefined, selectionAbort.signal, channel()),
+  ).rejects.toBe(selectionAbortReason);
+  expect(selectionStarted).toBe(true);
+  expect(await readdir(temporaryRoot)).toEqual([]);
+
+  let markVerificationEntered!: () => void;
+  const verificationEntered = new Promise<void>((resolve) => {
+    markVerificationEntered = resolve;
+  });
+  let releaseVerification!: () => void;
+  const stalled = new Promise<void>((resolve) => {
+    releaseVerification = resolve;
+  });
+  const verify = preparation(target(), {
+    dataPlaneAddress: () => currentDataPlaneAddress,
+    verifySelected: async () => {
+      markVerificationEntered();
+      return stalled;
+    },
+  });
+  const abort = new AbortController();
+  const abortReason = new Error("verification query aborted");
+  const pending = verify(identity, undefined, abort.signal, channel());
+  await verificationEntered;
+  let verificationSettled = false;
+  void pending.then(
+    () => {
+      verificationSettled = true;
+    },
+    () => {
+      verificationSettled = true;
+    },
+  );
+  abort.abort(abortReason);
+  await Promise.resolve();
+  expect(verificationSettled).toBe(false);
+  releaseVerification();
+  await expect(pending).rejects.toBe(abortReason);
+  expect(await readdir(temporaryRoot)).toEqual([]);
+
+  const rejected = preparation(target(), {
+    verifySelected: async () => {
+      throw new Error("selected graph changed");
+    },
+  });
+  await expect(
+    rejected(identity, undefined, new AbortController().signal, channel()),
+  ).rejects.toThrow("selected graph changed");
+  expect(await readdir(temporaryRoot)).toEqual([]);
+
+  const malformedRef = preparation(
+    target({
+      runtimeClassRef: {
+        ...WORKFLOW_V3_RUNTIME_REF,
+        schemaDigest: "sha256:wrong",
+      },
+    }),
+    { verifySelected: async () => {} },
+  );
+  await expect(
+    malformedRef(identity, undefined, new AbortController().signal, channel()),
+  ).rejects.toThrow("invalid_runtime_input");
   expect(await readdir(temporaryRoot)).toEqual([]);
 });
