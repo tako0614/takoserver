@@ -360,6 +360,8 @@ export interface SelfhostArtifacts {
 export interface SelfhostProviderOptions {
   readonly id?: string;
   readonly offerings: readonly ProviderOffering[];
+  /** Exact displaced current Forms; recorded Deployment recovery only. */
+  readonly recoveryOfferings?: readonly ProviderOffering[];
   /** Domain-selected forward Actor technical tuple, when composed. */
   readonly actorClassRuntime?: {
     readonly providerInstallationRef: string;
@@ -4620,6 +4622,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   return {
     id,
     offerings: structuredClone(options.offerings) as ProviderOffering[],
+    ...(options.recoveryOfferings
+      ? { recoveryOfferings: structuredClone(options.recoveryOfferings) as ProviderOffering[] }
+      : {}),
     ...(actorClassRuntime ? { workerClassRuntime: actorClassRuntime } : {}),
     standardServiceProtocols: standardServices.protocols,
     ...(options.nativeReadbackAuthorities

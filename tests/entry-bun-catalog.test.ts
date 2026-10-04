@@ -3,13 +3,16 @@ import { existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-test("the standalone Bun entry uses the generated corpus only as current candidates", async () => {
+test("the standalone Bun entry selects the exact Form source before local state", async () => {
   const source = await Bun.file(new URL("../src/entry-bun.ts", import.meta.url)).text();
 
   expect(source).toContain(
-    'import { currentTakoformCandidates } from "./takoform/current-candidates.ts";',
+    'import { selectPublicHostFormSource } from "./public-host-form-source.ts";',
   );
-  expect(source).toContain("const currentCandidates = currentTakoformCandidates();");
+  expect(source).toContain("const currentCandidates = selectPublicHostFormSource(");
+  expect(source.indexOf("const currentCandidates = selectPublicHostFormSource(")).toBeLessThan(
+    source.indexOf('if (databasePath !== ":memory:")'),
+  );
   expect(source).not.toContain("stableProductionTakoformCatalog");
   expect(source).not.toContain("currentTakoformCatalog(edge)");
   expect(source).toContain('from "./standalone-provider-composition.ts";');
@@ -27,6 +30,8 @@ test("the standalone Bun entry uses the generated corpus only as current candida
   expect(source).not.toContain("edgeForms: process.env.TAKOSERVER_EDGE_FORMS");
   expect(source).not.toContain("JSON.parse(process.env.TAKOSERVER_ZONES");
   expect(source).toContain("stableForms: currentCandidates.forms,");
+  expect(source).toContain("retainedForms: currentCandidates.retainedForms,");
+  expect(source).toContain("retainedBindings: currentCandidates.retainedBindings,");
   expect(source).toContain("forms: currentCandidates.forms,");
   expect(source).toContain("bindings: currentCandidates.bindings,");
   expect(source).toContain("hostForms: currentCandidates.forms,");
@@ -86,6 +91,37 @@ test("the Bun entry rejects the unsupported shared R2 composition before opening
     expect(exitCode).not.toBe(0);
     expect(`${stdout}\n${stderr}`).toContain("TAKOSERVER_R2_BUCKET");
     expect(`${stdout}\n${stderr}`).toContain("not supported by the Bun entry");
+    expect(existsSync(dataRoot)).toBe(false);
+  } finally {
+    rmSync(dataRoot, { recursive: true, force: true });
+  }
+});
+
+test("the Bun entry rejects an unknown Form source before opening local state", async () => {
+  const dataRoot = join(tmpdir(), `takoserver-unknown-form-source-${crypto.randomUUID()}`);
+  const child = Bun.spawn([process.execPath, "src/entry-bun.ts"], {
+    cwd: join(import.meta.dir, ".."),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      TAKOSERVER_FORM_SOURCE_CANDIDATE: "unknown-source",
+      TAKOSERVER_DATA_ROOT: dataRoot,
+      TAKOSERVER_DB: join(dataRoot, "control.sqlite"),
+    },
+  });
+
+  const exitCode = await Promise.race([child.exited, Bun.sleep(2_000).then(() => null)]);
+  if (exitCode === null) child.kill("SIGKILL");
+  const [stdout, stderr] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  try {
+    expect(exitCode).not.toBeNull();
+    expect(exitCode).not.toBe(0);
+    expect(`${stdout}\n${stderr}`).toContain("unknown public Host Form source candidate");
     expect(existsSync(dataRoot)).toBe(false);
   } finally {
     rmSync(dataRoot, { recursive: true, force: true });

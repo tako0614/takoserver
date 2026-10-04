@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCatalog } from "../src/catalog.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
+import { createEphemeralSql, createLedger, createResourceDeploymentStore } from "../src/index.ts";
 import { createProviderDriver, createProviderFormAvailability } from "../src/provider-driver.ts";
-import type { Provider, ProviderRelation } from "../src/provider-port.ts";
+import { type Provider, type ProviderRelation, succeeded } from "../src/provider-port.ts";
 import { resolveRuntimeBindingMaterialRoute } from "../src/provider-runtime-bindings.ts";
 import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
 import { derivedProviderResourceName } from "../src/provider-worker-endpoint-origin.ts";
@@ -17,6 +18,7 @@ import {
 import type { SelfhostContainerCapability } from "../src/providers/selfhost-container-lifecycle.ts";
 import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-runtime-bindings.ts";
 import { createSelfhostScriptStateStore } from "../src/providers/selfhost-script-state.ts";
+import { selectPublicHostFormSource } from "../src/public-host-form-source.ts";
 import { openSelfhostActorPublicRuntime } from "../src/selfhost-actor-public-runtime.ts";
 import { createSelfhostComposition } from "../src/selfhost-composition.ts";
 import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
@@ -136,6 +138,175 @@ function bucketRelation(
 }
 
 describe("the self-host catalog", () => {
+  test("retains displaced current Forms only for recorded observe and delete", async () => {
+    const selected = selectPublicHostFormSource("actor-forward");
+    const composition = createSelfhostComposition({
+      edge: await buildEdgeForms(),
+      stableForms: selected.forms,
+      stableBindings: selected.bindings,
+      retainedForms: selected.retainedForms,
+      retainedBindings: selected.retainedBindings,
+      dataRoot: "/tmp/unused",
+      runtime,
+      artifacts: {
+        async manifest() {
+          return null;
+        },
+        async blob() {
+          return null;
+        },
+      },
+      edgeForms: true,
+      now: new Date("2026-10-04T00:00:00.000Z"),
+    });
+    const retained = selected.retainedForms.find(
+      (form) => form.identity.formRef.kind === "ModuleWorker",
+    );
+    const sold = composition.offerings.find((offering) => offering.form.kind === "ModuleWorker");
+    if (!retained || !sold) throw new Error("both ModuleWorker families are required");
+    expect(sold.form).not.toEqual(retained.identity.formRef);
+    expect(
+      composition.provider.offerings.some(
+        (offering) => offering.form.schemaDigest === retained.identity.formRef.schemaDigest,
+      ),
+    ).toBe(false);
+    expect(composition.provider.recoveryOfferings).toContainEqual(
+      expect.objectContaining({ id: sold.id, form: retained.identity.formRef }),
+    );
+    expect(
+      composition.provider.recoveryOfferings?.some(
+        (offering) => offering.form.kind === "ActorNamespace",
+      ),
+    ).toBe(false);
+    expect(
+      composition.offerings.some(
+        (offering) => offering.form.schemaDigest === retained.identity.formRef.schemaDigest,
+      ),
+    ).toBe(false);
+    expect(
+      (
+        await createProviderFormAvailability([composition.provider]).resolve({
+          tenantId: "org_test",
+          principalId: "principal",
+          form: retained,
+        })
+      ).executable,
+    ).toBe(false);
+
+    const tenantId = "org_test";
+    const resourceUid = "uid_retained_worker";
+    const nativeId = "selfhost-script:retained";
+    const sql = createEphemeralSql();
+    const deployments = createResourceDeploymentStore(
+      sql,
+      () => new Date("2026-10-04T00:00:00.000Z"),
+    );
+    await deployments.create({
+      tenantId,
+      id: "dep_retained_worker",
+      resourceUid,
+      offeringId: sold.id,
+      providerPackRef: composition.provider.id,
+      providerInstallationRef: "local.primary",
+      nativeId,
+      state: "active",
+      observed: {},
+      outputs: {},
+    });
+    const calls: string[] = [];
+    const provider: Provider = {
+      ...composition.provider,
+      async observe(input) {
+        calls.push(`observe:${input.offering.form.schemaDigest}`);
+        return succeeded({ nativeId: input.nativeId, observed: {}, outputs: {} });
+      },
+      async delete(input) {
+        calls.push(`delete:${input.offering.form.schemaDigest}`);
+        return succeeded({
+          nativeId: input.nativeId,
+          observed: {},
+          outputs: {},
+          disposition: "deleted",
+        });
+      },
+    };
+    const driver = createProviderDriver({
+      providers: [provider],
+      providerPacks: composition.providerPacks,
+      catalog: createCatalog(composition.offerings),
+      ledger: createLedger(sql, () => new Date("2026-10-04T00:00:00.000Z")),
+      deployments,
+    });
+    const resource = {
+      apiVersion: retained.identity.formRef.apiVersion,
+      kind: retained.identity.formRef.kind,
+      form: retained.identity,
+      metadata: {
+        name: "retained-worker",
+        space: "default",
+        uid: resourceUid,
+        generation: "1",
+        revision: "1",
+      },
+      spec: {},
+      status: { observedGeneration: "1", conditions: [] },
+    } as const;
+    await expect(
+      driver.observe({
+        tenantId,
+        resourceUid,
+        resource: {
+          ...resource,
+          form: {
+            ...retained.identity,
+            formRef: { ...retained.identity.formRef, schemaDigest: `sha256:${"0".repeat(64)}` },
+          },
+        },
+        relations: [],
+      }),
+    ).rejects.toMatchObject({ code: "backend_unavailable" });
+    await deployments.create({
+      tenantId,
+      id: "dep_wrong_installation",
+      resourceUid: "uid_wrong_installation",
+      offeringId: sold.id,
+      providerPackRef: composition.provider.id,
+      providerInstallationRef: "other.installation",
+      nativeId,
+      state: "active",
+      observed: {},
+      outputs: {},
+    });
+    await expect(
+      driver.observe({
+        tenantId,
+        resourceUid: "uid_wrong_installation",
+        resource: {
+          ...resource,
+          metadata: { ...resource.metadata, uid: "uid_wrong_installation" },
+        },
+        relations: [],
+      }),
+    ).rejects.toMatchObject({ code: "backend_unavailable" });
+    await driver.observe({ tenantId, resourceUid, resource, relations: [] });
+    await driver.delete({
+      tenantId,
+      resourceUid,
+      resource,
+      relations: [],
+      operationId: "delete_retained_worker",
+      executionAuthority: {
+        tenantId,
+        resourceUid,
+        leaseToken: "test_lease",
+        fingerprint: "test:fingerprint",
+      },
+    });
+    expect(calls).toEqual([
+      `observe:${retained.identity.formRef.schemaDigest}`,
+      `delete:${retained.identity.formRef.schemaDigest}`,
+    ]);
+  });
   test("does not offer released Actor without an exact forward class runtime", async () => {
     const root = await mkdtemp(join(tmpdir(), "actor-composition-"));
     const released = stableProductionTakoformCatalog();

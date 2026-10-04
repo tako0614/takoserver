@@ -158,7 +158,7 @@ test("the generated 17-Form corpus is candidate input, never runtime admission",
   expect(appSource).toContain("createTakoformHostAuthority");
   expect(appSource).toMatch(/candidates\s*:\s*ports\.hostForms\b/u);
   expect(bunEntrySource).toMatch(
-    /const\s+currentCandidates\s*=\s*currentTakoformCandidates\s*\(\s*\)/u,
+    /const\s+currentCandidates\s*=\s*selectPublicHostFormSource\s*\(\s*process\.env\.TAKOSERVER_FORM_SOURCE_CANDIDATE\s*\)/u,
   );
   expect(bunEntrySource).toMatch(/stableForms\s*:\s*currentCandidates\.forms\b/u);
   expect(bunEntrySource).toMatch(/forms\s*:\s*currentCandidates\.forms\b/u);

@@ -23,6 +23,7 @@ import type { SelfhostActorPublicRuntime } from "./selfhost-actor-public-runtime
 import { createSelfhostComposition } from "./selfhost-composition.ts";
 import type { TakoformStore } from "./takoform/store.ts";
 import type { InstalledTakoformBinding, InstalledTakoformForm } from "./takoform/types.ts";
+import type { WorkerClassRuntimeContract } from "./worker-class-runtime-port.ts";
 import type { WorkerdRuntime } from "./workerd-runtime.ts";
 
 export const RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN = "cloudflare-object-bucket-drain" as const;
@@ -231,6 +232,9 @@ export function createStandaloneProviderComposition(input: {
   readonly mode: StandaloneProviderMode;
   readonly stableForms: readonly InstalledTakoformForm[];
   readonly stableBindings?: readonly InstalledTakoformBinding[];
+  readonly retainedForms?: readonly InstalledTakoformForm[];
+  readonly retainedBindings?: readonly InstalledTakoformBinding[];
+  readonly workerClassRuntimeContracts?: readonly WorkerClassRuntimeContract[];
   readonly edge: EdgeFormBundle;
   readonly dataRoot: string;
   readonly runtime: WorkerdRuntime;
@@ -269,6 +273,11 @@ export function createStandaloneProviderComposition(input: {
     const composition = createSelfhostComposition({
       stableForms: input.stableForms,
       ...(input.stableBindings ? { stableBindings: input.stableBindings } : {}),
+      ...(input.retainedForms ? { retainedForms: input.retainedForms } : {}),
+      ...(input.retainedBindings ? { retainedBindings: input.retainedBindings } : {}),
+      ...(input.workerClassRuntimeContracts
+        ? { workerClassRuntimeContracts: input.workerClassRuntimeContracts }
+        : {}),
       edge: input.edge,
       dataRoot: input.dataRoot,
       runtime: input.runtime,
