@@ -28,6 +28,34 @@ export type ActorResourceGraphReader = (
   signal: AbortSignal,
 ) => Promise<ActorResourceGraph | null>;
 
+/** Persisted Workflow Resource facts; this port grants no execution authority. */
+export interface WorkflowResourceAddress {
+  readonly space: string;
+  readonly apiVersion: string;
+  readonly kind: string;
+  readonly name: string;
+}
+
+export interface WorkflowResourceFacts {
+  readonly address: WorkflowResourceAddress;
+  readonly uid: string;
+  readonly generation: string;
+  readonly revision: string;
+  readonly formRef: TakoformV1Alpha3FormRef;
+}
+
+export interface WorkflowResourceGraph {
+  readonly tenantId: string;
+  readonly workflow: WorkflowResourceFacts & { readonly className: string };
+  readonly worker: WorkflowResourceFacts;
+  readonly runtimeClassRef?: TakoformInterfaceRef;
+}
+
+export type WorkflowResourceGraphReader = (
+  scope: { readonly tenantId: string; readonly workflowResourceUid: string },
+  signal: AbortSignal,
+) => Promise<WorkflowResourceGraph | null>;
+
 /** Exact software capability; neither an Offering nor a support/activation grant. */
 export interface WorkerClassRuntimeContract {
   readonly formRef: TakoformV1Alpha3FormRef;

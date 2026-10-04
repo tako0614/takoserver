@@ -28,6 +28,12 @@ import {
   renderSelfhostActorForwardRuntimeModuleSource,
   selfhostActorForwardEntrypointSource,
 } from "../src/selfhost-actor-forward-worker-wrapper.ts";
+import {
+  renderSelfhostWorkflowBindingRuntimeModuleSource,
+  SELFHOST_WORKFLOW_BINDING_ENTRYPOINT_MODULE,
+  SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
+  selfhostWorkflowBindingEntrypointSource,
+} from "../src/selfhost-workflow-binding-worker-wrapper.ts";
 import { forwardTakoformCandidates } from "../src/takoform/forward-candidates.ts";
 import {
   compileWorkerdVersionGraph,
@@ -68,6 +74,52 @@ function graphInput(overrides: Partial<WorkerdVersionGraphInput> = {}): WorkerdV
       probeHostname: "site.selfhost-internal.invalid",
     },
     ...overrides,
+  };
+}
+
+function workflowForwardInput(
+  bindings?: Array<{
+    publicName: string;
+    tenantId: string;
+    workflowResourceUid: string;
+    workflowFormRef: Record<string, string>;
+    bindingRef: Record<string, string>;
+    runtimeClassRef: Record<string, string>;
+    token: string;
+    [key: string]: unknown;
+  }>,
+): {
+  snapshotDigest: string;
+  bindings: NonNullable<typeof bindings>;
+} {
+  return {
+    snapshotDigest: `sha256:${"a".repeat(64)}`,
+    bindings: bindings ?? [
+      {
+        publicName: "ORDERS",
+        tenantId: "tenant-workflow-1",
+        workflowResourceUid: "workflow-resource-001",
+        workflowFormRef: {
+          apiVersion: "edge.forms.takoform.com",
+          kind: "DurableWorkflow",
+          definitionVersion: "0.2.0",
+          schemaDigest: "sha256:a58c885bed4431fbdc6b923059fe3b3bf98f7727578914d2d212552ae97fdc65",
+        },
+        bindingRef: {
+          apiVersion: "bindings.takoform.com/v1alpha2",
+          name: "module-worker.workflow",
+          version: "3.0.0",
+          schemaDigest: "sha256:2b8df3ba036b2781ee3ea8af6603b3de5f09226f4eb1f3385565211cdacc854b",
+        },
+        runtimeClassRef: {
+          apiVersion: "interfaces.takoform.com/v1alpha1",
+          name: "worker.workflow",
+          version: "3.0.0",
+          schemaDigest: "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
+        },
+        token: SERVICE_TOKEN,
+      },
+    ],
   };
 }
 
@@ -207,6 +259,290 @@ test("compiles the opt-in Actor forward outer Host entrypoint without changing t
     bindings: [actorBinding],
   });
   expect(source(graph.hostModules.get(innerModule))).toContain('"name":"ROOM","type":"json"');
+});
+
+test("projects exact Workflow bindings from the selected V10 snapshot without aliasing it", () => {
+  const workflowForward = workflowForwardInput();
+  const input = graphInput({ workflowForward } as never);
+
+  const graph = compileWorkerdVersionGraph(input);
+
+  expect(graph.site).toMatchObject({
+    workflowForward: {
+      schema: "takoserver.selfhost-workflow-binding-forward@v1",
+      snapshotDigest: workflowForward.snapshotDigest,
+      bindings: [
+        {
+          publicName: "ORDERS",
+          serviceName: "__TAKOSERVER_WORKFLOW_BINDING_00000",
+          tenantId: "tenant-workflow-1",
+          workflowResourceUid: "workflow-resource-001",
+          workflowFormRef: workflowForward.bindings[0]?.workflowFormRef,
+          bindingRef: workflowForward.bindings[0]?.bindingRef,
+          runtimeClassRef: workflowForward.bindings[0]?.runtimeClassRef,
+          token: SERVICE_TOKEN,
+        },
+      ],
+    },
+  });
+  expect(graph.site).not.toBe(input);
+  expect(graph.site.serviceBindings).toBeUndefined();
+  expect(graph.site.vars?.some((binding) => binding.name === "ORDERS")).toBe(false);
+
+  const callerBinding = workflowForward.bindings[0];
+  if (!callerBinding) throw new Error("Workflow binding fixture unavailable");
+  callerBinding.workflowFormRef.kind = "ChangedAfterProjection";
+  callerBinding.token = "changed";
+  expect(graph.site).toMatchObject({
+    workflowForward: {
+      bindings: [
+        {
+          workflowFormRef: { kind: "DurableWorkflow" },
+          token: SERVICE_TOKEN,
+        },
+      ],
+    },
+  });
+});
+
+test("rejects non-selected Workflow refs, malformed snapshots, and cross-kind name aliases", () => {
+  const valid = workflowForwardInput();
+  const base = valid.bindings[0] as NonNullable<typeof valid.bindings>[number];
+  const candidates = [
+    {
+      ...valid,
+      bindings: [
+        {
+          ...base,
+          workflowFormRef: { ...base.workflowFormRef, schemaDigest: `sha256:${"f".repeat(64)}` },
+        },
+      ],
+    },
+    {
+      ...valid,
+      bindings: [
+        {
+          ...base,
+          bindingRef: { ...base.bindingRef, schemaDigest: `sha256:${"f".repeat(64)}` },
+        },
+      ],
+    },
+    {
+      ...valid,
+      bindings: [
+        {
+          ...base,
+          runtimeClassRef: { ...base.runtimeClassRef, schemaDigest: `sha256:${"f".repeat(64)}` },
+        },
+      ],
+    },
+    { ...valid, snapshotDigest: "sha256:short" },
+    { ...valid, bindings: [{ ...base, token: "not-a-token" }] },
+    { ...valid, bindings: [{ ...base, extra: "not-a-closed-snapshot" }] },
+    { ...valid, bindings: [{ ...base, workflowFormRef: { kind: "DurableWorkflow" } }] },
+    { ...valid, bindings: [{ ...base, publicName: "__TAKOSERVER_INTERNAL" }] },
+    { ...valid, bindings: [{ ...base }, { ...base }] },
+    {
+      ...valid,
+      bindings: Array.from({ length: 65 }, (_, index) => ({
+        ...base,
+        publicName: `WORKFLOW_${index}`,
+        workflowResourceUid: `workflow-resource-${index.toString().padStart(3, "0")}`,
+      })),
+    },
+  ];
+  for (const workflowForward of candidates) {
+    expect(() => compileWorkerdVersionGraph(graphInput({ workflowForward } as never))).toThrow(
+      TypeError,
+    );
+  }
+
+  expect(() =>
+    compileWorkerdVersionGraph(
+      graphInput({
+        workflowForward: valid,
+        environment: [{ name: "ORDERS", value: "{}", type: "json" }],
+      } as never),
+    ),
+  ).toThrow(TypeError);
+  expect(() =>
+    compileWorkerdVersionGraph(
+      graphInput({
+        workflowForward: valid,
+        environment: [
+          {
+            name: "__TAKOSERVER_WORKFLOW_BINDING_00000",
+            value: "reserved",
+            type: "plain_text",
+          },
+        ],
+      } as never),
+    ),
+  ).toThrow(TypeError);
+  expect(() =>
+    compileWorkerdVersionGraph(
+      graphInput({
+        workflowForward: { ...valid, bindings: [{ ...base, publicName: "DATA" }] },
+        dataPlane: {
+          address: "127.0.0.1:4666",
+          token: DATA_TOKEN,
+          bindings: [{ kind: "edge.kv@1.0.0", publicName: "DATA" }],
+        },
+      } as never),
+    ),
+  ).toThrow(TypeError);
+  expect(() =>
+    compileWorkerdVersionGraph(
+      graphInput({
+        workflowForward: valid,
+        serviceBindings: [
+          {
+            publicName: "ORDERS",
+            target: "orders",
+            targetResourceUid: "service-resource-001",
+            unavailableToken: "unavailable",
+          },
+        ],
+      } as never),
+    ),
+  ).toThrow(TypeError);
+  expect(() =>
+    compileWorkerdVersionGraph(
+      graphInput({
+        workflowForward: valid,
+        actorForward: [
+          {
+            publicName: "ORDERS",
+            tenantId: "tenant-actor-1",
+            namespaceResourceUid: "actor-namespace-001",
+            token: SERVICE_TOKEN,
+          },
+        ],
+      } as never),
+    ),
+  ).toThrow(TypeError);
+});
+
+test("compiles the V10 maximum of 64 distinct Workflow bindings", () => {
+  const binding = workflowForwardInput().bindings[0];
+  if (!binding) throw new Error("Workflow binding fixture unavailable");
+  const bindings = Array.from({ length: 64 }, (_, index) => ({
+    ...binding,
+    publicName: `WORKFLOW_${index}`,
+    workflowResourceUid: `workflow-resource-${index.toString().padStart(3, "0")}`,
+  }));
+
+  const graph = compileWorkerdVersionGraph(
+    graphInput({ workflowForward: { ...workflowForwardInput(), bindings } } as never),
+  );
+
+  expect(graph.site.workflowForward?.bindings).toHaveLength(64);
+  expect(graph.site.workflowForward?.bindings.map((item) => item.serviceName)).toEqual(
+    Array.from(
+      { length: 64 },
+      (_, index) => `__TAKOSERVER_WORKFLOW_BINDING_${index.toString().padStart(5, "0")}`,
+    ),
+  );
+});
+
+test("composes Workflow as the outer wrapper and preserves the selected event handlers", () => {
+  const forward = workflowForwardInput();
+  const input = graphInput({
+    workflowForward: forward as never,
+    declaredHandlers: ["fetch", "queue", "scheduled"],
+    eventToken: EVENT_TOKEN,
+  } as never);
+
+  const graph = compileWorkerdVersionGraph(input);
+
+  expect(graph.site.hostEntrypoint).toBe(SELFHOST_WORKFLOW_BINDING_ENTRYPOINT_MODULE);
+  expect(graph.site.hostModules).toContain(SELFHOST_WORKER_ENTRYPOINT_MODULE);
+  expect(graph.site.hostModules).toContain(SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE);
+  expect(source(graph.hostModules.get(SELFHOST_WORKFLOW_BINDING_ENTRYPOINT_MODULE))).toBe(
+    selfhostWorkflowBindingEntrypointSource({
+      runtimeModule: SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
+      innerModule: SELFHOST_WORKER_ENTRYPOINT_MODULE,
+      bindings: [
+        {
+          publicName: "ORDERS",
+          serviceName: "__TAKOSERVER_WORKFLOW_BINDING_00000",
+          token: SERVICE_TOKEN,
+        },
+      ],
+      queue: true,
+      scheduled: true,
+      events: true,
+    }),
+  );
+  expect(source(graph.hostModules.get(SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE))).toBe(
+    renderSelfhostWorkflowBindingRuntimeModuleSource(),
+  );
+  const innerWrapper = source(graph.hostModules.get(SELFHOST_WORKER_ENTRYPOINT_MODULE));
+  expect(innerWrapper).toContain('"name":"ORDERS","type":"json"');
+  expect(innerWrapper).not.toContain(SERVICE_TOKEN);
+});
+
+test("nests Workflow outside Actor and preserves both private facades and handlers", () => {
+  const forward = workflowForwardInput();
+  const actorForward = [
+    {
+      publicName: "ROOM",
+      tenantId: "tenant-actor-1",
+      namespaceResourceUid: "actor-namespace-001",
+      token: SERVICE_TOKEN,
+    },
+  ];
+  const input = graphInput({
+    workflowForward: forward as never,
+    actorForward,
+    declaredHandlers: ["fetch", "queue", "scheduled"],
+    eventToken: EVENT_TOKEN,
+  } as never);
+
+  const graph = compileWorkerdVersionGraph(input);
+
+  expect(graph.site.hostEntrypoint).toBe(SELFHOST_WORKFLOW_BINDING_ENTRYPOINT_MODULE);
+  expect(graph.site.hostModules).toEqual([
+    selfhostWorkerPreludeModuleName(input.mainModule),
+    SELFHOST_WORKER_ENTRYPOINT_MODULE,
+    "__takoserver-selfhost-actor-forward-runtime.js",
+    "__takoserver-selfhost-actor-forward-entrypoint.js",
+    SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
+  ]);
+  expect(source(graph.hostModules.get("__takoserver-selfhost-actor-forward-entrypoint.js"))).toBe(
+    selfhostActorForwardEntrypointSource({
+      runtimeModule: "__takoserver-selfhost-actor-forward-runtime.js",
+      innerModule: SELFHOST_WORKER_ENTRYPOINT_MODULE,
+      bindings: [
+        {
+          publicName: "ROOM",
+          httpService: "__TAKOSERVER_ACTOR_HTTP_00000",
+          upgradeService: "__TAKOSERVER_ACTOR_UPGRADE_00000",
+          token: SERVICE_TOKEN,
+        },
+      ],
+      queue: true,
+      scheduled: true,
+      events: true,
+      projectEnvironment: true,
+    }),
+  );
+  expect(source(graph.hostModules.get(SELFHOST_WORKFLOW_BINDING_ENTRYPOINT_MODULE))).toBe(
+    selfhostWorkflowBindingEntrypointSource({
+      runtimeModule: SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
+      innerModule: "__takoserver-selfhost-actor-forward-entrypoint.js",
+      bindings: [
+        {
+          publicName: "ORDERS",
+          serviceName: "__TAKOSERVER_WORKFLOW_BINDING_00000",
+          token: SERVICE_TOKEN,
+        },
+      ],
+      queue: true,
+      scheduled: true,
+      events: true,
+    }),
+  );
 });
 
 test("compiles the released maximum of 64 distinct Actor forward bindings", () => {

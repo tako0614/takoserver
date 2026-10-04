@@ -18,8 +18,10 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseActorAbiRef } from "./actor-abi-ref.ts";
-import type { TakoformInterfaceRef } from "./interface-ref.ts";
+import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
+import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 import { bytesDigest } from "./json.ts";
+import { normalizeWorkflowBindings } from "./providers/selfhost-version-bindings.ts";
 import {
   canonicalSelfhostWeightedVersions,
   type SelfhostWeightedVersion,
@@ -112,6 +114,36 @@ export interface WorkerdActorForward {
   readonly bindings: readonly WorkerdActorForwardBinding[];
 }
 
+/** Unpublished Host-only Workflow forward projection from one immutable V10 snapshot. */
+export interface WorkerdWorkflowForwardBinding {
+  readonly publicName: string;
+  readonly serviceName: string;
+  readonly tenantId: string;
+  readonly workflowResourceUid: string;
+  readonly workflowFormRef: TakoformV1Alpha3FormRef;
+  readonly bindingRef: TakoformBindingRef;
+  readonly runtimeClassRef: TakoformInterfaceRef;
+  /** Host-private bearer already embedded in the generated outer wrapper. */
+  readonly token: string;
+}
+
+export interface WorkerdWorkflowForward {
+  readonly schema: "takoserver.selfhost-workflow-binding-forward@v1";
+  readonly snapshotDigest: `sha256:${string}`;
+  readonly bindings: readonly WorkerdWorkflowForwardBinding[];
+}
+
+/** Exact Host-owned broker socket for one immutable Workflow binding. */
+export interface WorkerdWorkflowForwardSocket {
+  readonly script: string;
+  readonly workerResourceUid: string;
+  readonly versionId: string;
+  readonly workerVersionResourceUid: string;
+  readonly snapshotDigest: `sha256:${string}`;
+  readonly binding: WorkerdWorkflowForwardBinding;
+  readonly socketPath: string;
+}
+
 export interface WorkerdActorForwardSocket {
   readonly tenantId: string;
   readonly namespaceResourceUid: string;
@@ -175,6 +207,8 @@ export interface WorkerdSite {
   readonly serviceBindings?: readonly WorkerdServiceBinding[];
   /** Unpublished Host-only Actor forward projection; never a worker.service binding. */
   readonly actorForward?: WorkerdActorForward;
+  /** Unpublished Host-only Workflow binding projection; never public support. */
+  readonly workflowForward?: WorkerdWorkflowForward;
   /**
    * How the Host-owned HTTP router composes this script with its asset lookup.
    * Absent means it declared no assets and public traffic reaches the script
@@ -480,6 +514,8 @@ export interface WorkerdRuntimeOptions {
     /** An unproved activation cannot authorize any new Actor calls. Must not throw. */
     uncertain(): void;
   };
+  /** Current Host-owned Workflow brokers, sampled once per rendered graph. */
+  readonly workflowForwardSockets?: () => readonly WorkerdWorkflowForwardSocket[];
   /**
    * Terminates TLS on that port with this keypair. Absent means the socket is
    * plain HTTP, which is what the Host must then publish as the endpoint
@@ -507,6 +543,7 @@ interface Manifest {
   readonly fetchHandler?: boolean;
   readonly serviceBindings?: readonly WorkerdServiceBinding[];
   readonly actorForward?: WorkerdActorForward;
+  readonly workflowForward?: WorkerdWorkflowForward;
   readonly assets?: WorkerdAssetManifest;
   readonly vars?: readonly WorkerdBinding[];
   readonly modules?: readonly string[];
@@ -824,8 +861,19 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
    * re-rendered by some other route would be the second place the router, the
    * asset shim and the socket are decided.
    */
-  const writeRendered = async (published: readonly PublishedDeployment[]): Promise<void> => {
+  const workflowSocketSnapshot = async (
+    published: readonly PublishedDeployment[],
+  ): Promise<readonly WorkerdWorkflowForwardSocket[] | undefined> => {
     await options.beforeRender?.();
+    const workflowSockets = copyWorkflowForwardSockets(options.workflowForwardSockets?.());
+    resolveWorkflowForwardServices(published, workflowSockets);
+    return workflowSockets;
+  };
+
+  const writeRendered = async (
+    published: readonly PublishedDeployment[],
+    workflowSockets: readonly WorkerdWorkflowForwardSocket[] | undefined,
+  ): Promise<void> => {
     await options.actorForwardLifecycle?.prepare(actorForwardPublications(published));
     const actorSockets = actorForwardSockets();
     if (serviceSocketDirectory !== undefined) {
@@ -883,6 +931,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         privateServiceGraph(published),
         actorSockets,
         exactActorSockets,
+        workflowSockets,
       ),
       "utf8",
       () => transitionPrivateSockets(published),
@@ -892,13 +941,17 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
   const activated = (published: readonly PublishedDeployment[]) =>
     Object.fromEntries(published.map((entry) => [entry.name, entry.generation ?? null]));
 
-  const renderedConfirmed = async (published: readonly PublishedDeployment[]): Promise<boolean> => {
+  const renderedConfirmed = async (
+    published: readonly PublishedDeployment[],
+    workflowSockets: readonly WorkerdWorkflowForwardSocket[] | undefined,
+  ): Promise<boolean> => {
     const actorSockets = actorForwardSockets();
     const expected = publishedGraphIdentity(
       published,
       privateServiceGraph(published),
       actorSockets,
       exactActorSockets,
+      workflowSockets,
     );
     let confirmed = false;
     try {
@@ -922,14 +975,17 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     return confirmed && (await capturePrivateSockets());
   };
 
-  const proveRendered = async (published: readonly PublishedDeployment[]): Promise<void> => {
+  const proveRendered = async (
+    published: readonly PublishedDeployment[],
+    workflowSockets: readonly WorkerdWorkflowForwardSocket[] | undefined,
+  ): Promise<void> => {
     // A composition with no process hook intentionally stages files only. It
     // cannot prove serving truth, but `has()` will still fail closed unless its
     // composition supplies a live `isReady` probe.
     if (options.onReload === undefined) return;
     const deadline = Date.now() + 5_000;
     for (;;) {
-      if (await renderedConfirmed(published)) return;
+      if (await renderedConfirmed(published, workflowSockets)) return;
       if (Date.now() >= deadline) {
         throw new Error("worker runtime did not confirm the rendered configuration");
       }
@@ -959,6 +1015,20 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     },
   ): Promise<void> => {
     requireCertainRuntime();
+    let workflowSockets: readonly WorkerdWorkflowForwardSocket[] | undefined;
+    try {
+      // Resolve the complete candidate before changing activation truth. Reuse
+      // this exact socket locator result for rendering and readback.
+      workflowSockets = await workflowSocketSnapshot(published);
+    } catch (failure) {
+      // A same-generation restore has no older candidate to preserve. Do not
+      // leave a prior process's marker as current truth when its graph cannot
+      // be revalidated in this runtime incarnation.
+      if (JSON.stringify(activated(previous)) === JSON.stringify(activated(published))) {
+        await clearFailedActorActivation(failure);
+      }
+      throw failure;
+    }
     const initialSocketTransition = privateSocketTransition;
     let graphProved = false;
     try {
@@ -976,9 +1046,9 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       // commits. Clear only the changing scripts first so an external event
       // selector cannot mistake either side of that crossing for committed.
       if (changed) await writeActivation(activationPath, indeterminate);
-      await writeRendered(published);
+      await writeRendered(published, workflowSockets);
       await options.onReload?.(configPath);
-      await proveRendered(published);
+      await proveRendered(published, workflowSockets);
       graphProved = options.onReload !== undefined;
       if (!pointer?.commitAfterActivation) await pointer?.commit();
       await writeActivation(activationPath, activated(published));
@@ -1012,9 +1082,10 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         // token. A config left by an earlier Host instance contains that
         // instance's token, so restoring its bytes would make an otherwise
         // successful rollback impossible for this process to authenticate.
-        await writeRendered(previous);
+        const previousWorkflowSockets = await workflowSocketSnapshot(previous);
+        await writeRendered(previous, previousWorkflowSockets);
         await options.onReload?.(configPath);
-        await proveRendered(previous);
+        await proveRendered(previous, previousWorkflowSockets);
         // The graph just proved is the authority. A marker captured before
         // this call may be stale after a crash between pointer commit and
         // marker commit, especially during boot restore.
@@ -1484,12 +1555,24 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       }
       const actorForward =
         site.actorForward === undefined ? undefined : validActorForward(site.actorForward);
+      const workflowForward =
+        site.workflowForward === undefined ? undefined : validWorkflowForward(site.workflowForward);
       validActorForwardCollision(
         actorForward,
         validBindings(site.vars ?? []),
         serviceBindings,
         hostEntrypoint,
       );
+      validWorkflowForwardCollision(
+        workflowForward,
+        validBindings(site.vars ?? []),
+        serviceBindings,
+        actorForward,
+        hostEntrypoint,
+      );
+      if (workflowForward !== undefined) {
+        throw new Error("Workflow forward requires an immutable weighted publication");
+      }
       // Replaced rather than merged: a module the new bundle does not contain
       // must not survive from the old one, where it would be loadable and
       // wrong.
@@ -1600,7 +1683,8 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           // A stale activation marker, a previous Host process, and a graph
           // still serving after a failed reload cannot answer for it.
           const published = await readPublished(scriptsRoot, assetsRoot);
-          if (!(await renderedConfirmed(published))) return "unknown";
+          if (!(await renderedConfirmed(published, options.workflowForwardSockets?.())))
+            return "unknown";
           if (privateSocketUncertain || !options.isReady()) return "unknown";
           const entry = published.find((candidate) => candidate.name === name);
           if (!entry) return "absent";
@@ -1816,6 +1900,10 @@ const SERVICE_UNAVAILABLE_TOKEN = /^[0-9a-f]{64}$/u;
 const ACTOR_FORWARD_SCHEMA = "takoserver.selfhost-actor-forward@v1" as const;
 const ACTOR_FORWARD_PUBLIC_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
 const ACTOR_FORWARD_TOKEN = /^[a-f0-9]{64}$/u;
+const WORKFLOW_FORWARD_SCHEMA = "takoserver.selfhost-workflow-binding-forward@v1" as const;
+const WORKFLOW_FORWARD_PUBLIC_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
+const WORKFLOW_FORWARD_SERVICE_NAME = /^__TAKOSERVER_WORKFLOW_BINDING_[0-9]{5}$/u;
+const WORKFLOW_FORWARD_TOKEN = /^[a-f0-9]{64}$/u;
 const ACTOR_FORWARD_MANIFEST_KEYS = new Set([
   "mainModule",
   "hostEntrypoint",
@@ -1828,6 +1916,7 @@ const ACTOR_FORWARD_MANIFEST_KEYS = new Set([
   "fetchHandler",
   "serviceBindings",
   "actorForward",
+  "workflowForward",
   "assets",
   "vars",
   "modules",
@@ -1984,6 +2073,314 @@ function validActorForwardCollision(
       names.has(binding.upgradeService)
     )
       throw new Error("unusable Actor forward binding collision");
+  }
+}
+
+function workflowForwardServiceName(index: number): string {
+  return `__TAKOSERVER_WORKFLOW_BINDING_${index.toString(10).padStart(5, "0")}`;
+}
+
+function validWorkflowForwardBinding(value: unknown, index: number): WorkerdWorkflowForwardBinding {
+  const keys =
+    "bindingRef,publicName,runtimeClassRef,serviceName,tenantId,token,workflowFormRef,workflowResourceUid";
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.keys(value).sort().join(",") !== keys
+  ) {
+    throw new Error("unusable Workflow forward graph");
+  }
+  const binding = value as WorkerdWorkflowForwardBinding;
+  if (
+    typeof binding.publicName !== "string" ||
+    !WORKFLOW_FORWARD_PUBLIC_NAME.test(binding.publicName) ||
+    binding.publicName.startsWith("__TAKOSERVER_") ||
+    binding.serviceName !== workflowForwardServiceName(index) ||
+    typeof binding.tenantId !== "string" ||
+    binding.tenantId.length === 0 ||
+    binding.tenantId.includes("\u0000") ||
+    typeof binding.workflowResourceUid !== "string" ||
+    !RESOURCE_UID.test(binding.workflowResourceUid) ||
+    typeof binding.token !== "string" ||
+    !WORKFLOW_FORWARD_TOKEN.test(binding.token)
+  ) {
+    throw new Error("unusable Workflow forward graph");
+  }
+  let normalized: NonNullable<ReturnType<typeof normalizeWorkflowBindings>>[number] | undefined;
+  try {
+    normalized = normalizeWorkflowBindings([
+      {
+        name: binding.publicName,
+        tenantId: binding.tenantId,
+        workflowResourceUid: binding.workflowResourceUid,
+        workflowFormRef: binding.workflowFormRef,
+        bindingRef: binding.bindingRef,
+        runtimeClassRef: binding.runtimeClassRef,
+      },
+    ])?.[0];
+  } catch {
+    throw new Error("unusable Workflow forward graph");
+  }
+  if (!normalized) throw new Error("unusable Workflow forward graph");
+  return {
+    publicName: normalized.name,
+    serviceName: binding.serviceName,
+    tenantId: normalized.tenantId,
+    workflowResourceUid: normalized.workflowResourceUid,
+    workflowFormRef: normalized.workflowFormRef,
+    bindingRef: normalized.bindingRef,
+    runtimeClassRef: normalized.runtimeClassRef,
+    token: binding.token,
+  };
+}
+
+function validWorkflowForward(value: unknown): WorkerdWorkflowForward {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.keys(value).sort().join(",") !== "bindings,schema,snapshotDigest"
+  ) {
+    throw new Error("unusable Workflow forward graph");
+  }
+  const candidate = value as WorkerdWorkflowForward;
+  if (
+    candidate.schema !== WORKFLOW_FORWARD_SCHEMA ||
+    typeof candidate.snapshotDigest !== "string" ||
+    !/^sha256:[a-f0-9]{64}$/u.test(candidate.snapshotDigest) ||
+    !Array.isArray(candidate.bindings) ||
+    candidate.bindings.length === 0 ||
+    candidate.bindings.length > 64
+  ) {
+    throw new Error("unusable Workflow forward graph");
+  }
+  const names = new Set<string>();
+  const bindings = candidate.bindings.map((binding, index) => {
+    const normalized = validWorkflowForwardBinding(binding, index);
+    if (names.has(normalized.publicName)) throw new Error("unusable Workflow forward graph");
+    names.add(normalized.publicName);
+    capnpText(normalized.publicName);
+    capnpText(normalized.serviceName);
+    return normalized;
+  });
+  return {
+    schema: WORKFLOW_FORWARD_SCHEMA,
+    snapshotDigest: candidate.snapshotDigest,
+    bindings,
+  };
+}
+
+function workflowForwardBindingIdentity(binding: WorkerdWorkflowForwardBinding): string {
+  return JSON.stringify([
+    binding.publicName,
+    binding.serviceName,
+    binding.tenantId,
+    binding.workflowResourceUid,
+    binding.workflowFormRef,
+    binding.bindingRef,
+    binding.runtimeClassRef,
+    binding.token,
+  ]);
+}
+
+function workflowForwardSocketIdentity(value: {
+  readonly script: string;
+  readonly workerResourceUid: string;
+  readonly versionId: string;
+  readonly workerVersionResourceUid: string;
+  readonly snapshotDigest: string;
+  readonly binding: WorkerdWorkflowForwardBinding;
+}): string {
+  return JSON.stringify([
+    value.script,
+    value.workerResourceUid,
+    value.versionId,
+    value.workerVersionResourceUid,
+    value.snapshotDigest,
+    workflowForwardBindingIdentity(value.binding),
+  ]);
+}
+
+function copyWorkflowForwardSockets(
+  value: unknown,
+): readonly WorkerdWorkflowForwardSocket[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) return value as readonly WorkerdWorkflowForwardSocket[];
+  return value.map((entry) => {
+    const socket = copyOwnRecord(entry);
+    if (!socket) return entry as WorkerdWorkflowForwardSocket;
+    const binding = copyOwnRecord(socket.binding);
+    if (!binding) return socket as unknown as WorkerdWorkflowForwardSocket;
+    return {
+      ...socket,
+      binding: {
+        ...binding,
+        workflowFormRef: copyWorkflowForwardValue(binding.workflowFormRef),
+        bindingRef: copyWorkflowForwardValue(binding.bindingRef),
+        runtimeClassRef: copyWorkflowForwardValue(binding.runtimeClassRef),
+      },
+    } as unknown as WorkerdWorkflowForwardSocket;
+  });
+}
+
+function copyOwnRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  return { ...value };
+}
+
+function copyWorkflowForwardValue(value: unknown): unknown {
+  return copyOwnRecord(value) ?? value;
+}
+
+interface ResolvedWorkflowForwardService {
+  readonly bindingName: string;
+  readonly serviceName: string;
+  readonly socketPath: string;
+}
+
+function resolveWorkflowForwardServices(
+  published: readonly PublishedDeployment[],
+  sockets: readonly WorkerdWorkflowForwardSocket[] | undefined,
+): ReadonlyMap<string, readonly ResolvedWorkflowForwardService[]> {
+  const expected = new Map<
+    string,
+    readonly {
+      readonly variant: PublishedVariant;
+      readonly binding: WorkerdWorkflowForwardBinding;
+      readonly identity: string;
+    }[]
+  >();
+  const identities = new Set<string>();
+  for (const deployment of published) {
+    for (const variant of deployment.variants) {
+      if (variant.manifest.workflowForward === undefined) continue;
+      if (
+        !deployment.weighted ||
+        !deployment.workerResourceUid ||
+        !variant.versionId ||
+        !variant.workerVersionUid
+      ) {
+        throw new Error("Workflow forward requires an immutable weighted Version");
+      }
+      const forward = validWorkflowForward(variant.manifest.workflowForward);
+      const entries = forward.bindings.map((binding) => {
+        const identity = workflowForwardSocketIdentity({
+          script: deployment.name,
+          workerResourceUid: deployment.workerResourceUid as string,
+          versionId: variant.versionId as string,
+          workerVersionResourceUid: variant.workerVersionUid as string,
+          snapshotDigest: forward.snapshotDigest,
+          binding,
+        });
+        if (identities.has(identity)) throw new Error("unusable Workflow forward socket graph");
+        identities.add(identity);
+        return { variant, binding, identity };
+      });
+      expected.set(variant.name, entries);
+    }
+  }
+  if (expected.size === 0) return new Map();
+  if (!Array.isArray(sockets) || sockets.length < identities.size) {
+    throw new Error("Workflow forward Host socket unavailable");
+  }
+  const resolvedByIdentity = new Map<string, WorkerdWorkflowForwardSocket>();
+  const paths = new Set<string>();
+  for (const value of sockets) {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      Array.isArray(value) ||
+      Object.keys(value).sort().join(",") !==
+        "binding,script,snapshotDigest,socketPath,versionId,workerResourceUid,workerVersionResourceUid" ||
+      typeof value.script !== "string" ||
+      !SCRIPT_NAME.test(value.script) ||
+      typeof value.workerResourceUid !== "string" ||
+      !RESOURCE_UID.test(value.workerResourceUid) ||
+      typeof value.versionId !== "string" ||
+      value.versionId.length === 0 ||
+      value.versionId.length > 256 ||
+      value.versionId.includes("\u0000") ||
+      typeof value.workerVersionResourceUid !== "string" ||
+      !RESOURCE_UID.test(value.workerVersionResourceUid) ||
+      typeof value.snapshotDigest !== "string" ||
+      !/^sha256:[a-f0-9]{64}$/u.test(value.snapshotDigest) ||
+      typeof value.socketPath !== "string" ||
+      !isAbsolute(value.socketPath) ||
+      resolve(value.socketPath) !== value.socketPath ||
+      value.socketPath.includes("\u0000") ||
+      Buffer.byteLength(value.socketPath) > 100 ||
+      paths.has(value.socketPath)
+    ) {
+      throw new Error("unusable Workflow forward socket graph");
+    }
+    if (
+      typeof value.binding !== "object" ||
+      value.binding === null ||
+      Array.isArray(value.binding) ||
+      typeof value.binding.serviceName !== "string" ||
+      !WORKFLOW_FORWARD_SERVICE_NAME.test(value.binding.serviceName)
+    ) {
+      throw new Error("unusable Workflow forward socket graph");
+    }
+    const binding = validWorkflowForwardBinding(
+      value.binding,
+      Number.parseInt(value.binding.serviceName.slice("__TAKOSERVER_WORKFLOW_BINDING_".length), 10),
+    );
+    const identity = workflowForwardSocketIdentity({ ...value, binding });
+    if (!identities.has(identity) || resolvedByIdentity.has(identity)) {
+      throw new Error("Workflow forward Host socket unavailable");
+    }
+    paths.add(value.socketPath);
+    resolvedByIdentity.set(identity, { ...value, binding });
+  }
+  if (resolvedByIdentity.size !== identities.size) {
+    throw new Error("Workflow forward Host socket unavailable");
+  }
+  const resolved = new Map<string, readonly ResolvedWorkflowForwardService[]>();
+  for (const [variantName, entries] of expected) {
+    resolved.set(
+      variantName,
+      entries.map(({ binding, identity }, index) => {
+        const socket = resolvedByIdentity.get(identity);
+        if (!socket) throw new Error("Workflow forward Host socket unavailable");
+        return {
+          bindingName: binding.serviceName,
+          serviceName: `${variantName}-workflow-binding-${index}`,
+          socketPath: socket.socketPath,
+        };
+      }),
+    );
+  }
+  return resolved;
+}
+
+function validWorkflowForwardCollision(
+  workflowForward: WorkerdWorkflowForward | undefined,
+  vars: readonly WorkerdBinding[],
+  serviceBindings: readonly WorkerdServiceBinding[],
+  actorForward: WorkerdActorForward | undefined,
+  hostEntrypoint: string | undefined,
+): void {
+  if (!workflowForward) return;
+  if (hostEntrypoint === undefined) throw new Error("unusable Workflow forward entrypoint");
+  const names = new Set([
+    INTERNAL_READINESS_CAPABILITY_BINDING,
+    DATA_SERVICE_BINDING,
+    ...vars.map((binding) => binding.name),
+    ...serviceBindings.map((binding) => binding.name),
+    ...(actorForward?.bindings.flatMap((binding) => [
+      binding.publicName,
+      binding.httpService,
+      binding.upgradeService,
+    ]) ?? []),
+  ]);
+  for (const binding of workflowForward.bindings) {
+    if (names.has(binding.publicName) || names.has(binding.serviceName)) {
+      throw new Error("unusable Workflow forward binding collision");
+    }
+    names.add(binding.publicName);
+    names.add(binding.serviceName);
   }
 }
 
@@ -2514,10 +2911,19 @@ async function prepareWorkerdSite(
   }
   const actorForward =
     site.actorForward === undefined ? undefined : validActorForward(site.actorForward);
+  const workflowForward =
+    site.workflowForward === undefined ? undefined : validWorkflowForward(site.workflowForward);
   validActorForwardCollision(
     actorForward,
     validBindings(site.vars ?? []),
     serviceBindings,
+    hostEntrypoint,
+  );
+  validWorkflowForwardCollision(
+    workflowForward,
+    validBindings(site.vars ?? []),
+    serviceBindings,
+    actorForward,
     hostEntrypoint,
   );
   return {
@@ -2538,6 +2944,7 @@ async function prepareWorkerdSite(
       ...(site.fetchHandler === undefined ? {} : { fetchHandler: site.fetchHandler }),
       ...(serviceBindings.length > 0 ? { serviceBindings } : {}),
       ...(actorForward === undefined ? {} : { actorForward }),
+      ...(workflowForward === undefined ? {} : { workflowForward }),
       ...(assetDeclaration ? { assets: assetDeclaration.configuration } : {}),
       ...(site.vars && site.vars.length > 0 ? { vars: validBindings(site.vars) } : {}),
       ...(site.modules && site.modules.length > 0 ? { modules: declaredModules } : {}),
@@ -3137,8 +3544,8 @@ async function readValidatedManifest(
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("unusable worker runtime manifest");
   }
-  // The legacy schema is the same known field set without actorForward. Never
-  // reinterpret an unknown old field as a new capability on restore.
+  // The legacy schema is the same known field set without optional forward
+  // projections. Never reinterpret an unknown old field as a capability.
   if (Object.keys(value).some((key) => !ACTOR_FORWARD_MANIFEST_KEYS.has(key)))
     throw new Error("unusable worker runtime manifest");
   let manifest = value as Manifest;
@@ -3171,8 +3578,20 @@ async function readValidatedManifest(
   }
   const actorForward =
     manifest.actorForward === undefined ? undefined : validActorForward(manifest.actorForward);
+  const workflowForward =
+    manifest.workflowForward === undefined
+      ? undefined
+      : validWorkflowForward(manifest.workflowForward);
   validActorForwardCollision(actorForward, vars, serviceBindings, manifest.hostEntrypoint);
+  validWorkflowForwardCollision(
+    workflowForward,
+    vars,
+    serviceBindings,
+    actorForward,
+    manifest.hostEntrypoint,
+  );
   if (actorForward) manifest = { ...manifest, actorForward };
+  if (workflowForward) manifest = { ...manifest, workflowForward };
   if (manifest.dataPlane !== undefined) validDataPlane(manifest.dataPlane);
   if (manifest.events !== undefined) validEventGate(manifest.events);
   return manifest;
@@ -3594,6 +4013,20 @@ export async function readWorkerdSelectedActiveVersion(
               bindings: manifest.actorForward.bindings.map((binding) => ({ ...binding })),
             },
           }),
+      ...(manifest.workflowForward === undefined
+        ? {}
+        : {
+            workflowForward: {
+              schema: manifest.workflowForward.schema,
+              snapshotDigest: manifest.workflowForward.snapshotDigest,
+              bindings: manifest.workflowForward.bindings.map((binding) => ({
+                ...binding,
+                workflowFormRef: { ...binding.workflowFormRef },
+                bindingRef: { ...binding.bindingRef },
+                runtimeClassRef: { ...binding.runtimeClassRef },
+              })),
+            },
+          }),
       ...(manifest.assets === undefined
         ? {}
         : {
@@ -3906,6 +4339,9 @@ async function readPublished(
         join(assetsRoot, entry.name),
         value,
       );
+      if (manifest.workflowForward !== undefined) {
+        throw new Error("Workflow forward requires an immutable weighted Version");
+      }
       internalHostname(entry.name);
       eventHostname(entry.name);
     } catch {
@@ -4124,6 +4560,7 @@ function publishedGraphIdentity(
   privateServices?: PrivateServiceGraph,
   actorForwardSockets: ReadonlyMap<string, WorkerdActorForwardSocket> = new Map(),
   exactActorSockets = false,
+  workflowForwardSockets?: readonly WorkerdWorkflowForwardSocket[],
 ): string {
   const hash = createHash("sha256").update(
     JSON.stringify(
@@ -4165,6 +4602,12 @@ function publishedGraphIdentity(
     hash
       .update("\u0000actor-forward-sockets\u0000")
       .update(JSON.stringify([...actorServices.entries()]));
+  }
+  const workflowServices = resolveWorkflowForwardServices(published, workflowForwardSockets);
+  if (workflowServices.size > 0) {
+    hash
+      .update("\u0000workflow-forward-sockets\u0000")
+      .update(JSON.stringify([...workflowServices.entries()]));
   }
   return hash.digest("hex");
 }
@@ -4224,6 +4667,7 @@ function renderConfig(
   privateServices?: PrivateServiceGraph,
   actorForwardSockets: ReadonlyMap<string, WorkerdActorForwardSocket> = new Map(),
   exactActorSockets = false,
+  workflowForwardSockets?: readonly WorkerdWorkflowForwardSocket[],
 ): string {
   const variants = published.flatMap((deployment) => deployment.variants);
   const actorServices = resolveActorForwardServices(
@@ -4231,11 +4675,13 @@ function renderConfig(
     actorForwardSockets,
     exactActorSockets,
   );
+  const workflowServices = resolveWorkflowForwardServices(published, workflowForwardSockets);
   const graphIdentity = publishedGraphIdentity(
     published,
     privateServices,
     actorForwardSockets,
     exactActorSockets,
+    workflowForwardSockets,
   );
   const services = variants
     .map((entry) => {
@@ -4256,6 +4702,10 @@ function renderConfig(
           `(name = ${capnpText(binding.httpBinding)}, service = ${capnpText(binding.httpService)})`,
           `(name = ${capnpText(binding.upgradeBinding)}, service = ${capnpText(binding.upgradeService)})`,
         ]),
+        ...(workflowServices.get(entry.name) ?? []).map(
+          (binding) =>
+            `(name = ${capnpText(binding.bindingName)}, service = ${capnpText(binding.serviceName)})`,
+        ),
         ...validBindings(entry.manifest.vars ?? []).map(
           (binding) =>
             `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
@@ -4290,6 +4740,14 @@ function renderConfig(
         `  (name = ${capnpText(binding.httpService)}, external = (address = ${capnpText(`unix:${binding.httpSocketPath}`)}, http = ())),`,
         `  (name = ${capnpText(binding.upgradeService)}, external = (address = ${capnpText(`unix:${binding.upgradeSocketPath}`)}, http = (style = proxy))),`,
       ]),
+    )
+    .join("\n");
+  const workflowExternalServices = [...workflowServices.values()]
+    .flatMap((bindings) =>
+      bindings.map(
+        (binding) =>
+          `  (name = ${capnpText(binding.serviceName)}, external = (address = ${capnpText(`unix:${binding.socketPath}`)}, http = ())),`,
+      ),
     )
     .join("\n");
 
@@ -4552,7 +5010,7 @@ function renderConfig(
 const config :Workerd.Config = (
   services = [
 ${services}
-${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${actorExternalServices === "" ? "" : `\n${actorExternalServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
+${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${actorExternalServices === "" ? "" : `\n${actorExternalServices}`}${workflowExternalServices === "" ? "" : `\n${workflowExternalServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
   ( name = "router",
     worker = (
       modules = [ (name = "router.js", esModule = embed "router.js") ],

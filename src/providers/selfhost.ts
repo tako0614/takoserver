@@ -70,7 +70,7 @@ import {
   type VectorIndexStore,
   VectorIndexStoreError,
 } from "../vector-index-store.ts";
-import type { ActorResourceGraph } from "../worker-class-runtime-port.ts";
+import type { ActorResourceGraph, WorkflowResourceGraph } from "../worker-class-runtime-port.ts";
 import {
   internalHostname,
   readWorkerdActiveDeployment,
@@ -119,7 +119,9 @@ import {
 import {
   createSelfhostVersionBindingStore,
   deriveSelfhostActorForwardToken,
+  deriveSelfhostWorkflowBindingToken,
   normalizeSelfhostVersionBindingSet,
+  normalizeWorkflowBindings,
   SELFHOST_WORKER_HANDLER_NAMES,
   type SelfhostRuntimeInputMarker,
   type SelfhostRuntimeInputMarkerIdentity,
@@ -130,6 +132,7 @@ import {
   type SelfhostVersionDataBinding,
   type SelfhostVersionQueueSettings,
   type SelfhostVersionServiceBinding,
+  type SelfhostVersionWorkflowBinding,
   type SelfhostWorkerHandlerName,
   type StoredSelfhostVersionBindings,
 } from "./selfhost-version-bindings.ts";
@@ -253,6 +256,36 @@ const SELFHOST_ACTOR_INTERFACE_REF = Object.freeze({
   version: "1.0.0",
   schemaDigest: "sha256:f5428fb587de80261dd7363dc5b8a3f4aab7e469fa1b5fce8441ad9acbec8218",
 });
+const SELFHOST_WORKFLOW_VERSION_FORM_REF = Object.freeze({
+  apiVersion: "edge.forms.takoform.com",
+  kind: "WorkerVersion",
+  definitionVersion: "0.4.0",
+  schemaDigest: "sha256:ba59a72fb2c12aa6e9d09173943eb4bb8d2eadac25840d87356a25286007354b",
+});
+const SELFHOST_WORKFLOW_WORKER_FORM_REF = Object.freeze({
+  apiVersion: "edge.forms.takoform.com",
+  kind: "ModuleWorker",
+  definitionVersion: "0.2.0",
+  schemaDigest: "sha256:761180705a6f2a75fa0bc0061794a269342fafe0309c26ecd7530f12fcda1399",
+});
+const SELFHOST_WORKFLOW_FORM_REF = Object.freeze({
+  apiVersion: "edge.forms.takoform.com",
+  kind: "DurableWorkflow",
+  definitionVersion: "0.2.0",
+  schemaDigest: "sha256:a58c885bed4431fbdc6b923059fe3b3bf98f7727578914d2d212552ae97fdc65",
+});
+const SELFHOST_WORKFLOW_BINDING_REF = Object.freeze({
+  apiVersion: "bindings.takoform.com/v1alpha2",
+  name: "module-worker.workflow",
+  version: "3.0.0",
+  schemaDigest: "sha256:2b8df3ba036b2781ee3ea8af6603b3de5f09226f4eb1f3385565211cdacc854b",
+});
+const SELFHOST_WORKFLOW_RUNTIME_REF = Object.freeze({
+  apiVersion: "interfaces.takoform.com/v1alpha1",
+  name: "worker.workflow",
+  version: "3.0.0",
+  schemaDigest: "sha256:2584721b4bc9f5feef94b272337c348fb67130de57317afaf84aa7ca55246f69",
+});
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
 /**
  * How long a ledger statement waits for a tenant's lock, in milliseconds.
@@ -340,6 +373,25 @@ export interface SelfhostProviderOptions {
       readonly tenantId: string;
       readonly namespaceResourceUid: string;
     }): Promise<void>;
+  };
+  /** Optional factual graph and canonical Deployment authority for unpublished Workflow V10. */
+  readonly workflowVersionAuthority?: {
+    readCurrentGraph(
+      scope: { readonly tenantId: string; readonly workflowResourceUid: string },
+      signal: AbortSignal,
+    ): Promise<WorkflowResourceGraph | null>;
+    readVersionDeployment(scope: {
+      readonly tenantId: string;
+      readonly workerVersionResourceUid: string;
+    }): Promise<{
+      readonly tenantId: string;
+      readonly resourceUid: string;
+      readonly state: string;
+      readonly providerPackRef: string;
+      readonly providerInstallationRef: string;
+      readonly nativeId: string;
+      readonly observed: JsonObject;
+    } | null>;
   };
   /** Explicit native runtime for an independently installed Container Form. */
   readonly container?: SelfhostContainerCapability;
@@ -1018,6 +1070,50 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   ): Promise<StoredSelfhostVersionBindings | null> =>
     bindingStoreOperation(() => versionBindings.read(script, versionId));
 
+  const readCanonicalWorkflowVersion = async (scope: {
+    readonly tenantId: string;
+    readonly workerVersionResourceUid: string;
+  }) => {
+    try {
+      return (await options.workflowVersionAuthority?.readVersionDeployment(scope)) ?? null;
+    } catch {
+      throw new SelfhostFailure(
+        failed("unavailable", "the canonical Workflow Version authority is unavailable", true),
+      );
+    }
+  };
+
+  const assertExistingWorkflowPin = async (
+    tenantId: string,
+    workerVersionResourceUid: string,
+    script: string,
+    versionId: string,
+    recorded: StoredSelfhostVersionBindings | null,
+  ): Promise<void> => {
+    if (!recorded?.workflowBindings?.length) return;
+    const canonical = await readCanonicalWorkflowVersion({ tenantId, workerVersionResourceUid });
+    // An initial apply/recovery can precede the Host's first atomic Deployment
+    // commit. Once it exists, a native retry cannot silently rotate its pin.
+    if (!canonical) return;
+    if (
+      canonical.tenantId !== tenantId ||
+      canonical.resourceUid !== workerVersionResourceUid ||
+      canonical.state !== "active" ||
+      canonical.providerPackRef !== id ||
+      canonical.providerInstallationRef !== "local.primary" ||
+      parseSelfhostNativeId("WorkerVersion", canonical.nativeId)?.script !== script ||
+      parseSelfhostNativeId("WorkerVersion", canonical.nativeId)?.versionId !== versionId ||
+      !canonical.nativeId.startsWith(`selfhost-version:${script}:${versionId}:`) ||
+      canonical.observed.scriptName !== script ||
+      canonical.observed.versionId !== versionId ||
+      canonical.observed.workflowBindingsDigest !== recorded.digest
+    ) {
+      throw new SelfhostFailure(
+        failed("conflict", "the Workflow Version has no exact canonical binding pin"),
+      );
+    }
+  };
+
   // Runtime activation is identified by the complete desired route set, the
   // exact environment, and everything attached to the script, not merely by the
   // active version. An endpoint/domain write can stage a new manifest while
@@ -1289,6 +1385,41 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         failed("unavailable", "the Worker Version requires authoritative reapply", true),
       );
     }
+    if (bindings.workflowBindings?.length) {
+      const selectedUid = state.deployment?.versions.find(
+        (version) => version.versionId === versionId,
+      )?.workerVersionUid;
+      const canonicalVersion =
+        selectedUid && options.workflowVersionAuthority
+          ? await readCanonicalWorkflowVersion({
+              tenantId: bindings.workflowBindings[0]?.tenantId as string,
+              workerVersionResourceUid: selectedUid,
+            })
+          : null;
+      const expected = canonicalVersion?.observed.workflowBindingsDigest;
+      if (
+        !options.workflowVersionAuthority ||
+        !canonicalVersion ||
+        canonicalVersion.tenantId !== bindings.workflowBindings[0]?.tenantId ||
+        selectedUid !== bindings.workerVersionResourceUid ||
+        canonicalVersion.resourceUid !== bindings.workerVersionResourceUid ||
+        canonicalVersion.state !== "active" ||
+        canonicalVersion.providerPackRef !== id ||
+        canonicalVersion.providerInstallationRef !== "local.primary" ||
+        parseSelfhostNativeId("WorkerVersion", canonicalVersion.nativeId)?.script !== script ||
+        parseSelfhostNativeId("WorkerVersion", canonicalVersion.nativeId)?.versionId !==
+          versionId ||
+        !canonicalVersion.nativeId.startsWith(`selfhost-version:${script}:${versionId}:`) ||
+        canonicalVersion.observed.scriptName !== script ||
+        canonicalVersion.observed.versionId !== versionId ||
+        typeof expected !== "string" ||
+        expected !== bindings.digest
+      ) {
+        throw new SelfhostFailure(
+          failed("conflict", "the Workflow Version has no exact canonical binding pin"),
+        );
+      }
+    }
     const verificationFailure = await verifyPreparedWorkerModule(
       inspected.prepared,
       bindings.handlers,
@@ -1364,6 +1495,19 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         binding,
       }),
     }));
+    const workflowForward = (bindings.workflowBindings ?? []).map((binding) => ({
+      publicName: binding.name,
+      tenantId: binding.tenantId,
+      workflowResourceUid: binding.workflowResourceUid,
+      workflowFormRef: binding.workflowFormRef,
+      bindingRef: binding.bindingRef,
+      runtimeClassRef: binding.runtimeClassRef,
+      token: deriveSelfhostWorkflowBindingToken({
+        eventToken: bindings.eventToken as string,
+        workerVersionResourceUid: bindings.workerVersionResourceUid as string,
+        binding,
+      }),
+    }));
     try {
       const graph = compileWorkerdVersionGraph({
         directory: script,
@@ -1381,6 +1525,14 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         readiness: { publication: readinessPublication, probeHostname: internalHostname(script) },
         serviceBindings: resolvedServices,
         ...(actorForward.length > 0 ? { actorForward } : {}),
+        ...(workflowForward.length > 0
+          ? {
+              workflowForward: {
+                snapshotDigest: bindings.digest,
+                bindings: workflowForward,
+              },
+            }
+          : {}),
         ...(meta.assets && assets
           ? {
               assets: {
@@ -1728,8 +1880,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       .sort((left, right) => (left.name < right.name ? -1 : 1));
   };
 
-  /** Workflow remains unavailable; Actor needs the explicit owned runtime. */
-  const assertSupportedClassBindings = (spec: JsonObject, operationId?: string): void => {
+  /** Only the exact unpublished V10 can opt into the private factual seam. */
+  const assertSupportedClassBindings = (
+    spec: JsonObject,
+    offering: ProviderOffering,
+    operationId?: string,
+  ): void => {
     // Keep workflow first: its refusal predates the actor guard and remains the
     // result when a malformed or unsupported Version declares both fields.
     for (const [field, label] of [
@@ -1739,6 +1895,16 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       const declared = spec[field];
       if (declared === undefined || (Array.isArray(declared) && declared.length === 0)) continue;
       if (field === "actorBindings" && options.actorNamespace && Array.isArray(declared)) continue;
+      if (
+        field === "workflowBindings" &&
+        options.workflowVersionAuthority &&
+        Array.isArray(declared) &&
+        sameSelfhostFormRef(offering.form, SELFHOST_WORKFLOW_VERSION_FORM_REF) &&
+        offering.bindingRefs.some(
+          (ref) => canonicalJson(ref) === canonicalJson(SELFHOST_WORKFLOW_BINDING_REF),
+        )
+      )
+        continue;
       const code = Array.isArray(declared) ? "denied" : "invalid_spec";
       const message = Array.isArray(declared)
         ? `the Worker Version ${label} bindings are not supported by this provider`
@@ -1754,6 +1920,138 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   };
 
   type WorkerVersionDeclarationInput = Pick<ApplyInput, "identity" | "spec" | "relations">;
+
+  const declaredWorkflowBindings = async (
+    input: WorkerVersionDeclarationInput & Pick<ApplyInput, "offering">,
+    callerScript: string,
+    reserved: ReadonlySet<string>,
+  ): Promise<readonly SelfhostVersionWorkflowBinding[]> => {
+    const raw = input.spec.workflowBindings;
+    if (raw === undefined || (Array.isArray(raw) && raw.length === 0)) return [];
+    const invalid = (): never => {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version Workflow bindings are invalid"),
+      );
+    };
+    const workflowAuthority = options.workflowVersionAuthority;
+    if (
+      !Array.isArray(raw) ||
+      raw.length > 64 ||
+      !workflowAuthority ||
+      !sameSelfhostFormRef(input.offering.form, SELFHOST_WORKFLOW_VERSION_FORM_REF) ||
+      !input.identity.uid ||
+      !RESOURCE_UID.test(input.identity.uid)
+    )
+      invalid();
+    const declaredBindings = raw as readonly JsonValue[];
+    const authority = workflowAuthority as NonNullable<typeof workflowAuthority>;
+    const workerRelation = input.relations?.find((entry) => entry.pointer === "/worker");
+    const worker = workerRelation?.resource;
+    const workerDeployment = workerRelation?.deployment;
+    // No WorkerDeployment is required here: a Version can precede its first publication.
+    if (
+      !workerRelation ||
+      !worker ||
+      worker.kind !== "ModuleWorker" ||
+      !sameSelfhostFormRef(worker.form.formRef, SELFHOST_WORKFLOW_WORKER_FORM_REF) ||
+      worker.metadata.space !== input.identity.space ||
+      workerRelation.targetUid !== worker.metadata.uid ||
+      workerDeployment?.tenantId !== input.identity.tenantRef ||
+      workerDeployment.resourceUid !== worker.metadata.uid ||
+      workerDeployment.state !== "active" ||
+      workerDeployment.providerPackRef !== id ||
+      workerDeployment.providerInstallationRef !== "local.primary" ||
+      parseSelfhostNativeId("ModuleWorker", workerDeployment.nativeId)?.script !== callerScript ||
+      workerDeployment.outputs.scriptName !== callerScript
+    )
+      invalid();
+    const names = new Set(reserved);
+    const result: SelfhostVersionWorkflowBinding[] = [];
+    for (let index = 0; index < declaredBindings.length; index += 1) {
+      const declared = isJsonObject(declaredBindings[index])
+        ? (declaredBindings[index] as JsonObject)
+        : null;
+      const resource = isJsonObject(declared?.resource) ? declared.resource : null;
+      const name = typeof declared?.name === "string" ? declared.name : null;
+      const matches =
+        input.relations?.filter(
+          (entry) => entry.pointer === `/workflowBindings/${index}/resource`,
+        ) ?? [];
+      const relation = matches.length === 1 ? matches[0] : undefined;
+      if (
+        !name ||
+        name.length > 64 ||
+        !DATA_BINDING_NAME.test(name) ||
+        name.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX) ||
+        names.has(name) ||
+        !resource ||
+        !relation ||
+        relation.relation !== "/workflowBindings/*/resource" ||
+        canonicalJson(relation.bindingRef) !== canonicalJson(SELFHOST_WORKFLOW_BINDING_REF) ||
+        relation.resource.kind !== "DurableWorkflow" ||
+        !sameSelfhostFormRef(relation.resource.form.formRef, SELFHOST_WORKFLOW_FORM_REF) ||
+        relation.resource.metadata.space !== input.identity.space ||
+        relation.targetUid !== relation.resource.metadata.uid ||
+        !RESOURCE_UID.test(relation.targetUid) ||
+        resource.apiVersion !== relation.resource.apiVersion ||
+        resource.kind !== relation.resource.kind ||
+        resource.name !== relation.resource.metadata.name ||
+        relation.deployment !== undefined
+      )
+        invalid();
+      const target = relation as NonNullable<typeof relation>;
+      const caller = worker as NonNullable<typeof worker>;
+      const publicName = name as string;
+      let graph: WorkflowResourceGraph | null;
+      try {
+        graph = await authority.readCurrentGraph(
+          {
+            tenantId: input.identity.tenantRef,
+            workflowResourceUid: target.targetUid,
+          },
+          AbortSignal.timeout(30_000),
+        );
+      } catch {
+        throw new SelfhostFailure(
+          failed("unavailable", "the Workflow graph authority is unavailable", true),
+        );
+      }
+      if (
+        !graph ||
+        graph.tenantId !== input.identity.tenantRef ||
+        graph.workflow.uid !== target.targetUid ||
+        graph.workflow.address.space !== input.identity.space ||
+        graph.workflow.address.apiVersion !== target.resource.apiVersion ||
+        graph.workflow.address.kind !== target.resource.kind ||
+        graph.workflow.address.name !== target.resource.metadata.name ||
+        !sameSelfhostFormRef(graph.workflow.formRef, SELFHOST_WORKFLOW_FORM_REF) ||
+        graph.workflow.className !== target.resource.spec.className ||
+        graph.worker.uid !== caller.metadata.uid ||
+        graph.worker.address.space !== caller.metadata.space ||
+        graph.worker.address.apiVersion !== caller.apiVersion ||
+        graph.worker.address.kind !== caller.kind ||
+        graph.worker.address.name !== caller.metadata.name ||
+        !sameSelfhostFormRef(graph.worker.formRef, SELFHOST_WORKFLOW_WORKER_FORM_REF) ||
+        graph.runtimeClassRef === undefined ||
+        canonicalJson(graph.runtimeClassRef) !== canonicalJson(SELFHOST_WORKFLOW_RUNTIME_REF)
+      )
+        invalid();
+      names.add(publicName);
+      result.push({
+        name: publicName,
+        tenantId: input.identity.tenantRef,
+        workflowResourceUid: target.targetUid,
+        workflowFormRef: SELFHOST_WORKFLOW_FORM_REF,
+        bindingRef: SELFHOST_WORKFLOW_BINDING_REF,
+        runtimeClassRef: SELFHOST_WORKFLOW_RUNTIME_REF,
+      });
+    }
+    try {
+      return normalizeWorkflowBindings(result) ?? [];
+    } catch {
+      return invalid();
+    }
+  };
 
   /**
    * The Worker Version's KV, queue, and SQLite bindings, resolved to what they
@@ -2544,7 +2842,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (!requiredSensitive) {
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
     }
-    assertSupportedClassBindings(input.spec, input.operationId);
+    assertSupportedClassBindings(input.spec, input.offering, input.operationId);
     const runtimeInputTarget = sensitiveTarget(input);
     if (requiredSensitive.length > 0 && !claimAvailable(input, runtimeInputTarget)) {
       return failed("denied", "required sensitive Worker runtime inputs are unavailable");
@@ -2588,6 +2886,17 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         ...requiredSensitive,
         ...dataBindings.map((binding) => binding.name),
         ...serviceBindings.map((binding) => binding.name),
+      ]),
+    );
+    const workflowBindings = await declaredWorkflowBindings(
+      input,
+      script,
+      new Set([
+        ...vars.map((binding) => binding.name),
+        ...requiredSensitive,
+        ...dataBindings.map((binding) => binding.name),
+        ...serviceBindings.map((binding) => binding.name),
+        ...actorBindings.map((binding) => binding.name),
       ]),
     );
     if (
@@ -2647,19 +2956,21 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           ...dataBindings.map(({ name }) => name),
           ...serviceBindings.map(({ name }) => name),
           ...actorBindings.map(({ name }) => name),
+          ...workflowBindings.map(({ name }) => name),
         ]),
       );
     } catch (error) {
       if (error instanceof SelfhostStandardServiceError) return failed("denied", error.message);
       throw error;
     }
-    if (serviceBindings.length > 0 || actorBindings.length > 0) {
+    if (serviceBindings.length > 0 || actorBindings.length > 0 || workflowBindings.length > 0) {
       const existing = await readVersionBindings(script, versionId);
       if (
         existing &&
         (existing.workerResourceUid === undefined ||
           existing.serviceBindings === undefined ||
-          (actorBindings.length > 0 && !existing.actorBindings))
+          (actorBindings.length > 0 && !existing.actorBindings) ||
+          (workflowBindings.length > 0 && !existing.workflowBindings))
       ) {
         return failed(
           "invalid_spec",
@@ -2721,6 +3032,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         serviceBindings,
         ...(actorBindings.length > 0
           ? { workerVersionResourceUid: input.identity.uid, actorBindings }
+          : {}),
+        ...(workflowBindings.length > 0
+          ? { workerVersionResourceUid: input.identity.uid, workflowBindings }
           : {}),
         ...(externalServices.length > 0 ? { externalServices } : {}),
         ...(dataPlane ? { dataPlane } : {}),
@@ -2808,11 +3122,21 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         dataBindings,
         serviceBindings,
         actorBindings,
+        workflowBindings,
         input.spec,
       ) ||
       (lease && recorded?.runtimeInputGeneration !== lease.preparation.generation)
     ) {
       return failed("unavailable", "the Worker Version did not settle on this machine", true);
+    }
+    if (workflowBindings.length > 0) {
+      await assertExistingWorkflowPin(
+        input.identity.tenantRef,
+        input.identity.uid as string,
+        script,
+        versionId,
+        recorded,
+      );
     }
     if (dispatched && runtimeInputMarker) {
       try {
@@ -2847,6 +3171,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         ...(serviceBindings.length > 0
           ? { serviceBindingNames: serviceBindings.map((binding) => binding.name) }
           : {}),
+        ...(workflowBindings.length > 0
+          ? { workflowBindingsDigest: recorded?.digest as string }
+          : {}),
       },
       outputs: {
         scriptName: script,
@@ -2867,7 +3194,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (!requiredSensitive) {
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
     }
-    assertSupportedClassBindings(input.spec, input.operationId);
+    assertSupportedClassBindings(input.spec, input.offering, input.operationId);
     const runtimeInputTarget = sensitiveTarget(input);
     if (requiredSensitive.length > 0 && !leasesAvailable(input, runtimeInputTarget)) {
       return failed("denied", "required sensitive Worker runtime inputs are unavailable");
@@ -2912,6 +3239,17 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         ...requiredSensitive,
         ...dataBindings.map((binding) => binding.name),
         ...serviceBindings.map((binding) => binding.name),
+      ]),
+    );
+    const workflowBindings = await declaredWorkflowBindings(
+      input,
+      script,
+      new Set([
+        ...vars.map((binding) => binding.name),
+        ...requiredSensitive,
+        ...dataBindings.map((binding) => binding.name),
+        ...serviceBindings.map((binding) => binding.name),
+        ...actorBindings.map((binding) => binding.name),
       ]),
     );
     if (dataBindings.length > 0 && !options.dataPlaneAddress) {
@@ -3056,11 +3394,21 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         dataBindings,
         serviceBindings,
         actorBindings,
+        workflowBindings,
         input.spec,
       ) ||
       (recoveryLease && recorded?.runtimeInputGeneration !== recoveryLease.preparation.generation)
     ) {
       return failed("not_found", "the Worker Version environment was not recorded");
+    }
+    if (workflowBindings.length > 0) {
+      await assertExistingWorkflowPin(
+        input.identity.tenantRef,
+        input.identity.uid as string,
+        script,
+        versionId,
+        recorded,
+      );
     }
     const verificationFailure = await verifyPreparedWorkerModule(materialized.prepared, handlers);
     if (verificationFailure) return verificationFailure;
@@ -3094,6 +3442,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           : {}),
         ...(serviceBindings.length > 0
           ? { serviceBindingNames: serviceBindings.map((binding) => binding.name) }
+          : {}),
+        ...(workflowBindings.length > 0
+          ? { workflowBindingsDigest: recorded?.digest as string }
           : {}),
       },
       outputs: {
@@ -4765,7 +5116,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             });
           }
           case "WorkerVersion": {
-            assertSupportedClassBindings(input.spec);
+            assertSupportedClassBindings(input.spec, input.offering);
             const workerRelation = input.relations?.find(
               (candidate) => candidate.pointer === "/worker",
             );
@@ -4829,9 +5180,51 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               script,
               new Set(serviceBindings.map((binding) => binding.name)),
             );
+            const workflowBindings = await declaredWorkflowBindings(
+              input,
+              script,
+              new Set([
+                ...serviceBindings.map((binding) => binding.name),
+                ...actorBindings.map((binding) => binding.name),
+              ]),
+            );
+            let pinnedWorkflowDigest: string | undefined;
+            if (workflowBindings.length > 0) {
+              const authority = options.workflowVersionAuthority;
+              const canonical =
+                authority && input.identity.uid
+                  ? await readCanonicalWorkflowVersion({
+                      tenantId: input.identity.tenantRef,
+                      workerVersionResourceUid: input.identity.uid,
+                    })
+                  : null;
+              if (
+                !canonical ||
+                canonical.tenantId !== input.identity.tenantRef ||
+                canonical.resourceUid !== input.identity.uid ||
+                canonical.state !== "active" ||
+                canonical.providerPackRef !== id ||
+                canonical.providerInstallationRef !== "local.primary" ||
+                canonical.nativeId !== input.nativeId ||
+                parseSelfhostNativeId("WorkerVersion", canonical.nativeId)?.script !== script ||
+                parseSelfhostNativeId("WorkerVersion", canonical.nativeId)?.versionId !==
+                  versionId ||
+                !canonical.nativeId.startsWith(`selfhost-version:${script}:${versionId}:`) ||
+                canonical.observed.scriptName !== script ||
+                canonical.observed.versionId !== versionId ||
+                canonical.observed.workflowBindingsDigest !== bindings.digest
+              ) {
+                return failed(
+                  "conflict",
+                  "the Workflow Version has no exact canonical binding pin",
+                );
+              }
+              pinnedWorkflowDigest = bindings.digest;
+            }
             if (
               !sameVersionAuthority(bindings, worker.metadata.uid, serviceBindings) ||
               !sameActorBindingAuthority(bindings, input.identity.uid, actorBindings) ||
+              !sameWorkflowBindingAuthority(bindings, input.identity.uid, workflowBindings) ||
               !sameSelfhostStandardServiceDeclaration(input.spec, bindings.externalServices)
             ) {
               return failed(
@@ -4851,6 +5244,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                 versionId,
                 materialized: true,
                 materializationDigest: materialized.prepared.materializationDigest,
+                ...(pinnedWorkflowDigest ? { workflowBindingsDigest: pinnedWorkflowDigest } : {}),
               },
               outputs: {
                 scriptName: script,
@@ -6948,6 +7342,7 @@ function sameVersionDeclaration(
   dataBindings: readonly SelfhostVersionDataBinding[],
   serviceBindings: readonly SelfhostVersionServiceBinding[],
   actorBindings: readonly SelfhostVersionActorBinding[],
+  workflowBindings: readonly SelfhostVersionWorkflowBinding[],
   spec: JsonObject,
 ): boolean {
   if (
@@ -6955,6 +7350,7 @@ function sameVersionDeclaration(
     !sameStrings(recorded.handlers, handlers) ||
     !sameVersionAuthority(recorded, workerResourceUid, serviceBindings) ||
     !sameActorBindingAuthority(recorded, workerVersionResourceUid, actorBindings) ||
+    !sameWorkflowBindingAuthority(recorded, workerVersionResourceUid, workflowBindings) ||
     !sameSelfhostStandardServiceDeclaration(spec, recorded.externalServices)
   ) {
     return false;
@@ -6993,14 +7389,31 @@ function sameVersionDeclaration(
   );
 }
 
+function sameWorkflowBindingAuthority(
+  recorded: StoredSelfhostVersionBindings | null,
+  workerVersionResourceUid: string | undefined,
+  workflowBindings: readonly SelfhostVersionWorkflowBinding[],
+): boolean {
+  if (!recorded) return false;
+  if (workflowBindings.length === 0)
+    return (
+      recorded.workflowBindings === undefined &&
+      (recorded.actorBindings !== undefined || recorded.workerVersionResourceUid === undefined)
+    );
+  return (
+    recorded.workerVersionResourceUid === workerVersionResourceUid &&
+    canonicalJson(recorded.workflowBindings ?? []) ===
+      canonicalJson(normalizeWorkflowBindings(workflowBindings) ?? [])
+  );
+}
+
 function sameActorBindingAuthority(
   recorded: StoredSelfhostVersionBindings | null,
   workerVersionResourceUid: string | undefined,
   actorBindings: readonly SelfhostVersionActorBinding[],
 ): boolean {
   if (!recorded) return false;
-  if (actorBindings.length === 0)
-    return recorded.actorBindings === undefined && recorded.workerVersionResourceUid === undefined;
+  if (actorBindings.length === 0) return recorded.actorBindings === undefined;
   if (recorded.workerVersionResourceUid !== workerVersionResourceUid) return false;
   const canonical = (bindings: readonly SelfhostVersionActorBinding[]) =>
     JSON.stringify([...bindings].sort((a, b) => a.name.localeCompare(b.name)));

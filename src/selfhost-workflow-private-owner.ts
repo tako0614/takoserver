@@ -23,6 +23,7 @@ import {
 } from "./workflow-execution.ts";
 import {
   isExactWorkflowV3InterfaceRef,
+  WorkflowInstanceError,
   type WorkflowInstances,
   type WorkflowScope,
 } from "./workflow-instances.ts";
@@ -173,6 +174,7 @@ export function createSelfhostWorkflowPrivateOwner(options: {
   const readTrustedTarget = async (
     scope: WorkflowScope,
     signal: AbortSignal,
+    unsupportedIfNoActiveDeployment = false,
   ): Promise<{
     readonly graph: WorkflowResourceGraph;
     readonly deployment: ResourceDeployment;
@@ -203,6 +205,9 @@ export function createSelfhostWorkflowPrivateOwner(options: {
       return null;
     const active = await deployments.active(scope.tenantId, resolved.worker.uid);
     signal.throwIfAborted();
+    if (!active && unsupportedIfNoActiveDeployment) {
+      throw new WorkflowInstanceError("unsupported_capability");
+    }
     const script = active?.outputs.scriptName;
     if (
       active?.state !== "active" ||
@@ -354,7 +359,7 @@ export function createSelfhostWorkflowPrivateOwner(options: {
             if (closed) throw new WorkflowRuntimeError("host_unavailable");
             // These reads share the caller's Sql. Abort may prevent later
             // work, but close must JOIN the actual query before Sql handoff.
-            const trusted = await readTrustedTarget(scope, controller.signal);
+            const trusted = await readTrustedTarget(scope, controller.signal, true);
             if (closed || !trusted) throw new WorkflowRuntimeError("host_unavailable");
             let selected: Awaited<ReturnType<typeof readWorkerdSelectedActiveVersion>>;
             try {
@@ -369,9 +374,9 @@ export function createSelfhostWorkflowPrivateOwner(options: {
             } catch {
               throw new WorkflowRuntimeError("host_unavailable");
             }
+            if (closed) throw new WorkflowRuntimeError("host_unavailable");
+            if (!selected) throw new WorkflowRuntimeError("host_unavailable");
             if (
-              closed ||
-              !selected ||
               ((selected.site.serviceBindings?.length ?? 0) > 0 &&
                 options.serviceRuntime === undefined) ||
               (selected.site.dataPlane && options.dataPlaneAddress === undefined)
