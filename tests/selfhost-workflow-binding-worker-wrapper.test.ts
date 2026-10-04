@@ -180,6 +180,7 @@ export function __takoserverSelfhostProjectEnv(rawEnv) { return rawEnv; }
 export const takoserverSelfhostEvents = { async fetch(_request, env) { return new Response(describe(env)); } };
 `;
   const directory = mkdtempSync(join(tmpdir(), "workflow-binding-wrapper-"));
+  const responseDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Response");
   try {
     writeFileSync(
       join(directory, "actor-runtime.mjs"),
@@ -247,6 +248,11 @@ export const takoserverSelfhostEvents = { async fetch(_request, env) { return ne
     expect(projectEnv[selectedBinding.serviceName]).toBeUndefined();
     expect(JSON.stringify(projectEnv)).not.toContain(selectedBinding.token);
   } finally {
+    if (responseDescriptor) {
+      Object.defineProperty(globalThis, "Response", responseDescriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "Response");
+    }
     rmSync(directory, { recursive: true, force: true });
   }
 });
