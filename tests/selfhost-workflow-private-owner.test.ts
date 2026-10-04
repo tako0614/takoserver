@@ -12,6 +12,7 @@ import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { forwardTakoformCandidates } from "../src/takoform/forward-candidates.ts";
 import type { InstalledTakoformForm } from "../src/takoform/types.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
+import { WorkflowRuntimeError } from "../src/workflow-driver.ts";
 
 const NOW = Date.UTC(2026, 9, 4);
 const TENANT = "tenant-workflow";
@@ -287,6 +288,89 @@ test("private instance creation refuses an unqualified Workflow graph", async ()
   }
 });
 
+test("private instance creation reports unsupported capability when no serving Deployment exists", async () => {
+  const db = new Database(":memory:");
+  databases.push(db);
+  migrateSqlite(db);
+  const sql = createSqliteSql(db);
+  await insertSelectedPair(sql);
+  const owner = createSelfhostWorkflowPrivateOwner({
+    sql,
+    clock: () => new Date(NOW),
+    randomId: () => "unused-private-id",
+    waitUntil: async () => {
+      throw new Error("no waiting expected");
+    },
+    runtimeRoot: "/unmounted-workflow-runtime",
+    guardBinary: "/unmounted-workflow-guard",
+    workerdBinary: "/unmounted-workerd",
+    maximumRegistrations: 1,
+    providerPackRef: "selfhost-test-pack",
+    providerInstallationRef: "selfhost-test-installation",
+  });
+  try {
+    await expect(
+      owner.instances.create(
+        { tenantId: TENANT, workflowResourceUid: "wf-qualified" },
+        { id: "instance-no-serving-deployment" },
+      ),
+    ).rejects.toMatchObject({ code: "unsupported_capability" });
+    expect(await sql.query("SELECT * FROM tf_workflow_instances")).toEqual([]);
+    await owner.close();
+    await expect(
+      owner.instances.create(
+        { tenantId: TENANT, workflowResourceUid: "wf-qualified" },
+        { id: "instance-after-close" },
+      ),
+    ).rejects.toMatchObject({ code: "host_unavailable" });
+    expect(await sql.query("SELECT * FROM tf_workflow_instances")).toEqual([]);
+  } finally {
+    await owner.close();
+  }
+});
+
+test("private instance creation preserves backend failure when serving-state SQL is unavailable", async () => {
+  const db = new Database(":memory:");
+  databases.push(db);
+  migrateSqlite(db);
+  const sqlite = createSqliteSql(db);
+  await insertSelectedPair(sqlite);
+  const sql: Sql = {
+    ...sqlite,
+    async query(statement, params) {
+      if (statement.includes("FROM tf_resource_deployments")) {
+        throw new WorkflowRuntimeError("backend_unavailable");
+      }
+      return sqlite.query(statement, params);
+    },
+  };
+  const owner = createSelfhostWorkflowPrivateOwner({
+    sql,
+    clock: () => new Date(NOW),
+    randomId: () => "unused-private-id",
+    waitUntil: async () => {
+      throw new Error("no waiting expected");
+    },
+    runtimeRoot: "/unmounted-workflow-runtime",
+    guardBinary: "/unmounted-workflow-guard",
+    workerdBinary: "/unmounted-workerd",
+    maximumRegistrations: 1,
+    providerPackRef: "selfhost-test-pack",
+    providerInstallationRef: "selfhost-test-installation",
+  });
+  try {
+    await expect(
+      owner.instances.create(
+        { tenantId: TENANT, workflowResourceUid: "wf-qualified" },
+        { id: "instance-storage-failure" },
+      ),
+    ).rejects.toMatchObject({ code: "backend_unavailable" });
+    expect(await sqlite.query("SELECT * FROM tf_workflow_instances")).toEqual([]);
+  } finally {
+    await owner.close();
+  }
+});
+
 test("private close drains a begun direct run before handing off its Sql", async () => {
   const db = new Database(":memory:");
   databases.push(db);
@@ -338,7 +422,7 @@ test("private close drains a begun direct run before handing off its Sql", async
   expect(closeSettled).toBe(true);
 });
 
-test("private instance creation refuses a graph and active Deployment without a selected live Version", async () => {
+test("private instance creation treats a missing selected Version marker as unavailable host state", async () => {
   const db = new Database(":memory:");
   databases.push(db);
   migrateSqlite(db);
@@ -384,6 +468,80 @@ test("private instance creation refuses a graph and active Deployment without a 
         { id: "instance-2" },
       ),
     ).rejects.toMatchObject({ code: "host_unavailable" });
+  } finally {
+    await owner.close();
+  }
+});
+
+test("private instance creation keeps a stale selected Worker UID as unavailable host state", async () => {
+  const db = new Database(":memory:");
+  databases.push(db);
+  migrateSqlite(db);
+  const sql = createSqliteSql(db);
+  await insertSelectedPair(sql);
+  await createResourceDeploymentStore(sql, () => new Date(NOW)).create({
+    tenantId: TENANT,
+    id: "deployment-qualified",
+    resourceUid: "worker-qualified",
+    offeringId: "offering-qualified",
+    providerPackRef: "selfhost-test-pack",
+    providerInstallationRef: "selfhost-test-installation",
+    nativeId: "selfhost-worker:worker-script:operation-qualified",
+    state: "active",
+    observed: { scriptName: "worker-script" },
+    outputs: { scriptName: "worker-script" },
+  });
+  const root = mkdtempSync(join(tmpdir(), "takoserver-workflow-private-owner-stale-worker-"));
+  runtimeRoots.push(root);
+  const serving = createWorkerdRuntime({ root, isReady: () => true });
+  if (!serving.publish) throw new Error("weighted publication is unavailable");
+  await serving.publish("worker-script", {
+    generation: "generation-stale-worker",
+    workerResourceUid: "worker-replaced",
+    hostnames: [],
+    versions: [
+      {
+        versionId: "version-stale-worker",
+        workerVersionUid: "worker-version-stale-worker",
+        weight: 10_000,
+        site: {
+          directory: "worker-script",
+          mainModule: "app.js",
+          hostEntrypoint: "__host.js",
+          hostnames: [],
+          generation: "generation-stale-worker",
+          workerResourceUid: "worker-replaced",
+          fetchHandler: true,
+        },
+        modules: new Map([["app.js", new TextEncoder().encode("export default { fetch() {} };")]]),
+        hostModules: new Map([
+          ["__host.js", new TextEncoder().encode("export { default } from './app.js';")],
+        ]),
+      },
+    ],
+  });
+  const owner = createSelfhostWorkflowPrivateOwner({
+    sql,
+    clock: () => new Date(NOW),
+    randomId: () => "unused-private-id",
+    waitUntil: async () => {
+      throw new Error("no waiting expected");
+    },
+    runtimeRoot: root,
+    guardBinary: "/unmounted-workflow-guard",
+    workerdBinary: "/unmounted-workerd",
+    maximumRegistrations: 1,
+    providerPackRef: "selfhost-test-pack",
+    providerInstallationRef: "selfhost-test-installation",
+  });
+  try {
+    await expect(
+      owner.instances.create(
+        { tenantId: TENANT, workflowResourceUid: "wf-qualified" },
+        { id: "instance-stale-worker" },
+      ),
+    ).rejects.toMatchObject({ code: "host_unavailable" });
+    expect(await sql.query("SELECT * FROM tf_workflow_instances")).toEqual([]);
   } finally {
     await owner.close();
   }
