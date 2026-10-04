@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { get as httpsGet } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -56,6 +57,89 @@ async function certificateFixture(subjectAltName = "DNS:*.example.test") {
       await rm(directory, { recursive: true, force: true });
     },
   };
+}
+
+async function liveLoopbackListener(
+  fixture: Awaited<ReturnType<typeof certificateFixture>>,
+  options: { readonly rejectFirstStop?: boolean } = {},
+) {
+  let server:
+    | {
+        readonly port: number | undefined;
+        stop(closeActiveConnections?: boolean): void | Promise<void>;
+      }
+    | undefined;
+  let underlyingPort: number | undefined;
+  let rejectNextStop = options.rejectFirstStop ?? false;
+  const stopModes: boolean[] = [];
+  const listener = await createSelfhostContainerEndpointHttpsListener({
+    configuration: { configuredSuffix: suffix, publicOrigin: `https://${suffix}`, port: 443 },
+    certificateChain: fixture.certificateChain,
+    privateKey: fixture.privateKey,
+    factories: {
+      serve(options) {
+        const liveServer = Bun.serve({ ...options, port: 0, hostname: "127.0.0.1" });
+        server = liveServer;
+        underlyingPort = liveServer.port;
+        return {
+          port: 443,
+          stop(closeActiveConnections) {
+            stopModes.push(closeActiveConnections ?? false);
+            if (rejectNextStop) {
+              rejectNextStop = false;
+              return Promise.reject(new Error("synthetic stop outcome unknown"));
+            }
+            return server?.stop(closeActiveConnections);
+          },
+        };
+      },
+      async proveSni(input) {
+        if (underlyingPort === undefined) throw new Error("loopback listener was not created");
+        await verifySelfhostContainerEndpointHttpsHandshake({
+          ...input,
+          host: "127.0.0.1",
+          port: underlyingPort,
+        });
+      },
+    },
+  });
+  if (underlyingPort === undefined) throw new Error("loopback listener was not created");
+  return { listener, port: underlyingPort, stopModes };
+}
+
+function tlsGet(
+  port: number,
+  path: string,
+): Promise<{ readonly status: number; readonly body: string }> {
+  const host = `ce-${"0".repeat(40)}.${suffix}`;
+  return new Promise((resolve) => {
+    const request = httpsGet(
+      {
+        hostname: "127.0.0.1",
+        port,
+        servername: host,
+        path,
+        headers: { host },
+        rejectUnauthorized: false,
+      },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => (body += chunk));
+        response.once("end", () => resolve({ status: response.statusCode ?? 0, body }));
+      },
+    );
+    request.setTimeout(5_000, () => request.destroy(new Error("test HTTPS request timed out")));
+    request.once("error", () => resolve({ status: 0, body: "" }));
+  });
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
 }
 
 test("Container endpoint HTTPS requires explicit suffix and the existing runtime", () => {
@@ -270,8 +354,8 @@ test("live listener capability is minted only after independent local SNI proof"
         dispatch = options.fetch;
         return {
           port: 443,
-          async stop() {
-            calls.push("stop");
+          async stop(closeActiveConnections = true) {
+            calls.push(`stop:${closeActiveConnections}`);
           },
         };
       },
@@ -322,8 +406,148 @@ test("live listener capability is minted only after independent local SNI proof"
     expect(await failed?.text()).toBe("");
   } finally {
     await listener.close();
-    expect(calls.at(-1)).toBe("stop");
+    expect(calls.at(-1)).toBe("stop:true");
     expect(() => listener.ingress.assertServing()).toThrow("not serving");
+    await fixture.cleanup();
+  }
+});
+
+test("default close force-cuts an accepted pending HTTPS response", async () => {
+  const fixture = await certificateFixture();
+  const accepted = deferred();
+  const responseGate = deferred();
+  const { listener, port, stopModes } = await liveLoopbackListener(fixture);
+  listener.installEndpointFetch(async () => {
+    accepted.resolve();
+    await responseGate.promise;
+    return new Response("completed after force close");
+  });
+
+  try {
+    const response = tlsGet(port, "/pending-force");
+    await accepted.promise;
+    const close = listener.close();
+    expect(listener.close()).toBe(close);
+    await close;
+    expect(stopModes).toEqual([true]);
+    expect(() => listener.ingress.assertServing()).toThrow("not serving");
+    responseGate.resolve();
+    expect((await response).status).not.toBe(200);
+  } finally {
+    responseGate.resolve();
+    await listener.close();
+    await fixture.cleanup();
+  }
+});
+
+test("graceful close waits for accepted response bodies and refuses new requests", async () => {
+  const fixture = await certificateFixture();
+  const accepted = deferred();
+  const handlerGate = deferred();
+  const bodyStarted = deferred();
+  const bodyGate = deferred();
+  const { listener, port, stopModes } = await liveLoopbackListener(fixture);
+  listener.installEndpointFetch(async () => {
+    accepted.resolve();
+    await handlerGate.promise;
+    let started = false;
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (!started) {
+          started = true;
+          bodyStarted.resolve();
+        }
+        await bodyGate.promise;
+        controller.enqueue(new TextEncoder().encode("drained"));
+        controller.close();
+      },
+    });
+    return new Response(body);
+  });
+
+  try {
+    const response = tlsGet(port, "/pending-graceful");
+    await accepted.promise;
+    const close = listener.close(false);
+    expect(listener.close(false)).toBe(close);
+    expect(() => listener.ingress.assertServing()).toThrow("not serving");
+    expect(stopModes).toEqual([false]);
+
+    let closeSettled = false;
+    void close.then(
+      () => (closeSettled = true),
+      () => (closeSettled = true),
+    );
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    const refused = await tlsGet(port, "/after-close").then(
+      (result) => result.status,
+      () => 0,
+    );
+    expect(refused).not.toBe(200);
+
+    handlerGate.resolve();
+    await bodyStarted.promise;
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    bodyGate.resolve();
+    expect(await response).toEqual({ status: 200, body: "drained" });
+    await close;
+    expect(closeSettled).toBe(true);
+    expect(listener.close(true)).toBe(close);
+    expect(stopModes).toEqual([false]);
+  } finally {
+    handlerGate.resolve();
+    bodyGate.resolve();
+    await listener.close(true);
+    await fixture.cleanup();
+  }
+});
+
+test("force close escalates pending graceful stop through the retained listener", async () => {
+  const fixture = await certificateFixture();
+  const accepted = deferred();
+  const responseGate = deferred();
+  const { listener, port, stopModes } = await liveLoopbackListener(fixture);
+  listener.installEndpointFetch(async () => {
+    accepted.resolve();
+    await responseGate.promise;
+    return new Response("must not survive forced close");
+  });
+
+  try {
+    const response = tlsGet(port, "/pending-escalation");
+    await accepted.promise;
+    const close = listener.close(false);
+    expect(listener.close(true)).toBe(close);
+    await close;
+    expect(stopModes).toEqual([false, true]);
+    expect(() => listener.ingress.assertServing()).toThrow("not serving");
+    responseGate.resolve();
+    expect((await response).status).not.toBe(200);
+  } finally {
+    responseGate.resolve();
+    await listener.close(true);
+    await fixture.cleanup();
+  }
+});
+
+test("a rejected close keeps the listener handle available for forced retry", async () => {
+  const fixture = await certificateFixture();
+  const { listener, port, stopModes } = await liveLoopbackListener(fixture, {
+    rejectFirstStop: true,
+  });
+  listener.installEndpointFetch(() => new Response("must refuse after close starts"));
+
+  try {
+    await expect(listener.close(false)).rejects.toThrow("synthetic stop outcome unknown");
+    expect(() => listener.ingress.assertServing()).toThrow("not serving");
+    expect(await tlsGet(port, "/after-rejected-close")).toEqual({ status: 503, body: "" });
+    await listener.close(true);
+    expect(stopModes).toEqual([false, true]);
+    expect(() => listener.ingress.assertServing()).toThrow("not serving");
+  } finally {
+    await listener.close(true).catch(() => undefined);
     await fixture.cleanup();
   }
 });
