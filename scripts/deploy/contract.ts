@@ -1776,6 +1776,7 @@ export const DEPLOY_CONTRACT = {
       covers: [
         "scripts/deploy.ts",
         "scripts/deploy/org-api-key.ts",
+        "scripts/deploy/operator-authority.ts",
         "scripts/deploy/identity.ts",
         "scripts/deploy/target.ts",
         "src/auth.ts",
