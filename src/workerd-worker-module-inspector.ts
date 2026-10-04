@@ -2,13 +2,17 @@ import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { ACTOR_NATIVE_BOOTSTRAP_SOURCE } from "./generated/actor-native-bootstrap.ts";
 import {
   semanticInspectionPreludeSource,
   semanticInspectionTestWrapperSource,
+  snapshotWorkerActorClassInspectionInput,
   snapshotWorkerModuleInspectionInput,
   WORKER_MODULE_AUXILIARY_MEDIA_TYPES,
   WORKER_MODULE_HANDLER_NAMES,
   WORKER_MODULE_IMPORTABLE_MEDIA_TYPES,
+  type WorkerActorClassInspectionInput,
+  type WorkerActorClassInspectionResult,
   type WorkerModuleHandlerName,
   type WorkerModuleInspectionInput,
   type WorkerModuleInspectionModule,
@@ -86,6 +90,21 @@ export function createWorkerdWorkerModuleInspector(
         return Promise.resolve(unavailable());
       }
       return inspectSnapshot({
+        binary,
+        snapshot,
+        wallTimeoutMs,
+        outputLimitBytes,
+        ...(options.temporaryRoot === undefined ? {} : { temporaryRoot: options.temporaryRoot }),
+      });
+    },
+    inspectActorClass(input) {
+      let snapshot: WorkerActorClassInspectionInput;
+      try {
+        snapshot = snapshotWorkerActorClassInspectionInput(input);
+      } catch {
+        return Promise.resolve(unavailableActorClass());
+      }
+      return inspectActorClassSnapshot({
         binary,
         snapshot,
         wallTimeoutMs,
@@ -177,6 +196,210 @@ async function inspectSnapshot(input: {
     }
   }
   return result;
+}
+
+async function inspectActorClassSnapshot(input: {
+  readonly binary: string | null;
+  readonly snapshot: WorkerActorClassInspectionInput;
+  readonly wallTimeoutMs: number;
+  readonly outputLimitBytes: number;
+  readonly temporaryRoot?: string;
+}): Promise<WorkerActorClassInspectionResult> {
+  const admitted = admitSnapshot({
+    mainModule: input.snapshot.mainModule,
+    modules: input.snapshot.modules,
+    declaredHandlers: [],
+  });
+  if ("outcome" in admitted || input.binary === null) return unavailableActorClass();
+
+  let root: string;
+  try {
+    const temporaryRoot = input.temporaryRoot ?? tmpdir();
+    await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
+    await chmod(temporaryRoot, 0o700);
+    root = await mkdtemp(join(temporaryRoot, "takoserver-actor-class-inspection-"));
+    await chmod(root, 0o700);
+  } catch {
+    return unavailableActorClass();
+  }
+
+  let childExited = true;
+  let result: WorkerActorClassInspectionResult = unavailableActorClass();
+  try {
+    const generated = generatedNames(admitted.mainModule);
+    const nonce = `${randomBytes(32).toString("base64url")}:`;
+    const helperName = actorHelperName(admitted.modules);
+    const wrapper = actorClassInspectionWrapperSource({
+      preludeModuleSpecifier: `./${generated.preludeName}`,
+      helperModuleSpecifier: `./${helperName}`,
+      tenantModuleSpecifier: `./${admitted.mainModule}`,
+      className: input.snapshot.className,
+      runtimeClassRef: input.snapshot.runtimeClassRef,
+      nonce,
+    });
+    await writeActorClassInspection(
+      root,
+      generated,
+      helperName,
+      admitted.mainModule,
+      admitted.importableModules,
+      semanticInspectionPreludeSource({ startupReportNonce: nonce }),
+      wrapper,
+    );
+    const execution = await runWorkerd({
+      binary: input.binary,
+      root,
+      wallTimeoutMs: input.wallTimeoutMs,
+      outputLimitBytes: input.outputLimitBytes,
+    });
+    childExited = execution.childExited;
+    result = classifyActorClassExecution(execution, nonce);
+  } catch {
+    result = unavailableActorClass();
+  } finally {
+    if (childExited) {
+      try {
+        await rm(root, { recursive: true, force: true });
+      } catch {
+        result = unavailableActorClass();
+      }
+    } else {
+      result = unavailableActorClass();
+    }
+  }
+  return result;
+}
+
+function actorHelperName(modules: readonly WorkerModuleInspectionModule[]): string {
+  const names = new Set(modules.map((entry) => entry.name));
+  let name = "__takoserver-actor-class-inspection-helper.mjs";
+  for (let ordinal = 1; names.has(name); ordinal += 1) {
+    name = `__takoserver-actor-class-inspection-helper-${ordinal}.mjs`;
+  }
+  return name;
+}
+
+function actorClassInspectionWrapperSource(input: {
+  readonly preludeModuleSpecifier: string;
+  readonly helperModuleSpecifier: string;
+  readonly tenantModuleSpecifier: string;
+  readonly className: string;
+  readonly runtimeClassRef: WorkerActorClassInspectionInput["runtimeClassRef"];
+  readonly nonce: string;
+}): string {
+  if (
+    !isSafeModuleSpecifier(input.helperModuleSpecifier) ||
+    !isSafeModuleSpecifier(input.preludeModuleSpecifier) ||
+    !isSafeModuleSpecifier(input.tenantModuleSpecifier) ||
+    !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(input.className) ||
+    !/^[A-Za-z0-9_-]{32,160}:$/u.test(input.nonce)
+  ) {
+    throw new TypeError("Actor class inspection wrapper input is invalid");
+  }
+  return `import ${JSON.stringify(input.preludeModuleSpecifier)};
+import { prepareActorClassInspection, resolveActorAbiProfile } from ${JSON.stringify(input.helperModuleSpecifier)};
+import * as actorNamespace from ${JSON.stringify(input.tenantModuleSpecifier)};
+const SafeConsole = console;
+const SafeConsoleLog = console.log;
+const SafeApply = Reflect.apply;
+let verdict = "invalid";
+try {
+  prepareActorClassInspection({
+    namespace: actorNamespace,
+    exportName: ${JSON.stringify(input.className)},
+    profile: resolveActorAbiProfile(${JSON.stringify(input.runtimeClassRef)}),
+  });
+  verdict = "valid";
+} catch {}
+export default {
+  test() { SafeApply(SafeConsoleLog, SafeConsole, [${JSON.stringify(input.nonce)} + verdict]); },
+};
+`;
+}
+
+async function writeActorClassInspection(
+  root: string,
+  generated: GeneratedNames,
+  helperName: string,
+  applicationMain: string,
+  modules: readonly WorkerModuleInspectionModule[],
+  preludeSource: string,
+  wrapperSource: string,
+): Promise<void> {
+  const entries: string[] = [];
+  const hostRoot = join(root, "host-private");
+  const applicationRoot = join(root, "application");
+  await mkdir(hostRoot, { recursive: true, mode: 0o700 });
+  await mkdir(applicationRoot, { recursive: true, mode: 0o700 });
+  await writeFile(join(hostRoot, "entrypoint.mjs"), wrapperSource, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await writeFile(join(hostRoot, "prelude.mjs"), preludeSource, { encoding: "utf8", mode: 0o600 });
+  await writeFile(join(hostRoot, "actor-helper.mjs"), ACTOR_NATIVE_BOOTSTRAP_SOURCE, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  entries.push(
+    moduleEntry(generated.wrapperName, "esModule", "host-private/entrypoint.mjs", "hostPrivate"),
+  );
+  entries.push(
+    moduleEntry(generated.preludeName, "esModule", "host-private/prelude.mjs", "hostPrivate"),
+  );
+  entries.push(moduleEntry(helperName, "esModule", "host-private/actor-helper.mjs", "hostPrivate"));
+  for (let index = 0; index < modules.length; index += 1) {
+    const declaration = modules[index];
+    if (!declaration) throw new Error("Actor class module snapshot changed");
+    const file = `module-${index.toString().padStart(4, "0")}.bin`;
+    await writeFile(join(applicationRoot, file), declaration.bytes, { mode: 0o600 });
+    entries.push(
+      moduleEntry(
+        declaration.name,
+        workerdModuleKind(declaration.mediaType),
+        `application/${file}`,
+        "application",
+      ),
+    );
+  }
+  const config = `using Workerd = import "/workerd/workerd.capnp";
+
+const config : Workerd.Config = (
+  services = [
+    (name = ${capnpText(SERVICE_NAME)}, worker = (modules = [${entries.join(",\n      ")}], compatibilityDate = "2026-01-01", compatibilityFlags = ["disallow_importable_env"], globalOutbound = "inspection-deny", modulePolicy = (applicationMain = ${capnpText(applicationMain)}))),
+    (name = "inspection-deny", network = (allow = [])),
+  ],
+  sockets = [],
+);
+`;
+  await writeFile(join(root, "workerd.capnp"), config, { encoding: "utf8", mode: 0o600 });
+}
+
+export function classifyActorClassExecution(
+  execution: WorkerdExecution,
+  nonce: string,
+): WorkerActorClassInspectionResult {
+  if (
+    !execution.childExited ||
+    execution.exitCode === null ||
+    execution.timedOut ||
+    execution.outputExceeded
+  )
+    return unavailableActorClass();
+  const reports = inspectionReports(execution.stdout, nonce);
+  if (reports[0] !== "start") return unavailableActorClass();
+  if (execution.exitCode !== 0 || reports.length !== 2) return unavailableActorClass();
+  if (reports[1] === "valid") return { outcome: "valid" };
+  return reports[1] === "invalid"
+    ? { outcome: "invalid", error: "actor_class_invalid" }
+    : unavailableActorClass();
+}
+
+function unavailableActorClass(): WorkerActorClassInspectionResult {
+  return { outcome: "unavailable", retryable: true };
+}
+
+function isSafeModuleSpecifier(value: string): boolean {
+  return value.length > 0 && value.length <= 1_100 && !value.includes("\0");
 }
 
 function admitSnapshot(

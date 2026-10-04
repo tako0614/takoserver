@@ -1,5 +1,6 @@
-import type { TakoformBindingRef } from "./interface-ref.ts";
-import { isJsonObject } from "./json.ts";
+import { parseActorAbiRef } from "./actor-abi-ref.ts";
+import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
+import { canonicalJson, isJsonObject } from "./json.ts";
 import type { RuntimeBindingMaterializer, RuntimeBindingMaterialRoute } from "./provider-pack.ts";
 import { SELFHOST_ACTOR_BINDING_REF } from "./providers/selfhost.ts";
 import {
@@ -13,6 +14,8 @@ import {
   isOwnedSelfhostActorPublicRuntime,
   type SelfhostActorPublicRuntime,
 } from "./selfhost-actor-public-runtime.ts";
+import { forwardTakoformCandidates } from "./takoform/forward-candidates.ts";
+import type { InstalledTakoformBinding } from "./takoform/types.ts";
 
 const EXPORTED_BUCKET = Symbol("selfhost-object-bucket-runtime-binding-export");
 const EXPORTED_ACTOR = Symbol("selfhost-actor-runtime-binding-export");
@@ -25,6 +28,8 @@ interface ExportedSelfhostActorBinding {
   readonly namespaceResourceUid: string;
   readonly workerResourceUid: string;
   readonly className: string;
+  readonly bindingRef: TakoformBindingRef;
+  readonly runtimeClassRef?: TakoformInterfaceRef;
 }
 
 interface ExportedSelfhostBucketBinding {
@@ -65,8 +70,45 @@ const SELFHOST_ACTOR_ROUTE = Object.freeze({
 export function createSelfhostRuntimeBindingMaterializer(
   providerPackRef: string,
   actorRuntime?: SelfhostActorPublicRuntime,
+  actorBinding?: InstalledTakoformBinding,
 ): RuntimeBindingMaterializer {
   const actorSupported = isOwnedSelfhostActorPublicRuntime(actorRuntime);
+  const forward = actorBinding ? forwardTakoformCandidates() : undefined;
+  const selected = forward?.bindings.filter(
+    (binding) => canonicalJson(binding) === canonicalJson(actorBinding),
+  );
+  const selectedBinding = selected?.length === 1 ? selected[0] : undefined;
+  const selectedActor = forward?.forms.find(
+    (form) => form.identity.formRef.kind === "ActorNamespace",
+  );
+  const selectedWorker = forward?.forms.find(
+    (form) => form.identity.formRef.kind === "ModuleWorker",
+  );
+  if (
+    actorBinding &&
+    (!actorSupported ||
+      !selectedBinding ||
+      selectedBinding.bindingRef.name !== "module-worker.actor" ||
+      parseActorAbiRef(selectedBinding.targetInterface)?.kind !== "v2" ||
+      !selectedActor ||
+      !selectedWorker ||
+      canonicalJson(selectedActor.workerClassRuntime?.runtimeClassRef) !==
+        canonicalJson(selectedBinding.targetInterface))
+  ) {
+    throw new TypeError("self-host Actor runtime Binding closure unavailable");
+  }
+  const actorRoute: RuntimeBindingMaterialRoute = selectedBinding
+    ? Object.freeze({
+        bindingRef: Object.freeze(structuredClone(selectedBinding.bindingRef)),
+        materialKind: SELFHOST_ACTOR_MATERIAL_KIND,
+      })
+    : SELFHOST_ACTOR_ROUTE;
+  const runtimeClassRef = selectedBinding
+    ? Object.freeze(structuredClone(selectedBinding.targetInterface))
+    : undefined;
+  const sameActorRoute = (route: RuntimeBindingMaterialRoute) =>
+    sameBinding(route.bindingRef, actorRoute.bindingRef) &&
+    route.materialKind === SELFHOST_ACTOR_MATERIAL_KIND;
   const exported = (value: unknown): ExportedSelfhostBucketBinding | null => {
     if (typeof value !== "object" || value === null) return null;
     const candidate = value as Partial<ExportedSelfhostBucketBinding>;
@@ -80,9 +122,7 @@ export function createSelfhostRuntimeBindingMaterializer(
   return {
     id: `${providerPackRef}-runtime-bindings`,
     exporter: {
-      routes: actorSupported
-        ? [SELFHOST_OBJECTS_ROUTE, SELFHOST_ACTOR_ROUTE]
-        : [SELFHOST_OBJECTS_ROUTE],
+      routes: actorSupported ? [SELFHOST_OBJECTS_ROUTE, actorRoute] : [SELFHOST_OBJECTS_ROUTE],
       async exportTarget({ tenantId, relation, route }) {
         if (actorSupported && sameActorRoute(route)) {
           const uid = relation.targetUid;
@@ -97,7 +137,12 @@ export function createSelfhostRuntimeBindingMaterializer(
             relation.deployment.nativeId !== `selfhost-actor:${uid}` ||
             relation.resource.apiVersion !== "edge.forms.takoform.com" ||
             relation.resource.kind !== "ActorNamespace" ||
-            relation.resource.metadata.uid !== uid
+            relation.resource.metadata.uid !== uid ||
+            !relation.bindingRef ||
+            !sameBinding(relation.bindingRef, actorRoute.bindingRef) ||
+            (selectedActor &&
+              canonicalJson(relation.resource.form.formRef) !==
+                canonicalJson(selectedActor.identity.formRef))
           )
             return null;
           const scope = { tenantId, namespaceResourceUid: uid };
@@ -107,6 +152,8 @@ export function createSelfhostRuntimeBindingMaterializer(
           );
           if (
             !graph ||
+            graph.tenantId !== tenantId ||
+            graph.namespace.uid !== uid ||
             graph.namespace.address.space !== relation.resource.metadata.space ||
             graph.namespace.address.name !== relation.resource.metadata.name ||
             graph.namespace.className !== relation.resource.spec.className ||
@@ -114,6 +161,15 @@ export function createSelfhostRuntimeBindingMaterializer(
             graph.worker.address.apiVersion !== relation.resource.spec.worker.apiVersion ||
             graph.worker.address.kind !== relation.resource.spec.worker.kind ||
             graph.worker.address.name !== relation.resource.spec.worker.name ||
+            (runtimeClassRef &&
+              (canonicalJson(graph.runtimeClassRef) !== canonicalJson(runtimeClassRef) ||
+                canonicalJson(graph.worker.formRef) !==
+                  canonicalJson(selectedWorker?.identity.formRef) ||
+                canonicalJson(graph.namespace.formRef) !==
+                  canonicalJson(relation.resource.form.formRef) ||
+                graph.namespace.generation !== relation.resource.metadata.generation ||
+                graph.namespace.revision !== relation.resource.metadata.revision ||
+                graph.worker.address.space !== relation.resource.metadata.space)) ||
             !(await actorRuntime.actorNamespace.hasNamespace(scope))
           )
             return null;
@@ -124,6 +180,8 @@ export function createSelfhostRuntimeBindingMaterializer(
             namespaceResourceUid: uid,
             workerResourceUid: graph.worker.uid,
             className: graph.namespace.className,
+            bindingRef: actorRoute.bindingRef,
+            ...(runtimeClassRef ? { runtimeClassRef } : {}),
           }) satisfies ExportedSelfhostActorBinding;
         }
         const bucketId = relation.deployment.outputs.bucketName;
@@ -144,10 +202,8 @@ export function createSelfhostRuntimeBindingMaterializer(
       },
     },
     importer: {
-      routes: actorSupported
-        ? [SELFHOST_OBJECTS_ROUTE, SELFHOST_ACTOR_ROUTE]
-        : [SELFHOST_OBJECTS_ROUTE],
-      async importBinding({ tenantId, relation, route, exported: capability }) {
+      routes: actorSupported ? [SELFHOST_OBJECTS_ROUTE, actorRoute] : [SELFHOST_OBJECTS_ROUTE],
+      async importBinding({ tenantId, source, relation, route, exported: capability }) {
         if (actorSupported && sameActorRoute(route)) {
           const value = capability.material;
           if (
@@ -158,7 +214,15 @@ export function createSelfhostRuntimeBindingMaterializer(
             capability.materialKind !== SELFHOST_ACTOR_MATERIAL_KIND ||
             (value as ExportedSelfhostActorBinding).providerPackRef !== providerPackRef ||
             (value as ExportedSelfhostActorBinding).tenantId !== tenantId ||
-            (value as ExportedSelfhostActorBinding).namespaceResourceUid !== relation.targetUid
+            (value as ExportedSelfhostActorBinding).namespaceResourceUid !== relation.targetUid ||
+            canonicalJson((value as ExportedSelfhostActorBinding).bindingRef) !==
+              canonicalJson(actorRoute.bindingRef) ||
+            (runtimeClassRef &&
+              (canonicalJson((value as ExportedSelfhostActorBinding).runtimeClassRef) !==
+                canonicalJson(runtimeClassRef) ||
+                source.tenantRef !== tenantId ||
+                source.space !== relation.resource.metadata.space ||
+                canonicalJson(relation.bindingRef) !== canonicalJson(actorRoute.bindingRef)))
           )
             return null;
           const actor = value as ExportedSelfhostActorBinding;
@@ -186,13 +250,6 @@ export function createSelfhostRuntimeBindingMaterializer(
       },
     },
   };
-}
-
-function sameActorRoute(route: RuntimeBindingMaterialRoute): boolean {
-  return (
-    sameBinding(route.bindingRef, SELFHOST_ACTOR_BINDING_REF) &&
-    route.materialKind === SELFHOST_ACTOR_MATERIAL_KIND
-  );
 }
 
 function sameRoute(route: RuntimeBindingMaterialRoute): boolean {

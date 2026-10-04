@@ -230,7 +230,7 @@ test("self-host Actor identity allocates only for a same-tenant pinned Worker re
   }
 });
 
-test("Worker Version pins legacy v8 and forward v9 Actor relations from Host graph", async () => {
+test("Worker Version pins legacy v8 and refuses unselected forward Actor metadata", async () => {
   const root = await mkdtemp(join(tmpdir(), "actor-version-provider-"));
   const candidates = currentTakoformCandidates().forms;
   const form = (kind: string) => {
@@ -546,26 +546,13 @@ test("Worker Version pins legacy v8 and forward v9 Actor relations from Host gra
       }),
     ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
     expect(await readdir(bindingPath)).toEqual(beforeForward);
-    const forwardApplied = await provider.apply(forwardRequest);
-    expect(forwardApplied).toMatchObject({ phase: "succeeded" });
-    if (forwardApplied.phase !== "succeeded")
-      throw new Error("forward Actor Version did not apply");
-    const forwardRaw = JSON.parse(
-      await Bun.file(
-        join(bindingPath, `${String(forwardApplied.result.outputs.versionId)}.json`),
-      ).text(),
-    ) as Record<string, unknown>;
-    expect(forwardRaw.format).toBe("takoserver.selfhost-version-bindings@v9");
-    expect(forwardRaw.actorBindings).toEqual([
-      {
-        name: "COUNTER",
-        tenantId,
-        namespaceResourceUid: actorUid,
-        workerResourceUid: actorWorkerUid,
-        className: "Counter",
-        runtimeClassRef: forwardRef,
-      },
-    ]);
+    // A legacy Binding1 offering cannot infer a forward Actor2 registration
+    // from Host graph metadata; the exact selected Binding2 path is covered separately.
+    expect(await provider.apply(forwardRequest)).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec" },
+    });
+    expect(await readdir(bindingPath)).toEqual(beforeForward);
     ownerGraph = graph;
     const actorBinding = (raw.actorBindings as SelfhostVersionActorBinding[])[0];
     if (!actorBinding) throw new Error("stored Actor relation missing");

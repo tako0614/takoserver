@@ -24,8 +24,11 @@ import {
 import { deriveSelfhostFormAuthorityCatalog } from "../src/selfhost-form-authority-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStandaloneProviderComposition } from "../src/standalone-provider-composition.ts";
+import { createAdmissionHandleIssuer } from "../src/takoform/admission.ts";
+import { createFormAdmissionStore } from "../src/takoform/admission-store.ts";
 import { createTakoformArtifacts } from "../src/takoform/artifacts.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
+import { takoformActivationAudience } from "../src/takoform/host-authority.ts";
 import {
   selfhostLifecycleCapabilityManifest,
   yurucommuLifecycleCapabilityManifest,
@@ -276,7 +279,7 @@ describe("self-host Form admission", () => {
     ).toBe(false);
   });
 
-  test("a restored local Actor owner admits the exact released namespace lifecycle", async () => {
+  test("a restored local Actor owner does not advertise the unimplemented released lifecycle", async () => {
     const fixture = dataRoot();
     let owner: SelfhostActorPublicRuntime | undefined;
     try {
@@ -309,14 +312,8 @@ describe("self-host Form admission", () => {
         stableBindings: candidates.bindings,
         actorRuntime: owner,
       };
-      const capabilities = selfhostLifecycleCapabilityManifest(
-        SELFHOST_IDENTITY_CAPABILITY_KINDS,
-        actorForm,
-      );
-      const implementationPayloadDigest = await canonicalDigest({
-        kind: "takoserver.selfhost-form-implementation@v1",
-        capabilities,
-      });
+      const capabilities = SELFHOST_CAPABILITIES;
+      const implementationPayloadDigest = SELFHOST_IMPLEMENTATION_PAYLOAD_DIGEST;
       await expect(
         deriveSelfhostFormAuthorityCatalog({ implementationPayloadDigest, capabilities, source }),
       ).rejects.toMatchObject({ code: "production_not_ready" });
@@ -327,44 +324,22 @@ describe("self-host Form admission", () => {
         capabilities,
         source,
       });
-      expect(
-        catalog.entries.find((entry) => entry.formRef.kind === "ActorNamespace")?.operations,
-      ).toEqual(["create", "read", "delete", "import", "observe"]);
-      expect(catalog.capabilityDigest).not.toBe(SELFHOST_CATALOG.capabilityDigest);
+      expect(catalog.entries.some((entry) => entry.formRef.kind === "ActorNamespace")).toBe(false);
+      expect(catalog.capabilityDigest).toBe(SELFHOST_CATALOG.capabilityDigest);
+      const actorCapabilities = selfhostLifecycleCapabilityManifest(
+        SELFHOST_IDENTITY_CAPABILITY_KINDS,
+        actorForm,
+      );
       await expect(
         deriveSelfhostFormAuthorityCatalog({
-          implementationPayloadDigest,
-          capabilities,
-          source: { provider, stableForms: candidates.forms, stableBindings: candidates.bindings },
+          implementationPayloadDigest: await canonicalDigest({
+            kind: "takoserver.selfhost-form-implementation@v1",
+            capabilities: actorCapabilities,
+          }),
+          capabilities: actorCapabilities,
+          source,
         }),
       ).rejects.toMatchObject({ code: "identity_mismatch" });
-      await expect(
-        deriveSelfhostFormAuthorityCatalog({
-          implementationPayloadDigest,
-          capabilities,
-          source: {
-            ...source,
-            stableBindings: candidates.bindings.filter(
-              (binding) =>
-                canonicalJson(binding.bindingRef) !== canonicalJson(SELFHOST_ACTOR_BINDING_REF),
-            ),
-          },
-        }),
-      ).rejects.toMatchObject({ code: "production_not_ready" });
-      await expect(
-        deriveSelfhostFormAuthorityCatalog({
-          implementationPayloadDigest,
-          capabilities,
-          source: {
-            ...source,
-            provider: Object.assign(Object.create(provider) as Provider, {
-              offerings: provider.offerings.filter(
-                (offering) => offering.form.kind !== "ActorNamespace",
-              ),
-            }),
-          },
-        }),
-      ).rejects.toMatchObject({ code: "production_not_ready" });
       const verifier = createSyntheticPublisherSetVerifier();
       const result = await runSelfhostFormAdmission({
         organizationId: "org_actor_source",
@@ -383,9 +358,45 @@ describe("self-host Form admission", () => {
         result.applied?.readback.forms.find((form) => form.formRef.kind === "ActorNamespace"),
       ).toMatchObject({
         installed: true,
+        supported: false,
+        operations: [],
+        activationHead: { present: false, active: false },
+      });
+      const actorAdmission = result.applied?.readback.forms.find(
+        (form) => form.formRef.kind === "ActorNamespace",
+      );
+      if (!actorAdmission) throw new Error("Actor package readback is missing");
+      const authority = createFormAdmissionStore({
+        sql: fixture.sql,
+        objects: fixture.objects,
+        handles: createAdmissionHandleIssuer(),
+      });
+      const historicalImplementationDigest = await canonicalDigest({
+        kind: "test.historical-actor-implementation@v1",
+      });
+      await authority.execute({
+        kind: "SetSupport",
+        formRef: actorForm.identity.formRef,
+        packageDigest: actorAdmission.packageDigest,
         supported: true,
+        profile: { kind: "historical-actor-profile@v1" },
         operations: ["create", "read", "delete", "import", "observe"],
-        activationHead: { present: true, active: true },
+        implementationDigest: historicalImplementationDigest,
+        actor: "integration-operator",
+        reason: "seed a historical active Actor head for contraction recovery coverage",
+      });
+      await authority.execute({
+        kind: "SetActivation",
+        formRef: actorForm.identity.formRef,
+        packageDigest: actorAdmission.packageDigest,
+        active: true,
+        audience: takoformActivationAudience("space", {
+          tenantId: "org_actor_source",
+          space: "default",
+        }),
+        implementationDigest: historicalImplementationDigest,
+        actor: "integration-operator",
+        reason: "seed a historical active Actor head for contraction recovery coverage",
       });
       const broken = join(fixture.root, "workers", "broken");
       mkdirSync(broken, { recursive: true });

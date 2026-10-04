@@ -63,7 +63,7 @@ test("forward binding captures its trusted InterfaceRef once before tenant execu
             apiVersion: "interfaces.takoform.com/v1alpha1",
             name: "worker.actor",
             version: "2.0.0",
-            schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+            schemaDigest: "sha256:f4d70bb6d63c436e43b2e6cc50069fa6ed68eca68aea2fbc10a77969738db156",
           };
         },
       },
@@ -88,7 +88,7 @@ const ref = {
   apiVersion: "interfaces.takoform.com/v1alpha1",
   name: "worker.actor",
   version: "2.0.0",
-  schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+  schemaDigest: "sha256:f4d70bb6d63c436e43b2e6cc50069fa6ed68eca68aea2fbc10a77969738db156",
 };
 function service(name, reservation) {
   return {

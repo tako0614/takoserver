@@ -1,12 +1,15 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
+import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
 import type {
   WorkerModuleHandlerName,
   WorkerModuleInspectionInput,
   WorkerModuleInspectionModule,
 } from "../src/providers/worker-module-semantic-inspection.ts";
+import { snapshotWorkerModuleInspectionModules } from "../src/providers/worker-module-semantic-inspection.ts";
 import {
+  classifyActorClassExecution,
   createWorkerdWorkerModuleInspector,
   WORKERD_INSPECTION_ENTRYPOINT_MODULE,
 } from "../src/workerd-worker-module-inspector.ts";
@@ -43,6 +46,51 @@ function input(
 function inspector(wallTimeoutMs = 2_000) {
   return createWorkerdWorkerModuleInspector({ repositoryRoot, wallTimeoutMs, binary: workerd });
 }
+
+test("snapshots expected Actor module bytes before asynchronous inspection", () => {
+  const original = module("worker.mjs", new Uint8Array([1, 2, 3]));
+  const snapshot = snapshotWorkerModuleInspectionModules([original]);
+  original.bytes[0] = 9;
+  const copied = snapshot[0];
+  if (!copied) throw new Error("module snapshot missing");
+  expect([...copied.bytes]).toEqual([1, 2, 3]);
+});
+
+test("only a clean authenticated class verdict can be invalid", () => {
+  const nonce = "testnonce012345678901234567890123:";
+  const execution = {
+    childExited: true,
+    exitCode: 0,
+    timedOut: false,
+    outputExceeded: false,
+    stderr: "",
+    stdout: `${nonce}start\n${nonce}invalid\n`,
+  };
+  expect(classifyActorClassExecution({ ...execution, exitCode: 1 }, nonce)).toEqual({
+    outcome: "unavailable",
+    retryable: true,
+  });
+  expect(classifyActorClassExecution({ ...execution, stdout: `${nonce}start\n` }, nonce)).toEqual({
+    outcome: "unavailable",
+    retryable: true,
+  });
+  expect(
+    classifyActorClassExecution(
+      { ...execution, stdout: `${nonce}start\n${nonce}invalid\n${nonce}valid\n` },
+      nonce,
+    ),
+  ).toEqual({ outcome: "unavailable", retryable: true });
+  expect(classifyActorClassExecution(execution, nonce)).toEqual({
+    outcome: "invalid",
+    error: "actor_class_invalid",
+  });
+  expect(
+    classifyActorClassExecution(
+      { ...execution, stdout: `${nonce}start\n${nonce}unknown\n` },
+      nonce,
+    ),
+  ).toEqual({ outcome: "unavailable", retryable: true });
+});
 
 test.skipIf(workerd === null)(
   "loads the exact JavaScript, text, data, and compiled Wasm module graph",
@@ -392,6 +440,55 @@ test.skipIf(workerd === null)("does not invoke handlers while inspecting them", 
   );
   expect(result).toEqual({ outcome: "valid", exportedHandlers: ["fetch"] });
 });
+
+test.skipIf(workerd === null)(
+  "inspects the exact Actor class profile in a disposable Workerd child without constructing it",
+  async () => {
+    const result = await inspector().inspectActorClass({
+      mainModule: "worker.mjs",
+      className: "Actor",
+      runtimeClassRef: ACTOR_ABI_INTERFACE_REFS.v2,
+      modules: [
+        module(
+          "worker.mjs",
+          `export class Actor {
+  constructor() { throw new Error("constructor must not run during class inspection"); }
+  fetch() {}
+  alarm() {}
+  socketMessage() {}
+  socketClose() {}
+  socketError() {}
+  start() {}
+}`,
+        ),
+      ],
+    });
+    expect(result).toEqual({ outcome: "valid" });
+  },
+);
+
+test.skipIf(workerd === null)(
+  "distinguishes a class-contract refusal from runtime unavailability",
+  async () => {
+    const selected = inspector();
+    const base = {
+      mainModule: "worker.mjs",
+      className: "Actor",
+      runtimeClassRef: ACTOR_ABI_INTERFACE_REFS.v2,
+      modules: [module("worker.mjs", `export class Other {}`)],
+    } as const;
+    expect(await selected.inspectActorClass(base)).toEqual({
+      outcome: "invalid",
+      error: "actor_class_invalid",
+    });
+    expect(
+      await selected.inspectActorClass({
+        ...base,
+        runtimeClassRef: { ...ACTOR_ABI_INTERFACE_REFS.v2, version: "2.0.1" },
+      }),
+    ).toEqual({ outcome: "unavailable", retryable: true });
+  },
+);
 
 test.skipIf(workerd === null)(
   "has no undeclared importable environment and deny-all outbound networking",

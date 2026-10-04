@@ -48,6 +48,10 @@ import {
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
 import {
+  createSelfhostActorClassRuntime,
+  selfhostActorExpectedGraph,
+} from "../selfhost-actor-class-runtime.ts";
+import {
   canonicalSelfhostWeightedVersions,
   persistedSelfhostWeightedDeployment,
   randomSelfhostDeploymentBasisPoint,
@@ -70,7 +74,14 @@ import {
   type VectorIndexStore,
   VectorIndexStoreError,
 } from "../vector-index-store.ts";
-import type { ActorResourceGraph, WorkflowResourceGraph } from "../worker-class-runtime-port.ts";
+import type {
+  ActorResourceGraph,
+  ProviderWorkerClassRuntime,
+  WorkerClassBindingSelection,
+  WorkerClassInspectionVerdict,
+  WorkerClassRuntimeContract,
+  WorkflowResourceGraph,
+} from "../worker-class-runtime-port.ts";
 import {
   internalHostname,
   readWorkerdActiveDeployment,
@@ -157,6 +168,7 @@ import {
   selfhostReadinessFailureMessage,
 } from "./selfhost-worker-wrapper.ts";
 import { assertSafeMigrationSql } from "./sqlite-migration-policy.ts";
+import type { WorkerActorClassExpectedGraph } from "./worker-module-semantic-inspection.ts";
 
 /**
  * Provisioning the released Takoform Edge Family on the machine this runs on.
@@ -260,19 +272,19 @@ export const SELFHOST_WORKFLOW_VERSION_FORM_REF = Object.freeze({
   apiVersion: "edge.forms.takoform.com",
   kind: "WorkerVersion",
   definitionVersion: "0.4.0",
-  schemaDigest: "sha256:ba59a72fb2c12aa6e9d09173943eb4bb8d2eadac25840d87356a25286007354b",
+  schemaDigest: "sha256:9d2dd1cc902105ff979f7949bc08febfe85f519421e04875bc46b4f59a410c71",
 });
 export const SELFHOST_WORKFLOW_WORKER_FORM_REF = Object.freeze({
   apiVersion: "edge.forms.takoform.com",
   kind: "ModuleWorker",
   definitionVersion: "0.2.0",
-  schemaDigest: "sha256:761180705a6f2a75fa0bc0061794a269342fafe0309c26ecd7530f12fcda1399",
+  schemaDigest: "sha256:e3cd4e8c18b9511286e5b5f824c4eaf1bdac7d78fc8d20a87c9cbe4cb6f2255c",
 });
 const SELFHOST_WORKFLOW_FORM_REF = Object.freeze({
   apiVersion: "edge.forms.takoform.com",
   kind: "DurableWorkflow",
   definitionVersion: "0.2.0",
-  schemaDigest: "sha256:a58c885bed4431fbdc6b923059fe3b3bf98f7727578914d2d212552ae97fdc65",
+  schemaDigest: "sha256:21b0c5cfd9722d58ca669297cf856120cf8443aa8f653a36f13d452ddf8e5585",
 });
 const SELFHOST_WORKFLOW_BINDING_REF = Object.freeze({
   apiVersion: "bindings.takoform.com/v1alpha2",
@@ -348,6 +360,17 @@ export interface SelfhostArtifacts {
 export interface SelfhostProviderOptions {
   readonly id?: string;
   readonly offerings: readonly ProviderOffering[];
+  /** Domain-selected forward Actor technical tuple, when composed. */
+  readonly actorClassRuntime?: {
+    readonly providerInstallationRef: string;
+    /** Domain-selected technical tuple; publisher closure is checked by composition. */
+    readonly binding: WorkerClassBindingSelection;
+    readonly contracts: readonly WorkerClassRuntimeContract[];
+    inspect(
+      input: Parameters<ProviderWorkerClassRuntime["inspect"]>[0],
+      expectedGraph: WorkerActorClassExpectedGraph,
+    ): Promise<WorkerClassInspectionVerdict>;
+  };
   /** The existing Host-owned Actor namespace registration lifecycle, if composed. */
   readonly actorNamespace?: {
     readCurrentGraph(
@@ -887,6 +910,53 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       throw error;
     }
   };
+  const actorClassConfiguration = options.actorClassRuntime
+    ? {
+        providerInstallationRef: options.actorClassRuntime.providerInstallationRef,
+        binding: structuredClone(options.actorClassRuntime.binding),
+        contracts: structuredClone(options.actorClassRuntime.contracts),
+        inspect: options.actorClassRuntime.inspect,
+      }
+    : undefined;
+  if (
+    actorClassConfiguration &&
+    !isWellFormedSelfhostActorClassSelection(actorClassConfiguration)
+  ) {
+    throw new TypeError("self-host Actor class selection is malformed or mismatched");
+  }
+  const actorClassRuntime = actorClassConfiguration
+    ? createSelfhostActorClassRuntime({
+        providerInstallationRef: actorClassConfiguration.providerInstallationRef,
+        contracts: actorClassConfiguration.contracts,
+        async inspect(input) {
+          try {
+            const native = parseSelfhostNativeId("WorkerVersion", input.versionNativeId);
+            if (!native?.script || !native.versionId) return "unavailable";
+            const before = await readVersionSnapshot(native.script, native.versionId);
+            if (before.state !== "present") return "unavailable";
+            const expectedGraph = await selfhostActorExpectedGraph(
+              before.prepared,
+              input.bundle.manifestDigest,
+            );
+            if (!expectedGraph) return "unavailable";
+            const verdict = await actorClassConfiguration.inspect(input, expectedGraph);
+            if (verdict !== "valid" && verdict !== "invalid") return "unavailable";
+            const after = await readVersionSnapshot(native.script, native.versionId);
+            if (
+              after.state !== "present" ||
+              after.prepared.meta.manifestDigest !== input.bundle.manifestDigest ||
+              after.prepared.meta.mainModule !== before.prepared.meta.mainModule ||
+              !sameSelfhostVersionSnapshot(before.prepared, after.prepared)
+            ) {
+              return "unavailable";
+            }
+            return verdict;
+          } catch {
+            return "unavailable";
+          }
+        },
+      })
+    : undefined;
   const hasUnknownAssetRouting = (prepared: PreparedSelfhostVersionMaterialization): boolean =>
     Boolean(prepared.meta.assets && typeof prepared.meta.assets.runWorkerFirst !== "boolean");
   const hasUnknownAssetMedia = (prepared: PreparedSelfhostVersionMaterialization): boolean =>
@@ -2555,19 +2625,29 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     const raw = input.spec.actorBindings;
     if (raw === undefined || (Array.isArray(raw) && raw.length === 0)) return [];
     const actorNamespace = options.actorNamespace;
+    const actorBindingRef =
+      actorClassConfiguration?.binding.bindingRef ?? SELFHOST_ACTOR_BINDING_REF;
+    const selectedForwardVersionForm = actorClassConfiguration?.binding.versionFormRef ?? null;
     if (
       !Array.isArray(raw) ||
       raw.length > 64 ||
       !actorNamespace ||
+      (actorClassConfiguration &&
+        (!selectedForwardVersionForm ||
+          canonicalJson(input.offering.form) !== canonicalJson(selectedForwardVersionForm))) ||
       input.offering.bindingRefs.filter(
-        (ref) => canonicalJson(ref) === canonicalJson(SELFHOST_ACTOR_BINDING_REF),
+        (ref) => canonicalJson(ref) === canonicalJson(actorBindingRef),
       ).length !== 1
     )
       invalid();
     const declaredBindings = raw as readonly JsonValue[];
     const namespaceRuntime = actorNamespace as NonNullable<typeof actorNamespace>;
+    const selectedForwardWorkerForm = actorClassConfiguration?.binding.workerFormRef ?? null;
     const caller = input.relations?.find((candidate) => candidate.pointer === "/worker");
     const callerDeployment = caller?.deployment;
+    const callerOffering = callerDeployment
+      ? options.offerings.find((candidate) => candidate.id === callerDeployment.offeringId)
+      : undefined;
     if (
       !caller ||
       !callerDeployment ||
@@ -2579,6 +2659,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       callerDeployment.resourceUid !== caller.targetUid ||
       callerDeployment.providerPackRef !== id ||
       callerDeployment.providerInstallationRef !== "local.primary" ||
+      (actorClassConfiguration &&
+        (!selectedForwardWorkerForm ||
+          !callerOffering ||
+          !sameSelfhostFormRef(caller.resource.form.formRef, selectedForwardWorkerForm) ||
+          !sameSelfhostFormRef(callerOffering.form, selectedForwardWorkerForm) ||
+          !sameSelfhostFormRef(callerOffering.form, caller.resource.form.formRef))) ||
       parseSelfhostNativeId("ModuleWorker", callerDeployment.nativeId)?.script !== callerScript ||
       callerDeployment.outputs.scriptName !== callerScript
     )
@@ -2601,6 +2687,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       const offering = deployment
         ? options.offerings.find((candidate) => candidate.id === deployment.offeringId)
         : undefined;
+      const selectedForwardActorForm = actorClassConfiguration?.binding.contract.formRef ?? null;
       if (
         !name ||
         name.length > 64 ||
@@ -2610,7 +2697,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         !resource ||
         !relation ||
         relation.relation !== "/actorBindings/*/resource" ||
-        canonicalJson(relation.bindingRef) !== canonicalJson(SELFHOST_ACTOR_BINDING_REF) ||
+        canonicalJson(relation.bindingRef) !== canonicalJson(actorBindingRef) ||
         relation.resource.kind !== "ActorNamespace" ||
         relation.resource.apiVersion !== "edge.forms.takoform.com" ||
         relation.resource.metadata.space !== input.identity.space ||
@@ -2619,6 +2706,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         resource.apiVersion !== relation.resource.apiVersion ||
         resource.kind !== relation.resource.kind ||
         resource.name !== relation.resource.metadata.name ||
+        canonicalJson(relation.resource.form.formRef) !== canonicalJson(offering?.form) ||
+        (actorClassConfiguration &&
+          (!selectedForwardActorForm ||
+            canonicalJson(offering?.form) !== canonicalJson(selectedForwardActorForm))) ||
         !deployment ||
         deployment.state !== "active" ||
         deployment.tenantId !== input.identity.tenantRef ||
@@ -2668,13 +2759,27 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       )
         invalid();
       const currentGraph = graph as ActorResourceGraph;
+      if (
+        actorClassConfiguration &&
+        (!selectedForwardWorkerForm ||
+          !sameSelfhostFormRef(currentGraph.worker.formRef, selectedForwardWorkerForm))
+      ) {
+        invalid();
+      }
       const graphRef = currentGraph.runtimeClassRef;
       const graphAbi = graphRef === undefined ? null : parseActorAbiRef(graphRef);
       const offeredRef = offering?.providedInterfaces[0];
+      const expectedRuntimeClassRef =
+        actorClassConfiguration?.binding.contract.runtimeClassRef ?? SELFHOST_ACTOR_INTERFACE_REF;
       if (
         offeredRef === undefined ||
-        (graphRef !== undefined && graphAbi?.kind !== "v2") ||
-        canonicalJson(offeredRef) !== canonicalJson(graphAbi?.ref ?? SELFHOST_ACTOR_INTERFACE_REF)
+        (actorClassConfiguration
+          ? graphAbi?.kind !== "v2" ||
+            canonicalJson(graphAbi.ref) !== canonicalJson(expectedRuntimeClassRef)
+          : graphRef !== undefined && graphAbi?.kind !== "legacy") ||
+        canonicalJson(offeredRef) !== canonicalJson(expectedRuntimeClassRef) ||
+        (graphRef !== undefined &&
+          canonicalJson(graphRef) !== canonicalJson(expectedRuntimeClassRef))
       )
         invalid();
       names.add(publicName);
@@ -4515,6 +4620,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   return {
     id,
     offerings: structuredClone(options.offerings) as ProviderOffering[],
+    ...(actorClassRuntime ? { workerClassRuntime: actorClassRuntime } : {}),
     standardServiceProtocols: standardServices.protocols,
     ...(options.nativeReadbackAuthorities
       ? { nativeReadbackAuthorities: structuredClone(options.nativeReadbackAuthorities) }
@@ -6449,6 +6555,71 @@ function isExactSelfhostVectorInterfaceRef(value: unknown): boolean {
     ref.version === SELFHOST_VECTOR_INTERFACE_REF.version &&
     ref.schemaDigest === SELFHOST_VECTOR_INTERFACE_REF.schemaDigest
   );
+}
+
+function isWellFormedSelfhostActorClassSelection(input: {
+  readonly providerInstallationRef: string;
+  readonly binding: WorkerClassBindingSelection;
+  readonly contracts: readonly WorkerClassRuntimeContract[];
+}): boolean {
+  try {
+    const selection = input.binding;
+    const contract = selection.contract;
+    return (
+      hasExactOwnKeys(selection, ["bindingRef", "contract", "workerFormRef", "versionFormRef"]) &&
+      input.providerInstallationRef === "local.primary" &&
+      input.contracts.length === 1 &&
+      hasExactOwnKeys(contract, ["formRef", "packageDigest", "runtimeClassRef"]) &&
+      canonicalJson(input.contracts[0]) === canonicalJson(contract) &&
+      parseActorAbiRef(contract.runtimeClassRef)?.kind === "v2" &&
+      isSha256Digest(contract.packageDigest) &&
+      isExactSelfhostFormRef(selection.contract.formRef, "ActorNamespace") &&
+      isExactSelfhostFormRef(selection.workerFormRef, "ModuleWorker") &&
+      isExactSelfhostFormRef(selection.versionFormRef, "WorkerVersion") &&
+      isExactSelfhostBindingRef(selection.bindingRef)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isSha256Digest(value: unknown): value is `sha256:${string}` {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
+}
+
+function isExactSelfhostFormRef(
+  value: unknown,
+  kind: "ActorNamespace" | "ModuleWorker" | "WorkerVersion",
+): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const ref = value as Record<string, unknown>;
+  return (
+    hasExactOwnKeys(ref, ["apiVersion", "kind", "definitionVersion", "schemaDigest"]) &&
+    ref.apiVersion === "edge.forms.takoform.com" &&
+    ref.kind === kind &&
+    typeof ref.definitionVersion === "string" &&
+    ref.definitionVersion.length > 0 &&
+    isSha256Digest(ref.schemaDigest)
+  );
+}
+
+function isExactSelfhostBindingRef(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const ref = value as Record<string, unknown>;
+  return (
+    hasExactOwnKeys(ref, ["apiVersion", "name", "version", "schemaDigest"]) &&
+    (ref.apiVersion === "bindings.takoform.com/v1alpha1" ||
+      ref.apiVersion === "bindings.takoform.com/v1alpha2") &&
+    ref.name === "module-worker.actor" &&
+    typeof ref.version === "string" &&
+    ref.version.length > 0 &&
+    isSha256Digest(ref.schemaDigest)
+  );
+}
+
+function hasExactOwnKeys(value: object, expected: readonly string[]): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => Object.hasOwn(value, key));
 }
 
 function sameSelfhostFormRef(

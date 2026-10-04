@@ -140,12 +140,10 @@ export async function runSelfhostFormAdmission(
     stableBindings: candidates.bindings,
     ...(options.actorRuntime ? { actorRuntime: options.actorRuntime } : {}),
   };
-  const capabilities = selfhostLifecycleCapabilityManifest(
-    SELFHOST_IDENTITY_CAPABILITY_KINDS,
-    options.actorRuntime
-      ? candidates.forms.find((form) => form.identity.formRef.kind === "ActorNamespace")
-      : undefined,
-  );
+  // An owned/restored Actor runtime provides management custody only. The
+  // published Actor Form has no exact executable Host registration, so the
+  // production admission profile remains the published base implementation.
+  const capabilities = selfhostLifecycleCapabilityManifest(SELFHOST_IDENTITY_CAPABILITY_KINDS);
   const implementationPayloadDigest = await canonicalDigest({
     kind: "takoserver.selfhost-form-implementation@v1",
     capabilities,
