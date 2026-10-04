@@ -3,6 +3,8 @@ import { expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { canonicalJson } from "../src/json.ts";
+import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import {
   selfhostWorkerPreludeModuleName,
   selfhostWorkerPreludeSource,
@@ -11,9 +13,12 @@ import {
   SELFHOST_WORKER_ENTRYPOINT_MODULE,
   selfhostWorkerEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
+import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 import { createWorkerdWorkflowExecutionHost } from "../src/selfhost-workflow-execution-host.ts";
 import { createSelfhostWorkflowPreparation } from "../src/selfhost-workflow-preparation.ts";
+import { createSelfhostWorkflowPrivateOwner } from "../src/selfhost-workflow-private-owner.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { forwardTakoformCandidates } from "../src/takoform/forward-candidates.ts";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createWorkflowRuntime } from "../src/workflow-execution.ts";
@@ -383,6 +388,227 @@ test.skipIf(workerd === undefined || guardBinary === undefined)(
         }
       }
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+  40_000,
+);
+
+// Source-only native journey. This deliberately remains skipped without the
+// pinned native binaries; portable SQLite tests do not qualify physical stop.
+test.skipIf(workerd === undefined || guardBinary === undefined)(
+  "private selected Resource graph runs one active weighted Version class through the native guard",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "takoserver-private-workflow-native-"));
+    const db = new Database(":memory:");
+    try {
+      const artifact = await selectClosedGraphWorkerd({
+        binary: workerd as string,
+        privateRoot: join(root, "artifact"),
+      });
+      if (!artifact.binary) throw new Error(artifact.diagnostic ?? "no pinned runtime");
+      migrateSqlite(db);
+      const sql = createSqliteSql(db);
+      const now = () => new Date();
+      const forms = forwardTakoformCandidates().forms;
+      const workflowForm = forms.find((form) => form.identity.formRef.kind === "DurableWorkflow");
+      const workerForm = forms.find((form) => form.identity.formRef.kind === "ModuleWorker");
+      const versionForm = forms.find((form) => form.identity.formRef.kind === "WorkerVersion");
+      if (!workflowForm || !workerForm || !versionForm)
+        throw new Error("selected source vocabulary is unavailable");
+      const tenantId = "tenant-private-native";
+      const workerUid = "uid-ModuleWorker-native";
+      const workflowUid = "uid-DurableWorkflow-native";
+      const versionUid = "uid-WorkerVersion-native";
+      const relation = (targetUid: string) => [
+        {
+          pointer: "/worker",
+          relation: "/worker",
+          targetApiVersion: workerForm.identity.formRef.apiVersion,
+          targetKind: "ModuleWorker",
+          targetName: "worker",
+          targetUid,
+          targetRevision: "1",
+          targetFormRef: workerForm.identity.formRef,
+        },
+      ];
+      const insertLive = async (
+        form: typeof workflowForm,
+        uid: string,
+        name: string,
+        spec: Record<string, unknown>,
+        relations: readonly Record<string, unknown>[] = [],
+      ) => {
+        const resource = {
+          apiVersion: form.identity.formRef.apiVersion,
+          kind: form.identity.formRef.kind,
+          form: form.identity,
+          metadata: { space: "default", name, uid, generation: "1", revision: "1" },
+          spec,
+          status: { observedGeneration: "1", conditions: [] },
+        };
+        await sql.run(
+          `INSERT INTO tf_resources
+             (tenant_id, space, api_version, kind, name, uid, generation, revision,
+              resource_json, relations_json, updated_at)
+           VALUES (?, 'default', ?, ?, ?, ?, '1', '1', ?, ?, ?)`,
+          [
+            tenantId,
+            resource.apiVersion,
+            resource.kind,
+            name,
+            uid,
+            JSON.stringify(resource),
+            JSON.stringify(relations),
+            Date.now(),
+          ],
+        );
+        await sql.run(
+          `INSERT INTO tf_resource_deletion_attestations
+             (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
+              state, closure_fence, effects_json, created_at, updated_at)
+           VALUES (?, ?, 'default', ?, ?, ?, ?, 'live', 1, '[]', ?, ?)`,
+          [
+            tenantId,
+            uid,
+            resource.apiVersion,
+            resource.kind,
+            name,
+            canonicalJson(form.identity.formRef),
+            Date.now(),
+            Date.now(),
+          ],
+        );
+      };
+      await insertLive(workerForm, workerUid, "worker", {});
+      await insertLive(
+        workflowForm,
+        workflowUid,
+        "workflow",
+        {
+          className: "Application",
+          worker: {
+            apiVersion: workerForm.identity.formRef.apiVersion,
+            kind: "ModuleWorker",
+            name: "worker",
+          },
+        },
+        relation(workerUid),
+      );
+      await insertLive(
+        versionForm,
+        versionUid,
+        "version",
+        {
+          bundle: { apiVersion: "edge.forms.takoform.com", kind: "WorkerBundle", name: "bundle" },
+          handlers: ["fetch"],
+          worker: { apiVersion: "edge.forms.takoform.com", kind: "ModuleWorker", name: "worker" },
+        },
+        relation(workerUid),
+      );
+      await createResourceDeploymentStore(sql, now).create({
+        tenantId,
+        id: "deployment-private-native",
+        resourceUid: workerUid,
+        offeringId: "offering-private-native",
+        providerPackRef: "private-native-pack",
+        providerInstallationRef: "private-native-installation",
+        nativeId: "selfhost-worker:workflow:operation-private-native",
+        state: "active",
+        observed: { scriptName: "workflow" },
+        outputs: { scriptName: "workflow" },
+      });
+      const prelude = selfhostWorkerPreludeModuleName("app.js");
+      const wrapper = SELFHOST_WORKER_ENTRYPOINT_MODULE;
+      const serving = createWorkerdRuntime({ root, isReady: () => true });
+      if (!serving.publish) throw new Error("weighted publication is unavailable");
+      await serving.publish("workflow", {
+        generation: "workflow.private.native",
+        workerResourceUid: workerUid,
+        hostnames: [],
+        versions: [
+          {
+            versionId: "version-native",
+            workerVersionUid: versionUid,
+            weight: 10_000,
+            site: {
+              directory: "workflow",
+              mainModule: "app.js",
+              hostEntrypoint: wrapper,
+              hostModules: [prelude],
+              hostnames: [],
+              fetchHandler: true,
+              generation: "workflow.private.native",
+              workerResourceUid: workerUid,
+            },
+            modules: new Map([
+              [
+                "app.js",
+                new TextEncoder().encode(
+                  "export class Application { run(event) { return { value: event.params.value }; } }; export default { fetch() { return new Response('ok'); } };",
+                ),
+              ],
+            ]),
+            hostModules: new Map([
+              [prelude, new TextEncoder().encode(selfhostWorkerPreludeSource())],
+              [
+                wrapper,
+                new TextEncoder().encode(
+                  selfhostWorkerEntrypointSource({
+                    originalMainModule: "app.js",
+                    publication: "workflow.private.native",
+                    probeHostname: "workflow.internal.invalid",
+                    declaredHandlers: ["fetch"],
+                    bindings: [],
+                  }),
+                ),
+              ],
+            ]),
+          },
+        ],
+      });
+      const owner = createSelfhostWorkflowPrivateOwner({
+        sql,
+        clock: now,
+        randomId: () => crypto.randomUUID(),
+        waitUntil: (epoch, signal) =>
+          new Promise<void>((resolve) => {
+            if (signal.aborted) return resolve();
+            const finish = () => {
+              clearTimeout(timer);
+              signal.removeEventListener("abort", finish);
+              resolve();
+            };
+            const timer = setTimeout(finish, Math.max(0, epoch - Date.now()));
+            signal.addEventListener("abort", finish, { once: true });
+          }),
+        runtimeRoot: root,
+        guardBinary: guardBinary as string,
+        workerdBinary: artifact.binary,
+        maximumRegistrations: 1,
+        providerPackRef: "private-native-pack",
+        providerInstallationRef: "private-native-installation",
+        basisPoint: () => 0,
+      });
+      try {
+        const selectedScope = { tenantId, workflowResourceUid: workflowUid };
+        await owner.instances.create(selectedScope, {
+          id: "instance-native",
+          params: { value: 7 },
+        });
+        expect(await owner.runOne(selectedScope, "instance-native")).toEqual({
+          kind: "complete",
+          output: { value: 7 },
+        });
+        expect(await owner.instances.status(selectedScope, "instance-native")).toMatchObject({
+          status: "complete",
+          output: { value: 7 },
+        });
+      } finally {
+        await owner.close();
+      }
+    } finally {
+      db.close();
       await rm(root, { recursive: true, force: true });
     }
   },

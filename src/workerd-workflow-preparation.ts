@@ -2,6 +2,7 @@ import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { WORKFLOW_HTTP_BOOTSTRAP_SOURCE } from "./generated/workflow-http-bootstrap.ts";
+import type { TakoformInterfaceRef } from "./interface-ref.ts";
 import type { JsonObject } from "./ports.ts";
 import type { PreparedWorkerdWorkflow } from "./selfhost-workflow-execution-host.ts";
 import { prepareWorkflowHttpExecution } from "./selfhost-workflow-http-transport.ts";
@@ -13,6 +14,7 @@ import {
 } from "./workerd-runtime.ts";
 import { WorkflowRuntimeError } from "./workflow-driver.ts";
 import type { WorkflowRunIdentity } from "./workflow-execution.ts";
+import { isExactWorkflowV3InterfaceRef } from "./workflow-instances.ts";
 
 /**
  * Secret-bearing, already selected execution graph supplied by the trusted Host.
@@ -28,6 +30,7 @@ export interface WorkerdWorkflowSelection {
   readonly versionId: string;
   readonly workerVersionUid: string;
   readonly className: string;
+  readonly runtimeClassRef?: TakoformInterfaceRef;
   readonly site: WorkerdSite;
   readonly modules: ReadonlyMap<string, Uint8Array>;
   readonly hostModules: ReadonlyMap<string, Uint8Array>;
@@ -126,6 +129,10 @@ export async function prepareWorkerdWorkflowExecution(
   signal.throwIfAborted();
   const temporaryRoot = options.temporaryRoot ?? tmpdir();
   const selected = options.selection;
+  const runtimeClassRef = selected.runtimeClassRef;
+  if (runtimeClassRef !== undefined && !isExactWorkflowV3InterfaceRef(runtimeClassRef)) {
+    throw new WorkflowRuntimeError("invalid_runtime_input");
+  }
   if (
     !isAbsolute(temporaryRoot) ||
     selected.tenantId !== options.identity.scope.tenantId ||
