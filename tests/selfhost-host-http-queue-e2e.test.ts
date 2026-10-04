@@ -5,7 +5,7 @@ import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runSelfhostFormAdmission } from "../scripts/selfhost-form-admission.ts";
-import { buildApp } from "../src/app.ts";
+import { buildApp, createAppResourceStoreBundle } from "../src/app.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { bytesDigest } from "../src/json.ts";
@@ -18,7 +18,10 @@ import {
 import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
 import { createSelfhostQueuePump } from "../src/selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "../src/selfhost-scheduler.ts";
-import { createStandaloneProviderComposition } from "../src/standalone-provider-composition.ts";
+import {
+  createSelfhostCronOwnerReader,
+  createStandaloneProviderComposition,
+} from "../src/standalone-provider-composition.ts";
 import { createTakoformArtifacts } from "../src/takoform/artifacts.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import type { TakoformV1Alpha3FormRef as FormRef } from "../src/takoform/types.ts";
@@ -116,6 +119,7 @@ test.skipIf(WORKERD === null)(
       // it verifies public resource readback, not OS-process restart recovery.
       let millis = Date.now();
       const clock = () => new Date(millis);
+      const resourceStores = createAppResourceStoreBundle(sql, clock);
       const access = createSelfhostDataPlaneAccess(root);
       planes = serveSelfhostDataPlanes({
         sql,
@@ -169,10 +173,11 @@ test.skipIf(WORKERD === null)(
       const targets = createSelfhostEventTargets(root);
       const pump = createSelfhostQueuePump({ sql, runtime, targets, clock });
       const scheduler = createSelfhostWorkerScheduler({ sql, runtime, targets, clock });
+      const edge = await buildEdgeForms();
       const composition = createStandaloneProviderComposition({
         mode: "stable-selfhost",
         stableForms: candidates.forms,
-        edge: await buildEdgeForms(),
+        edge,
         dataRoot: root,
         runtime,
         workerRuntimeAvailable: true,
@@ -184,6 +189,10 @@ test.skipIf(WORKERD === null)(
         events: {
           forgetSchedules: (script, cron) => scheduler.forgetSchedules(script, cron),
         },
+        listCronOwners: createSelfhostCronOwnerReader({
+          inventory: resourceStores.inventory,
+          forms: [...candidates.forms, ...edge.forms],
+        }),
         artifacts: {
           manifest: (tenantId, digest) => artifacts.resolveManifest(tenantId, digest),
           async blob(digest) {
@@ -202,6 +211,7 @@ test.skipIf(WORKERD === null)(
         bindings: candidates.bindings,
         hostForms: candidates.forms,
         hostBindings: candidates.bindings,
+        resourceStores,
         ...composition,
         artifacts,
         identity: {
@@ -465,7 +475,8 @@ test.skipIf(WORKERD === null)(
         cron: cronA,
         worker: reference("ModuleWorker", "journey-worker"),
       });
-      expect(initialCron.status.outputs).toBeDefined();
+      // The released Cron Form declares no outputSchema, so Host omits outputs.
+      expect(initialCron.status.outputs).toBeUndefined();
       const cronResource = await call<{
         metadata: { uid: string; generation: string; revision: string };
         spec: { cron: string };
@@ -475,7 +486,7 @@ test.skipIf(WORKERD === null)(
       const scheduled = async () =>
         ((await (await ask("/scheduled")).json()) as { scheduled: ScheduledObservation[] })
           .scheduled;
-      const cronStart = (Math.floor(millis / 86_400_000) + 1) * 86_400_000 + 2 * 60_000;
+      const cronStart = (Math.floor(millis / 3_600_000) + 1) * 3_600_000 + 2 * 60_000;
       millis = cronStart;
       expect(await scheduler.tick()).toBe(0);
       millis = cronStart + 60_000;
