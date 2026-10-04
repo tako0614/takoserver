@@ -1,9 +1,19 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  cpSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { applicationSchemaMatches } from "../scripts/deploy/application-schema-shape.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import type {
   IntegrationStorageD1Database,
@@ -21,6 +31,7 @@ import {
 } from "../scripts/deploy/production-d1-fresh-init.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
+import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
 
 const fixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-production-d1-tests-"));
@@ -28,13 +39,14 @@ const currentMigrations = copyCurrentSchemaFixture(join(fixtureRoot, "current-mi
 const expectedApplicationShape = applicationShape(currentMigrations);
 const COMMIT = "a".repeat(40);
 const GENERATION = "b".repeat(32);
-const APPLY_MIGRATIONS = MIGRATIONS.slice(0, 66);
+const APPLY_MIGRATIONS = MIGRATIONS;
 const ACCOUNT_ID = "a10162d23653f1ad1193dabf520a5dd0";
 const DATABASE_ID = "00000000-0000-4000-8000-000000000061";
 const INCUMBENT_DATABASE = "takoserver-runtime-ga-20260820";
 const INCUMBENT_ID = "1d5d828a-8607-41f2-b67e-c1a0cac3c139";
 const INCUMBENT_BUCKET = "takoserver-objects-ga-20260820";
 const FRESH_NAME = `${PRODUCTION_FRESH_D1_PREFIX}${GENERATION}`;
+const newCustodyDirectory = () => mkdtempSync(join(fixtureRoot, "custody-"));
 
 const target = {
   kind: "takoserver.deploy-target@v2",
@@ -73,7 +85,7 @@ function stateWithShape(applied: readonly string[], shape: string): D1SchemaStat
 function applicationShape(directory: string): string {
   const database = new Database(":memory:");
   try {
-    for (const name of readdirSync(directory).sort().slice(0, 66)) {
+    for (const name of readdirSync(directory).sort()) {
       database.exec(readFileSync(join(directory, name), "utf8"));
     }
     const rows = database
@@ -134,6 +146,7 @@ function providerFixture(
     readonly existing?: IntegrationStorageD1Database;
     readonly created?: IntegrationStorageD1Database;
     readonly failCreate?: boolean;
+    readonly onCreate?: () => void;
   } = {},
 ): {
   readonly provider: ProductionD1FreshInitProvider;
@@ -146,10 +159,12 @@ function providerFixture(
     provider: {
       async listD1(name) {
         calls.push(`listD1:${name}`);
-        return input.existing === undefined ? [] : [input.existing];
+        const observed = input.existing ?? created;
+        return observed === undefined ? [] : [observed];
       },
       async createD1(name) {
         calls.push(`createD1:${name}`);
+        input.onCreate?.();
         if (input.failCreate === true) throw new Error("lost create acknowledgement");
         created = input.created ?? { name, uuid: DATABASE_ID };
         return created;
@@ -172,6 +187,7 @@ function options(
     provider,
     run: process.run,
     review: "independent-reviewer",
+    custodyDirectory: newCustodyDirectory(),
     migrationDirectory: currentMigrations,
     reader: {
       async read() {
@@ -193,10 +209,32 @@ async function rejected(operation: Promise<unknown>): Promise<DeployError> {
 }
 
 describe("production D1 fresh init", () => {
+  test("the fresh D1 application shape equals a fresh self-host SQLite bootstrap", () => {
+    const database = new Database(":memory:");
+    try {
+      const report = migrateSqlite(database);
+      expect(report.applied).toEqual(APPLY_MIGRATIONS.map(({ name }) => name));
+      const rows = database
+        .query(
+          "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql " +
+            "FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .all() as Record<string, unknown>[];
+      const selfhostShape = canonicalSchemaShape(
+        rows.filter((row) => row.name !== "applied_migrations"),
+      );
+      expect(
+        applicationSchemaMatches(stateWithShape([], selfhostShape), expectedApplicationShape),
+      ).toBe(true);
+    } finally {
+      database.close();
+    }
+  });
   test("status is the side-effect-free dry run and reports the planned identity", async () => {
     const fixture = providerFixture();
     const result = await runProductionD1FreshInit({ ...invocation, action: "status" }, target, {
       provider: fixture.provider,
+      custodyDirectory: newCustodyDirectory(),
       migrationDirectory: currentMigrations,
     });
     expect(result).toMatchObject({
@@ -222,6 +260,7 @@ describe("production D1 fresh init", () => {
     });
     const result = await runProductionD1FreshInit({ ...invocation, action: "status" }, target, {
       provider: fixture.provider,
+      custodyDirectory: newCustodyDirectory(),
       migrationDirectory: currentMigrations,
     });
     expect(result).toMatchObject({
@@ -229,6 +268,63 @@ describe("production D1 fresh init", () => {
       readyForApply: false,
     });
     expect(fixture.calls).toEqual([`listD1:${FRESH_NAME}`]);
+  });
+
+  test("missing or malformed private attempt custody refuses before provider access", async () => {
+    const fixture = providerFixture();
+    const missing = join(fixtureRoot, "missing-custody");
+    const error = await rejected(
+      runProductionD1FreshInit({ ...invocation, action: "status" }, target, {
+        provider: fixture.provider,
+        migrationDirectory: currentMigrations,
+        custodyDirectory: missing,
+      }),
+    );
+    expect(error.phase).toBe("preflight");
+    expect(fixture.calls).toEqual([]);
+
+    const nonPrivate = newCustodyDirectory();
+    chmodSync(nonPrivate, 0o755);
+    const permissions = await rejected(
+      runProductionD1FreshInit({ ...invocation, action: "status" }, target, {
+        provider: fixture.provider,
+        migrationDirectory: currentMigrations,
+        custodyDirectory: nonPrivate,
+      }),
+    );
+    expect(permissions.phase).toBe("preflight");
+    const alias = join(fixtureRoot, "custody-symlink");
+    symlinkSync(newCustodyDirectory(), alias);
+    const symlink = await rejected(
+      runProductionD1FreshInit({ ...invocation, action: "status" }, target, {
+        provider: fixture.provider,
+        migrationDirectory: currentMigrations,
+        custodyDirectory: alias,
+      }),
+    );
+    expect(symlink.phase).toBe("preflight");
+    expect(fixture.calls).toEqual([]);
+
+    const custodyDirectory = newCustodyDirectory();
+    const lostCreate = providerFixture({ failCreate: true });
+    await rejected(
+      runProductionD1FreshInit(invocation, target, {
+        ...options(lostCreate.provider),
+        custodyDirectory,
+      }),
+    );
+    const intent = readdirSync(custodyDirectory).find((name) => name.endsWith(".intent.json"));
+    expect(intent).toBeDefined();
+    writeFileSync(join(custodyDirectory, intent as string), '{"bad":true}\n');
+    const malformed = await rejected(
+      runProductionD1FreshInit({ ...invocation, action: "status" }, target, {
+        provider: fixture.provider,
+        migrationDirectory: currentMigrations,
+        custodyDirectory,
+      }),
+    );
+    expect(malformed.phase).toBe("mutation");
+    expect(fixture.calls).toEqual([]);
   });
 
   test("source-tail drift is refused before production D1 provider access", async () => {
@@ -265,14 +361,20 @@ describe("production D1 fresh init", () => {
     }
   });
 
-  test("apply creates one empty production database and applies the exact 0001-0066 lineage", async () => {
-    const fixture = providerFixture();
+  test("apply creates one empty production database and applies the exact 0001-0069 lineage", async () => {
+    const custodyDirectory = newCustodyDirectory();
+    const fixture = providerFixture({
+      onCreate() {
+        expect(readdirSync(custodyDirectory).some((name) => name.endsWith(".intent.json"))).toBe(
+          true,
+        );
+      },
+    });
     const process = processFixture();
-    const result = await runProductionD1FreshInit(
-      invocation,
-      target,
-      options(fixture.provider, [emptyState, completeState], process),
-    );
+    const result = await runProductionD1FreshInit(invocation, target, {
+      ...options(fixture.provider, [emptyState, completeState], process),
+      custodyDirectory,
+    });
     expect(result).toMatchObject({
       kind: "takoserver.production-d1-fresh-init-apply@v1",
       surface: PRODUCTION_D1_FRESH_INIT_SURFACE,
@@ -294,6 +396,39 @@ describe("production D1 fresh init", () => {
       `getD1:${DATABASE_ID}`,
     ]);
     expect(process.commands.some((command) => command.includes("execute"))).toBe(true);
+  });
+
+  test("a completed generation reopens as read-only complete and cannot dispatch again", async () => {
+    const fixture = providerFixture();
+    const custodyDirectory = newCustodyDirectory();
+    await runProductionD1FreshInit(invocation, target, {
+      ...options(fixture.provider),
+      custodyDirectory,
+    });
+    const status = await runProductionD1FreshInit({ ...invocation, action: "status" }, target, {
+      provider: fixture.provider,
+      migrationDirectory: currentMigrations,
+      custodyDirectory,
+      reader: {
+        async read() {
+          return completeState;
+        },
+      },
+    });
+    expect(status).toMatchObject({
+      attemptState: "complete",
+      readyForApply: false,
+      d1: { databaseId: DATABASE_ID, present: true },
+    });
+    const calls = [...fixture.calls];
+    const repeated = await rejected(
+      runProductionD1FreshInit(invocation, target, {
+        ...options(fixture.provider),
+        custodyDirectory,
+      }),
+    );
+    expect(repeated.message).toContain("retained attempt");
+    expect(fixture.calls).toEqual(calls);
   });
 
   test("apply carries the explicit production token to the single migration import child", async () => {
@@ -326,6 +461,7 @@ describe("production D1 fresh init", () => {
         review: "independent-reviewer",
         migrationDirectory: currentMigrations,
         cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "production-deploy-token" },
+        custodyDirectory: newCustodyDirectory(),
         outputDirectory,
         reader: {
           async read() {
@@ -367,8 +503,34 @@ describe("production D1 fresh init", () => {
         "utf8",
       );
       expect(migrationImport).toContain("0066_cloudflare_managed_actor_kv_capability_claims.sql");
-      expect(migrationImport).not.toContain("0067_takoform_container_endpoint_hostname_index.sql");
-      expect(migrationImport).not.toContain("0068_cloudflare_provider_invocation_custody.sql");
+      expect(migrationImport).toContain("0067_takoform_container_endpoint_hostname_index.sql");
+      expect(migrationImport).toContain("0068_cloudflare_provider_invocation_custody.sql");
+      expect(migrationImport).toContain("0069_cloudflare_provider_invocation_delete_ack.sql");
+      const imported = new Database(":memory:");
+      try {
+        imported.exec(migrationImport);
+        expect(
+          (
+            imported.query("SELECT name FROM d1_migrations ORDER BY id").all() as { name: string }[]
+          ).map(({ name }) => name),
+        ).toEqual(APPLY_MIGRATIONS.map(({ name }) => name));
+        const importedRows = imported
+          .query(
+            "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql " +
+              "FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+          )
+          .all() as Record<string, unknown>[];
+        const importedShape = canonicalSchemaShape(
+          importedRows.filter(
+            (row) => row.name !== "d1_migrations" && row.tbl_name !== "d1_migrations",
+          ),
+        );
+        expect(
+          applicationSchemaMatches(stateWithShape([], importedShape), expectedApplicationShape),
+        ).toBe(true);
+      } finally {
+        imported.close();
+      }
     } finally {
       rmSync(outputDirectory, { recursive: true, force: true });
     }
@@ -384,6 +546,7 @@ describe("production D1 fresh init", () => {
       runProductionD1FreshInit(invocation, target, {
         provider: fixture.provider,
         run: qualification.run,
+        custodyDirectory: newCustodyDirectory(),
         migrationDirectory: currentMigrations,
       }),
     );
@@ -468,6 +631,7 @@ describe("production D1 fresh init", () => {
         provider: fixture.provider,
         run: gate,
         review: "independent-reviewer",
+        custodyDirectory: newCustodyDirectory(),
         migrationDirectory: currentMigrations,
       }),
     );
@@ -477,27 +641,144 @@ describe("production D1 fresh init", () => {
 
   test("a lost create acknowledgement is indeterminate and is never retried", async () => {
     const fixture = providerFixture({ failCreate: true });
+    const custodyDirectory = newCustodyDirectory();
     const error = await rejected(
-      runProductionD1FreshInit(invocation, target, options(fixture.provider)),
+      runProductionD1FreshInit(invocation, target, {
+        ...options(fixture.provider),
+        custodyDirectory,
+      }),
     );
     expect(error.phase).toBe("mutation");
     expect(fixture.calls.filter((call) => call.startsWith("createD1:"))).toHaveLength(1);
+    const repeated = await rejected(
+      runProductionD1FreshInit(invocation, target, {
+        ...options(fixture.provider),
+        custodyDirectory,
+      }),
+    );
+    expect(repeated.message).toContain("retained attempt");
+    expect(fixture.calls.filter((call) => call.startsWith("createD1:"))).toHaveLength(1);
+    const wrongTarget = await rejected(
+      runProductionD1FreshInit(
+        { ...invocation, action: "status" },
+        { ...target, r2: { bucketName: "another-bucket" } },
+        { provider: fixture.provider, migrationDirectory: currentMigrations, custodyDirectory },
+      ),
+    );
+    expect(wrongTarget.phase).toBe("mutation");
+    const status = await runProductionD1FreshInit({ ...invocation, action: "status" }, target, {
+      provider: fixture.provider,
+      migrationDirectory: currentMigrations,
+      custodyDirectory,
+    });
+    expect(status).toMatchObject({ attemptState: "pending", readyForApply: false });
+    const source = new URL("../scripts/deploy/production-d1-fresh-init.ts", import.meta.url)
+      .pathname;
+    const reopened = Bun.spawnSync([
+      process.execPath,
+      "-e",
+      `import { runProductionD1FreshInit } from ${JSON.stringify(source)};
+       const status = await runProductionD1FreshInit(
+         ${JSON.stringify({ ...invocation, action: "status" })},
+         ${JSON.stringify(target)},
+         {
+           provider: { async listD1() { return []; }, async getD1() { throw Error("unused"); }, async createD1() { throw Error("must not create"); } },
+           migrationDirectory: ${JSON.stringify(currentMigrations)},
+           custodyDirectory: ${JSON.stringify(custodyDirectory)}
+         }
+       );
+       console.log(JSON.stringify({ attemptState: status.attemptState, readyForApply: status.readyForApply }));`,
+    ]);
+    expect(reopened.exitCode).toBe(0);
+    expect(new TextDecoder().decode(reopened.stdout).trim()).toBe(
+      JSON.stringify({ attemptState: "pending", readyForApply: false }),
+    );
+  });
+
+  test("concurrent same-generation applies dispatch at most one create and import", async () => {
+    const fixture = providerFixture();
+    const custodyDirectory = newCustodyDirectory();
+    const runs = await Promise.allSettled([
+      runProductionD1FreshInit(invocation, target, {
+        ...options(fixture.provider),
+        custodyDirectory,
+      }),
+      runProductionD1FreshInit(invocation, target, {
+        ...options(fixture.provider),
+        custodyDirectory,
+      }),
+    ]);
+    expect(runs.filter((run) => run.status === "fulfilled")).toHaveLength(1);
+    expect(runs.filter((run) => run.status === "rejected")).toHaveLength(1);
+    expect(fixture.calls.filter((call) => call.startsWith("createD1:"))).toHaveLength(1);
+  });
+
+  test("a lost import acknowledgement does not redispatch against a present exact generation", async () => {
+    const fixture = providerFixture();
+    const process = processFixture();
+    const custodyDirectory = newCustodyDirectory();
+    let imports = 0;
+    const run: IntegrationStorageGenerationProcess = async (command, runOptions) => {
+      if (command.includes("execute") && command.includes("--file")) {
+        imports += 1;
+        throw new Error("lost import acknowledgement");
+      }
+      return await process.run(command, runOptions);
+    };
+    const error = await rejected(
+      runProductionD1FreshInit(invocation, target, {
+        ...options(fixture.provider, [emptyState], process),
+        custodyDirectory,
+        run,
+      }),
+    );
+    expect(error.phase).toBe("mutation");
+    expect(imports).toBe(1);
+
+    const present = providerFixture({ existing: { name: FRESH_NAME, uuid: DATABASE_ID } });
+    const repeated = await rejected(
+      runProductionD1FreshInit(invocation, target, {
+        ...options(present.provider),
+        custodyDirectory,
+      }),
+    );
+    expect(repeated.phase).toBe("preflight");
+    expect(repeated.message).toContain("retained attempt");
+    expect(present.calls).toEqual([]);
+    expect(imports).toBe(1);
+    const status = await runProductionD1FreshInit({ ...invocation, action: "status" }, target, {
+      provider: fixture.provider,
+      custodyDirectory,
+      migrationDirectory: currentMigrations,
+      reader: {
+        async read() {
+          return completeState;
+        },
+      },
+    });
+    expect(status).toMatchObject({ attemptState: "complete", readyForApply: false });
   });
 
   test("a database that is not exactly empty withholds the migration", async () => {
     const fixture = providerFixture();
     const process = processFixture();
+    const custodyDirectory = newCustodyDirectory();
     const notEmpty = stateWithShape(["0001_runtime_storage.sql"], "[]\n");
     const error = await rejected(
-      runProductionD1FreshInit(
-        invocation,
-        target,
-        options(fixture.provider, [notEmpty, completeState], process),
-      ),
+      runProductionD1FreshInit(invocation, target, {
+        ...options(fixture.provider, [notEmpty, completeState], process),
+        custodyDirectory,
+      }),
     );
     expect(error.phase).toBe("mutation");
     expect(error.message).toContain("not exactly empty");
     expect(process.commands.some((command) => command.includes("execute"))).toBe(false);
+    const status = await runProductionD1FreshInit({ ...invocation, action: "status" }, target, {
+      provider: fixture.provider,
+      migrationDirectory: currentMigrations,
+      custodyDirectory,
+    });
+    expect(status).toMatchObject({ attemptState: "identified", readyForApply: false });
   });
 
   test("a readback that is not the exact audited lineage fails verification", async () => {
@@ -514,7 +795,25 @@ describe("production D1 fresh init", () => {
       ),
     );
     expect(error.phase).toBe("verification");
-    expect(error.message).toContain("0001-0066");
+    expect(error.message).toContain("0001-0069");
+  });
+
+  test("the complete lineage with a different application shape is not a fresh-init success", async () => {
+    const fixture = providerFixture();
+    const wrongShape = stateWithShape(
+      APPLY_MIGRATIONS.map(({ name }) => name),
+      "[]\n",
+    );
+    const error = await rejected(
+      runProductionD1FreshInit(
+        invocation,
+        target,
+        options(fixture.provider, [emptyState, wrongShape]),
+      ),
+    );
+    expect(error.phase).toBe("verification");
+    expect(error.message).toContain("exact audited application schema");
+    expect(fixture.calls).not.toContain(`getD1:${INCUMBENT_ID}`);
   });
 
   test("apply refuses a malformed generation, commit or account before provider access", async () => {
@@ -546,6 +845,7 @@ describe("production D1 fresh init", () => {
     const error = await rejected(
       runProductionD1FreshInit({ ...invocation, action: "status" }, target, {
         cloudflareEnvironment: {},
+        custodyDirectory: newCustodyDirectory(),
         migrationDirectory: currentMigrations,
       }),
     );

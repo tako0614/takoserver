@@ -886,7 +886,7 @@ export function assertCompleteDatabase(
   if (JSON.stringify(state.applied) !== JSON.stringify(expectedMigrations)) {
     throw completeDatabaseReadbackError(
       phase,
-      "does not contain the exact audited 0001-0066 lineage",
+      `does not contain the exact audited ${expectedMigrations[0]?.slice(0, 4) ?? "unknown"}-${expectedMigrations.at(-1)?.slice(0, 4) ?? "unknown"} lineage`,
       JSON.stringify({ databaseId, expectedMigrations, appliedMigrations: state.applied }),
     );
   }

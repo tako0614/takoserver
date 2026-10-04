@@ -1083,6 +1083,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy.ts",
         "scripts/deploy/contract.ts",
         "scripts/deploy/production-d1-fresh-init.ts",
+        "scripts/deploy/production-d1-fresh-init-custody.ts",
         "scripts/deploy/integration-storage-generation.ts",
         "scripts/deploy/d1-migration-import.ts",
         "scripts/deploy/application-schema-shape.ts",
@@ -1100,6 +1101,7 @@ export const DEPLOY_CONTRACT = {
         "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
         "CLOUDFLARE_API_TOKEN",
         "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_D1_FRESH_INIT_CUSTODY_DIRECTORY",
       ],
       triggers: ["irreversible", "authority"],
       obligations: {
@@ -1107,22 +1109,25 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Production only. One explicit --generation=<32-lowercase-hex> derives ` +
           "the fresh name as takoserver-p-<generation>; TAKOSERVER_DEPLOY_TARGET_PRODUCTION must " +
           "name the incumbent production target, whose D1 identity is printed and never read by a " +
-          "provider operation. The scoped migration gate runs once; the fixed audited 0001-0066 " +
-          "names and bytes are sealed before creation. A separately digested import file preserves " +
+          "provider operation. The scoped migration gate runs once; the fixed audited 0001-0069 " +
+          "names and bytes are sealed before creation. A required preexisting owner-private " +
+          "TAKOSERVER_D1_FRESH_INIT_CUSTODY_DIRECTORY retains one account/generation attempt " +
+          "across process failure. A separately digested import file preserves " +
           "every migration byte and adds only Wranglers migration-ledger DDL and inserts.",
         "pre-mutation-proof":
           "The fresh name must be absent at inspection and again at the creation fence; an existing " +
           "database is never adopted, reset or re-migrated. The new D1 UUID/name and exact empty " +
-          "canonical shape are checked before migration, and the exact 0001-0066 lineage, canonical " +
+          "canonical shape are checked before migration; durable intent is fsynced before create. " +
+          "The exact 0001-0069 lineage, canonical " +
           "schema digest and application-schema match are checked after. The incumbent database and " +
           "object bucket are outside this surface provider capability.",
         "independent-review": review,
         "post-conditions":
           "One new D1 is created, proved empty, migrated through one Wrangler file import and read " +
-          "back as the exact 0001-0066 lineage with a matching application schema. The result prints " +
+          "back as the exact 0001-0069 lineage with a matching application schema. The result prints " +
           "the exact d1.databaseName/d1.databaseId a successor target descriptor needs and reports " +
           "targetBinding not-written. No Worker, route, namespace, secret, R2 object state or " +
-          "current target is changed.",
+          "current target is changed. Reopening the same generation is read-only; no create or import is redispatched.",
         reversal:
           "The incumbent database and bucket are untouched, so the deliberate reversal is to " +
           "discard the fresh database and keep serving the incumbent; archiving the incumbent is a " +
@@ -1131,7 +1136,9 @@ export const DEPLOY_CONTRACT = {
         "failure-handling":
           `${highRiskFailure} Both actions require an explicit CLOUDFLARE_API_TOKEN and apply also ` +
           "requires TAKOSERVER_INDEPENDENT_REVIEW. There is no OAuth or integration fallback and no " +
-          "--dry-run beyond the side-effect-free --status probe." +
+          "--dry-run beyond the side-effect-free --status probe. Missing, replaced or malformed " +
+          "attempt custody is refusal, not evidence of no prior dispatch; preserve it and choose a " +
+          "distinct generation after an indeterminate effect." +
           inputContract(applyReviewInput),
       },
     },
@@ -1375,7 +1382,7 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056, 0057 or status-only 0058. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current audited source inventory is exactly 0001-0069; unreviewed 0070+ tails are refused before qualification or provider mutation. The source-only 0067, 0068 and 0069 migrations do not expand the 0066 apply-qualified ceiling. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the full audited lineage. Protected mutation remains capped at 0057; 0058 inspects an exact canonical 0057 predecessor but cannot apply until real owner evidence exists. " +
+          "forward-only apply. The current audited source inventory is exactly 0001-0069; unreviewed 0070+ tails are refused before qualification or provider mutation. The source-only 0067, 0068 and 0069 migrations do not expand the 0066 existing-target apply-qualified ceiling; the separate fresh-empty production D1 path selects all 69 without granting an in-place wave. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the apply-qualified 0001-0066 lineage. Protected mutation remains capped at 0057; 0058 inspects an exact canonical 0057 predecessor but cannot apply until real owner evidence exists. " +
           "Integration may select one audited wave or a separately qualified existing-data additive " +
           "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
