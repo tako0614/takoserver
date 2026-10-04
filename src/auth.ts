@@ -651,8 +651,6 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     options.apiKeyAdministration ??
     createApiKeyAdministration({ sql, clock, randomSecret, randomId });
   const stamp = (): string => clock().toISOString();
-  const after = (seconds: number): string =>
-    new Date(clock().getTime() + seconds * 1_000).toISOString();
 
   const issueSessionToken = async (input: {
     readonly principalId: string;
@@ -665,8 +663,9 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
   }> => {
     const secret = randomSecret();
     const id = `ses_${randomId()}`;
-    const createdAt = stamp();
-    const expiresAt = after(input.expiresInSeconds);
+    const issuedAt = clock();
+    const createdAt = issuedAt.toISOString();
+    const expiresAt = new Date(issuedAt.getTime() + input.expiresInSeconds * 1_000).toISOString();
     await sql.run(
       `INSERT INTO auth_tokens
          (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at)
