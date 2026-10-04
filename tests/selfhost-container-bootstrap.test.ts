@@ -52,6 +52,88 @@ test("configured signal shutdown closes before stopping workerd and exits on clo
   expect(calls).toEqual(["close-container", "close-error", "stop-workerd", "exit"]);
 });
 
+test("a throwing close-failure reporter does not skip awaited Workerd shutdown", async () => {
+  const calls: string[] = [];
+  const handleSignal = createSelfhostContainerSignalHandler(
+    {
+      async close() {
+        calls.push("close-container");
+        throw new Error("private close failure");
+      },
+    },
+    () => {
+      calls.push("report-close-failure");
+      throw new Error("private reporter failure");
+    },
+    async () => {
+      calls.push("stop-workerd");
+    },
+    () => calls.push("exit"),
+  );
+
+  await handleSignal();
+  expect(calls).toEqual(["close-container", "report-close-failure", "stop-workerd", "exit"]);
+});
+
+test("signal shutdown awaits asynchronous workerd stop before exiting", async () => {
+  const calls: string[] = [];
+  let release!: () => void;
+  let started!: () => void;
+  const stopped = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const workerdStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const handleSignal = createSelfhostContainerSignalHandler(
+    {
+      async close() {
+        calls.push("close-container");
+      },
+    },
+    () => calls.push("close-error"),
+    async () => {
+      calls.push("workerd-shutdown");
+      started();
+      await stopped;
+      calls.push("actor-close");
+      calls.push("data-plane-close");
+      calls.push("control-database-close");
+    },
+    () => calls.push("exit"),
+  );
+
+  const shuttingDown = handleSignal();
+  await workerdStarted;
+  expect(calls).toEqual(["close-container", "workerd-shutdown"]);
+  release();
+  await shuttingDown;
+  expect(calls).toEqual([
+    "close-container",
+    "workerd-shutdown",
+    "actor-close",
+    "data-plane-close",
+    "control-database-close",
+    "exit",
+  ]);
+});
+
+test("signal shutdown does not report success when asynchronous workerd stop fails", async () => {
+  const calls: string[] = [];
+  const handleSignal = createSelfhostContainerSignalHandler(
+    undefined,
+    () => calls.push("close-error"),
+    async () => {
+      calls.push("stop-workerd");
+      throw new Error("child exit was not proved");
+    },
+    () => calls.push("exit"),
+  );
+
+  await expect(handleSignal()).rejects.toThrow("child exit was not proved");
+  expect(calls).toEqual(["stop-workerd"]);
+});
+
 test("container bootstrap is absent without explicit Docker opt-in", () => {
   const configuration = parseSelfhostContainerBootstrapConfiguration({
     DOCKER_HOST: "unix:///var/run/docker.sock",

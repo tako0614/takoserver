@@ -54,13 +54,33 @@ export function createSelfhostContainerSignalHandler(
   onCloseFailure: () => void,
   stopWorkerd: () => void,
   exitProcess: () => void,
+): () => Promise<void>;
+export function createSelfhostContainerSignalHandler(
+  container: Pick<SelfhostContainerBootstrap, "close"> | undefined,
+  onCloseFailure: () => void,
+  stopWorkerd: () => Promise<void>,
+  exitProcess: () => void,
+): () => Promise<void>;
+export function createSelfhostContainerSignalHandler(
+  container: Pick<SelfhostContainerBootstrap, "close"> | undefined,
+  onCloseFailure: () => void,
+  stopWorkerd: () => void | Promise<void>,
+  exitProcess: () => void,
 ): () => Promise<void> {
-  return () => {
-    const closing = container ? Promise.resolve().then(() => container.close()) : Promise.resolve();
-    return closing.catch(onCloseFailure).finally(() => {
-      stopWorkerd();
-      exitProcess();
-    });
+  return async () => {
+    if (container) {
+      await Promise.resolve()
+        .then(() => container.close())
+        .catch(() => {
+          try {
+            onCloseFailure();
+          } catch {
+            // Reporting failure must not skip the awaited best-effort stop.
+          }
+        });
+    }
+    await stopWorkerd();
+    exitProcess();
   };
 }
 
