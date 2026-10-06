@@ -38,7 +38,8 @@ function setup(runtime = fencedRuntime()) {
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);
   const sql = createSqliteSql(db);
-  let nowMs = Date.UTC(2026, 9, 6, 12);
+  // Custody writes are fenced by SQLite's clock, not a historical fixture date.
+  let nowMs = Date.now();
   const now = () => new Date(nowMs++);
   let sourceReads = 0;
   let sourceAvailable = true;

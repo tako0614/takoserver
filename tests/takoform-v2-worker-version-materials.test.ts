@@ -40,7 +40,8 @@ function fixture(options: { omitBundleReference?: boolean } = {}) {
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);
   const sql = createSqliteSql(db);
-  let clockMs = Date.UTC(2026, 9, 6, 12);
+  // Custody write guards use SQLite's real clock; keep lease tests on that epoch.
+  let clockMs = Date.now();
   let sourceAvailable = true;
   let sourceReads = 0;
   const bundleManifest = new TextEncoder().encode(

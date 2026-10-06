@@ -32,7 +32,8 @@ function fixture() {
   const db = new Database(path);
   migrateSqlite(db);
   const sql = createSqliteSql(db);
-  let clockMs = Date.UTC(2026, 9, 6, 12);
+  // Custody write guards use SQLite's real clock; advance from that same epoch.
+  let clockMs = Date.now();
   const now = () => new Date(clockMs++);
   const moduleUrl = "https://artifacts.example.test/fixture/index.js";
   const manifestUrl = "https://artifacts.example.test/fixture/manifest.json";
@@ -634,7 +635,7 @@ test("a live Deployment claim rematerializes settled Version bytes from verified
   try {
     migrateSqlite(db);
     const sql = createSqliteSql(db);
-    let nowMs = Date.UTC(2026, 9, 6, 12);
+    let nowMs = Date.now();
     const now = () => new Date(nowMs++);
     const moduleBytes = new TextEncoder().encode(
       "export default { fetch() { return new Response('held'); } };",
