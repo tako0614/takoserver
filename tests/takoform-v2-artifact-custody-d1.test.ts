@@ -167,6 +167,32 @@ test("native D1 custody verifies its own BLOB readback and survives source remov
       ).rejects.toMatchObject({ code: "unavailable" });
     }
     available.clear();
+    const bounded = await createWorkerBundleCustody({
+      sql,
+      source: {
+        async read() {
+          throw new Error("source must not be read");
+        },
+      },
+    }).openHeldUnverified({
+      targetResourceUid: accepted.resourceUid,
+      principal: "alice",
+      space: "default",
+      expectedSpec: resource.spec,
+      expectedObserved: resource.observed,
+      stillAuthorized: async () => true,
+    });
+    expect(bounded.fileSizes).toEqual([FILE_BYTES.byteLength]);
+    const staged: Uint8Array[] = [];
+    expect(
+      await bounded.stageVerifiedFile({
+        fileIndex: 0,
+        async write(chunk) {
+          staged.push(new Uint8Array(chunk));
+        },
+      }),
+    ).toEqual({ sha256: fileSha256, byteSize: FILE_BYTES.byteLength });
+    expect(staged).toEqual([FILE_BYTES]);
     const update = await engine.acceptUpdate({
       principal: "alice",
       key: "d1-bundle-update-0001",

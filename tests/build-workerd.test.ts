@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 
@@ -67,6 +68,23 @@ test("build plan refuses to combine with source preparation", async () => {
 
   expect(result.code).toBe(1);
   expect(result.stderr).toContain("--plan cannot be combined with --prepare-only");
+});
+
+test("native artifact workflow allows the pinned two-worker build to finish and report", async () => {
+  const workflow = await readFile(
+    resolve(repositoryRoot, ".github/workflows/workerd-closed-graph-build.yml"),
+    "utf8",
+  );
+  const buildStep = workflow.match(
+    /- name: Build the pinned artifact \(no native qualification\)([\s\S]*?)(?=\n      - name:)/u,
+  )?.[1];
+
+  expect(workflow).toContain("timeout-minutes: 150");
+  expect(buildStep).toContain("timeout --signal=TERM --kill-after=30s 120m");
+  expect(buildStep).toContain("--jobs 2");
+  expect(buildStep).toContain("--memory-mb 8192");
+  expect(workflow).toContain("if: success()");
+  expect(workflow).toContain("if: failure()");
 });
 
 async function runBuildScript(arguments_: readonly string[]): Promise<{

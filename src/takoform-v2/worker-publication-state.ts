@@ -1,7 +1,10 @@
 import { canonicalJson } from "../json.ts";
 import type { Clock, JsonObject, Sql } from "../ports.ts";
 import { SqlError } from "../ports.ts";
-import type { SqlArtifactCustodyRead } from "./forms/artifact-custody.ts";
+import type {
+  SqlArtifactCustodyRead,
+  SqlArtifactCustodyUnverified,
+} from "./forms/artifact-custody.ts";
 import {
   parseStaticAssetBundleSpec,
   STATIC_ASSET_BUNDLE_FORM_URL,
@@ -75,6 +78,8 @@ export type V2WorkerPublicationResolution =
       stillCurrent(): Promise<boolean>;
       /** Host-private, held-only bytes for one selected settled Version. */
       readVersionMaterials(versionUid: string): Promise<V2WorkerVersionMaterials>;
+      /** Metadata and bounded pages only; file bytes still need full digest verification. */
+      openVersionMaterialsUnverified?(versionUid: string): Promise<V2WorkerVersionMaterialScopes>;
     }
   | {
       readonly kind: "unresolved";
@@ -117,6 +122,16 @@ export type V2WorkerVersionResolution =
       readonly message: string;
     };
 
+/** Graph-captured only: unlike resolveVersion().ready, this has not rehashed files. */
+export type V2WorkerVersionMaterialScopeResolution =
+  | {
+      readonly kind: "unverified";
+      readonly snapshot: V2WorkerVersionSnapshot;
+      graphStillCurrent(): Promise<boolean>;
+      openMaterialsUnverified(): Promise<V2WorkerVersionMaterialScopes>;
+    }
+  | Extract<V2WorkerVersionResolution, { kind: "unresolved" }>;
+
 type Unresolved = Extract<V2WorkerPublicationResolution, { kind: "unresolved" }>;
 type ReadyCapture = {
   readonly kind: "ready";
@@ -148,6 +163,11 @@ interface VersionMaterialTargets {
 export interface V2WorkerVersionMaterials {
   readonly bundle: SqlArtifactCustodyRead<WorkerBundleManifest> | null;
   readonly assets: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
+}
+
+export interface V2WorkerVersionMaterialScopes {
+  readonly bundle: SqlArtifactCustodyUnverified<WorkerBundleManifest> | null;
+  readonly assets: SqlArtifactCustodyUnverified<StaticAssetBundleManifest> | null;
 }
 
 type ReferenceRow = {
@@ -275,8 +295,10 @@ function outputHostname(row: ResourceRow): { hostname: string; url: string } | n
 export function createV2WorkerPublicationState(options: {
   sql: Sql;
   now?: Clock;
-  bundleCustody?: Pick<WorkerBundleCustody, "readHeldVerified">;
-  assetCustody?: Pick<StaticAssetBundleCustody, "readHeldVerified">;
+  bundleCustody?: Pick<WorkerBundleCustody, "readHeldVerified"> &
+    Partial<Pick<WorkerBundleCustody, "openHeldUnverified">>;
+  assetCustody?: Pick<StaticAssetBundleCustody, "readHeldVerified"> &
+    Partial<Pick<StaticAssetBundleCustody, "openHeldUnverified">>;
 }) {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
@@ -1047,7 +1069,76 @@ export function createV2WorkerPublicationState(options: {
     return { bundle: cloneRead(bundle), assets: cloneRead(assets) };
   }
 
+  async function openMaterialsTargetsUnverified(
+    target: VersionMaterialTargets,
+    principal: string,
+    space: string,
+    stillAuthorized: () => Promise<boolean>,
+  ): Promise<V2WorkerVersionMaterialScopes> {
+    const denied = () => new SqlError("unavailable", "Worker Version materials are not authorized");
+    if (!(await stillAuthorized())) throw denied();
+    const bundleCustody = options.bundleCustody;
+    const assetCustody = options.assetCustody;
+    if (
+      (target.bundle && !bundleCustody?.openHeldUnverified) ||
+      (target.assets && !assetCustody?.openHeldUnverified)
+    )
+      throw denied();
+    const bundle =
+      target.bundle && bundleCustody?.openHeldUnverified
+        ? await bundleCustody.openHeldUnverified({
+            targetResourceUid: target.bundle.uid,
+            principal,
+            space,
+            expectedSpec: target.bundle.spec,
+            expectedObserved: target.bundle.observed,
+            stillAuthorized,
+          })
+        : null;
+    const assets =
+      target.assets && assetCustody?.openHeldUnverified
+        ? await assetCustody.openHeldUnverified({
+            targetResourceUid: target.assets.uid,
+            principal,
+            space,
+            expectedSpec: target.assets.spec,
+            expectedObserved: target.assets.observed,
+            stillAuthorized,
+          })
+        : null;
+    if (!(await stillAuthorized())) throw denied();
+    return { bundle, assets };
+  }
+
   return {
+    async resolveVersionUnverified(input: {
+      execution: V2Execution;
+    }): Promise<V2WorkerVersionMaterialScopeResolution> {
+      const initial = await captureVersion(input.execution);
+      if (initial.kind === "unresolved") return initial;
+      const stillAuthorized = async () => {
+        const latest = await captureVersion(input.execution);
+        return latest.kind === "ready" && latest.vector === initial.vector;
+      };
+      if (!(await stillAuthorized())) {
+        return versionUnresolved(
+          "stale_claim",
+          "The accepted Version graph changed during capture",
+        );
+      }
+      return {
+        kind: "unverified",
+        snapshot: initial.snapshot,
+        graphStillCurrent: stillAuthorized,
+        openMaterialsUnverified: () =>
+          openMaterialsTargetsUnverified(
+            initial.materials,
+            initial.snapshot.worker.principal,
+            initial.snapshot.worker.space,
+            stillAuthorized,
+          ),
+      };
+    },
     async resolveVersion(input: { execution: V2Execution }): Promise<V2WorkerVersionResolution> {
       const initial = await captureVersion(input.execution);
       if (initial.kind === "unresolved") return initial;
@@ -1126,6 +1217,23 @@ export function createV2WorkerPublicationState(options: {
           if (!target)
             throw new SqlError("unavailable", "Worker Version materials are not authorized");
           return readMaterialsTargets(
+            target,
+            initial.snapshot.worker.principal,
+            initial.snapshot.worker.space,
+            stillAuthorized,
+          );
+        },
+        async openVersionMaterialsUnverified(
+          versionUid: string,
+        ): Promise<V2WorkerVersionMaterialScopes> {
+          const target = initial.materials.get(versionUid);
+          const stillAuthorized = async () => {
+            const latest = await capture(input);
+            return latest.kind === "ready" && latest.vector === initial.vector;
+          };
+          if (!target)
+            throw new SqlError("unavailable", "Worker Version materials are not authorized");
+          return openMaterialsTargetsUnverified(
             target,
             initial.snapshot.worker.principal,
             initial.snapshot.worker.space,

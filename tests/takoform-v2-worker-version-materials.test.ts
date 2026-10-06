@@ -5,13 +5,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
-import type { JsonObject } from "../src/ports.ts";
+import type { JsonObject, Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { createStaticAssetBundleHost } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
-import { createWorkerBundleHost } from "../src/takoform-v2/forms/worker-bundle-backend.ts";
+import {
+  createWorkerBundleCustody,
+  createWorkerBundleHost,
+} from "../src/takoform-v2/forms/worker-bundle-backend.ts";
 import { referencesForWorkerVersion } from "../src/takoform-v2/forms/worker-references.ts";
 import {
   MODULE_WORKER_FORM_URL,
@@ -35,7 +38,7 @@ const BUNDLE_FILE = new TextEncoder().encode(
 const ASSET_FILE = new TextEncoder().encode("<main>held asset</main>");
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
-function fixture(options: { omitBundleReference?: boolean } = {}) {
+function fixture(options: { omitBundleReference?: boolean; bundleFile?: Uint8Array } = {}) {
   const root = mkdtempSync(join(tmpdir(), "v2-version-materials-"));
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);
@@ -44,6 +47,7 @@ function fixture(options: { omitBundleReference?: boolean } = {}) {
   let clockMs = Date.now();
   let sourceAvailable = true;
   let sourceReads = 0;
+  const bundleFile = options.bundleFile ?? BUNDLE_FILE;
   const bundleManifest = new TextEncoder().encode(
     JSON.stringify({
       entrypoint: "index.js",
@@ -51,7 +55,7 @@ function fixture(options: { omitBundleReference?: boolean } = {}) {
         {
           path: "index.js",
           url: BUNDLE_FILE_URL,
-          sha256: sha256(BUNDLE_FILE),
+          sha256: sha256(bundleFile),
           mediaType: "application/javascript+module",
         },
       ],
@@ -75,7 +79,7 @@ function fixture(options: { omitBundleReference?: boolean } = {}) {
       if (!sourceAvailable) throw new Error("fixture source is gone");
       const bytes = new Map([
         [BUNDLE_MANIFEST_URL, bundleManifest],
-        [BUNDLE_FILE_URL, BUNDLE_FILE],
+        [BUNDLE_FILE_URL, bundleFile],
         [ASSET_MANIFEST_URL, assetManifest],
         [ASSET_FILE_URL, ASSET_FILE],
       ]).get(url);
@@ -279,6 +283,279 @@ test("current accepted Version reads exact held Bundle and Asset bytes without s
   }
 });
 
+test("unverified Version scope stages bounded held pages without aggregate reads or source access", async () => {
+  const large = new Uint8Array(16 * 65_536 + 23);
+  for (let index = 0; index < large.length; index += 1) large[index] = index % 251;
+  const f = fixture({ bundleFile: large });
+  try {
+    const { spec } = await f.basics();
+    f.sourceAvailable = false;
+    const before = f.sourceReads;
+    const version = await f.create(WORKER_VERSION_FORM_URL, "paged-version", spec, false);
+    const execution = await f.claim(version.id);
+    const reader = createV2WorkerPublicationState({
+      sql: f.sql,
+      now: () => new Date(f.nowMs),
+      bundleCustody: {
+        ...f.bundleHost.custody,
+        async readHeldVerified() {
+          throw new Error("aggregate material read is forbidden");
+        },
+      },
+      assetCustody: f.assetHost.custody,
+    });
+    const captured = await reader.resolveVersionUnverified({ execution });
+    expect(captured.kind).toBe("unverified");
+    if (captured.kind !== "unverified") return;
+    const scopes = await captured.openMaterialsUnverified();
+    expect(scopes.bundle?.fileSizes).toEqual([large.byteLength]);
+    const first = await scopes.bundle?.readPage({ fileIndex: 0, nextChunk: 0 });
+    expect(first?.chunks).toHaveLength(16);
+    expect(first?.nextChunk).toBe(16);
+    const last = await scopes.bundle?.readPage({ fileIndex: 0, nextChunk: 16 });
+    expect(last?.chunks).toEqual([large.slice(16 * 65_536)]);
+    expect(last?.nextChunk).toBeNull();
+    scopes.bundle?.manifestBytes.fill(0);
+    if (scopes.bundle) (scopes.bundle.fileSizes as number[])[0] = 0;
+    const staged: Uint8Array[] = [];
+    expect(
+      await scopes.bundle?.stageVerifiedFile({
+        fileIndex: 0,
+        async write(chunk) {
+          staged.push(new Uint8Array(chunk));
+        },
+      }),
+    ).toEqual({ sha256: sha256(large), byteSize: large.byteLength });
+    expect(staged.reduce((total, chunk) => total + chunk.byteLength, 0)).toBe(large.byteLength);
+    expect(sha256(Buffer.concat(staged))).toBe(sha256(large));
+    expect(await captured.graphStillCurrent()).toBe(true);
+    expect(f.sourceReads).toBe(before);
+  } finally {
+    f.close();
+  }
+});
+
+test("bounded Version scope rejects stale graph and missing held chunks", async () => {
+  const f = fixture();
+  try {
+    const { bundle, spec } = await f.basics();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "bounded-stale", spec, false);
+    const execution = await f.claim(version.id);
+    const captured = await f.reader.resolveVersionUnverified({ execution });
+    expect(captured.kind).toBe("unverified");
+    if (captured.kind !== "unverified") return;
+    const scopes = await captured.openMaterialsUnverified();
+    await f.sql.run("DELETE FROM tf_v2_artifact_chunks WHERE resource_uid = ?", [
+      bundle.resourceUid,
+    ]);
+    await expect(
+      scopes.bundle?.stageVerifiedFile({
+        fileIndex: 0,
+        async write() {
+          throw new Error("no chunk may be staged");
+        },
+      }),
+    ).rejects.toThrow();
+    f.nowMs += 60_001;
+    await expect(scopes.bundle?.readPage({ fileIndex: 0, nextChunk: 0 })).rejects.toThrow();
+    await expect(captured.openMaterialsUnverified()).rejects.toThrow();
+  } finally {
+    f.close();
+  }
+});
+
+test("bounded custody accepts an empty held file sentinel and refuses invalid cursors", async () => {
+  const f = fixture({ bundleFile: new Uint8Array() });
+  try {
+    const { bundle } = await f.basics();
+    const resource = await f.engine.getResource({ principal: "org-1", uid: bundle.resourceUid });
+    if (!resource) throw new Error("missing bundle");
+    f.sourceAvailable = false;
+    const scope = await f.bundleHost.custody.openHeldUnverified({
+      targetResourceUid: bundle.resourceUid,
+      principal: "org-1",
+      space: "prod",
+      expectedSpec: resource.spec,
+      expectedObserved: resource.observed,
+      stillAuthorized: async () => true,
+    });
+    expect(scope.fileSizes).toEqual([0]);
+    expect(await scope.readPage({ fileIndex: 0, nextChunk: 0 })).toEqual({
+      chunks: [new Uint8Array()],
+      nextChunk: null,
+    });
+    expect(await scope.stageVerifiedFile({ fileIndex: 0, async write() {} })).toEqual({
+      sha256: sha256(new Uint8Array()),
+      byteSize: 0,
+    });
+    for (const request of [
+      { fileIndex: -1, nextChunk: 0 },
+      { fileIndex: 1, nextChunk: 0 },
+      { fileIndex: 0, nextChunk: -1 },
+      { fileIndex: 0, nextChunk: 1 },
+      { fileIndex: 0.5, nextChunk: 0 },
+    ])
+      await expect(scope.readPage(request)).rejects.toMatchObject({ code: "unavailable" });
+  } finally {
+    f.close();
+  }
+});
+
+test("bounded custody refuses gap, extra, invalid and corrupt held pages before proof", async () => {
+  const f = fixture();
+  try {
+    const { bundle } = await f.basics();
+    const resource = await f.engine.getResource({ principal: "org-1", uid: bundle.resourceUid });
+    if (!resource) throw new Error("missing bundle");
+    f.sourceAvailable = false;
+    const open = async (mode: "gap" | "extra" | "invalid" | "corrupt") => {
+      const wrapped: Sql = {
+        async query(statement, params) {
+          const rows = await f.sql.query(statement, params);
+          if (mode === "extra" && statement.includes("SELECT 1 FROM tf_v2_artifact_chunks chunk")) {
+            return [{ present: 1 }];
+          }
+          if (!statement.includes("SELECT chunk.chunk_index, chunk.bytes")) return rows;
+          const row = rows[0];
+          if (!row) return rows;
+          if (mode === "gap") return [{ ...row, chunk_index: 1 }];
+          if (mode === "invalid") return [{ ...row, bytes: [256] }];
+          if (mode === "corrupt") {
+            const bytes = new Uint8Array(row.bytes as Uint8Array);
+            bytes[0] = (bytes[0] ?? 0) ^ 1;
+            return [{ ...row, bytes }];
+          }
+          return rows;
+        },
+        run: f.sql.run,
+        batch: f.sql.batch,
+      };
+      return await createWorkerBundleCustody({
+        sql: wrapped,
+        source: {
+          async read() {
+            throw new Error("source must not be read");
+          },
+        },
+      }).openHeldUnverified({
+        targetResourceUid: bundle.resourceUid,
+        principal: "org-1",
+        space: "prod",
+        expectedSpec: resource.spec,
+        expectedObserved: resource.observed,
+        stillAuthorized: async () => true,
+      });
+    };
+    for (const mode of ["gap", "extra", "invalid"] as const) {
+      const scope = await open(mode);
+      await expect(scope.readPage({ fileIndex: 0, nextChunk: 0 })).rejects.toMatchObject({
+        code: "unavailable",
+      });
+    }
+    const corrupt = await open("corrupt");
+    expect((await corrupt.readPage({ fileIndex: 0, nextChunk: 0 })).chunks).toHaveLength(1);
+    let staged = 0;
+    await expect(
+      corrupt.stageVerifiedFile({
+        fileIndex: 0,
+        async write() {
+          staged += 1;
+        },
+      }),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    expect(staged).toBe(1);
+  } finally {
+    f.close();
+  }
+});
+
+test("bounded page fences lease, graph and target changes while the SQL read is awaited", async () => {
+  for (const drift of ["lease", "graph", "target"] as const) {
+    const f = fixture();
+    try {
+      const { bundle, spec } = await f.basics();
+      const version = await f.create(WORKER_VERSION_FORM_URL, `bounded-${drift}`, spec, false);
+      const execution = await f.claim(version.id);
+      let changed = false;
+      const wrapped: Sql = {
+        async query(statement, params) {
+          const rows = await f.sql.query(statement, params);
+          if (!changed && statement.includes("SELECT chunk.chunk_index, chunk.bytes")) {
+            changed = true;
+            await Promise.resolve();
+            if (drift === "lease") f.nowMs += 60_001;
+            else if (drift === "graph") {
+              await f.sql.run("UPDATE tf_v2_resources SET spec_json = ? WHERE uid = ?", [
+                "{}",
+                version.resourceUid,
+              ]);
+            } else
+              await f.sql.run("UPDATE tf_v2_resources SET spec_json = ? WHERE uid = ?", [
+                '{"artifact":{"url":"https://changed.example.test/","sha256":"bad"}}',
+                bundle.resourceUid,
+              ]);
+          }
+          return rows;
+        },
+        run: f.sql.run,
+        batch: f.sql.batch,
+      };
+      const reader = createV2WorkerPublicationState({
+        sql: wrapped,
+        now: () => new Date(f.nowMs),
+        bundleCustody: createWorkerBundleCustody({
+          sql: wrapped,
+          source: {
+            async read() {
+              throw new Error("source must not be read");
+            },
+          },
+        }),
+        assetCustody: f.assetHost.custody,
+      });
+      const captured = await reader.resolveVersionUnverified({ execution });
+      expect(captured.kind).toBe("unverified");
+      if (captured.kind !== "unverified") continue;
+      const scopes = await captured.openMaterialsUnverified();
+      await expect(scopes.bundle?.readPage({ fileIndex: 0, nextChunk: 0 })).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      expect(changed).toBe(true);
+    } finally {
+      f.close();
+    }
+  }
+});
+
+test("bounded file proof refuses a lease lost during awaited private staging", async () => {
+  const f = fixture();
+  try {
+    const { spec } = await f.basics();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "bounded-stage-lease", spec, false);
+    const captured = await f.reader.resolveVersionUnverified({
+      execution: await f.claim(version.id),
+    });
+    expect(captured.kind).toBe("unverified");
+    if (captured.kind !== "unverified") return;
+    const scopes = await captured.openMaterialsUnverified();
+    let stagingCalls = 0;
+    await expect(
+      scopes.bundle?.stageVerifiedFile({
+        fileIndex: 0,
+        async write() {
+          stagingCalls += 1;
+          await Promise.resolve();
+          f.nowMs += 60_001;
+        },
+      }),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    expect(stagingCalls).toBe(1);
+    expect(await captured.graphStillCurrent()).toBe(false);
+  } finally {
+    f.close();
+  }
+});
+
 test("static-only Version reads its asset without inventing a code bundle", async () => {
   const f = fixture();
   try {
@@ -392,6 +669,10 @@ test("Version resolver refuses incomplete accepted references and cross-owner or
     const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec, false);
     const execution = await f.claim(version.id);
     expect(await f.reader.resolveVersion({ execution })).toMatchObject({
+      kind: "unresolved",
+      code: "graph_unresolved",
+    });
+    expect(await f.reader.resolveVersionUnverified({ execution })).toMatchObject({
       kind: "unresolved",
       code: "graph_unresolved",
     });

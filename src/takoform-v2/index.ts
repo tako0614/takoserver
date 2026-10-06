@@ -50,6 +50,8 @@ export {
   type V2WorkerPublicationResolution,
   type V2WorkerPublicationSnapshot,
   type V2WorkerPublicationSqlGuard,
+  type V2WorkerVersionMaterialScopeResolution,
+  type V2WorkerVersionMaterialScopes,
   type V2WorkerVersionMaterials,
   type V2WorkerVersionResolution,
   type V2WorkerVersionSnapshot,
