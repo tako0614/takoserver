@@ -47,16 +47,16 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0070_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0070_container_runtime_input_custody (id TEXT);\n",
+    "0071_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0071_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0071_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0071_container_runtime_input_rewrap (id TEXT);\n",
+    "0072_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0072_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0072_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0072_container_runtime_input_acceptance (id TEXT);\n",
+    "0073_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0073_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -69,7 +69,7 @@ function currentIntegrationMigrations(directory: string): string {
 }
 
 // These cases exercise fixed next-wave boundaries from the current audited
-// 0001-0069 source closure. The apply ceiling remains 0066. Historical
+// 0001-0070 source closure. The apply ceiling remains 0066. Historical
 // 0001-0049 fixtures are passed explicitly by tests that exercise frozen
 // import/lineage behavior.
 function runD1Schema(...[invocation, selectedTarget, options]: Parameters<typeof runSchema>) {
@@ -702,7 +702,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0069");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0070");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1136,14 +1136,14 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0069");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0070");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("audited 0067-0069 are source closure only and leave existing apply boundaries unchanged", async () => {
+  test("audited 0067-0070 are source closure only and leave existing apply boundaries unchanged", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0067-source-only-"));
     try {
       const result = await runD1Schema(
@@ -1249,31 +1249,28 @@ describe("production-shaped D1 migration lane", () => {
   for (const drift of [
     {
       name: "missing",
-      expected: "selected D1 wave requires the exact audited source inventory 0001-0069",
+      expected: "selected D1 wave requires the exact audited source inventory 0001-0070",
     },
     { name: "changed", expected: "exact audited migration SHA-256" },
-    { name: "extra", expected: "exact audited source inventory 0001-0069" },
+    { name: "extra", expected: "exact audited source inventory 0001-0070" },
   ] as const) {
-    test(`current 0069 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
-      const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0069-${drift.name}-`));
+    test(`current 0070 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
+      const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0070-${drift.name}-`));
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const migration0069 = join(
-          migrationDirectory,
-          "0069_cloudflare_provider_invocation_delete_ack.sql",
-        );
+        const migration0070 = join(migrationDirectory, "0070_takoform_v2.sql");
         if (drift.name === "missing") {
-          rmSync(migration0069);
+          rmSync(migration0070);
         } else if (drift.name === "changed") {
           writeFileSync(
-            migration0069,
-            `${readFileSync(migration0069, "utf8")}\n-- mutated after source audit\n`,
+            migration0070,
+            `${readFileSync(migration0070, "utf8")}\n-- mutated after source audit\n`,
           );
         } else {
           writeFileSync(
-            join(migrationDirectory, "0070_unreviewed_extension.sql"),
-            "CREATE TABLE synthetic_0070_unreviewed_extension (id TEXT);\n",
+            join(migrationDirectory, "0071_unreviewed_extension.sql"),
+            "CREATE TABLE synthetic_0071_unreviewed_extension (id TEXT);\n",
             { mode: 0o600 },
           );
         }

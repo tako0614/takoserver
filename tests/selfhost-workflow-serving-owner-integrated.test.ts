@@ -100,7 +100,9 @@ async function insertLive(
 test("selected serving manager dispatches to a real private owner and drains before same-DB handoff", async () => {
   // Only the external guard/workerd child boundary is substituted: no class is
   // run. Resource, deployment, Version selection, owner, broker and UDS are real.
-  const root = await mkdtemp(join(tmpdir(), "takoserver-workflow-serving-owner-"));
+  // Leave room for the broker's suffix under the 100-byte Unix socket limit,
+  // including a short RAM-backed TMPDIR such as /dev/shm/t.
+  const root = await mkdtemp(join(tmpdir(), "ts-workflow-owner-"));
   await chmod(root, 0o700);
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);
