@@ -25,6 +25,7 @@ async function fixture(input?: {
     "0070_takoform_v2.sql",
     "0071_v2_sqlite_migration_set_custody.sql",
     "0072_v2_artifact_custody.sql",
+    "0075_v2_artifact_progress.sql",
   ]) {
     db.exec(readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8"));
   }
@@ -68,7 +69,7 @@ async function fixture(input?: {
   const source = input?.customizeSource?.(plainSource, blobs) ?? plainSource;
   const rawForm = createWorkerBundleForm({ sql, source, targetKey: "selfhost-control-sqlite-1" });
   const form = input?.customizeForm?.(rawForm) ?? rawForm;
-  let nowMs = Date.parse("2026-10-06T00:00:00.000Z");
+  let nowMs = Date.now();
   const engine = () =>
     createTakoformV2Engine({
       sql,

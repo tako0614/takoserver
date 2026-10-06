@@ -47,6 +47,7 @@ test("native D1 custody verifies its own BLOB readback and survives source remov
         "0070_takoform_v2.sql",
         "0071_v2_sqlite_migration_set_custody.sql",
         "0072_v2_artifact_custody.sql",
+        "0075_v2_artifact_progress.sql",
       ].includes(name),
     )) {
       for (const statement of splitMigration(migration.sql)) {

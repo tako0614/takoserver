@@ -5,6 +5,7 @@ import type { V2ArtifactSource } from "./artifact-source.ts";
 import {
   parseWorkerBundleManifest,
   parseWorkerBundleSpec,
+  projectWorkerBundleVerified,
   validateWorkerBundlePayload,
   validateWorkerBundleUpdate,
   WORKER_BUNDLE_FORM_URL,
@@ -30,6 +31,7 @@ export function createWorkerBundleCustody(options: {
     parseSpec: parseWorkerBundleSpec,
     parseManifest: parseWorkerBundleManifest,
     validatePayload: validateWorkerBundlePayload,
+    projectVerified: projectWorkerBundleVerified,
     invalidArtifact: () => new WorkerBundleValidationError("invalid_artifact"),
     invalidManifest: () => new WorkerBundleValidationError("invalid_manifest"),
     failureNoun: "Bundle",

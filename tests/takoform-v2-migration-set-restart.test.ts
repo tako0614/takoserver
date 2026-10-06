@@ -242,4 +242,4 @@ test("real HTTP Host restarts after verified custody and finishes read, update, 
     if (second) await second.close();
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 15_000);

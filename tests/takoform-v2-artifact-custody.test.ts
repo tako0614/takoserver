@@ -16,6 +16,7 @@ async function runWithSmallLimits(files: readonly Uint8Array[]) {
       "0070_takoform_v2.sql",
       "0071_v2_sqlite_migration_set_custody.sql",
       "0072_v2_artifact_custody.sql",
+      "0075_v2_artifact_progress.sql",
     ]) {
       db.exec(readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8"));
     }
@@ -55,6 +56,10 @@ async function runWithSmallLimits(files: readonly Uint8Array[]) {
         },
       validatePayload: async ({ fileBytes }) => ({
         observed: { fileCount: fileBytes.length },
+        output: {},
+      }),
+      projectVerified: async ({ fileSizes }) => ({
+        observed: { fileCount: fileSizes.length },
         output: {},
       }),
       invalidArtifact: () => new Error("invalid artifact"),
