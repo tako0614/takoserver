@@ -65,6 +65,11 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "v2-contract"],
   },
   {
+    name: "v2-form",
+    match: /^src\/takoform-v2\/forms\/[^/]+\.ts$/u,
+    may: ["core", "v2-contract", "v2-form"],
+  },
+  {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
     may: ["core", "v2-contract", "v2-state"],
