@@ -65,6 +65,10 @@ export async function projectV2WorkerCodeVersion(input: {
 }): Promise<V2WorkerCodeDeploymentVariant> {
   const versionUnavailable = () => new V2WorkerCodeRuntimeError("worker_version_unavailable");
   const bundleUnavailable = () => new V2WorkerCodeRuntimeError("worker_bundle_unavailable");
+  const inspectModule = input.inspectModule;
+  if (typeof inspectModule !== "function") {
+    throw new V2WorkerCodeRuntimeError("worker_module_inspection_unavailable");
+  }
 
   const identity = snapshotIdentity(input.identity);
   let spec: ReturnType<typeof parseWorkerVersionSpec>;
@@ -103,7 +107,7 @@ export async function projectV2WorkerCodeVersion(input: {
   const held = snapshotBundle(input.bundle);
   const observed = await verifyBundle(held);
   const inspectionInput = inspectionInputForBundle(held, observed.manifest, spec.handlers);
-  const inspection = await input.inspectModule(inspectionInput);
+  const inspection = await inspectModule(inspectionInput);
   if (!isValidInspection(inspection)) {
     throw new V2WorkerCodeRuntimeError("worker_module_inspection_unavailable");
   }

@@ -246,17 +246,23 @@ test("rejects unavailable or invalid semantic inspection without publishing a gr
 test("invokes the trusted inspector on the exact verified bundle snapshot", async () => {
   const held = await heldBundle();
   let inspected: WorkerModuleInspectionInput | undefined;
-  const projectionPromise = projectV2WorkerCodeVersion({
+  let substitutedInspectorCalled = false;
+  const request = {
     identity: identity(),
     spec: versionSpec(),
     bundle: held,
     inspectModule: inspector(validInspection, (input) => {
       inspected = input;
     }),
-  });
+  };
+  const projectionPromise = projectV2WorkerCodeVersion(request);
 
+  request.inspectModule = inspector({ outcome: "valid", exportedHandlers: [] }, () => {
+    substitutedInspectorCalled = true;
+  });
   held.files[0]?.fill(0x20);
   const projection = await projectionPromise;
+  expect(substitutedInspectorCalled).toBe(false);
   expect(inspected?.mainModule).toBe(MODULE_PATH);
   expect(inspected?.declaredHandlers).toEqual(["fetch"]);
   expect(inspected?.modules.map((module) => module.name)).toEqual([MODULE_PATH, MESSAGE_PATH]);
