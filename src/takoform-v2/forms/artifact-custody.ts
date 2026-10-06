@@ -537,6 +537,19 @@ export function createSqlArtifactCustody<
 function asBytes(value: unknown): Uint8Array {
   if (value instanceof Uint8Array) return new Uint8Array(value);
   if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+  // D1 returns BLOB columns as arrays of byte numbers. Validate before copying:
+  // Uint8Array.from would silently coerce fractions and out-of-range values.
+  if (Array.isArray(value)) {
+    const bytes = new Uint8Array(value.length);
+    for (let index = 0; index < value.length; index += 1) {
+      const byte: unknown = value[index];
+      if (typeof byte !== "number" || !Number.isInteger(byte) || byte < 0 || byte > 255) {
+        throw new SqlError("unavailable", "invalid stored byte representation");
+      }
+      bytes[index] = byte;
+    }
+    return bytes;
+  }
   throw new SqlError("unavailable", "invalid stored byte representation");
 }
 
