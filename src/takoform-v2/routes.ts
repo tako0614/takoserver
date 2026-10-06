@@ -10,6 +10,12 @@ const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u;
 const GENERATION = /^[1-9][0-9]*$/u;
 
+/** Identity and authority of this request's current credential, never shared mutable state. */
+export interface TakoformV2HttpPrincipal {
+  readonly principal: string;
+  readonly access: "read" | "write";
+}
+
 export interface TakoformV2HttpOptions {
   baseUrl: string;
   documentation: string;
@@ -20,8 +26,8 @@ export interface TakoformV2HttpOptions {
   replayWindowSeconds: number;
   /** Stable operator-managed HMAC key for pagination cursor authentication. */
   cursorSigningKey: Uint8Array;
-  /** Stable authenticated identity, not a credential or request-provided value. */
-  authenticate(request: Request): Promise<string | null>;
+  /** Stable owner identity and current credential rights; write includes read. */
+  authenticate(request: Request): Promise<TakoformV2HttpPrincipal | null>;
 }
 
 export interface TakoformV2Router {
@@ -115,13 +121,18 @@ async function route(
   if (!isV2Route(routePath)) return null;
 
   try {
-    const principal = await options.authenticate(request);
-    if (typeof principal !== "string" || principal.length === 0) {
+    const identity = await options.authenticate(request);
+    if (
+      !identity ||
+      typeof identity.principal !== "string" ||
+      identity.principal.length === 0 ||
+      (identity.access !== "read" && identity.access !== "write")
+    ) {
       return problem(401, "unauthenticated", {
         wwwAuthenticate: options.authenticationSchemes.join(", "),
       });
     }
-    return await authenticatedRoute(request, url, routePath, principal, engine, options, config);
+    return await authenticatedRoute(request, url, routePath, identity, engine, options, config);
   } catch (error) {
     return asProblem(error, options);
   }
@@ -143,11 +154,14 @@ async function authenticatedRoute(
   request: Request,
   url: URL,
   path: string,
-  principal: string,
+  identity: TakoformV2HttpPrincipal,
   engine: TakoformV2Engine,
   options: TakoformV2HttpOptions,
   config: HttpConfig,
 ): Promise<Response> {
+  // Copy the authenticated grant before any body read or asynchronous engine call.
+  // The stable owner may have several credentials with different permissions.
+  const { principal, access } = identity;
   if (
     path === "/offerings" ||
     path === "/previews" ||
@@ -169,6 +183,7 @@ async function authenticatedRoute(
     });
   }
   if (path === "/resources" && request.method === "POST") {
+    if (access !== "write") return problem(403, "forbidden");
     rejectQuery(url);
     const key = idempotencyKey(request);
     const input = await readJsonObject(request, options.maxRequestBytes);
@@ -228,6 +243,7 @@ async function authenticatedRoute(
       return json(await engine.getResource({ principal, uid }));
     }
     if (request.method === "PUT") {
+      if (access !== "write") return problem(403, "forbidden");
       rejectQuery(url);
       const key = idempotencyKey(request);
       const expectedGeneration = expectedGenerationHeader(request);
@@ -245,6 +261,7 @@ async function authenticatedRoute(
       return operationResponse(operation, config);
     }
     if (request.method === "DELETE") {
+      if (access !== "write") return problem(403, "forbidden");
       rejectQuery(url);
       await rejectDeleteBody(request);
       const key = idempotencyKey(request);

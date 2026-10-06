@@ -97,7 +97,9 @@ const host = createTakoformV2Host({
   maxRequestBytes: 4_096,
   maxPageSize: 20,
   authenticate: async (request) =>
-    request.headers.get("authorization") === "Bearer test-only" ? "owner" : null,
+    request.headers.get("authorization") === "Bearer test-only"
+      ? { principal: "owner", access: "write" }
+      : null,
 });
 
 let running = false;

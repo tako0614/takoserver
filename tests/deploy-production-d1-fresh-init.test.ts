@@ -218,7 +218,7 @@ describe("production D1 fresh init", () => {
     expect(surface?.covers).toContain("scripts/deploy/wrangler-state.ts");
   });
 
-  test("fresh production stays at 0069 while self-host source bootstraps through 0070", () => {
+  test("fresh production stays at 0069 while self-host source bootstraps through 0071", () => {
     const database = new Database(":memory:");
     try {
       const report = migrateSqlite(database);
@@ -346,13 +346,13 @@ describe("production D1 fresh init", () => {
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const tail = join(migrationDirectory, "0070_takoform_v2.sql");
+        const tail = join(migrationDirectory, "0071_v2_sqlite_migration_set_custody.sql");
         if (drift === "missing") rmSync(tail);
         else if (drift === "changed") {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0071_unreviewed.sql"),
+            join(migrationDirectory, "0072_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }
@@ -365,7 +365,7 @@ describe("production D1 fresh init", () => {
         ).rejects.toThrow(
           drift === "changed"
             ? "exact audited migration SHA-256"
-            : "audited migration lineage must contain exactly 0001-0070",
+            : "audited migration lineage must contain exactly 0001-0071",
         );
         expect(fixture.calls).toEqual([]);
       } finally {
@@ -520,6 +520,7 @@ describe("production D1 fresh init", () => {
       expect(migrationImport).toContain("0068_cloudflare_provider_invocation_custody.sql");
       expect(migrationImport).toContain("0069_cloudflare_provider_invocation_delete_ack.sql");
       expect(migrationImport).not.toContain("0070_takoform_v2.sql");
+      expect(migrationImport).not.toContain("0071_v2_sqlite_migration_set_custody.sql");
       const imported = new Database(":memory:");
       try {
         imported.exec(migrationImport);

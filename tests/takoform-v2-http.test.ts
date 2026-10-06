@@ -79,10 +79,12 @@ function setup() {
     cursorSigningKey: FIXTURE_CURSOR_KEY,
     authenticate: async (request) =>
       request.headers.get("authorization") === "Bearer fixture-token"
-        ? "fixture-principal"
+        ? { principal: "fixture-principal", access: "write" }
         : request.headers.get("authorization") === "Bearer other-token"
-          ? "other-principal"
-          : null,
+          ? { principal: "other-principal", access: "write" }
+          : request.headers.get("authorization") === "Bearer fixture-reader"
+            ? { principal: "fixture-principal", access: "read" }
+            : null,
   });
   return {
     database,
@@ -471,6 +473,102 @@ test("v2 rejects ambiguous requests and keeps authentication and errors uncachea
     expect(
       await router.fetch(new Request("https://host.example/custom/takoform-v2/v1/resources")),
     ).toBeNull();
+  } finally {
+    database.close();
+  }
+});
+
+test("v2 checks each credential's write grant before mutation and replay, without sharing request authority", async () => {
+  const { database, router } = setup();
+  const input = {
+    form: FIXTURE_FORM,
+    space: "fixture-space",
+    name: "scoped",
+    spec: { value: "one" },
+  };
+  const reader = { authorization: "Bearer fixture-reader" };
+  try {
+    const created = await response(
+      router,
+      call("/resources", {
+        method: "POST",
+        headers: { "idempotency-key": KEY_A },
+        body: JSON.stringify(input),
+      }),
+    );
+    expect(created.status).toBe(202);
+    const accepted = (await created.json()) as { id: string; resourceUid: string };
+    for (const path of [
+      `/support?form=${encodeURIComponent(FIXTURE_FORM)}`,
+      `/resources/${accepted.resourceUid}`,
+      `/operations/${accepted.id}`,
+      "/resources",
+    ]) {
+      expect((await response(router, call(path, { headers: reader }))).status).toBe(200);
+    }
+
+    for (const request of [
+      call("/resources", {
+        method: "POST",
+        headers: { ...reader, "idempotency-key": KEY_A },
+        body: JSON.stringify(input),
+      }),
+      call(`/resources/${accepted.resourceUid}`, {
+        method: "PUT",
+        headers: {
+          ...reader,
+          "idempotency-key": KEY_C,
+          "takoform-expected-generation": "1",
+        },
+        body: JSON.stringify({ spec: { value: "changed" } }),
+      }),
+      call(`/resources/${accepted.resourceUid}`, {
+        method: "DELETE",
+        headers: {
+          ...reader,
+          "idempotency-key": KEY_D,
+          "takoform-expected-generation": "1",
+        },
+      }),
+    ]) {
+      const denied = await response(router, request);
+      expect(denied.status).toBe(403);
+      expect(denied.headers.get("cache-control")).toBe("no-store");
+      expect((await denied.json()).code).toBe("forbidden");
+    }
+
+    const concurrent = await Promise.all(
+      [false, true].map((readOnly) =>
+        response(
+          router,
+          call("/resources", {
+            method: "POST",
+            headers: {
+              ...(readOnly ? reader : {}),
+              "idempotency-key": readOnly ? "reader-create-00001" : KEY_B,
+            },
+            body: JSON.stringify({ ...input, name: readOnly ? "denied" : "allowed" }),
+          }),
+        ),
+      ),
+    );
+    expect(concurrent.map((item) => item.status)).toEqual([202, 403]);
+    const unchanged = await response(
+      router,
+      call(`/resources/${accepted.resourceUid}`, { headers: reader }),
+    );
+    expect(await unchanged.json()).toMatchObject({ generation: 1, spec: input.spec });
+    const inventory = await response(router, call("/resources", { headers: reader }));
+    expect(((await inventory.json()) as { items: unknown[] }).items).toHaveLength(2);
+    const replay = await response(
+      router,
+      call("/resources", {
+        method: "POST",
+        headers: { "idempotency-key": KEY_A },
+        body: JSON.stringify(input),
+      }),
+    );
+    expect((await replay.json()).id).toBe(accepted.id);
   } finally {
     database.close();
   }

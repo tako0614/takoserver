@@ -319,16 +319,16 @@ describe("0065 to 0066 durable Actor KV capability claim transition", () => {
     }
   });
 
-  test("rejects any unreviewed post-0070 source tail before qualification or mutation", async () => {
+  test("rejects any unreviewed post-0071 source tail before qualification or mutation", async () => {
     const unreviewed = join(root, "unreviewed-migrations");
     cpSync(migrations, unreviewed, { recursive: true });
     writeFileSync(
-      join(unreviewed, "0071_unreviewed_extension.sql"),
+      join(unreviewed, "0072_unreviewed_extension.sql"),
       "CREATE TABLE unreviewed_extension(value TEXT);\n",
     );
     const f = fixture({ migrationDirectory: unreviewed });
     try {
-      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0070");
+      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0071");
       expect(f.applies()).toBe(0);
       expect(f.commands().some((command) => command.startsWith("git "))).toBe(false);
     } finally {

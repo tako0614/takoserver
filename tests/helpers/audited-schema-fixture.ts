@@ -6,13 +6,13 @@ import { canonicalSchemaShape, type D1SchemaState } from "../../scripts/deploy/m
 import { MIGRATIONS } from "../../src/db-schema.ts";
 
 const APPLY_QUALIFIED_MIGRATION_END = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
-const CURRENT_SOURCE_MIGRATION_END = "0070_takoform_v2.sql";
+const CURRENT_SOURCE_MIGRATION_END = "0071_v2_sqlite_migration_set_custody.sql";
 
 function applyQualifiedMigrations() {
   const endIndex = MIGRATIONS.findIndex(({ name }) => name === APPLY_QUALIFIED_MIGRATION_END);
   if (
     endIndex !== 65 ||
-    MIGRATIONS.length !== 70 ||
+    MIGRATIONS.length !== 71 ||
     MIGRATIONS.at(-1)?.name !== CURRENT_SOURCE_MIGRATION_END
   ) {
     throw new Error("apply-qualified schema fixture requires the exact audited 0001-0066 prefix");
@@ -83,10 +83,11 @@ export function copyAuditedSchemaFixture(directory: string): string {
  * claims, 0065 runtime-input lease generation, 0066 Actor KV capability
  * claims, source-only audited 0067 hostname lookup index, source-only 0068
  * Cloudflare provider invocation custody schema, source-only 0069
- * WorkerVersion delete acknowledgement proof, and source-only 0070 v2 Host core. */
+ * WorkerVersion delete acknowledgement proof, source-only 0070 v2 Host core,
+ * and source-only 0071 Migration Set custody. */
 export function copyCurrentSchemaFixture(directory: string): string {
-  if (MIGRATIONS.length !== 70 || MIGRATIONS.at(-1)?.name !== CURRENT_SOURCE_MIGRATION_END) {
-    throw new Error("current schema fixture requires the audited 0001-0070 source inventory");
+  if (MIGRATIONS.length !== 71 || MIGRATIONS.at(-1)?.name !== CURRENT_SOURCE_MIGRATION_END) {
+    throw new Error("current schema fixture requires the audited 0001-0071 source inventory");
   }
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   for (const { name } of MIGRATIONS) {
