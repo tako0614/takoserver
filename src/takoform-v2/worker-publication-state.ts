@@ -1,5 +1,20 @@
 import { canonicalJson } from "../json.ts";
 import type { Clock, JsonObject, Sql } from "../ports.ts";
+import { SqlError } from "../ports.ts";
+import type { SqlArtifactCustodyRead } from "./forms/artifact-custody.ts";
+import {
+  parseStaticAssetBundleSpec,
+  STATIC_ASSET_BUNDLE_FORM_URL,
+  type StaticAssetBundleManifest,
+} from "./forms/static-asset-bundle.ts";
+import type { StaticAssetBundleCustody } from "./forms/static-asset-bundle-backend.ts";
+import {
+  parseWorkerBundleSpec,
+  WORKER_BUNDLE_FORM_URL,
+  type WorkerBundleManifest,
+} from "./forms/worker-bundle.ts";
+import type { WorkerBundleCustody } from "./forms/worker-bundle-backend.ts";
+import { referencesForWorkerVersion } from "./forms/worker-references.ts";
 import {
   MODULE_WORKER_FORM_URL,
   parseModuleWorkerSpec,
@@ -50,6 +65,8 @@ export type V2WorkerPublicationResolution =
       readonly snapshot: V2WorkerPublicationSnapshot;
       /** Re-read the complete SQL vector after any await and before the native effect. */
       stillCurrent(): Promise<boolean>;
+      /** Host-private, held-only bytes for one selected settled Version. */
+      readVersionMaterials(versionUid: string): Promise<V2WorkerVersionMaterials>;
     }
   | {
       readonly kind: "unresolved";
@@ -66,8 +83,23 @@ type ReadyCapture = {
   readonly kind: "ready";
   readonly snapshot: V2WorkerPublicationSnapshot;
   readonly vector: string;
+  readonly materials: ReadonlyMap<string, VersionMaterialTargets>;
 };
 type Capture = ReadyCapture | Unresolved;
+
+interface ArtifactTarget {
+  readonly uid: string;
+  readonly spec: JsonObject;
+  readonly observed: JsonObject;
+}
+interface VersionMaterialTargets {
+  readonly bundle: ArtifactTarget | null;
+  readonly assets: ArtifactTarget | null;
+}
+export interface V2WorkerVersionMaterials {
+  readonly bundle: SqlArtifactCustodyRead<WorkerBundleManifest> | null;
+  readonly assets: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
+}
 
 type ReferenceRow = {
   target_uid: string;
@@ -184,7 +216,12 @@ function outputHostname(row: ResourceRow): { hostname: string; url: string } | n
 }
 
 /** No separate desired-state ledger: every read starts from the accepted v2 Operation. */
-export function createV2WorkerPublicationState(options: { sql: Sql; now?: Clock }) {
+export function createV2WorkerPublicationState(options: {
+  sql: Sql;
+  now?: Clock;
+  bundleCustody?: Pick<WorkerBundleCustody, "readHeldVerified">;
+  assetCustody?: Pick<StaticAssetBundleCustody, "readHeldVerified">;
+}) {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
 
@@ -261,6 +298,64 @@ export function createV2WorkerPublicationState(options: { sql: Sql; now?: Clock 
        ORDER BY op.created_at, op.id`,
       [WORKER_DEPLOYMENT_FORM_URL, WORKER_ENDPOINT_FORM_URL, workerUid],
     )) as unknown as OperationRow[];
+  }
+
+  async function artifactTarget(input: {
+    versionUid: string;
+    targetUid: string;
+    formUrl: typeof WORKER_BUNDLE_FORM_URL | typeof STATIC_ASSET_BUNDLE_FORM_URL;
+    principal: string;
+    space: string;
+  }): Promise<{ target: ArtifactTarget; evidence: unknown } | null> {
+    const target = await resource(input.targetUid);
+    const last = target ? await operation(target.last_operation) : null;
+    const spec = target ? parseObject(target.spec_json) : null;
+    const observed = target ? parseObject(target.observed_json) : null;
+    if (
+      !target ||
+      !last ||
+      !spec ||
+      !observed ||
+      target.form_url !== input.formUrl ||
+      target.principal !== input.principal ||
+      target.space !== input.space ||
+      !settled(target, last)
+    )
+      return null;
+    let expectedDigest: string;
+    try {
+      expectedDigest =
+        input.formUrl === WORKER_BUNDLE_FORM_URL
+          ? parseWorkerBundleSpec(spec).artifact.sha256
+          : parseStaticAssetBundleSpec(spec).artifact.sha256;
+    } catch {
+      return null;
+    }
+    const edge = await sql.query(
+      `SELECT target_uid, referrer_uid FROM tf_v2_resource_references
+       WHERE target_uid = ? AND referrer_uid = ?`,
+      [input.targetUid, input.versionUid],
+    );
+    const owner = (
+      await sql.query(
+        `SELECT resource_uid, form_url, manifest_sha256, state, observation_json,
+              verified_operation_id FROM tf_v2_artifact_owners WHERE resource_uid = ?`,
+        [input.targetUid],
+      )
+    )[0];
+    if (
+      edge.length !== 1 ||
+      !owner ||
+      owner.form_url !== input.formUrl ||
+      owner.state !== "verified" ||
+      owner.manifest_sha256 !== expectedDigest ||
+      owner.observation_json !== target.observed_json
+    )
+      return null;
+    return {
+      target: { uid: input.targetUid, spec, observed },
+      evidence: { target, last, edge, owner },
+    };
   }
 
   async function capture(input: {
@@ -424,6 +519,7 @@ export function createV2WorkerPublicationState(options: { sql: Sql; now?: Clock 
     }
 
     const evidence: unknown[] = [];
+    const materials = new Map<string, VersionMaterialTargets>();
     let deployment: V2WorkerPublicationSnapshot["deployment"] = null;
     if (chosenDeployment) {
       let spec: WorkerDeploymentSpec;
@@ -495,13 +591,62 @@ export function createV2WorkerPublicationState(options: { sql: Sql; now?: Clock 
           );
         }
         const versionReferences = last ? await references(last.id) : null;
-        if (
-          !versionReferences?.some(
-            (ref) => ref.target_uid === workerUid && ref.form_url === MODULE_WORKER_FORM_URL,
-          )
-        ) {
-          return unresolved("graph_unresolved", "A weighted Worker Version lacks sealed ownership");
+        let expectedVersionReferences: ReturnType<typeof referencesForWorkerVersion>;
+        try {
+          expectedVersionReferences = referencesForWorkerVersion(versionSpec);
+        } catch {
+          return unresolved("graph_unresolved", "A weighted Worker Version has invalid references");
         }
+        if (
+          !versionReferences ||
+          versionReferences.length !== expectedVersionReferences.length ||
+          expectedVersionReferences.some((expected, index) => {
+            const actual = versionReferences[index];
+            const expectedPath = expected.targetSpecMatch
+              ? `$.${expected.targetSpecMatch.path.join(".")}`
+              : null;
+            return (
+              !actual ||
+              actual.target_uid !== expected.resourceUid ||
+              actual.form_url !== expected.formUrl ||
+              actual.readiness !== expected.readiness ||
+              actual.target_spec_path !== expectedPath ||
+              actual.target_spec_equals !== (expected.targetSpecMatch?.equals ?? null)
+            );
+          })
+        ) {
+          return unresolved(
+            "graph_unresolved",
+            "A weighted Worker Version references are not sealed and exact",
+          );
+        }
+        const bundle = versionSpec.bundle
+          ? await artifactTarget({
+              versionUid: uid,
+              targetUid: versionSpec.bundle.resourceUid,
+              formUrl: WORKER_BUNDLE_FORM_URL,
+              principal: op.principal,
+              space: own.space,
+            })
+          : null;
+        const assets = versionSpec.assets
+          ? await artifactTarget({
+              versionUid: uid,
+              targetUid: versionSpec.assets.bundle.resourceUid,
+              formUrl: STATIC_ASSET_BUNDLE_FORM_URL,
+              principal: op.principal,
+              space: own.space,
+            })
+          : null;
+        if ((versionSpec.bundle && !bundle) || (versionSpec.assets && !assets)) {
+          return unresolved(
+            "graph_unresolved",
+            "A weighted Worker Version artifact is unavailable",
+          );
+        }
+        if (bundle) evidence.push(bundle.evidence);
+        if (assets) evidence.push(assets.evidence);
+        materials.set(uid, { bundle: bundle?.target ?? null, assets: assets?.target ?? null });
         versionEvidence.push({ row, last, versionReferences });
         versions.push({
           uid,
@@ -590,7 +735,13 @@ export function createV2WorkerPublicationState(options: { sql: Sql; now?: Clock 
       evidence,
       snapshot,
     } as unknown as JsonObject);
-    return { kind: "ready", snapshot, vector };
+    // SQL graph reads above may await after the first lease check. Do not
+    // return a once-valid claim as ready after its known deadline elapsed.
+    const finalNow = now().getTime();
+    if (!Number.isFinite(finalNow) || op.lease_until_ms === null || op.lease_until_ms <= finalNow) {
+      return unresolved("stale_claim", "The accepted operation lease expired during graph read");
+    }
+    return { kind: "ready", snapshot, vector, materials };
   }
 
   return {
@@ -606,6 +757,55 @@ export function createV2WorkerPublicationState(options: { sql: Sql; now?: Clock 
         async stillCurrent(): Promise<boolean> {
           const latest = await capture(input);
           return latest.kind === "ready" && latest.vector === initial.vector;
+        },
+        async readVersionMaterials(versionUid: string): Promise<V2WorkerVersionMaterials> {
+          const target = initial.materials.get(versionUid);
+          const stillAuthorized = async () => {
+            const latest = await capture(input);
+            return latest.kind === "ready" && latest.vector === initial.vector;
+          };
+          const denied = () =>
+            new SqlError("unavailable", "Worker Version materials are not authorized");
+          if (!target || !(await stillAuthorized())) throw denied();
+          const principal = initial.snapshot.worker.principal;
+          const space = initial.snapshot.worker.space;
+          const bundleCustody = options.bundleCustody;
+          const assetCustody = options.assetCustody;
+          if (target.bundle && !bundleCustody) throw denied();
+          if (target.assets && !assetCustody) throw denied();
+          const bundle =
+            target.bundle && bundleCustody
+              ? await bundleCustody.readHeldVerified({
+                  targetResourceUid: target.bundle.uid,
+                  principal,
+                  space,
+                  expectedSpec: target.bundle.spec,
+                  expectedObserved: target.bundle.observed,
+                  stillAuthorized,
+                })
+              : null;
+          const assets =
+            target.assets && assetCustody
+              ? await assetCustody.readHeldVerified({
+                  targetResourceUid: target.assets.uid,
+                  principal,
+                  space,
+                  expectedSpec: target.assets.spec,
+                  expectedObserved: target.assets.observed,
+                  stillAuthorized,
+                })
+              : null;
+          if (!(await stillAuthorized())) throw denied();
+          const cloneRead = <M>(
+            read: SqlArtifactCustodyRead<M> | null,
+          ): SqlArtifactCustodyRead<M> | null =>
+            read && {
+              manifest: structuredClone(read.manifest),
+              manifestBytes: new Uint8Array(read.manifestBytes),
+              files: read.files.map((file) => new Uint8Array(file)),
+              observed: structuredClone(read.observed),
+            };
+          return { bundle: cloneRead(bundle), assets: cloneRead(assets) };
         },
       };
     },

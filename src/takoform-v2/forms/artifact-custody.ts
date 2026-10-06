@@ -1,5 +1,5 @@
 import { bytesDigest, canonicalJson } from "../../json.ts";
-import type { JsonObject, Row, Sql } from "../../ports.ts";
+import type { Clock, JsonObject, Row, Sql } from "../../ports.ts";
 import { SqlError } from "../../ports.ts";
 import type { V2BackendResult, V2Execution } from "../types.ts";
 import type { V2ArtifactSource } from "./artifact-source.ts";
@@ -53,6 +53,15 @@ export interface SqlArtifactCustody<M extends { readonly files: readonly Artifac
     readonly execution: V2Execution;
     readonly targetResourceUid: string;
   }): Promise<SqlArtifactCustodyRead<M>>;
+  /** Internal graph read. The caller must prove its accepted graph on both sides. */
+  readHeldVerified(input: {
+    readonly targetResourceUid: string;
+    readonly principal: string;
+    readonly space: string;
+    readonly expectedSpec: JsonObject;
+    readonly expectedObserved: JsonObject;
+    readonly stillAuthorized: () => Promise<boolean>;
+  }): Promise<SqlArtifactCustodyRead<M>>;
 }
 
 /** Byte custody only: Form-specific parsing and observation remain with callers. */
@@ -60,6 +69,8 @@ export function createSqlArtifactCustody<
   M extends { readonly files: readonly ArtifactFile[] },
 >(options: {
   readonly sql: Sql;
+  /** Host-owned clock for SQL lease checks; never supplied by a read caller. */
+  readonly now?: Clock;
   readonly source: V2ArtifactSource;
   readonly layout: CustodyLayout;
   readonly formUrl: string;
@@ -82,6 +93,7 @@ export function createSqlArtifactCustody<
   readonly failureNoun: string;
 }): SqlArtifactCustody<M> {
   const { sql, source } = options;
+  const now = options.now ?? (() => new Date());
   const tables = TABLES[options.layout];
 
   async function owner(uid: string): Promise<OwnerRow | null> {
@@ -162,13 +174,17 @@ export function createSqlArtifactCustody<
     if (!held || !sameBytes(held, bytes)) throw options.invalidArtifact();
   }
 
-  async function ensureManifest(input: V2Execution, mayAcquire = true) {
+  async function ensureManifest(
+    input: Pick<V2Execution, "resourceUid" | "spec">,
+    mayAcquire = true,
+    acquisition?: V2Execution,
+  ) {
     const spec = options.parseSpec(input.spec);
     let current = await owner(input.resourceUid);
     if (!current) {
-      if (!mayAcquire) throw options.invalidArtifact();
+      if (!mayAcquire || !acquisition) throw options.invalidArtifact();
       const bytes = await acquire(
-        input,
+        acquisition,
         spec.artifact.url,
         spec.artifact.sha256,
         options.limits.manifestBytes,
@@ -189,8 +205,8 @@ export function createSqlArtifactCustody<
           ...(tables.hasFormUrl ? [options.formUrl] : []),
           spec.artifact.sha256,
           exactBuffer(bytes),
-          input.operationId,
-          input.leaseToken,
+          acquisition.operationId,
+          acquisition.leaseToken,
         ],
       );
       current = await owner(input.resourceUid);
@@ -210,9 +226,10 @@ export function createSqlArtifactCustody<
   }
 
   async function ensureFiles(
-    input: V2Execution,
+    input: Pick<V2Execution, "resourceUid" | "spec">,
     manifest: M,
     mayAcquire: boolean,
+    acquisition?: V2Execution,
   ): Promise<readonly Uint8Array[]> {
     const held: Uint8Array[] = [];
     let total = 0;
@@ -226,15 +243,15 @@ export function createSqlArtifactCustody<
         file.sha256,
       );
       if (bytes && bytes.byteLength > remainingBytes) throw options.invalidArtifact();
-      if (!bytes && mayAcquire) {
+      if (!bytes && mayAcquire && acquisition) {
         bytes = await acquire(
-          input,
+          acquisition,
           file.url,
           file.sha256,
           Math.min(options.limits.fileBytes, remainingBytes),
         );
         if (!(await validFile(bytes, file.sha256))) throw options.invalidArtifact();
-        await stageFile(input, index, bytes);
+        await stageFile(acquisition, index, bytes);
       }
       if (!bytes) throw options.invalidArtifact();
       total += bytes.byteLength;
@@ -245,8 +262,8 @@ export function createSqlArtifactCustody<
   }
 
   async function verify(input: V2Execution): Promise<V2BackendResult> {
-    const { current, manifestBytes, manifest } = await ensureManifest(input);
-    const files = await ensureFiles(input, manifest, current.state !== "verified");
+    const { current, manifestBytes, manifest } = await ensureManifest(input, true, input);
+    const files = await ensureFiles(input, manifest, current.state !== "verified", input);
     const result = await options.validatePayload({
       spec: input.spec,
       manifestBytes,
@@ -296,20 +313,53 @@ export function createSqlArtifactCustody<
     return { kind: "complete", observed: {}, output: {} };
   }
 
+  const denied = () => new SqlError("unavailable", "verified artifact is unavailable");
+
+  async function heldVerified(
+    targetResourceUid: string,
+    targetSpec: JsonObject,
+    targetObserved: JsonObject,
+  ): Promise<SqlArtifactCustodyRead<M>> {
+    const heldInput = { resourceUid: targetResourceUid, spec: targetSpec };
+    const { current, manifestBytes, manifest } = await ensureManifest(heldInput, false);
+    if (current.state !== "verified" || !current.observation_json) throw denied();
+    const files = await ensureFiles(heldInput, manifest, false);
+    const result = await options.validatePayload({
+      spec: targetSpec,
+      manifestBytes,
+      fileBytes: files,
+    });
+    const observedJson = canonicalJson(result.observed);
+    if (
+      current.observation_json !== observedJson ||
+      canonicalJson(targetObserved) !== observedJson
+    ) {
+      throw denied();
+    }
+    return {
+      manifest,
+      manifestBytes: new Uint8Array(manifestBytes),
+      files: files.map((bytes) => new Uint8Array(bytes)),
+      observed: JSON.parse(observedJson) as JsonObject,
+    };
+  }
+
   async function readVerified(input: {
     readonly execution: V2Execution;
     readonly targetResourceUid: string;
   }): Promise<SqlArtifactCustodyRead<M>> {
     const { execution, targetResourceUid } = input;
-    const denied = () => new SqlError("unavailable", "verified artifact is unavailable");
     if (!tables.hasFormUrl || !targetResourceUid) throw denied();
 
     const authorizationRow = async (): Promise<Row> => {
       let candidate: Row | undefined;
       try {
+        const nowMs = now().getTime();
+        if (!Number.isFinite(nowMs)) throw denied();
         candidate = (
           await sql.query(
-            `SELECT op.accepted_spec_json, target.spec_json AS target_spec_json,
+            `SELECT op.accepted_spec_json, op.lease_until_ms,
+                target.spec_json AS target_spec_json,
                 target.observed_json AS target_observed_json,
                 owner.state AS owner_state, owner.observation_json AS owner_observation_json
          FROM tf_v2_operations op
@@ -324,7 +374,8 @@ export function createSqlArtifactCustody<
          JOIN tf_v2_resources target ON target.uid = accepted_ref.target_uid
          JOIN tf_v2_artifact_owners owner ON owner.resource_uid = target.uid
          WHERE op.id = ? AND op.lease_token = ? AND op.status = 'reconciling'
-           AND op.action IN ('create', 'update')
+           AND op.dispatch_possible = 1 AND op.lease_until_ms > ?
+           AND op.action IN ('create', 'update') AND op.action = ?
            AND op.resource_uid = ? AND op.principal = ? AND op.generation = ?
            AND op.backend_key = ? AND op.backend_id = ? AND op.target_key = ?
            AND consumer.principal = op.principal AND consumer.form_url = ?
@@ -332,6 +383,7 @@ export function createSqlArtifactCustody<
            AND consumer.backend_id = op.backend_id AND consumer.target_key = op.target_key
            AND consumer.busy_operation = op.id AND consumer.last_operation = op.id
            AND consumer.generation = op.generation AND consumer.deleted_at IS NULL
+           AND consumer.spec_json = op.accepted_spec_json
            AND accepted_ref.form_url = ?
            AND (accepted_ref.target_spec_path IS NULL OR
                 json_extract(target.spec_json, accepted_ref.target_spec_path) =
@@ -345,6 +397,8 @@ export function createSqlArtifactCustody<
               targetResourceUid,
               execution.operationId,
               execution.leaseToken,
+              nowMs,
+              execution.action,
               execution.resourceUid,
               execution.principal,
               execution.generation,
@@ -363,6 +417,13 @@ export function createSqlArtifactCustody<
         throw denied();
       }
       if (candidate?.owner_state !== "verified") throw denied();
+      const freshNowMs = now().getTime();
+      if (
+        !Number.isFinite(freshNowMs) ||
+        typeof candidate.lease_until_ms !== "number" ||
+        candidate.lease_until_ms <= freshNowMs
+      )
+        throw denied();
       return candidate;
     };
     const candidate = await authorizationRow();
@@ -372,33 +433,7 @@ export function createSqlArtifactCustody<
       if (canonicalJson(acceptedSpec) !== canonicalJson(execution.spec)) throw denied();
       const targetSpec = JSON.parse(String(candidate.target_spec_json)) as JsonObject;
       const targetObserved = JSON.parse(String(candidate.target_observed_json)) as JsonObject;
-      const { current, manifestBytes, manifest } = await ensureManifest(
-        {
-          ...execution,
-          resourceUid: targetResourceUid,
-          form: options.formUrl,
-          spec: targetSpec,
-        },
-        false,
-      );
-      if (current.state !== "verified" || !current.observation_json) throw denied();
-      const files = await ensureFiles(
-        { ...execution, resourceUid: targetResourceUid, form: options.formUrl, spec: targetSpec },
-        manifest,
-        false,
-      );
-      const result = await options.validatePayload({
-        spec: targetSpec,
-        manifestBytes,
-        fileBytes: files,
-      });
-      const observedJson = canonicalJson(result.observed);
-      if (
-        current.observation_json !== observedJson ||
-        canonicalJson(targetObserved) !== observedJson
-      ) {
-        throw denied();
-      }
+      const read = await heldVerified(targetResourceUid, targetSpec, targetObserved);
       const finalAuthorization = await authorizationRow();
       if (
         finalAuthorization.accepted_spec_json !== candidate.accepted_spec_json ||
@@ -408,12 +443,67 @@ export function createSqlArtifactCustody<
       ) {
         throw denied();
       }
-      return {
-        manifest,
-        manifestBytes: new Uint8Array(manifestBytes),
-        files: files.map((bytes) => new Uint8Array(bytes)),
-        observed: JSON.parse(observedJson) as JsonObject,
+      return read;
+    } catch {
+      throw denied();
+    }
+  }
+
+  async function readHeldVerified(input: {
+    readonly targetResourceUid: string;
+    readonly principal: string;
+    readonly space: string;
+    readonly expectedSpec: JsonObject;
+    readonly expectedObserved: JsonObject;
+    readonly stillAuthorized: () => Promise<boolean>;
+  }): Promise<SqlArtifactCustodyRead<M>> {
+    if (!tables.hasFormUrl || !input.targetResourceUid) throw denied();
+    try {
+      const expectedSpecJson = canonicalJson(input.expectedSpec);
+      const expectedObservedJson = canonicalJson(input.expectedObserved);
+      const authorizationRow = async (): Promise<Row> => {
+        const row = (
+          await sql.query(
+            `SELECT target.uid, target.generation, target.last_operation,
+              target.spec_json, target.observed_json, owner.observation_json
+           FROM tf_v2_resources target
+           JOIN tf_v2_operations settled ON settled.id = target.last_operation
+           JOIN tf_v2_artifact_owners owner ON owner.resource_uid = target.uid
+           WHERE target.uid = ? AND target.principal = ? AND target.space = ?
+             AND target.form_url = ? AND target.deleted_at IS NULL
+             AND target.busy_operation IS NULL AND target.phase = 'idle'
+             AND target.generation = target.observed_generation
+             AND settled.resource_uid = target.uid AND settled.principal = target.principal
+             AND settled.generation = target.generation
+             AND settled.status = 'succeeded' AND settled.effect = 'complete'
+             AND target.spec_json = ? AND target.observed_json = ?
+             AND owner.form_url = target.form_url AND owner.state = 'verified'
+             AND owner.observation_json = target.observed_json
+           LIMIT 1`,
+            [
+              input.targetResourceUid,
+              input.principal,
+              input.space,
+              options.formUrl,
+              expectedSpecJson,
+              expectedObservedJson,
+            ],
+          )
+        )[0];
+        if (!row) throw denied();
+        return row;
       };
+      if (!(await input.stillAuthorized())) throw denied();
+      const before = await authorizationRow();
+      const read = await heldVerified(
+        input.targetResourceUid,
+        input.expectedSpec,
+        input.expectedObserved,
+      );
+      const after = await authorizationRow();
+      if (canonicalJson(before) !== canonicalJson(after)) throw denied();
+      if (!(await input.stillAuthorized())) throw denied();
+      return read;
     } catch {
       throw denied();
     }
@@ -441,7 +531,7 @@ export function createSqlArtifactCustody<
     }
   }
 
-  return { execute, readVerified };
+  return { execute, readVerified, readHeldVerified };
 }
 
 function asBytes(value: unknown): Uint8Array {

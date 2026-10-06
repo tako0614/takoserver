@@ -262,6 +262,22 @@ Forms: those Forms are not registered in the normal application and do not call
 it. It does not provide multi-process fencing or invocation retirement, and it
 does not establish v2 Worker publication or traffic readiness.
 
+The internal material reader reuses the existing immutable Bundle and StaticAssetBundle
+custody rather than create another Version byte ledger. A live Version's sealed
+references retain those Resources and their verified bytes. The runtime's staged
+immutable generation is its execution copy; Resource/Operation records remain
+the desired-state authority. Version deletion must still wait for both ordinary
+references and invocation retirement, then release only its execution copy.
+
+Publication must read through its own live Operation and the exact selected,
+settled Version. An Endpoint reaches a Version through the confirmed Deployment
+in the SQL graph; its own Worker reference is not a grant to arbitrary Versions.
+The reader must recheck the graph and artifact digests after asynchronous reads.
+It must neither impersonate a completed Version Operation nor reacquire source
+URLs when held bytes are missing. Missing or changed custody remains unresolved.
+This held-byte connection does not yet register Worker Form backends or establish
+module execution, Binding capability, or complete Worker Form support.
+
 Forms can also calculate initial public output in a pure callback. That output
 is committed at acceptance, including before backend execution, and is not
 reallocated on replay or update. This supports the Endpoint requirement to retain
