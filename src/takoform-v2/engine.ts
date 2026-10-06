@@ -308,7 +308,11 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       if (target.busy_operation) fail("resource_busy", 409);
       if (target.generation !== input.expectedGeneration) fail("generation_conflict", 409);
       if (target.generation >= Number.MAX_SAFE_INTEGER) fail("invalid_request", 400);
-      boundForm(target);
+      const selectedForm = boundForm(target);
+      const mustRejectReferences = selectedForm.rejectDeleteWhileReferenced === true;
+      if (mustRejectReferences && (await store.hasReferences(target.uid))) {
+        fail("dependency_conflict", 409);
+      }
       const record = accepted("delete", {
         principal: input.principal,
         key: input.key,
@@ -319,7 +323,8 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         formUrl: target.form_url,
       });
       try {
-        if (await store.insertChange(record)) return operation(await storedOperation(record.id));
+        if (await store.insertChange(record, mustRejectReferences))
+          return operation(await storedOperation(record.id));
       } catch (error) {
         const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
         if (winner) return winner;
@@ -327,6 +332,9 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       }
       const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
       if (winner) return winner;
+      if (mustRejectReferences && (await store.hasReferences(target.uid))) {
+        fail("dependency_conflict", 409);
+      }
       const latest = await ownedResource(input.principal, input.uid, "write");
       if (latest.busy_operation) fail("resource_busy", 409);
       fail("generation_conflict", 409);
@@ -393,6 +401,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         backendId: claimed.backend_id,
         targetKey: claimed.target_key,
         resourceUid: target.uid,
+        principal: claimed.principal,
         action: claimed.action,
         generation: claimed.generation,
         form: target.form_url,

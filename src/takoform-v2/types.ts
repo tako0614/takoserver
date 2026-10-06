@@ -54,6 +54,8 @@ export interface V2Execution {
   backendId: string;
   targetKey: string;
   resourceUid: string;
+  /** Accepted owner, used only by form-specific authorized input resolution. */
+  principal: string;
   action: V2Action;
   generation: number;
   form: string;
@@ -84,6 +86,8 @@ export interface V2Backend {
 export interface V2Form {
   validateCreate(spec: JsonObject): void;
   validateUpdate(previousSpec: JsonObject, spec: JsonObject): void;
+  /** Optional generic SQL reference guard, enforced in the same delete acceptance batch. */
+  rejectDeleteWhileReferenced?: true;
   backend: V2Backend;
 }
 

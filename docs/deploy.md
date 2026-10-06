@@ -184,8 +184,8 @@ production commit, runs the migration gate once, seals the fixed audited
 proves the empty canonical shape, applies the lineage through one sealed
 `wrangler d1 execute --file` import, and verifies the exact lineage and
 application schema afterwards. The complete source inventory is audited through
-0070, but this fresh-empty-target path deliberately projects only the frozen
-0001–0069 payload. An empty self-host SQLite boot includes 0070, so its schema is
+0071, but this fresh-empty-target path deliberately projects only the frozen
+0001–0069 payload. An empty self-host SQLite boot includes 0071, so its schema is
 not yet identical to this production bootstrap. Adding the v2 tables to a live
 production database requires a separately authorized migration path; source
 recognition does not raise the existing-target or protected migration-wave
@@ -1245,12 +1245,12 @@ managed customer runtime.
 
   Integration may select one of the same audited boundaries to exercise a
   bounded protected wave. The selector is checked against the immutable
-  0001–0070 names and SHA-256 source inventory, so a checkout with unreviewed
-  0071+ migrations is refused before qualification or provider mutation. The
+  0001–0071 names and SHA-256 source inventory, so a checkout with unreviewed
+  0072+ migrations is refused before qualification or provider mutation. The
   selected integration lane projects only the audited through-prefix, with
   apply and remote D1 qualification still capped at 0066. The source-only 0067
   Container Endpoint index, 0068 future provider-invocation custody schema,
-  0069 future delete-ack proof projection and 0070 v2 tables are source-only for existing-target
+  0069 future delete-ack proof projection and 0070–0071 v2 tables are source-only for existing-target
   waves: they are not new protected waves or in-place D1 apply authority. The
   separately selected fresh-empty production D1 path remains pinned to 0001–0069,
   without qualifying a live remote D1 import or existing-data upgrade.
@@ -1734,12 +1734,12 @@ for protected data.
 The no-selector `takoserver-d1-schema` integration lane accepts one further
 standalone transition: the exact audited 0062 prefix with only
 `0063_cloudflare_managed_queue_retirement.sql` pending. The source inventory
-must be exactly 0001–0070 with the audited 0063 SHA-256, and the selected D1
+must be exactly 0001–0071 with the audited 0063 SHA-256, and the selected D1
 must have the canonical 0062 application shape. Protected rehearsal and
 production selectors remain capped at 0057. The audited 0064 Actor-owner
 table has a separate in-place integration wave only after exact 0063; a fresh
 integration storage generation remains limited to the apply-qualified 0001–0066
-prefix. An unreviewed 0071-or-later tail is refused.
+prefix. An unreviewed 0072-or-later tail is refused.
 
 0063 creates only the durable managed Queue retirement marker, helper-phase
 rows, route tripwire and their immutable/no-regression guards. It rewrites and

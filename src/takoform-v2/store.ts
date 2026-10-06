@@ -124,6 +124,18 @@ export function createV2Store(sql: Sql) {
         ).length > 0
       );
     },
+    async hasReferences(uid: string): Promise<boolean> {
+      return (
+        (
+          await sql.query(
+            `SELECT 1 FROM tf_v2_resource_references edge
+             JOIN tf_v2_resources referrer ON referrer.uid = edge.referrer_uid
+             WHERE edge.target_uid = ? AND referrer.deleted_at IS NULL LIMIT 1`,
+            [uid],
+          )
+        ).length > 0
+      );
+    },
     async list(input: {
       principal: string;
       afterUid?: string;
@@ -181,13 +193,21 @@ export function createV2Store(sql: Sql) {
         { sql: opInsert, params: opParams(record) },
       ]);
     },
-    async insertChange(record: AcceptRecord): Promise<boolean> {
+    async insertChange(record: AcceptRecord, forbidReferences = false): Promise<boolean> {
       const writes = await sql.batch([
         {
           sql: `UPDATE tf_v2_resources SET generation = ?, spec_json = ?,
               phase = ?, last_operation = ?, busy_operation = ?
             WHERE uid = ? AND principal = ? AND deleted_at IS NULL
-              AND generation = ? AND busy_operation IS NULL`,
+              AND generation = ? AND busy_operation IS NULL
+              ${
+                forbidReferences
+                  ? `AND NOT EXISTS (
+                      SELECT 1 FROM tf_v2_resource_references edge
+                      JOIN tf_v2_resources referrer ON referrer.uid = edge.referrer_uid
+                      WHERE edge.target_uid = ? AND referrer.deleted_at IS NULL)`
+                  : ""
+              }`,
           params: [
             record.generation,
             record.specJson,
@@ -197,6 +217,7 @@ export function createV2Store(sql: Sql) {
             record.resourceUid,
             record.principal,
             record.generation - 1,
+            ...(forbidReferences ? [record.resourceUid] : []),
           ],
         },
         {

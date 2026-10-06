@@ -47,6 +47,30 @@ resource authorization. Preserve it across restarts; rotating it invalidates old
 cursors. Never put a production key in source or logs. Fixture keys in tests are
 not usable deployment credentials.
 
+## Organization ownership and credential permissions
+
+The normal organization lane assigns one v2 Space to each organization: the
+Space is exactly the organization ID. Its stable v2 principal is
+`org:<organizationId>`. Authorized organization API keys and the organization's
+owner session share this identity, so replacing a key does not strand its v2
+Resources. They also share the idempotency-key namespace; clients must generate
+distinct operation keys rather than using a counter local to one credential.
+
+Authentication still checks each request's current credential. An API key is
+bound to its stored organization; a request header cannot select another one.
+`resources:read` permits reads, and `resources:write` permits reads and mutations.
+The HTTP boundary checks the current write grant before accepting or replaying a
+mutation. A session must explicitly select `takoform-organization` and pass the
+existing organization-owner check. No reseller or sponsorship credential is
+implicitly admitted to this lane.
+
+This is a new v2 ownership policy, not a rewrite of v1's per-key service
+principals. `Actor.hostPrincipalId` and existing keys/records retain their current
+meaning. The generic engine still receives an explicit Space authorization
+function; its stable owner identity alone is not proof of the current key's
+write permission. Ordinary application wiring and live adoption remain separate
+from adding this composition module.
+
 ## First implementation slice
 
 The initial slice covers the required common HTTP operations and durable
@@ -71,9 +95,26 @@ a new HTTP envelope.
 An artifact-only Form such as
 [`SQLiteMigrationSet 0.2.0`](https://edge.forms.takoform.com/forms/SQLiteMigrationSet/0.2.0/)
 can form a smaller first real-resource journey without requiring a Worker
-runtime. That still requires authorized bounded artifact acquisition, exact-byte
-verification, durable owner-specific custody, and reference-safe deletion. These
-are implementation work, not capabilities of the initial generic engine.
+runtime. Its implementation uses the Form's Host-held artifact acquisition
+option: an operator explicitly maps an exact URL and digest to an existing
+object and grants access to an exact principal/Space pair. A digest match alone
+never grants access. The resolver does not fetch arbitrary URLs or reuse v1
+artifact holds, and stops at finite time and actual-byte limits. Outbound public
+HTTPS acquisition is not implemented by this resolver.
+
+The migration-set backend verifies the manifest and files, then keeps its own
+Resource-scoped bytes in SQL custody. The accepted Operation and current lease
+fence each write in the same database as the Resource. This avoids a late object
+upload recreating bytes after deletion. Updates verify the already-held bytes;
+reads do not contact the source. Deletion releases only the Resource's custody,
+not the operator's source objects, and a live inbound reference prevents delete
+acceptance. None of these operations executes SQL from the migration files.
+
+These modules are a source candidate for a self-host path, not a claim that the
+normal shipped application, Hosted D1 or a WfP backend now serves the Form. Its
+organization access, scheduler, source mappings and durable target must be
+composed explicitly. Source and custody authorization are distinct: a caller
+may have write access to a Space but no grant to a particular source artifact.
 
 ## Existing installations
 
