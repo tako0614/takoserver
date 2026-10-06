@@ -21,6 +21,53 @@ const WORKER_ENDPOINT_PUBLIC_CREATE_ENV = "TAKOSERVER_NATIVE_WORKER_ENDPOINT_PUB
 const SELFHOST_ARTIFACT_UPLOAD_ENV = "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE";
 const QUEUE_HTTPS_DIAGNOSTIC_ENV = "TAKOSERVER_SELFHOST_QUEUE_HTTPS_DIAGNOSTIC_NATIVE";
 const WORKERD_PARENT_LIFETIME_ENV = "TAKOSERVER_NATIVE_WORKERD_PARENT_LIFETIME";
+const V2_ENTRY_ENV = "TAKOSERVER_V2_ENTRY_NATIVE";
+
+test("classifies the normal Bun v2 entry journey as readiness, not execution", () => {
+  const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));
+  const own = gates.filter((gate) => gate.file === "tests/takoform-v2-entry-bun-native.test.ts");
+  expect(own).toHaveLength(1);
+  expect(own[0]?.environments).toEqual([V2_ENTRY_ENV]);
+  expect(own[0]?.capability).toBe("takoform-v2-bun-entry-lifecycle");
+
+  const capability = NATIVE_EVIDENCE_CAPABILITIES.find(
+    (entry) => entry.id === "takoform-v2-bun-entry-lifecycle",
+  );
+  if (!capability) throw new Error("v2 Bun entry capability missing");
+  expect(capability.companionEnvironment).toEqual([]);
+  expect(capability.inspect(undefined, {}, probe()).state).toBe("unconfigured");
+  expect(capability.inspect("", {}, probe()).state).toBe("unconfigured");
+  expect(capability.inspect("true", {}, probe()).state).toBe("invalid");
+  expect(capability.inspect("1", {}, probe())).toMatchObject({
+    state: "ready",
+    readinessOnly: true,
+  });
+  expect(capability.proves).toContain("two configured Bun entry process boots");
+  expect(capability.proves).toContain("terminal Operation replay after restart");
+  expect(capability.proves).toContain("does not prove public TLS");
+  expect(capability.proves).toContain("does not prove public TLS, Hosted");
+
+  const summaries = summarizeNativeEvidence({
+    gates: own,
+    environment: { [V2_ENTRY_ENV]: "1" },
+    probe: probe(),
+  });
+  const summary = summaries.find((entry) => entry.capability === capability.id);
+  expect(summary).toMatchObject({ state: "ready", readinessOnly: true, tests: 1, files: 1 });
+  expect(renderNativeEvidenceReport({ summaries, gates: own }).join("\n")).toContain(
+    "runtime execution is not proven by this inspection",
+  );
+  expect(
+    nativeEvidenceExitCode({
+      summaries: summarizeNativeEvidence({
+        gates: own,
+        environment: { [V2_ENTRY_ENV]: "true" },
+        probe: probe(),
+      }),
+      gates: own,
+    }),
+  ).toBe(1);
+});
 
 test("classifies the opt-in Linux parent lifetime suite and rejects invalid enablement", () => {
   const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));

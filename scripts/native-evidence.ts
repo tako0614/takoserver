@@ -295,6 +295,33 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
     },
   },
   {
+    id: "takoform-v2-bun-entry-lifecycle",
+    label: "normal self-host Bun Takoform v2 entry lifecycle",
+    environment: "TAKOSERVER_V2_ENTRY_NATIVE",
+    companionEnvironment: [],
+    proves:
+      "two configured Bun entry process boots after an Accounts bootstrap boot against the same local SQLite database and FileObjectStore, with settled Resource readback and terminal Operation replay after restart and operator-held source deletion, followed by Takoform v2 SQLiteMigrationSet update/delete over loopback HTTP behind a configured HTTPS authority; it does not prove public TLS, Hosted/D1 execution, or forced lost-ACK recovery",
+    enable: "TAKOSERVER_V2_ENTRY_NATIVE=1 with Bun and isolated local test state",
+    inspect: (configured) => {
+      if (configured === undefined || configured.trim() === "") {
+        return {
+          state: "unconfigured",
+          detail:
+            "TAKOSERVER_V2_ENTRY_NATIVE is not configured; the normal Bun entry lifecycle test is disabled",
+        };
+      }
+      if (configured !== "1") {
+        return { state: "invalid", detail: "TAKOSERVER_V2_ENTRY_NATIVE must be exactly 1" };
+      }
+      return {
+        state: "ready",
+        detail:
+          "the exact opt-in is configured; only the gated normal Bun entry lifecycle test can establish runtime evidence",
+        readinessOnly: true,
+      };
+    },
+  },
+  {
     id: "selfhost-artifact-upload",
     label: "self-host public Host artifact upload lifecycle",
     environment: "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE",

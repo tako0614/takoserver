@@ -7,7 +7,7 @@ import { createFileObjectStore } from "../src/objects-fs.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 
-const OPT_IN = process.env.TAKOSERVER_V2_ENTRY_NATIVE === "1";
+const OPT_IN = process.env.TAKOSERVER_V2_ENTRY_NATIVE;
 const PUBLIC_ORIGIN = "https://v2-entry.takoserver.test";
 const PUBLIC_HOST = "v2-entry.takoserver.test";
 const V2 = "/apis/forms.takoform.com/v2";
@@ -143,9 +143,12 @@ async function settled(port: number, token: string, operationId: string): Promis
   throw new Error("native v2 operation settlement deadline exceeded");
 }
 
-test.skipIf(!OPT_IN)(
+test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
   "normal Bun entry serves v2 SQLite Migration Set over loopback behind a configured HTTPS authority",
   async () => {
+    if (OPT_IN !== "1") {
+      throw new Error("TAKOSERVER_V2_ENTRY_NATIVE must be exactly 1");
+    }
     const root = await mkdtemp(join(tmpdir(), "takoserver-v2-entry-native-"));
     const port = await choosePort();
     let bootstrap: Child | null = null;
@@ -215,14 +218,11 @@ test.skipIf(!OPT_IN)(
         await objects.create(FILE_KEY, fileBytes, { contentType: "application/sql" }),
       ).not.toBeNull();
       const grants = [{ principal: `org:${organizationId}`, space: organizationId }];
-      serving = await startHost(
-        root,
-        port,
-        fixtureConfig([
-          { url: MANIFEST_URL, sha256: manifestSha256, objectKey: MANIFEST_KEY, grants },
-          { url: FILE_URL, sha256: fileSha256, objectKey: FILE_KEY, grants },
-        ]),
-      );
+      const configured = fixtureConfig([
+        { url: MANIFEST_URL, sha256: manifestSha256, objectKey: MANIFEST_KEY, grants },
+        { url: FILE_URL, sha256: fileSha256, objectKey: FILE_KEY, grants },
+      ]);
+      serving = await startHost(root, port, configured);
       expect((await requestAt(port, "/.well-known/takoform/v1")).status).toBe(404);
       expect((await requestAt(port, "/.well-known/takoform/v2")).status).toBe(200);
       const auth = { authorization: `Bearer ${secret}` };
@@ -238,23 +238,53 @@ test.skipIf(!OPT_IN)(
       ).toMatchObject({ supported: true });
 
       const spec = { artifact: { url: MANIFEST_URL, sha256: manifestSha256 } };
-      const create = await jsonAt(
-        port,
-        "POST",
-        `${V2}/resources`,
-        202,
-        { form: SQLITE_MIGRATION_SET_FORM_URL, space: organizationId, name: "schema", spec },
-        { ...auth, "idempotency-key": "native-entry-create-0001" },
-      );
+      const createBody = {
+        form: SQLITE_MIGRATION_SET_FORM_URL,
+        space: organizationId,
+        name: "schema",
+        spec,
+      };
+      const createHeaders = { ...auth, "idempotency-key": "native-entry-create-0001" };
+      const create = await jsonAt(port, "POST", `${V2}/resources`, 202, createBody, createHeaders);
       const resourceUid = String(create.resourceUid);
       expect(await settled(port, secret, String(create.id))).toMatchObject({ effect: "complete" });
-      expect(
-        await jsonAt(port, "GET", `${V2}/resources/${resourceUid}`, 200, undefined, auth),
-      ).toMatchObject({ uid: resourceUid, generation: 1, observed: { manifestSha256 } });
+      const beforeRestart = await jsonAt(
+        port,
+        "GET",
+        `${V2}/resources/${resourceUid}`,
+        200,
+        undefined,
+        auth,
+      );
+      expect(beforeRestart).toMatchObject({
+        uid: resourceUid,
+        generation: 1,
+        observedGeneration: 1,
+        observed: { manifestSha256 },
+      });
 
-      // Reading and same-spec update use SQL custody after the source is gone.
+      // A normal entry restart retains Resource, Operation replay, and SQL
+      // custody even though neither original held source object is available.
+      const firstServingPid = serving.pid;
+      await stopHost(serving);
+      serving = null;
       expect(await objects.delete(MANIFEST_KEY)).toBe(true);
       expect(await objects.delete(FILE_KEY)).toBe(true);
+      serving = await startHost(root, port, configured);
+      expect(serving.pid).not.toBe(firstServingPid);
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${resourceUid}`, 200, undefined, auth),
+      ).toEqual(beforeRestart);
+      expect(
+        await jsonAt(port, "POST", `${V2}/resources`, 200, createBody, createHeaders),
+      ).toMatchObject({
+        id: create.id,
+        resourceUid,
+        generation: 1,
+        status: "succeeded",
+      });
+
+      // Same-spec update and deletion continue from held SQL bytes.
       const update = await jsonAt(
         port,
         "PUT",
