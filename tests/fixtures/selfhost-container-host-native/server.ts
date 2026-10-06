@@ -13,6 +13,7 @@ import { createStandaloneProviderComposition } from "../../../src/standalone-pro
 import { createTakoformArtifacts } from "../../../src/takoform/artifacts.ts";
 import { currentTakoformCandidates } from "../../../src/takoform/current-candidates.ts";
 import type { WorkerdRuntime } from "../../../src/workerd-runtime.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "../../helpers/takoform-v2-config.ts";
 import { loadVerifiedLocalContainerCandidate } from "../selfhost-container-host-authority.ts";
 
 const required = (name: string): string => {
@@ -107,6 +108,7 @@ const composition = createStandaloneProviderComposition({
   } satisfies ProviderRuntimeInputLeasePort,
 });
 const app = buildApp({
+  v2: TEST_TAKOFORM_V2_CONFIG,
   sql,
   objects,
   publicOrigin: "https://container-host-native.test",

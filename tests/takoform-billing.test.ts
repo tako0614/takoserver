@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildEdgeForms, edgeProviderOffering } from "../src/edge-forms.ts";
 import {
-  buildApp,
   createCatalog,
   createEphemeralSql,
   createLedger,
@@ -27,7 +26,11 @@ import {
 import { createFakeProviderState, FakeProvider } from "../src/providers/fake.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
 import { applyWithSelection } from "./helpers/apply-with-selection.ts";
-import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
+import {
+  buildHistoricalTakoformApp,
+  createStaticStableTestTakoformHost,
+} from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const fakeReadback = {
   createNativeReadbackDescriptor(input: {
@@ -170,7 +173,8 @@ function newApp(options: { failOn?: readonly string[]; usageOnly?: boolean } = {
     offerings: [PROVIDER_OFFERING],
     ...(options.failOn ? { failOn: options.failOn } : {}),
   });
-  const app = buildApp({
+  const app = buildHistoricalTakoformApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql,
     objects: createMemoryObjectStore(),
     identity,
@@ -604,7 +608,8 @@ describe("Takoform apply on a real backend", () => {
         return succeeded({ nativeId: input.nativeId, observed: {}, outputs: {} });
       },
     };
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects: createMemoryObjectStore(),
       identity,
@@ -736,7 +741,8 @@ describe("Takoform apply on a real backend", () => {
           return failed("not_found", "not found");
         },
       };
-      const app = buildApp({
+      const app = buildHistoricalTakoformApp({
+        v2: TEST_TAKOFORM_V2_CONFIG,
         sql,
         objects: createMemoryObjectStore(),
         identity,
@@ -927,7 +933,8 @@ describe("Takoform apply on a real backend", () => {
           return failed("not_found", "not found");
         },
       };
-      const app = buildApp({
+      const app = buildHistoricalTakoformApp({
+        v2: TEST_TAKOFORM_V2_CONFIG,
         sql,
         objects: createMemoryObjectStore(),
         identity,
@@ -1062,7 +1069,8 @@ describe("Takoform apply on a real backend", () => {
         return failed("not_found", "not found");
       },
     };
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects: createMemoryObjectStore(),
       identity,
@@ -1144,7 +1152,8 @@ describe("Takoform apply on a real backend", () => {
       providerPackRef: initialProvider.id,
       providerInstallationRef: "fake-initial.primary",
     };
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects,
       identity,
@@ -1190,7 +1199,8 @@ describe("Takoform apply on a real backend", () => {
         return failed("not_found", "not found");
       },
     };
-    const restarted = buildApp({
+    const restarted = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects,
       identity,
@@ -1269,7 +1279,8 @@ describe("Takoform apply on a real backend", () => {
       },
     };
     const open = (selected: Provider) =>
-      buildApp({
+      buildHistoricalTakoformApp({
+        v2: TEST_TAKOFORM_V2_CONFIG,
         sql,
         objects,
         identity,
@@ -1370,7 +1381,8 @@ describe("Takoform apply on a real backend", () => {
       ...FORM,
       operations: [...FORM.operations, "import"],
     };
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects: createMemoryObjectStore(),
       identity,
@@ -1913,7 +1925,8 @@ describe("Takoform apply on a real backend", () => {
       batch: (statements) => durable.batch(statements),
     };
     const provider = new FakeProvider({ offerings: [PROVIDER_OFFERING] });
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects: createMemoryObjectStore(),
       identity,
@@ -1982,7 +1995,8 @@ describe("Takoform apply on a real backend", () => {
     };
     const provider = new FakeProvider({ offerings: [PROVIDER_OFFERING] });
     const clock = () => new Date("2026-08-24T00:00:00.000Z");
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects: createMemoryObjectStore(),
       identity,
@@ -2073,7 +2087,8 @@ describe("Takoform apply on a real backend", () => {
       },
       adopt: (input) => fake.adopt(input),
     };
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects: createMemoryObjectStore(),
       identity,
@@ -3472,7 +3487,8 @@ describe("Takoform apply on a real backend", () => {
           return succeeded({ nativeId: input.nativeId, observed: {}, outputs: {} });
         },
       };
-      const app = buildApp({
+      const app = buildHistoricalTakoformApp({
+        v2: TEST_TAKOFORM_V2_CONFIG,
         sql,
         objects: createMemoryObjectStore(),
         identity,
@@ -3583,7 +3599,8 @@ describe("Takoform apply on a real backend", () => {
       return await apply(input);
     };
     const clock = () => new Date("2026-09-13T00:00:00.000Z");
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects: createMemoryObjectStore(),
       identity,
@@ -3813,7 +3830,8 @@ describe("orphaned declarations", () => {
       offerings: [SOLD],
     };
 
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       ...ports,
       forms: [FORM],
       hostForms: [FORM],
@@ -3826,7 +3844,8 @@ describe("orphaned declarations", () => {
     // The same deployment, restarted with a Form whose schema moved on without
     // a new definition version. The declaration is now unresolvable, and the
     // backend resource it describes is still running.
-    const moved = buildApp({
+    const moved = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       ...ports,
       hostForms: [FORM],
       takoformHostFactory: createStaticStableTestTakoformHost,

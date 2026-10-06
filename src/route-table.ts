@@ -36,7 +36,7 @@ export const ROUTES: readonly RouteDeclaration[] = [
   { method: "get", pattern: "/", operation: "console" },
   { method: "get", pattern: "/openapi.json", operation: "openapiDocument" },
   { method: "get", pattern: "/.well-known/takoserver", operation: "productDiscovery" },
-  { method: "get", pattern: "/.well-known/takoform/v1", operation: "takoformDiscovery" },
+  { method: "get", pattern: "/.well-known/takoform/v2", operation: "takoformDiscovery" },
   { method: "get", pattern: "/v1/identity/providers", operation: "identityProviders" },
   {
     method: "post",
@@ -255,79 +255,17 @@ export const ROUTES: readonly RouteDeclaration[] = [
 ];
 
 /** The one stable Takoform Host lane this Host serves. */
-export const TAKOFORM_LANES = ["v1"] as const;
+export const TAKOFORM_LANES = ["v2"] as const;
 
 /** Every Takoform Host route, relative to a lane mount. */
 export const TAKOFORM_ROUTES: readonly RouteDeclaration[] = [
-  { method: "get", pattern: "/forms", operation: "takoformResolveForm" },
-  {
-    method: "get",
-    pattern: "/form-definitions/{group}/{kind}",
-    operation: "takoformReadFormDefinition",
-  },
-  { method: "get", pattern: "/support/forms", operation: "takoformListSupportProfiles" },
-  {
-    method: "get",
-    pattern: "/support/forms/{group}/{kind}/{definitionVersion}",
-    operation: "takoformReadSupportProfile",
-  },
-  {
-    method: "get",
-    pattern: "/support/interfaces/{name}/{version}",
-    operation: "takoformReadInterfaceContract",
-  },
-  {
-    method: "get",
-    pattern: "/support/bindings/{name}/{version}",
-    operation: "takoformReadBindingContract",
-  },
-  { method: "post", pattern: "/resources/validate", operation: "takoformValidateResource" },
-  { method: "post", pattern: "/resources/prepare", operation: "takoformPrepareResource" },
-  { method: "get", pattern: "/resources/{group}/{kind}/{name}", operation: "takoformReadResource" },
-  {
-    method: "put",
-    pattern: "/resources/{group}/{kind}/{name}",
-    operation: "takoformApplyResource",
-  },
-  {
-    method: "delete",
-    pattern: "/resources/{group}/{kind}/{name}",
-    operation: "takoformDeleteResource",
-  },
-  {
-    method: "post",
-    pattern: "/resources/{group}/{kind}/{name}/observe",
-    operation: "takoformObserveResource",
-  },
-  {
-    method: "post",
-    pattern: "/resources/{group}/{kind}/{name}/import",
-    operation: "takoformImportResource",
-  },
+  { method: "get", pattern: "/support", operation: "takoformReadSupport" },
+  { method: "get", pattern: "/resources", operation: "takoformListResources" },
+  { method: "post", pattern: "/resources", operation: "takoformCreateResource" },
+  { method: "get", pattern: "/resources/{uid}", operation: "takoformReadResource" },
+  { method: "put", pattern: "/resources/{uid}", operation: "takoformUpdateResource" },
+  { method: "delete", pattern: "/resources/{uid}", operation: "takoformDeleteResource" },
   { method: "get", pattern: "/operations/{operationId}", operation: "takoformReadOperation" },
-  {
-    method: "post",
-    pattern: "/operations/{operationId}/cancel",
-    operation: "takoformCancelOperation",
-  },
-  { method: "post", pattern: "/artifacts/uploads", operation: "takoformStartArtifactUpload" },
-  {
-    method: "delete",
-    pattern: "/artifacts/uploads/{uploadId}",
-    operation: "takoformAbandonArtifactUpload",
-  },
-  {
-    method: "post",
-    pattern: "/artifacts/uploads/{uploadId}/commit",
-    operation: "takoformCommitArtifactUpload",
-  },
-  {
-    method: "put",
-    pattern: "/artifacts/uploads/{uploadId}/blobs/{digest}",
-    operation: "takoformUploadArtifactBlob",
-  },
-  { method: "get", pattern: "/artifacts/{digest}", operation: "takoformReadArtifactManifest" },
-  { method: "head", pattern: "/artifacts/blobs/{digest}", operation: "takoformHeadArtifactBlob" },
 ];
 
 /** The mounted path of one Takoform Host route on one lane. */

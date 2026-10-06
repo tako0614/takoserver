@@ -7,15 +7,14 @@ describe("Takoserver public site", () => {
       consoleOrigin: "https://console.takoserver.example",
       apiOrigin: "https://api.takoserver.example",
     });
-    expect(html).toContain("Declare infrastructure. The Host prices, provisions, and meters it.");
+    expect(html).toContain("Run a Takoform Host.");
     expect(html).toContain("Exact Form identity");
-    expect(html).toContain("Prepaid hold / capture");
-    expect(html).toContain("edge.objects");
-    expect(html).toContain('"service_forms": <b>true</b>');
-    expect(html).toContain('"api": "https://api.takoserver.example/apis/forms.takoform.com/v1"');
-    expect(html).toContain("bun src/entry-bun.ts");
+    expect(html).toContain("Each key keeps its own read and write permissions.");
+    expect(html).toContain("Create, read, update and delete through Host API v2.");
+    expect(html).toContain("https://api.takoserver.example/.well-known/takoform/v2");
+    expect(html).toContain("Host API v2 — operator setup");
     expect(html).toContain("https://github.com/tako0614/takoserver");
-    expect(html).toContain("インフラを宣言。Hostが価格を決め、プロビジョニングし、計測します。");
+    expect(html).toContain("Takoform Hostを、自分の基盤で動かす。");
     expect(html).toContain("コンソールを開く");
     expect(html).toContain("Open the console");
     expect(html).toContain('data-locale="ja"');
@@ -37,14 +36,16 @@ describe("Takoserver public site", () => {
       locale: "ja",
     });
     expect(html).toContain('<html lang="ja">');
-    expect(html).toContain("インフラを宣言。Hostが価格を決め、プロビジョニングし、計測します。");
+    expect(html).toContain(
+      "公開されたFormの仕様URLを指定して、Host運営者の基盤上で資源を管理します。",
+    );
     expect(html).toContain("厳密なForm同一性");
     expect(html).toContain("日本語");
   });
 
   test("renders complete endpoint URLs in every locale", () => {
     const apiOrigin = "https://api.takoserver.example";
-    const endpoints = ["/openapi.json", "/.well-known/takoserver", "/.well-known/takoform/v1"];
+    const endpoints = ["/openapi.json", "/.well-known/takoserver", "/.well-known/takoform/v2"];
 
     for (const locale of ["en", "ja"] as const) {
       const html = landingHtml({ consoleOrigin: null, apiOrigin, locale });

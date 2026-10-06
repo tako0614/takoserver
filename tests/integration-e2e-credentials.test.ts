@@ -13,7 +13,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
   credentialPaths,
@@ -32,6 +31,7 @@ import {
   INTEGRATION_E2E_ORGANIZATION_ID,
   type IntegrationE2eCredentialAuthorityAction,
 } from "../src/integration-e2e-credential-authority.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const ORIGIN = "https://api.integration.example.test";
 const NOW = Date.UTC(2026, 7, 30, 12, 0, 0);
@@ -311,6 +311,7 @@ describe("integration E2E credential helper", () => {
         publicWorkerVersionId: "00000000-0000-4000-8000-000000000002",
       } as const;
       const currentApp = buildApp({
+        v2: TEST_TAKOFORM_V2_CONFIG,
         sql: fixture.sql,
         objects: createMemoryObjectStore(),
         identity: { verify: () => Promise.reject(new Error("not configured")) },
@@ -578,6 +579,7 @@ async function testFixture() {
 
   const sql = createEphemeralSql();
   const bootstrap = buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql,
     objects: createMemoryObjectStore(),
     identity: {
@@ -621,6 +623,7 @@ async function testFixture() {
     publicWorkerVersionId: "00000000-0000-4000-8000-000000000001",
   } as const;
   const app = buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql,
     objects: createMemoryObjectStore(),
     identity: { verify: () => Promise.reject(new Error("not configured")) },

@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  buildApp,
   createEphemeralSql,
   createMemoryObjectStore,
   type ExternalIdentityVerifier,
@@ -16,10 +15,12 @@ import {
 } from "../src/index.ts";
 import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
 import {
+  buildHistoricalTakoformApp,
   createHistoricalInMemoryTakoformHost as createInMemoryTakoformHost,
   createStaticStableTestTakoformHost,
   createHistoricalTakoformHost as createTakoformHost,
 } from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const OWNER_IDENTITY: ExternalIdentityVerifier = {
   async verify() {
@@ -45,7 +46,8 @@ function handlerFor(
   takoformHost: TakoformHost,
   identity: ExternalIdentityVerifier = OWNER_IDENTITY,
 ) {
-  return buildApp({
+  return buildHistoricalTakoformApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     identity,
@@ -1480,7 +1482,8 @@ describe("historical Takoform Host engine regression", () => {
     };
     // No Host is injected here: the app wires the lane to its own control
     // plane, which is exactly the policy under test.
-    const handler = buildApp({
+    const handler = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       takoformHostFactory: createStaticStableTestTakoformHost,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),

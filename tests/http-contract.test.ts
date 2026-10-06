@@ -16,6 +16,7 @@ import {
   takoformRoutePattern,
 } from "../src/route-table.ts";
 import type { WorkerEndpointOriginReservations } from "../src/worker-endpoint-origin-reservations.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const TAKOSUMI_TENANT_SPACE = "tenant:tsh_2IS0Th3vfHv-B1kAAJfyNKHM79GJ0SxuZdRM147QfvI";
 
@@ -33,6 +34,7 @@ const settlement: FundingSettlementVerifier = {
 
 function handler(publicOrigin = "https://api.takoserver.com") {
   return buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     identity,
@@ -92,6 +94,7 @@ function reservationStub(): WorkerEndpointOriginReservations {
 function completeHandler() {
   const publicWorkerVersionId = "00000000-0000-4000-8000-000000000001";
   return buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     identity,
@@ -118,6 +121,7 @@ const PATH_SAMPLES: Readonly<Record<string, string>> = {
   organizationId: "org_probe",
   deploymentId: "dep_probe",
   resourceUid: "uid_probe",
+  uid: "uid_probe",
   migrationId: "mig_probe",
   attachmentId: "att_probe",
   apiKeyId: "key_probe",
@@ -162,8 +166,22 @@ describe("published API description", () => {
     // second hand-written copy of the document, so the two could only ever
     // agree — including about a route neither of them mentioned.
     expect(openApiPaths()).toEqual(DOCUMENTED_PATTERNS);
+    expect(TAKOFORM_LANES).toEqual(["v2"]);
+    expect(TAKOFORM_ROUTES).toEqual([
+      { method: "get", pattern: "/support", operation: "takoformReadSupport" },
+      { method: "get", pattern: "/resources", operation: "takoformListResources" },
+      { method: "post", pattern: "/resources", operation: "takoformCreateResource" },
+      { method: "get", pattern: "/resources/{uid}", operation: "takoformReadResource" },
+      { method: "put", pattern: "/resources/{uid}", operation: "takoformUpdateResource" },
+      { method: "delete", pattern: "/resources/{uid}", operation: "takoformDeleteResource" },
+      { method: "get", pattern: "/operations/{operationId}", operation: "takoformReadOperation" },
+    ]);
+    expect(openApiPaths()).toContain("/apis/forms.takoform.com/v2/resources");
+    expect(openApiPaths()).toContain("/apis/forms.takoform.com/v2/resources/{uid}");
+    expect(openApiPaths()).toContain("/apis/forms.takoform.com/v2/operations/{operationId}");
+    expect(openApiPaths()).not.toContain("/apis/forms.takoform.com/v1/resources");
     expect(JSON.stringify(openApiDocument)).not.toMatch(
-      /forms\.takoform\.com\/(?:v1alpha3|v1beta1|v1beta4)/u,
+      /forms\.takoform\.com\/(?:v1|v1alpha3|v1beta1|v1beta4)/u,
     );
     expect(JSON.stringify(openApiDocument)).not.toMatch(
       /s3-credentials|takoserver\.s3-connection|support\/standard-services/u,
@@ -488,6 +506,25 @@ describe("published API description", () => {
     );
   });
 
+  test("serves only v2 Takoform discovery on the public Host", async () => {
+    const fetch = handler();
+    const discovery = await fetch(
+      new Request("https://api.takoserver.com/.well-known/takoform/v2"),
+    );
+    expect(discovery.status).toBe(200);
+    expect(await discovery.json()).toMatchObject({
+      api: "forms.takoform.com/v2",
+      baseUrl: "https://api.takoserver.com/apis/forms.takoform.com/v2",
+    });
+    expect(
+      (await fetch(new Request("https://api.takoserver.com/.well-known/takoform/v1"))).status,
+    ).toBe(404);
+    expect(
+      (await fetch(new Request("https://api.takoserver.com/apis/forms.takoform.com/v1/resources")))
+        .status,
+    ).toBe(404);
+  });
+
   test("advertises the deployment public origin for staging and production", async () => {
     for (const publicOrigin of [
       "https://takoserver-api-staging.shoutatomiyama0614.workers.dev",
@@ -525,6 +562,7 @@ describe("published API description", () => {
       "/",
       "/openapi.json",
       "/.well-known/takoserver",
+      "/.well-known/takoform/v2",
       "/v1/identity/providers",
     ]) {
       expect((await fetch(new Request(`https://api.takoserver.com${path}`))).status).toBe(200);
@@ -584,6 +622,7 @@ describe("published API description", () => {
     ]) {
       expect(() =>
         buildApp({
+          v2: TEST_TAKOFORM_V2_CONFIG,
           sql: createEphemeralSql(),
           objects: createMemoryObjectStore(),
           identity,
@@ -596,14 +635,30 @@ describe("published API description", () => {
         }),
       ).toThrow();
     }
-    // Loopback stays usable so a self-hosted server needs no certificate.
+    // The generic control API supports HTTP loopback, but the composed v2
+    // Host advertises an HTTPS discovery base and therefore requires HTTPS.
     expect(() =>
       buildApp({
+        v2: TEST_TAKOFORM_V2_CONFIG,
         sql: createEphemeralSql(),
         objects: createMemoryObjectStore(),
         identity,
         settlement,
         publicOrigin: "http://localhost:8787",
+        forms: [],
+        hostForms: [],
+        driver: new InMemoryTakoformResourceDriver(),
+        offerings: [],
+      }),
+    ).toThrow(/absolute HTTPS URL/u);
+    expect(() =>
+      buildApp({
+        v2: TEST_TAKOFORM_V2_CONFIG,
+        sql: createEphemeralSql(),
+        objects: createMemoryObjectStore(),
+        identity,
+        settlement,
+        publicOrigin: "https://localhost:8787",
         forms: [],
         hostForms: [],
         driver: new InMemoryTakoformResourceDriver(),

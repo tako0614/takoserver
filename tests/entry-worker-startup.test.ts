@@ -30,6 +30,11 @@ function workerEnv(
       list: () => null,
     },
     WORKER_VERSION: { id: "00000000-0000-4000-8000-0000000000a1" },
+    TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+      documentation: "https://docs.example.invalid/takoform-v2",
+      authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
+    }),
+    TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: "A".repeat(43),
     ...overrides,
   } as unknown as Parameters<typeof worker.fetch>[1];
 }
@@ -45,6 +50,54 @@ async function envelope(response: Response) {
 }
 
 describe("Worker startup diagnostics", () => {
+  test("requires explicit v2 startup config before touching durable bindings", async () => {
+    const env = workerEnv({ TAKOSERVER_TAKOFORM_V2_CONFIG: undefined });
+    let storageReads = 0;
+    Object.defineProperty(env, "STATE_DB", {
+      get() {
+        storageReads += 1;
+        throw new Error("storage must not be composed");
+      },
+    });
+    const response = await worker.fetch(new Request(`${ORIGIN}/.well-known/takoserver`), env);
+    const body = await response.text();
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(body).toContain("missing_configuration");
+    expect(body).not.toContain("storage must not be composed");
+    expect(storageReads).toBe(0);
+  });
+
+  test("refuses configured SQLiteMigrationSet before touching Worker storage", async () => {
+    const env = workerEnv({
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
+        sqliteMigrationSet: { targetKey: "operator-sqlite-primary", heldArtifacts: [] },
+      }),
+    });
+    let storageReads = 0;
+    for (const name of ["STATE_DB", "OBJECTS"] as const) {
+      Object.defineProperty(env, name, {
+        get() {
+          storageReads += 1;
+          throw new Error("storage must not be composed");
+        },
+      });
+    }
+
+    const response = await worker.fetch(new Request(`${ORIGIN}/.well-known/takoserver`), env);
+    const body = await response.text();
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(body).toContain("runtime-configuration");
+    expect(body).toContain("SQLiteMigrationSet is not supported by this Worker runtime");
+    expect(body).not.toContain("storage must not be composed");
+    expect(storageReads).toBe(0);
+  });
+
   test("selects unpublished Actor source only by exact opt-in and keeps absent supply non-sellable", async () => {
     const env = workerEnv({ TAKOSERVER_FORM_SOURCE_CANDIDATE: "actor-forward" });
     const discovery = await worker.fetch(new Request(`${ORIGIN}/.well-known/takoserver`), env);
@@ -310,6 +363,11 @@ describe("Worker startup diagnostics", () => {
   test("classifies a configuration refusal without publishing an unreadable failure", async () => {
     const response = await worker.fetch(new Request(`${ORIGIN}/healthz`), {
       PUBLIC_ORIGIN: ORIGIN,
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: "A".repeat(43),
     } as Parameters<typeof worker.fetch>[1]);
 
     expect(response.status).toBe(503);

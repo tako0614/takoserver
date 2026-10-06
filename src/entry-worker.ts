@@ -30,6 +30,7 @@ import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createTakoformStore } from "./takoform/store.ts";
+import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
 import {
   createWorkerEndpointOriginReservationBindingHandle,
@@ -53,6 +54,10 @@ export interface WorkerEnv {
   readonly OBJECTS: Parameters<typeof createR2ObjectStore>[0];
   readonly WORKER_VERSION: { readonly id: string };
   readonly PUBLIC_ORIGIN?: string;
+  /** Non-secret exact v2 documentation and optional complete Form composition. */
+  readonly TAKOSERVER_TAKOFORM_V2_CONFIG?: string;
+  /** Stable operator-managed canonical base64url cursor HMAC key. */
+  readonly TAKOSERVER_TAKOFORM_V2_CURSOR_KEY?: string;
   /** Exact deploy lane. Integration-only operator routes refuse every other value. */
   readonly TAKOSERVER_ENVIRONMENT?: string;
   /** Public half of the dedicated operator proof key for the JIT pair lifecycle. */
@@ -523,6 +528,14 @@ async function proveSigningPublicJwk(privateJwk: string, privateKey: CryptoKey):
 
 async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   if (cached?.env === env) return cached.app;
+  const v2Config = startupStage("runtime-configuration", () =>
+    parseTakoformV2ApplicationConfig(env),
+  );
+  if (v2Config.sqliteMigrationSet !== undefined) {
+    startupStage("runtime-configuration", () => {
+      throw new TypeError("SQLiteMigrationSet is not supported by this Worker runtime");
+    });
+  }
   const signingKey = await loadSigningKey(
     env.TAKOSERVER_SIGNING_KEY_ID,
     env.TAKOSERVER_SIGNING_KEY,
@@ -609,6 +622,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     ...(checkout ? { checkout } : {}),
     ...dataServices,
     publicOrigin: origin,
+    v2: v2Config,
     ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
     forms: formSource.forms,
     bindings: formSource.bindings,
@@ -660,6 +674,15 @@ export default {
     if (schemaMaintenanceMode(env) === "pre-0058-quiesced") return;
     if (artifactBlobIoMode(env) === "pre-0043-quiesced") return;
     const app = await appFor(env, requirePublicOrigin(env));
-    await app.tick();
+    const results = await Promise.allSettled([
+      Promise.resolve().then(() => app.tick()),
+      Promise.resolve().then(() => app.tickTakoformV2()),
+    ]);
+    const failures = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "one or more scheduled Host passes failed");
+    }
   },
 };

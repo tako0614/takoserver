@@ -8,6 +8,7 @@ import {
   publicFormCapabilityManifest,
 } from "../src/public-worker-implementation.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 /**
  * The public Form catalogue answers "which Forms exist" for the whole platform.
@@ -61,6 +62,7 @@ function host(options: { readonly backed: boolean }) {
   const candidates = currentTakoformCandidates();
   let counter = 0;
   return buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql,
     objects: createMemoryObjectStore(),
     identity: identity(),

@@ -3,13 +3,12 @@ import type { DataAiRoutes } from "./data-ai.ts";
 import { landingHtml } from "./landing.ts";
 import { createOpenApiDocument } from "./openapi.ts";
 import type { RequestLifetime } from "./request-lifetime.ts";
-import type { TakoformHost } from "./takoform/types.ts";
 
 /**
- * The single HTTP entry: discovery, the direct control plane, and the one
- * literal stable Takoform Host lane behind one dispatch.
+ * The single HTTP entry: discovery, the direct control plane, and the v2
+ * Takoform Host behind one dispatch.
  *
- * Order matters. The Takoform Host is offered the request first because it owns
+ * Order matters. The v2 Host is offered the request first because it owns
  * a whole path prefix and answers `null` for anything outside it; the control
  * plane then claims `/v1`; everything else is either a documented public page
  * or a 404.
@@ -27,7 +26,8 @@ export interface CreateRouterOptions {
   readonly control: ControlRoutes;
   readonly dataAi?: DataAiRoutes;
   readonly aiAvailable?: boolean;
-  readonly takoformHost?: TakoformHost;
+  /** This is the only public Takoform Host handler; legacy repair has no route. */
+  readonly takoformV2Host: { fetch(request: Request): Promise<Response | null> };
   readonly publicOrigin: string;
   /**
    * Where this deployment's console is served, if it has one.
@@ -104,7 +104,7 @@ function crossOrigin(request: Request, consoleOrigin: string | undefined): Recor
 
 function dispatch(options: CreateRouterOptions, origin: string): Router {
   const console = options.consoleOrigin === undefined ? null : httpsOrigin(options.consoleOrigin);
-  return async (request, lifetime) => {
+  return async (request) => {
     const url = new URL(request.url);
 
     if (options.dataAi) {
@@ -112,10 +112,8 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
       if (served) return served;
     }
 
-    if (options.takoformHost) {
-      const handled = await options.takoformHost.handle(request, lifetime);
-      if (handled) return handled;
-    }
+    const handled = await options.takoformV2Host.fetch(request);
+    if (handled) return handled;
 
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(landingPage(console), {
@@ -133,39 +131,15 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
           api: origin,
           ...(console ? { console } : {}),
           openapi: `${origin}/openapi.json`,
-          takoform: `${origin}/apis/forms.takoform.com/v1`,
+          takoform: `${origin}/apis/forms.takoform.com/v2`,
           ...(options.aiAvailable ? { ai: `${origin}/v1/ai` } : {}),
         },
       });
     }
-    if (request.method === "GET" && url.pathname === "/.well-known/takoform/v1") {
-      if (!options.takoformHost) return notFound();
-      return Response.json(discovery(origin));
-    }
-
     const control = await options.control(request, url);
     if (control) return control;
 
     return notFound();
-  };
-}
-
-function discovery(origin: string): Record<string, unknown> {
-  const base = `${origin}/apis/forms.takoform.com/v1`;
-  return {
-    api_versions: ["forms.takoform.com/v1"],
-    features: {
-      service_forms: true,
-      exact_form_ref: true,
-      optimistic_concurrency: true,
-      idempotent_lifecycle: true,
-      operations: true,
-      artifact_upload: true,
-      support_profiles: true,
-    },
-    endpoints: {
-      api: base,
-    },
   };
 }
 

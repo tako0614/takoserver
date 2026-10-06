@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import type { ObjectStoreAccess, StoredObjectBody } from "../../ports.ts";
 import { isV2HttpsUrl } from "../identity.ts";
 import { SQLITE_MIGRATION_SET_LIMITS } from "./sqlite-migration-set.ts";
@@ -196,7 +197,7 @@ async function readHeldBytes(input: {
     }
     const chunks: Uint8Array[] = [];
     const pendingChunks: Uint8Array[] = [];
-    const hash = createHash("sha256");
+    const hash = sha256.create();
     let totalBytes = 0;
     let pendingBytes = 0;
     let iterations = 0;
@@ -239,7 +240,7 @@ async function readHeldBytes(input: {
 
     if (timedOut || Date.now() >= deadline) throw expire();
     if (pendingChunks.length > 0) chunks.push(compactChunks(pendingChunks, pendingBytes));
-    if (hash.digest("hex") !== input.expectedSha256) {
+    if (bytesToHex(hash.digest()) !== input.expectedSha256) {
       throw new V2ArtifactSourceError("integrity_failure");
     }
     if (timedOut || Date.now() >= deadline) throw expire();

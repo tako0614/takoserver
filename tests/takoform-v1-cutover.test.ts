@@ -7,9 +7,11 @@ import {
   type InstalledTakoformForm,
 } from "../src/index.ts";
 import { createStaticStableInMemoryTakoformHost as createInMemoryTakoformHost } from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 function handler() {
   return buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     identity: {
@@ -39,28 +41,21 @@ function handler() {
 }
 
 describe("literal stable Takoform Host cutover", () => {
-  test("serves only Host v1 while preserving Takoserver product and provision routes", async () => {
+  test("serves only Host v2 while preserving Takoserver product and provision routes", async () => {
     const fetch = handler();
 
     const discovery = await fetch(
-      new Request("https://api.takoserver.com/.well-known/takoform/v1"),
+      new Request("https://api.takoserver.com/.well-known/takoform/v2"),
     );
     expect(discovery.status).toBe(200);
-    expect(await discovery.json()).toEqual({
-      api_versions: ["forms.takoform.com/v1"],
-      features: {
-        service_forms: true,
-        exact_form_ref: true,
-        optimistic_concurrency: true,
-        idempotent_lifecycle: true,
-        operations: true,
-        artifact_upload: true,
-        support_profiles: true,
-      },
-      endpoints: {
-        api: "https://api.takoserver.com/apis/forms.takoform.com/v1",
-      },
+    expect(await discovery.json()).toMatchObject({
+      api: "forms.takoform.com/v2",
+      baseUrl: "https://api.takoserver.com/apis/forms.takoform.com/v2",
+      capabilities: { offerings: false, previews: false, privateInputs: false },
     });
+    expect(
+      (await fetch(new Request("https://api.takoserver.com/.well-known/takoform/v1"))).status,
+    ).toBe(404);
 
     const productDiscovery = await fetch(
       new Request("https://api.takoserver.com/.well-known/takoserver"),
@@ -68,12 +63,12 @@ describe("literal stable Takoform Host cutover", () => {
     expect(productDiscovery.status).toBe(200);
     expect(await productDiscovery.json()).toMatchObject({
       endpoints: {
-        takoform: "https://api.takoserver.com/apis/forms.takoform.com/v1",
+        takoform: "https://api.takoserver.com/apis/forms.takoform.com/v2",
       },
     });
 
     const mountedHostApi = await fetch(
-      new Request("https://api.takoserver.com/apis/forms.takoform.com/v1/forms?space=main"),
+      new Request("https://api.takoserver.com/apis/forms.takoform.com/v2/resources"),
     );
     expect(mountedHostApi.status).toBe(401);
 
@@ -130,7 +125,7 @@ describe("literal stable Takoform Host cutover", () => {
           }),
         )
       ).status,
-    ).not.toBe(404);
+    ).toBe(404);
   });
 
   test("ignores an attempted historical route override on the public constructor", async () => {

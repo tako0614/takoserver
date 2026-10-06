@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createGoogleIdentity, GoogleIdentityError } from "../src/google-identity.ts";
 import { base64UrlEncode } from "../src/json.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 /**
  * This module decides who somebody is, so every check it makes is worth a test
@@ -360,6 +361,7 @@ describe("sign-in request", () => {
     const edge = await buildEdgeForms();
     const seen: string[] = [];
     const app = buildApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       forms: edge.forms,

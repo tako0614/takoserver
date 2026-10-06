@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { buildApp, createAppResourceStoreBundle } from "../src/app.ts";
 import { createEphemeralSql, InMemoryTakoformResourceDriver } from "../src/index.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 test("precomposed Actor startup stores are the exact stores used by the app", () => {
   const sql = createEphemeralSql();
@@ -24,6 +25,7 @@ test("precomposed Actor startup stores are the exact stores used by the app", ()
       },
     },
     publicOrigin: "https://api.example.test",
+    v2: TEST_TAKOFORM_V2_CONFIG,
     forms: [],
     hostForms: [],
     offerings: [],

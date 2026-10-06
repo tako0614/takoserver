@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createStaticTestTakoformHost } from "../src/app.ts";
 import {
-  buildApp,
   createEphemeralSql,
   createMemoryObjectStore,
   InMemoryTakoformResourceDriver,
@@ -9,6 +8,8 @@ import {
 } from "../src/index.ts";
 import { canonicalDigest } from "../src/json.ts";
 import { createSponsorshipCredentialIssuer } from "../src/sponsorship-credential.ts";
+import { buildHistoricalTakoformApp } from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const origin = "https://api.takoserver.com";
 const lane = "/apis/forms.takoform.com/v1";
@@ -41,7 +42,8 @@ describe("Hosted logical operation owner through the public Host", () => {
       signingKey: { keyId, privateKey: pair.privateKey },
       clock,
     });
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects: createMemoryObjectStore(),
       identity: {

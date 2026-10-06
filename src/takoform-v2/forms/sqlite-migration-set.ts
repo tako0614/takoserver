@@ -238,7 +238,7 @@ function hasPathControl(value: string): boolean {
 
 function isStrictUtf8(bytes: Uint8Array): boolean {
   try {
-    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
     return true;
   } catch {
     return false;

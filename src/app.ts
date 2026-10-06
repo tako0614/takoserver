@@ -68,6 +68,9 @@ import type {
   TakoformStandardServiceResolver,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
+import { createTakoformV2Application } from "./takoform-v2/application.ts";
+import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
+import type { V2Operation } from "./takoform-v2/types.ts";
 import { tenantRunPrincipalId } from "./tenant-run-principal.ts";
 import {
   createTokenService,
@@ -111,6 +114,8 @@ export interface AppPorts {
   /** OpenAI-compatible inference backend. Absent keeps the AI route unavailable. */
   readonly ai?: AiGateway;
   readonly publicOrigin: string;
+  /** Required, explicit v2 wire identity and supported Form composition. */
+  readonly v2: V2ApplicationConfig;
   /** Current Cloudflare Worker Version, retained only as operation and audit provenance. */
   readonly publicWorkerVersionId?: string;
   /** Current semantic Form implementation identity. */
@@ -170,6 +175,8 @@ export interface AppPorts {
   readonly takoformHostFactory?: (
     options: Omit<CreateTakoformHostOptions, "authority">,
   ) => TakoformHost;
+  /** Test-only observer of the exact legacy Host selected for private repair. Never routed. */
+  readonly captureLegacyHostForTests?: (host: TakoformHost) => void;
   readonly clock?: Clock;
   readonly randomId?: () => string;
 }
@@ -199,6 +206,8 @@ export interface App {
   };
   /** One pass of background settlement. Safe to call concurrently. */
   tick(): Promise<TickReport>;
+  /** Independently scheduled v2 executor; one Operation at most per call. */
+  tickTakoformV2(): Promise<V2Operation | null>;
 }
 
 export interface TickReport {
@@ -289,6 +298,14 @@ export function buildApp(ports: AppPorts): App {
     clock,
     randomId,
     apiKeyAdministration,
+  });
+  const takoformV2Host = createTakoformV2Application({
+    sql: ports.sql,
+    objects: ports.objects,
+    accounts,
+    publicOrigin: ports.publicOrigin,
+    config: ports.v2,
+    clock,
   });
   const integrationE2eCredentialRoute = integrationE2eCredentialAuthority
     ? createIntegrationE2eCredentialAuthority({
@@ -620,6 +637,7 @@ export function buildApp(ports: AppPorts): App {
     (ports.takoformHostFactory
       ? ports.takoformHostFactory(hostOptions)
       : createDerivedTakoformHost(hostOptions));
+  ports.captureLegacyHostForTests?.(takoformHost);
 
   const verifyNativeAbsence = driver.verifyNativeAbsence;
   const control = createControlRoutes({
@@ -693,7 +711,7 @@ export function buildApp(ports: AppPorts): App {
     control,
     dataAi,
     aiAvailable: ports.ai !== undefined,
-    takoformHost,
+    takoformV2Host,
     publicOrigin: ports.publicOrigin,
     ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
   });
@@ -706,13 +724,24 @@ export function buildApp(ports: AppPorts): App {
             (await router(request, lifetime))
         : router,
     maintenance: { artifacts: artifactReconciler },
+    tickTakoformV2: () => takoformV2Host.runNext(),
     async tick(): Promise<TickReport> {
-      const providerRepairs = (await takoformHost.maintenance?.drainProviderRepairs(64)) ?? {
+      // Legacy recovery remains independent of potentially slow v2 effects.
+      let drainFailed = false;
+      let drainFailure: unknown;
+      let providerRepairs = {
         candidates: 0,
         acquired: 0,
         settled: 0,
         pending: 0,
       };
+      try {
+        providerRepairs =
+          (await takoformHost.maintenance?.drainProviderRepairs(64)) ?? providerRepairs;
+      } catch (error) {
+        drainFailed = true;
+        drainFailure = error;
+      }
       await reseller.reconcileDue(64, async (intent) => {
         if (!intent.authorityRef) return "ready";
         const migration = await migrations.read(intent.organizationId, intent.authorityRef);
@@ -746,6 +775,9 @@ export function buildApp(ports: AppPorts): App {
             hint: "a Form schema changed without a new definitionVersion",
           }),
         );
+      }
+      if (drainFailed) {
+        throw new AggregateError([drainFailure], "legacy Takoform repair drain failed");
       }
       return {
         expiredReservations,

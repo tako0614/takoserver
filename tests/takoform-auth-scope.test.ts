@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  buildApp,
   createEphemeralSql,
   createMemoryObjectStore,
   type ExternalIdentityVerifier,
@@ -8,7 +7,11 @@ import {
   InMemoryTakoformResourceDriver,
   type InstalledTakoformForm,
 } from "../src/index.ts";
-import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
+import {
+  buildHistoricalTakoformApp,
+  createStaticStableTestTakoformHost,
+} from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const FORM_REF = {
   apiVersion: "edge.forms.takoform.com",
@@ -42,7 +45,8 @@ const SETTLEMENT: FundingSettlementVerifier = {
 describe("Takoform Host resource scopes", () => {
   test("allows resource readers to read only, while writers retain read/write access", async () => {
     let now = Date.UTC(2026, 7, 28, 12, 0, 0);
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       identity: IDENTITY,

@@ -20,26 +20,30 @@ const landingMessages = {
     description: "A Takoform Host that owns accounts, money, and machines.",
     console: "Open the console",
     eyebrow: "Takoform Host",
-    headline: "Declare infrastructure. The Host prices, provisions, and meters it.",
-    lede: "Takoserver owns the accounts, money, and machines. Declare an exact Form, fund a prepaid wallet, and inspect every usage charge.",
+    headline: "Run a Takoform Host.",
+    lede: "Manage resources against published Form URLs, on infrastructure owned by the Host operator. Check this Host's support before choosing a Form.",
     products: "Host primitives",
     formTitle: "Exact Form identity",
-    formBody: "Every declaration pins group, kind, definition version, and schema digest.",
-    holdTitle: "Prepaid hold / capture",
-    holdBody: "Work holds wallet balance, captures on success, and releases on failure.",
-    objectTitle: "edge.objects",
-    objectBody: "ObjectBucket binds through bucketBindings to the exact edge.objects interface.",
-    meterTitle: "Provision + meter",
-    meterBody: "Provision Deployments, record usage, and capture reported AI token use.",
+    formBody:
+      "An exact, versioned HTTPS URL identifies the resource contract. Support depends on the configured implementation.",
+    holdTitle: "Organization ownership",
+    holdBody:
+      "Replace an API key without losing resource ownership. Each key keeps its own read and write permissions.",
+    objectTitle: "Resource lifecycle",
+    objectBody:
+      "Create, read, update and delete through Host API v2. Track accepted changes by their Operation.",
+    meterTitle: "Durable recovery",
+    meterBody:
+      "Retry with the same operation key. A lost response stays unresolved until the recorded effect can be reconciled.",
     discovery: "The Host describes itself",
     billingTitle: "Usage-based, prepaid billing",
     billingBody:
-      "Measured usage is accumulated at fine precision and settled to your wallet in clear rollups. You can see what was used and charged.",
+      "Accounts, wallet and service billing are separate product APIs. Their presence does not mean every Form is available or that v2 resource billing is enabled.",
     onSuccess: "on success",
     onFailure: "on failure",
     selfhostTitle: "Open source. Self-host the whole Host.",
     selfhostBody:
-      "The first run creates its schema, generates the keys it signs with, prints a console sign-in, and starts serving.",
+      "Configure the HTTPS origin, v2 documentation URLs and a persistent cursor key before starting. Enable only the Form backends and artifact grants you intend to provide.",
     endpoints: "Endpoints",
     source: "source",
     api: "API description",
@@ -50,28 +54,29 @@ const landingMessages = {
     description: "アカウント、資金、マシンを管理するTakoform Host。",
     console: "コンソールを開く",
     eyebrow: "Takoform Host",
-    headline: "インフラを宣言。Hostが価格を決め、プロビジョニングし、計測します。",
-    lede: "Takoserverはアカウント、資金、マシンを管理します。厳密なFormを宣言し、前払いウォレットから利用量に応じて支払います。",
+    headline: "Takoform Hostを、自分の基盤で動かす。",
+    lede: "公開されたFormの仕様URLを指定して、Host運営者の基盤上で資源を管理します。使う前に、そのHostの対応範囲を確認できます。",
     products: "Hostの基本機能",
     formTitle: "厳密なForm同一性",
-    formBody: "すべての宣言はgroup、kind、definition version、schema digestを固定します。",
-    holdTitle: "前払いの確保 / 確定",
-    holdBody: "処理の前にウォレットの残高を確保し、成功したら確定、失敗したら解放します。",
-    objectTitle: "edge.objects",
-    objectBody:
-      "ObjectBucketはbucketBindingsを通じて厳密なedge.objectsインターフェースに接続します。",
-    meterTitle: "プロビジョニングと計測",
+    formBody:
+      "版固定のHTTPS URLで資源の契約を識別します。対応範囲は設定された実装によって異なります。",
+    holdTitle: "組織単位の所有",
+    holdBody:
+      "APIキーを交換しても資源の所有は変わりません。各キーの読み取り・書き込み権限は個別に確認します。",
+    objectTitle: "資源のライフサイクル",
+    objectBody: "Host API v2から作成・取得・更新・削除し、受理された変更はOperationで追跡します。",
+    meterTitle: "永続状態からの復旧",
     meterBody:
-      "Deploymentをプロビジョニングし、利用量を記録して、AIが報告したトークン使用量を確定します。",
+      "再送は同じ操作キーで行います。応答を失った処理は、記録した実行結果を照合できるまで未確定として保持します。",
     discovery: "Hostのディスカバリー",
     billingTitle: "前払い・使用量ベースの課金",
     billingBody:
-      "細かな単位で利用量を蓄積し、分かりやすい集計としてウォレットへ精算します。利用量と請求額を確認できます。",
+      "アカウント・ウォレット・サービス課金は独立した製品APIです。これらが存在しても、全Formへの対応やv2資源への課金が有効という意味ではありません。",
     onSuccess: "成功時",
     onFailure: "失敗時",
     selfhostTitle: "オープンソース。Hostを自分で動かす。",
     selfhostBody:
-      "初回起動でスキーマを作成し、署名鍵を生成し、コンソールへのサインインを表示して、そのままリクエストを受け付けます。",
+      "起動前にHTTPS origin、v2の案内URL、永続するcursor鍵を設定します。提供するForm backendと、artifactの取得権限を明示的に選びます。",
     endpoints: "エンドポイント",
     source: "ソース",
     api: "API仕様",
@@ -285,32 +290,16 @@ ${takoMark(380, "tako-ghost")}
 <section aria-label="${copy.products}">
 <h2 class="shead" data-i18n="products">${copy.products}</h2>
 <div class="spec">
-<div class="row"><div class="term"><h3 data-i18n="formTitle">${copy.formTitle}</h3><code>FormRef</code></div><p data-i18n="formBody">${copy.formBody}</p></div>
-<div class="row"><div class="term"><h3 data-i18n="holdTitle">${copy.holdTitle}</h3><code>reservations &#8594; capture</code></div><p data-i18n="holdBody">${copy.holdBody}</p></div>
-<div class="row"><div class="term"><h3 data-i18n="objectTitle">${copy.objectTitle}</h3><code>bucketBindings</code></div><p data-i18n="objectBody">${copy.objectBody}</p></div>
-<div class="row"><div class="term"><h3 data-i18n="meterTitle">${copy.meterTitle}</h3><code>Deployment</code></div><p data-i18n="meterBody">${copy.meterBody}</p></div>
+<div class="row"><div class="term"><h3 data-i18n="formTitle">${copy.formTitle}</h3><code>Form URL</code></div><p data-i18n="formBody">${copy.formBody}</p></div>
+<div class="row"><div class="term"><h3 data-i18n="holdTitle">${copy.holdTitle}</h3><code>Organization</code></div><p data-i18n="holdBody">${copy.holdBody}</p></div>
+<div class="row"><div class="term"><h3 data-i18n="objectTitle">${copy.objectTitle}</h3><code>Resource / Operation</code></div><p data-i18n="objectBody">${copy.objectBody}</p></div>
+<div class="row"><div class="term"><h3 data-i18n="meterTitle">${copy.meterTitle}</h3><code>Idempotency-Key</code></div><p data-i18n="meterBody">${copy.meterBody}</p></div>
 </div>
 </section>
 <section aria-label="${copy.discovery}">
 <h2 class="shead" data-i18n="discovery">${copy.discovery}</h2>
-<p class="get"><code><b>GET</b> ${base}/.well-known/takoform/v1</code></p>
-<pre>{
-  "api_versions": [
-    "forms.takoform.com/v1"
-  ],
-  "features": {
-    "service_forms": <b>true</b>,
-    "exact_form_ref": <b>true</b>,
-    "optimistic_concurrency": <b>true</b>,
-    "idempotent_lifecycle": <b>true</b>,
-    "operations": <b>true</b>,
-    "artifact_upload": <b>true</b>,
-    "support_profiles": <b>true</b>
-  },
-  "endpoints": {
-    "api": "${base}/apis/forms.takoform.com/v1"
-  }
-}</pre>
+<p class="get"><code><b>GET</b> ${base}/.well-known/takoform/v2</code></p>
+<pre>curl ${base}/.well-known/takoform/v2</pre>
 </section>
 <section class="billing" aria-label="${copy.billingTitle}">
 <h2 class="shead" data-i18n="billingTitle">${copy.billingTitle}</h2>
@@ -325,8 +314,7 @@ ${takoMark(380, "tako-ghost")}
 </section>
 <section class="selfhost" aria-label="${copy.selfhostTitle}">
 <h2 class="shead" data-i18n="selfhostTitle">${copy.selfhostTitle}</h2>
-<pre class="cmd">bun install
-bun src/entry-bun.ts</pre>
+<p class="body"><a href="https://github.com/tako0614/takoserver/blob/main/docs/takoform-v2.md">Host API v2 — operator setup</a></p>
 <p class="body" data-i18n="selfhostBody">${copy.selfhostBody}</p>
 </section>
 <section aria-label="${copy.endpoints}">
@@ -334,7 +322,7 @@ bun src/entry-bun.ts</pre>
 <ul>
 <li><a href="${base}/openapi.json"><code>${base}/openapi.json</code><span data-i18n="api">${copy.api}</span></a></li>
 <li><a href="${base}/.well-known/takoserver"><code>${base}/.well-known/takoserver</code><span data-i18n="product">${copy.product}</span></a></li>
-<li><a href="${base}/.well-known/takoform/v1"><code>${base}/.well-known/takoform/v1</code><span data-i18n="host">${copy.host}</span></a></li>
+<li><a href="${base}/.well-known/takoform/v2"><code>${base}/.well-known/takoform/v2</code><span data-i18n="host">${copy.host}</span></a></li>
 </ul>
 </section>
 <footer>takoserver.com &middot; <a href="https://github.com/tako0614/takoserver" data-i18n="source">${copy.source}</a></footer>

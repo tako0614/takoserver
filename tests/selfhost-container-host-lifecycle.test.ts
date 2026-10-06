@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp } from "../src/app.ts";
+import type { buildApp } from "../src/app.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
@@ -35,6 +35,8 @@ import {
   createResellerProvision,
   type HostJsonPost,
 } from "./fixtures/selfhost-container-host-reseller-requests.ts";
+import { buildHistoricalTakoformApp } from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const CANDIDATE_PROVENANCE = {
   repository: "takoform-forms",
@@ -494,7 +496,8 @@ test("publisher-emitted unpublished Form selects the Host Offering for a normal 
         artifacts: providerArtifacts,
         now,
       });
-      return buildApp({
+      return buildHistoricalTakoformApp({
+        v2: TEST_TAKOFORM_V2_CONFIG,
         sql: currentSql,
         objects,
         publicOrigin: ORIGIN,

@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { buildApp } from "../src/app.ts";
 import type { ExternalIdentityVerifier } from "../src/auth.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { bytesDigest } from "../src/json.ts";
@@ -16,6 +15,8 @@ import {
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import { formSupportProfile } from "../src/takoform/forms.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
+import { buildHistoricalTakoformApp } from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const PREFIX = "/apis/forms.takoform.com/v1/artifacts";
 const PRINCIPAL: TakoformArtifactPrincipal = {
@@ -2294,7 +2295,8 @@ describe("Takoform artifact lifecycle", () => {
   });
 
   test("composes typed maintenance without mounting a public repair route", async () => {
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       identity: IDENTITY,

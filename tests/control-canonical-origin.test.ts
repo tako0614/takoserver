@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { createAccounts } from "../src/auth.ts";
+import { createControlRoutes } from "../src/control.ts";
 import { resolveIdentity } from "../src/identity-setup.ts";
 import {
   buildApp,
@@ -7,12 +9,13 @@ import {
   InMemoryTakoformResourceDriver,
 } from "../src/index.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const PUBLIC_ORIGIN = "https://api.selfhost.test";
 const BACKEND_ORIGIN = "http://api.selfhost.test";
 const CONSOLE_ORIGIN = "https://console.selfhost.test";
 
-async function fixture(publicOrigin = PUBLIC_ORIGIN) {
+async function assertionAuthority(publicOrigin: string) {
   const pair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
   const publicJwk = await crypto.subtle.exportKey("jwk", pair.publicKey);
   const privateJwk = JSON.stringify(await crypto.subtle.exportKey("jwk", pair.privateKey));
@@ -20,7 +23,30 @@ async function fixture(publicOrigin = PUBLIC_ORIGIN) {
     operatorPublicKeyJwk: { kty: "OKP", crv: "Ed25519", x: String(publicJwk.x) },
     operatorAudience: publicOrigin,
   });
+  return {
+    identity,
+    async assertion(audience = publicOrigin) {
+      return await signOperatorAssertion({
+        privateJwk,
+        claims: {
+          purpose: "sign-in",
+          aud: audience,
+          provider: "google",
+          subject: "selfhost-operator",
+          email: "operator@example.test",
+          displayName: "Operator",
+        },
+        nowSeconds: Math.floor(Date.now() / 1_000),
+        lifetimeSeconds: 60,
+      });
+    },
+  };
+}
+
+async function fixture(publicOrigin = PUBLIC_ORIGIN) {
+  const { identity, assertion } = await assertionAuthority(publicOrigin);
   const app = buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     identity: identity.verifier,
@@ -37,22 +63,35 @@ async function fixture(publicOrigin = PUBLIC_ORIGIN) {
     driver: new InMemoryTakoformResourceDriver(),
     offerings: [],
   });
+  return { app, assertion };
+}
+
+async function controlOnlyFixture(publicOrigin: string) {
+  const { identity, assertion } = await assertionAuthority(publicOrigin);
+  const accounts = createAccounts({ sql: createEphemeralSql(), identity: identity.verifier });
+  const control = createControlRoutes({
+    publicOrigin,
+    consoleOrigin: CONSOLE_ORIGIN,
+    accounts,
+    inventory: {} as never,
+    deployments: {} as never,
+    attachments: {} as never,
+    migrations: {} as never,
+    forms: [],
+    identityProviders: identity.providers,
+    ledger: {} as never,
+    catalog: {} as never,
+    reseller: {} as never,
+    tokens: {} as never,
+    settlement: {} as never,
+    clock: () => new Date(),
+  });
   return {
-    app,
-    async assertion(audience = publicOrigin) {
-      return await signOperatorAssertion({
-        privateJwk,
-        claims: {
-          purpose: "sign-in",
-          aud: audience,
-          provider: "google",
-          subject: "selfhost-operator",
-          email: "operator@example.test",
-          displayName: "Operator",
-        },
-        nowSeconds: Math.floor(Date.now() / 1_000),
-        lifetimeSeconds: 60,
-      });
+    assertion,
+    async fetch(request: Request): Promise<Response> {
+      const response = await control(request, new URL(request.url));
+      if (!response) throw new Error("control route did not handle the session request");
+      return response;
     },
   };
 }
@@ -183,17 +222,22 @@ describe("control authentication behind a TLS front end", () => {
     expect(canonical.status).toBe(200);
   });
 
-  test("an explicitly HTTP local deployment retains non-Secure cookies", async () => {
+  test("standalone HTTP control routes retain non-Secure cookies while the normal Host refuses HTTP", async () => {
     const origin = "http://localhost:8787";
-    const { app, assertion } = await fixture(origin);
-    const response = await app.fetch(
+    await expect(fixture(origin)).rejects.toThrow(
+      "baseUrl must be an ASCII serialized absolute HTTPS URL",
+    );
+    // Control routes retain their standalone HTTP cookie contract. The normal
+    // public Takoform v2 Host cannot be composed with an HTTP origin.
+    const { fetch, assertion } = await controlOnlyFixture(origin);
+    const response = await fetch(
       request(origin, "/v1/sessions", signIn(await assertion()), { origin: CONSOLE_ORIGIN }),
     );
     expect(response.status).toBe(200);
     expect(response.headers.has("set-cookie")).toBe(true);
     expect(response.headers.get("set-cookie")?.includes("; Secure")).toBe(false);
     const cookie = response.headers.get("set-cookie")?.split(";")[0] ?? "";
-    const deleted = await app.fetch(
+    const deleted = await fetch(
       request(origin, "/v1/session", undefined, { origin: CONSOLE_ORIGIN, cookie }, "DELETE"),
     );
     expect(deleted.status).toBe(204);

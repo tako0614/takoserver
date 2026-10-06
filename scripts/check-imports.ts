@@ -90,6 +90,26 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "v2-http"],
   },
   {
+    name: "v2-config",
+    match: /^src\/takoform-v2\/config\.ts$/u,
+    may: ["core", "v2-contract", "v2-form"],
+  },
+  {
+    name: "v2-application",
+    match: /^src\/takoform-v2\/application\.ts$/u,
+    may: ["core", "domain", "v2-contract", "v2-config", "v2-accounts", "v2-form", "v2-host"],
+  },
+  {
+    name: "v2-documentation",
+    match: /^src\/takoform-v2\/openapi\.ts$/u,
+    may: [],
+  },
+  {
+    name: "app",
+    match: /^src\/selfhost-takoform-v2-ingress\.ts$/u,
+    may: ["v2-contract"],
+  },
+  {
     name: "release-data",
     match:
       /^(?:vendor\/takoform\/.*\.json|src\/generated\/takoform-(?:stable-v1-catalog|stable-error-taxonomy|integration-form-packages|publisher-set-receipt|publisher-set-authority-closure)\.ts)$/u,
@@ -120,7 +140,7 @@ const LAYERS: readonly Layer[] = [
     name: "routes",
     match:
       /^src\/(?:router|control|data-storage|data-ai|openapi|landing|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
-    may: ["core", "adapter", "domain", "routes"],
+    may: ["core", "adapter", "domain", "routes", "v2-documentation"],
   },
   {
     name: "app",
@@ -128,7 +148,17 @@ const LAYERS: readonly Layer[] = [
     // it composition rather than domain: it is allowed to know both halves.
     match:
       /^src\/(?:app|actor-addressing(?:-source)?|actor-upgrade-handoff(?:-source)?|actor-namespace-facade(?:-source)?|actor-native-(?:class-execution|owner-worker|bootstrap-entry|bootstrap-source)|selfhost-actor-(?:execution-host|native-process|upgrade-broker|http-broker|forward-runtime(?:-entry)?|forward-worker-wrapper|forward-brokers|public-runtime)|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|existing-space-operator(?:-proof)?|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-host-form-source|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-container-(?:bootstrap|endpoint-(?:ingress|https))|selfhost-data-planes|selfhost-entry-shutdown|selfhost-form-authority-composition|selfhost-health|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|selfhost-startup-instructions|selfhost-tenant-run-credentials|selfhost-workflow-binding-(?:broker|runtime-entry)|selfhost-workflow-execution-host|selfhost-workflow-http-transport|selfhost-workflow-preparation|selfhost-workflow-private-owner|selfhost-workflow-serving|workerd-workflow-preparation|workflow-http-bootstrap-entry|workflow-http-controller|workflow-http-worker|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/generated\/(?:workflow-http-bootstrap|actor-upgrade-handoff-source|actor-namespace-facade-source|actor-addressing-source)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
-    may: ["core", "adapter", "domain", "routes", "app", "release-data"],
+    may: [
+      "core",
+      "adapter",
+      "domain",
+      "routes",
+      "app",
+      "release-data",
+      "v2-application",
+      "v2-config",
+      "v2-contract",
+    ],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
   // may not do is reach something its host cannot support, which the
@@ -139,7 +169,7 @@ const LAYERS: readonly Layer[] = [
     // A runtime-specific wrapper may re-export the host-independent entry it
     // adapts (for example Cloudflare's WorkerEntrypoint intrinsic). Both remain
     // composition roots and the host-only graph checks below still apply.
-    may: ["core", "adapter", "domain", "routes", "app", "entry"],
+    may: ["core", "adapter", "domain", "routes", "app", "entry", "v2-config"],
   },
   // The published package surface re-exports the product for an embedder. It
   // states no policy of its own, so it may name anything a consumer is allowed

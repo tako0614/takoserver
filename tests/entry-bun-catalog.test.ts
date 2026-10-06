@@ -6,6 +6,14 @@ import { join } from "node:path";
 test("the standalone Bun entry selects the exact Form source before local state", async () => {
   const source = await Bun.file(new URL("../src/entry-bun.ts", import.meta.url)).text();
 
+  expect(source).toContain("parseTakoformV2ApplicationConfig({");
+  expect(source.indexOf("parseTakoformV2ApplicationConfig({")).toBeLessThan(
+    source.indexOf("const dataRoot"),
+  );
+  expect(source).toContain("TAKOSERVER_PUBLIC_ORIGIN must be a canonical HTTPS bare origin");
+  expect(source.indexOf("runtimeInputCanonicalOriginSupported(publicOrigin)")).toBeLessThan(
+    source.indexOf("const dataRoot"),
+  );
   expect(source).toContain(
     'import { selectPublicHostFormSource } from "./public-host-form-source.ts";',
   );
@@ -47,9 +55,15 @@ test("the Bun entry rejects shared D1 before opening local state", async () => {
     stderr: "pipe",
     env: {
       ...process.env,
+      TAKOSERVER_PUBLIC_ORIGIN: "https://api.example.test",
       TAKOSERVER_D1_DATABASE_ID: "shared-database",
       TAKOSERVER_DATA_ROOT: dataRoot,
       TAKOSERVER_DB: join(dataRoot, "control.sqlite"),
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: "A".repeat(43),
     },
   });
 
@@ -76,9 +90,15 @@ test("the Bun entry rejects the unsupported shared R2 composition before opening
     stderr: "pipe",
     env: {
       ...process.env,
+      TAKOSERVER_PUBLIC_ORIGIN: "https://api.example.test",
       TAKOSERVER_R2_BUCKET: "shared-artifacts",
       TAKOSERVER_DATA_ROOT: dataRoot,
       TAKOSERVER_DB: join(dataRoot, "control.sqlite"),
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: "A".repeat(43),
     },
   });
 
@@ -106,9 +126,15 @@ test("the Bun entry rejects an unknown Form source before opening local state", 
     stderr: "pipe",
     env: {
       ...process.env,
+      TAKOSERVER_PUBLIC_ORIGIN: "https://api.example.test",
       TAKOSERVER_FORM_SOURCE_CANDIDATE: "unknown-source",
       TAKOSERVER_DATA_ROOT: dataRoot,
       TAKOSERVER_DB: join(dataRoot, "control.sqlite"),
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: "A".repeat(43),
     },
   });
 
@@ -122,6 +148,74 @@ test("the Bun entry rejects an unknown Form source before opening local state", 
     expect(exitCode).not.toBeNull();
     expect(exitCode).not.toBe(0);
     expect(`${stdout}\n${stderr}`).toContain("unknown public Host Form source candidate");
+    expect(existsSync(dataRoot)).toBe(false);
+  } finally {
+    rmSync(dataRoot, { recursive: true, force: true });
+  }
+});
+
+test("the Bun entry refuses missing v2 config before creating local state", async () => {
+  const dataRoot = join(tmpdir(), `takoserver-missing-v2-config-${crypto.randomUUID()}`);
+  const env = { ...process.env };
+  delete env.TAKOSERVER_TAKOFORM_V2_CONFIG;
+  delete env.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY;
+  const child = Bun.spawn([process.execPath, "--no-env-file", "src/entry-bun.ts"], {
+    cwd: join(import.meta.dir, ".."),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...env,
+      TAKOSERVER_PUBLIC_ORIGIN: "https://api.example.test",
+      TAKOSERVER_DATA_ROOT: dataRoot,
+      TAKOSERVER_DB: join(dataRoot, "control.sqlite"),
+    },
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+
+  try {
+    expect(exitCode).not.toBe(0);
+    expect(`${stdout}\n${stderr}`).toContain("missing_configuration");
+    expect(existsSync(dataRoot)).toBe(false);
+  } finally {
+    rmSync(dataRoot, { recursive: true, force: true });
+  }
+});
+
+test("the Bun entry refuses an HTTP public origin before creating local state", async () => {
+  const dataRoot = join(tmpdir(), `takoserver-http-public-origin-${crypto.randomUUID()}`);
+  const child = Bun.spawn([process.execPath, "--no-env-file", "src/entry-bun.ts"], {
+    cwd: join(import.meta.dir, ".."),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      TAKOSERVER_PUBLIC_ORIGIN: "http://api.example.test",
+      TAKOSERVER_DATA_ROOT: dataRoot,
+      TAKOSERVER_DB: join(dataRoot, "control.sqlite"),
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: "A".repeat(43),
+    },
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+
+  try {
+    expect(exitCode).not.toBe(0);
+    expect(`${stdout}\n${stderr}`).toContain(
+      "TAKOSERVER_PUBLIC_ORIGIN must be a canonical HTTPS bare origin",
+    );
     expect(existsSync(dataRoot)).toBe(false);
   } finally {
     rmSync(dataRoot, { recursive: true, force: true });

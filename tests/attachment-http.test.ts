@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test";
 import {
-  buildApp,
   createEphemeralSql,
   createMemoryObjectStore,
   createProviderPack,
@@ -11,7 +10,11 @@ import {
   type InstalledTakoformForm,
   type TakoformInterfaceRef,
 } from "../src/index.ts";
-import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
+import {
+  buildHistoricalTakoformApp,
+  createStaticStableTestTakoformHost,
+} from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const NOW = Date.UTC(2026, 7, 18, 12);
 const POSTGRES = {
@@ -57,7 +60,8 @@ test("the ordinary control API resolves Attachments and blocks provider deletion
       },
     ],
   });
-  const app = buildApp({
+  const app = buildHistoricalTakoformApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     takoformHostFactory: createStaticStableTestTakoformHost,
     sql,
     objects: createMemoryObjectStore(),
