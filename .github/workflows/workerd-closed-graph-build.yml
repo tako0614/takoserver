@@ -31,7 +31,8 @@ jobs:
 
       - name: Initialize workerd build report
         shell: bash
-        run: : > "${RUNNER_TEMP}/workerd-build-runner-report.txt"
+        run: |
+          : > "${RUNNER_TEMP}/workerd-build-runner-report.txt"
 
       - name: Install and verify pinned libc++ headers
         shell: bash

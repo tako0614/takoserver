@@ -11,6 +11,7 @@ const workflowPath = resolve(repositoryRoot, ".github/workflows/workerd-closed-g
 
 test("closed-graph workflow installs and verifies libc++ before Bazelisk or build", async () => {
   const workflow = await readFile(workflowPath, "utf8");
+  expect(() => Bun.YAML.parse(workflow)).not.toThrow();
   const initializeReportStep = workflow.indexOf("Initialize workerd build report");
   const prerequisiteStep = workflow.indexOf("scripts/workerd-toolchain-prerequisites.sh");
   const compilerVerificationStep = workflow.indexOf("Verify exact compiler prerequisites");
