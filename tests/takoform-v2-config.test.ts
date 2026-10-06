@@ -1,12 +1,33 @@
 import { describe, expect, test } from "bun:test";
 import {
   parseTakoformV2ApplicationConfig,
+  parseTakoformV2PublicConfig,
   V2ApplicationConfigError,
 } from "../src/takoform-v2/config.ts";
 
 const CURSOR_KEY = "A".repeat(43);
 
 describe("Takoform v2 application configuration", () => {
+  test("pure deploy parser validates the same non-secret JSON without a cursor key", () => {
+    const json = JSON.stringify({
+      documentation: "https://docs.example.invalid/takoform-v2",
+      authenticationDocumentation: "https://docs.example.invalid/authentication",
+      staticAssetBundle: { targetKey: "asset-target", heldArtifacts: [] },
+    });
+    const publicConfig = parseTakoformV2PublicConfig(json);
+    expect(publicConfig.staticAssetBundle).toEqual({
+      targetKey: "asset-target",
+      heldArtifacts: [],
+    });
+    expect(publicConfig).not.toHaveProperty("cursorSigningKey");
+    expect(() => parseTakoformV2PublicConfig(`${json.slice(0, -1)},"extra":1}`)).toThrow(
+      "invalid_configuration",
+    );
+    // Startup still requires the separately managed key, even for valid JSON.
+    expect(() => parseTakoformV2ApplicationConfig({ TAKOSERVER_TAKOFORM_V2_CONFIG: json })).toThrow(
+      "missing_cursor_key",
+    );
+  });
   test("parses required HTTPS documentation and decodes the separate cursor key", () => {
     const config = parseTakoformV2ApplicationConfig({
       TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({

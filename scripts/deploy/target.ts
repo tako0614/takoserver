@@ -18,6 +18,7 @@ import {
   parseSpaceAdmissionPolicy,
   type SpaceAdmissionPolicyV1,
 } from "../../src/takoform/space-admission-policy.ts";
+import { parseTakoformV2PublicConfig } from "../../src/takoform-v2/config.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
 import type { DeployEnvironment } from "./qualification.ts";
@@ -35,6 +36,8 @@ export interface DeployTarget {
   readonly d1: { readonly databaseName: string; readonly databaseId: string };
   readonly r2: { readonly bucketName: string };
   readonly publicOrigin: string;
+  /** Exact non-secret v2 startup JSON; the cursor key is a separately managed Worker secret. */
+  readonly takoformV2?: { readonly config: string };
   /** Temporary pre-0043 runtime used only by the 0043 cutover protocol. */
   readonly artifactBlobIoMode?: "pre-0043-quiesced";
   /** Optional whole-Host source-only maintenance profile for the pending 0058 transition. */
@@ -421,6 +424,7 @@ export function parseDeployTarget(
       "artifactBlobIoMode",
       "schemaMaintenanceMode",
       "protected0058Custody",
+      "takoformV2",
     ],
   );
 
@@ -454,6 +458,7 @@ export function parseDeployTarget(
     },
     r2: { bucketName: pattern(r2.bucketName, BUCKET_NAME, "r2.bucketName") },
     publicOrigin: httpsOrigin(value.publicOrigin),
+    ...(value.takoformV2 === undefined ? {} : { takoformV2: takoformV2(value.takoformV2) }),
     ...artifactBlobIoMode(value.artifactBlobIoMode),
     ...schemaMaintenanceMode(value.schemaMaintenanceMode),
     ...(value.protected0058Custody === undefined
@@ -508,6 +513,14 @@ export function parseDeployTarget(
         }),
     signing: signing(value.signing),
   };
+  if (target.takoformV2 !== undefined) {
+    if (environment !== "integration") {
+      throw preflightError("v2 Worker target composition is integration-only");
+    }
+    if (target.artifactBlobIoMode !== undefined || target.schemaMaintenanceMode !== undefined) {
+      throw preflightError("v2 Worker target cannot select a maintenance profile");
+    }
+  }
   const cloudflareSupplies = [
     ...(target.objectBucketSupplies?.supplies.filter(
       (supply) => supply.provider.kind === "cloudflare",
@@ -1292,6 +1305,20 @@ function boolean(value: unknown, field: string): boolean {
     throw preflightError(`deploy target \`${field}\` is invalid`);
   }
   return value;
+}
+
+function takoformV2(value: unknown): NonNullable<DeployTarget["takoformV2"]> {
+  if (!isRecord(value)) throw preflightError("deploy target `takoformV2` must be an object");
+  assertExactKeys(value, ["config"]);
+  if (typeof value.config !== "string") {
+    throw preflightError("deploy target `takoformV2.config` must be non-secret JSON text");
+  }
+  try {
+    parseTakoformV2PublicConfig(value.config);
+  } catch {
+    throw preflightError("deploy target `takoformV2.config` is invalid v2 startup JSON");
+  }
+  return { config: value.config };
 }
 
 function artifactBlobIoMode(value: unknown): { readonly artifactBlobIoMode?: "pre-0043-quiesced" } {

@@ -1,5 +1,6 @@
 import { buildEdgeForms } from "../../src/edge-forms.ts";
 import { currentTakoformCandidates } from "../../src/takoform/current-candidates.ts";
+import { parseTakoformV2PublicConfig } from "../../src/takoform-v2/config.ts";
 import {
   createWorkerProductionComposition,
   type WorkerProductionCompositionEnv,
@@ -30,6 +31,7 @@ const COMPOSITION_VARS = [
   "TAKOSERVER_OBJECT_BUCKET_SUPPLIES",
   "TAKOSERVER_EDGE_SUPPLIES",
   "TAKOSERVER_MANAGED_BASE_DOMAIN",
+  "TAKOSERVER_TAKOFORM_V2_CONFIG",
 ] as const;
 
 /** The composition inputs the Worker reads, derived exactly as the upload does. */
@@ -71,6 +73,15 @@ export async function assertTargetComposes(
   const current = currentTakoformCandidates();
   const retained = await buildEdgeForms();
   try {
+    if (target.takoformV2 !== undefined) {
+      const realized = env as WorkerProductionCompositionEnv & {
+        readonly TAKOSERVER_TAKOFORM_V2_CONFIG?: string;
+      };
+      if (realized.TAKOSERVER_TAKOFORM_V2_CONFIG !== target.takoformV2.config) {
+        throw new TypeError("realized v2 startup configuration differs from the selected target");
+      }
+      parseTakoformV2PublicConfig(realized.TAKOSERVER_TAKOFORM_V2_CONFIG);
+    }
     createWorkerProductionComposition({
       env,
       forms: current.forms,
