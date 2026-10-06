@@ -49,6 +49,7 @@ export {
   createV2WorkerPublicationState,
   type V2WorkerPublicationResolution,
   type V2WorkerPublicationSnapshot,
+  type V2WorkerPublicationSqlGuard,
   type V2WorkerVersionMaterials,
   type V2WorkerVersionResolution,
   type V2WorkerVersionSnapshot,

@@ -247,6 +247,11 @@ test("accepted Deployment overlays only its own operation and fences every graph
     });
     expect(replay.id).toBe(deployment.id);
     const execution = await f.claim(deployment.id);
+    // The route fence uses the database clock, not this fixture's logical Host clock.
+    await f.sql.run("UPDATE tf_v2_operations SET lease_until_ms = ? WHERE id = ?", [
+      Date.now() + 60_000,
+      deployment.id,
+    ]);
     const resolved = await f.reader.resolve({ execution });
     expect(resolved.kind).toBe("ready");
     if (resolved.kind !== "ready") return;
@@ -256,6 +261,16 @@ test("accepted Deployment overlays only its own operation and fences every graph
     expect(resolved.snapshot.endpoint).toBeNull();
     expect(Object.isFrozen(resolved.snapshot.deployment?.versions[0]?.spec)).toBe(true);
     expect(await resolved.stillCurrent()).toBe(true);
+    f.db.exec("CREATE TABLE test_publication_route (id TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    f.db.exec("INSERT INTO test_publication_route VALUES ('worker', 'old')");
+    const guardedWrite = (value: string) =>
+      f.sql.run(
+        `UPDATE test_publication_route SET value = ? WHERE id = 'worker' AND (${resolved.sqlGuard.sql})`,
+        [value, ...resolved.sqlGuard.params],
+      );
+    expect(resolved.sqlGuard.params.length + 13).toBeLessThanOrEqual(100);
+    // This is the real settled WorkerBundle graph, not a hand-built row image.
+    expect((await guardedWrite("held-bundle-graph")).changes).toBe(1);
 
     const endpoint = await f.create(
       WORKER_ENDPOINT_FORM_URL,
@@ -264,6 +279,7 @@ test("accepted Deployment overlays only its own operation and fences every graph
       false,
     );
     expect(await resolved.stillCurrent()).toBe(false);
+    expect((await guardedWrite("stale-graph")).changes).toBe(0);
     const current = await f.reader.resolve({ execution });
     expect(current.kind).toBe("ready"); // later pending Endpoint is never adopted
     if (current.kind === "ready") expect(current.snapshot.endpoint).toBeNull();

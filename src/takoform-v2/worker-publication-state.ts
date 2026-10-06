@@ -30,6 +30,12 @@ import {
 } from "./forms/worker-specs.ts";
 import type { OperationRow, ResourceRow } from "./store.ts";
 import type { V2Execution } from "./types.ts";
+import {
+  createWorkerPublicationSqlGuard,
+  type V2WorkerPublicationSqlGuard,
+} from "./worker-publication-sql-guard.ts";
+
+export type { V2WorkerPublicationSqlGuard } from "./worker-publication-sql-guard.ts";
 
 /** A read-only SQL authority for one fenced private Worker publication. */
 export interface V2WorkerPublicationSnapshot {
@@ -63,6 +69,8 @@ export type V2WorkerPublicationResolution =
   | {
       readonly kind: "ready";
       readonly snapshot: V2WorkerPublicationSnapshot;
+      /** Embed this captured predicate in the same SQL statement as route CAS. */
+      readonly sqlGuard: V2WorkerPublicationSqlGuard;
       /** Re-read the complete SQL vector after any await and before the native effect. */
       stillCurrent(): Promise<boolean>;
       /** Host-private, held-only bytes for one selected settled Version. */
@@ -114,6 +122,7 @@ type ReadyCapture = {
   readonly kind: "ready";
   readonly snapshot: V2WorkerPublicationSnapshot;
   readonly vector: string;
+  readonly sqlGuard: V2WorkerPublicationSqlGuard;
   readonly materials: ReadonlyMap<string, VersionMaterialTargets>;
 };
 type Capture = ReadyCapture | Unresolved;
@@ -621,9 +630,10 @@ export function createV2WorkerPublicationState(options: {
 
     const incumbentId = input.incumbentSourceOperationId;
     let incumbent: OperationRow | null = null;
+    let incumbentResource: ResourceRow | null = null;
     if (incumbentId !== undefined) {
       incumbent = await operation(incumbentId);
-      const incumbentResource = incumbent ? await resource(incumbent.resource_uid) : null;
+      incumbentResource = incumbent ? await resource(incumbent.resource_uid) : null;
       if (
         !incumbent ||
         !incumbentResource ||
@@ -730,6 +740,7 @@ export function createV2WorkerPublicationState(options: {
     }
 
     const evidence: unknown[] = [];
+    const referenceSetIds: string[] = [];
     const materials = new Map<string, VersionMaterialTargets>();
     let deployment: V2WorkerPublicationSnapshot["deployment"] = null;
     if (chosenDeployment) {
@@ -767,6 +778,7 @@ export function createV2WorkerPublicationState(options: {
         );
       }
       evidence.push(refRows);
+      referenceSetIds.push(chosenDeployment.op.id);
       const versions: NonNullable<V2WorkerPublicationSnapshot["deployment"]>["versions"][number][] =
         [];
       const versionEvidence: unknown[] = [];
@@ -808,6 +820,7 @@ export function createV2WorkerPublicationState(options: {
             "A weighted Worker Version references are not sealed and exact",
           );
         }
+        if (last) referenceSetIds.push(last.id);
         const bundle = versionSpec.bundle
           ? await artifactTarget({
               versionUid: uid,
@@ -877,6 +890,7 @@ export function createV2WorkerPublicationState(options: {
         return unresolved("graph_unresolved", "Endpoint accepted owner or address is unavailable");
       }
       evidence.push(refRows);
+      referenceSetIds.push(chosenEndpoint.op.id);
       endpoint = {
         uid: chosenEndpoint.row.uid,
         generation: chosenEndpoint.op.generation,
@@ -906,30 +920,84 @@ export function createV2WorkerPublicationState(options: {
       deployment,
       endpoint,
     });
+    // An accepted attachment or Binding can add an incoming edge without
+    // altering a selected Resource row. Capture the complete inbound set, not
+    // only the explicit Deployment/Endpoint rows projected above.
+    const inboundTargetIds = [
+      workerUid,
+      ...(deployment?.versions.map((version) => version.uid) ?? []),
+      ...(deployment ? [deployment.uid] : []),
+      ...(endpoint ? [endpoint.uid] : []),
+      ...[...materials.values()].flatMap((target) =>
+        [target.bundle?.uid, target.assets?.uid].filter((uid): uid is string => uid !== undefined),
+      ),
+    ];
+    const inboundEdges = await sql.query(
+      `SELECT target_uid, referrer_uid FROM tf_v2_resource_references
+       WHERE target_uid IN (SELECT value FROM json_each(?))
+       ORDER BY target_uid, referrer_uid`,
+      [JSON.stringify(inboundTargetIds)],
+    );
     // The vector includes every row read above, including the incumbent and
     // pending queue. A later acceptance, settlement, deletion, or lease change
     // invalidates the snapshot even when its projected public fields look equal.
-    const vector = canonicalJson({
+    const graphEvidence = {
       op,
       own,
       worker,
       workerOp,
       incumbent,
+      incumbentResource,
       pending,
       deploymentRows,
       endpointRows,
       deployment: chosenDeployment,
       endpoint: chosenEndpoint,
       evidence,
+      inboundEdges,
       snapshot,
-    } as unknown as JsonObject);
+    };
+    const guardEvidence = {
+      op,
+      own,
+      worker,
+      workerOp,
+      incumbent,
+      incumbentResource,
+      pending,
+      deploymentRows,
+      endpointRows,
+      deployment: chosenDeployment && { row: chosenDeployment.row, op: chosenDeployment.op },
+      endpoint: chosenEndpoint && { row: chosenEndpoint.row, op: chosenEndpoint.op },
+      evidence,
+      inboundEdges,
+    };
+    const vector = canonicalJson(graphEvidence as unknown as JsonObject);
     // SQL graph reads above may await after the first lease check. Do not
     // return a once-valid claim as ready after its known deadline elapsed.
     const finalNow = now().getTime();
     if (!Number.isFinite(finalNow) || op.lease_until_ms === null || op.lease_until_ms <= finalNow) {
       return unresolved("stale_claim", "The accepted operation lease expired during graph read");
     }
-    return { kind: "ready", snapshot, vector, materials };
+    let sqlGuard: V2WorkerPublicationSqlGuard;
+    try {
+      sqlGuard = createWorkerPublicationSqlGuard({
+        execution,
+        workerUid,
+        principal: op.principal,
+        space: own.space,
+        pendingIds: pending.map((item) => item.id),
+        deploymentIds: deploymentRows.map((item) => item.uid),
+        endpointIds: endpointRows.map((item) => item.uid),
+        inboundTargetIds,
+        inboundEdges,
+        referenceSetIds,
+        evidence: guardEvidence,
+      });
+    } catch {
+      return unresolved("graph_unresolved", "Worker publication SQL guard is unavailable");
+    }
+    return { kind: "ready", snapshot, vector, materials, sqlGuard };
   }
 
   async function readMaterialsTargets(
@@ -1044,6 +1112,7 @@ export function createV2WorkerPublicationState(options: {
       return {
         kind: "ready",
         snapshot: initial.snapshot,
+        sqlGuard: initial.sqlGuard,
         async stillCurrent(): Promise<boolean> {
           const latest = await capture(input);
           return latest.kind === "ready" && latest.vector === initial.vector;
