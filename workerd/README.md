@@ -41,6 +41,13 @@ filesystem root containing that compiler under `usr/bin` and its matching
 LLVM/libc++ files under `usr/lib`; `/` is valid when those packages are
 installed on the host. `BAZELISK` is the absolute path to the pinned binary.
 
+The manual `workerd-closed-graph-build` workflow runs on an ephemeral
+`ubuntu-26.04` runner and installs the exact matching
+`libc++-20-dev=1:20.1.8-2ubuntu8` package. It checks the installed package
+version and `usr/lib/llvm-20/include/c++/v1/__config` before Bazel starts. The
+workflow's package installation does not change this repository's compiler or
+artifact pin; the build report still records `nativeQualification: "not-run"`.
+
 ```sh
 BAZELISK=/absolute/path/to/bazelisk \
 WORKERD_LLVM_ROOT=/absolute/compiler-root \
