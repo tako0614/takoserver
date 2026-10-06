@@ -33,8 +33,10 @@ import {
 } from "./qualification.ts";
 import {
   projectApplyQualifiedMigrationArtifact,
+  projectFreshV2ArtifactMigrationArtifact,
   readCurrentAuditedMigrationSourceArtifact,
   readSealedApplyQualifiedMigrationArtifact,
+  readSealedFreshV2ArtifactMigrationArtifact,
   type SchemaReader,
 } from "./schema.ts";
 import type { DeployTarget } from "./target.ts";
@@ -74,6 +76,8 @@ export interface IntegrationStorageGenerationInvocation {
   readonly environment: DeployEnvironment;
   readonly commit: string;
   readonly generation: string;
+  /** Exact fresh-only v2 artifact payload; omitted means the historical 0066 payload. */
+  readonly freshLineage?: "v2-artifacts-0075";
 }
 
 export interface IntegrationStorageD1Database {
@@ -149,6 +153,11 @@ export interface IntegrationStorageGenerationTargetProof {
   readonly schemaShapeDigest: string;
 }
 
+export interface FreshV2ArtifactIntegrationStorageTargetProof
+  extends IntegrationStorageGenerationTargetProof {
+  readonly freshLineage: "v2-artifacts-0075";
+}
+
 /**
  * Narrow read-only seam for proving that the selected integration Worker
  * target names one existing generated storage pair with the exact audited D1
@@ -188,7 +197,7 @@ export async function runIntegrationStorageGeneration(
   const names = validateInvocation(invocation, target);
   if (invocation.action === "status") {
     const provider = await resolveProvider(target, options);
-    return await statusStorageGeneration(invocation, names, provider);
+    return await statusStorageGeneration(invocation, target, names, provider, options);
   }
   return await applyStorageGeneration(invocation, target, names, options);
 }
@@ -203,6 +212,33 @@ export async function verifyIntegrationStorageGenerationTarget(
   target: DeployTarget,
   environment: DeployEnvironment,
   options: IntegrationStorageGenerationTargetVerificationOptions = {},
+): Promise<IntegrationStorageGenerationTargetProof> {
+  return await verifyGeneratedStorageTarget(target, environment, options, "apply-0066");
+}
+
+/**
+ * Read-only proof for one generated integration pair with the complete fixed
+ * v2 artifact schema. Existing v1 target readers remain pinned to 0066.
+ */
+export async function verifyFreshV2ArtifactIntegrationStorageTarget(
+  target: DeployTarget,
+  environment: DeployEnvironment,
+  options: IntegrationStorageGenerationTargetVerificationOptions = {},
+): Promise<FreshV2ArtifactIntegrationStorageTargetProof> {
+  const proof = await verifyGeneratedStorageTarget(
+    target,
+    environment,
+    options,
+    "v2-artifacts-0075",
+  );
+  return { ...proof, freshLineage: "v2-artifacts-0075" };
+}
+
+async function verifyGeneratedStorageTarget(
+  target: DeployTarget,
+  environment: DeployEnvironment,
+  options: IntegrationStorageGenerationTargetVerificationOptions,
+  lineage: "apply-0066" | "v2-artifacts-0075",
 ): Promise<IntegrationStorageGenerationTargetProof> {
   const generated = generatedStorageTarget(target, environment);
   const providerContext = await resolveTargetReadProvider(target, environment, options);
@@ -237,10 +273,9 @@ export async function verifyIntegrationStorageGenerationTarget(
     );
   }
 
-  const sourceArtifact = projectApplyQualifiedMigrationArtifact(
-    readCurrentAuditedMigrationSourceArtifact(
-      options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
-    ),
+  const sourceArtifact = selectedSourceArtifact(
+    options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+    lineage,
   );
   const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
   const temporary = options.outputDirectory === undefined;
@@ -373,6 +408,9 @@ function validateInvocation(
   if (!GENERATION.test(invocation.generation)) {
     throw preflightError("--generation must be exactly 32 lowercase hexadecimal characters");
   }
+  if (invocation.freshLineage !== undefined && invocation.freshLineage !== "v2-artifacts-0075") {
+    throw preflightError("unsupported fresh integration migration lineage");
+  }
   if (!ACCOUNT_ID.test(target.accountId)) {
     throw preflightError("integration storage generation requires one exact account id");
   }
@@ -394,9 +432,18 @@ function validateInvocation(
 
 async function statusStorageGeneration(
   invocation: IntegrationStorageGenerationInvocation,
+  target: DeployTarget,
   names: StorageNames,
   provider: ProviderContext,
+  options: IntegrationStorageGenerationOptions,
 ): Promise<Record<string, unknown>> {
+  const sourceArtifact =
+    invocation.freshLineage === undefined
+      ? null
+      : selectedSourceArtifact(
+          options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+          invocation.freshLineage,
+        );
   const inventory = await readInventory(provider.provider, names, "preflight");
   const d1 = inventory.d1[0] ?? null;
   const r2 = inventory.r2[0] ?? null;
@@ -408,7 +455,7 @@ async function statusStorageGeneration(
         : d1 === null
           ? "r2-only"
           : "both";
-  return {
+  const result: Record<string, unknown> = {
     kind: "takoserver.integration-storage-generation-status@v1",
     surface: "takoserver-integration-storage-generation",
     environment: "integration",
@@ -427,6 +474,70 @@ async function statusStorageGeneration(
     readyForApply: d1 === null && r2 === null,
     rollback: "old active target remains unchanged; repair forward from any known aftermath",
   };
+  if (invocation.freshLineage === undefined) return result;
+  result.freshLineage = invocation.freshLineage;
+  result.migrationDigest = sourceArtifact?.digest;
+  // This is diagnosis, not adoption: an earlier failed apply must be correlated
+  // with this exact name and UUID by the operator. No status path imports SQL.
+  if (d1 === null) return result;
+  if (sourceArtifact === null) throw preflightError("fresh v2 status source is unavailable");
+  const temporary = options.outputDirectory === undefined;
+  const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-v2-d1-status-"));
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const configPath = join(root, "read-wrangler.jsonc");
+  try {
+    if (existsSync(configPath)) {
+      throw preflightError("v2 D1 status output directory is already in use");
+    }
+    const identity = await providerCall("preflight", "v2 D1 status identity readback failed", () =>
+      provider.provider.getD1(d1.uuid),
+    );
+    if (identity.uuid !== d1.uuid || identity.name !== names.databaseName) {
+      throw preflightError("v2 D1 status identity changed during readback");
+    }
+    writeGenerationConfig(configPath, target.accountId, names.databaseName, d1.uuid);
+    const state = await readGeneratedState(
+      "preflight",
+      configPath,
+      { accountId: target.accountId, databaseName: names.databaseName, databaseId: d1.uuid },
+      provider.environment,
+      options.run ?? runCommand,
+      options,
+    );
+    const expectedShape = deriveExpectedApplicationShape(sourceArtifact.files);
+    let complete = false;
+    try {
+      assertCompleteDatabase(
+        state,
+        sourceArtifact.names,
+        sourceArtifact.digest,
+        expectedShape,
+        d1.uuid,
+        "preflight",
+      );
+      complete = true;
+    } catch {
+      // An exact-name D1 may be partially imported or foreign. It is never
+      // promoted, reset or retried merely because its name matches.
+    }
+    result.schemaReadback = complete ? "complete-0075" : "incomplete-or-divergent";
+    result.resume = complete
+      ? "Correlate the exact prior apply identity; separately review any missing R2 and target binding. No SQL re-import."
+      : "Quarantine this generation and plan separate owner-reviewed forward repair; no SQL re-import or new generation retry.";
+    return result;
+  } finally {
+    if (temporary) rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function selectedSourceArtifact(
+  directory: string,
+  lineage: "apply-0066" | "v2-artifacts-0075",
+): ReturnType<typeof readCurrentAuditedMigrationSourceArtifact> {
+  const source = readCurrentAuditedMigrationSourceArtifact(directory);
+  return lineage === "apply-0066"
+    ? projectApplyQualifiedMigrationArtifact(source)
+    : projectFreshV2ArtifactMigrationArtifact(source);
 }
 
 interface ProviderContext {
@@ -497,10 +608,9 @@ async function applyStorageGeneration(
   );
   await qualifySource({ environment: "integration", commit: invocation.commit, run });
 
-  const sourceArtifact = projectApplyQualifiedMigrationArtifact(
-    readCurrentAuditedMigrationSourceArtifact(
-      options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
-    ),
+  const sourceArtifact = selectedSourceArtifact(
+    options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+    invocation.freshLineage ?? "apply-0066",
   );
   await checkedMigrationGate(run);
   const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
@@ -527,7 +637,10 @@ async function applyStorageGeneration(
     for (const file of sourceArtifact.files) {
       copyFileSync(file.path, join(migrationOutput, file.name));
     }
-    const sealedArtifact = readSealedApplyQualifiedMigrationArtifact(migrationOutput);
+    const sealedArtifact =
+      invocation.freshLineage === "v2-artifacts-0075"
+        ? readSealedFreshV2ArtifactMigrationArtifact(migrationOutput)
+        : readSealedApplyQualifiedMigrationArtifact(migrationOutput);
     if (
       sealedArtifact.digest !== sourceArtifact.digest ||
       JSON.stringify(sealedArtifact.names) !== JSON.stringify(sourceArtifact.names)
@@ -676,6 +789,7 @@ async function applyStorageGeneration(
       commit: invocation.commit,
       reviewer,
       generation: invocation.generation,
+      ...(invocation.freshLineage === undefined ? {} : { freshLineage: invocation.freshLineage }),
       d1: {
         databaseName: names.databaseName,
         databaseId,
@@ -709,10 +823,22 @@ async function applyStorageGeneration(
   // error must never replace the operation's original bounded failure.
   if (operationFailed) {
     if (!mutationStarted) throw operationFailure;
-    throw normalizeAfterD1Create(operationFailure, knownDatabaseId);
+    throw normalizeAfterD1Create(
+      operationFailure,
+      knownDatabaseId,
+      invocation,
+      sourceArtifact.digest,
+    );
   }
   if (cleanupFailed) {
-    if (mutationStarted) throw normalizeAfterD1Create(cleanupFailure, knownDatabaseId);
+    if (mutationStarted) {
+      throw normalizeAfterD1Create(
+        cleanupFailure,
+        knownDatabaseId,
+        invocation,
+        sourceArtifact.digest,
+      );
+    }
     throw cleanupFailure;
   }
   if (result === undefined) {
@@ -1021,15 +1147,29 @@ function safeAppliedMigrations(
   return appliedMigrations.slice();
 }
 
-function normalizeAfterD1Create(error: unknown, databaseId: string | null): DeployError {
+function normalizeAfterD1Create(
+  error: unknown,
+  databaseId: string | null,
+  invocation: IntegrationStorageGenerationInvocation,
+  migrationDigest: string,
+): DeployError {
   const phase: DeployPhase =
     error instanceof DeployError && error.phase === "verification" ? "verification" : "mutation";
   const evidence = error instanceof MigrationApplyError ? error.evidence : undefined;
+  const context =
+    invocation.freshLineage === undefined
+      ? []
+      : [
+          `generation=${invocation.generation}`,
+          `freshLineage=${invocation.freshLineage}`,
+          `migrationDigest=${migrationDigest}`,
+        ];
   const detail =
     evidence === undefined
-      ? `databaseId=${databaseId ?? "unknown"}`
+      ? [`databaseId=${databaseId ?? "unknown"}`, ...context].join(" ")
       : [
           `databaseId=${databaseId ?? "unknown"}`,
+          ...context,
           `phase=${phase}`,
           `exitCode=${evidence.exitCode ?? "unknown"}`,
           `appliedMigrations=${JSON.stringify(evidence.appliedMigrations)}`,

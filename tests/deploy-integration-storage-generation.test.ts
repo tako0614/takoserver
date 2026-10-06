@@ -15,6 +15,7 @@ import {
   type IntegrationStorageR2Bucket,
   type IntegrationStorageTargetReadProvider,
   runIntegrationStorageGeneration,
+  verifyFreshV2ArtifactIntegrationStorageTarget,
   verifyIntegrationStorageGenerationTarget,
 } from "../scripts/deploy/integration-storage-generation.ts";
 import { canonicalSchemaShape, type D1SchemaState } from "../scripts/deploy/migrations.ts";
@@ -30,9 +31,11 @@ const fixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-integration-storage-t
 const auditedMigrations = copyAuditedSchemaFixture(join(fixtureRoot, "migrations"));
 const currentMigrations = copyCurrentSchemaFixture(join(fixtureRoot, "current-migrations"));
 const expectedApplicationShape = applicationShape(currentMigrations);
+const expectedV2ArtifactShape = applicationShape(currentMigrations, 75);
 const COMMIT = "a".repeat(40);
 const GENERATION = "b".repeat(32);
 const APPLY_MIGRATIONS = MIGRATIONS.slice(0, 66);
+const FRESH_V2_MIGRATIONS = MIGRATIONS.slice(0, 75);
 const DATABASE_ID = "00000000-0000-4000-8000-000000000051";
 const TARGET_DATABASE = "takoserver-runtime-integration";
 const TARGET_BUCKET = "takoserver-objects-integration";
@@ -60,6 +63,10 @@ const emptyState = state([], []);
 const completeState = stateWithShape(
   APPLY_MIGRATIONS.map(({ name }) => name),
   expectedApplicationShape,
+);
+const completeV2ArtifactState = stateWithShape(
+  FRESH_V2_MIGRATIONS.map(({ name }) => name),
+  expectedV2ArtifactShape,
 );
 
 afterAll(() => rmSync(fixtureRoot, { recursive: true, force: true }));
@@ -122,10 +129,10 @@ function editedSchemaSqlState(
   return stateWithSchemaRows(base, rows);
 }
 
-function applicationShape(directory: string): string {
+function applicationShape(directory: string, count = 66): string {
   const database = new Database(":memory:");
   try {
-    for (const name of readdirSync(directory).sort().slice(0, 66)) {
+    for (const name of readdirSync(directory).sort().slice(0, count)) {
       database.exec(readFileSync(join(directory, name), "utf8"));
     }
     const rows = database
@@ -800,16 +807,21 @@ describe("integration storage generation bootstrap", () => {
           );
         }
         const fixture = providerFixture();
-        await expect(
-          runIntegrationStorageGeneration(invocation, target, {
-            ...options(fixture.provider),
-            migrationDirectory,
-          }),
-        ).rejects.toThrow(
-          drift === "changed"
-            ? "exact audited migration SHA-256"
-            : "audited migration lineage must contain exactly 0001-0075",
-        );
+        for (const selected of [
+          invocation,
+          { ...invocation, freshLineage: "v2-artifacts-0075" } as const,
+        ]) {
+          await expect(
+            runIntegrationStorageGeneration(selected, target, {
+              ...options(fixture.provider),
+              migrationDirectory,
+            }),
+          ).rejects.toThrow(
+            drift === "changed"
+              ? "exact audited migration SHA-256"
+              : "audited migration lineage must contain exactly 0001-0075",
+          );
+        }
         expect(fixture.calls).toEqual([]);
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -891,6 +903,186 @@ describe("integration storage generation bootstrap", () => {
       expect(migrationImport).toContain("0066_cloudflare_managed_actor_kv_capability_claims.sql");
       expect(migrationImport).not.toContain("0067_takoform_container_endpoint_hostname_index.sql");
       expect(migrationImport).not.toContain("0068_cloudflare_provider_invocation_custody.sql");
+    } finally {
+      rmSync(outputDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("explicit fresh-v2 selector seals and imports exact 0075 before R2, while the default stays 0066", async () => {
+    const fixture = providerFixture();
+    const process = processFixture();
+    const outputDirectory = mkdtempSync(join(tmpdir(), "takoserver-v2-fresh-payload-"));
+    try {
+      const result = await runIntegrationStorageGeneration(
+        { ...invocation, freshLineage: "v2-artifacts-0075" },
+        target,
+        {
+          ...options(fixture.provider, [emptyState, completeV2ArtifactState], process),
+          outputDirectory,
+        },
+      );
+      expect(result).toMatchObject({
+        freshLineage: "v2-artifacts-0075",
+        appliedMigrations: FRESH_V2_MIGRATIONS.map(({ name }) => name),
+      });
+      const sealedMigrations = join(outputDirectory, "release", "payload", "migrations");
+      expect(readdirSync(sealedMigrations).sort()).toEqual(
+        FRESH_V2_MIGRATIONS.map(({ name }) => name),
+      );
+      const importSql = readFileSync(
+        join(outputDirectory, "release", "payload", "migration-import.sql"),
+        "utf8",
+      );
+      expect(importSql).toContain("0075_v2_artifact_progress.sql");
+      expect(result.migrationImportDigest).toBe(process.importDigests[0]);
+      expect(fixture.calls.at(-2)).toBe(`createR2:${GENERATED_NAME}`);
+    } finally {
+      rmSync(outputDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("fresh-v2 read-only proof requires exact generated identity and every 0075 schema object", async () => {
+    const generatedTarget = {
+      ...target,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    } satisfies DeployTarget;
+    const provider: IntegrationStorageTargetReadProvider = {
+      async getD1(databaseId) {
+        return { uuid: databaseId, name: GENERATED_NAME };
+      },
+      async getR2(name) {
+        return { name };
+      },
+    };
+    const reader = {
+      async read() {
+        return completeV2ArtifactState;
+      },
+    };
+    const proof = await verifyFreshV2ArtifactIntegrationStorageTarget(
+      generatedTarget,
+      "integration",
+      { provider, reader, migrationDirectory: currentMigrations },
+    );
+    expect(proof).toMatchObject({
+      freshLineage: "v2-artifacts-0075",
+      appliedMigrations: FRESH_V2_MIGRATIONS.map(({ name }) => name),
+      d1: { databaseId: DATABASE_ID, databaseName: GENERATED_NAME },
+    });
+    await expect(
+      verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+        provider,
+        reader,
+        migrationDirectory: currentMigrations,
+      }),
+    ).rejects.toThrow("does not contain the exact audited 0001-0066 lineage");
+    const progressTrigger = schemaRows(completeV2ArtifactState).find(
+      (row) => row.name === "tf_v2_artifact_progress_monotonic",
+    );
+    if (!progressTrigger) throw new Error("missing 0075 trigger fixture");
+    const missingTrigger = stateWithSchemaRows(
+      completeV2ArtifactState,
+      schemaRows(completeV2ArtifactState).filter((row) => row.name !== progressTrigger.name),
+    );
+    await expect(
+      verifyFreshV2ArtifactIntegrationStorageTarget(generatedTarget, "integration", {
+        provider,
+        reader: {
+          async read() {
+            return missingTrigger;
+          },
+        },
+        migrationDirectory: currentMigrations,
+      }),
+    ).rejects.toThrow("differs from the exact audited application schema");
+  });
+
+  test("fresh-v2 status diagnoses an exact completed or partial prior D1 without re-import or adoption", async () => {
+    const fixture = providerFixture({
+      existingD1: { name: GENERATED_NAME, uuid: DATABASE_ID },
+    });
+    for (const [state, schemaReadback] of [
+      [completeV2ArtifactState, "complete-0075"],
+      [completeState, "incomplete-or-divergent"],
+    ] as const) {
+      const process = processFixture();
+      const status = await runIntegrationStorageGeneration(
+        { ...invocation, action: "status", freshLineage: "v2-artifacts-0075" },
+        target,
+        options(fixture.provider, [state], process),
+      );
+      expect(status).toMatchObject({
+        presence: "d1-only",
+        readyForApply: false,
+        schemaReadback,
+      });
+      expect(String(status.resume).toLowerCase()).toContain("no sql re-import");
+      expect(process.commands.some((command) => command.includes("execute"))).toBe(false);
+    }
+    expect(fixture.calls.some((call) => call.startsWith("create"))).toBe(false);
+  });
+
+  test("fresh-v2 unknown or partial import halts with exact generation evidence and no R2", async () => {
+    const process = processFixture({ exitCode: 1, stdout: "private", stderr: "private" });
+    const fixture = providerFixture();
+    const error = await rejectedError(
+      runIntegrationStorageGeneration(
+        { ...invocation, freshLineage: "v2-artifacts-0075" },
+        target,
+        options(fixture.provider, [emptyState, state(["0001_runtime_storage.sql"], [])], process),
+      ),
+    );
+    expect(error).toBeInstanceOf(DeployError);
+    expect(error.message).toContain("not retried or adopted");
+    expect(String(error)).not.toContain("private");
+    expect(fixture.calls.filter((call) => call.startsWith("createD1:"))).toHaveLength(1);
+    expect(fixture.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
+    await expect(
+      runIntegrationStorageGeneration(
+        { ...invocation, freshLineage: "v2-artifacts-0075" },
+        target,
+        options(
+          providerFixture({ existingD1: { name: GENERATED_NAME, uuid: DATABASE_ID } }).provider,
+        ),
+      ),
+    ).rejects.toThrow("never adopted");
+  });
+
+  test("fresh-v2 sealed source drift at the immediate create fence refuses before provider mutation", async () => {
+    const fixture = providerFixture();
+    const outputDirectory = mkdtempSync(join(tmpdir(), "takoserver-v2-fresh-seal-"));
+    let changed = false;
+    const provider: IntegrationStorageGenerationProvider = {
+      ...fixture.provider,
+      async listD1(name) {
+        const rows = await fixture.provider.listD1(name);
+        if (!changed) {
+          changed = true;
+          const tail = join(
+            outputDirectory,
+            "release",
+            "payload",
+            "migrations",
+            "0075_v2_artifact_progress.sql",
+          );
+          writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- raced source change\n`);
+        }
+        return rows;
+      },
+    };
+    try {
+      await expect(
+        runIntegrationStorageGeneration(
+          { ...invocation, freshLineage: "v2-artifacts-0075" },
+          target,
+          {
+            ...options(provider, [emptyState, completeV2ArtifactState]),
+            outputDirectory,
+          },
+        ),
+      ).rejects.toThrow();
+      expect(fixture.calls.some((call) => call.startsWith("createD1:"))).toBe(false);
     } finally {
       rmSync(outputDirectory, { recursive: true, force: true });
     }

@@ -61,6 +61,7 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-integration-organization-bootstrap --<status|apply> --environment=integration --commit=<sha>
   bun run deploy -- takoserver-integration-storage-generation --<status|apply> --environment=integration --commit=<sha>
     --generation=<32-lowercase-hex> (new isolated D1/R2 only; never resets an existing target)
+    [--fresh-lineage=v2-artifacts-0075] (fixed fresh v2 artifact payload; default remains 0066)
   bun run deploy -- takoserver-integration-storage-disposal --<status|apply> --environment=integration --commit=<sha>
     (one exact selected D1/R2 pair only; refuses current regular/dispatch Worker bindings)
   bun run deploy -- takoserver-integration-host-retirement --<status|apply> --environment=integration --commit=<sha>
@@ -185,6 +186,7 @@ type Invocation =
       readonly surface: StorageGenerationSurface;
       readonly action: "status" | "apply";
       readonly generation: string;
+      readonly freshLineage?: "v2-artifacts-0075";
     })
   | (InvocationBase & {
       readonly surface: ProductionD1FreshInitSurface;
@@ -235,6 +237,7 @@ interface ParsedInvocation {
   readonly bootstrapVerifierBridge?: boolean;
   readonly bootstrapProbePredecessorVersionId?: string;
   readonly throughMigration?: SchemaWaveBoundary;
+  readonly freshLineage?: "v2-artifacts-0075";
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly organizationId?: string;
   readonly keyName?: string;
@@ -303,6 +306,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let environment: DeployEnvironment | null = null;
   let commit: string | null = null;
   let generation: string | null = null;
+  let freshLineage: "v2-artifacts-0075" | null = null;
   let retiredTargetPath: string | null = null;
   let retiredDeploymentId: string | null = null;
   let retiredVersionId: string | null = null;
@@ -425,6 +429,11 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       const value = flag.slice("--generation=".length);
       if (!/^[0-9a-f]{32}$/u.test(value)) return null;
       generation = value;
+      continue;
+    }
+    if (flag.startsWith("--fresh-lineage=")) {
+      if (freshLineage !== null || flag !== "--fresh-lineage=v2-artifacts-0075") return null;
+      freshLineage = "v2-artifacts-0075";
       continue;
     }
     if (flag.startsWith("--rebind-state-database-from=")) {
@@ -597,11 +606,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   }
   const storageGeneration = surfaceValue === "takoserver-integration-storage-generation";
   const productionFreshInit = surfaceValue === "takoserver-production-d1-fresh-init";
+  if (freshLineage !== null && !storageGeneration) return null;
   if ((generation !== null) !== (storageGeneration || productionFreshInit)) return null;
   if (
     storageGeneration &&
     (environment !== "integration" ||
-      args.length !== 5 ||
+      args.length !== (freshLineage === null ? 5 : 6) ||
       (action !== "status" && action !== "apply"))
   ) {
     return null;
@@ -939,6 +949,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...(throughMigration === null ? {} : { throughMigration }),
     ...(protectedReferenceEnvironment === null ? {} : { protectedReferenceEnvironment }),
     ...(generation === null ? {} : { generation }),
+    ...(freshLineage === null ? {} : { freshLineage }),
     ...(reverse ? { reverse: true } : {}),
   } as Invocation;
 }

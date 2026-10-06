@@ -108,6 +108,37 @@ audited 0001–0066 lineage and verifies its canonical schema, then creates the
 new R2 bucket. Creating the bucket last means older object operations cannot
 reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
 
+For a **new, empty integration generation only**, the same sole writer has one
+fixed v2 artifact payload. The selector is required on both the diagnostic
+status and the one-way apply; omitting it still means 0001–0066:
+
+```sh
+bun run deploy -- takoserver-integration-storage-generation --status --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-artifacts-0075
+bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-artifacts-0075
+```
+
+This imports the exact audited 0001–0075 bytes only after a new D1 UUID/name
+and empty schema/ledger are read back, then verifies every application table,
+index and trigger against the sealed source before R2 creation. A selected
+generated target can be checked read-only with the separate exact-0075 v2
+artifact verifier; the existing v1 target verifier, in-place apply ceiling
+0066, fresh production ceiling 0069, and rehearsal create-only path do not
+change. This source path does not bind a Worker or authorize a live migration.
+An existing D1, even if empty, is never adopted.
+The operator-private target selects the candidate for that verifier; its
+current identity/schema proof is not historical proof of who created the D1.
+Retain the generation apply output as operator-private provenance.
+
+After a lost import acknowledgement or partial failure, never rerun `--apply`
+or mint a different generation as a retry. Selected `--status` reads the exact
+generated name/UUID and reports whether its ledger and canonical schema are
+complete 0075 or incomplete/divergent. It is diagnosis, not proof that the
+operator's earlier create owned that D1: correlate the original bounded
+database ID and source digest. Complete readback permits a separately reviewed
+forward continuation (for example, a missing R2); incomplete/divergent or
+unreadable state remains quarantined for owner-reviewed repair. Neither status
+nor this surface performs a second SQL import.
+
 Disposal is a separate, one-way operation for an exact target-selected pair:
 
 ```sh

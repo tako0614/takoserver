@@ -308,6 +308,9 @@ const INTEGRATION_APPLY_CEILING_COUNT = 66;
 // Fresh production bootstrap is a distinct, still-frozen authority. Auditing
 // a new local source migration never silently adds it to this payload.
 const FRESH_PRODUCTION_APPLY_CEILING_COUNT = 69;
+// Separate fixed fresh-only integration artifact payload. A future audited
+// source tail must not silently expand this selector.
+const FRESH_V2_ARTIFACT_APPLY_CEILING_COUNT = 75;
 const APPLY_QUALIFIED_MIGRATION_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
   0,
   INTEGRATION_APPLY_CEILING_COUNT,
@@ -2348,6 +2351,41 @@ export function projectApplyQualifiedMigrationArtifact(
   const files = source.files.slice(0, INTEGRATION_APPLY_CEILING_COUNT);
   assertMigrationHashes(files, APPLY_QUALIFIED_MIGRATION_LINEAGE, APPLY_QUALIFIED_MIGRATION_SHA256);
   return createMigrationArtifact(files);
+}
+
+/**
+ * A separate, fixed fresh-only integration payload for the v2 artifact Host.
+ * It never changes the historical in-place 0066 wave or production 0069 init.
+ */
+export function projectFreshV2ArtifactMigrationArtifact(
+  source: ReturnType<typeof readMigrationArtifact>,
+): ReturnType<typeof readMigrationArtifact> {
+  if (JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    throw preflightError(
+      "fresh v2 artifact projection requires the exact audited source inventory 0001-0075",
+      `actual=${JSON.stringify(source.names)}`,
+    );
+  }
+  assertAuditedMigrationHashes(source.files);
+  const files = source.files.slice(0, FRESH_V2_ARTIFACT_APPLY_CEILING_COUNT);
+  assertAuditedMigrationHashes(files, FRESH_V2_ARTIFACT_APPLY_CEILING_COUNT);
+  return createMigrationArtifact(files);
+}
+
+/** Refuses missing, additional, reordered or byte-drifted files in the sealed 0075 payload. */
+export function readSealedFreshV2ArtifactMigrationArtifact(
+  directory: string,
+): ReturnType<typeof readMigrationArtifact> {
+  const artifact = readMigrationArtifact(directory);
+  const expected = AUDITED_MIGRATION_LINEAGE.slice(0, FRESH_V2_ARTIFACT_APPLY_CEILING_COUNT);
+  if (JSON.stringify(artifact.names) !== JSON.stringify(expected)) {
+    throw preflightError(
+      "sealed fresh v2 artifact migration lineage must contain exactly 0001-0075",
+      `actual=${JSON.stringify(artifact.names)}`,
+    );
+  }
+  assertAuditedMigrationHashes(artifact.files, FRESH_V2_ARTIFACT_APPLY_CEILING_COUNT);
+  return artifact;
 }
 
 /**
