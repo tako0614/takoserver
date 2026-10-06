@@ -17,6 +17,7 @@ import { canonicalDigest } from "../src/json.ts";
 import { createOperatorIdentity } from "../src/operator-credentials.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
 import type { Sql } from "../src/ports.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const ORIGIN = "https://api.integration.example.test";
 const ORGANIZATION_ID = "org_takosumi_hosted_staging";
@@ -60,6 +61,7 @@ describe("integration organization bootstrap", () => {
     );
 
     const app = buildApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects: createMemoryObjectStore(),
       identity: createOperatorIdentity({

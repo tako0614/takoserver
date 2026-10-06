@@ -228,7 +228,11 @@ test("the planes answer on their own loopback listener and never on the public o
   // The same token, the same path, the public dispatch: nothing there claims
   // it, so it falls through to the honest 404 every unknown path gets.
   const control: ControlRoutes = async () => null;
-  const publicRouter = createRouter({ control, publicOrigin: "https://api.example.test" });
+  const publicRouter = createRouter({
+    control,
+    takoformV2Host: { fetch: async () => null },
+    publicOrigin: "https://api.example.test",
+  });
   for (const path of [SELFHOST_DATA_PLANE_SQL_PATH, SELFHOST_DATA_PLANE_KV_PATH]) {
     const answered = await publicRouter(
       new Request(`https://api.example.test${path}`, { method: "POST", headers, body }),

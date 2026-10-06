@@ -7,6 +7,7 @@ import {
   InMemoryTakoformResourceDriver,
 } from "../src/index.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const PUBLIC_ORIGIN = "https://api.selfhost.test";
 const BACKEND_ORIGIN = "http://api.selfhost.test";
@@ -21,6 +22,7 @@ async function fixture(publicOrigin = PUBLIC_ORIGIN) {
     operatorAudience: publicOrigin,
   });
   const app = buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     identity: identity.verifier,

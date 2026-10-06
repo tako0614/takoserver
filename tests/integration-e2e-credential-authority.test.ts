@@ -21,6 +21,7 @@ import {
 } from "../src/integration-e2e-credential-authority.ts";
 import { OperatorAssertionError } from "../src/operator-credentials.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const ORIGIN = "https://api.integration.example.test";
 const SOURCE_COMMIT = "a".repeat(40);
@@ -1204,6 +1205,7 @@ async function authorityFixture(options: { readonly clock?: () => Date } = {}) {
 
 function basePorts(sql: Sql) {
   return {
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql,
     objects: createMemoryObjectStore(),
     identity: { verify: () => Promise.reject(new Error("identity unavailable")) },

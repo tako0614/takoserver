@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { createRouter } from "../src/router.ts";
-import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
+import {
+  buildHistoricalTakoformApp,
+  createStaticStableTestTakoformHost,
+} from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 /**
  * The console is served from its own hostname, so every call it makes is
@@ -9,6 +13,7 @@ import { createStaticStableTestTakoformHost } from "./helpers/historical-takofor
  */
 const router = createRouter({
   control: async () => null,
+  takoformV2Host: { fetch: async () => null },
   publicOrigin: "https://api.example.test",
 });
 
@@ -66,12 +71,12 @@ describe("cross-origin access", () => {
 
 describe("browser console session", () => {
   test("keeps the session in an HttpOnly cookie scoped to the exact console origin", async () => {
-    const { buildApp } = await import("../src/app.ts");
     const { buildEdgeForms } = await import("../src/edge-forms.ts");
     const { createEphemeralSql } = await import("../src/compat.ts");
     const { createMemoryObjectStore } = await import("../src/objects-mem.ts");
     const edge = await buildEdgeForms();
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       takoformHostFactory: createStaticStableTestTakoformHost,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
@@ -144,13 +149,13 @@ describe("browser console session", () => {
  */
 describe("Form registry on the control plane", () => {
   test("is reachable without an organization credential", async () => {
-    const { buildApp } = await import("../src/app.ts");
     const { buildEdgeForms } = await import("../src/edge-forms.ts");
     const { createEphemeralSql } = await import("../src/compat.ts");
     const { createMemoryObjectStore } = await import("../src/objects-mem.ts");
     const edge = await buildEdgeForms();
 
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       takoformHostFactory: createStaticStableTestTakoformHost,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
@@ -189,6 +194,7 @@ describe("product discovery", () => {
   const read = async (options: { readonly consoleOrigin?: string }) => {
     const served = createRouter({
       control: async () => null,
+      takoformV2Host: { fetch: async () => null },
       publicOrigin: "https://api.example.test",
       ...options,
     });
@@ -246,12 +252,12 @@ describe("scope implication", () => {
  */
 describe("entering the lane with a session", () => {
   const build = async () => {
-    const { buildApp } = await import("../src/app.ts");
     const { buildEdgeForms } = await import("../src/edge-forms.ts");
     const { createEphemeralSql } = await import("../src/compat.ts");
     const { createMemoryObjectStore } = await import("../src/objects-mem.ts");
     const edge = await buildEdgeForms();
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       takoformHostFactory: createStaticStableTestTakoformHost,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),

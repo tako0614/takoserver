@@ -13,6 +13,7 @@ import {
   OPERATOR_PROVIDERS,
   OperatorAssertionError,
 } from "../src/operator-credentials.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 let signingKey: CryptoKey;
 let publicKeyJwk: { kty: string; crv: string; x: string };
@@ -203,6 +204,7 @@ describe("operator sign-in over HTTP", () => {
       clock,
     });
     return buildApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       identity: setup.verifier,

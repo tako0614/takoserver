@@ -6,11 +6,42 @@ services. This repository owns the generic Host foundation and the self-host
 plugin. The managed Workers-for-Platforms implementation is a separately
 supplied, non-public operator backend; it is not needed to build or run the OSS
 self-host distribution. Where the control plane itself runs is an independent
-deployment choice. The public Host is the one literal `forms.takoform.com/v1` lane.
-Production installs only exact package bytes generated from one canonical,
-source-pinned Takoform commit. That downstream pin is Takoserver adoption
-authority, not a Takoform release, Form promotion, or claim that the current
-`0.x` FormRefs are no longer Experimental.
+deployment choice.
+
+The normal application serves only `forms.takoform.com/v2`. A versioned HTTPS
+Form URL identifies the contract; Host-side code implements it. The v2 path does
+not install Form packages, require their signatures, or translate into v1.
+Resources belong to an organization while each credential retains its own
+read/write permissions. See [v2 architecture and operator setup](docs/takoform-v2.md).
+
+Current source support is deliberately limited: the Bun entry can explicitly
+configure `SQLiteMigrationSet 0.2.0` using authorized Host-held bytes. This stores
+verified migration files; it does not execute SQL. Other v2 Form backends,
+Hosted D1 and WfP integration, downstream Provider adoption and deployment
+qualification remain separate work. A green portable gate is not a live rollout.
+
+Before starting, set a canonical external HTTPS origin, the non-secret
+`TAKOSERVER_TAKOFORM_V2_CONFIG`, and a persistent operator-secret
+`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY` as described in that guide. Then run:
+
+```sh
+bun install --frozen-lockfile
+bun src/entry-bun.ts
+```
+
+The public v2 discovery is `/.well-known/takoform/v2`; technical support for an
+exact Form URL is queried at `/apis/forms.takoform.com/v2/support?form=...` with
+authentication. An empty configured Form map is explicit non-support, not a
+fallback to the old Host. The Bun HTTP listener requires an operator-controlled
+HTTPS front end for public use. Do not expose that backend listener directly.
+
+## Legacy runtime and provider reference
+
+The implementation notes below describe retained pre-v2 provider, data-plane and
+recovery code. They are not the v2 support catalog or instructions for creating
+v2 resources. Package admission and old native Host tests must not be used as
+v2 readiness evidence. Existing v1 records are preserved and pending repair work
+continues internally; the old public Takoform HTTP handler is not mounted.
 
 Current managed object storage is one exact portable chain: the versionless
 `edge.forms.takoform.com/ObjectBucket` Resource provides `edge.objects`, and a
@@ -52,24 +83,17 @@ control state and a local exact-identity artifact store; it rejects
 Cloudflare Workers belongs to the Worker entry, not to an ambient account
 credential in the Bun entry.
 
-```
-bun install --frozen-lockfile
-bun src/entry-bun.ts
-```
-
-This starts the local Host; it does not by itself make a fresh Host ready to
-provision Takoform Resources. Startup creates the local schema and starts
+With the v2 configuration above, startup creates the local schema and starts
 serving. When no identity provider is configured, it generates the operator key
 and prints a 10-minute sign-in assertion. Use the exact external console origin
 if `TAKOSERVER_CONSOLE_ORIGIN` is configured; otherwise the Host also prints its
 origin, API documentation URL, and manual session/API onboarding instructions.
 The Bun Host itself does not serve a `/console` page. If an identity provider is
 configured, use that provider's sign-in flow. Create or select the organization
-that will own resources and choose its stable Space identifier. Then perform
-the explicit publisher-set admission while the Bun process is stopped, restart
-it, and verify the published Forms before creating a Resource. The complete
-operator sequence, including exact Core-verifier identity, is in
-[Self-host operations](docs/self-host-operations.md).
+that will own resources; its exact ID is the v2 Space. Do not run old
+publisher-set admission as v2 setup. [Self-host operations](docs/self-host-operations.md)
+contains the historical runtime and repair procedures; the current v2 setup is
+the separate guide linked above.
 
 Ordinary Bun always keeps the stable self-host Provider3 execution pack.
 `CLOUDFLARE_ACCOUNT_ID` may separately back an explicitly reviewed ObjectBucket

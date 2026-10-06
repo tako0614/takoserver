@@ -4,6 +4,20 @@ Takoserver turns provider capacity into independently managed cloud resources. T
 describes resource meaning and relationships; Takoserver owns placement, commercial
 availability, provider execution, credentials, metering, and migration.
 
+## Current Host API boundary
+
+The normal public Takoform entry is Host API v2. Forms are exact, versioned HTTPS
+contract URLs. The organization owns v2 Resources and Operations; each request
+still checks the current credential's read/write grant. One SQL ledger accepts
+changes and records their execution/reconciliation. The normal router does not
+mount v1 HTTP or translate v2 into the old package/admission protocol.
+
+The concrete composition and its current limits are documented in
+[Takoform v2 adoption](docs/takoform-v2.md). The model below also describes
+retained provider and legacy resource internals; it is not a declaration that
+all those capabilities are implemented or offered through v2. Old state and
+pending repair remain protected until an explicit installation cutover.
+
 ## Resource model
 
 **Form**:

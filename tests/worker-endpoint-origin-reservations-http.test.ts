@@ -100,7 +100,11 @@ function fixture(prepareRefusal?: WorkerEndpointOriginReservationError) {
   return {
     prepareCalls,
     activationCalls,
-    fetch: createRouter({ control, publicOrigin: "https://api.example.test" }),
+    fetch: createRouter({
+      control,
+      takoformV2Host: { fetch: async () => null },
+      publicOrigin: "https://api.example.test",
+    }),
   };
 }
 

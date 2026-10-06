@@ -19,7 +19,6 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { takoformCoreVerifierArtifactDigest } from "../scripts/deploy/form-authority.ts";
 import { runSelfhostFormAdmission } from "../scripts/selfhost-form-admission.ts";
-import { buildApp } from "../src/app.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { bytesDigest } from "../src/json.ts";
@@ -39,6 +38,7 @@ import {
   readQueueEventMessages,
   shouldInterceptQueueEvent,
 } from "./fixtures/selfhost-host-queue-process-child.ts";
+import { buildHistoricalTakoformApp } from "./helpers/historical-takoform-host.ts";
 import { assertIsolatedSelfhostNativeEnvironment } from "./helpers/isolated-selfhost-native.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 import {
@@ -46,6 +46,7 @@ import {
   realCoreVerificationRequest,
 } from "./helpers/real-core-verifier.ts";
 import { createSyntheticPublisherSetVerifier } from "./helpers/synthetic-publisher-set-verifier.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const EVENT_PATH = "/.well-known/takoserver/managed-worker-events/v1";
 const WORKERD = nativeEvidenceBinary("workerd-artifact") ?? null;
@@ -121,10 +122,13 @@ test("public Queue Resource update and fenced deletion preserve identity and rep
     },
     now: clock(),
   });
-  const app = buildApp({
+  const app = buildHistoricalTakoformApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql,
     objects,
-    publicOrigin: API_ORIGIN,
+    // Keep the normal v2 app composition's advertised Host origin HTTPS; the
+    // test-only historical adapter below still exercises the legacy v1 paths.
+    publicOrigin: `https://127.0.0.1:${API_PORT}`,
     clock,
     forms: candidates.forms,
     bindings: candidates.bindings,

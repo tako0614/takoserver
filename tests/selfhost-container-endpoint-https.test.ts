@@ -213,6 +213,11 @@ test("canonical Bun entry rejects 443 conflict and missing TLS material before o
       ...process.env,
       TAKOSERVER_DATA_ROOT: dataRoot,
       TAKOSERVER_DB: join(dataRoot, "control.sqlite"),
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: "A".repeat(43),
       TAKOSERVER_SELFHOST_CONTAINER_DOCKER_SOCKET: "/run/no-contact.sock",
       TAKOSERVER_SELFHOST_CONTAINER_NETWORK: "takoserver-container-internal",
       TAKOSERVER_SELFHOST_CONTAINER_ENDPOINT_SUFFIX: suffix,
@@ -245,6 +250,11 @@ test("canonical Bun entry rejects 443 conflict and missing TLS material before o
       ...process.env,
       TAKOSERVER_DATA_ROOT: missingTlsDataRoot,
       TAKOSERVER_DB: join(missingTlsDataRoot, "control.sqlite"),
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: "A".repeat(43),
       TAKOSERVER_SELFHOST_CONTAINER_DOCKER_SOCKET: "/run/no-contact.sock",
       TAKOSERVER_SELFHOST_CONTAINER_NETWORK: "takoserver-container-internal",
       TAKOSERVER_SELFHOST_CONTAINER_ENDPOINT_SUFFIX: suffix,

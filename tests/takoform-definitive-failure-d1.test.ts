@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { Miniflare } from "miniflare";
+import type { buildApp } from "../src/app.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import {
-  buildApp,
   createMemoryObjectStore,
   type ExternalIdentityVerifier,
   type FundingSettlementVerifier,
@@ -20,7 +20,11 @@ import { createD1Sql } from "../src/sql-d1.ts";
 import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
 import { createResourceDependencySet } from "../src/takoform/dependency-fence.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
-import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
+import {
+  buildHistoricalTakoformApp,
+  createStaticStableTestTakoformHost,
+} from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const TENANT_PREFIX = "d1-definitive-failure";
 const SPACE = "default";
@@ -497,7 +501,8 @@ async function withNativeD1(
       offerings: [PROVIDER_OFFERING],
       failOn: options.failOn,
     });
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects: createMemoryObjectStore(),
       identity,

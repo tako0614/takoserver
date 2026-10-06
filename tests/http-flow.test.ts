@@ -12,7 +12,11 @@ import {
 } from "../src/index.ts";
 import type { ProviderOffering } from "../src/provider-port.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
-import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
+import {
+  buildHistoricalTakoformApp,
+  createStaticStableTestTakoformHost,
+} from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 /**
  * The prepaid vertical, driven end to end over HTTP exactly as a customer
@@ -89,7 +93,8 @@ const settlement: FundingSettlementVerifier = {
 };
 
 function newApp() {
-  return buildApp({
+  return buildHistoricalTakoformApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     identity,
@@ -111,7 +116,8 @@ async function newSignedApp() {
     ["sign-http-flow", JSON.stringify({ kty: "OKP", crv: "Ed25519", x: jwk.x }), 0],
   );
   const signingKey: SigningKey = { keyId: "sign-http-flow", privateKey: pair.privateKey };
-  return buildApp({
+  return buildHistoricalTakoformApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql,
     objects: createMemoryObjectStore(),
     identity,
@@ -604,6 +610,7 @@ describe("prepaid vertical over HTTP", () => {
   test("returns expired holds when the background pass runs", async () => {
     let now = Date.UTC(2026, 7, 17, 12, 0, 0);
     const app = buildApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       identity,

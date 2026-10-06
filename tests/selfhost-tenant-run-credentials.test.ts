@@ -19,6 +19,8 @@ import type {
   WorkerEndpointOriginReservationProjection,
   WorkerEndpointOriginReservations,
 } from "../src/worker-endpoint-origin-reservations.ts";
+import { buildHistoricalTakoformApp } from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const ORIGIN = "https://api.selfhost.test";
 const START = Date.parse("2026-09-07T12:00:00.000Z");
@@ -42,6 +44,7 @@ describe("self-host tenant-run credential HTTP authority", () => {
     const now = START;
     const clock = () => new Date(now);
     const disabled = buildApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql: createEphemeralSql(),
       objects: createMemoryObjectStore(),
       identity,
@@ -75,6 +78,7 @@ describe("self-host tenant-run credential HTTP authority", () => {
     let randomIdCalls = 0;
     let admission: TenantRunCredentialAdmission | undefined;
     const enabled = buildApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects: createMemoryObjectStore(),
       identity,
@@ -296,7 +300,8 @@ describe("self-host tenant-run credential HTTP authority", () => {
     });
     const originReservations = reservationAuthority(async () => null);
     let credentialSequence = 0;
-    const app = buildApp({
+    const app = buildHistoricalTakoformApp({
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects: createMemoryObjectStore(),
       identity,

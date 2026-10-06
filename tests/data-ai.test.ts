@@ -9,6 +9,7 @@ import { createMetering } from "../src/metering.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import { createWorkerDataServices } from "../src/worker-data-services.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const identity: ExternalIdentityVerifier = {
   async verify({ assertion }) {
@@ -162,6 +163,7 @@ async function workerCompositionFixture(nativeOutput: unknown) {
     TAKOSERVER_AI_MODELS: WORKER_AI_MODELS,
   });
   const app = buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql,
     objects: createMemoryObjectStore(),
     identity,

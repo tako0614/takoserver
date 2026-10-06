@@ -1,3 +1,4 @@
+import { type App, type AppPorts, buildApp } from "../../src/app.ts";
 import { createEphemeralSql } from "../../src/compat.ts";
 import { createMemoryObjectStore } from "../../src/objects-mem.ts";
 import type { ObjectStoreAccess, Sql } from "../../src/ports.ts";
@@ -155,4 +156,46 @@ export function createStaticStableInMemoryTakoformHost(
     ...options,
     driver: new InMemoryTakoformResourceDriver(),
   });
+}
+
+/**
+ * Test-only old Host wire harness. Production buildApp mounts only v2, while
+ * this fixture reuses its exact composed lower-level legacy Host and authority.
+ */
+export function buildHistoricalTakoformApp(ports: AppPorts): App {
+  let historicalHost: TakoformHost | undefined;
+  const app = buildApp({
+    ...ports,
+    captureLegacyHostForTests(host) {
+      historicalHost = host;
+      ports.captureLegacyHostForTests?.(host);
+    },
+  });
+  if (!historicalHost) throw new Error("historical Host was not composed");
+  const host = historicalHost;
+  return {
+    ...app,
+    async fetch(request, lifetime) {
+      const path = new URL(request.url).pathname;
+      if (path === "/.well-known/takoform/v1" && request.method === "GET") {
+        return Response.json({
+          api_versions: ["forms.takoform.com/v1"],
+          features: {
+            service_forms: true,
+            exact_form_ref: true,
+            optimistic_concurrency: true,
+            idempotent_lifecycle: true,
+            operations: true,
+            artifact_upload: true,
+            support_profiles: true,
+          },
+          endpoints: { api: `${ports.publicOrigin}/apis/forms.takoform.com/v1` },
+        });
+      }
+      if (/^\/apis\/forms\.takoform\.com\/(?!v2(?:\/|$))/u.test(path)) {
+        return (await host.handle(request, lifetime)) ?? app.fetch(request, lifetime);
+      }
+      return app.fetch(request, lifetime);
+    },
+  };
 }

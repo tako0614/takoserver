@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { buildApp, createEphemeralSql, createMemoryObjectStore } from "../src/index.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 function app(consoleOrigin?: string) {
   return buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     identity: {

@@ -1,0 +1,138 @@
+import { describe, expect, test } from "bun:test";
+import {
+  parseTakoformV2ApplicationConfig,
+  V2ApplicationConfigError,
+} from "../src/takoform-v2/config.ts";
+
+const CURSOR_KEY = "A".repeat(43);
+
+describe("Takoform v2 application configuration", () => {
+  test("parses required HTTPS documentation and decodes the separate cursor key", () => {
+    const config = parseTakoformV2ApplicationConfig({
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/authentication",
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: CURSOR_KEY,
+    });
+
+    expect(config.documentation).toBe("https://docs.example.invalid/takoform-v2");
+    expect(config.authenticationDocumentation).toBe("https://docs.example.invalid/authentication");
+    expect(config.cursorSigningKey).toEqual(new Uint8Array(32));
+    expect(config.sqliteMigrationSet).toBeUndefined();
+  });
+
+  test("preserves only explicitly configured migration target, sources, and grants", () => {
+    const heldArtifact = {
+      url: "https://Artifacts.example.invalid/manifest.json",
+      sha256: "1".repeat(64),
+      objectKey: "operator-held/migration-manifest",
+      grants: [{ principal: "org:org-a", space: "org-a" }],
+    };
+    const config = parseTakoformV2ApplicationConfig({
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/authentication",
+        sqliteMigrationSet: {
+          targetKey: "operator-sqlite-primary",
+          heldArtifacts: [heldArtifact],
+        },
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: CURSOR_KEY,
+    });
+
+    expect(config.sqliteMigrationSet).toEqual({
+      targetKey: "operator-sqlite-primary",
+      heldArtifacts: [heldArtifact],
+    });
+  });
+
+  test("allows an explicitly configured deny-all source but does not synthesize a Form", () => {
+    const config = parseTakoformV2ApplicationConfig({
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/authentication",
+        sqliteMigrationSet: { targetKey: "operator-sqlite-primary", heldArtifacts: [] },
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: CURSOR_KEY,
+    });
+
+    expect(config.sqliteMigrationSet).toEqual({
+      targetKey: "operator-sqlite-primary",
+      heldArtifacts: [],
+    });
+  });
+
+  test("fails closed for missing, partial, unknown, duplicate, or malformed configuration", () => {
+    const validConfig = {
+      documentation: "https://docs.example.invalid/takoform-v2",
+      authenticationDocumentation: "https://docs.example.invalid/authentication",
+    };
+    const values = [
+      undefined,
+      "",
+      "not-json",
+      JSON.stringify({ ...validConfig, unknown: true }),
+      JSON.stringify({ ...validConfig, cursorSigningKey: "secret" }),
+      `{"documentation":"https://docs.example.invalid/a","documentation":"https://docs.example.invalid/b","authenticationDocumentation":"https://docs.example.invalid/auth"}`,
+      JSON.stringify({ ...validConfig, documentation: "http://docs.example.invalid/a" }),
+      JSON.stringify({
+        ...validConfig,
+        sqliteMigrationSet: { targetKey: "target-without-source-map" },
+      }),
+      JSON.stringify({
+        ...validConfig,
+        sqliteMigrationSet: { targetKey: "", heldArtifacts: [] },
+      }),
+      JSON.stringify({
+        ...validConfig,
+        sqliteMigrationSet: {
+          targetKey: "target",
+          heldArtifacts: [
+            {
+              url: "https://artifacts.example.invalid/manifest.json?token=secret",
+              sha256: "1".repeat(64),
+              objectKey: "held/manifest",
+              grants: [{ principal: "org:one", space: "one" }],
+            },
+          ],
+        },
+      }),
+    ];
+
+    for (const json of values) {
+      let caught: unknown;
+      try {
+        parseTakoformV2ApplicationConfig({
+          TAKOSERVER_TAKOFORM_V2_CONFIG: json,
+          TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: CURSOR_KEY,
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(V2ApplicationConfigError);
+      expect(String(caught)).not.toContain("secret");
+      expect(String(caught)).not.toContain("manifest.json");
+    }
+  });
+
+  test("requires a canonical unpadded base64url key of at least 32 bytes", () => {
+    const json = JSON.stringify({
+      documentation: "https://docs.example.invalid/takoform-v2",
+      authenticationDocumentation: "https://docs.example.invalid/authentication",
+    });
+    for (const key of [undefined, "AQ", `${CURSOR_KEY}=`, `${CURSOR_KEY}!`]) {
+      let caught: unknown;
+      try {
+        parseTakoformV2ApplicationConfig({
+          TAKOSERVER_TAKOFORM_V2_CONFIG: json,
+          TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: key,
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(V2ApplicationConfigError);
+      expect(String(caught)).not.toContain(key ?? "undefined");
+    }
+  });
+});

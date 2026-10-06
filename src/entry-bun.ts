@@ -66,6 +66,7 @@ import {
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
 import { renderSelfhostOperatorSignInInstructions } from "./selfhost-startup-instructions.ts";
+import { createSelfhostTakoformV2Ingress } from "./selfhost-takoform-v2-ingress.ts";
 import {
   assertActiveSelfhostTenantRunCredentialSigningKey,
   assertSelfhostTenantRunCredentialKeyConfiguration,
@@ -80,6 +81,7 @@ import {
   resolveStandaloneProviderMode,
 } from "./standalone-provider-composition.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
+import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
 import { selectClosedGraphWorkerd } from "./workerd-artifact.ts";
 import { spawnWorkerdWithParentDeath, workerPortOwnership } from "./workerd-linux-process.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
@@ -156,7 +158,14 @@ if (process.env.TAKOSERVER_R2_BUCKET !== undefined) {
   );
 }
 
-const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN ?? "http://localhost:8787";
+const takoformV2Config = parseTakoformV2ApplicationConfig({
+  TAKOSERVER_TAKOFORM_V2_CONFIG: process.env.TAKOSERVER_TAKOFORM_V2_CONFIG,
+  TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: process.env.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY,
+});
+const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN;
+if (!publicOrigin || !runtimeInputCanonicalOriginSupported(publicOrigin)) {
+  throw new Error("TAKOSERVER_PUBLIC_ORIGIN must be a canonical HTTPS bare origin");
+}
 const port = Number(process.env.PORT ?? 8787);
 
 /** Everything this machine keeps lives under one directory. */
@@ -838,6 +847,7 @@ const app = buildApp({
     (legacyPublicKeyJwk
       ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
       : unconfigured),
+  v2: takoformV2Config,
   ...(payment.checkout ? { checkout: payment.checkout } : {}),
   publicOrigin,
   ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
@@ -921,11 +931,15 @@ const selfhostHealth = createSelfhostHealthHandler({
   startupRestore,
   supervisor: workerd,
 });
+const takoformV2Ingress = createSelfhostTakoformV2Ingress({
+  publicOrigin,
+  appFetch: (request) => app.fetch(request),
+});
 
 const bunFetch = createSelfhostBunFetchHandler({
   health: selfhostHealth,
   provision,
-  appFetch: (request) => app.fetch(request),
+  appFetch: takoformV2Ingress,
 });
 let bunServer: ReturnType<typeof Bun.serve> | undefined;
 let shutdownClean = true;
@@ -1029,6 +1043,14 @@ entryShutdown.startInterval(
       await dataPlanes.maintenance.reconcileOrphanObjectFiles();
     }
     if (queuePump) await queuePump.sweep();
+  },
+  (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
+);
+entryShutdown.startInterval(
+  "takoform-v2",
+  1_000,
+  async () => {
+    await app.tickTakoformV2();
   },
   (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
 );

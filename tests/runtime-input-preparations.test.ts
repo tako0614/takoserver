@@ -8,6 +8,7 @@ import {
   runtimeInputPublicApplyCommitment,
 } from "../src/index.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const HOST_ORIGIN = "https://api.takoserver.test";
 const PREPARATION_TIME = "2026-08-31T18:00:00Z";
@@ -980,6 +981,7 @@ test("serves the private v2 route to one resources writer, shaped as the provide
   });
   const currentCandidates = currentTakoformCandidates();
   const app = buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql,
     objects: createMemoryObjectStore(),
     identity: {
@@ -1166,6 +1168,7 @@ test("serves the private v2 route to one resources writer, shaped as the provide
 
 test("hides whether a runtime-input service is composed until the caller authenticates", async () => {
   const app = buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     identity: {
@@ -1227,6 +1230,7 @@ test("refuses a canonical public origin the released provider would not speak", 
 test("refuses a composition whose runtime-input origin is not this Host's own", async () => {
   const { authority } = await runtimeInputFixture();
   const ports = {
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     identity: {

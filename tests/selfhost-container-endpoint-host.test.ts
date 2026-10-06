@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type AppPorts, buildApp } from "../src/app.ts";
+import type { AppPorts, buildApp } from "../src/app.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
@@ -29,6 +29,8 @@ import {
   installLocalContainerCandidateForTest,
   loadVerifiedLocalContainerCandidate,
 } from "./fixtures/selfhost-container-host-authority.ts";
+import { buildHistoricalTakoformApp } from "./helpers/historical-takoform-host.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const ORIGIN = "https://endpoint-host.test";
 const SERVICE_FORM = {
@@ -337,6 +339,7 @@ test("normal public Host creates and reads one exact ContainerEndpoint attachmen
       randomId: () => crypto.randomUUID(),
     });
     const appPorts: AppPorts = {
+      v2: TEST_TAKOFORM_V2_CONFIG,
       sql,
       objects,
       publicOrigin: ORIGIN,
@@ -369,7 +372,7 @@ test("normal public Host creates and reads one exact ContainerEndpoint attachmen
         },
       },
     };
-    let app = buildApp(appPorts);
+    let app = buildHistoricalTakoformApp(appPorts);
     const session = await request(app, "POST", "/v1/sessions", {
       provider: "google",
       assertion: "synthetic-local-identity",
@@ -420,7 +423,7 @@ test("normal public Host creates and reads one exact ContainerEndpoint attachmen
       hostId: ORIGIN,
       candidate: endpoint,
     });
-    app = buildApp(appPorts);
+    app = buildHistoricalTakoformApp(appPorts);
     const catalog = await request(
       app,
       "GET",
@@ -585,7 +588,7 @@ test("normal public Host creates and reads one exact ContainerEndpoint attachmen
     expect(docker.containers.size).toBe(1);
     // Lose the public acknowledgement and rebuild the ordinary Host instance;
     // the exact request/key must resolve to the committed UID, not a new route.
-    app = buildApp(appPorts);
+    app = buildHistoricalTakoformApp(appPorts);
     const endpointReplay = await request(
       app,
       "PUT",

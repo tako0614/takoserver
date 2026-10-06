@@ -7,6 +7,7 @@ import { TAKOSERVER_INTRINSIC_HANDLER_KINDS } from "../src/provider-driver.ts";
 import type { ProviderOffering } from "../src/provider-port.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import { validateSchemaValue } from "../src/takoform/schema.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 /**
  * The published Form vocabulary and this Host's answer for each identity have
@@ -67,6 +68,7 @@ function host() {
   const candidates = currentTakoformCandidates();
   let counter = 0;
   return buildApp({
+    v2: TEST_TAKOFORM_V2_CONFIG,
     sql,
     objects: createMemoryObjectStore(),
     identity: identity(),

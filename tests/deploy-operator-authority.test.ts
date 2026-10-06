@@ -20,6 +20,7 @@ import {
 } from "../src/index.ts";
 import { createOperatorSettlement } from "../src/operator-credentials.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const ORIGIN = "https://api.production.example.test";
 const OTHER_ORIGIN = "https://api.other-host.test";
@@ -415,6 +416,7 @@ describe("operator authority", () => {
       });
       const sql = createEphemeralSql();
       const app = buildApp({
+        v2: TEST_TAKOFORM_V2_CONFIG,
         sql,
         objects: createMemoryObjectStore(),
         identity: setup.verifier,
@@ -492,6 +494,7 @@ describe("operator authority", () => {
       });
       const otherSql = createEphemeralSql();
       const otherApp = buildApp({
+        v2: TEST_TAKOFORM_V2_CONFIG,
         sql: otherSql,
         objects: createMemoryObjectStore(),
         identity: otherSetup.verifier,

@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { buildApp } from "../../../src/app.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "../../helpers/takoform-v2-config.ts";
 import { buildEdgeForms } from "../../../src/edge-forms.ts";
 import { migrateSqlite } from "../../../src/migrate-sqlite.ts";
 import { createFileObjectStore } from "../../../src/objects-fs.ts";
@@ -107,6 +108,7 @@ const composition = createStandaloneProviderComposition({
   } satisfies ProviderRuntimeInputLeasePort,
 });
 const app = buildApp({
+  v2: TEST_TAKOFORM_V2_CONFIG,
   sql,
   objects,
   publicOrigin: "https://container-host-native.test",

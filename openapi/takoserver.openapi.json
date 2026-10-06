@@ -24,9 +24,196 @@
       }
     },
     "schemas": {
+      "TakoformV2Problem": {
+        "type": "object",
+        "required": [
+          "type",
+          "title",
+          "status",
+          "code"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "const": "about:blank"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "minimum": 400,
+            "maximum": 599
+          },
+          "code": {
+            "type": "string"
+          }
+        }
+      },
+      "TakoformV2Resource": {
+        "type": "object",
+        "required": [
+          "uid",
+          "form",
+          "space",
+          "name",
+          "generation",
+          "observedGeneration",
+          "observedAt",
+          "phase",
+          "spec",
+          "observed",
+          "output",
+          "lastOperation"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "uid": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "form": {
+            "type": "string",
+            "format": "uri",
+            "description": "Exact versioned HTTPS Form URL."
+          },
+          "space": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "observedGeneration": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "observedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "phase": {
+            "enum": [
+              "pending",
+              "idle",
+              "deleting",
+              "error"
+            ]
+          },
+          "spec": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "observed": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "output": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "lastOperation": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          }
+        }
+      },
+      "TakoformV2Operation": {
+        "type": "object",
+        "required": [
+          "id",
+          "resourceUid",
+          "action",
+          "generation",
+          "status",
+          "effect",
+          "createdAt",
+          "updatedAt",
+          "retainUntil"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "resourceUid": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "action": {
+            "enum": [
+              "create",
+              "update",
+              "delete"
+            ]
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "waiting_input",
+              "reconciling",
+              "succeeded",
+              "failed"
+            ]
+          },
+          "effect": {
+            "enum": [
+              "none",
+              "unknown",
+              "partial",
+              "complete"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "retainUntil": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
       "Error": {
         "type": "object",
-        "description": "The wire error envelope of the stable Takoform Host lane and the /v1/* control lane. Every response documented against this schema carries exactly these members. The OpenAI-compatible /v1/ai/* lane answers that API's own error shape and is documented separately.",
+        "description": "The /v1/* control lane's error envelope. Takoform v2 uses application/problem+json and TakoformV2Problem instead. The OpenAI-compatible /v1/ai/* lane answers that API's own error shape and is documented separately.",
         "required": [
           "error"
         ],
@@ -1172,9 +1359,9 @@
         "security": []
       }
     },
-    "/.well-known/takoform/v1": {
+    "/.well-known/takoform/v2": {
       "get": {
-        "summary": "Stable Takoform Host discovery",
+        "summary": "Takoform Host API v2 connection and capability discovery",
         "responses": {
           "200": {
             "description": "Success"
@@ -2902,208 +3089,612 @@
         }
       }
     },
-    "/apis/forms.takoform.com/v1/forms": {
+    "/apis/forms.takoform.com/v2/support": {
       "get": {
-        "summary": "Resolve one exact installed Form",
+        "summary": "Check implementation support for one exact Form URL",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Takoform-Organization",
+            "required": false,
+            "description": "Required for an owner session. An API key uses its authenticated organization, never this header.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          },
+          {
+            "in": "query",
+            "name": "form",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uri",
+              "description": "Exact versioned HTTPS Form URL."
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Technical support only; not authorization, capacity, or a guarantee of creation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "form",
+                    "supported",
+                    "operations",
+                    "privateInputs"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "form": {
+                      "type": "string",
+                      "format": "uri",
+                      "description": "Exact versioned HTTPS Form URL."
+                    },
+                    "supported": {
+                      "type": "boolean"
+                    },
+                    "operations": {
+                      "type": "array",
+                      "items": {
+                        "enum": [
+                          "create",
+                          "read",
+                          "update",
+                          "delete"
+                        ]
+                      }
+                    },
+                    "privateInputs": {
+                      "const": false
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Request refused; code classifies the failure without provider or secret payloads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Problem"
+                }
+              }
+            }
           }
         }
       }
     },
-    "/apis/forms.takoform.com/v1/form-definitions/{group}/{kind}": {
+    "/apis/forms.takoform.com/v2/resources": {
       "get": {
-        "summary": "Read an installed Form definition",
+        "summary": "List resources visible to this organization",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Takoform-Organization",
+            "required": false,
+            "description": "Required for an owner session. An API key uses its authenticated organization, never this header.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          },
+          {
+            "in": "query",
+            "name": "space",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          },
+          {
+            "in": "query",
+            "name": "name",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          },
+          {
+            "in": "query",
+            "name": "form",
+            "schema": {
+              "type": "string",
+              "format": "uri",
+              "description": "Exact versioned HTTPS Form URL."
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Page from durable state; reading does not dispatch operations.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "items",
+                    "nextCursor"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/TakoformV2Resource"
+                      }
+                    },
+                    "nextCursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Request refused; code classifies the failure without provider or secret payloads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Problem"
+                }
+              }
+            }
           }
         }
-      }
-    },
-    "/apis/forms.takoform.com/v1/support/forms": {
-      "get": {
-        "summary": "List support profiles for installed Forms",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/support/forms/{group}/{kind}/{definitionVersion}": {
-      "get": {
-        "summary": "Read one Form support profile",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/support/interfaces/{name}/{version}": {
-      "get": {
-        "summary": "Read a provided Interface contract",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/support/bindings/{name}/{version}": {
-      "get": {
-        "summary": "Read an accepted Binding contract",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/resources/validate": {
+      },
       "post": {
-        "summary": "Validate desired state without recording it",
+        "summary": "Accept creation of a resource and return its Operation",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Takoform-Organization",
+            "required": false,
+            "description": "Required for an owner session. An API key uses its authenticated organization, never this header.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "description": "Unique operation key shared by the organization's credentials.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "form",
+                  "space",
+                  "name",
+                  "spec"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "form": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "Exact versioned HTTPS Form URL."
+                  },
+                  "space": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+                  },
+                  "name": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+                  },
+                  "spec": {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Replay of a terminal Operation, including failed Operations; inspect status and effect.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Operation"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Operation durably accepted or still pending; this does not mean the effect succeeded.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Operation"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Request refused; code classifies the failure without provider or secret payloads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Problem"
+                }
+              }
+            }
           }
         }
       }
     },
-    "/apis/forms.takoform.com/v1/resources/prepare": {
-      "post": {
-        "summary": "Review desired state and mint a prepare digest",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/resources/{group}/{kind}/{name}": {
+    "/apis/forms.takoform.com/v2/resources/{uid}": {
       "get": {
-        "summary": "Read a resource",
+        "summary": "Read durable resource state without executing an operation",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Takoform-Organization",
+            "required": false,
+            "description": "Required for an owner session. An API key uses its authenticated organization, never this header.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          },
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Current resource state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Resource"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The resource was deleted and its tombstone is retained.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Problem"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Request refused; code classifies the failure without provider or secret payloads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Problem"
+                }
+              }
+            }
           }
         }
       },
       "put": {
-        "summary": "Apply reviewed desired state",
+        "summary": "Accept a replacement spec at the expected resource generation",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Takoform-Organization",
+            "required": false,
+            "description": "Required for an owner session. An API key uses its authenticated organization, never this header.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          },
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "description": "Unique operation key shared by the organization's credentials.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Takoform-Expected-Generation",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "spec"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "spec": {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Replay of a terminal Operation, including failed Operations; inspect status and effect.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Operation"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Operation durably accepted or still pending; this does not mean the effect succeeded.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Operation"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Request refused; code classifies the failure without provider or secret payloads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Problem"
+                }
+              }
+            }
           }
         }
       },
       "delete": {
-        "summary": "Delete a resource",
+        "summary": "Accept deletion at the expected generation; no request body",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Takoform-Organization",
+            "required": false,
+            "description": "Required for an owner session. An API key uses its authenticated organization, never this header.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          },
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "description": "Unique operation key shared by the organization's credentials.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Takoform-Expected-Generation",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Replay of a terminal Operation, including failed Operations; inspect status and effect.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Operation"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Operation durably accepted or still pending; this does not mean the effect succeeded.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Operation"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Request refused; code classifies the failure without provider or secret payloads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Problem"
+                }
+              }
+            }
           }
         }
       }
     },
-    "/apis/forms.takoform.com/v1/resources/{group}/{kind}/{name}/observe": {
-      "post": {
-        "summary": "Refresh observed state from the backend",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/resources/{group}/{kind}/{name}/import": {
-      "post": {
-        "summary": "Adopt an existing native resource",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/operations/{operationId}": {
+    "/apis/forms.takoform.com/v2/operations/{operationId}": {
       "get": {
-        "summary": "Read a settled operation",
-        "responses": {
-          "200": {
-            "description": "Success"
+        "summary": "Read an Operation without triggering execution",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Takoform-Organization",
+            "required": false,
+            "description": "Required for an owner session. An API key uses its authenticated organization, never this header.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          },
+          {
+            "in": "path",
+            "name": "operationId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
           }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/operations/{operationId}/cancel": {
-      "post": {
-        "summary": "Request cancellation of an operation",
+        ],
         "responses": {
           "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/artifacts/uploads": {
-      "post": {
-        "summary": "Start an artifact upload",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/artifacts/uploads/{uploadId}": {
-      "delete": {
-        "summary": "Abandon an artifact upload",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/artifacts/uploads/{uploadId}/commit": {
-      "post": {
-        "summary": "Commit an artifact upload",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/artifacts/uploads/{uploadId}/blobs/{digest}": {
-      "put": {
-        "summary": "Upload one declared blob",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/artifacts/{digest}": {
-      "get": {
-        "summary": "Read a committed manifest",
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/apis/forms.takoform.com/v1/artifacts/blobs/{digest}": {
-      "head": {
-        "summary": "Check whether a blob is held",
-        "responses": {
-          "200": {
-            "description": "Success"
+            "description": "Current Operation status and effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Operation"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Request refused; code classifies the failure without provider or secret payloads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Problem"
+                }
+              }
+            }
           }
         }
       }

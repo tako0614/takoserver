@@ -5,7 +5,7 @@ import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runSelfhostFormAdmission } from "../scripts/selfhost-form-admission.ts";
-import { buildApp, createAppResourceStoreBundle } from "../src/app.ts";
+import { createAppResourceStoreBundle } from "../src/app.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { bytesDigest } from "../src/json.ts";
@@ -27,8 +27,10 @@ import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts
 import type { TakoformV1Alpha3FormRef as FormRef } from "../src/takoform/types.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createWorkerdSupervisor } from "../src/workerd-supervisor.ts";
+import { buildHistoricalTakoformApp } from "./helpers/historical-takoform-host.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 import { createSyntheticPublisherSetVerifier } from "./helpers/synthetic-publisher-set-verifier.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 // Native-only: run in an isolated network namespace with loopback enabled and
 // port 443 free. WorkerEndpoint@0.1.0 promises HTTPS without a non-default port.
@@ -202,7 +204,8 @@ test.skipIf(WORKERD === null)(
         },
         now: clock(),
       });
-      const app = buildApp({
+      const app = buildHistoricalTakoformApp({
+        v2: TEST_TAKOFORM_V2_CONFIG,
         sql,
         objects,
         publicOrigin: HOST_ORIGIN,
