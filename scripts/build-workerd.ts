@@ -13,10 +13,30 @@ interface BuildArguments {
   readonly stateRoot: string;
   readonly archive?: string;
   readonly prepareOnly: boolean;
+  readonly planOnly: boolean;
+  readonly jobs: number;
+  readonly memoryMB: number;
 }
+
+const DEFAULT_JOBS = 2;
+const DEFAULT_MEMORY_MB = 8192;
 
 async function main(): Promise<void> {
   const input = parseArguments(process.argv.slice(2));
+  if (input.planOnly) {
+    console.log(
+      JSON.stringify({
+        kind: "workerd-build-plan",
+        target: WORKERD_TARGET,
+        artifactSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.sha256,
+        version: WORKERD_CLOSED_GRAPH_ARTIFACT.version,
+        resources: { jobs: input.jobs, memoryMB: input.memoryMB },
+        bazelResourceArgs: bazelResourceArgs(input),
+        nativeQualification: "not-run",
+      }),
+    );
+    return;
+  }
   requireLinuxX64();
   await requireDigest(OVERLAY, WORKERD_CLOSED_GRAPH_ARTIFACT.overlayPatchSha256, "overlay patch");
 
@@ -125,6 +145,7 @@ async function main(): Promise<void> {
       `--output_user_root=${join(stateRoot, "bazel-output")}`,
       "build",
       WORKERD_TARGET,
+      ...bazelResourceArgs(input),
       `--repository_cache=${join(stateRoot, "repository-cache")}`,
       `--action_env=LD_LIBRARY_PATH=${libraryPath}`,
       `--host_action_env=LD_LIBRARY_PATH=${libraryPath}`,
@@ -160,9 +181,11 @@ async function main(): Promise<void> {
   await chmod(artifact, 0o755);
   console.log(
     JSON.stringify({
+      kind: "takoserver.workerd-build-report",
       artifact,
       sha256: WORKERD_CLOSED_GRAPH_ARTIFACT.sha256,
       version: WORKERD_CLOSED_GRAPH_ARTIFACT.version,
+      nativeQualification: "not-run",
     }),
   );
 }
@@ -171,19 +194,35 @@ function parseArguments(arguments_: readonly string[]): BuildArguments {
   let stateRoot: string | undefined;
   let archive: string | undefined;
   let prepareOnly = false;
+  let planOnly = false;
+  let jobs = DEFAULT_JOBS;
+  let memoryMB = DEFAULT_MEMORY_MB;
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     if (argument === "--prepare-only") {
       prepareOnly = true;
       continue;
     }
-    if (argument === "--state-root" || argument === "--archive") {
+    if (argument === "--plan") {
+      planOnly = true;
+      continue;
+    }
+    if (["--state-root", "--archive", "--jobs", "--memory-mb"].includes(argument ?? "")) {
       const value = arguments_[index + 1];
-      if (value === undefined || !isAbsolute(value)) {
-        throw new Error(`${argument} requires an absolute path`);
+      if (argument === "--jobs" || argument === "--memory-mb") {
+        const parsed = value !== undefined && /^[1-9][0-9]*$/u.test(value) ? Number(value) : NaN;
+        if (!Number.isSafeInteger(parsed) || parsed < 1) {
+          throw new Error(`${argument} requires a positive integer`);
+        }
+        if (argument === "--jobs") jobs = parsed;
+        else memoryMB = parsed;
+      } else {
+        if (value === undefined || !isAbsolute(value)) {
+          throw new Error(`${argument} requires an absolute path`);
+        }
+        if (argument === "--state-root") stateRoot = value;
+        else archive = value;
       }
-      if (argument === "--state-root") stateRoot = value;
-      else archive = value;
       index += 1;
       continue;
     }
@@ -191,10 +230,30 @@ function parseArguments(arguments_: readonly string[]): BuildArguments {
   }
   if (stateRoot === undefined) {
     throw new Error(
-      "usage: bun run build:workerd -- --state-root /absolute/private/path [--archive /absolute/workerd.tar.gz] [--prepare-only]",
+      [
+        "usage: bun run build:workerd -- --state-root /absolute/private/path",
+        "[--archive /absolute/workerd.tar.gz] [--jobs 2] [--memory-mb 8192]",
+        "[--prepare-only] [--plan]",
+      ].join(" "),
     );
   }
-  return archive === undefined ? { stateRoot, prepareOnly } : { stateRoot, archive, prepareOnly };
+  if (prepareOnly && planOnly) throw new Error("--plan cannot be combined with --prepare-only");
+  return {
+    stateRoot,
+    ...(archive === undefined ? {} : { archive }),
+    prepareOnly,
+    planOnly,
+    jobs,
+    memoryMB,
+  };
+}
+
+function bazelResourceArgs(input: Pick<BuildArguments, "jobs" | "memoryMB">): string[] {
+  return [
+    `--jobs=${input.jobs}`,
+    `--local_cpu_resources=${input.jobs}`,
+    `--local_ram_resources=${input.memoryMB}`,
+  ];
 }
 
 function requireLinuxX64(): void {

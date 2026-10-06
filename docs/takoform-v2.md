@@ -36,6 +36,16 @@ unknown, recovery reconciles those identities rather than issuing a new create
 against another target. A worker that loses its claim cannot settle a newer
 worker's operation.
 
+A backend may return the internal `continue` result after a bounded step and
+its durable checkpoint have finished. All writes must have been awaited and
+fenced; an unacknowledged external effect remains `unknown`. A continuation
+keeps the same Operation and dispatch history, clears its old lease, and becomes
+eligible for reconciliation after one second. It neither claims readiness nor
+publishes an execution error. Actual execution still depends on the embedding
+scheduler. Due work is ordered by its last update, then creation and ID, so an
+older multi-step operation does not continually take the next worker slot.
+Unknown outcomes retain the existing reconciliation backoff.
+
 SQL claims fence settlement, not arbitrary network sends. A backend reports
 `no_effect` only when it can also exclude a delayed, previously authorized send;
 otherwise it must report uncertainty. Safe replay inside reconciliation requires
