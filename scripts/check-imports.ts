@@ -55,6 +55,11 @@ const LAYERS: readonly Layer[] = [
   // v2 shares neutral primitives, not the v1 package/admission domain. Keep
   // these edges explicit so a protocol translator cannot enter unnoticed.
   {
+    name: "v2-extension",
+    match: /^src\/takoform-v2\/index\.ts$/u,
+    may: ["core", "v2-contract", "v2-form", "v2-runtime"],
+  },
+  {
     name: "v2-contract",
     match: /^src\/takoform-v2\/(?:types|identity|references)\.ts$/u,
     may: ["core", "v2-contract"],

@@ -293,6 +293,27 @@ serving, mixed-version dispatch, service Bindings and native restart recovery
 still need that separate qualification. Static-only support is one implementation
 path within WorkerVersion, not grounds to advertise the whole Form as supported.
 
+The internal static publication port connects an accepted Deployment Operation
+to this runtime: it resolves the sealed SQL graph, reads held Version assets,
+and publishes one complete weighted selection under the existing activation
+lock. A new operation can replace the same Worker's prior publication after
+its incumbent Operation is checked in SQL. Read-only recovery compares the
+complete serving identity and never republishes on missing or uncertain proof.
+
+This port returns publication evidence, not a Form backend result. In particular,
+`confirmed(null)` proves publication absence, not completed Deployment deletion.
+The Form backend must also prove invocation cancellation, physical child retirement
+and old-owner fencing before settling DELETE. Updates must retain the old Version's
+invocation ownership until retirement permits Version deletion. The port neither
+creates another lifecycle ledger nor implements that missing retirement path.
+
+Private execution adapters can import the existing v2 backend types, Worker
+input/reference helpers and publication-state reader through
+`@takoserver/core/takoform-v2`. This Worker-compatible software extension exports
+the public implementation's contracts; it is not another Takoform API or a WfP
+implementation. It does not expose the self-host workerd implementation or change
+normal Form registration.
+
 Forms can also calculate initial public output in a pure callback. That output
 is committed at acceptance, including before backend execution, and is not
 reallocated on replay or update. This supports the Endpoint requirement to retain
