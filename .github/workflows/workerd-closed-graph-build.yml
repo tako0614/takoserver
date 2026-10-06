@@ -1,4 +1,4 @@
-name: workerd WorkerLoader candidate build
+name: build pinned closed-graph workerd artifact
 
 on:
   workflow_dispatch:
@@ -7,19 +7,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: workerd-workflow-loader-candidate-${{ github.ref }}
+  group: workerd-closed-graph-build-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  candidate-build:
-    name: build unqualified WorkerLoader candidate
+  artifact-build:
+    name: build exact pinned artifact (native qualification not run)
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
-      - name: Check out selected candidate commit
+      - name: Check out selected build commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pinned: v6.0.2
         with:
           persist-credentials: false
@@ -29,14 +29,13 @@ jobs:
         with:
           bun-version-file: .bun-version
 
-      - name: Record runner capacity and verify exact compiler prerequisites
-        id: preflight
+      - name: Verify exact compiler prerequisites and record runner capacity
         shell: bash
         run: |
           set -euo pipefail
-          report="${RUNNER_TEMP}/workerd-candidate-runner-report.txt"
+          report="${RUNNER_TEMP}/workerd-build-runner-report.txt"
           {
-            echo "candidate_commit=${GITHUB_SHA}"
+            echo "build_commit=${GITHUB_SHA}"
             echo "runner_image=ubuntu-26.04"
             echo "runner_name=${RUNNER_NAME}"
             echo "architecture=$(uname -m)"
@@ -67,7 +66,7 @@ jobs:
             fi
           done
           if [[ "$(uname -m)" != x86_64 ]]; then
-            echo "prerequisite_failure: candidate build requires linux/x64, got $(uname -m)" | tee -a "${report}"
+            echo "prerequisite_failure: build requires linux/x64, got $(uname -m)" | tee -a "${report}"
             exit 1
           fi
           echo "compiler_prerequisites=verified" | tee -a "${report}"
@@ -82,25 +81,24 @@ jobs:
             --output "${bazelisk}"
           echo '5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992  '"${bazelisk}" | sha256sum --check
           chmod 0755 "${bazelisk}"
-          echo "bazelisk_sha256=$(sha256sum "${bazelisk}" | cut -d ' ' -f 1)" >> "${RUNNER_TEMP}/workerd-candidate-runner-report.txt"
+          echo "bazelisk_sha256=$(sha256sum "${bazelisk}" | cut -d ' ' -f 1)" >> "${RUNNER_TEMP}/workerd-build-runner-report.txt"
 
-      - name: Build isolated WorkerLoader candidate (no native tests)
+      - name: Build the pinned artifact (no native qualification)
         id: build
         shell: bash
         run: |
           set -uo pipefail
-          state_root="${RUNNER_TEMP}/workerd-workflow-loader-state"
-          build_log="${RUNNER_TEMP}/workerd-workflow-loader-build.log"
-          report="${RUNNER_TEMP}/workerd-candidate-runner-report.txt"
+          state_root="${RUNNER_TEMP}/workerd-closed-graph-state"
+          build_log="${RUNNER_TEMP}/workerd-closed-graph-build.log"
+          report="${RUNNER_TEMP}/workerd-build-runner-report.txt"
           echo "build_start_available_disk_kib=$(df -Pk "${RUNNER_TEMP}" | awk 'NR == 2 { print $4 }')" | tee -a "${report}"
           set +e
           timeout --signal=TERM --kill-after=30s 40m \
             env BAZELISK="${RUNNER_TEMP}/bazelisk-1.29.0" WORKERD_LLVM_ROOT=/ \
             bun run build:workerd -- \
-              --candidate workflow-loader \
               --state-root "${state_root}" \
               --jobs 2 \
-              --memory-mib 8192 2>&1 | tee "${build_log}"
+              --memory-mb 8192 2>&1 | tee "${build_log}"
           pipeline_statuses=("${PIPESTATUS[@]}")
           build_status=${pipeline_statuses[0]:-1}
           tee_status=${pipeline_statuses[1]:-1}
@@ -109,51 +107,52 @@ jobs:
           echo "build_log_capture_exit_code=${tee_status}" | tee -a "${report}"
           echo "build_end_available_disk_kib=$(df -Pk "${RUNNER_TEMP}" | awk 'NR == 2 { print $4 }')" | tee -a "${report}"
           if [[ "${tee_status}" -ne 0 ]]; then
-            echo "capture_failure: tee failed to preserve the complete build log (exit ${tee_status}); candidate output cannot be accepted" | tee -a "${report}"
+            echo "capture_failure: tee failed to preserve the complete build log; artifact output cannot be accepted" | tee -a "${report}"
           fi
           if [[ "${build_status}" -ne 0 ]]; then
             if [[ "${build_status}" -eq 124 || "${build_status}" -eq 137 ]] || \
               grep -Eiq 'no space left on device|disk quota exceeded|ENOSPC|out of memory|resource exhausted|cannot allocate memory|killed' "${build_log}"; then
-              echo "capacity_failure: native candidate build stopped under runner disk, memory, or time limits (exit ${build_status}); this is not a successful build" | tee -a "${report}"
+              echo "capacity_failure: artifact build stopped under runner disk, memory, or time limits (exit ${build_status})" | tee -a "${report}"
             else
-              echo "candidate_build_failure: build failed before producing an unqualified candidate (exit ${build_status})" | tee -a "${report}"
+              echo "artifact_build_failure: build stopped before producing the pinned artifact (exit ${build_status})" | tee -a "${report}"
             fi
             exit "${build_status}"
           fi
           if [[ "${tee_status}" -ne 0 ]]; then
             exit "${tee_status}"
           fi
-          tail -n 1 "${build_log}" > "${RUNNER_TEMP}/workerd-candidate-result.json"
-          jq -e '
-            .qualification == "unqualified-native-tests-not-run" and
-            (.artifact | type == "string") and
-            (.provenance | type == "string")
-          ' "${RUNNER_TEMP}/workerd-candidate-result.json" > /dev/null
-          provenance="$(jq -r '.provenance' "${RUNNER_TEMP}/workerd-candidate-result.json")"
-          binary="$(jq -r '.artifact' "${RUNNER_TEMP}/workerd-candidate-result.json")"
-          test -f "${binary}"
-          test -f "${provenance}"
-          jq -e '.nativeQualification == "not-run" and .qualification == "unqualified-native-tests-not-run"' "${provenance}" > /dev/null
-          echo "candidate_binary=${binary}" >> "${GITHUB_OUTPUT}"
-          echo "candidate_provenance=${provenance}" >> "${GITHUB_OUTPUT}"
-          echo "build_result=unqualified-native-tests-not-run" | tee -a "${report}"
 
-      - name: Upload unqualified candidate binary and provenance
+          tail -n 1 "${build_log}" > "${RUNNER_TEMP}/workerd-build-report.json"
+          jq -e '
+            .kind == "takoserver.workerd-build-report" and
+            .sha256 == "c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52" and
+            .version == "2026-08-11" and
+            .nativeQualification == "not-run" and
+            (.artifact | type == "string")
+          ' "${RUNNER_TEMP}/workerd-build-report.json" > /dev/null
+          binary="$(jq -r '.artifact' "${RUNNER_TEMP}/workerd-build-report.json")"
+          test -f "${binary}"
+          echo 'c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52  '"${binary}" | sha256sum --check
+          echo "artifact=${binary}" >> "${GITHUB_OUTPUT}"
+          echo "build_result=artifact-pin-verified-native-qualification-not-run" | tee -a "${report}"
+
+      - name: Upload pinned artifact and honest build report
         if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pinned: v7.0.1
         with:
-          name: workerd-workflow-loader-candidate-${{ github.sha }}-${{ github.run_id }}
+          name: workerd-closed-graph-${{ github.sha }}-${{ github.run_id }}
           path: |
-            ${{ steps.build.outputs.candidate_binary }}
-            ${{ steps.build.outputs.candidate_provenance }}
+            ${{ steps.build.outputs.artifact }}
+            ${{ runner.temp }}/workerd-build-report.json
+            ${{ runner.temp }}/workerd-build-runner-report.txt
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload runner capacity report
-        if: always()
+      - name: Upload runner report on failure
+        if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pinned: v7.0.1
         with:
-          name: workerd-workflow-loader-runner-report-${{ github.sha }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/workerd-candidate-runner-report.txt
+          name: workerd-closed-graph-runner-report-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/workerd-build-runner-report.txt
           if-no-files-found: warn
           retention-days: 7
