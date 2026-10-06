@@ -138,7 +138,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "adapter",
     match:
-      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
     may: ["core", "adapter"],
   },
   {
@@ -246,6 +246,7 @@ const HOST_ONLY = [
   "src/workerd-runtime.ts",
   "src/workerd-supervisor.ts",
   "src/workerd-linux-process.ts",
+  "src/workerd-worker-execution-group.ts",
   // Health dispatch observes the Bun process's private startup-restore and
   // workerd-supervisor lifecycle; it is not a Worker health route.
   "src/selfhost-health.ts",
