@@ -317,6 +317,29 @@ and old-owner fencing before settling DELETE. Updates must retain the old Versio
 invocation ownership until retirement permits Version deletion. The port neither
 creates another lifecycle ledger nor implements that missing retirement path.
 
+The self-host `WorkerdWorkerRuntimeOwner` connects this static publication port
+to separate, immutable child incarnations for one Worker UID. Its local fetch
+dispatcher switches to the confirmed incarnation while existing HTTP response
+bodies retain their old owner. It schedules old-child retirement when those
+bodies finish or the 15-minute drain deadline is reached. A different Worker
+UID has a different process owner and is not stopped by that transition.
+
+On DELETE, the owner durably closes its own admission path, cancels tracked
+requests and response readers, and requires an exact retirement receipt for
+every recorded incarnation before the final SQL claim check. State transitions
+are serialized; an ambiguous durable write stops subsequent writes rather than
+rebasing on stale memory. Retirement receipts bind actual configuration bytes,
+child exit and listener vacancy. This result does not remove shared hostname
+routes, settle the Form, or qualify non-HTTP execution contexts.
+
+The owner is not registered by the normal application. Its portable tests do
+not qualify the pinned native workerd binary. Orderly closure can release its
+local lock after retirement, but an OS crash leaves that lock in place, including
+when all children had retired. Safe successor ownership and recovery of live
+children are still unimplemented; the code does not adopt them or remove a lock
+using only a PID. This limit remains distinct from successful same-process
+operation retry.
+
 Private execution adapters can import the existing v2 backend types, Worker
 input/reference helpers and publication-state reader through
 `@takoserver/core/takoform-v2`. This Worker-compatible software extension exports
