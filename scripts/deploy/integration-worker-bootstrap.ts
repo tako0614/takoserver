@@ -4,6 +4,7 @@ import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseRuntimeInputSealKeyRing } from "../../src/runtime-input-seal-keyring.ts";
+import { parseTakoformV2ApplicationConfig } from "../../src/takoform-v2/config.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import {
@@ -13,7 +14,12 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
-import { CloudflareIntegrationStorageProvider } from "./integration-storage-generation.ts";
+import {
+  CloudflareIntegrationStorageProvider,
+  type FreshV2ArtifactIntegrationStorageTargetProof,
+  type IntegrationStorageGenerationTargetVerificationOptions,
+  verifyFreshV2ArtifactIntegrationStorageTarget,
+} from "./integration-storage-generation.ts";
 import { canonicalSchemaShape, type D1SchemaState, readD1SchemaState } from "./migrations.ts";
 import {
   type CommandResult,
@@ -30,7 +36,11 @@ import {
   unsealDirectory,
 } from "./qualification.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
-import { readAuditedMigrationArtifact } from "./schema.ts";
+import {
+  projectFreshV2ArtifactMigrationArtifact,
+  readAuditedMigrationArtifact,
+  readCurrentAuditedMigrationSourceArtifact,
+} from "./schema.ts";
 import {
   activePublicJwk,
   createRemoteSigningDatabase,
@@ -160,6 +170,8 @@ export interface IntegrationWorkerBootstrapOptions {
   readonly signingDatabase?: Pick<SigningDatabase, "readKey">;
   readonly schemaReader?: IntegrationWorkerBootstrapSchemaReader;
   readonly r2Identity?: IntegrationWorkerBootstrapR2IdentityReader;
+  /** Narrow read-only test seam; production verifies the selected generated pair remotely. */
+  readonly v2StorageVerification?: IntegrationStorageGenerationTargetVerificationOptions;
   readonly secretDirectory?: string;
   /** The exact keyring retained by the qualified CPE owner (never emitted). */
   readonly expectedRuntimeInputSealKeyring?: string;
@@ -224,7 +236,22 @@ export async function runIntegrationWorkerBootstrap(
   // all four exhaustive native inventories prove exact absence.
   const initial = await readNativePresence("preflight", target, state);
   if (invocation.action === "status" && initial.absent) {
-    return statusResult(invocation, target, initial);
+    if (target.takoformV2 === undefined) return statusResult(invocation, target, initial);
+    let storageQualified = false;
+    try {
+      await readV2StorageProof(target, options);
+      storageQualified = true;
+    } catch {
+      // Status is value-free and never promotes an unavailable or unreadable
+      // D1 merely because the Worker name is unoccupied.
+    }
+    return {
+      ...statusResult(invocation, target, initial),
+      state: "not_published",
+      ready: false,
+      nativeCreateEligible: true,
+      storageQualified,
+    };
   }
   if (invocation.action === "apply" && !initial.absent) {
     throw preflightError(
@@ -273,11 +300,13 @@ export async function runIntegrationWorkerBootstrap(
       sourceRepositoryRoot,
       invocation.commit,
     );
-    const artifactBefore = readAuditedArtifact(sourceRepositoryRoot);
+    const artifactBefore = readBootstrapArtifact(sourceRepositoryRoot, target);
     const expectedShape = deriveExpectedApplicationShape(artifactBefore);
     const schemaReader = resolveSchemaReader(options, inspectionConfig, target, environment, run);
     const schemaBefore = await readSchema("preflight", schemaReader);
     assertCompleteSchema(schemaBefore, artifactBefore, expectedShape);
+    const v2StorageBefore =
+      target.takoformV2 === undefined ? null : await readV2StorageProof(target, options);
 
     const provider = providerExecutorQualificationReader({
       target,
@@ -345,6 +374,16 @@ export async function runIntegrationWorkerBootstrap(
         throw preflightError("runtime input seal keyring differs from qualified CPE input");
       }
     }
+    if (target.takoformV2 !== undefined) {
+      try {
+        parseTakoformV2ApplicationConfig({
+          TAKOSERVER_TAKOFORM_V2_CONFIG: target.takoformV2.config,
+          TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: secretValues.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY,
+        });
+      } catch {
+        throw preflightError("v2 Host cursor secret does not satisfy the selected configuration");
+      }
+    }
 
     const prepared = await prepareBootstrapArtifact(
       root,
@@ -377,7 +416,7 @@ export async function runIntegrationWorkerBootstrap(
         "integration Worker bootstrap native absence changed during qualification",
       );
     }
-    const artifactAfterBuild = readAuditedArtifact(sourceRepositoryRoot);
+    const artifactAfterBuild = readBootstrapArtifact(sourceRepositoryRoot, target);
     assertSameArtifact(artifactBefore, artifactAfterBuild);
     const schemaAfterBuild = await readSchema("preflight", schemaReader);
     assertCompleteSchema(schemaAfterBuild, artifactAfterBuild, expectedShape);
@@ -421,7 +460,7 @@ export async function runIntegrationWorkerBootstrap(
             "integration Worker bootstrap native absence fence failed immediately before deployment",
           );
         }
-        const localFinal = readAuditedArtifact(sourceRepositoryRoot);
+        const localFinal = readBootstrapArtifact(sourceRepositoryRoot, target);
         assertSameArtifact(artifactBefore, localFinal);
         const schemaFinal = await readSchema("preflight", schemaReader);
         assertCompleteSchema(schemaFinal, localFinal, expectedShape);
@@ -430,6 +469,10 @@ export async function runIntegrationWorkerBootstrap(
         assertSameSigning(signingBefore, signingFinal);
         assertDistinctJit(target, signingFinal);
         await assertR2Identity("preflight", target, r2Identity);
+        if (v2StorageBefore !== null) {
+          const storageFinal = await readV2StorageProof(target, options);
+          assertSameV2StorageProof(v2StorageBefore, storageFinal, "preflight");
+        }
         const providerFinal = provider === null ? null : await provider.read("preflight");
         if (providerBefore !== null && providerFinal !== null) {
           assertProviderExecutorUnchanged(providerBefore, providerFinal);
@@ -452,6 +495,7 @@ export async function runIntegrationWorkerBootstrap(
         artifact,
         schemaBefore,
         artifactBefore,
+        v2StorageBefore,
         expectedShape,
         signingDatabase,
         signingBefore,
@@ -542,7 +586,7 @@ async function statusExisting(
     const sourceRoot = resolve(options.sourceRepositoryRoot ?? REPOSITORY);
     const expectedSchedules = readExpectedWorkerSchedules("preflight", sourceRoot);
     const config = writeInspectionConfig(root, target, sourceRoot, invocation.commit);
-    const artifact = readAuditedArtifact(sourceRoot);
+    const artifact = readBootstrapArtifact(sourceRoot, target);
     const expectedShape = deriveExpectedApplicationShape(artifact);
     const schemaReader = resolveSchemaReader(options, config, target, environment, run);
     const schema = await readSchema("preflight", schemaReader);
@@ -566,6 +610,7 @@ async function statusExisting(
     assertDistinctJit(target, signing);
     const r2Identity = resolveR2IdentityReader(options, target, cloudflareToken);
     await assertR2Identity("preflight", target, r2Identity);
+    if (target.takoformV2 !== undefined) await readV2StorageProof(target, options);
     const history = initial.history;
     if (history === null) {
       throw preflightError("Worker bootstrap status cannot read an existing deployment history");
@@ -592,6 +637,7 @@ async function statusExisting(
       appliedMigrations: schema.applied,
       schemaShapeDigest: schema.shapeDigest,
       ready,
+      ...(target.takoformV2 === undefined ? {} : { storageQualified: true }),
       ...(providerInspection === null
         ? { cloudflareProviderExecutor: { required: false } }
         : {
@@ -622,7 +668,7 @@ function statusResult(
   target: DeployTarget,
   native: NativePresence,
 ): Record<string, unknown> {
-  return {
+  const result = {
     kind: "takoserver.integration-worker-bootstrap-status@v1",
     surface: INTEGRATION_WORKER_BOOTSTRAP_SURFACE,
     environment: "integration",
@@ -640,6 +686,15 @@ function statusResult(
     ready: native.absent,
     mutationApplied: false,
   };
+  return target.takoformV2 === undefined
+    ? result
+    : {
+        ...result,
+        state: native.absent ? "not_published" : "partial",
+        ready: false,
+        nativeCreateEligible: native.absent,
+        storageQualified: false,
+      };
 }
 
 async function verifyBootstrap(input: {
@@ -653,6 +708,7 @@ async function verifyBootstrap(input: {
   readonly artifact: ReturnType<PreparedWorkerArtifact["seal"]>;
   readonly schemaBefore: D1SchemaState;
   readonly artifactBefore: MigrationArtifact;
+  readonly v2StorageBefore: FreshV2ArtifactIntegrationStorageTargetProof | null;
   readonly expectedShape: string;
   readonly signingDatabase: Pick<SigningDatabase, "readKey">;
   readonly signingBefore: SigningEvidence;
@@ -693,8 +749,9 @@ async function verifyBootstrap(input: {
     input.signingBefore.keyId,
     input.prepared.bundleDigestHex,
   );
-  const artifactAfter = readAuditedArtifact(
+  const artifactAfter = readBootstrapArtifact(
     resolve(input.options.sourceRepositoryRoot ?? REPOSITORY),
+    input.target,
   );
   assertSameArtifact(input.artifactBefore, artifactAfter, "verification");
   const schemaAfter = await readSchema("verification", input.schemaReader);
@@ -704,6 +761,10 @@ async function verifyBootstrap(input: {
   assertSameSigning(input.signingBefore, signingAfter, "verification");
   assertDistinctJit(input.target, signingAfter, "verification");
   await assertR2Identity("verification", input.target, input.r2Identity);
+  if (input.v2StorageBefore !== null) {
+    const storageAfter = await readV2StorageProof(input.target, input.options);
+    assertSameV2StorageProof(input.v2StorageBefore, storageAfter, "verification");
+  }
   await assertWorkerSchedules("verification", input.target, input.state, input.expectedSchedules);
   const providerAfter = input.provider === null ? null : await input.provider.read("verification");
   if (input.providerBefore !== null && providerAfter !== null) {
@@ -1102,8 +1163,39 @@ function validateInvocation(
   }
 }
 
-function readAuditedArtifact(sourceRoot: string): MigrationArtifact {
-  return readAuditedMigrationArtifact(resolve(sourceRoot, "migrations"));
+function readBootstrapArtifact(sourceRoot: string, target: DeployTarget): MigrationArtifact {
+  const directory = resolve(sourceRoot, "migrations");
+  return target.takoformV2 === undefined
+    ? readAuditedMigrationArtifact(directory)
+    : projectFreshV2ArtifactMigrationArtifact(readCurrentAuditedMigrationSourceArtifact(directory));
+}
+
+async function readV2StorageProof(
+  target: DeployTarget,
+  options: IntegrationWorkerBootstrapOptions,
+): Promise<FreshV2ArtifactIntegrationStorageTargetProof> {
+  return await verifyFreshV2ArtifactIntegrationStorageTarget(target, "integration", {
+    ...(options.run === undefined ? {} : { run: options.run }),
+    ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: options.cloudflareEnvironment }),
+    ...options.v2StorageVerification,
+    migrationDirectory: resolve(options.sourceRepositoryRoot ?? REPOSITORY, "migrations"),
+  });
+}
+
+function assertSameV2StorageProof(
+  expected: FreshV2ArtifactIntegrationStorageTargetProof,
+  actual: FreshV2ArtifactIntegrationStorageTargetProof,
+  phase: "preflight" | "verification",
+): void {
+  if (canonicalJson(expected) !== canonicalJson(actual)) {
+    throw phaseError(
+      phase,
+      "v2 artifact storage identity, lineage or schema changed during bootstrap",
+    );
+  }
 }
 
 function deriveExpectedApplicationShape(artifact: MigrationArtifact): string {

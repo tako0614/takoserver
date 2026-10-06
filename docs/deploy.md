@@ -337,6 +337,22 @@ product probe. Cleanup failures are reported explicitly; a failed cleanup must
 not be treated as proof that temporary secret material was removed. Later updates and secret
 changes use their existing lifecycle surfaces.
 
+An explicitly selected `takoformV2` integration target follows this **same**
+first-publication writer, not a second Host uploader. Its D1/R2 must be the
+exact generated `takoserver-i-<generation>` pair with the complete fixed
+0001–0075 migration ledger and every application schema object. That proof is
+read before upload, at the immediate upload fence, and after the acknowledged
+Version; identity, source digest, lineage and schema digest must stay equal.
+The v2 cursor key is an operator-private file named
+`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY` in the same exact secret directory. Apply
+validates the real key bytes with the selected public v2 config, seals it with
+the other required secrets, and sends one `--secrets-file` upload; it never
+generates, logs or returns key bytes. For an absent v2 Worker, status reports
+`state: not_published`, `ready: false`, and separate `nativeCreateEligible` /
+`storageQualified` booleans; native absence alone is not serving readiness.
+The default non-v2 bootstrap stays fixed at 0001–0066, and an existing or
+partially published Worker is never adopted by either path.
+
 The integration JIT credential authority instead accepts exactly one of
 `--issue`, `--status`, or `--revoke` through that same entrypoint, and the
 durable organization API key surface accepts exactly one of `--mint`,
