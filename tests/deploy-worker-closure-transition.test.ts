@@ -45,6 +45,13 @@ const STORAGE_DATABASE_ID = "00000000-0000-4000-8000-0000000000a5";
 const STORAGE_GENERATION = "f".repeat(32);
 const PREDECESSOR_STORAGE_BUCKET = `takoserver-i-${"e".repeat(32)}`;
 const STORAGE_NAME = `takoserver-i-${STORAGE_GENERATION}`;
+const V2_CONFIG_VAR = "TAKOSERVER_TAKOFORM_V2_CONFIG";
+const V2_CURSOR_SECRET = "TAKOSERVER_TAKOFORM_V2_CURSOR_KEY";
+const V2_CURSOR_TEST_VALUE = "A".repeat(43);
+const V2_PUBLIC_CONFIG = JSON.stringify({
+  documentation: "https://docs.example.test/v2",
+  authenticationDocumentation: "https://docs.example.test/v2/authentication",
+});
 
 function integrationStorageVerificationOptions(
   target: DeployTarget,
@@ -125,6 +132,11 @@ const storageRebindTarget = {
   r2: { bucketName: STORAGE_NAME },
 } satisfies DeployTarget;
 
+const v2Target = {
+  ...storageRebindTarget,
+  takoformV2: { config: V2_PUBLIC_CONFIG },
+} satisfies DeployTarget;
+
 const STORAGE_REBIND: NonNullable<WorkerClosureDelta["storageRebind"]> = {
   predecessorStateDatabaseId: PREDECESSOR_STORAGE_DATABASE_ID,
   predecessorObjectBucketName: PREDECESSOR_STORAGE_BUCKET,
@@ -171,6 +183,8 @@ function predecessorVersion(
       Record<string, { readonly service: string; readonly entrypoint: string }>
     >;
     readonly storagePredecessor?: NonNullable<WorkerClosureDelta["storageRebind"]>;
+    /** Fixture for the new paired v2 startup binding transition, without old supply deltas. */
+    readonly v2Startup?: boolean;
   } = {},
 ) {
   const bindings = targetBindings(overrides.selected)
@@ -192,12 +206,14 @@ function predecessorVersion(
       return staleService === undefined ? binding : { ...binding, ...staleService };
     })
     .filter(
-      ({ name }) => name !== ADDED_BINDING || overrides.staleServiceBindings?.[name] !== undefined,
+      ({ name }) =>
+        overrides.v2Startup === true ||
+        name !== ADDED_BINDING ||
+        overrides.staleServiceBindings?.[name] !== undefined,
     )
     .filter(
       ({ name }) =>
-        name !== ADDED_VAR &&
-        name !== ADDED_SECRET &&
+        (overrides.v2Startup === true || (name !== ADDED_VAR && name !== ADDED_SECRET)) &&
         (overrides.dropVar === undefined || name !== overrides.dropVar),
     );
   const dropped = new Set(overrides.dropSecrets ?? []);
@@ -224,7 +240,9 @@ function predecessorVersion(
     resources: {
       bindings: [
         ...declared,
-        { name: RETIRED_VAR, type: "plain_text", text: '{"kind":"legacy"}' },
+        ...(overrides.v2Startup === true
+          ? []
+          : [{ name: RETIRED_VAR, type: "plain_text", text: '{"kind":"legacy"}' }]),
         ...(overrides.extraVar === undefined
           ? []
           : [{ name: overrides.extraVar, type: "plain_text", text: "left-over" }]),
@@ -351,6 +369,7 @@ function fixture(
   for (const [name, value] of [
     [ADDED_SECRET, SEAL_KEYRING_VALUE],
     [ROTATED_SECRET, PROVISIONER_TOKEN_VALUE],
+    [V2_CURSOR_SECRET, V2_CURSOR_TEST_VALUE],
   ] as const) {
     writeFileSync(join(secretDirectory, name), value, { mode: 0o600 });
     chmodSync(join(secretDirectory, name), 0o600);
@@ -444,6 +463,158 @@ function withRoot<T>(name: string, body: (root: string) => Promise<T>): Promise<
 }
 
 describe("reviewed Worker closure transition", () => {
+  test("atomically adds v2 startup JSON and cursor secret in one qualified integration upload", async () => {
+    await withRoot("takoserver-v2-startup-transition-", async (root) => {
+      const delta: WorkerClosureDelta = {
+        retiredVars: [],
+        addedVars: [V2_CONFIG_VAR],
+        refreshedVars: [],
+        addedBindings: [],
+        addedSecrets: [V2_CURSOR_SECRET],
+        rotatedSecrets: [],
+      };
+      const parts = fixture(root, {
+        selected: v2Target,
+        predecessor: {
+          selected: v2Target,
+          v2Startup: true,
+          dropVar: V2_CONFIG_VAR,
+          dropSecrets: [V2_CURSOR_SECRET],
+        },
+        storeSecrets: expectedWorkerSecrets(v2Target).filter((name) => name !== V2_CURSOR_SECRET),
+        local: schemaMigrations,
+        applied: schemaMigrations,
+      });
+      const input = {
+        surface: "takoserver-worker-authority-cutover",
+        environment: "integration",
+        commit: COMMIT,
+        closurePredecessorVersionId: PREDECESSOR,
+        delta,
+      } as const;
+      const options = {
+        ...parts,
+        review: "reviewer@example.test",
+        outputDirectory: root,
+        secretDirectory: parts.secretDirectory,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+        integrationStorageVerification: baseIntegrationStorageVerificationOptions(v2Target),
+        fetcher: publishedProductFetcher(),
+      };
+      const status = await runWorkerClosureTransition(
+        { ...input, action: "status" },
+        v2Target,
+        options,
+      );
+      expect(status).toMatchObject({
+        state: "closure-predecessor-current",
+        mutationApplied: false,
+        secretInputsRequired: [V2_CURSOR_SECRET],
+      });
+      expect(parts.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+      const result = await runWorkerClosureTransition(
+        { ...input, action: "apply" },
+        v2Target,
+        options,
+      );
+      expect(result).toMatchObject({ state: "closure-transition-applied", mutationApplied: true });
+      const uploads = parts.calls.filter((call) => call.includes("--no-bundle"));
+      expect(uploads).toHaveLength(1);
+      expect(uploads[0]).toContain("--secrets-file");
+      const uploaded = readFileSync(join(root, "release/wrangler.jsonc"), "utf8");
+      expect(uploaded).toContain(V2_CONFIG_VAR);
+      expect(uploaded).not.toContain(V2_CURSOR_TEST_VALUE);
+      expect(JSON.stringify(result)).not.toContain(V2_CURSOR_TEST_VALUE);
+    });
+  });
+
+  test("v2 startup refuses either lone delta before any provider or upload", async () => {
+    const base = { retiredVars: [], refreshedVars: [], addedBindings: [], rotatedSecrets: [] };
+    for (const delta of [
+      { ...base, addedVars: [V2_CONFIG_VAR], addedSecrets: [] },
+      { ...base, addedVars: [], addedSecrets: [V2_CURSOR_SECRET] },
+    ]) {
+      let calls = 0;
+      await expect(
+        runWorkerClosureTransition(
+          {
+            surface: "takoserver-worker-authority-cutover",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            closurePredecessorVersionId: PREDECESSOR,
+            delta,
+          },
+          v2Target,
+          {
+            run: async () => {
+              calls++;
+              throw new Error("must not run");
+            },
+          },
+        ),
+      ).rejects.toThrow("one closure transition");
+      expect(calls).toBe(0);
+    }
+  });
+
+  test("v2 cursor rotation validates its input before the single upload", async () => {
+    for (const valid of [false, true]) {
+      await withRoot("takoserver-v2-cursor-rotation-", async (root) => {
+        const parts = fixture(root, {
+          selected: v2Target,
+          predecessor: { selected: v2Target, v2Startup: true },
+          storeSecrets: expectedWorkerSecrets(v2Target),
+          local: schemaMigrations,
+          applied: schemaMigrations,
+        });
+        if (!valid) {
+          writeFileSync(join(parts.secretDirectory, V2_CURSOR_SECRET), "short", { mode: 0o600 });
+        }
+        const result = await runWorkerClosureTransition(
+          {
+            surface: "takoserver-worker-authority-cutover",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            closurePredecessorVersionId: PREDECESSOR,
+            delta: {
+              retiredVars: [],
+              addedVars: [],
+              refreshedVars: [],
+              addedBindings: [],
+              addedSecrets: [],
+              rotatedSecrets: [V2_CURSOR_SECRET],
+            },
+          },
+          v2Target,
+          {
+            ...parts,
+            review: "reviewer@example.test",
+            outputDirectory: root,
+            secretDirectory: parts.secretDirectory,
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+            integrationStorageVerification: baseIntegrationStorageVerificationOptions(v2Target),
+            fetcher: publishedProductFetcher(),
+          },
+        ).catch((error: unknown) => error);
+        const uploads = parts.calls.filter((call) => call.includes("--no-bundle"));
+        if (valid) {
+          expect(result).toMatchObject({
+            state: "closure-transition-applied",
+            mutationApplied: true,
+          });
+          expect(uploads).toHaveLength(1);
+        } else {
+          expect(result).toBeInstanceOf(DeployError);
+          expect((result as DeployError).phase).toBe("preflight");
+          expect((result as DeployError).message).not.toContain("short");
+          expect(uploads).toHaveLength(0);
+        }
+      });
+    }
+  });
+
   test("uses the composed Wrangler for the default remote migration reader", async () => {
     await withRoot("takoserver-closure-wrangler-path-", async (root) => {
       const parts = fixture(root);

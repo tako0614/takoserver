@@ -922,7 +922,19 @@ The routine surfaces are:
 - `takoserver-worker`: one Worker code publication. Before any live read or
   upload it composes the selected target with the Worker's own startup path and
   refuses with that composition's exact words, so a target that parses and yet
-  cannot serve never reaches an upload. Every environment requires
+  cannot serve never reaches an upload. A serving apply requires
+  an explicit operator-private `takoformV2.config`. This
+  field holds the exact non-secret JSON accepted by the Worker's v2 startup
+  parser; realization copies those bytes into
+  `TAKOSERVER_TAKOFORM_V2_CONFIG`. The separately installed, stable
+  `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY` is inventoried by name only, never
+  generated, read into target data, or printed by deploy. The first v2 serving
+  composition is integration-only and requires the exact generated 0075 D1/R2
+  storage proof before publication and after readback, including an empty
+  artifact source map. A legacy `--status` remains read-only; explicit
+  maintenance profiles remain separate and do not claim v2 readiness. An
+  initial legacy 0066 storage bootstrap is not silently upgraded into 0075.
+  Every environment requires
   the resolved direct-REST credential path. In integration, an absent explicit
   token uses the exact Wrangler OAuth JSON resolver; its bearer is held only in
   process for the direct REST reader, while every Wrangler child gets no token

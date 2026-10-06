@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
+import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { ProviderExecutorInspection } from "../scripts/deploy/worker.ts";
 import {
@@ -24,12 +25,17 @@ import {
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
 import { objectBucketSuppliesFixture } from "./helpers/hosted-supply-fixtures.ts";
+import {
+  completeIntegrationStorageState,
+  integrationStorageVerificationOptions,
+} from "./helpers/integration-storage-generation-verification.ts";
 
 const COMMIT = "a".repeat(40);
 const LIVE_COMMIT = "b".repeat(40);
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
 const VERSION_BEFORE = "00000000-0000-4000-8000-000000000001";
 const VERSION_AFTER = "00000000-0000-4000-8000-000000000002";
+const V2_DEPLOYMENT_AFTER = "00000000-0000-4000-8000-000000000012";
 const VERSION_UNRELATED = "00000000-0000-4000-8000-000000000003";
 const VERSION_UNRELATED_PREVIOUS = "00000000-0000-4000-8000-000000000004";
 const OTHER_COMMIT = "d".repeat(40);
@@ -55,6 +61,19 @@ const target = {
   r2: { bucketName: "takoserver-objects-integration" },
   publicOrigin: "https://api.integration.example.test",
   signing: { currentKeyId: "key-current" },
+} satisfies DeployTarget;
+
+const v2StorageName = `takoserver-i-${"f".repeat(32)}`;
+const v2Target = {
+  ...target,
+  d1: { databaseName: v2StorageName, databaseId: "00000000-0000-4000-8000-000000000075" },
+  r2: { bucketName: v2StorageName },
+  takoformV2: {
+    config: JSON.stringify({
+      documentation: "https://docs.example.test/v2",
+      authenticationDocumentation: "https://docs.example.test/v2/authentication",
+    }),
+  },
 } satisfies DeployTarget;
 
 const schemaMaintenanceTarget = {
@@ -109,12 +128,12 @@ function fixture(
   readonly migrations: WorkerMigrationReader;
 } {
   const calls: string[][] = [];
-  const selectedTarget = input.selectedTarget ?? target;
+  const selectedTarget: DeployTarget = input.selectedTarget ?? target;
   let current = input.current ?? "before";
   let built = false;
   let replacementObserved = false;
   let uploadMessage: string | null = null;
-  const run: WorkerProcess = async (command): Promise<CommandResult> => {
+  const run: WorkerProcess = async (command, options): Promise<CommandResult> => {
     calls.push([...command]);
     const key = command.join(" ");
     if (key === "git rev-parse HEAD") return ok(`${COMMIT}\n`);
@@ -136,6 +155,42 @@ function fixture(
       built = true;
       if (input.advanceDuringBuild === true) current = "after";
       return ok("Total Upload: 1 KiB\n");
+    }
+    if (command.includes("versions") && command.includes("upload")) {
+      uploadMessage = command[command.indexOf("--message") + 1] ?? null;
+      const outputPath = options?.env?.WRANGLER_OUTPUT_FILE_PATH;
+      if (!outputPath) throw new Error("version upload output path missing");
+      writeFileSync(
+        outputPath,
+        JSON.stringify({
+          type: "version-upload",
+          version: 1,
+          worker_name: selectedTarget.workerName,
+          worker_tag: null,
+          version_id: VERSION_AFTER,
+          preview_url: null,
+          preview_alias_url: null,
+          worker_name_overridden: false,
+        }),
+      );
+      return ok("Uploaded\n");
+    }
+    if (command.includes("versions") && command.includes("deploy")) {
+      const outputPath = options?.env?.WRANGLER_OUTPUT_FILE_PATH;
+      if (!outputPath) throw new Error("version deploy output path missing");
+      writeFileSync(
+        outputPath,
+        JSON.stringify({
+          type: "version-deploy",
+          version: 1,
+          worker_name: selectedTarget.workerName,
+          worker_tag: null,
+          deployment_id: V2_DEPLOYMENT_AFTER,
+          version_traffic: {},
+        }),
+      );
+      current = "after";
+      return ok("Deployed\n");
     }
     if (command.includes("deploy") && command.includes("--no-bundle")) {
       uploadMessage = command[command.indexOf("--message") + 1] ?? null;
@@ -166,7 +221,11 @@ function fixture(
         ];
       }
       return [
-        deployment("deployment-after", VERSION_AFTER, "2026-08-28T02:00:00Z"),
+        deployment(
+          selectedTarget.takoformV2 ? V2_DEPLOYMENT_AFTER : "deployment-after",
+          VERSION_AFTER,
+          "2026-08-28T02:00:00Z",
+        ),
         deployment("deployment-before", VERSION_BEFORE, "2026-08-28T01:00:00Z"),
       ];
     },
@@ -186,7 +245,14 @@ function fixture(
               ? `takoserver-worker:${OTHER_COMMIT}:${"e".repeat(64)}`
               : input.unrelatedMessage;
       const result =
-        input.selectedTarget !== undefined && message !== null
+        input.selectedTarget !== undefined &&
+        message !== null &&
+        /^takoserver-worker:[0-9a-f]{40}:[0-9a-f]{64}$/u.test(message) &&
+        !(
+          versionId === VERSION_BEFORE &&
+          input.legacyBeforeWithoutVersionMetadata === true &&
+          !(built && input.beforeVersionMetadataAfterBuild === true)
+        )
           ? versionForTarget(versionId, message, selectedTarget)
           : version(
               versionId,
@@ -198,6 +264,7 @@ function fixture(
                 : versionId === VERSION_AFTER && input.afterWithoutVersionMetadata === true
                   ? "legacy-pre-version-metadata"
                   : "current",
+              selectedTarget,
             );
       if (
         built &&
@@ -210,7 +277,7 @@ function fixture(
     },
     async workerSecrets() {
       if (built && input.secretsAfterBuild !== undefined) return input.secretsAfterBuild;
-      return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
+      return expectedWorkerSecrets(selectedTarget).map((name) => ({ name, type: "secret_text" }));
     },
   };
   return {
@@ -229,6 +296,157 @@ function fixture(
 }
 
 describe("split Takoserver Worker surfaces", () => {
+  test("v2 status remains read-only and cannot report ready without fixed 0075 proof", async () => {
+    const current = fixture({ selectedTarget: v2Target });
+    const failure = await runWorker(
+      {
+        surface: "takoserver-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      v2Target,
+      {
+        ...current,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+        integrationStorageVerification: {
+          ...integrationStorageVerificationOptions(v2Target),
+          reader: {
+            read: async () => {
+              const state = completeIntegrationStorageState();
+              return { ...state, applied: state.applied.slice(0, -1) };
+            },
+          },
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(DeployError);
+    expect((failure as DeployError).phase).toBe("preflight");
+    expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+  });
+
+  test("normal integration publication re-proves fixed 0075 storage before upload and after readback", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-v2-storage-"));
+    try {
+      const current = fixture({ selectedTarget: v2Target });
+      let reads = 0;
+      const verification = integrationStorageVerificationOptions(v2Target);
+      const result = await runWorker(
+        {
+          surface: "takoserver-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        v2Target,
+        {
+          ...current,
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+          fetcher: publishedProductFetcher(),
+          integrationStorageVerification: {
+            ...verification,
+            reader: {
+              read: async () => {
+                reads++;
+                return completeIntegrationStorageState();
+              },
+            },
+          },
+        },
+      );
+      expect(result).toMatchObject({ kind: "takoserver.worker-apply@v2", commit: COMMIT });
+      expect(reads).toBe(3);
+      expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fixed 0075 proof drift before upload refuses without provider mutation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-v2-drift-"));
+    try {
+      const current = fixture({ selectedTarget: v2Target });
+      let reads = 0;
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        v2Target,
+        {
+          ...current,
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+          integrationStorageVerification: {
+            ...integrationStorageVerificationOptions(v2Target),
+            reader: {
+              read: async () => {
+                reads++;
+                const state = completeIntegrationStorageState();
+                return reads === 1 ? state : { ...state, applied: state.applied.slice(0, -1) };
+              },
+            },
+          },
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("preflight");
+      expect(reads).toBe(2);
+      expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fixed 0075 proof loss after readback is verification-unknown, never a second upload", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-v2-post-drift-"));
+    try {
+      const current = fixture({ selectedTarget: v2Target });
+      let reads = 0;
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        v2Target,
+        {
+          ...current,
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+          integrationStorageVerification: {
+            ...integrationStorageVerificationOptions(v2Target),
+            reader: {
+              read: async () => {
+                reads++;
+                const state = completeIntegrationStorageState();
+                return reads < 3 ? state : { ...state, applied: state.applied.slice(0, -1) };
+              },
+            },
+          },
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("verification");
+      expect(reads).toBe(3);
+      expect(
+        current.calls.filter(
+          (call) =>
+            call.includes("versions") && call.includes("upload") && !call.includes("--dry-run"),
+        ),
+      ).toHaveLength(1);
+      expect(
+        current.calls.filter((call) => call.includes("versions") && call.includes("deploy")),
+      ).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("public Worker status and apply fail closed on an unready provider executor", async () => {
     const current = fixture({ selectedTarget: executorTarget });
     const qualification = {
@@ -557,7 +775,7 @@ describe("split Takoserver Worker surfaces", () => {
   test("integration Worker dispatch resolves OAuth without exposing it to Wrangler", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-oauth-"));
     try {
-      const current = fixture();
+      const current = fixture({ selectedTarget: v2Target });
       const oauthToken = "worker-oauth-token-only-in-process";
       const calls: {
         readonly command: readonly string[];
@@ -577,7 +795,7 @@ describe("split Takoserver Worker surfaces", () => {
           environment: "integration",
           commit: COMMIT,
         },
-        target,
+        v2Target,
         {
           state: current.state,
           migrations: current.migrations,
@@ -586,6 +804,7 @@ describe("split Takoserver Worker surfaces", () => {
           cloudflareEnvironment: {},
           review: "reviewer@example.test",
           fetcher: publishedProductFetcher(),
+          integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
         },
       );
       expect(result).toMatchObject({ kind: "takoserver.worker-apply@v2", commit: COMMIT });
@@ -930,7 +1149,7 @@ describe("split Takoserver Worker surfaces", () => {
   test("authority cutover needs review then seals one bundle/config for one upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-authority-"));
     try {
-      const current = fixture({ diff: "src/auth.ts\n" });
+      const current = fixture({ diff: "src/auth.ts\n", selectedTarget: v2Target });
       const result = await runWorker(
         {
           surface: "takoserver-worker-authority-cutover",
@@ -938,13 +1157,14 @@ describe("split Takoserver Worker surfaces", () => {
           environment: "integration",
           commit: COMMIT,
         },
-        target,
+        v2Target,
         {
           ...current,
           review: "reviewer@example.test",
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           fetcher: publishedProductFetcher(),
+          integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
         },
       );
       expect(result).toMatchObject({
@@ -1047,14 +1267,14 @@ describe("split Takoserver Worker surfaces", () => {
   test("only the integration authority cutover adds one complete provenance-bound JIT profile", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-jit-authority-"));
     const authorityTarget = {
-      ...target,
+      ...v2Target,
       integrationE2eCredentialAuthority: {
         organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
         publicJwk: { kty: "OKP", crv: "Ed25519", x: "E".repeat(43) },
       },
     } satisfies DeployTarget;
     try {
-      const process = fixture({ diff: "src/auth.ts\n" });
+      const process = fixture({ diff: "src/auth.ts\n", selectedTarget: v2Target });
       const activeSigningDatabase = signingDatabase(`${"F".repeat(42)}A`);
       const state: WorkerState = {
         async workerDomains() {
@@ -1074,7 +1294,7 @@ describe("split Takoserver Worker surfaces", () => {
             return versionForTarget(
               versionId,
               `takoserver-worker:${LIVE_COMMIT}:${"c".repeat(64)}`,
-              target,
+              v2Target,
             );
           }
           const upload = process.calls.find((call) => call.includes("--no-bundle"));
@@ -1083,7 +1303,7 @@ describe("split Takoserver Worker surfaces", () => {
           return versionForTarget(versionId, message, authorityTarget);
         },
         async workerSecrets() {
-          return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
+          return expectedWorkerSecrets(v2Target).map((name) => ({ name, type: "secret_text" }));
         },
       };
 
@@ -1101,6 +1321,7 @@ describe("split Takoserver Worker surfaces", () => {
           state,
           outputDirectory: root,
           signingDatabase: activeSigningDatabase,
+          integrationStorageVerification: integrationStorageVerificationOptions(authorityTarget),
         },
       );
       expect(status).toMatchObject({
@@ -1143,6 +1364,7 @@ describe("split Takoserver Worker surfaces", () => {
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           fetcher: publishedProductFetcher(),
           signingDatabase: activeSigningDatabase,
+          integrationStorageVerification: integrationStorageVerificationOptions(authorityTarget),
         },
       );
       expect(result).toMatchObject({
@@ -1314,6 +1536,7 @@ describe("split Takoserver Worker surfaces", () => {
         beforeMessage: null,
         dirty: " M src/catalog.ts\0",
         legacyBeforeWithoutVersionMetadata: true,
+        selectedTarget: v2Target,
       });
       const result = await runWorker(
         {
@@ -1323,13 +1546,14 @@ describe("split Takoserver Worker surfaces", () => {
           commit: COMMIT,
           legacyPredecessorVersionId: VERSION_BEFORE,
         },
-        target,
+        v2Target,
         {
           ...current,
           review: "reviewer@example.test",
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           fetcher: publishedProductFetcher(),
+          integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
         },
       );
       expect(result).toMatchObject({
@@ -1351,11 +1575,12 @@ describe("split Takoserver Worker surfaces", () => {
           environment: "integration",
           commit: COMMIT,
         },
-        target,
+        v2Target,
         {
           ...current,
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
         },
       );
       expect(status).toMatchObject({ deployedCommit: COMMIT, commitMatches: true });
@@ -1452,6 +1677,7 @@ describe("split Takoserver Worker surfaces", () => {
       const current = fixture({
         dirty: " M src/catalog.ts\0",
         legacyBeforeWithoutVersionMetadata: true,
+        selectedTarget: v2Target,
       });
       const result = await runWorker(
         {
@@ -1461,13 +1687,14 @@ describe("split Takoserver Worker surfaces", () => {
           commit: COMMIT,
           legacyPredecessorVersionId: VERSION_BEFORE,
         },
-        target,
+        v2Target,
         {
           ...current,
           review: "reviewer@example.test",
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           fetcher: publishedProductFetcher(),
+          integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
         },
       );
       expect(result).toMatchObject({
@@ -1879,7 +2106,7 @@ describe("split Takoserver Worker surfaces", () => {
   test("an explicit selector does not downgrade a canonical predecessor", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-canonical-"));
     try {
-      const current = fixture();
+      const current = fixture({ selectedTarget: v2Target });
       const status = await runWorker(
         {
           surface: "takoserver-worker-authority-cutover",
@@ -1888,11 +2115,12 @@ describe("split Takoserver Worker surfaces", () => {
           commit: COMMIT,
           legacyPredecessorVersionId: VERSION_BEFORE,
         },
-        target,
+        v2Target,
         {
           ...current,
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
         },
       );
       expect(status).toMatchObject({
@@ -1914,13 +2142,14 @@ describe("split Takoserver Worker surfaces", () => {
           commit: COMMIT,
           legacyPredecessorVersionId: VERSION_BEFORE,
         },
-        target,
+        v2Target,
         {
           ...current,
           review: "reviewer@example.test",
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           fetcher: publishedProductFetcher(),
+          integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
         },
       );
       expect(result).toMatchObject({
@@ -2036,6 +2265,7 @@ describe("split Takoserver Worker surfaces", () => {
         beforeMessage: null,
         afterMessage: "not-canonical",
         legacyBeforeWithoutVersionMetadata: true,
+        selectedTarget: v2Target,
       });
       const failure = await runWorker(
         {
@@ -2045,13 +2275,14 @@ describe("split Takoserver Worker surfaces", () => {
           commit: COMMIT,
           legacyPredecessorVersionId: VERSION_BEFORE,
         },
-        target,
+        v2Target,
         {
           ...current,
           review: "reviewer@example.test",
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           fetcher: publishedProductFetcher(),
+          integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
         },
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
@@ -2070,6 +2301,7 @@ describe("split Takoserver Worker surfaces", () => {
         beforeMessage: null,
         afterMessage: "not-canonical",
         legacyBeforeWithoutVersionMetadata: true,
+        selectedTarget: v2Target,
       });
       const first = await runWorker(
         {
@@ -2079,13 +2311,14 @@ describe("split Takoserver Worker surfaces", () => {
           commit: COMMIT,
           legacyPredecessorVersionId: VERSION_BEFORE,
         },
-        target,
+        v2Target,
         {
           ...current,
           review: "reviewer@example.test",
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           fetcher: publishedProductFetcher(),
+          integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
         },
       ).catch((error) => error);
       expect(first).toBeInstanceOf(DeployError);
@@ -2099,11 +2332,12 @@ describe("split Takoserver Worker surfaces", () => {
           commit: COMMIT,
           legacyPredecessorVersionId: VERSION_BEFORE,
         },
-        target,
+        v2Target,
         {
           ...current,
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
         },
       ).catch((error) => error);
       expect(second).toBeInstanceOf(DeployError);
@@ -2191,8 +2425,9 @@ function version(
   id: string,
   message: string | null,
   bindingProfile: "current" | "legacy-pre-version-metadata" = "current",
+  selectedTarget: DeployTarget = target,
 ) {
-  const expected = expectedExactBindingClosure(target);
+  const expected = expectedExactBindingClosure(selectedTarget);
   return {
     id,
     ...(message === null

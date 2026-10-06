@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { canonicalJson } from "../../src/json.ts";
 import {
   artifactBlobIoSchemaAllowsPending,
   probeArtifactBlobIoQuiescence,
@@ -14,6 +15,11 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
+import {
+  type FreshV2ArtifactIntegrationStorageTargetProof,
+  type IntegrationStorageGenerationTargetVerificationOptions,
+  verifyFreshV2ArtifactIntegrationStorageTarget,
+} from "./integration-storage-generation.ts";
 import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
 import {
   type CommandResult,
@@ -96,6 +102,11 @@ export interface WorkerOptions {
   readonly signingDatabase?: Pick<SigningDatabase, "readKey">;
   /** Exact private-executor qualification seam; injectable only for portable tests. */
   readonly providerExecutorQualification?: WorkerProviderExecutorQualification;
+  /** Read-only generated-storage verifier inputs; injectable only for portable tests. */
+  readonly integrationStorageVerification?: Omit<
+    IntegrationStorageGenerationTargetVerificationOptions,
+    "run" | "cloudflareEnvironment" | "wranglerPath"
+  >;
 }
 
 /** Immutable, value-free projection read by public lifecycle code. */
@@ -251,6 +262,17 @@ export async function runWorker(
   // Before any live read or upload: the selected target must compose the
   // Worker the same way the Worker composes itself on its first request.
   await assertTargetComposes("preflight", target);
+  const v2StorageBefore =
+    target.takoformV2 === undefined
+      ? null
+      : await readFreshV2StorageProof(
+          "preflight",
+          target,
+          invocation.environment,
+          options,
+          run,
+          sourceRepositoryRoot,
+        );
   const cloudflareState =
     options.state === undefined
       ? new CloudflareState({
@@ -564,6 +586,26 @@ export async function runWorker(
         );
       }
     }
+    if (
+      target.artifactBlobIoMode === undefined &&
+      target.schemaMaintenanceMode === undefined &&
+      target.takoformV2 === undefined
+    ) {
+      throw preflightError(
+        "serving Worker publication requires explicit target.takoformV2.config and the separately installed TAKOSERVER_TAKOFORM_V2_CURSOR_KEY secret; select an integration v2 target before apply",
+      );
+    }
+    if (v2StorageBefore !== null) {
+      const finalStorage = await readFreshV2StorageProof(
+        "preflight",
+        target,
+        invocation.environment,
+        options,
+        run,
+        sourceRepositoryRoot,
+      );
+      assertFreshV2StorageProofUnchanged("preflight", v2StorageBefore, finalStorage);
+    }
     const message = `takoserver-worker:${source.commit}:${bundleDigestHex}`;
     let publication: WranglerVersionPublication | null;
     if (versionPublication) {
@@ -657,6 +699,17 @@ export async function runWorker(
     if (!workerSchemaAllowsPending(target, after.migrations, sourceRepositoryRoot)) {
       throw verificationError("Worker publication left pending D1 migrations");
     }
+    if (v2StorageBefore !== null) {
+      const servedStorage = await readFreshV2StorageProof(
+        "verification",
+        target,
+        invocation.environment,
+        options,
+        run,
+        sourceRepositoryRoot,
+      );
+      assertFreshV2StorageProofUnchanged("verification", v2StorageBefore, servedStorage);
+    }
     const providerExecutorAfter =
       providerExecutorQualification === null
         ? null
@@ -733,6 +786,50 @@ export async function runWorker(
     unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
+}
+
+async function readFreshV2StorageProof(
+  phase: "preflight" | "verification",
+  target: DeployTarget,
+  environment: DeployEnvironment,
+  options: WorkerOptions,
+  run: WorkerProcess,
+  sourceRepositoryRoot: string,
+): Promise<FreshV2ArtifactIntegrationStorageTargetProof> {
+  try {
+    return await verifyFreshV2ArtifactIntegrationStorageTarget(target, environment, {
+      ...options.integrationStorageVerification,
+      run,
+      ...(options.cloudflareEnvironment === undefined
+        ? {}
+        : { cloudflareEnvironment: options.cloudflareEnvironment }),
+      migrationDirectory:
+        options.integrationStorageVerification?.migrationDirectory ??
+        resolve(sourceRepositoryRoot, "migrations"),
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+    });
+  } catch {
+    throw phase === "preflight"
+      ? preflightError(
+          "v2 Worker requires the exact generated integration D1/R2 and fixed 0075 schema before publication",
+        )
+      : verificationError(
+          "v2 Worker storage readback no longer proves the generated D1/R2 and fixed 0075 schema",
+        );
+  }
+}
+
+function assertFreshV2StorageProofUnchanged(
+  phase: "preflight" | "verification",
+  before: FreshV2ArtifactIntegrationStorageTargetProof,
+  after: FreshV2ArtifactIntegrationStorageTargetProof,
+): void {
+  if (canonicalJson(before) === canonicalJson(after)) return;
+  throw phase === "preflight"
+    ? preflightError("generated v2 integration storage target or schema changed before publication")
+    : verificationError(
+        "generated v2 integration storage target or schema changed after publication",
+      );
 }
 
 export function providerExecutorQualificationReader(input: {
