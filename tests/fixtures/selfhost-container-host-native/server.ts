@@ -2,7 +2,6 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { buildApp } from "../../../src/app.ts";
-import { TEST_TAKOFORM_V2_CONFIG } from "../../helpers/takoform-v2-config.ts";
 import { buildEdgeForms } from "../../../src/edge-forms.ts";
 import { migrateSqlite } from "../../../src/migrate-sqlite.ts";
 import { createFileObjectStore } from "../../../src/objects-fs.ts";
@@ -14,6 +13,7 @@ import { createStandaloneProviderComposition } from "../../../src/standalone-pro
 import { createTakoformArtifacts } from "../../../src/takoform/artifacts.ts";
 import { currentTakoformCandidates } from "../../../src/takoform/current-candidates.ts";
 import type { WorkerdRuntime } from "../../../src/workerd-runtime.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "../../helpers/takoform-v2-config.ts";
 import { loadVerifiedLocalContainerCandidate } from "../selfhost-container-host-authority.ts";
 
 const required = (name: string): string => {
