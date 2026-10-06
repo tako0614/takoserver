@@ -531,22 +531,6 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   const v2Config = startupStage("runtime-configuration", () =>
     parseTakoformV2ApplicationConfig(env),
   );
-  if (
-    v2Config.sqliteMigrationSet !== undefined ||
-    v2Config.workerBundle !== undefined ||
-    v2Config.staticAssetBundle !== undefined
-  ) {
-    const unsupportedForms = [
-      ...(v2Config.sqliteMigrationSet !== undefined ? ["SQLiteMigrationSet"] : []),
-      ...(v2Config.workerBundle !== undefined ? ["WorkerBundle"] : []),
-      ...(v2Config.staticAssetBundle !== undefined ? ["StaticAssetBundle"] : []),
-    ];
-    startupStage("runtime-configuration", () => {
-      throw new TypeError(
-        `${unsupportedForms.join(" and ")} ${unsupportedForms.length === 1 ? "is" : "are"} not supported by this Worker runtime`,
-      );
-    });
-  }
   const signingKey = await loadSigningKey(
     env.TAKOSERVER_SIGNING_KEY_ID,
     env.TAKOSERVER_SIGNING_KEY,

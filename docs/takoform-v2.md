@@ -115,8 +115,9 @@ required configuration prevents startup; it does not select v1 or generate a
 new cursor key. This key protects pagination state, not Form publication or
 user authentication.
 
-The Bun entry can additionally select `sqliteMigrationSet`, `workerBundle`,
-and/or `staticAssetBundle`, each with a stable `targetKey` and `heldArtifacts`.
+Both normal Bun and Cloudflare Worker entries can select `sqliteMigrationSet`,
+`workerBundle`, and/or `staticAssetBundle`, each with a stable `targetKey` and
+`heldArtifacts`.
 Each entry contains `url`,
 lowercase hex `sha256`, `objectKey`, and explicit `grants: [{ principal, space }]`.
 For ordinary organization use those grants name `org:<organizationId>` and that
@@ -172,12 +173,12 @@ asset projection and held bytes, but does not serve those assets, attach them
 to a Worker, or create a public endpoint. Its configured target and source
 grants are explicit operator settings, independent of WorkerBundle.
 
-The current Worker entry accepts an omitted/empty Form map but refuses any
-configured artifact backend before accessing D1 or R2, until those Worker storage
-paths are qualified. That is a current implementation limit, not a restriction
-imposed by Takoform. Neither entry advertises WfP or Worker execution through
-this configuration. Bun's three artifact-only Forms are management and custody
-surfaces only; they do not serve assets or execute Workers.
+The normal Worker entry uses its D1 and R2 bindings for these three configured
+artifact-only Forms. An omitted Form block remains unsupported; an explicit
+empty `heldArtifacts` list permits management of existing custody but denies
+new source acquisition. Neither entry advertises WfP or Worker execution through
+this configuration. These Forms are management and custody surfaces only; they
+do not serve assets or execute Workers.
 Discovery declares offerings, previews and privateInputs unavailable. Common
 limits are a 1 MiB request, 100 items per page and a 24-hour replay window.
 
