@@ -278,6 +278,21 @@ URLs when held bytes are missing. Missing or changed custody remains unresolved.
 This held-byte connection does not yet register Worker Form backends or establish
 module execution, Binding capability, or complete Worker Form support.
 
+Static-only Versions have an explicit runtime representation rather than a
+synthetic tenant module. The projection verifies and copies the held asset
+manifest, observation and every file before handing them to the runtime. The
+runtime stages these assets with the Host-owned asset router, can select them
+alongside module-backed Versions in a weighted publication, and preserves their
+identity and bytes in its on-disk readback. Static paths and media types follow
+the v2 artifact contract; existing module-backed storage remains compatible.
+
+Portable static-runtime checks exercise generated routers, simulated readiness,
+and reconstruction from the same runtime files. They do not start the pinned
+native workerd binary or terminate and restart its OS process. Actual static
+serving, mixed-version dispatch, service Bindings and native restart recovery
+still need that separate qualification. Static-only support is one implementation
+path within WorkerVersion, not grounds to advertise the whole Form as supported.
+
 Forms can also calculate initial public output in a pure callback. That output
 is committed at acceptance, including before backend execution, and is not
 reallocated on replay or update. This supports the Endpoint requirement to retain
