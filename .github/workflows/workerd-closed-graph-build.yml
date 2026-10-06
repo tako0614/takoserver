@@ -29,6 +29,10 @@ jobs:
         with:
           bun-version-file: .bun-version
 
+      - name: Install and verify pinned libc++ headers
+        shell: bash
+        run: bash scripts/workerd-toolchain-prerequisites.sh
+
       - name: Verify exact compiler prerequisites and record runner capacity
         shell: bash
         run: |
