@@ -84,47 +84,7 @@ test("normal Worker entry exposes only configured artifact Forms through authent
     workerBundle: { targetKey: "entry-bundle-v1", heldArtifacts: artifacts[1]?.heldArtifacts },
     staticAssetBundle: { targetKey: "entry-assets-v1", heldArtifacts: artifacts[2]?.heldArtifacts },
   });
-  const build = await Bun.build({
-    entrypoints: [resolve(import.meta.dir, "helpers/takoform-v2-entry-worker-miniflare.ts")],
-    target: "browser",
-    format: "esm",
-  });
-  expect(build.success).toBe(true);
-  const bundle = build.outputs[0];
-  if (!bundle) throw new Error("missing Worker entry test bundle");
-  const runtime = new Miniflare({
-    workers: [
-      {
-        config: {
-          name: "artifact-entry-bindings-test",
-          type: "worker",
-          compatibilityDate: "2026-08-17",
-          compatibilityFlags: ["nodejs_compat"],
-          manifest: {
-            mainModule: "worker.js",
-            modules: {
-              "worker.js": {
-                type: "esm",
-                contents: await bundle.text(),
-              },
-            },
-          },
-          env: {
-            STATE_DB: { type: "d1", id: "artifact-entry-bindings-test" },
-            OBJECTS: { type: "r2", name: "artifact-entry-bindings-test" },
-            PUBLIC_ORIGIN: { type: "text", value: ORIGIN },
-            WORKER_VERSION: {
-              type: "json",
-              value: { id: "00000000-0000-4000-8000-0000000000a1" },
-            },
-            TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: { type: "text", value: "A".repeat(43) },
-            TAKOSERVER_TAKOFORM_V2_CONFIG: { type: "text", value: config },
-          },
-          triggers: [],
-        },
-      },
-    ],
-  });
+  const runtime = await entryRuntime(config, "artifact-entry-bindings-test");
   try {
     const database = await runtime.getD1Database("STATE_DB");
     for (const migration of MIGRATIONS) {
@@ -285,6 +245,153 @@ test("normal Worker entry exposes only configured artifact Forms through authent
     await runtime.dispose();
   }
 }, 120_000);
+
+test("configured artifact Forms refuse stale or table-only partial 0075 before accepting work", async () => {
+  const runtime = await entryRuntime(
+    JSON.stringify({
+      documentation: "https://docs.example.test/v2",
+      authenticationDocumentation: "https://docs.example.test/v2/authentication",
+      sqliteMigrationSet: { targetKey: "entry-sqlite-v1", heldArtifacts: [] },
+    }),
+    "artifact-entry-stale-schema-test",
+  );
+  try {
+    const database = await runtime.getD1Database("STATE_DB");
+    const progressIndex = MIGRATIONS.findIndex(
+      ({ name }) => name === "0075_v2_artifact_progress.sql",
+    );
+    if (progressIndex < 0) throw new Error("missing 0075 fixture migration");
+    for (const migration of MIGRATIONS.slice(0, progressIndex)) {
+      for (const statement of splitMigration(migration.sql)) {
+        await database.prepare(statement).run();
+      }
+    }
+    const sql = createD1Sql(database);
+    const now = new Date().toISOString();
+    await sql.run(
+      "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
+      [ORGANIZATION, "Artifact entry test", "principal-artifact-entry", now],
+    );
+    await sql.run(
+      "INSERT INTO auth_tokens (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at, revoked_at) VALUES (?, ?, 'api_key', ?, ?, ?, ?, ?, ?, NULL)",
+      [
+        await bytesDigest(new TextEncoder().encode(TOKEN)),
+        "key-artifact-entry",
+        "principal-artifact-entry",
+        ORGANIZATION,
+        "artifact-entry-test",
+        JSON.stringify(["resources:write"]),
+        now,
+        new Date(Date.now() + 3_600_000).toISOString(),
+      ],
+    );
+    const refuseBeforeAcceptance = async () => {
+      const support = await runtime.dispatchFetch(
+        `${BASE}/support?form=${encodeURIComponent(SQLITE_MIGRATION_SET_FORM_URL)}`,
+        { headers: { authorization: `Bearer ${TOKEN}` } },
+      );
+      expect(support.status).toBe(503);
+      expect(await support.json()).toMatchObject({
+        error: { code: "backend_unavailable", details: { reason: "runtime-configuration" } },
+      });
+      const create = await runtime.dispatchFetch(`${BASE}/resources`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TOKEN}`,
+          "content-type": "application/json",
+          "idempotency-key": "artifact-entry-stale-create-0001",
+        },
+        body: JSON.stringify({
+          form: SQLITE_MIGRATION_SET_FORM_URL,
+          space: ORGANIZATION,
+          name: "stale-refused",
+          spec: {
+            artifact: {
+              url: "https://artifacts.example.test/stale/manifest.json",
+              sha256: "a".repeat(64),
+            },
+          },
+        }),
+      });
+      expect(create.status).toBe(503);
+      expect(await sql.query("SELECT count(*) AS count FROM tf_v2_operations")).toEqual([
+        { count: 0 },
+      ]);
+    };
+
+    await refuseBeforeAcceptance();
+    const progressStatements = splitMigration(MIGRATIONS[progressIndex]?.sql ?? "");
+    const progressTable = progressStatements[0];
+    if (!progressTable?.startsWith("CREATE TABLE tf_v2_artifact_progress")) {
+      throw new Error("missing 0075 progress table fixture");
+    }
+    await database.prepare(progressTable).run();
+    await refuseBeforeAcceptance();
+    for (const statement of progressStatements.slice(1)) {
+      await database.prepare(statement).run();
+    }
+    for (const trigger of [
+      "tf_v2_artifact_progress_monotonic",
+      "tf_v2_artifact_progress_terminal_gc",
+      "tf_v2_artifact_chunk_lease_guard",
+    ]) {
+      const definition = progressStatements.find((statement) =>
+        statement.startsWith(`CREATE TRIGGER ${trigger}\n`),
+      );
+      if (!definition) throw new Error(`missing ${trigger} fixture definition`);
+      await database.prepare(`DROP TRIGGER ${trigger}`).run();
+      await refuseBeforeAcceptance();
+      await database.prepare(definition).run();
+    }
+    const qualified = await runtime.dispatchFetch(
+      `${BASE}/support?form=${encodeURIComponent(SQLITE_MIGRATION_SET_FORM_URL)}`,
+      { headers: { authorization: `Bearer ${TOKEN}` } },
+    );
+    expect(qualified.status).toBe(200);
+    expect(await qualified.json()).toMatchObject({ supported: true });
+  } finally {
+    await runtime.dispose();
+  }
+}, 120_000);
+
+async function entryRuntime(config: string, name: string): Promise<Miniflare> {
+  const build = await Bun.build({
+    entrypoints: [resolve(import.meta.dir, "helpers/takoform-v2-entry-worker-miniflare.ts")],
+    target: "browser",
+    format: "esm",
+  });
+  expect(build.success).toBe(true);
+  const bundle = build.outputs[0];
+  if (!bundle) throw new Error("missing Worker entry test bundle");
+  return new Miniflare({
+    workers: [
+      {
+        config: {
+          name,
+          type: "worker",
+          compatibilityDate: "2026-08-17",
+          compatibilityFlags: ["nodejs_compat"],
+          manifest: {
+            mainModule: "worker.js",
+            modules: { "worker.js": { type: "esm", contents: await bundle.text() } },
+          },
+          env: {
+            STATE_DB: { type: "d1", id: name },
+            OBJECTS: { type: "r2", name },
+            PUBLIC_ORIGIN: { type: "text", value: ORIGIN },
+            WORKER_VERSION: {
+              type: "json",
+              value: { id: "00000000-0000-4000-8000-0000000000a1" },
+            },
+            TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: { type: "text", value: "A".repeat(43) },
+            TAKOSERVER_TAKOFORM_V2_CONFIG: { type: "text", value: config },
+          },
+          triggers: [],
+        },
+      },
+    ],
+  });
+}
 
 async function settle(runtime: Miniflare, operationId: string): Promise<void> {
   for (let pass = 0; pass < 32; pass += 1) {

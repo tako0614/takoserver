@@ -173,12 +173,20 @@ asset projection and held bytes, but does not serve those assets, attach them
 to a Worker, or create a public endpoint. Its configured target and source
 grants are explicit operator settings, independent of WorkerBundle.
 
-The normal Worker entry uses its D1 and R2 bindings for these three configured
-artifact-only Forms. An omitted Form block remains unsupported; an explicit
-empty `heldArtifacts` list permits management of existing custody but denies
-new source acquisition. Neither entry advertises WfP or Worker execution through
-this configuration. These Forms are management and custody surfaces only; they
-do not serve assets or execute Workers.
+The normal Worker entry has a D1/R2 composition path for these three configured
+artifact-only Forms. It refuses startup before support or Operation acceptance
+unless D1 has the complete 0075 artifact-progress table and its progress,
+lease, monotonicity and cleanup trigger closure. An omitted Form block remains
+unsupported; an explicit empty `heldArtifacts` list permits management of
+existing custody but denies new source acquisition. The current owning deploy
+contract applies at most 0066 to existing/integration D1 and 0069 to a fresh
+production D1; 0075 is only in the audited source inventory. Thus this Worker
+path is source/local-test qualified, not currently publishable as a working
+artifact Form through the owning deploy path. A separately authorized schema
+wave must precede enabling any of the three Form blocks in a deployment.
+Neither entry advertises WfP or Worker execution through this configuration.
+These Forms are management and custody surfaces only; they do not serve assets
+or execute Workers.
 Discovery declares offerings, previews and privateInputs unavailable. Common
 limits are a 1 MiB request, 100 items per page and a 24-hour replay window.
 
