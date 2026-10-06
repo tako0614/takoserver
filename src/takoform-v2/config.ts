@@ -13,6 +13,7 @@ export interface V2ApplicationConfig {
   readonly authenticationDocumentation: string;
   readonly sqliteMigrationSet?: V2HeldArtifactBackendConfig;
   readonly workerBundle?: V2HeldArtifactBackendConfig;
+  readonly staticAssetBundle?: V2HeldArtifactBackendConfig;
 }
 
 export interface V2HeldArtifactBackendConfig {
@@ -70,7 +71,7 @@ export function parseTakoformV2ApplicationConfig(
     !hasExactKeys(
       record,
       ["documentation", "authenticationDocumentation"],
-      ["sqliteMigrationSet", "workerBundle"],
+      ["sqliteMigrationSet", "workerBundle", "staticAssetBundle"],
     )
   ) {
     throw new V2ApplicationConfigError("invalid_configuration");
@@ -87,12 +88,17 @@ export function parseTakoformV2ApplicationConfig(
   if (Object.hasOwn(record, "workerBundle")) {
     workerBundle = parseHeldArtifactBackendConfig(record.workerBundle);
   }
+  let staticAssetBundle: V2ApplicationConfig["staticAssetBundle"];
+  if (Object.hasOwn(record, "staticAssetBundle")) {
+    staticAssetBundle = parseHeldArtifactBackendConfig(record.staticAssetBundle);
+  }
   return {
     cursorSigningKey: new Uint8Array(cursorKey),
     documentation: record.documentation,
     authenticationDocumentation: record.authenticationDocumentation,
     ...(sqliteMigrationSet ? { sqliteMigrationSet } : {}),
     ...(workerBundle ? { workerBundle } : {}),
+    ...(staticAssetBundle ? { staticAssetBundle } : {}),
   };
 }
 

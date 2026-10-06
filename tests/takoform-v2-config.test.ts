@@ -21,6 +21,7 @@ describe("Takoform v2 application configuration", () => {
     expect(config.cursorSigningKey).toEqual(new Uint8Array(32));
     expect(config.sqliteMigrationSet).toBeUndefined();
     expect(config.workerBundle).toBeUndefined();
+    expect(config.staticAssetBundle).toBeUndefined();
   });
 
   test("preserves only explicitly configured migration target, sources, and grants", () => {
@@ -106,6 +107,50 @@ describe("Takoform v2 application configuration", () => {
     });
   });
 
+  test("preserves explicit StaticAssetBundle source identity and grants", () => {
+    const heldArtifact = {
+      url: "https://Artifacts.example.invalid/assets/manifest.json",
+      sha256: "3".repeat(64),
+      objectKey: "operator-held/static-assets-manifest",
+      grants: [{ principal: "org:org-c", space: "org-c" }],
+    };
+    const config = parseTakoformV2ApplicationConfig({
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/authentication",
+        staticAssetBundle: {
+          targetKey: "operator-static-assets-target",
+          heldArtifacts: [heldArtifact],
+        },
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: CURSOR_KEY,
+    });
+
+    expect(config.staticAssetBundle).toEqual({
+      targetKey: "operator-static-assets-target",
+      heldArtifacts: [heldArtifact],
+    });
+  });
+
+  test("allows explicit StaticAssetBundle deny-all while preserving omitted distinction", () => {
+    const config = parseTakoformV2ApplicationConfig({
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/authentication",
+        staticAssetBundle: {
+          targetKey: "operator-static-assets-target",
+          heldArtifacts: [],
+        },
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: CURSOR_KEY,
+    });
+
+    expect(config.staticAssetBundle).toEqual({
+      targetKey: "operator-static-assets-target",
+      heldArtifacts: [],
+    });
+  });
+
   test("fails closed for missing, partial, unknown, duplicate, or malformed configuration", () => {
     const validConfig = {
       documentation: "https://docs.example.invalid/takoform-v2",
@@ -144,6 +189,10 @@ describe("Takoform v2 application configuration", () => {
       JSON.stringify({
         ...validConfig,
         workerBundle: { targetKey: "operator-worker-bundle-target" },
+      }),
+      JSON.stringify({
+        ...validConfig,
+        staticAssetBundle: { targetKey: "operator-static-assets-target" },
       }),
     ];
 

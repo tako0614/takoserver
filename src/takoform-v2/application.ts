@@ -5,6 +5,8 @@ import type { V2ApplicationConfig } from "./config.ts";
 import { createV2HeldArtifactSource } from "./forms/artifact-source.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "./forms/sqlite-migration-set.ts";
 import { createSQLiteMigrationSetForm } from "./forms/sqlite-migration-set-backend.ts";
+import { STATIC_ASSET_BUNDLE_FORM_URL } from "./forms/static-asset-bundle.ts";
+import { createStaticAssetBundleForm } from "./forms/static-asset-bundle-backend.ts";
 import { WORKER_BUNDLE_FORM_URL } from "./forms/worker-bundle.ts";
 import { createWorkerBundleForm } from "./forms/worker-bundle-backend.ts";
 import { createTakoformV2Host } from "./host.ts";
@@ -42,6 +44,17 @@ export function createTakoformV2Application(options: {
       sql,
       source,
       targetKey: config.workerBundle.targetKey,
+    });
+  }
+  if (config.staticAssetBundle) {
+    const source = createV2HeldArtifactSource({
+      objects,
+      entries: config.staticAssetBundle.heldArtifacts,
+    });
+    forms[STATIC_ASSET_BUNDLE_FORM_URL] = createStaticAssetBundleForm({
+      sql,
+      source,
+      targetKey: config.staticAssetBundle.targetKey,
     });
   }
   return createTakoformV2Host({

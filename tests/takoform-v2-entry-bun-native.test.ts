@@ -7,6 +7,7 @@ import { base64UrlEncode, bytesDigest } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
+import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
 
 const OPT_IN = process.env.TAKOSERVER_V2_ENTRY_NATIVE;
@@ -21,6 +22,10 @@ const BUNDLE_MANIFEST_URL = "https://artifacts.example.test/worker-bundle-manife
 const BUNDLE_FILE_URL = "https://artifacts.example.test/worker.js";
 const BUNDLE_MANIFEST_KEY = "operator-held/v2/worker-bundle-manifest";
 const BUNDLE_FILE_KEY = "operator-held/v2/worker.js";
+const ASSET_MANIFEST_URL = "https://artifacts.example.test/static-asset-manifest.json";
+const ASSET_FILE_URL = "https://artifacts.example.test/assets/site.css";
+const ASSET_MANIFEST_KEY = "operator-held/v2/static-asset-manifest";
+const ASSET_FILE_KEY = "operator-held/v2/assets/site.css";
 const CURSOR_KEY = base64UrlEncode(new Uint8Array(32).fill(0x74));
 
 type Child = ReturnType<typeof Bun.spawn>;
@@ -29,6 +34,7 @@ type Json = Record<string, unknown>;
 function fixtureConfig(
   heldArtifacts?: readonly Json[],
   workerBundleHeldArtifacts?: readonly Json[],
+  staticAssetBundleHeldArtifacts?: readonly Json[],
 ) {
   return JSON.stringify({
     documentation: "https://docs.example.test/takoform-v2",
@@ -47,6 +53,14 @@ function fixtureConfig(
           workerBundle: {
             targetKey: "native-entry-worker-bundle-v1",
             heldArtifacts: workerBundleHeldArtifacts,
+          },
+        }),
+    ...(staticAssetBundleHeldArtifacts === undefined
+      ? {}
+      : {
+          staticAssetBundle: {
+            targetKey: "native-entry-static-assets-v1",
+            heldArtifacts: staticAssetBundleHeldArtifacts,
           },
         }),
   });
@@ -78,6 +92,47 @@ function expectWorkerBundleCustody(
 
     expect(owner).toEqual({
       form_url: WORKER_BUNDLE_FORM_URL,
+      manifest_sha256: manifestSha256,
+      state: "verified",
+    });
+    expect(
+      database
+        .query(
+          "SELECT count(*) AS chunks, coalesce(sum(length(bytes)), 0) AS byte_count FROM tf_v2_artifact_chunks WHERE resource_uid = ?",
+        )
+        .get(resourceUid),
+    ).toEqual({ chunks: 1, byte_count: fileBytes });
+  } finally {
+    database.close();
+  }
+}
+
+function expectStaticAssetBundleCustody(
+  root: string,
+  resourceUid: string,
+  manifestSha256: string,
+  fileBytes: number,
+  exists: boolean,
+): void {
+  const database = new Database(join(root, "control.sqlite"), { readonly: true });
+  try {
+    const owner = database
+      .query(
+        "SELECT form_url, manifest_sha256, state FROM tf_v2_artifact_owners WHERE resource_uid = ?",
+      )
+      .get(resourceUid) as Json | null;
+    if (!exists) {
+      expect(owner).toBeNull();
+      expect(
+        database
+          .query("SELECT count(*) AS chunks FROM tf_v2_artifact_chunks WHERE resource_uid = ?")
+          .get(resourceUid),
+      ).toEqual({ chunks: 0 });
+      return;
+    }
+
+    expect(owner).toEqual({
+      form_url: STATIC_ASSET_BUNDLE_FORM_URL,
       manifest_sha256: manifestSha256,
       state: "verified",
     });
@@ -205,7 +260,7 @@ async function settled(port: number, token: string, operationId: string): Promis
 }
 
 test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
-  "normal Bun entry serves v2 SQLite Migration Set and WorkerBundle over loopback behind HTTPS authority",
+  "normal Bun entry manages v2 artifact Forms over loopback behind HTTPS authority",
   async () => {
     if (OPT_IN !== "1") {
       throw new Error("TAKOSERVER_V2_ENTRY_NATIVE must be exactly 1");
@@ -289,6 +344,21 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
         }),
       );
       const bundleManifestSha256 = (await bytesDigest(bundleManifestBytes)).slice(7);
+      const assetFileBytes = new TextEncoder().encode("body { color: #124; }\n");
+      const assetFileSha256 = (await bytesDigest(assetFileBytes)).slice(7);
+      const assetManifestBytes = new TextEncoder().encode(
+        JSON.stringify({
+          files: [
+            {
+              path: "public/site.css",
+              url: ASSET_FILE_URL,
+              sha256: assetFileSha256,
+              mediaType: "text/css",
+            },
+          ],
+        }),
+      );
+      const assetManifestSha256 = (await bytesDigest(assetManifestBytes)).slice(7);
       const objects = createFileObjectStore({ root });
       expect(
         await objects.create(MANIFEST_KEY, manifestBytes, { contentType: "application/json" }),
@@ -305,6 +375,14 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
         await objects.create(BUNDLE_FILE_KEY, bundleFileBytes, {
           contentType: "application/javascript+module",
         }),
+      ).not.toBeNull();
+      expect(
+        await objects.create(ASSET_MANIFEST_KEY, assetManifestBytes, {
+          contentType: "application/json",
+        }),
+      ).not.toBeNull();
+      expect(
+        await objects.create(ASSET_FILE_KEY, assetFileBytes, { contentType: "text/css" }),
       ).not.toBeNull();
       const grants = [{ principal: `org:${organizationId}`, space: organizationId }];
       const configured = fixtureConfig(
@@ -326,6 +404,20 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
             grants,
           },
         ],
+        [
+          {
+            url: ASSET_MANIFEST_URL,
+            sha256: assetManifestSha256,
+            objectKey: ASSET_MANIFEST_KEY,
+            grants,
+          },
+          {
+            url: ASSET_FILE_URL,
+            sha256: assetFileSha256,
+            objectKey: ASSET_FILE_KEY,
+            grants,
+          },
+        ],
       );
       serving = await startHost(root, port, configured);
       expect((await requestAt(port, "/.well-known/takoform/v1")).status).toBe(404);
@@ -336,6 +428,16 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
           port,
           "GET",
           `${V2}/support?form=${encodeURIComponent(SQLITE_MIGRATION_SET_FORM_URL)}`,
+          200,
+          undefined,
+          auth,
+        ),
+      ).toMatchObject({ supported: true });
+      expect(
+        await jsonAt(
+          port,
+          "GET",
+          `${V2}/support?form=${encodeURIComponent(STATIC_ASSET_BUNDLE_FORM_URL)}`,
           200,
           undefined,
           auth,
@@ -431,6 +533,66 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
         true,
       );
 
+      const assetSpec = {
+        artifact: { url: ASSET_MANIFEST_URL, sha256: assetManifestSha256 },
+      };
+      const assetCreateBody = {
+        form: STATIC_ASSET_BUNDLE_FORM_URL,
+        space: organizationId,
+        name: "site-assets",
+        spec: assetSpec,
+      };
+      const assetCreateHeaders = {
+        ...auth,
+        "idempotency-key": "native-entry-assets-create-0001",
+      };
+      const assetCreate = await jsonAt(
+        port,
+        "POST",
+        `${V2}/resources`,
+        202,
+        assetCreateBody,
+        assetCreateHeaders,
+      );
+      const assetResourceUid = String(assetCreate.resourceUid);
+      expect(await settled(port, secret, String(assetCreate.id))).toMatchObject({
+        effect: "complete",
+      });
+      const assetBeforeRestart = await jsonAt(
+        port,
+        "GET",
+        `${V2}/resources/${assetResourceUid}`,
+        200,
+        undefined,
+        auth,
+      );
+      expect(assetBeforeRestart).toMatchObject({
+        uid: assetResourceUid,
+        generation: 1,
+        observedGeneration: 1,
+        observed: {
+          manifestSha256: assetManifestSha256,
+          fileCount: 1,
+          totalBytes: assetFileBytes.byteLength,
+          files: [
+            {
+              path: "public/site.css",
+              sha256: assetFileSha256,
+              mediaType: "text/css",
+              byteSize: assetFileBytes.byteLength,
+            },
+          ],
+        },
+        output: {},
+      });
+      expectStaticAssetBundleCustody(
+        root,
+        assetResourceUid,
+        assetManifestSha256,
+        assetFileBytes.byteLength,
+        true,
+      );
+
       // A normal entry restart retains Resource, Operation replay, and SQL
       // custody even though neither original held source object is available.
       const firstServingPid = serving.pid;
@@ -440,6 +602,8 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
       expect(await objects.delete(FILE_KEY)).toBe(true);
       expect(await objects.delete(BUNDLE_MANIFEST_KEY)).toBe(true);
       expect(await objects.delete(BUNDLE_FILE_KEY)).toBe(true);
+      expect(await objects.delete(ASSET_MANIFEST_KEY)).toBe(true);
+      expect(await objects.delete(ASSET_FILE_KEY)).toBe(true);
       serving = await startHost(root, port, configured);
       expect(serving.pid).not.toBe(firstServingPid);
       expect(
@@ -486,6 +650,39 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
         bundleFileBytes.byteLength,
         true,
       );
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${assetResourceUid}`, 200, undefined, auth),
+      ).toEqual(assetBeforeRestart);
+      expect(
+        await jsonAt(
+          port,
+          "GET",
+          `${V2}/operations/${String(assetCreate.id)}`,
+          200,
+          undefined,
+          auth,
+        ),
+      ).toMatchObject({
+        id: assetCreate.id,
+        resourceUid: assetResourceUid,
+        status: "succeeded",
+        effect: "complete",
+      });
+      expect(
+        await jsonAt(port, "POST", `${V2}/resources`, 200, assetCreateBody, assetCreateHeaders),
+      ).toMatchObject({
+        id: assetCreate.id,
+        resourceUid: assetResourceUid,
+        generation: 1,
+        status: "succeeded",
+      });
+      expectStaticAssetBundleCustody(
+        root,
+        assetResourceUid,
+        assetManifestSha256,
+        assetFileBytes.byteLength,
+        true,
+      );
 
       // Same-spec update and deletion continue from held SQL bytes.
       const update = await jsonAt(
@@ -514,6 +711,21 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
         },
       );
       expect(await settled(port, secret, String(bundleUpdate.id))).toMatchObject({
+        effect: "complete",
+      });
+      const assetUpdate = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${assetResourceUid}`,
+        202,
+        { spec: assetSpec },
+        {
+          ...auth,
+          "idempotency-key": "native-entry-assets-update-0001",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(await settled(port, secret, String(assetUpdate.id))).toMatchObject({
         effect: "complete",
       });
       const deletion = await jsonAt(
@@ -546,6 +758,21 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
       expect(await settled(port, secret, String(bundleDeletion.id))).toMatchObject({
         effect: "complete",
       });
+      const assetDeletion = await jsonAt(
+        port,
+        "DELETE",
+        `${V2}/resources/${assetResourceUid}`,
+        202,
+        undefined,
+        {
+          ...auth,
+          "idempotency-key": "native-entry-assets-delete-0001",
+          "takoform-expected-generation": "2",
+        },
+      );
+      expect(await settled(port, secret, String(assetDeletion.id))).toMatchObject({
+        effect: "complete",
+      });
       const gone = await requestAt(port, `${V2}/resources/${resourceUid}`, { headers: auth });
       expect(gone.status).toBe(410);
       await gone.arrayBuffer();
@@ -554,11 +781,23 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
       });
       expect(bundleGone.status).toBe(410);
       await bundleGone.arrayBuffer();
+      const assetGone = await requestAt(port, `${V2}/resources/${assetResourceUid}`, {
+        headers: auth,
+      });
+      expect(assetGone.status).toBe(410);
+      await assetGone.arrayBuffer();
       expectWorkerBundleCustody(
         root,
         bundleResourceUid,
         bundleManifestSha256,
         bundleFileBytes.byteLength,
+        false,
+      );
+      expectStaticAssetBundleCustody(
+        root,
+        assetResourceUid,
+        assetManifestSha256,
+        assetFileBytes.byteLength,
         false,
       );
     } finally {

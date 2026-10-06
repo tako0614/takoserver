@@ -302,6 +302,14 @@ export interface WorkerdDeploymentPublication {
   readonly versions: readonly WorkerdDeploymentVariant[];
 }
 
+/** The whole logical identity to compare with one proven serving publication. */
+export interface WorkerdPublicationIdentity {
+  readonly generation: string;
+  readonly workerResourceUid: string;
+  readonly hostnames: readonly string[];
+  readonly versions: readonly SelfhostWeightedVersion[];
+}
+
 /** Exact weighted identity behind the runtime's committed stable pointer. */
 export interface WorkerdActiveDeployment {
   readonly generation: string;
@@ -373,6 +381,18 @@ export interface WorkerdRuntime {
    * absent; a provider may then refuse weighted publication before mutation.
    */
   publish?(name: string, publication: WorkerdDeploymentPublication | null): Promise<void>;
+  /**
+   * Resolve under this process's activation lock and refuse a lost caller fence.
+   * The lock is not an interprocess writer fence; the owning composition must
+   * keep one writer or supply its own independently proven exclusion.
+   */
+  publishFenced?(
+    name: string,
+    resolvePublication: (
+      current: WorkerdPublicationIdentity | null,
+    ) => Promise<WorkerdDeploymentPublication | null>,
+    isFenceCurrent: () => Promise<boolean>,
+  ): Promise<void>;
   /** Atomically reserves Actor capacity, commits Provider state, and publishes. */
   publishActorDeployment?(
     name: string,
@@ -403,6 +423,11 @@ export interface WorkerdRuntime {
       | { readonly kind: "version"; readonly versionId: string }
       | { readonly kind: "hostname"; readonly hostname: string },
   ): Promise<"present" | "absent" | "unknown">;
+  /** Compare a complete weighted identity, or prove absence when expected is null. */
+  observeExactPublication?(
+    name: string,
+    expected: WorkerdPublicationIdentity | null,
+  ): Promise<"matches" | "different" | "unknown">;
   /**
    * Asks one published script a question over the router this runtime serves.
    *
@@ -944,8 +969,10 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
   const writeRendered = async (
     published: readonly PublishedDeployment[],
     workflowGraph: WorkflowForwardRuntimeGraph,
+    assertFence?: () => Promise<void>,
   ): Promise<void> => {
     await options.actorForwardLifecycle?.prepare(actorForwardPublications(published));
+    await assertFence?.();
     const actorSockets = actorForwardSockets();
     if (serviceSocketDirectory !== undefined) {
       await requireSocketRoot();
@@ -987,6 +1014,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       immutableHelpers,
     );
     await privateDirectory(dirname(configPath));
+    await assertFence?.();
     // The rendered configuration contains every binding value, sensitive ones
     // included, so it is created `0600` and moved into place atomically.
     await writePrivate(
@@ -1085,6 +1113,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       readonly commitAfterActivation?: boolean;
     },
     preparedWorkflow?: PreparedWorkflowForwardGraph,
+    assertFence?: () => Promise<void>,
   ): Promise<void> => {
     requireCertainRuntime();
     let workflowGraph: WorkflowForwardRuntimeGraph;
@@ -1104,6 +1133,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     const initialSocketTransition = privateSocketTransition;
     let graphProved = false;
     let workflowAdmissionRejected = false;
+    let effectStarted = false;
     try {
       const before = activated(previous);
       const after = activated(published);
@@ -1118,16 +1148,27 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       // A watcher may begin serving the new config before its stable pointer
       // commits. Clear only the changing scripts first so an external event
       // selector cannot mistake either side of that crossing for committed.
+      await assertFence?.();
+      effectStarted = true;
       if (changed) await writeActivation(activationPath, indeterminate);
-      await writeRendered(published, workflowGraph);
+      await assertFence?.();
+      await writeRendered(published, workflowGraph, assertFence);
+      await assertFence?.();
       await options.onReload?.(configPath);
       await proveRendered(published, workflowGraph);
       graphProved = options.onReload !== undefined;
+      if (assertFence && options.isReady?.() !== true) {
+        throw new Error("worker runtime is not ready");
+      }
+      await assertFence?.();
       if (!pointer?.commitAfterActivation) await pointer?.commit();
+      await assertFence?.();
       await writeActivation(activationPath, activated(published));
+      await assertFence?.();
       // Retiring a validated scalar carrier is the final fallible operation.
       // Its absence must not precede a marker write that could still fail.
       if (pointer?.commitAfterActivation) await pointer.commit();
+      await assertFence?.();
       retainRenderedRouters(published);
       options.actorForwardLifecycle?.activated(actorForwardPublications(published));
       if (
@@ -1137,7 +1178,12 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         workflowAdmissionRejected = true;
         throw new Error("Workflow forward graph could not be admitted");
       }
+      await assertFence?.();
+      if (assertFence && options.isReady?.() !== true) {
+        throw new Error("worker runtime is not ready");
+      }
     } catch (failure) {
+      if (!effectStarted) throw failure;
       if (workflowAdmissionRejected) {
         if (serviceSocketDirectory !== undefined) privateSocketUncertain = true;
         await clearFailedActorActivation(failure);
@@ -1463,9 +1509,22 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         );
       });
     },
-    async publish(name, publication, commitDesiredState?: () => Promise<void>) {
+    async publish(
+      name,
+      publication,
+      commitDesiredState?: () => Promise<void>,
+      fenced?: {
+        readonly resolve: (
+          current: WorkerdPublicationIdentity | null,
+        ) => Promise<WorkerdDeploymentPublication | null>;
+        readonly assert: () => Promise<void>;
+      },
+    ) {
       requireCertainRuntime();
       const directory = scriptDirectory(name);
+      if (fenced && (options.onReload === undefined || options.isReady === undefined)) {
+        throw new Error("fenced worker publication requires serving proof");
+      }
       if (
         commitDesiredState &&
         (publication === null ||
@@ -1489,6 +1548,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       // always serialized so two valid publishes cannot each render a graph
       // missing the other. Private staging also shares the uncertainty fence.
       const concurrentStaged =
+        fenced ||
         publication === null ||
         serviceSocketDirectory !== undefined ||
         commitDesiredState ||
@@ -1497,7 +1557,22 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           : await stageDeployment(name, publication);
       await exclusiveActivation(async () => {
         requireCertainRuntime();
+        await fenced?.assert();
         const previous = await readPublished(scriptsRoot, assetsRoot);
+        if (fenced) {
+          await fenced.assert();
+          const carrier = await lstat(pointerPath).catch((error: unknown) => {
+            if ((error as { readonly code?: unknown }).code === "ENOENT") return null;
+            throw error;
+          });
+          if (carrier && !previous.some((entry) => entry.name === name)) {
+            throw new Error("current worker publication cannot be read");
+          }
+          publication = await fenced.resolve(
+            exactPublishedIdentity(previous.find((entry) => entry.name === name)),
+          );
+          await fenced.assert();
+        }
         let reservation: { release(): Promise<void> } | undefined;
         let preparedWorkflow: PreparedWorkflowForwardGraph | undefined;
         try {
@@ -1511,15 +1586,16 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
             preparedWorkflow = await prepareWorkflowForwardGraph(targetWorkflowPublications);
           }
           if (commitDesiredState && publication) {
+            const actorPublication = publication;
             if (!options.actorForwardLifecycle?.reserve)
               throw new Error("Actor forward capacity reservation unavailable");
-            const proposed = publication.versions.flatMap((version) =>
+            const proposed = actorPublication.versions.flatMap((version) =>
               version.site.actorForward === undefined
                 ? []
                 : [
                     {
                       script: name,
-                      workerResourceUid: publication.workerResourceUid,
+                      workerResourceUid: actorPublication.workerResourceUid,
                       versionId: version.versionId,
                       workerVersionResourceUid: version.workerVersionUid,
                       bindings: validActorForward(version.site.actorForward).bindings,
@@ -1534,16 +1610,19 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
             ]);
           }
           await commitDesiredState?.();
+          await fenced?.assert();
           // Private publication staging shares the uncertain-state fence. It
           // cannot keep writing after another activation invalidates this Host.
           const staged =
-            (serviceSocketDirectory !== undefined ||
+            (fenced ||
+              serviceSocketDirectory !== undefined ||
               commitDesiredState ||
               options.workflowForwardLifecycle !== undefined) &&
             publication !== null
               ? await stageDeployment(name, publication)
               : concurrentStaged;
           const beforePointer = await readFile(pointerPath, "utf8").catch(() => null);
+          await fenced?.assert();
           const next = (
             staged === null
               ? previous.filter((entry) => entry.name !== name)
@@ -1595,6 +1674,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
                 },
               },
               preparedWorkflow,
+              fenced?.assert,
             );
           } catch (failure) {
             if (retiredCarrier !== undefined && !retirementCommitted) {
@@ -1618,7 +1698,36 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
             await preparedWorkflow?.lease.release();
           }
         }
+        // Lease release is awaited after activation. If authority is lost in
+        // that tail, the prior pointer cannot be rolled back through activate's
+        // transaction. Revoke serving claims and report uncertainty instead.
+        if (fenced) {
+          try {
+            await fenced.assert();
+          } catch (failure) {
+            await clearFailedActorActivation(failure);
+            throw failure;
+          }
+        }
       });
+    },
+    async publishFenced(name, resolvePublication, isFenceCurrent) {
+      const assert = async (): Promise<void> => {
+        if (!(await isFenceCurrent())) throw new Error("worker publication fence lost");
+      };
+      await (
+        this.publish as (
+          name: string,
+          publication: WorkerdDeploymentPublication | null,
+          commit: undefined,
+          fenced: {
+            readonly resolve: (
+              current: WorkerdPublicationIdentity | null,
+            ) => Promise<WorkerdDeploymentPublication | null>;
+            readonly assert: () => Promise<void>;
+          },
+        ) => Promise<void>
+      )(name, null, undefined, { resolve: resolvePublication, assert });
     },
     async publishActorDeployment(name, publication, commitDesiredState) {
       // The ordinary publish entry remains the same two-argument public port;
@@ -1858,6 +1967,59 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
             return scalar.activeVersion === subject.versionId ? "present" : "absent";
           }
           return "present";
+        } catch {
+          return "unknown";
+        }
+      });
+    },
+
+    async observeExactPublication(name, expected) {
+      // Validate caller identity before treating any mismatch as factual absence.
+      scriptDirectory(name);
+      if (expected !== null) capnpText(expected.generation);
+      const requested =
+        expected === null
+          ? null
+          : {
+              generation: expected.generation,
+              workerResourceUid: validWorkerResourceUid(expected.workerResourceUid),
+              hostnames: [...validDeploymentHostnames(expected.hostnames)].sort(),
+              versions: canonicalSelfhostWeightedVersions(expected.versions),
+            };
+      return await exclusiveActivation(async () => {
+        if (
+          privateSocketUncertain ||
+          options.onReload === undefined ||
+          options.isReady?.() !== true
+        ) {
+          return "unknown";
+        }
+        try {
+          const published = await readPublished(scriptsRoot, assetsRoot);
+          const publications = workflowForwardPublications(published);
+          const sockets = copyWorkflowForwardSockets(
+            options.workflowForwardSockets?.(publications),
+          );
+          const workflowGraph = {
+            publications,
+            sockets,
+            services: resolveWorkflowForwardServices(published, publications, sockets),
+          };
+          if (!(await renderedConfirmed(published, workflowGraph))) return "unknown";
+          if (privateSocketUncertain || options.isReady() !== true) return "unknown";
+          const entry = published.find((candidate) => candidate.name === name);
+          const active = await readActivationStrict(activationPath);
+          if (active[name] !== (entry?.generation ?? undefined)) return "unknown";
+          if (requested === null) return entry === undefined ? "matches" : "different";
+          if (!entry) return "different";
+          if (!entry.weighted) return "different";
+          const current = exactPublishedIdentity(entry);
+          return current?.generation === requested.generation &&
+            current.workerResourceUid === requested.workerResourceUid &&
+            JSON.stringify(current.hostnames) === JSON.stringify(requested.hostnames) &&
+            JSON.stringify(current.versions) === JSON.stringify(requested.versions)
+            ? "matches"
+            : "different";
         } catch {
           return "unknown";
         }
@@ -3680,6 +3842,28 @@ interface PublishedDeployment {
   readonly hostnames: readonly string[];
   readonly weighted: boolean;
   readonly variants: readonly PublishedVariant[];
+}
+
+function exactPublishedIdentity(
+  entry: PublishedDeployment | undefined,
+): WorkerdPublicationIdentity | null {
+  if (entry === undefined) return null;
+  if (!entry.weighted || entry.generation === undefined || entry.workerResourceUid === undefined) {
+    throw new Error("current worker publication has no weighted identity");
+  }
+  capnpText(entry.generation);
+  return {
+    generation: entry.generation,
+    workerResourceUid: validWorkerResourceUid(entry.workerResourceUid),
+    hostnames: [...validDeploymentHostnames(entry.hostnames)].sort(),
+    versions: canonicalSelfhostWeightedVersions(
+      entry.variants.map((variant) => ({
+        versionId: variant.versionId,
+        workerVersionUid: variant.workerVersionUid,
+        weight: variant.weight,
+      })),
+    ),
+  };
 }
 
 /**

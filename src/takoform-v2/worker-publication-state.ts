@@ -1,0 +1,613 @@
+import { canonicalJson } from "../json.ts";
+import type { Clock, JsonObject, Sql } from "../ports.ts";
+import {
+  MODULE_WORKER_FORM_URL,
+  parseModuleWorkerSpec,
+  parseWorkerDeploymentSpec,
+  parseWorkerEndpointSpec,
+  parseWorkerVersionSpec,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+  WORKER_VERSION_FORM_URL,
+  type WorkerDeploymentSpec,
+  type WorkerEndpointSpec,
+  type WorkerVersionSpec,
+} from "./forms/worker-specs.ts";
+import type { OperationRow, ResourceRow } from "./store.ts";
+import type { V2Execution } from "./types.ts";
+
+/** A read-only SQL authority for one fenced private Worker publication. */
+export interface V2WorkerPublicationSnapshot {
+  readonly sourceOperationId: string;
+  readonly worker: {
+    readonly uid: string;
+    readonly principal: string;
+    readonly space: string;
+    readonly generation: number;
+  };
+  readonly deployment: {
+    readonly uid: string;
+    readonly generation: number;
+    readonly spec: WorkerDeploymentSpec;
+    readonly versions: readonly {
+      readonly uid: string;
+      readonly generation: number;
+      readonly weight: number;
+      readonly spec: WorkerVersionSpec;
+    }[];
+  } | null;
+  readonly endpoint: {
+    readonly uid: string;
+    readonly generation: number;
+    readonly spec: WorkerEndpointSpec;
+    readonly output: { readonly hostname: string; readonly url: string };
+  } | null;
+}
+
+export type V2WorkerPublicationResolution =
+  | {
+      readonly kind: "ready";
+      readonly snapshot: V2WorkerPublicationSnapshot;
+      /** Re-read the complete SQL vector after any await and before the native effect. */
+      stillCurrent(): Promise<boolean>;
+    }
+  | {
+      readonly kind: "unresolved";
+      readonly code:
+        | "stale_claim"
+        | "graph_unresolved"
+        | "publication_conflict"
+        | "incumbent_unresolved";
+      readonly message: string;
+    };
+
+type Unresolved = Extract<V2WorkerPublicationResolution, { kind: "unresolved" }>;
+type ReadyCapture = {
+  readonly kind: "ready";
+  readonly snapshot: V2WorkerPublicationSnapshot;
+  readonly vector: string;
+};
+type Capture = ReadyCapture | Unresolved;
+
+type ReferenceRow = {
+  target_uid: string;
+  form_url: string;
+  readiness: "observed" | "ready";
+  target_spec_path: string | null;
+  target_spec_equals: string | null;
+};
+
+const pendingStatuses = new Set(["queued", "running", "waiting_input", "reconciling"]);
+const uidPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const hostnamePattern =
+  /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/u;
+
+function unresolved(code: Unresolved["code"], message: string): Unresolved {
+  return { kind: "unresolved", code, message };
+}
+
+function parseObject(value: string): JsonObject | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as JsonObject)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function freezeDeep<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) freezeDeep(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function workerUidFromOperation(op: OperationRow): string | null {
+  const spec = parseObject(op.accepted_spec_json);
+  const worker = spec?.worker;
+  if (worker === null || typeof worker !== "object" || Array.isArray(worker)) return null;
+  const uid = (worker as { resourceUid?: unknown }).resourceUid;
+  return typeof uid === "string" && uidPattern.test(uid) ? uid : null;
+}
+
+function isCurrentClaim(
+  op: OperationRow,
+  resource: ResourceRow,
+  execution: V2Execution,
+  now: number,
+) {
+  let executionSpec: string;
+  try {
+    executionSpec = canonicalJson(execution.spec);
+  } catch {
+    return false;
+  }
+  return (
+    op.id === execution.operationId &&
+    op.resource_uid === execution.resourceUid &&
+    op.principal === execution.principal &&
+    op.backend_key === execution.backendKey &&
+    op.backend_id === execution.backendId &&
+    op.target_key === execution.targetKey &&
+    op.action === execution.action &&
+    op.generation === execution.generation &&
+    op.accepted_spec_json === executionSpec &&
+    op.status === "reconciling" &&
+    op.dispatch_possible === 1 &&
+    op.lease_token === execution.leaseToken &&
+    op.lease_until_ms !== null &&
+    op.lease_until_ms > now &&
+    resource.uid === op.resource_uid &&
+    resource.principal === execution.principal &&
+    resource.form_url === execution.form &&
+    resource.space === execution.space &&
+    resource.name === execution.name &&
+    resource.backend_id === op.backend_id &&
+    resource.target_key === op.target_key &&
+    resource.generation === op.generation &&
+    resource.last_operation === op.id &&
+    resource.busy_operation === op.id &&
+    resource.deleted_at === null &&
+    resource.spec_json === op.accepted_spec_json
+  );
+}
+
+function settled(row: ResourceRow, op: OperationRow | null): boolean {
+  return (
+    row.deleted_at === null &&
+    row.busy_operation === null &&
+    row.phase === "idle" &&
+    row.observed_generation === row.generation &&
+    op?.id === row.last_operation &&
+    op.resource_uid === row.uid &&
+    op.principal === row.principal &&
+    op.generation === row.generation &&
+    op.status === "succeeded" &&
+    op.effect === "complete" &&
+    op.accepted_spec_json === row.spec_json
+  );
+}
+
+function outputHostname(row: ResourceRow): { hostname: string; url: string } | null {
+  const output = parseObject(row.output_json);
+  const hostname = output?.hostname;
+  const url = output?.url;
+  return typeof hostname === "string" &&
+    hostnamePattern.test(hostname) &&
+    typeof url === "string" &&
+    url === `https://${hostname}/`
+    ? { hostname, url }
+    : null;
+}
+
+/** No separate desired-state ledger: every read starts from the accepted v2 Operation. */
+export function createV2WorkerPublicationState(options: { sql: Sql; now?: Clock }) {
+  const { sql } = options;
+  const now = options.now ?? (() => new Date());
+
+  async function resource(uid: string): Promise<ResourceRow | null> {
+    return ((await sql.query("SELECT * FROM tf_v2_resources WHERE uid = ?", [uid]))[0] ??
+      null) as ResourceRow | null;
+  }
+  async function operation(id: string): Promise<OperationRow | null> {
+    return ((await sql.query("SELECT * FROM tf_v2_operations WHERE id = ?", [id]))[0] ??
+      null) as OperationRow | null;
+  }
+  async function hasUnresolvedPriorEffect(row: ResourceRow): Promise<boolean> {
+    if (row.observed_generation >= row.generation) return false;
+    return (
+      (
+        await sql.query(
+          `SELECT 1 FROM tf_v2_operations WHERE resource_uid = ?
+       AND generation > ? AND generation < ? AND effect IN ('partial', 'unknown')
+       LIMIT 1`,
+          [row.uid, row.observed_generation, row.generation],
+        )
+      ).length > 0
+    );
+  }
+  async function references(id: string): Promise<ReferenceRow[] | null> {
+    const set = await sql.query(
+      "SELECT sealed FROM tf_v2_operation_reference_sets WHERE operation_id = ?",
+      [id],
+    );
+    if (set.length !== 1 || set[0]?.sealed !== 1) return null;
+    return (await sql.query(
+      `SELECT target_uid, form_url, readiness, target_spec_path, target_spec_equals
+       FROM tf_v2_operation_references WHERE operation_id = ? ORDER BY target_uid`,
+      [id],
+    )) as ReferenceRow[];
+  }
+  function hasReference(
+    rows: readonly ReferenceRow[],
+    uid: string,
+    form: string,
+    readiness: "observed" | "ready",
+    workerUid?: string,
+  ): boolean {
+    return rows.some(
+      (row) =>
+        row.target_uid === uid &&
+        row.form_url === form &&
+        row.readiness === readiness &&
+        (workerUid === undefined ||
+          (row.target_spec_path === "$.worker.resourceUid" &&
+            row.target_spec_equals === workerUid)),
+    );
+  }
+  async function matchingResources(
+    form: string,
+    workerUid: string,
+    principal: string,
+    space: string,
+  ): Promise<ResourceRow[]> {
+    return (await sql.query(
+      `SELECT * FROM tf_v2_resources
+       WHERE form_url = ? AND principal = ? AND space = ? AND deleted_at IS NULL
+         AND json_extract(spec_json, '$.worker.resourceUid') = ? ORDER BY uid`,
+      [form, principal, space, workerUid],
+    )) as unknown as ResourceRow[];
+  }
+  async function pendingPublication(workerUid: string): Promise<OperationRow[]> {
+    return (await sql.query(
+      `SELECT op.* FROM tf_v2_operations op
+       JOIN tf_v2_resources r ON r.uid = op.resource_uid
+       WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
+         AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
+         AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
+       ORDER BY op.created_at, op.id`,
+      [WORKER_DEPLOYMENT_FORM_URL, WORKER_ENDPOINT_FORM_URL, workerUid],
+    )) as unknown as OperationRow[];
+  }
+
+  async function capture(input: {
+    execution: V2Execution;
+    incumbentSourceOperationId?: string;
+  }): Promise<Capture> {
+    const { execution } = input;
+    if (
+      execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
+      execution.form !== WORKER_ENDPOINT_FORM_URL
+    )
+      return unresolved("graph_unresolved", "This operation is not a Worker publication");
+    const [op, own] = await Promise.all([
+      operation(execution.operationId),
+      resource(execution.resourceUid),
+    ]);
+    if (!op || !own || !isCurrentClaim(op, own, execution, now().getTime())) {
+      return unresolved("stale_claim", "The accepted operation lease is no longer current");
+    }
+    const accepted = parseObject(op.accepted_spec_json);
+    if (!accepted) return unresolved("graph_unresolved", "Accepted Worker spec is unavailable");
+    let workerUid: string;
+    try {
+      workerUid =
+        execution.form === WORKER_DEPLOYMENT_FORM_URL
+          ? parseWorkerDeploymentSpec(accepted).worker.resourceUid
+          : parseWorkerEndpointSpec(accepted).worker.resourceUid;
+    } catch {
+      return unresolved("graph_unresolved", "Accepted Worker spec is invalid");
+    }
+    if (!uidPattern.test(workerUid)) {
+      return unresolved("graph_unresolved", "Accepted Worker UID is invalid");
+    }
+    const worker = await resource(workerUid);
+    const workerOp = worker ? await operation(worker.last_operation) : null;
+    if (
+      !worker ||
+      worker.form_url !== MODULE_WORKER_FORM_URL ||
+      worker.principal !== op.principal ||
+      worker.space !== own.space ||
+      !settled(worker, workerOp)
+    )
+      return unresolved(
+        "graph_unresolved",
+        "Worker identity is not settled in this owner and Space",
+      );
+    try {
+      parseModuleWorkerSpec(parseObject(worker.spec_json));
+    } catch {
+      return unresolved("graph_unresolved", "Worker identity spec is invalid");
+    }
+
+    const incumbentId = input.incumbentSourceOperationId;
+    let incumbent: OperationRow | null = null;
+    if (incumbentId !== undefined) {
+      incumbent = await operation(incumbentId);
+      const incumbentResource = incumbent ? await resource(incumbent.resource_uid) : null;
+      if (
+        !incumbent ||
+        !incumbentResource ||
+        incumbentResource.principal !== op.principal ||
+        incumbentResource.space !== own.space ||
+        (incumbentResource.form_url !== WORKER_DEPLOYMENT_FORM_URL &&
+          incumbentResource.form_url !== WORKER_ENDPOINT_FORM_URL) ||
+        workerUidFromOperation(incumbent) !== workerUid ||
+        (incumbentResource.deleted_at !== null &&
+          !(incumbent.status === "succeeded" && incumbent.action === "delete")) ||
+        incumbent.status === "failed"
+      )
+        return unresolved("incumbent_unresolved", "Published incumbent has no confirmed SQL owner");
+      if (incumbent.id !== op.id && pendingStatuses.has(incumbent.status)) {
+        return unresolved("incumbent_unresolved", "Published incumbent has not settled");
+      }
+    }
+
+    const pending = await pendingPublication(workerUid);
+    if (!pending.some((item) => item.id === op.id)) {
+      return unresolved("stale_claim", "Publication operation is no longer pending");
+    }
+    if (pending[0]?.id !== op.id && incumbentId !== op.id) {
+      return unresolved("publication_conflict", "An earlier Worker publication is still pending");
+    }
+
+    const [deploymentRows, endpointRows] = await Promise.all([
+      matchingResources(WORKER_DEPLOYMENT_FORM_URL, workerUid, op.principal, own.space),
+      matchingResources(WORKER_ENDPOINT_FORM_URL, workerUid, op.principal, own.space),
+    ]);
+    for (const row of [...deploymentRows, ...endpointRows]) {
+      if (await hasUnresolvedPriorEffect(row)) {
+        return unresolved(
+          "graph_unresolved",
+          "A prior Worker attachment effect remains unresolved",
+        );
+      }
+    }
+    // A second UID is not an update. Never replace an already-active attachment.
+    for (const rows of [deploymentRows, endpointRows]) {
+      const confirmed = rows.filter((row) => row.observed_generation > 0);
+      const confirmedOthers = confirmed.filter((row) => row.uid !== own.uid);
+      if (
+        confirmed.length > 1 ||
+        (rows.some((row) => row.uid === own.uid) &&
+          confirmedOthers.length > 0 &&
+          ((execution.form === WORKER_DEPLOYMENT_FORM_URL && rows === deploymentRows) ||
+            (execution.form === WORKER_ENDPOINT_FORM_URL && rows === endpointRows)))
+      ) {
+        return unresolved(
+          "publication_conflict",
+          "A different active Worker attachment already exists",
+        );
+      }
+    }
+
+    async function chosen(
+      rows: readonly ResourceRow[],
+      form: string,
+    ): Promise<{ row: ResourceRow; accepted: JsonObject; op: OperationRow } | null | Unresolved> {
+      const isOwnForm = execution.form === form;
+      if (isOwnForm && execution.action === "delete") return null;
+      const row = isOwnForm ? own : rows.find((candidate) => candidate.observed_generation > 0);
+      if (!row) return null;
+      const chosenOp = isOwnForm
+        ? op
+        : row.busy_operation === null
+          ? await operation(row.last_operation)
+          : (((
+              await sql.query(
+                `SELECT * FROM tf_v2_operations WHERE resource_uid = ?
+             AND generation = ? AND status = 'succeeded' AND effect = 'complete' LIMIT 1`,
+                [row.uid, row.observed_generation],
+              )
+            )[0] ?? null) as OperationRow | null);
+      const confirmedPrior =
+        !isOwnForm &&
+        row.busy_operation !== null &&
+        chosenOp !== null &&
+        row.deleted_at === null &&
+        chosenOp.resource_uid === row.uid &&
+        chosenOp.principal === row.principal &&
+        chosenOp.generation === row.observed_generation &&
+        chosenOp.action !== "delete" &&
+        chosenOp.status === "succeeded" &&
+        chosenOp.effect === "complete";
+      if (!chosenOp || (!isOwnForm && !settled(row, chosenOp) && !confirmedPrior)) {
+        return unresolved("graph_unresolved", "A Worker attachment has unconfirmed effects");
+      }
+      const chosenSpec = parseObject(chosenOp.accepted_spec_json);
+      if (!chosenSpec) return unresolved("graph_unresolved", "A Worker attachment spec is invalid");
+      return { row, accepted: chosenSpec, op: chosenOp };
+    }
+
+    const chosenDeployment = await chosen(deploymentRows, WORKER_DEPLOYMENT_FORM_URL);
+    const chosenEndpoint = await chosen(endpointRows, WORKER_ENDPOINT_FORM_URL);
+    if (chosenDeployment && "kind" in chosenDeployment) return chosenDeployment;
+    if (chosenEndpoint && "kind" in chosenEndpoint) return chosenEndpoint;
+    if (
+      endpointRows.some((row) => row.uid !== own.uid && row.phase === "error") ||
+      deploymentRows.some((row) => row.uid !== own.uid && row.phase === "error")
+    ) {
+      return unresolved("graph_unresolved", "A Worker attachment has failed or partial effects");
+    }
+
+    const evidence: unknown[] = [];
+    let deployment: V2WorkerPublicationSnapshot["deployment"] = null;
+    if (chosenDeployment) {
+      let spec: WorkerDeploymentSpec;
+      try {
+        spec = parseWorkerDeploymentSpec(chosenDeployment.accepted);
+      } catch {
+        return unresolved("graph_unresolved", "Deployment spec is invalid");
+      }
+      if (chosenDeployment.op.id !== op.id) {
+        const observed = parseObject(chosenDeployment.row.observed_json);
+        if (observed?.ready !== true || observed.active !== true) {
+          return unresolved("graph_unresolved", "Deployment is not confirmed active and ready");
+        }
+      }
+      const refRows = await references(chosenDeployment.op.id);
+      if (
+        !refRows ||
+        refRows.length !== spec.versions.length + 1 ||
+        !hasReference(refRows, workerUid, MODULE_WORKER_FORM_URL, "observed") ||
+        spec.versions.some(
+          (item) =>
+            !hasReference(
+              refRows,
+              item.workerVersion.resourceUid,
+              WORKER_VERSION_FORM_URL,
+              "ready",
+              workerUid,
+            ),
+        )
+      ) {
+        return unresolved(
+          "graph_unresolved",
+          "Deployment accepted references are not sealed and exact",
+        );
+      }
+      evidence.push(refRows);
+      const versions: NonNullable<V2WorkerPublicationSnapshot["deployment"]>["versions"][number][] =
+        [];
+      const versionEvidence: unknown[] = [];
+      for (const weighted of spec.versions) {
+        const uid = weighted.workerVersion.resourceUid;
+        const row = await resource(uid);
+        const last = row ? await operation(row.last_operation) : null;
+        const observed = row ? parseObject(row.observed_json) : null;
+        if (
+          !row ||
+          row.form_url !== WORKER_VERSION_FORM_URL ||
+          row.principal !== op.principal ||
+          row.space !== own.space ||
+          !settled(row, last) ||
+          observed?.ready !== true ||
+          observed.resolvedBindings !== true
+        ) {
+          return unresolved("graph_unresolved", "A weighted Worker Version is not ready");
+        }
+        let versionSpec: WorkerVersionSpec;
+        try {
+          versionSpec = parseWorkerVersionSpec(parseObject(row.spec_json));
+        } catch {
+          return unresolved("graph_unresolved", "A weighted Worker Version spec is invalid");
+        }
+        if (
+          versionSpec.worker.resourceUid !== workerUid ||
+          (versionSpec.bundle && observed.bundleVerified !== true)
+        ) {
+          return unresolved(
+            "graph_unresolved",
+            "A weighted Worker Version does not match this Worker",
+          );
+        }
+        const versionReferences = last ? await references(last.id) : null;
+        if (
+          !versionReferences?.some(
+            (ref) => ref.target_uid === workerUid && ref.form_url === MODULE_WORKER_FORM_URL,
+          )
+        ) {
+          return unresolved("graph_unresolved", "A weighted Worker Version lacks sealed ownership");
+        }
+        versionEvidence.push({ row, last, versionReferences });
+        versions.push({
+          uid,
+          generation: row.generation,
+          weight: weighted.weight,
+          spec: versionSpec,
+        });
+      }
+      deployment = {
+        uid: chosenDeployment.row.uid,
+        generation: chosenDeployment.op.generation,
+        spec,
+        versions,
+      };
+      // Keep every dependency row in the readback vector, not just its public
+      // projection. A readiness/output change must invalidate stillCurrent.
+      evidence.push(...versionEvidence);
+    }
+    let endpoint: V2WorkerPublicationSnapshot["endpoint"] = null;
+    if (chosenEndpoint) {
+      let spec: WorkerEndpointSpec;
+      try {
+        spec = parseWorkerEndpointSpec(chosenEndpoint.accepted);
+      } catch {
+        return unresolved("graph_unresolved", "Endpoint spec is invalid");
+      }
+      const refRows = await references(chosenEndpoint.op.id);
+      const output = outputHostname(chosenEndpoint.row);
+      if (chosenEndpoint.op.id !== op.id) {
+        const observed = parseObject(chosenEndpoint.row.observed_json);
+        if (observed?.tlsReady !== true || observed.activeDeploymentRouteReady !== true) {
+          return unresolved("graph_unresolved", "Endpoint route is not confirmed ready");
+        }
+      }
+      if (
+        refRows?.length !== 1 ||
+        !hasReference(refRows, workerUid, MODULE_WORKER_FORM_URL, "observed") ||
+        !output
+      ) {
+        return unresolved("graph_unresolved", "Endpoint accepted owner or address is unavailable");
+      }
+      evidence.push(refRows);
+      endpoint = {
+        uid: chosenEndpoint.row.uid,
+        generation: chosenEndpoint.op.generation,
+        spec,
+        output,
+      };
+    }
+    if (endpoint && !deployment && execution.action !== "delete") {
+      return unresolved("graph_unresolved", "Endpoint has no active Deployment");
+    }
+    if (
+      endpoint &&
+      deployment?.versions.some(
+        (version) => !version.spec.handlers.includes("fetch") && !version.spec.assets,
+      )
+    ) {
+      return unresolved("graph_unresolved", "Endpoint requires HTTP-capable weighted Versions");
+    }
+    const snapshot = freezeDeep<V2WorkerPublicationSnapshot>({
+      sourceOperationId: op.id,
+      worker: {
+        uid: worker.uid,
+        principal: worker.principal,
+        space: worker.space,
+        generation: worker.generation,
+      },
+      deployment,
+      endpoint,
+    });
+    // The vector includes every row read above, including the incumbent and
+    // pending queue. A later acceptance, settlement, deletion, or lease change
+    // invalidates the snapshot even when its projected public fields look equal.
+    const vector = canonicalJson({
+      op,
+      own,
+      worker,
+      workerOp,
+      incumbent,
+      pending,
+      deploymentRows,
+      endpointRows,
+      deployment: chosenDeployment,
+      endpoint: chosenEndpoint,
+      evidence,
+      snapshot,
+    } as unknown as JsonObject);
+    return { kind: "ready", snapshot, vector };
+  }
+
+  return {
+    async resolve(input: {
+      execution: V2Execution;
+      incumbentSourceOperationId?: string;
+    }): Promise<V2WorkerPublicationResolution> {
+      const initial = await capture(input);
+      if (initial.kind === "unresolved") return initial;
+      return {
+        kind: "ready",
+        snapshot: initial.snapshot,
+        async stillCurrent(): Promise<boolean> {
+          const latest = await capture(input);
+          return latest.kind === "ready" && latest.vector === initial.vector;
+        },
+      };
+    },
+  };
+}

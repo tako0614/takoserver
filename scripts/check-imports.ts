@@ -71,8 +71,8 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "v2-runtime",
-    match: /^src\/takoform-v2\/worker-bundle-runtime\.ts$/u,
-    may: ["core", "v2-contract", "v2-form", "adapter"],
+    match: /^src\/takoform-v2\/(?:worker-bundle-runtime|worker-publication-state)\.ts$/u,
+    may: ["core", "v2-contract", "v2-state", "v2-form", "adapter"],
   },
   {
     name: "v2-engine",

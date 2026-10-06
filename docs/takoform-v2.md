@@ -105,8 +105,9 @@ required configuration prevents startup; it does not select v1 or generate a
 new cursor key. This key protects pagination state, not Form publication or
 user authentication.
 
-The Bun entry can additionally select `sqliteMigrationSet` and/or `workerBundle`,
-each with a stable `targetKey` and `heldArtifacts`. Each entry contains `url`,
+The Bun entry can additionally select `sqliteMigrationSet`, `workerBundle`,
+and/or `staticAssetBundle`, each with a stable `targetKey` and `heldArtifacts`.
+Each entry contains `url`,
 lowercase hex `sha256`, `objectKey`, and explicit `grants: [{ principal, space }]`.
 For ordinary organization use those grants name `org:<organizationId>` and that
 exact organization ID. Seed each exact manifest and payload byte sequence in the
@@ -132,6 +133,20 @@ execute a Worker):
 }
 ```
 
+To compose StaticAssetBundle while denying all new artifact acquisition, use
+its own independent block (this does not serve or publish the asset bytes):
+
+```json
+{
+  "documentation": "https://host.example/docs/resources",
+  "authenticationDocumentation": "https://host.example/docs/access",
+  "staticAssetBundle": {
+    "targetKey": "operator-static-assets-primary",
+    "heldArtifacts": []
+  }
+}
+```
+
 WorkerBundle (`https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/`)
 validates a UTF-8 manifest of at most 1 MiB, with 1–512 files,
 canonical relative POSIX paths of at most 1,024 UTF-8 bytes, and exact HTTPS
@@ -139,11 +154,20 @@ artifact identities. Each file is at most 16 MiB and the aggregate is at most
 128 MiB. The Host records only the validated bundle projection and held bytes;
 it does not execute the Worker or create a data-plane endpoint.
 
-The current Worker entry accepts an omitted/empty Form map but refuses either
+StaticAssetBundle (`https://edge.forms.takoform.com/forms/StaticAssetBundle/0.2.0/`)
+accepts a manifest up to 1 MiB with 1–512 files, canonical relative POSIX paths
+up to 1,024 UTF-8 bytes, exact HTTPS artifact identities, per-file bytes up to
+16 MiB and aggregate bytes up to 128 MiB. It records the validated ordered
+asset projection and held bytes, but does not serve those assets, attach them
+to a Worker, or create a public endpoint. Its configured target and source
+grants are explicit operator settings, independent of WorkerBundle.
+
+The current Worker entry accepts an omitted/empty Form map but refuses any
 configured artifact backend before accessing D1 or R2, until those Worker storage
 paths are qualified. That is a current implementation limit, not a restriction
-imposed by Takoform. Neither entry advertises WfP, Worker execution or other Edge
-Forms through this configuration.
+imposed by Takoform. Neither entry advertises WfP or Worker execution through
+this configuration. Bun's three artifact-only Forms are management and custody
+surfaces only; they do not serve assets or execute Workers.
 Discovery declares offerings, previews and privateInputs unavailable. Common
 limits are a 1 MiB request, 100 items per page and a 24-hour replay window.
 
@@ -202,8 +226,9 @@ copy. The two storage layouts are internal, fixed choices, not user-selected SQL
 identifiers. They share the Resource/Operation ledger and lease rules, rather
 than introducing a second resource authority.
 
-The normal Bun composition now connects this backend when explicitly configured.
-This source fact is not Hosted D1, WfP, public TLS or production qualification.
+The normal Bun composition connects each of these backends only when its exact
+configuration block is present. This source fact is not Hosted D1, WfP, public
+TLS or production qualification.
 Source and custody authorization are distinct: a caller
 may have write access to a Space but no grant to a particular source artifact.
 
@@ -229,6 +254,14 @@ without fetching or rewriting the original artifacts. The runtime adapter passes
 owned copies to the existing module inspector and exposes the same module graph
 inputs to the workerd compiler. Inspection is not publication or traffic readiness.
 
+Separately, the self-host `WorkerdRuntime` now has a lazy, same-process fenced
+publication seam with exact serving-identity readback. Focused source tests cover
+successful readback, stale-fence refusal, and restoring the prior pointer when
+readback cannot be proved. This generic seam is not connected to public v2 Worker
+Forms: those Forms are not registered in the normal application and do not call
+it. It does not provide multi-process fencing or invocation retirement, and it
+does not establish v2 Worker publication or traffic readiness.
+
 Forms can also calculate initial public output in a pure callback. That output
 is committed at acceptance, including before backend execution, and is not
 reallocated on replay or update. This supports the Endpoint requirement to retain
@@ -236,10 +269,10 @@ an assigned address while its route is pending or failed. The Endpoint backend
 must preserve that address in subsequent results; the callback must not create
 external routes or perform other effects.
 
-Remaining work includes actual Worker Form backends, fenced runtime publication,
-invocation retirement, Endpoint routing and their normal-entry composition.
-Neither these internal seams nor their focused tests establish complete Worker
-Form support, public HTTPS delivery, or Hosted qualification.
+Remaining work includes actual Worker Form backends and their normal-entry
+composition, invocation retirement, and Endpoint routing. Neither the existing
+generic publication seam nor these focused tests establish complete Worker Form
+support, public HTTPS delivery, or Hosted qualification.
 
 ## Existing installations
 
