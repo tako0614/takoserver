@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { type FileHandle, lstat, mkdir, open, readFile, realpath, rename } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnWorkerdWithParentDeath, workerPortOwnership } from "./workerd-linux-process.ts";
 import { createWorkerdSupervisor, type WorkerdProcess } from "./workerd-supervisor.ts";
 
@@ -35,7 +35,16 @@ export interface WorkerdWorkerRetirementReceipt {
 
 export interface WorkerdWorkerExecutionGroup {
   readonly workerResourceUid: string;
+  /** Private root used by the WorkerdRuntime owned by this incarnation. */
+  readonly runtimeRoot: string;
+  /** Exact config watched by this incarnation's one supervisor. */
+  readonly configurationPath: string;
   start(): Promise<void>;
+  /** Reconcile a renderer's atomic config replacement through the same supervisor. */
+  reloadConfiguration(): Promise<void>;
+  /** Freeze config mutation after the incarnation's exact publication is proved. */
+  sealConfiguration(): void;
+  isReady(): boolean;
   fetch(request: Request): Promise<Response>;
   /**
    * The trusted caller supplies the durable accepted Operation ID. This local
@@ -58,6 +67,8 @@ export interface OpenWorkerdWorkerExecutionGroupOptions {
   readonly workerResourceUid: string;
   readonly listenerPort: number;
   readonly configuration: Uint8Array;
+  /** Private relative path below the UID directory; defaults to `workerd.conf`. */
+  readonly configurationPath?: string;
   readonly workerdBinary: string | null;
   readonly spawn?: (command: readonly string[]) => WorkerdProcess;
 }
@@ -105,6 +116,20 @@ function expectedManifest(options: OpenWorkerdWorkerExecutionGroupOptions): Grou
     listenerPort: options.listenerPort,
     configurationSha256: sha256(options.configuration),
   };
+}
+
+function checkedConfigurationPath(value: string | undefined): string {
+  const path = value ?? CONFIG_NAME;
+  if (
+    path.length === 0 ||
+    path.length > 512 ||
+    path.startsWith("/") ||
+    path.includes("\\") ||
+    path.split("/").some((part) => part === "" || part === "." || part === "..")
+  ) {
+    throw new WorkerdWorkerExecutionGroupError("invalid_identity");
+  }
+  return path;
 }
 
 function canonicalJson(value: unknown): string {
@@ -180,6 +205,8 @@ function makeGroup(input: {
   readonly receipt?: WorkerdWorkerRetirementReceipt;
 }): WorkerdWorkerExecutionGroup {
   const { options, directory, manifest } = input;
+  const configurationPath = join(directory, checkedConfigurationPath(options.configurationPath));
+  let currentManifest = manifest;
   let state: GroupState = input.initialState;
   let supervisor: ReturnType<typeof createWorkerdSupervisor> | null = null;
   let startPromise: Promise<void> | null = null;
@@ -187,6 +214,8 @@ function makeGroup(input: {
   let retiringOperationId: string | null = null;
   let retirementStarted = input.initialState === "retired";
   let receipt = input.receipt ? Object.freeze({ ...input.receipt }) : undefined;
+  let configurationSealed = false;
+  let configurationReload: Promise<void> | null = null;
 
   const fail = (code: WorkerdWorkerExecutionGroupError["code"]): never => {
     throw new WorkerdWorkerExecutionGroupError(code);
@@ -236,7 +265,7 @@ function makeGroup(input: {
     // One supervisor owns this group's complete child/restart lifecycle.
     // Never replace it merely because its current child is temporarily absent.
     supervisor = created;
-    const promise = created.ensure(join(directory, CONFIG_NAME)).then(
+    const promise = created.ensure(configurationPath).then(
       () => {
         if (supervisor !== created || !created.isReady()) return fail("not_serving");
         if (state === "starting") state = "serving";
@@ -268,7 +297,7 @@ function makeGroup(input: {
     try {
       // Recheck the exact captured child and listener immediately before the
       // TCP request. This is not an atomic kernel check-and-connect primitive.
-      await owner.ensure(join(directory, CONFIG_NAME));
+      await owner.ensure(configurationPath);
     } catch {
       if (admissionClosed()) fail("admission_closed");
       state = "uncertain";
@@ -291,6 +320,50 @@ function makeGroup(input: {
         ? {}
         : { body: request.body, duplex: "half" as const }),
     });
+  };
+
+  const reloadConfiguration = (): Promise<void> => {
+    if (configurationSealed || retirementStarted || state === "retired")
+      return Promise.reject(new WorkerdWorkerExecutionGroupError("admission_closed"));
+    if (configurationReload) return configurationReload;
+    const task = (async () => {
+      try {
+        const info = await lstat(configurationPath);
+        if (!info.isFile() || info.isSymbolicLink())
+          throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+        const bytes = await readFile(configurationPath);
+        const nextManifest: GroupManifest = {
+          ...currentManifest,
+          configurationSha256: sha256(bytes),
+        };
+        if (nextManifest.configurationSha256 !== currentManifest.configurationSha256) {
+          await writeAtomic(
+            join(directory, MANIFEST_NAME),
+            new TextEncoder().encode(canonicalJson(nextManifest)),
+          );
+          currentManifest = nextManifest;
+        }
+        const currentSupervisor = supervisor;
+        if (currentSupervisor === null) await start();
+        else await currentSupervisor.ensure(configurationPath);
+        if (supervisor?.isReady() !== true)
+          throw new WorkerdWorkerExecutionGroupError("not_serving");
+        if (!retirementStarted) state = "serving";
+      } catch {
+        state = "uncertain";
+        throw new WorkerdWorkerExecutionGroupError("not_serving");
+      }
+    })();
+    configurationReload = task;
+    void task.then(
+      () => {
+        if (configurationReload === task) configurationReload = null;
+      },
+      () => {
+        if (configurationReload === task) configurationReload = null;
+      },
+    );
+    return task;
   };
 
   const retire = (retireInput: {
@@ -321,14 +394,28 @@ function makeGroup(input: {
     const task = (async () => {
       try {
         if (startPromise) await startPromise.catch(() => undefined);
+        if (configurationReload) await configurationReload;
+        const assertCurrentConfiguration = async (): Promise<string> => {
+          const info = await lstat(configurationPath).catch(() => null);
+          if (!info?.isFile() || info.isSymbolicLink())
+            throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+          const digest = sha256(await readFile(configurationPath));
+          if (digest !== currentManifest.configurationSha256)
+            throw new WorkerdWorkerExecutionGroupError("retirement_uncertain");
+          return digest;
+        };
+        await assertCurrentConfiguration();
         await supervisor?.shutdown();
         if ((await workerPortOwnership(options.listenerPort, undefined)) !== "vacant")
           throw new WorkerdWorkerExecutionGroupError("retirement_uncertain");
+        // Bind the receipt to the exact bytes still present after the child has
+        // exited; a sealed manifest alone cannot prove the file was unchanged.
+        const configurationSha256 = await assertCurrentConfiguration();
         const completed: WorkerdWorkerRetirementReceipt = Object.freeze({
           workerResourceUid: options.workerResourceUid,
           operationId,
           listenerPort: options.listenerPort,
-          configurationSha256: manifest.configurationSha256,
+          configurationSha256,
         });
         await writeAtomic(
           join(directory, RECEIPT_NAME),
@@ -351,7 +438,16 @@ function makeGroup(input: {
 
   return Object.freeze({
     workerResourceUid: options.workerResourceUid,
+    runtimeRoot: directory,
+    configurationPath,
     start,
+    reloadConfiguration,
+    sealConfiguration() {
+      configurationSealed = true;
+    },
+    isReady() {
+      return state === "serving" && supervisor?.isReady() === true;
+    },
     fetch: fetchRequest,
     retire,
   });
@@ -361,6 +457,7 @@ export async function openWorkerdWorkerExecutionGroup(
   options: OpenWorkerdWorkerExecutionGroupOptions,
 ): Promise<WorkerdWorkerExecutionGroup> {
   validateIdentity(options.workerResourceUid);
+  checkedConfigurationPath(options.configurationPath);
   if (
     !Number.isSafeInteger(options.listenerPort) ||
     options.listenerPort < 1 ||
@@ -387,11 +484,13 @@ export async function openWorkerdWorkerExecutionGroup(
     throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
 
   const manifest = expectedManifest(options);
+  const configurationPath = join(directory, checkedConfigurationPath(options.configurationPath));
   if (created) {
     try {
       // Persist the UID's permanent directory entry before any child can start.
       await syncDirectory(canonicalRoot);
-      const configFile = await open(join(directory, CONFIG_NAME), "wx", 0o600);
+      await mkdir(dirname(configurationPath), { recursive: true, mode: 0o700 });
+      const configFile = await open(configurationPath, "wx", 0o600);
       try {
         await configFile.writeFile(options.configuration);
         await configFile.sync();
@@ -413,7 +512,7 @@ export async function openWorkerdWorkerExecutionGroup(
   }
 
   const manifestInfo = await lstat(join(directory, MANIFEST_NAME)).catch(() => null);
-  const configurationInfo = await lstat(join(directory, CONFIG_NAME)).catch(() => null);
+  const configurationInfo = await lstat(configurationPath).catch(() => null);
   const receiptInfo = await lstat(join(directory, RECEIPT_NAME)).catch(() => null);
   if (
     !manifestInfo?.isFile() ||
@@ -424,7 +523,7 @@ export async function openWorkerdWorkerExecutionGroup(
   )
     throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
   const manifestText = await readText(join(directory, MANIFEST_NAME));
-  const storedConfiguration = await readFile(join(directory, CONFIG_NAME)).catch(() => null);
+  const storedConfiguration = await readFile(configurationPath).catch(() => null);
   if (
     !parseExactJson(manifestText, manifest) ||
     !storedConfiguration ||

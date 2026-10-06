@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { bytesDigest } from "../src/json.ts";
 import { spawnWorkerdWithParentDeath, workerPortOwnership } from "../src/workerd-linux-process.ts";
 import { openWorkerdWorkerExecutionGroup } from "../src/workerd-worker-execution-group.ts";
 
@@ -11,7 +12,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 const [verb, watch, configPath] = process.argv.slice(-3);
 if (verb !== "serve" || watch !== "--watch" || !configPath) throw new Error("unexpected child command");
 const { port, label, signalledPath, releasePath, dropListenerPath } = JSON.parse(readFileSync(configPath, "utf8"));
-const server = Bun.serve({ hostname: "127.0.0.1", port, fetch: () => new Response(label) });
+const server = Bun.serve({ hostname: "127.0.0.1", port, fetch: () => new Response(JSON.parse(readFileSync(configPath, "utf8")).label ?? label) });
 let listenerDropped = false;
 process.on("SIGTERM", () =>
   writeFileSync(signalledPath + "." + process.pid, "SIGTERM", { mode: 0o600 }),
@@ -280,6 +281,78 @@ test("an existing group with no committed retirement receipt refuses a second wr
         });
       } catch {
         // Cleanup only.
+      }
+    }
+    await cleanup(owned);
+  }
+});
+
+test("one group's watched configuration reloads through its same supervisor and receipt binds final bytes", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-rendered-config";
+  const operationId = "8dd887ae-47b3-4ee5-8c26-53a0d63cfc21";
+  const port = await unusedPort();
+  const initial = await owned.config({ workerUid, port, label: "baseline" });
+  let group: Awaited<ReturnType<typeof openWorkerdWorkerExecutionGroup>> | undefined;
+  try {
+    group = await openWorkerdWorkerExecutionGroup({
+      rootDirectory: join(owned.root, "rendered-groups"),
+      workerResourceUid: workerUid,
+      listenerPort: port,
+      configuration: initial.bytes,
+      configurationPath: "workers/workerd.capnp",
+      workerdBinary: owned.binary,
+      spawn: (command) => {
+        const child = spawnWorkerdWithParentDeath(command, {
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        owned.children.push(child);
+        return child;
+      },
+    });
+    await group.start();
+    const child = owned.children[0];
+    if (!child) throw new Error("worker group child did not start");
+    expect(await (await group.fetch(new Request("https://worker.test/"))).text()).toBe("baseline");
+
+    const nextConfig = {
+      ...JSON.parse(new TextDecoder().decode(initial.bytes)),
+      label: "rendered",
+    };
+    await writeFile(group.configurationPath, JSON.stringify(nextConfig), { mode: 0o600 });
+    await group.reloadConfiguration();
+    expect(owned.children).toHaveLength(1);
+    expect(await (await group.fetch(new Request("https://worker.test/"))).text()).toBe("rendered");
+    group.sealConfiguration();
+    const exactConfiguration = new TextEncoder().encode(JSON.stringify(nextConfig));
+    await writeFile(group.configurationPath, JSON.stringify({ ...nextConfig, label: "late" }));
+    await expect(group.reloadConfiguration()).rejects.toMatchObject({ code: "admission_closed" });
+
+    await expect(group.retire({ workerResourceUid: workerUid, operationId })).rejects.toMatchObject(
+      {
+        code: "retirement_uncertain",
+      },
+    );
+    expect(child.exitCode).toBeNull();
+    expect(child.signalCode).toBeNull();
+    await writeFile(group.configurationPath, exactConfiguration, { mode: 0o600 });
+    const retiring = group.retire({ workerResourceUid: workerUid, operationId });
+    await until(() => signalled(initial.signalledPath, child.pid), 500);
+    await writeFile(`${initial.releasePath}.${child.pid}`, "release", { mode: 0o600 });
+    const receipt = await retiring;
+    expect(receipt.configurationSha256).toBe(
+      (await bytesDigest(new TextEncoder().encode(JSON.stringify(nextConfig)))).slice(
+        "sha256:".length,
+      ),
+    );
+    expect(await workerPortOwnership(port, child.pid)).toBe("vacant");
+  } finally {
+    if (group) {
+      try {
+        await group.retire({ workerResourceUid: workerUid, operationId });
+      } catch {
+        // Cleanup only; assertions above are the process-lifecycle evidence.
       }
     }
     await cleanup(owned);
