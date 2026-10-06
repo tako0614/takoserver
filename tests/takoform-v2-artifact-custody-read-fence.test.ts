@@ -48,10 +48,11 @@ async function fixture(
       "0071_v2_sqlite_migration_set_custody.sql",
       "0072_v2_artifact_custody.sql",
       "0073_v2_reference_acceptance.sql",
+      "0075_v2_artifact_progress.sql",
     ])
       db.exec(readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8"));
     const base = createSqliteSql(db);
-    let nowMs = Date.UTC(2026, 9, 6, 12);
+    let nowMs = Date.now();
     let chunkReadArmed = false;
     let authorizationCalls = 0;
     let targetUid = "";
@@ -108,6 +109,9 @@ async function fixture(
         };
       },
       async validatePayload() {
+        return { observed: { ready: true }, output: {} };
+      },
+      async projectVerified() {
         return { observed: { ready: true }, output: {} };
       },
       invalidArtifact: () => new Error("invalid artifact"),

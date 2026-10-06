@@ -181,7 +181,6 @@ export async function validateSQLiteMigrationPayload(input: {
     totalBytes += bytes.byteLength;
   }
 
-  const observedFiles: SQLiteMigrationObservedFile[] = [];
   for (let index = 0; index < manifest.files.length; index += 1) {
     const file = manifest.files[index];
     const bytes = input.fileBytes[index];
@@ -189,13 +188,42 @@ export async function validateSQLiteMigrationPayload(input: {
     if (startsWithUtf8Bom(bytes) || !isStrictUtf8(bytes)) throw invalid("invalid_artifact");
     const digest = bareSha256Digest(await bytesDigest(bytes));
     if (digest !== file.sha256) throw invalid("invalid_artifact");
-    observedFiles.push({
-      path: file.path,
-      sha256: digest,
-      mediaType: "application/sql",
-      byteSize: bytes.byteLength,
-    });
   }
+
+  return await projectSQLiteMigrationVerified({
+    spec: input.spec,
+    manifestBytes: input.manifestBytes,
+    fileSizes: input.fileBytes.map((bytes) => bytes.byteLength),
+  });
+}
+
+/** The projection after custody has individually verified each immutable file. */
+export async function projectSQLiteMigrationVerified(input: {
+  readonly spec: unknown;
+  readonly manifestBytes: Uint8Array;
+  readonly fileSizes: readonly number[];
+}): Promise<SQLiteMigrationSetObservation> {
+  const spec = parseSQLiteMigrationSetSpec(input.spec);
+  const manifest = parseSQLiteMigrationManifest(input.manifestBytes);
+  const manifestSha256 = bareSha256Digest(await bytesDigest(input.manifestBytes));
+  if (manifestSha256 !== spec.artifact.sha256 || input.fileSizes.length !== manifest.files.length) {
+    throw invalid("invalid_artifact");
+  }
+  let totalBytes = 0;
+  const observedFiles: SQLiteMigrationObservedFile[] = manifest.files.map((file, index) => {
+    const size = input.fileSizes[index];
+    if (
+      !Number.isSafeInteger(size) ||
+      size === undefined ||
+      size < 0 ||
+      size > SQLITE_MIGRATION_SET_LIMITS.fileBytes ||
+      totalBytes + size > SQLITE_MIGRATION_SET_LIMITS.aggregateBytes
+    ) {
+      throw invalid("invalid_artifact");
+    }
+    totalBytes += size;
+    return { path: file.path, sha256: file.sha256, mediaType: "application/sql", byteSize: size };
+  });
 
   return {
     observed: {

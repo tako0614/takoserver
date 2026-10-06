@@ -5,6 +5,7 @@ import type { V2ArtifactSource } from "./artifact-source.ts";
 import {
   parseStaticAssetBundleManifest,
   parseStaticAssetBundleSpec,
+  projectStaticAssetBundleVerified,
   STATIC_ASSET_BUNDLE_FORM_URL,
   STATIC_ASSET_BUNDLE_LIMITS,
   type StaticAssetBundleManifest,
@@ -30,6 +31,7 @@ export function createStaticAssetBundleCustody(options: {
     parseSpec: parseStaticAssetBundleSpec,
     parseManifest: parseStaticAssetBundleManifest,
     validatePayload: validateStaticAssetBundlePayload,
+    projectVerified: projectStaticAssetBundleVerified,
     invalidArtifact: () => new StaticAssetBundleValidationError("invalid_artifact"),
     invalidManifest: () => new StaticAssetBundleValidationError("invalid_manifest"),
     failureNoun: "Static asset bundle",

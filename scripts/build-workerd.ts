@@ -251,8 +251,8 @@ function parseArguments(arguments_: readonly string[]): BuildArguments {
 function bazelResourceArgs(input: Pick<BuildArguments, "jobs" | "memoryMB">): string[] {
   return [
     `--jobs=${input.jobs}`,
-    `--local_cpu_resources=${input.jobs}`,
-    `--local_ram_resources=${input.memoryMB}`,
+    `--local_resources=cpu=${input.jobs}`,
+    `--local_resources=memory=${input.memoryMB}`,
   ];
 }
 

@@ -273,14 +273,15 @@ function seedLegacyInvocation(
 
 test("0069 is source inventory only and leaves the 0066 apply ceiling unchanged", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
-  expect(source.names).toHaveLength(74);
-  expect(source.names.at(-7)).toBe(PREDECESSOR);
-  expect(source.names.at(-6)).toBe(MIGRATION_NAME);
-  expect(source.names.at(-5)).toBe("0070_takoform_v2.sql");
-  expect(source.names.at(-4)).toBe("0071_v2_sqlite_migration_set_custody.sql");
-  expect(source.names.at(-3)).toBe("0072_v2_artifact_custody.sql");
-  expect(source.names.at(-2)).toBe("0073_v2_reference_acceptance.sql");
-  expect(source.names.at(-1)).toBe("0074_v2_worker_native_effects.sql");
+  expect(source.names).toHaveLength(75);
+  expect(source.names.at(-8)).toBe(PREDECESSOR);
+  expect(source.names.at(-7)).toBe(MIGRATION_NAME);
+  expect(source.names.at(-6)).toBe("0070_takoform_v2.sql");
+  expect(source.names.at(-5)).toBe("0071_v2_sqlite_migration_set_custody.sql");
+  expect(source.names.at(-4)).toBe("0072_v2_artifact_custody.sql");
+  expect(source.names.at(-3)).toBe("0073_v2_reference_acceptance.sql");
+  expect(source.names.at(-2)).toBe("0074_v2_worker_native_effects.sql");
+  expect(source.names.at(-1)).toBe("0075_v2_artifact_progress.sql");
   const qualified = projectApplyQualifiedMigrationArtifact(source);
   expect(qualified.names).toHaveLength(66);
   expect(qualified.names.at(-1)).toBe("0066_cloudflare_managed_actor_kv_capability_claims.sql");
@@ -292,9 +293,9 @@ test("0069 is source inventory only and leaves the 0066 apply ceiling unchanged"
     for (const file of source.files) copyFileSync(file.path, join(migrations, file.name));
     const tail = source.files.at(-1);
     if (!tail) throw new Error("audited source is missing its terminal migration");
-    copyFileSync(tail.path, join(migrations, "0075_unreviewed.sql"));
+    copyFileSync(tail.path, join(migrations, "0076_unreviewed.sql"));
     expect(() => readCurrentAuditedMigrationSourceArtifact(migrations)).toThrow(
-      "audited migration lineage must contain exactly 0001-0074",
+      "audited migration lineage must contain exactly 0001-0075",
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -5,6 +5,7 @@ import type { V2ArtifactSource } from "./artifact-source.ts";
 import {
   parseSQLiteMigrationManifest,
   parseSQLiteMigrationSetSpec,
+  projectSQLiteMigrationVerified,
   SQLITE_MIGRATION_SET_FORM_URL,
   SQLITE_MIGRATION_SET_LIMITS,
   SQLiteMigrationSetValidationError,
@@ -31,6 +32,7 @@ export function createSQLiteMigrationSetForm(options: {
     parseSpec: parseSQLiteMigrationSetSpec,
     parseManifest: parseSQLiteMigrationManifest,
     validatePayload: validateSQLiteMigrationPayload,
+    projectVerified: projectSQLiteMigrationVerified,
     validateFile: validSqlFile,
     invalidArtifact: () => new SQLiteMigrationSetValidationError("invalid_artifact"),
     invalidManifest: () => new SQLiteMigrationSetValidationError("invalid_manifest"),

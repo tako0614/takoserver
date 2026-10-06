@@ -526,27 +526,62 @@ async function proveSigningPublicJwk(privateJwk: string, privateKey: CryptoKey):
   }
 }
 
+/** 0075 is source-only until a separate schema wave; config never applies it. */
+async function requireV2ArtifactProgressSchema(sql: ReturnType<typeof createD1Sql>): Promise<void> {
+  const columns = [
+    "operation_id",
+    "resource_uid",
+    "form_url",
+    "next_file_index",
+    "current_file_bytes",
+    "current_file_sha256",
+    "file_sizes_json",
+    "total_bytes",
+    "lease_token",
+  ];
+  const actualColumns = await sql.query("PRAGMA table_info(tf_v2_artifact_progress)");
+  if (
+    actualColumns.length !== columns.length ||
+    actualColumns.some((column, index) => column.name !== columns[index]) ||
+    actualColumns[0]?.pk !== 1 ||
+    actualColumns[8]?.notnull !== 1
+  ) {
+    throw new TypeError("configured v2 artifact Forms require the complete 0075 D1 schema");
+  }
+  const triggers = [
+    ["tf_v2_artifact_progress_insert_guard", "tf_v2_artifact_progress"],
+    ["tf_v2_artifact_progress_update_guard", "tf_v2_artifact_progress"],
+    ["tf_v2_artifact_progress_monotonic", "tf_v2_artifact_progress"],
+    ["tf_v2_artifact_progress_terminal_gc", "tf_v2_operations"],
+    ["tf_v2_artifact_progress_no_early_delete", "tf_v2_artifact_progress"],
+    ["tf_v2_migration_set_owner_lease_guard", "tf_v2_migration_set_owners"],
+    ["tf_v2_artifact_owner_lease_guard", "tf_v2_artifact_owners"],
+    ["tf_v2_migration_set_chunk_lease_guard", "tf_v2_migration_set_chunks"],
+    ["tf_v2_artifact_chunk_lease_guard", "tf_v2_artifact_chunks"],
+    ["tf_v2_migration_set_verify_lease_guard", "tf_v2_migration_set_owners"],
+    ["tf_v2_artifact_verify_lease_guard", "tf_v2_artifact_owners"],
+  ] as const;
+  const actualTriggers = await sql.query(
+    `SELECT name, tbl_name, sql FROM sqlite_schema WHERE type = 'trigger' AND name IN (${triggers.map(() => "?").join(", ")})`,
+    triggers.map(([name]) => name),
+  );
+  const byName = new Map(actualTriggers.map((row) => [row.name, row]));
+  if (
+    actualTriggers.length !== triggers.length ||
+    triggers.some(([name, table]) => {
+      const row = byName.get(name);
+      return row?.tbl_name !== table || typeof row.sql !== "string" || row.sql.length === 0;
+    })
+  ) {
+    throw new TypeError("configured v2 artifact Forms require the complete 0075 D1 schema");
+  }
+}
+
 async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   if (cached?.env === env) return cached.app;
   const v2Config = startupStage("runtime-configuration", () =>
     parseTakoformV2ApplicationConfig(env),
   );
-  if (
-    v2Config.sqliteMigrationSet !== undefined ||
-    v2Config.workerBundle !== undefined ||
-    v2Config.staticAssetBundle !== undefined
-  ) {
-    const unsupportedForms = [
-      ...(v2Config.sqliteMigrationSet !== undefined ? ["SQLiteMigrationSet"] : []),
-      ...(v2Config.workerBundle !== undefined ? ["WorkerBundle"] : []),
-      ...(v2Config.staticAssetBundle !== undefined ? ["StaticAssetBundle"] : []),
-    ];
-    startupStage("runtime-configuration", () => {
-      throw new TypeError(
-        `${unsupportedForms.join(" and ")} ${unsupportedForms.length === 1 ? "is" : "are"} not supported by this Worker runtime`,
-      );
-    });
-  }
   const signingKey = await loadSigningKey(
     env.TAKOSERVER_SIGNING_KEY_ID,
     env.TAKOSERVER_SIGNING_KEY,
@@ -572,6 +607,20 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   );
   const { identity, identityProviders, settlement, checkout } = workerCredentials(env, origin);
   const sql = createD1Sql(env.STATE_DB);
+  if (
+    v2Config.sqliteMigrationSet !== undefined ||
+    v2Config.workerBundle !== undefined ||
+    v2Config.staticAssetBundle !== undefined
+  ) {
+    try {
+      await requireV2ArtifactProgressSchema(sql);
+    } catch {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("configured v2 artifact Forms require the complete 0075 D1 schema"),
+      );
+    }
+  }
   const objects = createR2ObjectStore(env.OBJECTS);
   const clock = () => new Date();
   const randomId = () => crypto.randomUUID();

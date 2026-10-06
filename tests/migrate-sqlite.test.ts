@@ -58,6 +58,7 @@ const V2_MIGRATION_SET = "0071_v2_sqlite_migration_set_custody.sql";
 const V2_ARTIFACT_CUSTODY = "0072_v2_artifact_custody.sql";
 const V2_REFERENCE_ACCEPTANCE = "0073_v2_reference_acceptance.sql";
 const V2_WORKER_NATIVE_EFFECTS = "0074_v2_worker_native_effects.sql";
+const V2_ARTIFACT_PROGRESS = "0075_v2_artifact_progress.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -101,6 +102,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   V2_ARTIFACT_CUSTODY,
   V2_REFERENCE_ACCEPTANCE,
   V2_WORKER_NATIVE_EFFECTS,
+  V2_ARTIFACT_PROGRESS,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -815,6 +817,7 @@ describe("bringing a local database up to date", () => {
       V2_ARTIFACT_CUSTODY,
       V2_REFERENCE_ACCEPTANCE,
       V2_WORKER_NATIVE_EFFECTS,
+      V2_ARTIFACT_PROGRESS,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -1100,6 +1103,7 @@ describe("bringing a local database up to date", () => {
         V2_ARTIFACT_CUSTODY,
         V2_REFERENCE_ACCEPTANCE,
         V2_WORKER_NATIVE_EFFECTS,
+        V2_ARTIFACT_PROGRESS,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1678,6 +1682,7 @@ describe("bringing a local database up to date", () => {
       V2_ARTIFACT_CUSTODY,
       V2_REFERENCE_ACCEPTANCE,
       V2_WORKER_NATIVE_EFFECTS,
+      V2_ARTIFACT_PROGRESS,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1833,6 +1838,7 @@ describe("bringing a local database up to date", () => {
       V2_ARTIFACT_CUSTODY,
       V2_REFERENCE_ACCEPTANCE,
       V2_WORKER_NATIVE_EFFECTS,
+      V2_ARTIFACT_PROGRESS,
     ]);
     expect(
       database
@@ -2795,6 +2801,7 @@ describe("bringing a local database up to date", () => {
       V2_ARTIFACT_CUSTODY,
       V2_REFERENCE_ACCEPTANCE,
       V2_WORKER_NATIVE_EFFECTS,
+      V2_ARTIFACT_PROGRESS,
     ]);
     expect(
       database

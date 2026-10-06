@@ -5,6 +5,14 @@ import type { V2BackendResult, V2Execution } from "../types.ts";
 import type { V2ArtifactSource } from "./artifact-source.ts";
 
 const CHUNK_BYTES = 65_536;
+const CHUNKS_PER_WRITE = 15; // six bindings each; D1 permits at most 100.
+const CHUNK_WRITES_PER_PASS = 4;
+const FILES_PER_PASS = 6;
+const CHUNKS_PER_READ = 16;
+// Reserve at least twelve D1 queries for the surrounding Host claim/settle.
+const VERIFY_SQL_STATEMENTS_PER_PASS = 38;
+
+class WorkBudgetExhausted extends Error {}
 
 /** Closed internal layouts. The 0071 layout remains authoritative for MigrationSet. */
 type CustodyLayout = "migration-set-0071" | "artifact-0072";
@@ -28,6 +36,18 @@ interface OwnerRow extends Row {
   manifest_bytes: Uint8Array | ArrayBuffer;
   state: "staging" | "verified";
   observation_json: string | null;
+}
+
+interface ProgressRow extends Row {
+  operation_id: string;
+  resource_uid: string;
+  form_url: string;
+  next_file_index: number;
+  current_file_bytes: number | null;
+  current_file_sha256: string | null;
+  file_sizes_json: string;
+  total_bytes: number;
+  lease_token: string;
 }
 
 interface ArtifactSpec {
@@ -86,6 +106,12 @@ export function createSqlArtifactCustody<
     readonly manifestBytes: Uint8Array;
     readonly fileBytes: readonly Uint8Array[];
   }) => Promise<{ readonly observed: object; readonly output: object }>;
+  /** Projection from already verified immutable files; no aggregate byte array. */
+  readonly projectVerified: (input: {
+    readonly spec: JsonObject;
+    readonly manifestBytes: Uint8Array;
+    readonly fileSizes: readonly number[];
+  }) => Promise<{ readonly observed: object; readonly output: object }>;
   /** Additional Form-specific byte rule, after raw digest verification. */
   readonly validateFile?: (bytes: Uint8Array, sha256: string) => Promise<boolean>;
   readonly invalidArtifact: () => Error;
@@ -96,8 +122,8 @@ export function createSqlArtifactCustody<
   const now = options.now ?? (() => new Date());
   const tables = TABLES[options.layout];
 
-  async function owner(uid: string): Promise<OwnerRow | null> {
-    return ((await sql.query(`SELECT * FROM ${tables.owners} WHERE resource_uid = ?`, [uid]))[0] ??
+  async function owner(uid: string, db: Sql = sql): Promise<OwnerRow | null> {
+    return ((await db.query(`SELECT * FROM ${tables.owners} WHERE resource_uid = ?`, [uid]))[0] ??
       null) as OwnerRow | null;
   }
 
@@ -124,63 +150,127 @@ export function createSqlArtifactCustody<
     return (await options.validateFile?.(bytes, sha256)) ?? true;
   }
 
-  async function heldFile(uid: string, fileIndex: number, expectedSha256: string) {
-    const chunks = await sql.query(
-      `SELECT chunk_index, bytes FROM ${tables.chunks}
-       WHERE resource_uid = ? AND file_index = ? ORDER BY chunk_index`,
-      [uid, fileIndex],
-    );
-    if (chunks.length === 0) return null;
+  async function heldFile(
+    uid: string,
+    fileIndex: number,
+    expectedSha256: string,
+    expectedSize?: number,
+    db: Sql = sql,
+  ) {
+    if (
+      expectedSize !== undefined &&
+      (!Number.isSafeInteger(expectedSize) ||
+        expectedSize < 0 ||
+        expectedSize > options.limits.fileBytes)
+    )
+      return null;
+    // D1 materializes BLOBs as arrays of JS numbers. Never ask it to return a
+    // whole 16 MiB file (roughly 128 MiB of numbers) in one query.
+    const joined = expectedSize === undefined ? null : new Uint8Array(expectedSize);
+    const parts: Uint8Array[] = [];
     let size = 0;
-    for (let index = 0; index < chunks.length; index += 1) {
-      const chunk = chunks[index];
-      if (!chunk || chunk.chunk_index !== index) return null;
-      const bytes = asBytes(chunk.bytes);
-      if (bytes.byteLength > CHUNK_BYTES) return null;
-      if (bytes.byteLength === 0 && (chunks.length !== 1 || index !== 0)) return null;
-      if (index < chunks.length - 1 && bytes.byteLength !== CHUNK_BYTES) return null;
-      size += bytes.byteLength;
-      if (size > options.limits.fileBytes) return null;
+    let next = 0;
+    let lastLength = CHUNK_BYTES;
+    for (;;) {
+      const page = await db.query(
+        `SELECT chunk_index, bytes FROM ${tables.chunks}
+         WHERE resource_uid = ? AND file_index = ? AND chunk_index >= ?
+         ORDER BY chunk_index LIMIT ?`,
+        [uid, fileIndex, next, CHUNKS_PER_READ],
+      );
+      for (const chunk of page) {
+        if (chunk.chunk_index !== next || lastLength !== CHUNK_BYTES) return null;
+        const bytes = asBytes(chunk.bytes);
+        if (bytes.byteLength > CHUNK_BYTES || (bytes.byteLength === 0 && next !== 0)) return null;
+        if (size + bytes.byteLength > (expectedSize ?? options.limits.fileBytes)) return null;
+        if (joined) joined.set(bytes, size);
+        else parts.push(bytes);
+        size += bytes.byteLength;
+        lastLength = bytes.byteLength;
+        next += 1;
+      }
+      if (page.length < CHUNKS_PER_READ) break;
     }
-    const joined = new Uint8Array(size);
-    let offset = 0;
-    for (const chunk of chunks) {
-      const bytes = asBytes(chunk.bytes);
-      joined.set(bytes, offset);
-      offset += bytes.byteLength;
+    if (next === 0 || (expectedSize !== undefined && size !== expectedSize)) return null;
+    const bytes = joined ?? new Uint8Array(size);
+    if (!joined) {
+      let offset = 0;
+      for (const part of parts) {
+        bytes.set(part, offset);
+        offset += part.byteLength;
+      }
     }
-    return (await validFile(joined, expectedSha256)) ? joined : null;
+    return (await validFile(bytes, expectedSha256)) ? bytes : null;
   }
 
-  async function stageFile(input: V2Execution, index: number, bytes: Uint8Array): Promise<void> {
-    for (let offset = 0; offset < Math.max(1, bytes.byteLength); offset += CHUNK_BYTES) {
-      const part = bytes.subarray(offset, Math.min(offset + CHUNK_BYTES, bytes.byteLength));
-      await sql.run(
-        `INSERT OR IGNORE INTO ${tables.chunks}
-           (resource_uid, file_index, chunk_index, bytes, operation_id, lease_token)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [
-          input.resourceUid,
-          index,
-          offset / CHUNK_BYTES,
-          exactBuffer(part),
-          input.operationId,
-          input.leaseToken,
-        ],
+  async function chunkPrefix(
+    uid: string,
+    fileIndex: number,
+    length: number,
+    db: Sql = sql,
+  ): Promise<number> {
+    const row = (
+      await db.query(
+        `SELECT COUNT(*) AS count, MAX(chunk_index) AS last_index,
+           COALESCE(SUM(length(bytes)), 0) AS total_bytes
+         FROM ${tables.chunks} WHERE resource_uid = ? AND file_index = ?`,
+        [uid, fileIndex],
+      )
+    )[0];
+    const count = row?.count;
+    const required = Math.max(1, Math.ceil(length / CHUNK_BYTES));
+    if (
+      typeof count !== "number" ||
+      count < 0 ||
+      count > required ||
+      (count > 0 && row?.last_index !== count - 1) ||
+      row?.total_bytes !== Math.min(count * CHUNK_BYTES, length)
+    ) {
+      throw options.invalidArtifact();
+    }
+    return count;
+  }
+
+  async function stageBatch(
+    input: V2Execution,
+    fileIndex: number,
+    bytes: Uint8Array,
+    firstChunk: number,
+    db: Sql = sql,
+  ): Promise<number> {
+    const required = Math.max(1, Math.ceil(bytes.byteLength / CHUNK_BYTES));
+    const count = Math.min(CHUNKS_PER_WRITE, required - firstChunk);
+    if (count <= 0) return firstChunk;
+    const params: (string | number | ArrayBuffer)[] = [];
+    for (let i = 0; i < count; i += 1) {
+      const chunkIndex = firstChunk + i;
+      const offset = chunkIndex * CHUNK_BYTES;
+      params.push(
+        input.resourceUid,
+        fileIndex,
+        chunkIndex,
+        exactBuffer(bytes.subarray(offset, Math.min(offset + CHUNK_BYTES, bytes.byteLength))),
+        input.operationId,
+        input.leaseToken,
       );
     }
-    const sha256 = (await bytesDigest(bytes)).slice("sha256:".length);
-    const held = await heldFile(input.resourceUid, index, sha256);
-    if (!held || !sameBytes(held, bytes)) throw options.invalidArtifact();
+    await db.run(
+      `INSERT OR IGNORE INTO ${tables.chunks}
+         (resource_uid, file_index, chunk_index, bytes, operation_id, lease_token)
+       VALUES ${Array.from({ length: count }, () => "(?, ?, ?, ?, ?, ?)").join(", ")}`,
+      params,
+    );
+    return firstChunk + count;
   }
 
   async function ensureManifest(
     input: Pick<V2Execution, "resourceUid" | "spec">,
     mayAcquire = true,
     acquisition?: V2Execution,
+    db: Sql = sql,
   ) {
     const spec = options.parseSpec(input.spec);
-    let current = await owner(input.resourceUid);
+    let current = await owner(input.resourceUid, db);
     if (!current) {
       if (!mayAcquire || !acquisition) throw options.invalidArtifact();
       const bytes = await acquire(
@@ -190,7 +280,7 @@ export function createSqlArtifactCustody<
         options.limits.manifestBytes,
       );
       options.parseManifest(bytes);
-      await sql.run(
+      await db.run(
         tables.hasFormUrl
           ? `INSERT OR IGNORE INTO ${tables.owners}
                (resource_uid, form_url, manifest_sha256, manifest_bytes,
@@ -209,7 +299,7 @@ export function createSqlArtifactCustody<
           acquisition.leaseToken,
         ],
       );
-      current = await owner(input.resourceUid);
+      current = await owner(input.resourceUid, db);
     }
     if (
       !current ||
@@ -228,8 +318,6 @@ export function createSqlArtifactCustody<
   async function ensureFiles(
     input: Pick<V2Execution, "resourceUid" | "spec">,
     manifest: M,
-    mayAcquire: boolean,
-    acquisition?: V2Execution,
   ): Promise<readonly Uint8Array[]> {
     const held: Uint8Array[] = [];
     let total = 0;
@@ -237,22 +325,12 @@ export function createSqlArtifactCustody<
       const file = manifest.files[index];
       if (!file) throw options.invalidManifest();
       const remainingBytes = options.limits.aggregateBytes - total;
-      let bytes: Uint8Array<ArrayBufferLike> | null = await heldFile(
+      const bytes: Uint8Array<ArrayBufferLike> | null = await heldFile(
         input.resourceUid,
         index,
         file.sha256,
       );
       if (bytes && bytes.byteLength > remainingBytes) throw options.invalidArtifact();
-      if (!bytes && mayAcquire && acquisition) {
-        bytes = await acquire(
-          acquisition,
-          file.url,
-          file.sha256,
-          Math.min(options.limits.fileBytes, remainingBytes),
-        );
-        if (!(await validFile(bytes, file.sha256))) throw options.invalidArtifact();
-        await stageFile(acquisition, index, bytes);
-      }
       if (!bytes) throw options.invalidArtifact();
       total += bytes.byteLength;
       if (total > options.limits.aggregateBytes) throw options.invalidArtifact();
@@ -261,19 +339,209 @@ export function createSqlArtifactCustody<
     return held;
   }
 
+  async function progress(input: V2Execution, fileCount: number, db: Sql): Promise<ProgressRow> {
+    await db.run(
+      `INSERT OR IGNORE INTO tf_v2_artifact_progress
+         (operation_id, resource_uid, form_url, lease_token) VALUES (?, ?, ?, ?)`,
+      [input.operationId, input.resourceUid, options.formUrl, input.leaseToken],
+    );
+    let row = (
+      await db.query("SELECT * FROM tf_v2_artifact_progress WHERE operation_id = ?", [
+        input.operationId,
+      ])
+    )[0] as ProgressRow | undefined;
+    if (!row || row.resource_uid !== input.resourceUid || row.form_url !== options.formUrl) {
+      throw new SqlError("unavailable", "artifact progress is unavailable");
+    }
+    if (row.lease_token !== input.leaseToken) {
+      const rotated = await db.run(
+        `UPDATE tf_v2_artifact_progress SET lease_token = ?
+         WHERE operation_id = ? AND lease_token = ?`,
+        [input.leaseToken, input.operationId, row.lease_token],
+      );
+      if (rotated.changes !== 1) throw new SqlError("unavailable", "artifact claim was lost");
+      row = { ...row, lease_token: input.leaseToken };
+    }
+    const sizes = JSON.parse(row.file_sizes_json) as unknown;
+    if (
+      !Array.isArray(sizes) ||
+      row.next_file_index > fileCount ||
+      sizes.length !== row.next_file_index ||
+      !sizes.every(
+        (size) => Number.isSafeInteger(size) && size >= 0 && size <= options.limits.fileBytes,
+      ) ||
+      sizes.reduce<number>((sum, size) => sum + size, 0) !== row.total_bytes ||
+      row.total_bytes > options.limits.aggregateBytes
+    ) {
+      throw options.invalidArtifact();
+    }
+    return row;
+  }
+
+  async function beginFile(
+    input: V2Execution,
+    row: ProgressRow,
+    fileSha256: string,
+    size: number,
+    db: Sql,
+  ): Promise<ProgressRow> {
+    if (size > options.limits.fileBytes || row.total_bytes + size > options.limits.aggregateBytes) {
+      throw options.invalidArtifact();
+    }
+    const written = await db.run(
+      `UPDATE tf_v2_artifact_progress
+       SET current_file_bytes = ?, current_file_sha256 = ?
+       WHERE operation_id = ? AND lease_token = ? AND next_file_index = ?
+         AND current_file_bytes IS NULL`,
+      [size, fileSha256, input.operationId, input.leaseToken, row.next_file_index],
+    );
+    if (written.changes !== 1) throw new SqlError("unavailable", "artifact claim was lost");
+    return { ...row, current_file_bytes: size, current_file_sha256: fileSha256 };
+  }
+
+  async function finishFile(input: V2Execution, row: ProgressRow, db: Sql): Promise<ProgressRow> {
+    const size = row.current_file_bytes;
+    if (size === null) throw options.invalidArtifact();
+    const sizes = JSON.parse(row.file_sizes_json) as number[];
+    const updated = {
+      ...row,
+      next_file_index: row.next_file_index + 1,
+      current_file_bytes: null,
+      current_file_sha256: null,
+      file_sizes_json: JSON.stringify([...sizes, size]),
+      total_bytes: row.total_bytes + size,
+    };
+    const written = await db.run(
+      `UPDATE tf_v2_artifact_progress SET next_file_index = ?,
+         current_file_bytes = NULL, current_file_sha256 = NULL,
+         file_sizes_json = ?, total_bytes = ?
+       WHERE operation_id = ? AND lease_token = ? AND next_file_index = ?
+         AND current_file_bytes = ?`,
+      [
+        updated.next_file_index,
+        updated.file_sizes_json,
+        updated.total_bytes,
+        input.operationId,
+        input.leaseToken,
+        row.next_file_index,
+        size,
+      ],
+    );
+    if (written.changes !== 1) throw new SqlError("unavailable", "artifact claim was lost");
+    return updated;
+  }
+
   async function verify(input: V2Execution): Promise<V2BackendResult> {
-    const { current, manifestBytes, manifest } = await ensureManifest(input, true, input);
-    const files = await ensureFiles(input, manifest, current.state !== "verified", input);
-    const result = await options.validatePayload({
+    let remainingSql = VERIFY_SQL_STATEMENTS_PER_PASS;
+    const spend = (statements = 1) => {
+      if (remainingSql < statements) throw new WorkBudgetExhausted();
+      remainingSql -= statements;
+    };
+    const db: Sql = {
+      query(statement, params) {
+        spend();
+        return sql.query(statement, params);
+      },
+      run(statement, params) {
+        spend();
+        return sql.run(statement, params);
+      },
+      batch(statements) {
+        spend(statements.length);
+        return sql.batch(statements);
+      },
+    };
+    const { current, manifestBytes, manifest } = await ensureManifest(input, true, input, db);
+    const observedFiles = current.observation_json
+      ? (JSON.parse(current.observation_json) as { files?: readonly { byteSize?: number }[] }).files
+      : undefined;
+    let checkpoint = await progress(input, manifest.files.length, db);
+    let advanced = 0;
+    let chunkWrites = 0;
+    while (checkpoint.next_file_index < manifest.files.length) {
+      if (advanced >= FILES_PER_PASS || chunkWrites >= CHUNK_WRITES_PER_PASS) {
+        return { kind: "continue" };
+      }
+      const index = checkpoint.next_file_index;
+      const file = manifest.files[index];
+      if (!file) throw options.invalidManifest();
+      if (checkpoint.current_file_bytes !== null && checkpoint.current_file_sha256 !== file.sha256)
+        throw options.invalidArtifact();
+
+      let bytes: Uint8Array | null = null;
+      if (checkpoint.current_file_bytes !== null) {
+        const count = await chunkPrefix(
+          input.resourceUid,
+          index,
+          checkpoint.current_file_bytes,
+          db,
+        );
+        const required = Math.max(1, Math.ceil(checkpoint.current_file_bytes / CHUNK_BYTES));
+        if (count === required) {
+          bytes = await heldFile(
+            input.resourceUid,
+            index,
+            file.sha256,
+            checkpoint.current_file_bytes,
+            db,
+          );
+          if (!bytes) throw options.invalidArtifact();
+        }
+      } else if (current.state === "verified") {
+        const recordedSize = observedFiles?.[index]?.byteSize;
+        bytes = await heldFile(
+          input.resourceUid,
+          index,
+          file.sha256,
+          Number.isSafeInteger(recordedSize) &&
+            recordedSize !== undefined &&
+            recordedSize >= 0 &&
+            recordedSize <= options.limits.fileBytes
+            ? recordedSize
+            : undefined,
+          db,
+        );
+        if (!bytes) throw options.invalidArtifact();
+        checkpoint = await beginFile(input, checkpoint, file.sha256, bytes.byteLength, db);
+      }
+      if (!bytes) {
+        if (current.state === "verified") throw options.invalidArtifact();
+        const remaining = options.limits.aggregateBytes - checkpoint.total_bytes;
+        const sourceBytes = await acquire(
+          input,
+          file.url,
+          file.sha256,
+          Math.min(options.limits.fileBytes, remaining),
+        );
+        if (!(await validFile(sourceBytes, file.sha256))) throw options.invalidArtifact();
+        if (checkpoint.current_file_bytes === null) {
+          checkpoint = await beginFile(input, checkpoint, file.sha256, sourceBytes.byteLength, db);
+        } else if (checkpoint.current_file_bytes !== sourceBytes.byteLength) {
+          throw options.invalidArtifact();
+        }
+        let nextChunk = await chunkPrefix(input.resourceUid, index, sourceBytes.byteLength, db);
+        const required = Math.max(1, Math.ceil(sourceBytes.byteLength / CHUNK_BYTES));
+        while (nextChunk < required && chunkWrites < CHUNK_WRITES_PER_PASS) {
+          nextChunk = await stageBatch(input, index, sourceBytes, nextChunk, db);
+          chunkWrites += 1;
+        }
+        if (nextChunk < required) return { kind: "continue" };
+        bytes = await heldFile(input.resourceUid, index, file.sha256, sourceBytes.byteLength, db);
+        if (!bytes || !sameBytes(bytes, sourceBytes)) throw options.invalidArtifact();
+      }
+      checkpoint = await finishFile(input, checkpoint, db);
+      advanced += 1;
+    }
+    const result = await options.projectVerified({
       spec: input.spec,
       manifestBytes,
-      fileBytes: files,
+      fileSizes: JSON.parse(checkpoint.file_sizes_json) as number[],
     });
     const observedJson = canonicalJson(result.observed);
     if (current.state === "verified") {
       if (current.observation_json !== observedJson) throw options.invalidArtifact();
     } else {
-      const written = await sql.run(
+      const written = await db.run(
         `UPDATE ${tables.owners} SET state = 'verified', observation_json = ?,
            verified_operation_id = ?, verified_lease_token = ?
          WHERE resource_uid = ? AND state = 'staging'`,
@@ -323,7 +591,7 @@ export function createSqlArtifactCustody<
     const heldInput = { resourceUid: targetResourceUid, spec: targetSpec };
     const { current, manifestBytes, manifest } = await ensureManifest(heldInput, false);
     if (current.state !== "verified" || !current.observation_json) throw denied();
-    const files = await ensureFiles(heldInput, manifest, false);
+    const files = await ensureFiles(heldInput, manifest);
     const result = await options.validatePayload({
       spec: targetSpec,
       manifestBytes,
@@ -514,6 +782,7 @@ export function createSqlArtifactCustody<
     try {
       return await verify(input);
     } catch (error) {
+      if (error instanceof WorkBudgetExhausted) return { kind: "continue" };
       if (error instanceof SqlError) throw error;
       const stage = await owner(input.resourceUid);
       // The terminal failed settlement atomically removes unverified stage rows.

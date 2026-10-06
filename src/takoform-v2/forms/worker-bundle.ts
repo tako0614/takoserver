@@ -198,20 +198,48 @@ export async function validateWorkerBundlePayload(input: {
     totalBytes += bytes.byteLength;
   }
 
-  const observedFiles: WorkerBundleObservedFile[] = [];
   for (let index = 0; index < manifest.files.length; index += 1) {
     const file = manifest.files[index];
     const bytes = input.fileBytes[index];
     if (!file || !bytes) throw invalid("invalid_artifact");
     const digest = bareSha256Digest(await bytesDigest(bytes));
     if (digest !== file.sha256) throw invalid("invalid_artifact");
-    observedFiles.push({
-      path: file.path,
-      sha256: digest,
-      mediaType: file.mediaType,
-      byteSize: bytes.byteLength,
-    });
   }
+
+  return await projectWorkerBundleVerified({
+    spec: input.spec,
+    manifestBytes: input.manifestBytes,
+    fileSizes: input.fileBytes.map((bytes) => bytes.byteLength),
+  });
+}
+
+/** Projection from a complete set of individually verified immutable files. */
+export async function projectWorkerBundleVerified(input: {
+  readonly spec: unknown;
+  readonly manifestBytes: Uint8Array;
+  readonly fileSizes: readonly number[];
+}): Promise<WorkerBundleObservation> {
+  const spec = parseWorkerBundleSpec(input.spec);
+  const manifest = parseWorkerBundleManifest(input.manifestBytes);
+  const manifestSha256 = bareSha256Digest(await bytesDigest(input.manifestBytes));
+  if (manifestSha256 !== spec.artifact.sha256 || input.fileSizes.length !== manifest.files.length) {
+    throw invalid("invalid_artifact");
+  }
+  let totalBytes = 0;
+  const observedFiles: WorkerBundleObservedFile[] = manifest.files.map((file, index) => {
+    const size = input.fileSizes[index];
+    if (
+      !Number.isSafeInteger(size) ||
+      size === undefined ||
+      size < 0 ||
+      size > WORKER_BUNDLE_LIMITS.fileBytes ||
+      totalBytes + size > WORKER_BUNDLE_LIMITS.aggregateBytes
+    ) {
+      throw invalid("invalid_artifact");
+    }
+    totalBytes += size;
+    return { path: file.path, sha256: file.sha256, mediaType: file.mediaType, byteSize: size };
+  });
 
   return {
     observed: {

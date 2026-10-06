@@ -789,13 +789,13 @@ describe("integration storage generation bootstrap", () => {
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const tail = join(migrationDirectory, "0074_v2_worker_native_effects.sql");
+        const tail = join(migrationDirectory, "0075_v2_artifact_progress.sql");
         if (drift === "missing") rmSync(tail);
         else if (drift === "changed") {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0075_unreviewed.sql"),
+            join(migrationDirectory, "0076_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }
@@ -808,7 +808,7 @@ describe("integration storage generation bootstrap", () => {
         ).rejects.toThrow(
           drift === "changed"
             ? "exact audited migration SHA-256"
-            : "audited migration lineage must contain exactly 0001-0074",
+            : "audited migration lineage must contain exactly 0001-0075",
         );
         expect(fixture.calls).toEqual([]);
       } finally {
@@ -1015,7 +1015,7 @@ describe("integration storage generation bootstrap", () => {
     expect(error.stack).not.toContain("secret should not escape");
     const tail = join(fixtureRoot, "tail-migrations");
     copyCurrentSchemaFixture(tail);
-    writeFileSync(join(tail, "0075_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+    writeFileSync(join(tail, "0076_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     for (const migrationDirectory of [auditedMigrations, tail]) {
       const refusedProvider = providerFixture();
       await expect(
@@ -1023,7 +1023,7 @@ describe("integration storage generation bootstrap", () => {
           ...options(refusedProvider.provider),
           migrationDirectory,
         }),
-      ).rejects.toThrow("exactly 0001-0074");
+      ).rejects.toThrow("exactly 0001-0075");
       expect(refusedProvider.calls).toEqual([]);
     }
   });

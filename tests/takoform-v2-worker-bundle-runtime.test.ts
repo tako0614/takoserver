@@ -73,6 +73,7 @@ async function fixture(input: {
       "0071_v2_sqlite_migration_set_custody.sql",
       "0072_v2_artifact_custody.sql",
       "0073_v2_reference_acceptance.sql",
+      "0075_v2_artifact_progress.sql",
     ]) {
       db.exec(readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8"));
     }

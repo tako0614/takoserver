@@ -1,6 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  unlink,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { WORKER_DEPLOYMENT_FORM_URL } from "./takoform-v2/forms/worker-specs.ts";
 import type { V2Execution } from "./takoform-v2/types.ts";
@@ -9,6 +21,7 @@ import {
   createV2StaticWorkerPublication,
   type V2StaticWorkerPublicationResult,
 } from "./takoform-v2/worker-static-publication.ts";
+import { workerPortOwnership } from "./workerd-linux-process.ts";
 import type {
   WorkerdPublicationIdentity,
   WorkerdRuntime,
@@ -25,9 +38,12 @@ import {
 const STATE_NAME = "runtime-owner.json";
 const LOCK_NAME = "runtime-owner.lock";
 const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@1";
+const LOCK_SCHEMA = "takoserver.v2-worker-runtime-owner-lock@2";
 const OPERATION_MARKER = "takoserver-v2-operation:";
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const DRAIN_GRACE_MS = 15 * 60 * 1000;
+const LOCK_MAX_BYTES = 2_048;
+const RECOVERY_PREFIX = ".runtime-owner-recovery.";
 
 type PublicationState = {
   resolve(input: {
@@ -110,6 +126,524 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
 
 function canonicalJson(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
+}
+
+interface OwnerProcessFingerprint {
+  readonly bootId: string;
+  readonly pidNamespace: string;
+  readonly startTimeTicks: string;
+}
+
+interface RuntimeOwnerLockRecord {
+  readonly schema: typeof LOCK_SCHEMA;
+  readonly ownerId: string;
+  readonly pid: number;
+  readonly process: OwnerProcessFingerprint | null;
+  readonly device: string;
+  readonly inode: string;
+}
+
+interface OwnerFileIdentity {
+  readonly device: string;
+  readonly inode: string;
+  readonly links: bigint;
+}
+
+interface OpenedOwnerLock {
+  readonly handle: Awaited<ReturnType<typeof open>>;
+  readonly record: RuntimeOwnerLockRecord;
+}
+
+interface ReadOwnerLock {
+  readonly record: RuntimeOwnerLockRecord;
+  readonly identity: OwnerFileIdentity;
+}
+
+type ProcessLiveness = "live" | "stale" | "unknown";
+
+function sameOwnerFile(left: OwnerFileIdentity, right: OwnerFileIdentity): boolean {
+  return left.device === right.device && left.inode === right.inode;
+}
+
+function parseOwnerFingerprint(value: unknown): OwnerProcessFingerprint | null | undefined {
+  if (value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const candidate = value as Record<string, unknown>;
+  if (
+    Object.keys(candidate).sort().join(",") !== "bootId,pidNamespace,startTimeTicks" ||
+    typeof candidate.bootId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(candidate.bootId) ||
+    typeof candidate.startTimeTicks !== "string" ||
+    !/^\d{1,32}$/u.test(candidate.startTimeTicks) ||
+    typeof candidate.pidNamespace !== "string" ||
+    !/^\d{1,32}:\d{1,32}$/u.test(candidate.pidNamespace)
+  ) {
+    return undefined;
+  }
+  return {
+    bootId: candidate.bootId.toLowerCase(),
+    pidNamespace: candidate.pidNamespace,
+    startTimeTicks: candidate.startTimeTicks,
+  };
+}
+
+function parseOwnerLockRecord(value: unknown, identity: OwnerFileIdentity): RuntimeOwnerLockRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  const candidate = value as Record<string, unknown>;
+  const expectedKeys = ["device", "inode", "ownerId", "pid", "process", "schema"];
+  const processFingerprint = parseOwnerFingerprint(candidate.process);
+  if (
+    Object.keys(candidate).sort().join(",") !== expectedKeys.join(",") ||
+    candidate.schema !== LOCK_SCHEMA ||
+    typeof candidate.ownerId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+      candidate.ownerId,
+    ) ||
+    !Number.isSafeInteger(candidate.pid) ||
+    (candidate.pid as number) < 1 ||
+    processFingerprint === undefined ||
+    candidate.device !== identity.device ||
+    candidate.inode !== identity.inode
+  ) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+  return {
+    schema: LOCK_SCHEMA,
+    ownerId: candidate.ownerId,
+    pid: candidate.pid as number,
+    process: processFingerprint,
+    device: identity.device,
+    inode: identity.inode,
+  };
+}
+
+function ownerFileIdentity(stat: { dev: bigint; ino: bigint; nlink: bigint }): OwnerFileIdentity {
+  return { device: String(stat.dev), inode: String(stat.ino), links: stat.nlink };
+}
+
+async function readBoundedText(path: string, maximumBytes: number): Promise<string | null> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const bytes = Buffer.alloc(maximumBytes + 1);
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const result = await handle.read(bytes, offset, bytes.byteLength - offset, null);
+      if (result.bytesRead <= 0) break;
+      offset += result.bytesRead;
+    }
+    if (offset > maximumBytes) return null;
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, offset));
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function currentOwnerFingerprint(): Promise<OwnerProcessFingerprint | null> {
+  if (process.platform !== "linux") return null;
+  const [bootIdText, statText, namespace] = await Promise.all([
+    readBoundedText("/proc/sys/kernel/random/boot_id", 128),
+    readBoundedText(`/proc/${process.pid}/stat`, 4_096),
+    stat("/proc/self/ns/pid", { bigint: true }).catch(() => null),
+  ]);
+  const bootId = bootIdText?.trim().toLowerCase();
+  if (
+    !bootId ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(bootId) ||
+    !statText ||
+    !namespace
+  ) {
+    return null;
+  }
+  const commandEnd = statText.lastIndexOf(")");
+  if (commandEnd < 0) return null;
+  const fields = statText
+    .slice(commandEnd + 1)
+    .trim()
+    .split(/\s+/u);
+  const startTimeTicks = fields[19];
+  if (!startTimeTicks || !/^\d{1,32}$/u.test(startTimeTicks)) return null;
+  return {
+    bootId,
+    pidNamespace: `${namespace.dev}:${namespace.ino}`,
+    startTimeTicks,
+  };
+}
+
+async function processLiveness(
+  pid: number,
+  expected: OwnerProcessFingerprint | null,
+): Promise<ProcessLiveness> {
+  if (expected === null) return "unknown";
+  const namespace = await stat("/proc/self/ns/pid", { bigint: true }).catch(() => null);
+  if (!namespace || `${namespace.dev}:${namespace.ino}` !== expected.pidNamespace) return "unknown";
+  let currentBootId: string | null = null;
+  const bootIdText = await readBoundedText("/proc/sys/kernel/random/boot_id", 128);
+  const bootId = bootIdText?.trim().toLowerCase();
+  if (bootId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(bootId))
+    currentBootId = bootId;
+  if (!currentBootId) return "unknown";
+  if (expected.bootId !== currentBootId) return "unknown";
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return "stale";
+    return "unknown";
+  }
+  const statText = await readBoundedText(`/proc/${pid}/stat`, 4_096);
+  if (!statText) return "unknown";
+  const commandEnd = statText.lastIndexOf(")");
+  if (commandEnd < 0) return "unknown";
+  const fields = statText
+    .slice(commandEnd + 1)
+    .trim()
+    .split(/\s+/u);
+  const state = fields[0];
+  const startTimeTicks = fields[19];
+  if (!state || !startTimeTicks || !/^\d{1,32}$/u.test(startTimeTicks)) return "unknown";
+  if (startTimeTicks !== expected.startTimeTicks) return "stale";
+  // A zombie has exited and cannot hold admission or restart a child. Listener
+  // vacancy is checked separately before a successor can take ownership.
+  return state === "Z" || state === "X" ? "stale" : "live";
+}
+
+async function readOwnerLock(path: string): Promise<ReadOwnerLock | null> {
+  const before = await lstat(path, { bigint: true }).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  if (before === null) return null;
+  if (!before.isFile() || before.isSymbolicLink() || (before.mode & 0o077n) !== 0n)
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const stat = await handle.stat({ bigint: true });
+    const identity = ownerFileIdentity(stat);
+    if (
+      !stat.isFile() ||
+      (stat.mode & 0o077n) !== 0n ||
+      stat.size < 1n ||
+      stat.size > BigInt(LOCK_MAX_BYTES)
+    ) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    const text = await handle.readFile({ encoding: "utf8" });
+    if (Buffer.byteLength(text, "utf8") > LOCK_MAX_BYTES)
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const after = await lstat(path, { bigint: true });
+    const afterIdentity = ownerFileIdentity(after);
+    if (
+      !sameOwnerFile(identity, ownerFileIdentity(before)) ||
+      !sameOwnerFile(identity, afterIdentity)
+    )
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    const record = parseOwnerLockRecord(parsed, identity);
+    if (canonicalJson(record) !== text)
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    return { record, identity: afterIdentity };
+  } catch (error) {
+    if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+interface OwnerStateSnapshot {
+  readonly state: PersistedOwnerState;
+  readonly identity: OwnerFileIdentity | null;
+  readonly text: string | null;
+}
+
+async function readOwnerStateSnapshot(
+  path: string,
+  workerResourceUid: string,
+): Promise<OwnerStateSnapshot> {
+  const before = await lstat(path, { bigint: true }).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  if (before === null) return { state: emptyState(workerResourceUid), identity: null, text: null };
+  if (
+    !before.isFile() ||
+    before.isSymbolicLink() ||
+    (before.mode & 0o077n) !== 0n ||
+    before.size > 8_388_608n
+  ) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+  const identity = ownerFileIdentity(before);
+  const text = await readFile(path, "utf8").catch(() => {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  const after = await lstat(path, { bigint: true }).catch(() => null);
+  if (!after || !sameOwnerFile(identity, ownerFileIdentity(after)))
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  return { state: parseState(text, workerResourceUid), identity, text };
+}
+
+function hasOnlyRetiredIncarnations(state: PersistedOwnerState): boolean {
+  return (
+    state.activeOperationId === null &&
+    state.incarnations.every(
+      (item) => item.status === "retired" && item.receipt !== null && item.retirementOperationId,
+    )
+  );
+}
+
+async function requireVacantOwnerListeners(state: PersistedOwnerState): Promise<void> {
+  const ports = new Set(state.incarnations.map((item) => item.listenerPort));
+  for (const port of ports) {
+    if ((await workerPortOwnership(port, undefined)) !== "vacant")
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+}
+
+function recoveryClaimName(fingerprint: OwnerProcessFingerprint, ownerId: string): string {
+  return `${RECOVERY_PREFIX}${process.pid}.${fingerprint.bootId}.${fingerprint.startTimeTicks}.${fingerprint.pidNamespace}.${ownerId}`;
+}
+
+function parseRecoveryClaimName(name: string): {
+  readonly pid: number;
+  readonly fingerprint: OwnerProcessFingerprint;
+} | null {
+  if (!name.startsWith(RECOVERY_PREFIX)) return null;
+  const parts = name.slice(RECOVERY_PREFIX.length).split(".");
+  const [pidText, bootId, startTimeTicks, pidNamespace, ownerId] = parts;
+  if (
+    parts.length !== 5 ||
+    !pidText ||
+    !/^\d{1,10}$/u.test(pidText) ||
+    !bootId ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(bootId) ||
+    !startTimeTicks ||
+    !/^\d{1,32}$/u.test(startTimeTicks) ||
+    !pidNamespace ||
+    !/^\d{1,32}:\d{1,32}$/u.test(pidNamespace) ||
+    !ownerId ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(ownerId)
+  ) {
+    return null;
+  }
+  const pid = Number(pidText);
+  if (!Number.isSafeInteger(pid) || pid < 1) return null;
+  return {
+    pid,
+    fingerprint: { bootId: bootId.toLowerCase(), pidNamespace, startTimeTicks },
+  };
+}
+
+async function cleanStaleRecoveryClaims(directory: string): Promise<number> {
+  const entries = await readdir(directory).catch(() => {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  let count = 0;
+  for (const name of entries) {
+    if (!name.startsWith(RECOVERY_PREFIX)) continue;
+    count += 1;
+    if (count > 64) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const parsed = parseRecoveryClaimName(name);
+    if (!parsed) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    if ((await processLiveness(parsed.pid, parsed.fingerprint)) !== "stale") continue;
+    const path = join(directory, name);
+    const stat = await lstat(path, { bigint: true }).catch(() => null);
+    if (stat === null) continue;
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077n) !== 0n)
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    if ((await processLiveness(parsed.pid, parsed.fingerprint)) !== "stale") continue;
+    await unlink(path).catch(() => {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    });
+    await syncDirectory(directory);
+  }
+  const remaining = await readdir(directory).catch(() => {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  return remaining.filter((name) => name.startsWith(RECOVERY_PREFIX)).length;
+}
+
+async function createOwnerLock(path: string, directory: string): Promise<OpenedOwnerLock | null> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let identity: OwnerFileIdentity | undefined;
+  try {
+    handle = await open(
+      path,
+      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    const stat = await handle.stat({ bigint: true });
+    identity = ownerFileIdentity(stat);
+    const record: RuntimeOwnerLockRecord = {
+      schema: LOCK_SCHEMA,
+      ownerId: randomUUID(),
+      pid: process.pid,
+      process: await currentOwnerFingerprint(),
+      device: identity.device,
+      inode: identity.inode,
+    };
+    await handle.writeFile(canonicalJson(record), "utf8");
+    await handle.sync();
+    await syncDirectory(directory);
+    return { handle, record };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST" && !handle) return null;
+    if (identity) {
+      const current = await lstat(path, { bigint: true }).catch(() => null);
+      if (current && sameOwnerFile(identity, ownerFileIdentity(current)))
+        await unlink(path).catch(() => undefined);
+    }
+    await handle?.close().catch(() => undefined);
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+}
+
+async function requireSafeStateForNewOwner(
+  snapshot: OwnerStateSnapshot,
+  allowDeleteReplayOnly: boolean,
+): Promise<void> {
+  if (!hasOnlyRetiredIncarnations(snapshot.state))
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  if (
+    allowDeleteReplayOnly &&
+    (snapshot.state.admissionClosedBy === null || !snapshot.state.deletionPublicationConfirmed)
+  ) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+  await requireVacantOwnerListeners(snapshot.state);
+}
+
+async function sameOwnerStateSnapshot(
+  path: string,
+  workerResourceUid: string,
+  expected: OwnerStateSnapshot,
+): Promise<boolean> {
+  const current = await readOwnerStateSnapshot(path, workerResourceUid);
+  return (
+    current.text === expected.text &&
+    ((current.identity === null && expected.identity === null) ||
+      (current.identity !== null &&
+        expected.identity !== null &&
+        sameOwnerFile(current.identity, expected.identity)))
+  );
+}
+
+async function acquireOwnerLock(
+  directory: string,
+  statePath: string,
+  workerResourceUid: string,
+): Promise<OpenedOwnerLock> {
+  const lockPath = join(directory, LOCK_NAME);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const remainingClaims = await cleanStaleRecoveryClaims(directory);
+    const previous = await readOwnerLock(lockPath);
+    if (previous === null) {
+      if (remainingClaims !== 0) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      const snapshot = await readOwnerStateSnapshot(statePath, workerResourceUid);
+      await requireSafeStateForNewOwner(snapshot, false);
+      const created = await createOwnerLock(lockPath, directory);
+      if (created) return created;
+      continue;
+    }
+
+    const priorLiveness = await processLiveness(previous.record.pid, previous.record.process);
+    if (priorLiveness !== "stale") throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const stateSnapshot = await readOwnerStateSnapshot(statePath, workerResourceUid);
+    await requireSafeStateForNewOwner(stateSnapshot, true);
+    const fingerprint = await currentOwnerFingerprint();
+    if (!fingerprint) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const claimPath = join(directory, recoveryClaimName(fingerprint, randomUUID()));
+    let pinnedIdentity: OwnerFileIdentity | null = null;
+    try {
+      await link(lockPath, claimPath);
+      const claimStat = await lstat(claimPath, { bigint: true }).catch(() => null);
+      const pinned = await readOwnerLock(lockPath);
+      if (
+        !claimStat ||
+        !pinned ||
+        !sameOwnerFile(previous.identity, ownerFileIdentity(claimStat)) ||
+        !sameOwnerFile(previous.identity, pinned.identity) ||
+        !sameOwnerFile(previous.identity, ownerFileIdentity(claimStat))
+      ) {
+        continue;
+      }
+      pinnedIdentity = ownerFileIdentity(claimStat);
+      if (pinnedIdentity.links !== 2n) continue;
+      if (
+        pinned.record.ownerId !== previous.record.ownerId ||
+        (await processLiveness(previous.record.pid, previous.record.process)) !== "stale" ||
+        !(await sameOwnerStateSnapshot(statePath, workerResourceUid, stateSnapshot))
+      ) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      await requireSafeStateForNewOwner(stateSnapshot, true);
+      const finalLock = await readOwnerLock(lockPath);
+      const finalClaim = await lstat(claimPath, { bigint: true }).catch(() => null);
+      if (
+        !finalLock ||
+        !finalClaim ||
+        !sameOwnerFile(previous.identity, finalLock.identity) ||
+        !sameOwnerFile(previous.identity, ownerFileIdentity(finalClaim)) ||
+        finalLock.identity.links !== 2n ||
+        (await processLiveness(previous.record.pid, previous.record.process)) !== "stale" ||
+        !(await sameOwnerStateSnapshot(statePath, workerResourceUid, stateSnapshot))
+      ) {
+        continue;
+      }
+      await unlink(lockPath);
+      await syncDirectory(directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
+      }
+      continue;
+    } finally {
+      if (pinnedIdentity) {
+        const currentClaim = await lstat(claimPath, { bigint: true }).catch(() => null);
+        if (currentClaim && sameOwnerFile(pinnedIdentity, ownerFileIdentity(currentClaim)))
+          await unlink(claimPath).catch(() => undefined);
+      } else {
+        await unlink(claimPath).catch(() => undefined);
+      }
+    }
+
+    const successor = await createOwnerLock(lockPath, directory);
+    if (!successor) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    return successor;
+  }
+  throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+}
+
+async function releaseOwnerLock(
+  lockPath: string,
+  directory: string,
+  opened: OpenedOwnerLock,
+): Promise<void> {
+  try {
+    const current = await readOwnerLock(lockPath);
+    if (
+      !current ||
+      current.record.ownerId !== opened.record.ownerId ||
+      current.record.pid !== opened.record.pid ||
+      current.record.device !== opened.record.device ||
+      current.record.inode !== opened.record.inode
+    ) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    await unlink(lockPath);
+    await syncDirectory(directory);
+  } finally {
+    await opened.handle.close().catch(() => undefined);
+  }
 }
 
 export function createSerializedWorkerdOwnerStateWriter<State>(
@@ -423,20 +957,16 @@ export async function openWorkerdWorkerRuntimeOwner(
   if (!ownerInfo?.isDirectory() || ownerInfo.isSymbolicLink() || (ownerInfo.mode & 0o077) !== 0)
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
 
-  let lockHandle: Awaited<ReturnType<typeof open>>;
+  const lockPath = join(directory, LOCK_NAME);
+  const statePath = join(directory, STATE_NAME);
+  let ownerLock: OpenedOwnerLock;
   try {
-    // Never reclaim a leftover lock from PID state alone. A crashed owner can
-    // leave Workerd children behind; crash recovery needs a separate proof of
-    // exclusive ownership and exact child retirement before this UID can open.
-    lockHandle = await open(join(directory, LOCK_NAME), "wx", 0o600);
-    await lockHandle.writeFile(`${process.pid}\n`);
-    await lockHandle.sync();
-    await syncDirectory(directory);
-  } catch {
+    ownerLock = await acquireOwnerLock(directory, statePath, options.workerResourceUid);
+  } catch (error) {
+    if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
 
-  const statePath = join(directory, STATE_NAME);
   let state: PersistedOwnerState;
   try {
     const text = await readFile(statePath, "utf8").catch((error: unknown) => {
@@ -448,8 +978,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
   } catch (error) {
-    await lockHandle.close().catch(() => undefined);
-    await rm(join(directory, LOCK_NAME), { force: true }).catch(() => undefined);
+    await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
     if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
@@ -954,10 +1483,8 @@ export async function openWorkerdWorkerRuntimeOwner(
       for (const item of handles.values()) {
         if (item.retirementTimer !== undefined) clearTimeout(item.retirementTimer);
       }
+      await releaseOwnerLock(lockPath, directory, ownerLock);
       closed = true;
-      await lockHandle.close();
-      await rm(join(directory, LOCK_NAME), { force: true });
-      await syncDirectory(directory);
     });
   };
 

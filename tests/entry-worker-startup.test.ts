@@ -69,12 +69,22 @@ describe("Worker startup diagnostics", () => {
     expect(storageReads).toBe(0);
   });
 
-  test("refuses configured SQLiteMigrationSet before touching Worker storage", async () => {
+  test("rejects an invalid SQLiteMigrationSet source grant before touching Worker storage", async () => {
     const env = workerEnv({
       TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
         documentation: "https://docs.example.invalid/takoform-v2",
         authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
-        sqliteMigrationSet: { targetKey: "operator-sqlite-primary", heldArtifacts: [] },
+        sqliteMigrationSet: {
+          targetKey: "operator-sqlite-primary",
+          heldArtifacts: [
+            {
+              url: "https://artifacts.example.test/sqlite/manifest.json",
+              sha256: "a".repeat(64),
+              objectKey: "held/sqlite/manifest",
+              grants: [],
+            },
+          ],
+        },
       }),
     });
     let storageReads = 0;
@@ -93,17 +103,27 @@ describe("Worker startup diagnostics", () => {
     expect(response.status).toBe(503);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(body).toContain("runtime-configuration");
-    expect(body).toContain("SQLiteMigrationSet is not supported by this Worker runtime");
+    expect(body).toContain("invalid_configuration");
     expect(body).not.toContain("storage must not be composed");
     expect(storageReads).toBe(0);
   });
 
-  test("refuses configured WorkerBundle before touching Worker storage", async () => {
+  test("rejects an invalid WorkerBundle source grant before touching Worker storage", async () => {
     const env = workerEnv({
       TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
         documentation: "https://docs.example.invalid/takoform-v2",
         authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
-        workerBundle: { targetKey: "operator-worker-bundle-target", heldArtifacts: [] },
+        workerBundle: {
+          targetKey: "operator-worker-bundle-target",
+          heldArtifacts: [
+            {
+              url: "https://artifacts.example.test/worker/manifest.json",
+              sha256: "a".repeat(64),
+              objectKey: "held/worker/manifest",
+              grants: [],
+            },
+          ],
+        },
       }),
     });
     let storageReads = 0;
@@ -122,19 +142,26 @@ describe("Worker startup diagnostics", () => {
     expect(response.status).toBe(503);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(body).toContain("runtime-configuration");
-    expect(body).toContain("WorkerBundle is not supported by this Worker runtime");
+    expect(body).toContain("invalid_configuration");
     expect(body).not.toContain("storage must not be composed");
     expect(storageReads).toBe(0);
   });
 
-  test("refuses configured StaticAssetBundle before touching Worker storage", async () => {
+  test("rejects an invalid StaticAssetBundle source grant before touching Worker storage", async () => {
     const env = workerEnv({
       TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
         documentation: "https://docs.example.invalid/takoform-v2",
         authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
         staticAssetBundle: {
           targetKey: "operator-static-assets-target",
-          heldArtifacts: [],
+          heldArtifacts: [
+            {
+              url: "https://artifacts.example.test/assets/manifest.json",
+              sha256: "a".repeat(64),
+              objectKey: "held/assets/manifest",
+              grants: [],
+            },
+          ],
         },
       }),
     });
@@ -154,7 +181,7 @@ describe("Worker startup diagnostics", () => {
     expect(response.status).toBe(503);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(body).toContain("runtime-configuration");
-    expect(body).toContain("StaticAssetBundle is not supported by this Worker runtime");
+    expect(body).toContain("invalid_configuration");
     expect(body).not.toContain("storage must not be composed");
     expect(storageReads).toBe(0);
   });

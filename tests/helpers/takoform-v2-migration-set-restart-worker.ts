@@ -55,9 +55,11 @@ const backend =
     : form.backend;
 const host = createTakoformV2Host({
   sql,
-  now: () => new Date(stage === "dispatch" ? "2026-10-06T00:00:00Z" : "2026-10-06T00:00:02Z"),
+  // Keep claim time tied to the real DB clock; a test-only second-process
+  // offset reclaims the killed first process's five-second lease promptly.
+  now: () => new Date(Date.now() + (stage === "dispatch" ? 0 : 6_000)),
   replayWindowSeconds: 3_600,
-  leaseMilliseconds: 1_000,
+  leaseMilliseconds: 5_000,
   authorize: async (principal, space) => principal === "alice" && space === "default",
   forms: { [SQLITE_MIGRATION_SET_FORM_URL]: { ...form, backend } },
   baseUrl: "https://fixture.example/apis/forms.takoform.com/v2",
