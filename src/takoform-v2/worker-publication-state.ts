@@ -78,6 +78,37 @@ export type V2WorkerPublicationResolution =
       readonly message: string;
     };
 
+/** A leased Version operation's accepted execution snapshot, not publication readiness. */
+export interface V2WorkerVersionSnapshot {
+  readonly sourceOperationId: string;
+  readonly worker: {
+    readonly uid: string;
+    readonly principal: string;
+    readonly space: string;
+    readonly generation: number;
+  };
+  readonly version: {
+    readonly uid: string;
+    readonly generation: number;
+    readonly spec: WorkerVersionSpec;
+  };
+}
+
+export type V2WorkerVersionResolution =
+  | {
+      readonly kind: "ready";
+      readonly snapshot: V2WorkerVersionSnapshot;
+      /** Re-read the full accepted SQL vector after awaits. */
+      stillCurrent(): Promise<boolean>;
+      /** Verified, caller-owned held bytes; never consults the source URL. */
+      readMaterials(): Promise<V2WorkerVersionMaterials>;
+    }
+  | {
+      readonly kind: "unresolved";
+      readonly code: "stale_claim" | "graph_unresolved";
+      readonly message: string;
+    };
+
 type Unresolved = Extract<V2WorkerPublicationResolution, { kind: "unresolved" }>;
 type ReadyCapture = {
   readonly kind: "ready";
@@ -86,6 +117,15 @@ type ReadyCapture = {
   readonly materials: ReadonlyMap<string, VersionMaterialTargets>;
 };
 type Capture = ReadyCapture | Unresolved;
+type VersionReadyCapture = {
+  readonly kind: "ready";
+  readonly snapshot: V2WorkerVersionSnapshot;
+  readonly vector: string;
+  readonly materials: VersionMaterialTargets;
+};
+type VersionCapture =
+  | VersionReadyCapture
+  | Extract<V2WorkerVersionResolution, { kind: "unresolved" }>;
 
 interface ArtifactTarget {
   readonly uid: string;
@@ -115,6 +155,13 @@ const hostnamePattern =
   /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/u;
 
 function unresolved(code: Unresolved["code"], message: string): Unresolved {
+  return { kind: "unresolved", code, message };
+}
+
+function versionUnresolved(
+  code: Extract<V2WorkerVersionResolution, { kind: "unresolved" }>["code"],
+  message: string,
+): Extract<V2WorkerVersionResolution, { kind: "unresolved" }> {
   return { kind: "unresolved", code, message };
 }
 
@@ -258,6 +305,38 @@ export function createV2WorkerPublicationState(options: {
       [id],
     )) as ReferenceRow[];
   }
+  async function exactVersionReferences(
+    operationId: string,
+    spec: WorkerVersionSpec,
+  ): Promise<ReferenceRow[] | null> {
+    const rows = await references(operationId);
+    let expected: ReturnType<typeof referencesForWorkerVersion>;
+    try {
+      expected = referencesForWorkerVersion(spec);
+    } catch {
+      return null;
+    }
+    if (
+      !rows ||
+      rows.length !== expected.length ||
+      expected.some((requirement, index) => {
+        const actual = rows[index];
+        const path = requirement.targetSpecMatch
+          ? `$.${requirement.targetSpecMatch.path.join(".")}`
+          : null;
+        return (
+          !actual ||
+          actual.target_uid !== requirement.resourceUid ||
+          actual.form_url !== requirement.formUrl ||
+          actual.readiness !== requirement.readiness ||
+          actual.target_spec_path !== path ||
+          actual.target_spec_equals !== (requirement.targetSpecMatch?.equals ?? null)
+        );
+      })
+    )
+      return null;
+    return rows;
+  }
   function hasReference(
     rows: readonly ReferenceRow[],
     uid: string,
@@ -355,6 +434,138 @@ export function createV2WorkerPublicationState(options: {
     return {
       target: { uid: input.targetUid, spec, observed },
       evidence: { target, last, edge, owner },
+    };
+  }
+
+  async function captureVersion(execution: V2Execution): Promise<VersionCapture> {
+    if (
+      execution.form !== WORKER_VERSION_FORM_URL ||
+      (execution.action !== "create" && execution.action !== "update")
+    ) {
+      return versionUnresolved(
+        "graph_unresolved",
+        "This operation is not a Worker Version materialization",
+      );
+    }
+    const [op, own] = await Promise.all([
+      operation(execution.operationId),
+      resource(execution.resourceUid),
+    ]);
+    if (!op || !own || !isCurrentClaim(op, own, execution, now().getTime())) {
+      return versionUnresolved("stale_claim", "The accepted Version lease is no longer current");
+    }
+    let spec: WorkerVersionSpec;
+    try {
+      spec = parseWorkerVersionSpec(parseObject(op.accepted_spec_json));
+    } catch {
+      return versionUnresolved("graph_unresolved", "Accepted Worker Version spec is invalid");
+    }
+    const worker = await resource(spec.worker.resourceUid);
+    const workerOp = worker ? await operation(worker.last_operation) : null;
+    if (
+      !worker ||
+      worker.form_url !== MODULE_WORKER_FORM_URL ||
+      worker.principal !== op.principal ||
+      worker.space !== own.space ||
+      !settled(worker, workerOp)
+    ) {
+      return versionUnresolved(
+        "graph_unresolved",
+        "Worker identity is not settled in this owner and Space",
+      );
+    }
+    try {
+      parseModuleWorkerSpec(parseObject(worker.spec_json));
+    } catch {
+      return versionUnresolved("graph_unresolved", "Worker identity spec is invalid");
+    }
+    const refRows = await exactVersionReferences(op.id, spec);
+    if (!refRows) {
+      return versionUnresolved(
+        "graph_unresolved",
+        "Version accepted references are not sealed and exact",
+      );
+    }
+    const referenceEvidence: unknown[] = [];
+    for (const ref of refRows) {
+      const target = await resource(ref.target_uid);
+      const last = target ? await operation(target.last_operation) : null;
+      const edge = (
+        await sql.query(
+          `SELECT target_uid, referrer_uid FROM tf_v2_resource_references
+         WHERE target_uid = ? AND referrer_uid = ?`,
+          [ref.target_uid, own.uid],
+        )
+      )[0];
+      if (
+        !target ||
+        target.form_url !== ref.form_url ||
+        target.principal !== own.principal ||
+        target.space !== own.space ||
+        !settled(target, last) ||
+        !edge
+      ) {
+        return versionUnresolved(
+          "graph_unresolved",
+          "A Version reference is not current in this owner and Space",
+        );
+      }
+      referenceEvidence.push({ target, last, edge });
+    }
+    const bundle = spec.bundle
+      ? await artifactTarget({
+          versionUid: own.uid,
+          targetUid: spec.bundle.resourceUid,
+          formUrl: WORKER_BUNDLE_FORM_URL,
+          principal: own.principal,
+          space: own.space,
+        })
+      : null;
+    const assets = spec.assets
+      ? await artifactTarget({
+          versionUid: own.uid,
+          targetUid: spec.assets.bundle.resourceUid,
+          formUrl: STATIC_ASSET_BUNDLE_FORM_URL,
+          principal: own.principal,
+          space: own.space,
+        })
+      : null;
+    if ((spec.bundle && !bundle) || (spec.assets && !assets)) {
+      return versionUnresolved("graph_unresolved", "Version held artifact is unavailable");
+    }
+    const snapshot = freezeDeep<V2WorkerVersionSnapshot>({
+      sourceOperationId: op.id,
+      worker: {
+        uid: worker.uid,
+        principal: worker.principal,
+        space: worker.space,
+        generation: worker.generation,
+      },
+      version: { uid: own.uid, generation: op.generation, spec },
+    });
+    const vector = canonicalJson({
+      op,
+      own,
+      worker,
+      workerOp,
+      refRows,
+      referenceEvidence,
+      bundle: bundle?.evidence ?? null,
+      assets: assets?.evidence ?? null,
+      snapshot,
+    } as unknown as JsonObject);
+    const finalNow = now().getTime();
+    if (!Number.isFinite(finalNow) || op.lease_until_ms === null || op.lease_until_ms <= finalNow) {
+      return versionUnresolved(
+        "stale_claim",
+        "The accepted Version lease expired during graph read",
+      );
+    }
+    return {
+      kind: "ready",
+      snapshot,
+      vector,
+      materials: { bundle: bundle?.target ?? null, assets: assets?.target ?? null },
     };
   }
 
@@ -590,31 +801,8 @@ export function createV2WorkerPublicationState(options: {
             "A weighted Worker Version does not match this Worker",
           );
         }
-        const versionReferences = last ? await references(last.id) : null;
-        let expectedVersionReferences: ReturnType<typeof referencesForWorkerVersion>;
-        try {
-          expectedVersionReferences = referencesForWorkerVersion(versionSpec);
-        } catch {
-          return unresolved("graph_unresolved", "A weighted Worker Version has invalid references");
-        }
-        if (
-          !versionReferences ||
-          versionReferences.length !== expectedVersionReferences.length ||
-          expectedVersionReferences.some((expected, index) => {
-            const actual = versionReferences[index];
-            const expectedPath = expected.targetSpecMatch
-              ? `$.${expected.targetSpecMatch.path.join(".")}`
-              : null;
-            return (
-              !actual ||
-              actual.target_uid !== expected.resourceUid ||
-              actual.form_url !== expected.formUrl ||
-              actual.readiness !== expected.readiness ||
-              actual.target_spec_path !== expectedPath ||
-              actual.target_spec_equals !== (expected.targetSpecMatch?.equals ?? null)
-            );
-          })
-        ) {
+        const versionReferences = last ? await exactVersionReferences(last.id, versionSpec) : null;
+        if (!versionReferences) {
           return unresolved(
             "graph_unresolved",
             "A weighted Worker Version references are not sealed and exact",
@@ -744,7 +932,109 @@ export function createV2WorkerPublicationState(options: {
     return { kind: "ready", snapshot, vector, materials };
   }
 
+  async function readMaterialsTargets(
+    target: VersionMaterialTargets,
+    principal: string,
+    space: string,
+    stillAuthorized: () => Promise<boolean>,
+  ): Promise<V2WorkerVersionMaterials> {
+    const denied = () => new SqlError("unavailable", "Worker Version materials are not authorized");
+    if (!(await stillAuthorized())) throw denied();
+    const bundleCustody = options.bundleCustody;
+    const assetCustody = options.assetCustody;
+    if (target.bundle && !bundleCustody) throw denied();
+    if (target.assets && !assetCustody) throw denied();
+    const bundle =
+      target.bundle && bundleCustody
+        ? await bundleCustody.readHeldVerified({
+            targetResourceUid: target.bundle.uid,
+            principal,
+            space,
+            expectedSpec: target.bundle.spec,
+            expectedObserved: target.bundle.observed,
+            stillAuthorized,
+          })
+        : null;
+    const assets =
+      target.assets && assetCustody
+        ? await assetCustody.readHeldVerified({
+            targetResourceUid: target.assets.uid,
+            principal,
+            space,
+            expectedSpec: target.assets.spec,
+            expectedObserved: target.assets.observed,
+            stillAuthorized,
+          })
+        : null;
+    if (!(await stillAuthorized())) throw denied();
+    const cloneRead = <M>(
+      read: SqlArtifactCustodyRead<M> | null,
+    ): SqlArtifactCustodyRead<M> | null =>
+      read && {
+        manifest: structuredClone(read.manifest),
+        manifestBytes: new Uint8Array(read.manifestBytes),
+        files: read.files.map((file) => new Uint8Array(file)),
+        observed: structuredClone(read.observed),
+      };
+    return { bundle: cloneRead(bundle), assets: cloneRead(assets) };
+  }
+
   return {
+    async resolveVersion(input: { execution: V2Execution }): Promise<V2WorkerVersionResolution> {
+      const initial = await captureVersion(input.execution);
+      if (initial.kind === "unresolved") return initial;
+      const stillAuthorized = async () => {
+        const latest = await captureVersion(input.execution);
+        return latest.kind === "ready" && latest.vector === initial.vector;
+      };
+      try {
+        // "ready" must mean the held bytes themselves were verified, not only
+        // that their SQL owner claimed verification in an earlier operation.
+        await readMaterialsTargets(
+          initial.materials,
+          initial.snapshot.worker.principal,
+          initial.snapshot.worker.space,
+          stillAuthorized,
+        );
+      } catch {
+        return (await stillAuthorized())
+          ? versionUnresolved("graph_unresolved", "Version held artifact bytes are unavailable")
+          : versionUnresolved("stale_claim", "The accepted Version graph changed during byte read");
+      }
+      if (!(await stillAuthorized())) {
+        return versionUnresolved(
+          "stale_claim",
+          "The accepted Version graph changed during byte read",
+        );
+      }
+      const stillCurrent = async (): Promise<boolean> => {
+        try {
+          // SQL identity alone cannot detect damaged held chunks. The last
+          // pre-effect fence also rehashes the exact accepted byte targets.
+          await readMaterialsTargets(
+            initial.materials,
+            initial.snapshot.worker.principal,
+            initial.snapshot.worker.space,
+            stillAuthorized,
+          );
+          return await stillAuthorized();
+        } catch {
+          return false;
+        }
+      };
+      return {
+        kind: "ready",
+        snapshot: initial.snapshot,
+        stillCurrent,
+        readMaterials: () =>
+          readMaterialsTargets(
+            initial.materials,
+            initial.snapshot.worker.principal,
+            initial.snapshot.worker.space,
+            stillAuthorized,
+          ),
+      };
+    },
     async resolve(input: {
       execution: V2Execution;
       incumbentSourceOperationId?: string;
@@ -764,48 +1054,14 @@ export function createV2WorkerPublicationState(options: {
             const latest = await capture(input);
             return latest.kind === "ready" && latest.vector === initial.vector;
           };
-          const denied = () =>
-            new SqlError("unavailable", "Worker Version materials are not authorized");
-          if (!target || !(await stillAuthorized())) throw denied();
-          const principal = initial.snapshot.worker.principal;
-          const space = initial.snapshot.worker.space;
-          const bundleCustody = options.bundleCustody;
-          const assetCustody = options.assetCustody;
-          if (target.bundle && !bundleCustody) throw denied();
-          if (target.assets && !assetCustody) throw denied();
-          const bundle =
-            target.bundle && bundleCustody
-              ? await bundleCustody.readHeldVerified({
-                  targetResourceUid: target.bundle.uid,
-                  principal,
-                  space,
-                  expectedSpec: target.bundle.spec,
-                  expectedObserved: target.bundle.observed,
-                  stillAuthorized,
-                })
-              : null;
-          const assets =
-            target.assets && assetCustody
-              ? await assetCustody.readHeldVerified({
-                  targetResourceUid: target.assets.uid,
-                  principal,
-                  space,
-                  expectedSpec: target.assets.spec,
-                  expectedObserved: target.assets.observed,
-                  stillAuthorized,
-                })
-              : null;
-          if (!(await stillAuthorized())) throw denied();
-          const cloneRead = <M>(
-            read: SqlArtifactCustodyRead<M> | null,
-          ): SqlArtifactCustodyRead<M> | null =>
-            read && {
-              manifest: structuredClone(read.manifest),
-              manifestBytes: new Uint8Array(read.manifestBytes),
-              files: read.files.map((file) => new Uint8Array(file)),
-              observed: structuredClone(read.observed),
-            };
-          return { bundle: cloneRead(bundle), assets: cloneRead(assets) };
+          if (!target)
+            throw new SqlError("unavailable", "Worker Version materials are not authorized");
+          return readMaterialsTargets(
+            target,
+            initial.snapshot.worker.principal,
+            initial.snapshot.worker.space,
+            stillAuthorized,
+          );
         },
       };
     },

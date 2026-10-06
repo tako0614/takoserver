@@ -218,7 +218,7 @@ describe("production D1 fresh init", () => {
     expect(surface?.covers).toContain("scripts/deploy/wrangler-state.ts");
   });
 
-  test("fresh production stays at 0069 while self-host source bootstraps through 0073", () => {
+  test("fresh production stays at 0069 while self-host source bootstraps through 0074", () => {
     const database = new Database(":memory:");
     try {
       const report = migrateSqlite(database);
@@ -346,13 +346,13 @@ describe("production D1 fresh init", () => {
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const tail = join(migrationDirectory, "0073_v2_reference_acceptance.sql");
+        const tail = join(migrationDirectory, "0074_v2_worker_native_effects.sql");
         if (drift === "missing") rmSync(tail);
         else if (drift === "changed") {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0074_unreviewed.sql"),
+            join(migrationDirectory, "0075_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }
@@ -365,7 +365,7 @@ describe("production D1 fresh init", () => {
         ).rejects.toThrow(
           drift === "changed"
             ? "exact audited migration SHA-256"
-            : "audited migration lineage must contain exactly 0001-0073",
+            : "audited migration lineage must contain exactly 0001-0074",
         );
         expect(fixture.calls).toEqual([]);
       } finally {
@@ -523,6 +523,7 @@ describe("production D1 fresh init", () => {
       expect(migrationImport).not.toContain("0071_v2_sqlite_migration_set_custody.sql");
       expect(migrationImport).not.toContain("0072_v2_artifact_custody.sql");
       expect(migrationImport).not.toContain("0073_v2_reference_acceptance.sql");
+      expect(migrationImport).not.toContain("0074_v2_worker_native_effects.sql");
       const imported = new Database(":memory:");
       try {
         imported.exec(migrationImport);

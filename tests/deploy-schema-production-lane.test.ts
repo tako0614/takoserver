@@ -47,16 +47,16 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0074_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0074_container_runtime_input_custody (id TEXT);\n",
+    "0075_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0075_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0075_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0075_container_runtime_input_rewrap (id TEXT);\n",
+    "0076_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0076_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0076_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0076_container_runtime_input_acceptance (id TEXT);\n",
+    "0077_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0077_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -69,7 +69,7 @@ function currentIntegrationMigrations(directory: string): string {
 }
 
 // These cases exercise fixed next-wave boundaries from the current audited
-// 0001-0073 source closure. The apply ceiling remains 0066. Historical
+// 0001-0074 source closure. The apply ceiling remains 0066. Historical
 // 0001-0049 fixtures are passed explicitly by tests that exercise frozen
 // import/lineage behavior.
 function runD1Schema(...[invocation, selectedTarget, options]: Parameters<typeof runSchema>) {
@@ -702,7 +702,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0073");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0074");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1136,14 +1136,14 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0073");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0074");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("audited 0067-0073 are source closure only and leave existing apply boundaries unchanged", async () => {
+  test("audited 0067-0074 are source closure only and leave existing apply boundaries unchanged", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0067-source-only-"));
     try {
       const result = await runD1Schema(
@@ -1249,28 +1249,28 @@ describe("production-shaped D1 migration lane", () => {
   for (const drift of [
     {
       name: "missing",
-      expected: "selected D1 wave requires the exact audited source inventory 0001-0073",
+      expected: "selected D1 wave requires the exact audited source inventory 0001-0074",
     },
     { name: "changed", expected: "exact audited migration SHA-256" },
-    { name: "extra", expected: "exact audited source inventory 0001-0073" },
+    { name: "extra", expected: "exact audited source inventory 0001-0074" },
   ] as const) {
-    test(`current 0073 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
-      const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0073-${drift.name}-`));
+    test(`current 0074 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
+      const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0074-${drift.name}-`));
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const migration0073 = join(migrationDirectory, "0073_v2_reference_acceptance.sql");
+        const migration0074 = join(migrationDirectory, "0074_v2_worker_native_effects.sql");
         if (drift.name === "missing") {
-          rmSync(migration0073);
+          rmSync(migration0074);
         } else if (drift.name === "changed") {
           writeFileSync(
-            migration0073,
-            `${readFileSync(migration0073, "utf8")}\n-- mutated after source audit\n`,
+            migration0074,
+            `${readFileSync(migration0074, "utf8")}\n-- mutated after source audit\n`,
           );
         } else {
           writeFileSync(
-            join(migrationDirectory, "0074_unreviewed_extension.sql"),
-            "CREATE TABLE synthetic_0074_unreviewed_extension (id TEXT);\n",
+            join(migrationDirectory, "0075_unreviewed_extension.sql"),
+            "CREATE TABLE synthetic_0075_unreviewed_extension (id TEXT);\n",
             { mode: 0o600 },
           );
         }

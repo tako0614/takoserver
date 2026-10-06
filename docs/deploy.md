@@ -184,8 +184,8 @@ production commit, runs the migration gate once, seals the fixed audited
 proves the empty canonical shape, applies the lineage through one sealed
 `wrangler d1 execute --file` import, and verifies the exact lineage and
 application schema afterwards. The complete source inventory is audited through
-0071, but this fresh-empty-target path deliberately projects only the frozen
-0001–0069 payload. An empty self-host SQLite boot includes 0071, so its schema is
+0074, but this fresh-empty-target path deliberately projects only the frozen
+0001–0069 payload. An empty self-host SQLite boot includes 0074, so its schema is
 not yet identical to this production bootstrap. Adding the v2 tables to a live
 production database requires a separately authorized migration path; source
 recognition does not raise the existing-target or protected migration-wave
