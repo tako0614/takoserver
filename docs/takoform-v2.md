@@ -167,13 +167,18 @@ it does not execute the Worker or create a data-plane endpoint.
 
 The internal `worker-code-runtime.ts` projection is a building block for a
 future code-bearing Worker path. It accepts already-authorized held bundle
-bytes and a matching semantic-inspection result, and projects module bytes,
-media types, fetch-handler identity and JSON `vars` to the Workerd graph.
-Auxiliary source-map bytes remain digest-checked in custody but are excluded
-from import and inspection graphs. It does not register a Worker Form or
-execute/publish a Worker. Bindings, private inputs, assets and scheduled/queue
-delivery remain explicit internal refusals; this projection is not evidence of
-Form support or native qualification.
+bytes and a trusted semantic inspector, then projects module bytes, media
+types, fetch-handler identity and JSON `vars` to the Workerd graph. It invokes
+inspection on that same owned snapshot. It does not
+register a Worker Form or execute/publish a Worker. Bindings, private inputs,
+assets and scheduled/queue delivery remain explicit internal refusals; this
+projection is not evidence of Form support or native qualification.
+
+The published ModuleWorker 0.3 text describes auxiliary source maps but does
+not name their MIME token, while WorkerBundle 0.2 defers its closed media-type
+set to that ModuleWorker section. This implementation does not infer a token;
+source-map media support needs an owning Form clarification or a later Form
+version before it can enter bundle custody.
 
 StaticAssetBundle (`https://edge.forms.takoform.com/forms/StaticAssetBundle/0.2.0/`)
 accepts a manifest up to 1 MiB with 1–512 files, canonical relative POSIX paths

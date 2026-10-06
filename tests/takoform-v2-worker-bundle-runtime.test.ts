@@ -30,17 +30,12 @@ import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 const MANIFEST_URL = "https://artifacts.example.test/bundle/manifest.json";
 const MODULE_URL = "https://artifacts.example.test/bundle/src/index.mjs";
 const MESSAGE_URL = "https://artifacts.example.test/bundle/message.txt";
-const SOURCE_MAP_URL = "https://artifacts.example.test/bundle/src/index.mjs.map";
 const MODULE_PATH = "src/index.mjs";
 const MESSAGE_PATH = "message.txt";
-const SOURCE_MAP_PATH = "src/index.mjs.map";
 const MODULE_BYTES = new TextEncoder().encode(
   'import message from "../message.txt";\nexport default { fetch() { return new Response(message); } };\n',
 );
 const MESSAGE_BYTES = new TextEncoder().encode("bundle bytes from verified custody");
-const SOURCE_MAP_BYTES = new TextEncoder().encode(
-  '{"version":3,"sources":["index.ts"],"mappings":""}',
-);
 
 interface Probe {
   inspectionInput?: WorkerModuleInspectionInput;
@@ -102,7 +97,6 @@ async function fixture(input: {
     };
     const moduleSha256 = (await bytesDigest(MODULE_BYTES)).slice(7);
     const messageSha256 = (await bytesDigest(MESSAGE_BYTES)).slice(7);
-    const sourceMapSha256 = (await bytesDigest(SOURCE_MAP_BYTES)).slice(7);
     const manifestBytes = new TextEncoder().encode(
       JSON.stringify({
         entrypoint: MODULE_PATH,
@@ -112,12 +106,6 @@ async function fixture(input: {
             url: MODULE_URL,
             sha256: moduleSha256,
             mediaType: "application/javascript+module",
-          },
-          {
-            path: SOURCE_MAP_PATH,
-            url: SOURCE_MAP_URL,
-            sha256: sourceMapSha256,
-            mediaType: "application/source-map+json",
           },
           {
             path: MESSAGE_PATH,
@@ -132,7 +120,6 @@ async function fixture(input: {
     const blobs = new Map<string, Uint8Array>([
       [MANIFEST_URL, manifestBytes],
       [MODULE_URL, MODULE_BYTES],
-      [SOURCE_MAP_URL, SOURCE_MAP_BYTES],
       [MESSAGE_URL, MESSAGE_BYTES],
     ]);
     const source: V2ArtifactSource = {
@@ -323,10 +310,6 @@ test("an accepted WorkerVersion projects only exact verified custody bytes to in
     [MODULE_PATH, MODULE_BYTES],
     [MESSAGE_PATH, MESSAGE_BYTES],
   ]);
-  expect(probe.inspectionInput?.modules.some((module) => module.name === SOURCE_MAP_PATH)).toBe(
-    false,
-  );
-  expect(probe.compiledGraph?.modules.has(SOURCE_MAP_PATH)).toBe(false);
 });
 
 const nativeWorkerd = nativeEvidenceBinary("workerd-artifact") ?? null;

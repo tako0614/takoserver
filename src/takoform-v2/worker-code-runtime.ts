@@ -8,6 +8,7 @@ import type {
   WorkerdBinding,
   WorkerdDeploymentVariant,
   WorkerdModuleMediaType,
+  WorkerdRuntime,
   WorkerdSite,
 } from "../workerd-runtime.ts";
 import type { SqlArtifactCustodyRead } from "./forms/artifact-custody.ts";
@@ -59,15 +60,13 @@ export async function projectV2WorkerCodeVersion(input: {
   readonly identity: V2WorkerCodeVersionIdentity;
   readonly spec: unknown;
   readonly bundle: SqlArtifactCustodyRead<WorkerBundleManifest> | null;
-  readonly inspectionInput: WorkerModuleInspectionInput;
-  readonly inspection: WorkerModuleInspectionResult;
+  readonly inspectModule: WorkerdRuntime["inspectModule"];
   readonly privateInputs?: unknown;
 }): Promise<V2WorkerCodeDeploymentVariant> {
   const versionUnavailable = () => new V2WorkerCodeRuntimeError("worker_version_unavailable");
   const bundleUnavailable = () => new V2WorkerCodeRuntimeError("worker_bundle_unavailable");
 
   const identity = snapshotIdentity(input.identity);
-  const inspection = snapshotInspectionResult(input.inspection);
   let spec: ReturnType<typeof parseWorkerVersionSpec>;
   try {
     spec = parseWorkerVersionSpec(structuredClone(input.spec));
@@ -102,9 +101,9 @@ export async function projectV2WorkerCodeVersion(input: {
   if (!input.bundle) throw bundleUnavailable();
 
   const held = snapshotBundle(input.bundle);
-  const inspectionInput = snapshotInspectionInput(input.inspectionInput);
   const observed = await verifyBundle(held);
-  verifyInspectedBytes(inspectionInput, spec.handlers, observed.manifest, held.files);
+  const inspectionInput = inspectionInputForBundle(held, observed.manifest, spec.handlers);
+  const inspection = await input.inspectModule(inspectionInput);
   if (!isValidInspection(inspection)) {
     throw new V2WorkerCodeRuntimeError("worker_module_inspection_unavailable");
   }
@@ -119,7 +118,6 @@ export async function projectV2WorkerCodeVersion(input: {
     const file = observed.manifest.files[index];
     const bytes = held.files[index];
     if (!file || !bytes) throw bundleUnavailable();
-    if (file.mediaType === "application/source-map+json") continue;
     modules.set(file.path, new Uint8Array(bytes));
     moduleMediaTypes[file.path] = file.mediaType;
   }
@@ -131,9 +129,7 @@ export async function projectV2WorkerCodeVersion(input: {
     directory: identity.directory,
     mainModule: entrypoint,
     modules: observed.manifest.files
-      .filter(
-        (file) => file.path !== entrypoint && file.mediaType !== "application/source-map+json",
-      )
+      .filter((file) => file.path !== entrypoint)
       .map((file) => file.path),
     moduleMediaTypes,
     hostnames: [...identity.hostnames],
@@ -198,105 +194,25 @@ function snapshotBundle(input: SqlArtifactCustodyRead<WorkerBundleManifest>): Bu
   }
 }
 
-function snapshotInspectionInput(input: WorkerModuleInspectionInput): WorkerModuleInspectionInput {
-  try {
-    if (
-      !input ||
-      typeof input.mainModule !== "string" ||
-      !Array.isArray(input.modules) ||
-      !Array.isArray(input.declaredHandlers)
-    ) {
-      throw new Error();
-    }
-    return {
-      mainModule: input.mainModule,
-      modules: input.modules.map((entry) => {
-        if (
-          !entry ||
-          typeof entry.name !== "string" ||
-          typeof entry.digest !== "string" ||
-          typeof entry.mediaType !== "string" ||
-          !(entry.bytes instanceof Uint8Array)
-        ) {
-          throw new Error();
-        }
-        return {
-          name: entry.name,
-          digest: entry.digest,
-          mediaType: entry.mediaType,
-          bytes: new Uint8Array(entry.bytes),
-        };
-      }),
-      declaredHandlers: [...input.declaredHandlers],
-    };
-  } catch {
-    throw new V2WorkerCodeRuntimeError("worker_module_inspection_unavailable");
-  }
-}
-
-function snapshotInspectionResult(
-  input: WorkerModuleInspectionResult,
-): WorkerModuleInspectionResult {
-  try {
-    if (!input || typeof input !== "object") throw new Error();
-    if (input.outcome === "valid") {
-      if (!Array.isArray(input.exportedHandlers)) throw new Error();
-      return { outcome: "valid", exportedHandlers: [...input.exportedHandlers] };
-    }
-    if (input.outcome === "invalid") return { outcome: "invalid", error: input.error };
-    if (input.outcome === "unavailable" && input.retryable === true) {
-      return { outcome: "unavailable", retryable: true };
-    }
-    throw new Error();
-  } catch {
-    throw new V2WorkerCodeRuntimeError("worker_module_inspection_unavailable");
-  }
-}
-
-function verifyInspectedBytes(
-  input: WorkerModuleInspectionInput,
-  declaredHandlers: readonly string[],
+function inspectionInputForBundle(
+  snapshot: BundleSnapshot,
   manifest: WorkerBundleManifest,
-  files: readonly Uint8Array[],
-): void {
-  const mismatch = () => new V2WorkerCodeRuntimeError("worker_module_inspection_unavailable");
-  const importableFiles = manifest.files.filter(
-    (file) => file.mediaType !== "application/source-map+json",
-  );
-  if (
-    input.mainModule !== manifest.entrypoint ||
-    canonicalJson(input.declaredHandlers) !== canonicalJson(declaredHandlers) ||
-    input.modules.length !== importableFiles.length
-  ) {
-    throw mismatch();
-  }
-  let inspectionIndex = 0;
-  for (let index = 0; index < manifest.files.length; index += 1) {
-    const expected = manifest.files[index];
-    if (expected?.mediaType === "application/source-map+json") continue;
-    const inspected = input.modules[inspectionIndex];
-    const bytes = files[index];
-    if (
-      !expected ||
-      !inspected ||
-      !bytes ||
-      inspected.name !== expected.path ||
-      inspected.digest !== `sha256:${expected.sha256}` ||
-      inspected.mediaType !== expected.mediaType ||
-      !equalBytes(inspected.bytes, bytes)
-    ) {
-      throw mismatch();
-    }
-    inspectionIndex += 1;
-  }
-}
-
-function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
-  if (left.byteLength !== right.byteLength) return false;
-  for (let index = 0; index < left.byteLength; index += 1) {
-    if (left[index] !== right[index]) return false;
-  }
-  return true;
+  declaredHandlers: readonly string[],
+): WorkerModuleInspectionInput {
+  return {
+    mainModule: manifest.entrypoint,
+    modules: manifest.files.map((file, index) => {
+      const bytes = snapshot.files[index];
+      if (!bytes) throw new V2WorkerCodeRuntimeError("worker_bundle_unavailable");
+      return {
+        name: file.path,
+        digest: `sha256:${file.sha256}`,
+        mediaType: file.mediaType,
+        bytes: new Uint8Array(bytes),
+      };
+    }),
+    declaredHandlers: [...declaredHandlers] as WorkerModuleInspectionInput["declaredHandlers"],
+  };
 }
 
 async function verifyBundle(snapshot: BundleSnapshot): Promise<{
