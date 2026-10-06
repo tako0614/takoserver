@@ -17,7 +17,7 @@ jobs:
   artifact-build:
     name: build exact pinned artifact (native qualification not run)
     runs-on: ubuntu-26.04
-    timeout-minutes: 45
+    timeout-minutes: 150
     steps:
       - name: Check out selected build commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pinned: v6.0.2
@@ -102,7 +102,7 @@ jobs:
           report="${RUNNER_TEMP}/workerd-build-runner-report.txt"
           echo "build_start_available_disk_kib=$(df -Pk "${RUNNER_TEMP}" | awk 'NR == 2 { print $4 }')" | tee -a "${report}"
           set +e
-          timeout --signal=TERM --kill-after=30s 40m \
+          timeout --signal=TERM --kill-after=30s 120m \
             env BAZELISK="${RUNNER_TEMP}/bazelisk-1.29.0" WORKERD_LLVM_ROOT=/ \
             bun run build:workerd -- \
               --state-root "${state_root}" \
