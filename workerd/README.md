@@ -58,13 +58,14 @@ bun run build:workerd -- \
 ```
 
 `--jobs` and `--memory-mb` limit Bazel's local action scheduling budget via
-`--jobs`, `--local_cpu_resources`, and `--local_ram_resources`; they are not
-OS-level memory limits for the Bazel server itself. Defaults are 2 jobs and
-8192 MB. Add `--plan` to print the exact pinned target, digest, and scheduler
-arguments without downloading, writing build state, or compiling. After a
-successful build, the final JSON line reports the copied artifact path, pinned
-digest/version, and `nativeQualification: "not-run"`. A matching digest is
-artifact identity, not native runtime or ABI qualification.
+`--jobs` and repeated `--local_resources=cpu=<jobs>` /
+`--local_resources=memory=<MB>` flags supported by the source-pinned Bazel
+9.2.0. They are not OS-level memory limits for the Bazel server itself.
+Defaults are 2 jobs and 8192 MB. Add `--plan` to print the exact pinned target,
+digest, and scheduler arguments without downloading, writing build state, or
+compiling. After a successful build, the final JSON line reports the copied
+artifact path, pinned digest/version, and `nativeQualification: "not-run"`. A
+matching digest is artifact identity, not native runtime or ABI qualification.
 
 An already downloaded upstream archive can be supplied with `--archive
 /absolute/workerd.tar.gz`; its digest is checked before extraction. To verify

@@ -16,7 +16,7 @@ test("build plan reports default bounded resources and the canonical artifact pi
     artifactSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.sha256,
     version: WORKERD_CLOSED_GRAPH_ARTIFACT.version,
     resources: { jobs: 2, memoryMB: 8192 },
-    bazelResourceArgs: ["--jobs=2", "--local_cpu_resources=2", "--local_ram_resources=8192"],
+    bazelResourceArgs: ["--jobs=2", "--local_resources=cpu=2", "--local_resources=memory=8192"],
     nativeQualification: "not-run",
   });
 });
@@ -35,7 +35,7 @@ test("build plan carries caller-selected local resource budgets through to Bazel
   expect(result.code, result.stderr).toBe(0);
   expect(JSON.parse(result.stdout)).toMatchObject({
     resources: { jobs: 3, memoryMB: 6144 },
-    bazelResourceArgs: ["--jobs=3", "--local_cpu_resources=3", "--local_ram_resources=6144"],
+    bazelResourceArgs: ["--jobs=3", "--local_resources=cpu=3", "--local_resources=memory=6144"],
   });
 });
 
