@@ -275,7 +275,7 @@ export function createV2Store(sql: Sql) {
           (status = 'queued' OR
             (status IN ('running', 'reconciling') AND
               (lease_until_ms IS NULL OR lease_until_ms <= ?)))
-         ORDER BY created_at, id LIMIT 1`,
+         ORDER BY updated_at, created_at, id LIMIT 1`,
           [nowMs, nowMs],
         )
       )[0] ?? null) as OperationRow | null;

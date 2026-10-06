@@ -485,6 +485,20 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
             ? { outputJson: canonicalRequest(result.output) }
             : {}),
         });
+      } else if (result.kind === "continue") {
+        // Known bounded work yielded after its checkpoint. Retain dispatch
+        // history and require reconcile, but do not impose uncertainty backoff
+        // or publish an error for an ordinary continuation. A stale writer's
+        // settlement still fails the same claim-token CAS.
+        await store.settle({
+          id: claimed.id,
+          token,
+          status: "reconciling",
+          effect: "unknown",
+          at: at.toISOString(),
+          retainUntil,
+          nextAttemptAtMs: at.getTime() + 1_000,
+        });
       } else {
         const error =
           result.code && result.message

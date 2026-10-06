@@ -40,6 +40,13 @@ export interface V2Operation {
 
 export type V2BackendResult =
   | { kind: "complete"; observed: JsonObject; output: JsonObject }
+  /**
+   * A bounded step and its durable checkpoint finished. All writes must be
+   * awaited and fenced; no unacknowledged external effect may use this result.
+   * The next scheduled pass reconciles this same Operation with a fresh lease.
+   * This is not Resource readiness or permission to repeat the initial send.
+   */
+  | { kind: "continue" }
   /** code/message are safe public classifications, never raw provider responses. */
   | { kind: "no_effect"; code: string; message: string }
   | { kind: "partial"; code: string; message: string; observed?: JsonObject; output?: JsonObject }
