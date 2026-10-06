@@ -19,6 +19,7 @@ import {
   type IntegrationE2eCredentialAuthorityAction,
   type IntegrationE2eCredentialAuthorityConfig,
 } from "../src/integration-e2e-credential-authority.ts";
+import { base64UrlEncode } from "../src/json.ts";
 import { OperatorAssertionError } from "../src/operator-credentials.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
 import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
@@ -991,6 +992,11 @@ describe("integration-only exact-organization API-key authority", () => {
     const startupEnvironment = {
       ...reusedSigningEnvironment,
       PUBLIC_ORIGIN: ORIGIN,
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: TEST_TAKOFORM_V2_CONFIG.documentation,
+        authenticationDocumentation: TEST_TAKOFORM_V2_CONFIG.authenticationDocumentation,
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: base64UrlEncode(TEST_TAKOFORM_V2_CONFIG.cursorSigningKey),
       get STATE_DB(): never {
         storageBindingReads += 1;
         throw new Error("D1 must not be composed");

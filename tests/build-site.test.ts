@@ -29,7 +29,7 @@ describe("Takoserver public site build", () => {
       expect(japaneseHtml).not.toBe(rootHtml);
       expect(japaneseHtml).toContain('<html lang="ja">');
       expect(japaneseHtml).toContain(
-        "インフラを宣言。Hostが価格を決め、プロビジョニングし、計測します。",
+        "公開されたFormの仕様URLを指定して、Host運営者の基盤上で資源を管理します。",
       );
     } finally {
       rmSync(root, { recursive: true, force: true });

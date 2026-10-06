@@ -213,6 +213,7 @@ test("canonical Bun entry rejects 443 conflict and missing TLS material before o
       ...process.env,
       TAKOSERVER_DATA_ROOT: dataRoot,
       TAKOSERVER_DB: join(dataRoot, "control.sqlite"),
+      TAKOSERVER_PUBLIC_ORIGIN: "https://api.selfhost.test",
       TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
         documentation: "https://docs.example.invalid/takoform-v2",
         authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
@@ -250,6 +251,7 @@ test("canonical Bun entry rejects 443 conflict and missing TLS material before o
       ...process.env,
       TAKOSERVER_DATA_ROOT: missingTlsDataRoot,
       TAKOSERVER_DB: join(missingTlsDataRoot, "control.sqlite"),
+      TAKOSERVER_PUBLIC_ORIGIN: "https://api.selfhost.test",
       TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
         documentation: "https://docs.example.invalid/takoform-v2",
         authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
