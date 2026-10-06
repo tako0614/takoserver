@@ -127,6 +127,38 @@ describe("Worker startup diagnostics", () => {
     expect(storageReads).toBe(0);
   });
 
+  test("refuses configured StaticAssetBundle before touching Worker storage", async () => {
+    const env = workerEnv({
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
+        staticAssetBundle: {
+          targetKey: "operator-static-assets-target",
+          heldArtifacts: [],
+        },
+      }),
+    });
+    let storageReads = 0;
+    for (const name of ["STATE_DB", "OBJECTS"] as const) {
+      Object.defineProperty(env, name, {
+        get() {
+          storageReads += 1;
+          throw new Error("storage must not be composed");
+        },
+      });
+    }
+
+    const response = await worker.fetch(new Request(`${ORIGIN}/.well-known/takoserver`), env);
+    const body = await response.text();
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(body).toContain("runtime-configuration");
+    expect(body).toContain("StaticAssetBundle is not supported by this Worker runtime");
+    expect(body).not.toContain("storage must not be composed");
+    expect(storageReads).toBe(0);
+  });
+
   test("selects unpublished Actor source only by exact opt-in and keeps absent supply non-sellable", async () => {
     const env = workerEnv({ TAKOSERVER_FORM_SOURCE_CANDIDATE: "actor-forward" });
     const discovery = await worker.fetch(new Request(`${ORIGIN}/.well-known/takoserver`), env);
