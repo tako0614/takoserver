@@ -11,21 +11,25 @@ const workflowPath = resolve(repositoryRoot, ".github/workflows/workerd-closed-g
 
 test("closed-graph workflow installs and verifies libc++ before Bazelisk or build", async () => {
   const workflow = await readFile(workflowPath, "utf8");
+  const initializeReportStep = workflow.indexOf("Initialize workerd build report");
   const prerequisiteStep = workflow.indexOf("scripts/workerd-toolchain-prerequisites.sh");
   const compilerVerificationStep = workflow.indexOf("Verify exact compiler prerequisites");
   const bazeliskStep = workflow.indexOf("Download and verify pinned Bazelisk");
   const buildStep = workflow.indexOf("Build the pinned artifact (no native qualification)");
 
+  expect(initializeReportStep).toBeGreaterThan(-1);
+  expect(initializeReportStep).toBeLessThan(prerequisiteStep);
   expect(prerequisiteStep).toBeGreaterThan(-1);
   expect(prerequisiteStep).toBeLessThan(compilerVerificationStep);
   expect(compilerVerificationStep).toBeLessThan(bazeliskStep);
   expect(bazeliskStep).toBeLessThan(buildStep);
+  expect(workflow).toContain('} | tee -a "${report}"');
 });
 
 test("missing pinned libc++ headers fail before the following Bazel command", async () => {
   const fixture = await createFixture();
   try {
-    const result = await runPrerequisites(fixture, false);
+    const result = await runPrerequisites(fixture, true);
 
     expect(result.code).not.toBe(0);
     expect(result.stdout).toContain("required pinned libc++ header missing");
@@ -55,6 +59,19 @@ test("pinned package installation failure is reported and stops before Bazel", a
   }
 });
 
+test("wrong installed libc++ version is rejected before the following Bazel command", async () => {
+  const fixture = await createFixture();
+  try {
+    const result = await runPrerequisites(fixture, true, false, "1:20.1.8-0ubuntu4");
+
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toContain("expected libc++-20-dev 1:20.1.8-2ubuntu8");
+    expect(await fileExists(fixture.bazelMarker)).toBe(false);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("exact libc++ package and header readback allow the next command", async () => {
   const fixture = await createFixture();
   try {
@@ -65,6 +82,9 @@ test("exact libc++ package and header readback allow the next command", async ()
     const result = await runPrerequisites(fixture, true);
 
     expect(result.code, result.stderr).toBe(0);
+    expect(await readFile(join(fixture.root, "workerd-build-runner-report.txt"), "utf8")).toContain(
+      "libcxx_prerequisites=verified",
+    );
     expect(await fileExists(fixture.bazelMarker)).toBe(true);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
@@ -92,7 +112,7 @@ async function createFixture(): Promise<Fixture> {
   );
   await writeFile(
     join(bin, "dpkg-query"),
-    '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$WORKERD_PREREQUISITE_COMMAND_LOG"\nprintf "1:20.1.8-2ubuntu8\\n"\n',
+    '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$WORKERD_PREREQUISITE_COMMAND_LOG"\nprintf "%s\\n" "${WORKERD_LIBCXX_PACKAGE_VERSION:-1:20.1.8-2ubuntu8}"\n',
   );
   await chmod(join(bin, "sudo"), 0o755);
   await chmod(join(bin, "dpkg-query"), 0o755);
@@ -103,6 +123,7 @@ async function runPrerequisites(
   fixture: Fixture,
   createBazelMarker: boolean,
   failAptInstall = false,
+  packageVersion = "1:20.1.8-2ubuntu8",
 ): Promise<{ readonly code: number | null; readonly stdout: string; readonly stderr: string }> {
   const command = [
     "set -euo pipefail",
@@ -117,6 +138,7 @@ async function runPrerequisites(
       RUNNER_TEMP: fixture.root,
       WORKERD_PREREQUISITE_COMMAND_LOG: fixture.commandLog,
       WORKERD_FAIL_APT_INSTALL: String(failAptInstall),
+      WORKERD_LIBCXX_PACKAGE_VERSION: packageVersion,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

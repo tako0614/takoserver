@@ -29,6 +29,10 @@ jobs:
         with:
           bun-version-file: .bun-version
 
+      - name: Initialize workerd build report
+        shell: bash
+        run: : > "${RUNNER_TEMP}/workerd-build-runner-report.txt"
+
       - name: Install and verify pinned libc++ headers
         shell: bash
         run: bash scripts/workerd-toolchain-prerequisites.sh
@@ -48,7 +52,7 @@ jobs:
             df -h "${RUNNER_TEMP}"
             echo "clang_package_version=$(dpkg-query -W -f='${Version}' clang-20 2>/dev/null || echo missing)"
             /usr/bin/clang-20 --version 2>&1 | head -n 1 || true
-          } | tee "${report}"
+          } | tee -a "${report}"
 
           expected_package_version='1:20.1.8-2ubuntu8'
           actual_package_version="$(dpkg-query -W -f='${Version}' clang-20 2>/dev/null || true)"
