@@ -18,6 +18,7 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseActorAbiRef } from "./actor-abi-ref.ts";
+import { isValidArtifactPath } from "./artifact-path.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 import { bytesDigest } from "./json.ts";
@@ -207,6 +208,7 @@ interface WorkerdModuleStorageManifest {
 }
 
 export interface WorkerdSite {
+  readonly kind?: never;
   /** Directory holding this script's modules. */
   readonly directory: string;
   readonly mainModule: string;
@@ -285,22 +287,51 @@ export interface WorkerdSite {
   readonly events?: WorkerdEventGate;
 }
 
+/** A module-less Worker Version served only by the Host-owned asset router. */
+export interface WorkerdStaticSite {
+  readonly kind: "static";
+  readonly directory: string;
+  readonly hostnames: readonly string[];
+  readonly generation?: string;
+  readonly workerResourceUid: string;
+  readonly fetchHandler: false;
+  readonly assets: WorkerdAssetDeclaration & { readonly runWorkerFirst: false };
+  readonly mainModule?: never;
+  readonly hostEntrypoint?: never;
+  readonly modules?: never;
+  readonly moduleMediaTypes?: never;
+  readonly hostModules?: never;
+  readonly vars?: never;
+  readonly serviceBindings?: never;
+  readonly actorForward?: never;
+  readonly workflowForward?: never;
+  readonly dataPlane?: never;
+  readonly events?: never;
+}
+
 /** One exact private Version in a single logical Worker publication. */
-export interface WorkerdDeploymentVariant extends SelfhostWeightedVersion {
+export interface WorkerdDeploymentVariant<S extends WorkerdSite | WorkerdStaticSite = WorkerdSite>
+  extends SelfhostWeightedVersion {
   /** Version-scoped runtime declaration. Its routes and Worker identity are owned above it. */
-  readonly site: WorkerdSite;
+  readonly site: S;
   readonly modules: ReadonlyMap<string, Uint8Array>;
   readonly assets?: ReadonlyMap<string, Uint8Array>;
   readonly hostModules?: ReadonlyMap<string, Uint8Array>;
 }
 
 /** The complete graph a logical Worker activates in one runtime write. */
-export interface WorkerdDeploymentPublication {
+export interface WorkerdDeploymentPublication<
+  S extends WorkerdSite | WorkerdStaticSite = WorkerdSite,
+> {
   readonly generation: string;
   readonly workerResourceUid: string;
   readonly hostnames: readonly string[];
-  readonly versions: readonly WorkerdDeploymentVariant[];
+  readonly versions: readonly WorkerdDeploymentVariant<S>[];
 }
+
+export type WorkerdMixedDeploymentPublication = WorkerdDeploymentPublication<
+  WorkerdSite | WorkerdStaticSite
+>;
 
 /** The whole logical identity to compare with one proven serving publication. */
 export interface WorkerdPublicationIdentity {
@@ -328,13 +359,15 @@ export interface WorkerdActiveDeployment {
  * provider/status response. Retain it only for trusted child preparation and
  * release references after disposal; JavaScript strings are not zeroizable.
  */
-export interface WorkerdSelectedActiveVersion {
+export interface WorkerdSelectedActiveVersion<
+  S extends WorkerdSite | WorkerdStaticSite = WorkerdSite,
+> {
   readonly generation: string;
   readonly generationKey: string;
   readonly workerResourceUid: string;
   readonly versionId: string;
   readonly workerVersionUid: string;
-  readonly site: WorkerdSite;
+  readonly site: S;
   readonly modules: ReadonlyMap<string, Uint8Array>;
   readonly hostModules: ReadonlyMap<string, Uint8Array>;
   readonly assets?: ReadonlyMap<string, Uint8Array>;
@@ -372,7 +405,7 @@ export interface WorkerdDataPlane {
 }
 
 /** The seam a provider publishes through: files present, config rewritten. */
-export interface WorkerdRuntime {
+export interface WorkerdRuntime<S extends WorkerdSite | WorkerdStaticSite = WorkerdSite> {
   /** Load one credential-free module snapshot in a fresh bounded runtime. */
   readonly inspectModule: ReturnType<typeof createWorkerdWorkerModuleInspector>["inspect"];
   /**
@@ -380,7 +413,7 @@ export interface WorkerdRuntime {
    * logical routes. Implementations without this capability must leave this
    * absent; a provider may then refuse weighted publication before mutation.
    */
-  publish?(name: string, publication: WorkerdDeploymentPublication | null): Promise<void>;
+  publish?(name: string, publication: WorkerdDeploymentPublication<S> | null): Promise<void>;
   /**
    * Resolve under this process's activation lock and refuse a lost caller fence.
    * The lock is not an interprocess writer fence; the owning composition must
@@ -390,13 +423,13 @@ export interface WorkerdRuntime {
     name: string,
     resolvePublication: (
       current: WorkerdPublicationIdentity | null,
-    ) => Promise<WorkerdDeploymentPublication | null>,
+    ) => Promise<WorkerdDeploymentPublication<S> | null>,
     isFenceCurrent: () => Promise<boolean>,
   ): Promise<void>;
   /** Atomically reserves Actor capacity, commits Provider state, and publishes. */
   publishActorDeployment?(
     name: string,
-    publication: WorkerdDeploymentPublication,
+    publication: WorkerdDeploymentPublication<S>,
     commitDesiredState: () => Promise<void>,
   ): Promise<void>;
   /** Makes a published script's files present, replacing whatever was there. */
@@ -486,7 +519,7 @@ export interface WorkerdPrivateServiceLease {
  * The composition restores the process and retains bindings for its children;
  * a provider only publishes through WorkerdRuntime.
  */
-export interface HostedWorkerdRuntime extends WorkerdRuntime {
+export interface HostedWorkerdRuntime extends WorkerdRuntime<WorkerdSite | WorkerdStaticSite> {
   /**
    * Brings the runtime back up for whatever is already published.
    *
@@ -604,9 +637,37 @@ interface Manifest {
   readonly events?: WorkerdEventGate;
 }
 
+interface StaticManifest {
+  readonly kind: "static";
+  readonly hostnames: readonly string[];
+  readonly generation: string;
+  readonly workerResourceUid: string;
+  readonly fetchHandler: false;
+  readonly assets: WorkerdAssetManifest;
+  readonly mainModule?: never;
+  readonly hostEntrypoint?: never;
+  readonly hostModules?: never;
+  readonly moduleStorageLayout?: never;
+  readonly moduleFiles?: never;
+  readonly serviceBindings?: never;
+  readonly actorForward?: never;
+  readonly workflowForward?: never;
+  readonly vars?: never;
+  readonly modules?: never;
+  readonly moduleMediaTypes?: never;
+  readonly dataPlane?: never;
+  readonly events?: never;
+}
+
+type StoredManifest = Manifest | StaticManifest;
+
+function isStaticManifest(manifest: StoredManifest): manifest is StaticManifest {
+  return "kind" in manifest && manifest.kind === "static";
+}
+
 interface WorkerdDeploymentStoredVersion extends SelfhostWeightedVersion {
   readonly storageKey: string;
-  readonly manifest: Manifest;
+  readonly manifest: StoredManifest;
 }
 
 interface WorkerdDeploymentManifest {
@@ -695,6 +756,7 @@ const APPLICATION_MODULE_DIRECTORY = "application";
 const HOST_PRIVATE_MODULE_DIRECTORY = "host-private";
 const SERVICE_ROUTER_MODULE = "service-router.js";
 const DEPLOYMENT_ROUTER_MODULE = "deployment-router.js";
+const STATIC_READINESS_MODULE = "static-readiness.js";
 const EVENT_DISPATCHER_MODULE = "event-dispatcher.js";
 const SERVICE_UNAVAILABLE_HEADER = "x-takoserver-selfhost-service-unavailable";
 
@@ -1008,6 +1070,17 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       DEPLOYMENT_ROUTER_SOURCE,
       immutableHelpers,
     );
+    if (
+      published.some((entry) =>
+        entry.variants.some((variant) => isStaticManifest(variant.manifest)),
+      )
+    ) {
+      await writeRuntimeModule(
+        join(scriptsRoot, STATIC_READINESS_MODULE),
+        STATIC_READINESS_SOURCE,
+        immutableHelpers,
+      );
+    }
     await writeRuntimeModule(
       join(scriptsRoot, EVENT_DISPATCHER_MODULE),
       EVENT_DISPATCHER_SOURCE,
@@ -1257,7 +1330,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
 
   const stageDeployment = async (
     name: string,
-    publication: WorkerdDeploymentPublication,
+    publication: WorkerdMixedDeploymentPublication,
   ): Promise<{
     readonly pointer: WorkerdDeploymentPointer;
     readonly deployment: PublishedDeployment;
@@ -1321,7 +1394,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         variant.assets,
         variant.hostModules,
       );
-      if (!prepared.manifest.hostEntrypoint) {
+      if (!isStaticManifest(prepared.manifest) && !prepared.manifest.hostEntrypoint) {
         throw new Error("weighted worker Versions require a Host entrypoint");
       }
       preparedVersions.push({
@@ -1516,7 +1589,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       fenced?: {
         readonly resolve: (
           current: WorkerdPublicationIdentity | null,
-        ) => Promise<WorkerdDeploymentPublication | null>;
+        ) => Promise<WorkerdMixedDeploymentPublication | null>;
         readonly assert: () => Promise<void>;
       },
     ) {
@@ -1718,12 +1791,12 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       await (
         this.publish as (
           name: string,
-          publication: WorkerdDeploymentPublication | null,
+          publication: WorkerdMixedDeploymentPublication | null,
           commit: undefined,
           fenced: {
             readonly resolve: (
               current: WorkerdPublicationIdentity | null,
-            ) => Promise<WorkerdDeploymentPublication | null>;
+            ) => Promise<WorkerdMixedDeploymentPublication | null>;
             readonly assert: () => Promise<void>;
           },
         ) => Promise<void>
@@ -1735,7 +1808,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       await (
         this.publish as (
           name: string,
-          publication: WorkerdDeploymentPublication,
+          publication: WorkerdMixedDeploymentPublication,
           commit: () => Promise<void>,
         ) => Promise<void>
       )(name, publication, commitDesiredState);
@@ -2653,7 +2726,7 @@ function workflowForwardPublications(
 
 function workflowForwardPublicationsForInput(
   script: string,
-  publication: WorkerdDeploymentPublication | null,
+  publication: WorkerdMixedDeploymentPublication | null,
 ): readonly WorkerdWorkflowForwardPublication[] {
   if (publication === null) return [];
   const workerResourceUid = validWorkerResourceUid(publication.workerResourceUid);
@@ -3061,12 +3134,15 @@ function validModuleMediaTypes(
 
 const SAFE_ASSET_PATH = /^[A-Za-z0-9_][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/u;
 const ASSET_MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u;
+const STATIC_ASSET_MEDIA_TYPE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u;
 const MAX_ASSET_MEDIA_TYPE_LENGTH = 255;
 const MAX_ASSET_ENTRIES = 16_384;
 const MAX_ASSET_BYTES = TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES;
+const MAX_STATIC_ASSET_FILE_BYTES = 16_777_216;
 const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 
-function validAssetPath(value: string): boolean {
+function validAssetPath(value: string, staticOnly = false): boolean {
+  if (staticOnly) return isValidArtifactPath(value);
   return (
     value.length > 0 &&
     value.length <= 240 &&
@@ -3075,11 +3151,12 @@ function validAssetPath(value: string): boolean {
   );
 }
 
-function validAssetMediaType(value: unknown): value is string {
+function validAssetMediaType(value: unknown, staticOnly = false): value is string {
   return (
     typeof value === "string" &&
-    value.length <= MAX_ASSET_MEDIA_TYPE_LENGTH &&
-    ASSET_MEDIA_TYPE.test(value)
+    (staticOnly
+      ? STATIC_ASSET_MEDIA_TYPE.test(value)
+      : value.length <= MAX_ASSET_MEDIA_TYPE_LENGTH && ASSET_MEDIA_TYPE.test(value))
   );
 }
 
@@ -3087,17 +3164,20 @@ function assetStorageName(index: number): string {
   return `asset-${index.toString(10).padStart(5, "0")}`;
 }
 
-function validAssetMediaTypes(value: unknown): Readonly<Record<string, string>> {
+function validAssetMediaTypes(
+  value: unknown,
+  staticOnly = false,
+): Readonly<Record<string, string>> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("unusable worker asset declaration");
   }
   const entries = Object.entries(value);
-  if (entries.length < 1 || entries.length > MAX_ASSET_ENTRIES) {
+  if (entries.length < 1 || entries.length > (staticOnly ? 512 : MAX_ASSET_ENTRIES)) {
     throw new Error("unusable worker asset declaration");
   }
   const normalized: Record<string, string> = Object.create(null);
   for (const [path, mediaType] of entries) {
-    if (!validAssetPath(path) || !validAssetMediaType(mediaType)) {
+    if (!validAssetPath(path, staticOnly) || !validAssetMediaType(mediaType, staticOnly)) {
       throw new Error("unusable worker asset declaration");
     }
     normalized[path] = mediaType;
@@ -3112,6 +3192,7 @@ function validAssetMediaTypes(value: unknown): Readonly<Record<string, string>> 
 async function validAssets(
   configuration: WorkerdSite["assets"] | undefined,
   assets: ReadonlyMap<string, Uint8Array> | undefined,
+  staticOnly = false,
 ): Promise<
   | {
       readonly configuration: WorkerdAssetManifest;
@@ -3120,13 +3201,17 @@ async function validAssets(
   | undefined
 > {
   if (configuration === undefined && assets === undefined) return undefined;
-  const normalized = validAssetDeclaration(configuration);
+  const normalized = validAssetDeclaration(configuration, staticOnly);
   if (normalized === undefined || assets === undefined || assets.size < 1) {
     throw new Error("unusable worker asset declaration");
   }
   const logicalEntries: Array<readonly [string, Uint8Array]> = [];
   for (const [name, source] of assets) {
-    if (typeof name !== "string" || !validAssetPath(name) || !(source instanceof Uint8Array)) {
+    if (
+      typeof name !== "string" ||
+      !validAssetPath(name, staticOnly) ||
+      !(source instanceof Uint8Array)
+    ) {
       throw new Error("unusable worker asset declaration");
     }
     logicalEntries.push([name, new Uint8Array(source)]);
@@ -3150,7 +3235,11 @@ async function validAssets(
   for (const [index, [name, bytes]] of logicalEntries.entries()) {
     const key = assetStorageName(index);
     total += bytes.byteLength;
-    if (!Number.isSafeInteger(total) || total > MAX_ASSET_BYTES) {
+    if (
+      (staticOnly && bytes.byteLength > MAX_STATIC_ASSET_FILE_BYTES) ||
+      !Number.isSafeInteger(total) ||
+      total > MAX_ASSET_BYTES
+    ) {
       throw new Error("unusable worker asset declaration");
     }
     files[name] = {
@@ -3172,7 +3261,10 @@ async function validAssets(
   };
 }
 
-function validAssetDeclaration(value: unknown): WorkerdSite["assets"] | undefined {
+function validAssetDeclaration(
+  value: unknown,
+  staticOnly = false,
+): WorkerdSite["assets"] | undefined {
   if (value === undefined) return undefined;
   if (
     typeof value !== "object" ||
@@ -3195,11 +3287,11 @@ function validAssetDeclaration(value: unknown): WorkerdSite["assets"] | undefine
   return {
     notFoundHandling,
     runWorkerFirst,
-    mediaTypes: validAssetMediaTypes(mediaTypes),
+    mediaTypes: validAssetMediaTypes(mediaTypes, staticOnly),
   };
 }
 
-function validAssetManifest(value: unknown): WorkerdAssetManifest | undefined {
+function validAssetManifest(value: unknown, staticOnly = false): WorkerdAssetManifest | undefined {
   if (value === undefined) return undefined;
   if (
     typeof value !== "object" ||
@@ -3228,7 +3320,7 @@ function validAssetManifest(value: unknown): WorkerdAssetManifest | undefined {
   const logicalPaths = Object.keys(filesRecord).sort((left, right) =>
     left < right ? -1 : left > right ? 1 : 0,
   );
-  if (logicalPaths.length < 1 || logicalPaths.length > MAX_ASSET_ENTRIES) {
+  if (logicalPaths.length < 1 || logicalPaths.length > (staticOnly ? 512 : MAX_ASSET_ENTRIES)) {
     throw new Error("unusable worker asset manifest");
   }
   const files: Record<string, WorkerdAssetManifestEntry> = Object.create(null);
@@ -3236,7 +3328,7 @@ function validAssetManifest(value: unknown): WorkerdAssetManifest | undefined {
   for (const [index, path] of logicalPaths.entries()) {
     const entry = filesRecord[path];
     if (
-      !validAssetPath(path) ||
+      !validAssetPath(path, staticOnly) ||
       typeof entry !== "object" ||
       entry === null ||
       Array.isArray(entry) ||
@@ -3247,10 +3339,10 @@ function validAssetManifest(value: unknown): WorkerdAssetManifest | undefined {
     const record = entry as Record<string, unknown>;
     if (
       record.key !== assetStorageName(index) ||
-      !validAssetMediaType(record.mediaType) ||
+      !validAssetMediaType(record.mediaType, staticOnly) ||
       !Number.isSafeInteger(record.size) ||
       (record.size as number) < 0 ||
-      (record.size as number) > MAX_ASSET_BYTES ||
+      (record.size as number) > (staticOnly ? MAX_STATIC_ASSET_FILE_BYTES : MAX_ASSET_BYTES) ||
       typeof record.digest !== "string" ||
       !SHA256_DIGEST.test(record.digest)
     ) {
@@ -3335,8 +3427,8 @@ function validEventGate(gate: WorkerdEventGate): WorkerdEventGate {
   return gate;
 }
 
-interface PreparedWorkerdSite {
-  readonly manifest: Manifest;
+interface PreparedWorkerdSite<M extends StoredManifest = StoredManifest> {
+  readonly manifest: M;
   readonly application: readonly SnapshottedModule[];
   readonly hostPrivate: readonly SnapshottedModule[];
   readonly assets?: readonly (readonly [string, Uint8Array])[];
@@ -3348,7 +3440,58 @@ async function prepareWorkerdSite(
   modules: ReadonlyMap<string, Uint8Array>,
   assets: ReadonlyMap<string, Uint8Array> | undefined,
   hostModules: ReadonlyMap<string, Uint8Array> | undefined,
+): Promise<PreparedWorkerdSite<Manifest>>;
+async function prepareWorkerdSite(
+  site: WorkerdStaticSite,
+  modules: ReadonlyMap<string, Uint8Array>,
+  assets: ReadonlyMap<string, Uint8Array> | undefined,
+  hostModules: ReadonlyMap<string, Uint8Array> | undefined,
+): Promise<PreparedWorkerdSite<StaticManifest>>;
+async function prepareWorkerdSite(
+  site: WorkerdSite | WorkerdStaticSite,
+  modules: ReadonlyMap<string, Uint8Array>,
+  assets: ReadonlyMap<string, Uint8Array> | undefined,
+  hostModules: ReadonlyMap<string, Uint8Array> | undefined,
+): Promise<PreparedWorkerdSite>;
+async function prepareWorkerdSite(
+  site: WorkerdSite | WorkerdStaticSite,
+  modules: ReadonlyMap<string, Uint8Array>,
+  assets: ReadonlyMap<string, Uint8Array> | undefined,
+  hostModules: ReadonlyMap<string, Uint8Array> | undefined,
 ): Promise<PreparedWorkerdSite> {
+  if ("kind" in site && site.kind !== "static") {
+    throw new Error("unusable worker Version kind");
+  }
+  if ("kind" in site && site.kind === "static") {
+    const keys = Object.keys(site).sort().join(",");
+    if (
+      keys !== "assets,directory,fetchHandler,generation,hostnames,kind,workerResourceUid" &&
+      keys !== "assets,directory,fetchHandler,hostnames,kind,workerResourceUid"
+    )
+      throw new Error("unusable static Worker Version declaration");
+    if (
+      typeof site.directory !== "string" ||
+      site.fetchHandler !== false ||
+      modules.size !== 0 ||
+      (hostModules?.size ?? 0) !== 0 ||
+      typeof site.generation !== "string"
+    )
+      throw new Error("unusable static Worker Version declaration");
+    capnpText(site.generation);
+    const assetDeclaration = await validAssets(site.assets, assets, true);
+    if (assetDeclaration?.configuration.runWorkerFirst !== false) {
+      throw new Error("unusable static Worker Version assets");
+    }
+    const manifest: StaticManifest = {
+      kind: "static",
+      hostnames: validDeploymentHostnames(site.hostnames),
+      generation: site.generation,
+      workerResourceUid: validWorkerResourceUid(site.workerResourceUid),
+      fetchHandler: false,
+      assets: assetDeclaration.configuration,
+    };
+    return { manifest, application: [], hostPrivate: [], assets: assetDeclaration.entries };
+  }
   const mainModule = validModules([site.mainModule])[0] as string;
   const declaredModules = validModules(site.modules ?? [], site.mainModule);
   const moduleMediaTypes = validModuleMediaTypes(
@@ -3440,7 +3583,9 @@ async function writePreparedWorkerdSite(
   prepared: PreparedWorkerdSite,
 ): Promise<void> {
   await privateDirectory(root);
-  await privateDirectory(join(root, APPLICATION_MODULE_DIRECTORY));
+  if (!isStaticManifest(prepared.manifest)) {
+    await privateDirectory(join(root, APPLICATION_MODULE_DIRECTORY));
+  }
   if (prepared.hostPrivate.length > 0) {
     await privateDirectory(join(root, HOST_PRIVATE_MODULE_DIRECTORY));
   }
@@ -3829,7 +3974,7 @@ interface PublishedVariant {
   readonly storagePrefix: string;
   /** Absolute immutable asset directory used by workerd's disk service. */
   readonly assetRoot: string;
-  readonly manifest: Manifest;
+  readonly manifest: StoredManifest;
   readonly versionId?: string;
   readonly workerVersionUid?: string;
   readonly weight?: number;
@@ -3889,13 +4034,18 @@ function hasHostEntrypoint(entry: PublishedVariant): boolean {
   return entry.manifest.hostEntrypoint !== undefined;
 }
 
+function hasHostReadiness(entry: PublishedVariant): boolean {
+  return isStaticManifest(entry.manifest) || hasHostEntrypoint(entry);
+}
+
 /** Exact private asset readback used before restart or configuration reload. */
 async function readPublishedAssetSnapshot(
   root: string,
   value: unknown,
   capture?: Map<string, Uint8Array>,
+  staticOnly = false,
 ): Promise<WorkerdAssetManifest | undefined> {
-  const manifest = validAssetManifest(value);
+  const manifest = validAssetManifest(value, staticOnly);
   if (!manifest) return undefined;
   const rootStat = await lstat(root);
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
@@ -4039,9 +4189,51 @@ async function readValidatedManifest(
   assetRoot: string,
   value: unknown,
   capture?: ReadbackCapture,
-): Promise<Manifest> {
+): Promise<StoredManifest> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("unusable worker runtime manifest");
+  }
+  const candidate = value as Record<string, unknown>;
+  if ("kind" in candidate) {
+    if (
+      Object.keys(candidate).sort().join(",") !==
+        "assets,fetchHandler,generation,hostnames,kind,workerResourceUid" ||
+      candidate.kind !== "static" ||
+      candidate.fetchHandler !== false ||
+      typeof candidate.generation !== "string" ||
+      typeof candidate.workerResourceUid !== "string"
+    )
+      throw new Error("unusable static Worker Version manifest");
+    capnpText(candidate.generation);
+    validWorkerResourceUid(candidate.workerResourceUid);
+    const hostnames = validDeploymentHostnames(candidate.hostnames);
+    await verifyStoredModuleDirectory(
+      join(moduleRoot, APPLICATION_MODULE_DIRECTORY),
+      [],
+      capture?.application,
+    );
+    await verifyStoredModuleDirectory(
+      join(moduleRoot, HOST_PRIVATE_MODULE_DIRECTORY),
+      [],
+      capture?.hostPrivate,
+    );
+    const assets = await readPublishedAssetSnapshot(
+      assetRoot,
+      candidate.assets,
+      capture?.assets,
+      true,
+    );
+    if (assets?.runWorkerFirst !== false) {
+      throw new Error("unusable static Worker Version manifest");
+    }
+    return {
+      kind: "static",
+      hostnames,
+      generation: candidate.generation,
+      workerResourceUid: candidate.workerResourceUid,
+      fetchHandler: false,
+      assets,
+    };
   }
   // The legacy schema is the same known field set without optional forward
   // projections. Never reinterpret an unknown old field as a capability.
@@ -4374,14 +4566,26 @@ export async function readWorkerdActiveDeployment(
  * returns `null`; malformed or tampered durable state throws one generic error
  * without exposing bindings or operator-private paths.
  */
+interface SelectedActiveVersionOptions {
+  readonly expectedWorkerResourceUid: string;
+  readonly basisPoint: number;
+}
+
 export async function readWorkerdSelectedActiveVersion(
   root: string,
   script: string,
-  options: {
-    readonly expectedWorkerResourceUid: string;
-    readonly basisPoint: number;
-  },
-): Promise<WorkerdSelectedActiveVersion | null> {
+  options: SelectedActiveVersionOptions & { readonly includeStatic: true },
+): Promise<WorkerdSelectedActiveVersion<WorkerdSite | WorkerdStaticSite> | null>;
+export async function readWorkerdSelectedActiveVersion(
+  root: string,
+  script: string,
+  options: SelectedActiveVersionOptions & { readonly includeStatic?: false },
+): Promise<WorkerdSelectedActiveVersion | null>;
+export async function readWorkerdSelectedActiveVersion(
+  root: string,
+  script: string,
+  options: SelectedActiveVersionOptions & { readonly includeStatic?: boolean },
+): Promise<WorkerdSelectedActiveVersion<WorkerdSite | WorkerdStaticSite> | null> {
   if (!SCRIPT_NAME.test(script)) throw new Error("unusable script name");
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     throw new Error("unusable worker active version options");
@@ -4444,6 +4648,9 @@ export async function readWorkerdSelectedActiveVersion(
   // files. The top-level Worker UID check above already rejects a stale caller
   // expectation before any secret-bearing Version material is read.
   const selectedManifest = stored.manifest;
+  // Class/event callers use the historical module-only read. Static bytes may
+  // be selected only by an explicit Host caller, never cast into class work.
+  if (isStaticManifest(selectedManifest) && options.includeStatic !== true) return null;
   if (
     typeof selectedManifest !== "object" ||
     selectedManifest === null ||
@@ -4461,7 +4668,7 @@ export async function readWorkerdSelectedActiveVersion(
     hostPrivate: new Map(),
     assets: new Map(),
   };
-  let manifest: Manifest;
+  let manifest: StoredManifest;
   try {
     const moduleRoot = join(deployment.generationRoot, stored.storageKey);
     manifest = await readValidatedManifest(
@@ -4481,90 +4688,108 @@ export async function readWorkerdSelectedActiveVersion(
     throw new Error("unusable worker active version snapshot");
   }
 
-  let site: WorkerdSite;
+  let site: WorkerdSite | WorkerdStaticSite;
   try {
-    site = {
-      directory: script,
-      mainModule: manifest.mainModule,
-      ...(manifest.hostEntrypoint === undefined ? {} : { hostEntrypoint: manifest.hostEntrypoint }),
-      ...(manifest.hostModules === undefined ? {} : { hostModules: [...manifest.hostModules] }),
-      hostnames: [...manifest.hostnames],
-      ...(manifest.generation === undefined ? {} : { generation: manifest.generation }),
-      ...(manifest.workerResourceUid === undefined
-        ? {}
-        : { workerResourceUid: manifest.workerResourceUid }),
-      ...(manifest.fetchHandler === undefined ? {} : { fetchHandler: manifest.fetchHandler }),
-      ...(manifest.serviceBindings === undefined
-        ? {}
-        : {
-            serviceBindings: manifest.serviceBindings.map((binding) => ({
-              name: binding.name,
-              target: binding.target,
-              targetResourceUid: binding.targetResourceUid,
-              unavailableToken: binding.unavailableToken,
-            })),
-          }),
-      ...(manifest.actorForward === undefined
-        ? {}
-        : {
-            actorForward: {
-              schema: manifest.actorForward.schema,
-              bindings: manifest.actorForward.bindings.map((binding) => ({ ...binding })),
-            },
-          }),
-      ...(manifest.workflowForward === undefined
-        ? {}
-        : {
-            workflowForward: {
-              schema: manifest.workflowForward.schema,
-              snapshotDigest: manifest.workflowForward.snapshotDigest,
-              bindings: manifest.workflowForward.bindings.map((binding) => ({
-                ...binding,
-                workflowFormRef: { ...binding.workflowFormRef },
-                bindingRef: { ...binding.bindingRef },
-                runtimeClassRef: { ...binding.runtimeClassRef },
-              })),
-            },
-          }),
-      ...(manifest.assets === undefined
-        ? {}
-        : {
-            assets: {
-              notFoundHandling: manifest.assets.notFoundHandling,
-              runWorkerFirst: manifest.assets.runWorkerFirst,
-              mediaTypes: Object.fromEntries(
-                Object.entries(manifest.assets.files).map(([path, entry]) => [
-                  path,
-                  entry.mediaType,
-                ]),
-              ),
-            },
-          }),
-      ...(manifest.vars === undefined
-        ? {}
-        : { vars: manifest.vars.map((binding) => ({ ...binding })) }),
-      ...(manifest.modules === undefined ? {} : { modules: [...manifest.modules] }),
-      ...(manifest.moduleMediaTypes === undefined
-        ? {}
-        : { moduleMediaTypes: { ...manifest.moduleMediaTypes } }),
-      ...(manifest.dataPlane === undefined
-        ? {}
-        : {
-            dataPlane: {
-              address: manifest.dataPlane.address,
-              module: manifest.dataPlane.module,
-              vars: manifest.dataPlane.vars.map((binding) => ({ ...binding })),
-            },
-          }),
-      ...(manifest.events === undefined
-        ? {}
-        : {
-            events: {
-              module: manifest.events.module,
-              vars: manifest.events.vars.map((binding) => ({ ...binding })),
-            },
-          }),
-    };
+    site = isStaticManifest(manifest)
+      ? {
+          kind: "static",
+          directory: script,
+          hostnames: [...manifest.hostnames],
+          generation: manifest.generation,
+          workerResourceUid: manifest.workerResourceUid,
+          fetchHandler: false,
+          assets: {
+            notFoundHandling: manifest.assets.notFoundHandling,
+            runWorkerFirst: false,
+            mediaTypes: Object.fromEntries(
+              Object.entries(manifest.assets.files).map(([path, entry]) => [path, entry.mediaType]),
+            ),
+          },
+        }
+      : {
+          directory: script,
+          mainModule: manifest.mainModule,
+          ...(manifest.hostEntrypoint === undefined
+            ? {}
+            : { hostEntrypoint: manifest.hostEntrypoint }),
+          ...(manifest.hostModules === undefined ? {} : { hostModules: [...manifest.hostModules] }),
+          hostnames: [...manifest.hostnames],
+          ...(manifest.generation === undefined ? {} : { generation: manifest.generation }),
+          ...(manifest.workerResourceUid === undefined
+            ? {}
+            : { workerResourceUid: manifest.workerResourceUid }),
+          ...(manifest.fetchHandler === undefined ? {} : { fetchHandler: manifest.fetchHandler }),
+          ...(manifest.serviceBindings === undefined
+            ? {}
+            : {
+                serviceBindings: manifest.serviceBindings.map((binding) => ({
+                  name: binding.name,
+                  target: binding.target,
+                  targetResourceUid: binding.targetResourceUid,
+                  unavailableToken: binding.unavailableToken,
+                })),
+              }),
+          ...(manifest.actorForward === undefined
+            ? {}
+            : {
+                actorForward: {
+                  schema: manifest.actorForward.schema,
+                  bindings: manifest.actorForward.bindings.map((binding) => ({ ...binding })),
+                },
+              }),
+          ...(manifest.workflowForward === undefined
+            ? {}
+            : {
+                workflowForward: {
+                  schema: manifest.workflowForward.schema,
+                  snapshotDigest: manifest.workflowForward.snapshotDigest,
+                  bindings: manifest.workflowForward.bindings.map((binding) => ({
+                    ...binding,
+                    workflowFormRef: { ...binding.workflowFormRef },
+                    bindingRef: { ...binding.bindingRef },
+                    runtimeClassRef: { ...binding.runtimeClassRef },
+                  })),
+                },
+              }),
+          ...(manifest.assets === undefined
+            ? {}
+            : {
+                assets: {
+                  notFoundHandling: manifest.assets.notFoundHandling,
+                  runWorkerFirst: manifest.assets.runWorkerFirst,
+                  mediaTypes: Object.fromEntries(
+                    Object.entries(manifest.assets.files).map(([path, entry]) => [
+                      path,
+                      entry.mediaType,
+                    ]),
+                  ),
+                },
+              }),
+          ...(manifest.vars === undefined
+            ? {}
+            : { vars: manifest.vars.map((binding) => ({ ...binding })) }),
+          ...(manifest.modules === undefined ? {} : { modules: [...manifest.modules] }),
+          ...(manifest.moduleMediaTypes === undefined
+            ? {}
+            : { moduleMediaTypes: { ...manifest.moduleMediaTypes } }),
+          ...(manifest.dataPlane === undefined
+            ? {}
+            : {
+                dataPlane: {
+                  address: manifest.dataPlane.address,
+                  module: manifest.dataPlane.module,
+                  vars: manifest.dataPlane.vars.map((binding) => ({ ...binding })),
+                },
+              }),
+          ...(manifest.events === undefined
+            ? {}
+            : {
+                events: {
+                  module: manifest.events.module,
+                  vars: manifest.events.vars.map((binding) => ({ ...binding })),
+                },
+              }),
+        };
   } catch {
     // Validators normally reject these shapes earlier. Keep the reader's
     // public failure generic even for legacy manifests with missing nested
@@ -4681,12 +4906,14 @@ export async function readWorkerdActiveActorGraph(
     let manifest: Manifest;
     try {
       const moduleRoot = join(deployment.generationRoot, stored.storageKey);
-      manifest = await readValidatedManifest(
+      const validated = await readValidatedManifest(
         moduleRoot,
         join(moduleRoot, ASSETS_ROOT_DIRECTORY),
         identity,
         capture,
       );
+      if (isStaticManifest(validated)) throw new Error("static Version has no Actor class");
+      manifest = validated;
     } catch {
       throw new Error("unusable worker active Actor graph");
     }
@@ -4833,11 +5060,15 @@ async function readPublished(
     // tampered manifest and a `renderConfig` that throws for everyone.
     let manifest: Manifest;
     try {
-      manifest = await readValidatedManifest(
+      const validated = await readValidatedManifest(
         join(scriptsRoot, entry.name),
         join(assetsRoot, entry.name),
         value,
       );
+      if (isStaticManifest(validated)) {
+        throw new Error("static Version requires an immutable weighted publication");
+      }
+      manifest = validated;
       if (manifest.workflowForward !== undefined) {
         throw new Error("Workflow forward requires an immutable weighted Version");
       }
@@ -5188,6 +5419,20 @@ function renderConfig(
   );
   const services = variants
     .map((entry) => {
+      if (isStaticManifest(entry.manifest)) {
+        if (!entry.versionId) throw new Error("static Version lacks a publication identity");
+        return `  ( name = ${capnpText(entry.name)},
+    worker = (
+      modules = [ (name = ${capnpText(STATIC_READINESS_MODULE)}, esModule = embed ${capnpText(STATIC_READINESS_MODULE)}) ],
+      bindings = [
+        (name = "PUBLICATION", text = ${capnpText(entry.versionId)}),
+        (name = "INTERNAL_HOSTNAME", text = ${capnpText(internalHostname(entry.logicalName))}),
+        (name = "INTERNAL_READINESS_CAPABILITY", text = ${capnpText(internalReadinessCapability)})
+      ],
+      compatibilityDate = "2026-01-01",
+    )
+  ),`;
+      }
       const bindings = [
         ...(hasHostEntrypoint(entry)
           ? [
@@ -5268,7 +5513,7 @@ function renderConfig(
   const assetServices = variants
     .filter((entry) => entry.manifest.assets)
     .map((entry) => {
-      const assets = validAssetManifest(entry.manifest.assets);
+      const assets = validAssetManifest(entry.manifest.assets, isStaticManifest(entry.manifest));
       if (!assets) throw new Error("unusable worker asset manifest");
       return `  ( name = "${entry.name}-assets-files",
     disk = ( path = ${capnpText(entry.assetRoot)}, writable = false )
@@ -5279,6 +5524,7 @@ function renderConfig(
       bindings = [
         (name = "FILES", service = "${entry.name}-assets-files"),
         (name = "NOT_FOUND", text = "${assets.notFoundHandling}"),
+        ${isStaticManifest(entry.manifest) ? '(name = "STRICT_PATHS", text = "true"),' : ""}
         (name = "ASSET_MANIFEST", json = ${capnpText(JSON.stringify(assets.files))}),
       ],
       compatibilityDate = "2026-01-01",
@@ -5288,7 +5534,7 @@ function renderConfig(
     worker = (
       modules = [ (name = "asset-router.js", esModule = embed "asset-router.js") ],
       bindings = [
-        (name = "WORKER", service = "${entry.name}"),
+        ${isStaticManifest(entry.manifest) ? '(name = "STATIC_ONLY", text = "true"),' : `(name = "WORKER", service = "${entry.name}"),`}
         (name = "ASSETS", service = "${entry.name}-assets"),
         (name = "RUN_WORKER_FIRST", text = "${assets.runWorkerFirst ? "true" : "false"}"),
       ],
@@ -5311,7 +5557,9 @@ function renderConfig(
       const target = publishedByName.get(binding.target);
       const active =
         target?.workerResourceUid === binding.targetResourceUid &&
-        target.variants.every((variant) => variant.manifest.fetchHandler === true);
+        target.variants.every(
+          (variant) => variant.manifest.fetchHandler === true || isStaticManifest(variant.manifest),
+        );
       const targetService = target ? logicalFetchService(target) : binding.target;
       return `  ( name = ${capnpText(name)},
     worker = (
@@ -5339,6 +5587,7 @@ function renderConfig(
   const dataServices = variants
     .filter((entry) => entry.manifest.dataPlane)
     .map((entry) => {
+      if (isStaticManifest(entry.manifest)) throw new Error("static Version cannot bind data");
       const plane = validDataPlane(entry.manifest.dataPlane as WorkerdDataPlane);
       const planeModule = requiredStoredModule(
         entry.manifest.moduleFiles.hostPrivate,
@@ -5371,6 +5620,7 @@ function renderConfig(
   const eventGateServices = variants
     .filter((entry) => entry.manifest.events)
     .map((entry) => {
+      if (isStaticManifest(entry.manifest)) throw new Error("static Version cannot bind events");
       const gate = validEventGate(entry.manifest.events as WorkerdEventGate);
       const gateModule = requiredStoredModule(entry.manifest.moduleFiles.hostPrivate, gate.module);
       const gateBindings = [
@@ -5470,7 +5720,7 @@ function renderConfig(
     // that bind a data plane: the entrypoint answers the readiness question and
     // a script this Host cannot ask is one it publishes without checking.
     ...published
-      .filter((entry) => entry.variants.every((variant) => hasHostEntrypoint(variant)))
+      .filter((entry) => entry.variants.every((variant) => hasHostReadiness(variant)))
       .map((entry) => ({
         hostname: internalHostname(entry.name),
         service: logicalFetchService(entry),
@@ -5486,7 +5736,7 @@ function renderConfig(
   const internalReadinessRoutes = JSON.stringify(
     Object.fromEntries(
       published
-        .filter((entry) => entry.variants.every((variant) => hasHostEntrypoint(variant)))
+        .filter((entry) => entry.variants.every((variant) => hasHostReadiness(variant)))
         .map((entry) => [internalHostname(entry.name), logicalFetchService(entry)]),
     ),
   );
@@ -5601,6 +5851,30 @@ export default {
       ) return refuse();
     }
     return env[service].fetch(request);
+  },
+};
+`;
+
+/** Host-only readiness for a module-less static Version; never serves public traffic. */
+export const STATIC_READINESS_SOURCE = `const READINESS_PATH = ${JSON.stringify(WORKER_READINESS_PATH)};
+const READINESS_HEADER = ${JSON.stringify(WORKER_READINESS_HEADER)};
+const READINESS_PROTOCOL = ${JSON.stringify(WORKER_READINESS_PROTOCOL)};
+const INTERNAL_READINESS_CAPABILITY_HEADER = ${JSON.stringify(INTERNAL_READINESS_CAPABILITY_HEADER)};
+const READINESS_SCHEMA = "takoserver.selfhost-worker-readiness-result@v1";
+
+export default {
+  fetch(request, env) {
+    const url = new URL(request.url);
+    if (request.method !== "POST" || url.hostname !== env.INTERNAL_HOSTNAME ||
+        url.pathname !== READINESS_PATH ||
+        request.headers.get(READINESS_HEADER) !== READINESS_PROTOCOL ||
+        request.headers.get(INTERNAL_READINESS_CAPABILITY_HEADER) !== env.INTERNAL_READINESS_CAPABILITY) {
+      return new Response(null, { status: 404 });
+    }
+    return new Response(JSON.stringify({ schema: READINESS_SCHEMA, publication: env.PUBLICATION }), {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+    });
   },
 };
 `;
@@ -5785,8 +6059,25 @@ function assetMethod(request) {
   return request.method === "GET" || request.method === "HEAD";
 }
 
+function finalStaticMiss(request) {
+  return new Response(request.method === "HEAD" ? null : "not found\\n", {
+    status: 404,
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  });
+}
+
 export default {
   async fetch(request, env) {
+    if (env.STATIC_ONLY === "true") {
+      if (!assetMethod(request)) return finalStaticMiss(request);
+      const asset = await env.ASSETS.fetch(request);
+      if (isAssetMiss(asset)) return finalStaticMiss(request);
+      // Service Binding fetch can observe a HEAD response before HTTP ingress
+      // strips a body. This also covers final malformed-path 404 responses.
+      return request.method === "HEAD"
+        ? new Response(null, { status: asset.status, statusText: asset.statusText, headers: asset.headers })
+        : asset;
+    }
     // A request body must cross exactly one service boundary. Static lookup is
     // not meaningful for another method and must not consume a body before the
     // application sees it.
@@ -5855,7 +6146,7 @@ function invalidPath() {
   });
 }
 
-function pathOf(request) {
+function pathOf(request, strictPaths) {
   const rawUrl = typeof request.url === "string" ? request.url : "";
   const rawPath = rawUrl.split(/[?#]/u, 1)[0] ?? "";
   // Some URL implementations normalize encoded dot segments while parsing;
@@ -5890,29 +6181,33 @@ function pathOf(request) {
     if (
       point <= 0x1f ||
       (point >= 0x7f && point <= 0x9f) ||
-      (point >= 0xfdd0 && point <= 0xfdef) ||
-      (point & 0xffff) === 0xfffe ||
-      (point & 0xffff) === 0xffff
+      (!strictPaths && point >= 0xfdd0 && point <= 0xfdef) ||
+      (!strictPaths && (point & 0xffff) === 0xfffe) ||
+      (!strictPaths && (point & 0xffff) === 0xffff)
     ) return null;
   }
   const path = decoded.slice(1);
-  // The root, a single trailing slash, and repeated slashes are valid missing
-  // paths. Only literal dot or dotdot segments are rejected as traversal.
-  if (path === "") return path;
+  // Legacy application asset routes retain their existing treatment of root
+  // and repeated slashes. A static-only Version follows the Form's stricter
+  // path grammar and resolves root/trailing slash to an index lookup.
+  if (path === "") return strictPaths ? "index.html" : path;
   const segments = path.split("/");
   const checkedSegments = segments.at(-1) === "" ? segments.slice(0, -1) : segments;
-  if (checkedSegments.some((segment) => segment === "." || segment === "..")) return null;
+  if (checkedSegments.some((segment) =>
+    segment === "." || segment === ".." || (strictPaths && segment === "")
+  )) return null;
+  if (strictPaths && segments.at(-1) === "") return path + "index.html";
   // URL paths are not constrained by the manifest filename grammar. A valid
   // Unicode, extensionless, or trailing-slash path can simply miss the
   // inventory and then follow the declared none/SPA fallback policy.
   return path;
 }
 
-function served(response, mediaType, status) {
+function served(response, mediaType, status, head) {
   const headers = new Headers(response.headers);
   // Artifact evidence, not a filename table, is the meaning of these bytes.
   headers.set("content-type", mediaType);
-  return new Response(response.body, { status, headers });
+  return new Response(head ? null : response.body, { status, headers });
 }
 
 function manifestEntry(env, path) {
@@ -5923,12 +6218,12 @@ function manifestEntry(env, path) {
 
 export default {
   async fetch(request, env) {
-    const assetPath = pathOf(request);
+    const assetPath = pathOf(request, env.STRICT_PATHS === "true");
     if (assetPath === null) return invalidPath();
 
     const directEntry = assetPath === "" ? null : manifestEntry(env, assetPath);
     const direct = directEntry ? await file(env, directEntry) : null;
-    if (direct) return direct.status === 200 ? served(direct, directEntry.mediaType, 200) : direct;
+    if (direct) return direct.status === 200 ? served(direct, directEntry.mediaType, 200, request.method === "HEAD") : direct;
 
     if (env.NOT_FOUND === "single-page-application") {
       const shellEntry = manifestEntry(env, "index.html");
@@ -5936,7 +6231,7 @@ export default {
       // Status 200, because the application is what was found and it will
       // route the path itself. A 200 is what Cloudflare's asset layer returns
       // here, and a client router behind a 404 is a different product.
-      if (shell) return shell.status === 200 ? served(shell, shellEntry.mediaType, 200) : shell;
+      if (shell) return shell.status === 200 ? served(shell, shellEntry.mediaType, 200, request.method === "HEAD") : shell;
     }
     return miss();
   },
