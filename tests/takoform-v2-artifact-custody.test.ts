@@ -72,8 +72,8 @@ async function runWithSmallLimits(files: readonly Uint8Array[]) {
           backend: {
             id: "test-custody-small-cap-v1",
             targetKey: "test-sqlite",
-            execute: apply,
-            reconcile: apply,
+            execute: apply.execute,
+            reconcile: apply.execute,
           },
         },
       },

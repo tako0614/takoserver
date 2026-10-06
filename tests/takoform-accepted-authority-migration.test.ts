@@ -18,6 +18,7 @@ const INVOCATION_DELETE_ACK_MIGRATION = "0069_cloudflare_provider_invocation_del
 const TAKOFORM_V2_MIGRATION = "0070_takoform_v2.sql";
 const V2_MIGRATION_SET_CUSTODY = "0071_v2_sqlite_migration_set_custody.sql";
 const V2_ARTIFACT_CUSTODY = "0072_v2_artifact_custody.sql";
+const V2_REFERENCE_ACCEPTANCE = "0073_v2_reference_acceptance.sql";
 
 const MUTATION_AUTHORITY_SUMMARY = JSON.stringify({
   formRef: {
@@ -241,6 +242,7 @@ describe("Takoform accepted-authority continuity migration", () => {
       TAKOFORM_V2_MIGRATION,
       V2_MIGRATION_SET_CUSTODY,
       V2_ARTIFACT_CUSTODY,
+      V2_REFERENCE_ACCEPTANCE,
     ]);
     expect(database.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
     expect(

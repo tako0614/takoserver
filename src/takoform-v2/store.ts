@@ -96,6 +96,33 @@ function opParams(record: AcceptRecord) {
   ] as const;
 }
 
+function referenceWrites(record: AcceptRecord, referencesJson: string | null) {
+  if (referencesJson === null) return [];
+  return [
+    {
+      sql: `INSERT INTO tf_v2_operation_reference_sets (operation_id)
+        SELECT ? WHERE EXISTS (SELECT 1 FROM tf_v2_operations
+          WHERE id = ? AND status = 'queued')`,
+      params: [record.id, record.id],
+    },
+    {
+      sql: `INSERT INTO tf_v2_operation_references
+          (operation_id, target_uid, form_url, readiness, target_spec_path, target_spec_equals)
+        SELECT ?, json_extract(value, '$.resourceUid'), json_extract(value, '$.formUrl'),
+          json_extract(value, '$.readiness'), json_extract(value, '$.targetSpecPath'),
+          json_extract(value, '$.targetSpecEquals')
+        FROM json_each(?)
+        WHERE EXISTS (SELECT 1 FROM tf_v2_operation_reference_sets WHERE operation_id = ?)`,
+      params: [record.id, referencesJson, record.id],
+    },
+    {
+      sql: `UPDATE tf_v2_operation_reference_sets SET sealed = 1
+        WHERE operation_id = ? AND sealed = 0`,
+      params: [record.id],
+    },
+  ];
+}
+
 export function createV2Store(sql: Sql) {
   return {
     async resource(uid: string): Promise<ResourceRow | null> {
@@ -168,14 +195,16 @@ export function createV2Store(sql: Sql) {
     async insertCreate(
       record: AcceptRecord,
       resource: { form: string; space: string; name: string },
+      referencesJson: string | null = null,
+      initialOutputJson = "{}",
     ): Promise<void> {
       await sql.batch([
         {
           sql: `INSERT INTO tf_v2_resources
             (uid, principal, form_url, space, name, backend_id, target_key,
              active_name, generation, phase,
-             spec_json, last_operation, busy_operation)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?, ?)`,
+             spec_json, output_json, last_operation, busy_operation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?, ?, ?)`,
           params: [
             record.resourceUid,
             record.principal,
@@ -186,14 +215,19 @@ export function createV2Store(sql: Sql) {
             record.targetKey,
             resource.name,
             record.specJson,
+            initialOutputJson,
             record.id,
             record.id,
           ],
         },
         { sql: opInsert, params: opParams(record) },
+        ...referenceWrites(record, referencesJson),
       ]);
     },
-    async insertChange(record: AcceptRecord, forbidReferences = false): Promise<boolean> {
+    async insertChange(
+      record: AcceptRecord,
+      referencesJson: string | null = null,
+    ): Promise<boolean> {
       const writes = await sql.batch([
         {
           sql: `UPDATE tf_v2_resources SET generation = ?, spec_json = ?,
@@ -201,7 +235,7 @@ export function createV2Store(sql: Sql) {
             WHERE uid = ? AND principal = ? AND deleted_at IS NULL
               AND generation = ? AND busy_operation IS NULL
               ${
-                forbidReferences
+                record.action === "delete"
                   ? `AND NOT EXISTS (
                       SELECT 1 FROM tf_v2_resource_references edge
                       JOIN tf_v2_resources referrer ON referrer.uid = edge.referrer_uid
@@ -217,7 +251,7 @@ export function createV2Store(sql: Sql) {
             record.resourceUid,
             record.principal,
             record.generation - 1,
-            ...(forbidReferences ? [record.resourceUid] : []),
+            ...(record.action === "delete" ? [record.resourceUid] : []),
           ],
         },
         {
@@ -230,6 +264,7 @@ export function createV2Store(sql: Sql) {
             record.generation,
           ],
         },
+        ...referenceWrites(record, referencesJson),
       ]);
       return writes[0]?.changes === 1 && writes[1]?.changes === 1;
     },

@@ -1,6 +1,7 @@
 import { canonicalJson } from "../json.ts";
-import type { JsonObject } from "../ports.ts";
+import { type JsonObject, SqlError } from "../ports.ts";
 import { isV2FormUrl } from "./identity.ts";
+import { prepareV2References } from "./references.ts";
 import { type AcceptRecord, createV2Store, type OperationRow, type ResourceRow } from "./store.ts";
 import {
   TakoformV2Error,
@@ -21,6 +22,10 @@ function fail(code: string, status: number): never {
 
 function validName(value: string): boolean {
   return namePattern.test(value);
+}
+
+function referenceUnavailable(error: unknown): boolean {
+  return error instanceof SqlError && error.message.includes("tf_v2_reference_target_unavailable");
 }
 
 function resource(row: ResourceRow): V2Resource {
@@ -222,6 +227,8 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       }
       const selected = form(desired.form);
       selected.validateCreate(desired.spec);
+      const referencesJson = prepareV2References(selected, desired.spec);
+      if (referencesJson !== null) await permitted(principal, desired.space, "read");
       const record = accepted("create", {
         principal,
         key,
@@ -231,14 +238,27 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         spec: desired.spec,
         formUrl: desired.form,
       });
+      const output = selected.initialOutput
+        ? selected.initialOutput({
+            resourceUid: record.resourceUid,
+            space: desired.space,
+            name: desired.name,
+            spec: JSON.parse(record.specJson) as JsonObject,
+          })
+        : {};
+      if (typeof output !== "object" || output === null || Array.isArray(output)) {
+        throw new TypeError("Form initial output must be a public JSON object");
+      }
+      const initialOutputJson = canonicalRequest(output);
       try {
-        await store.insertCreate(record, desired);
+        await store.insertCreate(record, desired, referencesJson, initialOutputJson);
       } catch (error) {
         const winner = await winnerAfterRace(principal, key, fingerprint);
         if (winner) return winner;
         if (await store.activeName(desired.space, desired.name)) {
           fail("name_conflict", 409);
         }
+        if (referenceUnavailable(error)) fail("dependency_conflict", 409);
         throw error;
       }
       return operation(await storedOperation(record.id));
@@ -265,7 +285,10 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       if (target.busy_operation) fail("resource_busy", 409);
       if (target.generation !== input.expectedGeneration) fail("generation_conflict", 409);
       if (target.generation >= Number.MAX_SAFE_INTEGER) fail("invalid_request", 400);
-      boundForm(target).validateUpdate(JSON.parse(target.spec_json) as JsonObject, input.spec);
+      const selectedForm = boundForm(target);
+      selectedForm.validateUpdate(JSON.parse(target.spec_json) as JsonObject, input.spec);
+      const referencesJson = prepareV2References(selectedForm, input.spec);
+      if (referencesJson !== null) await permitted(input.principal, target.space, "read");
       const record = accepted("update", {
         principal: input.principal,
         key: input.key,
@@ -276,10 +299,12 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         formUrl: target.form_url,
       });
       try {
-        if (await store.insertChange(record)) return operation(await storedOperation(record.id));
+        if (await store.insertChange(record, referencesJson))
+          return operation(await storedOperation(record.id));
       } catch (error) {
         const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
         if (winner) return winner;
+        if (referenceUnavailable(error)) fail("dependency_conflict", 409);
         throw error;
       }
       const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
@@ -308,9 +333,8 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       if (target.busy_operation) fail("resource_busy", 409);
       if (target.generation !== input.expectedGeneration) fail("generation_conflict", 409);
       if (target.generation >= Number.MAX_SAFE_INTEGER) fail("invalid_request", 400);
-      const selectedForm = boundForm(target);
-      const mustRejectReferences = selectedForm.rejectDeleteWhileReferenced === true;
-      if (mustRejectReferences && (await store.hasReferences(target.uid))) {
+      boundForm(target);
+      if (await store.hasReferences(target.uid)) {
         fail("dependency_conflict", 409);
       }
       const record = accepted("delete", {
@@ -323,8 +347,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         formUrl: target.form_url,
       });
       try {
-        if (await store.insertChange(record, mustRejectReferences))
-          return operation(await storedOperation(record.id));
+        if (await store.insertChange(record)) return operation(await storedOperation(record.id));
       } catch (error) {
         const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
         if (winner) return winner;
@@ -332,7 +355,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       }
       const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
       if (winner) return winner;
-      if (mustRejectReferences && (await store.hasReferences(target.uid))) {
+      if (await store.hasReferences(target.uid)) {
         fail("dependency_conflict", 409);
       }
       const latest = await ownedResource(input.principal, input.uid, "write");

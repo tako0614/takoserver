@@ -56,7 +56,7 @@ const LAYERS: readonly Layer[] = [
   // these edges explicit so a protocol translator cannot enter unnoticed.
   {
     name: "v2-contract",
-    match: /^src\/takoform-v2\/(?:types|identity)\.ts$/u,
+    match: /^src\/takoform-v2\/(?:types|identity|references)\.ts$/u,
     may: ["core", "v2-contract"],
   },
   {
@@ -68,6 +68,11 @@ const LAYERS: readonly Layer[] = [
     name: "v2-form",
     match: /^src\/takoform-v2\/forms\/[^/]+\.ts$/u,
     may: ["core", "v2-contract", "v2-form"],
+  },
+  {
+    name: "v2-runtime",
+    match: /^src\/takoform-v2\/worker-bundle-runtime\.ts$/u,
+    may: ["core", "v2-contract", "v2-form", "adapter"],
   },
   {
     name: "v2-engine",

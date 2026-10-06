@@ -26,6 +26,8 @@ const INVOCATION_CUSTODY_MIGRATION = "0068_cloudflare_provider_invocation_custod
 const INVOCATION_DELETE_ACK_MIGRATION = "0069_cloudflare_provider_invocation_delete_ack.sql";
 const TAKOFORM_V2_MIGRATION = "0070_takoform_v2.sql";
 const V2_MIGRATION_SET_CUSTODY = "0071_v2_sqlite_migration_set_custody.sql";
+const V2_ARTIFACT_CUSTODY = "0072_v2_artifact_custody.sql";
+const V2_REFERENCE_ACCEPTANCE = "0073_v2_reference_acceptance.sql";
 
 const DOMAIN_MIGRATION = "0058_cloudflare_managed_worker_domain_receipts.sql";
 const APPLY_PROVIDER_SELECTION_MIGRATION = "0059_takoform_apply_provider_selection.sql";
@@ -149,6 +151,8 @@ test("0058 interrupted receipt rebuild rolls back with exact ciphertext and line
     INVOCATION_DELETE_ACK_MIGRATION,
     TAKOFORM_V2_MIGRATION,
     V2_MIGRATION_SET_CUSTODY,
+    V2_ARTIFACT_CUSTODY,
+    V2_REFERENCE_ACCEPTANCE,
   ]);
   expect(preservedRows(database)).toEqual(rows);
   database.close();

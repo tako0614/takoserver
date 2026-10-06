@@ -269,16 +269,16 @@ describe("0063 to 0064 durable Actor owner claim transition", () => {
     }
   });
 
-  test("rejects any unreviewed post-0072 source tail before provider I/O", async () => {
+  test("rejects any unreviewed post-0073 source tail before provider I/O", async () => {
     const unreviewed = join(root, "unreviewed-migrations");
     cpSync(migrations, unreviewed, { recursive: true });
     writeFileSync(
-      join(unreviewed, "0073_unreviewed_extension.sql"),
+      join(unreviewed, "0074_unreviewed_extension.sql"),
       "CREATE TABLE unreviewed_extension(value TEXT);\n",
     );
     const f = fixture({ migrationDirectory: unreviewed });
     try {
-      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0072");
+      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0073");
       expect(f.applies()).toBe(0);
     } finally {
       f.db.close();

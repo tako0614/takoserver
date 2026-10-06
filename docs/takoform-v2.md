@@ -207,6 +207,40 @@ This source fact is not Hosted D1, WfP, public TLS or production qualification.
 Source and custody authorization are distinct: a caller
 may have write access to a Space but no grant to a particular source artifact.
 
+## Worker runtime integration in progress
+
+Worker Form input parsing and runtime integration are separate from support
+registration. The current source parses ModuleWorker 0.3.0, WorkerVersion 0.5.0,
+WorkerDeployment 0.4.0 and WorkerEndpoint 0.3.0, but does not register those Forms
+in the normal application yet.
+
+A Form can declare its complete outbound Resource reference set. Acceptance
+checks the exact owner, Space, Form URL, current observation and required target
+relationship, then reserves and seals that set in the same SQL transaction as
+the Operation. An incoming reference blocks target deletion. A failed or uncertain
+update retains both previous and pending targets; a confirmed replacement or
+referrer deletion releases the obsolete edges. New referencing Forms must use
+this declaration rather than adding edges afterward. This mechanism protects
+application-managed reference sets, not arbitrary privileged SQL writers.
+
+An accepted WorkerVersion operation can read its referenced WorkerBundle through
+the shared custody reader. The reader verifies held bytes and the current lease,
+without fetching or rewriting the original artifacts. The runtime adapter passes
+owned copies to the existing module inspector and exposes the same module graph
+inputs to the workerd compiler. Inspection is not publication or traffic readiness.
+
+Forms can also calculate initial public output in a pure callback. That output
+is committed at acceptance, including before backend execution, and is not
+reallocated on replay or update. This supports the Endpoint requirement to retain
+an assigned address while its route is pending or failed. The Endpoint backend
+must preserve that address in subsequent results; the callback must not create
+external routes or perform other effects.
+
+Remaining work includes actual Worker Form backends, fenced runtime publication,
+invocation retirement, Endpoint routing and their normal-entry composition.
+Neither these internal seams nor their focused tests establish complete Worker
+Form support, public HTTPS delivery, or Hosted qualification.
+
 ## Existing installations
 
 The additive v2 tables do not convert or delete existing v1 records. Preserving
