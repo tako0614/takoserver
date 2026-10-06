@@ -343,10 +343,19 @@ routes, settle the Form, or qualify non-HTTP execution contexts.
 
 The owner is not registered by the normal application. Its portable tests do
 not qualify the pinned native workerd binary. Orderly closure can release its
-local lock after retirement, but an OS crash leaves that lock in place, including
-when all children had retired. Safe successor ownership and recovery of live
-children are still unimplemented; the code does not adopt them or remove a lock
-using only a PID. This limit remains distinct from successful same-process
+local lock after retirement. After a Host-process crash, a successor may replay
+the same DELETE only when the durable owner state proves deletion and every
+recorded incarnation has an exact retirement receipt, every recorded listener
+is vacant, and Linux boot/PID-start identity proves the prior lock owner exited
+within the same boot and PID namespace recorded by the lock. This private owner
+root is for one local Host/PID namespace, not a shared-volume or reboot-recovery
+protocol.
+The successor pins and rechecks the exact lock inode before claiming it; competing
+successors cannot both acquire it. A legacy PID-only or malformed lock, an
+unavailable process identity, a foreign listener, or any unretired/uncertain
+incarnation remains an unknown manual-recovery case. The code never adopts a
+live child or removes a lock using only a PID. This recovery is not native
+workerd ABI qualification and remains distinct from successful same-process
 operation retry.
 
 Private execution adapters can import the existing v2 backend types, Worker
