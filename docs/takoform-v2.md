@@ -350,6 +350,25 @@ composition, invocation retirement, and Endpoint routing. Neither the existing
 generic publication seam nor these focused tests establish complete Worker Form
 support, public HTTPS delivery, or Hosted qualification.
 
+An internal execution-group primitive now owns one immutable Worker UID,
+configuration and child listener within a private incarnation directory. It
+reuses one supervisor across readiness failures and process restarts. Retirement
+closes admission, waits for the captured child to exit and the listener to become
+vacant, then durably records the Worker UID and Operation ID. The same operation
+can recover its receipt without starting or terminating another child. Failed
+shutdown proof stays unconfirmed and can be checked again through the same owner.
+A separate Worker group continues running during this retirement.
+
+This receipt retires an execution-group incarnation, not the logical Worker
+Resource forever. A future Deployment may use a new incarnation for the same UID.
+An unretired directory is not adopted by a second handle after loss of ownership.
+The owning v2 composition must resolve and authorize the Operation, connect graph
+routing and settlement, and supply a private or authenticated ingress boundary.
+The current local TCP ownership check is not atomic with connection establishment
+against a hostile local binder. OS-child tests qualify the process lifecycle,
+not native workerd ABI readiness, Host-process restart recovery, or a complete
+public Worker deletion. The primitive is not registered in the normal runtime.
+
 ## Existing installations
 
 The additive v2 tables do not convert or delete existing v1 records. Preserving
