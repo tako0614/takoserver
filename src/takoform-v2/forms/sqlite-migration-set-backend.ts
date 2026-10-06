@@ -302,7 +302,7 @@ async function validSqlFile(bytes: Uint8Array, sha256: string): Promise<boolean>
   if (bytes.byteLength >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf)
     return false;
   try {
-    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
   } catch {
     return false;
   }

@@ -412,7 +412,7 @@ async function readJsonObject(
   }
   let text: string;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
   } catch {
     throw new StrictJsonError();
   }
@@ -611,7 +611,9 @@ async function decodeCursor(
   if (!authenticated) throw invalidRequest();
   let payload: unknown;
   try {
-    payload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payloadBytes));
+    payload = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(payloadBytes),
+    );
   } catch {
     throw invalidRequest();
   }
