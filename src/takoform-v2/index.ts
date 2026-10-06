@@ -40,8 +40,16 @@ export type {
   V2ReferenceRequirement,
 } from "./types.ts";
 export {
+  createV2NativeEffectCustody,
+  type V2NativeEffectCustody,
+  type V2NativeEffectIdentity,
+  type V2NativeEffectInspection,
+} from "./worker-native-effects.ts";
+export {
   createV2WorkerPublicationState,
   type V2WorkerPublicationResolution,
   type V2WorkerPublicationSnapshot,
   type V2WorkerVersionMaterials,
+  type V2WorkerVersionResolution,
+  type V2WorkerVersionSnapshot,
 } from "./worker-publication-state.ts";

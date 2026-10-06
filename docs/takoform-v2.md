@@ -314,6 +314,30 @@ the public implementation's contracts; it is not another Takoform API or a WfP
 implementation. It does not expose the self-host workerd implementation or change
 normal Form registration.
 
+The same reader resolves an accepted WorkerVersion create or update before that
+Version is ready. It verifies the current Operation claim, the owning Worker's
+organization and Space, the complete sealed reference set, and verified held
+Bundle and Asset bytes. The returned snapshot and `readMaterials()` are inputs
+to native materialization, not a claim of Form readiness. `stillCurrent()`
+rechecks the SQL vector and held-byte integrity after asynchronous work. Source
+URLs are never a recovery fallback, and a Version does not need an existing
+Deployment to read its own accepted materials.
+
+Native adapters can use `createV2NativeEffectCustody` to persist one send grant
+for an accepted Version Operation. The grant binds that Operation and its
+current SQL claim to an opaque native identity and content digest. Reclaimed
+leases and duplicate calls cannot issue a second grant. Native acknowledgements
+and independently verified observations advance the same immutable record; they
+do not settle the Form Operation. The additive `0074` table survives a database
+reopen and has no automatic expiry or delete path.
+
+A SQL grant is not cancellation at the provider. A request already sent may
+still arrive after the local lease expires. Missing native state or an absent
+receipt therefore cannot by itself prove that the operation had no effect.
+Adapters must preserve uncertainty and use exact native readback; external
+retirement and cancellation still need their own implementation. Recognizing
+`0074` in source does not raise any live D1 migration or bootstrap ceiling.
+
 Forms can also calculate initial public output in a pure callback. That output
 is committed at acceptance, including before backend execution, and is not
 reallocated on replay or update. This supports the Endpoint requirement to retain
