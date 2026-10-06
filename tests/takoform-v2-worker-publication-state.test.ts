@@ -852,6 +852,12 @@ test("a live Deployment claim rematerializes settled Version bytes from verified
     const current = await reader.resolve({ execution });
     expect(current.kind).toBe("ready");
     if (current.kind !== "ready") return;
+    const bounded = await current.openVersionMaterialsUnverified?.(version.resourceUid);
+    expect(bounded?.bundle?.manifest.entrypoint).toBe("index.js");
+    expect(bounded?.assets?.manifest.files[0]?.path).toBe("index.html");
+    expect((await bounded?.bundle?.readPage({ fileIndex: 0, nextChunk: 0 }))?.chunks[0]).toEqual(
+      moduleBytes,
+    );
     expect(
       new TextDecoder().decode(
         (await current.readVersionMaterials(version.resourceUid)).bundle?.files[0],
@@ -888,9 +894,18 @@ test("a live Deployment claim rematerializes settled Version bytes from verified
       expect(new TextDecoder().decode(held.bundle?.files[0])).toBe(
         "export default { fetch() { return new Response('held'); } };",
       );
+      const reopenedScope = await afterRestart.openVersionMaterialsUnverified?.(
+        version.resourceUid,
+      );
+      expect(
+        (await reopenedScope?.bundle?.readPage({ fileIndex: 0, nextChunk: 0 }))?.chunks[0],
+      ).toEqual(moduleBytes);
     }
     expect(sourceReads).toBe(priorSourceReads);
     await expect(current.readVersionMaterials("wrong-selected-version")).rejects.toThrow();
+    await expect(
+      current.openVersionMaterialsUnverified?.("wrong-selected-version"),
+    ).rejects.toThrow();
     const foreignWorker = await engine.acceptCreate({
       principal: "org-2",
       key: "foreign-worker-materialization",

@@ -288,6 +288,21 @@ immutable generation is its execution copy; Resource/Operation records remain
 the desired-state authority. Version deletion must still wait for both ordinary
 references and invocation retirement, then release only its execution copy.
 
+An additive internal bounded reader can capture an accepted Version graph without
+loading all artifact files. Its returned manifest, observation and file sizes are
+explicitly **unverified metadata**, not ready-to-publish bytes. Each held read
+returns at most sixteen 64 KiB chunks and rechecks the exact organization, Space,
+Form, target generation, settled Operation, artifact owner and accepted graph
+around SQL awaits. A per-file staging helper hashes the complete held file and
+checks the graph again after awaited staging writes. A restarted consumer must
+reopen its scope from the current accepted Operation; a cursor is not a bearer
+grant. No source URL is read. The existing aggregate reader and its
+`resolveVersion().ready` byte-verification semantics remain for current consumers.
+The bounded reader alone does **not** qualify 128 MiB publication: static workerd
+projection and private WfP upload still construct aggregate in-memory payloads.
+Those consumers need bounded temporary staging, final fence and exact readback
+before their maximum-size journey can be claimed.
+
 Publication must read through its own live Operation and the exact selected,
 settled Version. An Endpoint reaches a Version through the confirmed Deployment
 in the SQL graph; its own Worker reference is not a grant to arbitrary Versions.
