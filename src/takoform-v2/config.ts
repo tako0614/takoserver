@@ -11,10 +11,13 @@ export interface V2ApplicationConfig {
   readonly cursorSigningKey: Uint8Array;
   readonly documentation: string;
   readonly authenticationDocumentation: string;
-  readonly sqliteMigrationSet?: {
-    readonly targetKey: string;
-    readonly heldArtifacts: readonly V2HeldArtifactEntry[];
-  };
+  readonly sqliteMigrationSet?: V2HeldArtifactBackendConfig;
+  readonly workerBundle?: V2HeldArtifactBackendConfig;
+}
+
+export interface V2HeldArtifactBackendConfig {
+  readonly targetKey: string;
+  readonly heldArtifacts: readonly V2HeldArtifactEntry[];
 }
 
 export interface V2ApplicationEnvironment {
@@ -64,7 +67,11 @@ export function parseTakoformV2ApplicationConfig(
   const record = asRecord(parsed);
   if (
     !record ||
-    !hasExactKeys(record, ["documentation", "authenticationDocumentation"], ["sqliteMigrationSet"])
+    !hasExactKeys(
+      record,
+      ["documentation", "authenticationDocumentation"],
+      ["sqliteMigrationSet", "workerBundle"],
+    )
   ) {
     throw new V2ApplicationConfigError("invalid_configuration");
   }
@@ -74,19 +81,22 @@ export function parseTakoformV2ApplicationConfig(
 
   let sqliteMigrationSet: V2ApplicationConfig["sqliteMigrationSet"];
   if (Object.hasOwn(record, "sqliteMigrationSet")) {
-    sqliteMigrationSet = parseSQLiteMigrationSetConfig(record.sqliteMigrationSet);
+    sqliteMigrationSet = parseHeldArtifactBackendConfig(record.sqliteMigrationSet);
+  }
+  let workerBundle: V2ApplicationConfig["workerBundle"];
+  if (Object.hasOwn(record, "workerBundle")) {
+    workerBundle = parseHeldArtifactBackendConfig(record.workerBundle);
   }
   return {
     cursorSigningKey: new Uint8Array(cursorKey),
     documentation: record.documentation,
     authenticationDocumentation: record.authenticationDocumentation,
     ...(sqliteMigrationSet ? { sqliteMigrationSet } : {}),
+    ...(workerBundle ? { workerBundle } : {}),
   };
 }
 
-function parseSQLiteMigrationSetConfig(
-  value: unknown,
-): NonNullable<V2ApplicationConfig["sqliteMigrationSet"]> {
+function parseHeldArtifactBackendConfig(value: unknown): V2HeldArtifactBackendConfig {
   const config = asRecord(value);
   if (!config || !hasExactKeys(config, ["targetKey", "heldArtifacts"])) {
     throw new V2ApplicationConfigError("invalid_configuration");

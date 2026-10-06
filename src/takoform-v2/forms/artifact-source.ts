@@ -2,9 +2,11 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import type { ObjectStoreAccess, StoredObjectBody } from "../../ports.ts";
 import { isV2HttpsUrl } from "../identity.ts";
-import { SQLITE_MIGRATION_SET_LIMITS } from "./sqlite-migration-set.ts";
+import { ARTIFACT_URL_MAX_ASCII_BYTES } from "./artifact-validation.ts";
 
 const SHA256 = /^[0-9a-f]{64}$/u;
+/** Generic reader ceiling; each Form supplies its own stricter artifact bound. */
+const MAX_HOST_HELD_ARTIFACT_READ_BYTES = 134_217_728;
 const DEFAULT_READ_TIMEOUT_MILLISECONDS = 30_000;
 const MAX_READ_TIMEOUT_MILLISECONDS = 120_000;
 const READ_YIELD_INTERVAL = 1_024;
@@ -136,7 +138,7 @@ export function createV2HeldArtifactSource(options: V2HeldArtifactSourceOptions)
         typeof input.sha256 !== "string" ||
         !Number.isSafeInteger(input.maxBytes) ||
         input.maxBytes < 0 ||
-        input.maxBytes > SQLITE_MIGRATION_SET_LIMITS.aggregateBytes
+        input.maxBytes > MAX_HOST_HELD_ARTIFACT_READ_BYTES
       ) {
         throw new V2ArtifactSourceError("unavailable");
       }
@@ -317,7 +319,7 @@ function cancelBody(body: ReadableStream<Uint8Array>): void {
 function isValidArtifactUrl(value: unknown): value is string {
   return (
     typeof value === "string" &&
-    value.length <= SQLITE_MIGRATION_SET_LIMITS.urlAsciiBytes &&
+    value.length <= ARTIFACT_URL_MAX_ASCII_BYTES &&
     isV2HttpsUrl(value) &&
     !value.includes("?") &&
     !value.includes("#")

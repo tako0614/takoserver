@@ -87,7 +87,7 @@ Both runtime entries require these explicit operator settings:
 | Setting | Meaning |
 | --- | --- |
 | `TAKOSERVER_PUBLIC_ORIGIN` (Bun) / `PUBLIC_ORIGIN` (Worker) | Bare external HTTPS origin for this Host. |
-| `TAKOSERVER_TAKOFORM_V2_CONFIG` | Strict JSON with `documentation`, `authenticationDocumentation`, and optionally the configured Form below. Both documentation URLs must be HTTPS. |
+| `TAKOSERVER_TAKOFORM_V2_CONFIG` | Strict JSON with `documentation`, `authenticationDocumentation`, and optional Form backend settings below. Both documentation URLs must be HTTPS. |
 | `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY` | At least 32 random bytes encoded as canonical, unpadded base64url. Keep this operator secret stable across restarts and outside source and logs. |
 
 For example, a Host with no Form backend enabled has this **non-secret** config:
@@ -105,21 +105,45 @@ required configuration prevents startup; it does not select v1 or generate a
 new cursor key. This key protects pagination state, not Form publication or
 user authentication.
 
-The Bun entry can additionally select `sqliteMigrationSet` with a stable
-`targetKey` and `heldArtifacts`. Each entry contains `url`, lowercase hex
-`sha256`, `objectKey`, and explicit `grants: [{ principal, space }]`. For ordinary
-organization use those grants name `org:<organizationId>` and that exact
-organization ID. Seed the exact manifest and SQL file bytes in the Host's object
-store through operator-owned tooling before relying on those grants. The API
-does not upload them and never fetches the source URL. An explicit empty list
-denies all new acquisition while preserving the ability to manage existing SQL
-custody; omitting the whole Form block instead removes that implementation.
-Do not remove an implementation with unresolved Resources or Operations.
+The Bun entry can additionally select `sqliteMigrationSet` and/or `workerBundle`,
+each with a stable `targetKey` and `heldArtifacts`. Each entry contains `url`,
+lowercase hex `sha256`, `objectKey`, and explicit `grants: [{ principal, space }]`.
+For ordinary organization use those grants name `org:<organizationId>` and that
+exact organization ID. Seed each exact manifest and payload byte sequence in the
+Host's object store through operator-owned tooling before relying on those
+grants. The API does not upload artifacts and never fetches their URLs. An
+explicit empty list denies new acquisition while preserving the ability to
+manage existing custody; omitting a Form block instead removes that
+implementation. Do not remove an implementation with unresolved Resources or
+Operations.
 
-The current Worker entry accepts the empty Form map but refuses a configured
-SQLiteMigrationSet backend until its D1 path is qualified. That is a current
-implementation limit, not a restriction imposed by Takoform. Neither entry
-advertises WfP, Worker execution or other Edge Forms through this configuration.
+To explicitly compose the WorkerBundle Form while denying all new artifact
+acquisition, include an empty `heldArtifacts` list (this does not create or
+execute a Worker):
+
+```json
+{
+  "documentation": "https://host.example/docs/resources",
+  "authenticationDocumentation": "https://host.example/docs/access",
+  "workerBundle": {
+    "targetKey": "operator-worker-bundle-primary",
+    "heldArtifacts": []
+  }
+}
+```
+
+WorkerBundle (`https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/`)
+validates a UTF-8 manifest of at most 1 MiB, with 1–512 files,
+canonical relative POSIX paths of at most 1,024 UTF-8 bytes, and exact HTTPS
+artifact identities. Each file is at most 16 MiB and the aggregate is at most
+128 MiB. The Host records only the validated bundle projection and held bytes;
+it does not execute the Worker or create a data-plane endpoint.
+
+The current Worker entry accepts an omitted/empty Form map but refuses either
+configured artifact backend before accessing D1 or R2, until those Worker storage
+paths are qualified. That is a current implementation limit, not a restriction
+imposed by Takoform. Neither entry advertises WfP, Worker execution or other Edge
+Forms through this configuration.
 Discovery declares offerings, previews and privateInputs unavailable. Common
 limits are a 1 MiB request, 100 items per page and a 24-hour replay window.
 
@@ -170,6 +194,13 @@ upload recreating bytes after deletion. Updates verify the already-held bytes;
 reads do not contact the source. Deletion releases only the Resource's custody,
 not the operator's source objects, and a live inbound reference prevents delete
 acceptance. None of these operations executes SQL from the migration files.
+
+WorkerBundle uses the same byte-custody mechanism with its own manifest and
+payload validation. New artifact Forms use the additive 0072 custody tables;
+existing MigrationSet custody stays in its original 0071 tables without a bulk
+copy. The two storage layouts are internal, fixed choices, not user-selected SQL
+identifiers. They share the Resource/Operation ledger and lease rules, rather
+than introducing a second resource authority.
 
 The normal Bun composition now connects this backend when explicitly configured.
 This source fact is not Hosted D1, WfP, public TLS or production qualification.

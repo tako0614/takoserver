@@ -149,6 +149,7 @@ test("0058 interrupted receipt rebuild rolls back with exact ciphertext and line
     INVOCATION_DELETE_ACK_MIGRATION,
     TAKOFORM_V2_MIGRATION,
     V2_MIGRATION_SET_CUSTODY,
+    "0072_v2_artifact_custody.sql",
   ]);
   expect(preservedRows(database)).toEqual(rows);
   database.close();

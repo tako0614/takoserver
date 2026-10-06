@@ -157,6 +157,7 @@ test("0067 upgrades nonempty 0066 Resource data without changing rows", async ()
       INVOCATION_DELETE_ACK_MIGRATION,
       TAKOFORM_V2_MIGRATION,
       V2_MIGRATION_SET_CUSTODY,
+      "0072_v2_artifact_custody.sql",
     ]);
     expect(database.query("SELECT * FROM tf_resources ORDER BY kind").all()).toEqual(before);
     expect(migrateSqlite(database).applied).toEqual([]);
