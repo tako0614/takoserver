@@ -165,6 +165,21 @@ artifact identities. Each file is at most 16 MiB and the aggregate is at most
 128 MiB. The Host records only the validated bundle projection and held bytes;
 it does not execute the Worker or create a data-plane endpoint.
 
+The internal `worker-code-runtime.ts` projection is a building block for a
+future code-bearing Worker path. It accepts already-authorized held bundle
+bytes and a trusted semantic inspector, then projects module bytes, media
+types, fetch-handler identity and JSON `vars` to the Workerd graph. It invokes
+inspection on that same owned snapshot. It does not
+register a Worker Form or execute/publish a Worker. Bindings, private inputs,
+assets and scheduled/queue delivery remain explicit internal refusals; this
+projection is not evidence of Form support or native qualification.
+
+The published ModuleWorker 0.3 text describes auxiliary source maps but does
+not name their MIME token, while WorkerBundle 0.2 defers its closed media-type
+set to that ModuleWorker section. This implementation does not infer a token;
+source-map media support needs an owning Form clarification or a later Form
+version before it can enter bundle custody.
+
 StaticAssetBundle (`https://edge.forms.takoform.com/forms/StaticAssetBundle/0.2.0/`)
 accepts a manifest up to 1 MiB with 1–512 files, canonical relative POSIX paths
 up to 1,024 UTF-8 bytes, exact HTTPS artifact identities, per-file bytes up to
@@ -287,6 +302,21 @@ references retain those Resources and their verified bytes. The runtime's staged
 immutable generation is its execution copy; Resource/Operation records remain
 the desired-state authority. Version deletion must still wait for both ordinary
 references and invocation retirement, then release only its execution copy.
+
+An additive internal bounded reader can capture an accepted Version graph without
+loading all artifact files. Its returned manifest, observation and file sizes are
+explicitly **unverified metadata**, not ready-to-publish bytes. Each held read
+returns at most sixteen 64 KiB chunks and rechecks the exact organization, Space,
+Form, target generation, settled Operation, artifact owner and accepted graph
+around SQL awaits. A per-file staging helper hashes the complete held file and
+checks the graph again after awaited staging writes. A restarted consumer must
+reopen its scope from the current accepted Operation; a cursor is not a bearer
+grant. No source URL is read. The existing aggregate reader and its
+`resolveVersion().ready` byte-verification semantics remain for current consumers.
+The bounded reader alone does **not** qualify 128 MiB publication: static workerd
+projection and private WfP upload still construct aggregate in-memory payloads.
+Those consumers need bounded temporary staging, final fence and exact readback
+before their maximum-size journey can be claimed.
 
 Publication must read through its own live Operation and the exact selected,
 settled Version. An Endpoint reaches a Version through the confirmed Deployment

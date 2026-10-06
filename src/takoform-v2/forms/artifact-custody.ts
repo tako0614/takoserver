@@ -1,3 +1,5 @@
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import { bytesDigest, canonicalJson } from "../../json.ts";
 import type { Clock, JsonObject, Row, Sql } from "../../ports.ts";
 import { SqlError } from "../../ports.ts";
@@ -66,6 +68,33 @@ export interface SqlArtifactCustodyRead<M> {
   readonly observed: JsonObject;
 }
 
+/** A scoped description, not proof that the held file bytes are still intact. */
+export interface SqlArtifactCustodyUnverified<M> {
+  readonly manifest: M;
+  readonly manifestBytes: Uint8Array;
+  readonly observed: JsonObject;
+  readonly fileSizes: readonly number[];
+  /** Returned chunks are untrusted until their complete file digest is checked. */
+  readPage(input: {
+    readonly fileIndex: number;
+    readonly nextChunk: number;
+  }): Promise<{ readonly chunks: readonly Uint8Array[]; readonly nextChunk: number | null }>;
+  /** The sink must be private staging, never a serving or native effect. */
+  stageVerifiedFile(input: {
+    readonly fileIndex: number;
+    readonly write: (chunk: Uint8Array) => Promise<void>;
+  }): Promise<{ readonly sha256: string; readonly byteSize: number }>;
+}
+
+export interface SqlArtifactCustodyHeldInput {
+  readonly targetResourceUid: string;
+  readonly principal: string;
+  readonly space: string;
+  readonly expectedSpec: JsonObject;
+  readonly expectedObserved: JsonObject;
+  readonly stillAuthorized: () => Promise<boolean>;
+}
+
 export interface SqlArtifactCustody<M extends { readonly files: readonly ArtifactFile[] }> {
   execute(input: V2Execution): Promise<V2BackendResult>;
   /** Read verified bytes only while this exact accepted v2 reference is leased. */
@@ -74,14 +103,9 @@ export interface SqlArtifactCustody<M extends { readonly files: readonly Artifac
     readonly targetResourceUid: string;
   }): Promise<SqlArtifactCustodyRead<M>>;
   /** Internal graph read. The caller must prove its accepted graph on both sides. */
-  readHeldVerified(input: {
-    readonly targetResourceUid: string;
-    readonly principal: string;
-    readonly space: string;
-    readonly expectedSpec: JsonObject;
-    readonly expectedObserved: JsonObject;
-    readonly stillAuthorized: () => Promise<boolean>;
-  }): Promise<SqlArtifactCustodyRead<M>>;
+  readHeldVerified(input: SqlArtifactCustodyHeldInput): Promise<SqlArtifactCustodyRead<M>>;
+  /** Internal graph-only bounded read. A caller must re-open after restart. */
+  openHeldUnverified(input: SqlArtifactCustodyHeldInput): Promise<SqlArtifactCustodyUnverified<M>>;
 }
 
 /** Byte custody only: Form-specific parsing and observation remain with callers. */
@@ -717,24 +741,18 @@ export function createSqlArtifactCustody<
     }
   }
 
-  async function readHeldVerified(input: {
-    readonly targetResourceUid: string;
-    readonly principal: string;
-    readonly space: string;
-    readonly expectedSpec: JsonObject;
-    readonly expectedObserved: JsonObject;
-    readonly stillAuthorized: () => Promise<boolean>;
-  }): Promise<SqlArtifactCustodyRead<M>> {
-    if (!tables.hasFormUrl || !input.targetResourceUid) throw denied();
-    try {
-      const expectedSpecJson = canonicalJson(input.expectedSpec);
-      const expectedObservedJson = canonicalJson(input.expectedObserved);
-      const authorizationRow = async (): Promise<Row> => {
-        const row = (
-          await sql.query(
-            `SELECT target.uid, target.generation, target.last_operation,
-              target.spec_json, target.observed_json, owner.observation_json
-           FROM tf_v2_resources target
+  function heldAuthorization(input: SqlArtifactCustodyHeldInput) {
+    const expectedSpecJson = canonicalJson(input.expectedSpec);
+    const expectedObservedJson = canonicalJson(input.expectedObserved);
+    const params = [
+      input.targetResourceUid,
+      input.principal,
+      input.space,
+      options.formUrl,
+      expectedSpecJson,
+      expectedObservedJson,
+    ];
+    const fromWhere = `FROM tf_v2_resources target
            JOIN tf_v2_operations settled ON settled.id = target.last_operation
            JOIN tf_v2_artifact_owners owner ON owner.resource_uid = target.uid
            WHERE target.uid = ? AND target.principal = ? AND target.space = ?
@@ -746,21 +764,30 @@ export function createSqlArtifactCustody<
              AND settled.status = 'succeeded' AND settled.effect = 'complete'
              AND target.spec_json = ? AND target.observed_json = ?
              AND owner.form_url = target.form_url AND owner.state = 'verified'
-             AND owner.observation_json = target.observed_json
-           LIMIT 1`,
-            [
-              input.targetResourceUid,
-              input.principal,
-              input.space,
-              options.formUrl,
-              expectedSpecJson,
-              expectedObservedJson,
-            ],
-          )
-        )[0];
-        if (!row) throw denied();
-        return row;
-      };
+             AND owner.observation_json = target.observed_json`;
+    const row = async (): Promise<Row> => {
+      const found = (
+        await sql.query(
+          `SELECT target.uid, target.generation, target.last_operation,
+              target.spec_json, target.observed_json, owner.observation_json,
+              owner.manifest_sha256, owner.verified_operation_id,
+              length(owner.manifest_bytes) AS manifest_byte_size
+           ${fromWhere} LIMIT 1`,
+          params,
+        )
+      )[0];
+      if (!found) throw denied();
+      return found;
+    };
+    return { params, fromWhere, row };
+  }
+
+  async function readHeldVerified(
+    input: SqlArtifactCustodyHeldInput,
+  ): Promise<SqlArtifactCustodyRead<M>> {
+    if (!tables.hasFormUrl || !input.targetResourceUid) throw denied();
+    try {
+      const authorizationRow = heldAuthorization(input).row;
       if (!(await input.stillAuthorized())) throw denied();
       const before = await authorizationRow();
       const read = await heldVerified(
@@ -772,6 +799,192 @@ export function createSqlArtifactCustody<
       if (canonicalJson(before) !== canonicalJson(after)) throw denied();
       if (!(await input.stillAuthorized())) throw denied();
       return read;
+    } catch {
+      throw denied();
+    }
+  }
+
+  async function openHeldUnverified(
+    input: SqlArtifactCustodyHeldInput,
+  ): Promise<SqlArtifactCustodyUnverified<M>> {
+    if (!tables.hasFormUrl || !input.targetResourceUid) throw denied();
+    try {
+      // Neither the caller's objects nor a previously returned descriptor are authority.
+      const scoped: SqlArtifactCustodyHeldInput = {
+        ...input,
+        expectedSpec: JSON.parse(canonicalJson(input.expectedSpec)) as JsonObject,
+        expectedObserved: JSON.parse(canonicalJson(input.expectedObserved)) as JsonObject,
+      };
+      const authorization = heldAuthorization(scoped);
+      if (!(await scoped.stillAuthorized())) throw denied();
+      const initial = await authorization.row();
+      if (
+        !Number.isSafeInteger(initial.generation) ||
+        typeof initial.last_operation !== "string" ||
+        typeof initial.verified_operation_id !== "string" ||
+        typeof initial.manifest_sha256 !== "string"
+      )
+        throw denied();
+      const pinned = [
+        initial.generation as number,
+        initial.last_operation,
+        initial.verified_operation_id,
+        initial.manifest_sha256,
+      ];
+      const { current, manifestBytes, manifest } = await ensureManifest(
+        { resourceUid: scoped.targetResourceUid, spec: scoped.expectedSpec },
+        false,
+      );
+      if (
+        current.state !== "verified" ||
+        current.observation_json !== canonicalJson(scoped.expectedObserved)
+      ) {
+        throw denied();
+      }
+      const observedFiles = scoped.expectedObserved.files;
+      if (!Array.isArray(observedFiles) || observedFiles.length !== manifest.files.length) {
+        throw denied();
+      }
+      const fileSizes = observedFiles.map((value: unknown) => {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) throw denied();
+        const size = (value as Record<string, unknown>).byteSize;
+        if (
+          !Number.isSafeInteger(size) ||
+          (size as number) < 0 ||
+          (size as number) > options.limits.fileBytes
+        ) {
+          throw denied();
+        }
+        return size as number;
+      });
+      const projection = await options.projectVerified({
+        spec: scoped.expectedSpec,
+        manifestBytes,
+        fileSizes,
+      });
+      if (canonicalJson(projection.observed) !== canonicalJson(scoped.expectedObserved))
+        throw denied();
+      const checkCurrent = async () => {
+        const latest = await authorization.row();
+        if (canonicalJson(latest) !== canonicalJson(initial) || !(await scoped.stillAuthorized())) {
+          throw denied();
+        }
+      };
+      await checkCurrent();
+
+      const readPage = async ({
+        fileIndex,
+        nextChunk,
+      }: {
+        readonly fileIndex: number;
+        readonly nextChunk: number;
+      }): Promise<{
+        readonly chunks: readonly Uint8Array[];
+        readonly nextChunk: number | null;
+      }> => {
+        try {
+          if (
+            !Number.isSafeInteger(fileIndex) ||
+            fileIndex < 0 ||
+            fileIndex >= manifest.files.length ||
+            !Number.isSafeInteger(nextChunk) ||
+            nextChunk < 0
+          )
+            throw denied();
+          const fileSize = fileSizes[fileIndex];
+          if (fileSize === undefined) throw denied();
+          const required = Math.max(1, Math.ceil(fileSize / CHUNK_BYTES));
+          if (nextChunk >= required) throw denied();
+          const count = Math.min(CHUNKS_PER_READ, required - nextChunk);
+          if (!(await scoped.stillAuthorized())) throw denied();
+          const before = await authorization.row();
+          if (canonicalJson(before) !== canonicalJson(initial)) throw denied();
+          const rows = await sql.query(
+            `SELECT chunk.chunk_index, chunk.bytes FROM ${tables.chunks} chunk
+           JOIN (SELECT target.uid, target.generation, target.last_operation,
+                        owner.verified_operation_id, owner.manifest_sha256
+                 ${authorization.fromWhere}) authorized
+             ON authorized.uid = chunk.resource_uid
+           WHERE chunk.file_index = ? AND chunk.chunk_index >= ?
+             AND authorized.generation = ? AND authorized.last_operation = ?
+             AND authorized.verified_operation_id = ? AND authorized.manifest_sha256 = ?
+           ORDER BY chunk.chunk_index LIMIT ?`,
+            [...authorization.params, fileIndex, nextChunk, ...pinned, count],
+          );
+          if (rows.length !== count) throw denied();
+          const chunks: Uint8Array[] = [];
+          for (let offset = 0; offset < count; offset += 1) {
+            const row = rows[offset];
+            const index = nextChunk + offset;
+            if (row?.chunk_index !== index) throw denied();
+            const bytes = asBytes(row.bytes);
+            const expectedLength =
+              index === required - 1 ? fileSize - index * CHUNK_BYTES : CHUNK_BYTES;
+            if (bytes.byteLength !== expectedLength) throw denied();
+            chunks.push(bytes);
+          }
+          if (nextChunk + count === required) {
+            const extra = await sql.query(
+              `SELECT 1 FROM ${tables.chunks} chunk
+             JOIN (SELECT target.uid, target.generation, target.last_operation,
+                          owner.verified_operation_id, owner.manifest_sha256
+                   ${authorization.fromWhere}) authorized
+               ON authorized.uid = chunk.resource_uid
+             WHERE chunk.file_index = ? AND chunk.chunk_index >= ?
+               AND authorized.generation = ? AND authorized.last_operation = ?
+               AND authorized.verified_operation_id = ? AND authorized.manifest_sha256 = ?
+             LIMIT 1`,
+              [...authorization.params, fileIndex, required, ...pinned],
+            );
+            if (extra.length !== 0) throw denied();
+          }
+          await checkCurrent();
+          return {
+            chunks,
+            nextChunk: nextChunk + count === required ? null : nextChunk + count,
+          };
+        } catch {
+          throw denied();
+        }
+      };
+
+      return {
+        manifest: structuredClone(manifest),
+        manifestBytes: new Uint8Array(manifestBytes),
+        observed: structuredClone(scoped.expectedObserved),
+        fileSizes: [...fileSizes],
+        readPage,
+        async stageVerifiedFile({ fileIndex, write }) {
+          try {
+            if (
+              typeof write !== "function" ||
+              !Number.isSafeInteger(fileIndex) ||
+              fileIndex < 0 ||
+              fileIndex >= manifest.files.length
+            )
+              throw denied();
+            const file = manifest.files[fileIndex];
+            const byteSize = fileSizes[fileIndex];
+            if (!file || byteSize === undefined) throw denied();
+            const hash = sha256.create();
+            let cursor: number | null = 0;
+            while (cursor !== null) {
+              const page = await readPage({ fileIndex, nextChunk: cursor });
+              for (const chunk of page.chunks) {
+                hash.update(chunk);
+                await write(new Uint8Array(chunk));
+              }
+              cursor = page.nextChunk;
+            }
+            const digest = bytesToHex(hash.digest());
+            if (digest !== file.sha256) throw denied();
+            await checkCurrent();
+            return { sha256: digest, byteSize };
+          } catch {
+            throw denied();
+          }
+        },
+      };
     } catch {
       throw denied();
     }
@@ -800,7 +1013,7 @@ export function createSqlArtifactCustody<
     }
   }
 
-  return { execute, readVerified, readHeldVerified };
+  return { execute, readVerified, readHeldVerified, openHeldUnverified };
 }
 
 function asBytes(value: unknown): Uint8Array {
