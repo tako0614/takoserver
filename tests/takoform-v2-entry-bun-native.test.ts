@@ -246,6 +246,121 @@ async function stopHost(child: Child | null): Promise<void> {
   throw new Error("normal Bun entry did not stop gracefully");
 }
 
+async function killHost(child: Child): Promise<void> {
+  if (child.exitCode !== null) throw new Error("normal Bun entry exited before the crash fence");
+  child.kill("SIGKILL");
+  const exited = await Promise.race([
+    child.exited.then(() => true),
+    Bun.sleep(3_000).then(() => false),
+  ]);
+  if (!exited) throw new Error("normal Bun entry survived SIGKILL");
+}
+
+/** Drop the response body and its IDs after the real HTTP acceptance headers. */
+async function postWithoutResponse(
+  port: number,
+  path: string,
+  body: Json,
+  token: string,
+  key: string,
+): Promise<void> {
+  const response = await requestAt(port, path, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "idempotency-key": key,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (response.status !== 202) {
+    const problem = (await response.json().catch(() => null)) as { code?: unknown } | null;
+    const code = typeof problem?.code === "string" ? problem.code : "unknown";
+    throw new Error(`native v2 abandoned response returned ${response.status}:${code}`);
+  }
+  await response.body?.cancel();
+}
+
+interface AcceptedCheckpoint {
+  readonly operationId: string;
+  readonly resourceUid: string;
+  readonly stagedChunks: number;
+}
+
+/** One bounded, read-only SELECT at each poll; no test changes the ledger. */
+async function waitForPartialCheckpoint(
+  root: string,
+  principal: string,
+  key: string,
+  fileBytes: number,
+): Promise<AcceptedCheckpoint> {
+  const database = new Database(join(root, "control.sqlite"), { readonly: true });
+  try {
+    const statement = database.query(
+      `SELECT op.id, op.resource_uid, op.principal, op.status, op.dispatch_possible,
+              op.lease_token, op.next_attempt_at_ms, progress.current_file_bytes,
+              (SELECT count(*) FROM tf_v2_migration_set_chunks chunk
+               WHERE chunk.resource_uid = op.resource_uid) AS staged_chunks
+       FROM tf_v2_operations op
+       LEFT JOIN tf_v2_artifact_progress progress ON progress.operation_id = op.id
+       WHERE op.replay_key = ? LIMIT 1`,
+    );
+    const deadline = Date.now() + 20_000;
+    let last: Json | null = null;
+    while (Date.now() < deadline) {
+      let row: Json | null;
+      try {
+        row = statement.get(key) as Json | null;
+      } catch (error) {
+        if (error && typeof error === "object" && "code" in error && error.code === "SQLITE_BUSY") {
+          await Bun.sleep(20);
+          continue;
+        }
+        throw error;
+      }
+      last = row;
+      if (row && row.principal !== principal) {
+        throw new Error("native v2 request was accepted for an unexpected principal");
+      }
+      if (row?.status === "failed" || row?.status === "succeeded") {
+        throw new Error("native v2 operation settled before a partial checkpoint was observed");
+      }
+      if (
+        row?.status === "reconciling" &&
+        row.dispatch_possible === 1 &&
+        row.lease_token === null &&
+        typeof row.next_attempt_at_ms === "number" &&
+        row.next_attempt_at_ms > Date.now() &&
+        row.current_file_bytes === fileBytes &&
+        typeof row.staged_chunks === "number" &&
+        row.staged_chunks > 0 &&
+        row.staged_chunks < Math.ceil(fileBytes / 65_536)
+      ) {
+        return {
+          operationId: String(row.id),
+          resourceUid: String(row.resource_uid),
+          stagedChunks: row.staged_chunks,
+        };
+      }
+      await Bun.sleep(20);
+    }
+    throw new Error(
+      `native v2 partial checkpoint was not observed before the deadline: ${JSON.stringify({
+        found: last !== null,
+        status: last?.status,
+        dispatchPossible: last?.dispatch_possible,
+        leaseActive: last !== null && last.lease_token !== null,
+        nextAttemptDue:
+          typeof last?.next_attempt_at_ms === "number" && last.next_attempt_at_ms <= Date.now(),
+        currentFileBytes: last?.current_file_bytes,
+        stagedChunks: last?.staged_chunks,
+      })}`,
+    );
+  } finally {
+    database.close();
+  }
+}
+
 async function settled(port: number, token: string, operationId: string): Promise<Json> {
   const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
@@ -808,6 +923,364 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
       });
     }
     if (cleanupFailed) throw new Error("native v2 child cleanup failed");
+  },
+  180_000,
+);
+
+test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
+  "normal Bun entry resumes one accepted partial artifact Operation after SIGKILL and a discarded response body",
+  async () => {
+    if (OPT_IN !== "1") throw new Error("TAKOSERVER_V2_ENTRY_NATIVE must be exactly 1");
+    const root = await mkdtemp(join(tmpdir(), "takoserver-v2-entry-crash-"));
+    const port = await choosePort();
+    let bootstrap: Child | null = null;
+    let serving: Child | null = null;
+    let cleanupFailed = false;
+    try {
+      bootstrap = await startHost(root, port, fixtureConfig());
+      const assertion = await signOperatorAssertion({
+        privateJwk: await readFile(join(root, "operator-key.jwk"), "utf8"),
+        claims: {
+          purpose: "sign-in",
+          aud: PUBLIC_ORIGIN,
+          provider: "google",
+          subject: "v2-crash-owner",
+          email: "v2-crash-owner@localhost",
+          displayName: "V2 Crash Owner",
+        },
+        nowSeconds: Math.floor(Date.now() / 1_000),
+        lifetimeSeconds: 60,
+      });
+      const session = await jsonAt(port, "POST", "/v1/sessions", 200, {
+        provider: "google",
+        method: "operator-assertion",
+        assertion,
+        sessionTtlSeconds: 60,
+      });
+      const sessionAuth = { authorization: `Bearer ${String(session.sessionToken)}` };
+      const primary = await jsonAt(
+        port,
+        "POST",
+        "/v1/organizations",
+        201,
+        { name: "V2 interrupted owner" },
+        sessionAuth,
+      );
+      const foreign = await jsonAt(
+        port,
+        "POST",
+        "/v1/organizations",
+        201,
+        { name: "V2 foreign custody sentinel" },
+        sessionAuth,
+      );
+      const primarySpace = String((primary.organization as Json).id);
+      const foreignSpace = String((foreign.organization as Json).id);
+      const primaryKey = await jsonAt(
+        port,
+        "POST",
+        `/v1/organizations/${primarySpace}/api-keys`,
+        201,
+        { name: "interrupted writer", scopes: ["resources:write"], expiresInSeconds: 600 },
+        sessionAuth,
+      );
+      const foreignKey = await jsonAt(
+        port,
+        "POST",
+        `/v1/organizations/${foreignSpace}/api-keys`,
+        201,
+        { name: "foreign sentinel writer", scopes: ["resources:write"], expiresInSeconds: 600 },
+        sessionAuth,
+      );
+      const primaryToken = String(primaryKey.secret);
+      const foreignToken = String(foreignKey.secret);
+      await stopHost(bootstrap);
+      bootstrap = null;
+
+      // 5 MiB exceeds the four guarded 15-chunk writes allowed in one pass.
+      // The first process must durably stage a prefix, then yield its lease.
+      const fileBytes = new Uint8Array(5 * 1_024 * 1_024).fill(0x78);
+      fileBytes[0] = 0x2d;
+      fileBytes[1] = 0x2d;
+      fileBytes[fileBytes.length - 1] = 0x0a;
+      const fileSha256 = (await bytesDigest(fileBytes)).slice(7);
+      const manifestBytes = new TextEncoder().encode(
+        JSON.stringify({
+          files: [
+            { path: "0001.sql", url: FILE_URL, sha256: fileSha256, mediaType: "application/sql" },
+          ],
+        }),
+      );
+      const manifestSha256 = (await bytesDigest(manifestBytes)).slice(7);
+      const sentinelBytes = new TextEncoder().encode(
+        "export default {fetch() {return new Response('sentinel')}};\n",
+      );
+      const sentinelSha256 = (await bytesDigest(sentinelBytes)).slice(7);
+      const sentinelManifest = new TextEncoder().encode(
+        JSON.stringify({
+          entrypoint: "worker.js",
+          files: [
+            {
+              path: "worker.js",
+              url: BUNDLE_FILE_URL,
+              sha256: sentinelSha256,
+              mediaType: "application/javascript+module",
+            },
+          ],
+        }),
+      );
+      const sentinelManifestSha256 = (await bytesDigest(sentinelManifest)).slice(7);
+      const objects = createFileObjectStore({ root });
+      expect(await objects.create(MANIFEST_KEY, manifestBytes)).not.toBeNull();
+      expect(await objects.create(FILE_KEY, fileBytes)).not.toBeNull();
+      expect(await objects.create(BUNDLE_MANIFEST_KEY, sentinelManifest)).not.toBeNull();
+      expect(await objects.create(BUNDLE_FILE_KEY, sentinelBytes)).not.toBeNull();
+      const primaryGrants = [{ principal: `org:${primarySpace}`, space: primarySpace }];
+      const foreignGrants = [{ principal: `org:${foreignSpace}`, space: foreignSpace }];
+      const configured = fixtureConfig(
+        [
+          {
+            url: MANIFEST_URL,
+            sha256: manifestSha256,
+            objectKey: MANIFEST_KEY,
+            grants: primaryGrants,
+          },
+          { url: FILE_URL, sha256: fileSha256, objectKey: FILE_KEY, grants: primaryGrants },
+        ],
+        [
+          {
+            url: BUNDLE_MANIFEST_URL,
+            sha256: sentinelManifestSha256,
+            objectKey: BUNDLE_MANIFEST_KEY,
+            grants: foreignGrants,
+          },
+          {
+            url: BUNDLE_FILE_URL,
+            sha256: sentinelSha256,
+            objectKey: BUNDLE_FILE_KEY,
+            grants: foreignGrants,
+          },
+        ],
+      );
+      serving = await startHost(root, port, configured);
+
+      expect(
+        await jsonAt(
+          port,
+          "GET",
+          `${V2}/support?form=${encodeURIComponent(SQLITE_MIGRATION_SET_FORM_URL)}`,
+          200,
+          undefined,
+          { authorization: `Bearer ${primaryToken}` },
+        ),
+      ).toMatchObject({ supported: true });
+
+      const sentinelSpec = {
+        artifact: { url: BUNDLE_MANIFEST_URL, sha256: sentinelManifestSha256 },
+      };
+      const sentinelCreate = await jsonAt(
+        port,
+        "POST",
+        `${V2}/resources`,
+        202,
+        {
+          form: WORKER_BUNDLE_FORM_URL,
+          space: foreignSpace,
+          name: "untouched",
+          spec: sentinelSpec,
+        },
+        { authorization: `Bearer ${foreignToken}`, "idempotency-key": "foreign-sentinel-create" },
+      );
+      const sentinelUid = String(sentinelCreate.resourceUid);
+      expect(await settled(port, foreignToken, String(sentinelCreate.id))).toMatchObject({
+        effect: "complete",
+      });
+      const foreignBefore = await jsonAt(
+        port,
+        "GET",
+        `${V2}/resources/${sentinelUid}`,
+        200,
+        undefined,
+        { authorization: `Bearer ${foreignToken}` },
+      );
+      expectWorkerBundleCustody(
+        root,
+        sentinelUid,
+        sentinelManifestSha256,
+        sentinelBytes.byteLength,
+        true,
+      );
+
+      const spec = { artifact: { url: MANIFEST_URL, sha256: manifestSha256 } };
+      const body = {
+        form: SQLITE_MIGRATION_SET_FORM_URL,
+        space: primarySpace,
+        name: "interrupted",
+        spec,
+      };
+      const replayKey = "native-entry-crash-create-0001";
+      await postWithoutResponse(port, `${V2}/resources`, body, primaryToken, replayKey);
+      const checkpoint = await waitForPartialCheckpoint(
+        root,
+        `org:${primarySpace}`,
+        replayKey,
+        fileBytes.byteLength,
+      );
+      expect(checkpoint.stagedChunks).toBeGreaterThan(0);
+      expect(checkpoint.stagedChunks).toBeLessThan(Math.ceil(fileBytes.byteLength / 65_536));
+      const firstPid = serving.pid;
+      await killHost(serving);
+      serving = null;
+
+      serving = await startHost(root, port, configured);
+      expect(serving.pid).not.toBe(firstPid);
+      const replay = await requestAt(port, `${V2}/resources`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${primaryToken}`,
+          "idempotency-key": replayKey,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      expect([200, 202]).toContain(replay.status);
+      const replayed = (await replay.json()) as Json;
+      expect(replayed).toMatchObject({
+        id: checkpoint.operationId,
+        resourceUid: checkpoint.resourceUid,
+        generation: 1,
+      });
+      expect(await settled(port, primaryToken, checkpoint.operationId)).toMatchObject({
+        id: checkpoint.operationId,
+        resourceUid: checkpoint.resourceUid,
+        effect: "complete",
+      });
+      const complete = await jsonAt(
+        port,
+        "GET",
+        `${V2}/resources/${checkpoint.resourceUid}`,
+        200,
+        undefined,
+        { authorization: `Bearer ${primaryToken}` },
+      );
+      expect(complete).toMatchObject({
+        uid: checkpoint.resourceUid,
+        generation: 1,
+        observedGeneration: 1,
+        observed: { manifestSha256, totalBytes: fileBytes.byteLength },
+      });
+      const database = new Database(join(root, "control.sqlite"), { readonly: true });
+      try {
+        expect(
+          database
+            .query(
+              "SELECT count(*) AS count FROM tf_v2_migration_set_chunks WHERE resource_uid = ?",
+            )
+            .get(checkpoint.resourceUid),
+        ).toEqual({ count: Math.ceil(fileBytes.byteLength / 65_536) });
+        expect(
+          database
+            .query("SELECT count(*) AS count FROM tf_v2_artifact_progress WHERE operation_id = ?")
+            .get(checkpoint.operationId),
+        ).toEqual({ count: 0 });
+      } finally {
+        database.close();
+      }
+      expect(
+        (
+          await requestAt(port, `${V2}/resources/${checkpoint.resourceUid}`, {
+            headers: { authorization: `Bearer ${foreignToken}` },
+          })
+        ).status,
+      ).toBe(404);
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${sentinelUid}`, 200, undefined, {
+          authorization: `Bearer ${foreignToken}`,
+        }),
+      ).toEqual(foreignBefore);
+      expectWorkerBundleCustody(
+        root,
+        sentinelUid,
+        sentinelManifestSha256,
+        sentinelBytes.byteLength,
+        true,
+      );
+
+      // Once the interrupted create has finished, later same-spec work needs
+      // only the held custody; the original source objects may disappear.
+      expect(await objects.delete(MANIFEST_KEY)).toBe(true);
+      expect(await objects.delete(FILE_KEY)).toBe(true);
+      const auth = { authorization: `Bearer ${primaryToken}` };
+      const update = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${checkpoint.resourceUid}`,
+        202,
+        { spec },
+        {
+          ...auth,
+          "idempotency-key": "native-entry-crash-update",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(await settled(port, primaryToken, String(update.id))).toMatchObject({
+        effect: "complete",
+      });
+      const deletion = await jsonAt(
+        port,
+        "DELETE",
+        `${V2}/resources/${checkpoint.resourceUid}`,
+        202,
+        undefined,
+        {
+          ...auth,
+          "idempotency-key": "native-entry-crash-delete",
+          "takoform-expected-generation": "2",
+        },
+      );
+      expect(await settled(port, primaryToken, String(deletion.id))).toMatchObject({
+        effect: "complete",
+      });
+      const gone = await requestAt(port, `${V2}/resources/${checkpoint.resourceUid}`, {
+        headers: auth,
+      });
+      expect(gone.status).toBe(410);
+      await gone.arrayBuffer();
+      const afterDelete = new Database(join(root, "control.sqlite"), { readonly: true });
+      try {
+        expect(
+          afterDelete
+            .query(
+              `SELECT
+                 (SELECT count(*) FROM tf_v2_migration_set_owners WHERE resource_uid = ?) AS owners,
+                 (SELECT count(*) FROM tf_v2_migration_set_chunks WHERE resource_uid = ?) AS chunks,
+                 (SELECT count(*) FROM tf_v2_artifact_progress WHERE resource_uid = ?) AS progress`,
+            )
+            .get(checkpoint.resourceUid, checkpoint.resourceUid, checkpoint.resourceUid),
+        ).toEqual({ owners: 0, chunks: 0, progress: 0 });
+      } finally {
+        afterDelete.close();
+      }
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${sentinelUid}`, 200, undefined, {
+          authorization: `Bearer ${foreignToken}`,
+        }),
+      ).toEqual(foreignBefore);
+      expectWorkerBundleCustody(
+        root,
+        sentinelUid,
+        sentinelManifestSha256,
+        sentinelBytes.byteLength,
+        true,
+      );
+    } finally {
+      const stops = await Promise.allSettled([stopHost(serving), stopHost(bootstrap)]);
+      cleanupFailed = stops.some((result) => result.status === "rejected");
+      await rm(root, { recursive: true, force: true }).catch(() => {
+        cleanupFailed = true;
+      });
+    }
+    if (cleanupFailed) throw new Error("native v2 crash child cleanup failed");
   },
   180_000,
 );

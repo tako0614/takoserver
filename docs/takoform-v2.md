@@ -480,6 +480,18 @@ same operation and resource identities. A restart test must terminate an OS
 process and reopen the same persistent state, not merely construct another
 JavaScript handle.
 
+The opt-in normal Bun entry test also exercises one interrupted artifact
+create: it discards the HTTP response body and returned IDs, observes a
+nonterminal 0075 checkpoint with a partial SQL chunk prefix through a bounded
+read-only query, then sends SIGKILL to that Host process. A new process opens
+the same SQLite and file store, and the identical idempotency key identifies
+the same Operation and Resource. It finishes custody, updates and deletes from
+the held bytes after the original source is removed, while an unrelated
+organization's Resource and custody remain unchanged. This is local OS-process
+recovery at a completed checkpoint; it does not prove recovery from a kill
+during a single SQL write, public TLS ingress, Hosted D1/R2, or native Worker
+execution.
+
 Portable core tests, self-host resource use, Hosted resource use and downstream
 Provider/application installation are separate evidence. The complete portable
 gate is necessary before integration, but is not a live qualification or a
