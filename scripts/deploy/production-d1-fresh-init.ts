@@ -42,7 +42,11 @@ import {
   sealDirectory,
   unsealDirectory,
 } from "./qualification.ts";
-import { readCurrentAuditedMigrationSourceArtifact } from "./schema.ts";
+import {
+  projectFreshProductionMigrationArtifact,
+  readCurrentAuditedMigrationSourceArtifact,
+  readSealedFreshProductionMigrationArtifact,
+} from "./schema.ts";
 import type { DeployTarget } from "./target.ts";
 import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 
@@ -113,7 +117,7 @@ interface IncumbentProductionD1 {
  * database starts from, and the rehearsal and integration storage owners
  * deliberately refuse production. This surface fills exactly that gap, so the
  * operator can choose between a wave-by-wave transition and a fresh start at
- * the current head without reaching for ad-hoc provider commands.
+ * the separately reviewed 0069 payload without reaching for ad-hoc provider commands.
  *
  * `--status` is the dry run: it proves exact name absence through the provider
  * and prints the planned identity plus the audited lineage digest, and it
@@ -129,8 +133,10 @@ export async function runProductionD1FreshInit(
   options: ProductionD1FreshInitOptions = {},
 ): Promise<Record<string, unknown>> {
   const names = validateInvocation(invocation, target);
-  const sourceArtifact = readCurrentAuditedMigrationSourceArtifact(
-    options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+  const sourceArtifact = projectFreshProductionMigrationArtifact(
+    readCurrentAuditedMigrationSourceArtifact(
+      options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+    ),
   );
   const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
   const expectedApplicationShapeDigest = `sha256:${createHash("sha256")
@@ -447,7 +453,7 @@ async function applyFreshProductionD1(
     for (const file of sourceArtifact.files) {
       copyFileSync(file.path, join(migrationOutput, file.name));
     }
-    const sealedArtifact = readCurrentAuditedMigrationSourceArtifact(migrationOutput);
+    const sealedArtifact = readSealedFreshProductionMigrationArtifact(migrationOutput);
     if (
       sealedArtifact.digest !== sourceArtifact.digest ||
       JSON.stringify(sealedArtifact.names) !== JSON.stringify(sourceArtifact.names)

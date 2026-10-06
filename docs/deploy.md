@@ -183,11 +183,14 @@ production commit, runs the migration gate once, seals the fixed audited
 0001–0069 names and bytes, proves the fresh name absent twice, creates one D1,
 proves the empty canonical shape, applies the lineage through one sealed
 `wrangler d1 execute --file` import, and verifies the exact lineage and
-application schema afterwards. This is a fresh-empty-target source path only:
-it selects the same current source lineage as an empty self-host SQLite boot,
-without raising the existing-target or protected migration-wave ceiling. The
-0067–0069 source selection and local SQLite stand-in checks are not evidence
-that the import has passed a native remote D1 or Hosted rollout qualification.
+application schema afterwards. The complete source inventory is audited through
+0070, but this fresh-empty-target path deliberately projects only the frozen
+0001–0069 payload. An empty self-host SQLite boot includes 0070, so its schema is
+not yet identical to this production bootstrap. Adding the v2 tables to a live
+production database requires a separately authorized migration path; source
+recognition does not raise the existing-target or protected migration-wave
+ceiling. Local SQLite stand-in checks are not evidence that the import has
+passed a native remote D1 or Hosted rollout qualification.
 
 Both actions require `TAKOSERVER_D1_FRESH_INIT_CUSTODY_DIRECTORY`: an existing,
 owner-owned `0700` absolute directory outside every Git checkout, with no
@@ -1242,15 +1245,15 @@ managed customer runtime.
 
   Integration may select one of the same audited boundaries to exercise a
   bounded protected wave. The selector is checked against the immutable
-  0001–0069 names and SHA-256 source inventory, so a checkout with unreviewed
-  0070+ migrations is refused before qualification or provider mutation. The
+  0001–0070 names and SHA-256 source inventory, so a checkout with unreviewed
+  0071+ migrations is refused before qualification or provider mutation. The
   selected integration lane projects only the audited through-prefix, with
   apply and remote D1 qualification still capped at 0066. The source-only 0067
-  Container Endpoint index, 0068 future provider-invocation custody schema and
-  0069 future delete-ack proof projection are source-only for existing-target
+  Container Endpoint index, 0068 future provider-invocation custody schema,
+  0069 future delete-ack proof projection and 0070 v2 tables are source-only for existing-target
   waves: they are not new protected waves or in-place D1 apply authority. The
-  separately selected fresh-empty production D1 path uses the full audited
-  source, without qualifying a live remote D1 import or existing-data upgrade.
+  separately selected fresh-empty production D1 path remains pinned to 0001–0069,
+  without qualifying a live remote D1 import or existing-data upgrade.
   Migration 0068 initializes its
   admission epoch closed and does not activate an invocation writer; 0069 does
   not qualify a live delete or migration apply. The apply-qualified ceiling
@@ -1731,12 +1734,12 @@ for protected data.
 The no-selector `takoserver-d1-schema` integration lane accepts one further
 standalone transition: the exact audited 0062 prefix with only
 `0063_cloudflare_managed_queue_retirement.sql` pending. The source inventory
-must be exactly 0001–0066 with the audited 0063 SHA-256, and the selected D1
+must be exactly 0001–0070 with the audited 0063 SHA-256, and the selected D1
 must have the canonical 0062 application shape. Protected rehearsal and
 production selectors remain capped at 0057. The audited 0064 Actor-owner
 table has a separate in-place integration wave only after exact 0063; a fresh
-integration storage generation can use the full audited lineage. An unreviewed
-0070-or-later tail is refused.
+integration storage generation remains limited to the apply-qualified 0001–0066
+prefix. An unreviewed 0071-or-later tail is refused.
 
 0063 creates only the durable managed Queue retirement marker, helper-phase
 rows, route tripwire and their immutable/no-regression guards. It rewrites and

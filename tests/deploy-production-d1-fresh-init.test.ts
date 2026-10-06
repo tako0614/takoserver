@@ -37,10 +37,10 @@ import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
 
 const fixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-production-d1-tests-"));
 const currentMigrations = copyCurrentSchemaFixture(join(fixtureRoot, "current-migrations"));
+const APPLY_MIGRATIONS = MIGRATIONS.slice(0, 69);
 const expectedApplicationShape = applicationShape(currentMigrations);
 const COMMIT = "a".repeat(40);
 const GENERATION = "b".repeat(32);
-const APPLY_MIGRATIONS = MIGRATIONS;
 const ACCOUNT_ID = "a10162d23653f1ad1193dabf520a5dd0";
 const DATABASE_ID = "00000000-0000-4000-8000-000000000061";
 const INCUMBENT_DATABASE = "takoserver-runtime-ga-20260820";
@@ -86,7 +86,7 @@ function stateWithShape(applied: readonly string[], shape: string): D1SchemaStat
 function applicationShape(directory: string): string {
   const database = new Database(":memory:");
   try {
-    for (const name of readdirSync(directory).sort()) {
+    for (const { name } of APPLY_MIGRATIONS) {
       database.exec(readFileSync(join(directory, name), "utf8"));
     }
     const rows = database
@@ -218,11 +218,11 @@ describe("production D1 fresh init", () => {
     expect(surface?.covers).toContain("scripts/deploy/wrangler-state.ts");
   });
 
-  test("the fresh D1 application shape equals a fresh self-host SQLite bootstrap", () => {
+  test("fresh production stays at 0069 while self-host source bootstraps through 0070", () => {
     const database = new Database(":memory:");
     try {
       const report = migrateSqlite(database);
-      expect(report.applied).toEqual(APPLY_MIGRATIONS.map(({ name }) => name));
+      expect(report.applied).toEqual(MIGRATIONS.map(({ name }) => name));
       const rows = database
         .query(
           "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql " +
@@ -234,7 +234,11 @@ describe("production D1 fresh init", () => {
       );
       expect(
         applicationSchemaMatches(stateWithShape([], selfhostShape), expectedApplicationShape),
-      ).toBe(true);
+      ).toBe(false);
+      expect(database.query("SELECT 1 FROM tf_v2_resources LIMIT 1").all()).toEqual([]);
+      expect(APPLY_MIGRATIONS.at(-1)?.name).toBe(
+        "0069_cloudflare_provider_invocation_delete_ack.sql",
+      );
     } finally {
       database.close();
     }
@@ -342,13 +346,13 @@ describe("production D1 fresh init", () => {
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const tail = join(migrationDirectory, "0069_cloudflare_provider_invocation_delete_ack.sql");
+        const tail = join(migrationDirectory, "0070_takoform_v2.sql");
         if (drift === "missing") rmSync(tail);
         else if (drift === "changed") {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0070_unreviewed.sql"),
+            join(migrationDirectory, "0071_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }
@@ -361,7 +365,7 @@ describe("production D1 fresh init", () => {
         ).rejects.toThrow(
           drift === "changed"
             ? "exact audited migration SHA-256"
-            : "audited migration lineage must contain exactly 0001-0069",
+            : "audited migration lineage must contain exactly 0001-0070",
         );
         expect(fixture.calls).toEqual([]);
       } finally {
@@ -515,6 +519,7 @@ describe("production D1 fresh init", () => {
       expect(migrationImport).toContain("0067_takoform_container_endpoint_hostname_index.sql");
       expect(migrationImport).toContain("0068_cloudflare_provider_invocation_custody.sql");
       expect(migrationImport).toContain("0069_cloudflare_provider_invocation_delete_ack.sql");
+      expect(migrationImport).not.toContain("0070_takoform_v2.sql");
       const imported = new Database(":memory:");
       try {
         imported.exec(migrationImport);

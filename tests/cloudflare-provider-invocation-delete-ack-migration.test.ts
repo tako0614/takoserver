@@ -273,9 +273,10 @@ function seedLegacyInvocation(
 
 test("0069 is source inventory only and leaves the 0066 apply ceiling unchanged", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
-  expect(source.names).toHaveLength(69);
-  expect(source.names.at(-2)).toBe(PREDECESSOR);
-  expect(source.names.at(-1)).toBe(MIGRATION_NAME);
+  expect(source.names).toHaveLength(70);
+  expect(source.names.at(-3)).toBe(PREDECESSOR);
+  expect(source.names.at(-2)).toBe(MIGRATION_NAME);
+  expect(source.names.at(-1)).toBe("0070_takoform_v2.sql");
   const qualified = projectApplyQualifiedMigrationArtifact(source);
   expect(qualified.names).toHaveLength(66);
   expect(qualified.names.at(-1)).toBe("0066_cloudflare_managed_actor_kv_capability_claims.sql");
@@ -287,9 +288,9 @@ test("0069 is source inventory only and leaves the 0066 apply ceiling unchanged"
     for (const file of source.files) copyFileSync(file.path, join(migrations, file.name));
     const tail = source.files.at(-1);
     if (!tail) throw new Error("audited source is missing its terminal migration");
-    copyFileSync(tail.path, join(migrations, "0070_unreviewed.sql"));
+    copyFileSync(tail.path, join(migrations, "0071_unreviewed.sql"));
     expect(() => readCurrentAuditedMigrationSourceArtifact(migrations)).toThrow(
-      "audited migration lineage must contain exactly 0001-0069",
+      "audited migration lineage must contain exactly 0001-0070",
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

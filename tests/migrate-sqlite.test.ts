@@ -53,6 +53,7 @@ const TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX =
 const CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY = "0068_cloudflare_provider_invocation_custody.sql";
 const CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK =
   "0069_cloudflare_provider_invocation_delete_ack.sql";
+const TAKOFORM_V2 = "0070_takoform_v2.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -91,6 +92,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX,
   CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
   CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
+  TAKOFORM_V2,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -760,6 +762,7 @@ describe("bringing a local database up to date", () => {
     expect(MIGRATIONS[receiptMigrationIndex + 25]?.name).toBe(
       CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
     );
+    expect(MIGRATIONS[receiptMigrationIndex + 26]?.name).toBe(TAKOFORM_V2);
 
     const database = new Database(":memory:");
     database.exec(`
@@ -799,6 +802,7 @@ describe("bringing a local database up to date", () => {
       TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX,
       CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
       CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
+      TAKOFORM_V2,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -1079,6 +1083,7 @@ describe("bringing a local database up to date", () => {
         TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX,
         CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
         CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
+        TAKOFORM_V2,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1652,6 +1657,7 @@ describe("bringing a local database up to date", () => {
       TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX,
       CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
       CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
+      TAKOFORM_V2,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1802,6 +1808,7 @@ describe("bringing a local database up to date", () => {
       TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX,
       CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
       CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
+      TAKOFORM_V2,
     ]);
     expect(
       database
@@ -2759,6 +2766,7 @@ describe("bringing a local database up to date", () => {
       TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX,
       CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
       CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
+      TAKOFORM_V2,
     ]);
     expect(
       database
