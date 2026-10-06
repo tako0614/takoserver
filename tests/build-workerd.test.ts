@@ -83,8 +83,8 @@ test("native artifact workflow allows the pinned two-worker build to finish and 
   expect(buildStep).toContain("timeout --signal=TERM --kill-after=30s 120m");
   expect(buildStep).toContain("--jobs 2");
   expect(buildStep).toContain("--memory-mb 8192");
-  expect(workflow).toContain('if: success()');
-  expect(workflow).toContain('if: failure()');
+  expect(workflow).toContain("if: success()");
+  expect(workflow).toContain("if: failure()");
 });
 
 async function runBuildScript(arguments_: readonly string[]): Promise<{
