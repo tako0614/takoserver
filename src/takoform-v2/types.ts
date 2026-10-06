@@ -83,10 +83,36 @@ export interface V2Backend {
   reconcile(input: V2Execution): Promise<V2BackendResult>;
 }
 
+/** Trusted Form declaration, never caller-supplied policy or SQL. */
+export interface V2ReferenceRequirement {
+  readonly resourceUid: string;
+  readonly formUrl: string;
+  /** `observed` permits a confirmed not-ready owner; `ready` requires observed.ready === true. */
+  readonly readiness: "observed" | "ready";
+  /** One bounded exact target spec string field, e.g. Version.worker.resourceUid. */
+  readonly targetSpecMatch?: {
+    readonly path: readonly string[];
+    readonly equals: string;
+  };
+}
+
 export interface V2Form {
   validateCreate(spec: JsonObject): void;
   validateUpdate(previousSpec: JsonObject, spec: JsonObject): void;
-  /** Optional generic SQL reference guard, enforced in the same delete acceptance batch. */
+  /**
+   * Pure initial public output, persisted with Resource/Operation acceptance.
+   * Must not perform external allocation: a losing acceptance can roll back.
+   * Replays and updates retain the stored output instead of calling this again.
+   */
+  initialOutput?(input: {
+    readonly resourceUid: string;
+    readonly space: string;
+    readonly name: string;
+    readonly spec: JsonObject;
+  }): JsonObject;
+  /** Complete outbound UID set for this accepted spec; evaluated before SQL acceptance. */
+  references?(spec: JsonObject): readonly V2ReferenceRequirement[];
+  /** Retained for existing adapters; all inbound v2 edges now protect deletion. */
   rejectDeleteWhileReferenced?: true;
   backend: V2Backend;
 }

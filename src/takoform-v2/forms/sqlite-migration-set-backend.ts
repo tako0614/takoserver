@@ -59,8 +59,8 @@ export function createSQLiteMigrationSetForm(options: {
     backend: {
       id: SQLITE_MIGRATION_SET_BACKEND_ID,
       targetKey: options.targetKey,
-      execute: apply,
-      reconcile: apply,
+      execute: apply.execute,
+      reconcile: apply.execute,
     },
   };
 }

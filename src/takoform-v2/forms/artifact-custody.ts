@@ -39,6 +39,22 @@ interface ArtifactFile {
   readonly sha256: string;
 }
 
+export interface SqlArtifactCustodyRead<M> {
+  readonly manifest: M;
+  readonly manifestBytes: Uint8Array;
+  readonly files: readonly Uint8Array[];
+  readonly observed: JsonObject;
+}
+
+export interface SqlArtifactCustody<M extends { readonly files: readonly ArtifactFile[] }> {
+  execute(input: V2Execution): Promise<V2BackendResult>;
+  /** Read verified bytes only while this exact accepted v2 reference is leased. */
+  readVerified(input: {
+    readonly execution: V2Execution;
+    readonly targetResourceUid: string;
+  }): Promise<SqlArtifactCustodyRead<M>>;
+}
+
 /** Byte custody only: Form-specific parsing and observation remain with callers. */
 export function createSqlArtifactCustody<
   M extends { readonly files: readonly ArtifactFile[] },
@@ -64,7 +80,7 @@ export function createSqlArtifactCustody<
   readonly invalidArtifact: () => Error;
   readonly invalidManifest: () => Error;
   readonly failureNoun: string;
-}): (input: V2Execution) => Promise<V2BackendResult> {
+}): SqlArtifactCustody<M> {
   const { sql, source } = options;
   const tables = TABLES[options.layout];
 
@@ -146,10 +162,11 @@ export function createSqlArtifactCustody<
     if (!held || !sameBytes(held, bytes)) throw options.invalidArtifact();
   }
 
-  async function ensureManifest(input: V2Execution) {
+  async function ensureManifest(input: V2Execution, mayAcquire = true) {
     const spec = options.parseSpec(input.spec);
     let current = await owner(input.resourceUid);
     if (!current) {
+      if (!mayAcquire) throw options.invalidArtifact();
       const bytes = await acquire(
         input,
         spec.artifact.url,
@@ -279,7 +296,130 @@ export function createSqlArtifactCustody<
     return { kind: "complete", observed: {}, output: {} };
   }
 
-  return async (input) => {
+  async function readVerified(input: {
+    readonly execution: V2Execution;
+    readonly targetResourceUid: string;
+  }): Promise<SqlArtifactCustodyRead<M>> {
+    const { execution, targetResourceUid } = input;
+    const denied = () => new SqlError("unavailable", "verified artifact is unavailable");
+    if (!tables.hasFormUrl || !targetResourceUid) throw denied();
+
+    const authorizationRow = async (): Promise<Row> => {
+      let candidate: Row | undefined;
+      try {
+        candidate = (
+          await sql.query(
+            `SELECT op.accepted_spec_json, target.spec_json AS target_spec_json,
+                target.observed_json AS target_observed_json,
+                owner.state AS owner_state, owner.observation_json AS owner_observation_json
+         FROM tf_v2_operations op
+         JOIN tf_v2_resources consumer ON consumer.uid = op.resource_uid
+         JOIN tf_v2_operation_reference_sets accepted_set
+           ON accepted_set.operation_id = op.id AND accepted_set.sealed = 1
+         JOIN tf_v2_operation_references accepted_ref
+           ON accepted_ref.operation_id = op.id AND accepted_ref.target_uid = ?
+         JOIN tf_v2_resource_references active_ref
+           ON active_ref.target_uid = accepted_ref.target_uid
+          AND active_ref.referrer_uid = consumer.uid
+         JOIN tf_v2_resources target ON target.uid = accepted_ref.target_uid
+         JOIN tf_v2_artifact_owners owner ON owner.resource_uid = target.uid
+         WHERE op.id = ? AND op.lease_token = ? AND op.status = 'reconciling'
+           AND op.action IN ('create', 'update')
+           AND op.resource_uid = ? AND op.principal = ? AND op.generation = ?
+           AND op.backend_key = ? AND op.backend_id = ? AND op.target_key = ?
+           AND consumer.principal = op.principal AND consumer.form_url = ?
+           AND consumer.space = ? AND consumer.name = ?
+           AND consumer.backend_id = op.backend_id AND consumer.target_key = op.target_key
+           AND consumer.busy_operation = op.id AND consumer.last_operation = op.id
+           AND consumer.generation = op.generation AND consumer.deleted_at IS NULL
+           AND accepted_ref.form_url = ?
+           AND (accepted_ref.target_spec_path IS NULL OR
+                json_extract(target.spec_json, accepted_ref.target_spec_path) =
+                  accepted_ref.target_spec_equals)
+           AND target.principal = op.principal AND target.space = consumer.space
+           AND target.form_url = ? AND target.deleted_at IS NULL
+           AND target.busy_operation IS NULL AND target.phase = 'idle'
+           AND target.generation = target.observed_generation
+           AND owner.form_url = target.form_url AND owner.state = 'verified'`,
+            [
+              targetResourceUid,
+              execution.operationId,
+              execution.leaseToken,
+              execution.resourceUid,
+              execution.principal,
+              execution.generation,
+              execution.backendKey,
+              execution.backendId,
+              execution.targetKey,
+              execution.form,
+              execution.space,
+              execution.name,
+              options.formUrl,
+              options.formUrl,
+            ],
+          )
+        )[0];
+      } catch {
+        throw denied();
+      }
+      if (candidate?.owner_state !== "verified") throw denied();
+      return candidate;
+    };
+    const candidate = await authorizationRow();
+
+    try {
+      const acceptedSpec = JSON.parse(String(candidate.accepted_spec_json)) as JsonObject;
+      if (canonicalJson(acceptedSpec) !== canonicalJson(execution.spec)) throw denied();
+      const targetSpec = JSON.parse(String(candidate.target_spec_json)) as JsonObject;
+      const targetObserved = JSON.parse(String(candidate.target_observed_json)) as JsonObject;
+      const { current, manifestBytes, manifest } = await ensureManifest(
+        {
+          ...execution,
+          resourceUid: targetResourceUid,
+          form: options.formUrl,
+          spec: targetSpec,
+        },
+        false,
+      );
+      if (current.state !== "verified" || !current.observation_json) throw denied();
+      const files = await ensureFiles(
+        { ...execution, resourceUid: targetResourceUid, form: options.formUrl, spec: targetSpec },
+        manifest,
+        false,
+      );
+      const result = await options.validatePayload({
+        spec: targetSpec,
+        manifestBytes,
+        fileBytes: files,
+      });
+      const observedJson = canonicalJson(result.observed);
+      if (
+        current.observation_json !== observedJson ||
+        canonicalJson(targetObserved) !== observedJson
+      ) {
+        throw denied();
+      }
+      const finalAuthorization = await authorizationRow();
+      if (
+        finalAuthorization.accepted_spec_json !== candidate.accepted_spec_json ||
+        finalAuthorization.target_spec_json !== candidate.target_spec_json ||
+        finalAuthorization.target_observed_json !== candidate.target_observed_json ||
+        finalAuthorization.owner_observation_json !== candidate.owner_observation_json
+      ) {
+        throw denied();
+      }
+      return {
+        manifest,
+        manifestBytes: new Uint8Array(manifestBytes),
+        files: files.map((bytes) => new Uint8Array(bytes)),
+        observed: JSON.parse(observedJson) as JsonObject,
+      };
+    } catch {
+      throw denied();
+    }
+  }
+
+  async function execute(input: V2Execution): Promise<V2BackendResult> {
     if (input.action === "delete") return await release(input);
     try {
       return await verify(input);
@@ -299,7 +439,9 @@ export function createSqlArtifactCustody<
             message: `${options.failureNoun} bytes could not be acquired`,
           };
     }
-  };
+  }
+
+  return { execute, readVerified };
 }
 
 function asBytes(value: unknown): Uint8Array {

@@ -12,6 +12,8 @@ const INVOCATION_CUSTODY_MIGRATION = "0068_cloudflare_provider_invocation_custod
 const INVOCATION_DELETE_ACK_MIGRATION = "0069_cloudflare_provider_invocation_delete_ack.sql";
 const TAKOFORM_V2_MIGRATION = "0070_takoform_v2.sql";
 const V2_MIGRATION_SET_CUSTODY = "0071_v2_sqlite_migration_set_custody.sql";
+const V2_ARTIFACT_CUSTODY = "0072_v2_artifact_custody.sql";
+const V2_REFERENCE_ACCEPTANCE = "0073_v2_reference_acceptance.sql";
 
 function insertResource(
   database: Database,
@@ -157,7 +159,8 @@ test("0067 upgrades nonempty 0066 Resource data without changing rows", async ()
       INVOCATION_DELETE_ACK_MIGRATION,
       TAKOFORM_V2_MIGRATION,
       V2_MIGRATION_SET_CUSTODY,
-      "0072_v2_artifact_custody.sql",
+      V2_ARTIFACT_CUSTODY,
+      V2_REFERENCE_ACCEPTANCE,
     ]);
     expect(database.query("SELECT * FROM tf_resources ORDER BY kind").all()).toEqual(before);
     expect(migrateSqlite(database).applied).toEqual([]);

@@ -9,7 +9,7 @@ import {
 } from "../scripts/deploy/schema.ts";
 
 const MIGRATION = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
-const CURRENT_SOURCE_TAIL = "0072_v2_artifact_custody.sql";
+const CURRENT_SOURCE_TAIL = "0073_v2_reference_acceptance.sql";
 const ROOT = mkdtempSync(
   join(process.env.TMPDIR ?? "/tmp", "takoserver-actor-kv-schema-inventory-"),
 );
@@ -18,11 +18,11 @@ afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 test("the current source closure projects to an explicit 0066 apply artifact", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
   const artifact = projectApplyQualifiedMigrationArtifact(source);
-  expect(source.names).toHaveLength(72);
+  expect(source.names).toHaveLength(73);
   expect(source.names.at(-1)).toBe(CURRENT_SOURCE_TAIL);
   expect(source.files.at(-1)).toMatchObject({
     name: CURRENT_SOURCE_TAIL,
-    digest: "sha256:2957b3b3837298cdda9d68459981d98a6bbf7291dd09e6845503936b95f73785",
+    digest: "sha256:cbbd9ae17aa61c9ac9f5a738f6d92206e410ce5756c30f3d7080617074083511",
   });
   expect(artifact.names).toHaveLength(66);
   expect(artifact.names.at(-1)).toBe(MIGRATION);
@@ -65,12 +65,12 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
     cpSync(resolve(import.meta.dir, "../migrations"), directory, { recursive: true });
     if (drift === "missing") rmSync(join(directory, CURRENT_SOURCE_TAIL));
     else
-      writeFileSync(join(directory, "0073_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+      writeFileSync(join(directory, "0074_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     expect(() => readCurrentAuditedMigrationSourceArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0072",
+      "audited migration lineage must contain exactly 0001-0073",
     );
     expect(() => readAuditedMigrationArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0072",
+      "audited migration lineage must contain exactly 0001-0073",
     );
   }
 });
