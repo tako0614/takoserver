@@ -5,6 +5,8 @@ import type { V2ApplicationConfig } from "./config.ts";
 import { createV2HeldArtifactSource } from "./forms/artifact-source.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "./forms/sqlite-migration-set.ts";
 import { createSQLiteMigrationSetForm } from "./forms/sqlite-migration-set-backend.ts";
+import { WORKER_BUNDLE_FORM_URL } from "./forms/worker-bundle.ts";
+import { createWorkerBundleForm } from "./forms/worker-bundle-backend.ts";
 import { createTakoformV2Host } from "./host.ts";
 import type { V2Form } from "./types.ts";
 
@@ -29,6 +31,17 @@ export function createTakoformV2Application(options: {
       sql,
       source,
       targetKey: config.sqliteMigrationSet.targetKey,
+    });
+  }
+  if (config.workerBundle) {
+    const source = createV2HeldArtifactSource({
+      objects,
+      entries: config.workerBundle.heldArtifacts,
+    });
+    forms[WORKER_BUNDLE_FORM_URL] = createWorkerBundleForm({
+      sql,
+      source,
+      targetKey: config.workerBundle.targetKey,
     });
   }
   return createTakoformV2Host({

@@ -20,6 +20,7 @@ describe("Takoform v2 application configuration", () => {
     expect(config.authenticationDocumentation).toBe("https://docs.example.invalid/authentication");
     expect(config.cursorSigningKey).toEqual(new Uint8Array(32));
     expect(config.sqliteMigrationSet).toBeUndefined();
+    expect(config.workerBundle).toBeUndefined();
   });
 
   test("preserves only explicitly configured migration target, sources, and grants", () => {
@@ -63,6 +64,48 @@ describe("Takoform v2 application configuration", () => {
     });
   });
 
+  test("preserves explicit WorkerBundle source identity and grants", () => {
+    const heldArtifact = {
+      url: "https://Artifacts.example.invalid/bundles/manifest.json",
+      sha256: "2".repeat(64),
+      objectKey: "operator-held/worker-bundle-manifest",
+      grants: [{ principal: "org:org-b", space: "org-b" }],
+    };
+    const config = parseTakoformV2ApplicationConfig({
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/authentication",
+        workerBundle: {
+          targetKey: "operator-worker-bundle-target",
+          heldArtifacts: [heldArtifact],
+        },
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: CURSOR_KEY,
+    });
+
+    expect(config.workerBundle).toEqual({
+      targetKey: "operator-worker-bundle-target",
+      heldArtifacts: [heldArtifact],
+    });
+    expect(config.sqliteMigrationSet).toBeUndefined();
+  });
+
+  test("allows explicit WorkerBundle deny-all while preserving omitted distinction", () => {
+    const config = parseTakoformV2ApplicationConfig({
+      TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/authentication",
+        workerBundle: { targetKey: "operator-worker-bundle-target", heldArtifacts: [] },
+      }),
+      TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: CURSOR_KEY,
+    });
+
+    expect(config.workerBundle).toEqual({
+      targetKey: "operator-worker-bundle-target",
+      heldArtifacts: [],
+    });
+  });
+
   test("fails closed for missing, partial, unknown, duplicate, or malformed configuration", () => {
     const validConfig = {
       documentation: "https://docs.example.invalid/takoform-v2",
@@ -97,6 +140,10 @@ describe("Takoform v2 application configuration", () => {
             },
           ],
         },
+      }),
+      JSON.stringify({
+        ...validConfig,
+        workerBundle: { targetKey: "operator-worker-bundle-target" },
       }),
     ];
 

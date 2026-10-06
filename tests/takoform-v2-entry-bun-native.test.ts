@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,6 +7,7 @@ import { base64UrlEncode, bytesDigest } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
+import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
 
 const OPT_IN = process.env.TAKOSERVER_V2_ENTRY_NATIVE;
 const PUBLIC_ORIGIN = "https://v2-entry.takoserver.test";
@@ -15,12 +17,19 @@ const MANIFEST_URL = "https://artifacts.example.test/migration-manifest.json";
 const FILE_URL = "https://artifacts.example.test/0001.sql";
 const MANIFEST_KEY = "operator-held/v2/manifest";
 const FILE_KEY = "operator-held/v2/0001.sql";
+const BUNDLE_MANIFEST_URL = "https://artifacts.example.test/worker-bundle-manifest.json";
+const BUNDLE_FILE_URL = "https://artifacts.example.test/worker.js";
+const BUNDLE_MANIFEST_KEY = "operator-held/v2/worker-bundle-manifest";
+const BUNDLE_FILE_KEY = "operator-held/v2/worker.js";
 const CURSOR_KEY = base64UrlEncode(new Uint8Array(32).fill(0x74));
 
 type Child = ReturnType<typeof Bun.spawn>;
 type Json = Record<string, unknown>;
 
-function fixtureConfig(heldArtifacts?: readonly Json[]) {
+function fixtureConfig(
+  heldArtifacts?: readonly Json[],
+  workerBundleHeldArtifacts?: readonly Json[],
+) {
   return JSON.stringify({
     documentation: "https://docs.example.test/takoform-v2",
     authenticationDocumentation: "https://docs.example.test/takoform-v2/authentication",
@@ -32,7 +41,56 @@ function fixtureConfig(heldArtifacts?: readonly Json[]) {
             heldArtifacts,
           },
         }),
+    ...(workerBundleHeldArtifacts === undefined
+      ? {}
+      : {
+          workerBundle: {
+            targetKey: "native-entry-worker-bundle-v1",
+            heldArtifacts: workerBundleHeldArtifacts,
+          },
+        }),
   });
+}
+
+function expectWorkerBundleCustody(
+  root: string,
+  resourceUid: string,
+  manifestSha256: string,
+  fileBytes: number,
+  exists: boolean,
+): void {
+  const database = new Database(join(root, "control.sqlite"), { readonly: true });
+  try {
+    const owner = database
+      .query(
+        "SELECT form_url, manifest_sha256, state FROM tf_v2_artifact_owners WHERE resource_uid = ?",
+      )
+      .get(resourceUid) as Json | null;
+    if (!exists) {
+      expect(owner).toBeNull();
+      expect(
+        database
+          .query("SELECT count(*) AS chunks FROM tf_v2_artifact_chunks WHERE resource_uid = ?")
+          .get(resourceUid),
+      ).toEqual({ chunks: 0 });
+      return;
+    }
+
+    expect(owner).toEqual({
+      form_url: WORKER_BUNDLE_FORM_URL,
+      manifest_sha256: manifestSha256,
+      state: "verified",
+    });
+    expect(
+      database
+        .query(
+          "SELECT count(*) AS chunks, coalesce(sum(length(bytes)), 0) AS byte_count FROM tf_v2_artifact_chunks WHERE resource_uid = ?",
+        )
+        .get(resourceUid),
+    ).toEqual({ chunks: 1, byte_count: fileBytes });
+  } finally {
+    database.close();
+  }
 }
 
 function requestAt(port: number, path: string, init: RequestInit = {}): Promise<Response> {
@@ -62,8 +120,11 @@ async function jsonAt(
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   if (response.status !== wantedStatus) {
-    await response.arrayBuffer();
-    throw new Error(`native v2 request returned ${response.status}, expected ${wantedStatus}`);
+    const problem = (await response.json().catch(() => null)) as { code?: unknown } | null;
+    const code = typeof problem?.code === "string" ? ` (${problem.code})` : "";
+    throw new Error(
+      `native v2 request returned ${response.status}${code}, expected ${wantedStatus}`,
+    );
   }
   return (await response.json()) as Json;
 }
@@ -144,7 +205,7 @@ async function settled(port: number, token: string, operationId: string): Promis
 }
 
 test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
-  "normal Bun entry serves v2 SQLite Migration Set over loopback behind a configured HTTPS authority",
+  "normal Bun entry serves v2 SQLite Migration Set and WorkerBundle over loopback behind HTTPS authority",
   async () => {
     if (OPT_IN !== "1") {
       throw new Error("TAKOSERVER_V2_ENTRY_NATIVE must be exactly 1");
@@ -202,6 +263,10 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
 
       const fileBytes = new TextEncoder().encode("CREATE TABLE must_not_execute (id INTEGER);\n");
       const fileSha256 = (await bytesDigest(fileBytes)).slice(7);
+      const bundleFileBytes = new TextEncoder().encode(
+        "export default { fetch() { return new Response('not executed'); } };\n",
+      );
+      const bundleFileSha256 = (await bytesDigest(bundleFileBytes)).slice(7);
       const manifestBytes = new TextEncoder().encode(
         JSON.stringify({
           files: [
@@ -210,6 +275,20 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
         }),
       );
       const manifestSha256 = (await bytesDigest(manifestBytes)).slice(7);
+      const bundleManifestBytes = new TextEncoder().encode(
+        JSON.stringify({
+          entrypoint: "worker.js",
+          files: [
+            {
+              path: "worker.js",
+              url: BUNDLE_FILE_URL,
+              sha256: bundleFileSha256,
+              mediaType: "application/javascript+module",
+            },
+          ],
+        }),
+      );
+      const bundleManifestSha256 = (await bytesDigest(bundleManifestBytes)).slice(7);
       const objects = createFileObjectStore({ root });
       expect(
         await objects.create(MANIFEST_KEY, manifestBytes, { contentType: "application/json" }),
@@ -217,11 +296,37 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
       expect(
         await objects.create(FILE_KEY, fileBytes, { contentType: "application/sql" }),
       ).not.toBeNull();
+      expect(
+        await objects.create(BUNDLE_MANIFEST_KEY, bundleManifestBytes, {
+          contentType: "application/json",
+        }),
+      ).not.toBeNull();
+      expect(
+        await objects.create(BUNDLE_FILE_KEY, bundleFileBytes, {
+          contentType: "application/javascript+module",
+        }),
+      ).not.toBeNull();
       const grants = [{ principal: `org:${organizationId}`, space: organizationId }];
-      const configured = fixtureConfig([
-        { url: MANIFEST_URL, sha256: manifestSha256, objectKey: MANIFEST_KEY, grants },
-        { url: FILE_URL, sha256: fileSha256, objectKey: FILE_KEY, grants },
-      ]);
+      const configured = fixtureConfig(
+        [
+          { url: MANIFEST_URL, sha256: manifestSha256, objectKey: MANIFEST_KEY, grants },
+          { url: FILE_URL, sha256: fileSha256, objectKey: FILE_KEY, grants },
+        ],
+        [
+          {
+            url: BUNDLE_MANIFEST_URL,
+            sha256: bundleManifestSha256,
+            objectKey: BUNDLE_MANIFEST_KEY,
+            grants,
+          },
+          {
+            url: BUNDLE_FILE_URL,
+            sha256: bundleFileSha256,
+            objectKey: BUNDLE_FILE_KEY,
+            grants,
+          },
+        ],
+      );
       serving = await startHost(root, port, configured);
       expect((await requestAt(port, "/.well-known/takoform/v1")).status).toBe(404);
       expect((await requestAt(port, "/.well-known/takoform/v2")).status).toBe(200);
@@ -231,6 +336,16 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
           port,
           "GET",
           `${V2}/support?form=${encodeURIComponent(SQLITE_MIGRATION_SET_FORM_URL)}`,
+          200,
+          undefined,
+          auth,
+        ),
+      ).toMatchObject({ supported: true });
+      expect(
+        await jsonAt(
+          port,
+          "GET",
+          `${V2}/support?form=${encodeURIComponent(WORKER_BUNDLE_FORM_URL)}`,
           200,
           undefined,
           auth,
@@ -263,6 +378,59 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
         observed: { manifestSha256 },
       });
 
+      const bundleSpec = {
+        artifact: { url: BUNDLE_MANIFEST_URL, sha256: bundleManifestSha256 },
+      };
+      const bundleCreateBody = {
+        form: WORKER_BUNDLE_FORM_URL,
+        space: organizationId,
+        name: "worker-bundle",
+        spec: bundleSpec,
+      };
+      const bundleCreateHeaders = {
+        ...auth,
+        "idempotency-key": "native-entry-bundle-create-0001",
+      };
+      const bundleCreate = await jsonAt(
+        port,
+        "POST",
+        `${V2}/resources`,
+        202,
+        bundleCreateBody,
+        bundleCreateHeaders,
+      );
+      const bundleResourceUid = String(bundleCreate.resourceUid);
+      expect(await settled(port, secret, String(bundleCreate.id))).toMatchObject({
+        effect: "complete",
+      });
+      const bundleBeforeRestart = await jsonAt(
+        port,
+        "GET",
+        `${V2}/resources/${bundleResourceUid}`,
+        200,
+        undefined,
+        auth,
+      );
+      expect(bundleBeforeRestart).toMatchObject({
+        uid: bundleResourceUid,
+        generation: 1,
+        observedGeneration: 1,
+        observed: {
+          manifestSha256: bundleManifestSha256,
+          fileCount: 1,
+          totalBytes: bundleFileBytes.byteLength,
+          entrypoint: "worker.js",
+        },
+        output: {},
+      });
+      expectWorkerBundleCustody(
+        root,
+        bundleResourceUid,
+        bundleManifestSha256,
+        bundleFileBytes.byteLength,
+        true,
+      );
+
       // A normal entry restart retains Resource, Operation replay, and SQL
       // custody even though neither original held source object is available.
       const firstServingPid = serving.pid;
@@ -270,6 +438,8 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
       serving = null;
       expect(await objects.delete(MANIFEST_KEY)).toBe(true);
       expect(await objects.delete(FILE_KEY)).toBe(true);
+      expect(await objects.delete(BUNDLE_MANIFEST_KEY)).toBe(true);
+      expect(await objects.delete(BUNDLE_FILE_KEY)).toBe(true);
       serving = await startHost(root, port, configured);
       expect(serving.pid).not.toBe(firstServingPid);
       expect(
@@ -283,6 +453,39 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
         generation: 1,
         status: "succeeded",
       });
+      expect(
+        await jsonAt(
+          port,
+          "GET",
+          `${V2}/operations/${String(bundleCreate.id)}`,
+          200,
+          undefined,
+          auth,
+        ),
+      ).toMatchObject({
+        id: bundleCreate.id,
+        resourceUid: bundleResourceUid,
+        status: "succeeded",
+        effect: "complete",
+      });
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${bundleResourceUid}`, 200, undefined, auth),
+      ).toEqual(bundleBeforeRestart);
+      expect(
+        await jsonAt(port, "POST", `${V2}/resources`, 200, bundleCreateBody, bundleCreateHeaders),
+      ).toMatchObject({
+        id: bundleCreate.id,
+        resourceUid: bundleResourceUid,
+        generation: 1,
+        status: "succeeded",
+      });
+      expectWorkerBundleCustody(
+        root,
+        bundleResourceUid,
+        bundleManifestSha256,
+        bundleFileBytes.byteLength,
+        true,
+      );
 
       // Same-spec update and deletion continue from held SQL bytes.
       const update = await jsonAt(
@@ -298,6 +501,21 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
         },
       );
       expect(await settled(port, secret, String(update.id))).toMatchObject({ effect: "complete" });
+      const bundleUpdate = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${bundleResourceUid}`,
+        202,
+        { spec: bundleSpec },
+        {
+          ...auth,
+          "idempotency-key": "native-entry-bundle-update-0001",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(await settled(port, secret, String(bundleUpdate.id))).toMatchObject({
+        effect: "complete",
+      });
       const deletion = await jsonAt(
         port,
         "DELETE",
@@ -313,9 +531,36 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
       expect(await settled(port, secret, String(deletion.id))).toMatchObject({
         effect: "complete",
       });
+      const bundleDeletion = await jsonAt(
+        port,
+        "DELETE",
+        `${V2}/resources/${bundleResourceUid}`,
+        202,
+        undefined,
+        {
+          ...auth,
+          "idempotency-key": "native-entry-bundle-delete-0001",
+          "takoform-expected-generation": "2",
+        },
+      );
+      expect(await settled(port, secret, String(bundleDeletion.id))).toMatchObject({
+        effect: "complete",
+      });
       const gone = await requestAt(port, `${V2}/resources/${resourceUid}`, { headers: auth });
       expect(gone.status).toBe(410);
       await gone.arrayBuffer();
+      const bundleGone = await requestAt(port, `${V2}/resources/${bundleResourceUid}`, {
+        headers: auth,
+      });
+      expect(bundleGone.status).toBe(410);
+      await bundleGone.arrayBuffer();
+      expectWorkerBundleCustody(
+        root,
+        bundleResourceUid,
+        bundleManifestSha256,
+        bundleFileBytes.byteLength,
+        false,
+      );
     } finally {
       const stops = await Promise.allSettled([stopHost(serving), stopHost(bootstrap)]);
       cleanupFailed = stops.some((result) => result.status === "rejected");

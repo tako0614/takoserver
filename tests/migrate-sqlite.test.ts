@@ -55,6 +55,7 @@ const CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK =
   "0069_cloudflare_provider_invocation_delete_ack.sql";
 const TAKOFORM_V2 = "0070_takoform_v2.sql";
 const V2_MIGRATION_SET = "0071_v2_sqlite_migration_set_custody.sql";
+const V2_ARTIFACT_CUSTODY = "0072_v2_artifact_custody.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -95,6 +96,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
   TAKOFORM_V2,
   V2_MIGRATION_SET,
+  V2_ARTIFACT_CUSTODY,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -806,6 +808,7 @@ describe("bringing a local database up to date", () => {
       CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
       TAKOFORM_V2,
       V2_MIGRATION_SET,
+      V2_ARTIFACT_CUSTODY,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -1088,6 +1091,7 @@ describe("bringing a local database up to date", () => {
         CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
         TAKOFORM_V2,
         V2_MIGRATION_SET,
+        V2_ARTIFACT_CUSTODY,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1663,6 +1667,7 @@ describe("bringing a local database up to date", () => {
       CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
       TAKOFORM_V2,
       V2_MIGRATION_SET,
+      V2_ARTIFACT_CUSTODY,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1815,6 +1820,7 @@ describe("bringing a local database up to date", () => {
       CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
       TAKOFORM_V2,
       V2_MIGRATION_SET,
+      V2_ARTIFACT_CUSTODY,
     ]);
     expect(
       database
@@ -2774,6 +2780,7 @@ describe("bringing a local database up to date", () => {
       CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
       TAKOFORM_V2,
       V2_MIGRATION_SET,
+      V2_ARTIFACT_CUSTODY,
     ]);
     expect(
       database

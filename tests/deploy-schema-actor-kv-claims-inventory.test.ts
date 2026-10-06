@@ -9,7 +9,7 @@ import {
 } from "../scripts/deploy/schema.ts";
 
 const MIGRATION = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
-const CURRENT_SOURCE_TAIL = "0071_v2_sqlite_migration_set_custody.sql";
+const CURRENT_SOURCE_TAIL = "0072_v2_artifact_custody.sql";
 const ROOT = mkdtempSync(
   join(process.env.TMPDIR ?? "/tmp", "takoserver-actor-kv-schema-inventory-"),
 );
@@ -18,11 +18,11 @@ afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 test("the current source closure projects to an explicit 0066 apply artifact", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
   const artifact = projectApplyQualifiedMigrationArtifact(source);
-  expect(source.names).toHaveLength(71);
+  expect(source.names).toHaveLength(72);
   expect(source.names.at(-1)).toBe(CURRENT_SOURCE_TAIL);
   expect(source.files.at(-1)).toMatchObject({
     name: CURRENT_SOURCE_TAIL,
-    digest: "sha256:e012cc3a966981c083fe496e44a683b05e159af65ae7566c29b3bc75ea4b1f80",
+    digest: "sha256:2957b3b3837298cdda9d68459981d98a6bbf7291dd09e6845503936b95f73785",
   });
   expect(artifact.names).toHaveLength(66);
   expect(artifact.names.at(-1)).toBe(MIGRATION);
@@ -65,12 +65,12 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
     cpSync(resolve(import.meta.dir, "../migrations"), directory, { recursive: true });
     if (drift === "missing") rmSync(join(directory, CURRENT_SOURCE_TAIL));
     else
-      writeFileSync(join(directory, "0072_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+      writeFileSync(join(directory, "0073_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     expect(() => readCurrentAuditedMigrationSourceArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0071",
+      "audited migration lineage must contain exactly 0001-0072",
     );
     expect(() => readAuditedMigrationArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0071",
+      "audited migration lineage must contain exactly 0001-0072",
     );
   }
 });
