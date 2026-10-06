@@ -57,6 +57,9 @@ export function createV2WorkerBundleRuntime(options: {
         if (!file || !heldBytes) {
           throw new V2WorkerBundleRuntimeError("bundle_reference_unavailable");
         }
+        // Source maps remain in exact Host custody and publication materials,
+        // but they are auxiliary bytes rather than importable Worker modules.
+        if (file.mediaType === "application/source-map+json") continue;
         const bytes = new Uint8Array(heldBytes);
         const digest = `sha256:${file.sha256}` as const;
         inspectionModules.push({

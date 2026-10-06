@@ -165,6 +165,16 @@ artifact identities. Each file is at most 16 MiB and the aggregate is at most
 128 MiB. The Host records only the validated bundle projection and held bytes;
 it does not execute the Worker or create a data-plane endpoint.
 
+The internal `worker-code-runtime.ts` projection is a building block for a
+future code-bearing Worker path. It accepts already-authorized held bundle
+bytes and a matching semantic-inspection result, and projects module bytes,
+media types, fetch-handler identity and JSON `vars` to the Workerd graph.
+Auxiliary source-map bytes remain digest-checked in custody but are excluded
+from import and inspection graphs. It does not register a Worker Form or
+execute/publish a Worker. Bindings, private inputs, assets and scheduled/queue
+delivery remain explicit internal refusals; this projection is not evidence of
+Form support or native qualification.
+
 StaticAssetBundle (`https://edge.forms.takoform.com/forms/StaticAssetBundle/0.2.0/`)
 accepts a manifest up to 1 MiB with 1–512 files, canonical relative POSIX paths
 up to 1,024 UTF-8 bytes, exact HTTPS artifact identities, per-file bytes up to

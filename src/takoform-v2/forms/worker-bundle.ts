@@ -25,6 +25,7 @@ export const WORKER_BUNDLE_MEDIA_TYPES = [
   "text/plain",
   "application/octet-stream",
   "application/wasm",
+  "application/source-map+json",
 ] as const;
 
 export type WorkerBundleMediaType = (typeof WORKER_BUNDLE_MEDIA_TYPES)[number];
