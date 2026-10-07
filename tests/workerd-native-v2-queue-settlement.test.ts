@@ -31,6 +31,7 @@ import {
   selfhostWorkerEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
+import { v2QueueId } from "../src/takoform-v2/worker-queue-delivery.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 const binary = nativeEvidenceBinary("workerd-artifact");
@@ -100,6 +101,7 @@ test.skipIf(binary === undefined)(
       },
     });
     const endpoint = createV2QueueSettlementEndpoint({
+      queueIdForUid: v2QueueId,
       auth: authority,
       custody: {
         async settleRegisteredBatchMessage(input) {

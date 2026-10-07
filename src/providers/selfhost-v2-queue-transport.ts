@@ -358,7 +358,12 @@ function envelope(code: string, status: number): Response {
 export function createV2QueueSettlementEndpoint(input: {
   readonly custody: RegisteredSettlement;
   readonly auth: V2QueueSettlementAuth;
+  /** Boot-required Core codec; the request never supplies a physical Queue ID. */
+  readonly queueIdForUid: (queueUid: string) => string;
 }): (request: Request) => Promise<Response> {
+  if (typeof input.queueIdForUid !== "function")
+    throw new TypeError("v2 Queue settlement requires a physical namespace codec");
+  const queueIdForUid = input.queueIdForUid;
   return async (request) => {
     let url: URL;
     try {
@@ -438,15 +443,18 @@ export function createV2QueueSettlementEndpoint(input: {
     if (!grant || grant.batchId !== body.batchId) return envelope("unknown_batch", 404);
     if (grant.messageId !== body.messageId || grant.leaseToken !== body.leaseToken)
       return envelope("unknown_message", 404);
+    let queueId: string;
+    try { queueId = queueIdForUid(grant.queueUid); }
+    catch { return envelope("backend_unavailable", 503); }
+    if (typeof queueId !== "string" || queueId.length === 0)
+      return envelope("backend_unavailable", 503);
     let result: Awaited<ReturnType<RegisteredSettlement["settleRegisteredBatchMessage"]>>;
     try {
       result = await input.custody.settleRegisteredBatchMessage({
         batchId: grant.batchId,
         messageId: body.messageId,
         expected: {
-          // Core's physical QueueCustody namespace is derived from the
-          // authenticated Resource UID, never supplied by the request body.
-          queueId: `takoform-v2-queue:${grant.queueUid}`,
+          queueId,
           consumerId: grant.consumerUid,
           generation: grant.generation,
           leaseToken: grant.leaseToken,

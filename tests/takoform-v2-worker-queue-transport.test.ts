@@ -11,6 +11,7 @@ import {
   V2_QUEUE_SETTLEMENT_PROTOCOL,
   v2QueueSettlementServiceSource,
 } from "../src/providers/selfhost-v2-queue-transport.ts";
+import { v2QueueId } from "../src/takoform-v2/worker-queue-delivery.ts";
 
 const grant = {
   batchId: "batch-1",
@@ -50,6 +51,7 @@ function request(overrides: Record<string, unknown> = {}, bearer = "owner-versio
 test("private settlement derives exact SQL scope from authenticated live grant", async () => {
   const calls: unknown[] = [];
   const endpoint = createV2QueueSettlementEndpoint({
+    queueIdForUid: v2QueueId,
     auth: {
       async authenticate(input) {
         return input.bearer === "owner-version-token" &&
@@ -71,7 +73,7 @@ test("private settlement derives exact SQL scope from authenticated live grant",
       batchId: "batch-1",
       messageId: "message-1",
       expected: {
-      queueId: "takoform-v2-queue:queue-uid-1",
+        queueId: v2QueueId("queue-uid-1"),
         consumerId: "consumer-uid-1",
         generation: 7,
         leaseToken: "lease-1",
@@ -90,6 +92,7 @@ test("private settlement derives exact SQL scope from authenticated live grant",
 test("private endpoint never confirms an unknown or unavailable SQL effect", async () => {
   let result: "unavailable" | "already_settled" = "unavailable";
   const endpoint = createV2QueueSettlementEndpoint({
+    queueIdForUid: v2QueueId,
     auth: {
       async authenticate() {
         return grant;
