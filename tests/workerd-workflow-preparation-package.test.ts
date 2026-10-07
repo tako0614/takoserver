@@ -320,6 +320,7 @@ test("malformed and mismatched private service leases release on rejection", asy
       services: [
         { name: serviceBinding.name, upstreamSocket: "", unavailableToken: SERVICE_TOKEN },
       ],
+      workflowServices: [],
       async release() {},
     },
     {
@@ -330,6 +331,7 @@ test("malformed and mismatched private service leases release on rejection", asy
           unavailableToken: SERVICE_TOKEN,
         },
       ],
+      workflowServices: [],
       async release() {},
     },
   ];
@@ -394,6 +396,7 @@ test("dispose retains combined cleanup failures, retries failed release, and is 
         unavailableToken: SERVICE_TOKEN,
       },
     ],
+    workflowServices: [],
     async release() {
       releases += 1;
       if (releases === 1) throw new Error("release failed");
