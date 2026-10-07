@@ -641,7 +641,7 @@ export function createSqlArtifactCustody<
     readonly targetResourceUid: string;
   }): Promise<SqlArtifactCustodyRead<M>> {
     const { execution, targetResourceUid } = input;
-    if (!tables.hasFormUrl || !targetResourceUid) throw denied();
+    if (!targetResourceUid) throw denied();
 
     const authorizationRow = async (): Promise<Row> => {
       let candidate: Row | undefined;
@@ -664,7 +664,7 @@ export function createSqlArtifactCustody<
            ON active_ref.target_uid = accepted_ref.target_uid
           AND active_ref.referrer_uid = consumer.uid
          JOIN tf_v2_resources target ON target.uid = accepted_ref.target_uid
-         JOIN tf_v2_artifact_owners owner ON owner.resource_uid = target.uid
+         JOIN ${tables.owners} owner ON owner.resource_uid = target.uid
          WHERE op.id = ? AND op.lease_token = ? AND op.status = 'reconciling'
            AND op.dispatch_possible = 1 AND op.lease_until_ms > ?
            AND op.action IN ('create', 'update') AND op.action = ?
@@ -684,7 +684,8 @@ export function createSqlArtifactCustody<
            AND target.form_url = ? AND target.deleted_at IS NULL
            AND target.busy_operation IS NULL AND target.phase = 'idle'
            AND target.generation = target.observed_generation
-           AND owner.form_url = target.form_url AND owner.state = 'verified'`,
+           AND owner.state = 'verified'
+           ${tables.hasFormUrl ? "AND owner.form_url = target.form_url" : ""}`,
             [
               targetResourceUid,
               execution.operationId,
@@ -754,7 +755,7 @@ export function createSqlArtifactCustody<
     ];
     const fromWhere = `FROM tf_v2_resources target
            JOIN tf_v2_operations settled ON settled.id = target.last_operation
-           JOIN tf_v2_artifact_owners owner ON owner.resource_uid = target.uid
+           JOIN ${tables.owners} owner ON owner.resource_uid = target.uid
            WHERE target.uid = ? AND target.principal = ? AND target.space = ?
              AND target.form_url = ? AND target.deleted_at IS NULL
              AND target.busy_operation IS NULL AND target.phase = 'idle'
@@ -763,7 +764,8 @@ export function createSqlArtifactCustody<
              AND settled.generation = target.generation
              AND settled.status = 'succeeded' AND settled.effect = 'complete'
              AND target.spec_json = ? AND target.observed_json = ?
-             AND owner.form_url = target.form_url AND owner.state = 'verified'
+             AND owner.state = 'verified'
+             ${tables.hasFormUrl ? "AND owner.form_url = target.form_url" : ""}
              AND owner.observation_json = target.observed_json`;
     const row = async (): Promise<Row> => {
       const found = (
@@ -785,7 +787,7 @@ export function createSqlArtifactCustody<
   async function readHeldVerified(
     input: SqlArtifactCustodyHeldInput,
   ): Promise<SqlArtifactCustodyRead<M>> {
-    if (!tables.hasFormUrl || !input.targetResourceUid) throw denied();
+    if (!input.targetResourceUid) throw denied();
     try {
       const authorizationRow = heldAuthorization(input).row;
       if (!(await input.stillAuthorized())) throw denied();
@@ -807,7 +809,7 @@ export function createSqlArtifactCustody<
   async function openHeldUnverified(
     input: SqlArtifactCustodyHeldInput,
   ): Promise<SqlArtifactCustodyUnverified<M>> {
-    if (!tables.hasFormUrl || !input.targetResourceUid) throw denied();
+    if (!input.targetResourceUid) throw denied();
     try {
       // Neither the caller's objects nor a previously returned descriptor are authority.
       const scoped: SqlArtifactCustodyHeldInput = {
