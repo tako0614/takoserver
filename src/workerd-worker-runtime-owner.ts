@@ -2868,7 +2868,9 @@ export async function openWorkerdWorkerRuntimeOwner(
               ),
               routerToken: binding.unavailableToken,
               claim,
-              bindingName: binding.name,
+              // The native graph alias is private/ordinal; the broker verifies
+              // the accepted public name in the immutable Core claim.
+              bindingName: selected.name,
               authority: v2ServiceBinding.authority,
               async acquireCallerLease(capturedClaim) {
                 const lease = await acquireServiceBindingRequest({
