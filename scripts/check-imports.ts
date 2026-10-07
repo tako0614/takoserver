@@ -111,6 +111,31 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "v2-contract", "v2-form", "v2-workflow-manager"],
   },
   {
+    name: "v2-workflow-native-selection",
+    match: /^src\/takoform-v2\/workflow-native-selection\.ts$/u,
+    may: ["core", "domain", "adapter", "app", "v2-form", "v2-runtime", "v2-workflow-manager"],
+  },
+  {
+    name: "v2-workflow-forward-runtime",
+    match: /^src\/takoform-v2\/workflow-forward-runtime\.ts$/u,
+    may: ["core", "domain", "app", "v2-workflow-native-selection"],
+  },
+  {
+    name: "v2-selfhost-workflow-composition",
+    match: /^src\/takoform-v2\/selfhost-v2-workflow-composition\.ts$/u,
+    may: [
+      "core",
+      "domain",
+      "app",
+      "package-surface",
+      "v2-form",
+      "v2-runtime",
+      "v2-workflow-manager",
+      "v2-workflow-native-selection",
+      "v2-workflow-forward-runtime",
+    ],
+  },
+  {
     name: "v2-runtime",
     match:
       /^src\/takoform-v2\/(?:worker-bundle-runtime|worker-code-runtime|worker-cron-trigger-backend|worker-cron-trigger-scheduler|worker-deployment-backend|worker-endpoint-backend|worker-lifecycle-backend|worker-runtime-readers|worker-publication-state|worker-publication-sql-guard|worker-static-runtime|worker-static-publication|worker-native-effects|worker-native-deletions)\.ts$|^src\/workerd-worker-runtime-owner\.ts$/u,
