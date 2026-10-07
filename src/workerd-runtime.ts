@@ -949,7 +949,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
               deployment.variants.flatMap((variant) =>
                 hasWorkerdV2PrivateBindingProfile(variant.manifest)
                   ? validServiceBindings(variant.manifest.serviceBindings ?? [], true).map(
-                      serviceRouterName,
+                      workerdServiceBindingRouterName,
                     )
                   : [],
               ),
@@ -1674,7 +1674,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           selected.site.serviceBindings ?? [],
           hasWorkerdV2PrivateBindingProfile(selected.site),
         );
-        const routers = bindings.map(serviceRouterName);
+        const routers = bindings.map(workerdServiceBindingRouterName);
         if (routers.some((router) => !renderedPrivateRouters.has(router))) throw unavailable();
         for (const router of routers) {
           const path = privateServiceSocket(serviceSocketDirectory, router);
@@ -1773,7 +1773,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
             name: binding.name,
             upstreamSocket: privateServiceSocket(
               serviceSocketDirectory,
-              serviceRouterName(binding),
+              workerdServiceBindingRouterName(binding),
             ),
             unavailableToken: binding.unavailableToken,
           })),
@@ -1797,7 +1797,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         // commit. No fallible service mapping or await can lose a new pin.
         const additions = bindings.map((binding) => ({
           binding,
-          router: serviceRouterName(binding),
+          router: workerdServiceBindingRouterName(binding),
         }));
         try {
           signal?.throwIfAborted();
@@ -5846,7 +5846,7 @@ function requiredStoredModule(
   return match;
 }
 
-function serviceRouterName(binding: WorkerdServiceBinding): string {
+export function workerdServiceBindingRouterName(binding: WorkerdServiceBinding): string {
   const digest = createHash("sha256")
     .update("takoserver.selfhost-service-router@v1\u0000", "utf8")
     .update(binding.target, "utf8")
@@ -5856,6 +5856,19 @@ function serviceRouterName(binding: WorkerdServiceBinding): string {
     .update(binding.unavailableToken, "utf8")
     .digest("hex");
   return `selfhost-service-${digest}`;
+}
+
+/** Socket path for the Host-owned v2 broker behind one private Service router. */
+export function workerdV2ServiceBindingBrokerSocketPath(
+  directory: string,
+  binding: WorkerdServiceBinding,
+): string {
+  const router = workerdServiceBindingRouterName(binding);
+  const digest = createHash("sha256")
+    .update("takoserver.v2-service-binding-broker-socket@1\u0000", "utf8")
+    .update(router, "utf8")
+    .digest("hex");
+  return join(directory, `${digest}.sock`);
 }
 
 function serviceBindingBrokerTargetName(router: string): string {
@@ -5974,11 +5987,11 @@ function collectServiceBindings(
         entry.manifest.serviceBindings ?? [],
         hasWorkerdV2PrivateBindingProfile(entry.manifest),
       )) {
-        bindings.set(serviceRouterName(binding), binding);
+        bindings.set(workerdServiceBindingRouterName(binding), binding);
       }
     }
   }
-  for (const binding of retained) bindings.set(serviceRouterName(binding), binding);
+  for (const binding of retained) bindings.set(workerdServiceBindingRouterName(binding), binding);
   return new Map([...bindings].sort(([left], [right]) => left.localeCompare(right)));
 }
 
@@ -6261,7 +6274,7 @@ function renderConfig(
           hasWorkerdV2PrivateBindingProfile(entry.manifest),
         ).map(
           (binding) =>
-            `(name = ${capnpText(binding.name)}, service = ${capnpText(serviceRouterName(binding))})`,
+            `(name = ${capnpText(binding.name)}, service = ${capnpText(workerdServiceBindingRouterName(binding))})`,
         ),
         ...(actorServices.get(entry.name) ?? []).flatMap((binding) => [
           `(name = ${capnpText(binding.httpBinding)}, service = ${capnpText(binding.httpService)})`,
@@ -6374,7 +6387,7 @@ function renderConfig(
       deployment.variants.flatMap((variant) =>
         hasWorkerdV2PrivateBindingProfile(variant.manifest)
           ? validServiceBindings(variant.manifest.serviceBindings ?? [], true).map(
-              serviceRouterName,
+              workerdServiceBindingRouterName,
             )
           : [],
       ),

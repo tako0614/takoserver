@@ -42,6 +42,7 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "./takoform-v2/forms/worker-specs.ts";
 import type { createSelfhostV2WorkflowComposition } from "./takoform-v2/selfhost-v2-workflow-composition.ts";
+import { createV2ServiceBindingAuthority } from "./takoform-v2/service-binding-authority.ts";
 import { createWorkerCronTriggerAdmissionReader } from "./takoform-v2/worker-cron-trigger-backend.ts";
 import { createWorkerDeploymentForm } from "./takoform-v2/worker-deployment-backend.ts";
 import { createWorkerEndpointForm } from "./takoform-v2/worker-endpoint-backend.ts";
@@ -534,6 +535,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   const queueProducerAuthority = v2QueueProducerBinding
     ? createQueueWorkerBindingAuthority({ sql, targetKey })
     : undefined;
+  const serviceBindingAuthority = createV2ServiceBindingAuthority({ sql, targetKey });
   const sqliteBroker =
     sqliteBinding && sqliteAuthority
       ? createSelfhostV2SqliteBindingBroker({
@@ -800,6 +802,21 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
         ...(kvBoot ? { v2KvBinding: kvBoot } : {}),
         ...(queueProducerBoot ? { v2QueueProducerBinding: queueProducerBoot } : {}),
+        v2ServiceBinding: {
+          authority: serviceBindingAuthority,
+          ownerForResourceUid: async (resourceUid) => {
+            if (!restorationComplete) return null;
+            try {
+              const targetOwner = await openOwner(resourceUid);
+              return {
+                workerResourceUid: targetOwner.workerResourceUid,
+                dispatchServiceBinding: targetOwner.dispatchServiceBinding.bind(targetOwner),
+              };
+            } catch {
+              return null;
+            }
+          },
+        },
         ...(actor && row.deleted_at === null
           ? {
               v2ActorForward: {

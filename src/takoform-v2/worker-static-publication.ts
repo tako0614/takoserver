@@ -29,6 +29,7 @@ import type { V2Execution } from "./types.ts";
 import { projectV2WorkerCodeVersion } from "./worker-code-runtime.ts";
 import type { V2CodeConfiguredInputReader } from "./worker-lifecycle-backend.ts";
 import type { V2WorkerPublicationResolution } from "./worker-publication-state.ts";
+import type { V2ResolvedServiceBinding } from "./worker-service-resolution.ts";
 import {
   projectV2ResolvedServiceBindings,
   v2ServiceTargetName,
@@ -58,6 +59,20 @@ type Candidate = {
   readonly publication: WorkerdDeploymentPublication<WorkerdSite | WorkerdStaticSite> | null;
   readonly deferRetirementUntilDeadline: boolean;
 };
+
+/** Immutable accepted caller-Version provenance passed only to the Host broker. */
+export interface V2WorkerServiceBindingClaim {
+  readonly principal: string;
+  readonly space: string;
+  readonly targetKey: string;
+  readonly workerUid: string;
+  readonly workerVersionUid: string;
+  readonly workerVersionOperationId: string;
+  readonly nativeVersionId: string;
+  readonly incarnationId: string;
+  readonly servingSourceOperationId: string;
+  readonly bindings: readonly { readonly name: string; readonly resourceUid: string }[];
+}
 
 /** Exact serving-publication evidence, deliberately separate from Form settlement. */
 export type V2WorkerPublicationResult =
@@ -232,6 +247,13 @@ export function createV2WorkerPublication(options: {
       claim: V2QueueProducerBindingGrant,
       binding: string,
     ): Promise<V2QueueProducerBindingResolution | null>;
+  };
+  /** Per-incarnation Host broker, opened before the native Version is published. */
+  readonly v2ServiceBindingForward?: {
+    issueBinding(
+      claim: V2WorkerServiceBindingClaim,
+      binding: V2ResolvedServiceBinding,
+    ): Promise<void>;
   };
   /** Same incarnation-scoped Actor grant source used by the native private brokers. */
   readonly v2ActorForward?: {
@@ -604,6 +626,32 @@ export function createV2WorkerPublication(options: {
           throw new Error("configured Worker Version input is unavailable");
         }
         const serviceBindings = await projectV2ResolvedServiceBindings(versionSpec.serviceBindings);
+        if (serviceBindings.length > 0) {
+          const forward = options.v2ServiceBindingForward;
+          if (!forward) throw new Error("native ServiceBinding forwarding is unavailable");
+          const claim: V2WorkerServiceBindingClaim = Object.freeze({
+            principal: snapshot.worker.principal,
+            space: snapshot.worker.space,
+            targetKey: options.targetKey,
+            workerUid: snapshot.worker.uid,
+            workerVersionUid: version.uid,
+            workerVersionOperationId: version.sourceOperationId,
+            nativeVersionId: identity.versionId,
+            incarnationId: execution.operationId,
+            servingSourceOperationId: execution.operationId,
+            bindings: Object.freeze(
+              versionSpec.serviceBindings.map((binding) =>
+                Object.freeze({
+                  name: binding.name,
+                  resourceUid: binding.resource.resourceUid,
+                }),
+              ),
+            ),
+          });
+          for (const binding of serviceBindings) await forward.issueBinding(claim, binding);
+          if (!(await resolution.stillCurrent()))
+            throw new Error("ServiceBinding reference graph changed");
+        }
         const codeProjection = await projectV2WorkerCodeVersion({
           identity: {
             ...identity,

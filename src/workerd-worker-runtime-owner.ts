@@ -37,6 +37,10 @@ import {
 } from "./providers/selfhost-v2-queue-transport.ts";
 import type { V2SqliteBindingGrant } from "./providers/selfhost-v2-sqlite-binding-broker.ts";
 import {
+  openSelfhostV2ServiceBindingBroker,
+  type SelfhostV2ServiceBindingTargetOwner,
+} from "./selfhost-v2-service-binding-broker.ts";
+import {
   randomSelfhostDeploymentBasisPoint,
   selectSelfhostWeightedVersion,
 } from "./selfhost-weighted-deployment.ts";
@@ -64,9 +68,14 @@ import type {
   V2WorkerVersionMaterials,
 } from "./takoform-v2/worker-publication-state.ts";
 import {
+  exactV2ResolvedServiceBindings,
+  v2ServiceTargetName,
+} from "./takoform-v2/worker-service-resolution.ts";
+import {
   createV2WorkerPublication,
   type V2EndpointRouteAbsentReceipt,
   type V2WorkerPublicationResult,
+  type V2WorkerServiceBindingClaim,
 } from "./takoform-v2/worker-static-publication.ts";
 import {
   type LinuxProcessIdentity,
@@ -82,8 +91,10 @@ import type {
   WorkerdPublicationIdentity,
   WorkerdRuntime,
   WorkerdSelectedActiveVersion,
+  WorkerdServiceBinding,
   WorkerdSite,
   WorkerdStaticSite,
+  WorkerdV2ServiceBindingBrokerSocket,
   WorkerdWorkflowForwardLifecycle,
   WorkerdWorkflowForwardPublication,
   WorkerdWorkflowForwardSocket,
@@ -93,6 +104,8 @@ import {
   readWorkerdActiveActorGraph,
   readWorkerdActiveDeployment,
   readWorkerdSelectedActiveVersion,
+  workerdServiceBindingRouterName,
+  workerdV2ServiceBindingBrokerSocketPath,
 } from "./workerd-runtime.ts";
 import type { WorkerdProcess } from "./workerd-supervisor.ts";
 import {
@@ -218,9 +231,16 @@ interface IncarnationHandle {
   readonly workflowLeases: Set<Promise<void>>;
   /** Native ServiceBinding calls pin the exact caller incarnation through body drain. */
   readonly serviceBindingLeases: Set<Promise<void>>;
+  readonly serviceBindingForward?: V2ServiceBindingForwardIncarnation;
   retirementTimer?: () => void;
   retiring?: Promise<WorkerdWorkerRetirementReceipt>;
 }
+
+type V2ServiceBindingForwardIncarnation = {
+  issueBinding(claim: V2WorkerServiceBindingClaim, binding: WorkerdServiceBinding): Promise<void>;
+  socket(binding: WorkerdServiceBinding): WorkerdV2ServiceBindingBrokerSocket | undefined;
+  close(): Promise<void>;
+};
 
 type V2ActorForwardIncarnation = NonNullable<
   ReturnType<NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2ActorForward"]>["openIncarnation"]>
@@ -483,6 +503,27 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
   readonly workerResourceUid: string;
   readonly targetKey: string;
   readonly publicationState: PublicationState;
+  /** Trusted Core reference authority and dynamic logical Worker owner lookup. */
+  readonly v2ServiceBinding?: {
+    readonly authority: {
+      resolveCurrentBinding(
+        claim: V2WorkerServiceBindingClaim,
+        bindingName: string,
+      ): Promise<{
+        readonly identity: {
+          readonly targetKey: string;
+          readonly principal: string;
+          readonly space: string;
+          readonly resourceUid: string;
+        };
+        readonly vector: string;
+        stillCurrent(): Promise<boolean>;
+      } | null>;
+    };
+    readonly ownerForResourceUid: (
+      resourceUid: string,
+    ) => Promise<SelfhostV2ServiceBindingTargetOwner | null>;
+  };
   /** Exact per-incarnation private Workflow broker; no tenant-provided socket paths. */
   readonly v2WorkflowForward?: {
     openIncarnation(input: {
@@ -2144,6 +2185,23 @@ export async function openWorkerdWorkerRuntimeOwner(
         ),
       })
     : undefined;
+  if (
+    options.v2ServiceBinding !== undefined &&
+    (typeof options.v2ServiceBinding.authority?.resolveCurrentBinding !== "function" ||
+      typeof options.v2ServiceBinding.ownerForResourceUid !== "function")
+  ) {
+    throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
+  }
+  const v2ServiceBinding = options.v2ServiceBinding
+    ? Object.freeze({
+        authority: Object.freeze({
+          resolveCurrentBinding: options.v2ServiceBinding.authority.resolveCurrentBinding.bind(
+            options.v2ServiceBinding.authority,
+          ),
+        }),
+        ownerForResourceUid: options.v2ServiceBinding.ownerForResourceUid,
+      })
+    : undefined;
 
   let canonicalRoot: string;
   try {
@@ -2587,6 +2645,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         });
         // No private Actor broker may outlive the child whose immutable graph
         // carried its token. A failed drain retains this UID's owner lock.
+        await incarnation.serviceBindingForward?.close();
         await incarnation.actorForward?.close();
         await incarnation.workflowForward?.close();
         await persistPhysicalAbsence(incarnation.record);
@@ -2722,6 +2781,94 @@ export async function openWorkerdWorkerRuntimeOwner(
             eventToken: record.eventToken,
           })
         : undefined;
+    const serviceBindingBrokers = new Map<
+      string,
+      {
+        readonly binding: WorkerdServiceBinding;
+        readonly socket: WorkerdV2ServiceBindingBrokerSocket;
+        readonly close: () => Promise<void>;
+      }
+    >();
+    const serviceBindingForward: V2ServiceBindingForwardIncarnation | undefined = v2ServiceBinding
+      ? {
+          async issueBinding(claim, binding) {
+            const selected = claim.bindings.find((item) => item.name === binding.name);
+            const version = record.identity?.versions.find(
+              (item) =>
+                item.workerVersionUid === claim.workerVersionUid &&
+                item.versionId === claim.nativeVersionId,
+            );
+            if (
+              claim.workerUid !== options.workerResourceUid ||
+              claim.incarnationId !== record.operationId ||
+              claim.servingSourceOperationId !== record.operationId ||
+              !version ||
+              selected?.resourceUid !== binding.targetResourceUid ||
+              binding.target !== (await v2ServiceTargetName(binding.targetResourceUid))
+            ) {
+              throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+            }
+            const router = workerdServiceBindingRouterName(binding);
+            const existing = serviceBindingBrokers.get(router);
+            if (existing) {
+              if (
+                existing.binding.name !== binding.name ||
+                existing.binding.target !== binding.target ||
+                existing.binding.targetResourceUid !== binding.targetResourceUid ||
+                existing.binding.unavailableToken !== binding.unavailableToken
+              ) {
+                throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+              }
+              return;
+            }
+            const broker = await openSelfhostV2ServiceBindingBroker({
+              socketPath: workerdV2ServiceBindingBrokerSocketPath(
+                privateSocketDirectoryFor(record.operationId),
+                binding,
+              ),
+              routerToken: binding.unavailableToken,
+              claim,
+              bindingName: binding.name,
+              authority: v2ServiceBinding.authority,
+              async acquireCallerLease(capturedClaim) {
+                const lease = await acquireServiceBindingRequest({
+                  workerUid: capturedClaim.workerUid,
+                  versionId: capturedClaim.nativeVersionId,
+                  incarnationId: capturedClaim.incarnationId,
+                  servingSourceOperationId: capturedClaim.servingSourceOperationId,
+                });
+                return lease ? { stillCurrent: lease.stillCurrent, release: lease.release } : null;
+              },
+              ownerForResourceUid: v2ServiceBinding.ownerForResourceUid,
+            });
+            serviceBindingBrokers.set(router, {
+              binding: { ...binding },
+              socket: { socketPath: broker.socketPath, identity: { ...broker.identity } },
+              close: broker.close,
+            });
+          },
+          socket(binding) {
+            const current = serviceBindingBrokers.get(workerdServiceBindingRouterName(binding));
+            if (
+              !current ||
+              current.binding.name !== binding.name ||
+              current.binding.target !== binding.target ||
+              current.binding.targetResourceUid !== binding.targetResourceUid ||
+              current.binding.unavailableToken !== binding.unavailableToken
+            ) {
+              return undefined;
+            }
+            return {
+              socketPath: current.socket.socketPath,
+              identity: { ...current.socket.identity },
+            };
+          },
+          async close() {
+            for (const broker of serviceBindingBrokers.values()) await broker.close();
+            serviceBindingBrokers.clear();
+          },
+        }
+      : undefined;
     const runtime = createWorkerdRuntime({
       root: group.runtimeRoot,
       configPath: group.configurationPath,
@@ -2734,6 +2881,9 @@ export async function openWorkerdWorkerRuntimeOwner(
       },
       isReady: () => group.isReady(),
       serviceBindingSocketDirectory: privateSocketDirectoryFor(record.operationId),
+      ...(serviceBindingForward
+        ? { v2ServiceBindingBrokerSocket: serviceBindingForward.socket }
+        : {}),
       ...(workflowForward
         ? {
             workflowForwardLifecycle: workflowForward.workflowForwardLifecycle,
@@ -2768,6 +2918,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       ...(v2ObjectBucketBinding ? { v2ObjectBucketBinding } : {}),
       ...(v2KvBinding ? { v2KvBinding } : {}),
       ...(v2QueueProducerBinding ? { v2QueueProducerBinding } : {}),
+      ...(serviceBindingForward ? { v2ServiceBindingForward: serviceBindingForward } : {}),
       ...(actorForward ? { v2ActorForward: actorForward } : {}),
       ...(workflowForward ? { v2WorkflowForward: workflowForward } : {}),
       ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
@@ -2779,6 +2930,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       publication,
       ...(actorForward ? { actorForward } : {}),
       ...(workflowForward ? { workflowForward } : {}),
+      ...(serviceBindingForward ? { serviceBindingForward } : {}),
       invocations: new Set(),
       workflowLeases: new Set(),
       serviceBindingLeases: new Set(),
@@ -3070,6 +3222,68 @@ export async function openWorkerdWorkerRuntimeOwner(
     }));
   };
 
+  const restoreServiceBindingBrokers = async (
+    handle: IncarnationHandle,
+    record: IncarnationRecord,
+    snapshot: V2WorkerPublicationSnapshot,
+  ): Promise<void> => {
+    const deployment = snapshot.deployment;
+    if (!deployment || !record.identity) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    let basisPoint = 0;
+    for (const version of deployment.versions) {
+      const selected = await readWorkerdSelectedActiveVersion(
+        handle.group.runtimeRoot,
+        scriptName(options.workerResourceUid),
+        { expectedWorkerResourceUid: options.workerResourceUid, basisPoint },
+      );
+      const expectedVersionId = `v2-${createHash("sha256")
+        .update(`${version.uid}\u0000${version.generation}`, "utf8")
+        .digest("hex")}`;
+      if (
+        !selected ||
+        selected.workerResourceUid !== options.workerResourceUid ||
+        selected.workerVersionUid !== version.uid ||
+        selected.versionId !== expectedVersionId ||
+        selected.generation !== record.identity.generation
+      ) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      const declared = parseWorkerVersionSpec(version.spec).serviceBindings;
+      const persisted = selected.site.serviceBindings ?? [];
+      if (!(await exactV2ResolvedServiceBindings(declared, persisted))) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      if (persisted.length > 0) {
+        const forward = handle.serviceBindingForward;
+        if (!forward) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        const claim: V2WorkerServiceBindingClaim = Object.freeze({
+          principal: snapshot.worker.principal,
+          space: snapshot.worker.space,
+          targetKey: options.targetKey,
+          workerUid: snapshot.worker.uid,
+          workerVersionUid: version.uid,
+          workerVersionOperationId: version.sourceOperationId,
+          nativeVersionId: expectedVersionId,
+          incarnationId: record.operationId,
+          servingSourceOperationId: record.operationId,
+          bindings: Object.freeze(
+            declared.map((binding) =>
+              Object.freeze({
+                name: binding.name,
+                resourceUid: binding.resource.resourceUid,
+              }),
+            ),
+          ),
+        });
+        for (const binding of persisted) await forward.issueBinding(claim, binding);
+      }
+      basisPoint += version.weight;
+    }
+    if (basisPoint !== 10_000) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  };
+
   const recoverActiveIncarnation = async (): Promise<void> => {
     // An old Queue grant may remain send-authorized. Record exact physical
     // absence before restore can replace the active record's process identity.
@@ -3092,6 +3306,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     if (
       resolution.kind !== "ready" ||
       resolution.snapshot.sourceOperationId !== sourceOperationId ||
+      activeRecord.operationId !== sourceOperationId ||
       resolution.snapshot.worker.uid !== options.workerResourceUid ||
       !resolution.snapshot.deployment ||
       canonicalJson(
@@ -3141,6 +3356,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     const group = await openExistingRecoveryGroup(activeRecord, configuration);
     recoveringGroup = group;
     const handle = makeIncarnationHandle(activeRecord, group, activeRecord.identity);
+    await restoreServiceBindingBrokers(handle, activeRecord, resolution.snapshot);
     await updateRecord(activeRecord.operationId, (current) => ({
       ...current,
       configurationRefreshPending: true,
@@ -5454,6 +5670,7 @@ export async function openWorkerdWorkerRuntimeOwner(
           if (handle.record.status === "active" || handle.record.status === "draining") {
             await handle.group.suspendRetainingCustody();
           }
+          await handle.serviceBindingForward?.close();
           await handle.actorForward?.close();
           await handle.workflowForward?.close();
         }
@@ -5483,12 +5700,15 @@ export async function openWorkerdWorkerRuntimeOwner(
       const operationId = state.activeOperationId;
       const failedRecoveryGroup = recoveringGroup as WorkerdWorkerExecutionGroup | null;
       if (failedRecoveryGroup && operationId) {
+        let stopped = false;
         try {
           await failedRecoveryGroup.stopAfterFailedRecovery();
+          stopped = true;
         } catch {
           // The child or listener is still unknown. The live successor lock
           // remains the only proof that this process owns the attempted recovery.
         }
+        if (stopped) await handles.get(operationId)?.serviceBindingForward?.close();
         handles.delete(operationId);
         active = null;
       }
