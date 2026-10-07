@@ -10,6 +10,10 @@ import {
   selfhostEventServiceSource,
 } from "../src/providers/selfhost-events.ts";
 import {
+  V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+  V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+} from "../src/providers/selfhost-v2-queue-transport.ts";
+import {
   selfhostWorkerPreludeModuleName,
   selfhostWorkerPreludeSource,
 } from "../src/providers/selfhost-worker-prelude.ts";
@@ -127,6 +131,34 @@ function source(bytes: Uint8Array | undefined): string {
   if (!bytes) throw new Error("expected generated module");
   return decoder.decode(bytes);
 }
+
+test("v2 queue settlement is an explicit private boot capability, not a tenant binding", () => {
+  const graph = compileWorkerdVersionGraph(
+    graphInput({
+      declaredHandlers: ["queue"],
+      eventToken: EVENT_TOKEN,
+      v2QueueSettlement: { address: "127.0.0.1:4999", token: "A".repeat(43) },
+    }),
+  );
+  expect(graph.site.queueSettlement).toEqual({
+    address: "127.0.0.1:4999",
+    module: V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+    vars: [{ name: V2_QUEUE_SETTLEMENT_TOKEN_BINDING, value: "A".repeat(43), kind: "text" }],
+  });
+  expect(graph.site.vars?.some((binding) => binding.value === "A".repeat(43))).not.toBe(true);
+  expect(source(graph.hostModules.get(SELFHOST_WORKER_ENTRYPOINT_MODULE))).toContain(
+    '"v2Queue":true',
+  );
+  expect(source(graph.hostModules.get(V2_QUEUE_SETTLEMENT_SERVICE_MODULE))).toContain("Bearer ");
+  expect(() =>
+    compileWorkerdVersionGraph(
+      graphInput({
+        declaredHandlers: ["queue"],
+        v2QueueSettlement: { address: "127.0.0.1:4999", token: "A".repeat(43) },
+      }),
+    ),
+  ).toThrow();
+});
 
 function graphSnapshot(graph: WorkerdVersionGraph): unknown {
   return {

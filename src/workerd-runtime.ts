@@ -22,6 +22,12 @@ import { isValidArtifactPath } from "./artifact-path.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 import { bytesDigest } from "./json.ts";
+import {
+  V2_QUEUE_SETTLEMENT_ORIGIN_BINDING,
+  V2_QUEUE_SETTLEMENT_SERVICE_BINDING,
+  V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+  V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+} from "./providers/selfhost-v2-queue-transport.ts";
 import { normalizeWorkflowBindings } from "./providers/selfhost-version-bindings.ts";
 import {
   canonicalSelfhostWeightedVersions,
@@ -288,6 +294,8 @@ export interface WorkerdSite {
    * else.
    */
   readonly events?: WorkerdEventGate;
+  /** Opt-in v2 Queue private RPC facade; never projected into tenant env. */
+  readonly queueSettlement?: WorkerdQueueSettlement;
 }
 
 /** A module-less Worker Version served only by the Host-owned asset router. */
@@ -310,6 +318,7 @@ export interface WorkerdStaticSite {
   readonly workflowForward?: never;
   readonly dataPlane?: never;
   readonly events?: never;
+  readonly queueSettlement?: never;
 }
 
 /** One exact private Version in a single logical Worker publication. */
@@ -404,6 +413,12 @@ export interface WorkerdDataPlane {
   /** Module inside the script's directory that implements the facade. */
   readonly module: string;
   /** Bindings for the facade service alone; this is where the token lives. */
+  readonly vars: readonly WorkerdBinding[];
+}
+
+export interface WorkerdQueueSettlement {
+  readonly address: string;
+  readonly module: string;
   readonly vars: readonly WorkerdBinding[];
 }
 
@@ -638,6 +653,7 @@ interface Manifest {
   readonly moduleMediaTypes?: Readonly<Record<string, WorkerdModuleMediaType>>;
   readonly dataPlane?: WorkerdDataPlane;
   readonly events?: WorkerdEventGate;
+  readonly queueSettlement?: WorkerdQueueSettlement;
 }
 
 interface StaticManifest {
@@ -660,6 +676,7 @@ interface StaticManifest {
   readonly moduleMediaTypes?: never;
   readonly dataPlane?: never;
   readonly events?: never;
+  readonly queueSettlement?: never;
 }
 
 type StoredManifest = Manifest | StaticManifest;
@@ -1940,6 +1957,9 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           ...(moduleMediaTypes ? { moduleMediaTypes } : {}),
           ...(site.dataPlane ? { dataPlane: validDataPlane(site.dataPlane) } : {}),
           ...(site.events ? { events: validEventGate(site.events) } : {}),
+          ...(site.queueSettlement
+            ? { queueSettlement: validQueueSettlement(site.queueSettlement) }
+            : {}),
         }),
         "utf8",
       );
@@ -2329,6 +2349,7 @@ const ACTOR_FORWARD_MANIFEST_KEYS = new Set([
   "moduleMediaTypes",
   "dataPlane",
   "events",
+  "queueSettlement",
 ]);
 
 function actorForwardServiceName(kind: "HTTP" | "UPGRADE", index: number): string {
@@ -3029,7 +3050,7 @@ function validModules(modules: readonly string[], mainModule?: string): readonly
 }
 
 function validHostModuleNames(
-  site: Pick<WorkerdSite, "hostModules" | "dataPlane" | "events">,
+  site: Pick<WorkerdSite, "hostModules" | "dataPlane" | "events" | "queueSettlement">,
   hostEntrypoint: string | undefined,
 ): readonly string[] {
   return validModules([
@@ -3037,6 +3058,9 @@ function validHostModuleNames(
     ...(site.hostModules ?? []),
     ...(site.dataPlane === undefined ? [] : [validDataPlane(site.dataPlane).module]),
     ...(site.events === undefined ? [] : [validEventGate(site.events).module]),
+    ...(site.queueSettlement === undefined
+      ? []
+      : [validQueueSettlement(site.queueSettlement).module]),
   ]);
 }
 
@@ -3446,6 +3470,26 @@ function validEventGate(gate: WorkerdEventGate): WorkerdEventGate {
   return gate;
 }
 
+function validQueueSettlement(plane: WorkerdQueueSettlement): WorkerdQueueSettlement {
+  if (typeof plane !== "object" || plane === null)
+    throw new Error("unusable queue settlement plane");
+  validDataPlaneAddress(plane.address);
+  if (
+    plane.module !== V2_QUEUE_SETTLEMENT_SERVICE_MODULE ||
+    !Array.isArray(plane.vars) ||
+    plane.vars.length !== 1 ||
+    plane.vars[0]?.name !== V2_QUEUE_SETTLEMENT_TOKEN_BINDING ||
+    plane.vars[0]?.kind !== "text" ||
+    typeof plane.vars[0]?.value !== "string" ||
+    !/^[A-Za-z0-9_-]{43}$/u.test(plane.vars[0].value)
+  ) {
+    throw new Error("unusable queue settlement plane");
+  }
+  validModules([plane.module]);
+  validBindings(plane.vars);
+  return plane;
+}
+
 interface PreparedWorkerdSite<M extends StoredManifest = StoredManifest> {
   readonly manifest: M;
   readonly application: readonly SnapshottedModule[];
@@ -3590,6 +3634,9 @@ async function prepareWorkerdSite(
       ...(moduleMediaTypes ? { moduleMediaTypes } : {}),
       ...(site.dataPlane ? { dataPlane: validDataPlane(site.dataPlane) } : {}),
       ...(site.events ? { events: validEventGate(site.events) } : {}),
+      ...(site.queueSettlement
+        ? { queueSettlement: validQueueSettlement(site.queueSettlement) }
+        : {}),
     },
     application: applicationSnapshot.entries,
     hostPrivate: hostSnapshot.entries,
@@ -3733,7 +3780,12 @@ export async function writeWorkerdPrivateExecution(options: {
   // Deliberately select declarations: never carry hostname, assets or event
   // ingress into a guarded class process. Their Host-private module bytes can
   // remain in the exact closed graph without installing their routing services.
-  const { assets: _assets, events: _events, ...classSite } = site;
+  const {
+    assets: _assets,
+    events: _events,
+    queueSettlement: _queueSettlement,
+    ...classSite
+  } = site;
   const prepared = await prepareWorkerdSite(
     { ...classSite, hostnames: [] },
     options.modules,
@@ -4311,6 +4363,7 @@ async function readValidatedManifest(
   if (workflowForward) manifest = { ...manifest, workflowForward };
   if (manifest.dataPlane !== undefined) validDataPlane(manifest.dataPlane);
   if (manifest.events !== undefined) validEventGate(manifest.events);
+  if (manifest.queueSettlement !== undefined) validQueueSettlement(manifest.queueSettlement);
   return manifest;
 }
 
@@ -4816,6 +4869,15 @@ export async function readWorkerdSelectedActiveVersion(
                   vars: manifest.events.vars.map((binding) => ({ ...binding })),
                 },
               }),
+          ...(manifest.queueSettlement === undefined
+            ? {}
+            : {
+                queueSettlement: {
+                  address: manifest.queueSettlement.address,
+                  module: manifest.queueSettlement.module,
+                  vars: manifest.queueSettlement.vars.map((binding) => ({ ...binding })),
+                },
+              }),
         };
   } catch {
     // Validators normally reject these shapes earlier. Keep the reader's
@@ -4998,6 +5060,14 @@ export async function readWorkerdActiveActorGraph(
               events: {
                 ...manifest.events,
                 vars: manifest.events.vars.map((binding) => ({ ...binding })),
+              },
+            }),
+        ...(manifest.queueSettlement === undefined
+          ? {}
+          : {
+              queueSettlement: {
+                ...manifest.queueSettlement,
+                vars: manifest.queueSettlement.vars.map((binding) => ({ ...binding })),
               },
             }),
         ...(manifest.assets === undefined
@@ -5470,6 +5540,11 @@ function renderConfig(
         ...(entry.manifest.dataPlane
           ? [`(name = "${DATA_SERVICE_BINDING}", service = "${entry.name}-selfhost-data")`]
           : []),
+        ...(entry.manifest.queueSettlement
+          ? [
+              `(name = ${capnpText(V2_QUEUE_SETTLEMENT_SERVICE_BINDING)}, service = ${capnpText(`${entry.name}-v2-queue-settlement`)})`,
+            ]
+          : []),
         ...validServiceBindings(entry.manifest.serviceBindings ?? []).map(
           (binding) =>
             `(name = ${capnpText(binding.name)}, service = ${capnpText(serviceRouterName(binding))})`,
@@ -5642,6 +5717,32 @@ function renderConfig(
     })
     .join("\n");
 
+  const queueSettlementServices = variants
+    .filter((entry) => entry.manifest.queueSettlement)
+    .map((entry) => {
+      if (isStaticManifest(entry.manifest))
+        throw new Error("static Version cannot bind queue settlement");
+      const plane = validQueueSettlement(entry.manifest.queueSettlement as WorkerdQueueSettlement);
+      const module = requiredStoredModule(entry.manifest.moduleFiles.hostPrivate, plane.module);
+      const bindings = [
+        `(name = ${capnpText(V2_QUEUE_SETTLEMENT_ORIGIN_BINDING)}, service = ${capnpText(`${entry.name}-v2-queue-settlement-origin`)})`,
+        ...validBindings(plane.vars).map(
+          (binding) =>
+            `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
+        ),
+      ].join(", ");
+      return `  ( name = ${capnpText(`${entry.name}-v2-queue-settlement`)},
+    worker = (
+      modules = [ (name = ${capnpText(plane.module)}, esModule = embed ${capnpText(`${entry.storagePrefix}/${HOST_PRIVATE_MODULE_DIRECTORY}/${module.key}`)}) ],
+      bindings = [ ${bindings} ], compatibilityDate = "2026-01-01", globalOutbound = "queue-settlement-deny"
+    )
+  ),
+  ( name = ${capnpText(`${entry.name}-v2-queue-settlement-origin`)},
+    external = ( address = ${capnpText(plane.address)}, http = () )
+  ),`;
+    })
+    .join("\n");
+
   // One gate per script that receives events. It holds the token and the only
   // binding on this machine that names the script's event entrypoint; the
   // script itself is not reachable on the event hostname at all, and the
@@ -5792,7 +5893,7 @@ function renderConfig(
 const config :Workerd.Config = (
   services = [
 ${services}
-${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${actorExternalServices === "" ? "" : `\n${actorExternalServices}`}${workflowExternalServices === "" ? "" : `\n${workflowExternalServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
+${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${queueSettlementServices === "" ? "" : `\n${queueSettlementServices}\n  (name = "queue-settlement-deny", network = (allow = [])),`}${actorExternalServices === "" ? "" : `\n${actorExternalServices}`}${workflowExternalServices === "" ? "" : `\n${workflowExternalServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
   ( name = "router",
     worker = (
       modules = [ (name = "router.js", esModule = embed "router.js") ],
@@ -5997,9 +6098,12 @@ export default {
 
 /** Stable dispatcher from one logical event route to one private Version gate. */
 export const EVENT_DISPATCHER_SOURCE = `const EVENT_PATH = "/.well-known/takoserver/managed-worker-events/v1";
+const V2_QUEUE_PATH = "/.well-known/takoserver/managed-worker-queue/v2";
 const EVENT_HEADER = "x-takoserver-managed-worker-event";
 const EVENT_PROTOCOL = "takoserver.managed-worker-event@v1";
 const EVENT_CONTENT_TYPE = "application/vnd.takoserver.managed-worker-event.v1+json";
+const V2_QUEUE_PROTOCOL = "takoserver.managed-worker-queue@v2";
+const V2_QUEUE_CONTENT_TYPE = "application/vnd.takoserver.managed-worker-queue.v2+json";
 const MAX_REQUEST_BYTES = ${2 * 1024 * 1024};
 
 function refuse() {
@@ -6009,11 +6113,13 @@ function refuse() {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const v1 = url.pathname === EVENT_PATH;
+    const v2Queue = url.pathname === V2_QUEUE_PATH;
     if (
       request.method !== "POST" ||
-      url.pathname !== EVENT_PATH ||
-      request.headers.get(EVENT_HEADER) !== EVENT_PROTOCOL ||
-      request.headers.get("content-type") !== EVENT_CONTENT_TYPE
+      (!v1 && !v2Queue) ||
+      request.headers.get(EVENT_HEADER) !== (v1 ? EVENT_PROTOCOL : V2_QUEUE_PROTOCOL) ||
+      request.headers.get("content-type") !== (v1 ? EVENT_CONTENT_TYPE : V2_QUEUE_CONTENT_TYPE)
     ) return refuse();
     const declaredLength = request.headers.get("content-length");
     if (declaredLength !== null && Number(declaredLength) > MAX_REQUEST_BYTES) return refuse();

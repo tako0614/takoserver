@@ -70,6 +70,13 @@ export const SELFHOST_WORKER_EVENT_TARGET_BINDING = "__TAKOSERVER_SELFHOST_EVENT
  */
 export const SELFHOST_WORKER_EVENT_ENTRYPOINT = "takoserverSelfhostEvents" as const;
 
+/** Separate opt-in delivery protocol; the retained v1 decision envelope is unchanged. */
+export const SELFHOST_V2_QUEUE_EVENT_PATH =
+  "/.well-known/takoserver/managed-worker-queue/v2" as const;
+export const SELFHOST_V2_QUEUE_EVENT_PROTOCOL = "takoserver.managed-worker-queue@v2" as const;
+export const SELFHOST_V2_QUEUE_EVENT_CONTENT_TYPE =
+  "application/vnd.takoserver.managed-worker-queue.v2+json" as const;
+
 /** The `edge.queue@1.0.0` producer facade, projected by the wrapper. */
 export const SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND = "edge.queue@1.0.0" as const;
 
@@ -99,6 +106,125 @@ export interface SelfhostQueueEvent {
   readonly deploymentId: string;
   readonly queue: string;
   readonly messages: readonly SelfhostQueueEventMessage[];
+}
+
+/** Private dispatch values never projected onto the tenant's QueueBatch/env. */
+export interface SelfhostV2QueueEvent {
+  readonly protocol: typeof SELFHOST_V2_QUEUE_EVENT_PROTOCOL;
+  readonly kind: "queue";
+  readonly batchId: string;
+  readonly logicalWorkerId: string;
+  readonly deploymentId: string;
+  readonly workerUid: string;
+  readonly consumerUid: string;
+  readonly queueUid: string;
+  readonly queue: string;
+  readonly messages: readonly (SelfhostQueueEventMessage & {
+    readonly leaseToken: string;
+    readonly invocationCapability: string;
+  })[];
+}
+
+export function selfhostV2QueueEvent(input: {
+  readonly batchId: string;
+  readonly script: string;
+  readonly publication: string;
+  readonly workerUid: string;
+  readonly consumerUid: string;
+  readonly queueUid: string;
+  readonly queue: string;
+  readonly messages: SelfhostV2QueueEvent["messages"];
+}): SelfhostV2QueueEvent {
+  if (
+    !EVENT_TOKEN.test(input.batchId) ||
+    input.batchId.length > 256 ||
+    !EVENT_TOKEN.test(input.script) ||
+    !EVENT_TOKEN.test(input.publication) ||
+    !EVENT_TOKEN.test(input.workerUid) ||
+    !EVENT_TOKEN.test(input.consumerUid) ||
+    !EVENT_TOKEN.test(input.queueUid) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(input.queue) ||
+    input.messages.length < 1 ||
+    input.messages.length > MAX_SELFHOST_QUEUE_MESSAGES
+  )
+    throw new SelfhostEventShapeError("self-host v2 queue event identity is invalid");
+  const seen = new Set<string>();
+  const messages: Array<SelfhostV2QueueEvent["messages"][number]> = [];
+  for (const message of input.messages) {
+    if (
+      !EVENT_TOKEN.test(message.messageId) ||
+      message.messageId.length > 256 ||
+      seen.has(message.messageId) ||
+      !EVENT_TOKEN.test(message.leaseToken) ||
+      message.leaseToken.length > 256 ||
+      typeof message.invocationCapability !== "string" ||
+      message.invocationCapability.length < 32 ||
+      message.invocationCapability.length > 4096 ||
+      !Number.isSafeInteger(message.timestampMillis) ||
+      message.timestampMillis < 0 ||
+      !Number.isSafeInteger(message.attempts) ||
+      message.attempts < 1 ||
+      message.body.encoding !== "base64"
+    )
+      throw new SelfhostEventShapeError("self-host v2 queue message is invalid");
+    seen.add(message.messageId);
+    messages.push({
+      messageId: message.messageId,
+      timestampMillis: message.timestampMillis,
+      attempts: message.attempts,
+      body: { encoding: "base64", data: message.body.data },
+      leaseToken: message.leaseToken,
+      invocationCapability: message.invocationCapability,
+    });
+  }
+  const event: SelfhostV2QueueEvent = {
+    protocol: SELFHOST_V2_QUEUE_EVENT_PROTOCOL,
+    kind: "queue",
+    batchId: input.batchId,
+    logicalWorkerId: input.script,
+    deploymentId: input.publication,
+    workerUid: input.workerUid,
+    consumerUid: input.consumerUid,
+    queueUid: input.queueUid,
+    queue: input.queue,
+    messages,
+  };
+  if (
+    new TextEncoder().encode(JSON.stringify(event)).byteLength > MAX_SELFHOST_EVENT_REQUEST_BYTES
+  ) {
+    throw new SelfhostEventShapeError("self-host v2 queue event is too large");
+  }
+  return event;
+}
+
+/**
+ * Parses only the wrapper's protected completion sentence. The caller must
+ * additionally prove this response came from its one-shot private event gate
+ * for the exact batch; parsing an arbitrary HTTP body grants no authority.
+ */
+export function selfhostV2QueueCompletionAnswer(answer: {
+  readonly status: number;
+  readonly body: string;
+}): "handler_resolved" | "handler_rejected" | null {
+  if (answer.status !== 200 || answer.body.length > MAX_SELFHOST_EVENT_RESPONSE_BYTES) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(answer.body);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const fields = value as Record<string, unknown>;
+  if (
+    Object.keys(fields).sort().join(",") !== "completion,kind,outcome,protocol" ||
+    fields.protocol !== SELFHOST_V2_QUEUE_EVENT_PROTOCOL ||
+    fields.kind !== "queue" ||
+    fields.completion !== "handler_and_wait_until"
+  )
+    return null;
+  if (fields.outcome === "resolved") return "handler_resolved";
+  if (fields.outcome === "rejected") return "handler_rejected";
+  return null;
 }
 
 export interface SelfhostScheduleEvent {
@@ -307,9 +433,13 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
 export function selfhostEventServiceSource(): string {
   return `const EVENT_PATH = ${JSON.stringify(SELFHOST_WORKER_EVENT_PATH)};
 const EVENT_URL = ${JSON.stringify(`http://takoserver-selfhost-events.invalid${SELFHOST_WORKER_EVENT_PATH}`)};
+const V2_QUEUE_PATH = ${JSON.stringify(SELFHOST_V2_QUEUE_EVENT_PATH)};
+const V2_QUEUE_URL = ${JSON.stringify(`http://takoserver-selfhost-events.invalid${SELFHOST_V2_QUEUE_EVENT_PATH}`)};
 const CONTENT_TYPE = ${JSON.stringify(SELFHOST_WORKER_EVENT_CONTENT_TYPE)};
+const V2_QUEUE_CONTENT_TYPE = ${JSON.stringify(SELFHOST_V2_QUEUE_EVENT_CONTENT_TYPE)};
 const RESPONSE_CONTENT_TYPE = ${JSON.stringify(SELFHOST_WORKER_EVENT_RESPONSE_CONTENT_TYPE)};
 const PROTOCOL = ${JSON.stringify(SELFHOST_WORKER_EVENT_PROTOCOL)};
+const V2_QUEUE_PROTOCOL = ${JSON.stringify(SELFHOST_V2_QUEUE_EVENT_PROTOCOL)};
 const EVENT_HEADER = ${JSON.stringify(SELFHOST_WORKER_EVENT_HEADER)};
 const TOKEN_HEADER = ${JSON.stringify(SELFHOST_WORKER_EVENT_TOKEN_HEADER)};
 const TOKEN = ${JSON.stringify(SELFHOST_WORKER_EVENT_TOKEN_BINDING)};
@@ -338,14 +468,18 @@ function sameToken(presented, expected) {
 
 export default {
   async fetch(request, env) {
+    let path;
     try {
-      if (new URL(request.url).pathname !== EVENT_PATH) return refuse(404);
+      path = new URL(request.url).pathname;
     } catch {
       return refuse(404);
     }
+    const v1 = path === EVENT_PATH;
+    const v2Queue = path === V2_QUEUE_PATH;
+    if (!v1 && !v2Queue) return refuse(404);
     if (request.method !== "POST") return refuse(404);
-    if (request.headers.get("content-type") !== CONTENT_TYPE) return refuse(404);
-    if (request.headers.get(EVENT_HEADER) !== PROTOCOL) return refuse(404);
+    if (request.headers.get("content-type") !== (v1 ? CONTENT_TYPE : V2_QUEUE_CONTENT_TYPE)) return refuse(404);
+    if (request.headers.get(EVENT_HEADER) !== (v1 ? PROTOCOL : V2_QUEUE_PROTOCOL)) return refuse(404);
     if (!sameToken(request.headers.get(TOKEN_HEADER), env[TOKEN])) return refuse(404);
     const target = env[TARGET];
     if (!target) return refuse(503);
@@ -360,12 +494,12 @@ export default {
     // not the destination, not the method, not one header of the caller's.
     let response;
     try {
-      response = await target.fetch(EVENT_URL, {
+      response = await target.fetch(v1 ? EVENT_URL : V2_QUEUE_URL, {
         method: "POST",
         headers: {
-          "content-type": CONTENT_TYPE,
+          "content-type": v1 ? CONTENT_TYPE : V2_QUEUE_CONTENT_TYPE,
           accept: RESPONSE_CONTENT_TYPE,
-          [EVENT_HEADER]: PROTOCOL,
+          [EVENT_HEADER]: v1 ? PROTOCOL : V2_QUEUE_PROTOCOL,
         },
         body,
       });

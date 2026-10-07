@@ -5,13 +5,18 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  SELFHOST_V2_QUEUE_EVENT_CONTENT_TYPE,
+  SELFHOST_V2_QUEUE_EVENT_PATH,
+  SELFHOST_V2_QUEUE_EVENT_PROTOCOL,
   SELFHOST_WORKER_EVENT_CONTENT_TYPE,
   SELFHOST_WORKER_EVENT_ENTRYPOINT,
   SELFHOST_WORKER_EVENT_HEADER,
   SELFHOST_WORKER_EVENT_PATH,
   SELFHOST_WORKER_EVENT_PROTOCOL,
   selfhostScheduleEvent,
+  selfhostV2QueueEvent,
 } from "../src/providers/selfhost-events.ts";
+import { V2_QUEUE_SETTLEMENT_SERVICE_BINDING } from "../src/providers/selfhost-v2-queue-transport.ts";
 import {
   SELFHOST_WORKER_PRELUDE_MODULE,
   selfhostWorkerPreludeModuleName,
@@ -163,6 +168,292 @@ function authenticatedReadinessHeaders(): Readonly<Record<string, string>> {
 }
 
 const context = { waitUntil() {} };
+
+function v2QueueRequest(messageIds = ["message-1", "message-2"]): Request {
+  const event = selfhostV2QueueEvent({
+    batchId: "batch-v2-1",
+    script: "worker-001",
+    publication: "version-001",
+    workerUid: "worker-uid-001",
+    consumerUid: "consumer-uid-001",
+    queueUid: "queue-uid-001",
+    queue: "task_queue",
+    messages: messageIds.map((messageId, index) => ({
+      messageId,
+      timestampMillis: 1_700_000_000_000 + index,
+      attempts: 1,
+      leaseToken: `lease-${index}`,
+      invocationCapability: String(index).repeat(64),
+      body: { encoding: "base64" as const, data: Buffer.from(`body-${index}`).toString("base64") },
+    })),
+  });
+  return new Request(`http://takoserver-selfhost-events.invalid${SELFHOST_V2_QUEUE_EVENT_PATH}`, {
+    method: "POST",
+    headers: {
+      "content-type": SELFHOST_V2_QUEUE_EVENT_CONTENT_TYPE,
+      [SELFHOST_WORKER_EVENT_HEADER]: SELFHOST_V2_QUEUE_EVENT_PROTOCOL,
+    },
+    body: JSON.stringify(event),
+  });
+}
+
+test("v2 QueueBatch acknowledgement awaits private durable receipt, then defaults only pending", async () => {
+  const generated = await loadGenerated(
+    `export default { async queue(batch) {
+      if (!(batch.messages[0].body instanceof Uint8Array) ||
+          new TextDecoder().decode(batch.messages[0].body) !== "body-0") throw new Error("v2 body is not bytes");
+      await batch.acknowledge("message-1");
+    } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["queue"],
+      bindings: [],
+      events: true,
+      v2Queue: true,
+    },
+  );
+  const calls: Array<Record<string, unknown>> = [];
+  let release: (() => void) | undefined;
+  const receipt = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const service = {
+    async fetch(_url: string, init: RequestInit) {
+      calls.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      if (calls.length === 1) await receipt;
+      return Response.json({ ok: true, value: null });
+    },
+  };
+  try {
+    let completed = false;
+    const pending = generated.eventEntrypoint
+      ?.fetch(v2QueueRequest(), { [V2_QUEUE_SETTLEMENT_SERVICE_BINDING]: service }, context)
+      .then((response) => {
+        completed = true;
+        return response;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(completed).toBe(false);
+    expect(calls).toHaveLength(1);
+    release?.();
+    const response = await pending;
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({
+      protocol: SELFHOST_V2_QUEUE_EVENT_PROTOCOL,
+      kind: "queue",
+      outcome: "resolved",
+      completion: "handler_and_wait_until",
+    });
+    expect(calls.map((call) => [call.messageId, call.outcome])).toEqual([
+      ["message-1", "ack"],
+      ["message-2", "ack"],
+    ]);
+    expect(calls[0]?.invocationCapability).toBe("0".repeat(64));
+    expect(calls[0]?.leaseToken).toBe("lease-0");
+  } finally {
+    release?.();
+    await generated.dispose();
+  }
+});
+
+test("v2 QueueBatch retries a lost ACK response with the same settlement token", async () => {
+  const generated = await loadGenerated(
+    `export default { async queue(batch) { await batch.acknowledge("message-1"); } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["queue"],
+      bindings: [],
+      events: true,
+      v2Queue: true,
+    },
+  );
+  const calls: Array<Record<string, unknown>> = [];
+  const service = {
+    async fetch(_url: string, init: RequestInit) {
+      calls.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      if (calls.length === 1) throw new Error("response lost after SQL commit");
+      return Response.json({ ok: true, value: null });
+    },
+  };
+  try {
+    const response = await generated.eventEntrypoint?.fetch(
+      v2QueueRequest(["message-1"]),
+      { [V2_QUEUE_SETTLEMENT_SERVICE_BINDING]: service },
+      context,
+    );
+    expect(response?.status).toBe(200);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.settlementToken).toBe(calls[1]?.settlementToken);
+    expect(calls[0]?.settlementToken).not.toBe("");
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("v2 QueueBatch preserves confirmed ACK and retries only pending on handler rejection", async () => {
+  const generated = await loadGenerated(
+    `export default { async queue(batch) {
+      await batch.acknowledge("message-1");
+      throw new Error("tenant-private");
+    } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["queue"],
+      bindings: [],
+      events: true,
+      v2Queue: true,
+    },
+  );
+  const calls: Array<Record<string, unknown>> = [];
+  const service = {
+    async fetch(_url: string, init: RequestInit) {
+      calls.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return Response.json({ ok: true, value: null });
+    },
+  };
+  try {
+    const response = await generated.eventEntrypoint?.fetch(
+      v2QueueRequest(),
+      { [V2_QUEUE_SETTLEMENT_SERVICE_BINDING]: service },
+      context,
+    );
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({
+      protocol: SELFHOST_V2_QUEUE_EVENT_PROTOCOL,
+      kind: "queue",
+      outcome: "rejected",
+      completion: "handler_and_wait_until",
+    });
+    expect(calls.map((call) => [call.messageId, call.outcome])).toEqual([
+      ["message-1", "ack"],
+      ["message-2", "retry"],
+    ]);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("v2 completion waits for early ACK, handler, waitUntil, and nested waitUntil", async () => {
+  const suffix = crypto.randomUUID().replaceAll("-", "");
+  const handlerKey = `__v2_handler_${suffix}`;
+  const workKey = `__v2_work_${suffix}`;
+  const nestedKey = `__v2_nested_${suffix}`;
+  const generated = await loadGenerated(
+    `export default { async queue(batch, _env, ctx) {
+      await batch.acknowledgeAll();
+      await new Promise((resolve) => { globalThis[${JSON.stringify(handlerKey)}] = resolve; });
+      ctx.waitUntil(new Promise((resolve) => { globalThis[${JSON.stringify(workKey)}] = resolve; })
+        .then(() => { ctx.waitUntil(new Promise((resolve) => { globalThis[${JSON.stringify(nestedKey)}] = resolve; })); }));
+    } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["queue"],
+      bindings: [],
+      events: true,
+      v2Queue: true,
+    },
+  );
+  const calls: Array<Record<string, unknown>> = [];
+  const nativeWaitUntil: Promise<unknown>[] = [];
+  const service = {
+    async fetch(_url: string, init: RequestInit) {
+      calls.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return Response.json({ ok: true, value: null });
+    },
+  };
+  const resolver = async (key: string): Promise<() => void> => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const value = (globalThis as Record<string, unknown>)[key];
+      if (typeof value === "function") return value as () => void;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    throw new Error("tenant work was not registered");
+  };
+  try {
+    let finished = false;
+    const response = generated.eventEntrypoint
+      ?.fetch(
+        v2QueueRequest(),
+        { [V2_QUEUE_SETTLEMENT_SERVICE_BINDING]: service },
+        {
+          waitUntil(value: Promise<unknown>) {
+            nativeWaitUntil.push(value);
+          },
+        },
+      )
+      .then((value) => {
+        finished = true;
+        return value;
+      });
+    const releaseHandler = await resolver(handlerKey);
+    expect(calls).toHaveLength(2);
+    expect(finished).toBe(false);
+    releaseHandler();
+    (await resolver(workKey))();
+    const releaseNested = await resolver(nestedKey);
+    expect(finished).toBe(false);
+    releaseNested();
+    const completed = await response;
+    expect(completed?.status).toBe(200);
+    expect(await completed?.json()).toEqual({
+      protocol: SELFHOST_V2_QUEUE_EVENT_PROTOCOL,
+      kind: "queue",
+      outcome: "resolved",
+      completion: "handler_and_wait_until",
+    });
+    expect(nativeWaitUntil).toHaveLength(2);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[handlerKey];
+    delete (globalThis as Record<string, unknown>)[workKey];
+    delete (globalThis as Record<string, unknown>)[nestedKey];
+    await generated.dispose();
+  }
+});
+
+test("v2 caught waitUntil registration failure cannot certify handler completion", async () => {
+  const generated = await loadGenerated(
+    `export default { async queue(batch, _env, ctx) {
+      try { ctx.waitUntil(Promise.resolve()); } catch {}
+      await batch.acknowledgeAll();
+    } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["queue"],
+      bindings: [],
+      events: true,
+      v2Queue: true,
+    },
+  );
+  const calls: Array<Record<string, unknown>> = [];
+  try {
+    const response = await generated.eventEntrypoint?.fetch(
+      v2QueueRequest(),
+      {
+        [V2_QUEUE_SETTLEMENT_SERVICE_BINDING]: {
+          async fetch(_url: string, init: RequestInit) {
+            calls.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+            return Response.json({ ok: true, value: null });
+          },
+        },
+      },
+      {},
+    );
+    expect(response?.status).toBe(500);
+    expect(calls).toHaveLength(2);
+  } finally {
+    await generated.dispose();
+  }
+});
 
 test("projects the declared facades and nothing else onto the tenant environment", async () => {
   const { service } = plane([]);

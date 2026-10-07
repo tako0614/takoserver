@@ -6,6 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { bytesDigest } from "../src/json.ts";
+import {
+  V2_QUEUE_SETTLEMENT_SERVICE_BINDING,
+  V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+  V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+  v2QueueSettlementServiceSource,
+} from "../src/providers/selfhost-v2-queue-transport.ts";
 import { forwardTakoformCandidates } from "../src/takoform/forward-candidates.ts";
 import {
   ASSET_ROUTER_SOURCE,
@@ -1747,6 +1753,55 @@ test("publishes one canonical immutable weighted graph and retains old generatio
   // Deactivation removes only the stable pointer. The immutable payload may
   // still back an in-flight request and has no safe eager-GC process boundary.
   expect(await readFile(join(firstRoot, "deployment.json"), "utf8")).toBe(firstManifest);
+});
+
+test("weighted v2 Queue settlement has a private service and survives manifest reopen", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication is unavailable");
+  const base = weightedPublication("queue-site", "queue-generation");
+  await runtime.publish("queue-site", {
+    ...base,
+    versions: base.versions.map((version) => ({
+      ...version,
+      site: {
+        ...version.site,
+        queueSettlement: {
+          address: "127.0.0.1:4999",
+          module: V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+          vars: [
+            {
+              name: V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+              value: "A".repeat(43),
+              kind: "text" as const,
+            },
+          ],
+        },
+      },
+      hostModules: new Map([
+        ...(version.hostModules ?? []),
+        [
+          V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+          new TextEncoder().encode(v2QueueSettlementServiceSource()),
+        ],
+      ]),
+    })),
+  });
+  const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  expect(config).toContain("-v2-queue-settlement-origin");
+  expect(config).toContain(`name = "${V2_QUEUE_SETTLEMENT_SERVICE_BINDING}"`);
+  expect(config).toContain(`name = "${V2_QUEUE_SETTLEMENT_TOKEN_BINDING}"`);
+  expect(config).toContain('globalOutbound = "queue-settlement-deny"');
+  expect(config).toContain('(name = "queue-settlement-deny", network = (allow = []))');
+  const restarted = createWorkerdRuntime({ root, isReady: () => true });
+  expect(await restarted.restore()).toEqual(["queue-site"]);
+  const normalize = (value: string) =>
+    withoutPrivateRuntimeTokens(value).replace(
+      /(name = "__TAKOSERVER_SELFHOST_RUNTIME_READINESS", text = ")[0-9a-f]{64}"/gu,
+      '$1<private-runtime-token>"',
+    );
+  expect(normalize(await readFile(join(root, "workers", "workerd.capnp"), "utf8"))).toBe(
+    normalize(config),
+  );
 });
 
 test("persists an opt-in Actor forward graph and rejects unmapped Host sockets", async () => {

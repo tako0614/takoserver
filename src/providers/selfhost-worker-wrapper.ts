@@ -7,6 +7,9 @@ import {
   MAX_SELFHOST_QUEUE_DELAY_SECONDS,
   MAX_SELFHOST_QUEUE_MESSAGE_BYTES,
   MAX_SELFHOST_QUEUE_MESSAGES,
+  SELFHOST_V2_QUEUE_EVENT_CONTENT_TYPE,
+  SELFHOST_V2_QUEUE_EVENT_PATH,
+  SELFHOST_V2_QUEUE_EVENT_PROTOCOL,
   SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND,
   SELFHOST_WORKER_EVENT_CONTENT_TYPE,
   SELFHOST_WORKER_EVENT_ENTRYPOINT,
@@ -14,6 +17,12 @@ import {
   SELFHOST_WORKER_EVENT_PATH,
   SELFHOST_WORKER_EVENT_PROTOCOL,
 } from "./selfhost-events.ts";
+import {
+  V2_QUEUE_SETTLEMENT_CONTENT_TYPE,
+  V2_QUEUE_SETTLEMENT_PATH,
+  V2_QUEUE_SETTLEMENT_PROTOCOL,
+  V2_QUEUE_SETTLEMENT_SERVICE_BINDING,
+} from "./selfhost-v2-queue-transport.ts";
 import { selfhostWorkerPreludeModuleName } from "./selfhost-worker-prelude.ts";
 import {
   WORKER_MODULE_HANDLER_NAMES,
@@ -345,6 +354,7 @@ export interface SelfhostWorkerEntrypointSourceInput {
    * delivers to publishes the module it would have published anyway.
    */
   readonly events?: boolean;
+  readonly v2Queue?: boolean;
 }
 
 const ARTIFACT_PART_NAME = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
@@ -379,6 +389,7 @@ export function selfhostWorkerEntrypointSource(input: SelfhostWorkerEntrypointSo
   const configuration = {
     declaredHandlers: normalized.declaredHandlers,
     bindings: normalized.bindings,
+    v2Queue: normalized.v2Queue,
   };
   // `fetch` is always exported, whether or not the version declared it. The
   // readiness route lives on it, and a version that declares only `queue` must
@@ -418,18 +429,23 @@ export const ${SELFHOST_WORKER_EVENT_ENTRYPOINT} = SafeApply(SafeObjectFreeze, S
   async fetch(request, rawEnv, rawContext) {
     try {
       const url = new SafeURL(SafeApply(SafeRequestUrlGet, request, []));
-      if (SafeApply(SafeURLPathnameGet, url, []) !== EVENT_PATH) return statusResponse(404);
+      const path = SafeApply(SafeURLPathnameGet, url, []);
+      const v1 = path === EVENT_PATH;
+      const v2Queue = CONFIGURATION.v2Queue && path === V2_QUEUE_EVENT_PATH;
+      if (!v1 && !v2Queue) return statusResponse(404);
       if (SafeApply(SafeRequestMethodGet, request, []) !== "POST") return statusResponse(404);
       const headers = SafeApply(SafeRequestHeadersGet, request, []);
       if (
-        SafeApply(SafeHeadersGet, headers, ["content-type"]) !== EVENT_CONTENT_TYPE ||
-        SafeApply(SafeHeadersGet, headers, [EVENT_HEADER]) !== EVENT_PROTOCOL
+        SafeApply(SafeHeadersGet, headers, ["content-type"]) !== (v1 ? EVENT_CONTENT_TYPE : V2_QUEUE_EVENT_CONTENT_TYPE) ||
+        SafeApply(SafeHeadersGet, headers, [EVENT_HEADER]) !== (v1 ? EVENT_PROTOCOL : V2_QUEUE_EVENT_PROTOCOL)
       ) {
         return statusResponse(404);
       }
-      const event = await boundedEvent(request);
+      const event = await boundedEvent(request, v2Queue);
       if (event.kind === "queue") {
         if (!declares("queue")) return statusResponse(404);
+        if (v2Queue) return await invokeV2Queue(event, rawEnv, rawContext);
+        if (CONFIGURATION.v2Queue) return statusResponse(404);
         return await invokeQueue(event, rawEnv, rawContext);
       }
       if (!declares("scheduled")) return statusResponse(404);
@@ -497,6 +513,7 @@ export const ${SELFHOST_WORKER_EVENT_ENTRYPOINT} = SafeApply(SafeObjectFreeze, S
   SafeSymbol,
   SafeURL,
   SafeHeadersGet,
+  SafeCryptoRandomUUID,
   SafeRequestText,
   SafeRequestUrlGet,
   SafeRequestMethodGet,
@@ -551,6 +568,13 @@ const MAX_OBJECT_DOCUMENT_BYTES = ${MAX_SELFHOST_OBJECT_DOCUMENT_BYTES};
 const EVENT_PATH = ${JSON.stringify(SELFHOST_WORKER_EVENT_PATH)};
 const EVENT_PROTOCOL = ${JSON.stringify(SELFHOST_WORKER_EVENT_PROTOCOL)};
 const EVENT_CONTENT_TYPE = ${JSON.stringify(SELFHOST_WORKER_EVENT_CONTENT_TYPE)};
+const V2_QUEUE_EVENT_PATH = ${JSON.stringify(SELFHOST_V2_QUEUE_EVENT_PATH)};
+const V2_QUEUE_EVENT_PROTOCOL = ${JSON.stringify(SELFHOST_V2_QUEUE_EVENT_PROTOCOL)};
+const V2_QUEUE_EVENT_CONTENT_TYPE = ${JSON.stringify(SELFHOST_V2_QUEUE_EVENT_CONTENT_TYPE)};
+const V2_SETTLEMENT_SERVICE = ${JSON.stringify(V2_QUEUE_SETTLEMENT_SERVICE_BINDING)};
+const V2_SETTLEMENT_URL = ${JSON.stringify(`http://takoserver-selfhost-queue.invalid${V2_QUEUE_SETTLEMENT_PATH}`)};
+const V2_SETTLEMENT_PROTOCOL = ${JSON.stringify(V2_QUEUE_SETTLEMENT_PROTOCOL)};
+const V2_SETTLEMENT_CONTENT_TYPE = ${JSON.stringify(V2_QUEUE_SETTLEMENT_CONTENT_TYPE)};
 const EVENT_HEADER = ${JSON.stringify(SELFHOST_WORKER_EVENT_HEADER)};
 const MAX_EVENT_BYTES = ${MAX_SELFHOST_EVENT_RESPONSE_BYTES};
 const MAX_QUEUE_MESSAGES = ${MAX_SELFHOST_QUEUE_MESSAGES};
@@ -825,6 +849,7 @@ function sealGeneratedConfiguration(raw) {
   const configuration = SafeObjectCreate(null);
   configuration.declaredHandlers = declaredHandlers;
   configuration.bindings = bindings;
+  configuration.v2Queue = raw.v2Queue === true;
   return SafeApply(SafeObjectFreeze, SafeObject, [configuration]);
 }
 
@@ -994,7 +1019,7 @@ function createServiceAdapter(rawEnv, descriptor) {
   return SafeApply(SafeObjectFreeze, SafeObject, [portable]);
 }
 
-function createPortableContext(rawContext, onRegistrationFailure) {
+function createPortableContext(rawContext, onRegistrationFailure, onRegistered) {
   const portable = SafeObjectCreate(null);
   const nativeWaitUntil =
     rawContext && typeof rawContext.waitUntil === "function" ? rawContext.waitUntil : undefined;
@@ -1009,6 +1034,7 @@ function createPortableContext(rawContext, onRegistrationFailure) {
       if (onRegistrationFailure) onRegistrationFailure();
       throw portableError("context_expired");
     }
+    if (onRegistered) onRegistered(promise);
   };
   return SafeApply(SafeObjectFreeze, SafeObject, [portable]);
 }
@@ -1025,7 +1051,7 @@ function declares(handler) {
  * still parsed strictly: a Host bug that sent a malformed envelope must be a
  * refused delivery rather than a batch the tenant sees half of.
  */
-async function boundedEvent(request) {
+async function boundedEvent(request, v2Queue) {
   let body;
   try {
     body = await SafeApply(SafeRequestText, request, []);
@@ -1041,8 +1067,22 @@ async function boundedEvent(request) {
   } catch {
     throw new SafeTypeError("self-host Worker event is not JSON");
   }
-  if (!isRecord(event) || event.protocol !== EVENT_PROTOCOL) {
+  if (!isRecord(event) || event.protocol !== (v2Queue ? V2_QUEUE_EVENT_PROTOCOL : EVENT_PROTOCOL)) {
     throw new SafeTypeError("self-host Worker event protocol is invalid");
+  }
+  if (v2Queue) {
+    if (
+      event.kind !== "queue" ||
+      !exactKeys(event, ["protocol", "kind", "batchId", "logicalWorkerId", "deploymentId", "workerUid", "consumerUid", "queueUid", "queue", "messages"]) ||
+      !boundedText(event.batchId, 256) ||
+      !boundedText(event.logicalWorkerId, 256) ||
+      !boundedText(event.deploymentId, 256) ||
+      !boundedText(event.queue, 128) ||
+      !boundedText(event.workerUid, 256) ||
+      !boundedText(event.consumerUid, 256) ||
+      !boundedText(event.queueUid, 256)
+    ) throw new SafeTypeError("self-host v2 queue event is invalid");
+    return event;
   }
   if (event.kind === "queue") {
     if (
@@ -1184,6 +1224,157 @@ function decision(messageId, outcome, delaySeconds) {
   value.outcome = outcome;
   if (delaySeconds !== undefined) value.delaySeconds = delaySeconds;
   return value;
+}
+
+/** v2 keeps settlement inside the handler invocation and awaits SQL readback. */
+async function invokeV2Queue(event, rawEnv, rawContext) {
+  if (!SafeArrayIsArray(event.messages) || event.messages.length < 1 || event.messages.length > MAX_QUEUE_MESSAGES) {
+    throw new SafeTypeError("self-host v2 queue event is invalid");
+  }
+  const settle = createV2SettlementCaller(rawEnv, event);
+  const env = projectEnv(rawEnv);
+  const waitUntilWork = internalArray();
+  let registrationFailed = false;
+  const context = createPortableContext(
+    rawContext,
+    () => { registrationFailed = true; },
+    (promise) => { waitUntilWork[waitUntilWork.length] = promise; },
+  );
+  const original = await loadOriginal();
+  const messages = [];
+  const claims = new SafeMap();
+  const settled = new SafeMap();
+  const ids = [];
+  for (let index = 0; index < event.messages.length; index += 1) {
+    const input = event.messages[index];
+    if (
+      !isRecord(input) ||
+      !exactKeys(input, ["messageId", "timestampMillis", "attempts", "body", "leaseToken", "invocationCapability"]) ||
+      !boundedText(input.messageId, 256) ||
+      !boundedText(input.leaseToken, 256) ||
+      !boundedText(input.invocationCapability, 4096) || input.invocationCapability.length < 32 ||
+      !nonNegativeInteger(input.timestampMillis) ||
+      !SafeNumberIsSafeInteger(input.attempts) || input.attempts < 1 ||
+      SafeApply(SafeMapHas, claims, [input.messageId])
+    ) throw new SafeTypeError("self-host v2 queue message is invalid");
+    const encodedBody = projectEncodedBody(input.body);
+    const id = input.messageId;
+    SafeApply(SafeMapSet, claims, [id, { leaseToken: input.leaseToken, invocationCapability: input.invocationCapability }]);
+    ids[index] = id;
+    const message = SafeObjectCreate(null);
+    message.id = id;
+    message.timestampMillis = input.timestampMillis;
+    // v2 Form exposes a fresh byte copy; the retained v1 encoded-body shape
+    // remains in invokeQueue above and is deliberately not changed here.
+    message.body = new SafeUint8Array(decodeBase64(encodedBody.data));
+    message.attempts = input.attempts;
+    messages[index] = SafeApply(SafeObjectFreeze, SafeObject, [message]);
+  }
+  const settleOne = async (id, outcome, delaySeconds) => {
+    if (typeof id !== "string" || !SafeApply(SafeMapHas, claims, [id])) throw portableError("unknown_message");
+    if (SafeApply(SafeMapHas, settled, [id])) throw portableError("already_settled");
+    if (delaySeconds !== undefined &&
+        (!SafeNumberIsSafeInteger(delaySeconds) || delaySeconds < 0 || delaySeconds > MAX_QUEUE_DELAY_SECONDS)) {
+      throw new SafeTypeError("Queue retry delay is invalid");
+    }
+    await settle(id, SafeApply(SafeMapGet, claims, [id]), outcome, delaySeconds);
+    SafeApply(SafeMapSet, settled, [id, true]);
+  };
+  const settleAll = async (outcome, delaySeconds) => {
+    if (delaySeconds !== undefined &&
+        (!SafeNumberIsSafeInteger(delaySeconds) || delaySeconds < 0 || delaySeconds > MAX_QUEUE_DELAY_SECONDS)) {
+      throw new SafeTypeError("Queue retry delay is invalid");
+    }
+    for (let index = 0; index < ids.length; index += 1) {
+      const id = ids[index];
+      if (SafeApply(SafeMapHas, settled, [id])) continue;
+      try { await settleOne(id, outcome, delaySeconds); }
+      catch (error) {
+        if (error && error.name === "already_settled") {
+          SafeApply(SafeMapSet, settled, [id, true]);
+          continue;
+        }
+        throw error;
+      }
+    }
+  };
+  const batch = SafeObjectCreate(null);
+  batch.batchId = event.batchId;
+  batch.queue = event.queue;
+  batch.messages = SafeApply(SafeObjectFreeze, SafeObject, [messages]);
+  batch.acknowledge = async (id) => await settleOne(id, "ack");
+  batch.retry = async (id, delaySeconds) => await settleOne(id, "retry", delaySeconds);
+  batch.acknowledgeAll = async () => await settleAll("ack");
+  batch.retryAll = async (delaySeconds) => await settleAll("retry", delaySeconds);
+  SafeApply(SafeObjectFreeze, SafeObject, [batch]);
+  let rejected = false;
+  try { await SafeApply(original.handlers.queue, original.target, [batch, env, context]); }
+  catch { rejected = true; }
+  // This default only touches still-pending messages. If readback is uncertain,
+  // the outer entrypoint refuses; the Host must not infer an ACK from return.
+  await settleAll(rejected ? "retry" : "ack");
+  // ACK is not handler completion. Withhold the private result until all
+  // accepted waitUntil work, including nested registrations, has completed.
+  for (let index = 0; index < waitUntilWork.length; index += 1) {
+    try { await waitUntilWork[index]; } catch { /* native context owns diagnostics */ }
+  }
+  if (registrationFailed) throw portableError("context_expired");
+  const answer = SafeObjectCreate(null);
+  answer.protocol = V2_QUEUE_EVENT_PROTOCOL;
+  answer.kind = "queue";
+  answer.outcome = rejected ? "rejected" : "resolved";
+  answer.completion = "handler_and_wait_until";
+  return jsonResponse(answer);
+}
+
+function createV2SettlementCaller(rawEnv, event) {
+  const service = rawEnv[V2_SETTLEMENT_SERVICE];
+  const send = captureMethod(service, "fetch");
+  const batchId = event.batchId;
+  return async (messageId, claim, outcome, delaySeconds) => {
+    // One token per logical decision, reused on ambiguous response loss.
+    const settlementToken = SafeApply(SafeCryptoRandomUUID, null, []);
+    const payload = SafeObjectCreate(null);
+    payload.protocol = V2_SETTLEMENT_PROTOCOL;
+    payload.invocationCapability = claim.invocationCapability;
+    payload.batchId = batchId;
+    payload.messageId = messageId;
+    payload.leaseToken = claim.leaseToken;
+    payload.settlementToken = settlementToken;
+    payload.outcome = outcome;
+    if (delaySeconds !== undefined) payload.delaySeconds = delaySeconds;
+    const bytes = SafeJSONStringify(payload);
+    const headers = SafeObjectCreate(null);
+    headers["content-type"] = V2_SETTLEMENT_CONTENT_TYPE;
+    headers["x-takoserver-queue-settlement"] = V2_SETTLEMENT_PROTOCOL;
+    const init = SafeObjectCreate(null);
+    init.method = "POST";
+    init.headers = headers;
+    init.body = bytes;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let response;
+      try { response = await SafeApply(send, service, [V2_SETTLEMENT_URL, init]); }
+      catch { if (attempt === 0) continue; throw portableError("backend_unavailable"); }
+      let text;
+      try { text = await SafeApply(SafeResponseText, response, []); }
+      catch { if (attempt === 0) continue; throw portableError("backend_unavailable"); }
+      if (typeof text !== "string" || text.length > 8192) {
+        if (attempt === 0) continue;
+        throw portableError("backend_unavailable");
+      }
+      let answer;
+      try { answer = SafeJSONParse(text); }
+      catch { if (attempt === 0) continue; throw portableError("backend_unavailable"); }
+      if (isRecord(answer) && exactKeys(answer, ["ok", "value"]) && answer.ok === true && answer.value === null) return;
+      if (isRecord(answer) && exactKeys(answer, ["ok", "error"]) && answer.ok === false &&
+          isRecord(answer.error) && exactKeys(answer.error, ["code"]) &&
+          includes(["unknown_batch", "unknown_message", "already_settled"], answer.error.code)) {
+        throw portableError(answer.error.code);
+      }
+      if (attempt === 0) continue;
+      throw portableError("backend_unavailable");
+    }
+  };
 }
 
 async function invokeScheduled(event, rawEnv, rawContext) {
@@ -2522,7 +2713,7 @@ function decodeBase64(value) {
   const binary = SafeAtob(value);
   const bytes = new SafeUint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
+    bytes[index] = SafeApply(SafeStringCharCodeAt, binary, [index]);
   }
   return SafeApply(SafeTypedArrayBufferGet, bytes, []);
 }
@@ -2657,6 +2848,7 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
   readonly publication: string;
   readonly probeHostname: string;
   readonly events: boolean;
+  readonly v2Queue: boolean;
 } {
   const fields = dataProperties(input, "input");
   // `events` is optional, so the accepted key set is built from what is present
@@ -2670,10 +2862,12 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
       "publication",
       "probeHostname",
       ...(Object.hasOwn(fields, "events") ? ["events"] : []),
+      ...(Object.hasOwn(fields, "v2Queue") ? ["v2Queue"] : []),
     ],
     "input",
   );
   if (Object.hasOwn(fields, "events") && typeof fields.events !== "boolean") invalid("events");
+  if (Object.hasOwn(fields, "v2Queue") && typeof fields.v2Queue !== "boolean") invalid("v2Queue");
   validateArtifactPartName(fields.originalMainModule);
   if (typeof fields.publication !== "string" || !PUBLICATION.test(fields.publication)) {
     invalid("publication");
@@ -2748,6 +2942,8 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
     });
   }
   const events = fields.events === true;
+  const v2Queue = fields.v2Queue === true;
+  if (v2Queue && (!events || !declaredHandlers.includes("queue"))) invalid("v2Queue");
   // A wrapper with no data binding and no event is not a degenerate wrapper: it
   // is the load probe. The entrypoint imports the tenant module and answers
   // whether it loaded, and a publication that carried no facade used to skip
@@ -2761,6 +2957,7 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
     publication: fields.publication,
     probeHostname: fields.probeHostname,
     events,
+    v2Queue,
   };
 }
 
