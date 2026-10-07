@@ -63,7 +63,7 @@ export class ReportWorkflow {
   constructor(env) { this.env = env; }
   async run(event, step) {
     const first = await step.do("memo", () => ({ value: this.env.SETTING, input: event.params.value }));
-    await step.sleep("zero", 0);
+    await step.sleep("pause", 1);
     const replayed = await step.do("memo", null);
     return { first, replayed, instance: event.instanceId };
   }
@@ -144,6 +144,7 @@ export default { fetch() { return new Response("worker-serving"); } };
         workerdBinary: artifact.binary,
         spawn: (command) =>
           spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "inherit" }),
+        // This fixture checks owner routing, not certificate or HTTPS readiness.
         endpoint: {
           assignHostname({ resourceUid }) {
             return `worker-${resourceUid.slice(0, 8)}.example.test`;
@@ -307,10 +308,11 @@ export default { fetch() { return new Response("worker-serving"); } };
           name: "memo",
           kind: "do",
           state: "complete",
-          result_json: '{"value":"selected","input":7}',
+          result_json: '{"input":7,"value":"selected"}',
         },
-        { name: "zero", kind: "sleep" },
+        { name: "pause", kind: "sleep" },
       ]);
+      await Bun.sleep(1_200);
       expect(await activeWorkflowComposition.runtime.runOne(scope, "native-instance")).toEqual({
         kind: "complete",
         output: {
@@ -341,6 +343,8 @@ export default { fetch() { return new Response("worker-serving"); } };
         1,
       );
       expect(deleted.status).toBe(202);
+      expect(await app.tickTakoformV2()).toMatchObject({ status: "reconciling" });
+      await Bun.sleep(1_100);
       expect(await app.tickTakoformV2()).toMatchObject({ status: "succeeded", effect: "complete" });
       expect((await request(`/resources/${workflow.resourceUid}`)).status).toBe(410);
     } catch (error) {
