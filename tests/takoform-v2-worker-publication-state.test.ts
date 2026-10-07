@@ -24,6 +24,82 @@ import type { V2Execution, V2Form } from "../src/takoform-v2/types.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
 
 const BUNDLE_FORM_URL = "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/";
+const ACCEPTANCE_ORDER_MIGRATION = "0077_v2_operation_acceptance_order.sql";
+const historicalMigrationCount = MIGRATIONS.findIndex(
+  (migration) => migration.name === ACCEPTANCE_ORDER_MIGRATION,
+);
+if (historicalMigrationCount < 0) throw new Error("missing acceptance-order migration");
+
+// Current acceptance code expects columns added after 0077. Seed only the two
+// old, settled rows needed for this migration test through the 0076 schema.
+function insertHistoricalResource(
+  db: Database,
+  input: {
+    form: string;
+    name: string;
+    spec: JsonObject;
+    observed: JsonObject;
+    output?: JsonObject;
+    workerUid?: string;
+  },
+) {
+  const resourceUid = crypto.randomUUID();
+  const id = crypto.randomUUID();
+  const at = new Date().toISOString();
+  const output = input.output ?? {};
+  db.query(
+    `INSERT INTO tf_v2_resources
+      (uid, principal, form_url, space, name, backend_id, target_key,
+       active_name, generation, phase, spec_json, output_json, last_operation, busy_operation)
+     VALUES (?, 'org-1', ?, 'prod', ?, 'fixture-worker-publication-v1',
+             'fixture-workerd-root', ?, 1, 'pending', ?, ?, ?, ?)`,
+  ).run(
+    resourceUid,
+    input.form,
+    input.name,
+    input.name,
+    JSON.stringify(input.spec),
+    JSON.stringify(output),
+    id,
+    id,
+  );
+  db.query(
+    `INSERT INTO tf_v2_operations
+      (id, resource_uid, principal, replay_key, request_fingerprint, action, generation,
+       status, effect, created_at, updated_at, retain_until, backend_id, target_key,
+       backend_key, accepted_spec_json)
+     VALUES (?, ?, 'org-1', ?, ?, 'create', 1, 'queued', 'none', ?, ?, ?,
+             'fixture-worker-publication-v1', 'fixture-workerd-root', ?, ?)`,
+  ).run(
+    id,
+    resourceUid,
+    `historical-${input.name}`,
+    `historical-${id}`,
+    at,
+    at,
+    new Date(Date.now() + 3_600_000).toISOString(),
+    `historical-${id}`,
+    JSON.stringify(input.spec),
+  );
+  if (input.workerUid) {
+    db.query("INSERT INTO tf_v2_operation_reference_sets (operation_id) VALUES (?)").run(id);
+    db.query(
+      `INSERT INTO tf_v2_operation_references
+        (operation_id, target_uid, form_url, readiness)
+       VALUES (?, ?, ?, 'observed')`,
+    ).run(id, input.workerUid, MODULE_WORKER_FORM_URL);
+    db.query("UPDATE tf_v2_operation_reference_sets SET sealed = 1 WHERE operation_id = ?").run(id);
+  }
+  db.query("UPDATE tf_v2_operations SET status = 'running' WHERE id = ?").run(id);
+  db.query(
+    "UPDATE tf_v2_operations SET status = 'reconciling', effect = 'unknown' WHERE id = ?",
+  ).run(id);
+  db.query(
+    `UPDATE tf_v2_operations SET status = 'succeeded', effect = 'complete',
+      result_observed_json = ?, result_output_json = ? WHERE id = ?`,
+  ).run(JSON.stringify(input.observed), JSON.stringify(output), id);
+  return { id, resourceUid };
+}
 
 // The Version backend below is a graph-only substitute, not ABI qualification;
 // its Bundle dependency uses real verified SQL byte custody.
@@ -35,11 +111,9 @@ function fixture(distinctFormBackends = false, legacySchema = false) {
     db.exec(`CREATE TABLE applied_migrations (
       name TEXT PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL
     )`);
-    for (const migration of MIGRATIONS.filter(
-      (item) =>
-        item.name !== "0077_v2_operation_acceptance_order.sql" &&
-        item.name !== "0078_v2_worker_invocation_retirement.sql",
-    )) {
+    // A real pre-0077 database has only the prefix. Later migrations depend on
+    // 0077/0078 and must run through the normal migrator after the old row exists.
+    for (const migration of MIGRATIONS.slice(0, historicalMigrationCount)) {
       db.exec(migration.sql);
       db.query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, datetime('now'))").run(
         migration.name,
@@ -174,8 +248,8 @@ function fixture(distinctFormBackends = false, legacySchema = false) {
       expect(await engine.runNext()).toMatchObject({ id: accepted.id, status: "succeeded" });
     return accepted;
   }
-  async function basics() {
-    const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
+  async function basics(existingWorker?: { id: string; resourceUid: string }) {
+    const worker = existingWorker ?? (await create(MODULE_WORKER_FORM_URL, "worker", {}));
     const bundle = await create(BUNDLE_FORM_URL, "bundle", {
       artifact: { url: manifestUrl, sha256: digest(manifestBytes) },
     });
@@ -685,43 +759,68 @@ test("a fresh SQL handle reconstructs a terminal current serving graph without a
 test("a historical source without acceptance order is unresolved after additive migration", async () => {
   const f = fixture(false, true);
   try {
-    const { worker, version } = await f.basics();
-    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+    const worker = insertHistoricalResource(f.db, {
+      form: MODULE_WORKER_FORM_URL,
+      name: "worker",
+      spec: {},
+      observed: { ready: true },
+    });
+    const endpointSpec = { worker: { resourceUid: worker.resourceUid } };
+    const endpoint = insertHistoricalResource(f.db, {
+      form: WORKER_ENDPOINT_FORM_URL,
+      name: "endpoint",
+      spec: endpointSpec,
+      observed: { tlsReady: true, activeDeploymentRouteReady: true },
+      output: { hostname: "assigned.example.test", url: "https://assigned.example.test/" },
+      workerUid: worker.resourceUid,
+    });
+    expect(migrateSqlite(f.db).applied).toEqual(
+      MIGRATIONS.slice(historicalMigrationCount).map((migration) => migration.name),
+    );
+    expect(
+      await f.sql.query("SELECT acceptance_order FROM tf_v2_operations WHERE id = ?", [
+        endpoint.id,
+      ]),
+    ).toEqual([{ acceptance_order: null }]);
+    const { version } = await f.basics(worker);
+    await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
       worker: { resourceUid: worker.resourceUid },
       versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
     });
-    expect(migrateSqlite(f.db).applied).toEqual([
-      "0077_v2_operation_acceptance_order.sql",
-      "0078_v2_worker_invocation_retirement.sql",
-    ]);
-    expect(
-      await f.sql.query("SELECT acceptance_order FROM tf_v2_operations WHERE id = ?", [
-        deployment.id,
-      ]),
-    ).toEqual([{ acceptance_order: null }]);
     const oldInput = {
       workerUid: worker.resourceUid,
       targetKey: "fixture-workerd-root",
-      sourceOperationId: deployment.id,
+      sourceOperationId: endpoint.id,
       expectedIdentity: {
-        generation: `takoserver-v2-operation:${deployment.id}`,
+        generation: `takoserver-v2-operation:${endpoint.id}`,
         workerResourceUid: worker.resourceUid,
-        hostnames: [],
+        hostnames: ["assigned.example.test"],
         versions: [{ workerVersionUid: version.resourceUid, weight: 10_000 }],
       },
     };
-    expect(await f.reader.resolveCurrentServing(oldInput)).toMatchObject({ kind: "unresolved" });
-    const endpoint = await f.create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
-      worker: { resourceUid: worker.resourceUid },
+    expect(await f.reader.resolveCurrentServing(oldInput)).toMatchObject({
+      kind: "unresolved",
+      code: "graph_unresolved",
+      message: "Serving source is not the unique latest publisher",
     });
+    const current = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "update-historical-endpoint-key",
+      uid: endpoint.resourceUid,
+      expectedGeneration: 1,
+      spec: endpointSpec,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: current.id, status: "succeeded" });
+    expect(
+      await f.sql.query("SELECT acceptance_order FROM tf_v2_operations WHERE id = ?", [current.id]),
+    ).toEqual([{ acceptance_order: expect.any(Number) }]);
     expect(
       await f.reader.resolveCurrentServing({
         ...oldInput,
-        sourceOperationId: endpoint.id,
+        sourceOperationId: current.id,
         expectedIdentity: {
           ...oldInput.expectedIdentity,
-          generation: `takoserver-v2-operation:${endpoint.id}`,
-          hostnames: ["assigned.example.test"],
+          generation: `takoserver-v2-operation:${current.id}`,
         },
       }),
     ).toMatchObject({ kind: "ready" });
