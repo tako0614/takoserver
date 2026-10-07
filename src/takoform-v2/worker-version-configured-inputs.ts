@@ -173,7 +173,7 @@ export function createV2WorkerVersionConfiguredInputSealer(
           ),
         );
         const parsed: unknown = JSON.parse(
-          new TextDecoder("utf-8", { fatal: true }).decode(plaintext),
+          new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(plaintext),
         );
         if (
           !parsed ||
