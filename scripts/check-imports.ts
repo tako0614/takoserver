@@ -152,6 +152,12 @@ const LAYERS: readonly Layer[] = [
     ],
   },
   {
+    // Core-only immutable caller binding authority for native ServiceBinding.
+    name: "v2-service-binding-authority",
+    match: /^src\/takoform-v2\/service-binding-authority\.ts$/u,
+    may: ["core", "v2-form"],
+  },
+  {
     // Accepted Core Workflow/Version graph, never legacy Workflow Resource lookup.
     name: "v2-workflow-binding-authority",
     match: /^src\/takoform-v2\/workflow-binding-authority\.ts$/u,
