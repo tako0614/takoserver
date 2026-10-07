@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
 import { bytesDigest } from "../src/json.ts";
 import type { JsonObject } from "../src/ports.ts";
 import type {
@@ -189,6 +190,73 @@ test("projects verified code and JSON vars without changing v2 Worker identities
   expect(projection.modules.get(MODULE_PATH)).not.toBe(held.files[0]);
   held.files[0]?.fill(0x20);
   expect(projection.modules.get(MODULE_PATH)).toEqual(MODULE_BYTES);
+});
+
+test("Actor code eligibility requires the exact resolved namespace relation", async () => {
+  const held = await heldBundle();
+  const spec = versionSpec({
+    actorBindings: [{ name: "ACTOR", resource: { resourceUid: "actor-namespace-uid-001" } }],
+  });
+  const input = {
+    workerResourceUid: WORKER_UID,
+    bundleResourceUid: BUNDLE_UID,
+    spec,
+    bundle: held,
+    inspectModule: inspector(),
+  };
+  await expect(inspectV2WorkerCodeVersionEligibility(input)).rejects.toMatchObject({
+    code: "worker_binding_unavailable",
+  });
+  await expect(
+    inspectV2WorkerCodeVersionEligibility({
+      ...input,
+      resolvedActorBindings: [
+        { name: "ACTOR", resourceUid: "actor-namespace-uid-001", className: "CounterActor" },
+      ],
+    }),
+  ).resolves.toBeUndefined();
+  const resolvedActorBindings = [
+    { name: "ACTOR", resourceUid: "actor-namespace-uid-001", className: "CounterActor" },
+  ];
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec,
+      bundle: held,
+      inspectModule: inspector(),
+      resolvedActorBindings,
+    }),
+  ).rejects.toMatchObject({ code: "worker_binding_unavailable" });
+  const actorForward = [
+    {
+      publicName: "ACTOR",
+      tenantId: "principal-uid-001",
+      namespaceResourceUid: "actor-namespace-uid-001",
+      token: "a".repeat(64),
+      runtimeClassRef: ACTOR_ABI_INTERFACE_REFS.v2,
+    },
+  ];
+  const projected = await projectV2WorkerCodeVersion({
+    identity: identity(),
+    spec,
+    bundle: held,
+    inspectModule: inspector(),
+    resolvedActorBindings,
+    actorForward,
+  });
+  expect(projected.site.mainModule).toBe(MODULE_PATH);
+  const firstActorForward = actorForward[0];
+  if (!firstActorForward) throw new Error("Actor forward test grant unavailable");
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec,
+      bundle: held,
+      inspectModule: inspector(),
+      resolvedActorBindings,
+      actorForward: [{ ...firstActorForward, namespaceResourceUid: "wrong-uid" }],
+    }),
+  ).rejects.toMatchObject({ code: "worker_binding_unavailable" });
 });
 
 test("Queue producer code requires exact accepted refs and a private signed native boot", async () => {

@@ -1,3 +1,4 @@
+import { parseActorAbiRef } from "../actor-abi-ref.ts";
 import { bytesDigest, canonicalJson } from "../json.ts";
 import type { JsonObject } from "../ports.ts";
 import type {
@@ -109,6 +110,20 @@ export interface V2WorkerCodeEligibilityInput {
   readonly resolvedObjectBucketBindings?: readonly V2ResolvedObjectBucketBinding[];
   readonly resolvedKvBindings?: readonly V2ResolvedKvBinding[];
   readonly resolvedQueueProducerBindings?: readonly V2ResolvedQueueProducerBinding[];
+  /** Exact accepted Actor Namespace target proof, not a readiness boolean. */
+  readonly resolvedActorBindings?: readonly {
+    readonly name: string;
+    readonly resourceUid: string;
+    readonly className: string;
+  }[];
+  /** Host-issued, incarnation-scoped grants; never accepted from a Version spec. */
+  readonly actorForward?: readonly {
+    readonly publicName: string;
+    readonly tenantId: string;
+    readonly namespaceResourceUid: string;
+    readonly token: string;
+    readonly runtimeClassRef: unknown;
+  }[];
 }
 
 interface VerifiedV2WorkerCodeEligibility {
@@ -197,7 +212,50 @@ async function verifyV2WorkerCodeProjection(
   ) {
     throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
   }
-  if (spec.actorBindings.length > 0 || spec.workflowBindings.length > 0) {
+  if (spec.workflowBindings.length > 0) {
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
+  }
+  const actorBindings = input.resolvedActorBindings;
+  let actorForward:
+    | readonly {
+        readonly publicName: string;
+        readonly tenantId: string;
+        readonly namespaceResourceUid: string;
+        readonly token: string;
+        readonly runtimeClassRef: unknown;
+      }[]
+    | undefined;
+  try {
+    actorForward = input.actorForward?.map((binding) => ({
+      publicName: binding.publicName,
+      tenantId: binding.tenantId,
+      namespaceResourceUid: binding.namespaceResourceUid,
+      token: binding.token,
+      runtimeClassRef: binding.runtimeClassRef,
+    }));
+  } catch {
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
+  }
+  if (
+    spec.actorBindings.length !== (actorBindings?.length ?? 0) ||
+    spec.actorBindings.some(
+      (binding, index) =>
+        binding.name !== actorBindings?.[index]?.name ||
+        binding.resource.resourceUid !== actorBindings[index]?.resourceUid ||
+        !/^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u.test(actorBindings[index]?.className ?? ""),
+    ) ||
+    (inspectionOnly && actorForward !== undefined) ||
+    (!inspectionOnly && spec.actorBindings.length !== (actorForward?.length ?? 0)) ||
+    actorForward?.some(
+      (binding, index) =>
+        binding.publicName !== spec.actorBindings[index]?.name ||
+        binding.namespaceResourceUid !== spec.actorBindings[index]?.resource.resourceUid ||
+        typeof binding.tenantId !== "string" ||
+        binding.tenantId.length === 0 ||
+        !/^[0-9a-f]{64}$/u.test(binding.token) ||
+        parseActorAbiRef(binding.runtimeClassRef)?.kind !== "v2",
+    )
+  ) {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
   // Snapshot the accepted graph and the private grant before any material or

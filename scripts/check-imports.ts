@@ -178,6 +178,12 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "app", "v2-form", "v2-actor-physical-backend"],
   },
   {
+    // Outer Host-private v2 Actor forward boot, never a pure Form/parser layer.
+    name: "v2-actor-forward-runtime",
+    match: /^src\/takoform-v2\/actor-forward-runtime\.ts$/u,
+    may: ["core", "adapter", "app", "v2-form", "v2-actor-binding-authority"],
+  },
+  {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state"],

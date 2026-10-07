@@ -75,6 +75,9 @@ export async function projectV2WorkerCodeVersion(input: {
   readonly resolvedObjectBucketBindings?: readonly V2ResolvedObjectBucketBinding[];
   readonly resolvedKvBindings?: readonly V2ResolvedKvBinding[];
   readonly resolvedQueueProducerBindings?: readonly V2ResolvedQueueProducerBinding[];
+  /** Exact Host-issued Actor grants, projected by graph compiler after this guard. */
+  readonly actorForward?: import("./worker-code-eligibility.ts").V2WorkerCodeEligibilityInput["actorForward"];
+  readonly resolvedActorBindings?: import("./worker-code-eligibility.ts").V2WorkerCodeEligibilityInput["resolvedActorBindings"];
   /** Signed by the fixed Host-private broker after selected native ID is known. */
   readonly sqliteBoot?: V2SqliteNativeBoot;
   /** Exact selected-Version grant for the private ObjectBucket dispatcher. */
@@ -154,6 +157,10 @@ export async function projectV2WorkerCodeVersion(input: {
     ...(resolvedObjectBucketBindings === undefined ? {} : { resolvedObjectBucketBindings }),
     ...(resolvedKvBindings === undefined ? {} : { resolvedKvBindings }),
     ...(resolvedQueueProducerBindings === undefined ? {} : { resolvedQueueProducerBindings }),
+    ...(input.resolvedActorBindings === undefined
+      ? {}
+      : { resolvedActorBindings: input.resolvedActorBindings }),
+    ...(input.actorForward === undefined ? {} : { actorForward: input.actorForward }),
     ...(input.sqliteBoot === undefined ? {} : { sqliteBoot: input.sqliteBoot }),
     ...(input.objectBucketBoot === undefined ? {} : { objectBucketBoot: input.objectBucketBoot }),
     ...(input.kvBoot === undefined ? {} : { kvBoot: input.kvBoot }),

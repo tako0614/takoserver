@@ -30,6 +30,14 @@ export interface V2ActorBindingResolution {
   readonly vector: string;
 }
 
+export interface V2ActorBindingTarget {
+  readonly principal: string;
+  readonly space: string;
+  readonly targetKey: string;
+  readonly workerUid: string;
+  readonly namespaceResourceUid: string;
+}
+
 /** V2 SQL and physical namespace proof; no v1 Version store or ResourceDeployment. */
 export function createV2ActorBindingAuthority(options: {
   readonly sql: Sql;
@@ -126,6 +134,67 @@ export function createV2ActorBindingAuthority(options: {
     return canonicalJson([row, refs, edges]);
   };
 
+  async function resolveTarget(
+    source: V2ActorBindingTarget,
+  ): Promise<V2ActorBindingResolution | null> {
+    try {
+      const target = { ...source };
+      if (target.targetKey !== options.targetKey) return null;
+      const scope = {
+        tenantId: target.principal,
+        namespaceResourceUid: target.namespaceResourceUid,
+      };
+      const capture = async () => {
+        const rows = await options.sql.query(
+          `SELECT uid, spec_json, backend_id FROM tf_v2_resources
+           WHERE uid = ? AND form_url = ? AND principal = ? AND space = ?
+             AND target_key = ? AND deleted_at IS NULL LIMIT 2`,
+          [
+            target.namespaceResourceUid,
+            ACTOR_NAMESPACE_FORM_URL,
+            target.principal,
+            target.space,
+            target.targetKey,
+          ],
+        );
+        const namespace = rows.length === 1 ? rows[0] : null;
+        if (
+          !namespace ||
+          namespace.backend_id !== V2_ACTOR_NAMESPACE_BACKEND_ID ||
+          typeof namespace.spec_json !== "string" ||
+          parseActorNamespaceSpec(JSON.parse(namespace.spec_json)).worker.resourceUid !==
+            target.workerUid
+        )
+          return null;
+        const graph = await options.namespaceGraph.readGraph(scope, AbortSignal.timeout(30_000));
+        if (
+          !graph ||
+          graph.workerUid !== target.workerUid ||
+          graph.scope.tenantId !== target.principal ||
+          graph.scope.namespaceResourceUid !== target.namespaceResourceUid
+        )
+          return null;
+        return {
+          graph,
+          vector: canonicalJson([namespace, graph.authorityKey]),
+        };
+      };
+      const before = await capture();
+      if (!before || !(await options.physical.hasNamespace(scope))) return null;
+      const after = await capture();
+      if (!after || after.vector !== before.vector) return null;
+      return {
+        tenantId: target.principal,
+        namespaceResourceUid: target.namespaceResourceUid,
+        className: before.graph.className,
+        runtimeClassRef: before.graph.runtimeClassRef,
+        vector: before.vector,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   async function resolveCurrentBinding(
     source: V2ActorBindingClaim,
     bindingName: string,
@@ -151,60 +220,32 @@ export function createV2ActorBindingAuthority(options: {
       if (selected.length !== 1 || !selected[0]) return null;
       const beforeVersion = await captureVersion(claim);
       if (!beforeVersion) return null;
-      const scope = { tenantId: claim.principal, namespaceResourceUid: selected[0].resourceUid };
-      const namespaceRows = await options.sql.query(
-        `SELECT uid, spec_json, backend_id FROM tf_v2_resources
-         WHERE uid = ? AND form_url = ? AND principal = ? AND space = ?
-           AND target_key = ? AND deleted_at IS NULL LIMIT 2`,
-        [
-          scope.namespaceResourceUid,
-          ACTOR_NAMESPACE_FORM_URL,
-          claim.principal,
-          claim.space,
-          claim.targetKey,
-        ],
-      );
-      const namespace = namespaceRows.length === 1 ? namespaceRows[0] : null;
-      if (
-        !namespace ||
-        namespace.backend_id !== V2_ACTOR_NAMESPACE_BACKEND_ID ||
-        typeof namespace.spec_json !== "string" ||
-        parseActorNamespaceSpec(JSON.parse(namespace.spec_json)).worker.resourceUid !==
-          claim.workerUid
-      )
-        return null;
-      const beforeGraph = await options.namespaceGraph.readGraph(
-        scope,
-        AbortSignal.timeout(30_000),
-      );
-      if (
-        !beforeGraph ||
-        beforeGraph.workerUid !== claim.workerUid ||
-        beforeGraph.scope.tenantId !== claim.principal ||
-        beforeGraph.scope.namespaceResourceUid !== scope.namespaceResourceUid ||
-        !(await options.physical.hasNamespace(scope))
-      )
-        return null;
+      const target = await resolveTarget({
+        principal: claim.principal,
+        space: claim.space,
+        targetKey: claim.targetKey,
+        workerUid: claim.workerUid,
+        namespaceResourceUid: selected[0].resourceUid,
+      });
+      if (!target) return null;
       const afterVersion = await captureVersion(claim);
-      const afterGraph = await options.namespaceGraph.readGraph(scope, AbortSignal.timeout(30_000));
-      if (
-        !afterVersion ||
-        afterVersion !== beforeVersion ||
-        !afterGraph ||
-        afterGraph.authorityKey !== beforeGraph.authorityKey
-      )
-        return null;
+      if (!afterVersion || afterVersion !== beforeVersion) return null;
+      const finalTarget = await resolveTarget({
+        principal: claim.principal,
+        space: claim.space,
+        targetKey: claim.targetKey,
+        workerUid: claim.workerUid,
+        namespaceResourceUid: selected[0].resourceUid,
+      });
+      if (!finalTarget || finalTarget.vector !== target.vector) return null;
       return {
-        tenantId: claim.principal,
-        namespaceResourceUid: scope.namespaceResourceUid,
-        className: beforeGraph.className,
-        runtimeClassRef: beforeGraph.runtimeClassRef,
-        vector: canonicalJson([beforeVersion, beforeGraph.authorityKey]),
+        ...finalTarget,
+        vector: canonicalJson([beforeVersion, target.vector]),
       };
     } catch {
       return null;
     }
   }
 
-  return Object.freeze({ resolveCurrentBinding });
+  return Object.freeze({ resolveTarget, resolveCurrentBinding });
 }

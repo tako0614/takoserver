@@ -75,6 +75,7 @@ import {
 import type {
   HostedWorkerdRuntime,
   WorkerdActiveActorGraph,
+  WorkerdActorForwardSocket,
   WorkerdPublicationIdentity,
   WorkerdRuntime,
   WorkerdSite,
@@ -202,10 +203,15 @@ interface IncarnationHandle {
   readonly group: WorkerdWorkerExecutionGroup;
   readonly runtime: HostedWorkerdRuntime;
   readonly publication: ReturnType<typeof createV2WorkerPublication>;
+  readonly actorForward?: V2ActorForwardIncarnation;
   readonly invocations: Set<ActiveInvocation>;
   retirementTimer?: () => void;
   retiring?: Promise<WorkerdWorkerRetirementReceipt>;
 }
+
+type V2ActorForwardIncarnation = NonNullable<
+  ReturnType<NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2ActorForward"]>["openIncarnation"]>
+>;
 
 export class WorkerdWorkerRuntimeOwnerError extends Error {
   readonly code: "invalid_identity" | "ownership_uncertain" | "not_serving" | "admission_closed";
@@ -475,6 +481,24 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
       claim: QueueWorkerBindingClaim,
       binding: string,
     ): Promise<QueueWorkerBindingResolution | null>;
+  };
+  /** Parent-composed accepted-v2 Actor authority and physical host, one boot per incarnation. */
+  readonly v2ActorForward?: {
+    openIncarnation(source: {
+      readonly workerUid: string;
+      readonly sourceOperationId: string;
+      readonly eventToken: string;
+      readonly scriptName: string;
+    }): {
+      readonly actorForwardLifecycle: NonNullable<
+        Parameters<typeof createWorkerdRuntime>[0]["actorForwardLifecycle"]
+      >;
+      actorForwardSockets(): readonly WorkerdActorForwardSocket[];
+      readonly issueBinding: NonNullable<
+        Parameters<typeof createV2WorkerPublication>[0]["v2ActorForward"]
+      >["issueBinding"];
+      close(): Promise<void>;
+    };
   };
   readonly workerdBinary: string | null;
   /** Trusted code-module inspector; absent uses the WorkerdRuntime's pinned inspector. */
@@ -2388,6 +2412,9 @@ export async function openWorkerdWorkerRuntimeOwner(
           workerResourceUid: options.workerResourceUid,
           operationId,
         });
+        // No private Actor broker may outlive the child whose immutable graph
+        // carried its token. A failed drain retains this UID's owner lock.
+        await incarnation.actorForward?.close();
         await persistPhysicalAbsence(incarnation.record);
         const verified = await verifyRetiredWorkerdWorkerExecutionCopies({
           groupDirectory: incarnation.group.runtimeRoot,
@@ -2499,6 +2526,15 @@ export async function openWorkerdWorkerRuntimeOwner(
     group: WorkerdWorkerExecutionGroup,
     incumbent: WorkerdPublicationIdentity | null,
   ): IncarnationHandle => {
+    const actorForward =
+      options.v2ActorForward && record.eventToken
+        ? options.v2ActorForward.openIncarnation({
+            workerUid: options.workerResourceUid,
+            sourceOperationId: record.operationId,
+            eventToken: record.eventToken,
+            scriptName: scriptName(options.workerResourceUid),
+          })
+        : undefined;
     const runtime = createWorkerdRuntime({
       root: group.runtimeRoot,
       configPath: group.configurationPath,
@@ -2510,6 +2546,12 @@ export async function openWorkerdWorkerRuntimeOwner(
         await group.reloadConfiguration();
       },
       isReady: () => group.isReady(),
+      ...(actorForward
+        ? {
+            actorForwardLifecycle: actorForward.actorForwardLifecycle,
+            actorForwardSockets: actorForward.actorForwardSockets,
+          }
+        : {}),
     });
     const candidateRuntime: WorkerdRuntime<WorkerdSite | WorkerdStaticSite> = {
       ...runtime,
@@ -2532,6 +2574,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       ...(v2ObjectBucketBinding ? { v2ObjectBucketBinding } : {}),
       ...(v2KvBinding ? { v2KvBinding } : {}),
       ...(v2QueueProducerBinding ? { v2QueueProducerBinding } : {}),
+      ...(actorForward ? { v2ActorForward: actorForward } : {}),
       ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
     });
     const handle: IncarnationHandle = {
@@ -2539,6 +2582,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       group,
       runtime,
       publication,
+      ...(actorForward ? { actorForward } : {}),
       invocations: new Set(),
     };
     handles.set(record.operationId, handle);
@@ -4766,6 +4810,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       for (const item of handles.values()) {
         item.retirementTimer?.();
+        await item.actorForward?.close();
       }
       await releaseOwnerLock(lockPath, directory, ownerLock);
       closed = true;
@@ -4797,6 +4842,7 @@ export async function openWorkerdWorkerRuntimeOwner(
           if (handle.record.status === "active" || handle.record.status === "draining") {
             await handle.group.suspendRetainingCustody();
           }
+          await handle.actorForward?.close();
         }
         await persistPhysicalAbsences(true);
         await releaseOwnerLock(lockPath, directory, ownerLock);

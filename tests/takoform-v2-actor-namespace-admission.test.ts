@@ -9,6 +9,7 @@ import type { JsonObject, Sql } from "../src/ports.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createV2ActorBindingAuthority } from "../src/takoform-v2/actor-binding-authority.ts";
+import { createV2ActorForwardBoot } from "../src/takoform-v2/actor-forward-runtime.ts";
 import { prepareV2ActorNamespaceAdmission } from "../src/takoform-v2/actor-namespace-admission.ts";
 import { createV2ActorNamespaceForm } from "../src/takoform-v2/actor-namespace-backend.ts";
 import { createV2ActorNamespaceGraphAuthority } from "../src/takoform-v2/actor-namespace-graph-authority.ts";
@@ -461,6 +462,19 @@ test("accepted sealed WorkerVersion Actor binding resolves its exact physical na
       namespaceGraph: graph,
       physical: f.physical,
     });
+    expect(
+      await authority.resolveTarget({
+        principal: PRINCIPAL,
+        space: SPACE,
+        targetKey: TARGET,
+        workerUid: worker.resourceUid,
+        namespaceResourceUid: namespace.resourceUid,
+      }),
+    ).toMatchObject({
+      tenantId: PRINCIPAL,
+      namespaceResourceUid: namespace.resourceUid,
+      className: "CounterActor",
+    });
     const nativeVersionId = `v2-${createHash("sha256")
       .update(`${version.resourceUid}\u00001`)
       .digest("hex")}`;
@@ -479,11 +493,62 @@ test("accepted sealed WorkerVersion Actor binding resolves its exact physical na
       namespaceResourceUid: namespace.resourceUid,
       className: "CounterActor",
     });
+    const forward = createV2ActorForwardBoot({
+      sql: f.sql,
+      targetKey: TARGET,
+      authority,
+      physical: f.physical,
+      privateSocketDirectory: join(root, "brokers"),
+    }).openIncarnation({
+      principal: PRINCIPAL,
+      space: SPACE,
+      workerUid: worker.resourceUid,
+      sourceOperationId: "8c44e450-1765-4366-919a-4c022f48d97c",
+      eventToken: "a".repeat(64),
+      scriptName: "actor-binding-test-script",
+    });
+    const issued = await forward.issueBinding(claim, "ACTOR");
+    expect(issued).toMatchObject({
+      publicName: "ACTOR",
+      tenantId: PRINCIPAL,
+      namespaceResourceUid: namespace.resourceUid,
+    });
+    expect(issued?.token).toMatch(/^[a-f0-9]{64}$/u);
+    if (!issued) throw new Error("Actor private grant unavailable");
+    const publication = {
+      script: "actor-binding-test-script",
+      workerResourceUid: worker.resourceUid,
+      versionId: nativeVersionId,
+      workerVersionResourceUid: version.resourceUid,
+      bindings: [
+        {
+          publicName: issued.publicName,
+          tenantId: issued.tenantId,
+          namespaceResourceUid: issued.namespaceResourceUid,
+          httpService: "actor-test-http",
+          upgradeService: "actor-test-upgrade",
+          token: issued.token,
+          runtimeClassRef: issued.runtimeClassRef,
+        },
+      ],
+    };
+    await forward.actorForwardLifecycle.prepare([publication]);
+    expect(forward.actorForwardSockets()).toMatchObject([
+      {
+        tenantId: PRINCIPAL,
+        namespaceResourceUid: namespace.resourceUid,
+        token: issued.token,
+      },
+    ]);
+    forward.actorForwardLifecycle.activated([publication]);
     await f.sql.run(
       "DELETE FROM tf_v2_resource_references WHERE referrer_uid = ? AND target_uid = ?",
       [version.resourceUid, namespace.resourceUid],
     );
     expect(await authority.resolveCurrentBinding(claim, "ACTOR")).toBeNull();
+    await expect(forward.actorForwardLifecycle.prepare([publication])).rejects.toThrow();
+    forward.actorForwardLifecycle.uncertain();
+    await forward.close();
   } finally {
     await f.physical.close();
     f.db.close();

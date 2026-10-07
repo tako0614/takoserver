@@ -8,6 +8,7 @@ import type { V2SqliteBindingGrant } from "../providers/selfhost-v2-sqlite-bindi
 import { SELFHOST_WORKER_EDGE_SQL_BINDING_KIND } from "../providers/selfhost-worker-wrapper.ts";
 import { canonicalSelfhostWeightedVersions } from "../selfhost-weighted-deployment.ts";
 import type {
+  WorkerdActorForwardBinding,
   WorkerdDeploymentPublication,
   WorkerdDeploymentVariant,
   WorkerdPublicationIdentity,
@@ -230,6 +231,29 @@ export function createV2WorkerPublication(options: {
       binding: string,
     ): Promise<V2QueueProducerBindingResolution | null>;
   };
+  /** Same incarnation-scoped Actor grant source used by the native private brokers. */
+  readonly v2ActorForward?: {
+    issueBinding(
+      claim: {
+        readonly principal: string;
+        readonly space: string;
+        readonly targetKey: string;
+        readonly workerUid: string;
+        readonly workerVersionUid: string;
+        readonly workerVersionOperationId: string;
+        readonly nativeVersionId: string;
+        readonly bindings: readonly { readonly name: string; readonly resourceUid: string }[];
+      },
+      bindingName: string,
+    ): Promise<{
+      readonly publicName: string;
+      readonly tenantId: string;
+      readonly namespaceResourceUid: string;
+      readonly className: string;
+      readonly token: string;
+      readonly runtimeClassRef: NonNullable<WorkerdActorForwardBinding["runtimeClassRef"]>;
+    } | null>;
+  };
 }): V2WorkerPublication {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   const inspectModule = options.runtime.inspectModule;
@@ -270,6 +294,44 @@ export function createV2WorkerPublication(options: {
       let projection: WorkerdDeploymentVariant<WorkerdSite | WorkerdStaticSite>;
       const versionSpec = parseWorkerVersionSpec(version.spec);
       if (versionSpec.bundle) {
+        const actorClaims = versionSpec.actorBindings.map((binding) => ({
+          name: binding.name,
+          resourceUid: binding.resource.resourceUid,
+        }));
+        const actorForward = [] as {
+          readonly publicName: string;
+          readonly tenantId: string;
+          readonly namespaceResourceUid: string;
+          readonly className: string;
+          readonly token: string;
+          readonly runtimeClassRef: NonNullable<WorkerdActorForwardBinding["runtimeClassRef"]>;
+        }[];
+        if (actorClaims.length > 0) {
+          const binder = options.v2ActorForward;
+          if (!binder) throw new Error("native Actor forwarding is unavailable");
+          const claim = {
+            principal: snapshot.worker.principal,
+            space: snapshot.worker.space,
+            targetKey: options.targetKey,
+            workerUid: snapshot.worker.uid,
+            workerVersionUid: version.uid,
+            workerVersionOperationId: version.sourceOperationId,
+            nativeVersionId: identity.versionId,
+            bindings: actorClaims,
+          };
+          for (const binding of actorClaims) {
+            const issued = await binder.issueBinding(claim, binding.name);
+            if (
+              !issued ||
+              issued.publicName !== binding.name ||
+              issued.tenantId !== snapshot.worker.principal ||
+              issued.namespaceResourceUid !== binding.resourceUid
+            )
+              throw new Error("current Actor binding is unavailable");
+            actorForward.push(issued);
+          }
+          if (!(await resolution.stillCurrent())) throw new Error("Actor reference graph changed");
+        }
         const sqliteBindings = versionSpec.sqliteBindings.map((binding) => ({
           name: binding.name,
           resourceUid: binding.resource.resourceUid,
@@ -505,6 +567,16 @@ export function createV2WorkerPublication(options: {
           inspectModule,
           ...(configuredPrivateInputs ? { configuredPrivateInputs } : {}),
           ...(serviceBindings.length > 0 ? { resolvedServiceBindings: serviceBindings } : {}),
+          ...(actorForward.length > 0
+            ? {
+                resolvedActorBindings: actorForward.map((binding) => ({
+                  name: binding.publicName,
+                  resourceUid: binding.namespaceResourceUid,
+                  className: binding.className,
+                })),
+                actorForward,
+              }
+            : {}),
           ...(sqliteBindings.length > 0 ? { resolvedSqliteBindings: sqliteBindings } : {}),
           ...(codeObjectBucketBoot
             ? {
@@ -551,6 +623,7 @@ export function createV2WorkerPublication(options: {
             targetResourceUid: binding.targetResourceUid,
             unavailableToken: binding.unavailableToken,
           })),
+          ...(actorForward.length > 0 ? { actorForward } : {}),
           ...(sqliteBoot === undefined
             ? {}
             : {

@@ -357,7 +357,9 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
           queue: input.declaredHandlers.includes("queue"),
           scheduled: input.declaredHandlers.includes("scheduled"),
           ...(eventToken === undefined ? {} : { events: true }),
-          ...(workflowForward === undefined ? {} : { projectEnvironment: true }),
+          // The Actor child imports this Host-private projector even when no
+          // Workflow wrapper surrounds the Actor forwarding entrypoint.
+          projectEnvironment: true,
         }),
       ),
     );
