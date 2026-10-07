@@ -28,6 +28,7 @@ const V2_WORKER_NATIVE_DELETIONS = "0079_v2_worker_native_deletions.sql";
 const V2_WORKER_CRON_TRIGGER_MATCHES = "0080_v2_worker_cron_trigger_matches.sql";
 const V2_PRIVATE_INPUTS = "0081_v2_private_inputs.sql";
 const V2_QUEUE_BATCH_SETTLEMENTS = "0082_v2_queue_batch_settlements.sql";
+const V2_QUEUE_CONSUMER_ACCEPTANCE = "0083_v2_queue_consumer_acceptance.sql";
 
 const MUTATION_AUTHORITY_SUMMARY = JSON.stringify({
   formRef: {
@@ -261,6 +262,7 @@ describe("Takoform accepted-authority continuity migration", () => {
       V2_WORKER_CRON_TRIGGER_MATCHES,
       V2_PRIVATE_INPUTS,
       V2_QUEUE_BATCH_SETTLEMENTS,
+      V2_QUEUE_CONSUMER_ACCEPTANCE,
     ]);
     expect(database.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
     expect(
