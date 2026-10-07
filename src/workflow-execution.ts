@@ -133,6 +133,8 @@ export type WorkflowRunOutcome =
 export interface WorkflowRuntime {
   readonly instances: WorkflowInstances;
   runOne(scope: WorkflowScope, id: string): Promise<WorkflowRunOutcome>;
+  /** v2 DELETE only: prove an expired physical row has no running child owner. */
+  retireExpiredForResourceDelete(scope: WorkflowScope, id: string): Promise<void>;
 }
 
 const ACTIVE = "'queued', 'running', 'sleeping', 'waiting'";
@@ -280,6 +282,24 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
   ): Promise<void> {
     await stop(identity, reason);
     await clearOwner(identity);
+  }
+
+  async function retireExpiredForResourceDelete(scope: WorkflowScope, id: string): Promise<void> {
+    if (!options.v2ResourceAuthority) throw new WorkflowRuntimeError("invalid_runtime_input");
+    const normalizedScope = normalizeScope(scope);
+    const normalizedId = inputIdentifier(id, "instance id");
+    const current = await read(normalizedScope, normalizedId);
+    if (!current || current.retentionUntil > now()) throw new WorkflowRuntimeError("stale_claim");
+    if (current.owner !== null) await stopAndClear(identityOf(current), "termination");
+    const after = await read(normalizedScope, normalizedId);
+    if (
+      !after ||
+      !sameIncarnation(after, current) ||
+      after.retentionUntil > now() ||
+      after.owner !== null ||
+      after.leaseUntil !== null
+    )
+      throw new WorkflowRuntimeError("stale_claim");
   }
 
   /**
@@ -1273,7 +1293,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     return rows[0] ? parseStep(rows[0]) : null;
   }
 
-  return { instances, runOne };
+  return { instances, runOne, retireExpiredForResourceDelete };
 }
 
 interface InstanceRow {

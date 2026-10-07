@@ -59,7 +59,7 @@ test("exact v2 Workflow spec is immutable and references only its accepted Worke
   );
 });
 
-function setup(sql: Sql, time: { now: number }, effects: { count: number }) {
+function setup(sql: Sql, time: { now: number }, effects: { count: number; stops?: number }) {
   const clock = () => new Date(time.now);
   let id = 0;
   const authority = createV2WorkflowResourceAuthority(sql);
@@ -102,6 +102,7 @@ function setup(sql: Sql, time: { now: number }, effects: { count: number }) {
         };
       },
       async stop() {
+        if (typeof effects.stops === "number") effects.stops += 1;
         return "stopped" as const;
       },
     },
@@ -252,18 +253,20 @@ test("synthetic v2 accepted CRUD, step/replay, stop and explicit DELETE survive 
       },
     });
     expect(await engine.runNext()).toMatchObject({ id: workflow.id, status: "succeeded" });
-    await expect(
-      engine.acceptCreate({
-        principal: "alice",
-        key: "workflow-duplicate-class-key",
-        input: {
-          form: DURABLE_WORKFLOW_FORM_URL,
-          space: "default",
-          name: "duplicate-class",
-          spec: { worker: { resourceUid: worker.resourceUid }, className: "ReportWorkflow" },
-        },
-      }),
-    ).rejects.toMatchObject({ code: "dependency_conflict", status: 409 });
+    const sibling = await engine.acceptCreate({
+      principal: "alice",
+      key: "workflow-duplicate-class-key",
+      input: {
+        form: DURABLE_WORKFLOW_FORM_URL,
+        space: "default",
+        name: "duplicate-class",
+        spec: { worker: { resourceUid: worker.resourceUid }, className: "ReportWorkflow" },
+      },
+    });
+    expect(await engine.runNext()).toMatchObject({ id: sibling.id, status: "succeeded" });
+    const siblingScope = { tenantId: "alice", workflowResourceUid: sibling.resourceUid };
+    await runtime.instances.create(siblingScope, { id: "run-one" });
+    expect(await runtime.instances.status(siblingScope, "run-one")).toEqual({ status: "queued" });
     expect(
       (await engine.getResource({ principal: "alice", uid: workflow.resourceUid })).observed,
     ).toMatchObject({ ready: true, instanceCounts: { queued: 0 } });
@@ -387,6 +390,73 @@ test("v2 instance INSERT loses atomically to accepted Resource DELETE without or
   expect(
     await sql.query("SELECT 1 FROM tf_workflow_instances WHERE workflow_resource_uid = ?", [
       workflow.resourceUid,
+    ]),
+  ).toHaveLength(0);
+});
+
+test("v2 DELETE purges unswept expired terminal rows only after retained owners stop", async () => {
+  const db = new Database(":memory:");
+  dbs.push(db);
+  migrateSqlite(db);
+  const sql = createSqliteSql(db);
+  const time = { now: START };
+  const effects = { count: 0, stops: 0 };
+  const { engine, runtime } = setup(sql, time, effects);
+  const worker = await engine.acceptCreate({
+    principal: "alice",
+    key: "expired-worker-create",
+    input: { form: MODULE_WORKER_FORM_URL, space: "default", name: "worker", spec: {} },
+  });
+  await engine.runNext();
+  const workflow = await engine.acceptCreate({
+    principal: "alice",
+    key: "expired-workflow-create",
+    input: {
+      form: DURABLE_WORKFLOW_FORM_URL,
+      space: "default",
+      name: "workflow",
+      spec: { worker: { resourceUid: worker.resourceUid }, className: "ReportWorkflow" },
+    },
+  });
+  await engine.runNext();
+  const scope = { tenantId: "alice", workflowResourceUid: workflow.resourceUid };
+  await runtime.instances.create(scope, { id: "expired-terminal" });
+  await runtime.instances.terminate(scope, "expired-terminal");
+  await runtime.instances.create(scope, { id: "expired-with-owner" });
+  await runtime.instances.terminate(scope, "expired-with-owner");
+  time.now += 2_592_001_000;
+  await sql.run(
+    `UPDATE tf_workflow_instances
+      SET run_owner = 'retained-owner', run_lease_until = ?, run_epoch = 1
+      WHERE tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ?`,
+    [time.now + 10_000, scope.tenantId, scope.workflowResourceUid, "expired-with-owner"],
+  );
+  await expect(runtime.instances.status(scope, "expired-terminal")).rejects.toMatchObject({
+    code: "unknown_instance",
+  });
+  expect(
+    await sql.query("SELECT 1 FROM tf_workflow_instances WHERE instance_id = ?", [
+      "expired-terminal",
+    ]),
+  ).toHaveLength(1);
+  const deleted = await engine.acceptDelete({
+    principal: "alice",
+    key: "expired-workflow-delete",
+    uid: workflow.resourceUid,
+    expectedGeneration: 1,
+  });
+  await engine.runNext();
+  time.now += 1_001;
+  expect(await engine.runNext()).toMatchObject({ id: deleted.id, status: "succeeded" });
+  expect(effects.stops).toBe(1);
+  expect(
+    await sql.query("SELECT 1 FROM tf_workflow_instances WHERE instance_id = ?", [
+      "expired-terminal",
+    ]),
+  ).toHaveLength(0);
+  expect(
+    await sql.query("SELECT 1 FROM tf_workflow_instances WHERE instance_id = ?", [
+      "expired-with-owner",
     ]),
   ).toHaveLength(0);
 });

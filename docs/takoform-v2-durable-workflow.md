@@ -16,6 +16,9 @@ v1 Resource deletion contribution continues to refuse active instances; it is
 not re-labelled as v2 authority. Runtime writes and new instance insertion
 embed the v2 Resource predicate in the same SQL statement, so a racing DELETE
 cannot leave an orphan execution. No new schema or management ledger is added.
+An unswept instance past caller-visible retention is still retired by its
+physical row: the v2-only engine path stops any retained owner before the
+claimed purge, without reopening the expired instance to public callers.
 
 `createDurableWorkflowForm` requires a boot-selected class-admission port that
 proves every active and pending weighted Version from accepted SQL, verifies
@@ -31,6 +34,8 @@ backend tests.
 
 The focused synthetic test exercises accepted v2 HTTP Resource/Operation CRUD,
 step history replay after SQLite close/reopen, active-instance DELETE, and an
-instance-create versus DELETE race. It supplies a fake class-admission result
+instance-create versus DELETE race. Two Workflow Resources may share one
+Worker/class while retaining separate instance ID spaces. The test also covers
+unswept expired rows and synthetic owner-stop acknowledgement. It supplies a fake class-admission result
 and an in-process execution host. It does not qualify held-byte inspection,
 physical workerd stop, broker delivery, OS process recovery, or public Support.

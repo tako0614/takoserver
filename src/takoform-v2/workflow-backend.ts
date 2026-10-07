@@ -99,7 +99,7 @@ export function createDurableWorkflowForm(options: {
   readonly clock: Clock;
   readonly targetKey: string;
   readonly classAdmission: V2WorkflowClassAdmission;
-  readonly runtime: Pick<WorkflowRuntime, "instances">;
+  readonly runtime: Pick<WorkflowRuntime, "instances" | "retireExpiredForResourceDelete">;
 }): V2Form {
   const { sql, clock, targetKey, classAdmission, runtime } = options;
   if (
@@ -112,7 +112,8 @@ export function createDurableWorkflowForm(options: {
     !targetKey ||
     typeof classAdmission?.prepare !== "function" ||
     typeof classAdmission?.observe !== "function" ||
-    typeof runtime?.instances?.terminate !== "function"
+    typeof runtime?.instances?.terminate !== "function" ||
+    typeof runtime?.retireExpiredForResourceDelete !== "function"
   ) {
     throw new TypeError("v2 Workflow requires SQL, clock, class qualification and execution owner");
   }
@@ -166,17 +167,25 @@ export function createDurableWorkflowForm(options: {
     // wake and execution write has a same-statement v2 live predicate.
     if (!(await owns(input))) return UNKNOWN;
     const rows = await sql.query(
-      `SELECT instance_id FROM tf_workflow_instances
+      `SELECT instance_id, retention_until FROM tf_workflow_instances
        WHERE tenant_id = ? AND workflow_resource_uid = ?
        ORDER BY instance_id LIMIT ?`,
       [scope.tenantId, scope.workflowResourceUid, PAGE],
     );
     if (rows.length > PAGE) return UNKNOWN;
     for (const row of rows) {
-      if (typeof row.instance_id !== "string" || !(await owns(input))) return UNKNOWN;
+      if (
+        typeof row.instance_id !== "string" ||
+        typeof row.retention_until !== "number" ||
+        !Number.isSafeInteger(row.retention_until) ||
+        !(await owns(input))
+      )
+        return UNKNOWN;
       // This is the core's physical-stop path, including terminal rows still
       // carrying an owner. A failed stop retains history and keeps DELETE open.
-      await runtime.instances.terminate(scope, row.instance_id);
+      if (row.retention_until <= now())
+        await runtime.retireExpiredForResourceDelete(scope, row.instance_id);
+      else await runtime.instances.terminate(scope, row.instance_id);
     }
     if (!(await owns(input))) return UNKNOWN;
     if (rows.length === 0) {
@@ -193,9 +202,9 @@ export function createDurableWorkflowForm(options: {
     const guard = claimSql();
     const guardParams = claimParams(input, now());
     const parent = `tenant_id = ? AND workflow_resource_uid = ? AND instance_id IN (${slots})
-      AND status IN ('complete','errored','terminated')
+      AND (status IN ('complete','errored','terminated') OR retention_until <= ?)
       AND run_owner IS NULL AND run_lease_until IS NULL`;
-    const parentParams = [scope.tenantId, scope.workflowResourceUid, ...ids];
+    const parentParams = [scope.tenantId, scope.workflowResourceUid, ...ids, now()];
     // Child journal rows are removed by their exact execution incarnation.
     // Every statement repeats the accepted Operation lease predicate, so an
     // expired former worker cannot purge after a replacement claim.
@@ -281,25 +290,7 @@ export function createDurableWorkflowForm(options: {
       });
       if (result.kind === "unavailable") throw new TakoformV2Error("resource_busy", 409);
       if (result.kind === "incompatible") return null;
-      return {
-        sql: `(${result.predicate.sql}) AND NOT EXISTS (
-          SELECT 1 FROM tf_v2_resources AS sibling
-          WHERE sibling.form_url = ? AND sibling.principal = ? AND sibling.space = ?
-            AND sibling.target_key = ? AND sibling.deleted_at IS NULL AND sibling.uid <> ?
-            AND json_extract(sibling.spec_json, '$.worker.resourceUid') = ?
-            AND json_extract(sibling.spec_json, '$.className') = ?
-        )`,
-        params: [
-          ...result.predicate.params,
-          DURABLE_WORKFLOW_FORM_URL,
-          input.principal,
-          input.space,
-          targetKey,
-          input.resourceUid,
-          spec.worker.resourceUid,
-          spec.className,
-        ],
-      };
+      return result.predicate;
     },
     rejectDeleteWhileReferenced: true,
     backend: {
