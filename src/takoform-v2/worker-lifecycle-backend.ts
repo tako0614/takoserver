@@ -617,6 +617,7 @@ export function createInternalV2ModuleWorkerForm(options: {
     validateUpdate(previous, spec) {
       validated(() => validateModuleWorkerUpdate(previous, spec));
     },
+    serializeUpdatesWithPendingReferrers: true,
     rejectDeleteWhileReferenced: true,
     backend: {
       id: MODULE_WORKER_LIFECYCLE_BACKEND_ID,

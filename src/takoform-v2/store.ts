@@ -77,6 +77,17 @@ const opInsertIfAccepted = `INSERT INTO tf_v2_operations
   WHERE EXISTS (SELECT 1 FROM tf_v2_resources
     WHERE uid = ? AND last_operation = ? AND busy_operation = ? AND generation = ?)`;
 
+// A current referrer publication must settle before its target starts a new
+// observation. The accepted edge and busy Operation are checked inside the
+// target's own UPDATE statement, not by a preflight read.
+const pendingReferrersSql = `SELECT 1 FROM tf_v2_resource_references edge
+  JOIN tf_v2_resources referrer ON referrer.uid = edge.referrer_uid
+  JOIN tf_v2_operations op ON op.id = referrer.busy_operation
+  WHERE edge.target_uid = ? AND referrer.deleted_at IS NULL
+    AND referrer.last_operation = op.id AND referrer.generation = op.generation
+    AND op.resource_uid = referrer.uid AND op.principal = referrer.principal
+    AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling') LIMIT 1`;
+
 function opParams(record: AcceptRecord) {
   return [
     record.id,
@@ -227,7 +238,9 @@ export function createV2Store(sql: Sql) {
     async insertChange(
       record: AcceptRecord,
       referencesJson: string | null = null,
-    ): Promise<boolean> {
+      serializeUpdatesWithPendingReferrers = false,
+    ): Promise<"accepted" | "dependency_conflict" | "conflict"> {
+      const serialize = record.action === "update" && serializeUpdatesWithPendingReferrers;
       const writes = await sql.batch([
         {
           sql: `UPDATE tf_v2_resources SET generation = ?, spec_json = ?,
@@ -241,7 +254,8 @@ export function createV2Store(sql: Sql) {
                       JOIN tf_v2_resources referrer ON referrer.uid = edge.referrer_uid
                       WHERE edge.target_uid = ? AND referrer.deleted_at IS NULL)`
                   : ""
-              }`,
+              }
+              ${serialize ? `AND NOT EXISTS (${pendingReferrersSql})` : ""}`,
           params: [
             record.generation,
             record.specJson,
@@ -252,6 +266,7 @@ export function createV2Store(sql: Sql) {
             record.principal,
             record.generation - 1,
             ...(record.action === "delete" ? [record.resourceUid] : []),
+            ...(serialize ? [record.resourceUid] : []),
           ],
         },
         {
@@ -265,8 +280,27 @@ export function createV2Store(sql: Sql) {
           ],
         },
         ...referenceWrites(record, referencesJson),
+        ...(serialize
+          ? [
+              {
+                sql: `SELECT 1 FROM tf_v2_resources target
+                  WHERE target.uid = ? AND target.principal = ?
+                    AND target.deleted_at IS NULL AND target.generation = ?
+                    AND target.busy_operation IS NULL
+                    AND EXISTS (${pendingReferrersSql}) LIMIT 1`,
+                params: [
+                  record.resourceUid,
+                  record.principal,
+                  record.generation - 1,
+                  record.resourceUid,
+                ],
+              },
+            ]
+          : []),
       ]);
-      return writes[0]?.changes === 1 && writes[1]?.changes === 1;
+      if (writes[0]?.changes === 1 && writes[1]?.changes === 1) return "accepted";
+      if (serialize && writes.at(-1)?.rows.length) return "dependency_conflict";
+      return "conflict";
     },
     async nextCandidate(nowMs: number): Promise<OperationRow | null> {
       return ((

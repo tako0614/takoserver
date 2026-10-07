@@ -40,6 +40,7 @@ const FILE_BYTES = new TextEncoder().encode("<main>held asset</main>");
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
 function fixture(options?: {
+  gateEndpointWithPublicationReader?: boolean;
   backendQueryHook?: (
     statement: string,
     sql: Sql,
@@ -178,6 +179,12 @@ function fixture(options?: {
   };
   const confirmedEndpoint = async (execution: V2Execution) => {
     parseWorkerEndpointSpec(execution.spec);
+    if (options?.gateEndpointWithPublicationReader) {
+      const resolution = await publicationState.resolve({ execution });
+      if (resolution.kind !== "ready" || !(await resolution.stillCurrent())) {
+        return { kind: "unknown" as const };
+      }
+    }
     if (!served) return { kind: "unknown" as const };
     served = {
       ...served,
@@ -226,6 +233,9 @@ function fixture(options?: {
       },
       // Endpoint fixture only supplies a synthetic confirmed attachment.
       [WORKER_ENDPOINT_FORM_URL]: {
+        initialOutput() {
+          return { hostname: "worker.example.test", url: "https://worker.example.test/" };
+        },
         validateCreate(spec) {
           parseWorkerEndpointSpec(spec);
         },
@@ -460,8 +470,8 @@ test("ModuleWorker observation follows settled Endpoint publication and removal 
   }
 });
 
-test("ModuleWorker PUT stays unknown while an Endpoint publication is pending", async () => {
-  const f = fixture();
+test("pending Endpoint publishes before a same-spec ModuleWorker PUT retries", async () => {
+  const f = fixture({ gateEndpointWithPublicationReader: true });
   try {
     const { worker, spec } = await f.createWorkerAndAssets();
     const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec);
@@ -479,24 +489,143 @@ test("ModuleWorker PUT stays unknown while an Endpoint publication is pending", 
         spec: { worker: { resourceUid: worker.resourceUid } },
       },
     });
-    await f.sql.run("UPDATE tf_v2_operations SET next_attempt_at_ms = ? WHERE id = ?", [
-      f.nowMs + 60_000,
-      endpoint.id,
-    ]);
-    const workerUpdate = await f.engine.acceptUpdate({
+    const workerInput = {
       principal: "org-1",
       key: "worker-with-pending-endpoint",
       uid: worker.resourceUid,
       expectedGeneration: 1,
       spec: {},
+    };
+    await expect(f.engine.acceptUpdate(workerInput)).rejects.toMatchObject({
+      code: "dependency_conflict",
+      status: 409,
     });
-    expect(await f.engine.runNext()).toMatchObject({ id: workerUpdate.id, status: "reconciling" });
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({ generation: 1, lastOperation: worker.id });
+    const endpointOutcome = await f.engine.runNext();
+    expect(endpointOutcome).toMatchObject({ id: endpoint.id, status: "succeeded" });
+    const workerUpdate = await f.engine.acceptUpdate(workerInput);
+    expect(await f.engine.runNext()).toMatchObject({ id: workerUpdate.id, status: "succeeded" });
+    expect(await f.engine.acceptUpdate(workerInput)).toMatchObject({ id: workerUpdate.id });
     expect(
       await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
     ).toMatchObject({
-      observedGeneration: 1,
-      observed: { activeDeploymentUid: null, ready: false },
+      observedGeneration: 2,
+      observed: { ready: true },
     });
+  } finally {
+    f.close();
+  }
+});
+
+test("a pending ModuleWorker PUT blocks later Endpoint acceptance until Worker settles", async () => {
+  const f = fixture({ gateEndpointWithPublicationReader: true });
+  try {
+    const { worker, spec } = await f.createWorkerAndAssets();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec);
+    await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    const workerUpdate = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "worker-first-pending-update",
+      uid: worker.resourceUid,
+      expectedGeneration: 1,
+      spec: {},
+    });
+    const endpointInput = {
+      principal: "org-1",
+      key: "endpoint-after-worker-pending",
+      input: {
+        form: WORKER_ENDPOINT_FORM_URL,
+        space: "prod",
+        name: "endpoint",
+        spec: { worker: { resourceUid: worker.resourceUid } },
+      },
+    };
+    await expect(f.engine.acceptCreate(endpointInput)).rejects.toMatchObject({
+      code: "dependency_conflict",
+      status: 409,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: workerUpdate.id, status: "succeeded" });
+    const endpoint = await f.engine.acceptCreate(endpointInput);
+    expect(await f.engine.runNext()).toMatchObject({ id: endpoint.id, status: "succeeded" });
+  } finally {
+    f.close();
+  }
+});
+
+test("pending Deployment settles before a referenced ModuleWorker PUT is accepted", async () => {
+  const f = fixture();
+  try {
+    const { worker, spec } = await f.createWorkerAndAssets();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec);
+    const deployment = await f.engine.acceptCreate({
+      principal: "org-1",
+      key: "pending-deployment-before-worker",
+      input: {
+        form: WORKER_DEPLOYMENT_FORM_URL,
+        space: "prod",
+        name: "deployment",
+        spec: {
+          worker: { resourceUid: worker.resourceUid },
+          versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+        },
+      },
+    });
+    const workerInput = {
+      principal: "org-1",
+      key: "worker-after-pending-deployment",
+      uid: worker.resourceUid,
+      expectedGeneration: 1,
+      spec: {},
+    };
+    await expect(f.engine.acceptUpdate(workerInput)).rejects.toMatchObject({
+      code: "dependency_conflict",
+      status: 409,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: deployment.id, status: "succeeded" });
+    const update = await f.engine.acceptUpdate(workerInput);
+    expect(await f.engine.runNext()).toMatchObject({ id: update.id, status: "succeeded" });
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({
+      observedGeneration: 2,
+      observed: { activeDeploymentUid: deployment.resourceUid, ready: true },
+    });
+  } finally {
+    f.close();
+  }
+});
+
+test("other Forms keep their existing update admission while a referrer is pending", async () => {
+  const f = fixture();
+  try {
+    const { worker, spec } = await f.createWorkerAndAssets();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec);
+    await f.engine.acceptCreate({
+      principal: "org-1",
+      key: "pending-deployment-for-version-update",
+      input: {
+        form: WORKER_DEPLOYMENT_FORM_URL,
+        space: "prod",
+        name: "deployment",
+        spec: {
+          worker: { resourceUid: worker.resourceUid },
+          versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+        },
+      },
+    });
+    const update = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "version-update-while-deployment-pending",
+      uid: version.resourceUid,
+      expectedGeneration: 1,
+      spec,
+    });
+    expect(update).toMatchObject({ action: "update", generation: 2, status: "queued" });
   } finally {
     f.close();
   }
