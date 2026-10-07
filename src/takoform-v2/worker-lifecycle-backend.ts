@@ -569,6 +569,7 @@ export function createInternalV2ModuleWorkerForm(options: {
       if (!(await currentClaim(sql, execution))) return unresolved();
       const before = await confirmedModuleObservation(sql, execution);
       if (!before) return unresolved();
+      let sourceOperationId: string | null = null;
       if (before.servingTarget) {
         const target = before.servingTarget;
         const proof = await observeServing(
@@ -583,14 +584,21 @@ export function createInternalV2ModuleWorkerForm(options: {
           proof.targetKey !== target.targetKey ||
           proof.generation !== `takoserver-v2-operation:${proof.sourceOperationId}` ||
           canonicalJson(proof.hostnames) !== canonicalJson(target.hostnames) ||
-          canonicalJson(proof.versions) !== canonicalJson(target.versions) ||
-          !(await isCurrentPublisher(sql, execution, target, proof.sourceOperationId))
+          canonicalJson(proof.versions) !== canonicalJson(target.versions)
         ) {
           return unresolved();
         }
+        sourceOperationId = proof.sourceOperationId;
       }
       const after = await confirmedModuleObservation(sql, execution);
       if (!after || canonicalJson(after) !== canonicalJson(before)) return unresolved();
+      if (
+        before.servingTarget &&
+        (!sourceOperationId ||
+          !(await isCurrentPublisher(sql, execution, before.servingTarget, sourceOperationId)))
+      ) {
+        return unresolved();
+      }
       if (!(await currentClaim(sql, execution))) return unresolved();
       return {
         kind: "complete",

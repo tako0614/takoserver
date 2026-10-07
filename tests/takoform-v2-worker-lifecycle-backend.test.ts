@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +24,7 @@ import {
   WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import type { V2Execution } from "../src/takoform-v2/types.ts";
 import {
   createInternalV2ModuleWorkerForm,
   createInternalV2StaticWorkerVersionForm,
@@ -175,11 +176,7 @@ function fixture(options?: {
       output: {},
     };
   };
-  const confirmedEndpoint = async (execution: {
-    action: string;
-    spec: JsonObject;
-    operationId: string;
-  }) => {
+  const confirmedEndpoint = async (execution: V2Execution) => {
     parseWorkerEndpointSpec(execution.spec);
     if (!served) return { kind: "unknown" as const };
     served = {
@@ -579,6 +576,78 @@ test("ModuleWorker observation does not materialize historical publisher Operati
       await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
     ).toMatchObject({
       observed: { activeDeploymentUid: deployment.resourceUid, ready: true },
+    });
+  } finally {
+    f.close();
+  }
+});
+
+test("ModuleWorker PUT refuses a same-millisecond Endpoint source change during graph reread", async () => {
+  let endpointUid: string | null = null;
+  let endpointReads = 0;
+  const f = fixture({
+    backendQueryHook: async (statement, sql) => {
+      if (
+        !endpointUid ||
+        !statement.includes("FROM tf_v2_resources r") ||
+        !statement.includes("WHERE r.form_url = ? AND r.deleted_at IS NULL")
+      ) {
+        return;
+      }
+      endpointReads += 1;
+      if (endpointReads !== 2) return;
+      const current = await sql.query("SELECT last_operation FROM tf_v2_resources WHERE uid = ?", [
+        endpointUid,
+      ]);
+      const nextOperationId = randomUUID();
+      await sql.run(
+        `INSERT INTO tf_v2_operations
+         (id, resource_uid, principal, replay_key, request_fingerprint, action,
+          generation, status, effect, created_at, updated_at, retain_until,
+          backend_id, target_key, backend_key, accepted_spec_json)
+         SELECT ?, resource_uid, principal, ?, request_fingerprint, 'update',
+           generation + 1, 'succeeded', 'complete', created_at, updated_at, retain_until,
+           backend_id, target_key, ?, accepted_spec_json
+         FROM tf_v2_operations WHERE id = ?`,
+        [
+          nextOperationId,
+          `synthetic-endpoint-source-${nextOperationId}`,
+          nextOperationId,
+          String(current[0]?.last_operation),
+        ],
+      );
+      await sql.run(
+        `UPDATE tf_v2_resources SET generation = generation + 1,
+           observed_generation = observed_generation + 1, last_operation = ? WHERE uid = ?`,
+        [nextOperationId, endpointUid],
+      );
+    },
+  });
+  try {
+    const { worker, spec } = await f.createWorkerAndAssets();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec);
+    await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    const endpoint = await f.create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    endpointUid = endpoint.resourceUid;
+    const update = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "worker-endpoint-source-race",
+      uid: worker.resourceUid,
+      expectedGeneration: 1,
+      spec: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: update.id, status: "reconciling" });
+    expect(endpointReads).toBe(2);
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({
+      observedGeneration: 1,
+      observed: { activeDeploymentUid: null, ready: false },
     });
   } finally {
     f.close();
