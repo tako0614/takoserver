@@ -1329,6 +1329,33 @@ test("configured code Version seals exact UID inputs, retains them on omitted PU
     const parsedSpec = parseWorkerVersionSpec(spec);
     if (!parsedSpec.bundle) throw new Error("configured code fixture has no Bundle");
     expect(() => f.versionForm.privateInputs?.validateCreate(baseSpec, null as never)).toThrow();
+    const emptyInputsVersion = await f.engine.acceptCreate({
+      principal: "org-1",
+      key: "create-no-secret-version-empty-inputs",
+      input: {
+        form: WORKER_VERSION_FORM_URL,
+        space: "prod",
+        name: "no-secret-version",
+        spec: baseSpec,
+        privateInputs: {},
+      },
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: emptyInputsVersion.id,
+      status: "succeeded",
+    });
+    const emptyInputsUpdate = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "update-no-secret-version-empty-inputs",
+      uid: emptyInputsVersion.resourceUid,
+      expectedGeneration: 1,
+      spec: baseSpec,
+      privateInputs: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: emptyInputsUpdate.id,
+      status: "succeeded",
+    });
     f.sourceAvailable = false;
     const accepted = await f.engine.acceptCreate({
       principal: "org-1",

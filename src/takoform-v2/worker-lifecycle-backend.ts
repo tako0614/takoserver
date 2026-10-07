@@ -976,7 +976,12 @@ export function createInternalV2CodeWorkerVersionForm(options: {
             }) {
               const spec = parseWorkerVersionSpec(input.spec);
               if (spec.requiredSensitiveVars.length === 0) {
-                if (input.configured || input.privateInputs !== undefined)
+                const emptyInputs = snapshotV2WorkerPrivateInputs(input.privateInputs);
+                if (
+                  input.configured ||
+                  emptyInputs === null ||
+                  (emptyInputs !== undefined && Object.keys(emptyInputs).length > 0)
+                )
                   throw new TakoformV2Error("invalid_spec", 422);
                 return;
               }
