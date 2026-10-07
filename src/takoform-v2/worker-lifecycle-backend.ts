@@ -138,7 +138,9 @@ async function noInboundReferences(sql: Sql, uid: string): Promise<boolean> {
   return (
     (
       await sql.query(
-        "SELECT target_uid FROM tf_v2_resource_references WHERE target_uid = ? LIMIT 1",
+        `SELECT target_uid FROM tf_v2_resource_references edge
+         JOIN tf_v2_resources referrer ON referrer.uid = edge.referrer_uid
+         WHERE edge.target_uid = ? AND referrer.deleted_at IS NULL LIMIT 1`,
         [uid],
       )
     ).length === 0
