@@ -328,8 +328,20 @@ test("an unconfirmed send, mismatched receipt, or lost SQL fence never settles a
       generation: 1,
       spec,
       versions: [
-        { uid: versionUid, generation: 1, weight: 7_000, spec: versionSpec },
-        { uid: secondVersionUid, generation: 1, weight: 3_000, spec: versionSpec },
+        {
+          uid: versionUid,
+          sourceOperationId: "fixture-first-version-operation",
+          generation: 1,
+          weight: 7_000,
+          spec: versionSpec,
+        },
+        {
+          uid: secondVersionUid,
+          sourceOperationId: "fixture-second-version-operation",
+          generation: 1,
+          weight: 3_000,
+          spec: versionSpec,
+        },
       ],
     },
     endpoint: null,

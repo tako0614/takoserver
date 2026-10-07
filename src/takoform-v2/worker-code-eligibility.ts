@@ -32,10 +32,36 @@ export interface V2ResolvedSqliteBinding {
   readonly resourceUid: string;
 }
 
+/** Exact accepted Core ObjectBucket references verified by the lifecycle backend. */
+export interface V2ResolvedObjectBucketBinding {
+  readonly name: string;
+  readonly resourceUid: string;
+}
+
+/** Exact accepted Core KV references verified by the lifecycle backend. */
+export interface V2ResolvedKvBinding {
+  readonly name: string;
+  readonly resourceUid: string;
+}
+
 /** Host-private native companion destination and selected-Version signed grant. */
 export interface V2SqliteNativeBoot {
   readonly address: string;
   readonly token: string;
+}
+
+/** Private native ObjectBucket dispatcher and exact public binding names. */
+export interface V2ObjectBucketNativeBoot {
+  readonly address: string;
+  readonly token: string;
+  readonly bindings: readonly { readonly publicName: string }[];
+}
+
+/** Private native KV dispatcher and exact public binding names. */
+export interface V2KvNativeBoot {
+  readonly address: string;
+  readonly token: string;
+  readonly bindings: readonly { readonly publicName: string }[];
 }
 
 export type V2WorkerCodeRuntimeErrorCode =
@@ -68,6 +94,8 @@ export interface V2WorkerCodeEligibilityInput {
   /** Supplied only after the current accepted SQL reference graph was verified. */
   readonly resolvedServiceBindings?: readonly V2ResolvedServiceBinding[];
   readonly resolvedSqliteBindings?: readonly V2ResolvedSqliteBinding[];
+  readonly resolvedObjectBucketBindings?: readonly V2ResolvedObjectBucketBinding[];
+  readonly resolvedKvBindings?: readonly V2ResolvedKvBinding[];
 }
 
 interface VerifiedV2WorkerCodeEligibility {
@@ -80,6 +108,7 @@ interface VerifiedV2WorkerCodeEligibility {
   }[];
   readonly assets?: V2VerifiedAssetMaterials;
   readonly sqliteBoot?: V2SqliteNativeBoot;
+  readonly kvBoot?: V2KvNativeBoot;
 }
 
 /**
@@ -102,6 +131,8 @@ export async function prepareV2WorkerCodeProjection(
     /** Real boot-composed private settlement plane, never a handler flag. */
     readonly queueSettlement?: { readonly address: string; readonly token: string };
     readonly sqliteBoot?: V2SqliteNativeBoot;
+    readonly objectBucketBoot?: V2ObjectBucketNativeBoot;
+    readonly kvBoot?: V2KvNativeBoot;
   },
 ): Promise<VerifiedV2WorkerCodeEligibility> {
   return await verifyV2WorkerCodeProjection(input, false);
@@ -114,6 +145,8 @@ async function verifyV2WorkerCodeProjection(
     readonly eventDelivery?: { readonly token: string };
     readonly queueSettlement?: { readonly address: string; readonly token: string };
     readonly sqliteBoot?: V2SqliteNativeBoot;
+    readonly objectBucketBoot?: V2ObjectBucketNativeBoot;
+    readonly kvBoot?: V2KvNativeBoot;
   },
   inspectionOnly: boolean,
 ): Promise<VerifiedV2WorkerCodeEligibility> {
@@ -149,8 +182,6 @@ async function verifyV2WorkerCodeProjection(
     throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
   }
   if (
-    spec.kvBindings.length > 0 ||
-    spec.bucketBindings.length > 0 ||
     spec.queueProducerBindings.length > 0 ||
     spec.actorBindings.length > 0 ||
     spec.workflowBindings.length > 0
@@ -161,6 +192,12 @@ async function verifyV2WorkerCodeProjection(
   // inspector await. A declaration alone never authorizes native projection.
   const sqliteBindings = snapshotResolvedSqliteBindings(input.resolvedSqliteBindings);
   const sqliteBoot = snapshotSqliteBoot(input.sqliteBoot);
+  const objectBucketBindings = snapshotResolvedObjectBucketBindings(
+    input.resolvedObjectBucketBindings,
+  );
+  const objectBucketBoot = snapshotObjectBucketBoot(input.objectBucketBoot);
+  const kvBindings = snapshotResolvedKvBindings(input.resolvedKvBindings);
+  const kvBoot = snapshotKvBoot(input.kvBoot);
   if (
     sqliteBindings === null ||
     sqliteBoot === null ||
@@ -171,7 +208,37 @@ async function verifyV2WorkerCodeProjection(
         binding.resource.resourceUid !== sqliteBindings[index]?.resourceUid,
     ) ||
     (spec.sqliteBindings.length > 0 && !inspectionOnly && sqliteBoot === undefined) ||
-    (spec.sqliteBindings.length === 0 && sqliteBoot !== undefined)
+    (spec.sqliteBindings.length === 0 && sqliteBoot !== undefined) ||
+    objectBucketBindings === null ||
+    objectBucketBoot === null ||
+    spec.bucketBindings.length !== (objectBucketBindings?.length ?? 0) ||
+    spec.bucketBindings.some(
+      (binding, index) =>
+        binding.name !== objectBucketBindings?.[index]?.name ||
+        binding.resource.resourceUid !== objectBucketBindings[index]?.resourceUid,
+    ) ||
+    (spec.bucketBindings.length > 0 && !inspectionOnly && objectBucketBoot === undefined) ||
+    (spec.bucketBindings.length === 0 && objectBucketBoot !== undefined) ||
+    (objectBucketBoot !== undefined &&
+      (objectBucketBoot.bindings.length !== spec.bucketBindings.length ||
+        spec.bucketBindings.some(
+          (binding, index) => objectBucketBoot.bindings[index]?.publicName !== binding.name,
+        ))) ||
+    kvBindings === null ||
+    kvBoot === null ||
+    spec.kvBindings.length !== (kvBindings?.length ?? 0) ||
+    spec.kvBindings.some(
+      (binding, index) =>
+        binding.name !== kvBindings?.[index]?.name ||
+        binding.resource.resourceUid !== kvBindings[index]?.resourceUid,
+    ) ||
+    (spec.kvBindings.length > 0 && !inspectionOnly && kvBoot === undefined) ||
+    (spec.kvBindings.length === 0 && kvBoot !== undefined) ||
+    (kvBoot !== undefined &&
+      (kvBoot.bindings.length !== spec.kvBindings.length ||
+        spec.kvBindings.some(
+          (binding, index) => kvBoot.bindings[index]?.publicName !== binding.name,
+        )))
   ) {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
@@ -244,7 +311,116 @@ async function verifyV2WorkerCodeProjection(
     }),
     ...(assets ? { assets } : {}),
     ...(sqliteBoot ? { sqliteBoot } : {}),
+    ...(kvBoot ? { kvBoot } : {}),
   };
+}
+
+function snapshotResolvedKvBindings(
+  input: readonly V2ResolvedKvBinding[] | undefined,
+): readonly V2ResolvedKvBinding[] | null | undefined {
+  if (input === undefined) return undefined;
+  try {
+    if (!Array.isArray(input) || input.length > 64) return null;
+    const copied = input.map(({ name, resourceUid }) => ({ name, resourceUid }));
+    if (
+      copied.some(
+        ({ name, resourceUid }) =>
+          typeof name !== "string" ||
+          typeof resourceUid !== "string" ||
+          !/^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u.test(name) ||
+          !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(resourceUid),
+      ) ||
+      copied.some((item, index) => index > 0 && (copied[index - 1]?.name ?? "") >= item.name)
+    )
+      return null;
+    return copied;
+  } catch {
+    return null;
+  }
+}
+
+function snapshotKvBoot(input: V2KvNativeBoot | undefined): V2KvNativeBoot | null | undefined {
+  if (input === undefined) return undefined;
+  try {
+    const { address, token } = input;
+    const port = Number(address.slice(address.lastIndexOf(":") + 1));
+    const bindings = input.bindings.map(({ publicName }) => ({ publicName }));
+    if (
+      !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(address) ||
+      port > 65_535 ||
+      typeof token !== "string" ||
+      token.length > 32_768 ||
+      !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/u.test(token) ||
+      bindings.length === 0 ||
+      bindings.length > 64 ||
+      bindings.some(({ publicName }) => !/^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u.test(publicName)) ||
+      bindings.some(
+        (item, index) => index > 0 && (bindings[index - 1]?.publicName ?? "") >= item.publicName,
+      )
+    )
+      return null;
+    return { address, token, bindings };
+  } catch {
+    return null;
+  }
+}
+
+function snapshotResolvedObjectBucketBindings(
+  input: readonly V2ResolvedObjectBucketBinding[] | undefined,
+): readonly V2ResolvedObjectBucketBinding[] | null | undefined {
+  if (input === undefined) return undefined;
+  try {
+    if (!Array.isArray(input) || input.length > 64) return null;
+    const copied = input.map((binding) => ({
+      name: binding.name,
+      resourceUid: binding.resourceUid,
+    }));
+    if (
+      copied.some(
+        (binding) =>
+          typeof binding.name !== "string" ||
+          typeof binding.resourceUid !== "string" ||
+          !/^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u.test(binding.name) ||
+          !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(binding.resourceUid),
+      ) ||
+      copied.some((binding, index) => index > 0 && (copied[index - 1]?.name ?? "") >= binding.name)
+    )
+      return null;
+    return copied;
+  } catch {
+    return null;
+  }
+}
+
+function snapshotObjectBucketBoot(
+  input: V2ObjectBucketNativeBoot | undefined,
+): V2ObjectBucketNativeBoot | null | undefined {
+  if (input === undefined) return undefined;
+  try {
+    const address = input.address;
+    const token = input.token;
+    const port = Number(address.slice(address.lastIndexOf(":") + 1));
+    const bindings = input.bindings.map(({ publicName }) => ({ publicName }));
+    if (
+      typeof address !== "string" ||
+      !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(address) ||
+      port > 65_535 ||
+      typeof token !== "string" ||
+      token.length > 32_768 ||
+      !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/u.test(token) ||
+      !Array.isArray(input.bindings) ||
+      bindings.length > 64 ||
+      bindings.some((binding) => !/^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u.test(binding.publicName)) ||
+      bindings.some(
+        (binding, index) =>
+          index > 0 && (bindings[index - 1]?.publicName ?? "") >= binding.publicName,
+      )
+    )
+      return null;
+    return { address, token, bindings };
+  } catch {
+    return null;
+  }
 }
 
 function snapshotResolvedSqliteBindings(

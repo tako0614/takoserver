@@ -172,7 +172,13 @@ test("publication binds the selected native Version ID to the accepted SQLite gr
         versions: [{ workerVersion: { resourceUid: identity.workerVersionUid }, weight: 10_000 }],
       },
       versions: [
-        { uid: identity.workerVersionUid, generation: 3, weight: 10_000, spec: versionSpec },
+        {
+          uid: identity.workerVersionUid,
+          sourceOperationId: "22222222-2222-4222-8222-222222222222",
+          generation: 3,
+          weight: 10_000,
+          spec: versionSpec,
+        },
       ],
     },
     endpoint: null,

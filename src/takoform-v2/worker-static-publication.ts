@@ -1,4 +1,5 @@
 import { bytesDigest, canonicalJson } from "../json.ts";
+import type { V2KvBindingGrant } from "../providers/selfhost-v2-kv-binding-broker.ts";
 import type { V2SqliteBindingGrant } from "../providers/selfhost-v2-sqlite-binding-broker.ts";
 import { SELFHOST_WORKER_EDGE_SQL_BINDING_KIND } from "../providers/selfhost-worker-wrapper.ts";
 import { canonicalSelfhostWeightedVersions } from "../selfhost-weighted-deployment.ts";
@@ -12,6 +13,7 @@ import type {
 } from "../workerd-runtime.ts";
 import { internalHostname } from "../workerd-runtime.ts";
 import { compileWorkerdVersionGraph } from "../workerd-version-graph.ts";
+import type { ObjectBucketWorkerBindingClaim } from "./forms/object-bucket-worker-binding-authority.ts";
 import type { SQLiteWorkerBindingClaim } from "./forms/sqlite-worker-binding-authority.ts";
 import {
   parseWorkerVersionSpec,
@@ -181,6 +183,40 @@ export function createV2WorkerPublication(options: {
       binding: string,
     ): Promise<{ readonly resourceUid: string; readonly vector: string } | null>;
   };
+  /** Fixed Host-private object broker; grants use exact selected Version provenance. */
+  readonly v2ObjectBucketBinding?: {
+    readonly address: string;
+    issueGrant(grant: ObjectBucketWorkerBindingClaim): string;
+    resolveCurrentBucketBinding(
+      claim: ObjectBucketWorkerBindingClaim,
+      binding: string,
+    ): Promise<{
+      readonly identity: {
+        readonly targetKey: string;
+        readonly principal: string;
+        readonly space: string;
+        readonly resourceUid: string;
+      };
+      readonly vector: string;
+    } | null>;
+  };
+  /** Fixed Host-private KV broker; grants use exact selected Version provenance. */
+  readonly v2KvBinding?: {
+    readonly address: string;
+    issueGrant(grant: V2KvBindingGrant): string;
+    resolveCurrentBinding(
+      claim: V2KvBindingGrant,
+      binding: string,
+    ): Promise<{
+      readonly identity: {
+        readonly targetKey: string;
+        readonly principal: string;
+        readonly space: string;
+        readonly resourceUid: string;
+      };
+      readonly vector: string;
+    } | null>;
+  };
 }): V2WorkerPublication {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   const inspectModule = options.runtime.inspectModule;
@@ -254,6 +290,116 @@ export function createV2WorkerPublication(options: {
           };
           sqliteBoot = { address: binder.address, token: binder.issueGrant(grant) };
         }
+        const bucketBindings = versionSpec.bucketBindings.map((binding) => ({
+          name: binding.name,
+          resourceUid: binding.resource.resourceUid,
+        }));
+        let objectBucketBoot:
+          | {
+              readonly address: string;
+              readonly token: string;
+              readonly bindings: readonly { readonly publicName: string }[];
+            }
+          | undefined;
+        if (bucketBindings.length > 0) {
+          const binder = options.v2ObjectBucketBinding;
+          if (!binder || !OPERATION_ID.test(version.sourceOperationId)) {
+            throw new Error("native ObjectBucket binding is unavailable");
+          }
+          const claim: ObjectBucketWorkerBindingClaim = {
+            principal: snapshot.worker.principal,
+            space: snapshot.worker.space,
+            targetKey: options.targetKey,
+            workerUid: snapshot.worker.uid,
+            workerVersionUid: version.uid,
+            workerVersionOperationId: version.sourceOperationId,
+            nativeVersionId: identity.versionId,
+            incarnationId: execution.operationId,
+            servingSourceOperationId: execution.operationId,
+            bindings: bucketBindings,
+          };
+          for (const binding of bucketBindings) {
+            const current = await binder.resolveCurrentBucketBinding(claim, binding.name);
+            if (
+              !current ||
+              current.identity.targetKey !== claim.targetKey ||
+              current.identity.principal !== claim.principal ||
+              current.identity.space !== claim.space ||
+              current.identity.resourceUid !== binding.resourceUid ||
+              typeof current.vector !== "string" ||
+              current.vector.length === 0
+            ) {
+              throw new Error("current ObjectBucket binding is unavailable");
+            }
+          }
+          if (!(await resolution.stillCurrent())) {
+            throw new Error("ObjectBucket binding reference graph changed");
+          }
+          objectBucketBoot = {
+            address: binder.address,
+            token: binder.issueGrant(claim),
+            bindings: bucketBindings.map(({ name }) => ({ publicName: name })),
+          };
+        }
+        const codeObjectBucketBoot = bucketBindings.length > 0 ? objectBucketBoot : undefined;
+        if (bucketBindings.length > 0 && !codeObjectBucketBoot) {
+          throw new Error("native ObjectBucket binding is unavailable");
+        }
+        const kvBindings = versionSpec.kvBindings.map((binding) => ({
+          name: binding.name,
+          resourceUid: binding.resource.resourceUid,
+        }));
+        let kvBoot:
+          | {
+              readonly address: string;
+              readonly token: string;
+              readonly bindings: readonly { readonly publicName: string }[];
+            }
+          | undefined;
+        if (kvBindings.length > 0) {
+          const binder = options.v2KvBinding;
+          if (!binder || !OPERATION_ID.test(version.sourceOperationId)) {
+            throw new Error("native KV binding is unavailable");
+          }
+          const claim: V2KvBindingGrant = {
+            principal: snapshot.worker.principal,
+            space: snapshot.worker.space,
+            targetKey: options.targetKey,
+            workerUid: snapshot.worker.uid,
+            workerVersionUid: version.uid,
+            workerVersionOperationId: version.sourceOperationId,
+            nativeVersionId: identity.versionId,
+            incarnationId: execution.operationId,
+            servingSourceOperationId: execution.operationId,
+            bindings: kvBindings,
+          };
+          for (const binding of kvBindings) {
+            const current = await binder.resolveCurrentBinding(claim, binding.name);
+            if (
+              !current ||
+              current.identity.targetKey !== claim.targetKey ||
+              current.identity.principal !== claim.principal ||
+              current.identity.space !== claim.space ||
+              current.identity.resourceUid !== binding.resourceUid ||
+              typeof current.vector !== "string" ||
+              current.vector.length === 0
+            ) {
+              throw new Error("current KV binding is unavailable");
+            }
+          }
+          if (!(await resolution.stillCurrent())) {
+            throw new Error("KV binding reference graph changed");
+          }
+          kvBoot = {
+            address: binder.address,
+            token: binder.issueGrant(claim),
+            bindings: kvBindings.map(({ name }) => ({ publicName: name })),
+          };
+        }
+        const codeKvBoot = kvBindings.length > 0 ? kvBoot : undefined;
+        if (kvBindings.length > 0 && !codeKvBoot) {
+          throw new Error("native KV binding is unavailable");
+        }
         const queueSettlement =
           versionSpec.handlers.includes("queue") && options.v2QueueSettlement !== undefined
             ? {
@@ -295,6 +441,13 @@ export function createV2WorkerPublication(options: {
           ...(configuredPrivateInputs ? { configuredPrivateInputs } : {}),
           ...(serviceBindings.length > 0 ? { resolvedServiceBindings: serviceBindings } : {}),
           ...(sqliteBindings.length > 0 ? { resolvedSqliteBindings: sqliteBindings } : {}),
+          ...(codeObjectBucketBoot
+            ? {
+                resolvedObjectBucketBindings: bucketBindings,
+                objectBucketBoot: codeObjectBucketBoot,
+              }
+            : {}),
+          ...(codeKvBoot ? { resolvedKvBindings: kvBindings, kvBoot: codeKvBoot } : {}),
           ...(sqliteBoot === undefined ? {} : { sqliteBoot }),
           ...(options.scheduledEventToken === undefined
             ? {}
@@ -339,6 +492,8 @@ export function createV2WorkerPublication(options: {
                   })),
                 },
               }),
+          ...(objectBucketBoot === undefined ? {} : { v2ObjectBucketBinding: objectBucketBoot }),
+          ...(kvBoot === undefined ? {} : { v2KvBinding: kvBoot }),
           hostnames: [],
           generation,
           workerResourceUid: snapshot.worker.uid,

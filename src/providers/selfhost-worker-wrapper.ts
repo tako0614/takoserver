@@ -31,6 +31,8 @@ import {
 import {
   isWorkerdV2PrivateServiceBindingName,
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
+  WORKERD_V2_PRIVATE_KV_BINDING,
+  WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
   WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING,
   WORKERD_V2_PRIVATE_READINESS_BINDING,
 } from "./workerd-v2-private-binding-names.ts";
@@ -266,6 +268,13 @@ export const SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER = "x-takoserver-selfhost-
 export const SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER =
   "x-takoserver-selfhost-object-result" as const;
 export const SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE = "application/octet-stream" as const;
+/** Private v2-only path; the legacy object data-plane URL remains unchanged. */
+export const SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH =
+  `${SELFHOST_DATA_PLANE_PATH_PREFIX}/objects/v2-binding` as const;
+export const SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN =
+  "http://takoserver-selfhost-v2-object.invalid" as const;
+export const SELFHOST_V2_OBJECT_MULTIPART_PARTS_CONTENT_TYPE =
+  "application/vnd.takoserver.selfhost-object.multipart-parts.v2+json" as const;
 /**
  * The ceiling on either header.
  *
@@ -315,6 +324,8 @@ export interface SelfhostWorkerDataBindingDescriptor {
     | typeof SELFHOST_WORKER_EDGE_SQL_BINDING_KIND
     | typeof SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND;
   readonly publicName: string;
+  /** Separate private native service used only by the v2 ObjectBucket facade. */
+  readonly internalName?: string;
 }
 
 /** A native workerd service projected as the fetch-only portable facade. */
@@ -855,8 +866,10 @@ function sealGeneratedConfiguration(raw) {
     if (SafeObjectHasOwn(source, "kind")) {
       descriptor.kind = source.kind;
       descriptor.publicName = source.publicName;
-      if (source.kind === SERVICE_KIND) {
+      if (SafeObjectHasOwn(source, "internalName")) {
         descriptor.internalName = source.internalName;
+      }
+      if (source.kind === SERVICE_KIND) {
         descriptor.unavailableToken = source.unavailableToken;
       }
     } else {
@@ -964,8 +977,8 @@ function projectEnv(rawEnv) {
     throw portableError("backend_unavailable");
   }
   const projected = SafeObjectCreate(null);
-  let call;
-  let objectCall;
+  const planeCalls = new SafeMap();
+  const objectCalls = new SafeMap();
   for (let index = 0; index < CONFIGURATION.bindings.length; index += 1) {
     const descriptor = CONFIGURATION.bindings[index];
     if (SafeObjectHasOwn(descriptor, "kind")) {
@@ -976,14 +989,28 @@ function projectEnv(rawEnv) {
       // The object facade streams, so it has a caller of its own: everything
       // else on this seam is one JSON envelope in and one out.
       if (descriptor.kind === OBJECTS_KIND) {
-        if (!objectCall) objectCall = createObjectCaller(rawEnv);
-        projected[descriptor.publicName] = createObjectsAdapter(objectCall, descriptor.publicName);
+        const objectService = descriptor.internalName || DATA_SERVICE;
+        let objectCall = SafeApply(SafeMapGet, objectCalls, [objectService]);
+        if (!objectCall) {
+          objectCall = createObjectCaller(rawEnv, descriptor.internalName);
+          SafeApply(SafeMapSet, objectCalls, [objectService, objectCall]);
+        }
+        projected[descriptor.publicName] = createObjectsAdapter(
+          objectCall,
+          descriptor.publicName,
+          descriptor.internalName !== undefined,
+        );
         continue;
       }
-      if (!call) call = createPlaneCaller(rawEnv);
+      const planeService = descriptor.internalName || DATA_SERVICE;
+      let call = SafeApply(SafeMapGet, planeCalls, [planeService]);
+      if (!call) {
+        call = createPlaneCaller(rawEnv, descriptor.internalName);
+        SafeApply(SafeMapSet, planeCalls, [planeService, call]);
+      }
       projected[descriptor.publicName] =
         descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_KV_BINDING_KIND)}
-          ? createKvAdapter(call, descriptor.publicName)
+          ? createKvAdapter(call, descriptor.publicName, descriptor.internalName !== undefined)
           : descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND)}
             ? createQueueAdapter(call, descriptor.publicName)
             : descriptor.kind === VECTOR_KIND
@@ -1560,7 +1587,7 @@ function validateQueueSendOptions(options) {
  * its receipt ledger in a private Durable Object while R2 owns the native
  * upload, which is the recovery difference ADR 0007 names between runtimes.
  */
-function createObjectsAdapter(call, binding) {
+function createObjectsAdapter(call, binding, v2PrivateObject) {
   const multipart = new SafeMap();
   const portable = SafeObjectCreate(null);
   portable.head = async function (key) {
@@ -1721,8 +1748,15 @@ function createObjectsAdapter(call, binding) {
     validateKnownObjectParts(multipart, key, uploadId, parts);
     const document = objectDocument(binding, "completeMultipartUpload", key);
     document.uploadId = uploadId;
-    document.parts = parts;
-    const value = objectJson(await call(document));
+    let body;
+    let contentType;
+    if (v2PrivateObject) {
+      body = SafeApply(SafeTextEncoderEncode, encoder, [SafeJSONStringify({ parts })]);
+      contentType = ${JSON.stringify(SELFHOST_V2_OBJECT_MULTIPART_PARTS_CONTENT_TYPE)};
+    } else {
+      document.parts = parts;
+    }
+    const value = objectJson(await call(document, body, contentType));
     const result = SafeObjectCreate(null);
     result.etag = objectEtag(value.etag);
     result.size = objectSize(value.size);
@@ -1749,19 +1783,23 @@ function createObjectsAdapter(call, binding) {
  * so this module can name an operation and nothing else — not a destination,
  * not a token, and not a second route on this machine.
  */
-function createObjectCaller(rawEnv) {
-  const service = rawEnv[DATA_SERVICE];
+function createObjectCaller(rawEnv, internalName) {
+  const service = rawEnv[internalName || DATA_SERVICE];
   const send = captureMethod(service, "fetch");
-  return async (document, body) => {
+  return async (document, body, requestContentType) => {
     const headers = SafeObjectCreate(null);
     headers[OBJECT_REQUEST_HEADER] = encodeObjectDocument(document);
+    if (requestContentType !== undefined) headers["content-type"] = requestContentType;
     const init = SafeObjectCreate(null);
     init.method = "POST";
     init.headers = headers;
     if (body !== undefined) init.body = body;
     let response;
     try {
-      response = await SafeApply(send, service, [OBJECTS_URL, init]);
+      const url = internalName
+        ? ${JSON.stringify(`${SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN}${SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH}`)}
+        : OBJECTS_URL;
+      response = await SafeApply(send, service, [url, init]);
     } catch {
       throw portableError("backend_unavailable");
     }
@@ -2381,8 +2419,8 @@ function freezeObject(value) {
  * the plane address and rewrites every request it is handed. This module can
  * name one of two paths and a JSON body; it cannot name a destination.
  */
-function createPlaneCaller(rawEnv) {
-  const service = rawEnv[DATA_SERVICE];
+function createPlaneCaller(rawEnv, internalName) {
+  const service = rawEnv[internalName || DATA_SERVICE];
   const send = captureMethod(service, "fetch");
   return async (url, payload, codes, project) => {
     const headers = SafeObjectCreate(null);
@@ -2437,25 +2475,31 @@ function planeRequest(binding, op) {
   return payload;
 }
 
-function createKvAdapter(call, binding) {
+function createKvAdapter(call, binding, strictTypes) {
   const portable = SafeObjectCreate(null);
-  portable.get = async (key) => {
-    const found = await kvRead(call, binding, key, "get");
+  portable.get = async (...args) => {
+    if (strictTypes && args.length !== 1) throw new SafeTypeError("Invalid EdgeKV arguments");
+    const found = await kvRead(call, binding, args[0], "get", strictTypes);
     return found === null ? null : found.value;
   };
-  portable.getWithMetadata = async (key) => {
-    const found = await kvRead(call, binding, key, "getWithMetadata");
+  portable.getWithMetadata = async (...args) => {
+    if (strictTypes && args.length !== 1) throw new SafeTypeError("Invalid EdgeKV arguments");
+    const found = await kvRead(call, binding, args[0], "getWithMetadata", strictTypes);
     if (found === null) return null;
     const result = SafeObjectCreate(null);
     result.value = found.value;
     if (found.metadata !== undefined) result.metadata = found.metadata;
     return result;
   };
-  portable.put = async (key, value, options) => {
-    validateKey(key, MAX_KV_KEY_BYTES);
-    const bytes = runtimeBytes(value, "invalid_value");
+  portable.put = async (...args) => {
+    if (strictTypes && (args.length < 2 || args.length > 3)) {
+      throw new SafeTypeError("Invalid EdgeKV arguments");
+    }
+    const [key, value, options] = args;
+    validateKey(key, MAX_KV_KEY_BYTES, strictTypes);
+    const bytes = runtimeBytes(value, "invalid_value", strictTypes);
     if (viewByteLength(bytes) > MAX_KV_VALUE_BYTES) throw portableError("value_too_large");
-    const normalized = validateKvPutOptions(options);
+    const normalized = validateKvPutOptions(options, strictTypes);
     const payload = planeRequest(binding, "put");
     payload.key = key;
     payload.value = encodeBase64(bytes);
@@ -2466,15 +2510,19 @@ function createKvAdapter(call, binding) {
     const value_ = await call(KV_URL, payload, KV_ERROR_CODES);
     if (!isRecord(value_) || !exactKeys(value_, [])) throw portableError("backend_unavailable");
   };
-  portable.delete = async (key) => {
-    validateKey(key, MAX_KV_KEY_BYTES);
+  portable.delete = async (...args) => {
+    if (strictTypes && args.length !== 1) throw new SafeTypeError("Invalid EdgeKV arguments");
+    const [key] = args;
+    validateKey(key, MAX_KV_KEY_BYTES, strictTypes);
     const payload = planeRequest(binding, "delete");
     payload.key = key;
     const value = await call(KV_URL, payload, KV_ERROR_CODES);
     if (!isRecord(value) || !exactKeys(value, [])) throw portableError("backend_unavailable");
   };
-  portable.list = async (options) => {
-    const normalized = validateKvListOptions(options);
+  portable.list = async (...args) => {
+    if (strictTypes && args.length > 1) throw new SafeTypeError("Invalid EdgeKV arguments");
+    const [options] = args;
+    const normalized = validateKvListOptions(options, strictTypes);
     const payload = planeRequest(binding, "list");
     if (normalized.prefix !== undefined) payload.prefix = normalized.prefix;
     if (normalized.cursor !== undefined) payload.cursor = normalized.cursor;
@@ -2510,8 +2558,8 @@ function createKvAdapter(call, binding) {
   return portable;
 }
 
-async function kvRead(call, binding, key, op) {
-  validateKey(key, MAX_KV_KEY_BYTES);
+async function kvRead(call, binding, key, op, strictTypes) {
+  validateKey(key, MAX_KV_KEY_BYTES, strictTypes);
   const payload = planeRequest(binding, op);
   payload.key = key;
   const value = await call(KV_URL, payload, KV_ERROR_CODES);
@@ -2519,7 +2567,7 @@ async function kvRead(call, binding, key, op) {
     throw portableError("backend_unavailable");
   }
   if (!value.found) return null;
-  if (!isCanonicalBase64(value.value, MAX_KV_VALUE_BYTES)) {
+  if (!isCanonicalKvBase64(value.value, MAX_KV_VALUE_BYTES)) {
     throw portableError("backend_unavailable");
   }
   const result = SafeObjectCreate(null);
@@ -2657,13 +2705,20 @@ function projectSqlValue(value, output) {
   throw portableError(output ? "backend_unavailable" : "sql_error");
 }
 
-function validateKvPutOptions(options) {
+function validateKvPutOptions(options, strictTypes) {
   if (options === undefined) return SafeObjectCreate(null);
-  if (!isRecord(options) || !onlyKeys(options, ["expirationTtlSeconds", "metadata"])) {
+  if (
+    !(strictTypes ? isPlainRecord(options) : isRecord(options)) ||
+    !onlyKeys(options, ["expirationTtlSeconds", "metadata"])
+  ) {
+    if (strictTypes) throw new SafeTypeError("Invalid EdgeKV options");
     throw portableError("invalid_value");
   }
   const result = SafeObjectCreate(null);
   if (options.expirationTtlSeconds !== undefined) {
+    if (strictTypes && typeof options.expirationTtlSeconds !== "number") {
+      throw new SafeTypeError("Invalid EdgeKV expirationTtlSeconds");
+    }
     if (
       !SafeNumberIsSafeInteger(options.expirationTtlSeconds) ||
       options.expirationTtlSeconds < 60 ||
@@ -2674,8 +2729,11 @@ function validateKvPutOptions(options) {
     result.expirationTtlSeconds = options.expirationTtlSeconds;
   }
   if (options.metadata !== undefined) {
-    if (!isRecord(options.metadata)) throw portableError("invalid_value");
-    const metadata = projectStringRecord(options.metadata);
+    if (!(strictTypes ? isPlainRecord(options.metadata) : isRecord(options.metadata))) {
+      if (strictTypes) throw new SafeTypeError("Invalid EdgeKV metadata");
+      throw portableError("invalid_value");
+    }
+    const metadata = projectStringRecord(options.metadata, strictTypes);
     if (utf8Length(SafeJSONStringify(metadata)) > MAX_KV_METADATA_BYTES) {
       throw portableError("metadata_too_large");
     }
@@ -2684,23 +2742,37 @@ function validateKvPutOptions(options) {
   return result;
 }
 
-function validateKvListOptions(options) {
+function validateKvListOptions(options, strictTypes) {
   if (options === undefined) return SafeObjectCreate(null);
-  if (!isRecord(options) || !onlyKeys(options, ["prefix", "cursor", "limit"])) {
+  if (
+    !(strictTypes ? isPlainRecord(options) : isRecord(options)) ||
+    !onlyKeys(options, ["prefix", "cursor", "limit"])
+  ) {
+    if (strictTypes) throw new SafeTypeError("Invalid EdgeKV list options");
     throw portableError("invalid_argument");
   }
   const result = SafeObjectCreate(null);
   if (options.prefix !== undefined) {
-    if (typeof options.prefix !== "string" || utf8Length(options.prefix) > MAX_KV_KEY_BYTES) {
+    if (typeof options.prefix !== "string") {
+      if (strictTypes) throw new SafeTypeError("Invalid EdgeKV prefix");
+      throw portableError("invalid_key");
+    }
+    if (utf8Length(options.prefix) > MAX_KV_KEY_BYTES) {
       throw portableError("invalid_key");
     }
     result.prefix = options.prefix;
   }
   if (options.cursor !== undefined) {
+    if (strictTypes && typeof options.cursor !== "string") {
+      throw new SafeTypeError("Invalid EdgeKV cursor");
+    }
     if (!boundedText(options.cursor, 4096)) throw portableError("invalid_cursor");
     result.cursor = options.cursor;
   }
   if (options.limit !== undefined) {
+    if (strictTypes && typeof options.limit !== "number") {
+      throw new SafeTypeError("Invalid EdgeKV limit");
+    }
     if (!SafeNumberIsSafeInteger(options.limit) || options.limit < 1 || options.limit > 1000) {
       throw portableError("invalid_argument");
     }
@@ -2709,7 +2781,7 @@ function validateKvListOptions(options) {
   return result;
 }
 
-function runtimeBytes(value, code) {
+function runtimeBytes(value, code, strictTypes) {
   if (typeof value === "string") return SafeApply(SafeTextEncoderEncode, encoder, [value]);
   try { return new SafeUint8Array(SafeApply(SafeArrayBufferSlice, value, [0])); } catch {}
   if (SafeArrayBufferIsView(value)) {
@@ -2723,10 +2795,14 @@ function runtimeBytes(value, code) {
         buffer = SafeApply(SafeDataViewBufferGet, value, []);
         byteOffset = SafeApply(SafeDataViewByteOffsetGet, value, []);
         byteLength = SafeApply(SafeDataViewByteLengthGet, value, []);
-      } catch { throw portableError(code); }
+      } catch {
+        if (strictTypes) throw new SafeTypeError("Invalid EdgeKV value");
+        throw portableError(code);
+      }
     }
     return new SafeUint8Array(SafeApply(SafeArrayBufferSlice, buffer, [byteOffset, byteOffset + byteLength]));
   }
+  if (strictTypes) throw new SafeTypeError("Invalid EdgeKV value");
   throw portableError(code);
 }
 
@@ -2761,11 +2837,58 @@ function isCanonicalBase64(value, maximumBytes) {
   } catch { return false; }
 }
 
+/**
+ * KV values may be the full 25 MiB contract limit. Validate their base64
+ * spelling with bounded linear scans rather than a backtracking expression,
+ * which can overflow the runtime stack on a valid large response.
+ */
+function isCanonicalKvBase64(value, maximumBytes) {
+  if (typeof value !== "string" || value.length % 4 !== 0) return false;
+  const length = value.length;
+  let padding = 0;
+  if (length > 0 && SafeApply(SafeStringCharCodeAt, value, [length - 1]) === 61) {
+    padding = 1;
+    if (length > 1 && SafeApply(SafeStringCharCodeAt, value, [length - 2]) === 61) padding = 2;
+  }
+  const dataLength = length - padding;
+  if (
+    (padding === 1 && dataLength % 4 !== 3) ||
+    (padding === 2 && dataLength % 4 !== 2) ||
+    (padding === 0 && dataLength % 4 !== 0) ||
+    (length / 4) * 3 - padding > maximumBytes
+  ) {
+    return false;
+  }
+  for (let index = 0; index < dataLength; index += 1) {
+    if (base64Sextet(SafeApply(SafeStringCharCodeAt, value, [index])) < 0) return false;
+  }
+  if (padding === 1) {
+    const finalSextet = base64Sextet(SafeApply(SafeStringCharCodeAt, value, [dataLength - 1]));
+    if ((finalSextet & 0b11) !== 0) return false;
+  } else if (padding === 2) {
+    const finalSextet = base64Sextet(SafeApply(SafeStringCharCodeAt, value, [dataLength - 1]));
+    if ((finalSextet & 0b1111) !== 0) return false;
+  }
+  return true;
+}
+
+function base64Sextet(code) {
+  if (code >= 65 && code <= 90) return code - 65;
+  if (code >= 97 && code <= 122) return code - 71;
+  if (code >= 48 && code <= 57) return code + 4;
+  if (code === 43) return 62;
+  if (code === 47) return 63;
+  return -1;
+}
+
 // Metadata that is the wrong kind of thing is invalid_value; only too much of
 // it is metadata_too_large. Answering a size refusal to a one-member record
 // whose value is a number sends the caller to shrink what is already small.
-function projectStringRecord(value) {
-  if (!isRecord(value)) throw portableError("invalid_value");
+function projectStringRecord(value, strictTypes) {
+  if (!(strictTypes ? isPlainRecord(value) : isRecord(value))) {
+    if (strictTypes) throw new SafeTypeError("Invalid EdgeKV metadata");
+    throw portableError("invalid_value");
+  }
   const keys = SafeObjectKeys(value);
   sortStrings(keys);
   if (SafeOwnKeys(value).length !== keys.length) throw portableError("invalid_value");
@@ -2774,7 +2897,10 @@ function projectStringRecord(value) {
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index];
     const item = value[key];
-    if (typeof item !== "string") throw portableError("invalid_value");
+    if (typeof item !== "string") {
+      if (strictTypes) throw new SafeTypeError("Invalid EdgeKV metadata value");
+      throw portableError("invalid_value");
+    }
     if (key.length > 256 || item.length > 8192) {
       throw portableError("metadata_too_large");
     }
@@ -2795,7 +2921,10 @@ function sortStrings(values) {
   }
 }
 
-function validateKey(value, maximum) {
+function validateKey(value, maximum, strictTypes) {
+  if (strictTypes && typeof value !== "string") {
+    throw new SafeTypeError("Invalid EdgeKV key");
+  }
   if (!boundedUtf8(value, maximum)) throw portableError("invalid_key");
 }
 
@@ -2958,14 +3087,41 @@ function normalizeSourceInput(
         });
         continue;
       }
-      exactNormalizedKeys(binding, ["kind", "publicName"], "bindings");
+      const privateObjectService =
+        binding.kind === SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND &&
+        Object.hasOwn(binding, "internalName");
+      const privateKvService =
+        binding.kind === SELFHOST_WORKER_EDGE_KV_BINDING_KIND &&
+        Object.hasOwn(binding, "internalName");
+      exactNormalizedKeys(
+        binding,
+        privateObjectService || privateKvService
+          ? ["kind", "publicName", "internalName"]
+          : ["kind", "publicName"],
+        "bindings",
+      );
       if (typeof binding.kind !== "string" || !DATA_BINDING_KINDS.has(binding.kind)) {
+        invalid("bindings");
+      }
+      if (
+        privateObjectService &&
+        (!v2PrivateNames || binding.internalName !== WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING)
+      ) {
+        invalid("bindings");
+      }
+      if (
+        privateKvService &&
+        (!v2PrivateNames || binding.internalName !== WORKERD_V2_PRIVATE_KV_BINDING)
+      ) {
         invalid("bindings");
       }
       validatePublicName(binding.publicName, publicNames, false, v2PrivateNames);
       bindings.push({
         kind: binding.kind as SelfhostWorkerDataBindingDescriptor["kind"],
         publicName: binding.publicName as string,
+        ...(privateObjectService || privateKvService
+          ? { internalName: binding.internalName as string }
+          : {}),
       });
       continue;
     }

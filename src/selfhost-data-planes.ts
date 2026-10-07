@@ -1529,10 +1529,7 @@ function encodeBase64(bytes: Uint8Array): string {
 }
 
 function decodeBase64(value: unknown, maximum: number, tooLarge: PlaneErrorCode): Uint8Array {
-  if (
-    typeof value !== "string" ||
-    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value)
-  ) {
+  if (typeof value !== "string" || !isBase64(value)) {
     throw new PlaneError("invalid_value");
   }
   let binary: string;
@@ -1545,6 +1542,37 @@ function decodeBase64(value: unknown, maximum: number, tooLarge: PlaneErrorCode)
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
   return bytes;
+}
+
+/** The equivalent of the former anchored grammar without a large-input regex. */
+function isBase64(value: string): boolean {
+  const length = value.length;
+  if (length % 4 !== 0) return false;
+  let padding = 0;
+  if (length > 0 && value.charCodeAt(length - 1) === 61) {
+    padding = 1;
+    if (length > 1 && value.charCodeAt(length - 2) === 61) padding = 2;
+  }
+  if (padding > 0 && length < 4) return false;
+  const dataLength = length - padding;
+  for (let index = 0; index < dataLength; index += 1) {
+    const code = value.charCodeAt(index);
+    if (
+      !(
+        (code >= 65 && code <= 90) ||
+        (code >= 97 && code <= 122) ||
+        (code >= 48 && code <= 57) ||
+        code === 43 ||
+        code === 47
+      )
+    ) {
+      return false;
+    }
+  }
+  for (let index = dataLength; index < length; index += 1) {
+    if (value.charCodeAt(index) !== 61) return false;
+  }
+  return true;
 }
 
 function decodeBase64Url(value: string, maximum: number): Uint8Array {

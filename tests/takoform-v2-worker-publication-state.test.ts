@@ -276,7 +276,12 @@ test("accepted Deployment overlays only its own operation and fences every graph
     expect(resolved.kind).toBe("ready");
     if (resolved.kind !== "ready") return;
     expect(resolved.snapshot.deployment?.versions).toMatchObject([
-      { uid: version.resourceUid, weight: 10_000, spec: { handlers: ["fetch"] } },
+      {
+        uid: version.resourceUid,
+        weight: 10_000,
+        spec: { handlers: ["fetch"] },
+        sourceOperationId: version.id,
+      },
     ]);
     expect(resolved.snapshot.endpoint).toBeNull();
     expect(Object.isFrozen(resolved.snapshot.deployment?.versions[0]?.spec)).toBe(true);

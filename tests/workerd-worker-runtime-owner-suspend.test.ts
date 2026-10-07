@@ -144,6 +144,8 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
       versions: [
         {
           uid: "version-suspend",
+          // This fixture does not create WorkerVersion Core rows.
+          sourceOperationId: "fixture-version-operation-suspend",
           generation: 1,
           weight: 10_000,
           spec: versionSpec,

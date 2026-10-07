@@ -33,6 +33,9 @@ import {
   SELFHOST_DATA_PLANE_PROTOCOL,
   SELFHOST_DATA_PLANE_SQL_PATH,
   SELFHOST_DATA_PLANE_VECTOR_PATH,
+  SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN,
+  SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH,
+  SELFHOST_V2_OBJECT_MULTIPART_PARTS_CONTENT_TYPE,
   SELFHOST_WORKER_DATA_SERVICE_BINDING,
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
@@ -50,6 +53,11 @@ import {
   selfhostReadinessFailureMessage,
   selfhostWorkerEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
+import {
+  WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
+  WORKERD_V2_PRIVATE_KV_BINDING,
+  WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+} from "../src/providers/workerd-v2-private-binding-names.ts";
 
 /**
  * The generated entrypoint is the only thing standing between a tenant's module
@@ -126,7 +134,19 @@ async function loadGenerated(
     selfhostWorkerPreludeSource(),
   );
   const wrapperPath = join(root, "wrapper.mjs");
-  await Bun.write(wrapperPath, selfhostWorkerEntrypointSource(input));
+  await Bun.write(
+    wrapperPath,
+    selfhostWorkerEntrypointSource(
+      input,
+      input.bindings.some(
+        (binding) =>
+          "kind" in binding &&
+          (binding.kind === SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND ||
+            binding.kind === SELFHOST_WORKER_EDGE_KV_BINDING_KIND) &&
+          "internalName" in binding,
+      ),
+    ),
+  );
   const loaded = (await import(
     `${pathToFileURL(wrapperPath).href}?test=${crypto.randomUUID()}`
   )) as {
@@ -2070,6 +2090,277 @@ test("a multipart complete is refused against the receipts this isolate holds", 
       uploadId: "upload-1",
       part: { etag: "part-1", partNumber: 1 },
       refused: "invalid_part",
+    });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("v2 ObjectBucket uses its private service and streams a 10,000-part manifest as a body", async () => {
+  const documents: Record<string, unknown>[] = [];
+  let complete:
+    | { readonly document: Record<string, unknown>; readonly parts: unknown[] }
+    | undefined;
+  const v2Service = {
+    async fetch(url: string, init: RequestInit) {
+      const headers = init.headers as Record<string, string>;
+      const document = JSON.parse(
+        Buffer.from(headers[SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER] ?? "", "base64url").toString(
+          "utf8",
+        ),
+      ) as Record<string, unknown>;
+      documents.push(document);
+      if (document.op === "completeMultipartUpload") {
+        expect(url).toBe(
+          `${SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN}${SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH}`,
+        );
+        expect(headers["content-type"]).toBe(SELFHOST_V2_OBJECT_MULTIPART_PARTS_CONTENT_TYPE);
+        const body = JSON.parse(await new Response(init.body).text()) as { parts: unknown[] };
+        complete = { document, parts: body.parts };
+        return Response.json({ ok: true, value: { etag: "whole", size: 1 } });
+      }
+      if (document.op === "createMultipartUpload") {
+        return Response.json({ ok: true, value: { uploadId: "upload-v2" } });
+      }
+      if (document.op === "uploadPart") {
+        return Response.json({
+          ok: true,
+          value: { etag: `etag-${document.partNumber}`, partNumber: document.partNumber },
+        });
+      }
+      return Response.json({ ok: false, error: { code: "backend_unavailable" } });
+    },
+  };
+  const legacyService = {
+    async fetch() {
+      throw new Error("v2 object binding must not use the legacy data service");
+    },
+  };
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const parts = Array.from({ length: 10000 }, (_, index) => ({
+         etag: "etag-" + (index + 1), partNumber: index + 1
+       }));
+       const done = await env.MEDIA.completeMultipartUpload("large", "upload-v2", parts);
+       return Response.json(done);
+     } };`,
+    {
+      ...OBJECTS_ONLY,
+      publication: "v2-private-publication",
+      bindings: [
+        {
+          kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
+          publicName: "MEDIA",
+          internalName: WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+        },
+      ],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(legacyService, { [WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING]: v2Service }),
+      context,
+    );
+    expect(response.status).toBe(200);
+    expect(JSON.parse(await response.text())).toEqual({ etag: "whole", size: 1 });
+    expect(documents).toHaveLength(1);
+    const recorded = complete;
+    expect(recorded).toBeDefined();
+    if (!recorded) throw new Error("expected multipart body capture");
+    expect(recorded.document).not.toHaveProperty("parts");
+    expect(recorded.parts).toHaveLength(10_000);
+    expect((recorded.parts[0] as { partNumber: number }).partNumber).toBe(1);
+    expect((recorded.parts[9_999] as { partNumber: number }).partNumber).toBe(10_000);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("generic and private ObjectBucket bindings use their own services in one Worker", async () => {
+  const genericRequests: string[] = [];
+  const privateRequests: string[] = [];
+  const genericService = {
+    async fetch(url: string) {
+      genericRequests.push(url);
+      return Response.json({ ok: true, value: { found: false } });
+    },
+  };
+  const privateService = {
+    async fetch(url: string) {
+      privateRequests.push(url);
+      return Response.json({ ok: true, value: { found: false } });
+    },
+  };
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const legacy = await env.LEGACY.head("legacy-key");
+       const bucket = await env.MEDIA.head("bucket-key");
+       return Response.json({ legacy, bucket });
+     } };`,
+    {
+      ...OBJECTS_ONLY,
+      publication: "mixed-object-services",
+      bindings: [
+        { kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND, publicName: "LEGACY" },
+        {
+          kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
+          publicName: "MEDIA",
+          internalName: WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+        },
+      ],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(genericService, {
+        [WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING]: genericService,
+        [WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING]: privateService,
+      }),
+      context,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ legacy: null, bucket: null });
+    expect(genericRequests).toHaveLength(1);
+    expect(privateRequests).toHaveLength(1);
+    expect(genericRequests[0]).toBe(
+      `${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`,
+    );
+    expect(privateRequests[0]).toBe(
+      `${SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN}${SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH}`,
+    );
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("generic and private KV bindings use their own services in one Worker", async () => {
+  const genericRequests: string[] = [];
+  const privateRequests: string[] = [];
+  const response = () => Response.json({ ok: true, value: {} });
+  const genericService = {
+    async fetch(url: string) {
+      genericRequests.push(url);
+      return response();
+    },
+  };
+  const privateService = {
+    async fetch(url: string) {
+      privateRequests.push(url);
+      return response();
+    },
+  };
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       await env.LEGACY.put("legacy-key", "legacy");
+       await env.CACHE.put("v2-key", "private");
+       return Response.json({ ok: true });
+     } };`,
+    {
+      ...KV_ONLY,
+      publication: "mixed-kv-services",
+      bindings: [
+        { kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND, publicName: "LEGACY" },
+        {
+          kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
+          publicName: "CACHE",
+          internalName: WORKERD_V2_PRIVATE_KV_BINDING,
+        },
+      ],
+    },
+  );
+  try {
+    const result = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(genericService, {
+        [WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING]: genericService,
+        [WORKERD_V2_PRIVATE_KV_BINDING]: privateService,
+      }),
+      context,
+    );
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({ ok: true });
+    expect(genericRequests).toHaveLength(1);
+    expect(privateRequests).toHaveLength(1);
+    expect(genericRequests[0]).toEndWith(SELFHOST_DATA_PLANE_KV_PATH);
+    expect(privateRequests[0]).toEndWith(SELFHOST_DATA_PLANE_KV_PATH);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("private v2 KV preserves EdgeKV argument TypeErrors without changing legacy KV behavior", async () => {
+  const genericService = {
+    async fetch(_url: string, init: RequestInit) {
+      const request = JSON.parse(String(init.body)) as { op: string };
+      return Response.json({
+        ok: true,
+        value:
+          request.op === "get"
+            ? { found: false }
+            : request.op === "list"
+              ? { keys: [], listComplete: true }
+              : {},
+      });
+    },
+  };
+  const privateService = {
+    async fetch(_url: string, init: RequestInit) {
+      const request = JSON.parse(String(init.body)) as { op: string };
+      return Response.json({
+        ok: true,
+        value:
+          request.op === "get"
+            ? { found: false }
+            : request.op === "list"
+              ? { keys: [], listComplete: true }
+              : {},
+      });
+    },
+  };
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const errors = {};
+       const record = async (name, run) => {
+         try { await run(); errors[name] = "resolved"; }
+         catch (error) { errors[name] = error.name; }
+       };
+       await record("privateMetadataType", () => env.CACHE.put("k", "v", { metadata: "no" }));
+       await record("privateListLimitType", () => env.CACHE.list({ limit: "10" }));
+       await record("privateExtraGetArgument", () => env.CACHE.get("k", "ignored"));
+       await record("legacyMetadataType", () => env.LEGACY.put("k", "v", { metadata: "no" }));
+       await record("legacyExtraGetArgument", () => env.LEGACY.get("k", "ignored"));
+       return Response.json(errors);
+     } };`,
+    {
+      ...KV_ONLY,
+      publication: "private-kv-types",
+      bindings: [
+        { kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND, publicName: "LEGACY" },
+        {
+          kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
+          publicName: "CACHE",
+          internalName: WORKERD_V2_PRIVATE_KV_BINDING,
+        },
+      ],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(genericService, {
+        [WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING]: genericService,
+        [WORKERD_V2_PRIVATE_KV_BINDING]: privateService,
+      }),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      privateMetadataType: "TypeError",
+      privateListLimitType: "TypeError",
+      privateExtraGetArgument: "TypeError",
+      legacyMetadataType: "invalid_value",
+      legacyExtraGetArgument: "resolved",
     });
   } finally {
     await generated.dispose();

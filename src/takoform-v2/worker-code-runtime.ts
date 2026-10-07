@@ -15,6 +15,9 @@ import type { WorkerBundleManifest } from "./forms/worker-bundle.ts";
 import {
   prepareV2WorkerCodeProjection,
   snapshotV2WorkerPrivateInputs,
+  type V2KvNativeBoot,
+  type V2ResolvedKvBinding,
+  type V2ResolvedObjectBucketBinding,
   type V2ResolvedSqliteBinding,
   type V2SqliteNativeBoot,
   V2WorkerCodeRuntimeError,
@@ -23,6 +26,9 @@ import type { V2ResolvedServiceBinding } from "./worker-service-resolution.ts";
 
 export {
   inspectV2WorkerCodeVersionEligibility,
+  type V2KvNativeBoot,
+  type V2ResolvedKvBinding,
+  type V2ResolvedObjectBucketBinding,
   type V2ResolvedSqliteBinding,
   type V2SqliteNativeBoot,
   V2WorkerCodeRuntimeError,
@@ -64,8 +70,14 @@ export async function projectV2WorkerCodeVersion(input: {
   readonly configuredPrivateInputs?: unknown;
   readonly resolvedServiceBindings?: readonly V2ResolvedServiceBinding[];
   readonly resolvedSqliteBindings?: readonly V2ResolvedSqliteBinding[];
+  readonly resolvedObjectBucketBindings?: readonly V2ResolvedObjectBucketBinding[];
+  readonly resolvedKvBindings?: readonly V2ResolvedKvBinding[];
   /** Signed by the fixed Host-private broker after selected native ID is known. */
   readonly sqliteBoot?: V2SqliteNativeBoot;
+  /** Exact selected-Version grant for the private ObjectBucket dispatcher. */
+  readonly objectBucketBoot?: import("./worker-code-eligibility.ts").V2ObjectBucketNativeBoot;
+  /** Exact selected-Version grant for the private KV data-service facade. */
+  readonly kvBoot?: V2KvNativeBoot;
   /** Non-optional private event gate capability composed by the owning Host. */
   readonly eventDelivery?: { readonly token: string };
   /** Exact private settlement binding selected before tenant materialization. */
@@ -94,6 +106,24 @@ export async function projectV2WorkerCodeVersion(input: {
   } catch {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
+  let resolvedObjectBucketBindings: readonly V2ResolvedObjectBucketBinding[] | undefined;
+  try {
+    resolvedObjectBucketBindings = input.resolvedObjectBucketBindings?.map((binding) => ({
+      name: binding.name,
+      resourceUid: binding.resourceUid,
+    }));
+  } catch {
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
+  }
+  let resolvedKvBindings: readonly V2ResolvedKvBinding[] | undefined;
+  try {
+    resolvedKvBindings = input.resolvedKvBindings?.map((binding) => ({
+      name: binding.name,
+      resourceUid: binding.resourceUid,
+    }));
+  } catch {
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
+  }
   const verified = await prepareV2WorkerCodeProjection({
     workerResourceUid: identity.workerResourceUid,
     bundleResourceUid: identity.bundleResourceUid,
@@ -108,7 +138,11 @@ export async function projectV2WorkerCodeVersion(input: {
     ...(configuredPrivateInputs === undefined ? {} : { configuredPrivateInputs }),
     ...(resolvedServiceBindings === undefined ? {} : { resolvedServiceBindings }),
     ...(resolvedSqliteBindings === undefined ? {} : { resolvedSqliteBindings }),
+    ...(resolvedObjectBucketBindings === undefined ? {} : { resolvedObjectBucketBindings }),
+    ...(resolvedKvBindings === undefined ? {} : { resolvedKvBindings }),
     ...(input.sqliteBoot === undefined ? {} : { sqliteBoot: input.sqliteBoot }),
+    ...(input.objectBucketBoot === undefined ? {} : { objectBucketBoot: input.objectBucketBoot }),
+    ...(input.kvBoot === undefined ? {} : { kvBoot: input.kvBoot }),
     requireEventDelivery: true,
     ...(input.eventDelivery === undefined ? {} : { eventDelivery: input.eventDelivery }),
     ...(input.queueSettlement === undefined ? {} : { queueSettlement: input.queueSettlement }),
@@ -195,6 +229,15 @@ export async function projectV2WorkerCodeVersion(input: {
                 kind: "text" as const,
               },
             ],
+          },
+        }
+      : {}),
+    ...(verified.kvBoot
+      ? {
+          v2KvBinding: {
+            address: verified.kvBoot.address,
+            token: verified.kvBoot.token,
+            bindings: verified.kvBoot.bindings,
           },
         }
       : {}),
