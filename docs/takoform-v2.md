@@ -612,6 +612,12 @@ SQL graph and held bytes to the exact native owner and selected Version. A nativ
 Host journey covers durable ACK, retry, Consumer update and deletion refusal.
 External currentness preflight occurs outside the owner's serial lane; native
 identity, SQL source and one-send authorization remain checked inside it.
+The same internal composition also keeps an execution outstanding after durable
+ACK while native `waitUntil` work remains. Closing the scheduler refuses new
+ticks but does not release that execution; the native handler's later completion
+permits retirement and reference-ordered deletion. This same-process test does
+not prove owner suspension with pending work, retention beyond expiry, response
+loss, or delivery settlement after an OS restart.
 
 SQLite calls now use a separate private streaming transport rather than the
 shared 40 MiB buffered companion path. The operator supplies a pre-existing
@@ -670,6 +676,17 @@ to a different expression, and delete in reference order. It also confirms that
 closing an in-flight delivery keeps its late native result unknown in SQL.
 Those native ABI tests run within one Host process; they do not replace the
 stand-in process-restart test or qualify native delivery after an OS restart.
+
+A separate pinned-workerd process journey persists the real organization,
+API-key identity, accepted Worker graph, Cron Attachment and match in the same
+SQLite database. It SIGKILLs an identity-checked Host, restores with different
+Host and native child PIDs, resolves the same match through a second attempt,
+then checks Cron update, retrieval and reference-ordered deletion. Normal
+teardown requires the child fixture's post-owner-stop witness and zero exit;
+unproven shutdown retains its workspace. Effects are observed inside the native
+module, not in an external durable destination. This proves that local native
+restart path, not exactly-once external effects, an independent response-loss
+case, ordinary-entry Form registration, or Hosted qualification.
 
 The normal Bun entry now also constructs the v2 UID-owner composition against
 its canonical SQL, object store, clock and selected workerd binary. Before its
@@ -753,10 +770,13 @@ bytes and an atomic SQL graph predicate. Proven ABI failures and existing
 Worker/class duplicates are dependency conflicts; unavailable inspection or a
 graph change before acceptance is retryable busy, without Resource/Operation
 creation. A separate physical backend can confirm an empty namespace before any
-Deployment and delete it with authoritative absence proof. Its tests use a
-semantic-inspector stand-in, not native active Actor ABI proof. Active runtime
-counts and the executable Actor Binding remain incomplete; these internal paths
-do not register or advertise ActorNamespace Form support.
+Deployment and delete it with authoritative absence proof. Its empty-namespace
+tests use a semantic-inspector stand-in. The internal boot also composes the
+executable Actor Binding and accepted-operation warm/runtime-count paths with
+the same physical owner. Separate pinned-workerd tests exercise fetch and
+WebSocket upgrade, active same-spec update counts, and first active creation.
+These internal paths do not register or advertise ActorNamespace Form support,
+or establish Hosted or ordinary-entry qualification.
 
 The normal Bun entry can now opt in to its existing private v2 Actor and
 Workflow boot ports with `TAKOSERVER_V2_WORKER_RUNTIME_BOOT`, for example
