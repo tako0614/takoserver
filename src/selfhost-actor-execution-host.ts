@@ -5,21 +5,22 @@ import { dirname, isAbsolute, join } from "node:path";
 import type { ActorResourceGraph, ActorResourceGraphReader } from "./actor-resource-graph.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
 import {
+  type ActorExecutionGraph,
+  type ActorExecutionRealization,
+  type ActorGraphAuthority,
+  type ActorRealizationRead,
+  createLegacyActorGraphAuthority,
+} from "./selfhost-actor-graph-authority.ts";
+import {
   openWorkerdActorNamespace,
   type WorkerdActorNamespace,
 } from "./selfhost-actor-native-process.ts";
-import {
-  readWorkerdActiveActorGraph,
-  readWorkerdSelectedActiveVersion,
-  type WorkerdActiveActorGraph,
-  type WorkerdSelectedActiveVersion,
-} from "./workerd-runtime.ts";
+import type { WorkerdActiveActorGraph, WorkerdSelectedActiveVersion } from "./workerd-runtime.ts";
 
 interface Session {
   readonly selection: string;
-  readonly resourceGraph: ActorResourceGraph;
-  readonly deploymentJson: string;
-  readonly script: string;
+  readonly authorityGraph: ActorExecutionGraph;
+  readonly realization: ActorExecutionRealization;
   readonly graph: WorkerdActiveActorGraph;
   readonly epoch: string;
   readonly process: WorkerdActorNamespace;
@@ -77,10 +78,12 @@ export function createSelfhostActorExecutionHost(options: {
   readonly storageRoot: string;
   /** Same operator-selected executable used by the serving workerd owner. */
   readonly binary: string;
-  readonly graph: ActorResourceGraphReader;
-  readonly deployments: Pick<ResourceDeploymentStore, "active">;
-  readonly providerPackRef: string;
-  readonly providerInstallationRef: string;
+  readonly authority?: ActorGraphAuthority;
+  /** Retired v1 compatibility input, isolated in createLegacyActorGraphAuthority. */
+  readonly graph?: ActorResourceGraphReader;
+  readonly deployments?: Pick<ResourceDeploymentStore, "active">;
+  readonly providerPackRef?: string;
+  readonly providerInstallationRef?: string;
   readonly basisPoint?: () => number;
   /** Fault injection only: an unknown registration ACK must be retryable from exact bytes. */
   readonly afterRegistrationLinkBeforeSync?: () => Promise<void>;
@@ -91,6 +94,23 @@ export function createSelfhostActorExecutionHost(options: {
 }) {
   if (!isAbsolute(options.runtimeRoot) || !isAbsolute(options.storageRoot))
     throw new Error("Actor owner roots must be absolute");
+  if (options.authority && (options.graph || options.deployments))
+    throw new TypeError("Actor owner cannot combine graph authorities");
+  const authority =
+    options.authority ??
+    (options.graph &&
+    options.deployments &&
+    options.providerPackRef &&
+    options.providerInstallationRef
+      ? createLegacyActorGraphAuthority({
+          runtimeRoot: options.runtimeRoot,
+          graph: options.graph,
+          deployments: options.deployments,
+          providerPackRef: options.providerPackRef,
+          providerInstallationRef: options.providerInstallationRef,
+        })
+      : null);
+  if (!authority) throw new TypeError("Actor graph authority is required");
   const owners = new Map<string, Owner>();
   const revoked = new Set<string>();
   const coldStartFailures = new Map<string, ActorColdStartFailure>();
@@ -214,14 +234,13 @@ export function createSelfhostActorExecutionHost(options: {
     await (session.reap ?? session.process.close());
     if (owner.session === session) delete owner.session;
   };
-  const sameGraph = (a: ActorResourceGraph, b: ActorResourceGraph | null): boolean =>
-    b !== null && JSON.stringify(a) === JSON.stringify(b);
-  const selectedVersion = async (script: string, workerResourceUid: string, basisPoint: number) => {
+  const selectedVersion = async (
+    graph: ActorExecutionGraph,
+    realization: ActorExecutionRealization,
+    basisPoint: number,
+  ) => {
     try {
-      return await readWorkerdSelectedActiveVersion(options.runtimeRoot, script, {
-        expectedWorkerResourceUid: workerResourceUid,
-        basisPoint,
-      });
+      return await authority.selectVersion(graph, realization, basisPoint);
     } catch (error) {
       // A bad current snapshot refuses this event. Retain the old native
       // carrier as a wake source: its alarm bridge rechecks authority on
@@ -230,12 +249,12 @@ export function createSelfhostActorExecutionHost(options: {
     }
   };
 
-  const activeGraph = async (
-    script: string,
-    workerResourceUid: string,
-  ): Promise<WorkerdActiveActorGraph | null> => {
+  const currentRealization = async (
+    graph: ActorExecutionGraph,
+    signal: AbortSignal,
+  ): Promise<ActorRealizationRead> => {
     try {
-      return await readWorkerdActiveActorGraph(options.runtimeRoot, script, workerResourceUid);
+      return await authority.readRealization(graph, signal);
     } catch (error) {
       // Keep the previous carrier for alarm watchdog retries, but do not
       // admit new application work from an unproven graph.
@@ -244,28 +263,16 @@ export function createSelfhostActorExecutionHost(options: {
   };
 
   const hasCurrentRealization = async (
-    candidate: ActorResourceGraph | null,
+    candidate: ActorExecutionGraph | null,
     identity: ActorScope,
   ): Promise<boolean> => {
     if (
       !candidate ||
-      candidate.tenantId !== identity.tenantId ||
-      candidate.namespace.uid !== identity.namespaceResourceUid
+      candidate.scope.tenantId !== identity.tenantId ||
+      candidate.scope.namespaceResourceUid !== identity.namespaceResourceUid
     )
       return false;
-    const realized = await options.deployments.active(candidate.tenantId, candidate.worker.uid);
-    const script = realized?.outputs.scriptName;
-    return (
-      realized?.state === "active" &&
-      realized.tenantId === candidate.tenantId &&
-      realized.resourceUid === candidate.worker.uid &&
-      realized.providerPackRef === options.providerPackRef &&
-      realized.providerInstallationRef === options.providerInstallationRef &&
-      typeof script === "string" &&
-      /^[a-z0-9][a-z0-9_-]{0,127}$/u.test(script) &&
-      realized.nativeId.startsWith(`selfhost-worker:${script}:`) &&
-      realized.nativeId !== `selfhost-worker:${script}:`
-    );
+    return authority.hasRealization(candidate);
   };
 
   const scheduleRefresh = (owner: Owner, identity: ActorScope): void => {
@@ -305,42 +312,32 @@ export function createSelfhostActorExecutionHost(options: {
       if (stopped || current.revoked || revoked.has(key)) throw new Error("Actor owner stopped");
       if (!(await registeredScope(key, identity)))
         throw new ActorAuthorityUnavailable("Actor namespace is not registered");
-      const graph = await options.graph(identity, signal);
+      const graph = await authority.readGraph(identity, signal);
       if (
         !graph ||
-        graph.tenantId !== identity.tenantId ||
-        graph.namespace.uid !== identity.namespaceResourceUid
+        graph.scope.tenantId !== identity.tenantId ||
+        graph.scope.namespaceResourceUid !== identity.namespaceResourceUid
       ) {
         await retire(current);
         throw new ActorAuthorityUnavailable("Actor Resource unavailable");
       }
-      const deployment = await options.deployments.active(identity.tenantId, graph.worker.uid);
-      const script = deployment?.outputs.scriptName;
-      if (
-        deployment?.state !== "active" ||
-        deployment.tenantId !== identity.tenantId ||
-        deployment.resourceUid !== graph.worker.uid ||
-        deployment.providerPackRef !== options.providerPackRef ||
-        deployment.providerInstallationRef !== options.providerInstallationRef ||
-        typeof script !== "string" ||
-        !/^[a-z0-9][a-z0-9_-]{0,127}$/u.test(script) ||
-        !deployment.nativeId.startsWith(`selfhost-worker:${script}:`) ||
-        deployment.nativeId === `selfhost-worker:${script}:`
-      ) {
+      if (!(await authority.hasRealization(graph))) {
         await retire(current);
         throw new ActorAuthorityUnavailable("Actor Worker realization unavailable");
       }
-      const residentGraph = await activeGraph(script, graph.worker.uid);
-      if (!residentGraph) {
+      const realized = await currentRealization(graph, signal);
+      if (realized.kind === "authority_changed") {
+        await retire(current);
+        throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
+      }
+      if (realized.kind !== "ready") {
         throw new ActorAuthorityUnavailable("Actor Worker graph unavailable");
       }
+      const realization = realized.realization;
+      const residentGraph = realization.graph;
       // A publication read cannot confer authority after Resource deletion
       // or deployment replacement during that read.
-      const again = await options.deployments.active(identity.tenantId, graph.worker.uid);
-      if (
-        !sameGraph(graph, await options.graph(identity, signal)) ||
-        JSON.stringify(again) !== JSON.stringify(deployment)
-      ) {
+      if (!(await authority.stillCurrent(graph, realization, signal))) {
         await retire(current);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
@@ -348,7 +345,7 @@ export function createSelfhostActorExecutionHost(options: {
       if (revoked.has(key)) throw new ActorAuthorityUnavailable("Actor namespace revoked");
       const selection = JSON.stringify([
         graph,
-        deployment,
+        realization.authorityKey,
         residentGraph.generationKey,
         residentGraph.versions.map((version) => [
           version.variantKey,
@@ -401,16 +398,12 @@ export function createSelfhostActorExecutionHost(options: {
             session.retiring
           )
             return null;
-          const graphNow = await options.graph(identity, gateSignal);
-          if (!sameGraph(graph, graphNow)) {
+          const graphNow = await authority.readGraph(identity, gateSignal);
+          if (!graphNow || graphNow.authorityKey !== graph.authorityKey) {
             if (await hasCurrentRealization(graphNow, identity)) scheduleRefresh(current, identity);
             return null;
           }
-          const deploymentNow = await options.deployments.active(
-            identity.tenantId,
-            graph.worker.uid,
-          );
-          if (JSON.stringify(deploymentNow) !== JSON.stringify(deployment)) {
+          if (!(await authority.stillCurrent(graph, realization, gateSignal))) {
             if (await hasCurrentRealization(graphNow, identity)) scheduleRefresh(current, identity);
             return null;
           }
@@ -420,10 +413,7 @@ export function createSelfhostActorExecutionHost(options: {
           const basisPoint = (options.basisPoint ?? (() => randomInt(10_000)))();
           let versionNow: WorkerdSelectedActiveVersion | null;
           try {
-            versionNow = await readWorkerdSelectedActiveVersion(options.runtimeRoot, script, {
-              expectedWorkerResourceUid: graph.worker.uid,
-              basisPoint,
-            });
+            versionNow = await selectedVersion(graph, realization, basisPoint);
           } catch {
             return null;
           }
@@ -438,23 +428,20 @@ export function createSelfhostActorExecutionHost(options: {
               entry.workerVersionUid === versionNow.workerVersionUid,
           );
           if (!variant) return null;
-          // Fence graph/deployment again after the asynchronous Version read.
+          // Fence accepted graph and realization again after Version selection.
           // Pending deletion before this final graph read denies the callback.
-          const finalDeployment = await options.deployments.active(
-            identity.tenantId,
-            graph.worker.uid,
-          );
-          const finalGraph = await options.graph(identity, gateSignal);
+          const stillCurrent = await authority.stillCurrent(graph, realization, gateSignal);
           gateSignal.throwIfAborted();
           const stillAuthorized =
             !stopped &&
             current.session === session &&
             !session.dead &&
             !session.retiring &&
-            sameGraph(graph, finalGraph) &&
-            JSON.stringify(finalDeployment) === JSON.stringify(deployment);
+            stillCurrent;
           if (!stillAuthorized) {
-            if (await hasCurrentRealization(finalGraph, identity))
+            if (
+              await hasCurrentRealization(await authority.readGraph(identity, gateSignal), identity)
+            )
               scheduleRefresh(current, identity);
             return null;
           }
@@ -473,7 +460,7 @@ export function createSelfhostActorExecutionHost(options: {
           process = await openWorkerdActorNamespace(options.binary, {
             namespaceKey: key,
             storagePath: join(options.storageRoot, "namespaces", key),
-            className: graph.namespace.className,
+            className: graph.className,
             ...(graph.runtimeClassRef === undefined
               ? {}
               : { runtimeClassRef: graph.runtimeClassRef }),
@@ -497,9 +484,8 @@ export function createSelfhostActorExecutionHost(options: {
         }
         const session: Session = {
           selection,
-          resourceGraph: graph,
-          deploymentJson: JSON.stringify(deployment),
-          script,
+          authorityGraph: graph,
+          realization,
           graph: residentGraph,
           epoch: process.epoch,
           process,
@@ -578,14 +564,8 @@ export function createSelfhostActorExecutionHost(options: {
       // can also yield. A Resource or publication selected before either
       // wait must not be dispatched afterward without another readback.
       const basisPoint = (options.basisPoint ?? (() => randomInt(10_000)))();
-      const finalVersion = await selectedVersion(script, graph.worker.uid, basisPoint);
-      const finalDeployment = await options.deployments.active(identity.tenantId, graph.worker.uid);
-      const finalGraph = await options.graph(identity, signal);
-      if (
-        stopped ||
-        !sameGraph(graph, finalGraph) ||
-        JSON.stringify(finalDeployment) !== JSON.stringify(deployment)
-      ) {
+      const finalVersion = await selectedVersion(graph, realization, basisPoint);
+      if (stopped || !(await authority.stillCurrent(graph, realization, signal))) {
         await retire(current);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
@@ -706,11 +686,13 @@ export function createSelfhostActorExecutionHost(options: {
       await ready;
       if (stopped || !validScope(scope)) return null;
       const identity = { ...scope };
-      const graph = await options.graph(identity, signal);
+      const graph = await authority.readGraph(identity, signal);
       if (!graph || !(await hasCurrentRealization(graph, identity))) return null;
-      const again = await options.graph(identity, signal);
+      const again = await authority.readGraph(identity, signal);
       signal.throwIfAborted();
-      return sameGraph(graph, again) ? graph : null;
+      if (!again || again.authorityKey !== graph.authorityKey) return null;
+      const legacy = await authority.readLegacyGraph?.(identity, signal);
+      return legacy && JSON.stringify(legacy) === graph.authorityKey ? legacy : null;
     },
     async registerNamespace(scope: ActorScope): Promise<void> {
       await ready;
@@ -786,7 +768,7 @@ export function createSelfhostActorExecutionHost(options: {
         // The canonical Resource deletion attestation must already have
         // withdrawn graph authority. A standalone owner call is not a
         // tombstone and may not destroy a still-live namespace.
-        if (await options.graph(scope, AbortSignal.timeout(30_000))) {
+        if (await authority.hasNamespaceAuthority(scope, AbortSignal.timeout(30_000))) {
           revoked.delete(key);
           throw new Error("Actor namespace still has Resource authority");
         }
@@ -929,20 +911,19 @@ export function createSelfhostActorExecutionHost(options: {
         const verifyAuthority = async (): Promise<void> => {
           if (settled) throw new Error("Actor socket reservation expired");
           const session = acquired.session;
-          const graphNow = await options.graph(identity, request.signal);
-          const deploymentNow = await options.deployments.active(
-            identity.tenantId,
-            session.resourceGraph.worker.uid,
-          );
-          const residentNow = await activeGraph(session.script, session.resourceGraph.worker.uid);
+          const residentNow = await currentRealization(session.authorityGraph, request.signal);
           request.signal.throwIfAborted();
           if (
             stopped ||
             session.dead ||
             session.retiring ||
-            !sameGraph(session.resourceGraph, graphNow) ||
-            JSON.stringify(deploymentNow) !== session.deploymentJson ||
-            residentNow?.generationKey !== session.graph.generationKey ||
+            !(await authority.stillCurrent(
+              session.authorityGraph,
+              session.realization,
+              request.signal,
+            )) ||
+            residentNow.kind !== "ready" ||
+            residentNow.realization.graph.generationKey !== session.graph.generationKey ||
             settled
           )
             throw new ActorAuthorityUnavailable("Actor authority changed before upgrade");
