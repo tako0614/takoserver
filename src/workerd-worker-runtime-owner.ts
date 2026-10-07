@@ -253,6 +253,7 @@ export interface WorkerdWorkerRuntimeOwner {
         readonly kind: "ready";
         readonly sourceOperationId: string;
         readonly incarnationId: string;
+        readonly script: string;
         readonly identity: WorkerdPublicationIdentity;
         readonly graph: WorkerdActiveActorGraph;
       }
@@ -3373,6 +3374,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       kind: "ready",
       sourceOperationId: target.sourceOperationId,
       incarnationId: captured.incarnationId,
+      script: scriptName(target.workerResourceUid),
       identity: captured.identity,
       graph,
     };

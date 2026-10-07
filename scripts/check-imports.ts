@@ -120,6 +120,14 @@ const LAYERS: readonly Layer[] = [
     ],
   },
   {
+    // Outer adapter: accepted v2 SQL/native authority meets the existing
+    // physical Actor port, whose explicit legacy adapter lives in one module.
+    // This is not a pure Form parser or a new native-import permission for it.
+    name: "v2-actor-graph-authority",
+    match: /^src\/takoform-v2\/actor-namespace-graph-authority\.ts$/u,
+    may: ["core", "adapter", "app", "v2-form", "v2-runtime"],
+  },
+  {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state"],
