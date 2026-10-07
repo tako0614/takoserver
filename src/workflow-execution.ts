@@ -34,6 +34,11 @@ import {
   type WorkflowResourceDeletionContribution,
   workflowResourceLiveSql,
 } from "./workflow-resource-lifecycle.ts";
+import {
+  requireV2WorkflowResourceAuthority,
+  type V2WorkflowResourceAuthority,
+  v2WorkflowLiveSql,
+} from "./workflow-v2-resource-authority.ts";
 
 export {
   type WorkflowApplicationOutcome,
@@ -114,6 +119,8 @@ export interface WorkflowRuntimeOptions {
   readonly workflowInterfaceRef?: TakoformInterfaceRef;
   /** Source-only Resource admission on the same durable Sql as this runtime. */
   readonly workflowResourceDeletion?: WorkflowResourceDeletionContribution;
+  /** Boot-resolved v2 authority; never supplied from an application Binding. */
+  readonly v2ResourceAuthority?: V2WorkflowResourceAuthority;
 }
 
 export type WorkflowRunOutcome =
@@ -152,18 +159,29 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
   ) {
     throw new WorkflowRuntimeError("invalid_runtime_input");
   }
+  if (options.workflowResourceDeletion && options.v2ResourceAuthority) {
+    throw new WorkflowRuntimeError("invalid_runtime_input");
+  }
   if (options.workflowResourceDeletion) {
     if (options.workflowInterfaceRef === undefined) {
       throw new WorkflowRuntimeError("invalid_runtime_input");
     }
     requireWorkflowResourceDeletionContribution(options.workflowResourceDeletion, options.sql);
   }
-  const liveInstance = options.workflowResourceDeletion
-    ? workflowResourceLiveSql(
+  if (options.v2ResourceAuthority) {
+    requireV2WorkflowResourceAuthority(options.v2ResourceAuthority, options.sql);
+  }
+  const liveInstance = options.v2ResourceAuthority
+    ? v2WorkflowLiveSql(
         "tf_workflow_instances.tenant_id",
         "tf_workflow_instances.workflow_resource_uid",
       )
-    : "1 = 1";
+    : options.workflowResourceDeletion
+      ? workflowResourceLiveSql(
+          "tf_workflow_instances.tenant_id",
+          "tf_workflow_instances.workflow_resource_uid",
+        )
+      : "1 = 1";
   const RUNNABLE = `${RUNNABLE_BASE} AND ${liveInstance}`;
   const RUN_EXISTS = `EXISTS (SELECT 1 FROM tf_workflow_instances WHERE ${RUNNABLE})`;
   const sql: Sql = {
@@ -188,6 +206,9 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     ...(options.workflowResourceDeletion === undefined
       ? {}
       : { workflowResourceDeletion: options.workflowResourceDeletion }),
+    ...(options.v2ResourceAuthority === undefined
+      ? {}
+      : { v2ResourceAuthority: options.v2ResourceAuthority }),
   });
   const now = (): number => {
     const value = options.clock().getTime();

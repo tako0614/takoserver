@@ -106,6 +106,11 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "v2-contract", "v2-form", "v2-runtime", "v2-queue-manager"],
   },
   {
+    name: "v2-workflow-manager",
+    match: /^src\/takoform-v2\/workflow-backend\.ts$/u,
+    may: ["core", "domain", "v2-contract", "v2-form"],
+  },
+  {
     name: "v2-runtime",
     match:
       /^src\/takoform-v2\/(?:worker-bundle-runtime|worker-code-runtime|worker-cron-trigger-backend|worker-cron-trigger-scheduler|worker-deployment-backend|worker-endpoint-backend|worker-lifecycle-backend|worker-runtime-readers|worker-publication-state|worker-publication-sql-guard|worker-static-runtime|worker-static-publication|worker-native-effects|worker-native-deletions)\.ts$|^src\/workerd-worker-runtime-owner\.ts$/u,
@@ -235,7 +240,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|artifact-path|cron|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|artifact-path|cron|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.

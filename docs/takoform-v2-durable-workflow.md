@@ -1,0 +1,36 @@
+# DurableWorkflow v2 implementation boundary
+
+The exact contract is Takoform Edge `DurableWorkflow/0.3.0` and its
+`WorkerVersion/0.5.0` `workflowBindings`, as authored in the Edge `spec/forms/`
+tree. It is not the earlier v1 FormRef/package/Interface series. A v2 instance
+is execution data under one accepted `tf_v2_resources` UID; it is never a
+second managed Resource or Operation.
+
+The source contains an unmounted v2 Form adapter and an opt-in Resource guard
+for the shared instance/step engine. The Form validates the exact immutable
+`worker`/`className` spec and UID reference. Its backend observes instance
+counts and retires an explicitly deleted UID in bounded pages: v2 DELETE first
+closes new instance/event/wake admission via Resource phase, then uses the
+engine's physical-stop-aware termination before purging history. The existing
+v1 Resource deletion contribution continues to refuse active instances; it is
+not re-labelled as v2 authority. Runtime writes and new instance insertion
+embed the v2 Resource predicate in the same SQL statement, so a racing DELETE
+cannot leave an orphan execution. No new schema or management ledger is added.
+
+`createDurableWorkflowForm` requires a boot-selected class-admission port that
+proves every active and pending weighted Version from accepted SQL, verifies
+the sealed reference graph and held module bytes, inspects the named Workflow
+class in isolation, and returns a same-statement graph predicate. The current
+repository has no concrete Workflow-specific v2 inspector/selector behind
+that port. It also lacks a v2 native Workflow Binding/runner composition that
+binds the private broker scope to the same principal, Space, UID, current
+Deployment and selected Version. Consequently the Form is not registered in
+the normal factory and `workflowBindings` remains rejected in WorkerVersion
+eligibility. Do not advertise v2 Workflow FormSupport from the synthetic
+backend tests.
+
+The focused synthetic test exercises accepted v2 HTTP Resource/Operation CRUD,
+step history replay after SQLite close/reopen, active-instance DELETE, and an
+instance-create versus DELETE race. It supplies a fake class-admission result
+and an in-process execution host. It does not qualify held-byte inspection,
+physical workerd stop, broker delivery, OS process recovery, or public Support.

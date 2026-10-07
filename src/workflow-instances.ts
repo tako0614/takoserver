@@ -19,6 +19,12 @@ import {
   type WorkflowResourceDeletionContribution,
   workflowResourceLiveSql,
 } from "./workflow-resource-lifecycle.ts";
+import {
+  requireV2WorkflowResourceAuthority,
+  type V2WorkflowResourceAuthority,
+  v2WorkflowLiveSql,
+  v2WorkflowReadySql,
+} from "./workflow-v2-resource-authority.ts";
 
 export { WORKFLOW_MAX_DOCUMENT_BYTES, WORKFLOW_MAX_TOP_PROPERTIES } from "./workflow-data.ts";
 
@@ -111,6 +117,8 @@ export interface WorkflowInstancesOptions {
   readonly workflowInterfaceRef?: TakoformInterfaceRef;
   /** Exact source-only Resource admission, bound to this very Sql object. */
   readonly workflowResourceDeletion?: WorkflowResourceDeletionContribution;
+  /** Exact v2 Resource/Operation admission; mutually exclusive with legacy v1. */
+  readonly v2ResourceAuthority?: V2WorkflowResourceAuthority;
 }
 
 export interface WorkflowInstances {
@@ -212,20 +220,31 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
   ) {
     throw new TypeError("unsupported workflow interface reference");
   }
-  const workflowV3Enabled = options.workflowInterfaceRef !== undefined;
+  // v2 DurableWorkflow fixes these semantics by its own exact Form URL; the
+  // legacy InterfaceRef remains an opt-in only for the legacy v1 Resource.
+  const workflowV3Enabled =
+    options.workflowInterfaceRef !== undefined || options.v2ResourceAuthority !== undefined;
+  if (options.workflowResourceDeletion && options.v2ResourceAuthority) {
+    throw new TypeError("Workflow Resource authority is ambiguous");
+  }
   if (options.workflowResourceDeletion) {
     if (!workflowV3Enabled) throw new TypeError("Workflow Resource lifecycle requires exact v3");
     requireWorkflowResourceDeletionContribution(options.workflowResourceDeletion, options.sql);
   }
-  const liveInstance = options.workflowResourceDeletion
-    ? workflowResourceLiveSql(
-        "tf_workflow_instances.tenant_id",
-        "tf_workflow_instances.workflow_resource_uid",
-      )
-    : "1 = 1";
-  const liveSelected = options.workflowResourceDeletion
-    ? workflowResourceLiveSql("instance.tenant_id", "instance.workflow_resource_uid")
-    : "1 = 1";
+  if (options.v2ResourceAuthority) {
+    requireV2WorkflowResourceAuthority(options.v2ResourceAuthority, options.sql);
+  }
+  const liveSql = options.v2ResourceAuthority
+    ? v2WorkflowLiveSql
+    : options.workflowResourceDeletion
+      ? workflowResourceLiveSql
+      : () => "1 = 1";
+  const readySql = options.v2ResourceAuthority ? v2WorkflowReadySql : liveSql;
+  const liveInstance = liveSql(
+    "tf_workflow_instances.tenant_id",
+    "tf_workflow_instances.workflow_resource_uid",
+  );
+  const liveSelected = liveSql("instance.tenant_id", "instance.workflow_resource_uid");
 
   const randomId = options.randomId;
   const now = (): number => {
@@ -236,11 +255,11 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
     return timestamp;
   };
   const selectedResourceLive = async (scope: WorkflowScope): Promise<boolean> => {
-    if (!options.workflowResourceDeletion) return true;
-    const rows = await options.sql.query(
-      `SELECT 1 AS live WHERE ${workflowResourceLiveSql("?", "?")}`,
-      [scope.tenantId, scope.workflowResourceUid],
-    );
+    if (!options.workflowResourceDeletion && !options.v2ResourceAuthority) return true;
+    const rows = await options.sql.query(`SELECT 1 AS live WHERE ${readySql("?", "?")}`, [
+      scope.tenantId,
+      scope.workflowResourceUid,
+    ]);
     return rows.length === 1;
   };
 
@@ -313,7 +332,7 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
                         SELECT 1
                         FROM tf_workflow_instances
                         WHERE tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ?
-                      ) AND ${options.workflowResourceDeletion ? workflowResourceLiveSql("?", "?") : "1 = 1"}`,
+                      ) AND ${readySql("?", "?")}`,
                 params: [
                   normalizedScope.tenantId,
                   normalizedScope.workflowResourceUid,
@@ -327,7 +346,7 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
                   normalizedScope.tenantId,
                   normalizedScope.workflowResourceUid,
                   instanceId,
-                  ...(options.workflowResourceDeletion
+                  ...(options.workflowResourceDeletion || options.v2ResourceAuthority
                     ? [normalizedScope.tenantId, normalizedScope.workflowResourceUid]
                     : []),
                 ],
