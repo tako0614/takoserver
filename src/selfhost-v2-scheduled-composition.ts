@@ -42,11 +42,19 @@ export function createSelfhostV2ScheduledComposition(
 
   const capability: WorkerCronTriggerCapabilityReader = {
     async observeScheduledCapability(input) {
-      if (closed || input.targetKey !== targetKey) return { kind: "unknown" };
+      // This is a caller-owned object. Capture the complete scope before the
+      // first await so a mutation cannot retarget the native readback.
+      const requested = Object.freeze({
+        workerUid: input.workerUid,
+        principal: input.principal,
+        space: input.space,
+        targetKey: input.targetKey,
+      });
+      if (closed || requested.targetKey !== targetKey) return { kind: "unknown" };
       try {
-        const owner = await ownerForWorkerUid(input.workerUid);
+        const owner = await ownerForWorkerUid(requested.workerUid);
         if (closed) return { kind: "unknown" };
-        const observed = await owner.observeScheduledCapability(input);
+        const observed = await owner.observeScheduledCapability(requested);
         if (closed || observed.kind !== "confirmed") return { kind: "unknown" };
         const nativeStillCurrent = observed.stillCurrent.bind(observed);
         return {
@@ -97,8 +105,8 @@ export function createSelfhostV2ScheduledComposition(
   }
 
   async function drain(): Promise<void> {
-    // Call after native owner suspension: an unresolved native invocation is
-    // unknown, not an accepted ACK or a reason to release its Worker early.
+    // Close admission, then join this scan before suspending native owners.
+    // A late result after close becomes unknown rather than an accepted ACK.
     await activeTick;
   }
 
