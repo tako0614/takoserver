@@ -2,6 +2,7 @@ import type { Sql } from "../../ports.ts";
 import { SQLITE_DATABASE_FORM_URL } from "./sqlite-database.ts";
 import { referencesForWorkerVersion } from "./worker-references.ts";
 import { parseWorkerVersionSpec, WORKER_VERSION_FORM_URL } from "./worker-specs.ts";
+import { isReadyWorkerVersionObservation } from "./worker-version-observed.ts";
 
 /** Core-only authority input. Native version identity is checked by the Host broker. */
 export interface SQLiteWorkerBindingClaim {
@@ -62,7 +63,8 @@ export function createSQLiteWorkerBindingAuthority(options: {
     let spec: ReturnType<typeof parseWorkerVersionSpec>;
     try {
       spec = parseWorkerVersionSpec(JSON.parse(version.spec_json));
-      if (JSON.parse(version.observed_json)?.ready !== true) return null;
+      if (!isReadyWorkerVersionObservation(JSON.parse(version.observed_json), spec.bundle !== null))
+        return null;
     } catch {
       return null;
     }

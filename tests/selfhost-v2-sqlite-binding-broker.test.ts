@@ -132,7 +132,8 @@ async function fixture(bindingName = "DB") {
     "UPDATE tf_v2_operations SET status='reconciling', effect='unknown' WHERE id='op-version-one'",
   );
   control.exec(`UPDATE tf_v2_operations SET status='succeeded', effect='complete',
-    result_observed_json='{"ready":true}' WHERE id='op-version-one'`);
+    result_observed_json='{"ready":true,"resolvedBindings":true,"bundleVerified":true}'
+    WHERE id='op-version-one'`);
   const grant = {
     principal: "alice",
     space: "default",
@@ -196,6 +197,37 @@ async function fixture(bindingName = "DB") {
 
 test("a SQLite binding broker requires private signing authority", () => {
   expect(() => createSelfhostV2SqliteBindingBroker({} as never)).toThrow(TypeError);
+});
+
+test("SQLite bindings refuse incomplete or unresolved WorkerVersion observations", async () => {
+  const host = await fixture();
+  try {
+    const updateObservation = host.control.prepare(
+      "UPDATE tf_v2_resources SET observed_json = ? WHERE uid = 'version-one'",
+    );
+    for (const observation of [
+      { ready: true },
+      { ready: true, resolvedBindings: true },
+      { ready: true, resolvedBindings: false, bundleVerified: true },
+      { ready: true, resolvedBindings: true, bundleVerified: false },
+      { ready: true, resolvedBindings: "true", bundleVerified: true },
+    ]) {
+      updateObservation.run(JSON.stringify(observation));
+      expect(await host.call("query", { sql: "SELECT body FROM records" })).toEqual({
+        ok: false,
+        error: { code: "backend_unavailable" },
+      });
+    }
+    updateObservation.run(
+      JSON.stringify({ ready: true, resolvedBindings: true, bundleVerified: true }),
+    );
+    expect(await host.call("query", { sql: "SELECT body FROM records" })).toEqual({
+      ok: true,
+      value: { rows: [], rowsWritten: 0 },
+    });
+  } finally {
+    host.close();
+  }
 });
 
 test("a signed Version binding reaches only its current UID database and survives same-spec PUT", async () => {
