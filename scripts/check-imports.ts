@@ -128,6 +128,13 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "adapter", "app", "v2-form", "v2-runtime"],
   },
   {
+    // Actor acceptance reads v2 SQL and held Form bytes through typed ports;
+    // it does not import the native owner or the legacy Actor adapter.
+    name: "v2-actor-admission",
+    match: /^src\/takoform-v2\/actor-namespace-admission\.ts$/u,
+    may: ["core", "v2-contract", "v2-form"],
+  },
+  {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state"],
