@@ -773,10 +773,12 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     }
     if (!restorationComplete)
       throw new TypeError("v2 Worker owners must restore before Form composition");
+    const endpoint = options.endpoint;
     if (
-      !options.endpoint?.assignHostname ||
-      !options.endpoint.observeTls ||
-      !options.endpoint.observeRouteAbsent
+      endpoint !== undefined &&
+      (typeof endpoint?.assignHostname !== "function" ||
+        typeof endpoint.observeTls !== "function" ||
+        typeof endpoint.observeRouteAbsent !== "function")
     ) {
       throw new TypeError("v2 Worker Endpoint frontend proof is not composed");
     }
@@ -809,15 +811,19 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           return await openOwner(uid);
         },
       }),
-      [WORKER_ENDPOINT_FORM_URL]: createWorkerEndpointForm({
-        targetKey,
-        publicationState,
-        ownerForWorker: async (uid) => {
-          await restoration;
-          return await openOwner(uid);
-        },
-        ...options.endpoint,
-      }),
+      ...(endpoint
+        ? {
+            [WORKER_ENDPOINT_FORM_URL]: createWorkerEndpointForm({
+              targetKey,
+              publicationState,
+              ownerForWorker: async (uid) => {
+                await restoration;
+                return await openOwner(uid);
+              },
+              ...endpoint,
+            }),
+          }
+        : {}),
     };
   };
 

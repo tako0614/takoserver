@@ -103,7 +103,50 @@ test("normal Worker boot refuses an unexplained private owner namespace", async 
   }
 });
 
-test("normal organization HTTP accepts internal Worker Version, Deployment and Endpoint through one UID owner", async () => {
+test("normal Worker factory refuses partial or invalid Endpoint frontend proof", async () => {
+  const root = await mkdtemp(join(tmpdir(), "selfhost-v2-worker-partial-endpoint-"));
+  const database = new Database(join(root, "control.sqlite"));
+  try {
+    migrateSqlite(database);
+    const sql = createSqliteSql(database);
+    const objects = createMemoryObjectStore();
+    const clock = () => new Date();
+    for (const endpoint of [
+      { assignHostname: () => "worker.example.test" },
+      {
+        assignHostname: () => "worker.example.test",
+        observeTls: true,
+        observeRouteAbsent: async () => ({ absent: true }),
+      },
+    ]) {
+      const composition = createSelfhostV2WorkerComposition({
+        sql,
+        objects,
+        clock,
+        config: {
+          cursorSigningKey: new Uint8Array(32).fill(0x52),
+          documentation: "https://docs.example.test/v2",
+          authenticationDocumentation: "https://docs.example.test/v2/authentication",
+        },
+        rootDirectory: join(root, "v2-worker-owners"),
+        targetKey: TARGET,
+        workerdBinary: null,
+        endpoint: endpoint as unknown as NonNullable<
+          Parameters<typeof createSelfhostV2WorkerComposition>[0]["endpoint"]
+        >,
+      });
+      expect(await composition.restoreOwners()).toEqual([]);
+      expect(() => composition.internalFormFactory({ sql, objects, clock })).toThrow(
+        "v2 Worker Endpoint frontend proof is not composed",
+      );
+    }
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function exerciseStaticWorkerGraph(withEndpoint: boolean): Promise<void> {
   // This registers the incomplete Forms only in a local test Host. The child
   // proves process/listener fencing, not native Workerd or public HTTPS TLS.
   const root = await mkdtemp(join(tmpdir(), "selfhost-v2-worker-http-"));
@@ -181,35 +224,50 @@ test("normal organization HTTP accepts internal Worker Version, Deployment and E
         children.push(child);
         return child;
       },
-      endpoint: {
-        assignHostname({ resourceUid }) {
-          return `worker-${resourceUid.slice(0, 8)}.example.test`;
-        },
-        async observeTls(input) {
-          const owner = await composition.ownerForWorkerUid(input.workerUid);
-          const serving = await owner.observeServing({
-            workerResourceUid: input.workerUid,
-            targetKey: TARGET,
-          });
-          return {
-            ...input,
-            ready: serving.kind === "serving" && serving.hostnames.includes(input.hostname),
-          };
-        },
-        async observeRouteAbsent(input) {
-          const owner = await composition.ownerForWorkerUid(input.workerUid);
-          const serving = await owner.observeServing({
-            workerResourceUid: input.workerUid,
-            targetKey: TARGET,
-          });
-          return {
-            ...input,
-            absent: serving.kind === "serving" && !serving.hostnames.includes(input.hostname),
-          };
-        },
-      },
+      ...(withEndpoint
+        ? {
+            endpoint: {
+              assignHostname({ resourceUid }) {
+                return `worker-${resourceUid.slice(0, 8)}.example.test`;
+              },
+              async observeTls(input) {
+                const owner = await composition.ownerForWorkerUid(input.workerUid);
+                const serving = await owner.observeServing({
+                  workerResourceUid: input.workerUid,
+                  targetKey: TARGET,
+                });
+                return {
+                  ...input,
+                  ready: serving.kind === "serving" && serving.hostnames.includes(input.hostname),
+                };
+              },
+              async observeRouteAbsent(input) {
+                const owner = await composition.ownerForWorkerUid(input.workerUid);
+                const serving = await owner.observeServing({
+                  workerResourceUid: input.workerUid,
+                  targetKey: TARGET,
+                });
+                return {
+                  ...input,
+                  absent: serving.kind === "serving" && !serving.hostnames.includes(input.hostname),
+                };
+              },
+            },
+          }
+        : {}),
     });
+    expect(() => composition.internalFormFactory({ sql, objects, clock })).toThrow(
+      "v2 Worker owners must restore before Form composition",
+    );
     expect(await composition.restoreOwners()).toEqual([]);
+    expect(() =>
+      composition.internalFormFactory({ sql, objects: createMemoryObjectStore(), clock }),
+    ).toThrow("v2 Worker Forms must use this application's exact SQL, objects and clock");
+    const workerForms = composition.internalFormFactory({ sql, objects, clock });
+    expect(workerForms[MODULE_WORKER_FORM_URL]).toBeDefined();
+    expect(workerForms[WORKER_VERSION_FORM_URL]).toBeDefined();
+    expect(workerForms[WORKER_DEPLOYMENT_FORM_URL]).toBeDefined();
+    expect(workerForms[WORKER_ENDPOINT_FORM_URL] !== undefined).toBe(withEndpoint);
     const app = buildApp({
       sql,
       objects,
@@ -296,22 +354,28 @@ test("normal organization HTTP accepts internal Worker Version, Deployment and E
       worker: { resourceUid: workerUid },
       versions: [{ workerVersion: { resourceUid: versionUid }, weight: 10_000 }],
     });
-    const endpointUid = await create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
-      worker: { resourceUid: workerUid },
-    });
-    const endpoint = await http(`/resources/${endpointUid}`);
-    expect(endpoint.status).toBe(200);
-    expect(await endpoint.json()).toMatchObject({
-      uid: endpointUid,
-      observed: { activeDeploymentRouteReady: true, tlsReady: true },
-    });
+    let endpointUid: string | undefined;
+    if (withEndpoint) {
+      endpointUid = await create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
+        worker: { resourceUid: workerUid },
+      });
+      const endpoint = await http(`/resources/${endpointUid}`);
+      expect(endpoint.status).toBe(200);
+      expect(await endpoint.json()).toMatchObject({
+        uid: endpointUid,
+        observed: { activeDeploymentRouteReady: true, tlsReady: true },
+      });
+    }
     const owner = await composition.ownerForWorkerUid(workerUid);
     closeOwner = () => owner.close();
-    const serving = await owner.observeServing({ workerResourceUid: workerUid, targetKey: TARGET });
+    const serving = await owner.observeServing({
+      workerResourceUid: workerUid,
+      targetKey: TARGET,
+    });
     expect(serving).toMatchObject({ kind: "serving", workerResourceUid: workerUid });
     const served = await owner.fetch(new Request("https://worker.example.test/"));
     expect(served.status).toBe(200);
-    await remove(endpointUid, "endpoint");
+    if (endpointUid) await remove(endpointUid, "endpoint");
     await remove(deploymentUid, "deployment");
     await remove(versionUid, "version");
     await remove(assetUid, "asset");
@@ -324,4 +388,9 @@ test("normal organization HTTP accepts internal Worker Version, Deployment and E
     database.close();
     await rm(root, { recursive: true, force: true });
   }
-});
+}
+
+test("normal organization HTTP accepts static Worker graph with Endpoint frontend proof", () =>
+  exerciseStaticWorkerGraph(true));
+test("normal organization HTTP accepts static Worker graph without Endpoint frontend proof", () =>
+  exerciseStaticWorkerGraph(false));
