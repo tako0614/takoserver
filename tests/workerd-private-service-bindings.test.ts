@@ -300,7 +300,11 @@ async function runtimeConfig(): Promise<string> {
 }
 
 function privateSocketPath(binding: WorkerdServiceBinding): string {
-  const digest = createHash("sha256")
+  return join(socketDirectory, `${privateServiceDigest(binding)}.sock`);
+}
+
+function privateServiceDigest(binding: WorkerdServiceBinding): string {
+  return createHash("sha256")
     .update("takoserver.selfhost-service-router@v1\u0000", "utf8")
     .update(binding.target, "utf8")
     .update("\u0000", "utf8")
@@ -308,7 +312,14 @@ function privateSocketPath(binding: WorkerdServiceBinding): string {
     .update("\u0000", "utf8")
     .update(binding.unavailableToken, "utf8")
     .digest("hex");
-  return join(socketDirectory, `${digest}.sock`);
+}
+
+function serviceRouterBlock(config: string, binding: WorkerdServiceBinding): string {
+  const start = config.indexOf(`( name = "selfhost-service-${privateServiceDigest(binding)}"`);
+  if (start < 0) throw new Error("private service router missing from config");
+  const end = config.indexOf("\n  ),", start);
+  if (end < 0) throw new Error("private service router block is incomplete");
+  return config.slice(start, end);
 }
 
 function writerSite(
@@ -386,6 +397,94 @@ test("without a private socket option, the existing serving service graph remain
   expect(config).toContain(SERVICE_NAME);
   expect(config).toMatch(/selfhost-service-[0-9a-f]{64}/u);
   expect(config).not.toContain("unix:");
+});
+
+test("v2 ServiceBinding without private socket options never binds the logical target", async () => {
+  const runtime = createWorkerdRuntime({ root: runtimeRoot, isReady: () => true });
+  const binding = {
+    ...SERVICE_BINDING,
+    name: workerdV2PrivateServiceBindingName(0),
+    target: "v2-worker-target",
+  };
+  await publish(
+    runtime,
+    "v2-worker-target",
+    publication("v2-worker-target", { workerResourceUid: TARGET_UID }),
+  );
+  await publish(
+    runtime,
+    "v2-caller",
+    publication("v2-caller", {
+      workerResourceUid: CALLER_UID,
+      serviceBindings: [binding],
+      v2Private: true,
+    }),
+  );
+
+  const router = serviceRouterBlock(await runtimeConfig(), binding);
+  expect(router).toContain(`(name = "UNAVAILABLE_TOKEN", text = "${binding.unavailableToken}")`);
+  expect(router).not.toContain('(name = "TARGET", service =');
+});
+
+test("v2 ServiceBinding with a missing broker callback never binds the logical target", async () => {
+  const runtime = runtimeWithPrivateSockets();
+  const binding = {
+    ...SERVICE_BINDING,
+    name: workerdV2PrivateServiceBindingName(0),
+    target: "v2-worker-target",
+  };
+  await publish(
+    runtime,
+    "v2-worker-target",
+    publication("v2-worker-target", { workerResourceUid: TARGET_UID }),
+  );
+  await publish(
+    runtime,
+    "v2-caller",
+    publication("v2-caller", {
+      workerResourceUid: CALLER_UID,
+      serviceBindings: [binding],
+      v2Private: true,
+    }),
+  );
+
+  const router = serviceRouterBlock(await runtimeConfig(), binding);
+  expect(router).toContain(`(name = "UNAVAILABLE_TOKEN", text = "${binding.unavailableToken}")`);
+  expect(router).not.toContain('(name = "TARGET", service =');
+});
+
+test("retained v2 ServiceBinding lease never falls back to a logical target after unpublish", async () => {
+  const runtime = runtimeWithPrivateSockets();
+  const binding = {
+    ...SERVICE_BINDING,
+    name: workerdV2PrivateServiceBindingName(0),
+    target: "v2-worker-target",
+  };
+  await publish(
+    runtime,
+    "v2-worker-target",
+    publication("v2-worker-target", { workerResourceUid: TARGET_UID }),
+  );
+  await publish(
+    runtime,
+    "v2-caller",
+    publication("v2-caller", {
+      workerResourceUid: CALLER_UID,
+      serviceBindings: [binding],
+      v2Private: true,
+    }),
+  );
+  const lease = await runtime.acquirePrivateServiceBindings(
+    await selectedIdentity("v2-caller", CALLER_UID),
+  );
+  try {
+    await publish(runtime, "v2-caller", null);
+    const router = serviceRouterBlock(await runtimeConfig(), binding);
+    expect(router).toContain(`(name = "UNAVAILABLE_TOKEN", text = "${binding.unavailableToken}")`);
+    expect(router).not.toContain('(name = "TARGET", service =');
+  } finally {
+    await lease.release();
+  }
 });
 
 test("v2 ServiceBinding broker socket is the exact private router target", async () => {

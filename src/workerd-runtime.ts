@@ -970,7 +970,12 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
               });
             }
           }
-          return { socketDirectory: serviceSocketDirectory, bindings, brokerSockets };
+          return {
+            socketDirectory: serviceSocketDirectory,
+            bindings,
+            brokerSockets,
+            v2PrivateRouters: v2Routers,
+          };
         })();
   const retainRenderedRouters = (published: readonly PublishedDeployment[]) => {
     renderedPrivateRouters = new Set(privateServiceGraph(published)?.bindings.keys());
@@ -5955,6 +5960,7 @@ interface PrivateServiceGraph {
   readonly socketDirectory: string;
   readonly bindings: ReadonlyMap<string, WorkerdServiceBinding>;
   readonly brokerSockets: ReadonlyMap<string, WorkerdV2ServiceBindingBrokerSocket>;
+  readonly v2PrivateRouters: ReadonlySet<string>;
 }
 
 function collectServiceBindings(
@@ -6108,6 +6114,7 @@ function publishedGraphIdentity(
         directory: privateServices.socketDirectory,
         routers: [...privateServices.bindings.keys()],
         brokerSockets: [...privateServices.brokerSockets.entries()],
+        v2PrivateRouters: [...privateServices.v2PrivateRouters].sort(),
       }),
     );
   }
@@ -6362,16 +6369,33 @@ function renderConfig(
   // the request URL and Host header are never consulted.
   const publishedByName = new Map(published.map((entry) => [entry.name, entry] as const));
   const routedBindings = privateServices?.bindings ?? collectServiceBindings(published);
+  const v2PrivateServiceRouters = new Set(
+    published.flatMap((deployment) =>
+      deployment.variants.flatMap((variant) =>
+        hasWorkerdV2PrivateBindingProfile(variant.manifest)
+          ? validServiceBindings(variant.manifest.serviceBindings ?? [], true).map(
+              serviceRouterName,
+            )
+          : [],
+      ),
+    ),
+  );
+  for (const router of privateServices?.v2PrivateRouters ?? []) {
+    v2PrivateServiceRouters.add(router);
+  }
   const v2BrokerExternalServices: string[] = [];
   const serviceBindingServices = [...routedBindings]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, binding]) => {
+      const v2Private = v2PrivateServiceRouters.has(name);
       const target = publishedByName.get(binding.target);
       const active =
         target?.workerResourceUid === binding.targetResourceUid &&
         target.variants.every(
           (variant) => variant.manifest.fetchHandler === true || isStaticManifest(variant.manifest),
         );
+      // A v2-private router without its exact Host broker must stay unbound:
+      // the logical in-process route would bypass Core and native ownership.
       const brokerSocket = privateServices?.brokerSockets.get(name);
       const brokerTargetService = brokerSocket ? serviceBindingBrokerTargetName(name) : undefined;
       if (brokerSocket && brokerTargetService) {
@@ -6380,15 +6404,16 @@ function renderConfig(
         );
       }
       const targetService =
-        brokerTargetService ?? (target ? logicalFetchService(target) : binding.target);
+        brokerTargetService ??
+        (v2Private ? undefined : target ? logicalFetchService(target) : binding.target);
       return `  ( name = ${capnpText(name)},
     worker = (
       modules = [ (name = ${capnpText(SERVICE_ROUTER_MODULE)}, esModule = embed ${capnpText(SERVICE_ROUTER_MODULE)}) ],
       bindings = [
         (name = "${SERVICE_UNAVAILABLE_TOKEN_BINDING}", text = ${capnpText(binding.unavailableToken)}),${
-          brokerSocket
+          brokerSocket && targetService
             ? `\n        (name = "BROKER_TOKEN", text = ${capnpText(binding.unavailableToken)}),\n        (name = "TARGET", service = ${capnpText(targetService)}),`
-            : active
+            : !v2Private && active && targetService
               ? `\n        (name = "TARGET", service = ${capnpText(targetService)}),`
               : ""
         }
