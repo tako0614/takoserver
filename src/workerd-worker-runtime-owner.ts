@@ -401,7 +401,7 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
     bindingToken(input: {
       readonly workerUid: string;
       readonly versionId: string;
-      readonly incarnationId: string;
+      readonly servingSourceOperationId: string;
     }): string;
   };
   /** Trusted SQL-only facade boot seam; exact selected Version grants are minted during publication. */

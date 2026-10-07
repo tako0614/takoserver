@@ -4,8 +4,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import type { JsonObject, SqlParam } from "../src/ports.ts";
+import type { JsonObject, Sql, SqlParam } from "../src/ports.ts";
 import { createQueueCustody } from "../src/queue-custody.ts";
+import { createSelfhostV2QueueComposition } from "../src/selfhost-v2-queue-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
@@ -26,9 +27,12 @@ import {
   cancelV2QueueBatchBeforeSend,
   confirmV2QueueBatchRetirement,
   createV2QueueDelivery,
+  listV2AuthorizedQueueExecutions,
+  listV2AuthorizedQueueExecutionsForWorker,
   v2QueueId,
   verifyV2QueueSettlementScope,
 } from "../src/takoform-v2/worker-queue-delivery.ts";
+import type { WorkerdWorkerRuntimeOwner } from "../src/workerd-worker-runtime-owner.ts";
 
 const principal = "org-one";
 const space = "default";
@@ -1461,6 +1465,19 @@ test("retiring Consumer reaps only a physically retired expired handler lease", 
       incarnationOperationId: "retire-incarnation",
     };
     expect(await authorizeV2QueueBatchSend(f.sql, execution)).toBe("authorized");
+    expect(
+      await listV2AuthorizedQueueExecutions(f.sql, {
+        consumerUid: consumer.resourceUid,
+        principal,
+        space,
+        targetKey,
+      }),
+    ).toEqual([execution]);
+    expect(
+      await listV2AuthorizedQueueExecutionsForWorker(f.sql, {
+        workerUid: worker.resourceUid,
+      }),
+    ).toEqual({ executions: [execution], nextCursor: null });
     // Simulate the actual clock passing the persisted message lease deadline;
     // no settlement or native handler receipt is manufactured by this write.
     await f.sql.run("UPDATE selfhost_queue_messages SET lease_expires_at_ms = ?", [Date.now() - 1]);
@@ -1481,6 +1498,19 @@ test("retiring Consumer reaps only a physically retired expired handler lease", 
         receiptDigest: "c".repeat(64),
       }),
     ).toBe("retired");
+    expect(
+      await listV2AuthorizedQueueExecutions(f.sql, {
+        consumerUid: consumer.resourceUid,
+        principal,
+        space,
+        targetKey,
+      }),
+    ).toEqual([]);
+    expect(
+      await listV2AuthorizedQueueExecutionsForWorker(f.sql, {
+        workerUid: worker.resourceUid,
+      }),
+    ).toEqual({ executions: [], nextCursor: null });
     await expect(
       custody.reapRetiredV2({
         queueId: v2QueueId(queue.resourceUid),
@@ -1515,6 +1545,168 @@ test("retiring Consumer reaps only a physically retired expired handler lease", 
   } finally {
     f.database.close();
   }
+});
+
+test("old physical Queue execution retires only with exact persisted absence proof", async () => {
+  const f = fixture();
+  let composition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "absence-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "absence-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "absence-version", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "absence-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "absence-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId: "absence-message", body: new Uint8Array([9]) },
+    );
+    const batch = await createV2QueueDelivery({
+      sql: f.sql,
+      custody,
+      capability: f.capability,
+    }).claimRegisteredBatch({ consumerUid: consumer.resourceUid, principal, space, targetKey });
+    if (batch.kind !== "ready") throw new Error("absence batch not registered");
+    const physicalIncarnation = "physical-incarnation-one";
+    expect(
+      await authorizeV2QueueBatchSend(f.sql, {
+        batchId: batch.batchId,
+        reservationToken: batch.reservationToken,
+        queueUid: queue.resourceUid,
+        consumerUid: consumer.resourceUid,
+        generation: batch.generation,
+        workerUid: worker.resourceUid,
+        servingSourceOperationId: deployment.id,
+        workerVersionUid: version.resourceUid,
+        workerVersionGeneration: 1,
+        incarnationOperationId: physicalIncarnation,
+      }),
+    ).toBe("authorized");
+    await f.engine.acceptDelete({
+      principal,
+      key: "absence-consumer-delete-key-01",
+      uid: consumer.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect((await f.engine.runNext())?.status).toBe("reconciling");
+    expect(
+      await f.sql.query("SELECT busy_operation FROM tf_v2_resources WHERE uid = ?", [
+        consumer.resourceUid,
+      ]),
+    ).toMatchObject([{ busy_operation: expect.any(String) }]);
+    const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+    const privatePort = Number(reservation.port);
+    await reservation.stop(true);
+    let observedIncarnation = "wrong-physical-incarnation";
+    composition = createSelfhostV2QueueComposition({
+      sql: f.sql,
+      custody,
+      capability: f.capability,
+      settlementKey: new Uint8Array(32).fill(7),
+      privatePort,
+      ownerForWorkerUid: async (uid) => {
+        expect(uid).toBe(worker.resourceUid);
+        return {
+          async observeQueuePhysicalAbsence(input: {
+            workerUid: string;
+            incarnationId: string;
+            servingSourceOperationId: string;
+          }) {
+            return {
+              kind: "confirmed_absent" as const,
+              workerUid: input.workerUid,
+              incarnationId: observedIncarnation,
+              servingSourceOperationId: input.servingSourceOperationId,
+              receiptDigest: "a".repeat(64),
+            };
+          },
+        } as unknown as WorkerdWorkerRuntimeOwner;
+      },
+    });
+    const scan = { workerUid: worker.resourceUid };
+    expect(await composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "unknown",
+      retired: 0,
+      nextCursor: null,
+    });
+    expect(await f.sql.query("SELECT state FROM queue_v2_batch_executions")).toEqual([
+      { state: "send_authorized" },
+    ]);
+    observedIncarnation = physicalIncarnation;
+    expect(await composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "reconciled",
+      retired: 1,
+      nextCursor: null,
+    });
+    expect(
+      await f.sql.query("SELECT state,retirement_kind FROM queue_v2_batch_executions"),
+    ).toEqual([{ state: "retired", retirement_kind: "incarnation_absent" }]);
+    expect(await f.sql.query("SELECT state FROM queue_v2_batch_settlements")).toEqual([
+      { state: "pending" },
+    ]);
+    expect(await f.sql.query("SELECT deliveries FROM selfhost_queue_messages")).toEqual([
+      { deliveries: 1 },
+    ]);
+    expect(await composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "reconciled",
+      retired: 0,
+      nextCursor: null,
+    });
+  } finally {
+    await composition?.close();
+    f.database.close();
+  }
+});
+
+test("worker-wide authorized recovery advances a bounded 32-row keyset cursor", async () => {
+  const rows = Array.from({ length: 34 }, (_, index) => ({
+    batch_id: `batch-${String(index + 1).padStart(3, "0")}`,
+    reservation_token: `reservation-${index + 1}`,
+    queue_id: v2QueueId("cursor-queue"),
+    consumer_uid: "cursor-consumer",
+    consumer_generation: 1,
+    worker_uid: "cursor-worker",
+    serving_source_operation_id: "cursor-source",
+    worker_version_uid: "cursor-version",
+    worker_version_generation: 1,
+    incarnation_operation_id: "cursor-physical-incarnation",
+  }));
+  const sql = {
+    async query(statement: string, params?: readonly SqlParam[]) {
+      expect(statement).toContain("state = 'send_authorized'");
+      expect(params?.[0]).toBe("cursor-worker");
+      const after = String(params?.[1] ?? "");
+      return rows.filter((row) => row.batch_id > after).slice(0, 33);
+    },
+  } as unknown as Sql;
+  const first = await listV2AuthorizedQueueExecutionsForWorker(sql, {
+    workerUid: "cursor-worker",
+  });
+  expect(first.executions).toHaveLength(32);
+  expect(first.nextCursor).toBe("batch-032");
+  if (!first.nextCursor) throw new Error("first recovery page did not advance");
+  const second = await listV2AuthorizedQueueExecutionsForWorker(sql, {
+    workerUid: "cursor-worker",
+    afterBatchId: first.nextCursor,
+  });
+  expect(second.executions.map((row) => row.batchId)).toEqual(["batch-033", "batch-034"]);
+  expect(second.nextCursor).toBeNull();
 });
 
 test("retiring Consumer retains a DLQ wake notice after terminal copy", async () => {

@@ -208,7 +208,7 @@ export function createV2QueueSettlementAuthority(input: {
 }): V2QueueSettlementAuth & {
   mint(grant: V2QueueDispatchGrant): string;
   bindingToken(
-    grant: Pick<V2QueueDispatchGrant, "workerUid" | "versionId" | "incarnationId">,
+    grant: Pick<V2QueueDispatchGrant, "workerUid" | "versionId" | "servingSourceOperationId">,
   ): string;
 } {
   if (!(input.key instanceof Uint8Array) || input.key.byteLength < 32) {
@@ -219,17 +219,17 @@ export function createV2QueueSettlementAuthority(input: {
   const mac = (domain: string, value: string): Buffer =>
     createHmac("sha256", key).update(domain, "utf8").update("\0").update(value, "utf8").digest();
   const bindingToken = (
-    grant: Pick<V2QueueDispatchGrant, "workerUid" | "versionId" | "incarnationId">,
+    grant: Pick<V2QueueDispatchGrant, "workerUid" | "versionId" | "servingSourceOperationId">,
   ) => {
     if (
-      [grant.workerUid, grant.versionId, grant.incarnationId].some(
+      [grant.workerUid, grant.versionId, grant.servingSourceOperationId].some(
         (value) => typeof value !== "string" || value.length < 1 || value.length > 256,
       )
     )
       throw new TypeError("v2 Queue binding scope is invalid");
     return mac(
       "binding/v2",
-      JSON.stringify([grant.workerUid, grant.versionId, grant.incarnationId]),
+      JSON.stringify([grant.workerUid, grant.versionId, grant.servingSourceOperationId]),
     ).toString("base64url");
   };
   const validGrant = (grant: V2QueueDispatchGrant): boolean =>
