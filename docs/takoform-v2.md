@@ -287,7 +287,10 @@ second create. The source migration does not change the live apply ceilings.
 
 The private Cloudflare adapter exercises accepted Core Host operations with
 explicit organization principals and real SQLite, using a simulated external
-API. This does not prove HTTP authentication or complete Form support. Native
+API. The separate `buildApp.fetch` journey exercises stored organization API-key
+authentication, the same UID across two writer keys, read-only mutation refusal
+and cross-organization read refusal. It still uses a simulated identity provider
+and Cloudflare API and does not prove complete Form support. Native
 Worker Binding execution remains unqualified, as does the client's assumption
 that an exact-ID GET HTTP 404 proves absence rather than an account or permission
 failure. EdgeKVNamespace 0.2.0 gives bounds for TTL, list limit and prefix,
@@ -746,9 +749,13 @@ existing private data root. Boot restores the single SQL-backed Worker owner
 before opening ingress, polls Workflow due work as a separate tracked pass, and
 closes Workflow/Actor execution before suspending that owner. This is private
 source assembly only: the ordinary Host still does not register incomplete
-Worker Forms. In particular, the v2 Endpoint frontend lacks this composition's
-single publication-state port and an explicitly qualified HTTPS/TLS address,
-so this setting does not make v2 WorkerEndpoint or complete Worker support live.
+Worker Forms. `createSelfhostV2WorkerEndpointBoot` now joins the existing
+SQL/native frontend and HTTPS listener through one captured configuration and
+authority snapshot. It supplies the existing Endpoint backend ports and closes
+the listener if frontend construction fails. The ordinary entry does not yet
+select this boot or pass its publication-state port; its local certificate
+tests are not public DNS/CA qualification. This setting therefore does not make
+v2 WorkerEndpoint or complete Worker support live.
 
 ## Existing installations
 
@@ -779,6 +786,22 @@ failure recovery and delete. Concurrency and lost responses must preserve the
 same operation and resource identities. A restart test must terminate an OS
 process and reopen the same persistent state, not merely construct another
 JavaScript handle.
+
+The pinned-workerd Service Binding journey accepts caller and target resources
+through the authenticated Host fixture, then kills that Host process and proves
+both previous native children stale. A distinct Host and native PIDs reopen the
+same SQLite, file object store and owner roots. Service calls retain the original
+URL/Host and exclude private transport headers; a target-only Deployment change
+is visible without republishing the caller, followed by dependency-ordered
+deletion. This is loopback fixture evidence, not public TLS, normal Form
+registration or a long-stream interruption proof.
+
+Within one accepted publication, candidate revalidation reuses the exact
+Operation/Version/ordered-Binding token projection instead of opening an orphan
+broker for each pass. A different incarnation receives fresh credentials.
+Read-only publication observation rechecks the current graph and existing
+native/socket proof without opening another broker. Unknown legacy socket
+custody is not adopted or deleted by this repair.
 
 The opt-in normal Bun entry test also exercises one interrupted artifact
 create: it discards the HTTP response body and returned IDs, observes a

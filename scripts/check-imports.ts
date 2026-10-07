@@ -314,12 +314,25 @@ const LAYERS: readonly Layer[] = [
     may: [],
   },
   {
-    name: "app",
+    name: "v2-selfhost-endpoint-https",
     // This exact HTTPS listener adapts the v2 Endpoint observation contract
     // to a local TLS socket; it is not a general app permission to import the
     // v2 runtime layer.
     match: /^src\/selfhost-v2-worker-endpoint-https\.ts$/u,
     may: ["core", "adapter", "v2-runtime"],
+  },
+  {
+    // The exact outer boot joins the existing TLS witness and SQL/native
+    // frontend; it does not broaden generic Form/runtime import authority.
+    name: "v2-selfhost-endpoint-boot",
+    match: /^src\/selfhost-v2-worker-endpoint-boot\.ts$/u,
+    may: [
+      "core",
+      "v2-contract",
+      "v2-runtime",
+      "v2-selfhost-endpoint-frontend",
+      "v2-selfhost-endpoint-https",
+    ],
   },
   {
     name: "app",
