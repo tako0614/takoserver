@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import {
   mkdirSync,
@@ -13,7 +14,7 @@ import {
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { verifyBuiltWorkerd } from "../scripts/build-workerd.ts";
+import { installVerifiedArtifact, verifyBuiltWorkerd } from "../scripts/build-workerd.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
@@ -87,6 +88,34 @@ test("a mismatched candidate never creates the normal accepted artifact", async 
       }),
     ).rejects.toThrow("unqualified candidate retained");
     expect(readdirSync(join(root, "artifacts"))).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("only verified copied bytes acquire the no-overwrite accepted artifact name", async () => {
+  const root = mkdtempSync(join(tmpdir(), "workerd-install-test-"));
+  try {
+    const built = join(root, "built-workerd");
+    const artifact = join(root, "workerd-accepted");
+    const expected = createHash("sha256").update("expected bytes").digest("hex");
+    writeFileSync(built, "different bytes");
+
+    await expect(installVerifiedArtifact(built, artifact, expected)).rejects.toThrow(
+      "copied workerd artifact digest",
+    );
+    expect(readdirSync(root)).toEqual(["built-workerd"]);
+
+    writeFileSync(built, "expected bytes");
+    await installVerifiedArtifact(built, artifact, expected);
+    expect(readFileSync(artifact, "utf8")).toBe("expected bytes");
+    expect(statSync(artifact).mode & 0o777).toBe(0o755);
+
+    writeFileSync(built, "later unqualified replacement");
+    const laterDigest = createHash("sha256").update("later unqualified replacement").digest("hex");
+    await expect(installVerifiedArtifact(built, artifact, laterDigest)).rejects.toThrow();
+    expect(readFileSync(artifact, "utf8")).toBe("expected bytes");
+    expect(readdirSync(root).sort()).toEqual(["built-workerd", "workerd-accepted"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

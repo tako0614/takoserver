@@ -1,6 +1,16 @@
 import { createHash } from "node:crypto";
 import { createReadStream, constants as fsConstants } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, rename, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  copyFile,
+  link,
+  lstat,
+  mkdir,
+  rename,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 
@@ -47,10 +57,29 @@ export async function verifyBuiltWorkerd(_input: {
   }
 
   const artifact = join(_input.stateRoot, "artifacts", `workerd-${expected}`);
-  await copyFile(_input.built, artifact, fsConstants.COPYFILE_EXCL);
-  await chmod(artifact, 0o755);
-  await requireDigest(artifact, expected, "copied workerd artifact");
+  await installVerifiedArtifact(_input.built, artifact, expected);
   return artifact;
+}
+
+/** Verify private copied bytes before exposing the no-overwrite accepted name. */
+export async function installVerifiedArtifact(
+  built: string,
+  artifact: string,
+  expectedSha256: string,
+): Promise<void> {
+  const temporary = `${artifact}.unqualified-${crypto.randomUUID()}`;
+  let copied = false;
+  try {
+    await copyFile(built, temporary, fsConstants.COPYFILE_EXCL);
+    copied = true;
+    await chmod(temporary, 0o755);
+    await requireDigest(temporary, expectedSha256, "copied workerd artifact");
+    // Same-directory hard link is atomic and, unlike rename, cannot replace an
+    // existing accepted artifact. The temporary name is private until verified.
+    await link(temporary, artifact);
+  } finally {
+    if (copied) await unlink(temporary);
+  }
 }
 
 async function retainUnqualifiedCandidate(
