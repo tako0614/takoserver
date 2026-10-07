@@ -16,7 +16,10 @@ import {
   validateWorkerBundlePayload,
   type WorkerBundleManifest,
 } from "../src/takoform-v2/forms/worker-bundle.ts";
-import { projectV2WorkerCodeVersion } from "../src/takoform-v2/worker-code-runtime.ts";
+import {
+  inspectV2WorkerCodeVersionEligibility,
+  projectV2WorkerCodeVersion,
+} from "../src/takoform-v2/worker-code-runtime.ts";
 
 const encoder = new TextEncoder();
 const MANIFEST_URL = "https://artifacts.example.test/bundle/manifest.json";
@@ -182,6 +185,34 @@ test("projects verified code and JSON vars without changing v2 Worker identities
   expect(projection.modules.get(MODULE_PATH)).not.toBe(held.files[0]);
   held.files[0]?.fill(0x20);
   expect(projection.modules.get(MODULE_PATH)).toEqual(MODULE_BYTES);
+});
+
+test("checks scheduled code eligibility without inventing an event-delivery token", async () => {
+  const held = await heldBundle();
+  const observed: WorkerModuleInspectionInput[] = [];
+
+  await expect(
+    inspectV2WorkerCodeVersionEligibility({
+      workerResourceUid: WORKER_UID,
+      bundleResourceUid: BUNDLE_UID,
+      spec: versionSpec({ handlers: ["scheduled"] }),
+      bundle: held,
+      inspectModule: inspector({ outcome: "valid", exportedHandlers: ["scheduled"] }, (input) =>
+        observed.push(input),
+      ),
+    }),
+  ).resolves.toBeUndefined();
+  expect(observed).toHaveLength(1);
+  expect(observed[0]?.declaredHandlers).toEqual(["scheduled"]);
+
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec: versionSpec({ handlers: ["scheduled"] }),
+      bundle: held,
+      inspectModule: inspector({ outcome: "valid", exportedHandlers: ["scheduled"] }),
+    }),
+  ).rejects.toMatchObject({ code: "worker_event_delivery_unavailable" });
 });
 
 test("rejects bytes that no longer match the immutable bundle digest and observation", async () => {

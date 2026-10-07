@@ -53,6 +53,31 @@ export class V2WorkerCodeRuntimeError extends Error {
   }
 }
 
+interface VerifiedV2WorkerCodeEligibility {
+  readonly spec: ReturnType<typeof parseWorkerVersionSpec>;
+  readonly bundle: BundleSnapshot;
+  readonly manifest: WorkerBundleManifest;
+  readonly assets?: Awaited<ReturnType<typeof verifyV2AssetMaterials>>;
+}
+
+/**
+ * Verify whether an accepted held WorkerVersion can be interpreted by the
+ * current code projection. This is eligibility only: scheduled validation
+ * does not authorize delivery or manufacture an event token.
+ */
+export async function inspectV2WorkerCodeVersionEligibility(input: {
+  readonly workerResourceUid: string;
+  readonly bundleResourceUid?: string;
+  readonly assetResourceUid?: string;
+  readonly spec: unknown;
+  readonly bundle: SqlArtifactCustodyRead<WorkerBundleManifest> | null;
+  readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
+  readonly inspectModule: WorkerdRuntime["inspectModule"];
+  readonly privateInputs?: unknown;
+}): Promise<void> {
+  await verifyV2WorkerCodeEligibility(input);
+}
+
 /**
  * Project an already-authorized immutable WorkerBundle and inspected code
  * snapshot into the existing Workerd application-module representation.
@@ -69,7 +94,6 @@ export async function projectV2WorkerCodeVersion(input: {
   /** Non-optional private event gate capability composed by the owning Host. */
   readonly eventDelivery?: { readonly token: string };
 }): Promise<V2WorkerCodeDeploymentVariant> {
-  const versionUnavailable = () => new V2WorkerCodeRuntimeError("worker_version_unavailable");
   const bundleUnavailable = () => new V2WorkerCodeRuntimeError("worker_bundle_unavailable");
   const inspectModule = input.inspectModule;
   if (typeof inspectModule !== "function") {
@@ -77,79 +101,27 @@ export async function projectV2WorkerCodeVersion(input: {
   }
 
   const identity = snapshotIdentity(input.identity);
-  let spec: ReturnType<typeof parseWorkerVersionSpec>;
-  try {
-    spec = parseWorkerVersionSpec(structuredClone(input.spec));
-  } catch {
-    throw versionUnavailable();
-  }
-  if (
-    !spec.bundle ||
-    spec.worker.resourceUid !== identity.workerResourceUid ||
-    spec.bundle.resourceUid !== identity.bundleResourceUid
-  ) {
-    throw bundleUnavailable();
-  }
-  if (spec.requiredSensitiveVars.length > 0 || hasPrivateInputs(input.privateInputs)) {
-    throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
-  }
-  if (
-    spec.kvBindings.length > 0 ||
-    spec.sqliteBindings.length > 0 ||
-    spec.bucketBindings.length > 0 ||
-    spec.queueProducerBindings.length > 0 ||
-    spec.serviceBindings.length > 0 ||
-    spec.actorBindings.length > 0 ||
-    spec.workflowBindings.length > 0
-  ) {
-    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
-  }
-  if (
-    spec.handlers.some((handler) => handler !== "fetch" && handler !== "scheduled") ||
-    (spec.handlers.includes("scheduled") &&
-      (!input.eventDelivery || !/^[0-9a-f]{64}$/u.test(input.eventDelivery.token)))
-  ) {
-    throw new V2WorkerCodeRuntimeError("worker_event_delivery_unavailable");
-  }
-  if (spec.assets?.bundle.resourceUid !== identity.assetResourceUid) {
-    throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
-  }
-  if (!spec.assets && input.assets) {
-    throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
-  }
-  if (!input.bundle) throw bundleUnavailable();
+  const verified = await verifyV2WorkerCodeEligibility({
+    workerResourceUid: identity.workerResourceUid,
+    bundleResourceUid: identity.bundleResourceUid,
+    ...(identity.assetResourceUid === undefined
+      ? {}
+      : { assetResourceUid: identity.assetResourceUid }),
+    spec: input.spec,
+    bundle: input.bundle,
+    ...(input.assets === undefined ? {} : { assets: input.assets }),
+    inspectModule,
+    privateInputs: input.privateInputs,
+    requireEventDelivery: true,
+    ...(input.eventDelivery === undefined ? {} : { eventDelivery: input.eventDelivery }),
+  });
+  const { spec, bundle: held, manifest, assets } = verified;
 
-  const held = snapshotBundle(input.bundle);
-  const observed = await verifyBundle(held);
-  let assets: Awaited<ReturnType<typeof verifyV2AssetMaterials>> | undefined;
-  if (spec.assets) {
-    if (!input.assets) throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
-    try {
-      assets = await verifyV2AssetMaterials(input.assets);
-    } catch {
-      throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
-    }
-    if (
-      spec.assets.notFoundHandling === "single_page_application" &&
-      !assets.bytes.has("index.html")
-    ) {
-      throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
-    }
-  }
-  const inspectionInput = inspectionInputForBundle(held, observed.manifest, spec.handlers);
-  const inspection = await inspectModule(inspectionInput);
-  if (!isValidInspection(inspection)) {
-    throw new V2WorkerCodeRuntimeError("worker_module_inspection_unavailable");
-  }
-  if (spec.handlers.some((handler) => !inspection.exportedHandlers.includes(handler))) {
-    throw new V2WorkerCodeRuntimeError("worker_handler_mismatch");
-  }
-
-  const entrypoint = observed.manifest.entrypoint;
+  const entrypoint = manifest.entrypoint;
   const modules = new Map<string, Uint8Array>();
   const moduleMediaTypes = Object.create(null) as Record<string, WorkerdModuleMediaType>;
-  for (let index = 0; index < observed.manifest.files.length; index += 1) {
-    const file = observed.manifest.files[index];
+  for (let index = 0; index < manifest.files.length; index += 1) {
+    const file = manifest.files[index];
     const bytes = held.files[index];
     if (!file || !bytes) throw bundleUnavailable();
     modules.set(file.path, new Uint8Array(bytes));
@@ -162,9 +134,7 @@ export async function projectV2WorkerCodeVersion(input: {
   const site: WorkerdSite = {
     directory: identity.directory,
     mainModule: entrypoint,
-    modules: observed.manifest.files
-      .filter((file) => file.path !== entrypoint)
-      .map((file) => file.path),
+    modules: manifest.files.filter((file) => file.path !== entrypoint).map((file) => file.path),
     moduleMediaTypes,
     hostnames: [...identity.hostnames],
     generation: identity.generation,
@@ -192,6 +162,101 @@ export async function projectV2WorkerCodeVersion(input: {
     site,
     modules,
     ...(assets ? { assets: assets.bytes } : {}),
+  };
+}
+
+async function verifyV2WorkerCodeEligibility(input: {
+  readonly workerResourceUid: string;
+  readonly bundleResourceUid?: string;
+  readonly assetResourceUid?: string;
+  readonly spec: unknown;
+  readonly bundle: SqlArtifactCustodyRead<WorkerBundleManifest> | null;
+  readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
+  readonly inspectModule: WorkerdRuntime["inspectModule"];
+  readonly privateInputs?: unknown;
+  readonly requireEventDelivery?: boolean;
+  readonly eventDelivery?: { readonly token: string };
+}): Promise<VerifiedV2WorkerCodeEligibility> {
+  const versionUnavailable = () => new V2WorkerCodeRuntimeError("worker_version_unavailable");
+  const bundleUnavailable = () => new V2WorkerCodeRuntimeError("worker_bundle_unavailable");
+  const inspectModule = input.inspectModule;
+  if (typeof inspectModule !== "function") {
+    throw new V2WorkerCodeRuntimeError("worker_module_inspection_unavailable");
+  }
+  let spec: ReturnType<typeof parseWorkerVersionSpec>;
+  try {
+    spec = parseWorkerVersionSpec(structuredClone(input.spec));
+  } catch {
+    throw versionUnavailable();
+  }
+  if (
+    !spec.bundle ||
+    spec.worker.resourceUid !== input.workerResourceUid ||
+    spec.bundle.resourceUid !== input.bundleResourceUid
+  ) {
+    throw bundleUnavailable();
+  }
+  if (spec.requiredSensitiveVars.length > 0 || hasPrivateInputs(input.privateInputs)) {
+    throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
+  }
+  if (
+    spec.kvBindings.length > 0 ||
+    spec.sqliteBindings.length > 0 ||
+    spec.bucketBindings.length > 0 ||
+    spec.queueProducerBindings.length > 0 ||
+    spec.serviceBindings.length > 0 ||
+    spec.actorBindings.length > 0 ||
+    spec.workflowBindings.length > 0
+  ) {
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
+  }
+  if (
+    spec.handlers.some((handler) => handler !== "fetch" && handler !== "scheduled") ||
+    (input.requireEventDelivery === true &&
+      spec.handlers.includes("scheduled") &&
+      (!input.eventDelivery || !/^[0-9a-f]{64}$/u.test(input.eventDelivery.token)))
+  ) {
+    throw new V2WorkerCodeRuntimeError("worker_event_delivery_unavailable");
+  }
+  if (spec.assets?.bundle.resourceUid !== input.assetResourceUid) {
+    throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
+  }
+  if (!spec.assets && input.assets) {
+    throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
+  }
+  if (!input.bundle) throw bundleUnavailable();
+
+  const bundle = snapshotBundle(input.bundle);
+  const verifiedBundle = await verifyBundle(bundle);
+  let assets: Awaited<ReturnType<typeof verifyV2AssetMaterials>> | undefined;
+  if (spec.assets) {
+    if (!input.assets) throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
+    try {
+      assets = await verifyV2AssetMaterials(input.assets);
+    } catch {
+      throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
+    }
+    if (
+      spec.assets.notFoundHandling === "single_page_application" &&
+      !assets.bytes.has("index.html")
+    ) {
+      throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
+    }
+  }
+  const inspection = await inspectModule(
+    inspectionInputForBundle(bundle, verifiedBundle.manifest, spec.handlers),
+  );
+  if (!isValidInspection(inspection)) {
+    throw new V2WorkerCodeRuntimeError("worker_module_inspection_unavailable");
+  }
+  if (spec.handlers.some((handler) => !inspection.exportedHandlers.includes(handler))) {
+    throw new V2WorkerCodeRuntimeError("worker_handler_mismatch");
+  }
+  return {
+    spec,
+    bundle,
+    manifest: verifiedBundle.manifest,
+    ...(assets ? { assets } : {}),
   };
 }
 

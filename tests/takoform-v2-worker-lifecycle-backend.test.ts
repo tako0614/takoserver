@@ -10,6 +10,8 @@ import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { createStaticAssetBundleHost } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
+import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
+import { createWorkerBundleHost } from "../src/takoform-v2/forms/worker-bundle-backend.ts";
 import {
   referencesForWorkerDeployment,
   referencesForWorkerEndpoint,
@@ -26,21 +28,30 @@ import {
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import type { V2Execution } from "../src/takoform-v2/types.ts";
 import {
+  createInternalV2CodeWorkerVersionForm,
   createInternalV2ModuleWorkerForm,
   createInternalV2StaticWorkerVersionForm,
   type V2WorkerRetirementProof,
   type V2WorkerRetirementTarget,
 } from "../src/takoform-v2/worker-lifecycle-backend.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
+import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
 
 const TARGET_KEY = "internal-static-worker-management";
 const MANIFEST_URL = "https://artifacts.example.test/static/manifest.json";
 const FILE_URL = "https://artifacts.example.test/static/index.html";
 const FILE_BYTES = new TextEncoder().encode("<main>held asset</main>");
+const BUNDLE_MANIFEST_URL = "https://artifacts.example.test/code/manifest.json";
+const BUNDLE_FILE_URL = "https://artifacts.example.test/code/index.mjs";
+const BUNDLE_FILE_BYTES = new TextEncoder().encode(
+  "export default { fetch() { return new Response('held'); }, scheduled() {} };",
+);
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
 function fixture(options?: {
   gateEndpointWithPublicationReader?: boolean;
+  codeWorkerVersion?: boolean;
+  inspectModule?: WorkerdRuntime["inspectModule"];
   backendQueryHook?: (
     statement: string,
     sql: Sql,
@@ -89,20 +100,37 @@ function fixture(options?: {
       ],
     }),
   );
+  const bundleManifest = new TextEncoder().encode(
+    JSON.stringify({
+      entrypoint: "index.mjs",
+      files: [
+        {
+          path: "index.mjs",
+          url: BUNDLE_FILE_URL,
+          sha256: sha256(BUNDLE_FILE_BYTES),
+          mediaType: "application/javascript+module",
+        },
+      ],
+    }),
+  );
   const source = {
     async read({ url }: { url: string }) {
       sourceReads += 1;
       if (!sourceAvailable) throw new Error("artifact source is offline");
       if (url === MANIFEST_URL) return manifest;
       if (url === FILE_URL) return FILE_BYTES;
+      if (url === BUNDLE_MANIFEST_URL) return bundleManifest;
+      if (url === BUNDLE_FILE_URL) return BUNDLE_FILE_BYTES;
       throw new Error("unrecognized artifact source");
     },
   };
   const assetHost = createStaticAssetBundleHost({ sql, source, targetKey: TARGET_KEY });
+  const bundleHost = createWorkerBundleHost({ sql, source, targetKey: TARGET_KEY });
   const publicationState = createV2WorkerPublicationState({
     sql,
     now: () => new Date(nowMs),
     assetCustody: assetHost.custody,
+    bundleCustody: bundleHost.custody,
   });
   const retirement = {
     async observeRetired(target: V2WorkerRetirementTarget) {
@@ -144,12 +172,22 @@ function fixture(options?: {
     retirement,
     serving,
   });
-  const versionForm = createInternalV2StaticWorkerVersionForm({
-    sql: backendSql,
-    targetKey: TARGET_KEY,
-    publicationState,
-    retirement,
-  });
+  const versionForm = options?.codeWorkerVersion
+    ? createInternalV2CodeWorkerVersionForm({
+        sql: backendSql,
+        targetKey: TARGET_KEY,
+        publicationState,
+        retirement,
+        inspectModule:
+          options.inspectModule ??
+          (async () => ({ outcome: "valid", exportedHandlers: ["fetch", "scheduled"] })),
+      })
+    : createInternalV2StaticWorkerVersionForm({
+        sql: backendSql,
+        targetKey: TARGET_KEY,
+        publicationState,
+        retirement,
+      });
   const confirmedDeployment = async (execution: { spec: JsonObject; operationId: string }) => {
     const spec = parseWorkerDeploymentSpec(execution.spec);
     served = {
@@ -212,6 +250,7 @@ function fixture(options?: {
       [MODULE_WORKER_FORM_URL]: workerForm,
       [WORKER_VERSION_FORM_URL]: versionForm,
       [STATIC_ASSET_BUNDLE_FORM_URL]: assetHost.form,
+      [WORKER_BUNDLE_FORM_URL]: bundleHost.form,
       // A test-only confirmed Deployment observation, not native publication proof.
       [WORKER_DEPLOYMENT_FORM_URL]: {
         validateCreate(spec) {
@@ -281,6 +320,36 @@ function fixture(options?: {
     };
     return { worker, assets, spec };
   }
+  async function createWorkerAndBundle(
+    handlers: readonly string[] = ["scheduled"],
+    withAssets = false,
+  ) {
+    const worker = await create(MODULE_WORKER_FORM_URL, "code-worker", {});
+    const bundle = await create(WORKER_BUNDLE_FORM_URL, "code-bundle", {
+      artifact: { url: BUNDLE_MANIFEST_URL, sha256: sha256(bundleManifest) },
+    });
+    const assets = withAssets
+      ? await create(STATIC_ASSET_BUNDLE_FORM_URL, "code-assets", {
+          artifact: { url: MANIFEST_URL, sha256: sha256(manifest) },
+        })
+      : undefined;
+    const spec: JsonObject = {
+      worker: { resourceUid: worker.resourceUid },
+      bundle: { resourceUid: bundle.resourceUid },
+      handlers: [...handlers],
+      vars: { MODE: "scheduled-eligible" },
+      ...(assets
+        ? {
+            assets: {
+              bundle: { resourceUid: assets.resourceUid },
+              runWorkerFirst: false,
+              notFoundHandling: "none",
+            },
+          }
+        : {}),
+    };
+    return { worker, bundle, assets, spec };
+  }
   return {
     db,
     sql,
@@ -291,6 +360,7 @@ function fixture(options?: {
     serving,
     create,
     createWorkerAndAssets,
+    createWorkerAndBundle,
     get nowMs() {
       return nowMs;
     },
@@ -1141,6 +1211,196 @@ test("DELETE refuses a claim whose lease expires during its final reference read
       observedGeneration: 1,
     });
   } finally {
+    f.close();
+  }
+});
+
+test("scheduled code WorkerVersion settles from held bundle eligibility without publishing", async () => {
+  const inspected: { declaredHandlers: readonly string[]; moduleBytes: Uint8Array }[] = [];
+  const f = fixture({
+    codeWorkerVersion: true,
+    inspectModule: async (input) => {
+      inspected.push({
+        declaredHandlers: input.declaredHandlers,
+        moduleBytes: new Uint8Array(input.modules[0]?.bytes ?? []),
+      });
+      return { outcome: "valid", exportedHandlers: ["scheduled"] };
+    },
+  });
+  try {
+    const { spec } = await f.createWorkerAndBundle(["scheduled"], true);
+    f.sourceAvailable = false;
+    const readsBeforeVersion = f.sourceReads;
+    const accepted = await f.create(WORKER_VERSION_FORM_URL, "scheduled-version", spec);
+    expect(f.sourceReads).toBe(readsBeforeVersion);
+    expect(inspected).toEqual([
+      {
+        declaredHandlers: ["scheduled"],
+        moduleBytes: BUNDLE_FILE_BYTES,
+      },
+    ]);
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: accepted.resourceUid }),
+    ).toMatchObject({
+      form: WORKER_VERSION_FORM_URL,
+      observed: { ready: true, codeVerified: true },
+      output: {},
+    });
+    expect(
+      await f.sql.query("SELECT uid FROM tf_v2_resources WHERE form_url = ?", [
+        WORKER_DEPLOYMENT_FORM_URL,
+      ]),
+    ).toHaveLength(0);
+    expect(
+      await f.engine.acceptCreate({
+        principal: "org-1",
+        key: "create-scheduled-version-key",
+        input: { form: WORKER_VERSION_FORM_URL, space: "prod", name: "scheduled-version", spec },
+      }),
+    ).toMatchObject({ id: accepted.id, status: "succeeded" });
+
+    f.retirementMode = "confirmed";
+    const deletion = await f.engine.acceptDelete({
+      principal: "org-1",
+      key: "delete-scheduled-version-key",
+      uid: accepted.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: deletion.id,
+      status: "succeeded",
+      effect: "complete",
+    });
+  } finally {
+    f.close();
+  }
+});
+
+test("unsupported code handlers refuse before acceptance and never inspect", async () => {
+  let inspections = 0;
+  const f = fixture({
+    codeWorkerVersion: true,
+    inspectModule: async () => {
+      inspections += 1;
+      return { outcome: "valid", exportedHandlers: ["queue"] };
+    },
+  });
+  try {
+    const { spec } = await f.createWorkerAndBundle(["queue"]);
+    await expect(
+      f.engine.acceptCreate({
+        principal: "org-1",
+        key: "unsupported-queue-code-version",
+        input: { form: WORKER_VERSION_FORM_URL, space: "prod", name: "queue-version", spec },
+      }),
+    ).rejects.toMatchObject({ code: "capability_required", status: 422 });
+    expect(inspections).toBe(0);
+    expect(
+      await f.sql.query("SELECT id FROM tf_v2_operations WHERE replay_key = ?", [
+        "unsupported-queue-code-version",
+      ]),
+    ).toHaveLength(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("a scheduled declaration without an exported scheduled handler stays unresolved", async () => {
+  const f = fixture({
+    codeWorkerVersion: true,
+    inspectModule: async () => ({ outcome: "valid", exportedHandlers: ["fetch"] }),
+  });
+  try {
+    const { spec } = await f.createWorkerAndBundle();
+    const accepted = await f.engine.acceptCreate({
+      principal: "org-1",
+      key: "scheduled-handler-mismatch",
+      input: { form: WORKER_VERSION_FORM_URL, space: "prod", name: "mismatch-version", spec },
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: accepted.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: accepted.resourceUid }),
+    ).toMatchObject({ observedGeneration: 0, observed: {} });
+  } finally {
+    f.close();
+  }
+});
+
+test("damaged held WorkerBundle custody cannot make code Version eligible", async () => {
+  let inspections = 0;
+  const f = fixture({
+    codeWorkerVersion: true,
+    inspectModule: async () => {
+      inspections += 1;
+      return { outcome: "valid", exportedHandlers: ["scheduled"] };
+    },
+  });
+  try {
+    const { bundle, spec } = await f.createWorkerAndBundle();
+    await f.sql.run("DELETE FROM tf_v2_artifact_chunks WHERE resource_uid = ?", [
+      bundle.resourceUid,
+    ]);
+    const accepted = await f.engine.acceptCreate({
+      principal: "org-1",
+      key: "damaged-code-version-custody",
+      input: { form: WORKER_VERSION_FORM_URL, space: "prod", name: "damaged-version", spec },
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: accepted.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(inspections).toBe(0);
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: accepted.resourceUid }),
+    ).toMatchObject({ observedGeneration: 0, observed: {} });
+  } finally {
+    f.close();
+  }
+});
+
+test("scheduled code inspector cannot settle after its accepted SQL claim expires", async () => {
+  let enterInspection!: () => void;
+  let releaseInspection!: () => void;
+  const inspectionEntered = new Promise<void>((resolve) => {
+    enterInspection = resolve;
+  });
+  const inspectionBlocked = new Promise<void>((resolve) => {
+    releaseInspection = resolve;
+  });
+  const f = fixture({
+    codeWorkerVersion: true,
+    inspectModule: async () => {
+      enterInspection();
+      await inspectionBlocked;
+      return { outcome: "valid", exportedHandlers: ["scheduled"] };
+    },
+  });
+  try {
+    const { spec } = await f.createWorkerAndBundle();
+    const accepted = await f.engine.acceptCreate({
+      principal: "org-1",
+      key: "scheduled-version-expired-inspection",
+      input: { form: WORKER_VERSION_FORM_URL, space: "prod", name: "expired-version", spec },
+    });
+    const processing = f.engine.runNext();
+    await inspectionEntered;
+    await f.sql.run("UPDATE tf_v2_operations SET lease_until_ms = 1 WHERE id = ?", [accepted.id]);
+    releaseInspection();
+    expect(await processing).toMatchObject({
+      id: accepted.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: accepted.resourceUid }),
+    ).toMatchObject({ observedGeneration: 0, observed: {} });
+  } finally {
+    releaseInspection();
     f.close();
   }
 });
