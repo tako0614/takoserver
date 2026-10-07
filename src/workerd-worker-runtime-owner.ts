@@ -1979,15 +1979,25 @@ export async function openWorkerdWorkerRuntimeOwner(
   });
   const transitionState = stateWriter.transition;
 
-  const persistPhysicalAbsence = async (record: IncarnationRecord): Promise<void> => {
+  const persistPhysicalAbsence = async (
+    record: IncarnationRecord,
+    successorIdentity?: LinuxProcessIdentity,
+  ): Promise<void> => {
+    if (!record.processIdentity || (await linuxProcessLiveness(record.processIdentity)) !== "stale")
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const listener = await workerPortOwnership(record.listenerPort, undefined);
     if (
-      !record.processIdentity ||
-      (await linuxProcessLiveness(record.processIdentity)) !== "stale" ||
-      (await workerPortOwnership(record.listenerPort, undefined)) !== "vacant"
+      listener !== "vacant" &&
+      (!successorIdentity ||
+        (await linuxProcessLiveness(successorIdentity)) !== "live" ||
+        (await workerPortOwnership(record.listenerPort, successorIdentity.pid)) !== "owned")
     )
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     const receipt = physicalAbsenceFor(record);
     await transitionState((current) => {
+      const exact = current.incarnations.find((item) => item.operationId === record.operationId);
+      if (!exact || canonicalJson(exact) !== canonicalJson(record))
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       const existing = current.physicalAbsences.find(
         (item) => item.incarnationId === receipt.incarnationId,
       );
@@ -2190,6 +2200,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     invocation.finished = true;
     incarnation.invocations.delete(invocation);
     if (
+      !suspending &&
       incarnation.invocations.size === 0 &&
       incarnation.record.status === "draining" &&
       !incarnation.record.deferRetirementUntilDeadline
@@ -2309,8 +2320,11 @@ export async function openWorkerdWorkerRuntimeOwner(
     const delay = Math.max(0, at - Date.now());
     const run = () => {
       delete incarnation.retirementTimer;
+      if (suspending) return;
       void cancelInvocations(incarnation)
-        .then(() => retireIncarnation(incarnation))
+        .then(() => {
+          if (!suspending) return retireIncarnation(incarnation);
+        })
         .catch(() => undefined);
     };
     if (options.scheduleRetirement) {
@@ -2382,6 +2396,16 @@ export async function openWorkerdWorkerRuntimeOwner(
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
     const spawningRecord = recordFor(operationId);
+    if (
+      spawningRecord?.processIdentity &&
+      canonicalJson(spawningRecord.processIdentity) !== canonicalJson(processIdentity)
+    ) {
+      // A supervisor may replace a crashed child without a Host restart. Its
+      // old Queue execution must be absent before this exact record is repinned
+      // to the new PID, whether the listener is vacant or already owned by the
+      // new child. A live/unknown old birth never permits this transition.
+      await persistPhysicalAbsence(spawningRecord, processIdentity);
+    }
     let refreshedDigest: string | null = null;
     if (spawningRecord?.configurationRefreshPending) {
       const groupDirectory = join(
@@ -4447,6 +4471,14 @@ export async function openWorkerdWorkerRuntimeOwner(
           throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
         for (const handle of handles.values()) {
           handle.retirementTimer?.();
+        }
+        // A drain callback may already have started retirement before the
+        // synchronous admission freeze. Join it before touching or releasing
+        // its group; a failed retire leaves this owner lock in place.
+        for (const handle of handles.values()) {
+          if (handle.retiring) await handle.retiring;
+        }
+        for (const handle of handles.values()) {
           await cancelInvocations(handle);
         }
         for (const handle of handles.values()) {

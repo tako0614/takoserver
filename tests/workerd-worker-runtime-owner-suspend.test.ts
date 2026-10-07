@@ -283,6 +283,35 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
         incarnationId: physicalId(OPERATION_ID, afterRecord.processIdentity),
       }),
     ).toMatchObject({ kind: "confirmed", status: "active" });
+    const restartedChild = children.find((child) => child.pid === afterRecord.processIdentity.pid);
+    if (!restartedChild) throw new Error("restored child missing");
+    restartedChild.kill("SIGKILL");
+    await restartedChild.exited;
+    const autoRestartDeadline = Date.now() + 5_000;
+    let autoRestarted: StoredState | null = null;
+    while (Date.now() < autoRestartDeadline) {
+      const candidate = JSON.parse(await readFile(statePath, "utf8")) as StoredState;
+      if (
+        candidate.incarnations[0]?.processIdentity.pid !== afterRecord.processIdentity.pid &&
+        (await owner.observeServing({ workerResourceUid: WORKER_UID, targetKey: TARGET_KEY }))
+          .kind === "serving"
+      ) {
+        autoRestarted = candidate;
+        break;
+      }
+      await Bun.sleep(20);
+    }
+    if (!autoRestarted) throw new Error("automatic child restart did not regain serving");
+    expect(autoRestarted.physicalAbsences.map((item) => item.incarnationId)).toContain(
+      physicalId(OPERATION_ID, afterRecord.processIdentity),
+    );
+    expect(
+      await owner.observeQueuePhysicalAbsence({
+        workerUid: WORKER_UID,
+        incarnationId: physicalId(OPERATION_ID, afterRecord.processIdentity),
+        servingSourceOperationId: OPERATION_ID,
+      }),
+    ).toMatchObject({ kind: "confirmed_absent" });
     expect(
       await owner.observeQueuePhysicalAbsence({
         workerUid: WORKER_UID,

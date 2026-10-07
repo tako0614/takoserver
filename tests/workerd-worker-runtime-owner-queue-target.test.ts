@@ -73,7 +73,8 @@ afterAll(async () => {
 
 // A real child/listener and exact on-disk publication, but no tenant handler execution.
 const CHILD_SOURCE = `
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 const [verb, watch, configPath] = process.argv.slice(-3);
 if (verb !== "serve" || watch !== "--watch" || !configPath) throw new Error("unexpected command");
 function identity() {
@@ -105,7 +106,19 @@ const server = Bun.serve({ hostname: "127.0.0.1", port: initial.port, async fetc
   }
   return new Response(current.generation);
 } });
-process.on("SIGTERM", () => server.stop(true));
+process.on("SIGTERM", () => {
+  const root = dirname(process.argv[1]);
+  if (!existsSync(join(root, "hold-retirement." + process.pid))) {
+    server.stop(true);
+    return;
+  }
+  writeFileSync(join(root, "retirement-entered." + process.pid), "entered");
+  const timer = setInterval(() => {
+    if (!existsSync(join(root, "release-retirement." + process.pid))) return;
+    clearInterval(timer);
+    server.stop(true);
+  }, 10);
+});
 process.on("SIGUSR1", () => { server.stop(true); setInterval(() => {}, 1000); });
 `;
 
@@ -431,6 +444,104 @@ test("Queue target observation confirms only the exact live active or draining n
   } finally {
     await heldReader?.cancel().catch(() => undefined);
     await closeFixtureOwner(owner, children, root);
+  }
+});
+
+test("suspend joins a draining retirement already waiting for exact child exit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "takoserver-queue-owner-suspend-drain-"));
+  const binary = join(root, "bun-workerd-stand-in.js");
+  const children: ReturnType<typeof spawnWorkerdWithParentDeath>[] = [];
+  const publication = publicationState();
+  await writeFile(binary, `#!${process.execPath}\n${CHILD_SOURCE}`, { mode: 0o700 });
+  await chmod(binary, 0o700);
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: join(root, "owners"),
+    workerResourceUid: WORKER_UID,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: binary,
+    listenerPortForOperation: unusedPort,
+    spawn(command): WorkerdProcess {
+      const child = spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" });
+      children.push(child);
+      return child;
+    },
+  });
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let oldPid = 0;
+  try {
+    expect(await owner.execute(execution(CREATE_ID, "create"))).toMatchObject({
+      kind: "confirmed",
+    });
+    publication.setCurrent(CREATE_ID);
+    const oldChild = children[0];
+    if (!oldChild?.pid) throw new Error("old child PID missing");
+    oldPid = oldChild.pid;
+    reader = (
+      await owner.fetch(new Request(`https://${WORKER_UID}.example.test/hold`))
+    ).body?.getReader();
+    if (!reader) throw new Error("held reader missing");
+    await reader.read();
+    expect(await owner.execute(execution(UPDATE_ID, "update"))).toMatchObject({
+      kind: "confirmed",
+    });
+    publication.setCurrent(UPDATE_ID);
+    await writeFile(join(root, `hold-retirement.${oldPid}`), "hold", { mode: 0o600 });
+    await reader.cancel();
+    reader = undefined;
+    const entered = join(root, `retirement-entered.${oldPid}`);
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline && !(await Bun.file(entered).exists())) await Bun.sleep(10);
+    expect(await Bun.file(entered).exists()).toBe(true);
+    let settled = false;
+    const pending = owner.suspend().then(() => {
+      settled = true;
+    });
+    await Bun.sleep(50);
+    expect(settled).toBe(false);
+    expect(
+      await linuxProcessLiveness(
+        await (async () => {
+          const key = createHash("sha256").update(WORKER_UID).digest("hex");
+          const state = JSON.parse(
+            await Bun.file(join(root, "owners", key, "runtime-owner.json")).text(),
+          ) as {
+            incarnations: Array<{
+              operationId: string;
+              processIdentity: Parameters<typeof linuxProcessLiveness>[0];
+            }>;
+          };
+          const old = state.incarnations.find((item) => item.operationId === CREATE_ID);
+          if (!old) throw new Error("old incarnation missing");
+          return old.processIdentity;
+        })(),
+      ),
+    ).toBe("live");
+    await writeFile(join(root, `release-retirement.${oldPid}`), "release", { mode: 0o600 });
+    await pending;
+    expect(await oldChild.exited).toBe(0);
+    const key = createHash("sha256").update(WORKER_UID).digest("hex");
+    const state = JSON.parse(
+      await Bun.file(join(root, "owners", key, "runtime-owner.json")).text(),
+    ) as {
+      suspended: boolean;
+      incarnations: Array<{ operationId: string; status: string; receipt: unknown }>;
+      physicalAbsences: Array<{ operationId: string }>;
+    };
+    expect(state.suspended).toBe(true);
+    expect(state.incarnations.find((item) => item.operationId === CREATE_ID)).toMatchObject({
+      status: "retired",
+    });
+    expect(state.physicalAbsences.map((item) => item.operationId)).toContain(CREATE_ID);
+    expect(state.physicalAbsences.map((item) => item.operationId)).toContain(UPDATE_ID);
+  } finally {
+    await reader?.cancel().catch(() => undefined);
+    if (oldPid)
+      await writeFile(join(root, `release-retirement.${oldPid}`), "release", { mode: 0o600 });
+    for (const child of children)
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await Promise.all(children.map((child) => child.exited));
+    await rm(root, { recursive: true, force: true });
   }
 });
 
