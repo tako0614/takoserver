@@ -444,7 +444,9 @@ export function createV2QueueSettlementEndpoint(input: {
         batchId: grant.batchId,
         messageId: body.messageId,
         expected: {
-          queueId: grant.queueUid,
+          // Core's physical QueueCustody namespace is derived from the
+          // authenticated Resource UID, never supplied by the request body.
+          queueId: `takoform-v2-queue:${grant.queueUid}`,
           consumerId: grant.consumerUid,
           generation: grant.generation,
           leaseToken: grant.leaseToken,

@@ -71,7 +71,7 @@ test("private settlement derives exact SQL scope from authenticated live grant",
       batchId: "batch-1",
       messageId: "message-1",
       expected: {
-        queueId: "queue-uid-1",
+      queueId: "takoform-v2-queue:queue-uid-1",
         consumerId: "consumer-uid-1",
         generation: 7,
         leaseToken: "lease-1",
