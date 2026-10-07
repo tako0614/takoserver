@@ -526,7 +526,7 @@ async function proveSigningPublicJwk(privateJwk: string, privateKey: CryptoKey):
   }
 }
 
-/** 0075 is source-only until a separate schema wave; config never applies it. */
+/** Source-only migrations never apply themselves merely because a Form is configured. */
 async function requireV2ArtifactProgressSchema(sql: ReturnType<typeof createD1Sql>): Promise<void> {
   const columns = [
     "operation_id",
@@ -577,6 +577,98 @@ async function requireV2ArtifactProgressSchema(sql: ReturnType<typeof createD1Sq
   }
 }
 
+async function requireV2PrivateInputSchema(sql: ReturnType<typeof createD1Sql>): Promise<void> {
+  const unavailable = () =>
+    new TypeError("configured v2 Forms require the complete 0081 D1 schema");
+  const operations = await sql.query("PRAGMA table_info(tf_v2_operations)");
+  const privatePresence = operations.find((column) => column.name === "private_inputs_present");
+  if (
+    privatePresence?.notnull !== 1 ||
+    !operations.some((column) => column.name === "input_required_names_json") ||
+    !operations.some((column) => column.name === "input_required_reason")
+  ) {
+    throw unavailable();
+  }
+  for (const [table, names] of [
+    [
+      "tf_v2_private_inputs",
+      [
+        "operation_id",
+        "names_json",
+        "comparison_key_id",
+        "comparison_tag",
+        "transfer_key_id",
+        "transfer_nonce",
+        "transfer_ciphertext",
+        "transfer_expires_at_ms",
+      ],
+    ],
+    ["tf_v2_configured_private_inputs", ["resource_uid", "key_id", "nonce", "ciphertext"]],
+  ] as const) {
+    const columns = await sql.query(`PRAGMA table_info(${table})`);
+    if (
+      columns.length !== names.length ||
+      columns.some((column, index) => column.name !== names[index]) ||
+      columns[0]?.pk !== 1
+    ) {
+      throw unavailable();
+    }
+  }
+  const triggers = [
+    [
+      "tf_v2_configured_private_acceptance",
+      "tf_v2_configured_private_inputs",
+      "op.private_inputs_present = 1",
+    ],
+    [
+      "tf_v2_configured_private_immutable",
+      "tf_v2_configured_private_inputs",
+      "tf_v2_configured_private_immutable",
+    ],
+    [
+      "tf_v2_configured_private_delete_guard",
+      "tf_v2_configured_private_inputs",
+      "tf_v2_configured_private_active",
+    ],
+    [
+      "tf_v2_configured_private_delete",
+      "tf_v2_resources",
+      "DELETE FROM tf_v2_configured_private_inputs",
+    ],
+    ["tf_v2_private_inputs_acceptance", "tf_v2_private_inputs", "op.private_inputs_present = 1"],
+    [
+      "tf_v2_private_input_presence_immutable",
+      "tf_v2_operations",
+      "tf_v2_private_input_presence_immutable",
+    ],
+    [
+      "tf_v2_operation_transition",
+      "tf_v2_operations",
+      "OLD.status = 'waiting_input' AND NEW.status = 'queued'",
+    ],
+    ["tf_v2_private_transfer_dispatched", "tf_v2_operations", "transfer_ciphertext = NULL"],
+    ["tf_v2_private_transfer_waiting", "tf_v2_operations", "NEW.status = 'waiting_input'"],
+  ] as const;
+  const actual = await sql.query(
+    `SELECT name, tbl_name, sql FROM sqlite_schema WHERE type = 'trigger' AND name IN (${triggers.map(() => "?").join(", ")})`,
+    triggers.map(([name]) => name),
+  );
+  const byName = new Map(actual.map((row) => [row.name, row]));
+  if (
+    actual.length !== triggers.length ||
+    triggers.some(([name, table, required]) => {
+      const row = byName.get(name);
+      return (
+        row?.tbl_name !== table ||
+        typeof row.sql !== "string" ||
+        !row.sql.replace(/\s+/gu, " ").includes(required)
+      );
+    })
+  ) {
+    throw unavailable();
+  }
+}
+
 async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   if (cached?.env === env) return cached.app;
   const v2Config = startupStage("runtime-configuration", () =>
@@ -614,10 +706,11 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   ) {
     try {
       await requireV2ArtifactProgressSchema(sql);
+      await requireV2PrivateInputSchema(sql);
     } catch {
       throw new WorkerStartupError(
         "runtime-configuration",
-        new TypeError("configured v2 artifact Forms require the complete 0075 D1 schema"),
+        new TypeError("configured v2 artifact Forms require the complete 0075 and 0081 D1 schema"),
       );
     }
   }
