@@ -53,6 +53,7 @@ interface Forwarded {
   readonly authorization: string | null;
   readonly headers: readonly string[];
   readonly body: string;
+  readonly streamed: boolean;
 }
 
 /** Loads the generated facade as a real module, with a plane it can watch. */
@@ -78,12 +79,15 @@ async function facade(answer = { ok: true, value: {} }): Promise<{
       [SELFHOST_WORKER_DATA_PLANE_BINDING]: {
         async fetch(url: string, init: RequestInit) {
           const headers = init.headers as Record<string, string>;
+          const streamed = init.body instanceof ReadableStream;
+          const body = await new Response(init.body).text();
           forwarded.push({
             url,
             method: String(init.method),
             authorization: headers.authorization ?? null,
             headers: Object.keys(headers).sort(),
-            body: new TextDecoder().decode(init.body as ArrayBuffer),
+            body,
+            streamed,
           });
           return new Response(JSON.stringify(answer), {
             status: 200,
@@ -113,6 +117,11 @@ test("the facade forwards to the two plane routes and presents the token itself"
   expect(forwarded[0]?.authorization).toBe(`Bearer ${TOKEN}`);
   expect(forwarded[0]?.headers).toEqual(["authorization", "content-type"]);
   expect(forwarded[0]?.method).toBe("POST");
+  expect(forwarded.map((entry) => entry.streamed)).toEqual([false, true]);
+  expect(forwarded.map((entry) => entry.body)).toEqual([
+    JSON.stringify({ protocol: SELFHOST_DATA_PLANE_PROTOCOL, binding: "DB", op: "execute" }),
+    JSON.stringify({ protocol: SELFHOST_DATA_PLANE_PROTOCOL, binding: "DB", op: "execute" }),
+  ]);
 });
 
 test("a leaked service binding reaches nothing but those two routes", async () => {
