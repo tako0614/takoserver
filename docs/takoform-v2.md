@@ -266,9 +266,32 @@ The initial candidate,
 [`EdgeKVNamespace 0.2.0`](https://edge.forms.takoform.com/forms/EdgeKVNamespace/0.2.0/),
 cannot be qualified by a local SQL namespace alone: it defines replicated
 eventual-consistency storage and a WorkerVersion JavaScript Binding. The existing
-Cloudflare namespace-create path also cannot safely reconcile a lost create
-acknowledgement. Neither path becomes compatible by wrapping its old request in
-a new HTTP envelope.
+Cloudflare namespace-create path cannot safely adopt a namespace when its
+acknowledgement loses the provider ID. Neither path becomes compatible by
+wrapping its old request in a new HTTP envelope.
+
+The canonical Form constructor now accepts either its existing local Store or
+an operator-selected native `V2Backend`, never both. Both modes retain the same
+Form validation and target identity. The native adapter receives the full
+accepted execution and must return the exact Form observation with empty output;
+a malformed completion or authority change remains unknown.
+
+Migration `0085` adds Operation-owned native KV custody, not a second Resource
+ledger. CREATE and DELETE each receive a durable one-shot send grant. A trusted
+CREATE acknowledgement preserves the provider ID, original Operation and
+generation; reconciliation reads that ID, never a matching title. Same-spec
+UPDATE keeps the confirmed namespace. DELETE resolves the original identity
+before its grant and requires exact-ID absence after its single send. Losing a
+CREATE acknowledgement without its ID remains unknown and never authorizes a
+second create. The source migration does not change the live apply ceilings.
+
+The private Cloudflare adapter exercises this management path through the public
+Host and real SQLite with a simulated external API. This is not complete Form
+support: native Worker Binding execution and provider error semantics remain
+unqualified. EdgeKVNamespace 0.2.0 gives bounds for TTL, list limit and prefix,
+but does not name their out-of-range errors despite requiring named errors.
+The implementation must not invent those names or revise the published Form in
+place; the SDK gap requires an owning successor contract decision.
 
 An artifact-only Form such as
 [`SQLiteMigrationSet 0.2.0`](https://edge.forms.takoform.com/forms/SQLiteMigrationSet/0.2.0/)
