@@ -272,6 +272,14 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "app",
+    // This exact HTTPS listener adapts the v2 Endpoint observation contract
+    // to a local TLS socket; it is not a general app permission to import the
+    // v2 runtime layer.
+    match: /^src\/selfhost-v2-worker-endpoint-https\.ts$/u,
+    may: ["core", "adapter", "v2-runtime"],
+  },
+  {
+    name: "app",
     match: /^src\/selfhost-takoform-v2-ingress\.ts$/u,
     may: ["v2-contract"],
   },
@@ -329,7 +337,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "adapter",
     match:
-      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-object-store|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-object-store|selfhost-endpoint-https-tls|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
     may: ["core", "adapter"],
   },
   {

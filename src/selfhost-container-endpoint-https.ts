@@ -1,7 +1,9 @@
-import { createPrivateKey, createPublicKey, X509Certificate } from "node:crypto";
-import { connect as tlsConnect } from "node:tls";
 import type { SelfhostContainerEndpointHttpsIngressPort } from "./providers/selfhost-container-endpoint.ts";
 import { SELFHOST_CONTAINER_ENDPOINT_HTTPS_INGRESS_BRAND } from "./providers/selfhost-container-endpoint.ts";
+import {
+  validateWildcardEndpointCertificate,
+  verifyLocalEndpointHttpsSni,
+} from "./selfhost-endpoint-https-tls.ts";
 
 export type { SelfhostContainerEndpointHttpsIngressPort } from "./providers/selfhost-container-endpoint.ts";
 
@@ -125,39 +127,21 @@ function checkedLeaf(
   certificateChain: string,
   privateKey: string,
   suffix: string,
-): X509Certificate {
-  let certificate: X509Certificate;
-  try {
-    certificate = new X509Certificate(certificateChain);
-  } catch {
-    throw new TypeError("Container HTTPS certificate is invalid");
-  }
-  let keyPublic: string;
-  try {
-    keyPublic = createPublicKey(createPrivateKey(privateKey))
-      .export({ type: "spki", format: "der" })
-      .toString("base64");
-  } catch {
-    throw new TypeError("Container HTTPS private key is invalid");
-  }
-  const certificatePublic = certificate.publicKey
-    .export({ type: "spki", format: "der" })
-    .toString("base64");
-  if (certificatePublic !== keyPublic)
-    throw new TypeError("Container HTTPS certificate and private key do not match");
-  const now = Date.now();
-  if (now < Date.parse(certificate.validFrom) || now > Date.parse(certificate.validTo)) {
-    throw new TypeError("Container HTTPS certificate is not currently valid");
-  }
-  const wildcardSan = certificate.subjectAltName
-    ?.split(/,\s*/u)
-    .some((entry) => entry.toLowerCase() === `dns:*.${suffix}`);
-  if (!wildcardSan || !certificate.checkHost(specimenHostname(suffix))) {
-    throw new TypeError(
-      "Container HTTPS certificate must cover the one-label Endpoint hostname wildcard",
-    );
-  }
-  return certificate;
+): ReturnType<typeof validateWildcardEndpointCertificate> {
+  return validateWildcardEndpointCertificate({
+    certificateChain,
+    privateKey,
+    suffix,
+    specimenHostname: specimenHostname(suffix),
+    errors: {
+      certificateInvalid: "Container HTTPS certificate is invalid",
+      privateKeyInvalid: "Container HTTPS private key is invalid",
+      keyMismatch: "Container HTTPS certificate and private key do not match",
+      certificateNotCurrent: "Container HTTPS certificate is not currently valid",
+      wildcardRequired:
+        "Container HTTPS certificate must cover the one-label Endpoint hostname wildcard",
+    },
+  });
 }
 
 export function validateSelfhostContainerEndpointHttpsCertificate(input: {
@@ -181,26 +165,16 @@ export function verifySelfhostContainerEndpointHttpsHandshake(input: {
   readonly certificateChain: string;
 }): Promise<void> {
   const suffix = canonicalSuffix(input.suffix);
-  const expected = new X509Certificate(input.certificateChain).fingerprint256;
-  return new Promise((resolve, reject) => {
-    const socket = tlsConnect({
-      host: input.host,
-      port: input.port,
-      servername: specimenHostname(suffix),
-      rejectUnauthorized: false,
-    });
-    socket.setTimeout(2_000, () => socket.destroy(new Error("TLS handshake timed out")));
-    socket.once("secureConnect", () => {
-      const peer = socket.getPeerCertificate(true).raw;
-      const fingerprint = peer ? new X509Certificate(peer).fingerprint256 : undefined;
-      socket.end();
-      if (fingerprint !== expected)
-        reject(new TypeError("Container HTTPS listener did not serve the configured certificate"));
-      else resolve();
-    });
-    socket.once("error", (error) =>
-      reject(new TypeError(`Container HTTPS local TLS handshake failed: ${error.message}`)),
-    );
+  return verifyLocalEndpointHttpsSni({
+    host: input.host,
+    port: input.port,
+    hostname: specimenHostname(suffix),
+    certificateChain: input.certificateChain,
+    errors: {
+      invalidCertificate: "Container HTTPS certificate is invalid",
+      certificateMismatch: "Container HTTPS listener did not serve the configured certificate",
+      handshakeFailed: (cause) => `Container HTTPS local TLS handshake failed: ${cause}`,
+    },
   });
 }
 
