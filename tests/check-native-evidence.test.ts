@@ -26,9 +26,11 @@ const V2_ENTRY_ENV = "TAKOSERVER_V2_ENTRY_NATIVE";
 test("classifies the normal Bun v2 entry journey as readiness, not execution", () => {
   const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));
   const own = gates.filter((gate) => gate.file === "tests/takoform-v2-entry-bun-native.test.ts");
-  expect(own).toHaveLength(1);
-  expect(own[0]?.environments).toEqual([V2_ENTRY_ENV]);
-  expect(own[0]?.capability).toBe("takoform-v2-bun-entry-lifecycle");
+  expect(own).toHaveLength(2);
+  for (const gate of own) {
+    expect(gate.environments).toEqual([V2_ENTRY_ENV]);
+    expect(gate.capability).toBe("takoform-v2-bun-entry-lifecycle");
+  }
 
   const capability = NATIVE_EVIDENCE_CAPABILITIES.find(
     (entry) => entry.id === "takoform-v2-bun-entry-lifecycle",
@@ -42,8 +44,11 @@ test("classifies the normal Bun v2 entry journey as readiness, not execution", (
     state: "ready",
     readinessOnly: true,
   });
-  expect(capability.proves).toContain("two configured Bun entry process boots");
-  expect(capability.proves).toContain("terminal Operation replay after restart");
+  expect(capability.proves).toContain("graceful restart");
+  expect(capability.proves).toContain("SIGKILL after a durable nonterminal artifact checkpoint");
+  expect(capability.proves).toContain("same-key Operation replay");
+  expect(capability.proves).toContain("202 headers before discarding response body and returned IDs");
+  expect(capability.proves).toContain("loss of all response headers or TCP acknowledgement");
   expect(capability.proves).toContain("does not prove public TLS");
   expect(capability.proves).toContain("does not prove public TLS, Hosted");
 
@@ -53,7 +58,12 @@ test("classifies the normal Bun v2 entry journey as readiness, not execution", (
     probe: probe(),
   });
   const summary = summaries.find((entry) => entry.capability === capability.id);
-  expect(summary).toMatchObject({ state: "ready", readinessOnly: true, tests: 1, files: 1 });
+  expect(summary).toMatchObject({
+    state: "ready",
+    readinessOnly: true,
+    tests: own.length,
+    files: 1,
+  });
   expect(renderNativeEvidenceReport({ summaries, gates: own }).join("\n")).toContain(
     "runtime execution is not proven by this inspection",
   );
