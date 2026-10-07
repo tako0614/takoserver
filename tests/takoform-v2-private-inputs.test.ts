@@ -244,7 +244,7 @@ function createBody(privateInputs: unknown = ORIGINAL) {
   return { form: FORM, space: "one", name: "secret-one", spec: { mode: "secret" }, privateInputs };
 }
 
-test("v2 private map survives lost HTTP response and SQLite process restart without public leakage", async () => {
+test("v2 private map survives lost HTTP response and SQLite reopen without public leakage", async () => {
   const directory = mkdtempSync(join(tmpdir(), "v2-private-"));
   const path = join(directory, "state.sqlite");
   const custody = await keys();
