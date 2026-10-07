@@ -188,6 +188,8 @@ async function authenticatedRoute(
     rejectQuery(url);
     const key = idempotencyKey(request);
     const input = await readJsonObject(request, options.maxRequestBytes);
+    const prior = await engine.replayExistingCreate({ principal, key, body: input });
+    if (prior) return operationResponse(prior, config);
     if (Object.hasOwn(input, "offering")) throw capabilityRequired();
     exactKeys(input, ["form", "space", "name", "spec"], ["privateInputs"]);
     if (typeof input.form !== "string" || !isFormUrl(input.form)) throw invalidRequest();
@@ -260,6 +262,14 @@ async function authenticatedRoute(
       const key = idempotencyKey(request);
       const expectedGeneration = expectedGenerationHeader(request);
       const body = await readJsonObject(request, options.maxRequestBytes);
+      const prior = await engine.replayExistingUpdate({
+        principal,
+        key,
+        uid,
+        expectedGeneration,
+        body,
+      });
+      if (prior) return operationResponse(prior, config);
       exactKeys(body, ["spec"], ["privateInputs"]);
       if (
         Object.hasOwn(body, "privateInputs") &&

@@ -590,6 +590,112 @@ test("private field presence, even empty, is distinct from omission and requires
   }
 });
 
+test("accepted-key replay precedes changed Host or Form private capability", async () => {
+  const database = new Database(":memory:");
+  migrateSqlite(database);
+  const custody = await keys();
+  try {
+    const original = fixture(database, custody);
+    const created = await fetch(original.host, request("/resources", "POST", createBody(), KEY));
+    expect(created.status).toBe(202);
+    const createdId = created.body.id as string;
+    const uid = created.body.resourceUid as string;
+    const withoutHostCustody = fixture(database);
+    const unknownCreate = await fetch(
+      withoutHostCustody.host,
+      request("/resources", "POST", createBody(), KEY),
+    );
+    expect(unknownCreate.body).toMatchObject({
+      code: "private_inputs_unverifiable",
+      operationId: createdId,
+    });
+    const withoutFormPolicy = fixture(database, custody, undefined, undefined, false);
+    const knownCreate = await fetch(
+      withoutFormPolicy.host,
+      request("/resources", "POST", createBody(), KEY),
+    );
+    expect(knownCreate.body.id).toBe(createdId);
+    expect(await original.host.runNext()).toMatchObject({ status: "succeeded" });
+    const updateBody = { spec: { mode: "secret" }, privateInputs: ORIGINAL };
+    const updateRequest = () =>
+      new Request(`${BASE}/resources/${uid}`, {
+        method: "PUT",
+        headers: {
+          authorization: "Bearer old",
+          "content-type": "application/json",
+          "idempotency-key": "private-update-replay-0001",
+          "takoform-expected-generation": "1",
+        },
+        body: JSON.stringify(updateBody),
+      });
+    const updated = await fetch(original.host, updateRequest());
+    expect(updated.status).toBe(202);
+    const updatedId = updated.body.id as string;
+    const unknownUpdate = await fetch(withoutHostCustody.host, updateRequest());
+    expect(unknownUpdate.body).toMatchObject({
+      code: "private_inputs_unverifiable",
+      operationId: updatedId,
+    });
+    const knownUpdate = await fetch(withoutFormPolicy.host, updateRequest());
+    expect(knownUpdate.body.id).toBe(updatedId);
+  } finally {
+    database.close();
+  }
+});
+
+test("public HTTP replay retains pre-private zero-secret Create and Update fingerprints", async () => {
+  const database = new Database(":memory:");
+  migrateSqlite(database);
+  const runtime = fixture(database, undefined, undefined, undefined, false);
+  try {
+    const body = { form: FORM, space: "one", name: "plain", spec: { mode: "secret" } };
+    const created = await fetch(runtime.host, request("/resources", "POST", body, KEY));
+    expect(created.status).toBe(202);
+    expect(
+      database
+        .query("SELECT request_fingerprint FROM tf_v2_operations WHERE id = ?")
+        .get(created.body.id as string),
+    ).toEqual({
+      request_fingerprint: canonicalJson({ method: "POST", path: "/resources", query: {}, body }),
+    });
+    expect((await fetch(runtime.host, request("/resources", "POST", body, KEY))).body.id).toBe(
+      created.body.id,
+    );
+    expect(await runtime.host.runNext()).toMatchObject({ status: "succeeded" });
+    const uid = created.body.resourceUid as string;
+    const updateBody = { spec: { mode: "secret" } };
+    const updateRequest = () =>
+      new Request(`${BASE}/resources/${uid}`, {
+        method: "PUT",
+        headers: {
+          authorization: "Bearer old",
+          "content-type": "application/json",
+          "idempotency-key": "zero-secret-update-0001",
+          "takoform-expected-generation": "1",
+        },
+        body: JSON.stringify(updateBody),
+      });
+    const updated = await fetch(runtime.host, updateRequest());
+    expect(updated.status).toBe(202);
+    expect(
+      database
+        .query("SELECT request_fingerprint FROM tf_v2_operations WHERE id = ?")
+        .get(updated.body.id as string),
+    ).toEqual({
+      request_fingerprint: canonicalJson({
+        method: "PUT",
+        path: `/resources/${uid}`,
+        query: {},
+        expectedGeneration: 1,
+        body: updateBody,
+      }),
+    });
+    expect((await fetch(runtime.host, updateRequest())).body.id).toBe(updated.body.id);
+  } finally {
+    database.close();
+  }
+});
+
 test("omitted private field preserves the exact pre-private v2 replay fingerprint bytes", async () => {
   const database = new Database(":memory:");
   migrateSqlite(database);

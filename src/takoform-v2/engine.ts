@@ -323,6 +323,59 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       const target = await ownedResource(principal, uid, "write");
       return privateInputsCapability && boundForm(target).privateInputs !== undefined;
     },
+    /** Known-key lookup precedes all fresh-request capability and shape checks. */
+    async replayExistingCreate(input: {
+      principal: string;
+      key: string;
+      body: Readonly<Record<string, unknown>>;
+    }): Promise<V2Operation | null> {
+      const body = input.body;
+      return replay(
+        input.principal,
+        input.key,
+        canonicalRequest({
+          method: "POST",
+          path: "/resources",
+          query: {},
+          body: {
+            ...(Object.hasOwn(body, "form") ? { form: body.form } : {}),
+            ...(Object.hasOwn(body, "space") ? { space: body.space } : {}),
+            ...(Object.hasOwn(body, "name") ? { name: body.name } : {}),
+            ...(Object.hasOwn(body, "spec") ? { spec: body.spec } : {}),
+            ...(Object.hasOwn(body, "privateInputs") ? { privateInputs: true } : {}),
+          },
+        }),
+        Object.hasOwn(body, "privateInputs")
+          ? (body.privateInputs as V2PrivateInputMap)
+          : undefined,
+      );
+    },
+    async replayExistingUpdate(input: {
+      principal: string;
+      key: string;
+      uid: string;
+      expectedGeneration: number;
+      body: Readonly<Record<string, unknown>>;
+    }): Promise<V2Operation | null> {
+      const body = input.body;
+      return replay(
+        input.principal,
+        input.key,
+        canonicalRequest({
+          method: "PUT",
+          path: `/resources/${input.uid}`,
+          query: {},
+          expectedGeneration: input.expectedGeneration,
+          body: {
+            ...(Object.hasOwn(body, "spec") ? { spec: body.spec } : {}),
+            ...(Object.hasOwn(body, "privateInputs") ? { privateInputs: true } : {}),
+          },
+        }),
+        Object.hasOwn(body, "privateInputs")
+          ? (body.privateInputs as V2PrivateInputMap)
+          : undefined,
+      );
+    },
     async acceptCreate(input: {
       principal: string;
       key: string;
