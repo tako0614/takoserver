@@ -689,12 +689,17 @@ test.skipIf(binary === undefined)(
       expect(unknownSends).toBe(1);
     } finally {
       await queueComposition?.close().catch(() => undefined);
-      await owner?.close().catch(() => undefined);
-      for (const child of children)
-        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-      await Promise.all(children.map((child) => child.exited));
-      db.close();
-      await rm(root, { recursive: true, force: true });
+      try {
+        // close() intentionally refuses an active serving graph. Suspend the
+        // real owner so its child exits and its private lock is released.
+        await owner?.suspend();
+      } finally {
+        for (const child of children)
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        await Promise.all(children.map((child) => child.exited));
+        db.close();
+        await rm(root, { recursive: true, force: true });
+      }
     }
   },
 );
