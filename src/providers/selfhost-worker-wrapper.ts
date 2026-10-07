@@ -514,6 +514,7 @@ export const ${SELFHOST_WORKER_EVENT_ENTRYPOINT} = SafeApply(SafeObjectFreeze, S
   SafeURL,
   SafeHeadersGet,
   SafeCryptoRandomUUID,
+  SafeConsoleError,
   SafeRequestText,
   SafeRequestUrlGet,
   SafeRequestMethodGet,
@@ -1294,6 +1295,10 @@ async function invokeV2Queue(event, rawEnv, rawContext) {
           SafeApply(SafeMapSet, settled, [id, true]);
           continue;
         }
+        // All-methods have a batch-level rejection vocabulary. A missing
+        // registered message is an indeterminate backend failure here, not a
+        // caller-selected unknown id as it is for the single-message methods.
+        if (error && error.name === "unknown_message") throw portableError("backend_unavailable");
         throw error;
       }
     }
@@ -1316,7 +1321,13 @@ async function invokeV2Queue(event, rawEnv, rawContext) {
   // ACK is not handler completion. Withhold the private result until all
   // accepted waitUntil work, including nested registrations, has completed.
   for (let index = 0; index < waitUntilWork.length; index += 1) {
-    try { await waitUntilWork[index]; } catch { /* native context owns diagnostics */ }
+    try { await waitUntilWork[index]; }
+    catch {
+      // The tenant's error text may contain secrets or capabilities. Record a
+      // bounded Host-owned diagnostic without reflecting the rejected value.
+      try { SafeApply(SafeConsoleError, console, ["self-host v2 Queue waitUntil rejected", index]); }
+      catch { /* diagnostics never make a settled message undecidable */ }
+    }
   }
   if (registrationFailed) throw portableError("context_expired");
   const answer = SafeObjectCreate(null);
@@ -1355,6 +1366,9 @@ function createV2SettlementCaller(rawEnv, event) {
       let response;
       try { response = await SafeApply(send, service, [V2_SETTLEMENT_URL, init]); }
       catch { if (attempt === 0) continue; throw portableError("backend_unavailable"); }
+      let status;
+      try { status = SafeApply(SafeResponseStatusGet, response, []); }
+      catch { if (attempt === 0) continue; throw portableError("backend_unavailable"); }
       let text;
       try { text = await SafeApply(SafeResponseText, response, []); }
       catch { if (attempt === 0) continue; throw portableError("backend_unavailable"); }
@@ -1365,7 +1379,7 @@ function createV2SettlementCaller(rawEnv, event) {
       let answer;
       try { answer = SafeJSONParse(text); }
       catch { if (attempt === 0) continue; throw portableError("backend_unavailable"); }
-      if (isRecord(answer) && exactKeys(answer, ["ok", "value"]) && answer.ok === true && answer.value === null) return;
+      if (status === 200 && isRecord(answer) && exactKeys(answer, ["ok", "value"]) && answer.ok === true && answer.value === null) return;
       if (isRecord(answer) && exactKeys(answer, ["ok", "error"]) && answer.ok === false &&
           isRecord(answer.error) && exactKeys(answer.error, ["code"]) &&
           includes(["unknown_batch", "unknown_message", "already_settled"], answer.error.code)) {

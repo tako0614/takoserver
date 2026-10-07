@@ -294,6 +294,89 @@ test("v2 QueueBatch retries a lost ACK response with the same settlement token",
   }
 });
 
+test("v2 ACK never resolves from a 503 carrying a success-looking body", async () => {
+  const key = `__v2_ack_error_${crypto.randomUUID().replaceAll("-", "")}`;
+  const generated = await loadGenerated(
+    `export default { async queue(batch) {
+      try { await batch.acknowledge("message-1"); globalThis[${JSON.stringify(key)}] = "resolved"; }
+      catch (error) { globalThis[${JSON.stringify(key)}] = error.name; }
+    } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["queue"],
+      bindings: [],
+      events: true,
+      v2Queue: true,
+    },
+  );
+  const calls: Array<Record<string, unknown>> = [];
+  try {
+    const response = await generated.eventEntrypoint?.fetch(
+      v2QueueRequest(["message-1"]),
+      {
+        [V2_QUEUE_SETTLEMENT_SERVICE_BINDING]: {
+          async fetch(_url: string, init: RequestInit) {
+            calls.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+            return Response.json({ ok: true, value: null }, { status: 503 });
+          },
+        },
+      },
+      context,
+    );
+    expect((globalThis as Record<string, unknown>)[key]).toBe("backend_unavailable");
+    expect(response?.status).toBe(500);
+    expect(calls).toHaveLength(4);
+    expect(calls[0]?.settlementToken).toBe(calls[1]?.settlementToken);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[key];
+    await generated.dispose();
+  }
+});
+
+test("v2 All methods normalize missing registered message to backend_unavailable", async () => {
+  for (const method of ["acknowledgeAll", "retryAll"] as const) {
+    const key = `__v2_all_error_${crypto.randomUUID().replaceAll("-", "")}`;
+    const generated = await loadGenerated(
+      `export default { async queue(batch) {
+        try { await batch.${method}(); }
+        catch (error) { globalThis[${JSON.stringify(key)}] = error.name; }
+      } };`,
+      {
+        originalMainModule: "index.js",
+        publication: "sw1.v1",
+        probeHostname: PROBE_HOSTNAME,
+        declaredHandlers: ["queue"],
+        bindings: [],
+        events: true,
+        v2Queue: true,
+      },
+    );
+    try {
+      const response = await generated.eventEntrypoint?.fetch(
+        v2QueueRequest(["message-1"]),
+        {
+          [V2_QUEUE_SETTLEMENT_SERVICE_BINDING]: {
+            async fetch() {
+              return Response.json(
+                { ok: false, error: { code: "unknown_message" } },
+                { status: 409 },
+              );
+            },
+          },
+        },
+        context,
+      );
+      expect((globalThis as Record<string, unknown>)[key]).toBe("backend_unavailable");
+      expect(response?.status).toBe(500);
+    } finally {
+      delete (globalThis as Record<string, unknown>)[key];
+      await generated.dispose();
+    }
+  }
+});
+
 test("v2 QueueBatch preserves confirmed ACK and retries only pending on handler rejection", async () => {
   const generated = await loadGenerated(
     `export default { async queue(batch) {
@@ -450,6 +533,55 @@ test("v2 caught waitUntil registration failure cannot certify handler completion
     );
     expect(response?.status).toBe(500);
     expect(calls).toHaveLength(2);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("v2 rejected waitUntil records a bounded Host diagnostic without tenant error text", async () => {
+  const lines: unknown[][] = [];
+  const originalError = console.error;
+  let generated: Awaited<ReturnType<typeof loadGenerated>>;
+  try {
+    console.error = (...values: unknown[]) => {
+      lines.push(values);
+    };
+    generated = await loadGenerated(
+      `export default { async queue(_batch, _env, ctx) {
+        ctx.waitUntil(Promise.reject(new Error("tenant-private-error-text")));
+      } };`,
+      {
+        originalMainModule: "index.js",
+        publication: "sw1.v1",
+        probeHostname: PROBE_HOSTNAME,
+        declaredHandlers: ["queue"],
+        bindings: [],
+        events: true,
+        v2Queue: true,
+      },
+    );
+  } finally {
+    console.error = originalError;
+  }
+  try {
+    const response = await generated.eventEntrypoint?.fetch(
+      v2QueueRequest(["message-1"]),
+      {
+        [V2_QUEUE_SETTLEMENT_SERVICE_BINDING]: {
+          async fetch() {
+            return Response.json({ ok: true, value: null });
+          },
+        },
+      },
+      {
+        waitUntil(value: Promise<unknown>) {
+          void value.catch(() => undefined);
+        },
+      },
+    );
+    expect(response?.status).toBe(200);
+    expect(lines).toEqual([["self-host v2 Queue waitUntil rejected", 0]]);
+    expect(JSON.stringify(lines)).not.toContain("tenant-private-error-text");
   } finally {
     await generated.dispose();
   }

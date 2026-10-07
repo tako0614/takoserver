@@ -81,6 +81,7 @@ const SafeSymbol = Symbol;
 const SafeURL = URL;
 const SafeHeadersGet = Headers.prototype.get;
 const SafeCryptoRandomUUID = crypto.randomUUID.bind(crypto);
+const SafeConsoleError = console.error;
 const SafeRequestText = Request.prototype.text;
 const SafeRequestUrlGet = captureGetter(Request.prototype, "url");
 const SafeRequestMethodGet = captureGetter(Request.prototype, "method");
@@ -165,6 +166,7 @@ export {
   SafeURL,
   SafeHeadersGet,
   SafeCryptoRandomUUID,
+  SafeConsoleError,
   SafeRequestText,
   SafeRequestUrlGet,
   SafeRequestMethodGet,

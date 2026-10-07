@@ -1430,6 +1430,12 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     if (eventShapes.size > 1) {
       throw new Error("weighted worker Versions require one event capability shape");
     }
+    const v2QueueShapes = new Set(
+      preparedVersions.map(({ prepared }) => prepared.manifest.queueSettlement !== undefined),
+    );
+    if (v2QueueShapes.size > 1 || (v2QueueShapes.has(true) && !eventShapes.has(true))) {
+      throw new Error("weighted worker Versions require one v2 Queue capability shape");
+    }
     const manifest: WorkerdDeploymentManifest = {
       publicationStorageLayout: WORKERD_DEPLOYMENT_STORAGE_LAYOUT,
       generation: publication.generation,
@@ -4606,6 +4612,7 @@ export async function readWorkerdActiveDeployment(
   }
   const snapshot = await readWeightedDeploymentSnapshot(scriptsRoot, script, pointer);
   const eventShapes = new Set<boolean>();
+  const v2QueueShapes = new Set<boolean>();
   for (const stored of snapshot.deployment.versions) {
     const manifest: unknown = stored.manifest;
     if (typeof manifest !== "object" || manifest === null || Array.isArray(manifest)) {
@@ -4621,9 +4628,14 @@ export async function readWorkerdActiveDeployment(
       throw new Error("unusable worker deployment Version");
     }
     if (identity.events !== undefined) validEventGate(identity.events);
+    if (identity.queueSettlement !== undefined) validQueueSettlement(identity.queueSettlement);
     eventShapes.add(identity.events !== undefined);
+    v2QueueShapes.add(identity.queueSettlement !== undefined);
   }
   if (eventShapes.size !== 1) throw new Error("unusable worker deployment event graph");
+  if (v2QueueShapes.size !== 1 || (v2QueueShapes.has(true) && !eventShapes.has(true))) {
+    throw new Error("unusable worker deployment v2 Queue graph");
+  }
   const after = await readActivationStrict(activationPath);
   if (after[script] !== activeGeneration || snapshot.deployment.generation !== activeGeneration) {
     return null;

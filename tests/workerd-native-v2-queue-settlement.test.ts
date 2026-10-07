@@ -135,7 +135,7 @@ test.skipIf(binary === undefined)(
       fetch(request) {
         settlementRequests += 1;
         return refuseSettlement
-          ? Response.json({ ok: false, error: { code: "backend_unavailable" } }, { status: 503 })
+          ? Response.json({ ok: true, value: null }, { status: 503 })
           : endpoint(request);
       },
     });
