@@ -104,6 +104,12 @@ function snapshotPrivateInputs(
   return Object.freeze(snapshot);
 }
 
+function replayBodyWithoutPrivateValues(body: Readonly<Record<string, unknown>>): JsonObject {
+  return Object.fromEntries(
+    Object.entries(body).map(([field, value]) => [field, field === "privateInputs" ? true : value]),
+  ) as JsonObject;
+}
+
 export function createTakoformV2Engine(options: V2EngineOptions) {
   if (options.privateInputCustody) validatePrivateInputCustody(options.privateInputCustody);
   if (!Number.isSafeInteger(options.replayWindowSeconds) || options.replayWindowSeconds < 1) {
@@ -337,13 +343,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           method: "POST",
           path: "/resources",
           query: {},
-          body: {
-            ...(Object.hasOwn(body, "form") ? { form: body.form } : {}),
-            ...(Object.hasOwn(body, "space") ? { space: body.space } : {}),
-            ...(Object.hasOwn(body, "name") ? { name: body.name } : {}),
-            ...(Object.hasOwn(body, "spec") ? { spec: body.spec } : {}),
-            ...(Object.hasOwn(body, "privateInputs") ? { privateInputs: true } : {}),
-          },
+          body: replayBodyWithoutPrivateValues(body),
         }),
         Object.hasOwn(body, "privateInputs")
           ? (body.privateInputs as V2PrivateInputMap)
@@ -366,10 +366,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           path: `/resources/${input.uid}`,
           query: {},
           expectedGeneration: input.expectedGeneration,
-          body: {
-            ...(Object.hasOwn(body, "spec") ? { spec: body.spec } : {}),
-            ...(Object.hasOwn(body, "privateInputs") ? { privateInputs: true } : {}),
-          },
+          body: replayBodyWithoutPrivateValues(body),
         }),
         Object.hasOwn(body, "privateInputs")
           ? (body.privateInputs as V2PrivateInputMap)

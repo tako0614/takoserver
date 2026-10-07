@@ -615,9 +615,22 @@ test("accepted-key replay precedes changed Host or Form private capability", asy
       request("/resources", "POST", createBody(), KEY),
     );
     expect(knownCreate.body.id).toBe(createdId);
+    const changedCreateEnvelope = await fetch(
+      withoutFormPolicy.host,
+      request("/resources", "POST", { ...createBody(), extra: 1 }, KEY),
+    );
+    expect(changedCreateEnvelope.body.code).toBe("idempotency_conflict");
+    expect(
+      (
+        await fetch(
+          withoutFormPolicy.host,
+          request("/resources", "POST", { ...createBody(), privateInputs: [] }, KEY),
+        )
+      ).body.code,
+    ).toBe("idempotency_conflict");
     expect(await original.host.runNext()).toMatchObject({ status: "succeeded" });
     const updateBody = { spec: { mode: "secret" }, privateInputs: ORIGINAL };
-    const updateRequest = () =>
+    const updateRequest = (body: unknown = updateBody) =>
       new Request(`${BASE}/resources/${uid}`, {
         method: "PUT",
         headers: {
@@ -626,7 +639,7 @@ test("accepted-key replay precedes changed Host or Form private capability", asy
           "idempotency-key": "private-update-replay-0001",
           "takoform-expected-generation": "1",
         },
-        body: JSON.stringify(updateBody),
+        body: JSON.stringify(body),
       });
     const updated = await fetch(original.host, updateRequest());
     expect(updated.status).toBe(202);
@@ -638,6 +651,15 @@ test("accepted-key replay precedes changed Host or Form private capability", asy
     });
     const knownUpdate = await fetch(withoutFormPolicy.host, updateRequest());
     expect(knownUpdate.body.id).toBe(updatedId);
+    const changedUpdateEnvelope = await fetch(
+      withoutFormPolicy.host,
+      updateRequest({ ...updateBody, extra: 1 }),
+    );
+    expect(changedUpdateEnvelope.body.code).toBe("idempotency_conflict");
+    expect(
+      (await fetch(withoutFormPolicy.host, updateRequest({ ...updateBody, privateInputs: [] })))
+        .body.code,
+    ).toBe("idempotency_conflict");
   } finally {
     database.close();
   }
