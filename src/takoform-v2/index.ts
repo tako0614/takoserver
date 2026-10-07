@@ -56,6 +56,12 @@ export {
   type V2NativeEffectInspection,
 } from "./worker-native-effects.ts";
 export {
+  createV2NativeDeletionCustody,
+  type V2NativeDeletionCustody,
+  type V2NativeDeletionInspection,
+  type V2NativeDeletionItem,
+} from "./worker-native-deletions.ts";
+export {
   createV2WorkerPublicationState,
   type V2WorkerPublicationResolution,
   type V2WorkerPublicationSnapshot,

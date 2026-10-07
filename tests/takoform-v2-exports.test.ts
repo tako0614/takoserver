@@ -18,6 +18,7 @@ import {
   MODULE_WORKER_FORM_URL,
   parseModuleWorkerSpec,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import { createV2NativeDeletionCustody } from "../src/takoform-v2/worker-native-deletions.ts";
 import { createV2NativeEffectCustody } from "../src/takoform-v2/worker-native-effects.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
 
@@ -28,6 +29,7 @@ const RUNTIME_EXPORTS = [
   "WORKER_VERSION_FORM_URL",
   "WorkerFormValidationError",
   "createV2NativeEffectCustody",
+  "createV2NativeDeletionCustody",
   "createV2WorkerInvocationLifecycle",
   "createV2WorkerPublicationState",
   "parseModuleWorkerSpec",
@@ -49,6 +51,7 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
   expect(extension.createV2NativeEffectCustody).toBe(createV2NativeEffectCustody);
+  expect(extension.createV2NativeDeletionCustody).toBe(createV2NativeDeletionCustody);
   expect(extension.parseModuleWorkerSpec).toBe(parseModuleWorkerSpec);
   expect(extension.referencesForWorkerForm).toBe(referencesForWorkerForm);
   expect(extension.MODULE_WORKER_FORM_URL).toBe(MODULE_WORKER_FORM_URL);
