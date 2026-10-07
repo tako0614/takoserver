@@ -172,6 +172,12 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "app", "v2-contract", "v2-form", "v2-actor-admission"],
   },
   {
+    // Exact v2 accepted-reference adapter for the existing physical Actor port.
+    name: "v2-actor-binding-authority",
+    match: /^src\/takoform-v2\/actor-binding-authority\.ts$/u,
+    may: ["core", "app", "v2-form", "v2-actor-physical-backend"],
+  },
+  {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state"],
