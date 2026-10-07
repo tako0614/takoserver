@@ -120,6 +120,21 @@ test.skipIf(binary === undefined)(
           })
         ).observed,
       };
+      const inspector = createWorkerdWorkerModuleInspector({ binary: selected.binary });
+      const inspected = await inspector.inspect({
+        mainModule: modulePath,
+        modules: [
+          {
+            name: modulePath,
+            mediaType: "application/javascript+module",
+            bytes: moduleBytes,
+            digest: `sha256:${sha(moduleBytes)}`,
+          },
+        ],
+        declaredHandlers: ["queue"],
+      });
+      expect(inspected).toMatchObject({ outcome: "valid", exportedHandlers: ["queue"] });
+      if (inspected.outcome !== "valid") throw new Error("native queue export inspection failed");
       let workerUid = "";
       let versionUid = "";
       let deploymentUid = "";
@@ -177,6 +192,19 @@ test.skipIf(binary === undefined)(
         },
       };
       const capability = {
+        async observeQueueServingCapability(input: {
+          workerUid: string;
+          principal: string;
+          space: string;
+          targetKey: string;
+        }) {
+          // Admission must use the installed native owner's current SQL graph
+          // and boot-inspected queue export proof, never the fixture snapshot
+          // alone or a caller-supplied ready flag.
+          return owner
+            ? await owner.observeQueueServingCapability(input)
+            : ({ kind: "unknown" } as const);
+        },
         async observeCurrentServing(input: {
           workerUid: string;
           principal: string;
@@ -201,8 +229,17 @@ test.skipIf(binary === undefined)(
         backend: {
           id: "native-queue-ordinary",
           targetKey,
-          async execute() {
-            return { kind: "complete" as const, observed: { ready: true }, output: {} };
+          async execute(execution) {
+            // The fixture records the actual held-byte and pinned native
+            // inspection result, while Core still checks the accepted SQL
+            // Version/Deployment identity at Consumer admission.
+            const observed =
+              execution.form === WORKER_VERSION_FORM_URL
+                ? { ready: true, bundleVerified: true, resolvedBindings: true }
+                : execution.form === WORKER_DEPLOYMENT_FORM_URL
+                  ? { active: true }
+                  : { ready: true };
+            return { kind: "complete" as const, observed, output: {} };
           },
           async reconcile() {
             return { kind: "unknown" as const };
@@ -245,7 +282,6 @@ test.skipIf(binary === undefined)(
       });
       deploymentUid = deployment.resourceUid;
       sourceOperationId = deployment.id;
-      const inspector = createWorkerdWorkerModuleInspector({ binary: selected.binary });
       const settlementKey = randomBytes(32);
       const privatePort = await unusedPort();
       queueComposition = createSelfhostV2QueueComposition({
@@ -758,6 +794,16 @@ test.skipIf(pidFixtureMode !== "recover")(
         },
       };
       const capability = {
+        async observeQueueServingCapability(input: {
+          workerUid: string;
+          principal: string;
+          space: string;
+          targetKey: string;
+        }) {
+          return owner
+            ? await owner.observeQueueServingCapability(input)
+            : ({ kind: "unknown" } as const);
+        },
         async observeCurrentServing(input: {
           workerUid: string;
           principal: string;
