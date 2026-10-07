@@ -5,6 +5,10 @@ import { dirname, join } from "node:path";
 import { createActorResourceGraphReader } from "./actor-resource-graph.ts";
 import { buildApp, createAppResourceStoreBundle } from "./app.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
+import {
+  parseSelfhostV2PrivatePlaneBoot,
+  prepareSelfhostV2PrivatePlaneRoots,
+} from "./entry-v2-private-plane-boot.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import { migrateSqlite } from "./migrate-sqlite.ts";
 import { createFileObjectStore } from "./objects-fs.ts";
@@ -22,8 +26,12 @@ import {
   createSelfhostEventTargets,
   selfhostObjectsRoot,
 } from "./providers/selfhost.ts";
+import { createSelfhostV2KvStore } from "./providers/selfhost-v2-kv-store.ts";
+import { createSelfhostV2ObjectBucketStore } from "./providers/selfhost-v2-object-bucket-store.ts";
+import { createSelfhostV2SQLiteStore } from "./providers/selfhost-v2-sqlite-store.ts";
 import { createProvisionerEndpoint } from "./provisioner-endpoint.ts";
 import { selectPublicHostFormSource } from "./public-host-form-source.ts";
+import { createQueueCustody } from "./queue-custody.ts";
 import {
   createRuntimeInputAuthority,
   runtimeInputCanonicalOriginSupported,
@@ -52,7 +60,11 @@ import {
   validateSelfhostContainerEndpointHttpsCertificate,
 } from "./selfhost-container-endpoint-https.ts";
 import { createSelfhostContainerEndpointIngress } from "./selfhost-container-endpoint-ingress.ts";
-import { serveSelfhostDataPlanes } from "./selfhost-data-planes.ts";
+import {
+  runSelfhostKvOperation,
+  selfhostKvOperationErrorCode,
+  serveSelfhostDataPlanes,
+} from "./selfhost-data-planes.ts";
 import {
   closeSelfhostEntryOwnedResources,
   createSelfhostEntryShutdown,
@@ -73,6 +85,7 @@ import {
   createSelfhostTenantRunCredentials,
 } from "./selfhost-tenant-run-credentials.ts";
 import { createSelfhostV2ConfiguredInputSealer } from "./selfhost-v2-configured-input-sealer.ts";
+import { createSelfhostV2QueueComposition } from "./selfhost-v2-queue-composition.ts";
 import { createSelfhostV2WorkerComposition } from "./selfhost-v2-worker-composition.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
@@ -172,6 +185,7 @@ const port = Number(process.env.PORT ?? 8787);
 
 /** Everything this machine keeps lives under one directory. */
 const dataRoot = process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver";
+const v2WorkerTargetKey = "selfhost-v2-worker-primary";
 const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
   ? Number(process.env.TAKOSERVER_WORKERD_PORT)
   : 8788;
@@ -254,6 +268,23 @@ const providerMode = resolveStandaloneProviderMode({
   suffixes: process.env.TAKOSERVER_SUFFIXES,
   workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
 });
+const v2PrivatePlaneBoot = parseSelfhostV2PrivatePlaneBoot(
+  process.env.TAKOSERVER_V2_WORKER_PRIVATE_PLANES,
+  {
+    dataRoot,
+    reservedPorts: [
+      port,
+      workerdPort,
+      workerEndpointPort,
+      ...(process.env.TAKOSERVER_DATA_PLANE_PORT
+        ? [Number(process.env.TAKOSERVER_DATA_PLANE_PORT)]
+        : []),
+    ],
+  },
+);
+if (v2PrivatePlaneBoot && providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN) {
+  throw new Error("v2 Worker private planes are unavailable in retired ObjectBucket drain mode");
+}
 const currentCandidates = selectPublicHostFormSource(process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE);
 const selfhostContainer = createSelfhostContainerBootstrap({
   environment: process.env,
@@ -615,17 +646,130 @@ try {
 // This does not register the incomplete Worker Forms or make an Endpoint HTTPS
 // frontend claim. Unknown private namespaces and missing serving owners are
 // startup failures, not silently forgotten native children.
-const v2WorkerComposition = createSelfhostV2WorkerComposition({
-  sql,
-  objects,
-  clock,
-  config: takoformV2Config,
-  rootDirectory: join(dataRoot === ":memory:" ? ".takoserver" : dataRoot, "v2-worker-owners"),
-  targetKey: "selfhost-v2-worker-primary",
-  workerdBinary,
-  ...(v2ConfiguredInputSealer ? { configuredInputSealer: v2ConfiguredInputSealer } : {}),
-});
-const restoredV2WorkerUids = await v2WorkerComposition.restoreOwners();
+if (v2PrivatePlaneBoot) prepareSelfhostV2PrivatePlaneRoots(v2PrivatePlaneBoot);
+const v2SqliteStore = v2PrivatePlaneBoot?.sqlite
+  ? createSelfhostV2SQLiteStore({
+      sql,
+      root: v2PrivatePlaneBoot.sqlite.root,
+      targetKey: v2WorkerTargetKey,
+      now: clock,
+    })
+  : undefined;
+const v2KvStore = v2PrivatePlaneBoot?.kv
+  ? createSelfhostV2KvStore({
+      sql,
+      root: v2PrivatePlaneBoot.kv.root,
+      clock,
+      runOperation: runSelfhostKvOperation,
+      operationErrorCode: selfhostKvOperationErrorCode,
+    })
+  : undefined;
+const v2ObjectBucketStore = v2PrivatePlaneBoot?.objectBucket
+  ? createSelfhostV2ObjectBucketStore({
+      sql,
+      root: v2PrivatePlaneBoot.objectBucket.root,
+      clock,
+    })
+  : undefined;
+let workers: ReturnType<typeof createSelfhostV2WorkerComposition> | undefined;
+let queueCapability:
+  | NonNullable<ReturnType<typeof createSelfhostV2WorkerComposition>["queueCapability"]>
+  | undefined;
+let ownersRestored = false;
+let v2QueueComposition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+let restoredV2WorkerUids: readonly string[];
+const clearV2BootKeys = () => {
+  for (const plane of [
+    v2PrivatePlaneBoot?.sqlite,
+    v2PrivatePlaneBoot?.kv,
+    v2PrivatePlaneBoot?.objectBucket,
+    v2PrivatePlaneBoot?.queue,
+  ]) {
+    plane?.signingKey.fill(0);
+  }
+};
+try {
+  if (v2PrivatePlaneBoot?.queue) {
+    const requireQueueCapability = (): NonNullable<
+      ReturnType<typeof createSelfhostV2WorkerComposition>["queueCapability"]
+    > => {
+      if (!ownersRestored || !queueCapability) {
+        throw new Error("v2 Queue owner capability is not restored");
+      }
+      return queueCapability;
+    };
+    v2QueueComposition = createSelfhostV2QueueComposition({
+      sql,
+      custody: createQueueCustody({ sql }),
+      capability: {
+        observeQueueServingCapability: (input) =>
+          requireQueueCapability().observeQueueServingCapability(input),
+        observeCurrentServing: (input) => requireQueueCapability().observeCurrentServing(input),
+      },
+      settlementKey: v2PrivatePlaneBoot.queue.signingKey,
+      privatePort: v2PrivatePlaneBoot.queue.privatePort,
+      ownerForWorkerUid: async (uid) => {
+        if (!ownersRestored || !workers) {
+          throw new Error("v2 Queue owner is not restored");
+        }
+        return await workers.ownerForWorkerUid(uid);
+      },
+    });
+  }
+  workers = createSelfhostV2WorkerComposition({
+    sql,
+    objects,
+    clock,
+    config: takoformV2Config,
+    rootDirectory: join(dataRoot === ":memory:" ? ".takoserver" : dataRoot, "v2-worker-owners"),
+    targetKey: v2WorkerTargetKey,
+    workerdBinary,
+    ...(v2ConfiguredInputSealer ? { configuredInputSealer: v2ConfiguredInputSealer } : {}),
+    ...(v2SqliteStore && v2PrivatePlaneBoot?.sqlite
+      ? {
+          sqliteBinding: {
+            store: v2SqliteStore,
+            signingKey: v2PrivatePlaneBoot.sqlite.signingKey,
+            stagingRoot: v2PrivatePlaneBoot.sqlite.stagingRoot,
+            privatePort: v2PrivatePlaneBoot.sqlite.privatePort,
+          },
+        }
+      : {}),
+    ...(v2KvStore && v2PrivatePlaneBoot?.kv
+      ? {
+          v2KvBinding: {
+            store: v2KvStore,
+            signingKey: v2PrivatePlaneBoot.kv.signingKey,
+            privatePort: v2PrivatePlaneBoot.kv.privatePort,
+          },
+        }
+      : {}),
+    ...(v2ObjectBucketStore && v2PrivatePlaneBoot?.objectBucket
+      ? {
+          v2ObjectBucketBinding: {
+            store: v2ObjectBucketStore,
+            signingKey: v2PrivatePlaneBoot.objectBucket.signingKey,
+            privatePort: v2PrivatePlaneBoot.objectBucket.privatePort,
+          },
+        }
+      : {}),
+    ...(v2QueueComposition ? { queueSettlement: v2QueueComposition.settlementBinding } : {}),
+  });
+  if (v2QueueComposition) {
+    if (!workers.queueCapability) throw new Error("v2 Queue native capability is unavailable");
+    queueCapability = workers.queueCapability;
+  }
+  // Both private broker and Queue authority have already copied the supplied
+  // bytes into their exact boot snapshot; do not retain a spare entry copy.
+  clearV2BootKeys();
+  restoredV2WorkerUids = await workers.restoreOwners();
+  ownersRestored = true;
+} catch (error) {
+  clearV2BootKeys();
+  await v2QueueComposition?.close();
+  throw error;
+}
+const v2WorkerComposition = workers;
 if (restoredV2WorkerUids.length > 0) {
   process.stdout.write(`restored ${restoredV2WorkerUids.length} v2 Worker owner(s)\n`);
 }
@@ -982,7 +1126,10 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
       (await closeSelfhostEntryOwnedResources({
         workerdShutdown: () => workerd.shutdown(),
         mayCloseDependents: () => shutdownClean,
-        v2WorkerSuspend: () => v2WorkerComposition.suspendOwnersRetainingCustody(),
+        v2WorkerSuspend: async () => {
+          await v2WorkerComposition.suspendOwnersRetainingCustody();
+          await v2QueueComposition?.close();
+        },
         actorClose: async () => {
           await actorRuntime?.close();
         },

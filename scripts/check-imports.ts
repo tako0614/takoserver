@@ -282,6 +282,7 @@ const LAYERS: readonly Layer[] = [
       "entry",
       "v2-config",
       "v2-selfhost-composition",
+      "v2-selfhost-queue-composition",
       "v2-selfhost-configured-input-sealer",
     ],
   },
