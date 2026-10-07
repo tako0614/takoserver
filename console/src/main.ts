@@ -317,12 +317,8 @@ function page(): Child {
     case undefined:
       return overviewPage(organization);
     case "resources":
-      return rest.length >= 3
-        ? resourceDetailPage(organization.id, {
-            space: rest[0] as string,
-            kind: rest[1] as string,
-            name: rest[2] as string,
-          })
+      return rest.length === 1
+        ? resourceDetailPage(organization.id, rest[0] as string)
         : resourcesPage(organization.id);
     case "billing":
       return billingPage(organization.id);

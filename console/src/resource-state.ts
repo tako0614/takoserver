@@ -1,80 +1,50 @@
-import type { Condition, ResourceSummary } from "./api.ts";
+import type { ResourceSummary } from "./api.ts";
 
-/**
- * What a resource's conditions add up to.
- *
- * Takoform reports state as conditions, which is the right wire shape and the
- * wrong thing to put in a table cell. A person scanning a list wants one word,
- * and it has to be the honest one: a resource whose Ready is False because it
- * failed is not the same as one still being made, and neither is "not ready".
- *
- * `Ready=Unknown` deliberately reads as Pending rather than as trouble — it is
- * what the Host says while it has not observed the backend yet.
- */
-
-export type Phase = "Ready" | "Pending" | "Failed" | "Deleting" | "Unknown";
+/** Display only states the v2 Resource actually reports. */
+export type Phase = "Ready" | "NotReady" | "Pending" | "Failed" | "Deleting" | "Unknown";
 
 export interface Health {
   readonly phase: Phase;
   readonly tone: "ok" | "warn" | "bad" | "idle";
   readonly reason: string | null;
   readonly message: string | null;
-  /** True when the last declaration has not been acted on yet. */
   readonly stale: boolean;
 }
 
 export function health(resource: ResourceSummary): Health {
-  const conditions = resource.status?.conditions ?? [];
-  const ready = find(conditions, "Ready");
-  const deleting = find(conditions, "Deleting");
-  const observed = resource.status?.observedGeneration ?? ready?.observedGeneration;
-  const stale = observed !== undefined && observed !== resource.metadata.generation;
-
-  if (deleting?.status === "True") {
-    return present("Deleting", "warn", deleting, stale);
+  const stale = resource.observedGeneration < resource.generation;
+  if (resource.phase === "deleting") {
+    return { phase: "Deleting", tone: "warn", reason: null, message: null, stale };
   }
-  if (!ready) {
-    return { phase: "Unknown", tone: "idle", reason: null, message: null, stale };
+  if (resource.phase === "error") {
+    return { phase: "Failed", tone: "bad", reason: null, message: null, stale };
   }
-  if (ready.status === "True") {
-    return present("Ready", "ok", ready, stale);
+  if (resource.phase === "pending" || stale) {
+    return { phase: "Pending", tone: "warn", reason: null, message: null, stale };
   }
-  if (ready.status === "Unknown") {
-    return present("Pending", "warn", ready, stale);
+  if (resource.observedAt !== null && resource.observed.ready === true) {
+    return { phase: "Ready", tone: "ok", reason: null, message: null, stale };
   }
-  // Ready=False splits on why: still being made, or given up on.
-  const provisioning = /provision|creat|pending|progress|updat/iu.test(ready.reason ?? "");
-  return present(provisioning ? "Pending" : "Failed", provisioning ? "warn" : "bad", ready, stale);
+  if (resource.observedAt !== null && resource.observed.ready === false) {
+    return { phase: "NotReady", tone: "warn", reason: null, message: null, stale };
+  }
+  return { phase: "Unknown", tone: "idle", reason: null, message: null, stale };
 }
 
-function present(phase: Phase, tone: Health["tone"], from: Condition, stale: boolean): Health {
-  return {
-    phase,
-    tone,
-    reason: from.reason ?? null,
-    message: from.message ?? null,
-    stale,
-  };
-}
-
-function find(conditions: readonly Condition[], type: string): Condition | undefined {
-  return conditions.find((condition) => condition.type === type);
-}
-
-/** Groups resources by kind, in a stable order, for overview counts. */
-export function byKind(resources: readonly ResourceSummary[]): readonly {
-  readonly kind: string;
+/** Counts by exact Form URL; a shared noun is not a Form identity. */
+export function byForm(resources: readonly ResourceSummary[]): readonly {
+  readonly form: string;
   readonly total: number;
-  readonly failing: number;
+  readonly attention: number;
 }[] {
-  const counts = new Map<string, { total: number; failing: number }>();
+  const counts = new Map<string, { total: number; attention: number }>();
   for (const resource of resources) {
-    const entry = counts.get(resource.kind) ?? { total: 0, failing: 0 };
+    const entry = counts.get(resource.form) ?? { total: 0, attention: 0 };
     entry.total += 1;
-    if (health(resource).phase === "Failed") entry.failing += 1;
-    counts.set(resource.kind, entry);
+    if (["Failed", "NotReady"].includes(health(resource).phase)) entry.attention += 1;
+    counts.set(resource.form, entry);
   }
   return [...counts.entries()]
-    .map(([kind, entry]) => ({ kind, ...entry }))
-    .sort((left, right) => right.total - left.total || left.kind.localeCompare(right.kind));
+    .map(([form, entry]) => ({ form, ...entry }))
+    .sort((left, right) => right.total - left.total || left.form.localeCompare(right.form));
 }
