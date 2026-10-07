@@ -92,8 +92,8 @@ interface CustodyRow {
 }
 
 function custodyRow(value: Row | undefined): CustodyRow | null {
+  if (!value) return null;
   if (
-    !value ||
     typeof value.operation_id !== "string" ||
     typeof value.resource_uid !== "string" ||
     (value.action !== "create" && value.action !== "delete") ||
@@ -112,7 +112,7 @@ function custodyRow(value: Row | undefined): CustodyRow | null {
     (value.acknowledged_receipt !== null && typeof value.acknowledged_receipt !== "string") ||
     (value.confirmed_receipt !== null && typeof value.confirmed_receipt !== "string")
   )
-    return null;
+    throw new Error("edge_kv_native_custody_invalid_row");
   return {
     operation_id: value.operation_id,
     resource_uid: value.resource_uid,

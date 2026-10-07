@@ -174,6 +174,50 @@ test("one CREATE grant survives duplicate/reopen; no-ID ACK loss never adopts ti
   }
 });
 
+test("present malformed CREATE and DELETE custody rows never report never_granted", async () => {
+  const f = await fixture();
+  const intent = { execution: f.create, plannedTitle: TITLE, closureDigest: DIGEST };
+  const malformedSql: Sql = {
+    run: f.sql.run,
+    batch: f.sql.batch,
+    async query(statement, params) {
+      const rows = await f.sql.query(statement, params);
+      if (!statement.startsWith("SELECT * FROM tf_v2_edge_kv_native_custody WHERE operation_id"))
+        return rows;
+      return rows.map((row) => ({ ...row, acknowledged_receipt: 123 }));
+    },
+  };
+  const malformed = createV2EdgeKvNativeCustody({ sql: malformedSql, now: f.now });
+  try {
+    expect(await malformed.inspectCreate(intent)).toEqual({ kind: "never_granted" });
+    expect(await f.custody.grantCreate(intent)).toBe("granted");
+    expect(malformed.inspectCreate(intent)).rejects.toThrow("edge_kv_native_custody_invalid_row");
+    expect(await f.custody.acknowledgeCreate({ ...intent, nativeId: ID, receipt: "post-id" })).toBe(
+      true,
+    );
+    expect(await f.custody.confirmCreate({ ...intent, nativeId: ID, receipt: "get-id" })).toBe(
+      true,
+    );
+    await f.settle(f.create);
+    const deletion = await f.engine.acceptDelete({
+      principal: "org-a",
+      key: "delete-malformed-native-0001",
+      uid: f.create.resourceUid,
+      expectedGeneration: 1,
+    });
+    const execution = await f.execution(deletion.id, "delete-malformed-lease");
+    const prepared = await f.custody.prepareDelete(execution);
+    if (!prepared) throw new Error("missing confirmed source");
+    expect(await malformed.inspectDelete(execution)).toEqual({ kind: "never_granted" });
+    expect(await f.custody.grantDelete(execution, prepared)).toMatchObject({ kind: "granted" });
+    expect(malformed.inspectDelete(execution)).rejects.toThrow(
+      "edge_kv_native_custody_invalid_row",
+    );
+  } finally {
+    f.close();
+  }
+});
+
 test("confirmed exact ID survives same-spec UPDATE and DELETE one-send/absence proof", async () => {
   const f = await fixture();
   const intent = { execution: f.create, plannedTitle: TITLE, closureDigest: DIGEST };
