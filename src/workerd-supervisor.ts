@@ -60,6 +60,13 @@ type CancelScheduledRestart = () => void;
 type ScheduleRestart = (run: () => void, delayMs: number) => CancelScheduledRestart;
 export type WorkerdReadinessMode = "startup" | "observation";
 
+class ChildIdentityPersistenceError extends Error {
+  constructor() {
+    super("workerd child identity persistence failed");
+    this.name = "ChildIdentityPersistenceError";
+  }
+}
+
 type RuntimeEntry = {
   readonly process: WorkerdProcess;
   readonly configPath: string;
@@ -328,7 +335,17 @@ export function createWorkerdSupervisor(options: {
       running = entry;
       observeExit(entry);
 
-      await options.onSpawned?.(child);
+      // Publish the start promise before invoking a hook that may reenter
+      // shutdown synchronously. Shutdown must be able to join this exact start.
+      await Promise.resolve();
+      if (running !== entry || shutdownRequested || nextEpoch !== epoch) {
+        throw new Error("workerd runtime startup was cancelled");
+      }
+      try {
+        await options.onSpawned?.(child);
+      } catch {
+        throw new ChildIdentityPersistenceError();
+      }
       if (running !== entry || shutdownRequested || nextEpoch !== epoch) {
         throw new Error("workerd runtime startup was cancelled");
       }
@@ -383,9 +400,15 @@ export function createWorkerdSupervisor(options: {
       () => {
         if (starting === attempt) starting = null;
       },
-      () => {
+      (error: unknown) => {
         if (starting === attempt) starting = null;
-        if (recovery && isDesiredEpoch(epoch)) schedule(epoch, configPath);
+        if (
+          recovery &&
+          isDesiredEpoch(epoch) &&
+          !(error instanceof ChildIdentityPersistenceError)
+        ) {
+          schedule(epoch, configPath);
+        }
       },
     );
     return promise;
@@ -483,6 +506,10 @@ export function createWorkerdSupervisor(options: {
   };
 
   const proveShutdown = async (): Promise<void> => {
+    // Capture before stopRuntime clears the public pointer. This exact start
+    // may still be committing child identity, and releasing the owner lock
+    // before it settles would permit a late write after shutdown.
+    const pendingStart = starting?.promise;
     const required =
       running !== null ||
       retiring !== null ||
@@ -493,10 +520,20 @@ export function createWorkerdSupervisor(options: {
       stoppedAfterRequiredRuntime;
     stopRuntime();
     const entry = retiring;
+    let exitError: unknown;
     if (entry) {
       kill(entry);
-      await waitForExit(entry);
+      try {
+        await waitForExit(entry);
+      } catch (error) {
+        exitError = error;
+      }
     }
+    // A persistence-hook rejection is not itself a shutdown failure: the
+    // captured child exit and listener vacancy are the shutdown proof. Joining
+    // the start first ensures no hook can commit after a successful return.
+    if (pendingStart) await pendingStart.catch(() => undefined);
+    if (exitError !== undefined) throw exitError;
     if (!required) return;
     const port = options.listenerPort;
     if (port === undefined)
