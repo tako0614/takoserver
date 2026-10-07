@@ -72,6 +72,7 @@ import {
   assertSelfhostTenantRunCredentialKeyConfiguration,
   createSelfhostTenantRunCredentials,
 } from "./selfhost-tenant-run-credentials.ts";
+import { createSelfhostV2WorkerComposition } from "./selfhost-v2-worker-composition.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import {
@@ -603,6 +604,24 @@ try {
       error instanceof Error ? error.message : "unknown error"
     }. Published Workers will not answer until the next publication.\n`,
   );
+}
+
+// Reopen every SQL-explained v2 Worker UID owner before the public listener.
+// This does not register the incomplete Worker Forms or make an Endpoint HTTPS
+// frontend claim. Unknown private namespaces and missing serving owners are
+// startup failures, not silently forgotten native children.
+const v2WorkerComposition = createSelfhostV2WorkerComposition({
+  sql,
+  objects,
+  clock,
+  config: takoformV2Config,
+  rootDirectory: join(dataRoot === ":memory:" ? ".takoserver" : dataRoot, "v2-worker-owners"),
+  targetKey: "selfhost-v2-worker-primary",
+  workerdBinary,
+});
+const restoredV2WorkerUids = await v2WorkerComposition.restoreOwners();
+if (restoredV2WorkerUids.length > 0) {
+  process.stdout.write(`restored ${restoredV2WorkerUids.length} v2 Worker owner(s)\n`);
 }
 
 /**
