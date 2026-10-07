@@ -81,7 +81,7 @@ async function unusedPort(): Promise<number> {
 
 async function closeFixtureOwner(
   owner: Awaited<ReturnType<typeof openWorkerdWorkerRuntimeOwner>>,
-  children: readonly WorkerdProcess[],
+  children: readonly ReturnType<typeof spawnWorkerdWithParentDeath>[],
   root: string,
 ): Promise<void> {
   try {
