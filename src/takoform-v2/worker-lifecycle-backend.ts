@@ -1,5 +1,5 @@
 import { canonicalJson } from "../json.ts";
-import type { Sql } from "../ports.ts";
+import type { JsonObject, Sql } from "../ports.ts";
 import type { WorkerdRuntime } from "../workerd-runtime.ts";
 import {
   referencesForWorkerDeployment,
@@ -20,10 +20,15 @@ import {
   type WorkerVersionSpec,
 } from "./forms/worker-specs.ts";
 import { TakoformV2Error, type V2BackendResult, type V2Execution, type V2Form } from "./types.ts";
+import { snapshotV2WorkerPrivateInputs } from "./worker-code-eligibility.ts";
 import { inspectV2WorkerCodeVersionEligibility } from "./worker-code-runtime.ts";
 import type { V2WorkerVersionResolution } from "./worker-publication-state.ts";
 import { projectV2ResolvedServiceBindings } from "./worker-service-resolution.ts";
 import { projectV2StaticWorkerVersion } from "./worker-static-runtime.ts";
+import type {
+  createV2WorkerVersionConfiguredInputSealer,
+  V2WorkerVersionSealedInputs,
+} from "./worker-version-configured-inputs.ts";
 
 export const MODULE_WORKER_LIFECYCLE_BACKEND_ID = "selfhost-v2-module-worker-identity-v1";
 export const WORKER_VERSION_LIFECYCLE_BACKEND_ID = "selfhost-v2-static-worker-version-v1";
@@ -646,11 +651,11 @@ function staticOnly(spec: WorkerVersionSpec): WorkerVersionSpec {
   return spec;
 }
 
-function codeOnly(spec: WorkerVersionSpec): WorkerVersionSpec {
+function codeOnly(spec: WorkerVersionSpec, configuredInputs: boolean): WorkerVersionSpec {
   if (
     !spec.bundle ||
     spec.handlers.some((handler) => handler !== "fetch" && handler !== "scheduled") ||
-    spec.requiredSensitiveVars.length > 0 ||
+    (spec.requiredSensitiveVars.length > 0 && !configuredInputs) ||
     spec.kvBindings.length > 0 ||
     spec.sqliteBindings.length > 0 ||
     spec.bucketBindings.length > 0 ||
@@ -661,6 +666,97 @@ function codeOnly(spec: WorkerVersionSpec): WorkerVersionSpec {
     throw new TakoformV2Error("capability_required", 422);
   }
   return spec;
+}
+
+type ConfiguredInputSealer = ReturnType<typeof createV2WorkerVersionConfiguredInputSealer>;
+
+/** Existing Core UID custody is injected; this runtime never reinterprets its row authority. */
+export interface V2CodeConfiguredInputCustody {
+  read(identity: {
+    readonly principal: string;
+    readonly space: string;
+    readonly name: string;
+    readonly form: string;
+    readonly resourceUid: string;
+  }): Promise<V2WorkerVersionSealedInputs | null>;
+}
+
+/** Resource-owned ciphertext read. A publication SQL vector must fence every await. */
+export interface V2CodeConfiguredInputReader {
+  read(input: {
+    readonly resourceUid: string;
+    readonly principal: string;
+    readonly space: string;
+    readonly targetKey: string;
+    readonly spec: WorkerVersionSpec;
+    stillCurrent(): Promise<boolean>;
+  }): Promise<Readonly<Record<string, string>> | null>;
+}
+
+export function createV2CodeConfiguredInputReader(options: {
+  readonly sql: Sql;
+  readonly sealer: ConfiguredInputSealer;
+  readonly custody: V2CodeConfiguredInputCustody;
+}): V2CodeConfiguredInputReader {
+  if (!options.sealer?.open || !options.custody?.read)
+    throw new TypeError("configured input sealer and custody reader are required");
+  const { sql } = options;
+  const open = options.sealer.open.bind(options.sealer);
+  const readConfigured = options.custody.read.bind(options.custody);
+  return {
+    async read(input) {
+      let expected: WorkerVersionSpec;
+      const resourceUid = input.resourceUid;
+      const principal = input.principal;
+      const space = input.space;
+      const targetKey = input.targetKey;
+      const stillCurrent = input.stillCurrent;
+      try {
+        expected = parseWorkerVersionSpec(structuredClone(input.spec));
+      } catch {
+        return null;
+      }
+      if (expected.requiredSensitiveVars.length === 0 || !(await stillCurrent())) return null;
+      const row = (
+        await sql.query(
+          `SELECT name, spec_json FROM tf_v2_resources
+           WHERE uid = ? AND principal = ? AND space = ? AND target_key = ?
+             AND form_url = ? AND deleted_at IS NULL`,
+          [resourceUid, principal, space, targetKey, WORKER_VERSION_FORM_URL],
+        )
+      )[0];
+      if (typeof row?.name !== "string" || typeof row.spec_json !== "string") return null;
+      try {
+        if (
+          canonicalJson(parseWorkerVersionSpec(JSON.parse(row.spec_json))) !==
+          canonicalJson(expected)
+        )
+          return null;
+      } catch {
+        return null;
+      }
+      const identity = {
+        principal,
+        space,
+        name: row.name,
+        form: WORKER_VERSION_FORM_URL,
+        resourceUid,
+        spec: expected,
+      };
+      const sealed = await readConfigured(identity);
+      if (!sealed) return null;
+      const opened = await open(identity, sealed);
+      const owned = snapshotV2WorkerPrivateInputs(opened);
+      if (
+        !owned ||
+        Object.keys(owned).length !== expected.requiredSensitiveVars.length ||
+        !expected.requiredSensitiveVars.every((name) => Object.hasOwn(owned, name))
+      )
+        return null;
+      if (!(await stillCurrent())) return null;
+      return owned;
+    },
+  };
 }
 
 /**
@@ -674,6 +770,8 @@ export function createInternalV2CodeWorkerVersionForm(options: {
   readonly publicationState: VersionState;
   readonly retirement: V2WorkerRetirementReader;
   readonly inspectModule: WorkerdRuntime["inspectModule"];
+  readonly configuredInputSealer?: ConfiguredInputSealer;
+  readonly configuredInputCustody?: V2CodeConfiguredInputCustody;
 }): V2Form {
   if (
     !options.targetKey ||
@@ -689,6 +787,20 @@ export function createInternalV2CodeWorkerVersionForm(options: {
   const resolveVersion = options.publicationState.resolveVersion.bind(options.publicationState);
   const observeRetired = options.retirement.observeRetired.bind(options.retirement);
   const inspectModule = options.inspectModule;
+  const configuredInputSealer = options.configuredInputSealer;
+  if (configuredInputSealer && !options.configuredInputCustody) {
+    throw new TypeError("configured input custody reader is required");
+  }
+  const configuredInputReader = configuredInputSealer
+    ? createV2CodeConfiguredInputReader({
+        sql,
+        sealer: configuredInputSealer,
+        custody: options.configuredInputCustody as V2CodeConfiguredInputCustody,
+      })
+    : null;
+  const sealConfigured = configuredInputSealer?.seal.bind(configuredInputSealer);
+  const openConfigured = configuredInputSealer?.open.bind(configuredInputSealer);
+  const compareConfigured = configuredInputSealer?.compare.bind(configuredInputSealer);
 
   async function manage(execution: V2Execution): Promise<V2BackendResult> {
     if (
@@ -700,7 +812,10 @@ export function createInternalV2CodeWorkerVersionForm(options: {
     }
     if (execution.action === "delete") {
       try {
-        const spec = codeOnly(parseWorkerVersionSpec(execution.spec));
+        const spec = codeOnly(
+          parseWorkerVersionSpec(execution.spec),
+          configuredInputSealer !== undefined,
+        );
         return (await retired(sql, observeRetired, execution, spec.worker.resourceUid, "version"))
           ? { kind: "complete", observed: {}, output: {} }
           : unresolved();
@@ -709,7 +824,10 @@ export function createInternalV2CodeWorkerVersionForm(options: {
       }
     }
     try {
-      const spec = codeOnly(parseWorkerVersionSpec(execution.spec));
+      const spec = codeOnly(
+        parseWorkerVersionSpec(execution.spec),
+        configuredInputSealer !== undefined,
+      );
       if (!(await currentClaim(sql, execution))) return unresolved();
       const resolution = await resolveVersion({ execution });
       if (resolution.kind !== "ready") return unresolved();
@@ -726,6 +844,18 @@ export function createInternalV2CodeWorkerVersionForm(options: {
         return unresolved();
       }
       const materials = await resolution.readMaterials();
+      const configuredPrivateInputs =
+        spec.requiredSensitiveVars.length > 0
+          ? await configuredInputReader?.read({
+              resourceUid: snapshot.version.uid,
+              principal: snapshot.worker.principal,
+              space: snapshot.worker.space,
+              targetKey: execution.targetKey,
+              spec: snapshot.version.spec,
+              stillCurrent: resolution.stillCurrent,
+            })
+          : undefined;
+      if (spec.requiredSensitiveVars.length > 0 && !configuredPrivateInputs) return unresolved();
       const resolvedServiceBindings = await projectV2ResolvedServiceBindings(
         snapshot.version.spec.serviceBindings,
       );
@@ -737,6 +867,7 @@ export function createInternalV2CodeWorkerVersionForm(options: {
         bundle: materials.bundle,
         assets: materials.assets,
         inspectModule,
+        ...(configuredPrivateInputs ? { privateInputs: configuredPrivateInputs } : {}),
         ...(resolvedServiceBindings.length > 0 ? { resolvedServiceBindings } : {}),
       });
       if (!(await resolution.stillCurrent()) || !(await currentClaim(sql, execution))) {
@@ -754,14 +885,128 @@ export function createInternalV2CodeWorkerVersionForm(options: {
 
   return {
     validateCreate(spec) {
-      codeOnly(validated(() => parseWorkerVersionSpec(spec)));
+      codeOnly(
+        validated(() => parseWorkerVersionSpec(spec)),
+        configuredInputSealer !== undefined,
+      );
     },
     validateUpdate(previous, spec) {
-      codeOnly(validated(() => validateWorkerVersionUpdate(previous, spec)));
+      codeOnly(
+        validated(() => validateWorkerVersionUpdate(previous, spec)),
+        configuredInputSealer !== undefined,
+      );
     },
     references(spec) {
-      return referencesForWorkerVersion(codeOnly(validated(() => parseWorkerVersionSpec(spec))));
+      return referencesForWorkerVersion(
+        codeOnly(
+          validated(() => parseWorkerVersionSpec(spec)),
+          configuredInputSealer !== undefined,
+        ),
+      );
     },
+    ...(configuredInputSealer
+      ? {
+          privateInputs: {
+            validateCreate(spec: JsonObject, inputs: Readonly<Record<string, string>> | undefined) {
+              const names = parseWorkerVersionSpec(spec).requiredSensitiveVars;
+              const owned = snapshotV2WorkerPrivateInputs(inputs);
+              if (
+                owned === null ||
+                (names.length > 0 && !owned) ||
+                (owned !== undefined &&
+                  (Object.keys(owned).length !== names.length ||
+                    !names.every((name) => Object.hasOwn(owned, name))))
+              ) {
+                throw new TakoformV2Error("invalid_spec", 422);
+              }
+            },
+            validateUpdate(
+              _previousSpec: JsonObject,
+              spec: JsonObject,
+              inputs: Readonly<Record<string, string>> | undefined,
+            ) {
+              if (inputs === undefined) return;
+              const names = parseWorkerVersionSpec(spec).requiredSensitiveVars;
+              const owned = snapshotV2WorkerPrivateInputs(inputs);
+              if (
+                !owned ||
+                Object.keys(owned).length !== names.length ||
+                !names.every((name) => Object.hasOwn(owned, name))
+              ) {
+                throw new TakoformV2Error("invalid_spec", 422);
+              }
+            },
+            async prepareCreate(input: {
+              readonly principal: string;
+              readonly space: string;
+              readonly name: string;
+              readonly form: string;
+              readonly resourceUid: string;
+              readonly spec: JsonObject;
+              readonly privateInputs: Readonly<Record<string, string>> | undefined;
+            }) {
+              const spec = parseWorkerVersionSpec(input.spec);
+              if (spec.requiredSensitiveVars.length === 0) return null;
+              if (!sealConfigured) throw new TypeError("configured input sealer is unavailable");
+              return await sealConfigured(
+                {
+                  principal: input.principal,
+                  space: input.space,
+                  name: input.name,
+                  form: input.form,
+                  resourceUid: input.resourceUid,
+                  spec,
+                },
+                input.privateInputs,
+              );
+            },
+            async prepareUpdate(input: {
+              readonly principal: string;
+              readonly space: string;
+              readonly name: string;
+              readonly form: string;
+              readonly resourceUid: string;
+              readonly spec: JsonObject;
+              readonly privateInputs: Readonly<Record<string, string>> | undefined;
+              readonly configured: {
+                readonly keyId: string;
+                readonly nonce: string;
+                readonly ciphertext: string;
+              } | null;
+            }) {
+              const spec = parseWorkerVersionSpec(input.spec);
+              if (spec.requiredSensitiveVars.length === 0) {
+                if (input.configured || input.privateInputs !== undefined)
+                  throw new TakoformV2Error("invalid_spec", 422);
+                return;
+              }
+              if (!input.configured) throw new TakoformV2Error("private_inputs_unverifiable", 409);
+              const identity = {
+                principal: input.principal,
+                space: input.space,
+                name: input.name,
+                form: input.form,
+                resourceUid: input.resourceUid,
+                spec,
+              };
+              if (input.privateInputs === undefined) {
+                if (!(await openConfigured?.(identity, input.configured))) {
+                  throw new TakoformV2Error("private_inputs_unverifiable", 409);
+                }
+                return;
+              }
+              const comparison = await compareConfigured?.(
+                identity,
+                input.configured,
+                input.privateInputs,
+              );
+              if (comparison === "unavailable")
+                throw new TakoformV2Error("private_inputs_unverifiable", 409);
+              if (comparison === "mismatched") throw new TakoformV2Error("invalid_spec", 422);
+            },
+          },
+        }
+      : {}),
     rejectDeleteWhileReferenced: true,
     backend: {
       id: WORKER_CODE_VERSION_LIFECYCLE_BACKEND_ID,

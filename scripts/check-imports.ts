@@ -90,7 +90,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "v2-code-validation",
     match:
-      /^src\/takoform-v2\/(?:worker-code-eligibility|worker-material-validation|worker-service-resolution)\.ts$/u,
+      /^src\/takoform-v2\/(?:worker-code-eligibility|worker-material-validation|worker-service-resolution|worker-version-configured-inputs)\.ts$/u,
     // Eligibility accepts a host-supplied semantic inspector. Its adapter
     // contract is imported as a type only; this layer never loads an adapter.
     may: ["core", "v2-form", "v2-code-validation"],
