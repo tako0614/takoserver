@@ -47,7 +47,9 @@ test("classifies the normal Bun v2 entry journey as readiness, not execution", (
   expect(capability.proves).toContain("graceful restart");
   expect(capability.proves).toContain("SIGKILL after a durable nonterminal artifact checkpoint");
   expect(capability.proves).toContain("same-key Operation replay");
-  expect(capability.proves).toContain("202 headers before discarding response body and returned IDs");
+  expect(capability.proves).toContain(
+    "202 headers before discarding response body and returned IDs",
+  );
   expect(capability.proves).toContain("loss of all response headers or TCP acknowledgement");
   expect(capability.proves).toContain("does not prove public TLS");
   expect(capability.proves).toContain("does not prove public TLS, Hosted");
