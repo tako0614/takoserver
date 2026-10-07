@@ -26,6 +26,10 @@ function seedGraph(
   db: Database,
   handlers: readonly string[] = ["scheduled"],
   settledAt = SETTLED_BEFORE_MATCH,
+  targetKey = TARGET_KEY,
+  additionalCronCount = 0,
+  versionTargetKey = targetKey,
+  triggerTargetKey = targetKey,
 ) {
   // This fixture seeds already accepted/settled v2 rows to isolate scheduler
   // durability. The production acceptance guard and match insert guard remain
@@ -65,6 +69,7 @@ function seedGraph(
     spec: string,
     observed: string,
     op: string,
+    resourceTargetKey = targetKey,
   ) {
     db.query(
       `INSERT INTO tf_v2_resources
@@ -79,7 +84,7 @@ function seedGraph(
       SPACE,
       name,
       "fixture-backend",
-      TARGET_KEY,
+      resourceTargetKey,
       name,
       settledAt,
       spec,
@@ -87,7 +92,13 @@ function seedGraph(
       op,
     );
   }
-  function operation(id: string, uid: string, spec: string, updatedAt: string) {
+  function operation(
+    id: string,
+    uid: string,
+    spec: string,
+    updatedAt: string,
+    operationTargetKey = targetKey,
+  ) {
     db.query(
       `INSERT INTO tf_v2_operations
        (id, resource_uid, principal, replay_key, request_fingerprint, action, generation,
@@ -107,7 +118,7 @@ function seedGraph(
       updatedAt,
       "2027-10-07T12:00:00.000Z",
       "fixture-backend",
-      TARGET_KEY,
+      operationTargetKey,
       `backend-${id}`,
       spec,
       id === workerOperation
@@ -127,6 +138,7 @@ function seedGraph(
     versionSpec,
     observedVersion,
     versionOperation,
+    versionTargetKey,
   );
   resource(
     deploymentUid,
@@ -143,11 +155,12 @@ function seedGraph(
     cronSpec,
     '{"ready":true}',
     cronOperation,
+    triggerTargetKey,
   );
   operation(workerOperation, workerUid, workerSpec, settledAt);
-  operation(versionOperation, versionUid, versionSpec, settledAt);
+  operation(versionOperation, versionUid, versionSpec, settledAt, versionTargetKey);
   operation(deploymentOperation, deploymentUid, deploymentSpec, settledAt);
-  operation(cronOperation, cronUid, cronSpec, settledAt);
+  operation(cronOperation, cronUid, cronSpec, settledAt, triggerTargetKey);
 
   function refs(
     operationId: string,
@@ -170,6 +183,22 @@ function seedGraph(
     { uid: versionUid, form: WORKER_VERSION_FORM_URL, readiness: "ready" },
   ]);
   refs(cronOperation, [{ uid: workerUid, form: moduleUrl, readiness: "observed" }]);
+  for (let index = 0; index < additionalCronCount; index += 1) {
+    const suffix = String(index).padStart(3, "0");
+    const extraUid = `cron-trigger-extra-${suffix}`;
+    const extraOperation = `cron-operation-extra-${suffix}`;
+    const extraSpec = JSON.stringify({ cron: "* * * * *", worker: { resourceUid: workerUid } });
+    resource(
+      extraUid,
+      WORKER_CRON_TRIGGER_FORM_URL,
+      `cron-extra-${suffix}`,
+      extraSpec,
+      "{}",
+      extraOperation,
+    );
+    operation(extraOperation, extraUid, extraSpec, settledAt);
+    refs(extraOperation, [{ uid: workerUid, form: moduleUrl, readiness: "observed" }]);
+  }
   return { workerUid, versionUid, deploymentUid, cronUid, cronOperation };
 }
 
@@ -200,6 +229,7 @@ test("records one exact match, redelivers the same id after unknown ACK and SQL 
         sql: createSqliteSql(first),
         now,
         delivery,
+        targetKey: TARGET_KEY,
         retryMilliseconds: 1_000,
       }),
     ).toEqual({ recorded: 1, claimed: 1, resolved: 0, rejected: 0, unknown: 1 });
@@ -212,6 +242,7 @@ test("records one exact match, redelivers the same id after unknown ACK and SQL 
           sql: createSqliteSql(restarted),
           now: () => new Date(MATCH_AT + 12_000),
           delivery,
+          targetKey: TARGET_KEY,
           retryMilliseconds: 1_000,
         }),
       ).toEqual({ recorded: 0, claimed: 1, resolved: 1, rejected: 0, unknown: 0 });
@@ -243,11 +274,60 @@ test("does not catch up an unrecorded minute after a late tick", async () => {
       sql: createSqliteSql(db),
       now: () => new Date(MATCH_AT + 70_000),
       delivery,
+      targetKey: TARGET_KEY,
     });
     expect(result.recorded).toBe(1);
     expect(db.query("SELECT scheduled_time_ms FROM tf_v2_worker_cron_matches").all()).toEqual([
       { scheduled_time_ms: MATCH_AT + 60_000 },
     ]);
+  } finally {
+    db.close();
+  }
+});
+
+test("records every current-minute match across bounded pages for only its target", async () => {
+  const db = openDb();
+  seedGraph(db, ["scheduled"], SETTLED_BEFORE_MATCH, TARGET_KEY, 130, TARGET_KEY, "other-target");
+  try {
+    const result = await runWorkerCronTriggerTick({
+      sql: createSqliteSql(db),
+      now: () => new Date(MATCH_AT + 10_000),
+      delivery: {
+        async invokeScheduled() {
+          return { kind: "unknown" };
+        },
+      },
+      targetKey: TARGET_KEY,
+      limit: 1,
+    });
+    expect(result.recorded).toBe(130);
+    expect(db.query("SELECT count(*) AS count FROM tf_v2_worker_cron_matches").get()).toEqual({
+      count: 130,
+    });
+  } finally {
+    db.close();
+  }
+});
+
+test("does not record a match when a selected Version belongs to another target", async () => {
+  const db = openDb();
+  seedGraph(db, ["scheduled"], SETTLED_BEFORE_MATCH, TARGET_KEY, 0, "other-target");
+  try {
+    const result = await runWorkerCronTriggerTick({
+      sql: createSqliteSql(db),
+      now: () => new Date(MATCH_AT + 10_000),
+      delivery: {
+        async invokeScheduled() {
+          throw new Error("must not dispatch a cross-target graph");
+        },
+      },
+      targetKey: TARGET_KEY,
+    });
+    expect(result.recorded).toBe(0);
+    expect(result.claimed).toBe(0);
+    expect(db.query("SELECT count(*) AS count FROM tf_v2_worker_cron_matches").get()).toEqual({
+      count: 0,
+    });
   } finally {
     db.close();
   }
@@ -268,12 +348,14 @@ test("does not record a later match while an earlier delivery remains outstandin
       sql: createSqliteSql(db),
       now: () => new Date(MATCH_AT + 10_000),
       delivery,
+      targetKey: TARGET_KEY,
       retryMilliseconds: 1_000,
     });
     const nextTick = await runWorkerCronTriggerTick({
       sql: createSqliteSql(db),
       now: () => new Date(MATCH_AT + 70_000),
       delivery,
+      targetKey: TARGET_KEY,
       retryMilliseconds: 1_000,
     });
     expect(nextTick.recorded).toBe(0);
@@ -302,6 +384,7 @@ test("a handler rejection is terminal and is not retried for the same match", as
       sql: createSqliteSql(db),
       now: () => new Date(MATCH_AT + 10_000),
       delivery,
+      targetKey: TARGET_KEY,
     };
     expect(await runWorkerCronTriggerTick(options)).toMatchObject({ rejected: 1, unknown: 0 });
     expect(await runWorkerCronTriggerTick(options)).toMatchObject({ rejected: 0, claimed: 0 });
@@ -327,6 +410,7 @@ test("fails closed when the selected Worker Version lacks the scheduled handler"
       sql: createSqliteSql(db),
       now: () => new Date(MATCH_AT + 10_000),
       delivery,
+      targetKey: TARGET_KEY,
     });
     expect(result.recorded).toBe(0);
     expect(result.claimed).toBe(0);

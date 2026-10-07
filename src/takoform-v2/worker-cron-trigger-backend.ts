@@ -131,79 +131,114 @@ export function createWorkerCronTriggerAdmissionReader(options: {
     }
     if (deploymentSpec.worker.resourceUid !== input.workerUid) return null;
 
-    const attachmentRows = (await options.sql.query(
-      `SELECT trigger.uid, trigger.generation, trigger.observed_generation,
-              trigger.phase, trigger.spec_json, trigger.last_operation,
-              trigger.busy_operation, trigger.deleted_at,
-              operation.status, operation.action,
-              operation.generation AS operation_generation,
-              operation.accepted_spec_json,
-              operation.principal AS operation_principal
-       FROM tf_v2_resources trigger
-       LEFT JOIN tf_v2_operations operation ON operation.id = trigger.last_operation
-       WHERE trigger.form_url = ? AND trigger.principal = ? AND trigger.space = ?
-         AND trigger.deleted_at IS NULL
-       ORDER BY trigger.uid LIMIT 257`,
-      [WORKER_CRON_TRIGGER_FORM_URL, input.principal, input.space],
-    )) as unknown as readonly Record<string, unknown>[];
-    if (attachmentRows.length > 256) return null;
     const attachmentSnapshot: Record<string, unknown>[] = [];
-    for (const row of attachmentRows) {
-      if (typeof row.spec_json !== "string") return null;
-      let cronSpec: ReturnType<typeof parseWorkerCronTriggerSpec>;
+    let afterUid = "";
+    while (true) {
+      let attachmentRows: readonly Record<string, unknown>[];
       try {
-        cronSpec = parseWorkerCronTriggerSpec(JSON.parse(row.spec_json));
+        attachmentRows = (await options.sql.query(
+          `SELECT trigger.uid, trigger.generation, trigger.observed_generation,
+                  trigger.phase, trigger.spec_json, trigger.last_operation,
+                  trigger.busy_operation, trigger.deleted_at,
+                  trigger.target_key,
+                  operation.status, operation.action,
+                  operation.generation AS operation_generation,
+                  operation.accepted_spec_json,
+                  operation.principal AS operation_principal,
+                  operation.target_key AS operation_target_key
+           FROM tf_v2_resources trigger
+           LEFT JOIN tf_v2_operations operation ON operation.id = trigger.last_operation
+           WHERE trigger.form_url = ? AND trigger.principal = ? AND trigger.space = ?
+             AND trigger.deleted_at IS NULL
+             AND (
+               CASE WHEN json_valid(trigger.spec_json) = 1
+                 THEN json_extract(trigger.spec_json, '$.worker.resourceUid') = ?
+                 ELSE 0
+               END
+               OR EXISTS (
+                 SELECT 1 FROM tf_v2_operation_references reference
+                 WHERE reference.operation_id = trigger.last_operation
+                   AND reference.target_uid = ?
+                   AND reference.form_url = 'https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/'
+               )
+             )
+             AND trigger.uid > ?
+           ORDER BY trigger.uid LIMIT ?`,
+          [
+            WORKER_CRON_TRIGGER_FORM_URL,
+            input.principal,
+            input.space,
+            input.workerUid,
+            input.workerUid,
+            afterUid,
+            128,
+          ],
+        )) as unknown as readonly Record<string, unknown>[];
       } catch {
         return null;
       }
-      if (cronSpec.worker.resourceUid !== input.workerUid) continue;
-      if (
-        typeof row.uid !== "string" ||
-        typeof row.generation !== "number" ||
-        typeof row.observed_generation !== "number" ||
-        typeof row.spec_json !== "string" ||
-        typeof row.last_operation !== "string" ||
-        row.operation_principal !== input.principal ||
-        row.operation_generation !== row.generation ||
-        row.accepted_spec_json !== row.spec_json
-      ) {
-        return null;
+      if (attachmentRows.length === 0) break;
+      for (const row of attachmentRows) {
+        if (
+          typeof row.uid !== "string" ||
+          typeof row.generation !== "number" ||
+          typeof row.observed_generation !== "number" ||
+          typeof row.spec_json !== "string" ||
+          typeof row.last_operation !== "string" ||
+          row.operation_principal !== input.principal ||
+          row.operation_target_key !== row.target_key ||
+          row.operation_generation !== row.generation ||
+          row.accepted_spec_json !== row.spec_json
+        ) {
+          return null;
+        }
+        if (typeof row.target_key !== "string" || row.target_key !== input.targetKey) return null;
+        let cronSpec: ReturnType<typeof parseWorkerCronTriggerSpec>;
+        try {
+          cronSpec = parseWorkerCronTriggerSpec(JSON.parse(row.spec_json));
+        } catch {
+          return null;
+        }
+        if (cronSpec.worker.resourceUid !== input.workerUid) return null;
+        if (
+          row.status === "succeeded" &&
+          (row.phase !== "idle" ||
+            row.busy_operation !== null ||
+            row.observed_generation !== row.generation)
+        )
+          return null;
+        if (
+          row.status !== "succeeded" &&
+          row.status !== "queued" &&
+          row.status !== "running" &&
+          row.status !== "waiting_input" &&
+          row.status !== "reconciling"
+        )
+          return null;
+        if (
+          !(await referencesMatch(
+            options.sql,
+            String(row.last_operation),
+            String(row.uid),
+            workerCronTriggerReferences(cronSpec),
+          ))
+        )
+          return null;
+        attachmentSnapshot.push({
+          uid: row.uid,
+          targetKey: row.target_key,
+          generation: row.generation,
+          phase: row.phase,
+          spec: row.spec_json,
+          operation: row.last_operation,
+          busy: row.busy_operation,
+          status: row.status,
+          action: row.action,
+          deleted: row.deleted_at,
+        });
+        afterUid = String(row.uid);
       }
-      if (
-        row.status === "succeeded" &&
-        (row.phase !== "idle" ||
-          row.busy_operation !== null ||
-          row.observed_generation !== row.generation)
-      )
-        return null;
-      if (
-        row.status !== "succeeded" &&
-        row.status !== "queued" &&
-        row.status !== "running" &&
-        row.status !== "waiting_input" &&
-        row.status !== "reconciling"
-      )
-        return null;
-      if (
-        !(await referencesMatch(
-          options.sql,
-          String(row.last_operation),
-          String(row.uid),
-          workerCronTriggerReferences(cronSpec),
-        ))
-      )
-        return null;
-      attachmentSnapshot.push({
-        uid: row.uid,
-        generation: row.generation,
-        phase: row.phase,
-        spec: row.spec_json,
-        operation: row.last_operation,
-        busy: row.busy_operation,
-        status: row.status,
-        action: row.action,
-        deleted: row.deleted_at,
-      });
+      if (attachmentRows.length < 128) break;
     }
     return { claim: claimRows[0], attachments: attachmentSnapshot };
   }
@@ -452,12 +487,15 @@ async function readSettledScheduledWorker(
     !worker ||
     worker.principal !== execution.principal ||
     worker.space !== execution.space ||
+    worker.target_key !== execution.targetKey ||
     worker.form_url !== "https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/" ||
     !settled(worker)
   ) {
     return { kind: "unknown" };
   }
-  if (!(await currentOperation(sql, worker))) return { kind: "unknown" };
+  if (!(await currentOperation(sql, worker))) {
+    return { kind: "unknown" };
+  }
   const workerObserved = parseObject(worker.observed_json);
   const deploymentUid = workerObserved?.activeDeploymentUid;
   if (workerObserved?.ready !== true || typeof deploymentUid !== "string") {
@@ -469,6 +507,7 @@ async function readSettledScheduledWorker(
     !deployment ||
     deployment.principal !== worker.principal ||
     deployment.space !== worker.space ||
+    deployment.target_key !== execution.targetKey ||
     deployment.form_url !== WORKER_DEPLOYMENT_FORM_URL ||
     !settled(deployment)
   ) {
@@ -510,6 +549,7 @@ async function readSettledScheduledWorker(
       !version ||
       version.principal !== worker.principal ||
       version.space !== worker.space ||
+      version.target_key !== execution.targetKey ||
       version.form_url !== WORKER_VERSION_FORM_URL ||
       !settled(version)
     ) {

@@ -9,6 +9,7 @@ CREATE TABLE tf_v2_worker_cron_matches (
   trigger_uid TEXT NOT NULL REFERENCES tf_v2_resources(uid),
   principal TEXT NOT NULL,
   space TEXT NOT NULL,
+  target_key TEXT NOT NULL,
   trigger_generation INTEGER NOT NULL CHECK (trigger_generation > 0),
   trigger_operation_id TEXT NOT NULL REFERENCES tf_v2_operations(id),
   trigger_settled_at TEXT NOT NULL,
@@ -135,6 +136,7 @@ WHEN EXISTS (
     ON deployment_ref_set.operation_id = deployment_operation.id AND deployment_ref_set.sealed = 1
   WHERE trigger_resource.uid = NEW.trigger_uid
     AND trigger_resource.principal = NEW.principal AND trigger_resource.space = NEW.space
+    AND trigger_resource.target_key = NEW.target_key
     AND trigger_resource.form_url = 'https://edge.forms.takoform.com/forms/WorkerCronTrigger/0.3.0/'
     AND trigger_resource.deleted_at IS NULL AND trigger_resource.phase = 'idle'
     AND trigger_resource.busy_operation IS NULL
@@ -143,6 +145,7 @@ WHEN EXISTS (
     AND trigger_resource.last_operation = NEW.trigger_operation_id
     AND trigger_operation.resource_uid = trigger_resource.uid
     AND trigger_operation.principal = NEW.principal
+    AND trigger_operation.target_key = NEW.target_key
     AND trigger_operation.action IN ('create', 'update')
     AND trigger_operation.status = 'succeeded'
     AND trigger_operation.generation = NEW.trigger_generation
@@ -154,17 +157,20 @@ WHEN EXISTS (
     AND json_extract(trigger_resource.spec_json, '$.worker.resourceUid') = NEW.worker_uid
     AND json_extract(trigger_resource.spec_json, '$.cron') = NEW.cron
     AND worker.principal = NEW.principal AND worker.space = NEW.space
+    AND worker.target_key = NEW.target_key
     AND worker.form_url = 'https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/'
     AND worker.deleted_at IS NULL AND worker.phase = 'idle' AND worker.busy_operation IS NULL
     AND worker.generation = worker.observed_generation
     AND json_type(worker.observed_json, '$.ready') = 'true'
     AND json_type(worker.observed_json, '$.activeDeploymentUid') = 'text'
     AND deployment.principal = NEW.principal AND deployment.space = NEW.space
+    AND deployment.target_key = NEW.target_key
     AND deployment.form_url = 'https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/'
     AND deployment.deleted_at IS NULL AND deployment.phase = 'idle' AND deployment.busy_operation IS NULL
     AND deployment.generation = deployment.observed_generation
     AND deployment_operation.resource_uid = deployment.uid
     AND deployment_operation.principal = NEW.principal
+    AND deployment_operation.target_key = NEW.target_key
     AND deployment_operation.action IN ('create', 'update')
     AND deployment_operation.status = 'succeeded'
     AND deployment_operation.generation = deployment.generation
@@ -221,6 +227,7 @@ WHEN EXISTS (
         ON version_ref_set.operation_id = version_operation.id AND version_ref_set.sealed = 1
       WHERE version.uid IS NULL OR version_ref_set.operation_id IS NULL
         OR version.principal IS NOT NEW.principal OR version.space IS NOT NEW.space
+        OR version.target_key IS NOT NEW.target_key
         OR version.form_url <> 'https://edge.forms.takoform.com/forms/WorkerVersion/0.5.0/'
         OR version.deleted_at IS NOT NULL OR version.phase <> 'idle'
         OR version.busy_operation IS NOT NULL OR version.generation <> version.observed_generation
@@ -233,6 +240,7 @@ WHEN EXISTS (
         OR version.last_operation IS NOT version_operation.id
         OR version_operation.resource_uid IS NOT version.uid
         OR version_operation.principal IS NOT NEW.principal
+        OR version_operation.target_key IS NOT NEW.target_key
         OR version_operation.action NOT IN ('create', 'update')
         OR version_operation.status IS NOT 'succeeded'
         OR version_operation.generation IS NOT version.generation
@@ -258,6 +266,7 @@ CREATE TRIGGER tf_v2_worker_cron_match_identity_immutable
 BEFORE UPDATE ON tf_v2_worker_cron_matches
 WHEN NEW.match_id IS NOT OLD.match_id OR NEW.trigger_uid IS NOT OLD.trigger_uid OR
   NEW.principal IS NOT OLD.principal OR NEW.space IS NOT OLD.space OR
+  NEW.target_key IS NOT OLD.target_key OR
   NEW.trigger_generation IS NOT OLD.trigger_generation OR
   NEW.trigger_operation_id IS NOT OLD.trigger_operation_id OR
   NEW.trigger_settled_at IS NOT OLD.trigger_settled_at OR
@@ -307,6 +316,7 @@ WHEN NEW.state = 'dispatching' AND NEW.lease_token IS NOT OLD.lease_token
     SELECT 1 FROM tf_v2_resources trigger_resource
     WHERE trigger_resource.uid = OLD.trigger_uid
       AND trigger_resource.principal = OLD.principal AND trigger_resource.space = OLD.space
+      AND trigger_resource.target_key = OLD.target_key
       AND trigger_resource.form_url = 'https://edge.forms.takoform.com/forms/WorkerCronTrigger/0.3.0/'
       AND trigger_resource.generation >= OLD.trigger_generation
       AND trigger_resource.deleted_at IS NULL

@@ -316,7 +316,7 @@ const AUDITED_MIGRATION_SHA256: Readonly<
   "0079_v2_worker_native_deletions.sql":
     "sha256:f8b4fdd60608f4c71a28c2d888c85457104905dffb48826f9a8ddccede0199c4",
   "0080_v2_worker_cron_trigger_matches.sql":
-    "sha256:a4be439da5f6f5e2bf23a742f8adc04d4919ee8099271c79d7da080f7b5b14f7",
+    "sha256:9410e2886d8f2b6fa3cd51800f3f8d9f5a14823dc01973d0a8830a076b8d6f6a",
 };
 // 0067-0080 are part of the exact source inventory only. None has an in-place apply wave.
 const INTEGRATION_APPLY_CEILING_COUNT = 66;
@@ -2212,7 +2212,7 @@ function selectSchemaWave(
     if (hasAvailabilityCutover) {
       if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
         throw preflightError(
-          "integration D1 cutover requires the exact audited source inventory 0001-0079",
+          "integration D1 cutover requires the exact audited source inventory 0001-0080",
         );
       }
       assertAuditedMigrationHashes(artifact.files);
@@ -2259,7 +2259,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0079",
+      "selected D1 wave requires the exact audited source inventory 0001-0080",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
