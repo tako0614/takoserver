@@ -749,13 +749,18 @@ existing private data root. Boot restores the single SQL-backed Worker owner
 before opening ingress, polls Workflow due work as a separate tracked pass, and
 closes Workflow/Actor execution before suspending that owner. This is private
 source assembly only: the ordinary Host still does not register incomplete
-Worker Forms. `createSelfhostV2WorkerEndpointBoot` now joins the existing
-SQL/native frontend and HTTPS listener through one captured configuration and
-authority snapshot. It supplies the existing Endpoint backend ports and closes
-the listener if frontend construction fails. The ordinary entry does not yet
-select this boot or pass its publication-state port; its local certificate
-tests are not public DNS/CA qualification. This setting therefore does not make
-v2 WorkerEndpoint or complete Worker support live.
+Worker Forms. `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` explicitly selects the
+existing v2 Worker Endpoint HTTPS boot in the ordinary Bun entry. It reuses
+`TAKOSERVER_WORKER_ENDPOINT_SUFFIX` and the existing Worker TLS certificate/key
+inputs, binds the shared listener on TCP 443, and rejects conflicts with the
+ordinary control, Workerd, data-plane, or legacy Container Endpoint HTTPS
+listener. Leaving the selection unset preserves the existing boot path. The
+selected listener is closed during ordered shutdown and if the ordinary Bun
+listener cannot start. This starts the SQL/native Endpoint frontend only; it
+does not mount the incomplete Worker Forms into the normal registry or mark
+them Ready. Local certificate/SNI and route checks are not public DNS, external
+CA trust, or reachability qualification, and this selection does not make
+complete Worker support live.
 
 ## Existing installations
 

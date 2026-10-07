@@ -74,6 +74,92 @@ test("normal Worker composition restores an empty private owner inventory", asyn
   }
 });
 
+test("Endpoint publication reader is fail-closed before restore and after owner suspension", async () => {
+  const root = await mkdtemp(join(tmpdir(), "selfhost-v2-endpoint-publication-reader-"));
+  const database = new Database(join(root, "control.sqlite"));
+  try {
+    migrateSqlite(database);
+    const sql = createSqliteSql(database);
+    const objects = createMemoryObjectStore();
+    const clock = () => new Date();
+    const composition = createSelfhostV2WorkerComposition({
+      sql,
+      objects,
+      clock,
+      config: {
+        cursorSigningKey: new Uint8Array(32).fill(0x52),
+        documentation: "https://docs.example.test/v2",
+        authenticationDocumentation: "https://docs.example.test/v2/authentication",
+      },
+      rootDirectory: join(root, "v2-worker-owners"),
+      targetKey: TARGET,
+      workerdBinary: null,
+    });
+    const execution = {
+      operationId: "23fd4413-9f1d-4f00-8acb-7a0e52328b41",
+      leaseToken: "fixture-lease",
+      backendKey: "fixture-backend-key",
+      backendId: "fixture-endpoint-backend",
+      targetKey: TARGET,
+      resourceUid: "e56df985-1f57-4e93-a1bd-bdcb0845ebc0",
+      principal: "org:fixture",
+      action: "create" as const,
+      generation: 1,
+      form: WORKER_ENDPOINT_FORM_URL,
+      space: "fixture",
+      name: "endpoint",
+      spec: { worker: { resourceUid: "b340e70c-fac9-48a6-a950-1b3034d7029a" } },
+      previousObserved: {},
+      previousOutput: {},
+    };
+    const currentServing = {
+      workerUid: "b340e70c-fac9-48a6-a950-1b3034d7029a",
+      targetKey: TARGET,
+      sourceOperationId: "23fd4413-9f1d-4f00-8acb-7a0e52328b41",
+      expectedIdentity: {
+        generation: "takoserver-v2-operation:23fd4413-9f1d-4f00-8acb-7a0e52328b41",
+        workerResourceUid: "b340e70c-fac9-48a6-a950-1b3034d7029a",
+        hostnames: ["v2-b340e70cfac948a6a9501b3034d7029a.workers.example.test"],
+        versions: [{ workerVersionUid: "a340e70c-fac9-48a6-a950-1b3034d7029a", weight: 10_000 }],
+      },
+    };
+
+    await expect(
+      composition.endpointPublicationState.resolve({ execution }),
+    ).resolves.toMatchObject({
+      kind: "unresolved",
+    });
+    await expect(
+      composition.endpointPublicationState.resolveCurrentServing(currentServing),
+    ).resolves.toMatchObject({ kind: "unresolved" });
+
+    await composition.restoreOwners();
+    await expect(
+      composition.endpointPublicationState.resolve({ execution }),
+    ).resolves.toMatchObject({
+      kind: "unresolved",
+    });
+    await composition.suspendOwnersRetainingCustody();
+    await expect(
+      composition.endpointPublicationState.resolve({ execution }),
+    ).resolves.toMatchObject({
+      kind: "unresolved",
+    });
+    await expect(
+      composition.endpointPublicationState.resolveCurrentServing(currentServing),
+    ).resolves.toMatchObject({ kind: "unresolved" });
+    await expect(composition.ownerForWorkerUid(currentServing.workerUid)).rejects.toThrow(
+      "v2 Worker owner admission is frozen",
+    );
+    expect(composition.internalFormFactory({ sql, objects, clock })[WORKER_ENDPOINT_FORM_URL]).toBe(
+      undefined,
+    );
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("normal Worker boot refuses an unexplained private owner namespace", async () => {
   const root = await mkdtemp(join(tmpdir(), "selfhost-v2-worker-foreign-"));
   const database = new Database(join(root, "control.sqlite"));

@@ -9,6 +9,7 @@ import {
   parseSelfhostV2PrivatePlaneBoot,
   prepareSelfhostV2PrivatePlaneRoots,
 } from "./entry-v2-private-plane-boot.ts";
+import { parseSelfhostV2WorkerEndpointHttpsSelection } from "./entry-v2-worker-endpoint-boot.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import { migrateSqlite } from "./migrate-sqlite.ts";
 import { createFileObjectStore } from "./objects-fs.ts";
@@ -93,6 +94,10 @@ import {
   startSelfhostV2WorkflowDuePass,
 } from "./selfhost-v2-runtime-boot.ts";
 import { createSelfhostV2WorkerComposition } from "./selfhost-v2-worker-composition.ts";
+import {
+  createSelfhostV2WorkerEndpointBoot,
+  type SelfhostV2WorkerEndpointBoot,
+} from "./selfhost-v2-worker-endpoint-boot.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import {
@@ -264,6 +269,20 @@ if (containerEndpointHttpsConfiguration) {
     privateKey: workerdTls.privateKey,
   });
 }
+const v2WorkerEndpointHttpsSelection = parseSelfhostV2WorkerEndpointHttpsSelection(
+  process.env.TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS,
+  {
+    workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
+    tlsConfigured: workerdTls !== undefined,
+    containerEndpointHttpsConfigured: containerEndpointHttpsConfiguration !== undefined,
+    reservedPorts: [
+      port,
+      workerdPort,
+      workerEndpointPort,
+      ...(process.env.TAKOSERVER_DATA_PLANE_PORT?.trim() === "443" ? [443] : []),
+    ],
+  },
+);
 const providerMode = resolveStandaloneProviderMode({
   retiredProviderMode: process.env.TAKOSERVER_RETIRED_PROVIDER_MODE,
   cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID,
@@ -288,6 +307,7 @@ const v2PrivatePlaneBoot = parseSelfhostV2PrivatePlaneBoot(
       ...(process.env.TAKOSERVER_DATA_PLANE_PORT
         ? [Number(process.env.TAKOSERVER_DATA_PLANE_PORT)]
         : []),
+      ...(v2WorkerEndpointHttpsSelection ? [v2WorkerEndpointHttpsSelection.port] : []),
     ],
   },
 );
@@ -1166,6 +1186,7 @@ const bunFetch = createSelfhostBunFetchHandler({
   appFetch: takoformV2Ingress,
 });
 let bunServer: ReturnType<typeof Bun.serve> | undefined;
+let selfhostV2WorkerEndpointBoot: SelfhostV2WorkerEndpointBoot | undefined;
 let shutdownClean = true;
 let closeSequenceFinished = false;
 const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
@@ -1209,12 +1230,19 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
 );
 const entryShutdown = createSelfhostEntryShutdown({
   stopIngress: async () => {
-    let endpointClosing: Promise<void> = Promise.resolve();
+    const endpointClosings: Promise<void>[] = [];
     if (selfhostContainerEndpointHttps) {
       try {
-        endpointClosing = selfhostContainerEndpointHttps.close(false);
+        endpointClosings.push(selfhostContainerEndpointHttps.close(false));
       } catch {
-        endpointClosing = Promise.reject(new Error("endpoint ingress close failed"));
+        endpointClosings.push(Promise.reject(new Error("Container Endpoint ingress close failed")));
+      }
+    }
+    if (selfhostV2WorkerEndpointBoot) {
+      try {
+        endpointClosings.push(selfhostV2WorkerEndpointBoot.close(false));
+      } catch {
+        endpointClosings.push(Promise.reject(new Error("v2 Worker Endpoint ingress close failed")));
       }
     }
 
@@ -1226,7 +1254,7 @@ const entryShutdown = createSelfhostEntryShutdown({
       serverStopping = Promise.reject(new Error("Bun ingress stop failed"));
     }
 
-    const stopped = await Promise.allSettled([endpointClosing, serverStopping]);
+    const stopped = await Promise.allSettled([...endpointClosings, serverStopping]);
     if (stopped.some((result) => result.status === "rejected")) {
       throw new Error("one or more self-host ingress listeners did not stop cleanly");
     }
@@ -1253,13 +1281,49 @@ process.on("exit", () => {
   workerd.stop();
 });
 
-bunServer = Bun.serve({
-  port,
-  // Longer than the default, because publishing a site means uploading its
-  // files and a request that is doing real work is not an idle one.
-  idleTimeout: 120,
-  fetch: (request) => entryShutdown.fetch(request, bunFetch),
-});
+if (v2WorkerEndpointHttpsSelection) {
+  if (!workerdTls) throw new Error("selected v2 Worker Endpoint HTTPS lost its TLS inputs");
+  try {
+    selfhostV2WorkerEndpointBoot = await createSelfhostV2WorkerEndpointBoot({
+      sql,
+      targetKey: v2WorkerTargetKey,
+      publicOrigin,
+      configuration: v2WorkerEndpointHttpsSelection,
+      certificateChain: workerdTls.certificateChain,
+      privateKey: workerdTls.privateKey,
+      publicationState: v2WorkerComposition.endpointPublicationState,
+      ownerForWorkerUid: async (uid) => {
+        if (!ownersRestored) throw new Error("v2 Worker owners are not restored");
+        return await v2WorkerComposition.ownerForWorkerUid(uid);
+      },
+    });
+    process.once("exit", () => {
+      void selfhostV2WorkerEndpointBoot?.close();
+    });
+  } catch (error) {
+    throw new Error("selected v2 Worker Endpoint HTTPS could not start", { cause: error });
+  }
+}
+
+try {
+  bunServer = Bun.serve({
+    port,
+    // Longer than the default, because publishing a site means uploading its
+    // files and a request that is doing real work is not an idle one.
+    idleTimeout: 120,
+    fetch: (request) => entryShutdown.fetch(request, bunFetch),
+  });
+} catch (error) {
+  try {
+    await selfhostV2WorkerEndpointBoot?.close(true);
+  } catch (closeError) {
+    throw new AggregateError(
+      [error, closeError],
+      "self-host Bun listener failed and v2 Worker Endpoint cleanup was not confirmed",
+    );
+  }
+  throw error;
+}
 
 // Background settlement. The shutdown owner retains each timer and each pass
 // promise, so no new work starts past the signal fence and accepted work drains.
