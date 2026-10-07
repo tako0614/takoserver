@@ -1012,6 +1012,51 @@ test("DELETE keeps references and physical retirement separate, then settles onl
   }
 });
 
+test("a retained edge from a tombstoned referrer does not block Worker retirement", async () => {
+  const f = fixture();
+  try {
+    const { worker, spec } = await f.createWorkerAndAssets();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec);
+    await expect(
+      f.engine.acceptDelete({
+        principal: "org-1",
+        key: "live-ref-worker-delete-key",
+        uid: worker.resourceUid,
+        expectedGeneration: 1,
+      }),
+    ).rejects.toMatchObject({ code: "dependency_conflict", status: 409 });
+
+    // A previous source lineage could retain this legal edge when its
+    // referrer became a tombstone. The current core explicitly ignores it.
+    await f.sql.run(
+      "UPDATE tf_v2_resources SET deleted_at = '2026-10-07T00:00:00Z', active_name = NULL WHERE uid = ?",
+      [version.resourceUid],
+    );
+    expect(
+      await f.sql.query(
+        "SELECT target_uid FROM tf_v2_resource_references WHERE referrer_uid = ? AND target_uid = ?",
+        [version.resourceUid, worker.resourceUid],
+      ),
+    ).toHaveLength(1);
+
+    const deletion = await f.engine.acceptDelete({
+      principal: "org-1",
+      key: "tombstone-ref-worker-delete-key",
+      uid: worker.resourceUid,
+      expectedGeneration: 1,
+    });
+    f.retirementMode = "confirmed";
+    const outcome = await f.engine.runNext();
+    expect(f.retirementCalls).toBe(1);
+    expect(outcome).toMatchObject({ id: deletion.id, status: "succeeded" });
+    await expect(
+      f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).rejects.toMatchObject({ code: "gone", status: 410 });
+  } finally {
+    f.close();
+  }
+});
+
 test("retirement is a required constructor capability, not a default absence claim", () => {
   const f = fixture();
   try {
