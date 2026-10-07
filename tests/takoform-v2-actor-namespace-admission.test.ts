@@ -47,7 +47,7 @@ function fixture() {
       },
     },
   });
-  let inspection: "valid" | "invalid" | "unavailable" | "second-invalid" = "valid";
+  let inspection: "valid" | "invalid" | "unavailable" | "second-invalid" | "mixed" = "valid";
   let inspected = 0;
   let onInspect: (() => Promise<void>) | undefined;
   const inspector = {
@@ -56,13 +56,14 @@ function fixture() {
       const callback = onInspect;
       onInspect = undefined;
       await callback?.();
+      const second = input.modules.some((module) =>
+        new TextDecoder().decode(module.bytes).includes("version-second"),
+      );
       const invalid =
         inspection === "invalid" ||
-        (inspection === "second-invalid" &&
-          input.modules.some((module) =>
-            new TextDecoder().decode(module.bytes).includes("version-second"),
-          ));
-      return inspection === "valid" || (inspection === "second-invalid" && !invalid)
+        (inspection === "second-invalid" && second) ||
+        (inspection === "mixed" && !second);
+      return inspection === "valid" || (inspection === "second-invalid" && !second)
         ? ({ outcome: "valid" } as const)
         : invalid
           ? ({ outcome: "invalid", error: "actor_class_invalid" } as const)
@@ -235,6 +236,54 @@ test("Actor Namespace admission allows pre-Deployment create, but not a duplicat
   }
 });
 
+test("an unrelated Worker's unresolved Deployment does not block pre-Deployment Actor Namespace", async () => {
+  const f = fixture();
+  try {
+    const own = await f.worker();
+    const other = await f.create(MODULE_WORKER_FORM_URL, "other-worker", {});
+    const otherVersion = await f.version(other.resourceUid, "other-version");
+    const spec = {
+      worker: { resourceUid: other.resourceUid },
+      versions: [{ workerVersion: { resourceUid: otherVersion.resourceUid }, weight: 10_000 }],
+    };
+    const otherDeployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "other-deployment", spec);
+    await f.sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+      JSON.stringify({ active: true, ready: false, selectedVersions: [] }),
+      otherDeployment.resourceUid,
+    ]);
+    const first = await f.create(
+      ACTOR_NAMESPACE_FORM_URL,
+      "own-before-deployment",
+      { worker: { resourceUid: own.resourceUid }, className: "CounterActor" },
+      false,
+    );
+    expect(first.status).toBe("queued");
+    expect(f.inspections()).toBe(0);
+    const pending = await f.engine.acceptUpdate({
+      principal: PRINCIPAL,
+      key: "other-deployment-pending-update-0001",
+      uid: otherDeployment.resourceUid,
+      expectedGeneration: 1,
+      spec,
+    });
+    await f.sql.run("UPDATE tf_v2_operations SET status = 'running' WHERE id = ?", [pending.id]);
+    await f.sql.run(
+      "UPDATE tf_v2_operations SET status = 'reconciling', effect = 'unknown' WHERE id = ?",
+      [pending.id],
+    );
+    const second = await f.create(
+      ACTOR_NAMESPACE_FORM_URL,
+      "own-before-deployment-two",
+      { worker: { resourceUid: own.resourceUid }, className: "OtherActor" },
+      false,
+    );
+    expect(second.status).toBe("queued");
+    expect(f.inspections()).toBe(0);
+  } finally {
+    f.db.close();
+  }
+});
+
 test("Actor admission treats missing held Bundle bytes as resource_busy, not a proven invalid class", async () => {
   const f = fixture();
   try {
@@ -366,6 +415,11 @@ test("Actor admission inspects held bytes for every accepted pending weighted Ve
       code: "dependency_conflict",
     });
     expect(f.inspections()).toBe(2);
+    f.setInspection("mixed");
+    await expect(
+      f.create(ACTOR_NAMESPACE_FORM_URL, "namespace-mixed", spec, false),
+    ).rejects.toMatchObject({ code: "dependency_conflict" });
+    expect(f.inspections()).toBe(4);
     expect(
       await f.sql.query("SELECT uid FROM tf_v2_resources WHERE form_url = ?", [
         ACTOR_NAMESPACE_FORM_URL,

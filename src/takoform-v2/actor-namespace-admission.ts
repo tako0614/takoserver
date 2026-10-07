@@ -177,23 +177,48 @@ async function capture(input: {
   for (const deployment of deployments) add("tf_v2_resources", ["uid"], deployment);
   const versionUids = new Set<string>();
   for (const deployment of deployments) {
+    // An unrelated Worker's partial or unready Deployment cannot make this
+    // Worker's pre-Deployment Namespace busy. Keep every Resource in the CAS
+    // set, but apply allocation semantics only after accepted spec ownership.
+    const currentRows = await sql.query("SELECT * FROM tf_v2_operations WHERE id = ?", [
+      String(deployment.last_operation),
+    ]);
+    const priorRows =
+      typeof deployment.observed_generation === "number" && deployment.observed_generation > 0
+        ? await sql.query(
+            `SELECT * FROM tf_v2_operations WHERE resource_uid = ? AND generation = ?
+         AND action IN ('create','update') AND status = 'succeeded' AND effect = 'complete'`,
+            [String(deployment.uid), deployment.observed_generation],
+          )
+        : [];
+    const namesWorker = (accepted: unknown): boolean => {
+      if (typeof accepted !== "string") throw busy();
+      const value = json(accepted);
+      const worker = value.worker;
+      return worker !== null && typeof worker === "object" && !Array.isArray(worker)
+        ? (worker as Record<string, unknown>).resourceUid === input.workerUid
+        : false;
+    };
+    if (
+      !namesWorker(deployment.spec_json) &&
+      !currentRows.some((row) => namesWorker(row.accepted_spec_json)) &&
+      !priorRows.some((row) => namesWorker(row.accepted_spec_json))
+    )
+      continue;
     const chosen: Row[] = [];
     if (typeof deployment.observed_generation !== "number") throw busy();
     if (deployment.observed_generation > 0) {
-      const prior = await sql.query(
-        `SELECT * FROM tf_v2_operations WHERE resource_uid = ? AND generation = ?
-         AND action IN ('create','update') AND status = 'succeeded' AND effect = 'complete'`,
-        [String(deployment.uid), deployment.observed_generation],
-      );
-      if (prior.length > 1) throw busy();
+      if (priorRows.length > 1) throw busy();
       const observed = json(String(deployment.observed_json));
       if (observed.active === true && observed.ready !== true) throw busy();
       if (observed.active === true) {
-        if (!prior[0]) throw busy();
-        chosen.push(prior[0]);
+        if (!priorRows[0]) throw busy();
+        chosen.push(priorRows[0]);
       }
     }
-    const current = await operation(String(deployment.last_operation));
+    if (currentRows.length !== 1 || !currentRows[0]) throw busy();
+    const current = currentRows[0];
+    add("tf_v2_operations", ["id"], current);
     if (
       current.resource_uid !== deployment.uid ||
       current.principal !== deployment.principal ||
@@ -361,6 +386,7 @@ export async function prepareV2ActorNamespaceAdmission(input: {
     }
   };
   let invalid = false;
+  let unavailable = false;
   for (const version of before.versions) {
     if (!version.bundleUid || !version.bundleSpec || !version.bundleObserved) {
       invalid = true;
@@ -377,10 +403,12 @@ export async function prepareV2ActorNamespaceAdmission(input: {
         stillAuthorized: stillCurrent,
       });
     } catch {
-      throw busy();
+      unavailable = true;
+      continue;
     }
-    const result = await scope.inspector
-      .inspectActorClass({
+    let result: Awaited<ReturnType<WorkerModuleSemanticInspector["inspectActorClass"]>>;
+    try {
+      result = await scope.inspector.inspectActorClass({
         mainModule: held.manifest.entrypoint,
         modules: held.manifest.files.map((file, index) => ({
           name: file.path,
@@ -390,16 +418,18 @@ export async function prepareV2ActorNamespaceAdmission(input: {
         })),
         className: spec.className,
         runtimeClassRef: ACTOR_ABI_INTERFACE_REFS.v2,
-      })
-      .catch(() => {
-        throw busy();
       });
-    if (result.outcome === "unavailable") throw busy();
+    } catch {
+      unavailable = true;
+      continue;
+    }
+    if (result.outcome === "unavailable") unavailable = true;
     if (result.outcome === "invalid") invalid = true;
     if (!(await stillCurrent())) throw busy();
   }
   if (!(await stillCurrent())) throw busy();
   if (invalid) return null;
+  if (unavailable) throw busy();
 
   const predicates = before.evidence.map(exactRows);
   const deploymentRows =
@@ -439,4 +469,22 @@ export async function prepareV2ActorNamespaceAdmission(input: {
     sql: predicates.map((predicate) => `(${predicate.sql})`).join(" AND "),
     params: predicates.flatMap((predicate) => predicate.params),
   };
+}
+
+/** Conservative SQL absence read for the no-Deployment physical namespace path. */
+export async function v2ActorDeploymentsAbsent(input: {
+  readonly sql: Sql;
+  readonly principal: string;
+  readonly space: string;
+  readonly targetKey: string;
+  readonly workerUid: string;
+}): Promise<boolean> {
+  try {
+    const before = await capture(input);
+    if (before.versions.length !== 0) return false;
+    const after = await capture(input);
+    return after.versions.length === 0 && after.vector === before.vector;
+  } catch {
+    return false;
+  }
 }
