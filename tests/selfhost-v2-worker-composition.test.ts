@@ -110,6 +110,7 @@ test("normal organization HTTP accepts internal Worker Version, Deployment and E
   const binary = join(root, "bun-workerd-stand-in.js");
   const database = new Database(join(root, "control.sqlite"));
   const children: WorkerdProcess[] = [];
+  let closeOwner: (() => Promise<void>) | undefined;
   const identity = {
     async verify({ assertion }: { assertion: string }) {
       return {
@@ -227,7 +228,13 @@ test("normal organization HTTP accepts internal Worker Version, Deployment and E
       v2: config,
       v2FormFactory: composition.internalFormFactory,
     });
-    const http = (path: string, method = "GET", body?: unknown, replayKey?: string) =>
+    const http = (
+      path: string,
+      method = "GET",
+      body?: unknown,
+      replayKey?: string,
+      generation?: number,
+    ) =>
       app.fetch(
         new Request(`${ORIGIN}${API}${path}`, {
           method,
@@ -235,6 +242,9 @@ test("normal organization HTTP accepts internal Worker Version, Deployment and E
             authorization: `Bearer ${key.secret}`,
             ...(body === undefined ? {} : { "content-type": "application/json" }),
             ...(replayKey ? { "idempotency-key": replayKey } : {}),
+            ...(generation === undefined
+              ? {}
+              : { "takoform-expected-generation": String(generation) }),
           },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         }),
@@ -251,6 +261,24 @@ test("normal organization HTTP accepts internal Worker Version, Deployment and E
       expect(await app.tickTakoformV2()).toMatchObject({ id: accepted.id, status: "succeeded" });
       return accepted.resourceUid;
     };
+    const remove = async (uid: string, name: string) => {
+      const response = await http(
+        `/resources/${uid}`,
+        "DELETE",
+        undefined,
+        `delete-${name}-normal-worker`,
+        1,
+      );
+      expect(response.status).toBe(202);
+      const accepted = (await response.json()) as { id: string; resourceUid: string };
+      expect(accepted.resourceUid).toBe(uid);
+      expect(await app.tickTakoformV2()).toMatchObject({
+        id: accepted.id,
+        status: "succeeded",
+        effect: "complete",
+      });
+      expect((await http(`/resources/${uid}`)).status).toBe(410);
+    };
     const workerUid = await create(MODULE_WORKER_FORM_URL, "worker", {});
     const assetUid = await create(STATIC_ASSET_BUNDLE_FORM_URL, "asset", {
       artifact: { url: manifestUrl, sha256: manifestSha },
@@ -264,7 +292,7 @@ test("normal organization HTTP accepts internal Worker Version, Deployment and E
         notFoundHandling: "none",
       },
     });
-    await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+    const deploymentUid = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
       worker: { resourceUid: workerUid },
       versions: [{ workerVersion: { resourceUid: versionUid }, weight: 10_000 }],
     });
@@ -278,11 +306,19 @@ test("normal organization HTTP accepts internal Worker Version, Deployment and E
       observed: { activeDeploymentRouteReady: true, tlsReady: true },
     });
     const owner = await composition.ownerForWorkerUid(workerUid);
+    closeOwner = () => owner.close();
     const serving = await owner.observeServing({ workerResourceUid: workerUid, targetKey: TARGET });
     expect(serving).toMatchObject({ kind: "serving", workerResourceUid: workerUid });
     const served = await owner.fetch(new Request("https://worker.example.test/"));
     expect(served.status).toBe(200);
+    await remove(endpointUid, "endpoint");
+    await remove(deploymentUid, "deployment");
+    await remove(versionUid, "version");
+    await remove(assetUid, "asset");
+    await remove(workerUid, "worker");
+    await owner.close();
   } finally {
+    await closeOwner?.().catch(() => undefined);
     for (const child of children) child.kill();
     await Promise.all(children.map((child) => child.exited));
     database.close();
