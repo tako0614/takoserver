@@ -447,6 +447,16 @@ test.skipIf(configuredBinary === null)(
         { spec: { worker: { resourceUid: workerUid } } },
         1,
       );
+      const updatedEndpointRead = await http(`/resources/${endpointUid}`);
+      expect(updatedEndpointRead.status).toBe(200);
+      const updatedEndpoint = (await updatedEndpointRead.json()) as {
+        uid: string;
+        output: { hostname: string; url: string };
+      };
+      expect(updatedEndpoint).toMatchObject({
+        uid: endpointUid,
+        output: { hostname: endpoint.output.hostname, url: endpoint.output.url },
+      });
       expect(await getHttps(loopbackPort, endpoint.output.hostname, "/after-update")).toEqual({
         status: 200,
         body: "native-worker:/after-update",
