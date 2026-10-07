@@ -2698,7 +2698,6 @@ export async function openWorkerdWorkerRuntimeOwner(
           }
           return result;
         }
-        candidate.group.sealConfiguration();
         return await activateIncarnation(
           candidate,
           result.identity,
@@ -3022,6 +3021,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     )
       return { kind: "unknown" };
     if (identity.generation !== expectedOperationMarker(operationId)) return { kind: "unknown" };
+    candidate.group.sealConfiguration();
     const previous = active;
     const now = Date.now();
     let oldRecord: IncarnationRecord | null = null;

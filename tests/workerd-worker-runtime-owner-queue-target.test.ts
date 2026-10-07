@@ -428,3 +428,51 @@ test("Queue target observation refuses a live child that lost its listener and a
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a candidate whose first child spawn fails can retry the same accepted Operation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "takoserver-queue-owner-candidate-retry-"));
+  const binary = join(root, "bun-workerd-stand-in.js");
+  const publication = publicationState();
+  let spawnCount = 0;
+  let child: ReturnType<typeof spawnWorkerdWithParentDeath> | undefined;
+  await writeFile(binary, `#!${process.execPath}\n${CHILD_SOURCE}`, { mode: 0o700 });
+  await chmod(binary, 0o700);
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: join(root, "owners"),
+    workerResourceUid: WORKER_UID,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: binary,
+    listenerPortForOperation: unusedPort,
+    spawn(command): WorkerdProcess {
+      spawnCount += 1;
+      if (spawnCount === 1) throw new Error("transient child spawn failure");
+      child = spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" });
+      return child;
+    },
+  });
+  try {
+    expect(await owner.execute(execution(CREATE_ID, "create"))).toEqual({ kind: "unknown" });
+    expect(await owner.execute(execution(CREATE_ID, "create"))).toMatchObject({
+      kind: "confirmed",
+    });
+    // The latch is private to the group: assert its source ordering as well as
+    // the behavioral retry above, without adding a production test-only port.
+    const source = await Bun.file(
+      new URL("../src/workerd-worker-runtime-owner.ts", import.meta.url),
+    ).text();
+    const activation = source.slice(
+      source.indexOf("async function activateIncarnation("),
+      source.indexOf("async function deleteDeployment("),
+    );
+    const seal = activation.indexOf("candidate.group.sealConfiguration()");
+    const durableActive = activation.indexOf("const snapshot = await transitionState(");
+    expect(seal).toBeGreaterThan(0);
+    expect(durableActive).toBeGreaterThan(seal);
+  } finally {
+    await owner.close().catch(() => undefined);
+    if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    if (child) await child.exited;
+    await rm(root, { recursive: true, force: true });
+  }
+});
