@@ -1,4 +1,4 @@
-import { canonicalJson } from "../../json.ts";
+import { bytesDigest, canonicalJson } from "../../json.ts";
 import type { Sql } from "../../ports.ts";
 import { OBJECT_BUCKET_LIMITS, parseObjectBucketSpec } from "./object-bucket.ts";
 import { OBJECT_BUCKET_BACKEND_ID } from "./object-bucket-backend.ts";
@@ -100,6 +100,45 @@ export function createObjectBucketWorkerBindingAuthority(options: {
         (item) => item.name === binding && item.resourceUid === selected.resourceUid,
       )
     ) {
+      return null;
+    }
+
+    // The grant names the immutable Version operation that produced the native
+    // code version. A same-spec PUT may advance the current Resource operation,
+    // so verify the original accepted operation against the current exact
+    // immutable spec instead of requiring it to remain last_operation.
+    const sourceOperations = await options.sql.query(
+      `SELECT id, resource_uid, principal, target_key, backend_id, generation,
+              action, status, effect, accepted_spec_json
+       FROM tf_v2_operations
+       WHERE id = ? AND resource_uid = ? AND principal = ? AND target_key = ?
+         AND backend_id = ? AND action IN ('create', 'update')
+         AND status = 'succeeded' AND effect = 'complete'
+         AND accepted_spec_json = ?`,
+      [
+        grant.workerVersionOperationId,
+        grant.workerVersionUid,
+        grant.principal,
+        grant.targetKey,
+        version.backend_id as string,
+        version.spec_json,
+      ],
+    );
+    const sourceOperation = sourceOperations.length === 1 ? sourceOperations[0] : null;
+    if (
+      !sourceOperation ||
+      typeof sourceOperation.generation !== "number" ||
+      !Number.isSafeInteger(sourceOperation.generation) ||
+      sourceOperation.generation < 1 ||
+      typeof version.generation !== "number" ||
+      sourceOperation.generation > version.generation
+    ) {
+      return null;
+    }
+    const nativeVersionDigest = await bytesDigest(
+      new TextEncoder().encode(`${grant.workerVersionUid}\u0000${sourceOperation.generation}`),
+    );
+    if (grant.nativeVersionId !== `v2-${nativeVersionDigest.slice("sha256:".length)}`) {
       return null;
     }
 

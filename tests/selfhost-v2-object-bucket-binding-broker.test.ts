@@ -3,11 +3,12 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalJson } from "../src/json.ts";
+import { bytesDigest, canonicalJson } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject } from "../src/ports.ts";
 import {
   createSelfhostV2ObjectBucketBindingBroker,
+  SELFHOST_V2_OBJECT_MULTIPART_PARTS_CONTENT_TYPE,
   type V2ObjectBucketBindingGrant,
 } from "../src/providers/selfhost-v2-object-bucket-binding-broker.ts";
 import {
@@ -84,7 +85,14 @@ async function fixture() {
       signingKey: new Uint8Array(32).fill(9),
       async observeVersionTarget(input) {
         if (nativeStatus === "stopped") return { kind: "unknown" as const };
-        return { kind: "confirmed" as const, ...input, status: nativeStatus };
+        return {
+          kind: "confirmed" as const,
+          workerUid: input.workerUid,
+          versionId: input.versionId,
+          incarnationId: input.incarnationId,
+          servingSourceOperationId: input.servingSourceOperationId,
+          status: nativeStatus,
+        };
       },
       async resolveCurrentBucketBinding(grant, binding) {
         if (
@@ -184,6 +192,24 @@ test("ObjectBucket broker requires a persistent signing key and exact grant shap
       resolveCurrentBucketBinding: async () => null,
     }),
   ).toThrow(TypeError);
+});
+
+test("grant bindings use the WorkerVersion code-unit comparator", async () => {
+  const host = await fixture();
+  try {
+    const token = host.broker.issueGrant({
+      ...GRANT,
+      bindings: [
+        { name: "_B", resourceUid: "bucket-underscore" },
+        { name: "A", resourceUid: "bucket-letter" },
+      ],
+    });
+    const payload = Buffer.from(token.split(".")[0] ?? "", "base64url").toString("utf8");
+    const parsed = JSON.parse(payload) as V2ObjectBucketBindingGrant;
+    expect(parsed.bindings.map(({ name }) => name)).toEqual(["A", "_B"]);
+  } finally {
+    host.close();
+  }
 });
 
 test("signed object binding streams CRUD, range, listing, and multipart through the exact UID bucket", async () => {
@@ -382,6 +408,94 @@ test("a streaming write is stopped when the native/Core grant changes during bod
   }
 });
 
+test("multipart completion body carries the full sorted 10,000-part manifest", async () => {
+  let capturedPartCount = 0;
+  let firstPart: { etag: string; partNumber: number } | undefined;
+  let lastPart: { etag: string; partNumber: number } | undefined;
+  const bucketAccess = {
+    async completeMultipartUpload(
+      _key: string,
+      _uploadId: string,
+      parts: readonly { etag: string; partNumber: number }[],
+    ) {
+      capturedPartCount = parts.length;
+      firstPart = parts[0];
+      lastPart = parts.at(-1);
+      return { etag: "complete-etag", size: 1 };
+    },
+  };
+  const broker = createSelfhostV2ObjectBucketBindingBroker({
+    store: {
+      async openBucket() {
+        return bucketAccess;
+      },
+    } as never,
+    targetKey: TARGET,
+    signingKey: new Uint8Array(32).fill(13),
+    async observeVersionTarget(input) {
+      return {
+        kind: "confirmed" as const,
+        workerUid: input.workerUid,
+        versionId: input.versionId,
+        incarnationId: input.incarnationId,
+        servingSourceOperationId: input.servingSourceOperationId,
+        status: "active" as const,
+      };
+    },
+    async resolveCurrentBucketBinding() {
+      return { identity: IDENTITY, vector: "current" };
+    },
+  });
+  const token = broker.issueGrant(GRANT);
+  const parts = Array.from({ length: 10_000 }, (_, index) => ({
+    etag: `etag-${index + 1}`,
+    partNumber: index + 1,
+  }));
+  const headerDocument = Buffer.from(
+    JSON.stringify({
+      protocol: SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
+      binding: "MEDIA",
+      op: "completeMultipartUpload",
+      key: "large.bin",
+      uploadId: "upload-1",
+    }),
+  ).toString("base64url");
+  const send = async (manifestParts: readonly { etag: string; partNumber: number }[]) =>
+    await broker.handle(
+      new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": SELFHOST_V2_OBJECT_MULTIPART_PARTS_CONTENT_TYPE,
+          [SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER]: headerDocument,
+        },
+        body: JSON.stringify({ parts: manifestParts }),
+      }),
+    );
+  const response = await send(parts);
+  expect(response?.status).toBe(200);
+  expect(await response?.json()).toEqual({
+    ok: true,
+    value: { etag: "complete-etag", size: 1 },
+  });
+  expect(capturedPartCount).toBe(10_000);
+  expect(firstPart?.etag).toBe("etag-1");
+  expect(firstPart?.partNumber).toBe(1);
+  expect(lastPart?.etag).toBe("etag-10000");
+  expect(lastPart?.partNumber).toBe(10_000);
+  expect(
+    await (
+      await send([
+        { etag: "etag-2", partNumber: 2 },
+        { etag: "etag-1", partNumber: 1 },
+      ])
+    )?.json(),
+  ).toMatchObject({ ok: false, error: { code: "invalid_part" } });
+  expect(
+    await (await send([...parts, { etag: "etag-10001", partNumber: 10_001 }]))?.json(),
+  ).toMatchObject({ ok: false, error: { code: "invalid_part" } });
+});
+
 test("Core reader proves the exact sealed same-owner binding and survives immutable Version PUT", async () => {
   const root = mkdtempSync(join(tmpdir(), "v2-object-authority-"));
   const database = new Database(join(root, "control.sqlite"));
@@ -476,6 +590,10 @@ test("Core reader proves the exact sealed same-owner binding and survives immuta
       "version",
       versionSpec as unknown as JsonObject,
     );
+    const versionGeneration = 1;
+    const nativeVersionDigest = await bytesDigest(
+      new TextEncoder().encode(`${version.resourceUid}\u0000${versionGeneration}`),
+    );
     const grant: V2ObjectBucketBindingGrant = {
       principal: "alice",
       space: "default",
@@ -483,7 +601,7 @@ test("Core reader proves the exact sealed same-owner binding and survives immuta
       workerUid: worker.resourceUid,
       workerVersionUid: version.resourceUid,
       workerVersionOperationId: version.id,
-      nativeVersionId: "native-v1",
+      nativeVersionId: `v2-${nativeVersionDigest.slice("sha256:".length)}`,
       incarnationId: "incarnation-v1",
       servingSourceOperationId: "source-op-v1",
       bindings: [{ name: "MEDIA", resourceUid: bucket.resourceUid }],
@@ -500,6 +618,18 @@ test("Core reader proves the exact sealed same-owner binding and survives immuta
     });
     expect(
       await authority.resolveCurrentBucketBinding(
+        { ...grant, nativeVersionId: "v2-not-derived-from-the-accepted-version-operation" },
+        "MEDIA",
+      ),
+    ).toBeNull();
+    expect(
+      await authority.resolveCurrentBucketBinding(
+        { ...grant, workerVersionOperationId: bucket.id },
+        "MEDIA",
+      ),
+    ).toBeNull();
+    expect(
+      await authority.resolveCurrentBucketBinding(
         { ...grant, targetKey: "foreign-target" },
         "MEDIA",
       ),
@@ -510,7 +640,14 @@ test("Core reader proves the exact sealed same-owner binding and survives immuta
       targetKey: TARGET,
       signingKey: new Uint8Array(32).fill(11),
       async observeVersionTarget(input) {
-        return { kind: "confirmed" as const, ...input, status: "active" as const };
+        return {
+          kind: "confirmed" as const,
+          workerUid: input.workerUid,
+          versionId: input.versionId,
+          incarnationId: input.incarnationId,
+          servingSourceOperationId: input.servingSourceOperationId,
+          status: "active" as const,
+        };
       },
       resolveCurrentBucketBinding: authority.resolveCurrentBucketBinding,
     });

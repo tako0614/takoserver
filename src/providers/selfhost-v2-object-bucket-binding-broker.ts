@@ -9,6 +9,7 @@ import type {
 import {
   MAX_SELFHOST_OBJECT_DOCUMENT_BYTES,
   SELFHOST_DATA_PLANE_CONTENT_TYPE,
+  SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES,
   SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
   SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
   SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER,
@@ -19,6 +20,10 @@ import {
 const UID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const BINDING = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
 const MAX_TOKEN_LENGTH = 32_768;
+/** Private broker body used only for the large completeMultipartUpload manifest. */
+export const SELFHOST_V2_OBJECT_MULTIPART_PARTS_CONTENT_TYPE =
+  "application/vnd.takoserver.selfhost-object.multipart-parts.v2+json" as const;
+const MAX_MULTIPART_PARTS = 10_000;
 const OBJECT_OPERATION_FIELDS: Readonly<Record<string, readonly string[]>> = {
   head: ["key"],
   get: ["key", "range", "ifMatch", "ifNoneMatch"],
@@ -47,8 +52,6 @@ export interface V2ObjectBucketBindingGrant {
 export interface V2ObjectBucketSelectedVersionObservation {
   readonly kind: "confirmed";
   readonly workerUid: string;
-  readonly workerVersionUid: string;
-  readonly workerVersionOperationId: string;
   readonly versionId: string;
   readonly incarnationId: string;
   readonly servingSourceOperationId: string;
@@ -72,8 +75,6 @@ export interface SelfhostV2ObjectBucketBindingBrokerOptions {
   /** Exact native owner readback; caller claims are not native-state authority. */
   readonly observeVersionTarget: (input: {
     readonly workerUid: string;
-    readonly workerVersionUid: string;
-    readonly workerVersionOperationId: string;
     readonly versionId: string;
     readonly incarnationId: string;
     readonly servingSourceOperationId: string;
@@ -154,8 +155,6 @@ export function createSelfhostV2ObjectBucketBindingBroker(
     if (!grant.bindings.some((entry) => entry.name === binding)) return null;
     const native = await options.observeVersionTarget({
       workerUid: grant.workerUid,
-      workerVersionUid: grant.workerVersionUid,
-      workerVersionOperationId: grant.workerVersionOperationId,
       versionId: grant.nativeVersionId,
       incarnationId: grant.incarnationId,
       servingSourceOperationId: grant.servingSourceOperationId,
@@ -163,8 +162,6 @@ export function createSelfhostV2ObjectBucketBindingBroker(
     if (
       native.kind !== "confirmed" ||
       native.workerUid !== grant.workerUid ||
-      native.workerVersionUid !== grant.workerVersionUid ||
-      native.workerVersionOperationId !== grant.workerVersionOperationId ||
       native.versionId !== grant.nativeVersionId ||
       native.incarnationId !== grant.incarnationId ||
       native.servingSourceOperationId !== grant.servingSourceOperationId ||
@@ -320,7 +317,7 @@ function checkedGrant(input: unknown, targetKey: string): V2ObjectBucketBindingG
     names.add(entry.name);
     return Object.freeze({ name: entry.name, resourceUid: entry.resourceUid });
   });
-  bindings.sort((left, right) => left.name.localeCompare(right.name));
+  bindings.sort((left, right) => compareStrings(left.name, right.name));
   return Object.freeze({
     principal: input.principal as string,
     space: input.space as string,
@@ -443,14 +440,17 @@ async function operate(
         ),
       );
     }
-    case "completeMultipartUpload":
+    case "completeMultipartUpload": {
+      const parts = await multipartPartsFromRequest(fields.parts, request, valid);
+      if (!(await valid())) throw new SelfhostObjectError("backend_unavailable");
       return answer(
         await bucket.completeMultipartUpload(
           stringField(fields.key),
           stringField(fields.uploadId),
-          partsField(fields.parts),
+          parts,
         ),
       );
+    }
     case "abortMultipartUpload":
       await bucket.abortMultipartUpload(stringField(fields.key), stringField(fields.uploadId));
       return answer({});
@@ -606,19 +606,93 @@ function rangeField(value: unknown): { readonly offset: number; readonly length?
 function partsField(
   value: unknown,
 ): readonly { readonly etag: string; readonly partNumber: number }[] {
-  if (!Array.isArray(value)) throw new SelfhostObjectError("invalid_part");
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_MULTIPART_PARTS) {
+    throw new SelfhostObjectError("invalid_part");
+  }
+  let previousPartNumber = 0;
   return value.map((entry) => {
     if (
       !record(entry) ||
       Object.keys(entry).sort().join(",") !== "etag,partNumber" ||
       typeof entry.etag !== "string" ||
+      entry.etag.length < 1 ||
+      entry.etag.length > 256 ||
       typeof entry.partNumber !== "number" ||
-      !Number.isSafeInteger(entry.partNumber)
+      !Number.isSafeInteger(entry.partNumber) ||
+      entry.partNumber < 1 ||
+      entry.partNumber > MAX_MULTIPART_PARTS ||
+      entry.partNumber <= previousPartNumber
     ) {
       throw new SelfhostObjectError("invalid_part");
     }
+    previousPartNumber = entry.partNumber;
     return { etag: entry.etag, partNumber: entry.partNumber };
   });
+}
+
+async function multipartPartsFromRequest(
+  headerParts: unknown,
+  request: Request,
+  valid: () => Promise<boolean>,
+): Promise<readonly { readonly etag: string; readonly partNumber: number }[]> {
+  if (headerParts !== undefined) {
+    if (request.body !== null) throw new SelfhostObjectError("invalid_part");
+    return partsField(headerParts);
+  }
+  if (
+    request.headers.get("content-type") !== SELFHOST_V2_OBJECT_MULTIPART_PARTS_CONTENT_TYPE ||
+    request.body === null
+  ) {
+    throw new SelfhostObjectError("invalid_part");
+  }
+  const bytes = await readBoundedBody(request.body, valid);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw new SelfhostObjectError("invalid_part");
+  }
+  if (!record(parsed) || Object.keys(parsed).join(",") !== "parts") {
+    throw new SelfhostObjectError("invalid_part");
+  }
+  return partsField(parsed.parts);
+}
+
+async function readBoundedBody(
+  source: ReadableStream<Uint8Array>,
+  valid: () => Promise<boolean>,
+): Promise<Uint8Array> {
+  const reader = source.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      if (!(await valid())) throw new SelfhostObjectError("backend_unavailable");
+      const next = await reader.read();
+      if (next.done) break;
+      if (!(await valid())) throw new SelfhostObjectError("backend_unavailable");
+      total += next.value.byteLength;
+      if (total > SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES) {
+        throw new SelfhostObjectError("invalid_body");
+      }
+      chunks.push(next.value);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
+  } catch (error) {
+    cancelReader(reader, error);
+    if (error instanceof SelfhostObjectError) throw error;
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+}
+
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function record(value: unknown): value is Record<string, unknown> {
