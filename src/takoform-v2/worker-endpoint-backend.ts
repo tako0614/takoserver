@@ -108,18 +108,25 @@ export function createWorkerEndpointForm(options: {
     readonly space: string;
     readonly name: string;
   }) => string;
-  readonly observeTls: (input: {
-    readonly endpointUid: string;
-    readonly workerUid: string;
-    readonly hostname: string;
-    readonly url: string;
-  }) => Promise<V2EndpointTlsObservation>;
-  readonly observeRouteAbsent?: (input: {
-    readonly endpointUid: string;
-    readonly workerUid: string;
-    readonly hostname: string;
-    readonly url: string;
-  }) => Promise<V2EndpointRouteAbsenceObservation>;
+  /** Private Host observer receives the accepted current lease, never Form output. */
+  readonly observeTls: (
+    input: {
+      readonly endpointUid: string;
+      readonly workerUid: string;
+      readonly hostname: string;
+      readonly url: string;
+    },
+    execution: V2Execution,
+  ) => Promise<V2EndpointTlsObservation>;
+  readonly observeRouteAbsent?: (
+    input: {
+      readonly endpointUid: string;
+      readonly workerUid: string;
+      readonly hostname: string;
+      readonly url: string;
+    },
+    execution: V2Execution,
+  ) => Promise<V2EndpointRouteAbsenceObservation>;
 }): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
 
@@ -206,11 +213,14 @@ export function createWorkerEndpointForm(options: {
       if (!options.observeRouteAbsent) return unknown();
       let route: V2EndpointRouteAbsenceObservation;
       try {
-        route = await options.observeRouteAbsent({
-          endpointUid: execution.resourceUid,
-          workerUid: spec.worker.resourceUid,
-          ...address,
-        });
+        route = await options.observeRouteAbsent(
+          {
+            endpointUid: execution.resourceUid,
+            workerUid: spec.worker.resourceUid,
+            ...address,
+          },
+          execution,
+        );
       } catch {
         return unknown();
       }
@@ -230,11 +240,14 @@ export function createWorkerEndpointForm(options: {
 
     let tls: V2EndpointTlsObservation;
     try {
-      tls = await options.observeTls({
-        endpointUid: execution.resourceUid,
-        workerUid: spec.worker.resourceUid,
-        ...address,
-      });
+      tls = await options.observeTls(
+        {
+          endpointUid: execution.resourceUid,
+          workerUid: spec.worker.resourceUid,
+          ...address,
+        },
+        execution,
+      );
     } catch {
       return unknown();
     }

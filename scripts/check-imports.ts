@@ -422,7 +422,16 @@ for (const path of walk("src")) {
       violations.push(`${path} (${layer.name}) imports unclassified module ${target}`);
       continue;
     }
-    if (!layer.may.includes(targetLayer.name)) {
+    // This Host-only callback carries the exact accepted execution into
+    // private lifecycle readbacks. Permit only this single type-only edge;
+    // do not widen the general self-host composition layer to v2-contract.
+    const exactExecutionTypeEdge =
+      path === "src/selfhost-v2-worker-endpoint-frontend.ts" &&
+      target === "src/takoform-v2/types.ts" &&
+      /import\s+type\s+\{\s*V2Execution\s*\}\s+from\s+["']\.\/takoform-v2\/types\.ts["'];/u.test(
+        readFileSync(path, "utf8"),
+      );
+    if (!layer.may.includes(targetLayer.name) && !exactExecutionTypeEdge) {
       violations.push(
         `${path} (${layer.name}) imports ${target} (${targetLayer.name}); ` +
           `${layer.name} may import only ${layer.may.join(", ")}`,

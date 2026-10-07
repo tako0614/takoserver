@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject } from "../src/ports.ts";
+import { createSelfhostV2WorkerEndpointFrontend } from "../src/selfhost-v2-worker-endpoint-frontend.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
@@ -79,9 +80,106 @@ async function exerciseEndpoint(deleteDeploymentFirst: boolean): Promise<void> {
   let routeAbsenceReady = false;
   let nativeRouteHostname = HOSTNAME;
   let tlsHostname = HOSTNAME;
+  let nativeServing: {
+    readonly sourceOperationId: string;
+    readonly generation: string;
+    readonly hostnames: readonly string[];
+    readonly versions: readonly {
+      readonly workerVersionUid: string;
+      readonly versionId: string;
+      readonly weight: number;
+    }[];
+  } | null = null;
   const tlsReady = true;
   let tlsCalls = 0;
   let routeAbsenceCalls = 0;
+  const runtimeOwner = {
+    get workerResourceUid() {
+      return workerUid;
+    },
+    async execute(execution: V2Execution): Promise<V2WorkerRuntimeOwnerExecutionResult> {
+      ownerCalls.push(execution.operationId);
+      if (loseNextOwnerAcknowledgement) {
+        loseNextOwnerAcknowledgement = false;
+        return { kind: "unknown" };
+      }
+      if (returnDeploymentDeleteReceipt && execution.action === "delete") {
+        return { kind: "confirmed", identity: null };
+      }
+      if (routeAbsentReceiptReady && execution.action === "delete") {
+        nativeServing = null;
+        return {
+          kind: "confirmed_route_absent",
+          sourceOperationId: execution.operationId,
+          endpointResourceUid: execution.resourceUid,
+          workerResourceUid: execution.principal === "org-endpoint" ? workerUid : "foreign",
+          targetKey: execution.targetKey,
+          assignedHostname: receiptHostname,
+        };
+      }
+      const versionId = `v2-${digest(new TextEncoder().encode(`${versionUid}\u00001`))}`;
+      const identity = {
+        generation: `takoserver-v2-operation:${execution.operationId}`,
+        workerResourceUid: workerUid,
+        hostnames: execution.action === "delete" ? [] : [nativeRouteHostname],
+        versions: [{ versionId, workerVersionUid: versionUid, weight: 10_000 }],
+      };
+      nativeServing = {
+        sourceOperationId: execution.operationId,
+        generation: identity.generation,
+        hostnames: identity.hostnames,
+        versions: identity.versions,
+      };
+      return { kind: "confirmed", deferRetirementUntilDeadline: false, identity };
+    },
+    async observeServing(input: { workerResourceUid: string; targetKey: string }) {
+      if (!nativeServing) return { kind: "unknown" as const };
+      return {
+        kind: "serving" as const,
+        workerResourceUid: input.workerResourceUid,
+        targetKey: input.targetKey,
+        ...nativeServing,
+      };
+    },
+    async observeRetirement() {
+      return routeAbsentReceiptReady
+        ? {
+            kind: "confirmed_absent" as const,
+            workerResourceUid: workerUid,
+            targetKey: TARGET_KEY,
+            incarnationOperationIds: [],
+          }
+        : { kind: "unknown" as const };
+    },
+    async fetch() {
+      return new Response("unused");
+    },
+  };
+  const workerEndpointFrontend = createSelfhostV2WorkerEndpointFrontend({
+    sql,
+    targetKey: TARGET_KEY,
+    publicOrigin: "https://api.example.test",
+    workerEndpointSuffix: "example.test",
+    publicationState,
+    ownerForWorkerUid: async (uid) => {
+      expect(uid).toBe(workerUid);
+      return runtimeOwner as never;
+    },
+    witness: {
+      async observeTls(input) {
+        tlsCalls += 1;
+        return {
+          ...input,
+          hostname: tlsHostname,
+          ready: tlsReady && input.hostname === HOSTNAME,
+        };
+      },
+      async observeRouteAbsent(input) {
+        routeAbsenceCalls += 1;
+        return { ...input, absent: routeAbsenceReady };
+      },
+    },
+  });
   const endpointForm = createWorkerEndpointForm({
     targetKey: TARGET_KEY,
     publicationState,
@@ -90,63 +188,11 @@ async function exerciseEndpoint(deleteDeploymentFirst: boolean): Promise<void> {
       expect(resourceUid).toMatch(/^[0-9a-f-]{36}$/u);
       return HOSTNAME;
     },
-    ownerForWorker(uid) {
-      expect(uid).toBe(workerUid);
-      return {
-        workerResourceUid: uid,
-        async execute(execution): Promise<V2WorkerRuntimeOwnerExecutionResult> {
-          ownerCalls.push(execution.operationId);
-          if (loseNextOwnerAcknowledgement) {
-            loseNextOwnerAcknowledgement = false;
-            return { kind: "unknown" };
-          }
-          if (returnDeploymentDeleteReceipt && execution.action === "delete") {
-            return { kind: "confirmed", identity: null };
-          }
-          if (routeAbsentReceiptReady && execution.action === "delete") {
-            return {
-              kind: "confirmed_route_absent",
-              sourceOperationId: execution.operationId,
-              endpointResourceUid: execution.resourceUid,
-              workerResourceUid: uid,
-              targetKey: execution.targetKey,
-              assignedHostname: receiptHostname,
-            };
-          }
-          const versionId = `v2-${digest(new TextEncoder().encode(`${versionUid}\u00001`))}`;
-          return {
-            kind: "confirmed",
-            deferRetirementUntilDeadline: false,
-            identity: {
-              generation: `takoserver-v2-operation:${execution.operationId}`,
-              workerResourceUid: uid,
-              hostnames: execution.action === "delete" ? [] : [nativeRouteHostname],
-              versions: [{ versionId, workerVersionUid: versionUid, weight: 10_000 }],
-            },
-          };
-        },
-      };
+    ownerForWorker() {
+      return runtimeOwner;
     },
-    async observeTls({ endpointUid, workerUid: observedWorkerUid, hostname, url }) {
-      tlsCalls += 1;
-      return {
-        endpointUid,
-        workerUid: observedWorkerUid,
-        hostname: tlsHostname,
-        url,
-        ready: tlsReady && hostname === HOSTNAME,
-      };
-    },
-    async observeRouteAbsent({ endpointUid, workerUid: observedWorkerUid, hostname, url }) {
-      routeAbsenceCalls += 1;
-      return {
-        endpointUid,
-        workerUid: observedWorkerUid,
-        hostname,
-        url,
-        absent: routeAbsenceReady,
-      };
-    },
+    observeTls: workerEndpointFrontend.observeTls,
+    observeRouteAbsent: workerEndpointFrontend.observeRouteAbsent,
   });
   const foundationBackend = {
     id: "fixture-confirmed-foundation",

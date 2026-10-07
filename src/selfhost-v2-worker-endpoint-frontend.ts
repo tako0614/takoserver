@@ -4,6 +4,7 @@ import {
   parseWorkerEndpointSpec,
   WORKER_ENDPOINT_FORM_URL,
 } from "./takoform-v2/forms/worker-specs.ts";
+import type { V2Execution } from "./takoform-v2/types.ts";
 import {
   type V2EndpointRouteAbsenceObservation,
   type V2EndpointTlsObservation,
@@ -12,6 +13,7 @@ import {
 import type {
   V2WorkerCurrentServingIdentity,
   V2WorkerCurrentServingResolution,
+  V2WorkerPublicationResolution,
 } from "./takoform-v2/worker-publication-state.ts";
 import type { WorkerdWorkerRuntimeOwner } from "./workerd-worker-runtime-owner.ts";
 
@@ -31,12 +33,6 @@ const ROUTES_BY_HOST_SQL = `SELECT ${ROUTE_COLUMNS}
   WHERE r.form_url = ? AND json_extract(r.output_json, '$.hostname') = ?
   ORDER BY r.uid LIMIT 2`;
 
-const ROUTE_BY_UID_SQL = `SELECT ${ROUTE_COLUMNS}
-  FROM tf_v2_resources r
-  JOIN tf_v2_operations op ON op.id = r.last_operation
-  WHERE r.uid = ? AND r.form_url = ? AND r.target_key = ?
-  LIMIT 2`;
-
 export interface V2WorkerEndpointAddress {
   readonly endpointUid: string;
   readonly workerUid: string;
@@ -54,6 +50,7 @@ export interface SelfhostV2WorkerEndpointFrontendWitness {
 }
 
 type PublicationState = {
+  resolve(input: { execution: V2Execution }): Promise<V2WorkerPublicationResolution>;
   resolveCurrentServing(input: {
     workerUid: string;
     targetKey: string;
@@ -66,6 +63,12 @@ type RuntimeOwner = Pick<
   WorkerdWorkerRuntimeOwner,
   "workerResourceUid" | "observeServing" | "observeRetirement" | "fetch"
 >;
+
+type ReadyPublication = Extract<V2WorkerPublicationResolution, { kind: "ready" }>;
+type ExecutionRoute = {
+  readonly address: { readonly hostname: string; readonly url: string };
+  readonly resolution: ReadyPublication;
+};
 
 interface EndpointRouteRow {
   readonly uid: unknown;
@@ -354,8 +357,16 @@ export function createSelfhostV2WorkerEndpointFrontend(options: {
 }): {
   /** `null` is reserved for unrelated authority; reserved misses are terminal. */
   fetch(request: Request): Promise<Response | null>;
-  observeTls(input: V2WorkerEndpointAddress): Promise<V2EndpointTlsObservation>;
-  observeRouteAbsent(input: V2WorkerEndpointAddress): Promise<V2EndpointRouteAbsenceObservation>;
+  /** True only when the same settled predicate used by fetch denies this address. */
+  routeDenies(input: V2WorkerEndpointAddress): Promise<boolean>;
+  observeTls(
+    input: V2WorkerEndpointAddress,
+    execution: V2Execution,
+  ): Promise<V2EndpointTlsObservation>;
+  observeRouteAbsent(
+    input: V2WorkerEndpointAddress,
+    execution: V2Execution,
+  ): Promise<V2EndpointRouteAbsenceObservation>;
 } {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   const publicOrigin = canonicalPublicOrigin(options.publicOrigin);
@@ -378,38 +389,6 @@ export function createSelfhostV2WorkerEndpointFrontend(options: {
       if (parsed.some((route) => route === null || route.row.target_key !== options.targetKey))
         return null;
       return parsed as ParsedRoute[];
-    } catch {
-      return null;
-    }
-  }
-
-  async function candidateForAddress(
-    input: V2WorkerEndpointAddress,
-    deleted: boolean,
-  ): Promise<ParsedRoute | null> {
-    try {
-      const rows = await options.sql.query(ROUTE_BY_UID_SQL, [
-        input.endpointUid,
-        WORKER_ENDPOINT_FORM_URL,
-        options.targetKey,
-      ]);
-      if (rows.length !== 1) return null;
-      const parsed = routeAddress(rows[0] as unknown as EndpointRouteRow, suffix);
-      if (
-        !parsed ||
-        parsed.workerUid !== input.workerUid ||
-        parsed.address.hostname !== input.hostname ||
-        parsed.address.url !== input.url ||
-        (deleted
-          ? parsed.row.deleted_at === null ||
-            parsed.row.operation_action !== "delete" ||
-            parsed.row.operation_status !== "succeeded" ||
-            parsed.row.operation_effect !== "complete"
-          : !activeRoute(parsed))
-      ) {
-        return null;
-      }
-      return parsed;
     } catch {
       return null;
     }
@@ -478,112 +457,150 @@ export function createSelfhostV2WorkerEndpointFrontend(options: {
     return { owner, serving, resolution };
   }
 
-  async function observeTls(input: V2WorkerEndpointAddress): Promise<V2EndpointTlsObservation> {
-    const notReady = (): V2EndpointTlsObservation => ({ ...input, ready: false });
-    const parsed = await candidateForAddress(input, false);
-    if (!parsed) return notReady();
-    const current = await activePublication(parsed);
-    if (!current) return notReady();
-    let witness: V2EndpointTlsObservation;
-    try {
-      witness = await options.witness.observeTls(input);
-    } catch {
-      return notReady();
-    }
-    let serving: Awaited<ReturnType<RuntimeOwner["observeServing"]>>;
-    try {
-      serving = await current.owner.observeServing({
-        workerResourceUid: parsed.workerUid,
-        targetKey: options.targetKey,
-      });
-    } catch {
-      return notReady();
-    }
-    const stillActive = await candidateForAddress(input, false);
+  async function routeForExecution(
+    input: V2WorkerEndpointAddress,
+    execution: V2Execution,
+    action: "create" | "update" | "delete",
+  ): Promise<ExecutionRoute | null> {
     if (
-      witness.ready !== true ||
-      witness.endpointUid !== input.endpointUid ||
-      witness.workerUid !== input.workerUid ||
-      witness.hostname !== input.hostname ||
-      witness.url !== input.url ||
-      !matchesServing(
-        serving,
-        exactIdentity(current.serving),
-        parsed.workerUid,
-        options.targetKey,
-        current.serving.sourceOperationId,
-      ) ||
-      !stillActive ||
-      !(await current.resolution.stillCurrent())
+      execution.action !== action ||
+      execution.form !== WORKER_ENDPOINT_FORM_URL ||
+      execution.backendId !== WORKER_ENDPOINT_BACKEND_ID ||
+      execution.targetKey !== options.targetKey ||
+      execution.resourceUid !== input.endpointUid ||
+      typeof execution.operationId !== "string" ||
+      !execution.operationId ||
+      typeof execution.leaseToken !== "string" ||
+      !execution.leaseToken
     ) {
-      return notReady();
+      return null;
     }
-    return { ...witness };
+    let resolution: V2WorkerPublicationResolution;
+    try {
+      resolution = await options.publicationState.resolve({ execution });
+    } catch {
+      return null;
+    }
+    if (resolution.kind !== "ready") return null;
+    const snapshot = resolution.snapshot;
+    let spec: ReturnType<typeof parseWorkerEndpointSpec>;
+    try {
+      spec = parseWorkerEndpointSpec(execution.spec);
+    } catch {
+      return null;
+    }
+    const address = snapshot.acceptedEndpointOutput;
+    if (
+      snapshot.sourceOperationId !== execution.operationId ||
+      snapshot.worker.uid !== spec.worker.resourceUid ||
+      snapshot.worker.principal !== execution.principal ||
+      snapshot.worker.space !== execution.space ||
+      !address ||
+      typeof address.hostname !== "string" ||
+      address.hostname !== address.hostname.toLowerCase() ||
+      !address.hostname.endsWith(`.${suffix}`) ||
+      address.url !== `https://${address.hostname}/` ||
+      address.hostname !== input.hostname ||
+      address.url !== input.url
+    ) {
+      return null;
+    }
+    if (action === "delete") {
+      if (snapshot.endpoint !== null) return null;
+    } else if (
+      !snapshot.deployment ||
+      snapshot.endpoint?.uid !== execution.resourceUid ||
+      snapshot.endpoint.generation !== execution.generation ||
+      canonicalJson(snapshot.endpoint.spec) !== canonicalJson(spec) ||
+      canonicalJson(snapshot.endpoint.output) !== canonicalJson(address)
+    ) {
+      return null;
+    }
+    if (!(await resolution.stillCurrent())) return null;
+    return { address, resolution };
   }
 
-  async function provesNativeRouteAbsent(
-    parsed: ParsedRoute,
-    input: V2WorkerEndpointAddress,
-  ): Promise<boolean> {
-    let owner: RuntimeOwner;
+  async function hasOtherLiveHostnameClaim(
+    hostname: string,
+    execution: V2Execution,
+  ): Promise<boolean | null> {
     try {
-      owner = await options.ownerForWorkerUid(input.workerUid);
+      const rows = await options.sql.query(
+        `SELECT r.uid FROM tf_v2_resources r
+           JOIN tf_v2_operations op ON op.id = r.last_operation
+           WHERE r.form_url = ? AND json_extract(r.output_json, '$.hostname') = ?
+             AND r.deleted_at IS NULL AND NOT (r.uid = ? AND op.id = ?) LIMIT 1`,
+        [WORKER_ENDPOINT_FORM_URL, hostname, execution.resourceUid, execution.operationId],
+      );
+      return rows.length > 0;
+    } catch {
+      return null;
+    }
+  }
+
+  function expectedExecutionIdentity(
+    route: ExecutionRoute,
+    execution: V2Execution,
+  ): V2WorkerCurrentServingIdentity {
+    const deployment = route.resolution.snapshot.deployment;
+    return {
+      generation: `takoserver-v2-operation:${execution.operationId}`,
+      workerResourceUid: route.resolution.snapshot.worker.uid,
+      hostnames: execution.action === "delete" ? [] : [route.address.hostname],
+      versions:
+        deployment?.versions.map(({ uid, weight }) => ({ workerVersionUid: uid, weight })) ?? [],
+    };
+  }
+
+  function matchesExecutionServing(
+    value: unknown,
+    route: ExecutionRoute,
+    execution: V2Execution,
+    expected: V2WorkerCurrentServingIdentity,
+  ): boolean {
+    if (!value || typeof value !== "object") return false;
+    const serving = value as Record<string, unknown>;
+    try {
+      return (
+        serving.kind === "serving" &&
+        serving.workerResourceUid === route.resolution.snapshot.worker.uid &&
+        serving.targetKey === options.targetKey &&
+        serving.sourceOperationId === execution.operationId &&
+        canonicalJson(exactIdentity(serving as never)) === canonicalJson(expected)
+      );
     } catch {
       return false;
     }
-    if (owner.workerResourceUid !== input.workerUid) return false;
+  }
+
+  async function ownerForExecution(route: ExecutionRoute): Promise<RuntimeOwner | null> {
+    try {
+      const owner = await options.ownerForWorkerUid(route.resolution.snapshot.worker.uid);
+      return owner.workerResourceUid === route.resolution.snapshot.worker.uid ? owner : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function nativeExecutionRouteMatches(
+    route: ExecutionRoute,
+    execution: V2Execution,
+    owner: RuntimeOwner,
+  ): Promise<boolean> {
+    const expected = expectedExecutionIdentity(route, execution);
     try {
       const serving = await owner.observeServing({
-        workerResourceUid: input.workerUid,
+        workerResourceUid: route.resolution.snapshot.worker.uid,
         targetKey: options.targetKey,
       });
-      if (
-        serving.kind === "serving" &&
-        serving.workerResourceUid === input.workerUid &&
-        serving.targetKey === options.targetKey &&
-        serving.sourceOperationId === parsed.operationId &&
-        serving.generation === `takoserver-v2-operation:${parsed.operationId}` &&
-        !serving.hostnames.includes(input.hostname)
-      ) {
-        const current = await options.publicationState.resolveCurrentServing({
-          workerUid: input.workerUid,
-          targetKey: options.targetKey,
-          sourceOperationId: parsed.operationId,
-          expectedIdentity: exactIdentity(serving),
-        });
-        return (
-          current.kind === "ready" &&
-          current.snapshot.sourceOperationId === parsed.operationId &&
-          current.snapshot.worker.uid === input.workerUid &&
-          current.snapshot.worker.principal === parsed.row.principal &&
-          current.snapshot.worker.space === parsed.row.space &&
-          current.snapshot.acceptedEndpointOutput?.hostname === input.hostname &&
-          current.snapshot.acceptedEndpointOutput.url === input.url &&
-          current.snapshot.endpoint === null &&
-          current.snapshot.deployment !== null &&
-          (await current.stillCurrent())
-        );
+      if (route.resolution.snapshot.deployment) {
+        return matchesExecutionServing(serving, route, execution, expected);
       }
-      if (serving.kind !== "unknown") return false;
-      // With no active Deployment, the only positive native proof is the
-      // owner's complete physical-retirement inventory; unknown is not absence.
-      const deployments = await options.sql.query(
-        `SELECT deployment.uid FROM tf_v2_resources deployment
-           JOIN tf_v2_resource_references edge ON edge.referrer_uid = deployment.uid
-           WHERE deployment.form_url = ? AND deployment.target_key = ?
-             AND deployment.deleted_at IS NULL AND edge.target_uid = ?
-           LIMIT 1`,
-        [
-          "https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/",
-          options.targetKey,
-          input.workerUid,
-        ],
-      );
+      if (execution.action !== "delete" || serving.kind !== "unknown") return false;
       const retired = await owner.observeRetirement({});
       return (
-        deployments.length === 0 &&
         retired.kind === "confirmed_absent" &&
-        retired.workerResourceUid === input.workerUid &&
+        retired.workerResourceUid === route.resolution.snapshot.worker.uid &&
         retired.targetKey === options.targetKey &&
         retired.workerVersionUid === undefined
       );
@@ -592,40 +609,125 @@ export function createSelfhostV2WorkerEndpointFrontend(options: {
     }
   }
 
+  async function stillSameExecution(
+    input: V2WorkerEndpointAddress,
+    execution: V2Execution,
+    original: ExecutionRoute,
+  ): Promise<ExecutionRoute | null> {
+    if (
+      execution.action !== "create" &&
+      execution.action !== "update" &&
+      execution.action !== "delete"
+    )
+      return null;
+    const latest = await routeForExecution(input, execution, execution.action);
+    if (
+      !latest ||
+      canonicalJson(latest.resolution.snapshot) !== canonicalJson(original.resolution.snapshot) ||
+      !(await original.resolution.stillCurrent()) ||
+      !(await latest.resolution.stillCurrent())
+    ) {
+      return null;
+    }
+    return latest;
+  }
+
+  async function observeTls(
+    input: V2WorkerEndpointAddress,
+    execution: V2Execution,
+  ): Promise<V2EndpointTlsObservation> {
+    const notReady = (): V2EndpointTlsObservation => ({ ...input, ready: false });
+    if (execution.action !== "create" && execution.action !== "update") return notReady();
+    const route = await routeForExecution(input, execution, execution.action);
+    if (!route || (await hasOtherLiveHostnameClaim(input.hostname, execution)) !== false)
+      return notReady();
+    const owner = await ownerForExecution(route);
+    if (!owner || !(await nativeExecutionRouteMatches(route, execution, owner))) return notReady();
+    let witness: V2EndpointTlsObservation;
+    try {
+      witness = await options.witness.observeTls(input);
+    } catch {
+      return notReady();
+    }
+    const latest = await stillSameExecution(input, execution, route);
+    const finalClaim = await hasOtherLiveHostnameClaim(input.hostname, execution);
+    if (
+      witness.ready !== true ||
+      witness.endpointUid !== input.endpointUid ||
+      witness.workerUid !== input.workerUid ||
+      witness.hostname !== input.hostname ||
+      witness.url !== input.url ||
+      !latest ||
+      finalClaim !== false ||
+      !(await nativeExecutionRouteMatches(latest, execution, owner))
+    ) {
+      return notReady();
+    }
+    return { ...witness };
+  }
+
   async function observeRouteAbsent(
     input: V2WorkerEndpointAddress,
+    execution: V2Execution,
   ): Promise<V2EndpointRouteAbsenceObservation> {
     const notAbsent = (): V2EndpointRouteAbsenceObservation => ({ ...input, absent: false });
-    const parsed = await candidateForAddress(input, true);
-    if (!parsed) return notAbsent();
-    const routes = await rowsForHostname(input.hostname);
-    if (routes?.length !== 0) return notAbsent();
-    if (!(await provesNativeRouteAbsent(parsed, input))) return notAbsent();
+    const route = await routeForExecution(input, execution, "delete");
+    if (!route || (await hasOtherLiveHostnameClaim(input.hostname, execution)) !== false)
+      return notAbsent();
+    if (!(await routeDenies(input))) return notAbsent();
+    const owner = await ownerForExecution(route);
+    if (!owner || !(await nativeExecutionRouteMatches(route, execution, owner))) return notAbsent();
     let witness: V2EndpointRouteAbsenceObservation;
     try {
       witness = await options.witness.observeRouteAbsent(input);
     } catch {
       return notAbsent();
     }
-    const finalRoutes = await rowsForHostname(input.hostname);
-    const finalTombstone = await candidateForAddress(input, true);
+    const latest = await stillSameExecution(input, execution, route);
+    const finalClaim = await hasOtherLiveHostnameClaim(input.hostname, execution);
     if (
       witness.absent !== true ||
       witness.endpointUid !== input.endpointUid ||
       witness.workerUid !== input.workerUid ||
       witness.hostname !== input.hostname ||
       witness.url !== input.url ||
-      !finalRoutes ||
-      finalRoutes.length !== 0 ||
-      !finalTombstone ||
-      !(await provesNativeRouteAbsent(finalTombstone, input))
+      !latest ||
+      finalClaim !== false ||
+      !(await routeDenies(input)) ||
+      !(await nativeExecutionRouteMatches(latest, execution, owner))
     ) {
       return notAbsent();
     }
     return { ...witness };
   }
 
+  async function routeDenies(input: V2WorkerEndpointAddress): Promise<boolean> {
+    if (
+      typeof input.hostname !== "string" ||
+      typeof input.url !== "string" ||
+      input.url !== `https://${input.hostname}/` ||
+      !isReserved(input.hostname)
+    ) {
+      return false;
+    }
+    const candidates = await rowsForHostname(input.hostname);
+    // The fetch path also fails closed on SQL ambiguity/unavailability, so it
+    // does not accept the address in that state. Lifecycle callers separately
+    // require exact execution and owner readbacks before treating this as
+    // route absence.
+    if (candidates === null) return true;
+    if (candidates.length === 0) return true;
+    const [candidate] = candidates;
+    if (!candidate || !activeRoute(candidate)) return true;
+    // This mirrors fetch's complete current-serving authority check: a SQL
+    // route is only accepting if its UID owner and publication reader agree.
+    const current = await activePublication(candidate);
+    if (!current) return true;
+    return false;
+  }
+
   return {
+    routeDenies,
     async fetch(request) {
       const hostname = requestHostname(request);
       if (hostname === null) {

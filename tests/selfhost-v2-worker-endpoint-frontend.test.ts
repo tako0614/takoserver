@@ -4,6 +4,7 @@ import {
   createSelfhostV2WorkerEndpointFrontend,
   type V2WorkerEndpointAddress,
 } from "../src/selfhost-v2-worker-endpoint-frontend.ts";
+import type { V2Execution } from "../src/takoform-v2/types.ts";
 
 const TARGET = "selfhost-v2-worker-primary";
 const PUBLIC_ORIGIN = "https://api.example.test";
@@ -13,6 +14,7 @@ const ENDPOINT_UID = "endpoint-one";
 const WORKER_UID = "worker-one";
 const VERSION_UID = "version-one";
 const OPERATION_ID = "6ac9c3c4-a76e-4a59-9b4a-8ac52df10c91";
+const UPDATE_OPERATION_ID = "ca53d879-ff44-47a5-8846-117bf82f7717";
 const DELETE_OPERATION_ID = "9d8b5fc4-066f-46a9-9a36-b9c57cabc971";
 const DEPLOYMENT_OPERATION_ID = "15e57614-257a-4e7f-8126-2e438c5872fb";
 const FORM = "https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/";
@@ -63,25 +65,6 @@ function endpointRows(): Row[] {
   ];
 }
 
-function deletedEndpointRows(): Row[] {
-  const row = endpointRows()[0] as unknown as Record<string, unknown>;
-  return [
-    {
-      ...row,
-      generation: 3,
-      observed_generation: 3,
-      observed_json: JSON.stringify({ tlsReady: false, activeDeploymentRouteReady: false }),
-      last_operation: DELETE_OPERATION_ID,
-      deleted_at: "2026-10-07T12:00:00.000Z",
-      operation_id: DELETE_OPERATION_ID,
-      operation_generation: 3,
-      operation_action: "delete",
-      accepted_spec_json: row.spec_json,
-      result_output_json: row.output_json,
-    } as unknown as Row,
-  ];
-}
-
 function publicationSnapshot(routeDelete = false, deploymentPublication = false) {
   return {
     sourceOperationId: routeDelete
@@ -119,6 +102,33 @@ function publicationSnapshot(routeDelete = false, deploymentPublication = false)
   };
 }
 
+function execution(action: V2Execution["action"] = "create"): V2Execution {
+  const operationId =
+    action === "delete"
+      ? DELETE_OPERATION_ID
+      : action === "update"
+        ? UPDATE_OPERATION_ID
+        : OPERATION_ID;
+  const generation = action === "create" ? 2 : action === "update" ? 3 : 4;
+  return {
+    operationId,
+    leaseToken: `lease-${operationId}`,
+    backendKey: "fixture-backend-key",
+    backendId: "selfhost-v2-worker-endpoint-owner-v1",
+    targetKey: TARGET,
+    resourceUid: ENDPOINT_UID,
+    principal: "org:acme",
+    action,
+    generation,
+    form: FORM,
+    space: "org:acme",
+    name: "endpoint",
+    spec: ENDPOINT_SPEC,
+    previousObserved: {},
+    previousOutput: ADDRESS,
+  };
+}
+
 function fixture(
   input: {
     readonly rows?: Row[];
@@ -126,12 +136,14 @@ function fixture(
     readonly stillCurrent?: boolean;
     readonly routeDelete?: boolean;
     readonly routeRows?: Row[];
+    readonly liveClaimRows?: Row[];
     readonly routeWitnessAbsent?: boolean;
     readonly tlsWitnessReady?: boolean;
     readonly servingUnknown?: boolean;
     readonly deploymentExists?: boolean;
     readonly staleAfterFetch?: boolean;
     readonly deploymentPublication?: boolean;
+    readonly action?: V2Execution["action"];
   } = {},
 ) {
   const fixtureOptions = input;
@@ -145,9 +157,11 @@ function fixture(
     ? DELETE_OPERATION_ID
     : input.deploymentPublication
       ? DEPLOYMENT_OPERATION_ID
-      : OPERATION_ID;
+      : input.action === "update"
+        ? UPDATE_OPERATION_ID
+        : OPERATION_ID;
   const servingIdentity =
-    input.routeDelete || input.deploymentPublication
+    input.routeDelete || input.deploymentPublication || input.action === "update"
       ? {
           ...IDENTITY,
           generation: `takoserver-v2-operation:${servingSourceOperationId}`,
@@ -192,11 +206,8 @@ function fixture(
   };
   const sql = {
     async query(query: string) {
-      if (query.includes("WHERE r.uid = ?"))
-        return input.routeDelete ? deletedEndpointRows() : rows;
+      if (query.includes("AND NOT (r.uid = ? AND op.id = ?)")) return input.liveClaimRows ?? [];
       if (query.includes("json_extract(r.output_json")) return input.routeRows ?? rows;
-      if (query.includes("SELECT deployment.uid"))
-        return input.deploymentExists ? [{ uid: "deployment-one" }] : [];
       return [];
     },
   } as unknown as Sql;
@@ -206,6 +217,36 @@ function fixture(
     publicOrigin: PUBLIC_ORIGIN,
     workerEndpointSuffix: SUFFIX,
     publicationState: {
+      async resolve({ execution: operation }: { execution: V2Execution }) {
+        publicationCalls.push({ operationId: operation.operationId, action: operation.action });
+        if (fixtureOptions.resolution === "unresolved")
+          return { kind: "unresolved", code: "graph_unresolved", message: "stale" };
+        const snapshot = publicationSnapshot(
+          operation.action === "delete",
+          fixtureOptions.deploymentPublication,
+        );
+        return {
+          kind: "ready",
+          snapshot: {
+            ...snapshot,
+            sourceOperationId: operation.operationId,
+            deployment: fixtureOptions.deploymentExists === false ? null : snapshot.deployment,
+            endpoint:
+              operation.action === "delete"
+                ? null
+                : {
+                    uid: ENDPOINT_UID,
+                    generation: operation.generation,
+                    spec: ENDPOINT_SPEC,
+                    output: ADDRESS,
+                  },
+          },
+          async stillCurrent() {
+            currentChecks += 1;
+            return fixtureOptions.stillCurrent !== false;
+          },
+        };
+      },
       async resolveCurrentServing(input: unknown) {
         publicationCalls.push(input);
         if (fixtureOptions.resolution === "unresolved")
@@ -227,9 +268,11 @@ function fixture(
     ownerForWorkerUid: async () => owner as never,
     witness: {
       async observeTls(value) {
+        observationCalls.push(value);
         return { ...value, ready: fixtureOptions.tlsWitnessReady ?? true };
       },
       async observeRouteAbsent(value) {
+        observationCalls.push(value);
         return { ...value, absent: fixtureOptions.routeWitnessAbsent ?? true };
       },
     },
@@ -297,6 +340,26 @@ describe("self-host v2 Worker Endpoint frontend adapter", () => {
 
     expect(response?.status).toBe(503);
     expect(fetchCalls).toHaveLength(0);
+  });
+
+  test("reports a reserved address as denied only when settled fetch authority does not accept it", async () => {
+    const active = fixture();
+    expect(
+      await active.frontend.routeDenies({
+        endpointUid: ENDPOINT_UID,
+        workerUid: WORKER_UID,
+        ...ADDRESS,
+      }),
+    ).toBe(false);
+
+    const absent = fixture({ routeRows: [] });
+    expect(
+      await absent.frontend.routeDenies({
+        endpointUid: ENDPOINT_UID,
+        workerUid: WORKER_UID,
+        ...ADDRESS,
+      }),
+    ).toBe(true);
   });
 
   test("does not dispatch when the captured SQL graph changes before the owner call", async () => {
@@ -370,40 +433,48 @@ describe("self-host v2 Worker Endpoint frontend adapter", () => {
   });
 
   test("only reports TLS ready after exact current Worker routing and listener witness", async () => {
-    const { frontend, publicationCalls } = fixture();
-    const observation = await frontend.observeTls({
-      endpointUid: ENDPOINT_UID,
-      workerUid: WORKER_UID,
-      ...ADDRESS,
-    });
+    const { frontend, publicationCalls, observationCalls } = fixture({ routeRows: [] });
+    const observation = await frontend.observeTls(
+      { endpointUid: ENDPOINT_UID, workerUid: WORKER_UID, ...ADDRESS },
+      execution(),
+    );
 
+    expect(publicationCalls).toHaveLength(2);
+    expect(observationCalls).toHaveLength(3);
     expect(observation).toEqual({
       endpointUid: ENDPOINT_UID,
       workerUid: WORKER_UID,
       ...ADDRESS,
       ready: true,
     });
-    expect(publicationCalls).toHaveLength(1);
   });
 
   test("does not manufacture TLS readiness when the shared listener witness is negative", async () => {
     const { frontend } = fixture({ tlsWitnessReady: false });
-    const observation = await frontend.observeTls({
-      endpointUid: ENDPOINT_UID,
-      workerUid: WORKER_UID,
-      ...ADDRESS,
-    });
+    const observation = await frontend.observeTls(
+      { endpointUid: ENDPOINT_UID, workerUid: WORKER_UID, ...ADDRESS },
+      execution(),
+    );
 
     expect(observation.ready).toBe(false);
   });
 
-  test("confirms route absence only for the exact settled delete and both native/frontend readbacks", async () => {
+  test("does not report TLS ready while another live Endpoint claims the assigned hostname", async () => {
+    const { frontend } = fixture({ liveClaimRows: endpointRows() });
+    const observation = await frontend.observeTls(
+      { endpointUid: ENDPOINT_UID, workerUid: WORKER_UID, ...ADDRESS },
+      execution(),
+    );
+
+    expect(observation.ready).toBe(false);
+  });
+
+  test("confirms route absence only for the exact in-flight delete and both native/frontend readbacks", async () => {
     const { frontend } = fixture({ routeDelete: true, routeRows: [] });
-    const observation = await frontend.observeRouteAbsent({
-      endpointUid: ENDPOINT_UID,
-      workerUid: WORKER_UID,
-      ...ADDRESS,
-    });
+    const observation = await frontend.observeRouteAbsent(
+      { endpointUid: ENDPOINT_UID, workerUid: WORKER_UID, ...ADDRESS },
+      execution("delete"),
+    );
 
     expect(observation).toEqual({
       endpointUid: ENDPOINT_UID,
@@ -414,12 +485,15 @@ describe("self-host v2 Worker Endpoint frontend adapter", () => {
   });
 
   test("does not confirm route absence while another current SQL route claims the hostname", async () => {
-    const { frontend } = fixture({ routeDelete: true, routeRows: endpointRows() });
-    const observation = await frontend.observeRouteAbsent({
-      endpointUid: ENDPOINT_UID,
-      workerUid: WORKER_UID,
-      ...ADDRESS,
+    const { frontend } = fixture({
+      routeDelete: true,
+      routeRows: [],
+      liveClaimRows: endpointRows(),
     });
+    const observation = await frontend.observeRouteAbsent(
+      { endpointUid: ENDPOINT_UID, workerUid: WORKER_UID, ...ADDRESS },
+      execution("delete"),
+    );
 
     expect(observation.absent).toBe(false);
   });
@@ -430,11 +504,10 @@ describe("self-host v2 Worker Endpoint frontend adapter", () => {
       routeRows: [],
       routeWitnessAbsent: false,
     });
-    const observation = await frontend.observeRouteAbsent({
-      endpointUid: ENDPOINT_UID,
-      workerUid: WORKER_UID,
-      ...ADDRESS,
-    });
+    const observation = await frontend.observeRouteAbsent(
+      { endpointUid: ENDPOINT_UID, workerUid: WORKER_UID, ...ADDRESS },
+      execution("delete"),
+    );
 
     expect(observation.absent).toBe(false);
   });
@@ -444,12 +517,12 @@ describe("self-host v2 Worker Endpoint frontend adapter", () => {
       routeDelete: true,
       routeRows: [],
       servingUnknown: true,
+      deploymentExists: false,
     });
-    const observation = await frontend.observeRouteAbsent({
-      endpointUid: ENDPOINT_UID,
-      workerUid: WORKER_UID,
-      ...ADDRESS,
-    });
+    const observation = await frontend.observeRouteAbsent(
+      { endpointUid: ENDPOINT_UID, workerUid: WORKER_UID, ...ADDRESS },
+      execution("delete"),
+    );
 
     expect(observation.absent).toBe(true);
   });
@@ -461,11 +534,10 @@ describe("self-host v2 Worker Endpoint frontend adapter", () => {
       servingUnknown: true,
       deploymentExists: true,
     });
-    const observation = await frontend.observeRouteAbsent({
-      endpointUid: ENDPOINT_UID,
-      workerUid: WORKER_UID,
-      ...ADDRESS,
-    });
+    const observation = await frontend.observeRouteAbsent(
+      { endpointUid: ENDPOINT_UID, workerUid: WORKER_UID, ...ADDRESS },
+      execution("delete"),
+    );
 
     expect(observation.absent).toBe(false);
   });
