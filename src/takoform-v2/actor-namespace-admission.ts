@@ -428,7 +428,33 @@ export async function prepareV2ActorNamespaceAdmission(input: {
     if (!(await stillCurrent())) throw busy();
   }
   if (!(await stillCurrent())) throw busy();
-  if (invalid) return null;
+
+  // A duplicate already visible in the accepted Resource set is definite.
+  // A new duplicate appearing after this read is still refused by the CAS,
+  // but its race-time classification remains retryable until recaptured.
+  const duplicates = await input.sql
+    .query(
+      `SELECT uid FROM tf_v2_resources namespace
+       WHERE namespace.form_url = ? AND namespace.principal = ?
+         AND namespace.space = ? AND namespace.target_key = ?
+         AND namespace.deleted_at IS NULL AND namespace.uid <> ?
+         AND json_extract(namespace.spec_json, '$.worker.resourceUid') = ?
+         AND json_extract(namespace.spec_json, '$.className') = ? LIMIT 1`,
+      [
+        ACTOR_NAMESPACE_FORM_URL,
+        scope.principal,
+        scope.space,
+        scope.targetKey,
+        scope.resourceUid,
+        spec.worker.resourceUid,
+        spec.className,
+      ],
+    )
+    .catch(() => {
+      throw busy();
+    });
+  if (!(await stillCurrent())) throw busy();
+  if (invalid || duplicates.length > 0) return null;
   if (unavailable) throw busy();
 
   const predicates = before.evidence.map(exactRows);
@@ -468,6 +494,9 @@ export async function prepareV2ActorNamespaceAdmission(input: {
   return {
     sql: predicates.map((predicate) => `(${predicate.sql})`).join(" AND "),
     params: predicates.flatMap((predicate) => predicate.params),
+    // A statement-time graph change has not been inspected. Keep the exact
+    // CAS refusal, but let a fresh admission classify the new allocation.
+    conflictCode: "resource_busy",
   };
 }
 

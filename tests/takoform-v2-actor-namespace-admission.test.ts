@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
-import type { JsonObject } from "../src/ports.ts";
+import type { JsonObject, Sql } from "../src/ports.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { prepareV2ActorNamespaceAdmission } from "../src/takoform-v2/actor-namespace-admission.ts";
@@ -40,7 +40,25 @@ const TARGET = "actor-admission-local-target";
 function fixture(physicalRoot?: string) {
   const db = new Database(":memory:");
   migrateSqlite(db);
-  const sql = createSqliteSql(db);
+  const rawSql = createSqliteSql(db);
+  let beforeActorBatch: (() => Promise<void>) | undefined;
+  const sql: Sql = {
+    query: rawSql.query,
+    run: rawSql.run,
+    async batch(statements) {
+      if (
+        beforeActorBatch &&
+        statements.some((statement) =>
+          statement.sql.includes("SELECT COUNT(*) FROM tf_v2_resources WHERE form_url"),
+        )
+      ) {
+        const callback = beforeActorBatch;
+        beforeActorBatch = undefined;
+        await callback();
+      }
+      return rawSql.batch(statements);
+    },
+  };
   const source = new Map<string, Uint8Array>();
   const bundleHost = createWorkerBundleHost({
     sql,
@@ -235,6 +253,9 @@ function fixture(physicalRoot?: string) {
     onInspect(callback: () => Promise<void>) {
       onInspect = callback;
     },
+    onActorBatch(callback: () => Promise<void>) {
+      beforeActorBatch = callback;
+    },
     inspections() {
       return inspected;
     },
@@ -259,6 +280,66 @@ test("Actor Namespace admission allows pre-Deployment create, but not a duplicat
         ACTOR_NAMESPACE_FORM_URL,
       ]),
     ).toHaveLength(1);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("new pending Deployment after final Actor graph capture is retryable without acceptance", async () => {
+  const f = fixture();
+  try {
+    const worker = await f.worker();
+    const version = await f.version(worker.resourceUid, "late-pending-version");
+    const spec = { worker: { resourceUid: worker.resourceUid }, className: "CounterActor" };
+    const request = {
+      principal: PRINCIPAL,
+      key: "actor-late-pending-admission-0001",
+      input: { form: ACTOR_NAMESPACE_FORM_URL, space: SPACE, name: "late-pending-actor", spec },
+    };
+    f.onActorBatch(async () => {
+      const pending = await f.create(
+        WORKER_DEPLOYMENT_FORM_URL,
+        "late-pending-deployment",
+        {
+          worker: { resourceUid: worker.resourceUid },
+          versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+        },
+        false,
+      );
+      expect(pending.status).toBe("queued");
+    });
+    await expect(f.engine.acceptCreate(request)).rejects.toMatchObject({
+      code: "resource_busy",
+      status: 409,
+    });
+    expect(
+      await f.sql.query("SELECT uid FROM tf_v2_resources WHERE form_url = ?", [
+        ACTOR_NAMESPACE_FORM_URL,
+      ]),
+    ).toHaveLength(0);
+    const accepted = await f.engine.acceptCreate(request);
+    expect(accepted.status).toBe("queued");
+    expect((await f.engine.acceptCreate(request)).id).toBe(accepted.id);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("accepted Worker/class duplicate remains definite when Version inspection is unavailable", async () => {
+  const f = fixture();
+  try {
+    const worker = await f.worker();
+    const spec = { worker: { resourceUid: worker.resourceUid }, className: "CounterActor" };
+    await f.create(ACTOR_NAMESPACE_FORM_URL, "existing-namespace", spec);
+    const version = await f.version(worker.resourceUid, "duplicate-unavailable-version");
+    await f.create(WORKER_DEPLOYMENT_FORM_URL, "duplicate-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    f.setInspection("unavailable");
+    await expect(
+      f.create(ACTOR_NAMESPACE_FORM_URL, "duplicate-unavailable", spec, false),
+    ).rejects.toMatchObject({ code: "dependency_conflict", status: 409 });
   } finally {
     f.db.close();
   }
