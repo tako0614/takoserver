@@ -467,6 +467,7 @@ const LAYERS: readonly Layer[] = [
       "v2-selfhost-queue-scheduler",
       "v2-selfhost-configured-input-sealer",
       "v2-selfhost-runtime-boot",
+      "v2-selfhost-endpoint-boot",
     ],
   },
   // The published package surface re-exports the product for an embedder. It
