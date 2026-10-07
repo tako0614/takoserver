@@ -183,6 +183,32 @@ class PlaneError extends Error {
   }
 }
 
+export type SelfhostKvOperationErrorCode =
+  | "invalid_key"
+  | "invalid_value"
+  | "invalid_argument"
+  | "invalid_cursor"
+  | "value_too_large"
+  | "metadata_too_large"
+  | "backend_unavailable";
+
+/** Classifies only the existing KV operation's closed public error vocabulary. */
+export function selfhostKvOperationErrorCode(error: unknown): SelfhostKvOperationErrorCode | null {
+  if (!(error instanceof PlaneError)) return null;
+  switch (error.code) {
+    case "invalid_key":
+    case "invalid_value":
+    case "invalid_argument":
+    case "invalid_cursor":
+    case "value_too_large":
+    case "metadata_too_large":
+    case "backend_unavailable":
+      return error.code;
+    default:
+      return null;
+  }
+}
+
 export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): SelfhostDataPlanes {
   const now = options.clock ?? (() => new Date());
   const messageId = options.messageId ?? (() => crypto.randomUUID());
@@ -773,6 +799,7 @@ async function kvOperation(
   namespace: string,
   op: string,
   payload: Readonly<Record<string, unknown>>,
+  validationProfile: "legacy" | "v2" = "legacy",
 ): Promise<Record<string, unknown>> {
   const millis = clock().getTime();
   switch (op) {
@@ -791,10 +818,10 @@ async function kvOperation(
         // Reading an expired entry is what proves it is gone, so this is where
         // the row is reclaimed. A sweeper would only find it later.
         await sql
-          .run("DELETE FROM selfhost_kv_entries WHERE namespace_id = ? AND key = ?", [
-            namespace,
-            key,
-          ])
+          .run(
+            "DELETE FROM selfhost_kv_entries WHERE namespace_id = ? AND key = ? AND expires_at_ms <= ?",
+            [namespace, key, millis],
+          )
           .catch(() => undefined);
         return { found: false };
       }
@@ -812,7 +839,7 @@ async function kvOperation(
     case "put": {
       const key = kvKey(payload.key);
       const value = decodeBase64(payload.value, MAX_KV_VALUE_BYTES, "value_too_large");
-      const metadata = kvMetadata(payload.metadata);
+      const metadata = kvMetadata(payload.metadata, validationProfile);
       const ttl = payload.expirationTtlSeconds;
       let expiresAt: number | null = null;
       if (ttl !== undefined) {
@@ -879,6 +906,17 @@ async function kvOperation(
   }
 }
 
+/** Reuses the v1 KV SQL engine with EdgeKVNamespace 0.2 input-count semantics. */
+export function runSelfhostKvOperation(
+  sql: Sql,
+  clock: () => Date,
+  namespace: string,
+  op: "get" | "getWithMetadata" | "put" | "delete" | "list",
+  payload: Readonly<Record<string, unknown>>,
+): Promise<Record<string, unknown>> {
+  return kvOperation(sql, clock, namespace, op, payload, "v2");
+}
+
 function kvKey(value: unknown, allowEmpty = false): string {
   if (typeof value !== "string") throw new PlaneError("invalid_key");
   const size = new TextEncoder().encode(value).byteLength;
@@ -917,7 +955,7 @@ function encodeCursor(key: string): string {
     .replace(/=+$/u, "");
 }
 
-function kvMetadata(value: unknown): string | null {
+function kvMetadata(value: unknown, validationProfile: "legacy" | "v2" = "legacy"): string | null {
   if (value === undefined) return null;
   const metadata = record(value);
   if (!metadata) throw new PlaneError("invalid_value");
@@ -929,7 +967,9 @@ function kvMetadata(value: unknown): string | null {
     // it. Reporting a size refusal for `{m: 1}` sends the caller to shrink
     // metadata that is already one member long.
     if (typeof item !== "string") throw new PlaneError("invalid_value");
-    if (name.length > 256 || item.length > 8_192) {
+    const nameBytes = new TextEncoder().encode(name).byteLength;
+    const itemLength = validationProfile === "v2" ? unicodeScalarLength(item) : item.length;
+    if ((validationProfile === "v2" ? nameBytes > 256 : name.length > 256) || itemLength > 8_192) {
       throw new PlaneError("metadata_too_large");
     }
     projected[name] = item;
@@ -939,6 +979,18 @@ function kvMetadata(value: unknown): string | null {
     throw new PlaneError("metadata_too_large");
   }
   return encoded;
+}
+
+function unicodeScalarLength(value: string): number {
+  let count = 0;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint === undefined || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+      throw new PlaneError("invalid_value");
+    }
+    count += 1;
+  }
+  return count;
 }
 
 // ---------------------------------------------------------------------------
