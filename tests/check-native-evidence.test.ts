@@ -519,6 +519,33 @@ test("ignores import-shaped lines inside embedded fixture module sources", async
   }
 });
 
+test("classifies Queue PID fixture gates without accepting unrelated environment switches", async () => {
+  const root = await fixture({
+    "queue.test.ts": [
+      'import { test } from "bun:test";',
+      'const binary = nativeEvidenceBinary("workerd-artifact");',
+      "const mode = process.env.TAKOSERVER_QUEUE_PID_FIXTURE;",
+      'test.skipIf(binary === undefined || mode !== "recover")("recover", () => {});',
+      'test.skipIf(binary === undefined || mode !== undefined)("parent", () => {});',
+    ].join("\n"),
+    "foreign.test.ts": [
+      'const binary = nativeEvidenceBinary("workerd-artifact");',
+      "const mode = process.env.UNRELATED_NATIVE_SWITCH;",
+      'test.skipIf(binary === undefined || mode !== undefined)("foreign", () => {});',
+    ].join("\n"),
+  });
+  try {
+    const gates = collectNativeEvidenceGates(root);
+    expect(gates.map((gate) => [gate.file, gate.capability])).toEqual([
+      ["foreign.test.ts", null],
+      ["queue.test.ts", "workerd-artifact"],
+      ["queue.test.ts", "workerd-artifact"],
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("classifies a gate that names a capability instead of an environment", async () => {
   const root = await fixture({
     "f.test.ts": [

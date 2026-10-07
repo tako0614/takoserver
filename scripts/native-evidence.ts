@@ -102,9 +102,13 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
     id: "workerd-artifact",
     label: "pinned closed-graph workerd artifact",
     environment: "TAKOSERVER_WORKERD_BINARY",
-    companionEnvironment: ["TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY"],
+    companionEnvironment: [
+      "TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY",
+      // Internal child mode for the opted-in Queue Host PID restart journey.
+      "TAKOSERVER_QUEUE_PID_FIXTURE",
+    ],
     proves:
-      "native Durable Object SQL, alarm and WebSocket persistence, Actor facets and sockets, module inspection, and Workflow execution against the exact pinned bytes",
+      "native Durable Object SQL, alarm and WebSocket persistence, Actor facets and sockets, module inspection, Workflow execution, and Queue Host PID restart custody against the exact pinned bytes",
     enable: `${"TAKOSERVER_WORKERD_BINARY"}=/absolute/path/to/pinned/workerd`,
     inspect: (configured, _environment, probe) => {
       if (configured === undefined || configured.trim() === "") {

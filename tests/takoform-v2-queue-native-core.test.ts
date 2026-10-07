@@ -684,7 +684,7 @@ test.skipIf(binary === undefined)(
   },
 );
 
-test.skipIf(pidFixtureMode !== "recover")(
+test.skipIf(binary === undefined || pidFixtureMode !== "recover")(
   "recover reserved Queue batch in a different Host PID without resending",
   async () => {
     if (!binary) throw new Error("pinned Workerd missing");
