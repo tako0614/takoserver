@@ -1,6 +1,17 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  cp,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bytesDigest } from "../src/json.ts";
@@ -22,6 +33,7 @@ import type { V2Execution } from "../src/takoform-v2/types.ts";
 import type { V2WorkerPublicationResolution } from "../src/takoform-v2/worker-publication-state.ts";
 import { spawnWorkerdWithParentDeath } from "../src/workerd-linux-process.ts";
 import type { WorkerdProcess } from "../src/workerd-supervisor.ts";
+import { inspectWorkerdWorkerExecutionCopies } from "../src/workerd-worker-execution-group.ts";
 import {
   createSerializedWorkerdOwnerStateWriter,
   openWorkerdWorkerRuntimeOwner,
@@ -82,6 +94,16 @@ async function until(check: () => boolean, timeoutMs = 3_000): Promise<void> {
     await Bun.sleep(20);
   }
   throw new Error("runtime-owner child observation timed out");
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 async function fixture() {
@@ -595,6 +617,211 @@ test("one Worker update switches only its child, pins an open stream, and replay
       .execute(execution("worker-b", "c7b001f1-2fe7-42a2-aa33-e6fd8c97bd5e", "delete"))
       .catch(() => undefined);
     await ownerB.close().catch(() => undefined);
+    await owned.cleanup();
+  }
+});
+
+test("owner serving observation is exact and restart retries retired copy cleanup", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-copy-retirement";
+  const createId = "b7b35f4f-48cb-4d43-b99d-f852c3308e1f";
+  const deleteId = "20b516a8-e7e7-48bd-8f8e-5f527dfab06a";
+  const versionUid = `version-${createId}`;
+  const publication = staticPublicationState(workerUid);
+  const ownerRoot = join(owned.root, "owners");
+  const ownerOptions = {
+    rootDirectory: ownerRoot,
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+  };
+  const owner = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+  const workerKey = createHash("sha256").update(workerUid, "utf8").digest("hex");
+  const script = `v2-worker-${workerKey}`;
+  const groupRoot = join(ownerRoot, workerKey, "incarnations", createId, "groups", workerKey);
+  const scriptCopy = join(groupRoot, "workers", script);
+  const publicationsCopy = join(groupRoot, "workers", ".publications", script);
+  const backup = join(owned.root, "retired-workers-backup");
+  const statePath = join(ownerRoot, workerKey, "runtime-owner.json");
+  try {
+    expect(await owner.execute(execution(workerUid, createId, "create", versionUid))).toMatchObject(
+      {
+        kind: "confirmed",
+      },
+    );
+    publication.setCurrent(createId);
+    const debugCopies = await inspectWorkerdWorkerExecutionCopies({
+      groupDirectory: groupRoot,
+      workerResourceUid: workerUid,
+      listenerPort: Number(
+        (await Bun.file(join(groupRoot, "group.json")).text()).match(/"listenerPort":(\d+)/u)?.[1],
+      ),
+      scriptName: script,
+    });
+    expect(debugCopies.versionUids).toContain(versionUid);
+    const serving = await owner.observeServing({
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+    });
+    expect(serving).toMatchObject({
+      kind: "serving",
+      sourceOperationId: createId,
+      generation: `takoserver-v2-operation:${createId}`,
+      versions: [{ workerVersionUid: versionUid, weight: 10_000 }],
+    });
+    expect(
+      await owner.observeServing({ workerResourceUid: "different-worker", targetKey: TARGET_KEY }),
+    ).toEqual({
+      kind: "unknown",
+    });
+    expect(
+      await owner.observeRetirement({ workerVersionUid: "version-never-published" }),
+    ).toMatchObject({
+      kind: "confirmed_absent",
+      workerResourceUid: workerUid,
+      workerVersionUid: "version-never-published",
+    });
+    expect(await owner.observeRetirement({ workerVersionUid: versionUid })).toEqual({
+      kind: "unknown",
+    });
+    expect(await owner.observeRetirement({})).toEqual({ kind: "unknown" });
+    const generationKey = (await readdir(publicationsCopy))[0];
+    if (!generationKey) throw new Error("weighted publication generation missing");
+    const deploymentPath = join(publicationsCopy, generationKey, "deployment.json");
+    const deployment = JSON.parse(await Bun.file(deploymentPath).text()) as {
+      versions: Array<{
+        storageKey: string;
+        manifest: { assets: { files: Record<string, { key: string }> } };
+      }>;
+    };
+    const version = deployment.versions[0];
+    const asset = version && Object.values(version.manifest.assets.files)[0];
+    if (!version || !asset) throw new Error("weighted asset manifest missing");
+    const assetPath = join(
+      publicationsCopy,
+      generationKey,
+      version.storageKey,
+      "assets",
+      asset.key,
+    );
+    const exactAsset = await Bun.file(assetPath).arrayBuffer();
+    await writeFile(assetPath, "tampered execution asset");
+    expect(
+      await owner.observeServing({ workerResourceUid: workerUid, targetKey: TARGET_KEY }),
+    ).toEqual({ kind: "unknown" });
+    await writeFile(assetPath, new Uint8Array(exactAsset), { mode: 0o600 });
+    const exactManifest = await Bun.file(deploymentPath).arrayBuffer();
+    await writeFile(deploymentPath, "tampered deployment manifest");
+    expect(
+      await owner.observeServing({ workerResourceUid: workerUid, targetKey: TARGET_KEY }),
+    ).toEqual({
+      kind: "unknown",
+    });
+    await writeFile(deploymentPath, new Uint8Array(exactManifest), { mode: 0o600 });
+    await cp(join(groupRoot, "workers"), backup, { recursive: true });
+    expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
+      kind: "confirmed",
+      identity: null,
+    });
+    await owner.close();
+
+    const persisted = JSON.parse(await Bun.file(statePath).text()) as {
+      deletionPublicationConfirmed: boolean;
+      incarnations: Array<Record<string, unknown>>;
+    };
+    persisted.deletionPublicationConfirmed = false;
+    for (const record of persisted.incarnations) record.executionCopiesReleased = false;
+    await writeFile(statePath, `${JSON.stringify(persisted)}\n`, { mode: 0o600 });
+    await cp(backup, join(groupRoot, "workers"), { recursive: true, force: true });
+
+    const foreignRoot = join(owned.root, "foreign-copy-root");
+    await mkdir(foreignRoot, { recursive: true });
+    await Bun.write(join(foreignRoot, "untouched"), "foreign");
+    await rm(scriptCopy, { recursive: true, force: true });
+    await symlink(foreignRoot, scriptCopy);
+    await expect(openWorkerdWorkerRuntimeOwner(ownerOptions)).rejects.toMatchObject({
+      code: "ownership_uncertain",
+    });
+    expect(await Bun.file(join(foreignRoot, "untouched")).text()).toBe("foreign");
+    await unlink(scriptCopy);
+    await cp(join(backup, script), scriptCopy, { recursive: true });
+
+    const reopened = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+    try {
+      expect(await pathExists(scriptCopy)).toBe(false);
+      expect(await pathExists(publicationsCopy)).toBe(false);
+      expect(await reopened.observeRetirement({ workerVersionUid: versionUid })).toMatchObject({
+        kind: "confirmed_absent",
+        workerResourceUid: workerUid,
+        targetKey: TARGET_KEY,
+        workerVersionUid: versionUid,
+        incarnationOperationIds: [createId],
+      });
+      expect(await reopened.observeRetirement({})).toMatchObject({
+        kind: "confirmed_absent",
+        workerResourceUid: workerUid,
+        targetKey: TARGET_KEY,
+        incarnationOperationIds: [createId],
+      });
+      expect(await reopened.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
+        kind: "confirmed",
+        identity: null,
+      });
+      const finalState = JSON.parse(await Bun.file(statePath).text()) as {
+        schema: string;
+        incarnations: Array<{ executionCopiesReleased: boolean }>;
+      };
+      expect(finalState.schema).toBe("takoserver.v2-worker-runtime-owner@3");
+      expect(finalState.incarnations.every((record) => record.executionCopiesReleased)).toBe(true);
+      expect(owned.children).toHaveLength(1);
+      await reopened.close();
+
+      await cp(backup, join(groupRoot, "workers"), { recursive: true, force: true });
+      expect(await pathExists(scriptCopy)).toBe(true);
+      await expect(openWorkerdWorkerRuntimeOwner(ownerOptions)).rejects.toMatchObject({
+        code: "ownership_uncertain",
+      });
+      expect(await pathExists(scriptCopy)).toBe(true);
+      await rm(scriptCopy, { recursive: true, force: true });
+      await rm(publicationsCopy, { recursive: true, force: true });
+
+      const previousV2 = JSON.parse(await Bun.file(statePath).text()) as {
+        schema: string;
+        incarnations: Array<Record<string, unknown>>;
+      };
+      previousV2.schema = "takoserver.v2-worker-runtime-owner@2";
+      for (const record of previousV2.incarnations) delete record.executionCopiesReleased;
+      await writeFile(statePath, `${JSON.stringify(previousV2)}\n`, { mode: 0o600 });
+      const migratedV2 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+      await migratedV2.close();
+      expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
+        "takoserver.v2-worker-runtime-owner@3",
+      );
+
+      const previousV1 = JSON.parse(await Bun.file(statePath).text()) as {
+        schema: string;
+        incarnations: Array<Record<string, unknown>>;
+      };
+      previousV1.schema = "takoserver.v2-worker-runtime-owner@1";
+      for (const record of previousV1.incarnations) {
+        delete record.executionCopiesReleased;
+        delete record.deferRetirementUntilDeadline;
+      }
+      await writeFile(statePath, `${JSON.stringify(previousV1)}\n`, { mode: 0o600 });
+      const migratedV1 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+      await migratedV1.close();
+      expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
+        "takoserver.v2-worker-runtime-owner@3",
+      );
+      expect(owned.children).toHaveLength(1);
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await owner.close().catch(() => undefined);
     await owned.cleanup();
   }
 });

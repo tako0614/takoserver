@@ -31,7 +31,9 @@ import type {
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
 import type { WorkerdProcess } from "./workerd-supervisor.ts";
 import {
+  inspectWorkerdWorkerExecutionCopies,
   openWorkerdWorkerExecutionGroup,
+  releaseRetiredWorkerdWorkerExecutionCopies,
   type WorkerdWorkerExecutionGroup,
   type WorkerdWorkerRetirementReceipt,
 } from "./workerd-worker-execution-group.ts";
@@ -39,7 +41,8 @@ import {
 const STATE_NAME = "runtime-owner.json";
 const LOCK_NAME = "runtime-owner.lock";
 const LEGACY_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@1";
-const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@2";
+const PREVIOUS_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@2";
+const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@3";
 const LOCK_SCHEMA = "takoserver.v2-worker-runtime-owner-lock@2";
 const OPERATION_MARKER = "takoserver-v2-operation:";
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -64,6 +67,8 @@ interface IncarnationRecord {
   readonly retireAtMs: number | null;
   /** Whether this exact candidate graph may have ctx.waitUntil work past response completion. */
   readonly deferRetirementUntilDeadline: boolean;
+  /** Persisted only after the exact retired group's execution copies are absent. */
+  readonly executionCopiesReleased: boolean;
   readonly identity: WorkerdPublicationIdentity | null;
   readonly receipt: WorkerdWorkerRetirementReceipt | null;
 }
@@ -110,6 +115,36 @@ export interface WorkerdWorkerRuntimeOwner {
   readonly workerResourceUid: string;
   /** Run one accepted WorkerDeployment Operation and switch only this UID's listener. */
   execute(execution: V2Execution): Promise<V2WorkerPublicationResult>;
+  /** Read exact current serving truth without changing publication state. */
+  observeServing(input: {
+    readonly workerResourceUid: string;
+    readonly targetKey: string;
+  }): Promise<
+    | {
+        readonly kind: "serving";
+        readonly workerResourceUid: string;
+        readonly targetKey: string;
+        readonly sourceOperationId: string;
+        readonly generation: string;
+        readonly hostnames: readonly string[];
+        readonly versions: readonly {
+          readonly workerVersionUid: string;
+          readonly weight: number;
+        }[];
+      }
+    | { readonly kind: "unknown" }
+  >;
+  /** Prove absence only after the exact active inventory or all retired receipts. */
+  observeRetirement(input: { readonly workerVersionUid?: string }): Promise<
+    | {
+        readonly kind: "confirmed_absent";
+        readonly workerResourceUid: string;
+        readonly targetKey: string;
+        readonly workerVersionUid?: string;
+        readonly incarnationOperationIds: readonly string[];
+      }
+    | { readonly kind: "unknown" }
+  >;
   /** Route a Host-accepted request to the exact active incarnation. */
   fetch(request: Request): Promise<Response>;
   /** Release the owner lock only after every known incarnation has a durable receipt. */
@@ -400,12 +435,12 @@ async function readOwnerStateSnapshot(
   return { state: parseState(text, workerResourceUid), identity, text };
 }
 
-function hasOnlyRetiredIncarnations(state: PersistedOwnerState): boolean {
-  return (
-    state.activeOperationId === null &&
-    state.incarnations.every(
-      (item) => item.status === "retired" && item.receipt !== null && item.retirementOperationId,
-    )
+function hasOnlyRetiredOrRetirementPendingIncarnations(state: PersistedOwnerState): boolean {
+  return state.incarnations.every(
+    (item) =>
+      (item.status === "retired" && item.receipt !== null && item.retirementOperationId) ||
+      ((item.status === "retiring" || item.status === "uncertain") &&
+        item.retirementOperationId !== null),
   );
 }
 
@@ -519,7 +554,7 @@ async function requireSafeStateForNewOwner(
   snapshot: OwnerStateSnapshot,
   allowDeleteReplayOnly: boolean,
 ): Promise<void> {
-  if (!hasOnlyRetiredIncarnations(snapshot.state))
+  if (!hasOnlyRetiredOrRetirementPendingIncarnations(snapshot.state))
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   if (
     allowDeleteReplayOnly &&
@@ -527,7 +562,7 @@ async function requireSafeStateForNewOwner(
   ) {
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
-  await requireVacantOwnerListeners(snapshot.state);
+  if (allowDeleteReplayOnly) await requireVacantOwnerListeners(snapshot.state);
 }
 
 async function sameOwnerStateSnapshot(
@@ -760,6 +795,26 @@ function validIdentity(value: unknown): value is WorkerdPublicationIdentity {
   );
 }
 
+function executionCopiesMatchRecord(
+  record: IncarnationRecord,
+  copies: Awaited<ReturnType<typeof inspectWorkerdWorkerExecutionCopies>>,
+  requirePublication: boolean,
+): boolean {
+  if (requirePublication && copies.publications.length === 0) return false;
+  const expectedGeneration =
+    record.identity?.generation ?? expectedOperationMarker(record.operationId);
+  const expectedVersions = record.identity?.versions.map(({ workerVersionUid, weight }) => ({
+    workerVersionUid,
+    weight,
+  }));
+  return copies.publications.every(
+    (publication) =>
+      publication.generation === expectedGeneration &&
+      (expectedVersions === undefined ||
+        canonicalJson(publication.versions) === canonicalJson(expectedVersions)),
+  );
+}
+
 function parseState(text: string | null, workerResourceUid: string): PersistedOwnerState {
   if (text === null) return emptyState(workerResourceUid);
   try {
@@ -767,8 +822,10 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
     const state = value as Record<string, unknown>;
     const legacyStaticState = state.schema === LEGACY_STATE_SCHEMA;
+    const previousState = state.schema === PREVIOUS_STATE_SCHEMA;
+    const currentState = state.schema === STATE_SCHEMA;
     if (
-      (!legacyStaticState && state.schema !== STATE_SCHEMA) ||
+      (!legacyStaticState && !previousState && !currentState) ||
       state.workerResourceUid !== workerResourceUid ||
       !(state.activeOperationId === null || typeof state.activeOperationId === "string") ||
       !(state.admissionClosedBy === null || typeof state.admissionClosedBy === "string") ||
@@ -796,6 +853,9 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         (legacyStaticState
           ? item.deferRetirementUntilDeadline !== undefined
           : typeof item.deferRetirementUntilDeadline !== "boolean") ||
+        (currentState
+          ? typeof item.executionCopiesReleased !== "boolean"
+          : item.executionCopiesReleased !== undefined) ||
         !(item.identity === null || validIdentity(item.identity)) ||
         !(item.receipt === null || validReceipt(item.receipt))
       ) {
@@ -816,6 +876,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         deferRetirementUntilDeadline: legacyStaticState
           ? false
           : (item.deferRetirementUntilDeadline as boolean),
+        executionCopiesReleased: currentState ? (item.executionCopiesReleased as boolean) : false,
       } as unknown as IncarnationRecord);
     }
     const result: PersistedOwnerState = {
@@ -831,18 +892,24 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
       (state.admissionClosedBy === null && state.deletionPublicationConfirmed) ||
       (state.deletionPublicationConfirmed &&
         (state.activeOperationId !== null ||
-          incarnations.some((item) => item.status !== "retired" || item.receipt === null))) ||
+          incarnations.some(
+            (item) =>
+              item.status !== "retired" ||
+              item.receipt === null ||
+              (currentState && !item.executionCopiesReleased),
+          ))) ||
       (state.activeOperationId === null && activeRecords.length !== 0) ||
       (state.activeOperationId !== null &&
         !incarnations.some(
           (item) =>
             item.operationId === state.activeOperationId &&
             item.identity !== null &&
-            ["active", "retiring", "retired"].includes(item.status),
+            ["active", "retiring", "retired", "uncertain"].includes(item.status),
         )) ||
       incarnations.some(
         (item) =>
-          (item.status === "retired") !== (item.receipt !== null) ||
+          (item.status === "retired" && item.receipt === null) ||
+          (item.executionCopiesReleased && (item.status !== "retired" || item.receipt === null)) ||
           (["draining", "retiring", "retired"].includes(item.status) &&
             item.retirementOperationId === null),
       )
@@ -857,10 +924,25 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
           admissionClosedBy: state.admissionClosedBy,
           deletionPublicationConfirmed: state.deletionPublicationConfirmed,
           incarnations: incarnations.map(
-            ({ deferRetirementUntilDeadline: _defer, ...item }) => item,
+            ({
+              deferRetirementUntilDeadline: _defer,
+              executionCopiesReleased: _released,
+              ...item
+            }) => item,
           ),
         }
-      : result;
+      : previousState
+        ? {
+            schema: PREVIOUS_STATE_SCHEMA,
+            workerResourceUid: state.workerResourceUid,
+            activeOperationId: state.activeOperationId,
+            admissionClosedBy: state.admissionClosedBy,
+            deletionPublicationConfirmed: state.deletionPublicationConfirmed,
+            incarnations: incarnations.map(
+              ({ executionCopiesReleased: _released, ...item }) => item,
+            ),
+          }
+        : result;
     if (canonicalJson(canonicalState) !== text) throw new Error();
     return result;
   } catch {
@@ -1003,7 +1085,14 @@ export async function openWorkerdWorkerRuntimeOwner(
       throw error;
     });
     state = parseState(text, options.workerResourceUid);
-    if (state.incarnations.some((item) => item.status !== "retired")) {
+    if (
+      state.incarnations.some(
+        (item) =>
+          item.status !== "retired" &&
+          (!(item.status === "retiring" || item.status === "uncertain") ||
+            item.retirementOperationId === null),
+      )
+    ) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
   } catch (error) {
@@ -1031,6 +1120,69 @@ export async function openWorkerdWorkerRuntimeOwner(
     return snapshot;
   });
   const transitionState = stateWriter.transition;
+
+  // Retired receipts outlive their publisher process. Retry physical-copy
+  // cleanup under this owner's lock before exposing any replay/observation API.
+  try {
+    for (const record of [...state.incarnations]) {
+      if (!record.retirementOperationId) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      const groupDirectory = join(
+        directory,
+        "incarnations",
+        record.operationId,
+        "groups",
+        uidKey(options.workerResourceUid),
+      );
+      const existingCopies = await inspectWorkerdWorkerExecutionCopies({
+        groupDirectory,
+        workerResourceUid: options.workerResourceUid,
+        listenerPort: record.listenerPort,
+        scriptName: `v2-worker-${uidKey(options.workerResourceUid)}`,
+      });
+      if (
+        !executionCopiesMatchRecord(record, existingCopies, false) ||
+        (record.executionCopiesReleased &&
+          (existingCopies.versionUids.length !== 0 || existingCopies.generationKeys.length !== 0))
+      ) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      const released = await releaseRetiredWorkerdWorkerExecutionCopies({
+        groupDirectory,
+        workerResourceUid: options.workerResourceUid,
+        operationId: record.retirementOperationId,
+        listenerPort: record.listenerPort,
+        scriptName: `v2-worker-${uidKey(options.workerResourceUid)}`,
+      });
+      if (record.receipt && canonicalJson(record.receipt) !== canonicalJson(released.receipt)) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      if (
+        record.status !== "retired" ||
+        !record.executionCopiesReleased ||
+        record.receipt === null
+      ) {
+        await transitionState((current) => ({
+          ...current,
+          incarnations: current.incarnations.map((item) =>
+            item.operationId === record.operationId
+              ? {
+                  ...item,
+                  status: "retired",
+                  receipt: released.receipt,
+                  executionCopiesReleased: true,
+                }
+              : item,
+          ),
+        }));
+      }
+    }
+  } catch (error) {
+    await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
+    if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
 
   const recordFor = (operationId: string): IncarnationRecord | undefined =>
     state.incarnations.find((item) => item.operationId === operationId);
@@ -1072,7 +1224,11 @@ export async function openWorkerdWorkerRuntimeOwner(
     incarnation: IncarnationHandle,
   ): Promise<WorkerdWorkerRetirementReceipt> {
     if (incarnation.retiring) return await incarnation.retiring;
-    if (incarnation.record.status === "retired" && incarnation.record.receipt)
+    if (
+      incarnation.record.status === "retired" &&
+      incarnation.record.receipt &&
+      incarnation.record.executionCopiesReleased
+    )
       return incarnation.record.receipt;
     const operationId = incarnation.record.retirementOperationId;
     if (!operationId) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
@@ -1088,10 +1244,36 @@ export async function openWorkerdWorkerRuntimeOwner(
           workerResourceUid: options.workerResourceUid,
           operationId,
         });
+        const receiptPersisted = await updateRecord(incarnation.record.operationId, (current) => ({
+          ...current,
+          status: "retiring",
+          receipt,
+        }));
+        incarnation.record = receiptPersisted;
+        const existingCopies = await inspectWorkerdWorkerExecutionCopies({
+          groupDirectory: incarnation.group.runtimeRoot,
+          workerResourceUid: options.workerResourceUid,
+          listenerPort: incarnation.record.listenerPort,
+          scriptName: scriptName(options.workerResourceUid),
+        });
+        if (!executionCopiesMatchRecord(incarnation.record, existingCopies, false)) {
+          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        }
+        const released = await releaseRetiredWorkerdWorkerExecutionCopies({
+          groupDirectory: incarnation.group.runtimeRoot,
+          workerResourceUid: options.workerResourceUid,
+          operationId,
+          listenerPort: incarnation.record.listenerPort,
+          scriptName: scriptName(options.workerResourceUid),
+        });
+        if (canonicalJson(receipt) !== canonicalJson(released.receipt)) {
+          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        }
         const retired = await updateRecord(incarnation.record.operationId, (current) => ({
           ...current,
           status: "retired",
           receipt,
+          executionCopiesReleased: true,
         }));
         incarnation.record = retired;
         incarnation.retirementTimer?.();
@@ -1170,6 +1352,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       retirementOperationId: null,
       retireAtMs: null,
       deferRetirementUntilDeadline: false,
+      executionCopiesReleased: false,
       identity: null,
       receipt: null,
     };
@@ -1269,7 +1452,10 @@ export async function openWorkerdWorkerRuntimeOwner(
       if (admissionClosedBy !== null && execution.operationId !== admissionClosedBy) {
         const deleteRetired =
           state.deletionPublicationConfirmed &&
-          state.incarnations.every((item) => item.status === "retired" && item.receipt !== null);
+          state.incarnations.every(
+            (item) =>
+              item.status === "retired" && item.receipt !== null && item.executionCopiesReleased,
+          );
         if (!deleteRetired) return { kind: "unknown" };
         admissionClosedBy = null;
         await transitionState((current) => ({
@@ -1355,6 +1541,184 @@ export async function openWorkerdWorkerRuntimeOwner(
       }
     });
   };
+
+  const observeServing: WorkerdWorkerRuntimeOwner["observeServing"] = (input) =>
+    runSerial(async () => {
+      const unknown = { kind: "unknown" } as const;
+      if (
+        closed ||
+        input.workerResourceUid !== options.workerResourceUid ||
+        input.targetKey !== options.targetKey ||
+        admissionClosedBy !== null
+      ) {
+        return unknown;
+      }
+      const incarnation = active;
+      const operationId = state.activeOperationId;
+      if (
+        !incarnation ||
+        !operationId ||
+        incarnation.record.operationId !== operationId ||
+        incarnation.record.status !== "active" ||
+        incarnation.record.identity === null ||
+        incarnation.record.identity.workerResourceUid !== options.workerResourceUid ||
+        incarnation.record.identity.generation !== expectedOperationMarker(operationId) ||
+        !incarnation.group.isReady()
+      ) {
+        return unknown;
+      }
+      const identity = cloneRecord(incarnation.record).identity;
+      if (!identity) return unknown;
+      const copies = await inspectWorkerdWorkerExecutionCopies({
+        groupDirectory: incarnation.group.runtimeRoot,
+        workerResourceUid: options.workerResourceUid,
+        listenerPort: incarnation.record.listenerPort,
+        scriptName: scriptName(options.workerResourceUid),
+      }).catch(() => null);
+      if (
+        !copies ||
+        !executionCopiesMatchRecord(incarnation.record, copies, true) ||
+        identity.versions.some(
+          (version) => !copies.versionUids.includes(version.workerVersionUid),
+        ) ||
+        (await incarnation.runtime.observeExactPublication?.(
+          scriptName(options.workerResourceUid),
+          identity,
+        )) !== "matches"
+      ) {
+        return unknown;
+      }
+      const current = recordFor(operationId);
+      if (
+        closed ||
+        admissionClosedBy !== null ||
+        active !== incarnation ||
+        state.activeOperationId !== operationId ||
+        current?.status !== "active" ||
+        current.identity === null ||
+        canonicalJson(current.identity) !== canonicalJson(identity) ||
+        !incarnation.group.isReady()
+      ) {
+        return unknown;
+      }
+      return {
+        kind: "serving",
+        workerResourceUid: options.workerResourceUid,
+        targetKey: options.targetKey,
+        sourceOperationId: operationId,
+        generation: identity.generation,
+        hostnames: [...identity.hostnames],
+        versions: identity.versions.map(({ workerVersionUid, weight }) => ({
+          workerVersionUid,
+          weight,
+        })),
+      };
+    });
+
+  const observeRetirement: WorkerdWorkerRuntimeOwner["observeRetirement"] = (input) =>
+    runSerial(async () => {
+      const unknown = { kind: "unknown" } as const;
+      if (closed || (input.workerVersionUid !== undefined && !input.workerVersionUid))
+        return unknown;
+      const servingIncarnation = active;
+      const operationIds: string[] = [];
+      for (const record of state.incarnations) {
+        operationIds.push(record.operationId);
+        if (record.status === "active") {
+          if (
+            input.workerVersionUid === undefined ||
+            !servingIncarnation ||
+            servingIncarnation.record.operationId !== record.operationId
+          ) {
+            return unknown;
+          }
+          const identity = record.identity;
+          if (
+            !identity ||
+            identity.generation !== expectedOperationMarker(record.operationId) ||
+            admissionClosedBy !== null ||
+            !servingIncarnation.group.isReady() ||
+            (await servingIncarnation.runtime.observeExactPublication?.(
+              scriptName(options.workerResourceUid),
+              identity,
+            )) !== "matches"
+          ) {
+            return unknown;
+          }
+          const copies = await inspectWorkerdWorkerExecutionCopies({
+            groupDirectory: servingIncarnation.group.runtimeRoot,
+            workerResourceUid: options.workerResourceUid,
+            listenerPort: record.listenerPort,
+            scriptName: scriptName(options.workerResourceUid),
+          }).catch(() => null);
+          if (
+            !copies ||
+            !executionCopiesMatchRecord(record, copies, true) ||
+            identity.versions.some(
+              (version) => !copies.versionUids.includes(version.workerVersionUid),
+            ) ||
+            copies.versionUids.includes(input.workerVersionUid)
+          ) {
+            return unknown;
+          }
+          const current = recordFor(record.operationId);
+          if (
+            active !== servingIncarnation ||
+            state.activeOperationId !== record.operationId ||
+            current?.status !== "active" ||
+            canonicalJson(current.identity) !== canonicalJson(identity) ||
+            admissionClosedBy !== null ||
+            !servingIncarnation.group.isReady()
+          ) {
+            return unknown;
+          }
+          continue;
+        }
+        if (
+          record.status !== "retired" ||
+          record.receipt === null ||
+          !record.executionCopiesReleased ||
+          record.retirementOperationId === null
+        ) {
+          return unknown;
+        }
+        const groupDirectory = join(
+          directory,
+          "incarnations",
+          record.operationId,
+          "groups",
+          uidKey(options.workerResourceUid),
+        );
+        const copies = await inspectWorkerdWorkerExecutionCopies({
+          groupDirectory,
+          workerResourceUid: options.workerResourceUid,
+          listenerPort: record.listenerPort,
+          scriptName: scriptName(options.workerResourceUid),
+        }).catch(() => null);
+        if (copies === null) return unknown;
+        if (copies.versionUids.length !== 0 || copies.generationKeys.length !== 0) {
+          return unknown;
+        }
+        const checked = await releaseRetiredWorkerdWorkerExecutionCopies({
+          groupDirectory,
+          workerResourceUid: options.workerResourceUid,
+          operationId: record.retirementOperationId,
+          listenerPort: record.listenerPort,
+          scriptName: scriptName(options.workerResourceUid),
+        }).catch(() => null);
+        if (!checked || canonicalJson(checked.receipt) !== canonicalJson(record.receipt))
+          return unknown;
+      }
+      return {
+        kind: "confirmed_absent",
+        workerResourceUid: options.workerResourceUid,
+        targetKey: options.targetKey,
+        ...(input.workerVersionUid === undefined
+          ? {}
+          : { workerVersionUid: input.workerVersionUid }),
+        incarnationOperationIds: operationIds.sort(),
+      };
+    });
 
   function scriptName(workerUid: string): string {
     return `v2-worker-${uidKey(workerUid)}`;
@@ -1461,7 +1825,10 @@ export async function openWorkerdWorkerRuntimeOwner(
     if (
       state.admissionClosedBy === execution.operationId &&
       state.deletionPublicationConfirmed &&
-      state.incarnations.every((item) => item.status === "retired" && item.receipt !== null)
+      state.incarnations.every(
+        (item) =>
+          item.status === "retired" && item.receipt !== null && item.executionCopiesReleased,
+      )
     ) {
       return (await resolution.stillCurrent())
         ? { kind: "confirmed", identity: null }
@@ -1480,7 +1847,9 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
     for (const incarnation of handles.values()) await cancelInvocations(incarnation);
 
-    const live = [...handles.values()].filter((item) => item.record.status !== "retired");
+    const live = [...handles.values()].filter(
+      (item) => item.record.status !== "retired" || !item.record.executionCopiesReleased,
+    );
     for (const incarnation of live) {
       incarnation.retirementTimer?.();
       delete incarnation.retirementTimer;
@@ -1541,7 +1910,12 @@ export async function openWorkerdWorkerRuntimeOwner(
   const close = async (): Promise<void> => {
     await runSerial(async () => {
       if (closed) return;
-      if (state.incarnations.some((item) => item.status !== "retired" || item.receipt === null))
+      if (
+        state.incarnations.some(
+          (item) =>
+            item.status !== "retired" || item.receipt === null || !item.executionCopiesReleased,
+        )
+      )
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       for (const item of handles.values()) {
         item.retirementTimer?.();
@@ -1558,6 +1932,8 @@ export async function openWorkerdWorkerRuntimeOwner(
   return Object.freeze({
     workerResourceUid: options.workerResourceUid,
     execute,
+    observeServing,
+    observeRetirement,
     fetch: fetchRequest,
     close,
   });
