@@ -28,6 +28,7 @@ const RUNTIME_EXPORTS = [
   "WORKER_VERSION_FORM_URL",
   "WorkerFormValidationError",
   "createV2NativeEffectCustody",
+  "createV2WorkerInvocationLifecycle",
   "createV2WorkerPublicationState",
   "parseModuleWorkerSpec",
   "parseWorkerDeploymentSpec",

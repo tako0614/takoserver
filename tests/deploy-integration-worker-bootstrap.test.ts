@@ -97,7 +97,9 @@ const APPLIED = applyQualifiedMigrationNames();
 const EXPECTED_SHAPE = applicationShape(join(sourceRoot, "migrations"), APPLIED);
 const COMPLETE_SCHEMA = schemaState(APPLIED, EXPECTED_SHAPE);
 const WRONG_SCHEMA = schemaState(APPLIED, "[]\n");
-const V2_APPLIED = MIGRATIONS.map(({ name }) => name);
+// The first v2 Worker bootstrap is qualified against the fixed 0075 payload,
+// not the newer source-only 0076 inventory copied into sourceRoot.
+const V2_APPLIED = MIGRATIONS.slice(0, 75).map(({ name }) => name);
 const COMPLETE_V2_SCHEMA = schemaState(
   V2_APPLIED,
   applicationShape(join(sourceRoot, "migrations"), V2_APPLIED),
