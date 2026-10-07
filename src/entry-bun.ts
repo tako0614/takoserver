@@ -982,6 +982,7 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
       (await closeSelfhostEntryOwnedResources({
         workerdShutdown: () => workerd.shutdown(),
         mayCloseDependents: () => shutdownClean,
+        v2WorkerSuspend: () => v2WorkerComposition.suspendOwnersRetainingCustody(),
         actorClose: async () => {
           await actorRuntime?.close();
         },

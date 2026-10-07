@@ -27,6 +27,7 @@ export interface SelfhostEntryShutdown {
 
 export type SelfhostEntryOwnedResourceStage =
   | "workerd-reap"
+  | "v2-worker-suspend"
   | "actor-close"
   | "data-plane-close"
   | "control-database-close";
@@ -34,6 +35,8 @@ export type SelfhostEntryOwnedResourceStage =
 export interface SelfhostEntryOwnedResourceOptions {
   readonly workerdShutdown: () => Promise<void>;
   readonly mayCloseDependents: () => boolean;
+  /** Stop v2 native owners while SQL and private binding services remain live. */
+  readonly v2WorkerSuspend?: () => Promise<void>;
   readonly actorClose: () => Promise<void>;
   readonly dataPlanesStop: () => Promise<void>;
   readonly controlDatabaseClose: () => void;
@@ -56,6 +59,13 @@ export async function closeSelfhostEntryOwnedResources(
   }
 
   if (!options.mayCloseDependents()) return false;
+
+  try {
+    await options.v2WorkerSuspend?.();
+  } catch {
+    options.onFailure("v2-worker-suspend");
+    return false;
+  }
 
   try {
     await options.actorClose();
