@@ -31,6 +31,7 @@ import {
 import {
   isWorkerdV2PrivateServiceBindingName,
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
+  WORKERD_V2_PRIVATE_KV_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
   WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING,
   WORKERD_V2_PRIVATE_READINESS_BINDING,
@@ -976,7 +977,7 @@ function projectEnv(rawEnv) {
     throw portableError("backend_unavailable");
   }
   const projected = SafeObjectCreate(null);
-  let call;
+  const planeCalls = new SafeMap();
   const objectCalls = new SafeMap();
   for (let index = 0; index < CONFIGURATION.bindings.length; index += 1) {
     const descriptor = CONFIGURATION.bindings[index];
@@ -1001,7 +1002,12 @@ function projectEnv(rawEnv) {
         );
         continue;
       }
-      if (!call) call = createPlaneCaller(rawEnv);
+      const planeService = descriptor.internalName || DATA_SERVICE;
+      let call = SafeApply(SafeMapGet, planeCalls, [planeService]);
+      if (!call) {
+        call = createPlaneCaller(rawEnv, descriptor.internalName);
+        SafeApply(SafeMapSet, planeCalls, [planeService, call]);
+      }
       projected[descriptor.publicName] =
         descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_KV_BINDING_KIND)}
           ? createKvAdapter(call, descriptor.publicName)
@@ -2413,8 +2419,8 @@ function freezeObject(value) {
  * the plane address and rewrites every request it is handed. This module can
  * name one of two paths and a JSON body; it cannot name a destination.
  */
-function createPlaneCaller(rawEnv) {
-  const service = rawEnv[DATA_SERVICE];
+function createPlaneCaller(rawEnv, internalName) {
+  const service = rawEnv[internalName || DATA_SERVICE];
   const send = captureMethod(service, "fetch");
   return async (url, payload, codes, project) => {
     const headers = SafeObjectCreate(null);
@@ -3037,9 +3043,14 @@ function normalizeSourceInput(
       const privateObjectService =
         binding.kind === SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND &&
         Object.hasOwn(binding, "internalName");
+      const privateKvService =
+        binding.kind === SELFHOST_WORKER_EDGE_KV_BINDING_KIND &&
+        Object.hasOwn(binding, "internalName");
       exactNormalizedKeys(
         binding,
-        privateObjectService ? ["kind", "publicName", "internalName"] : ["kind", "publicName"],
+        privateObjectService || privateKvService
+          ? ["kind", "publicName", "internalName"]
+          : ["kind", "publicName"],
         "bindings",
       );
       if (typeof binding.kind !== "string" || !DATA_BINDING_KINDS.has(binding.kind)) {
@@ -3051,11 +3062,19 @@ function normalizeSourceInput(
       ) {
         invalid("bindings");
       }
+      if (
+        privateKvService &&
+        (!v2PrivateNames || binding.internalName !== WORKERD_V2_PRIVATE_KV_BINDING)
+      ) {
+        invalid("bindings");
+      }
       validatePublicName(binding.publicName, publicNames, false, v2PrivateNames);
       bindings.push({
         kind: binding.kind as SelfhostWorkerDataBindingDescriptor["kind"],
         publicName: binding.publicName as string,
-        ...(privateObjectService ? { internalName: binding.internalName as string } : {}),
+        ...(privateObjectService || privateKvService
+          ? { internalName: binding.internalName as string }
+          : {}),
       });
       continue;
     }

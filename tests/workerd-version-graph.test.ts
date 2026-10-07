@@ -34,6 +34,7 @@ import {
 } from "../src/providers/selfhost-worker-wrapper.ts";
 import {
   WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+  WORKERD_V2_PRIVATE_KV_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
 } from "../src/providers/workerd-v2-private-binding-names.ts";
 import {
@@ -197,6 +198,32 @@ test("ObjectBucket uses a distinct signed-grant service beside the generic data 
   expect(source(graph.hostModules.get(SELFHOST_V2_OBJECT_BUCKET_DATA_SERVICE_MODULE))).toBe(
     selfhostV2ObjectBucketDataServiceSource(),
   );
+});
+
+test("v2 KV uses its own private service when mixed with the generic SQL plane", () => {
+  const grant = `${Buffer.from('{"schema":"fixture"}').toString("base64url")}.${"b".repeat(43)}`;
+  const graph = compileWorkerdVersionGraph(
+    graphInput({
+      generation: "takoserver-v2-operation:11111111-1111-4111-8111-111111111111",
+      dataPlane: {
+        address: "127.0.0.1:4666",
+        token: "generic-sql-plane-token",
+        bindings: [{ kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" }],
+      },
+      v2KvBinding: {
+        address: "127.0.0.1:4888",
+        token: grant,
+        bindings: [{ publicName: "CACHE" }],
+      },
+    }),
+  );
+
+  const descriptor = graph.hostModules.get(WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE);
+  const wrapper = source(descriptor);
+  expect(wrapper).toContain(WORKERD_V2_PRIVATE_KV_BINDING);
+  expect(wrapper).not.toContain(grant);
+  expect(graph.site.dataPlane?.address).toBe("127.0.0.1:4666");
+  expect(graph.site.v2KvPlane).toEqual({ address: "127.0.0.1:4888", token: grant });
 });
 
 function graphSnapshot(graph: WorkerdVersionGraph): unknown {

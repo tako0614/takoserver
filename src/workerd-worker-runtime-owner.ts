@@ -39,6 +39,7 @@ import {
   randomSelfhostDeploymentBasisPoint,
   selectSelfhostWeightedVersion,
 } from "./selfhost-weighted-deployment.ts";
+import type { KvWorkerBindingClaim } from "./takoform-v2/forms/kv-worker-binding-authority.ts";
 import type {
   ObjectBucketWorkerBindingClaim,
   ObjectBucketWorkerBindingResolution,
@@ -426,6 +427,23 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
       claim: ObjectBucketWorkerBindingClaim,
       binding: string,
     ): Promise<ObjectBucketWorkerBindingResolution | null>;
+  };
+  /** Fixed Host-private KV broker and Core authority, shared by every incarnation. */
+  readonly v2KvBinding?: {
+    readonly address: string;
+    issueGrant(grant: KvWorkerBindingClaim): string;
+    resolveCurrentBinding(
+      claim: KvWorkerBindingClaim,
+      binding: string,
+    ): Promise<{
+      readonly identity: {
+        readonly targetKey: string;
+        readonly principal: string;
+        readonly space: string;
+        readonly resourceUid: string;
+      };
+      readonly vector: string;
+    } | null>;
   };
   readonly workerdBinary: string | null;
   /** Trusted code-module inspector; absent uses the WorkerdRuntime's pinned inspector. */
@@ -1929,6 +1947,23 @@ export async function openWorkerdWorkerRuntimeOwner(
         ),
       })
     : undefined;
+  if (
+    options.v2KvBinding !== undefined &&
+    (typeof options.v2KvBinding.issueGrant !== "function" ||
+      typeof options.v2KvBinding.resolveCurrentBinding !== "function" ||
+      !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(options.v2KvBinding.address) ||
+      Number(options.v2KvBinding.address.slice(options.v2KvBinding.address.lastIndexOf(":") + 1)) >
+        65_535)
+  ) {
+    throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
+  }
+  const v2KvBinding = options.v2KvBinding
+    ? Object.freeze({
+        address: options.v2KvBinding.address,
+        issueGrant: options.v2KvBinding.issueGrant.bind(options.v2KvBinding),
+        resolveCurrentBinding: options.v2KvBinding.resolveCurrentBinding.bind(options.v2KvBinding),
+      })
+    : undefined;
 
   let canonicalRoot: string;
   try {
@@ -2411,6 +2446,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       ...(options.v2QueueSettlement ? { v2QueueSettlement: options.v2QueueSettlement } : {}),
       ...(options.v2SqliteBinding ? { v2SqliteBinding: options.v2SqliteBinding } : {}),
       ...(v2ObjectBucketBinding ? { v2ObjectBucketBinding } : {}),
+      ...(v2KvBinding ? { v2KvBinding } : {}),
       ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
     });
     const handle: IncarnationHandle = {

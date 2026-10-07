@@ -3,6 +3,13 @@ import type { JsonObject, Sql } from "../ports.ts";
 import type { V2SqliteBindingGrant } from "../providers/selfhost-v2-sqlite-binding-broker.ts";
 import type { WorkerdRuntime } from "../workerd-runtime.ts";
 import {
+  EDGE_KV_NAMESPACE_FORM_URL,
+  EDGE_KV_NAMESPACE_LIMITS,
+  parseEdgeKVNamespaceSpec,
+} from "./forms/edge-kv-namespace.ts";
+import { EDGE_KV_NAMESPACE_BACKEND_ID } from "./forms/edge-kv-namespace-backend.ts";
+import type { KvWorkerBindingClaim } from "./forms/kv-worker-binding-authority.ts";
+import {
   OBJECT_BUCKET_FORM_URL,
   OBJECT_BUCKET_LIMITS,
   parseObjectBucketSpec,
@@ -33,6 +40,7 @@ import { TakoformV2Error, type V2BackendResult, type V2Execution, type V2Form } 
 import { snapshotV2WorkerPrivateInputs } from "./worker-code-eligibility.ts";
 import {
   inspectV2WorkerCodeVersionEligibility,
+  type V2ResolvedKvBinding,
   type V2ResolvedObjectBucketBinding,
   type V2ResolvedSqliteBinding,
 } from "./worker-code-runtime.ts";
@@ -672,6 +680,7 @@ function codeOnly(
   queueSettlement: V2CodeQueueSettlementBoot | undefined,
   sqliteBinding: V2CodeSqliteBindingBoot | undefined,
   objectBucketBinding: V2CodeObjectBucketBindingBoot | undefined,
+  kvBinding: V2CodeKvBindingBoot | undefined,
 ): WorkerVersionSpec {
   if (
     !spec.bundle ||
@@ -680,7 +689,7 @@ function codeOnly(
     ) ||
     (spec.handlers.includes("queue") && !queueSettlement) ||
     (spec.requiredSensitiveVars.length > 0 && !configuredInputs) ||
-    spec.kvBindings.length > 0 ||
+    (spec.kvBindings.length > 0 && !kvBinding) ||
     (spec.sqliteBindings.length > 0 && !sqliteBinding) ||
     (spec.bucketBindings.length > 0 && !objectBucketBinding) ||
     spec.queueProducerBindings.length > 0 ||
@@ -736,6 +745,24 @@ export interface V2CodeObjectBucketBindingBoot {
   } | null>;
 }
 
+/** Initialized Host-private KV broker and exact same-target Core reader. */
+export interface V2CodeKvBindingBoot {
+  readonly address: string;
+  issueGrant(grant: KvWorkerBindingClaim): string;
+  resolveCurrentBinding(
+    claim: KvWorkerBindingClaim,
+    binding: string,
+  ): Promise<{
+    readonly identity: {
+      readonly targetKey: string;
+      readonly principal: string;
+      readonly space: string;
+      readonly resourceUid: string;
+    };
+    readonly vector: string;
+  } | null>;
+}
+
 function validQueueSettlementBoot(value: V2CodeQueueSettlementBoot): boolean {
   if (!value || typeof value.address !== "string") return false;
   const port = value.address.slice(value.address.lastIndexOf(":") + 1);
@@ -766,6 +793,17 @@ function validObjectBucketBindingBoot(value: V2CodeObjectBucketBindingBoot): boo
     Number(port) <= 65_535 &&
     typeof value.issueGrant === "function" &&
     typeof value.resolveCurrentBucketBinding === "function"
+  );
+}
+
+function validKvBindingBoot(value: V2CodeKvBindingBoot): boolean {
+  if (!value || typeof value.address !== "string") return false;
+  const port = value.address.slice(value.address.lastIndexOf(":") + 1);
+  return (
+    /^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(value.address) &&
+    Number(port) <= 65_535 &&
+    typeof value.issueGrant === "function" &&
+    typeof value.resolveCurrentBinding === "function"
   );
 }
 
@@ -853,6 +891,64 @@ async function resolvedObjectBucketBindings(
       if (
         canonicalJson(JSON.parse(row.observed_json)) !==
           canonicalJson({ bucketExists: true, ...OBJECT_BUCKET_LIMITS }) ||
+        canonicalJson(JSON.parse(row.output_json)) !== "{}"
+      ) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+    resolved.push({ name: binding.name, resourceUid: binding.resource.resourceUid });
+  }
+  return resolved;
+}
+
+/**
+ * A KV binding is usable only after the exact same-target namespace Resource
+ * has a settled, Form-defined observation and empty output. Native selection
+ * and grant authority are rechecked again by the private broker per request.
+ */
+async function resolvedEdgeKvBindings(
+  sql: Sql,
+  spec: WorkerVersionSpec,
+  identity: { readonly principal: string; readonly space: string; readonly targetKey: string },
+): Promise<readonly V2ResolvedKvBinding[] | null> {
+  const resolved: V2ResolvedKvBinding[] = [];
+  for (const binding of spec.kvBindings) {
+    const rows = await sql.query(
+      `SELECT r.spec_json, r.observed_json, r.output_json, r.backend_id
+       FROM tf_v2_resources r JOIN tf_v2_operations op ON op.id = r.last_operation
+       WHERE r.uid = ? AND r.form_url = ? AND r.principal = ? AND r.space = ?
+         AND r.target_key = ? AND r.deleted_at IS NULL AND r.busy_operation IS NULL
+         AND r.phase = 'idle' AND r.observed_generation = r.generation
+         AND r.backend_id = ? AND op.resource_uid = r.uid AND op.principal = r.principal
+         AND op.backend_id = r.backend_id AND op.target_key = r.target_key
+         AND op.generation = r.generation AND op.status = 'succeeded'
+         AND op.effect = 'complete' AND op.action IN ('create', 'update')
+         AND op.accepted_spec_json = r.spec_json`,
+      [
+        binding.resource.resourceUid,
+        EDGE_KV_NAMESPACE_FORM_URL,
+        identity.principal,
+        identity.space,
+        identity.targetKey,
+        EDGE_KV_NAMESPACE_BACKEND_ID,
+      ],
+    );
+    const row = rows.length === 1 ? rows[0] : null;
+    if (
+      typeof row?.spec_json !== "string" ||
+      typeof row.observed_json !== "string" ||
+      typeof row.output_json !== "string" ||
+      row.backend_id !== EDGE_KV_NAMESPACE_BACKEND_ID
+    ) {
+      return null;
+    }
+    try {
+      parseEdgeKVNamespaceSpec(JSON.parse(row.spec_json));
+      if (
+        canonicalJson(JSON.parse(row.observed_json)) !==
+          canonicalJson({ namespaceExists: true, ...EDGE_KV_NAMESPACE_LIMITS }) ||
         canonicalJson(JSON.parse(row.output_json)) !== "{}"
       ) {
         return null;
@@ -971,6 +1067,8 @@ type CodeWorkerVersionOptions = {
   readonly v2SqliteBinding?: V2CodeSqliteBindingBoot;
   /** Same private ObjectBucket broker and Core reader used by native publication. */
   readonly v2ObjectBucketBinding?: V2CodeObjectBucketBindingBoot;
+  /** Same private KV broker and Core reader used by native publication. */
+  readonly v2KvBinding?: V2CodeKvBindingBoot;
   readonly configuredInputSealer?: ConfiguredInputSealer;
   readonly configuredInputCustody?: V2CodeConfiguredInputCustody;
 };
@@ -1002,10 +1100,14 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
   ) {
     throw new TypeError("Code WorkerVersion requires a valid private ObjectBucket binding boot");
   }
+  if (options.v2KvBinding && !validKvBindingBoot(options.v2KvBinding)) {
+    throw new TypeError("Code WorkerVersion requires a valid private KV binding boot");
+  }
   const { sql, targetKey } = options;
   const queueSettlement = options.queueSettlement;
   const sqliteBinding = options.v2SqliteBinding;
   const objectBucketBinding = options.v2ObjectBucketBinding;
+  const kvBinding = options.v2KvBinding;
   const resolveVersion = options.publicationState.resolveVersion.bind(options.publicationState);
   const observeRetired = options.retirement.observeRetired.bind(options.retirement);
   const inspectModule = options.inspectModule;
@@ -1040,6 +1142,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
           queueSettlement,
           sqliteBinding,
           objectBucketBinding,
+          kvBinding,
         );
         return (await retired(sql, observeRetired, execution, spec.worker.resourceUid, "version"))
           ? { kind: "complete", observed: {}, output: {} }
@@ -1055,6 +1158,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
         queueSettlement,
         sqliteBinding,
         objectBucketBinding,
+        kvBinding,
       );
       if (!(await currentClaim(sql, execution))) return unresolved();
       const resolution = await resolveVersion({ execution });
@@ -1105,6 +1209,15 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
             })
           : [];
       if (resolvedBuckets === null) return unresolved();
+      const resolvedKv =
+        spec.kvBindings.length > 0
+          ? await resolvedEdgeKvBindings(sql, snapshot.version.spec, {
+              principal: execution.principal,
+              space: execution.space,
+              targetKey: execution.targetKey,
+            })
+          : [];
+      if (resolvedKv === null) return unresolved();
       await inspectV2WorkerCodeVersionEligibility({
         workerResourceUid: snapshot.worker.uid,
         ...(spec.bundle ? { bundleResourceUid: spec.bundle.resourceUid } : {}),
@@ -1117,6 +1230,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
         ...(resolvedServiceBindings.length > 0 ? { resolvedServiceBindings } : {}),
         ...(resolvedSQLite.length > 0 ? { resolvedSqliteBindings: resolvedSQLite } : {}),
         ...(resolvedBuckets.length > 0 ? { resolvedObjectBucketBindings: resolvedBuckets } : {}),
+        ...(resolvedKv.length > 0 ? { resolvedKvBindings: resolvedKv } : {}),
       });
       if (!(await resolution.stillCurrent()) || !(await currentClaim(sql, execution))) {
         return unresolved();
@@ -1139,6 +1253,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
         queueSettlement,
         sqliteBinding,
         objectBucketBinding,
+        kvBinding,
       );
     },
     validateUpdate(previous, spec) {
@@ -1148,6 +1263,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
         queueSettlement,
         sqliteBinding,
         objectBucketBinding,
+        kvBinding,
       );
     },
     references(spec) {
@@ -1158,6 +1274,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
           queueSettlement,
           sqliteBinding,
           objectBucketBinding,
+          kvBinding,
         ),
       );
     },

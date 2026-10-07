@@ -8,12 +8,22 @@ import { createAccounts } from "../src/auth.ts";
 import { bytesDigest } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { createSelfhostV2KvStore } from "../src/providers/selfhost-v2-kv-store.ts";
 import { createSelfhostV2ObjectBucketStore } from "../src/providers/selfhost-v2-object-bucket-store.ts";
+import { createSelfhostV2SQLiteStore } from "../src/providers/selfhost-v2-sqlite-store.ts";
+import {
+  runSelfhostKvOperation,
+  selfhostKvOperationErrorCode,
+} from "../src/selfhost-data-planes.ts";
 import { createSelfhostV2WorkerComposition } from "../src/selfhost-v2-worker-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
+import { EDGE_KV_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/edge-kv-namespace.ts";
+import { createEdgeKVNamespaceForm } from "../src/takoform-v2/forms/edge-kv-namespace-backend.ts";
 import { OBJECT_BUCKET_FORM_URL } from "../src/takoform-v2/forms/object-bucket.ts";
 import { createObjectBucketForm } from "../src/takoform-v2/forms/object-bucket-backend.ts";
+import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-database.ts";
+import { createSQLiteDatabaseForm } from "../src/takoform-v2/forms/sqlite-database-backend.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
 import {
   MODULE_WORKER_FORM_URL,
@@ -34,7 +44,7 @@ const MODULE_URL = "https://artifacts.example.test/object-worker/index.mjs";
 const binary = nativeEvidenceBinary("workerd-artifact") ?? null;
 
 test.skipIf(binary === null)(
-  "pinned Workerd serves v2 ObjectBucket streaming and multipart through test-local Host composition",
+  "pinned Workerd serves v2 KV, SQLite, and ObjectBucket through test-local Host composition",
   async () => {
     const root = await mkdtemp(join(tmpdir(), "selfhost-v2-object-binding-native-"));
     const database = new Database(join(root, "control.sqlite"));
@@ -58,7 +68,17 @@ export default {
       try {
         const value = encoder.encode("streamed-value");
         await env.MEDIA.put("single.txt", value.buffer, { contentLength: value.byteLength, contentType: "text/plain" });
-        return new Response(await read(env.MEDIA, "single.txt"));
+        await env.CACHE.put("fixture", "kv-value");
+        const kvBytes = await env.CACHE.get("fixture");
+        await env.DB.execute("INSERT INTO fixture (value) VALUES (?)", ["sql-value"]);
+        const rows = await env.DB.query("SELECT 1 AS value");
+        const stored = await env.DB.query("SELECT value FROM fixture");
+        return Response.json({
+          object: await read(env.MEDIA, "single.txt"),
+          kv: kvBytes === null ? null : new TextDecoder().decode(kvBytes),
+          sql: rows.rows[0]?.value,
+          sqlStored: stored.rows[0]?.value,
+        });
       } catch (error) {
         return new Response(String(error), { status: 500 });
       }
@@ -148,6 +168,32 @@ export default {
         root: join(root, "object-buckets"),
         clock,
       });
+      const sqliteStore = createSelfhostV2SQLiteStore({
+        sql,
+        root: join(root, "sqlite-databases"),
+        targetKey: TARGET,
+        now: clock,
+      });
+      const kvStore = createSelfhostV2KvStore({
+        sql,
+        root: join(root, "kv-namespaces"),
+        clock,
+        runOperation: runSelfhostKvOperation,
+        operationErrorCode: selfhostKvOperationErrorCode,
+      });
+      const reservePrivatePort = async () => {
+        const reservation = Bun.serve({
+          hostname: "127.0.0.1",
+          port: 0,
+          fetch: () => new Response(null, { status: 503 }),
+        });
+        const port = Number(reservation.port);
+        await reservation.stop(true);
+        if (!port) throw new Error("private binding port unavailable");
+        return port;
+      };
+      const sqlitePrivatePort = await reservePrivatePort();
+      const kvPrivatePort = await reservePrivatePort();
       const portReservation = Bun.serve({
         hostname: "127.0.0.1",
         port: 0,
@@ -171,6 +217,16 @@ export default {
           store: objectStore,
           signingKey: new Uint8Array(32).fill(0x63),
           privatePort: objectPrivatePort,
+        },
+        sqliteBinding: {
+          store: sqliteStore,
+          signingKey: new Uint8Array(32).fill(0x64),
+          privatePort: sqlitePrivatePort,
+        },
+        v2KvBinding: {
+          store: kvStore,
+          signingKey: new Uint8Array(32).fill(0x65),
+          privatePort: kvPrivatePort,
         },
         endpoint: {
           assignHostname({ resourceUid }) {
@@ -221,6 +277,11 @@ export default {
         v2FormFactory(context) {
           return {
             ...activeComposition.internalFormFactory(context),
+            [SQLITE_DATABASE_FORM_URL]: createSQLiteDatabaseForm({ store: sqliteStore }),
+            [EDGE_KV_NAMESPACE_FORM_URL]: createEdgeKVNamespaceForm({
+              store: kvStore,
+              targetKey: TARGET,
+            }),
             [OBJECT_BUCKET_FORM_URL]: createObjectBucketForm({
               store: objectStore,
               targetKey: TARGET,
@@ -289,6 +350,15 @@ export default {
 
       const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
       const bucket = await create(OBJECT_BUCKET_FORM_URL, "bucket", {});
+      const databaseResource = await create(SQLITE_DATABASE_FORM_URL, "database", {});
+      await sqliteStore.withAuthorizedDatabase({
+        resourceUid: databaseResource.resourceUid,
+        stillAuthorized: async () => true,
+        use(database) {
+          database.exec("CREATE TABLE fixture (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+        },
+      });
+      const namespace = await create(EDGE_KV_NAMESPACE_FORM_URL, "namespace", {});
       const bundle = await create(WORKER_BUNDLE_FORM_URL, "bundle", {
         artifact: { url: MANIFEST_URL, sha256: manifestSha },
       });
@@ -296,6 +366,8 @@ export default {
         worker: { resourceUid: worker.resourceUid },
         bundle: { resourceUid: bundle.resourceUid },
         handlers: ["fetch"],
+        sqliteBindings: [{ name: "DB", resource: { resourceUid: databaseResource.resourceUid } }],
+        kvBindings: [{ name: "CACHE", resource: { resourceUid: namespace.resourceUid } }],
         bucketBindings: [{ name: "MEDIA", resource: { resourceUid: bucket.resourceUid } }],
       };
       const version = await create(WORKER_VERSION_FORM_URL, "version", versionSpec);
@@ -312,7 +384,12 @@ export default {
         new Request(`https://worker-${endpoint.resourceUid.slice(0, 8)}.example.test/single`),
       );
       expect(single.status).toBe(200);
-      expect(await single.text()).toBe("streamed-value");
+      expect(await single.json()).toEqual({
+        object: "streamed-value",
+        kv: "kv-value",
+        sql: 1,
+        sqlStored: "sql-value",
+      });
       const multipart = await owner.fetch(
         new Request(`https://worker-${endpoint.resourceUid.slice(0, 8)}.example.test/multipart`),
       );
@@ -337,12 +414,19 @@ export default {
         new Request(`https://worker-${endpoint.resourceUid.slice(0, 8)}.example.test/single`),
       );
       expect(afterUpdate.status).toBe(200);
-      expect(await afterUpdate.text()).toBe("streamed-value");
+      expect(await afterUpdate.json()).toEqual({
+        object: "streamed-value",
+        kv: "kv-value",
+        sql: 1,
+        sqlStored: "sql-value",
+      });
 
       await remove(endpoint.resourceUid, "endpoint");
       await remove(deployment.resourceUid, "deployment");
       await remove(version.resourceUid, "version", 2);
       await remove(bucket.resourceUid, "bucket");
+      await remove(namespace.resourceUid, "namespace");
+      await remove(databaseResource.resourceUid, "database");
       await remove(bundle.resourceUid, "bundle");
       await remove(worker.resourceUid, "worker");
     } catch (error) {

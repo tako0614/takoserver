@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
+import { createSelfhostV2KvBindingBroker } from "./providers/selfhost-v2-kv-binding-broker.ts";
+import type { SelfhostV2KvStore } from "./providers/selfhost-v2-kv-store.ts";
 import { createSelfhostV2ObjectBucketBindingBroker } from "./providers/selfhost-v2-object-bucket-binding-broker.ts";
 import type { SelfhostV2ObjectBucketStore } from "./providers/selfhost-v2-object-bucket-store.ts";
 import {
@@ -9,6 +11,7 @@ import {
 } from "./providers/selfhost-v2-sqlite-binding-broker.ts";
 import type { SelfhostV2SQLiteStore } from "./providers/selfhost-v2-sqlite-store.ts";
 import {
+  SELFHOST_DATA_PLANE_KV_PATH,
   SELFHOST_DATA_PLANE_OBJECTS_PATH,
   SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH,
 } from "./providers/selfhost-worker-wrapper.ts";
@@ -16,6 +19,7 @@ import type { V2OperatorFormFactory } from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
 import { readV2ConfiguredPrivateInputs } from "./takoform-v2/configured-private-inputs.ts";
 import { createV2HeldArtifactSource } from "./takoform-v2/forms/artifact-source.ts";
+import { createKvWorkerBindingAuthority } from "./takoform-v2/forms/kv-worker-binding-authority.ts";
 import { createObjectBucketWorkerBindingAuthority } from "./takoform-v2/forms/object-bucket-worker-binding-authority.ts";
 import { createSQLiteWorkerBindingAuthority } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { createStaticAssetBundleCustody } from "./takoform-v2/forms/static-asset-bundle-backend.ts";
@@ -74,6 +78,13 @@ export interface SelfhostV2WorkerCompositionOptions {
   /** Separately keyed Host-private Worker Binding broker; not public Form registration. */
   readonly v2ObjectBucketBinding?: {
     readonly store: SelfhostV2ObjectBucketStore;
+    readonly signingKey: Uint8Array;
+    /** Stable loopback port embedded in each exact Version graph. */
+    readonly privatePort: number;
+  };
+  /** Separately keyed Host-private KV binding broker; not public Form registration. */
+  readonly v2KvBinding?: {
+    readonly store: SelfhostV2KvStore;
     readonly signingKey: Uint8Array;
     /** Stable loopback port embedded in each exact Version graph. */
     readonly privatePort: number;
@@ -213,6 +224,24 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       "v2 ObjectBucket binding requires exact store, separate key and fixed port",
     );
   }
+  if (
+    options.v2KvBinding &&
+    (!options.v2KvBinding.store ||
+      typeof options.v2KvBinding.store.openNamespace !== "function" ||
+      typeof options.v2KvBinding.store.create !== "function" ||
+      typeof options.v2KvBinding.store.reconcileCreate !== "function" ||
+      typeof options.v2KvBinding.store.observe !== "function" ||
+      typeof options.v2KvBinding.store.delete !== "function" ||
+      !(options.v2KvBinding.signingKey instanceof Uint8Array) ||
+      options.v2KvBinding.signingKey.byteLength < 32 ||
+      !Number.isSafeInteger(options.v2KvBinding.privatePort) ||
+      options.v2KvBinding.privatePort < 1 ||
+      options.v2KvBinding.privatePort > 65_535 ||
+      options.v2KvBinding.privatePort === options.sqliteBinding?.privatePort ||
+      options.v2KvBinding.privatePort === options.v2ObjectBucketBinding?.privatePort)
+  ) {
+    throw new TypeError("v2 KV binding requires exact store, separate key and fixed port");
+  }
   // A caller cannot retarget the private listener, signing bytes, or custody
   // methods between factory construction and the first owner restoration.
   const sqliteBinding = options.sqliteBinding
@@ -227,6 +256,13 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         store: Object.freeze({ ...options.v2ObjectBucketBinding.store }),
         signingKey: new Uint8Array(options.v2ObjectBucketBinding.signingKey),
         privatePort: options.v2ObjectBucketBinding.privatePort,
+      })
+    : undefined;
+  const v2KvBinding = options.v2KvBinding
+    ? Object.freeze({
+        store: Object.freeze({ ...options.v2KvBinding.store }),
+        signingKey: new Uint8Array(options.v2KvBinding.signingKey),
+        privatePort: options.v2KvBinding.privatePort,
       })
     : undefined;
   const suppliedSealer = options.configuredInputSealer;
@@ -295,6 +331,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   const objectBucketAuthority = v2ObjectBucketBinding
     ? createObjectBucketWorkerBindingAuthority({ sql, targetKey })
     : undefined;
+  const kvAuthority = v2KvBinding ? createKvWorkerBindingAuthority({ sql, targetKey }) : undefined;
   const sqliteBroker =
     sqliteBinding && sqliteAuthority
       ? createSelfhostV2SqliteBindingBroker({
@@ -315,6 +352,24 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           },
         })
       : undefined;
+  const kvBroker =
+    v2KvBinding && kvAuthority
+      ? createSelfhostV2KvBindingBroker({
+          store: v2KvBinding.store,
+          targetKey,
+          signingKey: v2KvBinding.signingKey,
+          async observeVersionTarget(input) {
+            try {
+              if (!restorationComplete) return { kind: "unknown" };
+              const owner = await openOwner(input.workerUid);
+              return await owner.observeVersionTarget(input);
+            } catch {
+              return { kind: "unknown" };
+            }
+          },
+          resolveCurrentBinding: kvAuthority.resolveCurrentBinding,
+        })
+      : undefined;
   const objectBucketBroker =
     v2ObjectBucketBinding && objectBucketAuthority
       ? createSelfhostV2ObjectBucketBindingBroker({
@@ -331,6 +386,14 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
             }
           },
           resolveCurrentBucketBinding: objectBucketAuthority.resolveCurrentBucketBinding,
+        })
+      : undefined;
+  const kvBoot =
+    v2KvBinding && kvBroker && kvAuthority
+      ? Object.freeze({
+          address: `127.0.0.1:${v2KvBinding.privatePort}`,
+          issueGrant: kvBroker.issueGrant,
+          resolveCurrentBinding: kvAuthority.resolveCurrentBinding,
         })
       : undefined;
   const sqliteBoot =
@@ -351,6 +414,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       : undefined;
   let sqliteServer: ReturnType<typeof Bun.serve> | undefined;
   let objectBucketServer: ReturnType<typeof Bun.serve> | undefined;
+  let kvServer: ReturnType<typeof Bun.serve> | undefined;
   const reservedPorts = new Set<number>();
   const listenerPortForOperation =
     options.listenerPortForOperation ?? (() => unusedPrivatePort(reservedPorts));
@@ -495,6 +559,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         ...(configuredInputs ? { configuredInputs } : {}),
         ...(sqliteBoot ? { v2SqliteBinding: sqliteBoot } : {}),
         ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
+        ...(kvBoot ? { v2KvBinding: kvBoot } : {}),
         workerdBinary: options.workerdBinary,
         inspectModule,
         listenerPortForOperation,
@@ -611,6 +676,33 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         throw new Error("v2 ObjectBucket private listener address changed");
       }
     }
+    if (kvBroker && v2KvBinding) {
+      kvServer = Bun.serve({
+        hostname: "127.0.0.1",
+        port: v2KvBinding.privatePort,
+        async fetch(request) {
+          let url: URL;
+          try {
+            url = new URL(request.url);
+          } catch {
+            return new Response(null, { status: 404 });
+          }
+          if (url.pathname !== SELFHOST_DATA_PLANE_KV_PATH) {
+            return new Response(null, { status: 404 });
+          }
+          return (await kvBroker.handle(request)) ?? new Response(null, { status: 404 });
+        },
+      });
+      if (kvServer.port !== v2KvBinding.privatePort) {
+        await kvServer.stop(true);
+        kvServer = undefined;
+        await sqliteServer?.stop(true);
+        sqliteServer = undefined;
+        await objectBucketServer?.stop(true);
+        objectBucketServer = undefined;
+        throw new Error("v2 KV private listener address changed");
+      }
+    }
     const restored: string[] = [];
     try {
       for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
@@ -624,6 +716,8 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       sqliteServer = undefined;
       await objectBucketServer?.stop(true);
       objectBucketServer = undefined;
+      await kvServer?.stop(true);
+      kvServer = undefined;
       throw error;
     }
     restorationComplete = true;
@@ -666,6 +760,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         inspectModule,
         ...(sqliteBoot ? { v2SqliteBinding: sqliteBoot } : {}),
         ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
+        ...(kvBoot ? { v2KvBinding: kvBoot } : {}),
         ...(configuredInputSealer && configuredInputCustody
           ? { configuredInputSealer, configuredInputCustody }
           : {}),
@@ -764,11 +859,13 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         sqliteServer = undefined;
         await objectBucketServer?.stop(true);
         objectBucketServer = undefined;
+        await kvServer?.stop(true);
+        kvServer = undefined;
       })();
       return suspension;
     },
     async closePrivateBindingServices() {
-      if (!sqliteServer && !objectBucketServer) return;
+      if (!sqliteServer && !objectBucketServer && !kvServer) return;
       // A private companion address is pinned in every live native graph.
       // Refuse to remove it while any owner still has an active/draining copy.
       for (const opening of owners.values()) await (await opening).close();
@@ -776,6 +873,8 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       sqliteServer = undefined;
       await objectBucketServer?.stop(true);
       objectBucketServer = undefined;
+      await kvServer?.stop(true);
+      kvServer = undefined;
     },
     internalFormFactory,
   };

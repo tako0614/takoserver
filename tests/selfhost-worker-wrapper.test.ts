@@ -55,6 +55,7 @@ import {
 } from "../src/providers/selfhost-worker-wrapper.ts";
 import {
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
+  WORKERD_V2_PRIVATE_KV_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
 } from "../src/providers/workerd-v2-private-binding-names.ts";
 
@@ -140,7 +141,8 @@ async function loadGenerated(
       input.bindings.some(
         (binding) =>
           "kind" in binding &&
-          binding.kind === SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND &&
+          (binding.kind === SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND ||
+            binding.kind === SELFHOST_WORKER_EDGE_KV_BINDING_KIND) &&
           "internalName" in binding,
       ),
     ),
@@ -2228,6 +2230,61 @@ test("generic and private ObjectBucket bindings use their own services in one Wo
     expect(privateRequests[0]).toBe(
       `${SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN}${SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH}`,
     );
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("generic and private KV bindings use their own services in one Worker", async () => {
+  const genericRequests: string[] = [];
+  const privateRequests: string[] = [];
+  const response = () => Response.json({ ok: true, value: {} });
+  const genericService = {
+    async fetch(url: string) {
+      genericRequests.push(url);
+      return response();
+    },
+  };
+  const privateService = {
+    async fetch(url: string) {
+      privateRequests.push(url);
+      return response();
+    },
+  };
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       await env.LEGACY.put("legacy-key", "legacy");
+       await env.CACHE.put("v2-key", "private");
+       return Response.json({ ok: true });
+     } };`,
+    {
+      ...KV_ONLY,
+      publication: "mixed-kv-services",
+      bindings: [
+        { kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND, publicName: "LEGACY" },
+        {
+          kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
+          publicName: "CACHE",
+          internalName: WORKERD_V2_PRIVATE_KV_BINDING,
+        },
+      ],
+    },
+  );
+  try {
+    const result = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(genericService, {
+        [WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING]: genericService,
+        [WORKERD_V2_PRIVATE_KV_BINDING]: privateService,
+      }),
+      context,
+    );
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({ ok: true });
+    expect(genericRequests).toHaveLength(1);
+    expect(privateRequests).toHaveLength(1);
+    expect(genericRequests[0]).toEndWith(SELFHOST_DATA_PLANE_KV_PATH);
+    expect(privateRequests[0]).toEndWith(SELFHOST_DATA_PLANE_KV_PATH);
   } finally {
     await generated.dispose();
   }

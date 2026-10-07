@@ -30,7 +30,7 @@ import {
 import {
   SELFHOST_WORKER_DATA_SERVICE_BINDING,
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
-  type SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
+  SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
   SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
   type SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
   type SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND,
@@ -43,6 +43,7 @@ import {
 import {
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
   WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+  WORKERD_V2_PRIVATE_KV_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
   workerdV2PrivateActorBindingName,
   workerdV2PrivateServiceBindingName,
@@ -125,6 +126,12 @@ export interface WorkerdVersionGraphInput {
   };
   /** Exact WorkerVersion-scoped signed grant, separate from the generic plane token. */
   readonly v2ObjectBucketBinding?: {
+    readonly address: string;
+    readonly token: string;
+    readonly bindings: readonly { readonly publicName: string }[];
+  };
+  /** Exact selected-Version signed KV grant, separate from the generic SQL plane. */
+  readonly v2KvBinding?: {
     readonly address: string;
     readonly token: string;
     readonly bindings: readonly { readonly publicName: string }[];
@@ -220,6 +227,7 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
     input.v2ObjectBucketBinding,
     v2PrivateNames,
   );
+  const v2KvBinding = projectV2KvBinding(input.v2KvBinding, v2PrivateNames);
   const serviceBindings = projectServiceBindings(input.serviceBindings);
   const actorForward = projectActorForward(input.actorForward, v2PrivateNames);
   const workflowForward = projectWorkflowForward(
@@ -262,6 +270,13 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
           kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
           publicName: binding.publicName,
           internalName: WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+        }))),
+    ...(v2KvBinding === undefined
+      ? []
+      : v2KvBinding.bindings.map((binding) => ({
+          kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
+          publicName: binding.publicName,
+          internalName: WORKERD_V2_PRIVATE_KV_BINDING,
         }))),
     ...services.map((service, index) => ({
       kind: SELFHOST_WORKER_SERVICE_BINDING_KIND,
@@ -359,7 +374,7 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
       encoder.encode(renderSelfhostWorkflowBindingRuntimeModuleSource()),
     );
   }
-  if (dataPlane !== undefined) {
+  if (dataPlane !== undefined || v2KvBinding !== undefined) {
     hostModules.set(
       SELFHOST_WORKER_DATA_SERVICE_MODULE,
       encoder.encode(selfhostDataServiceSource()),
@@ -429,6 +444,14 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
           v2ObjectBucketPlane: {
             address: v2ObjectBucketBinding.address,
             token: v2ObjectBucketBinding.token,
+          },
+        }),
+    ...(v2KvBinding === undefined
+      ? {}
+      : {
+          v2KvPlane: {
+            address: v2KvBinding.address,
+            token: v2KvBinding.token,
           },
         }),
     ...(eventToken === undefined
@@ -518,6 +541,43 @@ function projectV2ObjectBucketBinding(
     Object.keys(input).sort().join(",") !== "address,bindings,token" ||
     typeof input.address !== "string" ||
     !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(input.address) ||
+    typeof input.token !== "string" ||
+    input.token.length > 32_768 ||
+    !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/u.test(input.token) ||
+    !Array.isArray(input.bindings) ||
+    input.bindings.length === 0
+  ) {
+    invalid();
+  }
+  const seen = new Set<string>();
+  const bindings = input.bindings.map((binding) => {
+    if (
+      !isRecord(binding) ||
+      Object.keys(binding).sort().join(",") !== "publicName" ||
+      typeof binding.publicName !== "string" ||
+      !PUBLIC_VAR_NAME.test(binding.publicName) ||
+      seen.has(binding.publicName)
+    ) {
+      invalid();
+    }
+    seen.add(binding.publicName);
+    return { publicName: binding.publicName };
+  });
+  return { address: input.address, token: input.token, bindings };
+}
+
+function projectV2KvBinding(
+  input: WorkerdVersionGraphInput["v2KvBinding"],
+  v2PrivateNames: boolean,
+): WorkerdVersionGraphInput["v2KvBinding"] {
+  if (input === undefined) return undefined;
+  if (
+    !isRecord(input) ||
+    !v2PrivateNames ||
+    Object.keys(input).sort().join(",") !== "address,bindings,token" ||
+    typeof input.address !== "string" ||
+    !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(input.address) ||
+    Number(input.address.slice(input.address.lastIndexOf(":") + 1)) > 65_535 ||
     typeof input.token !== "string" ||
     input.token.length > 32_768 ||
     !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/u.test(input.token) ||
