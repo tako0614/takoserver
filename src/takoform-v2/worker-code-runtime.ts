@@ -13,6 +13,7 @@ import {
   prepareV2WorkerCodeProjection,
   V2WorkerCodeRuntimeError,
 } from "./worker-code-eligibility.ts";
+import type { V2ResolvedServiceBinding } from "./worker-service-resolution.ts";
 
 export {
   inspectV2WorkerCodeVersionEligibility,
@@ -48,6 +49,7 @@ export async function projectV2WorkerCodeVersion(input: {
   readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
   readonly inspectModule: WorkerdRuntime["inspectModule"];
   readonly privateInputs?: unknown;
+  readonly resolvedServiceBindings?: readonly V2ResolvedServiceBinding[];
   /** Non-optional private event gate capability composed by the owning Host. */
   readonly eventDelivery?: { readonly token: string };
 }): Promise<V2WorkerCodeDeploymentVariant> {
@@ -58,6 +60,12 @@ export async function projectV2WorkerCodeVersion(input: {
   }
 
   const identity = snapshotIdentity(input.identity);
+  let resolvedServiceBindings: readonly V2ResolvedServiceBinding[] | undefined;
+  try {
+    resolvedServiceBindings = input.resolvedServiceBindings?.map((binding) => ({ ...binding }));
+  } catch {
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
+  }
   const verified = await prepareV2WorkerCodeProjection({
     workerResourceUid: identity.workerResourceUid,
     bundleResourceUid: identity.bundleResourceUid,
@@ -69,6 +77,7 @@ export async function projectV2WorkerCodeVersion(input: {
     ...(input.assets === undefined ? {} : { assets: input.assets }),
     inspectModule,
     privateInputs: input.privateInputs,
+    ...(resolvedServiceBindings === undefined ? {} : { resolvedServiceBindings }),
     requireEventDelivery: true,
     ...(input.eventDelivery === undefined ? {} : { eventDelivery: input.eventDelivery }),
   });
@@ -100,6 +109,9 @@ export async function projectV2WorkerCodeVersion(input: {
     generation: identity.generation,
     workerResourceUid: identity.workerResourceUid,
     fetchHandler: spec.handlers.includes("fetch"),
+    ...(resolvedServiceBindings?.length
+      ? { serviceBindings: resolvedServiceBindings.map((binding) => ({ ...binding })) }
+      : {}),
     ...(assets && spec.assets
       ? {
           assets: {

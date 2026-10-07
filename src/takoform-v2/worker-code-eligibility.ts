@@ -17,6 +17,10 @@ import {
   type V2VerifiedAssetMaterials,
   verifyV2AssetMaterials,
 } from "./worker-material-validation.ts";
+import {
+  exactV2ResolvedServiceBindings,
+  type V2ResolvedServiceBinding,
+} from "./worker-service-resolution.ts";
 
 export type V2WorkerModuleInspector = (
   input: WorkerModuleInspectionInput,
@@ -49,6 +53,8 @@ export interface V2WorkerCodeEligibilityInput {
   readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
   readonly inspectModule: V2WorkerModuleInspector;
   readonly privateInputs?: unknown;
+  /** Supplied only after the current accepted SQL reference graph was verified. */
+  readonly resolvedServiceBindings?: readonly V2ResolvedServiceBinding[];
 }
 
 interface VerifiedV2WorkerCodeEligibility {
@@ -121,9 +127,13 @@ async function verifyV2WorkerCodeProjection(
     spec.sqliteBindings.length > 0 ||
     spec.bucketBindings.length > 0 ||
     spec.queueProducerBindings.length > 0 ||
-    spec.serviceBindings.length > 0 ||
     spec.actorBindings.length > 0 ||
     spec.workflowBindings.length > 0
+  ) {
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
+  }
+  if (
+    !(await exactV2ResolvedServiceBindings(spec.serviceBindings, input.resolvedServiceBindings))
   ) {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }

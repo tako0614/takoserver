@@ -18,6 +18,10 @@ import {
 import type { V2Execution } from "./types.ts";
 import { projectV2WorkerCodeVersion } from "./worker-code-runtime.ts";
 import type { V2WorkerPublicationResolution } from "./worker-publication-state.ts";
+import {
+  projectV2ResolvedServiceBindings,
+  v2ServiceTargetName,
+} from "./worker-service-resolution.ts";
 import { projectV2StaticWorkerVersion } from "./worker-static-runtime.ts";
 
 const OPERATION_MARKER = "takoserver-v2-operation:";
@@ -80,9 +84,7 @@ function parseOperationMarker(generation: string): string | null {
 }
 
 function scriptName(workerUid: string): Promise<string> {
-  return bytesDigest(new TextEncoder().encode(workerUid)).then(
-    (digest) => `v2-worker-${digest.slice("sha256:".length)}`,
-  );
+  return v2ServiceTargetName(workerUid);
 }
 
 function isCurrentIdentityShape(identity: WorkerdPublicationIdentity): boolean {
@@ -195,6 +197,7 @@ export function createV2WorkerPublication(options: {
       let projection: WorkerdDeploymentVariant<WorkerdSite | WorkerdStaticSite>;
       const versionSpec = parseWorkerVersionSpec(version.spec);
       if (versionSpec.bundle) {
+        const serviceBindings = await projectV2ResolvedServiceBindings(versionSpec.serviceBindings);
         const codeProjection = await projectV2WorkerCodeVersion({
           identity: {
             ...identity,
@@ -207,6 +210,7 @@ export function createV2WorkerPublication(options: {
           bundle: materials.bundle,
           assets: materials.assets,
           inspectModule,
+          ...(serviceBindings.length > 0 ? { resolvedServiceBindings: serviceBindings } : {}),
           ...(options.scheduledEventToken === undefined
             ? {}
             : { eventDelivery: { token: options.scheduledEventToken } }),
@@ -229,7 +233,12 @@ export function createV2WorkerPublication(options: {
             value: binding.value,
             type: "json" as const,
           })),
-          serviceBindings: [],
+          serviceBindings: serviceBindings.map((binding) => ({
+            publicName: binding.name,
+            target: binding.target,
+            targetResourceUid: binding.targetResourceUid,
+            unavailableToken: binding.unavailableToken,
+          })),
           hostnames: [],
           generation,
           workerResourceUid: snapshot.worker.uid,
