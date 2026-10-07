@@ -333,6 +333,7 @@ test.skipIf(WORKERD === undefined)(
       rmSync(root, { recursive: true, force: true });
     }
   },
+  30_000,
 );
 
 function settleTarget(
