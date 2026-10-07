@@ -434,6 +434,14 @@ test.skipIf(binary === undefined)(
           await Bun.sleep(10);
         }
         const shortLease = Date.now() + 180;
+        if (id === "message-late-ack" || id === "message-late-retry") {
+          // Retention applies to undelivered messages. This one is already in
+          // an exact native invocation; its ACK/default retry must complete.
+          await sql.run(
+            "UPDATE selfhost_queue_messages SET expires_at_ms = ? WHERE message_id = ?",
+            [Date.now() + 90, id],
+          );
+        }
         expect(
           (
             await sql.run(
@@ -486,24 +494,50 @@ test.skipIf(binary === undefined)(
             [Date.now() - 1, id],
           );
           expect(await custody.renewRegisteredV2BatchLeases(exactExecution)).toBe("unknown");
+          await custody.admit(
+            {
+              queueId: v2QueueId(queue.resourceUid),
+              messageRetentionSeconds: 3600,
+              deliveryDelaySeconds: 0,
+            },
+            { messageId: "expired-undelivered", body: new Uint8Array([9]) },
+          );
+          // Directly probe bounded custody maintenance: the expired sent lease
+          // must not consume its reap page and hide another ready message.
+          const [other] = await custody.claim({
+            queueId: v2QueueId(queue.resourceUid),
+            consumerId: consumer.resourceUid,
+            generation: 1,
+            limit: 1,
+          });
+          expect(other?.messageId).toBe("expired-undelivered");
+          if (!other) throw new Error("ready message hidden behind sent lease");
+          expect(await custody.release(other)).toBe(true);
           await sql.run(
             "UPDATE selfhost_queue_messages SET lease_expires_at_ms = ? WHERE message_id = ?",
             [renewedLease, id],
           );
-          // A global retention sweep is not proof of native handler completion.
+          // The oldest expired sent row must not starve a later expired
+          // undelivered row when a bounded sweep takes only one candidate.
           await sql.run(
-            "UPDATE selfhost_queue_messages SET expires_at_ms = ? WHERE message_id = ?",
-            [Date.now() - 1, id],
+            "UPDATE selfhost_queue_messages SET expires_at_ms = ? WHERE message_id = 'expired-undelivered'",
+            [Date.now() - 1],
           );
-          expect(await custody.sweepExpired(1)).toBe(0);
-          await sql.run(
-            "UPDATE selfhost_queue_messages SET expires_at_ms = ? WHERE message_id = ?",
-            [Date.now() + 3_600_000, id],
-          );
+          expect(await custody.sweepExpired(1)).toBe(1);
+          expect(
+            await sql.query("SELECT message_id FROM selfhost_queue_messages WHERE message_id = ?", [
+              id,
+            ]),
+          ).toEqual([{ message_id: id }]);
         }
         expect(await invoked).toEqual({ kind: expected });
         if (expected === "handler_rejected") {
-          expect(await queueComposition.deliverOnce(scope)).toEqual({ kind: "handler_resolved" });
+          expect(await queueComposition.deliverOnce(scope)).toEqual({ kind: "idle" });
+          expect(
+            await sql.query("SELECT message_id FROM selfhost_queue_messages WHERE message_id = ?", [
+              id,
+            ]),
+          ).toEqual([]);
         }
       }
       expect(await sql.query("SELECT count(*) AS n FROM selfhost_queue_messages")).toEqual([

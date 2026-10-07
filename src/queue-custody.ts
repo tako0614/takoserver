@@ -14,6 +14,13 @@ const MAX_TRANSFER_NOTICE_LIST = 100;
 const MAX_BATCH_TIMEOUT_SECONDS = 60;
 const MAX_SAFE_GENERATION = Number.MAX_SAFE_INTEGER;
 const SQL_NOW_MILLIS = `(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))`;
+const NO_SENT_V2_EXECUTION = `AND NOT EXISTS (
+  SELECT 1 FROM queue_v2_batch_executions execution
+  WHERE execution.queue_id = selfhost_queue_messages.queue_id
+    AND execution.consumer_uid = selfhost_queue_messages.lease_consumer_id
+    AND execution.consumer_generation = selfhost_queue_messages.lease_generation
+    AND execution.lease_token = selfhost_queue_messages.lease_token
+    AND execution.state = 'send_authorized')`;
 const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 
 export interface QueueCustodyTarget {
@@ -442,6 +449,8 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       readonly retryDelaySeconds: number;
       readonly target?: QueueCustodyDeadLetterTarget;
       readonly leaseExpiresAtMillis?: number;
+      /** Maintenance may never take a message from a sent native execution. */
+      readonly reapOnly?: boolean;
     },
     millis: number,
     providedDeadLetterId?: string,
@@ -449,6 +458,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
     const target = lease.target;
     const expirySql =
       lease.leaseExpiresAtMillis === undefined ? "" : " AND lease_expires_at_ms = ?";
+    const sentGuardSql = lease.reapOnly ? ` ${NO_SENT_V2_EXECUTION}` : "";
     const sourceParams = [
       lease.queueId,
       lease.messageId,
@@ -479,7 +489,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
              SELECT 1 FROM queue_consumer_custody
              WHERE queue_id = ? AND consumer_id = ? AND generation = ?
                AND state IN ('active', 'retiring')
-           )`,
+           )${sentGuardSql}`,
       params: sourceParams,
     };
     if (!target) return [removal];
@@ -505,7 +515,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                SELECT 1 FROM queue_consumer_custody
                WHERE queue_id = ? AND consumer_id = ? AND generation = ?
                  AND state IN ('active', 'retiring')
-             )`,
+             )${sentGuardSql}`,
         params: [deadLetterId, millis, millis, millis, ...sourceParams],
       },
       {
@@ -526,7 +536,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                SELECT 1 FROM queue_consumer_custody
                WHERE queue_id = ? AND consumer_id = ? AND generation = ?
                  AND state IN ('active', 'retiring')
-             )
+             )${sentGuardSql}
            ON CONFLICT (source_queue_id, source_consumer_id, source_generation, target_queue_id)
            DO UPDATE SET notice_token = excluded.notice_token`,
         params: [deadLetterId, ...sourceParams],
@@ -562,6 +572,12 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
        FROM selfhost_queue_messages AS message INDEXED BY selfhost_queue_messages_custody_lease
        WHERE queue_id = ? AND lease_consumer_id = ? AND lease_generation = ?
          AND lease_expires_at_ms <= ?
+         AND NOT EXISTS (SELECT 1 FROM queue_v2_batch_executions protected
+           WHERE protected.queue_id = message.queue_id
+             AND protected.consumer_uid = message.lease_consumer_id
+             AND protected.consumer_generation = message.lease_generation
+             AND protected.lease_token = message.lease_token
+             AND protected.state = 'send_authorized')
        ORDER BY lease_expires_at_ms LIMIT ?`,
       [identity.queueId, identity.consumerId, identity.generation, millis, limit],
     );
@@ -617,7 +633,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                  SELECT 1 FROM queue_consumer_custody
                  WHERE queue_id = ? AND consumer_id = ? AND generation = ?
                    AND state IN ('active', 'retiring')
-               )`,
+               ) ${NO_SENT_V2_EXECUTION}`,
           params: [...snapshotParams.slice(0, 15), millis, ...snapshotParams.slice(15)],
         });
         continue;
@@ -689,7 +705,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                  SELECT 1 FROM queue_consumer_custody
                  WHERE queue_id = ? AND consumer_id = ? AND generation = ?
                    AND state IN ('active', 'retiring')
-               )`,
+               ) ${NO_SENT_V2_EXECUTION}`,
           params: [retryAt, ...snapshotParams.slice(0, 15), millis, ...snapshotParams.slice(15)],
         });
         continue;
@@ -707,6 +723,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
             retryDelaySeconds,
             ...(target ? { target } : {}),
             leaseExpiresAtMillis: leaseExpiresAt,
+            reapOnly: true,
           },
           millis,
         ),
@@ -1711,12 +1728,10 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       // was reclaimed or expired, no member of this batch is silently revived.
       const updated = await sql.run(
         `UPDATE selfhost_queue_messages AS message
-         SET lease_expires_at_ms = MIN(message.expires_at_ms,
-           MAX(message.lease_expires_at_ms, ${SQL_NOW_MILLIS} + ?))
+         SET lease_expires_at_ms = MAX(message.lease_expires_at_ms, ${SQL_NOW_MILLIS} + ?)
          WHERE message.queue_id = ? AND message.lease_consumer_id = ?
            AND message.lease_generation = ?
            AND message.lease_expires_at_ms > ${SQL_NOW_MILLIS}
-           AND message.expires_at_ms > ${SQL_NOW_MILLIS}
            AND EXISTS (SELECT 1 FROM queue_v2_batch_executions execution
              WHERE execution.batch_id = ? AND execution.reservation_token = ?
                AND execution.queue_id = ? AND execution.consumer_uid = ?
@@ -1742,8 +1757,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                      AND live.lease_token = pending.lease_token
                      AND live.lease_consumer_id = pending.consumer_id
                      AND live.lease_generation = pending.generation
-                     AND live.lease_expires_at_ms > ${SQL_NOW_MILLIS}
-                     AND live.expires_at_ms > ${SQL_NOW_MILLIS}))
+                     AND live.lease_expires_at_ms > ${SQL_NOW_MILLIS}))
            AND EXISTS (SELECT 1 FROM queue_v2_batch_settlements receipt
              WHERE receipt.batch_id = ? AND receipt.queue_id = message.queue_id
                AND receipt.consumer_id = message.lease_consumer_id
@@ -1818,8 +1832,14 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       const rows = await sql.query(
         `SELECT queue_id, message_id, enqueued_at_ms, visible_at_ms, expires_at_ms,
                 deliveries, lease_token, lease_expires_at_ms
-         FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_expiry
+         FROM selfhost_queue_messages AS message INDEXED BY selfhost_queue_messages_expiry
          WHERE expires_at_ms <= ?
+           AND NOT EXISTS (SELECT 1 FROM queue_v2_batch_executions protected
+             WHERE protected.queue_id = message.queue_id
+               AND protected.consumer_uid = message.lease_consumer_id
+               AND protected.consumer_generation = message.lease_generation
+               AND protected.lease_token = message.lease_token
+               AND protected.state = 'send_authorized')
          ORDER BY expires_at_ms LIMIT ?`,
         [millis, limit],
       );
