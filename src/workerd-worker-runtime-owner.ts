@@ -477,6 +477,9 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
       readonly workflowForwardSockets: (
         publications: readonly WorkerdWorkflowForwardPublication[],
       ) => readonly WorkerdWorkflowForwardSocket[];
+      readonly issueBinding: NonNullable<
+        Parameters<typeof createV2WorkerPublication>[0]["v2WorkflowForward"]
+      >["issueBinding"];
       close(): Promise<void>;
     };
   };
@@ -2747,6 +2750,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       ...(v2KvBinding ? { v2KvBinding } : {}),
       ...(v2QueueProducerBinding ? { v2QueueProducerBinding } : {}),
       ...(actorForward ? { v2ActorForward: actorForward } : {}),
+      ...(workflowForward ? { v2WorkflowForward: workflowForward } : {}),
       ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
     });
     const handle: IncarnationHandle = {
