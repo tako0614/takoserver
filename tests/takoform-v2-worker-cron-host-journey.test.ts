@@ -186,7 +186,7 @@ async function tick(origin: string, at: number) {
 
 async function effects(
   root: string,
-): Promise<{ pid: number; cron: string; scheduledTime: number }[]> {
+): Promise<{ pid: number; cron: string; scheduledTime: number; moduleMarker: string }[]> {
   try {
     return (await readFile(join(root, "scheduled-effects.jsonl"), "utf8"))
       .trim()
@@ -199,13 +199,15 @@ async function effects(
   }
 }
 
-// The executable is a Bun stand-in for the native workerd child. It parses the
-// owner-generated private event gate, runs its scheduled function, and writes a
-// customer-handler side effect before sending the exact owner ACK. No callback
-// in the Host fixture fabricates a delivery result.
+// The executable is a Bun stand-in for native workerd. It uses the rendered
+// config's runtime root and the existing exact active-Version byte reader,
+// imports the digest-verified application module, and calls its scheduled
+// export behind the owner's private event gate. It does not qualify native ABI.
 const CHILD = String.raw`
 import { appendFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
+import { readWorkerdSelectedActiveVersion } from ${JSON.stringify(new URL("../src/workerd-runtime.ts", import.meta.url).pathname)};
 const [verb, watch, configPath] = process.argv.slice(-3);
 if (verb !== "serve" || watch !== "--watch" || !configPath) throw new Error("bad child command");
 function identity() {
@@ -218,16 +220,35 @@ function identity() {
   return { port: Number(port), generation, token, eventToken };
 }
 const root = dirname(process.argv[1]);
-const handler = { async scheduled(event) {
-  appendFileSync(join(root, "scheduled-effects.jsonl"), JSON.stringify({ pid: process.pid, cron: event.cron, scheduledTime: event.scheduledTime }) + "\n");
-  const hang = join(root, "hang-next-event");
-  if (existsSync(hang)) { rmSync(hang); await new Promise(() => {}); }
-  const reject = join(root, "reject-next-event");
-  if (existsSync(reject)) { rmSync(reject); throw new Error("fixture scheduled handler rejected"); }
-  const unknown = join(root, "unknown-next-event");
-  if (existsSync(unknown)) { rmSync(unknown); return "unknown_ack"; }
-  return "ack";
-} };
+const runtimeRoot = dirname(dirname(configPath));
+async function selectedHandler(event) {
+  const workerUid = readFileSync(join(root, "worker-resource-uid"), "utf8").trim();
+  const expectedScript = "v2-worker-" + createHash("sha256").update(workerUid).digest("hex");
+  if (event.logicalWorkerId !== expectedScript) return null;
+  const selected = await readWorkerdSelectedActiveVersion(runtimeRoot, event.logicalWorkerId, {
+    expectedWorkerResourceUid: workerUid,
+    basisPoint: 0,
+  });
+  if (!selected || selected.versionId !== event.deploymentId) return null;
+  const moduleBytes = selected.modules.get(selected.site.mainModule);
+  if (!moduleBytes) return null;
+  const digest = createHash("sha256").update(moduleBytes).digest("hex");
+  if (digest !== readFileSync(join(root, "module-sha256"), "utf8").trim()) return null;
+  const loaded = await import("data:text/javascript;base64," + Buffer.from(moduleBytes).toString("base64"));
+  return typeof loaded.default?.scheduled === "function" ? loaded.default.scheduled : null;
+}
+const env = Object.freeze({
+  async record(effect) {
+    appendFileSync(join(root, "scheduled-effects.jsonl"), JSON.stringify({ pid: process.pid, ...effect }) + "\n");
+  },
+  async consumeMode(mode) {
+    if (!new Set(["hang", "reject", "unknown"]).has(mode)) throw new Error("invalid fixture mode");
+    const path = join(root, mode + "-next-event");
+    if (!existsSync(path)) return false;
+    rmSync(path);
+    return true;
+  },
+});
 const server = Bun.serve({ hostname: "127.0.0.1", port: identity().port, async fetch(request) {
   const current = identity();
   const url = new URL(request.url);
@@ -240,8 +261,12 @@ const server = Bun.serve({ hostname: "127.0.0.1", port: identity().port, async f
     url.pathname === "/.well-known/takoserver/managed-worker-events/v1") {
     if (!current.eventToken || request.headers.get("x-takoserver-selfhost-event-token") !== current.eventToken) return new Response(null, { status: 404 });
     const event = await request.json();
+    let handler;
+    try { handler = await selectedHandler(event); }
+    catch { return new Response(null, { status: 503 }); }
+    if (!handler) return new Response(null, { status: 503 });
     let result;
-    try { result = await handler.scheduled(event); }
+    try { result = await handler(event, env, { waitUntil() { throw new Error("waitUntil not qualified by Bun stand-in"); } }); }
     catch { return Response.json({ protocol: "takoserver.managed-worker-event@v1", kind: "schedule", outcome: "rejected" }, { status: 500 }); }
     if (result === "unknown_ack") return Response.json({ ok: true });
     return Response.json({ protocol: "takoserver.managed-worker-event@v1", kind: "schedule", outcome: "ack" });
@@ -256,7 +281,15 @@ test(
   async () => {
     const root = await mkdtemp(join(tmpdir(), "v2-cron-host-"));
     const binary = join(root, "bun-workerd-stand-in.js");
-    const moduleBytes = new TextEncoder().encode("export default { scheduled() {} };\n");
+    const moduleBytes = new TextEncoder().encode(`export default {
+  async scheduled(event, env) {
+    await env.record({ cron: event.cron, scheduledTime: event.scheduledTime, moduleMarker: "held-module-scheduled-v1" });
+    if (await env.consumeMode("hang")) await new Promise(() => {});
+    if (await env.consumeMode("reject")) throw new Error("fixture scheduled handler rejected");
+    if (await env.consumeMode("unknown")) return "unknown_ack";
+    return "ack";
+  },
+};\n`);
     const moduleSha = (await bytesDigest(moduleBytes)).slice(7);
     const manifestBytes = new TextEncoder().encode(
       JSON.stringify({
@@ -278,10 +311,12 @@ test(
     try {
       await writeFile(binary, `#!${process.execPath}\n${CHILD}`, { mode: 0o700 });
       await chmod(binary, 0o700);
+      await writeFile(join(root, "module-sha256"), moduleSha);
       await objects.put("cron/manifest", manifestBytes);
       await objects.put("cron/index.js", moduleBytes);
       first = await startHost(root, binary, null, manifestSha, moduleSha);
       const worker = await create(first.origin, MODULE_WORKER_FORM_URL, "cron-worker", {});
+      await writeFile(join(root, "worker-resource-uid"), worker.resourceUid);
       const bundle = await create(first.origin, WORKER_BUNDLE_FORM_URL, "cron-bundle", {
         artifact: { url: MANIFEST_URL, sha256: manifestSha },
       });
@@ -305,7 +340,9 @@ test(
       // Only a future minute may be newly recorded after the accepted operation.
       const minute = Math.floor(Date.now() / 60_000) * 60_000 + 60_000;
       await writeFile(join(root, "hang-next-event"), "1");
-      const pendingTick = fetch(`${first.origin}/__fixture/tick?at=${minute + 2_000}`);
+      const pendingTick = fetch(`${first.origin}/__fixture/tick?at=${minute + 2_000}`).catch(
+        () => null,
+      );
       for (let attempt = 0; attempt < 1_000 && (await effects(root)).length === 0; attempt += 1)
         await Bun.sleep(10);
       expect(await effects(root)).toHaveLength(1);
@@ -320,7 +357,7 @@ test(
       const firstPid = first.child.pid;
       await first.close();
       first = undefined;
-      await pendingTick.catch(() => undefined);
+      await pendingTick;
 
       // Source is no longer available to this Host: Version/Bundle and serving
       // child must recover solely from exact held custody and accepted SQL state.
@@ -371,29 +408,41 @@ test(
         { cron: "* * * * *", scheduledTime: minute },
       ]);
       expect(retriedEffects[0]?.pid).not.toBe(retriedEffects[1]?.pid);
+      expect(retriedEffects.map((effect) => effect.moduleMarker)).toEqual([
+        "held-module-scheduled-v1",
+        "held-module-scheduled-v1",
+      ]);
 
       await update(
         second.origin,
         cron.resourceUid,
-        { worker: { resourceUid: worker.resourceUid }, cron: "*/1 * * * *" },
+        { worker: { resourceUid: worker.resourceUid }, cron: "*/2 * * * *" },
         1,
         "cron-future-update",
       );
+      const oldOnlyMinute =
+        minute + (new Date(minute).getUTCMinutes() % 2 === 0 ? 60_000 : 120_000);
+      expect(new Date(oldOnlyMinute).getUTCMinutes() % 2).toBe(1);
+      expect(await tick(second.origin, oldOnlyMinute + 1_000)).toMatchObject({
+        recorded: 0,
+        claimed: 0,
+      });
+      expect(await matches(second.origin)).toHaveLength(1);
       await writeFile(join(root, "reject-next-event"), "1");
-      const nextMinute = minute + 60_000;
+      const nextMinute = oldOnlyMinute + 60_000;
       expect(await tick(second.origin, nextMinute + 1_000)).toMatchObject({
         recorded: 1,
         claimed: 1,
         rejected: 1,
       });
       expect((await matches(second.origin))[1]).toMatchObject({
-        cron: "*/1 * * * *",
+        cron: "*/2 * * * *",
         state: "rejected",
         attempts: 1,
         result_version_uid: version.resourceUid,
       });
       await writeFile(join(root, "unknown-next-event"), "1");
-      const pendingMinute = nextMinute + 60_000;
+      const pendingMinute = nextMinute + 120_000;
       expect(await tick(second.origin, pendingMinute + 1_000)).toMatchObject({
         recorded: 1,
         claimed: 1,
@@ -401,7 +450,7 @@ test(
       });
       const beforeDelete = await matches(second.origin);
       expect(beforeDelete).toHaveLength(3);
-      expect(beforeDelete[2]).toMatchObject({ cron: "*/1 * * * *", state: "pending", attempts: 1 });
+      expect(beforeDelete[2]).toMatchObject({ cron: "*/2 * * * *", state: "pending", attempts: 1 });
       const deletion = await request(
         second.origin,
         `/resources/${cron.resourceUid}`,
@@ -436,7 +485,11 @@ test(
         claimed: 0,
       });
       expect(await matches(second.origin)).toHaveLength(3);
-      expect(await effects(root)).toHaveLength(5);
+      const allEffects = await effects(root);
+      expect(allEffects).toHaveLength(5);
+      expect(allEffects.every((effect) => effect.moduleMarker === "held-module-scheduled-v1")).toBe(
+        true,
+      );
       expect((await request(second.origin, `/resources/${deployment.resourceUid}`)).status).toBe(
         200,
       );

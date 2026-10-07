@@ -2,6 +2,7 @@
 // a native workerd qualification, or a public scheduled-delivery endpoint.
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
+import { bytesDigest } from "../../src/json.ts";
 import { migrateSqlite } from "../../src/migrate-sqlite.ts";
 import { createFileObjectStore } from "../../src/objects-fs.ts";
 import { createSqliteSql } from "../../src/sql-sqlite.ts";
@@ -83,18 +84,19 @@ async function main(): Promise<void> {
   type Owner = Awaited<ReturnType<typeof openWorkerdWorkerRuntimeOwner>>;
   const owners = new Map<string, Owner>();
 
-  // The fixture inspector recognizes only the exact held module used below.
-  // It is not a substitute for the production module semantic inspector.
+  // The fixture inspector recognizes only the exact held module digest. The
+  // subprocess below independently executes that module from verified active
+  // publication bytes; neither part qualifies production semantic inspection.
   const inspectModule = async (input: {
     readonly mainModule: string;
     readonly modules: readonly { readonly name: string; readonly bytes: Uint8Array }[];
     readonly declaredHandlers: readonly string[];
   }) => {
     const module = input.modules.find((item) => item.name === input.mainModule);
-    const code = module ? new TextDecoder("utf-8", { fatal: true }).decode(module.bytes) : "";
     return input.declaredHandlers.length === 1 &&
       input.declaredHandlers[0] === "scheduled" &&
-      code === "export default { scheduled() {} };\n"
+      module !== undefined &&
+      (await bytesDigest(module.bytes)) === `sha256:${moduleSha256}`
       ? { outcome: "valid" as const, exportedHandlers: ["scheduled" as const] }
       : { outcome: "invalid" as const, error: "handler_not_exported" as const };
   };
