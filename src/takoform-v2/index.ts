@@ -12,6 +12,20 @@ export {
   type V2ConfiguredPrivateInputs,
 } from "./configured-private-inputs.ts";
 export {
+  EDGE_KV_NAMESPACE_FORM_URL,
+  EDGE_KV_NAMESPACE_LIMITS,
+  EdgeKVNamespaceValidationError,
+  parseEdgeKVNamespaceSpec,
+  validateEdgeKVNamespaceUpdate,
+} from "./forms/edge-kv-namespace.ts";
+export {
+  createEdgeKVNamespaceForm,
+  EDGE_KV_NAMESPACE_BACKEND_ID,
+  type EdgeKVNamespaceFormOptions,
+  type EdgeKVNamespaceIdentity,
+  type EdgeKVNamespaceStore,
+} from "./forms/edge-kv-namespace-backend.ts";
+export {
   referencesForModuleWorker,
   referencesForWorkerDeployment,
   referencesForWorkerEndpoint,
