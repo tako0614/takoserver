@@ -71,6 +71,57 @@ function unknown(code: string): V2BackendResult {
   return { kind: "unknown", code, message: code };
 }
 
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function canonicalComplete(
+  result: Extract<V2BackendResult, { kind: "complete" }>,
+  action: V2Execution["action"],
+): boolean {
+  const { observed, output } = result;
+  return (
+    plainRecord(observed) &&
+    Reflect.ownKeys(observed).length === 5 &&
+    Object.keys(observed).length === 5 &&
+    observed.namespaceExists === (action !== "delete") &&
+    observed.maxKeyBytes === EDGE_KV_NAMESPACE_LIMITS.maxKeyBytes &&
+    observed.maxValueBytes === EDGE_KV_NAMESPACE_LIMITS.maxValueBytes &&
+    observed.maxMetadataBytes === EDGE_KV_NAMESPACE_LIMITS.maxMetadataBytes &&
+    observed.consistency === EDGE_KV_NAMESPACE_LIMITS.consistency &&
+    plainRecord(output) &&
+    Reflect.ownKeys(output).length === 0
+  );
+}
+
+const EXECUTION_SCOPE_FIELDS = [
+  "operationId",
+  "leaseToken",
+  "backendKey",
+  "backendId",
+  "targetKey",
+  "resourceUid",
+  "principal",
+  "action",
+  "generation",
+  "form",
+  "space",
+  "name",
+] as const;
+
+function captureExecutionScope(input: V2Execution) {
+  return EXECUTION_SCOPE_FIELDS.map((field) => input[field]);
+}
+
+function executionScopeUnchanged(
+  input: V2Execution,
+  captured: ReturnType<typeof captureExecutionScope>,
+): boolean {
+  return EXECUTION_SCOPE_FIELDS.every((field, index) => input[field] === captured[index]);
+}
+
 export type EdgeKVNamespaceFormOptions =
   | {
       readonly store: EdgeKVNamespaceStore;
@@ -189,23 +240,27 @@ export function createEdgeKVNamespaceForm(options: EdgeKVNamespaceFormOptions): 
     input.targetKey === targetKey &&
     implementationUnchanged();
 
-  const execute = async (input: V2Execution): Promise<V2BackendResult> => {
+  const invoke = async (
+    input: V2Execution,
+    method: V2Backend["execute"],
+  ): Promise<V2BackendResult> => {
     if (!permitted(input)) return unknown("ownership_uncertain");
+    const scope = captureExecutionScope(input);
+    const action = input.action;
     try {
-      return await dispatch(input);
+      const result = await method(input);
+      if (!permitted(input) || !executionScopeUnchanged(input, scope))
+        return unknown("ownership_uncertain");
+      if (result.kind === "complete" && !canonicalComplete(result, action))
+        return unknown("edge_kv_invalid_complete");
+      return result;
     } catch {
       return unknown("edge_kv_backend_unavailable");
     }
   };
 
-  const reconcile = async (input: V2Execution): Promise<V2BackendResult> => {
-    if (!permitted(input)) return unknown("ownership_uncertain");
-    try {
-      return await reconcileDispatch(input);
-    } catch {
-      return unknown("edge_kv_backend_unavailable");
-    }
-  };
+  const execute = (input: V2Execution) => invoke(input, dispatch);
+  const reconcile = (input: V2Execution) => invoke(input, reconcileDispatch);
 
   return {
     validateCreate(spec) {

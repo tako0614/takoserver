@@ -23,7 +23,7 @@ import {
   parseEdgeKVNamespaceSpec,
   validateEdgeKVNamespaceUpdate,
 } from "../src/takoform-v2/index.ts";
-import type { V2Backend, V2Execution } from "../src/takoform-v2/types.ts";
+import type { V2Backend, V2BackendResult, V2Execution } from "../src/takoform-v2/types.ts";
 
 function fixture() {
   const rootPromise = mkdtemp(join(tmpdir(), "takoserver-v2-edge-kv-"));
@@ -409,7 +409,17 @@ test("EdgeKVNamespace native backend receives the full fenced execution and refu
     targetKey: "private-target",
     async execute(input) {
       delivered.push(input);
-      return { kind: "complete", observed: { namespaceExists: true }, output: {} };
+      return {
+        kind: "complete",
+        observed: {
+          namespaceExists: true,
+          maxKeyBytes: 467,
+          maxValueBytes: 26214400,
+          maxMetadataBytes: 1024,
+          consistency: "eventual",
+        },
+        output: {},
+      };
     },
     async reconcile(input) {
       delivered.push(input);
@@ -462,6 +472,140 @@ test("EdgeKVNamespace native backend receives the full fenced execution and refu
   };
   expect(await form.backend.execute(execution)).toEqual(refused);
   expect(delivered).toHaveLength(2);
+});
+
+test("EdgeKVNamespace native completion requires exact observed facts and empty output", async () => {
+  const validObserved = {
+    namespaceExists: true,
+    maxKeyBytes: 467,
+    maxValueBytes: 26214400,
+    maxMetadataBytes: 1024,
+    consistency: "eventual",
+  };
+  let result: V2BackendResult = { kind: "complete", observed: validObserved, output: {} };
+  const backend: V2Backend = {
+    id: "private-v2-wfp-edge-kv-namespace-v1",
+    targetKey: "private-target",
+    async execute() {
+      return result;
+    },
+    async reconcile() {
+      return result;
+    },
+  };
+  const form = createEdgeKVNamespaceForm({ backend, targetKey: "private-target" });
+  const execution: V2Execution = {
+    operationId: "native-proof-op",
+    leaseToken: "native-proof-lease",
+    backendKey: "native-proof-key",
+    backendId: backend.id,
+    targetKey: backend.targetKey,
+    resourceUid: "native-proof-uid",
+    principal: "alice",
+    action: "create",
+    generation: 1,
+    form: EDGE_KV_NAMESPACE_FORM_URL,
+    space: "default",
+    name: "cache",
+    spec: {},
+    previousObserved: {},
+    previousOutput: {},
+  };
+  expect(await form.backend.execute(execution)).toEqual(result);
+  expect(await form.backend.reconcile(execution)).toEqual(result);
+  const invalid = {
+    kind: "unknown",
+    code: "edge_kv_invalid_complete",
+    message: "edge_kv_invalid_complete",
+  } as const;
+  for (const malformed of [
+    { kind: "complete", observed: { namespaceExists: true }, output: {} },
+    { kind: "complete", observed: { ...validObserved, maxKeyBytes: 468 }, output: {} },
+    { kind: "complete", observed: { ...validObserved, extra: 1 }, output: {} },
+    { kind: "complete", observed: validObserved, output: { token: "not-an-output" } },
+    { kind: "complete", observed: { ...validObserved, namespaceExists: false }, output: {} },
+  ] as V2BackendResult[]) {
+    result = malformed;
+    expect(await form.backend.execute(execution)).toEqual(invalid);
+    expect(await form.backend.reconcile(execution)).toEqual(invalid);
+  }
+  result = { kind: "complete", observed: { ...validObserved, namespaceExists: false }, output: {} };
+  const deletion = { ...execution, action: "delete" as const };
+  expect(await form.backend.execute(deletion)).toEqual(result);
+  expect(await form.backend.reconcile(deletion)).toEqual(result);
+  result = { kind: "complete", observed: validObserved, output: {} };
+  expect(await form.backend.execute(deletion)).toEqual(invalid);
+  expect(await form.backend.reconcile(deletion)).toEqual(invalid);
+  result = { kind: "no_effect", code: "native_no_effect", message: "native_no_effect" };
+  expect(await form.backend.execute(execution)).toEqual(result);
+  result = { kind: "unknown", code: "native_unknown" };
+  expect(await form.backend.reconcile(execution)).toEqual(result);
+});
+
+test("EdgeKVNamespace refuses native results after backend or accepted scope changes in flight", async () => {
+  const complete: V2BackendResult = {
+    kind: "complete",
+    observed: {
+      namespaceExists: true,
+      maxKeyBytes: 467,
+      maxValueBytes: 26214400,
+      maxMetadataBytes: 1024,
+      consistency: "eventual",
+    },
+    output: {},
+  };
+  const refused = {
+    kind: "unknown",
+    code: "ownership_uncertain",
+    message: "ownership_uncertain",
+  } as const;
+  for (const mutation of [
+    "backend-id",
+    "backend-target",
+    "backend-method",
+    "accepted-action",
+    "accepted-form",
+  ] as const) {
+    let release!: (result: V2BackendResult) => void;
+    const pendingAnswer = new Promise<V2BackendResult>((resolve) => {
+      release = resolve;
+    });
+    const backend: V2Backend = {
+      id: "private-v2-wfp-edge-kv-namespace-v1",
+      targetKey: "private-target",
+      execute: async () => pendingAnswer,
+      reconcile: async () => pendingAnswer,
+    };
+    const form = createEdgeKVNamespaceForm({ backend, targetKey: "private-target" });
+    const execution: V2Execution = {
+      operationId: "native-in-flight-op",
+      leaseToken: "native-in-flight-lease",
+      backendKey: "native-in-flight-key",
+      backendId: backend.id,
+      targetKey: backend.targetKey,
+      resourceUid: "native-in-flight-uid",
+      principal: "alice",
+      action: "create",
+      generation: 1,
+      form: EDGE_KV_NAMESPACE_FORM_URL,
+      space: "default",
+      name: "cache",
+      spec: {},
+      previousObserved: {},
+      previousOutput: {},
+    };
+    const returned =
+      mutation === "backend-target" || mutation === "accepted-form"
+        ? form.backend.reconcile(execution)
+        : form.backend.execute(execution);
+    if (mutation === "backend-id") backend.id = "changed-backend";
+    if (mutation === "backend-target") backend.targetKey = "changed-target";
+    if (mutation === "backend-method") backend.execute = async () => complete;
+    if (mutation === "accepted-action") execution.action = "delete";
+    if (mutation === "accepted-form") execution.form = "foreign-form";
+    release(complete);
+    expect(await returned).toEqual(refused);
+  }
 });
 
 test("EdgeKVNamespace rejects mixed or malformed native backend composition", async () => {
