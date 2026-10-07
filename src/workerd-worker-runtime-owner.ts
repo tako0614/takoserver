@@ -11,6 +11,7 @@ import {
   realpath,
   rename,
   rm,
+  rmdir,
   stat,
   unlink,
 } from "node:fs/promises";
@@ -60,6 +61,7 @@ import type { V2CodeConfiguredInputReader } from "./takoform-v2/worker-lifecycle
 import type {
   V2WorkerPublicationResolution,
   V2WorkerPublicationSnapshot,
+  V2WorkerVersionMaterials,
 } from "./takoform-v2/worker-publication-state.ts";
 import {
   createV2WorkerPublication,
@@ -76,10 +78,15 @@ import type {
   HostedWorkerdRuntime,
   WorkerdActiveActorGraph,
   WorkerdActorForwardSocket,
+  WorkerdPrivateServiceLease,
   WorkerdPublicationIdentity,
   WorkerdRuntime,
+  WorkerdSelectedActiveVersion,
   WorkerdSite,
   WorkerdStaticSite,
+  WorkerdWorkflowForwardLifecycle,
+  WorkerdWorkflowForwardPublication,
+  WorkerdWorkflowForwardSocket,
 } from "./workerd-runtime.ts";
 import {
   createWorkerdRuntime,
@@ -116,6 +123,7 @@ const LOCK_MAX_BYTES = 2_048;
 const RECOVERY_PREFIX = ".runtime-owner-recovery.";
 const ENDPOINT_HOSTNAME =
   /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/u;
+const PRIVATE_SOCKET_NAME = /^[0-9a-f]{64}\.sock$/u;
 
 type PublicationState = {
   resolve(input: {
@@ -132,6 +140,7 @@ type PublicationState = {
         readonly kind: "ready";
         readonly snapshot: V2WorkerPublicationSnapshot;
         stillCurrent(): Promise<boolean>;
+        readVersionMaterials?(versionUid: string): Promise<V2WorkerVersionMaterials>;
       }
     | { readonly kind: "unresolved"; readonly code: string; readonly message: string }
   >;
@@ -204,13 +213,18 @@ interface IncarnationHandle {
   readonly runtime: HostedWorkerdRuntime;
   readonly publication: ReturnType<typeof createV2WorkerPublication>;
   readonly actorForward?: V2ActorForwardIncarnation;
+  readonly workflowForward?: V2WorkflowForwardIncarnation;
   readonly invocations: Set<ActiveInvocation>;
+  readonly workflowLeases: Set<Promise<void>>;
   retirementTimer?: () => void;
   retiring?: Promise<WorkerdWorkerRetirementReceipt>;
 }
 
 type V2ActorForwardIncarnation = NonNullable<
   ReturnType<NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2ActorForward"]>["openIncarnation"]>
+>;
+type V2WorkflowForwardIncarnation = ReturnType<
+  NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2WorkflowForward"]>["openIncarnation"]
 >;
 
 export class WorkerdWorkerRuntimeOwnerError extends Error {
@@ -268,6 +282,23 @@ export interface WorkerdWorkerRuntimeOwner {
         readonly graph: WorkerdActiveActorGraph;
       }
     | { readonly kind: "unknown" }
+  >;
+  /** Exact active code Version and private Service bridge for one Workflow run. */
+  selectWorkflowExecution(input: {
+    readonly workerUid: string;
+    readonly targetKey: string;
+    readonly servingSourceOperationId: string;
+    readonly basisPoint: number;
+  }): Promise<
+    | { readonly kind: "unknown" }
+    | {
+        readonly kind: "selected";
+        readonly sourceOperationId: string;
+        readonly incarnationId: string;
+        readonly selected: WorkerdSelectedActiveVersion<WorkerdSite>;
+        stillCurrent(): Promise<boolean>;
+        acquirePrivateServiceBindings(signal: AbortSignal): Promise<WorkerdPrivateServiceLease>;
+      }
   >;
   /** Neutral exact native Version proof; SQL and binding authority remain with each caller. */
   observeVersionTarget(input: {
@@ -425,6 +456,22 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
   readonly workerResourceUid: string;
   readonly targetKey: string;
   readonly publicationState: PublicationState;
+  /** Exact per-incarnation private Workflow broker; no tenant-provided socket paths. */
+  readonly v2WorkflowForward?: {
+    openIncarnation(input: {
+      readonly workerUid: string;
+      readonly sourceOperationId: string;
+      readonly scriptName: string;
+      /** Persisted private owner credential, never exposed in tenant config. */
+      readonly eventToken: string;
+    }): {
+      readonly workflowForwardLifecycle: WorkerdWorkflowForwardLifecycle;
+      readonly workflowForwardSockets: (
+        publications: readonly WorkerdWorkflowForwardPublication[],
+      ) => readonly WorkerdWorkflowForwardSocket[];
+      close(): Promise<void>;
+    };
+  };
   /** Exact Resource-owned configured input reader, shared with Version eligibility. */
   readonly configuredInputs?: V2CodeConfiguredInputReader;
   /** Boot-composed Host-private settlement plane; no tenant input or use-time fallback. */
@@ -2084,6 +2131,98 @@ export async function openWorkerdWorkerRuntimeOwner(
   if (!ownerInfo?.isDirectory() || ownerInfo.isSymbolicLink() || (ownerInfo.mode & 0o077) !== 0)
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
 
+  // Linux's Unix-domain path limit excludes the ordinary (possibly very long)
+  // execution-copy root. This namespace is deterministic only within the exact
+  // owner lock; a pre-existing path is never adopted for a new incarnation.
+  const privateSocketDirectoryFor = (operationId: string): string =>
+    join(
+      "/tmp",
+      `tw-${createHash("sha256")
+        .update(canonicalRoot)
+        .update("\u0000")
+        .update(options.workerResourceUid)
+        .update("\u0000")
+        .update(operationId)
+        .digest("hex")
+        .slice(0, 20)}`,
+    );
+  const verifyPrivateSocketDirectory = async (path: string): Promise<void> => {
+    const info = await lstat(path).catch(() => null);
+    if (
+      !info?.isDirectory() ||
+      info.isSymbolicLink() ||
+      info.uid !== process.getuid?.() ||
+      (info.mode & 0o777) !== 0o700 ||
+      (await realpath(path)) !== path
+    )
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  };
+  const preparePrivateSockets = async (
+    operationId: string,
+    recoveryConfiguration?: Uint8Array,
+  ): Promise<string> => {
+    const path = privateSocketDirectoryFor(operationId);
+    if (recoveryConfiguration === undefined) {
+      await mkdir(path, { mode: 0o700 }).catch(() => {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      });
+    } else {
+      await mkdir(path, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "EEXIST") throw error;
+      });
+    }
+    await verifyPrivateSocketDirectory(path);
+    const entries = await readdir(path);
+    if (recoveryConfiguration !== undefined) {
+      const config = new TextDecoder().decode(recoveryConfiguration);
+      for (const entry of entries) {
+        const socket = join(path, entry);
+        const info = await lstat(socket).catch(() => null);
+        if (
+          !PRIVATE_SOCKET_NAME.test(entry) ||
+          !config.includes(`address = "unix:${socket}"`) ||
+          !info?.isSocket() ||
+          info.isSymbolicLink() ||
+          info.uid !== process.getuid?.()
+        )
+          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      // The recorded child was already proved absent by recovery. Remove only
+      // its exact config-declared socket files before a new runtime pins them.
+      for (const entry of entries) await unlink(join(path, entry));
+    } else if (entries.length !== 0) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    return path;
+  };
+  const releasePrivateSockets = async (
+    operationId: string,
+    configuration: Uint8Array,
+  ): Promise<void> => {
+    const path = privateSocketDirectoryFor(operationId);
+    const info = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!info) return; // Legacy incarnations had no private Service namespace.
+    await verifyPrivateSocketDirectory(path);
+    const config = new TextDecoder().decode(configuration);
+    for (const entry of await readdir(path)) {
+      const socket = join(path, entry);
+      const socketInfo = await lstat(socket).catch(() => null);
+      if (
+        !PRIVATE_SOCKET_NAME.test(entry) ||
+        !config.includes(`address = "unix:${socket}"`) ||
+        !socketInfo?.isSocket() ||
+        socketInfo.isSymbolicLink() ||
+        socketInfo.uid !== process.getuid?.()
+      )
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      await unlink(socket);
+    }
+    await rmdir(path);
+  };
+
   const lockPath = join(directory, LOCK_NAME);
   const statePath = join(directory, STATE_NAME);
   let ownerLock: OpenedOwnerLock;
@@ -2408,6 +2547,10 @@ export async function openWorkerdWorkerRuntimeOwner(
           retirementOperationId: operationId,
         }));
         incarnation.record = retiringRecord;
+        // A Workflow child may still be using an exact private Service socket.
+        // Do not stop its upstream or release the socket namespace until the
+        // caller's lease has completed; no elapsed timeout proves retirement.
+        await Promise.all([...incarnation.workflowLeases]);
         const receipt = await incarnation.group.retire({
           workerResourceUid: options.workerResourceUid,
           operationId,
@@ -2415,7 +2558,12 @@ export async function openWorkerdWorkerRuntimeOwner(
         // No private Actor broker may outlive the child whose immutable graph
         // carried its token. A failed drain retains this UID's owner lock.
         await incarnation.actorForward?.close();
+        await incarnation.workflowForward?.close();
         await persistPhysicalAbsence(incarnation.record);
+        await releasePrivateSockets(
+          incarnation.record.operationId,
+          await readFile(incarnation.group.configurationPath),
+        );
         const verified = await verifyRetiredWorkerdWorkerExecutionCopies({
           groupDirectory: incarnation.group.runtimeRoot,
           workerResourceUid: options.workerResourceUid,
@@ -2535,6 +2683,15 @@ export async function openWorkerdWorkerRuntimeOwner(
             scriptName: scriptName(options.workerResourceUid),
           })
         : undefined;
+    const workflowForward =
+      options.v2WorkflowForward && record.eventToken
+        ? options.v2WorkflowForward.openIncarnation({
+            workerUid: options.workerResourceUid,
+            sourceOperationId: record.operationId,
+            scriptName: scriptName(options.workerResourceUid),
+            eventToken: record.eventToken,
+          })
+        : undefined;
     const runtime = createWorkerdRuntime({
       root: group.runtimeRoot,
       configPath: group.configurationPath,
@@ -2546,6 +2703,13 @@ export async function openWorkerdWorkerRuntimeOwner(
         await group.reloadConfiguration();
       },
       isReady: () => group.isReady(),
+      serviceBindingSocketDirectory: privateSocketDirectoryFor(record.operationId),
+      ...(workflowForward
+        ? {
+            workflowForwardLifecycle: workflowForward.workflowForwardLifecycle,
+            workflowForwardSockets: workflowForward.workflowForwardSockets,
+          }
+        : {}),
       ...(actorForward
         ? {
             actorForwardLifecycle: actorForward.actorForwardLifecycle,
@@ -2583,7 +2747,9 @@ export async function openWorkerdWorkerRuntimeOwner(
       runtime,
       publication,
       ...(actorForward ? { actorForward } : {}),
+      ...(workflowForward ? { workflowForward } : {}),
       invocations: new Set(),
+      workflowLeases: new Set(),
     };
     handles.set(record.operationId, handle);
     return handle;
@@ -2681,6 +2847,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       endpointRouteAbsence: null,
       incarnations: [...current.incarnations, candidateRecord],
     }));
+    await preparePrivateSockets(operationId);
     const base = incarnationDirectory(operationId);
     const group = await openWorkerdWorkerExecutionGroup({
       rootDirectory: join(base, "groups"),
@@ -2693,7 +2860,23 @@ export async function openWorkerdWorkerRuntimeOwner(
       onSpawned: async (child) => await persistSpawnedChild(operationId, child),
     });
     const handle = makeIncarnationHandle(candidateRecord, group, incumbent);
-    await handle.runtime.reload();
+    // Preserve the pre-publication supervised child start. This bootstrap has
+    // no publication authority or private Service sockets: a failed initial
+    // spawn cannot poison the candidate's still-unused socket-enabled runtime.
+    // The latter remains the sole runtime that can publish tenant bytes.
+    const bootstrap = createWorkerdRuntime({
+      root: group.runtimeRoot,
+      configPath: group.configurationPath,
+      port: listenerPort,
+      binary: options.workerdBinary,
+      onReload: async (configPath) => {
+        if (configPath !== group.configurationPath)
+          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        await group.reloadConfiguration();
+      },
+      isReady: () => group.isReady(),
+    });
+    await bootstrap.reload();
     return handle;
   };
 
@@ -2814,6 +2997,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       const group = await openExistingRecoveryGroup(record, configuration);
       await group.retire({ workerResourceUid: options.workerResourceUid, operationId });
     }
+    await releasePrivateSockets(record.operationId, configuration);
     const verified = await verifyRetiredWorkerdWorkerExecutionCopies({
       groupDirectory,
       workerResourceUid: options.workerResourceUid,
@@ -2912,6 +3096,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
 
     const configuration = await readPinnedGroupConfiguration(activeRecord);
+    await preparePrivateSockets(activeRecord.operationId, configuration);
     const copies = await inspectWorkerdWorkerExecutionCopies({
       groupDirectory: groupDirectoryFor(activeRecord),
       workerResourceUid: options.workerResourceUid,
@@ -3488,6 +3673,267 @@ export async function openWorkerdWorkerRuntimeOwner(
       script: scriptName(target.workerResourceUid),
       identity: captured.identity,
       graph,
+    };
+  };
+
+  const selectWorkflowExecution: WorkerdWorkerRuntimeOwner["selectWorkflowExecution"] = async (
+    input,
+  ) => {
+    const unknown = { kind: "unknown" } as const;
+    const target = {
+      workerUid: input.workerUid,
+      targetKey: input.targetKey,
+      servingSourceOperationId: input.servingSourceOperationId,
+      basisPoint: input.basisPoint,
+    };
+    const source = options.publicationState.resolveCurrentServing;
+    if (
+      !source ||
+      target.workerUid !== options.workerResourceUid ||
+      target.targetKey !== options.targetKey ||
+      !OPERATION_ID.test(target.servingSourceOperationId) ||
+      !Number.isSafeInteger(target.basisPoint) ||
+      target.basisPoint < 0 ||
+      target.basisPoint >= 10_000
+    )
+      return unknown;
+    const captured = await runSerial(async () => {
+      const incarnation = active;
+      const record = recordFor(target.servingSourceOperationId);
+      if (
+        closed ||
+        suspending ||
+        admissionClosedBy !== null ||
+        !incarnation ||
+        state.activeOperationId !== target.servingSourceOperationId ||
+        incarnation.record.operationId !== target.servingSourceOperationId ||
+        record?.status !== "active" ||
+        !record.processIdentity ||
+        !record.configurationSha256 ||
+        record.configurationRefreshPending ||
+        record.configurationSha256 !== incarnation.group.configurationSha256 ||
+        !record.identity ||
+        record.identity.workerResourceUid !== target.workerUid ||
+        sourceOperationIdFromIdentity(record.identity) !== target.servingSourceOperationId ||
+        !incarnation.group.isReady()
+      )
+        return null;
+      return {
+        incarnation,
+        recordKey: canonicalJson(record),
+        identity: structuredClone(record.identity),
+        incarnationId: physicalIncarnationId(record.operationId, record.processIdentity),
+      };
+    });
+    if (!captured) return unknown;
+    // Never hold the owner serial lane while the accepted SQL/held-byte reader
+    // runs: a Binding reader may itself consult this owner.
+    const resolution = await source({
+      workerUid: target.workerUid,
+      targetKey: target.targetKey,
+      sourceOperationId: target.servingSourceOperationId,
+      expectedIdentity: captured.identity,
+    }).catch(() => null);
+    if (
+      resolution?.kind !== "ready" ||
+      resolution.snapshot.sourceOperationId !== target.servingSourceOperationId ||
+      resolution.snapshot.worker.uid !== target.workerUid ||
+      !resolution.snapshot.deployment
+    )
+      return unknown;
+    let weighted: ReturnType<typeof selectSelfhostWeightedVersion>;
+    try {
+      weighted = selectSelfhostWeightedVersion(captured.identity.versions, target.basisPoint);
+    } catch {
+      return unknown;
+    }
+    const version = resolution.snapshot.deployment.versions.find(
+      (item) => item.uid === weighted.workerVersionUid && item.weight === weighted.weight,
+    );
+    if (
+      !version ||
+      resolution.snapshot.deployment.versions.length !== captured.identity.versions.length
+    )
+      return unknown;
+    const expectedVersionId = `v2-${createHash("sha256")
+      .update(`${version.uid}\u0000${version.generation}`)
+      .digest("hex")}`;
+    if (weighted.versionId !== expectedVersionId || !version.spec.bundle) return unknown;
+    const materials = await resolution.readVersionMaterials?.(version.uid).catch(() => null);
+    const bundle = materials?.bundle;
+    if (!bundle || !(await resolution.stillCurrent().catch(() => false))) return unknown;
+    const currentOwner = () => {
+      const incarnation = active;
+      const record = recordFor(target.servingSourceOperationId);
+      return !closed &&
+        !suspending &&
+        admissionClosedBy === null &&
+        incarnation === captured.incarnation &&
+        state.activeOperationId === target.servingSourceOperationId &&
+        record?.status === "active" &&
+        canonicalJson(record) === captured.recordKey &&
+        incarnation.group.isReady()
+        ? { incarnation, record }
+        : null;
+    };
+    const script = scriptName(target.workerUid);
+    const readNative = async (): Promise<WorkerdSelectedActiveVersion<WorkerdSite> | null> => {
+      const current = currentOwner();
+      const processIdentity = current?.record.processIdentity;
+      if (!current || !processIdentity) return null;
+      const copies = await inspectWorkerdWorkerExecutionCopies({
+        groupDirectory: current.incarnation.group.runtimeRoot,
+        workerResourceUid: target.workerUid,
+        listenerPort: current.record.listenerPort,
+        scriptName: script,
+      }).catch(() => null);
+      if (
+        !copies ||
+        !executionCopiesMatchRecord(current.record, copies, true) ||
+        !copies.versionUids.includes(version.uid) ||
+        (await current.incarnation.runtime.observeExactPublication?.(script, captured.identity)) !==
+          "matches" ||
+        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) !== "live" ||
+        (await workerPortOwnership(current.record.listenerPort, processIdentity.pid).catch(
+          () => "foreign",
+        )) !== "owned"
+      )
+        return null;
+      const selected = await readWorkerdSelectedActiveVersion(
+        current.incarnation.group.runtimeRoot,
+        script,
+        { expectedWorkerResourceUid: target.workerUid, basisPoint: target.basisPoint },
+      ).catch(() => null);
+      if (
+        !selected ||
+        selected.generation !== captured.identity.generation ||
+        selected.workerResourceUid !== target.workerUid ||
+        selected.workerVersionUid !== version.uid ||
+        selected.versionId !== expectedVersionId ||
+        selected.site.workerResourceUid !== target.workerUid ||
+        selected.site.generation !== captured.identity.generation ||
+        selected.modules.size < bundle.manifest.files.length ||
+        bundle.manifest.files.some((file, index) => {
+          const bytes = selected.modules.get(file.path);
+          return !bytes || !Buffer.from(bytes).equals(Buffer.from(bundle.files[index] ?? []));
+        }) ||
+        (materials.assets !== null &&
+          (selected.assets === undefined ||
+            materials.assets.manifest.files.some((file, index) => {
+              const bytes = selected.assets?.get(file.path);
+              return (
+                !bytes ||
+                !Buffer.from(bytes).equals(Buffer.from(materials.assets?.files[index] ?? []))
+              );
+            }))) ||
+        !currentOwner()
+      )
+        return null;
+      return selected;
+    };
+    const selected = await runSerial(readNative);
+    if (!selected || !(await resolution.stillCurrent().catch(() => false))) return unknown;
+    const selectedKey = createHash("sha256")
+      .update(canonicalJson(selected.site as unknown as Record<string, unknown>))
+      .update(selected.generationKey)
+      .update(
+        [...selected.modules, ...selected.hostModules]
+          .map(([path, bytes]) => `${path}:${createHash("sha256").update(bytes).digest("hex")}`)
+          .join("\u0000"),
+      )
+      .digest("hex");
+    const stillCurrent = async (): Promise<boolean> => {
+      if (!(await resolution.stillCurrent().catch(() => false))) return false;
+      // A physical retirement may be waiting for this Workflow's lease while
+      // it owns the serial lane. This observer is read-only and rechecks the
+      // captured owner record after every await, so it must not queue behind
+      // the retirement that the caller's eventual release will unblock.
+      const current = await readNative().catch(() => null);
+      if (!current) return false;
+      const key = createHash("sha256")
+        .update(canonicalJson(current.site as unknown as Record<string, unknown>))
+        .update(current.generationKey)
+        .update(
+          [...current.modules, ...current.hostModules]
+            .map(([path, bytes]) => `${path}:${createHash("sha256").update(bytes).digest("hex")}`)
+            .join("\u0000"),
+        )
+        .digest("hex");
+      return key === selectedKey && (await resolution.stillCurrent().catch(() => false));
+    };
+    if (!(await stillCurrent())) return unknown;
+    const held: WorkerdSelectedActiveVersion<WorkerdSite> = {
+      ...selected,
+      site: structuredClone(selected.site),
+      modules: new Map([...selected.modules].map(([path, bytes]) => [path, new Uint8Array(bytes)])),
+      hostModules: new Map(
+        [...selected.hostModules].map(([path, bytes]) => [path, new Uint8Array(bytes)]),
+      ),
+      ...(selected.assets
+        ? {
+            assets: new Map(
+              [...selected.assets].map(([path, bytes]) => [path, new Uint8Array(bytes)]),
+            ),
+          }
+        : {}),
+    };
+    return {
+      kind: "selected",
+      sourceOperationId: target.servingSourceOperationId,
+      incarnationId: captured.incarnationId,
+      selected: held,
+      stillCurrent,
+      async acquirePrivateServiceBindings(signal) {
+        signal.throwIfAborted();
+        if (!(await stillCurrent())) throw new WorkerdWorkerRuntimeOwnerError("not_serving");
+        const lease = await captured.incarnation.runtime.acquirePrivateServiceBindings(
+          {
+            script,
+            generation: selected.generation,
+            generationKey: selected.generationKey,
+            workerResourceUid: selected.workerResourceUid,
+            versionId: selected.versionId,
+            workerVersionUid: selected.workerVersionUid,
+          },
+          signal,
+        );
+        let finish!: () => void;
+        const done = new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        const registered = await runSerial(async () => {
+          if (!currentOwner()) return false;
+          captured.incarnation.workflowLeases.add(done);
+          return true;
+        });
+        // The pin can block retirement inside the serial lane. Do not call
+        // stillCurrent() (which re-enters that lane) until after releasing it.
+        // SQL remains outside the lane; the final owner check is synchronous.
+        if (
+          !registered ||
+          !(await resolution.stillCurrent().catch(() => false)) ||
+          !currentOwner() ||
+          signal.aborted
+        ) {
+          await lease.release();
+          if (registered) {
+            captured.incarnation.workflowLeases.delete(done);
+            finish();
+          }
+          throw new WorkerdWorkerRuntimeOwnerError("not_serving");
+        }
+        let released = false;
+        return {
+          services: lease.services,
+          async release() {
+            if (released) return;
+            await lease.release();
+            released = true;
+            captured.incarnation.workflowLeases.delete(done);
+            finish();
+          },
+        };
+      },
     };
   };
 
@@ -4811,6 +5257,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       for (const item of handles.values()) {
         item.retirementTimer?.();
         await item.actorForward?.close();
+        await item.workflowForward?.close();
       }
       await releaseOwnerLock(lockPath, directory, ownerLock);
       closed = true;
@@ -4837,12 +5284,14 @@ export async function openWorkerdWorkerRuntimeOwner(
         }
         for (const handle of handles.values()) {
           await cancelInvocations(handle);
+          await Promise.all([...handle.workflowLeases]);
         }
         for (const handle of handles.values()) {
           if (handle.record.status === "active" || handle.record.status === "draining") {
             await handle.group.suspendRetainingCustody();
           }
           await handle.actorForward?.close();
+          await handle.workflowForward?.close();
         }
         await persistPhysicalAbsences(true);
         await releaseOwnerLock(lockPath, directory, ownerLock);
@@ -4894,6 +5343,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     execute,
     observeServing,
     observeActorGraph,
+    selectWorkflowExecution,
     observeVersionTarget,
     observeQueueTarget,
     observeQueuePhysicalAbsence,
