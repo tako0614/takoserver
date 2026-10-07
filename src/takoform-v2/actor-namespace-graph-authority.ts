@@ -17,6 +17,7 @@ interface NamespaceRow {
   readonly uid: unknown;
   readonly principal: unknown;
   readonly space: unknown;
+  readonly backend_id: unknown;
   readonly target_key: unknown;
   readonly generation: unknown;
   readonly observed_generation: unknown;
@@ -28,11 +29,17 @@ interface NamespaceRow {
   readonly action: unknown;
   readonly status: unknown;
   readonly effect: unknown;
+  readonly op_resource_uid: unknown;
+  readonly op_principal: unknown;
+  readonly op_backend_id: unknown;
+  readonly op_target_key: unknown;
   readonly op_generation: unknown;
   readonly accepted_spec_json: unknown;
   readonly worker_form_url: unknown;
+  readonly worker_uid: unknown;
   readonly worker_principal: unknown;
   readonly worker_space: unknown;
+  readonly worker_backend_id: unknown;
   readonly worker_target_key: unknown;
   readonly worker_deleted_at: unknown;
   readonly worker_busy_operation: unknown;
@@ -42,6 +49,11 @@ interface NamespaceRow {
   readonly worker_last_operation: unknown;
   readonly worker_op_status: unknown;
   readonly worker_op_effect: unknown;
+  readonly worker_op_action: unknown;
+  readonly worker_op_resource_uid: unknown;
+  readonly worker_op_principal: unknown;
+  readonly worker_op_backend_id: unknown;
+  readonly worker_op_target_key: unknown;
   readonly worker_op_generation: unknown;
   readonly worker_spec_json: unknown;
   readonly worker_accepted_spec_json: unknown;
@@ -71,15 +83,23 @@ export function createV2ActorNamespaceGraphAuthority(options: {
   const namespaceRow = async (scope: Scope): Promise<NamespaceRow | null> => {
     const rows = (await options.sql.query(
       `SELECT namespace.uid, namespace.principal, namespace.space,
+              namespace.backend_id,
               namespace.target_key, namespace.generation,
               namespace.observed_generation, namespace.phase,
               namespace.spec_json, namespace.last_operation,
               namespace.busy_operation, namespace.deleted_at,
-              op.action, op.status, op.effect, op.generation AS op_generation,
+              op.action, op.status, op.effect,
+              op.resource_uid AS op_resource_uid,
+              op.principal AS op_principal,
+              op.backend_id AS op_backend_id,
+              op.target_key AS op_target_key,
+              op.generation AS op_generation,
               op.accepted_spec_json,
+              worker.uid AS worker_uid,
               worker.form_url AS worker_form_url,
               worker.principal AS worker_principal,
               worker.space AS worker_space,
+              worker.backend_id AS worker_backend_id,
               worker.target_key AS worker_target_key,
               worker.deleted_at AS worker_deleted_at,
               worker.busy_operation AS worker_busy_operation,
@@ -89,17 +109,41 @@ export function createV2ActorNamespaceGraphAuthority(options: {
               worker.last_operation AS worker_last_operation,
               worker_op.status AS worker_op_status,
               worker_op.effect AS worker_op_effect,
+              worker_op.action AS worker_op_action,
+              worker_op.resource_uid AS worker_op_resource_uid,
+              worker_op.principal AS worker_op_principal,
+              worker_op.backend_id AS worker_op_backend_id,
+              worker_op.target_key AS worker_op_target_key,
               worker_op.generation AS worker_op_generation,
               worker.spec_json AS worker_spec_json,
               worker_op.accepted_spec_json AS worker_accepted_spec_json
        FROM tf_v2_resources namespace
-       LEFT JOIN tf_v2_operations op ON op.id = namespace.last_operation
-       LEFT JOIN tf_v2_resources worker ON worker.uid =
+       JOIN tf_v2_operations op ON op.id = namespace.last_operation
+       JOIN tf_v2_operation_reference_sets reference_set
+         ON reference_set.operation_id = op.id AND reference_set.sealed = 1
+       JOIN tf_v2_resources worker ON worker.uid =
          json_extract(namespace.spec_json, '$.worker.resourceUid')
+       JOIN tf_v2_operation_references reference
+         ON reference.operation_id = op.id AND reference.target_uid = worker.uid
+        AND reference.form_url = ? AND reference.readiness = 'observed'
+        AND reference.target_spec_path IS NULL AND reference.target_spec_equals IS NULL
+       JOIN tf_v2_resource_references edge
+         ON edge.referrer_uid = namespace.uid AND edge.target_uid = worker.uid
        LEFT JOIN tf_v2_operations worker_op ON worker_op.id = worker.last_operation
        WHERE namespace.uid = ? AND namespace.principal = ?
-         AND namespace.form_url = ? AND namespace.target_key = ? LIMIT 2`,
-      [scope.namespaceResourceUid, scope.tenantId, ACTOR_NAMESPACE_FORM_URL, options.targetKey],
+         AND namespace.form_url = ? AND namespace.target_key = ?
+         AND NOT EXISTS (SELECT 1 FROM tf_v2_operation_references extra
+           WHERE extra.operation_id = op.id AND extra.target_uid <> worker.uid)
+         AND NOT EXISTS (SELECT 1 FROM tf_v2_resource_references extra_edge
+           WHERE extra_edge.referrer_uid = namespace.uid AND extra_edge.target_uid <> worker.uid)
+       LIMIT 2`,
+      [
+        MODULE_WORKER_FORM_URL,
+        scope.namespaceResourceUid,
+        scope.tenantId,
+        ACTOR_NAMESPACE_FORM_URL,
+        options.targetKey,
+      ],
     )) as unknown as readonly NamespaceRow[];
     return rows.length === 1 ? (rows[0] ?? null) : null;
   };
@@ -118,8 +162,13 @@ export function createV2ActorNamespaceGraphAuthority(options: {
       row.generation !== row.observed_generation ||
       row.last_operation === null ||
       row.action === "delete" ||
+      (row.action !== "create" && row.action !== "update") ||
       row.status !== "succeeded" ||
       row.effect !== "complete" ||
+      row.op_resource_uid !== row.uid ||
+      row.op_principal !== row.principal ||
+      row.op_backend_id !== row.backend_id ||
+      row.op_target_key !== row.target_key ||
       row.op_generation !== row.generation ||
       row.accepted_spec_json !== row.spec_json ||
       typeof row.spec_json !== "string" ||
@@ -133,6 +182,11 @@ export function createV2ActorNamespaceGraphAuthority(options: {
       row.worker_generation !== row.worker_observed_generation ||
       row.worker_op_status !== "succeeded" ||
       row.worker_op_effect !== "complete" ||
+      (row.worker_op_action !== "create" && row.worker_op_action !== "update") ||
+      row.worker_op_resource_uid !== row.worker_uid ||
+      row.worker_op_principal !== row.worker_principal ||
+      row.worker_op_backend_id !== row.worker_backend_id ||
+      row.worker_op_target_key !== row.worker_target_key ||
       row.worker_op_generation !== row.worker_generation ||
       row.worker_spec_json !== row.worker_accepted_spec_json
     )

@@ -21,7 +21,7 @@ const CREATE_NAMESPACE = "f63bc8f8-880c-4d06-83a1-cc82403979f2";
 const CREATE_DEPLOYMENT = "d76bbd33-87e9-42ec-902d-c0c15097e530";
 const DELETE_NAMESPACE = "4a925f71-b1ab-4abd-b9b0-d9850aca4e6d";
 
-function fixture() {
+function fixture(options: { namespaceReferences?: boolean } = {}) {
   const db = new Database(":memory:");
   migrateSqlite(db);
   const sql = createSqliteSql(db);
@@ -38,8 +38,8 @@ function fixture() {
       `INSERT INTO tf_v2_resources
        (uid, principal, form_url, space, name, backend_id, target_key,
         active_name, generation, observed_generation, phase, spec_json,
-        observed_json, last_operation)
-       VALUES (?, ?, ?, ?, ?, 'actor-fixture-backend', ?, ?, 1, 1, 'idle', ?, ?, ?)`,
+        observed_json, last_operation, busy_operation)
+       VALUES (?, ?, ?, ?, ?, 'actor-fixture-backend', ?, ?, 1, 0, 'pending', ?, '{}', ?, ?)`,
     ).run(
       input.uid,
       PRINCIPAL,
@@ -49,7 +49,7 @@ function fixture() {
       TARGET,
       input.name,
       specJson,
-      JSON.stringify(input.observed ?? {}),
+      input.operationId,
       input.operationId,
     );
     db.query(
@@ -57,7 +57,7 @@ function fixture() {
        (id, resource_uid, principal, replay_key, request_fingerprint,
         action, generation, status, effect, created_at, updated_at,
         retain_until, backend_id, target_key, backend_key, accepted_spec_json)
-       VALUES (?, ?, ?, ?, 'fingerprint', 'create', 1, 'succeeded', 'complete',
+       VALUES (?, ?, ?, ?, 'fingerprint', 'create', 1, 'queued', 'none',
          '2026-10-07T00:00:00Z', '2026-10-07T00:00:00Z', '2027-10-07T00:00:00Z',
          'actor-fixture-backend', ?, ?, ?)`,
     ).run(
@@ -69,6 +69,27 @@ function fixture() {
       `backend-${input.uid}`,
       specJson,
     );
+    if (input.form === ACTOR_NAMESPACE_FORM_URL && options.namespaceReferences !== false) {
+      db.query("INSERT INTO tf_v2_operation_reference_sets (operation_id) VALUES (?)").run(
+        input.operationId,
+      );
+      db.query(
+        `INSERT INTO tf_v2_operation_references
+         (operation_id, target_uid, form_url, readiness)
+         VALUES (?, ?, ?, 'observed')`,
+      ).run(input.operationId, WORKER, MODULE_WORKER_FORM_URL);
+      db.query("UPDATE tf_v2_operation_reference_sets SET sealed = 1 WHERE operation_id = ?").run(
+        input.operationId,
+      );
+    }
+    db.query("UPDATE tf_v2_operations SET status = 'running' WHERE id = ?").run(input.operationId);
+    db.query(
+      "UPDATE tf_v2_operations SET status = 'reconciling', effect = 'unknown' WHERE id = ?",
+    ).run(input.operationId);
+    db.query(
+      `UPDATE tf_v2_operations SET status = 'succeeded', effect = 'complete',
+       result_observed_json = ? WHERE id = ?`,
+    ).run(JSON.stringify(input.observed ?? {}), input.operationId);
   };
   insert({
     uid: WORKER,
@@ -92,6 +113,36 @@ function fixture() {
   });
   return { db, sql, insert };
 }
+
+test("v2 Actor graph refuses an accepted Namespace without its sealed Worker reference and active edge", async () => {
+  const scope = { tenantId: PRINCIPAL, namespaceResourceUid: NAMESPACE };
+  const missing = fixture({ namespaceReferences: false });
+  try {
+    const authority = createV2ActorNamespaceGraphAuthority({
+      sql: missing.sql,
+      targetKey: TARGET,
+      owner: { ownerForWorker: async () => null },
+    });
+    expect(await authority.readGraph(scope, AbortSignal.timeout(1000))).toBeNull();
+  } finally {
+    missing.db.close();
+  }
+
+  const lostEdge = fixture();
+  try {
+    lostEdge.db
+      .query("DELETE FROM tf_v2_resource_references WHERE referrer_uid = ? AND target_uid = ?")
+      .run(NAMESPACE, WORKER);
+    const authority = createV2ActorNamespaceGraphAuthority({
+      sql: lostEdge.sql,
+      targetKey: TARGET,
+      owner: { ownerForWorker: async () => null },
+    });
+    expect(await authority.readGraph(scope, AbortSignal.timeout(1000))).toBeNull();
+  } finally {
+    lostEdge.db.close();
+  }
+});
 
 const graph: WorkerdActiveActorGraph = {
   generation: `takoserver-v2-operation:${CREATE_DEPLOYMENT}`,
