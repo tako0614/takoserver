@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   SELFHOST_WORKER_PRELUDE_MODULE,
   selfhostWorkerPreludeSource,
@@ -36,11 +36,12 @@ test.skipIf(binary === undefined)(
     const runtimeRoot = join(root, "runtime");
     const storageRoot = join(root, "state");
     const childPidFile = join(root, "child.pid");
+    const childConfigFile = join(root, "child-config");
     const denySpawnFile = join(root, "deny-spawn");
     const childWrapper = join(root, "child-wrapper");
     await writeFile(
       childWrapper,
-      `#!/bin/sh\nif test -e '${denySpawnFile}'; then exit 65; fi\nprintf '%s\\n' "$$" > '${childPidFile}'\nexec '${binary}' "$@"\n`,
+      `#!/bin/sh\nif test -e '${denySpawnFile}'; then exit 65; fi\nprintf '%s\\n' "$$" > '${childPidFile}'\nprintf '%s\\n' "$2" > '${childConfigFile}'\nexec '${binary}' "$@"\n`,
       { mode: 0o700 },
     );
     const runtime = createWorkerdRuntime({ root: runtimeRoot, isReady: () => true });
@@ -213,6 +214,32 @@ export class Counter extends Base {
       if (initial.kind !== "confirmed" || recovered.kind !== "confirmed")
         throw new Error("native observation was not confirmed");
       expect(recovered.epoch).not.toBe(initial.epoch);
+      // The original child is still alive; only its Unix pathname is replaced.
+      // A foreign listener may relay valid native replies, but it is not the
+      // listener whose readiness the Host accepted for this child.
+      const configPath = (await readFile(childConfigFile, "utf8")).trim();
+      const nativeSocket = join(dirname(configPath), "run.sock");
+      const displacedSocket = join(dirname(configPath), "run-displaced.sock");
+      await rename(nativeSocket, displacedSocket);
+      let foreign: ReturnType<typeof Bun.serve> | undefined;
+      try {
+        foreign = Bun.serve({
+          unix: nativeSocket,
+          fetch: (request) => fetch(request, { unix: displacedSocket, redirect: "manual" }),
+        });
+        expect(await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000))).toEqual({
+          kind: "unknown",
+        });
+      } finally {
+        foreign?.stop(true);
+        await unlink(nativeSocket).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+        await rename(displacedSocket, nativeSocket);
+      }
+      expect(await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000))).toEqual({
+        kind: "unknown",
+      });
       await runtime.publish?.("worker", {
         ...publication,
         generation: "observation-two",

@@ -1,5 +1,5 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { resolveActorAbiProfile } from "./actor-class-execution.ts";
@@ -654,6 +654,27 @@ export default {
         `Actor native child readiness unavailable${lastReadinessStatus === undefined ? "" : ` (${lastReadinessStatus})`}`,
       );
     options.signal.throwIfAborted();
+    // A successful HTTP readiness reply authenticates the request, not the
+    // pathname's future listener. Record the original native Unix inode;
+    // test adapters without a real listener cannot qualify observation.
+    const originalListener = options.processAdapter ? null : await lstat(socket);
+    if (
+      originalListener &&
+      (!originalListener.isSocket() || originalListener.uid !== process.getuid?.())
+    )
+      throw new Error("Actor native listener unavailable");
+    const requireOriginalListener = async (): Promise<void> => {
+      if (!originalListener) throw new Error("Actor native observation unavailable");
+      const current = await lstat(socket);
+      if (
+        !current.isSocket() ||
+        current.uid !== originalListener.uid ||
+        current.dev !== originalListener.dev ||
+        current.ino !== originalListener.ino ||
+        current.ctimeMs !== originalListener.ctimeMs
+      )
+        throw new Error("Actor native observation unavailable");
+    };
     const runningChild = startingChild;
     return {
       exited: runningChild.exited.then(() => {
@@ -662,12 +683,14 @@ export default {
       async probeRuntime(signal) {
         if (closing || isActorNativeChildTerminal(runningChild))
           throw new Error("Actor native observation unavailable");
+        await requireOriginalListener();
         const response = await processAdapter.probeReadiness({
           socketPath: socket,
           token,
           signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
         });
         await response.body?.cancel();
+        await requireOriginalListener();
         signal.throwIfAborted();
         if (response.status !== 204 || closing || isActorNativeChildTerminal(runningChild))
           throw new Error("Actor native observation unavailable");
@@ -697,6 +720,7 @@ export default {
       async observeActor(id, signal) {
         if (closing || isActorNativeChildTerminal(child) || !id || id.includes("\u0000"))
           throw new Error("Actor native observation unavailable");
+        await requireOriginalListener();
         const encodedId = encodeURIComponent(id);
         const controlToken = createHmac("sha256", alarmToken).update(encodedId).digest("hex");
         const response = await fetch("http://actor.invalid/__actor_observe__", {
@@ -726,6 +750,7 @@ export default {
         } finally {
           await reader.cancel().catch(() => {});
         }
+        await requireOriginalListener();
         const raw = new Uint8Array(size);
         let offset = 0;
         for (const chunk of chunks) {
