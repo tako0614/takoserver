@@ -234,7 +234,7 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "v2-selfhost-composition",
-    match: /^src\/selfhost-v2-worker-composition\.ts$/u,
+    match: /^src\/(?:selfhost-v2-worker-composition|selfhost-v2-worker-endpoint-frontend)\.ts$/u,
     may: [
       "core",
       "adapter",
