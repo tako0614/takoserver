@@ -19,7 +19,10 @@ import {
 import type { V2Form } from "../src/takoform-v2/types.ts";
 import type { V2WorkerCurrentServingResolution } from "../src/takoform-v2/worker-publication-state.ts";
 import { createAtLeastOnceQueueForm } from "../src/takoform-v2/worker-queue-backend.ts";
-import { createQueueConsumerForm } from "../src/takoform-v2/worker-queue-consumer-backend.ts";
+import {
+  createQueueConsumerForm,
+  type V2QueueConsumerCapability,
+} from "../src/takoform-v2/worker-queue-consumer-backend.ts";
 import {
   authorizeV2QueueBatchSend,
   createV2QueueDelivery,
@@ -49,8 +52,76 @@ function consumerSpec(
 
 async function acceptedConsumer(database: Database) {
   const sql = createSqliteSql(database);
+  let activeSql = sql;
   let servingSourceOperationId = "unassigned-source";
   let selectedVersionUid = "unassigned-version";
+  let selectedDeploymentUid = "unassigned-deployment";
+  // This test has no native workerd process. It grants the fixture's queue
+  // export observation only for the exact settled Version created below; the
+  // SQL graph is still re-read before every admission and final fence.
+  const inspectedQueueExports = new Set<string>();
+  const readAcceptedGraph = async (workerUid: string) => {
+    const rows = await activeSql.query(
+      `SELECT resource.uid,resource.form_url,resource.spec_json,resource.observed_json,
+              resource.last_operation,resource.generation
+       FROM tf_v2_resources resource
+       JOIN tf_v2_operations op ON op.id = resource.last_operation
+       WHERE resource.uid IN (?,?,?) AND resource.principal = ? AND resource.space = ?
+         AND resource.target_key = ? AND resource.deleted_at IS NULL
+         AND resource.phase = 'idle' AND resource.busy_operation IS NULL
+         AND resource.generation = resource.observed_generation
+         AND op.resource_uid = resource.uid AND op.principal = resource.principal
+         AND op.target_key = resource.target_key AND op.status = 'succeeded'
+         AND op.effect = 'complete' AND op.action IN ('create','update')
+         AND op.generation = resource.generation
+         AND op.accepted_spec_json = resource.spec_json LIMIT 4`,
+      [workerUid, selectedVersionUid, selectedDeploymentUid, principal, space, targetKey],
+    );
+    if (rows.length !== 3) return false;
+    const worker = rows.find(
+      (row) => row.uid === workerUid && row.form_url === MODULE_WORKER_FORM_URL,
+    );
+    const version = rows.find(
+      (row) => row.uid === selectedVersionUid && row.form_url === WORKER_VERSION_FORM_URL,
+    );
+    const deployment = rows.find(
+      (row) => row.uid === selectedDeploymentUid && row.form_url === WORKER_DEPLOYMENT_FORM_URL,
+    );
+    if (
+      !worker ||
+      !version ||
+      !deployment ||
+      deployment.last_operation !== servingSourceOperationId ||
+      !Number.isSafeInteger(version.generation) ||
+      !Number.isSafeInteger(deployment.generation) ||
+      !inspectedQueueExports.has(`${selectedVersionUid}:${version.generation}:queue`)
+    )
+      return false;
+    try {
+      const workerObserved = JSON.parse(String(worker.observed_json));
+      const versionSpec = JSON.parse(String(version.spec_json));
+      const versionObserved = JSON.parse(String(version.observed_json));
+      const deploymentSpec = JSON.parse(String(deployment.spec_json));
+      const deploymentObserved = JSON.parse(String(deployment.observed_json));
+      return (
+        workerObserved.ready === true &&
+        versionSpec.worker?.resourceUid === workerUid &&
+        Array.isArray(versionSpec.handlers) &&
+        versionSpec.handlers.includes("queue") &&
+        versionObserved.ready === true &&
+        versionObserved.resolvedBindings === true &&
+        versionObserved.bundleVerified === true &&
+        deploymentSpec.worker?.resourceUid === workerUid &&
+        Array.isArray(deploymentSpec.versions) &&
+        deploymentSpec.versions.length === 1 &&
+        deploymentSpec.versions[0]?.workerVersion?.resourceUid === selectedVersionUid &&
+        deploymentSpec.versions[0]?.weight === 10_000 &&
+        deploymentObserved.active === true
+      );
+    } catch {
+      return false;
+    }
+  };
   const worker: V2Form = {
     validateCreate() {},
     validateUpdate() {},
@@ -65,7 +136,34 @@ async function acceptedConsumer(database: Database) {
       },
     },
   };
-  const capability = {
+  const capability: V2QueueConsumerCapability = {
+    async observeQueueServingCapability(input) {
+      if (
+        input.principal !== principal ||
+        input.space !== space ||
+        input.targetKey !== targetKey ||
+        !(await readAcceptedGraph(input.workerUid))
+      )
+        return { kind: "unknown" };
+      const source = servingSourceOperationId;
+      const version = selectedVersionUid;
+      const deployment = selectedDeploymentUid;
+      return {
+        kind: "confirmed",
+        servingSourceOperationId: source,
+        deploymentUid: deployment,
+        deploymentGeneration: 1,
+        versions: [{ workerVersionUid: version, generation: 1, weight: 10_000 }],
+        async stillCurrent() {
+          return (
+            source === servingSourceOperationId &&
+            version === selectedVersionUid &&
+            deployment === selectedDeploymentUid &&
+            (await readAcceptedGraph(input.workerUid))
+          );
+        },
+      };
+    },
     async observeCurrentServing({ workerUid }: { workerUid: string }) {
       return {
         kind: "ready",
@@ -74,7 +172,7 @@ async function acceptedConsumer(database: Database) {
           sourceOperationId: servingSourceOperationId,
           worker: { uid: workerUid, principal, space, generation: 1 },
           deployment: {
-            uid: "scheduler-test-deployment",
+            uid: selectedDeploymentUid,
             generation: 1,
             spec: {},
             versions: [
@@ -89,7 +187,7 @@ async function acceptedConsumer(database: Database) {
           endpoint: null,
         },
         async stillCurrent() {
-          return true;
+          return readAcceptedGraph(workerUid);
         },
       } as unknown as V2WorkerCurrentServingResolution;
     },
@@ -110,7 +208,11 @@ async function acceptedConsumer(database: Database) {
           id: "scheduler-test-version",
           targetKey,
           async execute() {
-            return { kind: "complete", observed: { ready: true }, output: {} };
+            return {
+              kind: "complete",
+              observed: { ready: true, resolvedBindings: true, bundleVerified: true },
+              output: {},
+            };
           },
           async reconcile() {
             return { kind: "unknown" };
@@ -149,12 +251,15 @@ async function acceptedConsumer(database: Database) {
   const workerUid = await create(MODULE_WORKER_FORM_URL, "worker", {});
   selectedVersionUid = await create(WORKER_VERSION_FORM_URL, "version", {
     worker: { resourceUid: workerUid },
+    handlers: ["queue"],
   });
-  const deploymentUid = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+  inspectedQueueExports.add(`${selectedVersionUid}:1:queue`);
+  selectedDeploymentUid = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
     worker: { resourceUid: workerUid },
+    versions: [{ workerVersion: { resourceUid: selectedVersionUid }, weight: 10_000 }],
   });
   const [deployment] = await sql.query("SELECT last_operation FROM tf_v2_resources WHERE uid = ?", [
-    deploymentUid,
+    selectedDeploymentUid,
   ]);
   if (typeof deployment?.last_operation !== "string") throw new Error("Deployment not settled");
   servingSourceOperationId = deployment.last_operation;
@@ -173,6 +278,9 @@ async function acceptedConsumer(database: Database) {
     servingSourceOperationId,
     consumerUid,
     create,
+    useSql(next: typeof sql) {
+      activeSql = next;
+    },
   };
 }
 
@@ -255,6 +363,7 @@ test("a persisted send-authorized slot prevents a second send after SQL handle r
 
     database = new Database(path);
     const sql = createSqliteSql(database);
+    accepted.useSql(sql);
     const seen: string[] = [];
     const restarted = createSelfhostV2QueueScheduler({
       sql,
