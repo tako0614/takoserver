@@ -174,7 +174,7 @@ export default {
         targetKey: TARGET,
         workerdBinary: artifact.binary,
         spawn: (command) =>
-          spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "inherit" }),
+          spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" }),
         v2Workflow: boot,
         endpoint: {
           assignHostname({ resourceUid }) {
@@ -376,25 +376,40 @@ export default {
     } catch (error) {
       primaryError = error;
     }
-    let cleanupError: unknown;
+    const cleanupErrors: unknown[] = [];
     try {
       await composition?.closeWorkflowHost();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
       await composition?.suspendOwnersRetainingCustody();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
       await composition?.closePrivateBindingServices();
     } catch (error) {
-      cleanupError = error;
+      cleanupErrors.push(error);
     }
-    if (cleanupError === undefined) {
+    try {
       database.close();
-      await rm(root, { recursive: true, force: true });
+    } catch (error) {
+      cleanupErrors.push(error);
     }
-    if (primaryError !== undefined && cleanupError !== undefined)
+    if (cleanupErrors.length === 0) {
+      try {
+        await rm(root, { recursive: true, force: true });
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (cleanupErrors.length > 0)
       throw new AggregateError(
-        [primaryError, cleanupError],
-        "native Workflow Binding and cleanup failed",
+        [...(primaryError === undefined ? [] : [primaryError]), ...cleanupErrors],
+        `native Workflow Binding cleanup incomplete; retained ${root}`,
       );
     if (primaryError !== undefined) throw primaryError;
-    if (cleanupError !== undefined) throw cleanupError;
   },
   90_000,
 );
