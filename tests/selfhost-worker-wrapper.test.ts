@@ -2296,7 +2296,12 @@ test("private v2 KV preserves EdgeKV argument TypeErrors without changing legacy
       const request = JSON.parse(String(init.body)) as { op: string };
       return Response.json({
         ok: true,
-        value: request.op === "get" ? { found: false } : request.op === "list" ? { keys: [], listComplete: true } : {},
+        value:
+          request.op === "get"
+            ? { found: false }
+            : request.op === "list"
+              ? { keys: [], listComplete: true }
+              : {},
       });
     },
   };
@@ -2305,7 +2310,12 @@ test("private v2 KV preserves EdgeKV argument TypeErrors without changing legacy
       const request = JSON.parse(String(init.body)) as { op: string };
       return Response.json({
         ok: true,
-        value: request.op === "get" ? { found: false } : request.op === "list" ? { keys: [], listComplete: true } : {},
+        value:
+          request.op === "get"
+            ? { found: false }
+            : request.op === "list"
+              ? { keys: [], listComplete: true }
+              : {},
       });
     },
   };
