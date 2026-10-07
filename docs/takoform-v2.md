@@ -567,10 +567,12 @@ public HTTPS delivery or Hosted qualification.
 
 The internal factory also composes a separately keyed KV broker and private service.
 Linear Base64 validation passes the full 25 MiB value limit through pinned workerd.
-An organization-authenticated Host journey creates accepted KV, SQLite and Object
-references and uses all three from one Worker. A separate process test discards an
-accepted Version response, retries the same operation, SIGKILLs the Host, and
-restores the same Worker and stored values under new Host and native child PIDs.
+An organization-authenticated Host journey creates accepted KV, SQLite, Object and
+Queue references and uses all four from one Worker. A separate process test
+discards an accepted Queue create response, retries the same operation, SIGKILLs
+the Host, and restores the same Worker, stored values and queued message under
+new Host and native child PIDs. It replays the Queue create key without a second
+Resource and sends another message through the restored native Producer Binding.
 It checks update and deletion, then proves the child is gone while the recovered
 Host is still alive. These tests manually register the Forms in an isolated Host;
 they do not qualify normal-entry registration, public TLS, Hosted execution or
@@ -666,7 +668,9 @@ composes AtLeastOnceQueue. A pinned-workerd organization-HTTP journey covers
 Queue creation, a declared Producer Binding, `send`/`sendBatch`, retention update
 and dependency-ordered deletion without per-Form overrides. The ordinary entry
 still does not advertise incomplete Worker Forms. Its empty-owner process test
-proves orderly stop/reopen of these listeners, not active Worker crash recovery.
+proves orderly stop/reopen of these listeners; the separate mixed-binding Host
+process journey proves active Worker and Producer recovery through the internal
+factory, not the ordinary entry or delivery settlement after a crash.
 
 Orderly Bun shutdown freezes new v2 owner admission and awaits pending owner opens.
 An active serving owner is suspended with retained custody, rather than treated as
