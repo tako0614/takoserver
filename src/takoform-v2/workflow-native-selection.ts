@@ -355,8 +355,9 @@ export function createV2WorkflowNativeSelection(options: {
       selected.generation !== serving.generation ||
       selected.site.workerResourceUid !== resource.workerUid ||
       selected.site.generation !== serving.generation ||
-      canonicalJson([...selected.site.hostnames].sort()) !==
-        canonicalJson([...serving.hostnames].sort()) ||
+      // The weighted Version copy has no route hostnames. They belong to the
+      // accepted Worker publication identity proved above, not this site.
+      selected.site.hostnames.length !== 0 ||
       selected.versionId !==
         `v2-${createHash("sha256")
           .update(`${version.uid}\u0000${version.generation}`)

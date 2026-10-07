@@ -171,6 +171,7 @@ function fixture() {
   let ownerSelects = 0;
   let inspected = 0;
   const servingVersions = [{ workerVersionUid: VERSION_UID, weight: 10_000 }];
+  const servingHostnames: string[] = [];
   const owner = {
     async observeServing() {
       return {
@@ -179,7 +180,7 @@ function fixture() {
         targetKey: TARGET,
         sourceOperationId: SOURCE_OPERATION,
         generation: GENERATION,
-        hostnames: [],
+        hostnames: [...servingHostnames],
         versions: servingVersions,
       };
     },
@@ -283,6 +284,7 @@ function fixture() {
     selected,
     snapshot,
     servingVersions,
+    servingHostnames,
     get ownerSelects() {
       return ownerSelects;
     },
@@ -297,6 +299,17 @@ function fixture() {
     },
   };
 }
+
+test("synthetic selected Version has no hostnames while accepted Worker serves an Endpoint", async () => {
+  const f = fixture();
+  try {
+    f.servingHostnames.push("worker.example.test");
+    const captured = await f.select(identity, new AbortController().signal);
+    expect(captured.selection.site.hostnames).toEqual([]);
+  } finally {
+    f.db.close();
+  }
+});
 
 test("synthetic owner selection binds accepted Workflow principal, Space, class and held native bytes", async () => {
   const f = fixture();
