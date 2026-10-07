@@ -639,7 +639,12 @@ function metadata(input: unknown): EdgeKVMetadata {
     if (Buffer.byteLength(key, "utf8") > 256 || [...item].length > 8_192) {
       throw namedError("metadata_too_large");
     }
-    output[key] = item;
+    Object.defineProperty(output, key, {
+      value: item,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
   }
   if (Buffer.byteLength(canonicalJson(output), "utf8") > 1_024) {
     throw namedError("metadata_too_large");
@@ -653,7 +658,12 @@ function metadataResult(input: unknown): EdgeKVMetadata | undefined {
   const result: Record<string, string> = {};
   for (const [key, item] of Object.entries(value)) {
     if (typeof item !== "string") throw namedError("backend_unavailable");
-    result[key] = item;
+    Object.defineProperty(result, key, {
+      value: item,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
   }
   return result;
 }

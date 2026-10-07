@@ -3,6 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { canonicalJson } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createSelfhostV2KvStore } from "../src/providers/selfhost-v2-kv-store.ts";
 import {
@@ -103,6 +104,23 @@ test("EdgeKVNamespace binding uses the shared KV engine and preserves bytes", as
     const withMetadata = await binding.getWithMetadata("bytes");
     expect(withMetadata && [...new Uint8Array(withMetadata.value)]).toEqual([10, 11, 12]);
     expect(withMetadata?.metadata).toEqual({ label: "ok" });
+    const specialKeys = JSON.parse(
+      '{"__proto__":"proto-value","constructor":"ctor-value","toString":"string-value"}',
+    ) as Record<string, string>;
+    expect(canonicalJson(specialKeys)).toBe(
+      '{"__proto__":"proto-value","constructor":"ctor-value","toString":"string-value"}',
+    );
+    await binding.put("special-metadata-keys", "value", { metadata: specialKeys });
+    const specialKeysRoundTrip = await binding.getWithMetadata("special-metadata-keys");
+    expect(specialKeysRoundTrip?.metadata).toEqual(specialKeys);
+    expect(Object.hasOwn(specialKeysRoundTrip?.metadata ?? {}, "__proto__")).toBe(true);
+    expect(
+      Object.getOwnPropertyDescriptor(specialKeysRoundTrip?.metadata ?? {}, "constructor")?.value,
+    ).toBe("ctor-value");
+    expect(
+      Object.getOwnPropertyDescriptor(specialKeysRoundTrip?.metadata ?? {}, "toString")?.value,
+    ).toBe("string-value");
+    expect(Object.getPrototypeOf(specialKeysRoundTrip?.metadata)).toBe(Object.prototype);
     expect(await binding.get("missing")).toBeNull();
     await expect(
       binding.put("metadata-key-bytes", "x", {

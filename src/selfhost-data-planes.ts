@@ -972,7 +972,18 @@ function kvMetadata(value: unknown, validationProfile: "legacy" | "v2" = "legacy
     if ((validationProfile === "v2" ? nameBytes > 256 : name.length > 256) || itemLength > 8_192) {
       throw new PlaneError("metadata_too_large");
     }
-    projected[name] = item;
+    if (validationProfile === "v2") {
+      Object.defineProperty(projected, name, {
+        value: item,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    } else {
+      // Preserve the established v1 projection; this focused own-key handling
+      // is part of the new v2 profile only.
+      projected[name] = item;
+    }
   }
   const encoded = JSON.stringify(projected);
   if (new TextEncoder().encode(encoded).byteLength > MAX_KV_METADATA_BYTES) {
