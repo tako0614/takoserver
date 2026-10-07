@@ -34,6 +34,7 @@ import {
   inspectWorkerdWorkerExecutionCopies,
   openWorkerdWorkerExecutionGroup,
   releaseRetiredWorkerdWorkerExecutionCopies,
+  verifyRetiredWorkerdWorkerExecutionCopies,
   type WorkerdWorkerExecutionGroup,
   type WorkerdWorkerRetirementReceipt,
 } from "./workerd-worker-execution-group.ts";
@@ -42,7 +43,8 @@ const STATE_NAME = "runtime-owner.json";
 const LOCK_NAME = "runtime-owner.lock";
 const LEGACY_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@1";
 const PREVIOUS_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@2";
-const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@3";
+const RETIRED_COPIES_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@3";
+const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@4";
 const LOCK_SCHEMA = "takoserver.v2-worker-runtime-owner-lock@2";
 const OPERATION_MARKER = "takoserver-v2-operation:";
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -69,6 +71,10 @@ interface IncarnationRecord {
   readonly deferRetirementUntilDeadline: boolean;
   /** Persisted only after the exact retired group's execution copies are absent. */
   readonly executionCopiesReleased: boolean;
+  /** Persisted with the exact group receipt before any execution-copy rename/removal. */
+  readonly executionCopiesCleanupStarted: boolean;
+  /** Exact pre-cleanup path/type/size/content-digest inventory pinned in owner state. */
+  readonly executionCopiesCleanupManifestSha256: string | null;
   readonly identity: WorkerdPublicationIdentity | null;
   readonly receipt: WorkerdWorkerRetirementReceipt | null;
 }
@@ -823,9 +829,10 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
     const state = value as Record<string, unknown>;
     const legacyStaticState = state.schema === LEGACY_STATE_SCHEMA;
     const previousState = state.schema === PREVIOUS_STATE_SCHEMA;
+    const retiredCopiesState = state.schema === RETIRED_COPIES_STATE_SCHEMA;
     const currentState = state.schema === STATE_SCHEMA;
     if (
-      (!legacyStaticState && !previousState && !currentState) ||
+      (!legacyStaticState && !previousState && !retiredCopiesState && !currentState) ||
       state.workerResourceUid !== workerResourceUid ||
       !(state.activeOperationId === null || typeof state.activeOperationId === "string") ||
       !(state.admissionClosedBy === null || typeof state.admissionClosedBy === "string") ||
@@ -853,9 +860,19 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         (legacyStaticState
           ? item.deferRetirementUntilDeadline !== undefined
           : typeof item.deferRetirementUntilDeadline !== "boolean") ||
-        (currentState
+        (retiredCopiesState || currentState
           ? typeof item.executionCopiesReleased !== "boolean"
           : item.executionCopiesReleased !== undefined) ||
+        (currentState
+          ? typeof item.executionCopiesCleanupStarted !== "boolean"
+          : item.executionCopiesCleanupStarted !== undefined) ||
+        (currentState
+          ? !(
+              item.executionCopiesCleanupManifestSha256 === null ||
+              (typeof item.executionCopiesCleanupManifestSha256 === "string" &&
+                /^sha256:[0-9a-f]{64}$/u.test(item.executionCopiesCleanupManifestSha256))
+            )
+          : item.executionCopiesCleanupManifestSha256 !== undefined) ||
         !(item.identity === null || validIdentity(item.identity)) ||
         !(item.receipt === null || validReceipt(item.receipt))
       ) {
@@ -876,7 +893,16 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         deferRetirementUntilDeadline: legacyStaticState
           ? false
           : (item.deferRetirementUntilDeadline as boolean),
-        executionCopiesReleased: currentState ? (item.executionCopiesReleased as boolean) : false,
+        executionCopiesReleased:
+          retiredCopiesState || currentState ? (item.executionCopiesReleased as boolean) : false,
+        executionCopiesCleanupStarted: currentState
+          ? (item.executionCopiesCleanupStarted as boolean)
+          : retiredCopiesState
+            ? (item.executionCopiesReleased as boolean)
+            : false,
+        executionCopiesCleanupManifestSha256: currentState
+          ? (item.executionCopiesCleanupManifestSha256 as string | null)
+          : null,
       } as unknown as IncarnationRecord);
     }
     const result: PersistedOwnerState = {
@@ -896,7 +922,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
             (item) =>
               item.status !== "retired" ||
               item.receipt === null ||
-              (currentState && !item.executionCopiesReleased),
+              ((retiredCopiesState || currentState) && !item.executionCopiesReleased),
           ))) ||
       (state.activeOperationId === null && activeRecords.length !== 0) ||
       (state.activeOperationId !== null &&
@@ -910,6 +936,13 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         (item) =>
           (item.status === "retired" && item.receipt === null) ||
           (item.executionCopiesReleased && (item.status !== "retired" || item.receipt === null)) ||
+          (item.executionCopiesCleanupStarted && item.receipt === null) ||
+          (item.executionCopiesReleased && !item.executionCopiesCleanupStarted) ||
+          (item.executionCopiesCleanupStarted &&
+            !item.executionCopiesReleased &&
+            item.executionCopiesCleanupManifestSha256 === null) ||
+          (!item.executionCopiesCleanupStarted &&
+            item.executionCopiesCleanupManifestSha256 !== null) ||
           (["draining", "retiring", "retired"].includes(item.status) &&
             item.retirementOperationId === null),
       )
@@ -927,6 +960,8 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
             ({
               deferRetirementUntilDeadline: _defer,
               executionCopiesReleased: _released,
+              executionCopiesCleanupStarted: _cleanupStarted,
+              executionCopiesCleanupManifestSha256: _cleanupManifestSha256,
               ...item
             }) => item,
           ),
@@ -939,10 +974,30 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
             admissionClosedBy: state.admissionClosedBy,
             deletionPublicationConfirmed: state.deletionPublicationConfirmed,
             incarnations: incarnations.map(
-              ({ executionCopiesReleased: _released, ...item }) => item,
+              ({
+                executionCopiesReleased: _released,
+                executionCopiesCleanupStarted: _cleanupStarted,
+                executionCopiesCleanupManifestSha256: _cleanupManifestSha256,
+                ...item
+              }) => item,
             ),
           }
-        : result;
+        : retiredCopiesState
+          ? {
+              schema: RETIRED_COPIES_STATE_SCHEMA,
+              workerResourceUid: state.workerResourceUid,
+              activeOperationId: state.activeOperationId,
+              admissionClosedBy: state.admissionClosedBy,
+              deletionPublicationConfirmed: state.deletionPublicationConfirmed,
+              incarnations: incarnations.map(
+                ({
+                  executionCopiesCleanupStarted: _cleanupStarted,
+                  executionCopiesCleanupManifestSha256: _cleanupManifestSha256,
+                  ...item
+                }) => item,
+              ),
+            }
+          : result;
     if (canonicalJson(canonicalState) !== text) throw new Error();
     return result;
   } catch {
@@ -1135,33 +1190,91 @@ export async function openWorkerdWorkerRuntimeOwner(
         "groups",
         uidKey(options.workerResourceUid),
       );
-      const existingCopies = await inspectWorkerdWorkerExecutionCopies({
-        groupDirectory,
-        workerResourceUid: options.workerResourceUid,
-        listenerPort: record.listenerPort,
-        scriptName: `v2-worker-${uidKey(options.workerResourceUid)}`,
-      });
-      if (
-        !executionCopiesMatchRecord(record, existingCopies, false) ||
-        (record.executionCopiesReleased &&
-          (existingCopies.versionUids.length !== 0 || existingCopies.generationKeys.length !== 0))
-      ) {
+      let prepared = record;
+      if (!record.executionCopiesCleanupStarted) {
+        const verified = await verifyRetiredWorkerdWorkerExecutionCopies({
+          groupDirectory,
+          workerResourceUid: options.workerResourceUid,
+          operationId: record.retirementOperationId,
+          listenerPort: record.listenerPort,
+          scriptName: `v2-worker-${uidKey(options.workerResourceUid)}`,
+        });
+        if (
+          (record.receipt && canonicalJson(record.receipt) !== canonicalJson(verified.receipt)) ||
+          !executionCopiesMatchRecord(record, verified.copies, false) ||
+          (record.executionCopiesReleased &&
+            (verified.copies.versionUids.length !== 0 ||
+              verified.copies.generationKeys.length !== 0))
+        ) {
+          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        }
+        const snapshot = await transitionState((current) => ({
+          ...current,
+          incarnations: current.incarnations.map((item) =>
+            item.operationId === record.operationId
+              ? {
+                  ...item,
+                  receipt: verified.receipt,
+                  executionCopiesCleanupStarted: true,
+                  executionCopiesCleanupManifestSha256: verified.cleanupManifestSha256,
+                }
+              : item,
+          ),
+        }));
+        const updated = snapshot.incarnations.find(
+          (item) => item.operationId === record.operationId,
+        );
+        if (!updated) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        prepared = updated;
+      } else if (record.receipt === null) {
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      if (record.executionCopiesReleased) {
+        const verified = await verifyRetiredWorkerdWorkerExecutionCopies({
+          groupDirectory,
+          workerResourceUid: options.workerResourceUid,
+          operationId: record.retirementOperationId,
+          listenerPort: record.listenerPort,
+          scriptName: `v2-worker-${uidKey(options.workerResourceUid)}`,
+        });
+        if (
+          verified.copies.versionUids.length !== 0 ||
+          verified.copies.generationKeys.length !== 0 ||
+          !prepared.receipt ||
+          canonicalJson(prepared.receipt) !== canonicalJson(verified.receipt)
+        ) {
+          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        }
+        const confirmed = await releaseRetiredWorkerdWorkerExecutionCopies({
+          groupDirectory,
+          workerResourceUid: options.workerResourceUid,
+          operationId: record.retirementOperationId,
+          listenerPort: record.listenerPort,
+          scriptName: `v2-worker-${uidKey(options.workerResourceUid)}`,
+          cleanupIntentPersisted: true,
+          cleanupManifestSha256: prepared.executionCopiesCleanupManifestSha256,
+          alreadyReleased: true,
+        });
+        if (canonicalJson(confirmed.receipt) !== canonicalJson(prepared.receipt))
+          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        continue;
       }
       const released = await releaseRetiredWorkerdWorkerExecutionCopies({
         groupDirectory,
         workerResourceUid: options.workerResourceUid,
-        operationId: record.retirementOperationId,
+        operationId: prepared.retirementOperationId as string,
         listenerPort: record.listenerPort,
         scriptName: `v2-worker-${uidKey(options.workerResourceUid)}`,
+        cleanupIntentPersisted: true,
+        cleanupManifestSha256: prepared.executionCopiesCleanupManifestSha256,
       });
-      if (record.receipt && canonicalJson(record.receipt) !== canonicalJson(released.receipt)) {
+      if (prepared.receipt && canonicalJson(prepared.receipt) !== canonicalJson(released.receipt)) {
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       }
       if (
-        record.status !== "retired" ||
-        !record.executionCopiesReleased ||
-        record.receipt === null
+        prepared.status !== "retired" ||
+        !prepared.executionCopiesReleased ||
+        prepared.receipt === null
       ) {
         await transitionState((current) => ({
           ...current,
@@ -1172,6 +1285,7 @@ export async function openWorkerdWorkerRuntimeOwner(
                   status: "retired",
                   receipt: released.receipt,
                   executionCopiesReleased: true,
+                  executionCopiesCleanupStarted: true,
                 }
               : item,
           ),
@@ -1244,27 +1358,35 @@ export async function openWorkerdWorkerRuntimeOwner(
           workerResourceUid: options.workerResourceUid,
           operationId,
         });
+        const verified = await verifyRetiredWorkerdWorkerExecutionCopies({
+          groupDirectory: incarnation.group.runtimeRoot,
+          workerResourceUid: options.workerResourceUid,
+          operationId,
+          listenerPort: incarnation.record.listenerPort,
+          scriptName: scriptName(options.workerResourceUid),
+        });
+        if (
+          canonicalJson(receipt) !== canonicalJson(verified.receipt) ||
+          !executionCopiesMatchRecord(incarnation.record, verified.copies, false)
+        ) {
+          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        }
         const receiptPersisted = await updateRecord(incarnation.record.operationId, (current) => ({
           ...current,
           status: "retiring",
           receipt,
+          executionCopiesCleanupStarted: true,
+          executionCopiesCleanupManifestSha256: verified.cleanupManifestSha256,
         }));
         incarnation.record = receiptPersisted;
-        const existingCopies = await inspectWorkerdWorkerExecutionCopies({
-          groupDirectory: incarnation.group.runtimeRoot,
-          workerResourceUid: options.workerResourceUid,
-          listenerPort: incarnation.record.listenerPort,
-          scriptName: scriptName(options.workerResourceUid),
-        });
-        if (!executionCopiesMatchRecord(incarnation.record, existingCopies, false)) {
-          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
-        }
         const released = await releaseRetiredWorkerdWorkerExecutionCopies({
           groupDirectory: incarnation.group.runtimeRoot,
           workerResourceUid: options.workerResourceUid,
           operationId,
           listenerPort: incarnation.record.listenerPort,
           scriptName: scriptName(options.workerResourceUid),
+          cleanupIntentPersisted: true,
+          cleanupManifestSha256: incarnation.record.executionCopiesCleanupManifestSha256,
         });
         if (canonicalJson(receipt) !== canonicalJson(released.receipt)) {
           throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
@@ -1274,6 +1396,7 @@ export async function openWorkerdWorkerRuntimeOwner(
           status: "retired",
           receipt,
           executionCopiesReleased: true,
+          executionCopiesCleanupStarted: true,
         }));
         incarnation.record = retired;
         incarnation.retirementTimer?.();
@@ -1353,6 +1476,8 @@ export async function openWorkerdWorkerRuntimeOwner(
       retireAtMs: null,
       deferRetirementUntilDeadline: false,
       executionCopiesReleased: false,
+      executionCopiesCleanupStarted: false,
+      executionCopiesCleanupManifestSha256: null,
       identity: null,
       receipt: null,
     };
@@ -1705,6 +1830,9 @@ export async function openWorkerdWorkerRuntimeOwner(
           operationId: record.retirementOperationId,
           listenerPort: record.listenerPort,
           scriptName: scriptName(options.workerResourceUid),
+          cleanupIntentPersisted: true,
+          cleanupManifestSha256: record.executionCopiesCleanupManifestSha256,
+          alreadyReleased: true,
         }).catch(() => null);
         if (!checked || canonicalJson(checked.receipt) !== canonicalJson(record.receipt))
           return unknown;
