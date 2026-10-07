@@ -8,17 +8,6 @@ import { createTakoformStore } from "../src/takoform/store.ts";
 
 const HOSTNAME = "ce-1234567890abcdef1234567890abcdef12345678.container.test";
 const HOSTNAME_INDEX_MIGRATION = "0067_takoform_container_endpoint_hostname_index.sql";
-const INVOCATION_CUSTODY_MIGRATION = "0068_cloudflare_provider_invocation_custody.sql";
-const INVOCATION_DELETE_ACK_MIGRATION = "0069_cloudflare_provider_invocation_delete_ack.sql";
-const TAKOFORM_V2_MIGRATION = "0070_takoform_v2.sql";
-const V2_MIGRATION_SET_CUSTODY = "0071_v2_sqlite_migration_set_custody.sql";
-const V2_ARTIFACT_CUSTODY = "0072_v2_artifact_custody.sql";
-const V2_REFERENCE_ACCEPTANCE = "0073_v2_reference_acceptance.sql";
-const V2_WORKER_NATIVE_EFFECTS = "0074_v2_worker_native_effects.sql";
-const V2_ARTIFACT_PROGRESS = "0075_v2_artifact_progress.sql";
-const V2_WORKER_INVOCATION_CUSTODY = "0076_v2_worker_invocation_custody.sql";
-const V2_OPERATION_ACCEPTANCE_ORDER = "0077_v2_operation_acceptance_order.sql";
-const V2_WORKER_INVOCATION_RETIREMENT = "0078_v2_worker_invocation_retirement.sql";
 
 function insertResource(
   database: Database,
@@ -158,20 +147,11 @@ test("0067 upgrades nonempty 0066 Resource data without changing rows", async ()
     });
     const before = database.query("SELECT * FROM tf_resources ORDER BY kind").all();
     const report = migrateSqlite(database);
-    expect(report.applied).toEqual([
-      HOSTNAME_INDEX_MIGRATION,
-      INVOCATION_CUSTODY_MIGRATION,
-      INVOCATION_DELETE_ACK_MIGRATION,
-      TAKOFORM_V2_MIGRATION,
-      V2_MIGRATION_SET_CUSTODY,
-      V2_ARTIFACT_CUSTODY,
-      V2_REFERENCE_ACCEPTANCE,
-      V2_WORKER_NATIVE_EFFECTS,
-      V2_ARTIFACT_PROGRESS,
-      V2_WORKER_INVOCATION_CUSTODY,
-      V2_OPERATION_ACCEPTANCE_ORDER,
-      V2_WORKER_INVOCATION_RETIREMENT,
-    ]);
+    // The historical starting point is fixed; its current successor list is
+    // owned by the migration source, not a second hand-maintained inventory.
+    const successorIndex = MIGRATIONS.findIndex(({ name }) => name === HOSTNAME_INDEX_MIGRATION);
+    expect(successorIndex).toBe(66);
+    expect(report.applied).toEqual(MIGRATIONS.slice(successorIndex).map(({ name }) => name));
     expect(database.query("SELECT * FROM tf_resources ORDER BY kind").all()).toEqual(before);
     expect(migrateSqlite(database).applied).toEqual([]);
   } finally {
