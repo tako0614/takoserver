@@ -235,55 +235,99 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     try {
       if (!restorationComplete || grant.targetKey !== targetKey) return false;
       const owner = await openOwner(grant.workerUid);
-      const before = await owner.observeServing({
-        workerResourceUid: grant.workerUid,
-        targetKey,
-      });
-      if (
-        before.kind !== "serving" ||
-        !before.versions.some((version) => version.workerVersionUid === grant.workerVersionUid)
-      )
-        return false;
-      const current = await publicationState.resolveCurrentServing({
+      const nativeTarget = {
         workerUid: grant.workerUid,
-        targetKey,
-        sourceOperationId: before.sourceOperationId,
-        expectedIdentity: {
-          generation: before.generation,
-          workerResourceUid: before.workerResourceUid,
-          hostnames: before.hostnames,
-          versions: before.versions,
-        },
-      });
-      if (current.kind !== "ready") return false;
-      const { snapshot } = current;
-      const version = snapshot.deployment?.versions.find(
-        (item) => item.uid === grant.workerVersionUid,
-      );
+        versionId: grant.nativeVersionId,
+        incarnationId: grant.incarnationId,
+        servingSourceOperationId: grant.servingSourceOperationId,
+      };
+      const observedTarget = await owner.observeVersionTarget(nativeTarget);
       if (
-        snapshot.worker.uid !== grant.workerUid ||
-        snapshot.worker.principal !== grant.principal ||
-        snapshot.worker.space !== grant.space ||
-        !version ||
-        version.spec.sqliteBindings.length !== grant.bindings.length ||
-        version.spec.sqliteBindings.some(
-          (binding) =>
-            !grant.bindings.some(
-              (chosen) =>
-                chosen.name === binding.name && chosen.resourceUid === binding.resource.resourceUid,
-            ),
-        ) ||
-        !(await current.stillCurrent())
+        observedTarget.kind !== "confirmed" ||
+        observedTarget.workerUid !== grant.workerUid ||
+        observedTarget.versionId !== grant.nativeVersionId ||
+        observedTarget.incarnationId !== grant.incarnationId ||
+        observedTarget.servingSourceOperationId !== grant.servingSourceOperationId
       )
         return false;
-      const after = await owner.observeServing({
+      let beforeServing =
+        observedTarget.status === "active"
+          ? await owner.observeServing({ workerResourceUid: grant.workerUid, targetKey })
+          : null;
+      if (
+        beforeServing &&
+        (beforeServing.kind !== "serving" ||
+          beforeServing.sourceOperationId !== grant.servingSourceOperationId ||
+          !beforeServing.versions.some(
+            (version) => version.workerVersionUid === grant.workerVersionUid,
+          ))
+      ) {
+        const transitioned = await owner.observeVersionTarget(nativeTarget);
+        if (
+          transitioned.kind !== "confirmed" ||
+          transitioned.status !== "draining" ||
+          transitioned.workerUid !== grant.workerUid ||
+          transitioned.versionId !== grant.nativeVersionId ||
+          transitioned.incarnationId !== grant.incarnationId ||
+          transitioned.servingSourceOperationId !== grant.servingSourceOperationId
+        )
+          return false;
+        beforeServing = null;
+      }
+
+      // The grant is minted only from a preflighted accepted publication and
+      // bound to one native owner incarnation. A pending replacement may make
+      // current-serving SQL unavailable *before* that old owner drains. Existing
+      // contexts still retain their selected Version through both states; this
+      // gate cannot admit a new invocation or select a stale Version for one.
+      if (!sqliteAuthority || grant.bindings.length === 0) return false;
+      const worker = await sql.query(
+        `SELECT uid FROM tf_v2_resources
+         WHERE uid = ? AND form_url = ? AND principal = ? AND space = ?
+           AND target_key = ? AND deleted_at IS NULL`,
+        [grant.workerUid, MODULE_WORKER_FORM_URL, grant.principal, grant.space, targetKey],
+      );
+      if (worker.length !== 1 || worker[0]?.uid !== grant.workerUid) return false;
+      for (const binding of grant.bindings) {
+        const current = await sqliteAuthority.resolveCurrentBinding(grant, binding.name);
+        if (current?.resourceUid !== binding.resourceUid) return false;
+      }
+      const afterTarget = await owner.observeVersionTarget(nativeTarget);
+      if (
+        afterTarget.kind !== "confirmed" ||
+        (observedTarget.status === "draining" && afterTarget.status !== "draining") ||
+        (afterTarget.status !== "active" && afterTarget.status !== "draining") ||
+        afterTarget.workerUid !== observedTarget.workerUid ||
+        afterTarget.versionId !== observedTarget.versionId ||
+        afterTarget.incarnationId !== observedTarget.incarnationId ||
+        afterTarget.servingSourceOperationId !== observedTarget.servingSourceOperationId
+      )
+        return false;
+      if (afterTarget.status === "draining") return true;
+      if (!beforeServing) return false;
+      const afterServing = await owner.observeServing({
         workerResourceUid: grant.workerUid,
         targetKey,
       });
+      const finalTarget = await owner.observeVersionTarget(nativeTarget);
+      if (
+        finalTarget.kind === "confirmed" &&
+        finalTarget.status === "draining" &&
+        finalTarget.workerUid === grant.workerUid &&
+        finalTarget.versionId === grant.nativeVersionId &&
+        finalTarget.incarnationId === grant.incarnationId &&
+        finalTarget.servingSourceOperationId === grant.servingSourceOperationId
+      )
+        return true;
       return (
-        after.kind === "serving" &&
-        JSON.stringify(after) === JSON.stringify(before) &&
-        (await current.stillCurrent())
+        afterServing.kind === "serving" &&
+        JSON.stringify(afterServing) === JSON.stringify(beforeServing) &&
+        finalTarget.kind === "confirmed" &&
+        finalTarget.status === "active" &&
+        finalTarget.workerUid === grant.workerUid &&
+        finalTarget.versionId === grant.nativeVersionId &&
+        finalTarget.incarnationId === grant.incarnationId &&
+        finalTarget.servingSourceOperationId === grant.servingSourceOperationId
       );
     } catch {
       return false;

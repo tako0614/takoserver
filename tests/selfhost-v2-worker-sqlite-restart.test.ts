@@ -173,7 +173,7 @@ test.skipIf(binary === null)(
 
       const objects = createFileObjectStore({ root: join(root, "objects") });
       const code = new TextEncoder().encode(
-        "export default { async fetch(request, env) { const url = new URL(request.url); if (url.pathname === '/write') { await env.DB.execute('INSERT INTO records (value) VALUES (?)', [url.searchParams.get('value')]); return new Response('written'); } const result = await env.DB.query('SELECT value FROM records ORDER BY id'); return Response.json(result.rows); } };\n",
+        "export default { async fetch(request, env) { const url = new URL(request.url); if (url.pathname === '/write') { await env.DB.execute('INSERT INTO records (value) VALUES (?)', [url.searchParams.get('value')]); return new Response('written'); } if (url.pathname === '/wait') { await env.DB.execute(\"INSERT INTO records (value) VALUES ('wait-started')\"); for (let n = 0; n < 20; n++) { const old = await env.DB.query(\"SELECT value FROM records WHERE value = 'wait-started'\"); if (old.rows.length !== 1) throw new Error('old row unavailable'); await new Promise(resolve => setTimeout(resolve, 80)); } return new Response('old-version-finished'); } const result = await env.DB.query('SELECT value FROM records ORDER BY id'); return Response.json(result.rows); } };\n",
       );
       const bundle = new TextEncoder().encode(
         JSON.stringify({
@@ -219,9 +219,9 @@ test.skipIf(binary === null)(
       first = await startHost(root, binary as string, organization.id, hashes, privatePort);
       expect(first.restored).toEqual([]);
       const initial = first;
-      const create = async (form: string, name: string, spec: unknown) => {
+      const create = async (form: string, name: string, spec: unknown, port = initial.port) => {
         const response = await request(
-          initial.port,
+          port,
           key.secret,
           `${API}/resources`,
           "POST",
@@ -230,7 +230,7 @@ test.skipIf(binary === null)(
         );
         expect(response.status).toBe(202);
         const accepted = (await response.json()) as { id: string; resourceUid: string };
-        await settled(initial.port, key.secret, accepted.id);
+        await settled(port, key.secret, accepted.id);
         return accepted.resourceUid;
       };
       const workerUid = await create(MODULE_WORKER_FORM_URL, "worker", {});
@@ -297,7 +297,11 @@ test.skipIf(binary === null)(
         await readFile(join(root, "v2-worker-owners", ownerKey, "runtime-owner.json"), "utf8"),
       ) as {
         activeOperationId: string | null;
-        incarnations: { processIdentity: LinuxProcessIdentity | null; identity: unknown }[];
+        incarnations: {
+          operationId: string;
+          processIdentity: LinuxProcessIdentity | null;
+          identity: unknown;
+        }[];
       };
       const priorChildren = state.incarnations.flatMap((record) =>
         record.processIdentity ? [record.processIdentity] : [],
@@ -332,14 +336,18 @@ test.skipIf(binary === null)(
         await readFile(join(root, "v2-worker-owners", ownerKey, "runtime-owner.json"), "utf8"),
       ) as {
         activeOperationId: string | null;
-        incarnations: { processIdentity: LinuxProcessIdentity | null; identity: unknown }[];
+        incarnations: {
+          operationId: string;
+          processIdentity: LinuxProcessIdentity | null;
+          identity: unknown;
+        }[];
       };
       expect(recoveredState.activeOperationId).toBe(state.activeOperationId);
       const priorActive = state.incarnations.find(
-        (record) => record.identity !== null && record.processIdentity !== null,
+        (record) => record.operationId === state.activeOperationId,
       );
       const recoveredActive = recoveredState.incarnations.find(
-        (record) => record.identity !== null && record.processIdentity !== null,
+        (record) => record.operationId === recoveredState.activeOperationId,
       );
       expect(state.activeOperationId).not.toBeNull();
       expect(priorActive).toBeDefined();
@@ -382,6 +390,108 @@ test.skipIf(binary === null)(
         { value: "before-restart" },
         { value: "after-update" },
       ]);
+      const versionTwoUid = await create(
+        WORKER_VERSION_FORM_URL,
+        "version-two",
+        {
+          worker: { resourceUid: workerUid },
+          bundle: { resourceUid: bundleUid },
+          handlers: ["fetch"],
+          sqliteBindings: [{ name: "DB", resource: { resourceUid: databaseUid } }],
+        },
+        recoveredHost.port,
+      );
+      // The raw file is read only as a test barrier. Every Worker SQL operation
+      // before, during, and after publication still traverses the private broker.
+      const databasePath = join(
+        root,
+        "sqlite-custody",
+        "resources",
+        databaseUid,
+        "database.sqlite",
+      );
+      const controlDatabase = new Database(databasePath, { readonly: true });
+      let oldSettled = false;
+      const oldInvocation = request(
+        recoveredHost.port,
+        key.secret,
+        `/__fixture/serve/${workerUid}/wait`,
+      )
+        .catch(() => new Response(null, { status: 599 }))
+        .then((response) => {
+          oldSettled = true;
+          return response;
+        });
+      try {
+        let started = false;
+        for (let attempt = 0; attempt < 250; attempt += 1) {
+          if (controlDatabase.query("SELECT 1 FROM records WHERE value = 'wait-started'").get()) {
+            started = true;
+            break;
+          }
+          await Bun.sleep(10);
+        }
+        expect(started).toBe(true);
+        await Bun.sleep(100);
+        expect(oldSettled).toBe(false);
+        const deploymentUpdate = await request(
+          recoveredHost.port,
+          key.secret,
+          `${API}/resources/${deploymentUid}`,
+          "PUT",
+          {
+            spec: {
+              worker: { resourceUid: workerUid },
+              versions: [{ workerVersion: { resourceUid: versionTwoUid }, weight: 10_000 }],
+            },
+          },
+          "replace-version-sqlite-restart",
+          1,
+        );
+        expect(deploymentUpdate.status).toBe(202);
+        await settled(
+          recoveredHost.port,
+          key.secret,
+          ((await deploymentUpdate.json()) as { id: string }).id,
+        );
+        const switchedState = JSON.parse(
+          await readFile(join(root, "v2-worker-owners", ownerKey, "runtime-owner.json"), "utf8"),
+        ) as {
+          activeOperationId: string | null;
+          incarnations: {
+            operationId: string;
+            status: string;
+            identity: { versions: { workerVersionUid: string }[] } | null;
+          }[];
+        };
+        expect(
+          switchedState.incarnations.find(
+            (record) => record.operationId === recoveredState.activeOperationId,
+          )?.status,
+        ).toBe("draining");
+        expect(
+          switchedState.incarnations
+            .find((record) => record.operationId === switchedState.activeOperationId)
+            ?.identity?.versions.map((version) => version.workerVersionUid),
+        ).toEqual([versionTwoUid]);
+        expect(oldSettled).toBe(false);
+        const oldResult = await oldInvocation;
+        expect(oldResult.status).toBe(200);
+        expect(await oldResult.text()).toBe("old-version-finished");
+        const successorRead = await request(
+          recoveredHost.port,
+          key.secret,
+          `/__fixture/serve/${workerUid}/`,
+        );
+        expect(successorRead.status).toBe(200);
+        expect(await successorRead.json()).toEqual([
+          { value: "before-restart" },
+          { value: "after-update" },
+          { value: "wait-started" },
+        ]);
+      } finally {
+        controlDatabase.close();
+      }
       const remove = async (uid: string, name: string, generation: number) => {
         const response = await request(
           recoveredHost.port,
@@ -397,7 +507,8 @@ test.skipIf(binary === null)(
         await settled(recoveredHost.port, key.secret, accepted.id);
       };
       await remove(endpointUid, "endpoint", 1);
-      await remove(deploymentUid, "deployment", 1);
+      await remove(deploymentUid, "deployment", 2);
+      await remove(versionTwoUid, "version-two", 1);
       await remove(versionUid, "version", 1);
       await remove(migrationApplicationUid, "migration-application", 1);
       await remove(migrationSetUid, "migration-set", 1);
@@ -410,4 +521,5 @@ test.skipIf(binary === null)(
       await rm(root, { recursive: true, force: true });
     }
   },
+  20_000,
 );

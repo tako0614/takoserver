@@ -605,6 +605,10 @@ SQLite binding. It accepts the exact UID reference over organization HTTP,
 executes native Worker SQL writes and reads, SIGKILLs the Host, restores the
 same accepted graph with a different Host/native PID, then reads the same rows
 and continues after a same-spec Database PUT. All test keys are synthetic.
+An admitted old invocation also keeps its signed exact-incarnation SQLite
+Binding while a replacement Deployment is pending and while that incarnation
+drains; each call still checks the live native owner and current settled
+Version/Database references, and retirement ends that authority.
 That evidence does not qualify the 40 MiB companion transport boundary,
 public HTTPS/TLS, or complete WorkerVersion/SQLiteDatabase Form support.
 
