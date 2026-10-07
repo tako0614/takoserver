@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
@@ -45,13 +45,15 @@ const principal = "native-queue-principal";
 const space = "default";
 const targetKey = "native-queue-target";
 const modulePath = "app.mjs";
+const pidFixtureMode = process.env.TAKOSERVER_QUEUE_PID_FIXTURE;
+const waitUntilMillis = pidFixtureMode === "first" || pidFixtureMode === "recover" ? 30_000 : 180;
 const moduleBytes = new TextEncoder().encode(`
 export default {
   async queue(batch, _env, ctx) {
     if (batch.messages[0].id === "message-retry" && batch.messages[0].attempts === 1)
       throw new Error("retry once");
     await batch.acknowledgeAll();
-    ctx.waitUntil(new Promise((resolve) => setTimeout(resolve, 180)));
+    ctx.waitUntil(new Promise((resolve) => setTimeout(resolve, ${waitUntilMillis})));
   },
 };
 `);
@@ -68,7 +70,11 @@ test.skipIf(binary === undefined)(
   "real 0082/0083 custody + exact native owner holds maxConcurrency after early ACK until waitUntil completes",
   async () => {
     if (!binary) throw new Error("pinned Workerd missing");
-    const root = await mkdtemp(join(tmpdir(), "v2-queue-native-core-"));
+    const root =
+      pidFixtureMode === "first"
+        ? (process.env.TAKOSERVER_QUEUE_PID_ROOT ?? "")
+        : await mkdtemp(join(tmpdir(), "v2-queue-native-core-"));
+    if (!root) throw new Error("Queue PID fixture root missing");
     await chmod(root, 0o700);
     const db = new Database(join(root, "state.sqlite"));
     const children: ReturnType<typeof spawnWorkerdWithParentDeath>[] = [];
@@ -237,12 +243,14 @@ test.skipIf(binary === undefined)(
       deploymentUid = deployment.resourceUid;
       sourceOperationId = deployment.id;
       const inspector = createWorkerdWorkerModuleInspector({ binary: selected.binary });
+      const settlementKey = randomBytes(32);
+      const privatePort = await unusedPort();
       queueComposition = createSelfhostV2QueueComposition({
         sql,
         custody,
         capability,
-        settlementKey: randomBytes(32),
-        privatePort: await unusedPort(),
+        settlementKey,
+        privatePort,
         ownerForWorkerUid: async (uid) => {
           if (!owner || uid !== workerUid) throw new Error("unknown owner");
           return owner;
@@ -343,6 +351,30 @@ test.skipIf(binary === undefined)(
         await Bun.sleep(10);
       }
       expect(occupiedAfterAck).toBe(true);
+      if (pidFixtureMode === "first") {
+        await writeFile(join(root, "settlement.key"), settlementKey, { mode: 0o600 });
+        await writeFile(
+          join(root, "queue-pid-meta.json"),
+          JSON.stringify({
+            workerUid,
+            versionUid,
+            deploymentUid,
+            sourceOperationId,
+            consumerUid: consumer.resourceUid,
+            queueUid: queue.resourceUid,
+            privatePort,
+            nativePid: children[0]?.pid,
+          }),
+          { mode: 0o600 },
+        );
+        process.stdout.write(
+          `QUEUE_PID_READY ${JSON.stringify({
+            hostPid: process.pid,
+            nativePid: children[0]?.pid,
+          })}\n`,
+        );
+        await new Promise<void>(() => {});
+      }
       expect(await queueComposition.deliverOnce(scope)).toEqual({ kind: "idle" });
       const firstResult = await first;
       expect(firstResult).toEqual({ kind: "handler_resolved" });
@@ -428,6 +460,42 @@ test.skipIf(binary === undefined)(
       ).toEqual({ kind: "unknown" });
       expect(authorizeCalls).toBe(0);
       expect(await cancelV2QueueBatchBeforeSend(sql, reserved)).toBe(true);
+      await queueComposition.close();
+      let unknownSends = 0;
+      queueComposition = createSelfhostV2QueueComposition({
+        sql,
+        custody,
+        capability,
+        settlementKey,
+        privatePort,
+        ownerForWorkerUid: async (uid) => {
+          if (uid !== workerUid) throw new Error("foreign Worker");
+          return {
+            ...invokedOwner,
+            async invokeQueue(input) {
+              unknownSends++;
+              expect(
+                await input.authorizeSend({
+                  workerVersionUid: versionUid,
+                  workerVersionGeneration: 1,
+                  incarnationOperationId: sourceOperationId,
+                }),
+              ).toBe("authorized");
+              // The send may have happened. Lost native response is not proof
+              // of handler completion and must leave the 0083 slot occupied.
+              return { kind: "unknown" } as const;
+            },
+          };
+        },
+      });
+      expect(await queueComposition.deliverOnce(scope)).toEqual({ kind: "unknown" });
+      expect(
+        await sql.query(
+          "SELECT state FROM queue_v2_batch_executions WHERE state = 'send_authorized'",
+        ),
+      ).toEqual([{ state: "send_authorized" }]);
+      expect(await queueComposition.deliverOnce(scope)).toEqual({ kind: "idle" });
+      expect(unknownSends).toBe(1);
     } finally {
       await queueComposition?.close().catch(() => undefined);
       await owner?.close().catch(() => undefined);
@@ -435,6 +503,294 @@ test.skipIf(binary === undefined)(
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
       await Promise.all(children.map((child) => child.exited));
       db.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(pidFixtureMode !== "recover")(
+  "recover reserved Queue batch in a different Host PID without resending",
+  async () => {
+    if (!binary) throw new Error("pinned Workerd missing");
+    const root = process.env.TAKOSERVER_QUEUE_PID_ROOT;
+    if (!root) throw new Error("Queue PID fixture root missing");
+    const meta = JSON.parse(await readFile(join(root, "queue-pid-meta.json"), "utf8")) as {
+      workerUid: string;
+      versionUid: string;
+      deploymentUid: string;
+      sourceOperationId: string;
+      consumerUid: string;
+      queueUid: string;
+      privatePort: number;
+      nativePid: number;
+    };
+    const db = new Database(join(root, "state.sqlite"));
+    const children: ReturnType<typeof spawnWorkerdWithParentDeath>[] = [];
+    let owner: WorkerdWorkerRuntimeOwner | undefined;
+    let composition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+    try {
+      migrateSqlite(db);
+      const sql = createSqliteSql(db);
+      const custody = createQueueCustody({ sql });
+      const manifestUrl = "https://artifacts.example.test/native-queue/manifest.json";
+      const moduleUrl = "https://artifacts.example.test/native-queue/app.mjs";
+      const manifestBytes = new TextEncoder().encode(
+        JSON.stringify({
+          entrypoint: modulePath,
+          files: [
+            {
+              path: modulePath,
+              url: moduleUrl,
+              sha256: sha(moduleBytes),
+              mediaType: "application/javascript+module",
+            },
+          ],
+        }),
+      );
+      const held = {
+        manifest: parseWorkerBundleManifest(manifestBytes),
+        manifestBytes,
+        files: [moduleBytes],
+        observed: (
+          await validateWorkerBundlePayload({
+            spec: { artifact: { url: manifestUrl, sha256: sha(manifestBytes) } },
+            manifestBytes,
+            fileBytes: [moduleBytes],
+          })
+        ).observed,
+      };
+      const versionSpec = () => ({
+        worker: { resourceUid: meta.workerUid },
+        bundle: { resourceUid: "native-queue-bundle" },
+        handlers: ["queue"],
+      });
+      const serving = () => ({
+        kind: "ready" as const,
+        snapshot: {
+          sourceOperationId: meta.sourceOperationId,
+          worker: { uid: meta.workerUid, principal, space, generation: 1 },
+          deployment: {
+            uid: meta.deploymentUid,
+            generation: 1,
+            spec: {
+              worker: { resourceUid: meta.workerUid },
+              versions: [{ workerVersion: { resourceUid: meta.versionUid }, weight: 10_000 }],
+            },
+            versions: [
+              {
+                uid: meta.versionUid,
+                generation: 1,
+                weight: 10_000,
+                spec: versionSpec(),
+              },
+            ],
+          },
+          endpoint: null,
+        },
+        sqlGuard: { sql: "SELECT 1", params: [] },
+        stillCurrent: async () => true,
+        readVersionMaterials: async () => ({ bundle: held, assets: null }),
+      });
+      const publicationState = {
+        async resolve({
+          execution,
+        }: {
+          execution: V2Execution;
+        }): Promise<V2WorkerPublicationResolution> {
+          return execution.operationId === meta.sourceOperationId
+            ? (serving() as unknown as V2WorkerPublicationResolution)
+            : { kind: "unresolved", code: "stale_claim", message: "wrong operation" };
+        },
+        async resolveCurrentServing(input: {
+          workerUid: string;
+          targetKey: string;
+          sourceOperationId: string;
+        }) {
+          return input.workerUid === meta.workerUid &&
+            input.targetKey === targetKey &&
+            input.sourceOperationId === meta.sourceOperationId
+            ? (serving() as unknown as V2WorkerPublicationResolution)
+            : {
+                kind: "unresolved" as const,
+                code: "graph_unresolved" as const,
+                message: "wrong source",
+              };
+        },
+      };
+      const capability = {
+        async observeCurrentServing(input: {
+          workerUid: string;
+          principal: string;
+          space: string;
+          targetKey: string;
+        }) {
+          return input.workerUid === meta.workerUid &&
+            input.principal === principal &&
+            input.space === space &&
+            input.targetKey === targetKey
+            ? (serving() as never)
+            : {
+                kind: "unresolved" as const,
+                code: "graph_unresolved" as const,
+                message: "wrong scope",
+              };
+        },
+      };
+      const signingKey = await readFile(join(root, "settlement.key"));
+      composition = createSelfhostV2QueueComposition({
+        sql,
+        custody,
+        capability,
+        settlementKey: signingKey,
+        privatePort: meta.privatePort,
+        ownerForWorkerUid: async (uid) => {
+          if (!owner || uid !== meta.workerUid) throw new Error("unknown owner");
+          return owner;
+        },
+      });
+      const inspector = createWorkerdWorkerModuleInspector({ binary });
+      owner = await openWorkerdWorkerRuntimeOwner({
+        rootDirectory: join(root, "owner"),
+        workerResourceUid: meta.workerUid,
+        targetKey,
+        publicationState,
+        workerdBinary: binary,
+        inspectModule: inspector.inspect.bind(inspector),
+        v2QueueSettlement: composition.settlementBinding,
+        listenerPortForOperation: unusedPort,
+        spawn(command) {
+          const child = spawnWorkerdWithParentDeath(command, {
+            stdout: "ignore",
+            stderr: "ignore",
+          });
+          children.push(child);
+          return child;
+        },
+      });
+      const nativeVersionId = `v2-${sha(new TextEncoder().encode(`${meta.versionUid}\u00001`))}`;
+      expect(
+        await owner.observeQueueTarget({
+          workerUid: meta.workerUid,
+          versionId: nativeVersionId,
+          incarnationId: meta.sourceOperationId,
+          servingSourceOperationId: meta.sourceOperationId,
+        }),
+      ).toMatchObject({ kind: "confirmed", status: "active" });
+      expect(
+        await owner.observeQueueServingCapability({
+          workerUid: meta.workerUid,
+          principal,
+          space,
+          targetKey,
+        }),
+      ).toMatchObject({ kind: "confirmed", servingSourceOperationId: meta.sourceOperationId });
+      expect(
+        await sql.query(
+          "SELECT state FROM queue_v2_batch_executions WHERE state = 'send_authorized'",
+        ),
+      ).toEqual([{ state: "send_authorized" }]);
+      expect(
+        await composition.deliverOnce({
+          consumerUid: meta.consumerUid,
+          principal,
+          space,
+          targetKey,
+        }),
+      ).toEqual({ kind: "idle" });
+      await writeFile(
+        join(root, "queue-pid-recovered.json"),
+        JSON.stringify({
+          hostPid: process.pid,
+          nativePid: children[0]?.pid,
+          servingSourceOperationId: meta.sourceOperationId,
+        }),
+        { mode: 0o600 },
+      );
+      await new Promise<void>(() => {});
+    } finally {
+      await composition?.close().catch(() => undefined);
+      await owner?.close().catch(() => undefined);
+      for (const child of children)
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await Promise.all(children.map((child) => child.exited));
+      db.close();
+    }
+  },
+);
+
+test.skipIf(binary === undefined || pidFixtureMode !== undefined)(
+  "OS Host PID restart retains authorized Queue batch and forbids second send",
+  async () => {
+    if (!binary) throw new Error("pinned Workerd missing");
+    const root = await mkdtemp(join(tmpdir(), "v2-queue-host-pid-restart-"));
+    await chmod(root, 0o700);
+    const fixture = (mode: "first" | "recover") =>
+      Bun.spawn(
+        [
+          process.execPath,
+          "--no-env-file",
+          "test",
+          import.meta.path,
+          "-t",
+          mode === "first" ? "real 0082/0083 custody" : "recover reserved Queue batch",
+        ],
+        {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "pipe",
+          env: {
+            PATH: process.env.PATH ?? "/usr/bin:/bin",
+            TMPDIR: process.env.TMPDIR ?? tmpdir(),
+            TAKOSERVER_QUEUE_PID_FIXTURE: mode,
+            TAKOSERVER_QUEUE_PID_ROOT: root,
+            TAKOSERVER_WORKERD_BINARY: binary,
+          },
+        },
+      );
+    const waitForFile = async (name: string, child: ReturnType<typeof fixture>) => {
+      for (let attempt = 0; attempt < 1000; attempt++) {
+        try {
+          return JSON.parse(await readFile(join(root, name), "utf8")) as Record<string, unknown>;
+        } catch {
+          if (child.exitCode !== null)
+            throw new Error(`Queue PID fixture exited: ${await new Response(child.stderr).text()}`);
+          await Bun.sleep(10);
+        }
+      }
+      throw new Error(`Queue PID fixture did not write ${name}`);
+    };
+    let first: ReturnType<typeof fixture> | undefined;
+    let second: ReturnType<typeof fixture> | undefined;
+    try {
+      first = fixture("first");
+      const meta = await waitForFile("queue-pid-meta.json", first);
+      const firstHostPid = first.pid;
+      const firstNativePid = meta.nativePid;
+      first.kill("SIGKILL");
+      await first.exited;
+      second = fixture("recover");
+      const recovered = await waitForFile("queue-pid-recovered.json", second);
+      expect(recovered.hostPid).not.toBe(firstHostPid);
+      expect(recovered.nativePid).not.toBe(firstNativePid);
+      expect(recovered.servingSourceOperationId).toBe(meta.sourceOperationId);
+      const db = new Database(join(root, "state.sqlite"), { readonly: true });
+      try {
+        const sql = createSqliteSql(db);
+        expect(
+          await sql.query(
+            "SELECT state FROM queue_v2_batch_executions WHERE state = 'send_authorized'",
+          ),
+        ).toEqual([{ state: "send_authorized" }]);
+        expect(await sql.query("SELECT count(*) AS n FROM queue_v2_batch_executions")).toEqual([
+          { n: 1 },
+        ]);
+      } finally {
+        db.close();
+      }
+    } finally {
+      if (first && first.exitCode === null) first.kill("SIGKILL");
+      if (second && second.exitCode === null) second.kill("SIGKILL");
+      await Promise.all([first?.exited, second?.exited]);
       await rm(root, { recursive: true, force: true });
     }
   },
