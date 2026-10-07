@@ -2,7 +2,7 @@ import type { Organization } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
-import { byKind, health } from "../resource-state.ts";
+import { byForm, health } from "../resource-state.ts";
 import { linkProps, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
 import { ago, badge, card, copyable, empty, ICON, icon, money, stat, whenReady } from "../ui.ts";
@@ -11,9 +11,8 @@ import { ago, badge, card, copyable, empty, ICON, icon, money, stat, whenReady }
  * The first screen, answering the two questions someone signs in with: is
  * anything broken, and can I still pay for it.
  *
- * Everything else on this page is a shortcut. Nothing is summarised in a way
- * that could hide a failure — a kind with something failing says so on the
- * tile rather than only in the list one click away.
+ * Resource counts and Form groups describe only the first loaded v2 page;
+ * the full cursor chain remains on the Resources screen.
  */
 export function overviewPage(organization: Organization): Child {
   const wallet = resource(() => api.wallet(organization.id));
@@ -76,7 +75,7 @@ export function overviewPage(organization: Organization): Child {
               tr("リソース", "Resources"),
               String(all.length),
               failing === 0
-                ? tr("すべて正常です", "all reporting healthy")
+                ? tr("読み込み済みページの件数", "count from loaded page")
                 : h(
                     "span",
                     { style: { color: "var(--bad)" } },
@@ -98,31 +97,31 @@ export function overviewPage(organization: Organization): Child {
                 empty(
                   tr("リソースがありません", "Nothing declared yet"),
                   tr(
-                    "Takoform providerをこの組織へ接続して宣言を適用してください。ホストが受け付けたリソースがここに表示されます。",
-                    "Point the Takoform provider at this organization and apply a declaration. Whatever the Host accepts shows up here.",
+                    "リソース画面で運用者から渡された正確なForm URLを使って作成できます。",
+                    "Open Resources to create with an exact Form URL supplied by the operator.",
                   ),
                 ),
               )
             : card(
-                tr("種類別", "By kind"),
+                tr("Form別（読み込み済み）", "By Form (loaded page)"),
                 h(
                   "div",
                   { class: "card__body" },
                   h(
                     "div",
                     { class: "grid" },
-                    ...byKind(all).map((entry) =>
+                    ...byForm(all).map((entry) =>
                       h(
                         "a",
                         {
                           class: "card",
                           style: { display: "block" },
-                          ...linkProps(`/resources?kind=${encodeURIComponent(entry.kind)}`),
+                          ...linkProps("/resources"),
                         },
                         h(
                           "div",
                           { class: "card__body" },
-                          h("div", { class: "stat__label" }, entry.kind),
+                          h("div", { class: "stat__label" }, entry.form),
                           h("div", { class: "stat__value" }, String(entry.total)),
                           entry.failing > 0
                             ? h(
@@ -193,11 +192,9 @@ export function overviewPage(organization: Organization): Child {
                           "a",
                           {
                             class: "mono",
-                            ...linkProps(
-                              resourcePath(entry.metadata.space, entry.kind, entry.metadata.name),
-                            ),
+                            ...linkProps(resourcePath(entry.uid)),
                           },
-                          entry.metadata.name,
+                          entry.name,
                         ),
                       ),
                       h("td", null, badge(phaseLabel(state.phase), state.tone, true)),
@@ -229,7 +226,7 @@ export function overviewPage(organization: Organization): Child {
           all.length === 0
             ? h("div", { style: { display: "none" } })
             : card(
-                tr("最近の操作", "Recent operations"),
+                tr("最近のアカウント操作", "Recent account activity"),
                 h(
                   "div",
                   { class: "table-scroll" },

@@ -5,31 +5,18 @@ import { resource, signal } from "../reactive.ts";
 import { health } from "../resource-state.ts";
 import { linkProps, navigate, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
-import {
-  ago,
-  badge,
-  card,
-  copyable,
-  empty,
-  explain,
-  ICON,
-  icon,
-  shortDigest,
-  whenReady,
-} from "../ui.ts";
+import { ago, badge, card, copyable, empty, explain, ICON, icon, whenReady } from "../ui.ts";
 import { createResource } from "./create-resource.ts";
 
 /**
  * Everything the organization has declared.
  *
  * The columns answer the questions a person actually arrives with: is it
- * working, what is it, where does it live, and when did it last move. The Form
- * that produced it is one column over, because in an exact-pin protocol two
- * resources of the same kind are not necessarily the same thing.
+ * working, what is it, where does it live, and when did it last move. The
+ * exact Form URL is shown rather than a guessed catalog kind.
  */
 export function resourcesPage(organizationId: string): Child {
   const filter = signal("");
-  const spaceFilter = signal("");
   const additional = signal<readonly ResourceSummary[]>([]);
   const continuation = signal<{ readonly cursor?: string } | null>(null);
   const loadingMore = signal(false);
@@ -105,10 +92,6 @@ export function resourcesPage(organizationId: string): Child {
     const error = moreError();
     return error ? h("div", { class: "notice notice--bad" }, text(explain(error))) : null;
   };
-  // Loaded alongside, because the button that creates a resource must offer
-  // exactly what this organization may provision — not a list written here.
-  const catalog = resource(() => api.catalog(organizationId));
-
   return h(
     "div",
     { class: "page" },
@@ -137,24 +120,16 @@ export function resourcesPage(organizationId: string): Child {
           icon(ICON.refresh, 14),
           text(tr("再読み込み", "Reload")),
         ),
-        live(() => {
-          const state = catalog.get();
-          return h(
-            "button",
-            {
-              class: "btn btn--primary",
-              type: "button",
-              ...(state.state === "ready" ? {} : { disabled: true }),
-              onClick: () => {
-                if (state.state === "ready") {
-                  createResource(organizationId, state.value.offerings);
-                }
-              },
-            },
-            icon(ICON.plus, 14),
-            text(tr("リソースを作成", "New resource")),
-          );
-        }),
+        h(
+          "button",
+          {
+            class: "btn btn--primary",
+            type: "button",
+            onClick: () => createResource(organizationId),
+          },
+          icon(ICON.plus, 14),
+          text(tr("リソースを作成", "New resource")),
+        ),
       ),
     ),
     operation && operationId
@@ -168,31 +143,36 @@ export function resourcesPage(organizationId: string): Child {
               whenReady(
                 operation.get(),
                 (current) => {
-                  if (!current.done) {
+                  if (current.status !== "succeeded" && current.status !== "failed") {
                     return h(
                       "div",
                       { class: "notice" },
-                      tr(
-                        "操作を受け付けました。まだ完了していません。「再読み込み」で状態を確認できます。",
-                        "Accepted, not yet complete. Use Reload to check its status.",
+                      text(`${current.status} · ${current.effect}`),
+                      text(
+                        tr(
+                          " — まだ完了していません。「再読み込み」で確認してください。",
+                          " — not complete. Use Reload to check again.",
+                        ),
                       ),
                     );
                   }
-                  if ("deleted" in current.result) {
+                  if (current.status === "failed") {
+                    return h(
+                      "div",
+                      { class: "notice notice--bad" },
+                      text(`failed · ${current.effect}`),
+                      current.error
+                        ? text(` · ${current.error.code}: ${current.error.message}`)
+                        : null,
+                    );
+                  }
+                  if (current.action === "delete") {
                     return badge(tr("削除が完了しました", "Deletion complete"), "ok");
                   }
-                  const created = current.result.resource;
                   return h(
                     "a",
-                    {
-                      ...linkProps(
-                        resourcePath(created.metadata.space, created.kind, created.metadata.name),
-                      ),
-                    },
-                    tr(
-                      `${created.kind} ${created.metadata.name} の作成が完了しました`,
-                      `${created.kind} ${created.metadata.name} created`,
-                    ),
+                    { ...linkProps(resourcePath(current.resourceUid)) },
+                    tr("リソースを表示", "View resource"),
                   );
                 },
                 { retry: reload },
@@ -217,8 +197,8 @@ export function resourcesPage(organizationId: string): Child {
                 empty(
                   tr("リソースがありません", "Nothing declared yet"),
                   tr(
-                    "ここで作成するか、Takoform providerまたはCLIから適用してください。ホストで作成が完了すると表示されます。",
-                    "Declare one here, or apply it with the Takoform provider or the CLI. It appears once the Host completes creation.",
+                    "運用者から渡された正確なForm URLでここから作成できます。受理されたリソースも完了前から表示されます。",
+                    "Create one here with an exact Form URL supplied by the operator. An accepted resource can appear before execution completes.",
                   ),
                 ),
                 pagingError(),
@@ -226,11 +206,10 @@ export function resourcesPage(organizationId: string): Child {
               ),
             );
           }
-          const spaces = [...new Set(allResources.map((entry) => entry.metadata.space))].sort();
           return h(
             "div",
             { style: { display: "grid", gap: "14px" } },
-            toolbar(filter, spaceFilter, spaces),
+            toolbar(filter),
             nextCursor
               ? h(
                   "div",
@@ -241,14 +220,7 @@ export function resourcesPage(organizationId: string): Child {
                   ),
                 )
               : null,
-            card(
-              null,
-              h(
-                "div",
-                { class: "table-scroll" },
-                table(visible(allResources, filter(), spaceFilter())),
-              ),
-            ),
+            card(null, h("div", { class: "table-scroll" }, table(visible(allResources, filter())))),
             pagingError(),
             nextCursor ? moreButton(nextCursor) : null,
           );
@@ -259,11 +231,7 @@ export function resourcesPage(organizationId: string): Child {
   );
 }
 
-function toolbar(
-  filter: ReturnType<typeof signal<string>>,
-  spaceFilter: ReturnType<typeof signal<string>>,
-  spaces: readonly string[],
-): Child {
+function toolbar(filter: ReturnType<typeof signal<string>>): Child {
   return h(
     "div",
     { class: "toolbar" },
@@ -271,43 +239,21 @@ function toolbar(
       class: "input",
       style: { maxWidth: "300px" },
       type: "search",
-      placeholder: tr("名前または種類で絞り込み", "Filter by name or kind"),
+      placeholder: tr("名前またはFormで絞り込み", "Filter by name or Form"),
       value: filter(),
       onInput: (event: Event) => filter.set((event.target as HTMLInputElement).value),
     }),
-    spaces.length > 1
-      ? h(
-          "select",
-          {
-            class: "select",
-            style: { maxWidth: "200px" },
-            onChange: (event: Event) => spaceFilter.set((event.target as HTMLSelectElement).value),
-          },
-          h("option", { value: "" }, tr("すべてのスペース", "All spaces")),
-          ...spaces.map((space) =>
-            h(
-              "option",
-              { value: space, ...(space === spaceFilter() ? { selected: true } : {}) },
-              space,
-            ),
-          ),
-        )
-      : null,
   );
 }
 
 function visible(
   resources: readonly ResourceSummary[],
   needle: string,
-  space: string,
 ): readonly ResourceSummary[] {
   const term = needle.trim().toLowerCase();
   return resources.filter((entry) => {
-    if (space !== "" && entry.metadata.space !== space) return false;
     if (term === "") return true;
-    return (
-      entry.metadata.name.toLowerCase().includes(term) || entry.kind.toLowerCase().includes(term)
-    );
+    return entry.name.toLowerCase().includes(term) || entry.form.toLowerCase().includes(term);
   });
 }
 
@@ -329,10 +275,9 @@ function table(resources: readonly ResourceSummary[]): Child {
         null,
         h("th", null, tr("状態", "State")),
         h("th", null, tr("名前", "Name")),
-        h("th", null, tr("種類", "Kind")),
         h("th", null, tr("スペース", "Space")),
         h("th", null, "Form"),
-        h("th", null, tr("更新", "Changed")),
+        h("th", null, tr("観測", "Observed")),
       ),
     ),
     h("tbody", null, ...resources.map((entry) => row(entry))),
@@ -341,7 +286,7 @@ function table(resources: readonly ResourceSummary[]): Child {
 
 function row(entry: ResourceSummary): Child {
   const state = health(entry);
-  const href = resourcePath(entry.metadata.space, entry.kind, entry.metadata.name);
+  const href = resourcePath(entry.uid);
   return h(
     "tr",
     {
@@ -362,17 +307,14 @@ function row(entry: ResourceSummary): Child {
         ? h("span", { style: { marginLeft: "6px" } }, badge(tr("変更あり", "changed"), "accent"))
         : null,
     ),
-    h("td", null, h("a", { class: "mono", ...linkProps(href) }, entry.metadata.name)),
-    h("td", null, entry.kind),
-    h("td", { class: "dim" }, entry.metadata.space),
+    h("td", null, h("a", { class: "mono", ...linkProps(href) }, entry.name)),
+    h("td", { class: "dim" }, entry.space),
+    h("td", { class: "dim mono", style: { fontSize: "12px" } }, entry.form),
     h(
       "td",
-      { class: "dim mono", style: { fontSize: "12px" } },
-      entry.form
-        ? `${entry.form.formRef.definitionVersion} · ${shortDigest(entry.form.formRef.schemaDigest)}`
-        : "—",
+      { class: "dim", title: entry.observedAt ?? "" },
+      entry.observedAt ? ago(entry.observedAt) : "—",
     ),
-    h("td", { class: "dim", title: entry.metadata.updatedAt }, ago(entry.metadata.updatedAt)),
   );
 }
 

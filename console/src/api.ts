@@ -10,6 +10,7 @@
 
 import type { PricePlan } from "../../src/catalog.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "../../src/interface-ref.ts";
+import type { V2Operation, V2Resource } from "../../src/takoform-v2/types.ts";
 
 /** A way in, as the server advertises it. */
 export interface IdentityProvider {
@@ -90,36 +91,7 @@ export interface FormRef {
   readonly schemaDigest: string;
 }
 
-export interface Condition {
-  readonly type: string;
-  readonly status: string;
-  readonly reason?: string;
-  readonly message?: string;
-  readonly observedGeneration?: string;
-}
-
-export interface ResourceStatus {
-  readonly conditions?: readonly Condition[];
-  readonly observed?: Record<string, unknown>;
-  readonly outputs?: Record<string, unknown>;
-  readonly observedGeneration?: string;
-}
-
-export interface ResourceSummary {
-  readonly apiVersion: string;
-  readonly kind: string;
-  readonly metadata: {
-    readonly space: string;
-    readonly name: string;
-    readonly uid: string;
-    readonly generation: string;
-    readonly revision: string;
-    readonly updatedAt: string;
-  };
-  readonly spec?: Record<string, unknown>;
-  readonly status?: ResourceStatus;
-  readonly form?: { readonly formRef: FormRef };
-}
+export type ResourceSummary = V2Resource;
 
 export interface Operation {
   readonly id: string;
@@ -128,36 +100,14 @@ export interface Operation {
   readonly createdAt: string;
 }
 
-/** The Host receipt has no inventory-only update timestamp. */
-export type ResourceReceipt = Omit<ResourceSummary, "metadata"> & {
-  readonly metadata: Omit<ResourceSummary["metadata"], "updatedAt">;
-};
-
-/** A stable Host operation handle, distinct from the control-plane history. */
-export type ResourceOperation = {
-  readonly apiVersion: string;
-  readonly kind: "Operation";
-  readonly id: string;
-} & (
-  | { readonly done: false }
-  | {
-      readonly done: true;
-      readonly result: { readonly resource: ResourceReceipt } | { readonly deleted: true };
-    }
-);
-
-export type ResourceMutationResult<Result> =
-  | { readonly state: "completed"; readonly result: Result }
-  | { readonly state: "accepted"; readonly operation: ResourceOperation };
+/** Durable accepted v2 Operation, distinct from control-plane history. */
+export type ResourceOperation = V2Operation;
 
 /**
- * The exact-pin lane this console speaks.
- *
- * The stable lane addresses a Form family by its complete versionless
- * apiVersion as one path segment -- the retired alpha lanes carried a separate
- * version segment that no longer exists.
+ * The normal Host v2 lane. Form identity is one exact HTTPS URL in the body,
+ * while an accepted Resource is addressed by its UID thereafter.
  */
-const LANE = "/apis/forms.takoform.com/v1";
+const LANE = "/apis/forms.takoform.com/v2";
 
 export class ApiError extends Error {
   constructor(
@@ -172,19 +122,20 @@ export class ApiError extends Error {
   /**
    * True when the only useful next step is to sign in again.
    *
-   * Scoped to the control plane on purpose. Takoserver serves other lanes with
-   * their own credentials, and a 401 from one of those means the console asked
-   * the wrong door — not that the person's session died. Treating every 401 as
-   * a dead session logs somebody out for a mistake this code made.
+   * Scoped to the account lane and its organization-authenticated v2 Form
+   * lane. Other Host lanes may use different credentials.
    */
   get isExpiredSession(): boolean {
-    return this.path.startsWith("/v1/") && (this.status === 401 || this.code === "unauthenticated");
+    return (
+      (this.path.startsWith("/v1/") || this.path.startsWith(`${LANE}/`)) &&
+      (this.status === 401 || this.code === "unauthenticated")
+    );
   }
 }
 
 /** A resource as a person declares it in the console. */
 export interface ResourceDeclaration {
-  readonly form: FormRef;
+  readonly form: string;
   readonly space: string;
   readonly name: string;
   readonly spec: Record<string, unknown>;
@@ -228,7 +179,13 @@ export function createApi(options: ApiOptions) {
 
     if (!response.ok) {
       const envelope = (payload as { error?: { code?: unknown } } | null)?.error;
-      const code = typeof envelope?.code === "string" ? envelope.code : `http_${response.status}`;
+      const topLevelCode = (payload as { code?: unknown } | null)?.code;
+      const code =
+        typeof topLevelCode === "string"
+          ? topLevelCode
+          : typeof envelope?.code === "string"
+            ? envelope.code
+            : `http_${response.status}`;
       const failure = new ApiError(code, response.status, path);
       if (failure.isExpiredSession) options.onSessionLost();
       throw failure;
@@ -243,12 +200,27 @@ export function createApi(options: ApiOptions) {
     extra: Record<string, string> = {},
   ): Promise<Result> => (await request<Result>(method, path, body, extra)).payload;
 
-  const accepted = (payload: unknown, path: string): ResourceMutationResult<never> => {
-    if (!isRecord(payload) || !isOperation(payload.operation) || payload.operation.done !== false) {
-      throw new ApiError("invalid_response", 202, path);
+  const operation = (
+    payload: unknown,
+    status: number,
+    path: string,
+    read = false,
+  ): ResourceOperation => {
+    if ((read ? status !== 200 : status !== 200 && status !== 202) || !isV2Operation(payload)) {
+      throw new ApiError("invalid_response", status, path);
     }
-    return { state: "accepted", operation: payload.operation as ResourceOperation };
+    if (
+      !read &&
+      (payload.status === "succeeded" || payload.status === "failed") !== (status === 200)
+    ) {
+      throw new ApiError("invalid_response", status, path);
+    }
+    return payload;
   };
+
+  const organizationHeader = (organizationId: string) => ({
+    "takoform-organization": organizationId,
+  });
 
   return {
     identityProviders: () =>
@@ -327,107 +299,131 @@ export function createApi(options: ApiOptions) {
         `/v1/catalog?organizationId=${encodeURIComponent(organizationId)}`,
       ),
 
-    resources: (organizationId: string, query: { space?: string; cursor?: string } = {}) => {
-      const search = new URLSearchParams();
-      if (query.space) search.set("space", query.space);
-      if (query.cursor) search.set("cursor", query.cursor);
-      const suffix = search.size === 0 ? "" : `?${search.toString()}`;
-      return call<{ resources: readonly ResourceSummary[]; cursor?: string }>(
+    async formSupport(organizationId: string, form: string): Promise<boolean> {
+      const path = `${LANE}/support?form=${encodeURIComponent(form)}`;
+      const { payload, status } = await request<unknown>(
         "GET",
-        `/v1/organizations/${encodeURIComponent(organizationId)}/resources${suffix}`,
+        path,
+        undefined,
+        organizationHeader(organizationId),
+      );
+      if (
+        status !== 200 ||
+        !isRecord(payload) ||
+        payload.form !== form ||
+        typeof payload.supported !== "boolean" ||
+        !Array.isArray(payload.operations) ||
+        !payload.operations.every((entry) => typeof entry === "string")
+      )
+        throw new ApiError("invalid_response", status, path);
+      return payload.supported && payload.operations.includes("create");
+    },
+
+    resources: (organizationId: string, query: { cursor?: string } = {}) => {
+      const search = new URLSearchParams();
+      search.set("space", organizationId);
+      if (query.cursor) search.set("cursor", query.cursor);
+      const path = `${LANE}/resources?${search.toString()}`;
+      return request<unknown>("GET", path, undefined, organizationHeader(organizationId)).then(
+        ({ payload, status }) => {
+          if (
+            status !== 200 ||
+            !isRecord(payload) ||
+            !Array.isArray(payload.items) ||
+            !payload.items.every((item) => isV2Resource(item) && item.space === organizationId) ||
+            (payload.nextCursor !== null && typeof payload.nextCursor !== "string")
+          ) {
+            throw new ApiError("invalid_response", status, path);
+          }
+          return {
+            resources: payload.items as ResourceSummary[],
+            cursor: payload.nextCursor as string | null,
+          };
+        },
       );
     },
 
-    /**
-     * Creates a resource through the exact-pin lane.
-     *
-     * Two calls, because the protocol is reviewed: the Host says exactly what
-     * it read, and the apply must present that digest back. A console that
-     * skipped the review would be one that could apply something other than
-     * what it showed.
-     */
+    /** Accepts once with a caller-held key; ambiguous transport never mints a second key. */
     async createResource(
       organizationId: string,
       declaration: ResourceDeclaration,
-    ): Promise<ResourceMutationResult<ResourceReceipt>> {
-      const body = {
-        apiVersion: declaration.form.apiVersion,
-        kind: declaration.form.kind,
-        form: { formRef: declaration.form },
-        metadata: { name: declaration.name, space: declaration.space },
-        spec: declaration.spec,
-      };
-      const naming = { "takoform-organization": organizationId };
-      const prepared = await call<{ review: { prepareDigest: string } }>(
-        "POST",
-        `${LANE}/resources/prepare`,
-        body,
-        naming,
-      );
-      const path = `${LANE}/resources/${declaration.form.apiVersion}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}`;
-      const response = await request<unknown>(
-        "PUT",
-        path,
-        { ...body, review: { prepareDigest: prepared.review.prepareDigest } },
-        {
-          ...naming,
-          "idempotency-key": `console-create-${crypto.randomUUID()}`,
-          "if-none-match": "*",
-        },
-      );
-      if (response.status === 202) return accepted(response.payload, path);
-      if ((response.status !== 200 && response.status !== 201) || !isResource(response.payload)) {
-        throw new ApiError("invalid_response", response.status, path);
-      }
-      return { state: "completed", result: response.payload };
+      key: string,
+    ): Promise<ResourceOperation> {
+      const path = `${LANE}/resources`;
+      if (declaration.space !== organizationId) throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>("POST", path, declaration, {
+        ...organizationHeader(organizationId),
+        "idempotency-key": key,
+      });
+      return operation(payload, status, path);
     },
 
-    /** Deletes a resource, fenced on the generation the console last read. */
+    /** Updates one UID at the exact generation last read. */
+    async updateResource(
+      organizationId: string,
+      uid: string,
+      generation: number,
+      spec: Record<string, unknown>,
+      key: string,
+    ): Promise<ResourceOperation> {
+      const path = `${LANE}/resources/${encodeURIComponent(uid)}`;
+      const { payload, status } = await request<unknown>(
+        "PUT",
+        path,
+        { spec },
+        {
+          ...organizationHeader(organizationId),
+          "idempotency-key": key,
+          "takoform-expected-generation": String(generation),
+        },
+      );
+      return operation(payload, status, path);
+    },
+
+    /** Deletes one UID at the exact generation last read. */
     async deleteResource(
       organizationId: string,
-      declaration: Omit<ResourceDeclaration, "spec">,
-      generation: string,
-    ): Promise<ResourceMutationResult<void>> {
-      const query = new URLSearchParams({
-        space: declaration.space,
-        definitionVersion: declaration.form.definitionVersion,
-        schemaDigest: declaration.form.schemaDigest,
+      uid: string,
+      generation: number,
+      key: string,
+    ): Promise<ResourceOperation> {
+      const path = `${LANE}/resources/${encodeURIComponent(uid)}`;
+      const { payload, status } = await request<unknown>("DELETE", path, undefined, {
+        ...organizationHeader(organizationId),
+        "idempotency-key": key,
+        "takoform-expected-generation": String(generation),
       });
-      const path = `${LANE}/resources/${declaration.form.apiVersion}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}?${query}`;
-      const response = await request<unknown>("DELETE", path, undefined, {
-        "takoform-organization": organizationId,
-        "idempotency-key": `console-delete-${crypto.randomUUID()}`,
-        "takoform-expected-generation": generation,
-      });
-      if (response.status === 202) return accepted(response.payload, path);
-      if (response.status !== 204) throw new ApiError("invalid_response", response.status, path);
-      return { state: "completed", result: undefined };
+      return operation(payload, status, path);
     },
 
     /** Reads one accepted operation; never reissues the original mutation. */
     async resourceOperation(organizationId: string, id: string): Promise<ResourceOperation> {
       const path = `${LANE}/operations/${encodeURIComponent(id)}`;
       const { payload, status } = await request<unknown>("GET", path, undefined, {
-        "takoform-organization": organizationId,
+        ...organizationHeader(organizationId),
       });
-      if (status !== 200 || !isOperation(payload) || payload.id !== id) {
+      const observed = operation(payload, status, path, true);
+      if (observed.id !== id) throw new ApiError("invalid_response", status, path);
+      return observed;
+    },
+
+    /** Reads a current v2 Resource by UID, independent of list pagination. */
+    async resource(organizationId: string, uid: string): Promise<ResourceSummary> {
+      const path = `${LANE}/resources/${encodeURIComponent(uid)}`;
+      const { payload, status } = await request<unknown>(
+        "GET",
+        path,
+        undefined,
+        organizationHeader(organizationId),
+      );
+      if (
+        status !== 200 ||
+        !isV2Resource(payload) ||
+        payload.uid !== uid ||
+        payload.space !== organizationId
+      )
         throw new ApiError("invalid_response", status, path);
-      }
-      if (payload.done === false) return payload as ResourceOperation;
-      if (payload.done === true) {
-        if (isRecord(payload.error) && typeof payload.error.code === "string" && !payload.result) {
-          throw new ApiError(payload.error.code, status, path);
-        }
-        if (
-          !payload.error &&
-          isRecord(payload.result) &&
-          ((isResource(payload.result.resource) && payload.result.deleted === undefined) ||
-            (payload.result.deleted === true && payload.result.resource === undefined))
-        ) {
-          return payload as ResourceOperation;
-        }
-      }
-      throw new ApiError("invalid_response", status, path);
+      return payload;
     },
 
     operations: (organizationId: string) =>
@@ -442,25 +438,48 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isOperation(value: unknown): value is Record<string, unknown> {
+function isV2Operation(value: unknown): value is ResourceOperation {
   return (
     isRecord(value) &&
-    typeof value.apiVersion === "string" &&
-    value.kind === "Operation" &&
     typeof value.id === "string" &&
-    value.id.length > 0
+    value.id.length > 0 &&
+    typeof value.resourceUid === "string" &&
+    ["create", "update", "delete"].includes(String(value.action)) &&
+    Number.isSafeInteger(value.generation) &&
+    ["queued", "running", "waiting_input", "reconciling", "succeeded", "failed"].includes(
+      String(value.status),
+    ) &&
+    ["none", "unknown", "partial", "complete"].includes(String(value.effect)) &&
+    (value.status !== "succeeded" || value.effect === "complete") &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string" &&
+    typeof value.retainUntil === "string" &&
+    (value.error === undefined ||
+      (isRecord(value.error) &&
+        typeof value.error.code === "string" &&
+        typeof value.error.message === "string"))
   );
 }
 
-function isResource(value: unknown): value is ResourceReceipt {
-  if (!isRecord(value) || !isRecord(value.metadata)) return false;
-  const metadata = value.metadata;
+function isV2Resource(value: unknown): value is ResourceSummary {
+  if (!isRecord(value)) return false;
   return (
-    typeof value.apiVersion === "string" &&
-    typeof value.kind === "string" &&
-    ["space", "name", "uid", "generation", "revision"].every(
-      (key) => typeof metadata[key] === "string",
-    )
+    typeof value.uid === "string" &&
+    value.uid.length > 0 &&
+    typeof value.form === "string" &&
+    value.form.length > 0 &&
+    typeof value.space === "string" &&
+    value.space.length > 0 &&
+    typeof value.name === "string" &&
+    value.name.length > 0 &&
+    Number.isSafeInteger(value.generation) &&
+    Number.isSafeInteger(value.observedGeneration) &&
+    (value.observedAt === null || typeof value.observedAt === "string") &&
+    ["pending", "idle", "deleting", "error"].includes(String(value.phase)) &&
+    isRecord(value.spec) &&
+    isRecord(value.observed) &&
+    isRecord(value.output) &&
+    typeof value.lastOperation === "string"
   );
 }
 
