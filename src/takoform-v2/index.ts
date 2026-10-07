@@ -50,17 +50,17 @@ export {
   type V2WorkerInvocationSelection,
 } from "./worker-invocation-custody.ts";
 export {
-  createV2NativeEffectCustody,
-  type V2NativeEffectCustody,
-  type V2NativeEffectIdentity,
-  type V2NativeEffectInspection,
-} from "./worker-native-effects.ts";
-export {
   createV2NativeDeletionCustody,
   type V2NativeDeletionCustody,
   type V2NativeDeletionInspection,
   type V2NativeDeletionItem,
 } from "./worker-native-deletions.ts";
+export {
+  createV2NativeEffectCustody,
+  type V2NativeEffectCustody,
+  type V2NativeEffectIdentity,
+  type V2NativeEffectInspection,
+} from "./worker-native-effects.ts";
 export {
   createV2WorkerPublicationState,
   type V2WorkerPublicationResolution,
