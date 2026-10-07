@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { canonicalJson } from "../json.ts";
@@ -6,6 +6,7 @@ import { createFileObjectStore } from "../objects-fs.ts";
 import {
   createSelfhostObjectStore,
   type SelfhostObjectBody,
+  SelfhostObjectError,
   type SelfhostObjectGetOptions,
   type SelfhostObjectListOptions,
   type SelfhostObjectListResult,
@@ -20,6 +21,18 @@ const OWNER_DIRECTORY = ".takoform-v2-object-bucket-owners";
 const OWNER_MAX_BYTES = 16 * 1_024;
 const BUCKET_ID = /^tsb-[0-9a-f]{40}$/u;
 const ENCODER = new TextEncoder();
+const WRITER_AUTHORITY_KEY = "_host/object-bucket-writer-authority.json";
+const WRITER_AUTHORITY_BODY = ENCODER.encode(
+  JSON.stringify({ schema: "takoserver.v2-object-bucket-writer-authority@1" }),
+);
+const LIFECYCLE_MUTEXES_SYMBOL = Symbol.for("@takoserver/v2-object-bucket-lifecycle-mutexes");
+const globalState = globalThis as unknown as Record<symbol, unknown>;
+const sharedMutexes = globalState[LIFECYCLE_MUTEXES_SYMBOL];
+const LIFECYCLE_MUTEXES =
+  sharedMutexes instanceof Map
+    ? (sharedMutexes as Map<string, Promise<void>>)
+    : new Map<string, Promise<void>>();
+if (!(sharedMutexes instanceof Map)) globalState[LIFECYCLE_MUTEXES_SYMBOL] = LIFECYCLE_MUTEXES;
 
 export interface SelfhostV2ObjectBucketIdentity {
   readonly targetKey: string;
@@ -140,6 +153,42 @@ export function createSelfhostV2ObjectBucketStore(
   const ownerKey = (bucketId: string): string => `buckets/${bucketId}.json`;
   const ownerBody = (record: OwnerRecord): Uint8Array => ENCODER.encode(JSON.stringify(record));
 
+  // The owner FileObjectStore already holds a same-host process writer claim
+  // for its root after the first write. Acquire that existing claim before
+  // absence checks or object I/O so another process cannot finish an older
+  // accepted create after this process has reconciled it as absent.
+  const claimProcessWriter = async (): Promise<boolean> => {
+    const operationId = randomUUID();
+    try {
+      const saved = await ownerStore.put(WRITER_AUTHORITY_KEY, WRITER_AUTHORITY_BODY, {
+        contentType: "application/json",
+        writeOperationId: operationId,
+      });
+      if (saved.writeOperationId === operationId) return true;
+    } catch {
+      // Exact readback distinguishes a committed claim from a lost acknowledgement.
+    }
+    try {
+      const saved = await ownerStore.get(WRITER_AUTHORITY_KEY);
+      return saved?.writeOperationId === operationId;
+    } catch {
+      return false;
+    }
+  };
+
+  const withBucketLifecycle = async <T>(
+    bucketId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    if (!(await claimProcessWriter())) throw new SelfhostObjectError("backend_unavailable");
+    const ownerRoot = await lstat(join(root, OWNER_DIRECTORY)).catch(() => null);
+    if (!ownerRoot?.isDirectory() || ownerRoot.isSymbolicLink()) {
+      throw new SelfhostObjectError("backend_unavailable");
+    }
+    const key = `${ownerRoot.dev}:${ownerRoot.ino}\u0000${bucketId}`;
+    return await withLifecycleMutex(key, operation);
+  };
+
   const readOwner = async (bucketId: string): Promise<ReadOwnerResult> => {
     try {
       const stored = await ownerStore.get(ownerKey(bucketId));
@@ -258,103 +307,119 @@ export function createSelfhostV2ObjectBucketStore(
     async create({ identity, operationId }) {
       if (!identityIsValid(identity) || !operationId) return "unknown";
       const bucketId = bucketIdFor(identity);
-      const existing = await readOwner(bucketId);
-      if (existing.kind === "owner") {
-        return matches(existing.record, identity) &&
-          existing.record.state === "active" &&
-          existing.record.createOperationId === operationId
-          ? "ready"
-          : "conflict";
-      }
-      if (existing.kind === "invalid") return "unknown";
-      const unowned = await hasUnownedData(bucketId);
-      if (unowned !== false) return unowned === true ? "conflict" : "unknown";
+      return await withBucketLifecycle(bucketId, async () => {
+        const existing = await readOwner(bucketId);
+        if (existing.kind === "owner") {
+          return matches(existing.record, identity) &&
+            existing.record.state === "active" &&
+            existing.record.createOperationId === operationId
+            ? "ready"
+            : "conflict";
+        }
+        if (existing.kind === "invalid") return "unknown";
+        const unowned = await hasUnownedData(bucketId);
+        if (unowned !== false) return unowned === true ? "conflict" : "unknown";
 
-      const record = ownerFromIdentity(identity, bucketId, operationId);
-      try {
-        const created = await ownerStore.create(ownerKey(bucketId), ownerBody(record), {
-          contentType: "application/json",
-          writeOperationId: operationId,
-        });
-        if (created?.writeOperationId === operationId) return "ready";
-      } catch {
-        // Check whether this exact accepted create marker committed before its ack was lost.
-      }
-      const after = await readOwner(bucketId);
-      return after.kind === "owner" &&
-        matches(after.record, identity) &&
-        after.record.state === "active" &&
-        after.record.createOperationId === operationId
-        ? "ready"
-        : after.kind === "absent"
-          ? "unknown"
-          : "conflict";
+        const record = ownerFromIdentity(identity, bucketId, operationId);
+        try {
+          const created = await ownerStore.create(ownerKey(bucketId), ownerBody(record), {
+            contentType: "application/json",
+            writeOperationId: operationId,
+          });
+          if (created?.writeOperationId === operationId) return "ready";
+        } catch {
+          // Check whether this exact accepted create marker committed before its ack was lost.
+        }
+        const after = await readOwner(bucketId);
+        return after.kind === "owner" &&
+          matches(after.record, identity) &&
+          after.record.state === "active" &&
+          after.record.createOperationId === operationId
+          ? "ready"
+          : after.kind === "absent"
+            ? "unknown"
+            : "conflict";
+      }).catch(() => "unknown" as const);
     },
 
     async reconcileCreate({ identity, operationId }) {
       if (!identityIsValid(identity) || !operationId) return "unknown";
       const bucketId = bucketIdFor(identity);
-      const existing = await readOwner(bucketId);
-      if (existing.kind === "owner") {
-        return matches(existing.record, identity) &&
-          existing.record.state === "active" &&
-          existing.record.createOperationId === operationId
-          ? "ready"
-          : "conflict";
-      }
-      if (existing.kind === "invalid") return "unknown";
-      const unowned = await hasUnownedData(bucketId);
-      return unowned === false ? "absent" : unowned === true ? "conflict" : "unknown";
+      return await withBucketLifecycle(bucketId, async () => {
+        const existing = await readOwner(bucketId);
+        if (existing.kind === "owner") {
+          return matches(existing.record, identity) &&
+            existing.record.state === "active" &&
+            existing.record.createOperationId === operationId
+            ? "ready"
+            : "conflict";
+        }
+        if (existing.kind === "invalid") return "unknown";
+        const unowned = await hasUnownedData(bucketId);
+        return unowned === false ? "absent" : unowned === true ? "conflict" : "unknown";
+      }).catch(() => "unknown" as const);
     },
 
     async observe(identity) {
       if (!identityIsValid(identity)) return "unknown";
       const bucketId = bucketIdFor(identity);
-      return await stateForActiveOwner(identity, bucketId, await readOwner(bucketId));
+      return await withBucketLifecycle(bucketId, async () => {
+        return await stateForActiveOwner(identity, bucketId, await readOwner(bucketId));
+      }).catch(() => "unknown" as const);
     },
 
     async delete({ identity, operationId }) {
       if (!identityIsValid(identity) || !operationId) return "unknown";
       const bucketId = bucketIdFor(identity);
-      const existing = await readOwner(bucketId);
-      if (existing.kind !== "owner") return existing.kind === "absent" ? "unknown" : "unknown";
-      const record = existing.record;
-      if (!matches(record, identity)) return "conflict";
-      if (record.state === "deleted") {
-        if (record.deleteOperationId !== operationId) return "conflict";
-        return (await hasUnownedData(bucketId)) === false ? "deleted" : "unknown";
-      }
-      if (record.state === "deleting" && record.deleteOperationId !== operationId)
-        return "conflict";
+      return await withBucketLifecycle(bucketId, async () => {
+        const existing = await readOwner(bucketId);
+        if (existing.kind !== "owner") return "unknown";
+        const record = existing.record;
+        if (!matches(record, identity)) return "conflict";
+        if (record.state === "deleted") {
+          if (record.deleteOperationId !== operationId) return "conflict";
+          return (await hasUnownedData(bucketId)) === false ? "deleted" : "unknown";
+        }
+        if (record.state === "deleting" && record.deleteOperationId !== operationId)
+          return "conflict";
 
-      if (record.state === "active") {
-        const deleting: OwnerRecord = {
+        if (record.state === "active") {
+          const deleting: OwnerRecord = {
+            ...record,
+            state: "deleting",
+            deleteOperationId: operationId,
+          };
+          if (!(await writeOwner(bucketId, deleting, operationId))) return "unknown";
+        }
+        try {
+          await objectStore.destroy(bucketId);
+        } catch {
+          return "unknown";
+        }
+        if ((await hasUnownedData(bucketId)) !== false) return "unknown";
+        const deletingRecord: OwnerRecord = {
           ...record,
-          state: "deleting",
+          state: "deleted",
           deleteOperationId: operationId,
         };
-        if (!(await writeOwner(bucketId, deleting, operationId))) return "unknown";
-      }
-      try {
-        await objectStore.destroy(bucketId);
-      } catch {
-        return "unknown";
-      }
-      if ((await hasUnownedData(bucketId)) !== false) return "unknown";
-      const deletingRecord: OwnerRecord = {
-        ...record,
-        state: "deleted",
-        deleteOperationId: operationId,
-      };
-      return (await writeOwner(bucketId, deletingRecord, operationId)) ? "deleted" : "unknown";
+        return (await writeOwner(bucketId, deletingRecord, operationId)) ? "deleted" : "unknown";
+      }).catch(() => "unknown" as const);
     },
 
     async openBucket(identity) {
       if (!identityIsValid(identity)) return null;
       const bucketId = bucketIdFor(identity);
-      const state = await stateForActiveOwner(identity, bucketId, await readOwner(bucketId));
+      const state = await withBucketLifecycle(bucketId, async () =>
+        stateForActiveOwner(identity, bucketId, await readOwner(bucketId)),
+      ).catch(() => "unknown" as const);
       if (state !== "ready") return null;
-      return boundStore(objectStore, bucketId);
+      return boundStore(objectStore, bucketId, async (operation) =>
+        withBucketLifecycle(bucketId, async () => {
+          const current = await stateForActiveOwner(identity, bucketId, await readOwner(bucketId));
+          if (current !== "ready") throw new SelfhostObjectError("backend_unavailable");
+          return await operation();
+        }),
+      );
     },
   };
 }
@@ -401,29 +466,50 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function boundStore(store: SelfhostObjectStore, bucketId: string): SelfhostV2ObjectBucketAccess {
+function boundStore(
+  store: SelfhostObjectStore,
+  bucketId: string,
+  run: <T>(operation: () => Promise<T>) => Promise<T>,
+): SelfhostV2ObjectBucketAccess {
   return Object.freeze({
-    head: (key: string) => store.head(bucketId, key),
-    get: (key: string, options?: SelfhostObjectGetOptions) => store.get(bucketId, key, options),
+    head: (key: string) => run(() => store.head(bucketId, key)),
+    get: (key: string, options?: SelfhostObjectGetOptions) =>
+      run(() => store.get(bucketId, key, options)),
     put: (key: string, body: ReadableStream<Uint8Array>, options: SelfhostObjectPutOptions) =>
-      store.put(bucketId, key, body, options),
-    delete: (key: string) => store.delete(bucketId, key),
-    list: (options?: SelfhostObjectListOptions) => store.list(bucketId, options),
+      run(() => store.put(bucketId, key, body, options)),
+    delete: (key: string) => run(() => store.delete(bucketId, key)),
+    list: (options?: SelfhostObjectListOptions) => run(() => store.list(bucketId, options)),
     createMultipartUpload: (key: string, options?: { readonly contentType?: string }) =>
-      store.createMultipartUpload(bucketId, key, options),
+      run(() => store.createMultipartUpload(bucketId, key, options)),
     uploadPart: (
       key: string,
       uploadId: string,
       partNumber: number,
       body: ReadableStream<Uint8Array>,
       options: { readonly contentLength: number },
-    ) => store.uploadPart(bucketId, key, uploadId, partNumber, body, options),
+    ) => run(() => store.uploadPart(bucketId, key, uploadId, partNumber, body, options)),
     completeMultipartUpload: (
       key: string,
       uploadId: string,
       parts: readonly { readonly etag: string; readonly partNumber: number }[],
-    ) => store.completeMultipartUpload(bucketId, key, uploadId, parts),
+    ) => run(() => store.completeMultipartUpload(bucketId, key, uploadId, parts)),
     abortMultipartUpload: (key: string, uploadId: string) =>
-      store.abortMultipartUpload(bucketId, key, uploadId),
+      run(() => store.abortMultipartUpload(bucketId, key, uploadId)),
   });
+}
+
+async function withLifecycleMutex<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = LIFECYCLE_MUTEXES.get(key);
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  LIFECYCLE_MUTEXES.set(key, current);
+  if (previous) await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (LIFECYCLE_MUTEXES.get(key) === current) LIFECYCLE_MUTEXES.delete(key);
+  }
 }
