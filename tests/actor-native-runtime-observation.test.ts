@@ -170,6 +170,20 @@ test("an unindexed historical Actor namespace is unknown, not an invented zero s
     expect(await host.observeNamespaceRuntime(scope, AbortSignal.timeout(1_000))).toEqual({
       kind: "unknown",
     });
+    expect(
+      await host.observeNamespaceRuntimeForAcceptedOperation(
+        scope,
+        {
+          workerUid: "unopened-worker",
+          className: "Counter",
+          sourceOperationId: "unopened-source",
+          incarnationId: "unopened-incarnation",
+          generationKey: "unopened-generation",
+          versions: [],
+        },
+        AbortSignal.timeout(1_000),
+      ),
+    ).toEqual({ kind: "unknown" });
   } finally {
     await host.close();
     f.database.close();

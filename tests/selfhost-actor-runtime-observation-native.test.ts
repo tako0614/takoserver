@@ -9,6 +9,7 @@ import {
 } from "../src/providers/selfhost-worker-prelude.ts";
 import { selfhostWorkerEntrypointSource } from "../src/providers/selfhost-worker-wrapper.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
+import { createLegacyActorGraphAuthority } from "../src/selfhost-actor-graph-authority.ts";
 import { openWorkerdActorNamespace } from "../src/selfhost-actor-native-process.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 import {
@@ -109,14 +110,55 @@ export class Counter extends Base {
         },
       ],
     };
-    const host = createSelfhostActorExecutionHost({
+    const legacyAuthority = createLegacyActorGraphAuthority({
       runtimeRoot,
-      storageRoot,
-      binary: childWrapper,
       graph: f.read,
       deployments: f.deployments,
       providerPackRef: "selfhost",
       providerInstallationRef: "local.primary",
+    });
+    let ownOperationBusy = false;
+    const sourceOperationId = "physical-count-source-operation";
+    const incarnationId = "physical-count-incarnation";
+    const host = createSelfhostActorExecutionHost({
+      runtimeRoot,
+      storageRoot,
+      binary: childWrapper,
+      authority: {
+        ...legacyAuthority,
+        readGraph: (scope, signal) =>
+          ownOperationBusy ? Promise.resolve(null) : legacyAuthority.readGraph(scope, signal),
+        async readRealization(graph, signal) {
+          const result = await legacyAuthority.readRealization(graph, signal);
+          if (result.kind !== "ready") return result;
+          return {
+            kind: "ready" as const,
+            realization: {
+              ...result.realization,
+              authorityKey: JSON.stringify({
+                sourceOperationId,
+                incarnationId,
+                generationKey: result.realization.graph.generationKey,
+                versions: result.realization.graph.versions.map(
+                  ({ versionId, workerVersionUid, weight }) => ({
+                    versionId,
+                    workerVersionUid,
+                    weight,
+                  }),
+                ),
+              }),
+            },
+          };
+        },
+        async stillCurrent(graph, _realization, signal) {
+          if (ownOperationBusy) return false;
+          const result = await legacyAuthority.readRealization(graph, signal);
+          return (
+            result.kind === "ready" &&
+            (await legacyAuthority.stillCurrent(graph, result.realization, signal))
+          );
+        },
+      },
       basisPoint: () => 0,
     });
     try {
@@ -219,6 +261,59 @@ export class Counter extends Base {
       if (initial.kind !== "confirmed" || recovered.kind !== "confirmed")
         throw new Error("native observation was not confirmed");
       expect(recovered.epoch).not.toBe(initial.epoch);
+      const accepted = await legacyAuthority.readGraph(scope, AbortSignal.timeout(5_000));
+      if (!accepted) throw new Error("accepted Actor graph missing");
+      const currentNative = await legacyAuthority.readRealization(
+        accepted,
+        AbortSignal.timeout(5_000),
+      );
+      if (currentNative.kind !== "ready") throw new Error("native Actor graph missing");
+      const expected = {
+        workerUid: accepted.workerUid,
+        className: accepted.className,
+        sourceOperationId,
+        incarnationId,
+        generationKey: currentNative.realization.graph.generationKey,
+        versions: currentNative.realization.graph.versions.map(
+          ({ versionId, workerVersionUid, weight }) => ({ versionId, workerVersionUid, weight }),
+        ),
+      };
+      ownOperationBusy = true;
+      expect(await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000))).toEqual({
+        kind: "unknown",
+      });
+      expect(
+        await host.observeNamespaceRuntimeForAcceptedOperation(
+          scope,
+          expected,
+          AbortSignal.timeout(5_000),
+        ),
+      ).toMatchObject({ kind: "confirmed", pendingAlarmCount: 1 });
+      expect(
+        await host.observeNamespaceRuntimeForAcceptedOperation(
+          scope,
+          { ...expected, incarnationId: "foreign-incarnation" },
+          AbortSignal.timeout(5_000),
+        ),
+      ).toEqual({ kind: "unknown" });
+      expect(
+        await host.observeNamespaceRuntimeForAcceptedOperation(
+          scope,
+          { ...expected, sourceOperationId: "foreign-source-operation" },
+          AbortSignal.timeout(5_000),
+        ),
+      ).toEqual({ kind: "unknown" });
+      expect(
+        await host.observeNamespaceRuntimeForAcceptedOperation(
+          scope,
+          {
+            ...expected,
+            versions: expected.versions.map((version) => ({ ...version, weight: 1 })),
+          },
+          AbortSignal.timeout(5_000),
+        ),
+      ).toEqual({ kind: "unknown" });
+      ownOperationBusy = false;
       // The original child is still alive; only its Unix pathname is replaced.
       // A foreign listener may relay valid native replies, but it is not the
       // listener whose readiness the Host accepted for this child.

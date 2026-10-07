@@ -89,6 +89,20 @@ export type ActorNamespaceRuntimeObservation =
       readonly openSocketCount: number;
     };
 
+/** Backend-held exact native selection; this does not itself confer SQL authority. */
+export interface ActorAcceptedOperationRuntimeTarget {
+  readonly workerUid: string;
+  readonly className: string;
+  readonly sourceOperationId: string;
+  readonly incarnationId: string;
+  readonly generationKey: string;
+  readonly versions: readonly {
+    readonly versionId: string;
+    readonly workerVersionUid: string;
+    readonly weight: number;
+  }[];
+}
+
 /**
  * Internal self-host composition: persisted Resource incarnation -> active
  * Worker realization -> immutable published Version -> native Actor namespace.
@@ -838,6 +852,130 @@ export function createSelfhostActorExecutionHost(options: {
   const ready = restore();
   void ready.catch(() => {});
 
+  const acceptedOperationMatches = (
+    session: Session,
+    expected: ActorAcceptedOperationRuntimeTarget,
+  ): boolean => {
+    if (
+      session.authorityGraph.workerUid !== expected.workerUid ||
+      session.authorityGraph.className !== expected.className ||
+      session.graph.workerResourceUid !== expected.workerUid ||
+      session.graph.generationKey !== expected.generationKey ||
+      !expected.sourceOperationId ||
+      !expected.incarnationId ||
+      !Array.isArray(expected.versions)
+    )
+      return false;
+    const realization: unknown = JSON.parse(session.realization.authorityKey);
+    if (!realization || typeof realization !== "object" || Array.isArray(realization)) return false;
+    const record = realization as Record<string, unknown>;
+    if (
+      Object.keys(record).sort().join(",") !==
+        "generationKey,incarnationId,sourceOperationId,versions" ||
+      record.sourceOperationId !== expected.sourceOperationId ||
+      record.incarnationId !== expected.incarnationId ||
+      record.generationKey !== expected.generationKey
+    )
+      return false;
+    const residentVersions = session.graph.versions.map(
+      ({ versionId, workerVersionUid, weight }) => ({ versionId, workerVersionUid, weight }),
+    );
+    return (
+      JSON.stringify(record.versions) === JSON.stringify(residentVersions) &&
+      JSON.stringify(expected.versions) === JSON.stringify(residentVersions)
+    );
+  };
+
+  const observeSession = async (
+    scope: ActorScope,
+    signal: AbortSignal,
+    eligible: (session: Session, signal: AbortSignal) => Promise<boolean>,
+  ): Promise<ActorNamespaceRuntimeObservation> => {
+    const unknown = { kind: "unknown" } as const;
+    try {
+      await ready;
+      signal.throwIfAborted();
+      if (stopped || !validScope(scope)) return unknown;
+      const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
+      const owner = owners.get(key);
+      const session = owner?.session;
+      if (
+        revoked.has(key) ||
+        owner?.revoked ||
+        !session ||
+        session.dead ||
+        session.retiring ||
+        !(await registeredScope(key, scope))
+      )
+        return unknown;
+      const observationSignal = AbortSignal.any([signal, AbortSignal.timeout(5_000)]);
+      const current = async (): Promise<boolean> => {
+        observationSignal.throwIfAborted();
+        if (
+          stopped ||
+          revoked.has(key) ||
+          owner.revoked ||
+          owner.session !== session ||
+          session.dead ||
+          session.retiring ||
+          !(await registeredScope(key, scope)) ||
+          !(await eligible(session, observationSignal))
+        )
+          return false;
+        observationSignal.throwIfAborted();
+        return (
+          !stopped &&
+          !revoked.has(key) &&
+          !owner.revoked &&
+          owner.session === session &&
+          !session.dead &&
+          !session.retiring &&
+          (await registeredScope(key, scope))
+        );
+      };
+      if (!(await current())) return unknown;
+      const ids = await readActorIds(key);
+      const observeActor = session.process.observeActor;
+      const probeRuntime = session.process.probeRuntime;
+      if (!ids || !observeActor || !probeRuntime || !(await current())) return unknown;
+      const readPass = async (): Promise<readonly WorkerdActorRuntimeObservation[]> => {
+        await probeRuntime.call(session.process, observationSignal);
+        const values: WorkerdActorRuntimeObservation[] = [];
+        for (const id of ids) {
+          observationSignal.throwIfAborted();
+          const value = await observeActor.call(session.process, id, observationSignal);
+          if (
+            value.actorId !== id ||
+            value.epoch !== session.epoch ||
+            value.generationKey !== session.graph.generationKey
+          )
+            throw new Error("Actor native observation identity changed");
+          values.push(value);
+        }
+        return values;
+      };
+      const before = await readPass();
+      const observedAt = Date.now();
+      const after = await readPass();
+      if (
+        !(await current()) ||
+        JSON.stringify(ids) !== JSON.stringify(await readActorIds(key)) ||
+        before.some((entry, index) => JSON.stringify(entry) !== JSON.stringify(after[index]))
+      )
+        return unknown;
+      return {
+        kind: "confirmed",
+        epoch: session.epoch,
+        observedAt,
+        activeActorCount: before.filter((entry) => entry.activeActor).length,
+        pendingAlarmCount: before.reduce((count, entry) => count + entry.pendingAlarmCount, 0),
+        openSocketCount: before.reduce((count, entry) => count + entry.openSocketCount, 0),
+      };
+    } catch {
+      return unknown;
+    }
+  };
+
   return {
     ready,
     coldStartFailures: (): readonly ActorColdStartFailure[] =>
@@ -847,91 +985,36 @@ export function createSelfhostActorExecutionHost(options: {
       scope: ActorScope,
       signal: AbortSignal,
     ): Promise<ActorNamespaceRuntimeObservation> {
-      const unknown = { kind: "unknown" } as const;
+      return observeSession(scope, signal, async (session, observationSignal) => {
+        if (
+          !(await authority.stillCurrent(
+            session.authorityGraph,
+            session.realization,
+            observationSignal,
+          ))
+        )
+          return false;
+        const realization = await currentRealization(session.authorityGraph, observationSignal);
+        return (
+          realization.kind === "ready" &&
+          realization.realization.authorityKey === session.realization.authorityKey &&
+          realization.realization.graph.generationKey === session.graph.generationKey
+        );
+      });
+    },
+    /** Physical read for a backend-held accepted Operation, not SQL authority or warm admission. */
+    async observeNamespaceRuntimeForAcceptedOperation(
+      scope: ActorScope,
+      expected: ActorAcceptedOperationRuntimeTarget,
+      signal: AbortSignal,
+    ): Promise<ActorNamespaceRuntimeObservation> {
       try {
-        await ready;
-        signal.throwIfAborted();
-        if (stopped || !validScope(scope)) return unknown;
-        const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
-        const owner = owners.get(key);
-        const session = owner?.session;
-        if (
-          revoked.has(key) ||
-          owner?.revoked ||
-          !session ||
-          session.dead ||
-          session.retiring ||
-          !(await registeredScope(key, scope))
-        )
-          return unknown;
-        const observationSignal = AbortSignal.any([signal, AbortSignal.timeout(5_000)]);
-        const current = async (): Promise<boolean> => {
-          observationSignal.throwIfAborted();
-          if (
-            stopped ||
-            revoked.has(key) ||
-            owner.revoked ||
-            owner.session !== session ||
-            session.dead ||
-            session.retiring ||
-            !(await registeredScope(key, scope)) ||
-            !(await authority.stillCurrent(
-              session.authorityGraph,
-              session.realization,
-              observationSignal,
-            ))
-          )
-            return false;
-          const realization = await currentRealization(session.authorityGraph, observationSignal);
-          return (
-            realization.kind === "ready" &&
-            realization.realization.authorityKey === session.realization.authorityKey &&
-            realization.realization.graph.generationKey === session.graph.generationKey &&
-            owner.session === session &&
-            !session.dead &&
-            !session.retiring
-          );
-        };
-        if (!(await current())) return unknown;
-        const ids = await readActorIds(key);
-        const observeActor = session.process.observeActor;
-        const probeRuntime = session.process.probeRuntime;
-        if (!ids || !observeActor || !probeRuntime || !(await current())) return unknown;
-        const readPass = async (): Promise<readonly WorkerdActorRuntimeObservation[]> => {
-          await probeRuntime.call(session.process, observationSignal);
-          const values: WorkerdActorRuntimeObservation[] = [];
-          for (const id of ids) {
-            observationSignal.throwIfAborted();
-            const value = await observeActor.call(session.process, id, observationSignal);
-            if (
-              value.actorId !== id ||
-              value.epoch !== session.epoch ||
-              value.generationKey !== session.graph.generationKey
-            )
-              throw new Error("Actor native observation identity changed");
-            values.push(value);
-          }
-          return values;
-        };
-        const before = await readPass();
-        const observedAt = Date.now();
-        const after = await readPass();
-        if (
-          !(await current()) ||
-          JSON.stringify(ids) !== JSON.stringify(await readActorIds(key)) ||
-          before.some((entry, index) => JSON.stringify(entry) !== JSON.stringify(after[index]))
-        )
-          return unknown;
-        return {
-          kind: "confirmed",
-          epoch: session.epoch,
-          observedAt,
-          activeActorCount: before.filter((entry) => entry.activeActor).length,
-          pendingAlarmCount: before.reduce((count, entry) => count + entry.pendingAlarmCount, 0),
-          openSocketCount: before.reduce((count, entry) => count + entry.openSocketCount, 0),
-        };
+        const captured = structuredClone(expected);
+        return observeSession(scope, signal, async (session) =>
+          acceptedOperationMatches(session, captured),
+        );
       } catch {
-        return unknown;
+        return { kind: "unknown" };
       }
     },
     async readCurrentGraph(
