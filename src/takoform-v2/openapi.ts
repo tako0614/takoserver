@@ -1,5 +1,6 @@
 /** Documentation of this implementation, not a second normative Takoform specification. */
 const object = { type: "object", additionalProperties: true } as const;
+const privateInputs = { type: "object", additionalProperties: { type: "string" } } as const;
 const identifier = {
   type: "string",
   pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
@@ -64,6 +65,7 @@ export const TAKOFORM_V2_SCHEMAS = {
       title: { type: "string" },
       status: { type: "integer", minimum: 400, maximum: 599 },
       code: { type: "string" },
+      operationId: identifier,
     },
   },
   TakoformV2Resource: {
@@ -130,6 +132,15 @@ export const TAKOFORM_V2_SCHEMAS = {
         additionalProperties: false,
         properties: { code: { type: "string" }, message: { type: "string" } },
       },
+      inputRequired: {
+        type: "object",
+        required: ["names", "reason"],
+        additionalProperties: false,
+        properties: {
+          names: { type: "array", items: { type: "string" } },
+          reason: { enum: ["expired", "unavailable"] },
+        },
+      },
     },
   },
 };
@@ -151,7 +162,7 @@ export const TAKOFORM_V2_OPERATIONS: Readonly<Record<string, Record<string, unkn
             form: formUrl,
             supported: { type: "boolean" },
             operations: { type: "array", items: { enum: ["create", "read", "update", "delete"] } },
-            privateInputs: { const: false },
+            privateInputs: { type: "boolean" },
           },
         }),
       },
@@ -190,7 +201,13 @@ export const TAKOFORM_V2_OPERATIONS: Readonly<Record<string, Record<string, unkn
       type: "object",
       required: ["form", "space", "name", "spec"],
       additionalProperties: false,
-      properties: { form: formUrl, space: identifier, name: identifier, spec: object },
+      properties: {
+        form: formUrl,
+        space: identifier,
+        name: identifier,
+        spec: object,
+        privateInputs,
+      },
     }),
     responses: operationResponses,
   },
@@ -210,7 +227,7 @@ export const TAKOFORM_V2_OPERATIONS: Readonly<Record<string, Record<string, unkn
       type: "object",
       required: ["spec"],
       additionalProperties: false,
-      properties: { spec: object },
+      properties: { spec: object, privateInputs },
     }),
     responses: operationResponses,
   },
@@ -228,6 +245,26 @@ export const TAKOFORM_V2_OPERATIONS: Readonly<Record<string, Record<string, unkn
     responses: {
       "200": {
         description: "Current Operation status and effect.",
+        content: json(ref("Operation")),
+      },
+      default: problem,
+    },
+  },
+  takoformReplenishPrivateInputs: {
+    summary: "Replenish the entire original private-input map for the same unfinished Operation",
+    parameters: [
+      organization,
+      { in: "path", name: "operationId", required: true, schema: identifier },
+    ],
+    requestBody: body({
+      type: "object",
+      required: ["privateInputs"],
+      additionalProperties: false,
+      properties: { privateInputs },
+    }),
+    responses: {
+      "200": {
+        description: "Current same Operation; only waiting_input may return to queued.",
         content: json(ref("Operation")),
       },
       default: problem,

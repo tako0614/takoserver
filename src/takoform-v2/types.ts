@@ -1,4 +1,6 @@
 import type { Clock, JsonObject, Sql } from "../ports.ts";
+import type { V2ConfiguredPrivateInputs } from "./configured-private-inputs.ts";
+import type { V2PrivateInputCustody, V2PrivateInputMap } from "./private-inputs.ts";
 
 export type V2Action = "create" | "update" | "delete";
 export type V2Effect = "none" | "unknown" | "partial" | "complete";
@@ -36,6 +38,7 @@ export interface V2Operation {
   updatedAt: string;
   retainUntil: string;
   error?: { code: string; message: string };
+  inputRequired?: { names: string[]; reason: "expired" | "unavailable" };
 }
 
 export type V2BackendResult =
@@ -71,6 +74,8 @@ export interface V2Execution {
   spec: JsonObject;
   previousObserved: JsonObject;
   previousOutput: JsonObject;
+  /** Available only on a first, proven-unsent dispatch. Never persisted in public state. */
+  privateInputs?: V2PrivateInputMap;
 }
 
 export interface V2Backend {
@@ -106,6 +111,43 @@ export interface V2ReferenceRequirement {
 export interface V2Form {
   validateCreate(spec: JsonObject): void;
   validateUpdate(previousSpec: JsonObject, spec: JsonObject): void;
+  /** Exact Form-owned names, requiredness, and omission/update preservation semantics. */
+  readonly privateInputs?: {
+    /** If no secret-free instance is valid, a Host without custody must not claim support. */
+    readonly requiredForEveryInstance?: true;
+    validateCreate(spec: JsonObject, inputs: V2PrivateInputMap | undefined): void;
+    validateUpdate(
+      previousSpec: JsonObject,
+      spec: JsonObject,
+      inputs: V2PrivateInputMap | undefined,
+    ): void;
+    /** Pure, Form-owned sealing before the Host's atomic CREATE acceptance. */
+    prepareCreate?(input: {
+      readonly principal: string;
+      readonly space: string;
+      readonly name: string;
+      readonly form: string;
+      readonly resourceUid: string;
+      readonly operationId: string;
+      readonly generation: number;
+      readonly spec: JsonObject;
+      readonly privateInputs: V2PrivateInputMap | undefined;
+    }): Promise<V2ConfiguredPrivateInputs | null>;
+    /** Authorized preaccept policy; omission preserves the existing configured row. */
+    prepareUpdate?(input: {
+      readonly principal: string;
+      readonly space: string;
+      readonly name: string;
+      readonly form: string;
+      readonly resourceUid: string;
+      readonly operationId: string;
+      readonly generation: number;
+      readonly previousSpec: JsonObject;
+      readonly spec: JsonObject;
+      readonly privateInputs: V2PrivateInputMap | undefined;
+      readonly configured: V2ConfiguredPrivateInputs | null;
+    }): Promise<void>;
+  };
   /** Internal acceptance ordering for a target whose observation reads live referrers. */
   readonly serializeUpdatesWithPendingReferrers?: true;
   /**
@@ -135,6 +177,8 @@ export interface V2EngineOptions {
   authorize(principal: string, space: string, access: "read" | "write"): Promise<boolean>;
   /** Only fully implemented, exact Form URLs are entered here. */
   forms: Readonly<Record<string, V2Form>>;
+  /** Operator-selected keys; absence keeps the entire optional Host capability disabled. */
+  privateInputCustody?: V2PrivateInputCustody;
 }
 
 export interface V2CreateInput {
@@ -142,6 +186,7 @@ export interface V2CreateInput {
   space: string;
   name: string;
   spec: JsonObject;
+  privateInputs?: V2PrivateInputMap;
 }
 
 export class TakoformV2Error extends Error {
@@ -149,6 +194,7 @@ export class TakoformV2Error extends Error {
     readonly code: string,
     readonly status: number,
     message = code,
+    readonly operationId?: string,
   ) {
     super(message);
     this.name = "TakoformV2Error";

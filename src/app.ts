@@ -73,6 +73,7 @@ import {
   type V2OperatorFormFactory,
 } from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
+import type { V2PrivateInputCustody } from "./takoform-v2/private-inputs.ts";
 import type { V2Operation } from "./takoform-v2/types.ts";
 import { tenantRunPrincipalId } from "./tenant-run-principal.ts";
 import {
@@ -121,6 +122,8 @@ export interface AppPorts {
   readonly v2: V2ApplicationConfig;
   /** Operator-selected complete v2 backends, composed against this app's SQL, objects and clock. */
   readonly v2FormFactory?: V2OperatorFormFactory;
+  /** Explicit operator-private v2 keyring; absent disables privateInputs. */
+  readonly v2PrivateInputCustody?: V2PrivateInputCustody;
   /** Current Cloudflare Worker Version, retained only as operation and audit provenance. */
   readonly publicWorkerVersionId?: string;
   /** Current semantic Form implementation identity. */
@@ -312,6 +315,9 @@ export function buildApp(ports: AppPorts): App {
     config: ports.v2,
     clock,
     ...(ports.v2FormFactory === undefined ? {} : { formFactory: ports.v2FormFactory }),
+    ...(ports.v2PrivateInputCustody === undefined
+      ? {}
+      : { privateInputCustody: ports.v2PrivateInputCustody }),
   });
   const integrationE2eCredentialRoute = integrationE2eCredentialAuthority
     ? createIntegrationE2eCredentialAuthority({

@@ -266,6 +266,11 @@ export const TAKOFORM_ROUTES: readonly RouteDeclaration[] = [
   { method: "put", pattern: "/resources/{uid}", operation: "takoformUpdateResource" },
   { method: "delete", pattern: "/resources/{uid}", operation: "takoformDeleteResource" },
   { method: "get", pattern: "/operations/{operationId}", operation: "takoformReadOperation" },
+  {
+    method: "put",
+    pattern: "/operations/{operationId}/private-inputs",
+    operation: "takoformReplenishPrivateInputs",
+  },
 ];
 
 /** The mounted path of one Takoform Host route on one lane. */

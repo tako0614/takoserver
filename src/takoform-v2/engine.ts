@@ -1,6 +1,16 @@
 import { canonicalJson } from "../json.ts";
 import { type JsonObject, SqlError } from "../ports.ts";
+import { readV2ConfiguredPrivateInputs } from "./configured-private-inputs.ts";
 import { isV2FormUrl } from "./identity.ts";
+import {
+  hasPrivateComparisonMaterial,
+  matchesPrivateInputs,
+  sealPrivateInputs,
+  unsealPrivateInputs,
+  type V2PrivateInputBinding,
+  type V2PrivateInputMap,
+  validatePrivateInputCustody,
+} from "./private-inputs.ts";
 import { prepareV2References } from "./references.ts";
 import { type AcceptRecord, createV2Store, type OperationRow, type ResourceRow } from "./store.ts";
 import {
@@ -16,8 +26,8 @@ import {
 const tokenPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u;
 const namePattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 
-function fail(code: string, status: number): never {
-  throw new TakoformV2Error(code, status);
+function fail(code: string, status: number, operationId?: string): never {
+  throw new TakoformV2Error(code, status, code, operationId);
 }
 
 function validName(value: string): boolean {
@@ -63,6 +73,14 @@ function operation(row: OperationRow): V2Operation {
     ...(row.error_code && row.error_message
       ? { error: { code: row.error_code, message: row.error_message } }
       : {}),
+    ...(row.status === "waiting_input" && row.input_required_names_json && row.input_required_reason
+      ? {
+          inputRequired: {
+            names: JSON.parse(row.input_required_names_json) as string[],
+            reason: row.input_required_reason,
+          },
+        }
+      : {}),
   };
 }
 
@@ -75,6 +93,7 @@ function canonicalRequest(value: unknown): string {
 }
 
 export function createTakoformV2Engine(options: V2EngineOptions) {
+  if (options.privateInputCustody) validatePrivateInputCustody(options.privateInputCustody);
   if (!Number.isSafeInteger(options.replayWindowSeconds) || options.replayWindowSeconds < 1) {
     throw new TypeError("replayWindowSeconds must be a positive safe integer");
   }
@@ -86,6 +105,49 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
   const retryMs = Math.max(1_000, leaseMs);
   const store = createV2Store(options.sql);
   const formUrls = Object.freeze(Object.keys(options.forms));
+  const privateInputsCapability = options.privateInputCustody !== undefined;
+  for (const selected of Object.values(options.forms)) {
+    if (
+      selected.privateInputs &&
+      (typeof selected.privateInputs.validateCreate !== "function" ||
+        typeof selected.privateInputs.validateUpdate !== "function")
+    ) {
+      throw new TypeError("incomplete v2 Form private input declaration");
+    }
+  }
+
+  function privateBinding(
+    row: Pick<OperationRow, "id" | "principal" | "resource_uid" | "generation">,
+  ): V2PrivateInputBinding {
+    return {
+      operationId: row.id,
+      principal: row.principal,
+      resourceUid: row.resource_uid,
+      generation: row.generation,
+    };
+  }
+
+  async function seal(
+    record: AcceptRecord,
+    inputs: V2PrivateInputMap | undefined,
+  ): Promise<AcceptRecord> {
+    if (inputs === undefined) return record;
+    if (!options.privateInputCustody) fail("capability_required", 422);
+    return {
+      ...record,
+      privateInputs: await sealPrivateInputs(
+        options.privateInputCustody,
+        {
+          operationId: record.id,
+          principal: record.principal,
+          resourceUid: record.resourceUid,
+          generation: record.generation,
+        },
+        inputs,
+        now().getTime(),
+      ),
+    };
+  }
 
   async function storedOperation(id: string): Promise<OperationRow> {
     const row = await store.operation(id);
@@ -105,17 +167,42 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
     return row;
   }
 
-  async function replay(principal: string, key: string, fingerprint: string) {
+  async function comparePrivate(row: OperationRow, inputs: V2PrivateInputMap): Promise<boolean> {
+    const held = await store.privateInputs(row.id);
+    if (!held || !options.privateInputCustody) fail("private_inputs_unverifiable", 409, row.id);
+    const matches = await matchesPrivateInputs(
+      options.privateInputCustody,
+      privateBinding(row),
+      held.comparison_key_id,
+      held.comparison_tag,
+      inputs,
+    );
+    if (matches === null) fail("private_inputs_unverifiable", 409, row.id);
+    return matches;
+  }
+
+  async function replay(
+    principal: string,
+    key: string,
+    fingerprint: string,
+    inputs?: V2PrivateInputMap,
+  ) {
     const existing = await store.replay(principal, key);
     if (!existing) return null;
     await ownedResource(principal, existing.resource_uid, "write");
     if (existing.request_fingerprint !== fingerprint) fail("idempotency_conflict", 409);
+    if (existing.private_inputs_present === 1) {
+      if (inputs === undefined) fail("idempotency_conflict", 409);
+      if (!(await comparePrivate(existing, inputs))) fail("idempotency_conflict", 409);
+    }
     return operation(existing);
   }
 
   function form(formUrl: string) {
     const found = Object.hasOwn(options.forms, formUrl) ? options.forms[formUrl] : undefined;
-    if (!found) fail("unsupported_form", 422);
+    if (!found || (!privateInputsCapability && found.privateInputs?.requiredForEveryInstance)) {
+      fail("unsupported_form", 422);
+    }
     return found;
   }
 
@@ -167,8 +254,13 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
     };
   }
 
-  async function winnerAfterRace(principal: string, key: string, fingerprint: string) {
-    return replay(principal, key, fingerprint);
+  async function winnerAfterRace(
+    principal: string,
+    key: string,
+    fingerprint: string,
+    inputs?: V2PrivateInputMap,
+  ) {
+    return replay(principal, key, fingerprint, inputs);
   }
 
   async function nextRunnable() {
@@ -204,6 +296,17 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
 
   return {
     formUrls,
+    privateInputsCapability,
+    supportsForm(formUrl: string): boolean {
+      const selected = options.forms[formUrl];
+      return (
+        selected !== undefined &&
+        (privateInputsCapability || selected.privateInputs?.requiredForEveryInstance !== true)
+      );
+    },
+    supportsPrivateInputs(formUrl: string): boolean {
+      return privateInputsCapability && options.forms[formUrl]?.privateInputs !== undefined;
+    },
     async acceptCreate(input: {
       principal: string;
       key: string;
@@ -220,28 +323,69 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         method: "POST",
         path: "/resources",
         query: {},
-        body: desired,
+        body: {
+          form: desired.form,
+          space: desired.space,
+          name: desired.name,
+          spec: desired.spec,
+          ...(desired.privateInputs === undefined ? {} : { privateInputs: true }),
+        },
       });
-      const prior = await replay(principal, key, fingerprint);
+      const prior = await replay(principal, key, fingerprint, desired.privateInputs);
       if (prior) return prior;
       if (
-        Object.keys(desired).some((field) => !["form", "space", "name", "spec"].includes(field))
+        Object.keys(desired).some(
+          (field) => !["form", "space", "name", "spec", "privateInputs"].includes(field),
+        )
       ) {
         fail("capability_required", 422);
       }
       const selected = form(desired.form);
+      if (
+        desired.privateInputs !== undefined &&
+        (!privateInputsCapability || !selected.privateInputs)
+      )
+        fail("capability_required", 422);
       selected.validateCreate(desired.spec);
+      selected.privateInputs?.validateCreate(desired.spec, desired.privateInputs);
       const referencesJson = prepareV2References(selected, desired.spec);
       if (referencesJson !== null) await permitted(principal, desired.space, "read");
-      const record = accepted("create", {
-        principal,
-        key,
-        uid: crypto.randomUUID(),
-        generation: 1,
-        fingerprint,
-        spec: desired.spec,
-        formUrl: desired.form,
-      });
+      let record = await seal(
+        accepted("create", {
+          principal,
+          key,
+          uid: crypto.randomUUID(),
+          generation: 1,
+          fingerprint,
+          spec: desired.spec,
+          formUrl: desired.form,
+        }),
+        desired.privateInputs,
+      );
+      if (selected.privateInputs?.prepareCreate) {
+        const configured = await selected.privateInputs.prepareCreate({
+          principal,
+          space: desired.space,
+          name: desired.name,
+          form: desired.form,
+          resourceUid: record.resourceUid,
+          operationId: record.id,
+          generation: record.generation,
+          spec: JSON.parse(record.specJson) as JsonObject,
+          privateInputs: desired.privateInputs,
+        });
+        if (configured !== null) {
+          if (
+            desired.privateInputs === undefined ||
+            !configured.keyId ||
+            !configured.nonce ||
+            !configured.ciphertext
+          ) {
+            throw new TypeError("invalid configured private input preparation");
+          }
+          record = { ...record, configuredPrivateInputs: configured };
+        }
+      }
       const output = selected.initialOutput
         ? selected.initialOutput({
             resourceUid: record.resourceUid,
@@ -257,7 +401,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       try {
         await store.insertCreate(record, desired, referencesJson, initialOutputJson);
       } catch (error) {
-        const winner = await winnerAfterRace(principal, key, fingerprint);
+        const winner = await winnerAfterRace(principal, key, fingerprint, desired.privateInputs);
         if (winner) return winner;
         if (await store.activeName(desired.space, desired.name)) {
           fail("name_conflict", 409);
@@ -273,6 +417,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       uid: string;
       expectedGeneration: number;
       spec: JsonObject;
+      privateInputs?: V2PrivateInputMap;
     }): Promise<V2Operation> {
       if (!tokenPattern.test(input.key) || !validName(input.uid)) fail("invalid_request", 400);
       const target = await ownedResource(input.principal, input.uid, "write");
@@ -281,29 +426,68 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         path: `/resources/${input.uid}`,
         query: {},
         expectedGeneration: input.expectedGeneration,
-        body: { spec: input.spec },
+        body: {
+          spec: input.spec,
+          ...(input.privateInputs === undefined ? {} : { privateInputs: true }),
+        },
       });
-      const prior = await replay(input.principal, input.key, fingerprint);
+      const prior = await replay(input.principal, input.key, fingerprint, input.privateInputs);
       if (prior) return prior;
       if (target.deleted_at) fail("gone", 410);
       if (target.busy_operation) fail("resource_busy", 409);
       if (target.generation !== input.expectedGeneration) fail("generation_conflict", 409);
       if (target.generation >= Number.MAX_SAFE_INTEGER) fail("invalid_request", 400);
       const selectedForm = boundForm(target);
+      if (
+        input.privateInputs !== undefined &&
+        (!privateInputsCapability || !selectedForm.privateInputs)
+      )
+        fail("capability_required", 422);
       const serializeUpdatesWithPendingReferrers =
         selectedForm.serializeUpdatesWithPendingReferrers === true;
       selectedForm.validateUpdate(JSON.parse(target.spec_json) as JsonObject, input.spec);
+      selectedForm.privateInputs?.validateUpdate(
+        JSON.parse(target.spec_json) as JsonObject,
+        input.spec,
+        input.privateInputs,
+      );
       const referencesJson = prepareV2References(selectedForm, input.spec);
       if (referencesJson !== null) await permitted(input.principal, target.space, "read");
-      const record = accepted("update", {
-        principal: input.principal,
-        key: input.key,
-        uid: input.uid,
-        generation: target.generation + 1,
-        fingerprint,
-        spec: input.spec,
-        formUrl: target.form_url,
-      });
+      let record = await seal(
+        accepted("update", {
+          principal: input.principal,
+          key: input.key,
+          uid: input.uid,
+          generation: target.generation + 1,
+          fingerprint,
+          spec: input.spec,
+          formUrl: target.form_url,
+        }),
+        input.privateInputs,
+      );
+      if (selectedForm.privateInputs?.prepareUpdate) {
+        const configured = await readV2ConfiguredPrivateInputs(options.sql, {
+          principal: input.principal,
+          space: target.space,
+          name: target.name,
+          form: target.form_url,
+          resourceUid: target.uid,
+        });
+        await selectedForm.privateInputs.prepareUpdate({
+          principal: input.principal,
+          space: target.space,
+          name: target.name,
+          form: target.form_url,
+          resourceUid: target.uid,
+          operationId: record.id,
+          generation: record.generation,
+          previousSpec: JSON.parse(target.spec_json) as JsonObject,
+          spec: JSON.parse(record.specJson) as JsonObject,
+          privateInputs: input.privateInputs,
+          configured,
+        });
+        if (configured) record = { ...record, requiresConfiguredPrivateInputs: true };
+      }
       let result: Awaited<ReturnType<typeof store.insertChange>>;
       try {
         result = await store.insertChange(
@@ -313,12 +497,22 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         );
         if (result === "accepted") return operation(await storedOperation(record.id));
       } catch (error) {
-        const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
+        const winner = await winnerAfterRace(
+          input.principal,
+          input.key,
+          fingerprint,
+          input.privateInputs,
+        );
         if (winner) return winner;
         if (referenceUnavailable(error)) fail("dependency_conflict", 409);
         throw error;
       }
-      const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
+      const winner = await winnerAfterRace(
+        input.principal,
+        input.key,
+        fingerprint,
+        input.privateInputs,
+      );
       if (winner) return winner;
       if (result === "dependency_conflict") fail("dependency_conflict", 409);
       const latest = await ownedResource(input.principal, input.uid, "write");
@@ -421,6 +615,33 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       await ownedResource(input.principal, row.resource_uid, "read");
       return operation(row);
     },
+    async replenishPrivateInputs(input: {
+      principal: string;
+      id: string;
+      privateInputs: V2PrivateInputMap;
+    }): Promise<V2Operation> {
+      const row = await store.operation(input.id);
+      if (!row || row.principal !== input.principal) fail("not_found", 404);
+      await ownedResource(input.principal, row.resource_uid, "write");
+      if (row.private_inputs_present !== 1) fail("private_inputs_conflict", 409, row.id);
+      if (!(await comparePrivate(row, input.privateInputs))) {
+        fail("private_inputs_conflict", 409, row.id);
+      }
+      if (row.status === "succeeded" || row.status === "failed") {
+        fail("operation_terminal", 409, row.id);
+      }
+      if (row.status !== "waiting_input") return operation(row);
+      if (row.dispatch_possible !== 0) return operation(row);
+      if (!options.privateInputCustody) fail("private_inputs_unverifiable", 409, row.id);
+      const sealed = await sealPrivateInputs(
+        options.privateInputCustody,
+        privateBinding(row),
+        input.privateInputs,
+        now().getTime(),
+      );
+      await store.replenish(row.id, sealed, now().toISOString());
+      return operation(await storedOperation(row.id));
+    },
     async runNext(): Promise<V2Operation | null> {
       const runnable = await nextRunnable();
       if (!runnable) return null;
@@ -431,6 +652,72 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       const claimed = await storedOperation(candidate.id);
       const target = await store.resource(claimed.resource_uid);
       if (!target) fail("temporarily_unavailable", 503);
+      const mustReconcile = claimed.dispatch_possible === 1;
+      let transferInputs: V2PrivateInputMap | undefined;
+      if (!mustReconcile && claimed.private_inputs_present === 1) {
+        const held = await store.privateInputs(claimed.id);
+        const custody = options.privateInputCustody;
+        if (
+          !held ||
+          !custody ||
+          !(await hasPrivateComparisonMaterial(
+            custody,
+            held.comparison_key_id,
+            held.comparison_tag,
+          ))
+        ) {
+          const at = now();
+          await store.failUnverifiable(
+            claimed.id,
+            token,
+            at.toISOString(),
+            new Date(at.getTime() + options.replayWindowSeconds * 1000).toISOString(),
+          );
+          return operation(await storedOperation(claimed.id));
+        }
+        const expired =
+          held.transfer_expires_at_ms === null || held.transfer_expires_at_ms <= now().getTime();
+        if (!expired && held.transfer_key_id && held.transfer_nonce && held.transfer_ciphertext) {
+          transferInputs =
+            (await unsealPrivateInputs(
+              custody,
+              privateBinding(claimed),
+              held.transfer_key_id,
+              held.transfer_nonce,
+              held.transfer_ciphertext,
+            )) ?? undefined;
+          if (transferInputs !== undefined) {
+            const matched = await matchesPrivateInputs(
+              custody,
+              privateBinding(claimed),
+              held.comparison_key_id,
+              held.comparison_tag,
+              transferInputs,
+            );
+            if (matched === null) {
+              const at = now();
+              await store.failUnverifiable(
+                claimed.id,
+                token,
+                at.toISOString(),
+                new Date(at.getTime() + options.replayWindowSeconds * 1000).toISOString(),
+              );
+              return operation(await storedOperation(claimed.id));
+            }
+            if (!matched) transferInputs = undefined;
+          }
+        }
+        if (transferInputs === undefined) {
+          await store.waitForInputs(
+            claimed.id,
+            token,
+            now().toISOString(),
+            held.names_json,
+            expired ? "expired" : "unavailable",
+          );
+          return operation(await storedOperation(claimed.id));
+        }
+      }
       const execution: V2Execution = {
         operationId: claimed.id,
         leaseToken: token,
@@ -447,8 +734,8 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         spec: JSON.parse(claimed.accepted_spec_json) as JsonObject,
         previousObserved: JSON.parse(target.observed_json) as JsonObject,
         previousOutput: JSON.parse(target.output_json) as JsonObject,
+        ...(transferInputs === undefined ? {} : { privateInputs: transferInputs }),
       };
-      const mustReconcile = claimed.dispatch_possible === 1;
       if (!mustReconcile && !(await store.markDispatch(claimed.id, token, now().toISOString()))) {
         return operation(await storedOperation(claimed.id));
       }

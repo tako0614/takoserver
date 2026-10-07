@@ -10,6 +10,7 @@ import { createStaticAssetBundleForm } from "./forms/static-asset-bundle-backend
 import { WORKER_BUNDLE_FORM_URL } from "./forms/worker-bundle.ts";
 import { createWorkerBundleForm } from "./forms/worker-bundle-backend.ts";
 import { createTakoformV2Host } from "./host.ts";
+import type { V2PrivateInputCustody } from "./private-inputs.ts";
 import type { V2Form } from "./types.ts";
 
 export type V2OperatorFormFactory = (context: {
@@ -28,6 +29,8 @@ export function createTakoformV2Application(options: {
   readonly clock: Clock;
   /** Selected by the embedding operator, never by public configuration or a request. */
   readonly formFactory?: V2OperatorFormFactory;
+  /** Operator-private composition only; never parsed from public config. */
+  readonly privateInputCustody?: V2PrivateInputCustody;
 }) {
   if (options.formFactory !== undefined && typeof options.formFactory !== "function") {
     throw new TypeError("v2 Form factory must be a function");
@@ -116,6 +119,7 @@ export function createTakoformV2Application(options: {
     maxPageSize: 100,
     replayWindowSeconds: 86_400,
     cursorSigningKey: config.cursorSigningKey,
+    ...(options.privateInputCustody ? { privateInputCustody: options.privateInputCustody } : {}),
     authenticate: access.authenticate,
   });
 }
