@@ -64,6 +64,11 @@ export {
   type V2WorkerInvocationSelection,
 } from "./worker-invocation-custody.ts";
 export {
+  createInternalV2ModuleWorkerForm,
+  type V2WorkerRetirementReader,
+  type V2WorkerServingReader,
+} from "./worker-lifecycle-backend.ts";
+export {
   createV2NativeDeletionCustody,
   type V2NativeDeletionCustody,
   type V2NativeDeletionInspection,
