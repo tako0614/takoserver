@@ -54,6 +54,6 @@ export function linkProps(href: string): Record<string, unknown> {
   };
 }
 
-export function resourcePath(space: string, kind: string, name: string): string {
-  return `/resources/${encodeURIComponent(space)}/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`;
+export function resourcePath(uid: string): string {
+  return `/resources/${encodeURIComponent(uid)}`;
 }

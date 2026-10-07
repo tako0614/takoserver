@@ -1,213 +1,327 @@
-import type { FormRef, Offering } from "../api.ts";
+import { ApiError, type ResourceSummary } from "../api.ts";
 import { h } from "../dom.ts";
 import { tr } from "../i18n.ts";
-import { provisioningPriceSentence } from "../offering-view.ts";
-import { signal } from "../reactive.ts";
-import { navigate, resourcePath } from "../router.ts";
-import { api } from "../state.ts";
-import { explain, openModal, toast } from "../ui.ts";
+import {
+  isUnknownAcceptance,
+  prepareResourceIntent,
+  type ResourceIntent,
+  resourceIntentRequestBody,
+  sendResourceIntent,
+} from "../resource-intent.ts";
+import { navigate } from "../router.ts";
+import { api, currentOrganization } from "../state.ts";
+import { copyable, explain, openModal, toast } from "../ui.ts";
 
-/**
- * Declaring a resource from the console.
- *
- * The choices come from the catalog, so the console cannot offer a Form the
- * Host would refuse: what is listed is exactly what this organization may
- * provision, at the price it will be charged. The alternative — a hard-coded
- * list of kinds — drifts the day a Form ships, and drifts silently.
- *
- * The spec is left as JSON. A generated form per schema is the obvious next
- * step and a poor first one: it would have to be right about every Form, and
- * being wrong about one means a field nobody can fill. Text is honest until
- * the schemas are worth rendering.
- */
-export function createResource(organizationId: string, offerings: readonly Offering[]): void {
-  if (offerings.length === 0) {
-    toast(
-      tr(
-        "この組織で作成できるサービスはありません",
-        "This organization has nothing it may provision",
-      ),
-      "bad",
-    );
-    return;
+function jsonSpec(text: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
   }
+}
 
-  const chosen = signal<Offering>(offerings[0] as Offering);
-  const name = h("input", { class: "input", placeholder: "media", autocomplete: "off" });
-  const space = h("input", { class: "input", value: "default", autocomplete: "off" });
+function sameOrganization(organizationId: string): boolean {
+  if (currentOrganization()?.id === organizationId) return true;
+  toast(
+    tr(
+      "組織が変更されました。操作は送信していません。",
+      "Organization changed. No operation was sent.",
+    ),
+    "bad",
+  );
+  return false;
+}
+
+function recoveryDetails(
+  key: string,
+  method: string,
+  path: string,
+  body: string | null,
+  generation?: number,
+): HTMLElement {
+  return h(
+    "div",
+    { class: "field" },
+    h(
+      "small",
+      null,
+      tr(
+        "送信前に正確なキーと本文を確認・コピーできます。ページ再読み込み後はConsoleから再送できません。結果が不明なら読み取りで確認してください。",
+        "Review or copy the exact key and body before sending. After a full reload the Console cannot replay; reconcile by reading if acceptance is unknown.",
+      ),
+    ),
+    h("div", { class: "mono" }, `${method} ${path}`),
+    generation === undefined
+      ? null
+      : h("div", { class: "mono" }, `takoform-expected-generation: ${generation}`),
+    h("div", null, "idempotency-key: ", copyable(key)),
+    body === null
+      ? null
+      : h(
+          "div",
+          null,
+          tr("正確なJSON本文", "Exact JSON body"),
+          " ",
+          copyable(body, tr("本文をコピー", "Copy body")),
+          h("pre", { class: "mono" }, body),
+        ),
+  );
+}
+
+async function submit(intent: ResourceIntent, close: () => void): Promise<void> {
+  try {
+    const accepted = await sendResourceIntent(intent.id);
+    close();
+    if (currentOrganization()?.id === intent.organizationId)
+      navigate(
+        `/resources?operation=${encodeURIComponent(accepted.id)}&intent=${encodeURIComponent(intent.id)}`,
+      );
+  } catch (error) {
+    if (
+      isUnknownAcceptance(error) ||
+      (error instanceof ApiError && error.code === "replay_window_expired")
+    ) {
+      close();
+      if (currentOrganization()?.id === intent.organizationId)
+        navigate(`/resources?acceptance=unknown&intent=${encodeURIComponent(intent.id)}`);
+      return;
+    }
+    toast(explain(error as Error), "bad");
+  }
+}
+
+/** Create only against the exact Form URL supplied by the operator. */
+export function createResource(organizationId: string): void {
+  const key = `console-create-${crypto.randomUUID()}`;
+  const form = h("input", {
+    class: "input",
+    placeholder: "https://…/forms/…/0.1.0/",
+    autocomplete: "off",
+  });
+  const name = h("input", { class: "input", placeholder: "my-resource", autocomplete: "off" });
   const spec = h("textarea", { class: "textarea", spellcheck: "false" });
   spec.value = "{}";
-
-  const price = h("div", { class: "dim", style: { fontSize: "12.5px" } });
-  const showPrice = (offering: Offering): void => {
-    price.replaceChildren(document.createTextNode(provisioningPriceSentence(offering)));
+  const details = h("div");
+  const showDetails = (): void => {
+    const parsed = jsonSpec(spec.value);
+    const body = parsed
+      ? JSON.stringify({
+          form: form.value.trim(),
+          space: organizationId,
+          name: name.value.trim(),
+          spec: parsed,
+        })
+      : null;
+    details.replaceChildren(
+      recoveryDetails(key, "POST", "/apis/forms.takoform.com/v2/resources", body),
+    );
   };
-  showPrice(chosen());
-
-  const kind = h(
-    "select",
-    {
-      class: "select",
-      onChange: (event: Event) => {
-        const picked = offerings.find(
-          (offering) => offering.id === (event.target as HTMLSelectElement).value,
-        );
-        if (picked) {
-          chosen.set(picked);
-          showPrice(picked);
-        }
-      },
-    },
-    ...offerings.map((offering) =>
-      h("option", { value: offering.id }, `${offering.displayName} — ${offering.form.kind}`),
-    ),
-  );
-
+  for (const field of [form, name, spec]) field.addEventListener("input", showDetails);
+  showDetails();
+  let intent: ResourceIntent | null = null;
   const close = openModal({
     title: tr("リソースを作成", "New resource"),
-    confirmLabel: tr("作成", "Apply"),
+    confirmLabel: tr("受け付ける", "Accept create"),
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
-      h("div", { class: "field" }, h("label", null, tr("サービス", "Offering")), kind, price),
       h(
         "div",
         { class: "field" },
-        h("label", null, tr("名前", "Name")),
-        name,
+        h("label", null, tr("正確なForm URL", "Exact Form URL")),
+        form,
         h(
           "small",
           null,
           tr(
-            "スペース内で一意の名前です。作成後は変更できません。",
-            "Unique within its space. It cannot be changed afterwards.",
+            "運用者が提供したForm URLを入力してください。",
+            "Paste the operator-provided Form URL.",
           ),
         ),
       ),
-      h(
-        "div",
-        { class: "field" },
-        h("label", null, tr("スペース", "Space")),
-        space,
-        h(
-          "small",
-          null,
-          tr(
-            "任意の名前空間です。通常は `default` のままで構いません。",
-            "A namespace of your choosing. `default` is a fine answer.",
-          ),
-        ),
-      ),
-      h(
-        "div",
-        { class: "field" },
-        h("label", null, tr("設定", "Spec")),
-        spec,
-        h(
-          "small",
-          null,
-          tr(
-            "Formのスキーマで検証されるJSONです。多くの種類では空のオブジェクトを利用できます。",
-            "JSON, validated against the Form's schema. An empty object is valid for most kinds.",
-          ),
-        ),
-      ),
+      h("div", { class: "field" }, h("label", null, tr("名前", "Name")), name),
+      h("div", { class: "field" }, h("label", null, tr("スペース", "Space")), organizationId),
+      h("div", { class: "field" }, h("label", null, tr("設定 (JSON)", "Spec (JSON)")), spec),
+      details,
     ),
     onConfirm: async () => {
-      const declaredName = name.value.trim();
-      const declaredSpace = space.value.trim();
-      if (declaredName === "" || declaredSpace === "") {
-        toast(tr("名前とスペースを入力してください", "A name and a space are required"), "bad");
-        return;
-      }
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = JSON.parse(spec.value) as Record<string, unknown>;
-      } catch {
-        // Said here rather than by the server, because the server would be
-        // right and unhelpful: it never saw what was typed.
-        toast(tr("設定が正しいJSONではありません", "The spec is not valid JSON"), "bad");
-        return;
-      }
-      try {
-        const outcome = await api.createResource(organizationId, {
-          form: chosen().form,
-          space: declaredSpace,
-          name: declaredName,
-          spec: parsed,
-        });
-        if (outcome.state === "accepted") {
-          close();
-          navigate(`/resources?operation=${encodeURIComponent(outcome.operation.id)}`);
+      if (!sameOrganization(organizationId)) return;
+      if (!intent) {
+        const selectedForm = form.value.trim();
+        const selectedName = name.value.trim();
+        const parsed = jsonSpec(spec.value);
+        if (!selectedForm || !selectedName || !parsed) {
+          toast(
+            tr(
+              "Form URL、名前、JSONオブジェクトを入力してください",
+              "Enter a Form URL, name, and JSON object",
+            ),
+            "bad",
+          );
           return;
         }
-        const created = outcome.result;
-        toast(
-          tr(
-            `${created.kind} ${created.metadata.name} を作成しました`,
-            `${created.kind} ${created.metadata.name} is ready`,
-          ),
-          "ok",
-        );
-        close();
-        navigate(resourcePath(declaredSpace, created.kind, declaredName));
-      } catch (error) {
-        toast(explain(error as Error), "bad");
+        form.disabled = true;
+        name.disabled = true;
+        spec.disabled = true;
+        showDetails();
+        try {
+          if (!(await api.formSupport(organizationId, selectedForm))) {
+            toast(
+              tr(
+                "このHostはそのFormの作成をサポートしていません",
+                "This Host does not support create for that exact Form",
+              ),
+              "bad",
+            );
+            form.disabled = false;
+            name.disabled = false;
+            spec.disabled = false;
+            return;
+          }
+          if (!sameOrganization(organizationId)) return;
+          const replayWindowSeconds = await api.replayWindowSeconds();
+          if (!sameOrganization(organizationId)) return;
+          intent = prepareResourceIntent(
+            organizationId,
+            { action: "create", form: selectedForm, name: selectedName, spec: parsed },
+            replayWindowSeconds,
+            key,
+          );
+          details.replaceChildren(
+            recoveryDetails(
+              key,
+              "POST",
+              "/apis/forms.takoform.com/v2/resources",
+              resourceIntentRequestBody(intent),
+            ),
+          );
+        } catch (error) {
+          form.disabled = false;
+          name.disabled = false;
+          spec.disabled = false;
+          toast(explain(error as Error), "bad");
+          return;
+        }
       }
+      await submit(intent, close);
     },
   });
 }
 
-/**
- * Deleting one.
- *
- * Fenced on the generation the console last read, so a resource somebody else
- * changed in the meantime is refused rather than removed on stale information.
- */
-export function deleteResource(
-  organizationId: string,
-  declaration: {
-    readonly form: FormRef;
-    readonly space: string;
-    readonly name: string;
-    readonly generation: string;
-  },
-  done: () => void,
-): void {
+/** Update one observed UID, fenced on the generation the person last read. */
+export function updateResource(organizationId: string, resource: ResourceSummary): void {
+  const key = `console-update-${crypto.randomUUID()}`;
+  const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
+  const spec = h("textarea", { class: "textarea", spellcheck: "false" });
+  spec.value = JSON.stringify(resource.spec, null, 2);
+  const details = h("div");
+  const showDetails = (): void => {
+    const parsed = jsonSpec(spec.value);
+    details.replaceChildren(
+      recoveryDetails(
+        key,
+        "PUT",
+        path,
+        parsed ? JSON.stringify({ spec: parsed }) : null,
+        resource.generation,
+      ),
+    );
+  };
+  spec.addEventListener("input", showDetails);
+  showDetails();
+  let intent: ResourceIntent | null = null;
   const close = openModal({
-    title: tr(`${declaration.name}を削除しますか？`, `Delete ${declaration.name}?`),
+    title: tr(`${resource.name}を更新`, `Update ${resource.name}`),
+    confirmLabel: tr("更新を受け付ける", "Accept update"),
+    body: h(
+      "div",
+      { class: "field" },
+      h("label", null, tr("設定 (JSON)", "Spec (JSON)")),
+      spec,
+      details,
+    ),
+    onConfirm: async () => {
+      if (!sameOrganization(organizationId)) return;
+      if (!intent) {
+        const parsed = jsonSpec(spec.value);
+        if (!parsed) {
+          toast(tr("JSONオブジェクトを入力してください", "Enter a JSON object"), "bad");
+          return;
+        }
+        spec.disabled = true;
+        showDetails();
+        try {
+          const replayWindowSeconds = await api.replayWindowSeconds();
+          if (!sameOrganization(organizationId)) return;
+          intent = prepareResourceIntent(
+            organizationId,
+            { action: "update", uid: resource.uid, generation: resource.generation, spec: parsed },
+            replayWindowSeconds,
+            key,
+          );
+          details.replaceChildren(
+            recoveryDetails(
+              key,
+              "PUT",
+              path,
+              resourceIntentRequestBody(intent),
+              resource.generation,
+            ),
+          );
+        } catch (error) {
+          spec.disabled = false;
+          toast(explain(error as Error), "bad");
+          return;
+        }
+      }
+      await submit(intent, close);
+    },
+  });
+}
+
+/** Destructive delete requires a separate explicit confirmation. */
+export function deleteResource(organizationId: string, resource: ResourceSummary): void {
+  const key = `console-delete-${crypto.randomUUID()}`;
+  const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
+  let intent: ResourceIntent | null = null;
+  const close = openModal({
+    title: tr(`${resource.name}を削除しますか？`, `Delete ${resource.name}?`),
     confirmLabel: tr("リソースを削除", "Delete resource"),
     confirmTone: "danger",
     body: h(
       "div",
-      { class: "notice notice--bad" },
+      { style: { display: "grid", gap: "14px" } },
       h(
         "div",
-        null,
+        { class: "notice notice--bad" },
         tr(
           "実体と保存されているデータが削除されます。この操作は元に戻せません。",
-          "The backend resource is destroyed, along with anything stored in it. Nothing here can bring it back.",
+          "The backend resource and its data may be destroyed. This cannot be undone.",
         ),
       ),
+      recoveryDetails(key, "DELETE", path, null, resource.generation),
     ),
     onConfirm: async () => {
-      try {
-        const outcome = await api.deleteResource(
-          organizationId,
-          { form: declaration.form, space: declaration.space, name: declaration.name },
-          declaration.generation,
-        );
-        if (outcome.state === "accepted") {
-          close();
-          navigate(`/resources?operation=${encodeURIComponent(outcome.operation.id)}`);
+      if (!sameOrganization(organizationId)) return;
+      if (!intent) {
+        try {
+          const replayWindowSeconds = await api.replayWindowSeconds();
+          if (!sameOrganization(organizationId)) return;
+          intent = prepareResourceIntent(
+            organizationId,
+            { action: "delete", uid: resource.uid, generation: resource.generation },
+            replayWindowSeconds,
+            key,
+          );
+        } catch (error) {
+          toast(explain(error as Error), "bad");
           return;
         }
-        toast(tr(`${declaration.name}を削除しました`, `${declaration.name} deleted`), "ok");
-        close();
-        done();
-      } catch (error) {
-        toast(explain(error as Error), "bad");
       }
+      await submit(intent, close);
     },
   });
 }
