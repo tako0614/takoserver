@@ -264,7 +264,10 @@ function fixture() {
   const select = createV2WorkflowNativeSelection({
     sql,
     targetKey: TARGET,
-    owner,
+    ownerForWorkerUid: async (workerUid) => {
+      expect(workerUid).toBe(WORKER_UID);
+      return owner;
+    },
     publicationState,
     inspector,
     basisPoint: () => 7,

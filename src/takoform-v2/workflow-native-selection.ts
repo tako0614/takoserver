@@ -249,7 +249,7 @@ function cloneSelected(input: WorkerdSelectedActiveVersion): WorkerdSelectedActi
 export function createV2WorkflowNativeSelection(options: {
   readonly sql: Sql;
   readonly targetKey: string;
-  readonly owner: V2WorkflowNativeOwnerPort;
+  readonly ownerForWorkerUid: (workerUid: string) => Promise<V2WorkflowNativeOwnerPort>;
   readonly publicationState: PublicationState;
   readonly inspector: Pick<WorkerModuleSemanticInspector, "inspectWorkflowClass">;
   readonly basisPoint?: () => number;
@@ -258,8 +258,7 @@ export function createV2WorkflowNativeSelection(options: {
     !options.sql ||
     typeof options.sql.query !== "function" ||
     !options.targetKey ||
-    typeof options.owner?.observeServing !== "function" ||
-    typeof options.owner?.selectWorkflowExecution !== "function" ||
+    typeof options.ownerForWorkerUid !== "function" ||
     typeof options.publicationState?.resolveCurrentServing !== "function" ||
     typeof options.inspector?.inspectWorkflowClass !== "function"
   )
@@ -277,7 +276,15 @@ export function createV2WorkflowNativeSelection(options: {
     const resource = await captureResource(options.sql, options.targetKey, scope).catch(() => {
       throw unavailable();
     });
-    const serving = await options.owner.observeServing({
+    const owner = await options.ownerForWorkerUid(resource.workerUid).catch(() => {
+      throw unavailable();
+    });
+    if (
+      typeof owner?.observeServing !== "function" ||
+      typeof owner.selectWorkflowExecution !== "function"
+    )
+      throw unavailable();
+    const serving = await owner.observeServing({
       workerResourceUid: resource.workerUid,
       targetKey: options.targetKey,
     });
@@ -302,7 +309,7 @@ export function createV2WorkflowNativeSelection(options: {
         return selectedBasisPoint < accumulatedWeight;
       });
     if (!expectedWeighted) throw unavailable();
-    const owned = await options.owner.selectWorkflowExecution({
+    const owned = await owner.selectWorkflowExecution({
       workerUid: resource.workerUid,
       targetKey: options.targetKey,
       servingSourceOperationId: serving.sourceOperationId,

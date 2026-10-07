@@ -25,7 +25,7 @@ export function createSelfhostV2WorkflowComposition(options: {
   readonly randomId: () => string;
   readonly waitUntil: (epochMs: number, signal: AbortSignal) => Promise<void>;
   readonly targetKey: string;
-  readonly owner: V2WorkflowNativeOwnerPort;
+  readonly ownerForWorkerUid: (workerUid: string) => Promise<V2WorkflowNativeOwnerPort>;
   readonly bundleCustody: Pick<WorkerBundleCustody, "readHeldVerified">;
   readonly assetCustody?: Pick<StaticAssetBundleCustody, "readHeldVerified">;
   readonly inspector: Pick<WorkerModuleSemanticInspector, "inspectWorkflowClass">;
@@ -50,7 +50,7 @@ export function createSelfhostV2WorkflowComposition(options: {
   const select = createV2WorkflowNativeSelection({
     sql: options.sql,
     targetKey: options.targetKey,
-    owner: options.owner,
+    ownerForWorkerUid: options.ownerForWorkerUid,
     publicationState,
     inspector: options.inspector,
   });
