@@ -26,7 +26,7 @@ const BUNDLE_FORM_URL = "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.
 
 // The Version backend below is a graph-only substitute, not ABI qualification;
 // its Bundle dependency uses real verified SQL byte custody.
-function fixture() {
+function fixture(distinctFormBackends = false) {
   const root = mkdtempSync(join(tmpdir(), "v2-publication-"));
   const path = join(root, "state.sqlite");
   const db = new Database(path);
@@ -81,16 +81,18 @@ function fixture() {
       return { kind: "unknown" as const };
     },
   };
-  const form = (extra: Partial<V2Form> = {}): V2Form => ({
+  const form = (role: string, extra: Partial<V2Form> = {}): V2Form => ({
     validateCreate() {},
     validateUpdate() {},
-    backend,
+    backend: distinctFormBackends
+      ? { ...backend, id: `fixture-${role}-backend`, targetKey: `fixture-${role}-target` }
+      : backend,
     ...extra,
   });
   const forms = {
-    [MODULE_WORKER_FORM_URL]: form(),
+    [MODULE_WORKER_FORM_URL]: form("module"),
     [BUNDLE_FORM_URL]: bundleHost.form,
-    [WORKER_VERSION_FORM_URL]: form({
+    [WORKER_VERSION_FORM_URL]: form("version", {
       references(spec) {
         const workerUid = (spec.worker as { resourceUid: string }).resourceUid;
         const bundleUid = (spec.bundle as { resourceUid: string }).resourceUid;
@@ -100,7 +102,7 @@ function fixture() {
         ];
       },
     }),
-    [WORKER_DEPLOYMENT_FORM_URL]: form({
+    [WORKER_DEPLOYMENT_FORM_URL]: form("deployment", {
       references(spec) {
         const workerUid = (spec.worker as { resourceUid: string }).resourceUid;
         const versions = spec.versions as { workerVersion: { resourceUid: string } }[];
@@ -115,7 +117,7 @@ function fixture() {
         ];
       },
     }),
-    [WORKER_ENDPOINT_FORM_URL]: form({
+    [WORKER_ENDPOINT_FORM_URL]: form("endpoint", {
       references(spec) {
         return [
           {
@@ -568,6 +570,247 @@ test("fresh SQLite handle preserves accepted claim and sealed graph; this is not
     } finally {
       secondDb.close();
     }
+  } finally {
+    f.close();
+  }
+});
+
+test("a fresh SQL handle reconstructs a terminal current serving graph without a live lease", async () => {
+  const f = fixture();
+  try {
+    const { worker, version } = await f.basics();
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    const reopenedDb = new Database(f.path);
+    try {
+      const reader = createV2WorkerPublicationState({
+        sql: createSqliteSql(reopenedDb),
+        bundleCustody: createWorkerBundleHost({
+          sql: createSqliteSql(reopenedDb),
+          targetKey: "fixture-workerd-root",
+          source: {
+            async read() {
+              throw new Error("source is offline after restart");
+            },
+          },
+        }).custody,
+      });
+      const identity = {
+        generation: `takoserver-v2-operation:${deployment.id}`,
+        workerResourceUid: worker.resourceUid,
+        hostnames: [],
+        versions: [{ workerVersionUid: version.resourceUid, weight: 10_000 }],
+      };
+      const result = await reader.resolveCurrentServing({
+        workerUid: worker.resourceUid,
+        targetKey: "fixture-workerd-root",
+        sourceOperationId: deployment.id,
+        expectedIdentity: identity,
+      });
+      expect(result.kind).toBe("ready");
+      if (result.kind !== "ready") return;
+      expect(result.snapshot.sourceOperationId).toBe(deployment.id);
+      expect(result.snapshot.deployment?.versions).toMatchObject([
+        { uid: version.resourceUid, weight: 10_000 },
+      ]);
+      expect(await result.stillCurrent()).toBe(true);
+      expect((await result.readVersionMaterials(version.resourceUid)).bundle?.files.length).toBe(1);
+      const mutableIdentity = {
+        ...identity,
+        versions: [{ workerVersionUid: version.resourceUid, weight: 10_000 }],
+      };
+      const inFlight = reader.resolveCurrentServing({
+        workerUid: worker.resourceUid,
+        targetKey: "fixture-workerd-root",
+        sourceOperationId: deployment.id,
+        expectedIdentity: mutableIdentity,
+      });
+      const mutableVersion = mutableIdentity.versions[0];
+      if (!mutableVersion) throw new Error("missing selected Version fixture");
+      mutableVersion.weight = 1;
+      expect((await inFlight).kind).toBe("ready");
+      expect(
+        await reader.resolveCurrentServing({
+          workerUid: worker.resourceUid,
+          targetKey: "foreign-target",
+          sourceOperationId: deployment.id,
+          expectedIdentity: identity,
+        }),
+      ).toMatchObject({ kind: "unresolved" });
+      expect(
+        await reader.resolveCurrentServing({
+          workerUid: worker.resourceUid,
+          targetKey: "fixture-workerd-root",
+          sourceOperationId: deployment.id,
+          expectedIdentity: { ...identity, versions: [] },
+        }),
+      ).toMatchObject({ kind: "unresolved" });
+      await f.sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+        JSON.stringify({ ready: false, resolvedBindings: false, bundleVerified: false }),
+        version.resourceUid,
+      ]);
+      expect(await result.stillCurrent()).toBe(false);
+    } finally {
+      reopenedDb.close();
+    }
+  } finally {
+    f.close();
+  }
+});
+
+test("current serving follows the latest Endpoint marker across distinct Form backends and its DELETE tombstone", async () => {
+  const f = fixture(true);
+  try {
+    const { worker, version } = await f.basics();
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    const deploymentOp = await f.store.operation(deployment.id);
+    expect(deploymentOp).not.toBeNull();
+    const deploymentIdentity = {
+      generation: `takoserver-v2-operation:${deployment.id}`,
+      workerResourceUid: worker.resourceUid,
+      hostnames: [],
+      versions: [{ workerVersionUid: version.resourceUid, weight: 10_000 }],
+    };
+    const deploymentInput = {
+      workerUid: worker.resourceUid,
+      targetKey: deploymentOp?.target_key ?? "",
+      sourceOperationId: deployment.id,
+      expectedIdentity: deploymentIdentity,
+    };
+    const first = await f.reader.resolveCurrentServing(deploymentInput);
+    expect(first.kind).toBe("ready");
+    if (first.kind !== "ready") return;
+
+    const endpoint = await f.create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    const endpointOp = await f.store.operation(endpoint.id);
+    expect(endpointOp?.target_key).not.toBe(deploymentOp?.target_key);
+    const endpointIdentity = {
+      ...deploymentIdentity,
+      generation: `takoserver-v2-operation:${endpoint.id}`,
+      hostnames: ["assigned.example.test"],
+    };
+    const endpointInput = {
+      workerUid: worker.resourceUid,
+      targetKey: endpointOp?.target_key ?? "",
+      sourceOperationId: endpoint.id,
+      expectedIdentity: endpointIdentity,
+    };
+    expect(await first.stillCurrent()).toBe(false);
+    expect(await f.reader.resolveCurrentServing(deploymentInput)).toMatchObject({
+      kind: "unresolved",
+    });
+    const servingEndpoint = await f.reader.resolveCurrentServing(endpointInput);
+    expect(servingEndpoint.kind).toBe("ready");
+    if (servingEndpoint.kind !== "ready") return;
+    expect(servingEndpoint.snapshot.endpoint?.output.hostname).toBe("assigned.example.test");
+
+    const deleted = await f.engine.acceptDelete({
+      principal: "org-1",
+      key: "delete-endpoint-current-serving-key",
+      uid: endpoint.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect(
+      await f.reader.resolveCurrentServing({
+        ...endpointInput,
+        sourceOperationId: deleted.id,
+        expectedIdentity: {
+          ...endpointIdentity,
+          generation: `takoserver-v2-operation:${deleted.id}`,
+          hostnames: [],
+        },
+      }),
+    ).toMatchObject({ kind: "unresolved", code: "source_unsettled" });
+    expect(await f.engine.runNext()).toMatchObject({ id: deleted.id, status: "succeeded" });
+    const afterDelete = await f.reader.resolveCurrentServing({
+      ...endpointInput,
+      sourceOperationId: deleted.id,
+      expectedIdentity: {
+        ...endpointIdentity,
+        generation: `takoserver-v2-operation:${deleted.id}`,
+        hostnames: [],
+      },
+    });
+    expect(afterDelete.kind).toBe("ready");
+    if (afterDelete.kind !== "ready") return;
+    expect(afterDelete.snapshot.endpoint).toBeNull();
+    expect(afterDelete.snapshot.acceptedEndpointOutput?.hostname).toBe("assigned.example.test");
+    expect(afterDelete.snapshot.deployment?.uid).toBe(deployment.resourceUid);
+    expect(await afterDelete.stillCurrent()).toBe(true);
+    expect((await afterDelete.readVersionMaterials(version.resourceUid)).bundle?.files.length).toBe(
+      1,
+    );
+  } finally {
+    f.close();
+  }
+});
+
+test("current serving compares the complete weighted Version set independent of order", async () => {
+  const f = fixture();
+  try {
+    const { worker, bundle, version } = await f.basics();
+    const second = await f.create(WORKER_VERSION_FORM_URL, "second-version", {
+      worker: { resourceUid: worker.resourceUid },
+      bundle: { resourceUid: bundle.resourceUid },
+      handlers: ["fetch"],
+    });
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [
+        { workerVersion: { resourceUid: second.resourceUid }, weight: 4_000 },
+        { workerVersion: { resourceUid: version.resourceUid }, weight: 6_000 },
+      ],
+    });
+    const base = {
+      workerUid: worker.resourceUid,
+      targetKey: "fixture-workerd-root",
+      sourceOperationId: deployment.id,
+      expectedIdentity: {
+        generation: `takoserver-v2-operation:${deployment.id}`,
+        workerResourceUid: worker.resourceUid,
+        hostnames: [],
+        versions: [
+          { workerVersionUid: version.resourceUid, weight: 6_000 },
+          { workerVersionUid: second.resourceUid, weight: 4_000 },
+        ],
+      },
+    };
+    const ready = await f.reader.resolveCurrentServing(base);
+    expect(ready.kind).toBe("ready");
+    if (ready.kind !== "ready") return;
+    const selectedVersion = base.expectedIdentity.versions[0];
+    if (!selectedVersion) throw new Error("missing selected Version fixture");
+    expect(
+      await f.reader.resolveCurrentServing({
+        ...base,
+        expectedIdentity: {
+          ...base.expectedIdentity,
+          versions: base.expectedIdentity.versions.slice(0, 1),
+        },
+      }),
+    ).toMatchObject({ kind: "unresolved" });
+    expect(
+      await f.reader.resolveCurrentServing({
+        ...base,
+        expectedIdentity: {
+          ...base.expectedIdentity,
+          versions: [selectedVersion, selectedVersion],
+        },
+      }),
+    ).toMatchObject({ kind: "unresolved" });
+    await f.sql.run(
+      "DELETE FROM tf_v2_resource_references WHERE referrer_uid = ? AND target_uid = ?",
+      [second.resourceUid, bundle.resourceUid],
+    );
+    expect(await ready.stillCurrent()).toBe(false);
+    expect(await f.reader.resolveCurrentServing(base)).toMatchObject({ kind: "unresolved" });
   } finally {
     f.close();
   }
