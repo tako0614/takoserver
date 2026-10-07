@@ -36,10 +36,12 @@ import {
   createInternalV2CodeWorkerVersionForm,
   createInternalV2ModuleWorkerForm,
   createInternalV2StaticWorkerVersionForm,
+  createInternalV2WorkerVersionForm,
   createV2CodeConfiguredInputReader,
   type V2CodeConfiguredInputCustody,
   type V2WorkerRetirementProof,
   type V2WorkerRetirementTarget,
+  WORKER_VERSION_UNIFIED_BACKEND_ID,
 } from "../src/takoform-v2/worker-lifecycle-backend.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
 import { createV2WorkerPublication } from "../src/takoform-v2/worker-static-publication.ts";
@@ -64,6 +66,7 @@ const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest(
 function fixture(options?: {
   gateEndpointWithPublicationReader?: boolean;
   codeWorkerVersion?: boolean;
+  unifiedWorkerVersion?: boolean;
   configuredInputSealer?: ReturnType<typeof createV2WorkerVersionConfiguredInputSealer>;
   configuredInputCustody?: V2CodeConfiguredInputCustody;
   privateInputCustody?: V2PrivateInputCustody;
@@ -191,8 +194,8 @@ function fixture(options?: {
   const configuredInputCustody: V2CodeConfiguredInputCustody = options?.configuredInputCustody ?? {
     read: async (identity) => await readV2ConfiguredPrivateInputs(sql, identity),
   };
-  const versionForm = options?.codeWorkerVersion
-    ? createInternalV2CodeWorkerVersionForm({
+  const versionForm = options?.unifiedWorkerVersion
+    ? createInternalV2WorkerVersionForm({
         sql: backendSql,
         targetKey: TARGET_KEY,
         publicationState,
@@ -201,16 +204,29 @@ function fixture(options?: {
           options.inspectModule ??
           (async () => ({ outcome: "valid", exportedHandlers: ["scheduled"] })),
         ...(options.configuredInputSealer
-          ? { configuredInputSealer: options.configuredInputSealer }
+          ? { configuredInputSealer: options.configuredInputSealer, configuredInputCustody }
           : {}),
-        ...(options.configuredInputSealer ? { configuredInputCustody } : {}),
       })
-    : createInternalV2StaticWorkerVersionForm({
-        sql: backendSql,
-        targetKey: TARGET_KEY,
-        publicationState,
-        retirement,
-      });
+    : options?.codeWorkerVersion
+      ? createInternalV2CodeWorkerVersionForm({
+          sql: backendSql,
+          targetKey: TARGET_KEY,
+          publicationState,
+          retirement,
+          inspectModule:
+            options.inspectModule ??
+            (async () => ({ outcome: "valid", exportedHandlers: ["scheduled"] })),
+          ...(options.configuredInputSealer
+            ? { configuredInputSealer: options.configuredInputSealer }
+            : {}),
+          ...(options.configuredInputSealer ? { configuredInputCustody } : {}),
+        })
+      : createInternalV2StaticWorkerVersionForm({
+          sql: backendSql,
+          targetKey: TARGET_KEY,
+          publicationState,
+          retirement,
+        });
   const confirmedDeployment = async (execution: { spec: JsonObject; operationId: string }) => {
     const spec = parseWorkerDeploymentSpec(execution.spec);
     served = {
@@ -347,13 +363,14 @@ function fixture(options?: {
   async function createWorkerAndBundle(
     handlers: readonly string[] = ["scheduled"],
     withAssets = false,
+    suffix = "",
   ) {
-    const worker = await create(MODULE_WORKER_FORM_URL, "code-worker", {});
-    const bundle = await create(WORKER_BUNDLE_FORM_URL, "code-bundle", {
+    const worker = await create(MODULE_WORKER_FORM_URL, `code-worker${suffix}`, {});
+    const bundle = await create(WORKER_BUNDLE_FORM_URL, `code-bundle${suffix}`, {
       artifact: { url: BUNDLE_MANIFEST_URL, sha256: sha256(bundleManifest) },
     });
     const assets = withAssets
-      ? await create(STATIC_ASSET_BUNDLE_FORM_URL, "code-assets", {
+      ? await create(STATIC_ASSET_BUNDLE_FORM_URL, `code-assets${suffix}`, {
           artifact: { url: MANIFEST_URL, sha256: sha256(manifest) },
         })
       : undefined;
@@ -454,6 +471,92 @@ test("ModuleWorker allocation and isolated same-spec update never claim runtime 
     });
     expect(replay.id).toBe(update.id);
     expect(f.retirementCalls).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("one internal WorkerVersion Form routes static, code, and code-with-assets through a pinned backend", async () => {
+  const f = fixture({ unifiedWorkerVersion: true });
+  try {
+    const staticVersionSpec = (await f.createWorkerAndAssets()).spec;
+    const staticVersion = await f.create(
+      WORKER_VERSION_FORM_URL,
+      "unified-static",
+      staticVersionSpec,
+    );
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: staticVersion.resourceUid }),
+    ).toMatchObject({ observed: { ready: true, resolvedBindings: true } });
+
+    const codeVersionSpec = (await f.createWorkerAndBundle()).spec;
+    const codeVersion = await f.create(WORKER_VERSION_FORM_URL, "unified-code", codeVersionSpec);
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: codeVersion.resourceUid }),
+    ).toMatchObject({ observed: { ready: true, resolvedBindings: true, bundleVerified: true } });
+
+    const mixedVersionSpec = (await f.createWorkerAndBundle(["scheduled"], true, "-mixed")).spec;
+    const mixedVersion = await f.create(WORKER_VERSION_FORM_URL, "unified-mixed", mixedVersionSpec);
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: mixedVersion.resourceUid }),
+    ).toMatchObject({ observed: { ready: true, resolvedBindings: true, bundleVerified: true } });
+
+    const rows = await f.sql.query(
+      "SELECT backend_id FROM tf_v2_operations WHERE resource_uid IN (?, ?, ?) ORDER BY resource_uid",
+      [staticVersion.resourceUid, codeVersion.resourceUid, mixedVersion.resourceUid],
+    );
+    expect(rows).toHaveLength(3);
+    expect(rows.every((row) => row.backend_id === WORKER_VERSION_UNIFIED_BACKEND_ID)).toBe(true);
+    await expect(
+      f.engine.acceptCreate({
+        principal: "org-1",
+        key: "unsupported-unified-handler-key",
+        input: {
+          form: WORKER_VERSION_FORM_URL,
+          space: "prod",
+          name: "unsupported-unified-handler",
+          spec: { ...codeVersionSpec, handlers: ["queue"] },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "capability_required", status: 422 });
+    expect(
+      await f.sql.query("SELECT id FROM tf_v2_operations WHERE replay_key = ?", [
+        "unsupported-unified-handler-key",
+      ]),
+    ).toHaveLength(0);
+
+    const staticUpdate = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "update-unified-static-key",
+      uid: staticVersion.resourceUid,
+      expectedGeneration: 1,
+      spec: staticVersionSpec,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: staticUpdate.id, status: "succeeded" });
+    const codeUpdate = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "update-unified-code-key",
+      uid: codeVersion.resourceUid,
+      expectedGeneration: 1,
+      spec: codeVersionSpec,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: codeUpdate.id, status: "succeeded" });
+
+    f.retirementMode = "confirmed";
+    const staticDelete = await f.engine.acceptDelete({
+      principal: "org-1",
+      key: "delete-unified-static-key",
+      uid: staticVersion.resourceUid,
+      expectedGeneration: 2,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: staticDelete.id, status: "succeeded" });
+    const mixedDelete = await f.engine.acceptDelete({
+      principal: "org-1",
+      key: "delete-unified-mixed-key",
+      uid: mixedVersion.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: mixedDelete.id, status: "succeeded" });
   } finally {
     f.close();
   }
@@ -1315,7 +1418,7 @@ test("configured code Version seals exact UID inputs, retains them on omitted PU
     },
   });
   const f = fixture({
-    codeWorkerVersion: true,
+    unifiedWorkerVersion: true,
     configuredInputSealer: sealer,
     privateInputCustody: {
       transfer: { current: { id: "test-transfer", key: transferKey } },
@@ -1356,6 +1459,41 @@ test("configured code Version seals exact UID inputs, retains them on omitted PU
       id: emptyInputsUpdate.id,
       status: "succeeded",
     });
+    const staticSpec = (await f.createWorkerAndAssets()).spec;
+    const emptyStatic = await f.engine.acceptCreate({
+      principal: "org-1",
+      key: "create-static-version-empty-inputs",
+      input: {
+        form: WORKER_VERSION_FORM_URL,
+        space: "prod",
+        name: "empty-static-version",
+        spec: staticSpec,
+        privateInputs: {},
+      },
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: emptyStatic.id, status: "succeeded" });
+    const emptyStaticUpdate = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "update-static-version-empty-inputs",
+      uid: emptyStatic.resourceUid,
+      expectedGeneration: 1,
+      spec: staticSpec,
+      privateInputs: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: emptyStaticUpdate.id,
+      status: "succeeded",
+    });
+    await expect(
+      f.engine.acceptUpdate({
+        principal: "org-1",
+        key: "update-static-version-nonempty-inputs",
+        uid: emptyStatic.resourceUid,
+        expectedGeneration: 2,
+        spec: staticSpec,
+        privateInputs: { TOKEN: "not-declared" },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_spec", status: 422 });
     f.sourceAvailable = false;
     const accepted = await f.engine.acceptCreate({
       principal: "org-1",
@@ -1651,7 +1789,7 @@ test("configured code Version seals exact UID inputs, retains them on omitted PU
 });
 
 test("code Version without configured custody never accepts a secret-required Resource", async () => {
-  const f = fixture({ codeWorkerVersion: true });
+  const f = fixture({ unifiedWorkerVersion: true });
   try {
     const { spec: baseSpec } = await f.createWorkerAndBundle();
     const spec: JsonObject = { ...baseSpec, requiredSensitiveVars: ["TOKEN"] };

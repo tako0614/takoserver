@@ -33,6 +33,7 @@ import type {
 export const MODULE_WORKER_LIFECYCLE_BACKEND_ID = "selfhost-v2-module-worker-identity-v1";
 export const WORKER_VERSION_LIFECYCLE_BACKEND_ID = "selfhost-v2-static-worker-version-v1";
 export const WORKER_CODE_VERSION_LIFECYCLE_BACKEND_ID = "selfhost-v2-code-worker-version-v1";
+export const WORKER_VERSION_UNIFIED_BACKEND_ID = "selfhost-v2-worker-version-v1";
 
 type VersionState = {
   resolveVersion(input: { execution: V2Execution }): Promise<V2WorkerVersionResolution>;
@@ -764,7 +765,7 @@ export function createV2CodeConfiguredInputReader(options: {
  * exact accepted bundle can support the currently inspected handlers; it does
  * not publish a Deployment or authorize scheduled event delivery.
  */
-export function createInternalV2CodeWorkerVersionForm(options: {
+type CodeWorkerVersionOptions = {
   readonly sql: Sql;
   readonly targetKey: string;
   readonly publicationState: VersionState;
@@ -772,7 +773,13 @@ export function createInternalV2CodeWorkerVersionForm(options: {
   readonly inspectModule: WorkerdRuntime["inspectModule"];
   readonly configuredInputSealer?: ConfiguredInputSealer;
   readonly configuredInputCustody?: V2CodeConfiguredInputCustody;
-}): V2Form {
+};
+
+export function createInternalV2CodeWorkerVersionForm(options: CodeWorkerVersionOptions): V2Form {
+  return codeWorkerVersionForm(options, WORKER_CODE_VERSION_LIFECYCLE_BACKEND_ID);
+}
+
+function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: string): V2Form {
   if (
     !options.targetKey ||
     !options.publicationState?.resolveVersion ||
@@ -806,7 +813,7 @@ export function createInternalV2CodeWorkerVersionForm(options: {
     if (
       execution.form !== WORKER_VERSION_FORM_URL ||
       execution.targetKey !== targetKey ||
-      execution.backendId !== WORKER_CODE_VERSION_LIFECYCLE_BACKEND_ID
+      execution.backendId !== backendId
     ) {
       return unresolved();
     }
@@ -1014,7 +1021,7 @@ export function createInternalV2CodeWorkerVersionForm(options: {
       : {}),
     rejectDeleteWhileReferenced: true,
     backend: {
-      id: WORKER_CODE_VERSION_LIFECYCLE_BACKEND_ID,
+      id: backendId,
       targetKey,
       execute: manage,
       reconcile: manage,
@@ -1027,12 +1034,20 @@ export function createInternalV2CodeWorkerVersionForm(options: {
  * or make a Form support claim. The resolver owns accepted SQL references and
  * held-byte custody; the projection checks the asset serving snapshot.
  */
-export function createInternalV2StaticWorkerVersionForm(options: {
+type StaticWorkerVersionOptions = {
   readonly sql: Sql;
   readonly targetKey: string;
   readonly publicationState: VersionState;
   readonly retirement: V2WorkerRetirementReader;
-}): V2Form {
+};
+
+export function createInternalV2StaticWorkerVersionForm(
+  options: StaticWorkerVersionOptions,
+): V2Form {
+  return staticWorkerVersionForm(options, WORKER_VERSION_LIFECYCLE_BACKEND_ID);
+}
+
+function staticWorkerVersionForm(options: StaticWorkerVersionOptions, backendId: string): V2Form {
   if (
     !options.targetKey ||
     !options.publicationState?.resolveVersion ||
@@ -1050,7 +1065,7 @@ export function createInternalV2StaticWorkerVersionForm(options: {
     if (
       execution.form !== WORKER_VERSION_FORM_URL ||
       execution.targetKey !== targetKey ||
-      execution.backendId !== WORKER_VERSION_LIFECYCLE_BACKEND_ID
+      execution.backendId !== backendId
     ) {
       return unresolved();
     }
@@ -1119,10 +1134,43 @@ export function createInternalV2StaticWorkerVersionForm(options: {
     },
     rejectDeleteWhileReferenced: true,
     backend: {
-      id: WORKER_VERSION_LIFECYCLE_BACKEND_ID,
+      id: backendId,
       targetKey,
       execute: manage,
       reconcile: manage,
+    },
+  };
+}
+
+/** One internal Form identity for static, code, and code-plus-assets Versions. */
+export function createInternalV2WorkerVersionForm(options: CodeWorkerVersionOptions): V2Form {
+  const staticForm = staticWorkerVersionForm(options, WORKER_VERSION_UNIFIED_BACKEND_ID);
+  const codeForm = codeWorkerVersionForm(options, WORKER_VERSION_UNIFIED_BACKEND_ID);
+  const selected = (spec: JsonObject): V2Form =>
+    Object.hasOwn(spec, "bundle") ? codeForm : staticForm;
+  return {
+    validateCreate(spec) {
+      selected(spec).validateCreate(spec);
+    },
+    validateUpdate(previous, spec) {
+      selected(spec).validateUpdate(previous, spec);
+    },
+    references(spec) {
+      const form = selected(spec);
+      if (!form.references) throw new TypeError("WorkerVersion references are required");
+      return form.references(spec);
+    },
+    ...(codeForm.privateInputs ? { privateInputs: codeForm.privateInputs } : {}),
+    rejectDeleteWhileReferenced: true,
+    backend: {
+      id: WORKER_VERSION_UNIFIED_BACKEND_ID,
+      targetKey: options.targetKey,
+      async execute(execution) {
+        return await selected(execution.spec).backend.execute(execution);
+      },
+      async reconcile(execution) {
+        return await selected(execution.spec).backend.reconcile(execution);
+      },
     },
   };
 }
