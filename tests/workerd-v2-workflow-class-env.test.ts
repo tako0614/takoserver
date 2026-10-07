@@ -90,6 +90,9 @@ test("guarded v2 Workflow class uses exact selected broker UDS without public in
   const config = await readFile(configPath, "utf8");
   expect(config).toContain(`name = "${bindingName}"`);
   expect(config).toContain(`unix:${input.workflowBindings[0]?.socketPath}`);
+  expect(config).toContain(
+    `(name = "workflow-broker-0", external = (address = "unix:${input.workflowBindings[0]?.socketPath}", http = ()))`,
+  );
   expect(config).toContain(`name = "${input.site.hostEntrypoint}"`);
   expect(config).toContain('globalOutbound = "deny"');
   expect(config).not.toContain('name = "router"');

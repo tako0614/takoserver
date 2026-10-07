@@ -4348,7 +4348,7 @@ export async function writeWorkerdPrivateExecution(options: {
     .map((mapping, index) => {
       const name = `workflow-broker-${index}`;
       bindings.push(`(name = ${capnpText(mapping.name)}, service = ${capnpText(name)})`);
-      return `\n  (name = ${capnpText(name)}, external = (address = ${capnpText(`unix:${mapping.socketPath}`)}, http = (style = proxy))),`;
+      return `\n  (name = ${capnpText(name)}, external = (address = ${capnpText(`unix:${mapping.socketPath}`)}, http = ())),`;
     })
     .join("");
   let dataServices = "";
