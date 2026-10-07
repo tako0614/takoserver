@@ -418,6 +418,30 @@ test("pre-Deployment Actor backend settles only after durable physical namespace
     });
     expect(await f.engine.runNext()).toMatchObject({ id: deleted.id, status: "succeeded" });
     expect(await f.physical.namespaceAbsent(scope)).toBe(true);
+    const authority = createV2ActorBindingAuthority({
+      sql: f.sql,
+      targetKey: TARGET,
+      namespaceGraph: createV2ActorNamespaceGraphAuthority({
+        sql: f.sql,
+        targetKey: TARGET,
+        owner: { ownerForWorker: async () => null },
+      }),
+      physical: f.physical,
+    });
+    const target = {
+      principal: PRINCIPAL,
+      space: SPACE,
+      targetKey: TARGET,
+      workerUid: worker.resourceUid,
+      namespaceResourceUid: created.resourceUid,
+    };
+    expect(await authority.resolveTarget(target)).toBeNull();
+    const replacement = await f.create(ACTOR_NAMESPACE_FORM_URL, "replacement-namespace", spec);
+    expect(replacement.resourceUid).not.toBe(created.resourceUid);
+    expect(await authority.resolveTarget(target)).toBeNull();
+    expect(
+      await authority.resolveTarget({ ...target, namespaceResourceUid: replacement.resourceUid }),
+    ).not.toBeNull();
   } finally {
     await f.physical.close();
     f.db.close();

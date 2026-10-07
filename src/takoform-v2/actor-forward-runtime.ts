@@ -183,7 +183,7 @@ export function createV2ActorForwardBoot(options: {
         )
           throw new Error("Actor native publication identity unavailable");
         const rows = await sql.query(
-          `SELECT last_operation FROM tf_v2_resources
+          `SELECT spec_json, backend_id, generation FROM tf_v2_resources
            WHERE uid = ? AND form_url = ? AND principal = ? AND space = ?
              AND target_key = ? AND deleted_at IS NULL LIMIT 2`,
           [
@@ -194,8 +194,42 @@ export function createV2ActorForwardBoot(options: {
             options.targetKey,
           ],
         );
-        const operationId = rows.length === 1 ? rows[0]?.last_operation : null;
-        if (typeof operationId !== "string") throw new Error("Actor Version operation unavailable");
+        const version = rows.length === 1 ? rows[0] : null;
+        if (
+          !version ||
+          typeof version.spec_json !== "string" ||
+          typeof version.backend_id !== "string" ||
+          typeof version.generation !== "number"
+        )
+          throw new Error("Actor Version operation unavailable");
+        // The private publication records the native Version ID, not a second
+        // Operation ledger. Resolve its immutable source from Core's accepted
+        // operation history; current last_operation may be a same-spec PUT.
+        const sources = await sql.query(
+          `SELECT id, generation FROM tf_v2_operations
+           WHERE resource_uid = ? AND principal = ? AND target_key = ? AND backend_id = ?
+             AND action IN ('create','update') AND status = 'succeeded'
+             AND effect = 'complete' AND accepted_spec_json = ? AND generation <= ?`,
+          [
+            publication.workerVersionResourceUid,
+            identity.principal,
+            options.targetKey,
+            version.backend_id,
+            version.spec_json,
+            version.generation,
+          ],
+        );
+        let operationId: string | null = null;
+        for (const source of sources) {
+          if (typeof source.id !== "string" || typeof source.generation !== "number") continue;
+          const digest = createHash("sha256")
+            .update(`${publication.workerVersionResourceUid}\u0000${source.generation}`)
+            .digest("hex");
+          if (publication.versionId !== `v2-${digest}`) continue;
+          if (operationId !== null) throw new Error("Actor Version source ambiguous");
+          operationId = source.id;
+        }
+        if (!operationId) throw new Error("Actor Version operation unavailable");
         const claim: V2ActorBindingClaim = {
           principal: identity.principal,
           space: identity.space,

@@ -51,7 +51,7 @@ export function createV2ActorBindingAuthority(options: {
   const captureVersion = async (claim: V2ActorBindingClaim) => {
     const rows = await options.sql.query(
       `SELECT r.uid, r.generation, r.last_operation, r.spec_json, r.observed_json,
-              op.id AS operation_id, op.generation AS operation_generation
+              r.backend_id, op.id AS operation_id, op.generation AS operation_generation
        FROM tf_v2_resources r JOIN tf_v2_operations op ON op.id = r.last_operation
        WHERE r.uid = ? AND r.form_url = ? AND r.principal = ? AND r.space = ?
          AND r.target_key = ? AND r.deleted_at IS NULL AND r.busy_operation IS NULL
@@ -60,14 +60,13 @@ export function createV2ActorBindingAuthority(options: {
          AND op.backend_id = r.backend_id AND op.target_key = r.target_key
          AND op.generation = r.generation AND op.action IN ('create','update')
          AND op.status = 'succeeded' AND op.effect = 'complete'
-         AND op.accepted_spec_json = r.spec_json AND op.id = ? LIMIT 2`,
+         AND op.accepted_spec_json = r.spec_json LIMIT 2`,
       [
         claim.workerVersionUid,
         WORKER_VERSION_FORM_URL,
         claim.principal,
         claim.space,
         claim.targetKey,
-        claim.workerVersionOperationId,
       ],
     );
     const row = rows.length === 1 ? rows[0] : null;
@@ -75,8 +74,10 @@ export function createV2ActorBindingAuthority(options: {
       !row ||
       typeof row.spec_json !== "string" ||
       typeof row.observed_json !== "string" ||
+      typeof row.backend_id !== "string" ||
+      typeof row.operation_id !== "string" ||
       typeof row.generation !== "number" ||
-      row.last_operation !== claim.workerVersionOperationId ||
+      row.last_operation !== row.operation_id ||
       row.operation_generation !== row.generation
     )
       return null;
@@ -92,17 +93,51 @@ export function createV2ActorBindingAuthority(options: {
       ) !== canonicalJson(claim.bindings)
     )
       return null;
+    // A same-spec PUT advances the current Resource operation while the
+    // admitted native Version still names its immutable source operation.
+    const sources = await options.sql.query(
+      `SELECT generation FROM tf_v2_operations
+       WHERE id = ? AND resource_uid = ? AND principal = ? AND target_key = ?
+         AND backend_id = ? AND action IN ('create','update')
+         AND status = 'succeeded' AND effect = 'complete'
+         AND accepted_spec_json = ? LIMIT 2`,
+      [
+        claim.workerVersionOperationId,
+        claim.workerVersionUid,
+        claim.principal,
+        claim.targetKey,
+        row.backend_id,
+        row.spec_json,
+      ],
+    );
+    const source = sources.length === 1 ? sources[0] : null;
+    if (
+      typeof source?.generation !== "number" ||
+      !Number.isSafeInteger(source.generation) ||
+      source.generation < 1 ||
+      source.generation > row.generation
+    )
+      return null;
     const digest = await bytesDigest(
-      new TextEncoder().encode(`${claim.workerVersionUid}\u0000${row.generation}`),
+      new TextEncoder().encode(`${claim.workerVersionUid}\u0000${source.generation}`),
     );
     if (claim.nativeVersionId !== `v2-${digest.slice("sha256:".length)}`) return null;
     const expected = referencesForWorkerVersion(spec);
     const sealed = await options.sql.query(
-      "SELECT sealed FROM tf_v2_operation_reference_sets WHERE operation_id = ?",
-      [claim.workerVersionOperationId],
+      "SELECT operation_id, sealed FROM tf_v2_operation_reference_sets WHERE operation_id IN (?, ?)",
+      [row.operation_id, claim.workerVersionOperationId],
     );
-    if (sealed.length !== 1 || sealed[0]?.sealed !== 1) return null;
+    if (
+      sealed.length !== (row.operation_id === claim.workerVersionOperationId ? 1 : 2) ||
+      sealed.some((entry) => entry.sealed !== 1)
+    )
+      return null;
     const refs = await options.sql.query(
+      `SELECT target_uid, form_url, readiness, target_spec_path, target_spec_equals
+       FROM tf_v2_operation_references WHERE operation_id = ? ORDER BY target_uid`,
+      [row.operation_id],
+    );
+    const sourceRefs = await options.sql.query(
       `SELECT target_uid, form_url, readiness, target_spec_path, target_spec_equals
        FROM tf_v2_operation_references WHERE operation_id = ? ORDER BY target_uid`,
       [claim.workerVersionOperationId],
@@ -114,6 +149,7 @@ export function createV2ActorBindingAuthority(options: {
     );
     if (
       refs.length !== expected.length ||
+      canonicalJson(sourceRefs) !== canonicalJson(refs) ||
       edges.length !== expected.length ||
       expected.some((requirement, index) => {
         const ref = refs[index];
@@ -131,7 +167,9 @@ export function createV2ActorBindingAuthority(options: {
       })
     )
       return null;
-    return canonicalJson([row, refs, edges]);
+    // Only semantic current authority enters the token. Generation/last Op
+    // churn from an allowed same-spec PUT cannot invalidate an old invocation.
+    return canonicalJson([row.uid, row.spec_json, refs, edges]);
   };
 
   async function resolveTarget(
@@ -176,7 +214,20 @@ export function createV2ActorBindingAuthority(options: {
           return null;
         return {
           graph,
-          vector: canonicalJson([namespace, graph.authorityKey]),
+          // The strict graph proves the current sealed Namespace/Worker
+          // authority. Its operation/generation key is deliberately not part
+          // of an already admitted Version's forwarding credential: an
+          // allowed same-spec PUT preserves this namespace ID and class.
+          vector: canonicalJson([
+            target.principal,
+            target.space,
+            target.targetKey,
+            namespace.uid,
+            namespace.spec_json,
+            graph.workerUid,
+            graph.className,
+            graph.runtimeClassRef,
+          ]),
         };
       };
       const before = await capture();

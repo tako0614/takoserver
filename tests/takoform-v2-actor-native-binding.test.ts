@@ -203,34 +203,58 @@ test.skipIf(binary === undefined)(
       const bundle = await create(WORKER_BUNDLE_FORM_URL, "bundle", {
         artifact: { url: manifestUrl, sha256: sha(manifest) },
       });
-      const namespace = await create(ACTOR_NAMESPACE_FORM_URL, "namespace", {
+      const namespaceSpec = {
         worker: { resourceUid: worker.resourceUid },
         className: "CounterActor",
-      });
-      const version = await create(WORKER_VERSION_FORM_URL, "version", {
+      };
+      const namespace = await create(ACTOR_NAMESPACE_FORM_URL, "namespace", namespaceSpec);
+      const versionSpec = {
         worker: { resourceUid: worker.resourceUid },
         bundle: { resourceUid: bundle.resourceUid },
         handlers: ["fetch"],
         vars: { LABEL: "v2" },
         actorBindings: [{ name: "ACTOR", resource: { resourceUid: namespace.resourceUid } }],
-      });
-      let listenerPort = 0;
-      owner = await openWorkerdWorkerRuntimeOwner({
-        rootDirectory: join(root, "owner"),
-        workerResourceUid: worker.resourceUid,
+      };
+      const version = await create(WORKER_VERSION_FORM_URL, "version", versionSpec);
+      const targetClaim = {
+        principal,
+        space,
         targetKey,
-        publicationState,
-        workerdBinary: selected.binary,
-        inspectModule: inspector.inspect,
-        listenerPortForOperation: async () => (listenerPort = await unusedPort()),
-        spawn: (command) =>
-          spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" }),
-        v2ActorForward: {
-          openIncarnation(source) {
-            return actorBoot.openIncarnation({ principal, space, ...source });
-          },
-        },
+        workerUid: worker.resourceUid,
+        namespaceResourceUid: namespace.resourceUid,
+      };
+      const beforeNamespaceUpdate = await actorAuthority.resolveTarget(targetClaim);
+      expect(beforeNamespaceUpdate).not.toBeNull();
+      const updateNamespace = await engine.acceptUpdate({
+        principal,
+        key: "actor-native-namespace-same-spec-update",
+        uid: namespace.resourceUid,
+        expectedGeneration: 1,
+        spec: namespaceSpec,
       });
+      expect(await actorAuthority.resolveTarget(targetClaim)).toBeNull();
+      expect(await engine.runNext()).toMatchObject({ id: updateNamespace.id, status: "succeeded" });
+      const afterNamespaceUpdate = await actorAuthority.resolveTarget(targetClaim);
+      expect(afterNamespaceUpdate?.vector).toBe(beforeNamespaceUpdate?.vector);
+      let listenerPort = 0;
+      const openOwner = () =>
+        openWorkerdWorkerRuntimeOwner({
+          rootDirectory: join(root, "owner"),
+          workerResourceUid: worker.resourceUid,
+          targetKey,
+          publicationState,
+          workerdBinary: selected.binary,
+          inspectModule: inspector.inspect,
+          listenerPortForOperation: async () => (listenerPort = await unusedPort()),
+          spawn: (command) =>
+            spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" }),
+          v2ActorForward: {
+            openIncarnation(source) {
+              return actorBoot.openIncarnation({ principal, space, ...source });
+            },
+          },
+        });
+      owner = await openOwner();
       await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
         worker: { resourceUid: worker.resourceUid },
         versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
@@ -260,6 +284,33 @@ test.skipIf(binary === undefined)(
         throw new Error(`Actor native fetch ${response.status}: ${await response.text()}`);
       expect(response.status).toBe(200);
       expect(await response.text()).toBe("actor:v2");
+      const updateVersion = await engine.acceptUpdate({
+        principal,
+        key: "actor-native-version-same-spec-update",
+        uid: version.resourceUid,
+        expectedGeneration: 1,
+        spec: versionSpec,
+      });
+      const duringVersionUpdate = await fetch(`${origin}/plain`, {
+        headers: { host: hostname },
+        signal: AbortSignal.timeout(10_000),
+      });
+      expect(duringVersionUpdate.status).not.toBe(200);
+      expect(await engine.runNext()).toMatchObject({ id: updateVersion.id, status: "succeeded" });
+      const afterVersionUpdate = await fetch(`${origin}/plain`, {
+        headers: { host: hostname },
+        signal: AbortSignal.timeout(10_000),
+      });
+      expect(afterVersionUpdate.status).toBe(200);
+      expect(await afterVersionUpdate.text()).toBe("actor:v2");
+      await owner.suspend();
+      owner = await openOwner();
+      const afterRecoveredVersion = await fetch(`${origin}/plain`, {
+        headers: { host: hostname },
+        signal: AbortSignal.timeout(10_000),
+      });
+      expect(afterRecoveredVersion.status).toBe(200);
+      expect(await afterRecoveredVersion.text()).toBe("actor:v2");
       const WebSocketWithHeaders = WebSocket as unknown as new (
         url: string,
         options: { protocols: readonly string[]; headers: Record<string, string> },
