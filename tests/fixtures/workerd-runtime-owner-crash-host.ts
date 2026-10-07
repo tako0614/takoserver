@@ -201,6 +201,9 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
         spec: parsedSpec,
         versions: current.identity.versions.map(({ workerVersionUid, weight }) => ({
           uid: workerVersionUid,
+          // The crash fixture has no WorkerVersion Resource ledger; this is
+          // synthetic provenance, not a Deployment Operation ID.
+          sourceOperationId: "fixture-worker-version-operation",
           generation: 1,
           weight,
           spec: {

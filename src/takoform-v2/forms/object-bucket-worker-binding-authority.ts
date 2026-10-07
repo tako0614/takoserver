@@ -4,6 +4,7 @@ import { OBJECT_BUCKET_LIMITS, parseObjectBucketSpec } from "./object-bucket.ts"
 import { OBJECT_BUCKET_BACKEND_ID } from "./object-bucket-backend.ts";
 import { referencesForWorkerVersion } from "./worker-references.ts";
 import { parseWorkerVersionSpec, WORKER_VERSION_FORM_URL } from "./worker-specs.ts";
+import { isReadyWorkerVersionObservation } from "./worker-version-observed.ts";
 
 /** Structural input shared with the Host-private broker without importing its adapter. */
 export interface ObjectBucketWorkerBindingClaim {
@@ -85,7 +86,7 @@ export function createObjectBucketWorkerBindingAuthority(options: {
     let spec: ReturnType<typeof parseWorkerVersionSpec>;
     try {
       spec = parseWorkerVersionSpec(JSON.parse(version.spec_json));
-      if (JSON.parse(version.observed_json)?.ready !== true) return null;
+      if (!isReadyWorkerVersionObservation(JSON.parse(version.observed_json), true)) return null;
     } catch {
       return null;
     }

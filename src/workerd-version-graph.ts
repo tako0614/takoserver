@@ -11,6 +11,10 @@ import {
   selfhostEventServiceSource,
 } from "./providers/selfhost-events.ts";
 import {
+  SELFHOST_V2_OBJECT_BUCKET_DATA_SERVICE_MODULE,
+  selfhostV2ObjectBucketDataServiceSource,
+} from "./providers/selfhost-v2-object-bucket-data-service.ts";
+import {
   V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
   V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
   v2QueueSettlementServiceSource,
@@ -27,7 +31,7 @@ import {
   SELFHOST_WORKER_DATA_SERVICE_BINDING,
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
   type SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
-  type SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
+  SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
   type SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
   type SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND,
   SELFHOST_WORKER_ENTRYPOINT_MODULE,
@@ -39,6 +43,7 @@ import {
 import {
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
   WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+  WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
   workerdV2PrivateActorBindingName,
   workerdV2PrivateServiceBindingName,
   workerdV2PrivateWorkflowBindingName,
@@ -117,6 +122,12 @@ export interface WorkerdVersionGraphInput {
     readonly address: string;
     readonly token: string;
     readonly bindings: readonly WorkerdDataBinding[];
+  };
+  /** Exact WorkerVersion-scoped signed grant, separate from the generic plane token. */
+  readonly v2ObjectBucketBinding?: {
+    readonly address: string;
+    readonly token: string;
+    readonly bindings: readonly { readonly publicName: string }[];
   };
   readonly serviceBindings: readonly WorkerdServiceBinding[];
   /** Unpublished opt-in forwarding facades for exact Host-owned Actor namespaces. */
@@ -205,6 +216,10 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
   const assets = snapshotAssets(input.assets);
   const environment = projectEnvironment(input.environment);
   const dataPlane = projectDataPlane(input.dataPlane);
+  const v2ObjectBucketBinding = projectV2ObjectBucketBinding(
+    input.v2ObjectBucketBinding,
+    v2PrivateNames,
+  );
   const serviceBindings = projectServiceBindings(input.serviceBindings);
   const actorForward = projectActorForward(input.actorForward, v2PrivateNames);
   const workflowForward = projectWorkflowForward(
@@ -241,6 +256,13 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
   const bindings: SelfhostWorkerBindingDescriptor[] = [
     ...environment.descriptors,
     ...(dataPlane === undefined ? [] : dataPlane.descriptors),
+    ...(v2ObjectBucketBinding === undefined
+      ? []
+      : v2ObjectBucketBinding.bindings.map((binding) => ({
+          kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
+          publicName: binding.publicName,
+          internalName: WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+        }))),
     ...services.map((service, index) => ({
       kind: SELFHOST_WORKER_SERVICE_BINDING_KIND,
       publicName: serviceBindings[index]?.publicName as string,
@@ -286,6 +308,12 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
     [wrapperModule, encoder.encode(wrapperSource)],
     [preludeModule, encoder.encode(selfhostWorkerPreludeSource())],
   ]);
+  if (v2ObjectBucketBinding !== undefined) {
+    hostModules.set(
+      SELFHOST_V2_OBJECT_BUCKET_DATA_SERVICE_MODULE,
+      encoder.encode(selfhostV2ObjectBucketDataServiceSource()),
+    );
+  }
   const innerEntrypoint =
     actorForward === undefined ? wrapperModule : SELFHOST_ACTOR_FORWARD_ENTRYPOINT_MODULE;
   if (actorForward !== undefined) {
@@ -395,6 +423,14 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
             ],
           },
         }),
+    ...(v2ObjectBucketBinding === undefined
+      ? {}
+      : {
+          v2ObjectBucketPlane: {
+            address: v2ObjectBucketBinding.address,
+            token: v2ObjectBucketBinding.token,
+          },
+        }),
     ...(eventToken === undefined
       ? {}
       : {
@@ -469,6 +505,42 @@ function projectEnvironment(environment: readonly WorkerdEnvironmentEntry[]): {
     });
   }
   return { vars, descriptors };
+}
+
+function projectV2ObjectBucketBinding(
+  input: WorkerdVersionGraphInput["v2ObjectBucketBinding"],
+  v2PrivateNames: boolean,
+): WorkerdVersionGraphInput["v2ObjectBucketBinding"] {
+  if (input === undefined) return undefined;
+  if (
+    !isRecord(input) ||
+    !v2PrivateNames ||
+    Object.keys(input).sort().join(",") !== "address,bindings,token" ||
+    typeof input.address !== "string" ||
+    !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(input.address) ||
+    typeof input.token !== "string" ||
+    input.token.length > 32_768 ||
+    !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/u.test(input.token) ||
+    !Array.isArray(input.bindings) ||
+    input.bindings.length === 0
+  ) {
+    invalid();
+  }
+  const seen = new Set<string>();
+  const bindings = input.bindings.map((binding) => {
+    if (
+      !isRecord(binding) ||
+      Object.keys(binding).sort().join(",") !== "publicName" ||
+      typeof binding.publicName !== "string" ||
+      !PUBLIC_VAR_NAME.test(binding.publicName) ||
+      seen.has(binding.publicName)
+    ) {
+      invalid();
+    }
+    seen.add(binding.publicName);
+    return { publicName: binding.publicName };
+  });
+  return { address: input.address, token: input.token, bindings };
 }
 
 function projectDataPlane(dataPlane: WorkerdVersionGraphInput["dataPlane"]):

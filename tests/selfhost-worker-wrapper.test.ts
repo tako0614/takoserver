@@ -33,6 +33,9 @@ import {
   SELFHOST_DATA_PLANE_PROTOCOL,
   SELFHOST_DATA_PLANE_SQL_PATH,
   SELFHOST_DATA_PLANE_VECTOR_PATH,
+  SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN,
+  SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH,
+  SELFHOST_V2_OBJECT_MULTIPART_PARTS_CONTENT_TYPE,
   SELFHOST_WORKER_DATA_SERVICE_BINDING,
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
@@ -50,6 +53,7 @@ import {
   selfhostReadinessFailureMessage,
   selfhostWorkerEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
+import { WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING } from "../src/providers/workerd-v2-private-binding-names.ts";
 
 /**
  * The generated entrypoint is the only thing standing between a tenant's module
@@ -126,7 +130,18 @@ async function loadGenerated(
     selfhostWorkerPreludeSource(),
   );
   const wrapperPath = join(root, "wrapper.mjs");
-  await Bun.write(wrapperPath, selfhostWorkerEntrypointSource(input));
+  await Bun.write(
+    wrapperPath,
+    selfhostWorkerEntrypointSource(
+      input,
+      input.bindings.some(
+        (binding) =>
+          "kind" in binding &&
+          binding.kind === SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND &&
+          "internalName" in binding,
+      ),
+    ),
+  );
   const loaded = (await import(
     `${pathToFileURL(wrapperPath).href}?test=${crypto.randomUUID()}`
   )) as {
@@ -2071,6 +2086,87 @@ test("a multipart complete is refused against the receipts this isolate holds", 
       part: { etag: "part-1", partNumber: 1 },
       refused: "invalid_part",
     });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("v2 ObjectBucket uses its private service and streams a 10,000-part manifest as a body", async () => {
+  const documents: Record<string, unknown>[] = [];
+  let complete:
+    | { readonly document: Record<string, unknown>; readonly parts: unknown[] }
+    | undefined;
+  const v2Service = {
+    async fetch(url: string, init: RequestInit) {
+      const headers = init.headers as Record<string, string>;
+      const document = JSON.parse(
+        Buffer.from(headers[SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER] ?? "", "base64url").toString(
+          "utf8",
+        ),
+      ) as Record<string, unknown>;
+      documents.push(document);
+      if (document.op === "completeMultipartUpload") {
+        expect(url).toBe(
+          `${SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN}${SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH}`,
+        );
+        expect(headers["content-type"]).toBe(SELFHOST_V2_OBJECT_MULTIPART_PARTS_CONTENT_TYPE);
+        const body = JSON.parse(await new Response(init.body).text()) as { parts: unknown[] };
+        complete = { document, parts: body.parts };
+        return Response.json({ ok: true, value: { etag: "whole", size: 1 } });
+      }
+      if (document.op === "createMultipartUpload") {
+        return Response.json({ ok: true, value: { uploadId: "upload-v2" } });
+      }
+      if (document.op === "uploadPart") {
+        return Response.json({
+          ok: true,
+          value: { etag: `etag-${document.partNumber}`, partNumber: document.partNumber },
+        });
+      }
+      return Response.json({ ok: false, error: { code: "backend_unavailable" } });
+    },
+  };
+  const legacyService = {
+    async fetch() {
+      throw new Error("v2 object binding must not use the legacy data service");
+    },
+  };
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const parts = Array.from({ length: 10000 }, (_, index) => ({
+         etag: "etag-" + (index + 1), partNumber: index + 1
+       }));
+       const done = await env.MEDIA.completeMultipartUpload("large", "upload-v2", parts);
+       return Response.json(done);
+     } };`,
+    {
+      ...OBJECTS_ONLY,
+      publication: "v2-private-publication",
+      bindings: [
+        {
+          kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
+          publicName: "MEDIA",
+          internalName: WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+        },
+      ],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(legacyService, { [WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING]: v2Service }),
+      context,
+    );
+    expect(response.status).toBe(200);
+    expect(JSON.parse(await response.text())).toEqual({ etag: "whole", size: 1 });
+    expect(documents).toHaveLength(1);
+    const recorded = complete;
+    expect(recorded).toBeDefined();
+    if (!recorded) throw new Error("expected multipart body capture");
+    expect(recorded.document).not.toHaveProperty("parts");
+    expect(recorded.parts).toHaveLength(10_000);
+    expect((recorded.parts[0] as { partNumber: number }).partNumber).toBe(1);
+    expect((recorded.parts[9_999] as { partNumber: number }).partNumber).toBe(10_000);
   } finally {
     await generated.dispose();
   }

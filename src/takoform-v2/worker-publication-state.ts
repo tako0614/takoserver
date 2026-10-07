@@ -17,7 +17,10 @@ import {
   type WorkerBundleManifest,
 } from "./forms/worker-bundle.ts";
 import type { WorkerBundleCustody } from "./forms/worker-bundle-backend.ts";
-import { referencesForWorkerVersion } from "./forms/worker-references.ts";
+import {
+  referencesForWorkerDeployment,
+  referencesForWorkerVersion,
+} from "./forms/worker-references.ts";
 import {
   MODULE_WORKER_FORM_URL,
   parseModuleWorkerSpec,
@@ -1080,6 +1083,7 @@ export function createV2WorkerPublicationState(options: {
           row.form_url !== WORKER_VERSION_FORM_URL ||
           row.principal !== op.principal ||
           row.space !== own.space ||
+          !last ||
           !settled(row, last) ||
           observed?.ready !== true ||
           observed.resolvedBindings !== true
@@ -1428,6 +1432,175 @@ export function createV2WorkerPublicationState(options: {
   }
 
   return {
+    /** A bounded positive proof that this settled Worker currently has no serving Deployment. */
+    async observeNoCurrentServing(input: {
+      workerUid: string;
+      principal: string;
+      space: string;
+      targetKey: string;
+    }): Promise<{ readonly kind: "confirmed" } | { readonly kind: "unknown" }> {
+      const { workerUid, principal, space, targetKey } = input;
+      if (!workerUid || !principal || !space || !targetKey) return { kind: "unknown" };
+      try {
+        const worker = await resource(workerUid);
+        const workerOp = worker ? await operation(worker.last_operation) : null;
+        if (
+          !worker ||
+          worker.principal !== principal ||
+          worker.space !== space ||
+          worker.target_key !== targetKey ||
+          worker.form_url !== MODULE_WORKER_FORM_URL ||
+          !workerOp ||
+          !settled(worker, workerOp) ||
+          (workerOp.action !== "create" && workerOp.action !== "update")
+        ) {
+          return { kind: "unknown" };
+        }
+        const workerSpec = parseObject(worker.spec_json);
+        if (!workerSpec) return { kind: "unknown" };
+        parseModuleWorkerSpec(workerSpec);
+        if (await hasPendingPublication(workerUid)) return { kind: "unknown" };
+
+        const deployments = await matchingResources(
+          WORKER_DEPLOYMENT_FORM_URL,
+          workerUid,
+          principal,
+          space,
+          true,
+        );
+        if (deployments.length > 1) return { kind: "unknown" };
+        const deploymentEdges = await sql.query(
+          `SELECT d.uid, d.principal, d.space, d.target_key, d.deleted_at
+           FROM tf_v2_resource_references edge
+           JOIN tf_v2_resources d ON d.uid = edge.referrer_uid
+           WHERE edge.target_uid = ? AND d.form_url = ? ORDER BY d.uid LIMIT 3`,
+          [workerUid, WORKER_DEPLOYMENT_FORM_URL],
+        );
+        if (
+          deploymentEdges.length !== deployments.length ||
+          deploymentEdges.some((edge, index) => {
+            const deployment = deployments[index];
+            return (
+              !deployment ||
+              edge.uid !== deployment.uid ||
+              edge.principal !== principal ||
+              edge.space !== space ||
+              edge.target_key !== targetKey ||
+              edge.deleted_at !== null
+            );
+          })
+        ) {
+          return { kind: "unknown" };
+        }
+        for (const deployment of deployments) {
+          const deploymentOp = await operation(deployment.last_operation);
+          if (
+            !deploymentOp ||
+            !settled(deployment, deploymentOp) ||
+            (deploymentOp.action !== "create" && deploymentOp.action !== "update")
+          ) {
+            return { kind: "unknown" };
+          }
+          const specValue = parseObject(deployment.spec_json);
+          if (!specValue) return { kind: "unknown" };
+          const spec = parseWorkerDeploymentSpec(specValue);
+          if (spec.worker.resourceUid !== workerUid) return { kind: "unknown" };
+          const required = referencesForWorkerDeployment(spec);
+          const referencesForOp = await references(deploymentOp.id);
+          if (
+            !referencesForOp ||
+            referencesForOp.length !== required.length ||
+            required.some((item, index) => {
+              const actual = referencesForOp[index];
+              const path = item.targetSpecMatch ? `$.${item.targetSpecMatch.path.join(".")}` : null;
+              return (
+                !actual ||
+                actual.target_uid !== item.resourceUid ||
+                actual.form_url !== item.formUrl ||
+                actual.readiness !== item.readiness ||
+                actual.target_spec_path !== path ||
+                actual.target_spec_equals !== (item.targetSpecMatch?.equals ?? null)
+              );
+            })
+          ) {
+            return { kind: "unknown" };
+          }
+          const observed = parseObject(deployment.observed_json);
+          const selected = observed?.selectedVersions;
+          if (
+            observed?.ready !== true ||
+            observed.active !== false ||
+            !Array.isArray(selected) ||
+            selected.length !== spec.versions.length
+          ) {
+            return { kind: "unknown" };
+          }
+          const expectedSelected = spec.versions
+            .map(({ workerVersion, weight }) => ({
+              resourceUid: workerVersion.resourceUid,
+              weight,
+            }))
+            .sort((left, right) => left.resourceUid.localeCompare(right.resourceUid));
+          const actualSelected = selected.map((item) => {
+            if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+            const value = item as Record<string, unknown>;
+            return typeof value.resourceUid === "string" && typeof value.weight === "number"
+              ? { resourceUid: value.resourceUid, weight: value.weight }
+              : null;
+          });
+          if (canonicalJson(actualSelected) !== canonicalJson(expectedSelected)) {
+            return { kind: "unknown" };
+          }
+          if (await hasUnresolvedPriorEffect(deployment)) return { kind: "unknown" };
+        }
+
+        // No intervening Worker, Deployment, or Endpoint acceptance may have
+        // changed this conclusion while the sealed references were inspected.
+        const [latestWorker, latestDeployments, latestDeploymentEdges, pending] = await Promise.all(
+          [
+            resource(workerUid),
+            matchingResources(WORKER_DEPLOYMENT_FORM_URL, workerUid, principal, space, true),
+            sql.query(
+              `SELECT d.uid, d.principal, d.space, d.target_key, d.deleted_at
+             FROM tf_v2_resource_references edge
+             JOIN tf_v2_resources d ON d.uid = edge.referrer_uid
+             WHERE edge.target_uid = ? AND d.form_url = ? ORDER BY d.uid LIMIT 3`,
+              [workerUid, WORKER_DEPLOYMENT_FORM_URL],
+            ),
+            hasPendingPublication(workerUid),
+          ],
+        );
+        if (
+          pending ||
+          !latestWorker ||
+          !settled(latestWorker, await operation(latestWorker.last_operation)) ||
+          latestWorker.last_operation !== worker.last_operation ||
+          latestWorker.generation !== worker.generation ||
+          latestDeployments.length !== deployments.length ||
+          latestDeploymentEdges.length !== deploymentEdges.length ||
+          latestDeploymentEdges.some(
+            (edge, index) =>
+              edge.uid !== deploymentEdges[index]?.uid ||
+              edge.principal !== deploymentEdges[index]?.principal ||
+              edge.space !== deploymentEdges[index]?.space ||
+              edge.target_key !== deploymentEdges[index]?.target_key ||
+              edge.deleted_at !== deploymentEdges[index]?.deleted_at,
+          ) ||
+          latestDeployments.some(
+            (latest, index) =>
+              latest.uid !== deployments[index]?.uid ||
+              latest.last_operation !== deployments[index]?.last_operation ||
+              latest.generation !== deployments[index]?.generation ||
+              latest.observed_json !== deployments[index]?.observed_json,
+          )
+        ) {
+          return { kind: "unknown" };
+        }
+        return { kind: "confirmed" };
+      } catch {
+        return { kind: "unknown" };
+      }
+    },
     async resolveVersionUnverified(input: {
       execution: V2Execution;
     }): Promise<V2WorkerVersionMaterialScopeResolution> {

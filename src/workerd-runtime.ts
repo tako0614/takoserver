@@ -22,6 +22,7 @@ import { isValidArtifactPath } from "./artifact-path.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 import { bytesDigest } from "./json.ts";
+import { SELFHOST_V2_OBJECT_BUCKET_DATA_SERVICE_MODULE } from "./providers/selfhost-v2-object-bucket-data-service.ts";
 import {
   V2_QUEUE_SETTLEMENT_ORIGIN_BINDING,
   V2_QUEUE_SETTLEMENT_SERVICE_BINDING,
@@ -34,6 +35,9 @@ import {
   isWorkerdV2PrivateServiceBindingName,
   isWorkerdV2PrivateWorkflowBindingName,
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
+  WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+  WORKERD_V2_PRIVATE_OBJECT_BUCKET_ORIGIN_BINDING,
+  WORKERD_V2_PRIVATE_OBJECT_BUCKET_TOKEN_BINDING,
   WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING,
   WORKERD_V2_PRIVATE_READINESS_BINDING,
   workerdV2PrivateActorBindingName,
@@ -307,6 +311,8 @@ export interface WorkerdSite {
   readonly events?: WorkerdEventGate;
   /** Opt-in v2 Queue private RPC facade; never projected into tenant env. */
   readonly queueSettlement?: WorkerdQueueSettlement;
+  /** Opt-in v2 ObjectBucket binding service; grant is never on the tenant service. */
+  readonly v2ObjectBucketPlane?: WorkerdV2ObjectBucketPlane;
 }
 
 /** A module-less Worker Version served only by the Host-owned asset router. */
@@ -330,6 +336,7 @@ export interface WorkerdStaticSite {
   readonly dataPlane?: never;
   readonly events?: never;
   readonly queueSettlement?: never;
+  readonly v2ObjectBucketPlane?: never;
 }
 
 /** One exact private Version in a single logical Worker publication. */
@@ -431,6 +438,12 @@ export interface WorkerdQueueSettlement {
   readonly address: string;
   readonly module: string;
   readonly vars: readonly WorkerdBinding[];
+}
+
+/** A per-Version v2 object service with one exact signed Worker grant. */
+export interface WorkerdV2ObjectBucketPlane {
+  readonly address: string;
+  readonly token: string;
 }
 
 /** The seam a provider publishes through: files present, config rewritten. */
@@ -668,6 +681,7 @@ interface Manifest {
   readonly dataPlane?: WorkerdDataPlane;
   readonly events?: WorkerdEventGate;
   readonly queueSettlement?: WorkerdQueueSettlement;
+  readonly v2ObjectBucketPlane?: WorkerdV2ObjectBucketPlane;
 }
 
 interface StaticManifest {
@@ -691,6 +705,7 @@ interface StaticManifest {
   readonly dataPlane?: never;
   readonly events?: never;
   readonly queueSettlement?: never;
+  readonly v2ObjectBucketPlane?: never;
 }
 
 type StoredManifest = Manifest | StaticManifest;
@@ -1917,6 +1932,13 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         site.workflowForward === undefined
           ? undefined
           : validWorkflowForward(site.workflowForward, hasWorkerdV2PrivateBindingProfile(site));
+      const v2ObjectBucketPlane =
+        site.v2ObjectBucketPlane === undefined
+          ? undefined
+          : validV2ObjectBucketPlane(site.v2ObjectBucketPlane);
+      if (v2ObjectBucketPlane && !hasWorkerdV2PrivateBindingProfile(site)) {
+        throw new Error("v2 ObjectBucket service requires the private v2 Worker profile");
+      }
       validActorForwardCollision(
         actorForward,
         validBindings(site.vars ?? []),
@@ -1995,6 +2017,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           ...(site.queueSettlement
             ? { queueSettlement: validQueueSettlement(site.queueSettlement) }
             : {}),
+          ...(v2ObjectBucketPlane === undefined ? {} : { v2ObjectBucketPlane }),
         }),
         "utf8",
       );
@@ -2396,6 +2419,7 @@ const ACTOR_FORWARD_MANIFEST_KEYS = new Set([
   "dataPlane",
   "events",
   "queueSettlement",
+  "v2ObjectBucketPlane",
 ]);
 
 function actorForwardServiceName(
@@ -3125,7 +3149,10 @@ function validModules(modules: readonly string[], mainModule?: string): readonly
 }
 
 function validHostModuleNames(
-  site: Pick<WorkerdSite, "hostModules" | "dataPlane" | "events" | "queueSettlement">,
+  site: Pick<
+    WorkerdSite,
+    "hostModules" | "dataPlane" | "events" | "queueSettlement" | "v2ObjectBucketPlane"
+  >,
   hostEntrypoint: string | undefined,
 ): readonly string[] {
   return validModules([
@@ -3136,6 +3163,9 @@ function validHostModuleNames(
     ...(site.queueSettlement === undefined
       ? []
       : [validQueueSettlement(site.queueSettlement).module]),
+    ...(site.v2ObjectBucketPlane === undefined
+      ? []
+      : [SELFHOST_V2_OBJECT_BUCKET_DATA_SERVICE_MODULE]),
   ]);
 }
 
@@ -3565,6 +3595,22 @@ function validQueueSettlement(plane: WorkerdQueueSettlement): WorkerdQueueSettle
   return plane;
 }
 
+function validV2ObjectBucketPlane(plane: WorkerdV2ObjectBucketPlane): WorkerdV2ObjectBucketPlane {
+  if (
+    typeof plane !== "object" ||
+    plane === null ||
+    Object.keys(plane).sort().join(",") !== "address,token" ||
+    typeof plane.address !== "string" ||
+    typeof plane.token !== "string" ||
+    plane.token.length > 32_768 ||
+    !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/u.test(plane.token)
+  ) {
+    throw new Error("unusable v2 ObjectBucket binding plane");
+  }
+  validDataPlaneAddress(plane.address);
+  return { address: plane.address, token: plane.token };
+}
+
 interface PreparedWorkerdSite<M extends StoredManifest = StoredManifest> {
   readonly manifest: M;
   readonly application: readonly SnapshottedModule[];
@@ -3678,6 +3724,13 @@ async function prepareWorkerdSite(
     site.workflowForward === undefined
       ? undefined
       : validWorkflowForward(site.workflowForward, hasWorkerdV2PrivateBindingProfile(site));
+  const v2ObjectBucketPlane =
+    site.v2ObjectBucketPlane === undefined
+      ? undefined
+      : validV2ObjectBucketPlane(site.v2ObjectBucketPlane);
+  if (v2ObjectBucketPlane && !hasWorkerdV2PrivateBindingProfile(site)) {
+    throw new Error("v2 ObjectBucket service requires the private v2 Worker profile");
+  }
   validActorForwardCollision(
     actorForward,
     validBindings(site.vars ?? []),
@@ -3721,6 +3774,7 @@ async function prepareWorkerdSite(
       ...(site.queueSettlement
         ? { queueSettlement: validQueueSettlement(site.queueSettlement) }
         : {}),
+      ...(v2ObjectBucketPlane === undefined ? {} : { v2ObjectBucketPlane }),
     },
     application: applicationSnapshot.entries,
     hostPrivate: hostSnapshot.entries,
@@ -4469,6 +4523,12 @@ async function readValidatedManifest(
   if (manifest.dataPlane !== undefined) validDataPlane(manifest.dataPlane);
   if (manifest.events !== undefined) validEventGate(manifest.events);
   if (manifest.queueSettlement !== undefined) validQueueSettlement(manifest.queueSettlement);
+  if (manifest.v2ObjectBucketPlane !== undefined) {
+    validV2ObjectBucketPlane(manifest.v2ObjectBucketPlane);
+    if (!hasWorkerdV2PrivateBindingProfile(manifest)) {
+      throw new Error("v2 ObjectBucket service requires the private v2 Worker profile");
+    }
+  }
   return manifest;
 }
 
@@ -4989,6 +5049,9 @@ export async function readWorkerdSelectedActiveVersion(
                   vars: manifest.queueSettlement.vars.map((binding) => ({ ...binding })),
                 },
               }),
+          ...(manifest.v2ObjectBucketPlane === undefined
+            ? {}
+            : { v2ObjectBucketPlane: { ...manifest.v2ObjectBucketPlane } }),
         };
   } catch {
     // Validators normally reject these shapes earlier. Keep the reader's
@@ -5181,6 +5244,9 @@ export async function readWorkerdActiveActorGraph(
                 vars: manifest.queueSettlement.vars.map((binding) => ({ ...binding })),
               },
             }),
+        ...(manifest.v2ObjectBucketPlane === undefined
+          ? {}
+          : { v2ObjectBucketPlane: { ...manifest.v2ObjectBucketPlane } }),
         ...(manifest.assets === undefined
           ? {}
           : {
@@ -5667,6 +5733,11 @@ function renderConfig(
               `(name = ${capnpText(hasWorkerdV2PrivateBindingProfile(entry.manifest) ? WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING : V2_QUEUE_SETTLEMENT_SERVICE_BINDING)}, service = ${capnpText(`${entry.name}-v2-queue-settlement`)})`,
             ]
           : []),
+        ...(entry.manifest.v2ObjectBucketPlane
+          ? [
+              `(name = ${capnpText(WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING)}, service = ${capnpText(`${entry.name}-v2-object-bucket`)})`,
+            ]
+          : []),
         ...validServiceBindings(
           entry.manifest.serviceBindings ?? [],
           hasWorkerdV2PrivateBindingProfile(entry.manifest),
@@ -5868,6 +5939,35 @@ function renderConfig(
     })
     .join("\n");
 
+  const v2ObjectBucketServices = variants
+    .filter((entry) => entry.manifest.v2ObjectBucketPlane)
+    .map((entry) => {
+      if (isStaticManifest(entry.manifest)) {
+        throw new Error("static Version cannot bind a v2 ObjectBucket");
+      }
+      const plane = validV2ObjectBucketPlane(
+        entry.manifest.v2ObjectBucketPlane as WorkerdV2ObjectBucketPlane,
+      );
+      const module = requiredStoredModule(
+        entry.manifest.moduleFiles.hostPrivate,
+        SELFHOST_V2_OBJECT_BUCKET_DATA_SERVICE_MODULE,
+      );
+      return `  ( name = ${capnpText(`${entry.name}-v2-object-bucket`)},
+    worker = (
+      modules = [ (name = ${capnpText(SELFHOST_V2_OBJECT_BUCKET_DATA_SERVICE_MODULE)}, esModule = embed ${capnpText(`${entry.storagePrefix}/${HOST_PRIVATE_MODULE_DIRECTORY}/${module.key}`)}) ],
+      bindings = [
+        (name = ${capnpText(WORKERD_V2_PRIVATE_OBJECT_BUCKET_ORIGIN_BINDING)}, service = ${capnpText(`${entry.name}-v2-object-bucket-origin`)}),
+        (name = ${capnpText(WORKERD_V2_PRIVATE_OBJECT_BUCKET_TOKEN_BINDING)}, text = ${capnpText(plane.token)})
+      ],
+      compatibilityDate = "2026-01-01", globalOutbound = "object-bucket-deny"
+    )
+  ),
+  ( name = ${capnpText(`${entry.name}-v2-object-bucket-origin`)},
+    external = ( address = ${capnpText(plane.address)}, http = () )
+  ),`;
+    })
+    .join("\n");
+
   // One gate per script that receives events. It holds the token and the only
   // binding on this machine that names the script's event entrypoint; the
   // script itself is not reachable on the event hostname at all, and the
@@ -6018,7 +6118,7 @@ function renderConfig(
 const config :Workerd.Config = (
   services = [
 ${services}
-${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${queueSettlementServices === "" ? "" : `\n${queueSettlementServices}\n  (name = "queue-settlement-deny", network = (allow = [])),`}${actorExternalServices === "" ? "" : `\n${actorExternalServices}`}${workflowExternalServices === "" ? "" : `\n${workflowExternalServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
+${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${queueSettlementServices === "" ? "" : `\n${queueSettlementServices}\n  (name = "queue-settlement-deny", network = (allow = [])),`}${v2ObjectBucketServices === "" ? "" : `\n${v2ObjectBucketServices}\n  (name = "object-bucket-deny", network = (allow = [])),`}${actorExternalServices === "" ? "" : `\n${actorExternalServices}`}${workflowExternalServices === "" ? "" : `\n${workflowExternalServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
   ( name = "router",
     worker = (
       modules = [ (name = "router.js", esModule = embed "router.js") ],

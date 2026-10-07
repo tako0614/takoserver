@@ -29,6 +29,7 @@ import {
   selfhostV2QueueCompletionAnswer,
   selfhostV2QueueEvent,
 } from "./providers/selfhost-events.ts";
+import type { V2ObjectBucketBindingGrant } from "./providers/selfhost-v2-object-bucket-binding-broker.ts";
 import {
   V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
   type V2QueueDispatchGrant,
@@ -38,6 +39,10 @@ import {
   randomSelfhostDeploymentBasisPoint,
   selectSelfhostWeightedVersion,
 } from "./selfhost-weighted-deployment.ts";
+import type {
+  ObjectBucketWorkerBindingClaim,
+  ObjectBucketWorkerBindingResolution,
+} from "./takoform-v2/forms/object-bucket-worker-binding-authority.ts";
 import type { SQLiteWorkerBindingClaim } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import {
   parseWorkerEndpointSpec,
@@ -412,6 +417,15 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
       claim: SQLiteWorkerBindingClaim,
       binding: string,
     ): Promise<{ readonly resourceUid: string; readonly vector: string } | null>;
+  };
+  /** Fixed Host-private object broker; never selected by a Worker Version. */
+  readonly v2ObjectBucketBinding?: {
+    readonly address: string;
+    issueGrant(grant: V2ObjectBucketBindingGrant): string;
+    resolveCurrentBucketBinding(
+      claim: ObjectBucketWorkerBindingClaim,
+      binding: string,
+    ): Promise<ObjectBucketWorkerBindingResolution | null>;
   };
   readonly workerdBinary: string | null;
   /** Trusted code-module inspector; absent uses the WorkerdRuntime's pinned inspector. */
@@ -1893,6 +1907,28 @@ export async function openWorkerdWorkerRuntimeOwner(
   ) {
     throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
   }
+  if (
+    options.v2ObjectBucketBinding !== undefined &&
+    (typeof options.v2ObjectBucketBinding.issueGrant !== "function" ||
+      typeof options.v2ObjectBucketBinding.resolveCurrentBucketBinding !== "function" ||
+      !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(options.v2ObjectBucketBinding.address) ||
+      Number(
+        options.v2ObjectBucketBinding.address.slice(
+          options.v2ObjectBucketBinding.address.lastIndexOf(":") + 1,
+        ),
+      ) > 65_535)
+  ) {
+    throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
+  }
+  const v2ObjectBucketBinding = options.v2ObjectBucketBinding
+    ? Object.freeze({
+        address: options.v2ObjectBucketBinding.address,
+        issueGrant: options.v2ObjectBucketBinding.issueGrant.bind(options.v2ObjectBucketBinding),
+        resolveCurrentBucketBinding: options.v2ObjectBucketBinding.resolveCurrentBucketBinding.bind(
+          options.v2ObjectBucketBinding,
+        ),
+      })
+    : undefined;
 
   let canonicalRoot: string;
   try {
@@ -2374,6 +2410,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       ...(options.configuredInputs ? { configuredInputs: options.configuredInputs } : {}),
       ...(options.v2QueueSettlement ? { v2QueueSettlement: options.v2QueueSettlement } : {}),
       ...(options.v2SqliteBinding ? { v2SqliteBinding: options.v2SqliteBinding } : {}),
+      ...(v2ObjectBucketBinding ? { v2ObjectBucketBinding } : {}),
       ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
     });
     const handle: IncarnationHandle = {

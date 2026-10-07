@@ -12,11 +12,21 @@ import {
   selfhostEventServiceSource,
 } from "../src/providers/selfhost-events.ts";
 import {
+  SELFHOST_V2_OBJECT_BUCKET_DATA_SERVICE_MODULE,
+  selfhostV2ObjectBucketDataServiceSource,
+} from "../src/providers/selfhost-v2-object-bucket-data-service.ts";
+import {
   V2_QUEUE_SETTLEMENT_SERVICE_BINDING,
   V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
   V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
   v2QueueSettlementServiceSource,
 } from "../src/providers/selfhost-v2-queue-transport.ts";
+import {
+  WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+  WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+  WORKERD_V2_PRIVATE_OBJECT_BUCKET_ORIGIN_BINDING,
+  WORKERD_V2_PRIVATE_OBJECT_BUCKET_TOKEN_BINDING,
+} from "../src/providers/workerd-v2-private-binding-names.ts";
 import { forwardTakoformCandidates } from "../src/takoform/forward-candidates.ts";
 import {
   ASSET_ROUTER_SOURCE,
@@ -1835,6 +1845,50 @@ test("weighted v2 Queue settlement has a private service and survives manifest r
   expect(normalize(await readFile(join(root, "workers", "workerd.capnp"), "utf8"))).toBe(
     normalize(config),
   );
+});
+
+test("weighted v2 ObjectBucket uses a distinct signed private service and survives manifest reopen", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication is unavailable");
+  const base = weightedPublication("object-bucket-site", "object-bucket-generation");
+  const token = `${"a".repeat(32)}.${"b".repeat(43)}`;
+  const withObjectBucket = {
+    ...base,
+    versions: base.versions.map((version) => ({
+      ...version,
+      site: {
+        ...version.site,
+        hostEntrypoint: WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+        v2ObjectBucketPlane: { address: "127.0.0.1:4777", token },
+      },
+      hostModules: new Map([
+        [
+          WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+          new TextEncoder().encode('export { default } from "./index.js";'),
+        ],
+        [
+          SELFHOST_V2_OBJECT_BUCKET_DATA_SERVICE_MODULE,
+          new TextEncoder().encode(selfhostV2ObjectBucketDataServiceSource()),
+        ],
+      ]),
+    })),
+  };
+  await runtime.publish("object-bucket-site", withObjectBucket);
+  const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  expect(config).toContain(`name = "${WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING}"`);
+  expect(config).toContain(`name = "${WORKERD_V2_PRIVATE_OBJECT_BUCKET_ORIGIN_BINDING}"`);
+  expect(config).toContain(`name = "${WORKERD_V2_PRIVATE_OBJECT_BUCKET_TOKEN_BINDING}"`);
+  expect(config).toContain('globalOutbound = "object-bucket-deny"');
+  expect(config).toContain('(name = "object-bucket-deny", network = (allow = []))');
+  expect(config).toContain(token);
+
+  const restarted = createWorkerdRuntime({ root, isReady: () => true });
+  expect(await restarted.restore()).toEqual(["object-bucket-site"]);
+  const selected = await readWorkerdSelectedActiveVersion(root, "object-bucket-site", {
+    expectedWorkerResourceUid: base.workerResourceUid,
+    basisPoint: 0,
+  });
+  expect(selected?.site.v2ObjectBucketPlane).toEqual({ address: "127.0.0.1:4777", token });
 });
 
 test("persists an opt-in Actor forward graph and rejects unmapped Host sockets", async () => {

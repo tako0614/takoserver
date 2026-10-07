@@ -31,6 +31,7 @@ import {
 import {
   isWorkerdV2PrivateServiceBindingName,
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
+  WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
   WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING,
   WORKERD_V2_PRIVATE_READINESS_BINDING,
 } from "./workerd-v2-private-binding-names.ts";
@@ -266,6 +267,13 @@ export const SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER = "x-takoserver-selfhost-
 export const SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER =
   "x-takoserver-selfhost-object-result" as const;
 export const SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE = "application/octet-stream" as const;
+/** Private v2-only path; the legacy object data-plane URL remains unchanged. */
+export const SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH =
+  `${SELFHOST_DATA_PLANE_PATH_PREFIX}/objects/v2-binding` as const;
+export const SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN =
+  "http://takoserver-selfhost-v2-object.invalid" as const;
+export const SELFHOST_V2_OBJECT_MULTIPART_PARTS_CONTENT_TYPE =
+  "application/vnd.takoserver.selfhost-object.multipart-parts.v2+json" as const;
 /**
  * The ceiling on either header.
  *
@@ -315,6 +323,8 @@ export interface SelfhostWorkerDataBindingDescriptor {
     | typeof SELFHOST_WORKER_EDGE_SQL_BINDING_KIND
     | typeof SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND;
   readonly publicName: string;
+  /** Separate private native service used only by the v2 ObjectBucket facade. */
+  readonly internalName?: string;
 }
 
 /** A native workerd service projected as the fetch-only portable facade. */
@@ -855,8 +865,10 @@ function sealGeneratedConfiguration(raw) {
     if (SafeObjectHasOwn(source, "kind")) {
       descriptor.kind = source.kind;
       descriptor.publicName = source.publicName;
-      if (source.kind === SERVICE_KIND) {
+      if (SafeObjectHasOwn(source, "internalName")) {
         descriptor.internalName = source.internalName;
+      }
+      if (source.kind === SERVICE_KIND) {
         descriptor.unavailableToken = source.unavailableToken;
       }
     } else {
@@ -976,8 +988,12 @@ function projectEnv(rawEnv) {
       // The object facade streams, so it has a caller of its own: everything
       // else on this seam is one JSON envelope in and one out.
       if (descriptor.kind === OBJECTS_KIND) {
-        if (!objectCall) objectCall = createObjectCaller(rawEnv);
-        projected[descriptor.publicName] = createObjectsAdapter(objectCall, descriptor.publicName);
+        if (!objectCall) objectCall = createObjectCaller(rawEnv, descriptor.internalName);
+        projected[descriptor.publicName] = createObjectsAdapter(
+          objectCall,
+          descriptor.publicName,
+          descriptor.internalName !== undefined,
+        );
         continue;
       }
       if (!call) call = createPlaneCaller(rawEnv);
@@ -1560,7 +1576,7 @@ function validateQueueSendOptions(options) {
  * its receipt ledger in a private Durable Object while R2 owns the native
  * upload, which is the recovery difference ADR 0007 names between runtimes.
  */
-function createObjectsAdapter(call, binding) {
+function createObjectsAdapter(call, binding, v2PrivateObject) {
   const multipart = new SafeMap();
   const portable = SafeObjectCreate(null);
   portable.head = async function (key) {
@@ -1721,8 +1737,15 @@ function createObjectsAdapter(call, binding) {
     validateKnownObjectParts(multipart, key, uploadId, parts);
     const document = objectDocument(binding, "completeMultipartUpload", key);
     document.uploadId = uploadId;
-    document.parts = parts;
-    const value = objectJson(await call(document));
+    let body;
+    let contentType;
+    if (v2PrivateObject) {
+      body = SafeApply(SafeTextEncoderEncode, encoder, [SafeJSONStringify({ parts })]);
+      contentType = ${JSON.stringify(SELFHOST_V2_OBJECT_MULTIPART_PARTS_CONTENT_TYPE)};
+    } else {
+      document.parts = parts;
+    }
+    const value = objectJson(await call(document, body, contentType));
     const result = SafeObjectCreate(null);
     result.etag = objectEtag(value.etag);
     result.size = objectSize(value.size);
@@ -1749,19 +1772,23 @@ function createObjectsAdapter(call, binding) {
  * so this module can name an operation and nothing else — not a destination,
  * not a token, and not a second route on this machine.
  */
-function createObjectCaller(rawEnv) {
-  const service = rawEnv[DATA_SERVICE];
+function createObjectCaller(rawEnv, internalName) {
+  const service = rawEnv[internalName || DATA_SERVICE];
   const send = captureMethod(service, "fetch");
-  return async (document, body) => {
+  return async (document, body, requestContentType) => {
     const headers = SafeObjectCreate(null);
     headers[OBJECT_REQUEST_HEADER] = encodeObjectDocument(document);
+    if (requestContentType !== undefined) headers["content-type"] = requestContentType;
     const init = SafeObjectCreate(null);
     init.method = "POST";
     init.headers = headers;
     if (body !== undefined) init.body = body;
     let response;
     try {
-      response = await SafeApply(send, service, [OBJECTS_URL, init]);
+      const url = internalName
+        ? ${JSON.stringify(`${SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN}${SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH}`)}
+        : OBJECTS_URL;
+      response = await SafeApply(send, service, [url, init]);
     } catch {
       throw portableError("backend_unavailable");
     }
@@ -2958,14 +2985,28 @@ function normalizeSourceInput(
         });
         continue;
       }
-      exactNormalizedKeys(binding, ["kind", "publicName"], "bindings");
+      const privateObjectService =
+        binding.kind === SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND &&
+        Object.hasOwn(binding, "internalName");
+      exactNormalizedKeys(
+        binding,
+        privateObjectService ? ["kind", "publicName", "internalName"] : ["kind", "publicName"],
+        "bindings",
+      );
       if (typeof binding.kind !== "string" || !DATA_BINDING_KINDS.has(binding.kind)) {
+        invalid("bindings");
+      }
+      if (
+        privateObjectService &&
+        (!v2PrivateNames || binding.internalName !== WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING)
+      ) {
         invalid("bindings");
       }
       validatePublicName(binding.publicName, publicNames, false, v2PrivateNames);
       bindings.push({
         kind: binding.kind as SelfhostWorkerDataBindingDescriptor["kind"],
         publicName: binding.publicName as string,
+        ...(privateObjectService ? { internalName: binding.internalName as string } : {}),
       });
       continue;
     }

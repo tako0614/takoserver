@@ -1,15 +1,22 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
+import { createSelfhostV2ObjectBucketBindingBroker } from "./providers/selfhost-v2-object-bucket-binding-broker.ts";
+import type { SelfhostV2ObjectBucketStore } from "./providers/selfhost-v2-object-bucket-store.ts";
 import {
   createSelfhostV2SqliteBindingBroker,
   type V2SqliteBindingGrant,
 } from "./providers/selfhost-v2-sqlite-binding-broker.ts";
 import type { SelfhostV2SQLiteStore } from "./providers/selfhost-v2-sqlite-store.ts";
+import {
+  SELFHOST_DATA_PLANE_OBJECTS_PATH,
+  SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH,
+} from "./providers/selfhost-worker-wrapper.ts";
 import type { V2OperatorFormFactory } from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
 import { readV2ConfiguredPrivateInputs } from "./takoform-v2/configured-private-inputs.ts";
 import { createV2HeldArtifactSource } from "./takoform-v2/forms/artifact-source.ts";
+import { createObjectBucketWorkerBindingAuthority } from "./takoform-v2/forms/object-bucket-worker-binding-authority.ts";
 import { createSQLiteWorkerBindingAuthority } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { createStaticAssetBundleCustody } from "./takoform-v2/forms/static-asset-bundle-backend.ts";
 import { createWorkerBundleCustody } from "./takoform-v2/forms/worker-bundle-backend.ts";
@@ -27,6 +34,7 @@ import {
   createInternalV2ModuleWorkerForm,
   createInternalV2WorkerVersionForm,
   createV2CodeConfiguredInputReader,
+  MODULE_WORKER_LIFECYCLE_BACKEND_ID,
 } from "./takoform-v2/worker-lifecycle-backend.ts";
 import { createV2WorkerPublicationState } from "./takoform-v2/worker-publication-state.ts";
 import { createV2WorkerdWorkerRuntimeReaders } from "./takoform-v2/worker-runtime-readers.ts";
@@ -63,6 +71,13 @@ export interface SelfhostV2WorkerCompositionOptions {
     /** Stable operator-selected loopback port, retained across Host restarts. */
     readonly privatePort: number;
   };
+  /** Separately keyed Host-private Worker Binding broker; not public Form registration. */
+  readonly v2ObjectBucketBinding?: {
+    readonly store: SelfhostV2ObjectBucketStore;
+    readonly signingKey: Uint8Array;
+    /** Stable loopback port embedded in each exact Version graph. */
+    readonly privatePort: number;
+  };
   /** Exact frontend authority; absent on the ordinary public entry today. */
   readonly endpoint?: EndpointPorts;
   /** Tests may substitute a child, but production uses parent-death-fenced Workerd. */
@@ -72,6 +87,64 @@ export interface SelfhostV2WorkerCompositionOptions {
 
 function ownerKey(uid: string): string {
   return createHash("sha256").update(uid, "utf8").digest("hex");
+}
+
+async function workerShutdownKind(
+  sql: Sql,
+  uid: string,
+  targetKey: string,
+): Promise<"live" | "deleted"> {
+  const rows = await sql.query(
+    `SELECT r.uid, r.principal, r.form_url, r.backend_id, r.target_key,
+       r.generation, r.observed_generation, r.phase, r.spec_json, r.last_operation,
+       r.busy_operation, r.deleted_at,
+       op.id AS operation_id, op.resource_uid AS operation_resource_uid,
+       op.principal AS operation_principal, op.backend_id AS operation_backend_id,
+       op.target_key AS operation_target_key, op.generation AS operation_generation,
+       op.action AS operation_action, op.status AS operation_status,
+       op.effect AS operation_effect, op.accepted_spec_json
+     FROM tf_v2_resources r LEFT JOIN tf_v2_operations op ON op.id = r.last_operation
+     WHERE r.uid = ? LIMIT 2`,
+    [uid],
+  );
+  const row = rows.length === 1 ? rows[0] : undefined;
+  if (
+    row?.uid !== uid ||
+    typeof row.principal !== "string" ||
+    !row.principal ||
+    row.form_url !== MODULE_WORKER_FORM_URL ||
+    row.backend_id !== MODULE_WORKER_LIFECYCLE_BACKEND_ID ||
+    row.target_key !== targetKey ||
+    typeof row.generation !== "number" ||
+    !Number.isSafeInteger(row.generation) ||
+    row.generation < 1 ||
+    row.observed_generation !== row.generation ||
+    row.phase !== "idle" ||
+    row.busy_operation !== null ||
+    typeof row.last_operation !== "string" ||
+    row.operation_id !== row.last_operation ||
+    row.operation_resource_uid !== uid ||
+    row.operation_principal !== row.principal ||
+    row.operation_backend_id !== row.backend_id ||
+    row.operation_target_key !== targetKey ||
+    row.operation_generation !== row.generation ||
+    row.operation_status !== "succeeded" ||
+    row.operation_effect !== "complete" ||
+    typeof row.spec_json !== "string" ||
+    row.accepted_spec_json !== row.spec_json
+  ) {
+    throw new Error("v2 Worker SQL state is not settled for shutdown");
+  }
+  if (row.deleted_at !== null) {
+    if (typeof row.deleted_at !== "string" || row.operation_action !== "delete") {
+      throw new Error("v2 Worker deletion is not confirmed by its current Operation");
+    }
+    return "deleted";
+  }
+  if (row.operation_action !== "create" && row.operation_action !== "update") {
+    throw new Error("v2 Worker current Operation is not a live mutation");
+  }
+  return "live";
 }
 
 async function unusedPrivatePort(excluded: Set<number>): Promise<number> {
@@ -99,6 +172,8 @@ async function unusedPrivatePort(excluded: Set<number>): Promise<number> {
 export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompositionOptions): {
   restoreOwners(): Promise<readonly string[]>;
   ownerForWorkerUid(uid: string): Promise<WorkerdWorkerRuntimeOwner>;
+  /** Stop exact known children but retain UID owner locks and durable accepted state. */
+  suspendOwnersRetainingCustody(): Promise<void>;
   /** Close retired owners, then stop the private broker; active owners refuse. */
   closePrivateBindingServices(): Promise<void>;
   /** Internal acceptance seam only. The normal entry must not register it yet. */
@@ -120,6 +195,24 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   ) {
     throw new TypeError("v2 SQLite binding requires exact store, private key and fixed port");
   }
+  if (
+    options.v2ObjectBucketBinding &&
+    (!options.v2ObjectBucketBinding.store ||
+      typeof options.v2ObjectBucketBinding.store.openBucket !== "function" ||
+      typeof options.v2ObjectBucketBinding.store.create !== "function" ||
+      typeof options.v2ObjectBucketBinding.store.observe !== "function" ||
+      typeof options.v2ObjectBucketBinding.store.delete !== "function" ||
+      !(options.v2ObjectBucketBinding.signingKey instanceof Uint8Array) ||
+      options.v2ObjectBucketBinding.signingKey.byteLength < 32 ||
+      !Number.isSafeInteger(options.v2ObjectBucketBinding.privatePort) ||
+      options.v2ObjectBucketBinding.privatePort < 1 ||
+      options.v2ObjectBucketBinding.privatePort > 65_535 ||
+      options.v2ObjectBucketBinding.privatePort === options.sqliteBinding?.privatePort)
+  ) {
+    throw new TypeError(
+      "v2 ObjectBucket binding requires exact store, separate key and fixed port",
+    );
+  }
   // A caller cannot retarget the private listener, signing bytes, or custody
   // methods between factory construction and the first owner restoration.
   const sqliteBinding = options.sqliteBinding
@@ -127,6 +220,13 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         store: Object.freeze({ ...options.sqliteBinding.store }),
         signingKey: new Uint8Array(options.sqliteBinding.signingKey),
         privatePort: options.sqliteBinding.privatePort,
+      })
+    : undefined;
+  const v2ObjectBucketBinding = options.v2ObjectBucketBinding
+    ? Object.freeze({
+        store: Object.freeze({ ...options.v2ObjectBucketBinding.store }),
+        signingKey: new Uint8Array(options.v2ObjectBucketBinding.signingKey),
+        privatePort: options.v2ObjectBucketBinding.privatePort,
       })
     : undefined;
   const suppliedSealer = options.configuredInputSealer;
@@ -192,6 +292,9 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   const sqliteAuthority = sqliteBinding
     ? createSQLiteWorkerBindingAuthority({ sql, targetKey })
     : undefined;
+  const objectBucketAuthority = v2ObjectBucketBinding
+    ? createObjectBucketWorkerBindingAuthority({ sql, targetKey })
+    : undefined;
   const sqliteBroker =
     sqliteBinding && sqliteAuthority
       ? createSelfhostV2SqliteBindingBroker({
@@ -212,6 +315,24 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           },
         })
       : undefined;
+  const objectBucketBroker =
+    v2ObjectBucketBinding && objectBucketAuthority
+      ? createSelfhostV2ObjectBucketBindingBroker({
+          store: v2ObjectBucketBinding.store,
+          targetKey,
+          signingKey: v2ObjectBucketBinding.signingKey,
+          async observeVersionTarget(input) {
+            try {
+              if (!restorationComplete) return { kind: "unknown" };
+              const owner = await openOwner(input.workerUid);
+              return await owner.observeVersionTarget(input);
+            } catch {
+              return { kind: "unknown" };
+            }
+          },
+          resolveCurrentBucketBinding: objectBucketAuthority.resolveCurrentBucketBinding,
+        })
+      : undefined;
   const sqliteBoot =
     sqliteBinding && sqliteBroker && sqliteAuthority
       ? Object.freeze({
@@ -220,7 +341,16 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           resolveCurrentBinding: sqliteAuthority.resolveCurrentBinding,
         })
       : undefined;
+  const objectBucketBoot =
+    v2ObjectBucketBinding && objectBucketBroker && objectBucketAuthority
+      ? Object.freeze({
+          address: `127.0.0.1:${v2ObjectBucketBinding.privatePort}`,
+          issueGrant: objectBucketBroker.issueGrant,
+          resolveCurrentBucketBinding: objectBucketAuthority.resolveCurrentBucketBinding,
+        })
+      : undefined;
   let sqliteServer: ReturnType<typeof Bun.serve> | undefined;
+  let objectBucketServer: ReturnType<typeof Bun.serve> | undefined;
   const reservedPorts = new Set<number>();
   const listenerPortForOperation =
     options.listenerPortForOperation ?? (() => unusedPrivatePort(reservedPorts));
@@ -230,6 +360,8 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" }));
   let restoration: Promise<readonly string[]> | undefined;
   let restorationComplete = false;
+  let ownerAdmissionFrozen = false;
+  let suspension: Promise<void> | undefined;
 
   async function sqliteGrantGraphStillCurrent(grant: V2SqliteBindingGrant): Promise<boolean> {
     try {
@@ -338,6 +470,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     uid: string,
     allowRetiredSqlResource = false,
   ): Promise<WorkerdWorkerRuntimeOwner> {
+    if (ownerAdmissionFrozen) throw new Error("v2 Worker owner admission is frozen");
     if (!uid || uid.length > 256) throw new TypeError("invalid Worker UID");
     const existing = owners.get(uid);
     if (existing) return await existing;
@@ -361,6 +494,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         publicationState,
         ...(configuredInputs ? { configuredInputs } : {}),
         ...(sqliteBoot ? { v2SqliteBinding: sqliteBoot } : {}),
+        ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
         workerdBinary: options.workerdBinary,
         inspectModule,
         listenerPortForOperation,
@@ -448,6 +582,35 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         throw new Error("v2 SQLite private listener address changed");
       }
     }
+    if (objectBucketBroker && v2ObjectBucketBinding) {
+      objectBucketServer = Bun.serve({
+        hostname: "127.0.0.1",
+        port: v2ObjectBucketBinding.privatePort,
+        async fetch(request) {
+          let url: URL;
+          try {
+            url = new URL(request.url);
+          } catch {
+            return new Response(null, { status: 404 });
+          }
+          if (url.pathname !== SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH) {
+            return new Response(null, { status: 404 });
+          }
+          const brokerUrl = new URL(SELFHOST_DATA_PLANE_OBJECTS_PATH, request.url);
+          return (
+            (await objectBucketBroker.routes(request, brokerUrl)) ??
+            new Response(null, { status: 404 })
+          );
+        },
+      });
+      if (objectBucketServer.port !== v2ObjectBucketBinding.privatePort) {
+        await objectBucketServer.stop(true);
+        objectBucketServer = undefined;
+        await sqliteServer?.stop(true);
+        sqliteServer = undefined;
+        throw new Error("v2 ObjectBucket private listener address changed");
+      }
+    }
     const restored: string[] = [];
     try {
       for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
@@ -459,6 +622,8 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     } catch (error) {
       await sqliteServer?.stop(true);
       sqliteServer = undefined;
+      await objectBucketServer?.stop(true);
+      objectBucketServer = undefined;
       throw error;
     }
     restorationComplete = true;
@@ -500,6 +665,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         retirement: readers.retirement,
         inspectModule,
         ...(sqliteBoot ? { v2SqliteBinding: sqliteBoot } : {}),
+        ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
         ...(configuredInputSealer && configuredInputCustody
           ? { configuredInputSealer, configuredInputCustody }
           : {}),
@@ -535,13 +701,81 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       await restoration;
       return await openOwner(uid);
     },
+    suspendOwnersRetainingCustody() {
+      if (suspension) return suspension;
+      // This synchronous transition closes the only path that creates a new
+      // owner before awaiting restore/open work already admitted by this
+      // composition. Each owner then proves child exit and listener vacancy
+      // while retaining its durable lock/state for a later Host process.
+      ownerAdmissionFrozen = true;
+      suspension = (async () => {
+        if (restoration) await restoration;
+        const pending = [...owners.entries()];
+        const opened = await Promise.all(
+          pending.map(async ([uid, opening]) => ({ uid, owner: await opening })),
+        );
+        await Promise.all(
+          opened.map(async ({ uid, owner }) => {
+            const kind = await workerShutdownKind(sql, uid, targetKey);
+            if (kind === "deleted") {
+              // A terminal, exact ModuleWorker DELETE has already retired every
+              // native incarnation. close() independently verifies its durable
+              // receipts and vacancy before releasing this UID owner lock.
+              await owner.close();
+            } else {
+              const workerRows = await sql.query(
+                `SELECT principal, space FROM tf_v2_resources
+                 WHERE uid = ? AND form_url = ? AND target_key = ? AND deleted_at IS NULL LIMIT 2`,
+                [uid, MODULE_WORKER_FORM_URL, targetKey],
+              );
+              const workerRow = workerRows.length === 1 ? workerRows[0] : undefined;
+              if (typeof workerRow?.principal !== "string" || typeof workerRow.space !== "string") {
+                throw new Error("v2 Worker SQL identity is unavailable for shutdown");
+              }
+              const noServing = await publicationState.observeNoCurrentServing({
+                workerUid: uid,
+                principal: workerRow.principal,
+                space: workerRow.space,
+                targetKey,
+              });
+              if (noServing.kind === "confirmed") {
+                // No serving Deployment is positively established in the
+                // current SQL graph; close() still refuses any live or
+                // unreceipted incarnation, so no child is abandoned here.
+                await owner.close();
+              } else {
+                const serving = await owner.observeServing({
+                  workerResourceUid: uid,
+                  targetKey,
+                });
+                if (
+                  serving.kind !== "serving" ||
+                  serving.workerResourceUid !== uid ||
+                  serving.targetKey !== targetKey
+                ) {
+                  throw new Error("v2 Worker serving state is uncertain during shutdown");
+                }
+                await owner.suspend();
+              }
+            }
+          }),
+        );
+        await sqliteServer?.stop(true);
+        sqliteServer = undefined;
+        await objectBucketServer?.stop(true);
+        objectBucketServer = undefined;
+      })();
+      return suspension;
+    },
     async closePrivateBindingServices() {
-      if (!sqliteServer) return;
+      if (!sqliteServer && !objectBucketServer) return;
       // A private companion address is pinned in every live native graph.
       // Refuse to remove it while any owner still has an active/draining copy.
       for (const opening of owners.values()) await (await opening).close();
       await sqliteServer?.stop(true);
       sqliteServer = undefined;
+      await objectBucketServer?.stop(true);
+      objectBucketServer = undefined;
     },
     internalFormFactory,
   };
