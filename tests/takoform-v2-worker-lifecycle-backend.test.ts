@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -471,6 +471,49 @@ test("ModuleWorker allocation and isolated same-spec update never claim runtime 
     });
     expect(replay.id).toBe(update.id);
     expect(f.retirementCalls).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("ModuleWorker observes mixed-case selected Version UIDs in canonical spec order", async () => {
+  const f = fixture();
+  try {
+    const { worker, spec } = await f.createWorkerAndAssets();
+    const createVersionWithUid = async (name: string, uid: string) => {
+      const random = spyOn(crypto, "randomUUID").mockImplementationOnce(
+        () => uid as ReturnType<typeof crypto.randomUUID>,
+      );
+      try {
+        return await f.create(WORKER_VERSION_FORM_URL, name, spec);
+      } finally {
+        random.mockRestore();
+      }
+    };
+    const upper = await createVersionWithUid("upper-version", "Z-Version");
+    const lower = await createVersionWithUid("lower-version", "a-version");
+    expect([upper.resourceUid, lower.resourceUid]).toEqual(["Z-Version", "a-version"]);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "mixed-case-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [
+        { workerVersion: { resourceUid: lower.resourceUid }, weight: 5_000 },
+        { workerVersion: { resourceUid: upper.resourceUid }, weight: 5_000 },
+      ],
+    });
+    const update = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "mixed-case-worker-update",
+      uid: worker.resourceUid,
+      expectedGeneration: 1,
+      spec: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: update.id, status: "succeeded" });
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({
+      observedGeneration: 2,
+      observed: { activeDeploymentUid: deployment.resourceUid, ready: true },
+    });
   } finally {
     f.close();
   }

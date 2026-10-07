@@ -37,6 +37,11 @@ export {
   WorkerFormValidationError,
   type WorkerVersionSpec,
 } from "./forms/worker-specs.ts";
+export {
+  createInternalV2ModuleWorkerForm,
+  type V2WorkerRetirementReader,
+  type V2WorkerServingReader,
+} from "./module-worker-lifecycle-backend.ts";
 export type {
   V2PrivateInputCustody,
   V2PrivateInputKey,
@@ -63,11 +68,6 @@ export {
   type V2WorkerInvocationRetirementInput,
   type V2WorkerInvocationSelection,
 } from "./worker-invocation-custody.ts";
-export {
-  createInternalV2ModuleWorkerForm,
-  type V2WorkerRetirementReader,
-  type V2WorkerServingReader,
-} from "./worker-lifecycle-backend.ts";
 export {
   createV2NativeDeletionCustody,
   type V2NativeDeletionCustody,
