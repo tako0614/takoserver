@@ -204,16 +204,31 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
   let closed = false;
   let server: ListenerServer;
   const inFlightByHostname = new Map<string, number>();
+  let inFlightTotal = 0;
+  let drainedWaiters: (() => void)[] = [];
   const listenerCurrent = () => active && !closed && server.port === HTTPS_PORT;
   const inFlightCount = (hostname: string) => inFlightByHostname.get(hostname) ?? 0;
   const beginRequest = (hostname: string) => {
     inFlightByHostname.set(hostname, inFlightCount(hostname) + 1);
+    inFlightTotal++;
   };
   const finishRequest = (hostname: string) => {
-    const remaining = inFlightCount(hostname) - 1;
+    const current = inFlightCount(hostname);
+    if (current === 0) return;
+    const remaining = current - 1;
     if (remaining <= 0) inFlightByHostname.delete(hostname);
     else inFlightByHostname.set(hostname, remaining);
+    inFlightTotal--;
+    if (inFlightTotal === 0) {
+      const waiters = drainedWaiters;
+      drainedWaiters = [];
+      for (const resolve of waiters) resolve();
+    }
   };
+  const waitForResponsesToDrain = () =>
+    inFlightTotal === 0
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => drainedWaiters.push(resolve));
 
   function trackResponseBody(response: Response, hostname: string): Response {
     const body = response.body;
@@ -340,7 +355,9 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
 
   let closePromise: Promise<void> | undefined;
   let closeMode: "force" | "graceful" | undefined;
+  let closeResolve: (() => void) | undefined;
   let closeReject: ((error: unknown) => void) | undefined;
+  let closeSettled = false;
   const stop = (force: boolean) => {
     try {
       return Promise.resolve(server.stop(force));
@@ -381,9 +398,12 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
     }),
     close(closeActiveConnections = true) {
       if (closePromise) {
-        if (closeActiveConnections && closeMode === "graceful") {
+        if (closeActiveConnections && closeMode === "graceful" && !closeSettled) {
           closeMode = "force";
-          void stop(true).catch((error) => closeReject?.(error));
+          void stop(true).then(
+            () => closeResolve?.(),
+            (error) => closeReject?.(error),
+          );
         }
         return closePromise;
       }
@@ -391,9 +411,47 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
       closed = true;
       closeMode = closeActiveConnections ? "force" : "graceful";
       closePromise = new Promise<void>((resolve, reject) => {
+        closeResolve = resolve;
         closeReject = reject;
-        void stop(closeActiveConnections).then(resolve, reject);
       });
+      const completion = closePromise;
+      closeSettled = false;
+      void completion.then(
+        () => {
+          if (closePromise === completion) closeSettled = true;
+        },
+        () => {
+          if (closePromise !== completion) return;
+          closePromise = undefined;
+          closeMode = undefined;
+          closeResolve = undefined;
+          closeReject = undefined;
+          closeSettled = false;
+        },
+      );
+      if (closeActiveConnections) {
+        void stop(true).then(
+          () => closeResolve?.(),
+          (error) => closeReject?.(error),
+        );
+      } else {
+        void stop(false).then(
+          () => {
+            if (closeMode !== "graceful") return;
+            void waitForResponsesToDrain().then(
+              () => {
+                if (closeMode === "graceful") closeResolve?.();
+              },
+              (error) => {
+                if (closeMode === "graceful") closeReject?.(error);
+              },
+            );
+          },
+          (error) => {
+            if (closeMode === "graceful") closeReject?.(error);
+          },
+        );
+      }
       return closePromise;
     },
   };

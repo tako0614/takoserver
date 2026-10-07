@@ -337,6 +337,140 @@ test("a matching-host body cancellation is awaited before route absence can be w
   }
 });
 
+test("graceful close waits for tracked same-host bodies even when server.stop returns void", async () => {
+  const fixture = await certificateFixture();
+  let listenerFetch: ((request: Request) => Response | Promise<Response>) | undefined;
+  let finishBody: (() => void) | undefined;
+  const stopModes: boolean[] = [];
+  const listener = await createSelfhostV2WorkerEndpointHttpsListener({
+    configuration: { workerEndpointSuffix: suffix, port: 443 },
+    ...fixture,
+    routeDenies: async () => true,
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("hold"));
+            let closed = false;
+            finishBody = () => {
+              if (closed) return;
+              closed = true;
+              controller.close();
+            };
+          },
+        }),
+      ),
+    factories: {
+      serve(options) {
+        listenerFetch = options.fetch;
+        return {
+          port: 443,
+          stop(force) {
+            stopModes.push(force ?? false);
+          },
+        };
+      },
+      async proveSni() {},
+    },
+  });
+  try {
+    if (!listenerFetch) throw new Error("listener fetch was not installed");
+    const response = await listenerFetch(
+      new Request(`https://${address.hostname}/shutdown`, { headers: { host: address.hostname } }),
+    );
+    const close = listener.close(false);
+    expect(listener.close(false)).toBe(close);
+    expect(stopModes).toEqual([false]);
+    let settled = false;
+    void close.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+
+    const finish = finishBody;
+    finishBody = undefined;
+    finish?.();
+    await expect(response.text()).resolves.toBe("hold");
+    await close;
+    expect(settled).toBe(true);
+    expect(stopModes).toEqual([false]);
+  } finally {
+    finishBody?.();
+    await listener.close(true);
+    await fixture.cleanup();
+  }
+});
+
+test("force close escalates a graceful body drain without claiming graceful completion", async () => {
+  const fixture = await certificateFixture();
+  let listenerFetch: ((request: Request) => Response | Promise<Response>) | undefined;
+  let finishBody: (() => void) | undefined;
+  const stopModes: boolean[] = [];
+  const listener = await createSelfhostV2WorkerEndpointHttpsListener({
+    configuration: { workerEndpointSuffix: suffix, port: 443 },
+    ...fixture,
+    routeDenies: async () => true,
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("held"));
+            let closed = false;
+            finishBody = () => {
+              if (closed) return;
+              closed = true;
+              controller.close();
+            };
+          },
+        }),
+      ),
+    factories: {
+      serve(options) {
+        listenerFetch = options.fetch;
+        return {
+          port: 443,
+          stop(force) {
+            stopModes.push(force ?? false);
+          },
+        };
+      },
+      async proveSni() {},
+    },
+  });
+  try {
+    if (!listenerFetch) throw new Error("listener fetch was not installed");
+    const response = await listenerFetch(
+      new Request(`https://${address.hostname}/force-shutdown`, {
+        headers: { host: address.hostname },
+      }),
+    );
+    const graceful = listener.close(false);
+    let settled = false;
+    void graceful.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+
+    expect(listener.close(true)).toBe(graceful);
+    await graceful;
+    expect(settled).toBe(true);
+    expect(stopModes).toEqual([false, true]);
+
+    const finish = finishBody;
+    finishBody = undefined;
+    finish?.();
+    await response.text();
+  } finally {
+    finishBody?.();
+    await listener.close(true);
+    await fixture.cleanup();
+  }
+});
+
 test("listener rejects noncanonical suffix and validates matching wildcard cert before binding", async () => {
   const fixture = await certificateFixture();
   const wrongWildcard = await certificateFixture("DNS:*.unrelated.example.test");
