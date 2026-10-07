@@ -4,6 +4,16 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bytesDigest } from "../src/json.ts";
+import type {
+  WorkerModuleInspectionInput,
+  WorkerModuleInspectionResult,
+} from "../src/providers/worker-module-semantic-inspection.ts";
+import type { SqlArtifactCustodyRead } from "../src/takoform-v2/forms/artifact-custody.ts";
+import {
+  parseWorkerBundleManifest,
+  validateWorkerBundlePayload,
+  type WorkerBundleManifest,
+} from "../src/takoform-v2/forms/worker-bundle.ts";
 import {
   parseWorkerDeploymentSpec,
   WORKER_DEPLOYMENT_FORM_URL,
@@ -99,7 +109,42 @@ async function fixture() {
   };
 }
 
-function staticPublicationState(workerResourceUid: string) {
+async function heldCodeBundle(): Promise<SqlArtifactCustodyRead<WorkerBundleManifest>> {
+  const manifestUrl = "https://artifacts.example.test/runtime/manifest.json";
+  const moduleUrl = "https://artifacts.example.test/runtime/index.mjs";
+  const moduleBytes = new TextEncoder().encode(
+    "export default { fetch() { return new Response('ok'); } };\n",
+  );
+  const moduleSha256 = (await bytesDigest(moduleBytes)).slice("sha256:".length);
+  const manifestBytes = new TextEncoder().encode(
+    JSON.stringify({
+      entrypoint: "index.mjs",
+      files: [
+        {
+          path: "index.mjs",
+          url: moduleUrl,
+          sha256: moduleSha256,
+          mediaType: "application/javascript+module",
+        },
+      ],
+    }),
+  );
+  const manifest = parseWorkerBundleManifest(manifestBytes);
+  const manifestSha256 = (await bytesDigest(manifestBytes)).slice("sha256:".length);
+  const verified = await validateWorkerBundlePayload({
+    spec: { artifact: { url: manifestUrl, sha256: manifestSha256 } },
+    manifestBytes,
+    fileBytes: [moduleBytes],
+  });
+  return {
+    manifest,
+    manifestBytes,
+    files: [moduleBytes],
+    observed: verified.observed as unknown as import("../src/ports.ts").JsonObject,
+  };
+}
+
+function staticPublicationState(workerResourceUid: string, withCode = false) {
   const assetBytes = new TextEncoder().encode("owner fixture asset");
   let lastOperationId: string | undefined;
   let fenceCurrent = true;
@@ -125,15 +170,22 @@ function staticPublicationState(workerResourceUid: string) {
       const parsed = parseWorkerDeploymentSpec(execution.spec);
       const versionUid = parsed.versions[0]?.workerVersion.resourceUid;
       if (!versionUid && execution.action !== "delete") throw new Error("version missing");
-      const spec = {
-        worker: { resourceUid: workerResourceUid },
-        handlers: [],
-        assets: {
-          bundle: { resourceUid: `assets-${execution.operationId}` },
-          runWorkerFirst: false,
-          notFoundHandling: "none",
-        },
-      };
+      const spec = withCode
+        ? {
+            worker: { resourceUid: workerResourceUid },
+            bundle: { resourceUid: `code-${execution.operationId}` },
+            handlers: ["fetch"],
+            vars: { SETTINGS: { label: "owner fixture" } },
+          }
+        : {
+            worker: { resourceUid: workerResourceUid },
+            handlers: [],
+            assets: {
+              bundle: { resourceUid: `assets-${execution.operationId}` },
+              runWorkerFirst: false,
+              notFoundHandling: "none",
+            },
+          };
       const fileSha256 = (await bytesDigest(assetBytes)).slice("sha256:".length);
       const manifest = {
         files: [
@@ -206,7 +258,10 @@ function staticPublicationState(workerResourceUid: string) {
           return fenceCurrent;
         },
         async readVersionMaterials() {
-          return { bundle: null, assets: heldAssets };
+          return {
+            bundle: withCode ? await heldCodeBundle() : null,
+            assets: withCode ? null : heldAssets,
+          };
         },
       } as V2WorkerPublicationResolution;
     },
@@ -540,6 +595,74 @@ test("one Worker update switches only its child, pins an open stream, and replay
       .execute(execution("worker-b", "c7b001f1-2fe7-42a2-aa33-e6fd8c97bd5e", "delete"))
       .catch(() => undefined);
     await ownerB.close().catch(() => undefined);
+    await owned.cleanup();
+  }
+});
+
+test("code incarnation retirement waits for its persisted grace deadline after response completion", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-code-grace";
+  const publication = staticPublicationState(workerUid, true);
+  const createId = "c06561c1-f4b3-4dcc-9aca-dfc7cfb80c71";
+  const updateId = "1fc775ab-3b7b-4a6d-93f1-1232fdbca648";
+  const deleteId = "e7b5b5c5-bd5e-4cec-aa14-6d6a8557815b";
+  let scheduled: { run: () => void; delayMs: number } | undefined;
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: join(owned.root, "owners"),
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+    inspectModule: async (
+      _input: WorkerModuleInspectionInput,
+    ): Promise<WorkerModuleInspectionResult> => ({
+      outcome: "valid",
+      exportedHandlers: ["fetch"],
+    }),
+    scheduleRetirement(run, delayMs) {
+      scheduled = { run, delayMs };
+      return () => {
+        scheduled = undefined;
+      };
+    },
+  });
+  try {
+    expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
+      kind: "confirmed",
+      deferRetirementUntilDeadline: true,
+    });
+    publication.setCurrent(createId);
+    const oldChild = owned.children[0];
+    if (!oldChild) throw new Error("initial code Worker child missing");
+
+    expect(
+      await (await owner.fetch(new Request(`https://${workerUid}.example.test/`))).text(),
+    ).toBeTruthy();
+    expect(await owner.execute(execution(workerUid, updateId, "update"))).toMatchObject({
+      kind: "confirmed",
+      deferRetirementUntilDeadline: true,
+    });
+    publication.setCurrent(updateId);
+
+    expect(oldChild.exitCode).toBeNull();
+    expect(oldChild.signalCode).toBeNull();
+    expect(scheduled?.delayMs).toBeGreaterThan(899_000);
+    expect(scheduled?.delayMs).toBeLessThanOrEqual(900_000);
+    const deadlineRetirement = scheduled?.run;
+    if (!deadlineRetirement) throw new Error("code retirement deadline was not scheduled");
+    deadlineRetirement();
+    await until(() => oldChild.exitCode !== null || oldChild.signalCode !== null);
+
+    expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
+      kind: "confirmed",
+      identity: null,
+    });
+    publication.setCurrent(deleteId);
+    await owner.close();
+  } finally {
+    await owner.close().catch(() => undefined);
     await owned.cleanup();
   }
 });

@@ -12,6 +12,7 @@ import {
   ASSETS_SOURCE,
   createWorkerdRuntime,
   DEPLOYMENT_ROUTER_SOURCE,
+  internalHostname,
   ROUTER_SOURCE,
   readWorkerdActiveDeployment,
   readWorkerdSelectedActiveVersion,
@@ -42,6 +43,26 @@ afterEach(() => {
 const MODULES = new Map([["index.js", new TextEncoder().encode("export default {}")]]);
 
 const HOST_ENTRYPOINT = "__takoserver-host.js";
+
+test("internal readiness hostnames retain safe legacy labels and alias long or DNS-invalid script names", () => {
+  expect(internalHostname("site-name")).toBe("site-name.selfhost-internal.invalid");
+
+  const longName = `v2-worker-${"a".repeat(64)}`;
+  const longAlias = internalHostname(longName);
+  const expectedDigest = createHash("sha256").update(longName, "utf8").digest("hex");
+  expect(longAlias).toBe(
+    `v2-${expectedDigest.slice(0, 32)}.${expectedDigest.slice(32)}.selfhost-internal.invalid`,
+  );
+  expect(longAlias.split(".").every((label) => label.length <= 63)).toBe(true);
+
+  for (const name of [`a${"_".repeat(126)}z`, "trailing-"]) {
+    const alias = internalHostname(name);
+    expect(alias).not.toBe(`${name}.selfhost-internal.invalid`);
+    expect(alias.split(".").every((label) => label.length <= 63)).toBe(true);
+  }
+  expect(internalHostname(longName)).toBe(longAlias);
+  expect(internalHostname(`${longName}b`)).not.toBe(longAlias);
+});
 
 function weightedPublication(
   name: string,

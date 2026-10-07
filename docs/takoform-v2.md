@@ -165,14 +165,15 @@ artifact identities. Each file is at most 16 MiB and the aggregate is at most
 128 MiB. The Host records only the validated bundle projection and held bytes;
 it does not execute the Worker or create a data-plane endpoint.
 
-The internal `worker-code-runtime.ts` projection is a building block for a
-future code-bearing Worker path. It accepts already-authorized held bundle
-bytes and a trusted semantic inspector, then projects module bytes, media
-types, fetch-handler identity and JSON `vars` to the Workerd graph. It invokes
-inspection on that same owned snapshot. It does not
-register a Worker Form or execute/publish a Worker. Bindings, private inputs,
-assets and scheduled/queue delivery remain explicit internal refusals; this
-projection is not evidence of Form support or native qualification.
+The internal `worker-code-runtime.ts` projection accepts already-authorized
+held bundle bytes and a trusted semantic inspector, then projects module bytes,
+media types, fetch-handler identity and JSON `vars` to the existing Workerd
+version-graph compiler. The compiler adds the Host-owned readiness wrapper; the
+shared Deployment publisher can stage the resulting code graph alongside
+static-only Versions. It invokes inspection on the same owned snapshot. This is
+an internal publication building block, not Worker Form registration or support.
+Bindings, private inputs, assets and scheduled/queue delivery remain explicit
+internal refusals, and this portable path is not native qualification.
 
 The published ModuleWorker 0.3 text describes auxiliary source maps but does
 not name their MIME token, while WorkerBundle 0.2 defers its closed media-type
@@ -342,26 +343,39 @@ serving, mixed-version dispatch, service Bindings and native restart recovery
 still need that separate qualification. Static-only support is one implementation
 path within WorkerVersion, not grounds to advertise the whole Form as supported.
 
-The internal static publication port connects an accepted Deployment Operation
+The internal mixed publication port connects an accepted Deployment Operation
 to this runtime: it resolves the sealed SQL graph, reads held Version assets,
-and publishes one complete weighted selection under the existing activation
-lock. A new operation can replace the same Worker's prior publication after
+projects currently supported fetch+JSON-vars code graphs, and publishes one
+complete weighted selection under the existing activation lock. A new operation
+can replace the same Worker's prior publication after
 its incumbent Operation is checked in SQL. Read-only recovery compares the
 complete serving identity and never republishes on missing or uncertain proof.
 
 This port returns publication evidence, not a Form backend result. In particular,
 `confirmed(null)` proves publication absence, not completed Deployment deletion.
 The Form backend must also prove invocation cancellation, physical child retirement
-and old-owner fencing before settling DELETE. Updates must retain the old Version's
-invocation ownership until retirement permits Version deletion. The port neither
-creates another lifecycle ledger nor implements that missing retirement path.
+and old-owner fencing before settling DELETE. The owner receipt is per complete
+Deployment incarnation, not per Version; it does not prove one Version absent
+across all active/draining generations. The port neither creates another lifecycle
+ledger nor treats whole-group retirement as per-Version deletion proof.
 
-The self-host `WorkerdWorkerRuntimeOwner` connects this static publication port
+The self-host `WorkerdWorkerRuntimeOwner` connects this publication port
 to separate, immutable child incarnations for one Worker UID. Its local fetch
 dispatcher switches to the confirmed incarnation while existing HTTP response
-bodies retain their old owner. It schedules old-child retirement when those
-bodies finish or the 15-minute drain deadline is reached. A different Worker
-UID has a different process owner and is not stopped by that transition.
+bodies retain their old owner. Static-only old children may retire when those
+bodies finish; code-bearing old children are retained through the 15-minute
+deadline because the current owner has no `waitUntil` settlement witness.
+Deadline retirement cancels tracked HTTP requests and requires physical child
+exit plus listener-vacancy receipt. This is scheduler-policy evidence only;
+native `waitUntil` continuation/settlement is not tested here. A different
+Worker UID has a different process owner and is not stopped by that transition.
+
+The private internal readiness hostname preserves its legacy spelling for
+DNS-safe script labels. For accepted script names that are too long or contain
+non-DNS label characters, a full-SHA-256 two-label alias is used by both the
+renderer and readiness compiler. This changes neither script/path identity nor
+Worker UID or Endpoint hostname. It does not adopt a previously running child:
+an owner restart still requires the existing exact retirement/recovery proof.
 
 On DELETE, the owner durably closes its own admission path, cancels tracked
 requests and response readers, and requires an exact retirement receipt for

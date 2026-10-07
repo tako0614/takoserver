@@ -2,12 +2,17 @@ import { bytesDigest, canonicalJson } from "../json.ts";
 import { canonicalSelfhostWeightedVersions } from "../selfhost-weighted-deployment.ts";
 import type {
   WorkerdDeploymentPublication,
+  WorkerdDeploymentVariant,
   WorkerdPublicationIdentity,
   WorkerdRuntime,
+  WorkerdSite,
   WorkerdStaticSite,
 } from "../workerd-runtime.ts";
-import { WORKER_DEPLOYMENT_FORM_URL } from "./forms/worker-specs.ts";
+import { internalHostname } from "../workerd-runtime.ts";
+import { compileWorkerdVersionGraph } from "../workerd-version-graph.ts";
+import { parseWorkerVersionSpec, WORKER_DEPLOYMENT_FORM_URL } from "./forms/worker-specs.ts";
 import type { V2Execution } from "./types.ts";
+import { projectV2WorkerCodeVersion } from "./worker-code-runtime.ts";
 import type { V2WorkerPublicationResolution } from "./worker-publication-state.ts";
 import { projectV2StaticWorkerVersion } from "./worker-static-runtime.ts";
 
@@ -21,28 +26,35 @@ type PublicationState = {
   }): Promise<V2WorkerPublicationResolution>;
 };
 
-type StaticRuntime = Pick<
-  WorkerdRuntime<WorkerdStaticSite>,
-  "publishFenced" | "observeExactPublication"
+type WorkerRuntime = Pick<
+  WorkerdRuntime<WorkerdSite | WorkerdStaticSite>,
+  "inspectModule" | "publishFenced" | "observeExactPublication"
 >;
 
 type Candidate = {
   readonly name: string;
   readonly identity: WorkerdPublicationIdentity | null;
-  readonly publication: WorkerdDeploymentPublication<WorkerdStaticSite> | null;
+  readonly publication: WorkerdDeploymentPublication<WorkerdSite | WorkerdStaticSite> | null;
+  readonly deferRetirementUntilDeadline: boolean;
 };
 
 /** Exact serving-publication evidence, deliberately separate from Form settlement. */
-export type V2StaticWorkerPublicationResult =
-  | { readonly kind: "confirmed"; readonly identity: WorkerdPublicationIdentity | null }
+export type V2WorkerPublicationResult =
+  | {
+      readonly kind: "confirmed";
+      readonly identity: WorkerdPublicationIdentity;
+      /** Code may keep ctx.waitUntil work alive after its HTTP response body ends. */
+      readonly deferRetirementUntilDeadline: boolean;
+    }
+  | { readonly kind: "confirmed"; readonly identity: null }
   /** This invocation did not dispatch a runtime write; it proves no prior effect absent. */
   | { readonly kind: "not_dispatched"; readonly code: string }
   | { readonly kind: "unknown" };
 
-export interface V2StaticWorkerPublication {
-  publish(execution: V2Execution): Promise<V2StaticWorkerPublicationResult>;
+export interface V2WorkerPublication {
+  publish(execution: V2Execution): Promise<V2WorkerPublicationResult>;
   /** Read-only exact serving check for an accepted Operation. */
-  observe(execution: V2Execution): Promise<V2StaticWorkerPublicationResult>;
+  observe(execution: V2Execution): Promise<V2WorkerPublicationResult>;
 }
 
 function parseOperationMarker(generation: string): string | null {
@@ -82,7 +94,7 @@ function isCurrentIdentityShape(identity: WorkerdPublicationIdentity): boolean {
 }
 
 function expectedIdentity(
-  publication: WorkerdDeploymentPublication<WorkerdStaticSite> | null,
+  publication: WorkerdDeploymentPublication<WorkerdSite | WorkerdStaticSite> | null,
 ): WorkerdPublicationIdentity | null {
   if (publication === null) return null;
   return {
@@ -108,25 +120,27 @@ function exactIdentity(
   );
 }
 
-function notDispatched(code: string): V2StaticWorkerPublicationResult {
+function notDispatched(code: string): V2WorkerPublicationResult {
   return { kind: "not_dispatched", code };
 }
 
-function unknownResult(): V2StaticWorkerPublicationResult {
+function unknownResult(): V2WorkerPublicationResult {
   return { kind: "unknown" };
 }
 
 /**
- * Internal publication proof for accepted, static-only v2 Worker Deployments.
+ * Internal publication proof for accepted v2 Worker Deployments containing
+ * static-only or currently supported fetch+vars code Versions.
  * A Form backend must combine it with the Form's complete lifecycle before
  * settling its Operation; this port proves publication only.
  */
-export function createV2StaticWorkerPublication(options: {
+export function createV2WorkerPublication(options: {
   readonly targetKey: string;
   readonly publicationState: PublicationState;
-  readonly runtime: StaticRuntime;
-}): V2StaticWorkerPublication {
+  readonly runtime: WorkerRuntime;
+}): V2WorkerPublication {
   if (!options.targetKey) throw new TypeError("targetKey is required");
+  const inspectModule = options.runtime.inspectModule;
 
   async function candidate(
     execution: V2Execution,
@@ -134,38 +148,93 @@ export function createV2StaticWorkerPublication(options: {
   ): Promise<Candidate> {
     const snapshot = resolution.snapshot;
     const name = await scriptName(snapshot.worker.uid);
-    if (!snapshot.deployment) return { name, identity: null, publication: null };
+    if (!snapshot.deployment) {
+      return {
+        name,
+        identity: null,
+        publication: null,
+        deferRetirementUntilDeadline: false,
+      };
+    }
 
     const generation = `${OPERATION_MARKER}${execution.operationId}`;
-    const versions = [];
+    const versions: WorkerdDeploymentVariant<WorkerdSite | WorkerdStaticSite>[] = [];
+    let deferRetirementUntilDeadline = false;
     for (const version of snapshot.deployment.versions) {
       const versionSeed = `${version.uid}\u0000${version.generation}`;
       const versionDigest = await bytesDigest(new TextEncoder().encode(versionSeed));
       const materials = await resolution.readVersionMaterials(version.uid);
-      const projection = await projectV2StaticWorkerVersion({
-        identity: {
-          versionId: `v2-${versionDigest.slice("sha256:".length)}`,
-          workerVersionUid: version.uid,
-          weight: version.weight,
-          workerResourceUid: snapshot.worker.uid,
-          generation,
+      const identity = {
+        versionId: `v2-${versionDigest.slice("sha256:".length)}`,
+        workerVersionUid: version.uid,
+        weight: version.weight,
+        workerResourceUid: snapshot.worker.uid,
+        generation,
+        directory: name,
+        // Version variants are private and hostname-free. The outer logical
+        // Worker publication owns the active Endpoint route.
+        hostnames: [],
+      };
+      let projection: WorkerdDeploymentVariant<WorkerdSite | WorkerdStaticSite>;
+      const versionSpec = parseWorkerVersionSpec(version.spec);
+      if (versionSpec.bundle) {
+        const codeProjection = await projectV2WorkerCodeVersion({
+          identity: {
+            ...identity,
+            bundleResourceUid: versionSpec.bundle.resourceUid,
+          },
+          spec: versionSpec,
+          bundle: materials.bundle,
+          inspectModule,
+        });
+        const graph = compileWorkerdVersionGraph({
           directory: name,
-          // Version variants are private and hostname-free. The outer logical
-          // Worker publication owns the active Endpoint route.
+          mainModule: codeProjection.site.mainModule,
+          modules: codeProjection.modules,
+          moduleMediaTypes: codeProjection.site.moduleMediaTypes ?? {},
+          environment: (codeProjection.site.vars ?? []).map((binding) => ({
+            name: binding.name,
+            value: binding.value,
+            type: "json" as const,
+          })),
+          serviceBindings: [],
           hostnames: [],
-        },
-        spec: version.spec,
-        materials,
-      });
+          generation,
+          workerResourceUid: snapshot.worker.uid,
+          declaredHandlers: versionSpec.handlers,
+          readiness: {
+            publication: codeProjection.versionId,
+            probeHostname: internalHostname(name),
+          },
+        });
+        projection = {
+          versionId: codeProjection.versionId,
+          workerVersionUid: codeProjection.workerVersionUid,
+          weight: codeProjection.weight,
+          ...graph,
+        };
+        deferRetirementUntilDeadline = true;
+      } else {
+        projection = await projectV2StaticWorkerVersion({
+          identity,
+          spec: versionSpec,
+          materials,
+        });
+      }
       versions.push(projection);
     }
-    const publication: WorkerdDeploymentPublication<WorkerdStaticSite> = {
+    const publication: WorkerdDeploymentPublication<WorkerdSite | WorkerdStaticSite> = {
       generation,
       workerResourceUid: snapshot.worker.uid,
       hostnames: snapshot.endpoint ? [snapshot.endpoint.output.hostname] : [],
       versions,
     };
-    return { name, identity: expectedIdentity(publication), publication };
+    return {
+      name,
+      identity: expectedIdentity(publication),
+      publication,
+      deferRetirementUntilDeadline,
+    };
   }
 
   async function resolveInitial(execution: V2Execution) {
@@ -175,7 +244,7 @@ export function createV2StaticWorkerPublication(options: {
   async function resultFromReadback(
     candidateValue: Candidate,
     resolution: Extract<V2WorkerPublicationResolution, { kind: "ready" }>,
-  ): Promise<V2StaticWorkerPublicationResult> {
+  ): Promise<V2WorkerPublicationResult> {
     const observe = options.runtime.observeExactPublication;
     if (!observe) return unknownResult();
     let proof: "matches" | "different" | "unknown";
@@ -185,7 +254,12 @@ export function createV2StaticWorkerPublication(options: {
       return unknownResult();
     }
     if (proof !== "matches" || !(await resolution.stillCurrent())) return unknownResult();
-    return { kind: "confirmed", identity: candidateValue.identity };
+    if (candidateValue.identity === null) return { kind: "confirmed", identity: null };
+    return {
+      kind: "confirmed",
+      identity: candidateValue.identity,
+      deferRetirementUntilDeadline: candidateValue.deferRetirementUntilDeadline,
+    };
   }
 
   return {
