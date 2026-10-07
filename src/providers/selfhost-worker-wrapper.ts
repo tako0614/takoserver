@@ -514,6 +514,7 @@ export const ${SELFHOST_WORKER_EVENT_ENTRYPOINT} = SafeApply(SafeObjectFreeze, S
   SafeURL,
   SafeHeadersGet,
   SafeCryptoRandomUUID,
+  SafeConsole,
   SafeConsoleError,
   SafeRequestText,
   SafeRequestUrlGet,
@@ -1325,7 +1326,7 @@ async function invokeV2Queue(event, rawEnv, rawContext) {
     catch {
       // The tenant's error text may contain secrets or capabilities. Record a
       // bounded Host-owned diagnostic without reflecting the rejected value.
-      try { SafeApply(SafeConsoleError, console, ["self-host v2 Queue waitUntil rejected", index]); }
+      try { SafeApply(SafeConsoleError, SafeConsole, ["self-host v2 Queue waitUntil rejected", index]); }
       catch { /* diagnostics never make a settled message undecidable */ }
     }
   }

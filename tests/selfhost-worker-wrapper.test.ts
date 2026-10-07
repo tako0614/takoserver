@@ -540,14 +540,16 @@ test("v2 caught waitUntil registration failure cannot certify handler completion
 
 test("v2 rejected waitUntil records a bounded Host diagnostic without tenant error text", async () => {
   const lines: unknown[][] = [];
-  const originalError = console.error;
-  let generated: Awaited<ReturnType<typeof loadGenerated>>;
+  const originalConsole = console;
+  const originalError = originalConsole.error;
+  let generated: Awaited<ReturnType<typeof loadGenerated>> | undefined;
   try {
-    console.error = (...values: unknown[]) => {
+    originalConsole.error = (...values: unknown[]) => {
       lines.push(values);
     };
     generated = await loadGenerated(
-      `export default { async queue(_batch, _env, ctx) {
+      `globalThis.console = null;
+      export default { async queue(_batch, _env, ctx) {
         ctx.waitUntil(Promise.reject(new Error("tenant-private-error-text")));
       } };`,
       {
@@ -560,10 +562,6 @@ test("v2 rejected waitUntil records a bounded Host diagnostic without tenant err
         v2Queue: true,
       },
     );
-  } finally {
-    console.error = originalError;
-  }
-  try {
     const response = await generated.eventEntrypoint?.fetch(
       v2QueueRequest(["message-1"]),
       {
@@ -579,11 +577,14 @@ test("v2 rejected waitUntil records a bounded Host diagnostic without tenant err
         },
       },
     );
+    (globalThis as { console: Console }).console = originalConsole;
     expect(response?.status).toBe(200);
     expect(lines).toEqual([["self-host v2 Queue waitUntil rejected", 0]]);
     expect(JSON.stringify(lines)).not.toContain("tenant-private-error-text");
   } finally {
-    await generated.dispose();
+    (globalThis as { console: Console }).console = originalConsole;
+    originalConsole.error = originalError;
+    await generated?.dispose();
   }
 });
 
