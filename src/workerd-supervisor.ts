@@ -100,6 +100,12 @@ export function findWorkerd(repositoryRoot: string): string | null {
 export function createWorkerdSupervisor(options: {
   readonly binary: string | null;
   readonly spawn: (command: readonly string[]) => WorkerdProcess;
+  /**
+   * Persist the exact spawned child identity before readiness can admit it.
+   * If this fails, startup is refused and the child remains under the
+   * supervisor's retirement custody; automatic restart is not scheduled.
+   */
+  readonly onSpawned?: (child: WorkerdProcess) => Promise<void> | void;
   readonly listenerPort?: number;
   /** Kernel listener ownership; injectable only at the OS observation boundary. */
   readonly listenerOwnership?: typeof workerPortOwnership;
@@ -321,6 +327,11 @@ export function createWorkerdSupervisor(options: {
       };
       running = entry;
       observeExit(entry);
+
+      await options.onSpawned?.(child);
+      if (running !== entry || shutdownRequested || nextEpoch !== epoch) {
+        throw new Error("workerd runtime startup was cancelled");
+      }
 
       const ready = await awaitReadiness(entry);
       if (!ready) {
