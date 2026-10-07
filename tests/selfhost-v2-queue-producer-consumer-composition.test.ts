@@ -87,22 +87,35 @@ test.skipIf(binary === undefined)(
       const targetKey = "normal-v2-producer-consumer";
       const moduleUrl = "https://artifacts.example.test/connected-queue/app.mjs";
       const manifestUrl = "https://artifacts.example.test/connected-queue/manifest.json";
-      const moduleBytes = new TextEncoder().encode(`export default {
+      const moduleBytes = new TextEncoder().encode(`let releaseHold = null;
+export default {
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     try {
+      if (path === "/release") {
+        const release = releaseHold;
+        releaseHold = null;
+        if (release) release();
+        return Response.json({ released: !!release });
+      }
       if (path === "/batch") {
         const first = await env.TASKS.send("first");
         const rest = await env.TASKS.sendBatch([{ body: "second" }, { body: "third" }]);
         return Response.json({ first, rest, keys: Object.keys(env) });
       }
-      const id = await env.TASKS.send(path === "/retry" ? "retry" : "after-update");
+      const id = await env.TASKS.send(path === "/retry" ? "retry" : path === "/hold" ? "hold" : "after-update");
       return Response.json({ id });
     } catch (error) { return Response.json({ error: error.name }); }
   },
-  async queue(batch) {
+  async queue(batch, env, ctx) {
     if (new TextDecoder().decode(batch.messages[0].body) === "retry" &&
         batch.messages[0].attempts === 1) throw new Error("retry once");
+    if (new TextDecoder().decode(batch.messages[0].body) === "hold") {
+      ctx.waitUntil(new Promise((resolve) => {
+        const fallback = setTimeout(resolve, 5000);
+        releaseHold = () => { clearTimeout(fallback); resolve(); };
+      }));
+    }
     await batch.acknowledgeAll();
   }
 };`);
@@ -389,6 +402,35 @@ test.skipIf(binary === undefined)(
           [afterUpdateBody.id],
         ),
       ).toEqual([{ generation: 2, state: "settled" }]);
+      const held = await owner.fetch(new Request(`${origin}/hold`));
+      const heldBody = (await held.json()) as { id: string };
+      expect(typeof heldBody.id).toBe("string");
+      expect(await scheduler.tick()).toBe(1);
+      let acknowledgedWhileExecuting = false;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const receipt = await sql.query(
+          "SELECT state FROM queue_v2_batch_settlements WHERE message_id = ?",
+          [heldBody.id],
+        );
+        const execution = await sql.query(
+          "SELECT state FROM queue_v2_batch_executions ORDER BY rowid DESC LIMIT 1",
+        );
+        if (receipt[0]?.state === "settled" && execution[0]?.state === "send_authorized") {
+          acknowledgedWhileExecuting = true;
+          break;
+        }
+        await Bun.sleep(10);
+      }
+      expect(acknowledgedWhileExecuting).toBe(true);
+      await scheduler.close();
+      expect(await scheduler.tick()).toBe(0);
+      expect(
+        await sql.query("SELECT state FROM queue_v2_batch_executions ORDER BY rowid DESC LIMIT 1"),
+      ).toEqual([{ state: "send_authorized" }]);
+      const released = await owner.fetch(new Request(`${origin}/release`));
+      expect(released.status).toBe(200);
+      expect(await released.json()).toEqual({ released: true });
+      await waitForDrained(0);
       await remove(consumerUid, "consumer", 2);
       expect(await queue.deliverOnce(scope)).toEqual({ kind: "unknown" });
       expect(await scheduler.tick()).toBe(0);
