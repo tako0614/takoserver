@@ -146,7 +146,7 @@ export interface WorkerdActorForward {
 }
 
 /** Unpublished Host-only Workflow forward projection from one immutable V10 snapshot. */
-export interface WorkerdWorkflowForwardBinding {
+export interface WorkerdLegacyWorkflowForwardBinding {
   readonly publicName: string;
   readonly serviceName: string;
   readonly tenantId: string;
@@ -158,11 +158,30 @@ export interface WorkerdWorkflowForwardBinding {
   readonly token: string;
 }
 
-export interface WorkerdWorkflowForward {
-  readonly schema: "takoserver.selfhost-workflow-binding-forward@v1";
-  readonly snapshotDigest: `sha256:${string}`;
-  readonly bindings: readonly WorkerdWorkflowForwardBinding[];
+/** Internal v2 SQL-authorized Workflow grant, without legacy digest FormRefs. */
+export interface WorkerdV2WorkflowForwardBinding {
+  readonly publicName: string;
+  readonly serviceName: string;
+  readonly tenantId: string;
+  readonly workflowResourceUid: string;
+  readonly token: string;
 }
+
+export type WorkerdWorkflowForwardBinding =
+  | WorkerdLegacyWorkflowForwardBinding
+  | WorkerdV2WorkflowForwardBinding;
+
+export type WorkerdWorkflowForward =
+  | {
+      readonly schema: "takoserver.selfhost-workflow-binding-forward@v1";
+      readonly snapshotDigest: `sha256:${string}`;
+      readonly bindings: readonly WorkerdLegacyWorkflowForwardBinding[];
+    }
+  | {
+      readonly schema: "takoserver.v2-workflow-binding-forward@1";
+      readonly snapshotDigest: `sha256:${string}`;
+      readonly bindings: readonly WorkerdV2WorkflowForwardBinding[];
+    };
 
 /** One immutable Workflow binding projection requested by the current graph. */
 export interface WorkerdWorkflowForwardPublication {
@@ -2432,6 +2451,7 @@ const ACTOR_FORWARD_SCHEMA = "takoserver.selfhost-actor-forward@v1" as const;
 const ACTOR_FORWARD_PUBLIC_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
 const ACTOR_FORWARD_TOKEN = /^[a-f0-9]{64}$/u;
 const WORKFLOW_FORWARD_SCHEMA = "takoserver.selfhost-workflow-binding-forward@v1" as const;
+const V2_WORKFLOW_FORWARD_SCHEMA = "takoserver.v2-workflow-binding-forward@1" as const;
 const WORKFLOW_FORWARD_PUBLIC_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
 const WORKFLOW_FORWARD_SERVICE_NAME = /^__TAKOSERVER_WORKFLOW_BINDING_[0-9]{5}$/u;
 const WORKFLOW_FORWARD_TOKEN = /^[a-f0-9]{64}$/u;
@@ -2626,7 +2646,7 @@ function validWorkflowForwardBinding(
   value: unknown,
   index: number,
   v2PrivateNames = false,
-): WorkerdWorkflowForwardBinding {
+): WorkerdLegacyWorkflowForwardBinding {
   const keys =
     "bindingRef,publicName,runtimeClassRef,serviceName,tenantId,token,workflowFormRef,workflowResourceUid";
   if (
@@ -2637,7 +2657,7 @@ function validWorkflowForwardBinding(
   ) {
     throw new Error("unusable Workflow forward graph");
   }
-  const binding = value as WorkerdWorkflowForwardBinding;
+  const binding = value as WorkerdLegacyWorkflowForwardBinding;
   if (
     typeof binding.publicName !== "string" ||
     !WORKFLOW_FORWARD_PUBLIC_NAME.test(binding.publicName) ||
@@ -2681,6 +2701,35 @@ function validWorkflowForwardBinding(
   };
 }
 
+function validV2WorkflowForwardBinding(
+  value: unknown,
+  index: number,
+): WorkerdV2WorkflowForwardBinding {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.keys(value).sort().join(",") !==
+      "publicName,serviceName,tenantId,token,workflowResourceUid"
+  )
+    throw new Error("unusable v2 Workflow forward graph");
+  const binding = value as WorkerdV2WorkflowForwardBinding;
+  if (
+    typeof binding.publicName !== "string" ||
+    !WORKFLOW_FORWARD_PUBLIC_NAME.test(binding.publicName) ||
+    binding.serviceName !== workflowForwardServiceName(index, true) ||
+    typeof binding.tenantId !== "string" ||
+    binding.tenantId.length === 0 ||
+    binding.tenantId.includes("\u0000") ||
+    typeof binding.workflowResourceUid !== "string" ||
+    !RESOURCE_UID.test(binding.workflowResourceUid) ||
+    typeof binding.token !== "string" ||
+    !WORKFLOW_FORWARD_TOKEN.test(binding.token)
+  )
+    throw new Error("unusable v2 Workflow forward graph");
+  return { ...binding };
+}
+
 function validWorkflowForward(value: unknown, v2PrivateNames = false): WorkerdWorkflowForward {
   if (
     typeof value !== "object" ||
@@ -2692,7 +2741,9 @@ function validWorkflowForward(value: unknown, v2PrivateNames = false): WorkerdWo
   }
   const candidate = value as WorkerdWorkflowForward;
   if (
-    candidate.schema !== WORKFLOW_FORWARD_SCHEMA ||
+    (candidate.schema !== WORKFLOW_FORWARD_SCHEMA &&
+      candidate.schema !== V2_WORKFLOW_FORWARD_SCHEMA) ||
+    (candidate.schema === V2_WORKFLOW_FORWARD_SCHEMA && !v2PrivateNames) ||
     typeof candidate.snapshotDigest !== "string" ||
     !/^sha256:[a-f0-9]{64}$/u.test(candidate.snapshotDigest) ||
     !Array.isArray(candidate.bindings) ||
@@ -2702,22 +2753,43 @@ function validWorkflowForward(value: unknown, v2PrivateNames = false): WorkerdWo
     throw new Error("unusable Workflow forward graph");
   }
   const names = new Set<string>();
-  const bindings = candidate.bindings.map((binding, index) => {
-    const normalized = validWorkflowForwardBinding(binding, index, v2PrivateNames);
-    if (names.has(normalized.publicName)) throw new Error("unusable Workflow forward graph");
-    names.add(normalized.publicName);
-    capnpText(normalized.publicName);
-    capnpText(normalized.serviceName);
-    return normalized;
-  });
-  return {
-    schema: WORKFLOW_FORWARD_SCHEMA,
-    snapshotDigest: candidate.snapshotDigest,
-    bindings,
-  };
+  const check = <T extends WorkerdWorkflowForwardBinding>(bindings: readonly T[]): readonly T[] =>
+    bindings.map((binding) => {
+      if (names.has(binding.publicName)) throw new Error("unusable Workflow forward graph");
+      names.add(binding.publicName);
+      capnpText(binding.publicName);
+      capnpText(binding.serviceName);
+      return binding;
+    });
+  if (candidate.schema === V2_WORKFLOW_FORWARD_SCHEMA) {
+    const bindings = check(
+      candidate.bindings.map((binding, index) => validV2WorkflowForwardBinding(binding, index)),
+    );
+    return {
+      schema: V2_WORKFLOW_FORWARD_SCHEMA,
+      snapshotDigest: candidate.snapshotDigest,
+      bindings,
+    };
+  }
+  const bindings = check(
+    candidate.bindings.map((binding, index) =>
+      validWorkflowForwardBinding(binding, index, v2PrivateNames),
+    ),
+  );
+  return { schema: WORKFLOW_FORWARD_SCHEMA, snapshotDigest: candidate.snapshotDigest, bindings };
 }
 
 function workflowForwardBindingIdentity(binding: WorkerdWorkflowForwardBinding): string {
+  if (!("workflowFormRef" in binding)) {
+    return JSON.stringify([
+      V2_WORKFLOW_FORWARD_SCHEMA,
+      binding.publicName,
+      binding.serviceName,
+      binding.tenantId,
+      binding.workflowResourceUid,
+      binding.token,
+    ]);
+  }
   return JSON.stringify([
     binding.publicName,
     binding.serviceName,
@@ -2790,12 +2862,15 @@ function copyWorkflowForwardSockets(
     if (!binding) return socket as unknown as WorkerdWorkflowForwardSocket;
     return {
       ...socket,
-      binding: {
-        ...binding,
-        workflowFormRef: copyWorkflowForwardValue(binding.workflowFormRef),
-        bindingRef: copyWorkflowForwardValue(binding.bindingRef),
-        runtimeClassRef: copyWorkflowForwardValue(binding.runtimeClassRef),
-      },
+      binding:
+        "workflowFormRef" in binding
+          ? {
+              ...binding,
+              workflowFormRef: copyWorkflowForwardValue(binding.workflowFormRef),
+              bindingRef: copyWorkflowForwardValue(binding.bindingRef),
+              runtimeClassRef: copyWorkflowForwardValue(binding.runtimeClassRef),
+            }
+          : { ...binding },
     } as unknown as WorkerdWorkflowForwardSocket;
   });
 }
@@ -2807,6 +2882,26 @@ function copyOwnRecord(value: unknown): Record<string, unknown> | undefined {
 
 function copyWorkflowForwardValue(value: unknown): unknown {
   return copyOwnRecord(value) ?? value;
+}
+
+function copyWorkflowForward(value: WorkerdWorkflowForward): WorkerdWorkflowForward {
+  if (value.schema === V2_WORKFLOW_FORWARD_SCHEMA) {
+    return {
+      schema: V2_WORKFLOW_FORWARD_SCHEMA,
+      snapshotDigest: value.snapshotDigest,
+      bindings: value.bindings.map((binding) => ({ ...binding })),
+    };
+  }
+  return {
+    schema: WORKFLOW_FORWARD_SCHEMA,
+    snapshotDigest: value.snapshotDigest,
+    bindings: value.bindings.map((binding) => ({
+      ...binding,
+      workflowFormRef: { ...binding.workflowFormRef },
+      bindingRef: { ...binding.bindingRef },
+      runtimeClassRef: { ...binding.runtimeClassRef },
+    })),
+  };
 }
 
 interface ResolvedWorkflowForwardService {
@@ -2848,12 +2943,16 @@ function workflowForwardPublications(
       );
       const bindings = Object.freeze(
         forward.bindings.map((binding) =>
-          Object.freeze({
-            ...binding,
-            workflowFormRef: Object.freeze({ ...binding.workflowFormRef }),
-            bindingRef: Object.freeze({ ...binding.bindingRef }),
-            runtimeClassRef: Object.freeze({ ...binding.runtimeClassRef }),
-          }),
+          Object.freeze(
+            "workflowFormRef" in binding
+              ? {
+                  ...binding,
+                  workflowFormRef: Object.freeze({ ...binding.workflowFormRef }),
+                  bindingRef: Object.freeze({ ...binding.bindingRef }),
+                  runtimeClassRef: Object.freeze({ ...binding.runtimeClassRef }),
+                }
+              : { ...binding },
+          ),
         ),
       );
       publications.push(
@@ -2905,12 +3004,16 @@ function workflowForwardPublicationsForInput(
     );
     const bindings = Object.freeze(
       forward.bindings.map((binding) =>
-        Object.freeze({
-          ...binding,
-          workflowFormRef: Object.freeze({ ...binding.workflowFormRef }),
-          bindingRef: Object.freeze({ ...binding.bindingRef }),
-          runtimeClassRef: Object.freeze({ ...binding.runtimeClassRef }),
-        }),
+        Object.freeze(
+          "workflowFormRef" in binding
+            ? {
+                ...binding,
+                workflowFormRef: Object.freeze({ ...binding.workflowFormRef }),
+                bindingRef: Object.freeze({ ...binding.bindingRef }),
+                runtimeClassRef: Object.freeze({ ...binding.runtimeClassRef }),
+              }
+            : { ...binding },
+        ),
       ),
     );
     result.push(
@@ -2990,15 +3093,23 @@ function validateWorkflowForwardSockets(
     ) {
       throw new Error("unusable Workflow forward socket graph");
     }
-    const binding = validWorkflowForwardBinding(
-      value.binding,
-      workerdV2PrivateWorkflowBindingIndex(value.binding.serviceName) ??
-        Number.parseInt(
-          value.binding.serviceName.slice("__TAKOSERVER_WORKFLOW_BINDING_".length),
-          10,
-        ),
-      isWorkerdV2PrivateWorkflowBindingName(value.binding.serviceName),
-    );
+    const v2Index = workerdV2PrivateWorkflowBindingIndex(value.binding.serviceName);
+    const binding =
+      v2Index !== null &&
+      typeof value.binding === "object" &&
+      value.binding !== null &&
+      Object.keys(value.binding).sort().join(",") ===
+        "publicName,serviceName,tenantId,token,workflowResourceUid"
+        ? validV2WorkflowForwardBinding(value.binding, v2Index)
+        : validWorkflowForwardBinding(
+            value.binding,
+            v2Index ??
+              Number.parseInt(
+                value.binding.serviceName.slice("__TAKOSERVER_WORKFLOW_BINDING_".length),
+                10,
+              ),
+            v2Index !== null,
+          );
     const identity = workflowForwardSocketIdentity({ ...value, binding });
     if (!identities.has(identity) || resolved.has(identity)) {
       throw new Error("Workflow forward Host socket unavailable");
@@ -5080,18 +5191,7 @@ export async function readWorkerdSelectedActiveVersion(
               }),
           ...(manifest.workflowForward === undefined
             ? {}
-            : {
-                workflowForward: {
-                  schema: manifest.workflowForward.schema,
-                  snapshotDigest: manifest.workflowForward.snapshotDigest,
-                  bindings: manifest.workflowForward.bindings.map((binding) => ({
-                    ...binding,
-                    workflowFormRef: { ...binding.workflowFormRef },
-                    bindingRef: { ...binding.bindingRef },
-                    runtimeClassRef: { ...binding.runtimeClassRef },
-                  })),
-                },
-              }),
+            : { workflowForward: copyWorkflowForward(manifest.workflowForward) }),
           ...(manifest.assets === undefined
             ? {}
             : {
