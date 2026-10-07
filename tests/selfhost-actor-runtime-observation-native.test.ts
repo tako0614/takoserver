@@ -277,16 +277,23 @@ export class Counter extends Base {
         ),
       ).toEqual({ kind: "unknown" });
       await unlink(childPidFile);
-      const warmed = await host.warmNamespaceForAcceptedOperation(
-        scope,
-        {
-          graph: warmGraph,
-          realization: warmRealization,
-          expected: warmExpected,
-          stillAuthorized: async () => ownOperationBusy,
-        },
+      const mutableScope = { ...scope };
+      const mutableCandidate = {
+        graph: structuredClone(warmGraph),
+        realization: structuredClone(warmRealization),
+        expected: structuredClone(warmExpected),
+        // The backend's held predicate attests A, not later caller mutation B.
+        stillAuthorized: async () => ownOperationBusy && warmGraph.className === "Counter",
+      };
+      const pendingWarm = host.warmNamespaceForAcceptedOperation(
+        mutableScope,
+        mutableCandidate,
         AbortSignal.timeout(10_000),
       );
+      mutableScope.tenantId = "foreign-tenant";
+      Object.assign(mutableCandidate.graph, { className: "ForeignActor" });
+      mutableCandidate.expected.className = "ForeignActor";
+      const warmed = await pendingWarm;
       expect(warmed).toMatchObject({
         kind: "confirmed",
         activeActorCount: 0,

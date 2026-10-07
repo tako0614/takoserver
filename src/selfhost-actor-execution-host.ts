@@ -957,10 +957,14 @@ export function createSelfhostActorExecutionHost(options: {
   ): Promise<ActorNamespaceRuntimeObservation> => {
     const unknown = { kind: "unknown" } as const;
     try {
+      const identity = {
+        tenantId: scope.tenantId,
+        namespaceResourceUid: scope.namespaceResourceUid,
+      };
       await ready;
       signal.throwIfAborted();
-      if (stopped || !validScope(scope)) return unknown;
-      const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
+      if (stopped || !validScope(identity)) return unknown;
+      const key = keyOf(identity.tenantId, identity.namespaceResourceUid);
       const owner = owners.get(key);
       const session = owner?.session;
       if (
@@ -969,7 +973,7 @@ export function createSelfhostActorExecutionHost(options: {
         !session ||
         session.dead ||
         session.retiring ||
-        !(await registeredScope(key, scope))
+        !(await registeredScope(key, identity))
       )
         return unknown;
       const observationSignal = AbortSignal.any([signal, AbortSignal.timeout(5_000)]);
@@ -982,7 +986,7 @@ export function createSelfhostActorExecutionHost(options: {
           owner.session !== session ||
           session.dead ||
           session.retiring ||
-          !(await registeredScope(key, scope)) ||
+          !(await registeredScope(key, identity)) ||
           !(await eligible(session, observationSignal))
         )
           return false;
@@ -994,7 +998,7 @@ export function createSelfhostActorExecutionHost(options: {
           owner.session === session &&
           !session.dead &&
           !session.retiring &&
-          (await registeredScope(key, scope))
+          (await registeredScope(key, identity))
         );
       };
       if (!(await current())) return unknown;
@@ -1088,23 +1092,27 @@ export function createSelfhostActorExecutionHost(options: {
       signal: AbortSignal,
     ): Promise<ActorNamespaceRuntimeObservation> {
       try {
-        await ready;
-        signal.throwIfAborted();
-        if (stopped || !validScope(scope) || typeof candidate.stillAuthorized !== "function")
-          return { kind: "unknown" };
+        const identity = {
+          tenantId: scope.tenantId,
+          namespaceResourceUid: scope.namespaceResourceUid,
+        };
         const captured: ActorAcceptedOperationWarmCandidate = {
           graph: structuredClone(candidate.graph),
           realization: structuredClone(candidate.realization),
           expected: structuredClone(candidate.expected),
           stillAuthorized: candidate.stillAuthorized,
         };
+        await ready;
+        signal.throwIfAborted();
+        if (stopped || !validScope(identity) || typeof captured.stillAuthorized !== "function")
+          return { kind: "unknown" };
         if (
-          captured.graph.scope.tenantId !== scope.tenantId ||
-          captured.graph.scope.namespaceResourceUid !== scope.namespaceResourceUid ||
+          captured.graph.scope.tenantId !== identity.tenantId ||
+          captured.graph.scope.namespaceResourceUid !== identity.namespaceResourceUid ||
           !acceptedOperationMatches(captured.graph, captured.realization, captured.expected)
         )
           return { kind: "unknown" };
-        const warmed = await activate({ ...scope }, signal, captured);
+        const warmed = await activate(identity, signal, captured);
         return warmed.observation ?? { kind: "unknown" };
       } catch {
         return { kind: "unknown" };
