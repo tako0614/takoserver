@@ -1,0 +1,202 @@
+import { Database } from "bun:sqlite";
+import { expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { createSelfhostEntryShutdown } from "../src/selfhost-entry-shutdown.ts";
+import {
+  createSelfhostV2RuntimeBoot,
+  parseSelfhostV2RuntimeBoot,
+  startSelfhostV2WorkflowDuePass,
+} from "../src/selfhost-v2-runtime-boot.ts";
+import { createSelfhostV2WorkerComposition } from "../src/selfhost-v2-worker-composition.ts";
+import { createSqliteSql } from "../src/sql-sqlite.ts";
+
+const TARGET = "selfhost-v2-worker-primary";
+
+test("runtime boot config selects only exact explicit Actor and bounded Workflow ports", () => {
+  expect(parseSelfhostV2RuntimeBoot(undefined)).toBeNull();
+  expect(
+    parseSelfhostV2RuntimeBoot('{"actor":true,"workflow":{"maximumRegistrations":4}}'),
+  ).toEqual({
+    actor: true,
+    workflow: { maximumRegistrations: 4 },
+  });
+  for (const invalid of [
+    "{}",
+    '{"actor":false}',
+    '{"workflow":{}}',
+    '{"workflow":{"maximumRegistrations":0}}',
+    '{"workflow":{"maximumRegistrations":65}}',
+    '{"actor":true,"endpoint":true}',
+    '{"actor":true,"actor":true}',
+  ]) {
+    expect(() => parseSelfhostV2RuntimeBoot(invalid)).toThrow();
+  }
+});
+
+test("selected native ports fail before storage effects without executable or guard authority", () => {
+  const database = new Database(":memory:");
+  try {
+    const sql = createSqliteSql(database);
+    const base = {
+      sql,
+      clock: () => new Date(),
+      targetKey: TARGET,
+      dataRoot: ":memory:",
+      ownerForWorkerUid: async () => null,
+    };
+    expect(() =>
+      createSelfhostV2RuntimeBoot({
+        ...base,
+        dataRoot: tmpdir(),
+        selection: { actor: true },
+        workerdBinary: null,
+      }),
+    ).toThrow("v2 workerd");
+    expect(() =>
+      createSelfhostV2RuntimeBoot({
+        ...base,
+        selection: { workflow: { maximumRegistrations: 2 } },
+        workerdBinary: process.execPath,
+      }),
+    ).toThrow("v2 runtime boot requires durable private storage");
+    expect(() =>
+      createSelfhostV2RuntimeBoot({
+        ...base,
+        dataRoot: tmpdir(),
+        selection: { workflow: { maximumRegistrations: 2 } },
+        workerdBinary: process.execPath,
+      }),
+    ).toThrow("v2 Workflow guard");
+  } finally {
+    database.close();
+  }
+});
+
+test("stalled or rejected Workflow poll is an independent tracked pass", async () => {
+  let pollRun: (() => void | Promise<void>) | undefined;
+  let release!: () => void;
+  const stalled = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const order: string[] = [];
+  const shutdown = createSelfhostEntryShutdown({
+    stopIngress: async () => {
+      order.push("ingress");
+    },
+    finishShutdown: async () => {
+      order.push("closed");
+    },
+    onFailure: () => {
+      order.push("failure");
+    },
+    onSuccess: () => {
+      order.push("success");
+    },
+  });
+  startSelfhostV2WorkflowDuePass(
+    {
+      startInterval(name, milliseconds, run) {
+        expect(name).toBe("takoform-v2-workflow-due");
+        expect(milliseconds).toBe(1_000);
+        pollRun = run;
+      },
+    },
+    {
+      pollWorkflowDue: async () => {
+        order.push("workflow-start");
+        await stalled;
+        order.push("workflow-end");
+        return { examined: 0, selected: 0, outcomes: [] };
+      },
+    },
+    () => {
+      order.push("poll-failure");
+    },
+  );
+  if (!pollRun) throw new Error("Workflow pass was not registered");
+  const running = shutdown.runPass("takoform-v2-workflow-due", pollRun);
+  await Promise.resolve();
+  await shutdown.runPass("takoform-v2", async () => {
+    order.push("ordinary-pass");
+  });
+  const closing = shutdown.shutdown();
+  await Promise.resolve();
+  expect(order).toContain("ordinary-pass");
+  expect(order).not.toContain("closed");
+  release();
+  await running;
+  expect(await closing).toBe(true);
+  expect(order.indexOf("workflow-end")).toBeLessThan(order.indexOf("closed"));
+
+  startSelfhostV2WorkflowDuePass(
+    {
+      startInterval(_name, _milliseconds, run) {
+        pollRun = run;
+      },
+    },
+    {
+      pollWorkflowDue: async () => {
+        throw new Error("poll rejected");
+      },
+    },
+    () => {},
+  );
+  await expect(pollRun?.()).rejects.toThrow("poll rejected");
+});
+
+test("selected runtime ports restore on one SQLite and close Workflow before the Worker owner", async () => {
+  const root = await mkdtemp(join(tmpdir(), "selfhost-v2-runtime-boot-"));
+  const database = new Database(join(root, "control.sqlite"));
+  try {
+    migrateSqlite(database);
+    const sql = createSqliteSql(database);
+    const objects = createMemoryObjectStore();
+    const clock = () => new Date();
+    let workers: ReturnType<typeof createSelfhostV2WorkerComposition> | undefined;
+    const selection = parseSelfhostV2RuntimeBoot(
+      '{"actor":true,"workflow":{"maximumRegistrations":2}}',
+    );
+    if (!selection) throw new Error("test selection is required");
+    const boot = createSelfhostV2RuntimeBoot({
+      selection,
+      sql,
+      clock,
+      targetKey: TARGET,
+      dataRoot: root,
+      workerdBinary: process.execPath,
+      guardBinary: process.execPath,
+      ownerForWorkerUid: async (uid) => (workers ? await workers.ownerForWorkerUid(uid) : null),
+    });
+    expect(boot.v2Actor).toBeDefined();
+    expect(boot.v2Workflow).toBeDefined();
+    workers = createSelfhostV2WorkerComposition({
+      sql,
+      objects,
+      clock,
+      config: {
+        cursorSigningKey: new Uint8Array(32).fill(7),
+        documentation: "https://docs.example.test/v2",
+        authenticationDocumentation: "https://docs.example.test/v2/auth",
+        workerBundle: { targetKey: TARGET, heldArtifacts: [] },
+      },
+      targetKey: TARGET,
+      rootDirectory: join(root, "worker-owners"),
+      workerdBinary: process.execPath,
+      ...(boot.v2Actor ? { v2Actor: boot.v2Actor } : {}),
+      ...(boot.v2Workflow ? { v2Workflow: boot.v2Workflow } : {}),
+    });
+    expect(await workers.restoreOwners()).toEqual([]);
+    expect(await workers.pollWorkflowDue()).toEqual({ examined: 0, selected: 0, outcomes: [] });
+    await workers.closeWorkflowHost();
+    await expect(workers.pollWorkflowDue()).rejects.toThrow("unavailable");
+    await workers.suspendOwnersRetainingCustody();
+    await boot.closeActor();
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
