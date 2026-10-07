@@ -367,6 +367,16 @@ test.skipIf(nativeWorkerd === null)(
       expect(await waitForOperation(second.origin, endpointDeleteOperation.id)).toMatchObject({
         status: "succeeded",
       });
+      const routeStatus = (await (
+        await fetch(`${second.origin}/__fixture/status/${worker.resourceUid}`)
+      ).json()) as {
+        serving: { kind: string; hostnames?: string[]; sourceOperationId?: string };
+      };
+      expect(routeStatus.serving).toMatchObject({
+        kind: "serving",
+        hostnames: [],
+        sourceOperationId: endpointDeleteOperation.id,
+      });
       const deletion = await request(
         second.origin,
         `/resources/${deployed.resource.uid}`,
@@ -383,6 +393,11 @@ test.skipIf(nativeWorkerd === null)(
       expect((await request(second.origin, `/resources/${deployed.resource.uid}`)).status).toBe(
         410,
       );
+      const deletedStatus = (await (
+        await fetch(`${second.origin}/__fixture/status/${worker.resourceUid}`)
+      ).json()) as { childPids: number[]; serving: { kind: string } };
+      expect(deletedStatus.serving).toEqual({ kind: "unknown" });
+      expect(deletedStatus.childPids).toEqual([]);
     } finally {
       await first?.close();
       await second?.close();
