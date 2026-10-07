@@ -36,7 +36,9 @@ function fixture(distinctFormBackends = false, legacySchema = false) {
       name TEXT PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL
     )`);
     for (const migration of MIGRATIONS.filter(
-      (item) => item.name !== "0077_v2_operation_acceptance_order.sql",
+      (item) =>
+        item.name !== "0077_v2_operation_acceptance_order.sql" &&
+        item.name !== "0078_v2_worker_invocation_retirement.sql",
     )) {
       db.exec(migration.sql);
       db.query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, datetime('now'))").run(
@@ -683,7 +685,10 @@ test("a historical source without acceptance order is unresolved after additive 
       worker: { resourceUid: worker.resourceUid },
       versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
     });
-    expect(migrateSqlite(f.db).applied).toEqual(["0077_v2_operation_acceptance_order.sql"]);
+    expect(migrateSqlite(f.db).applied).toEqual([
+      "0077_v2_operation_acceptance_order.sql",
+      "0078_v2_worker_invocation_retirement.sql",
+    ]);
     expect(
       await f.sql.query("SELECT acceptance_order FROM tf_v2_operations WHERE id = ?", [
         deployment.id,
