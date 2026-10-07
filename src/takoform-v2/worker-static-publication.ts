@@ -296,10 +296,24 @@ export function createV2WorkerPublication(options: {
 }): V2WorkerPublication {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   const inspectModule = options.runtime.inspectModule;
+  // A fenced publication resolves its candidate before and inside the native
+  // write. Reuse only this incarnation's exact accepted Version/Binding vector:
+  // each resolution otherwise mints a different broker token and leaves a
+  // socket outside the final pinned native configuration after Host SIGKILL.
+  let serviceProjection:
+    | {
+        operationId: string;
+        versions: Map<
+          string,
+          { vector: string; bindings: Promise<readonly V2ResolvedServiceBinding[]> }
+        >;
+      }
+    | undefined;
 
   async function candidate(
     execution: V2Execution,
     resolution: Extract<V2WorkerPublicationResolution, { kind: "ready" }>,
+    issueServiceBindings = true,
   ): Promise<Candidate> {
     const snapshot = resolution.snapshot;
     const name = await scriptName(snapshot.worker.uid);
@@ -628,7 +642,36 @@ export function createV2WorkerPublication(options: {
         if (versionSpec.requiredSensitiveVars.length > 0 && !configuredPrivateInputs) {
           throw new Error("configured Worker Version input is unavailable");
         }
-        const serviceBindings = await projectV2ResolvedServiceBindings(versionSpec.serviceBindings);
+        let serviceBindings: readonly V2ResolvedServiceBinding[];
+        if (!issueServiceBindings || versionSpec.serviceBindings.length === 0) {
+          serviceBindings = await projectV2ResolvedServiceBindings(versionSpec.serviceBindings);
+        } else {
+          if (serviceProjection?.operationId !== execution.operationId) {
+            serviceProjection = { operationId: execution.operationId, versions: new Map() };
+          }
+          const vector = canonicalJson({
+            sourceOperationId: snapshot.sourceOperationId,
+            worker: snapshot.worker,
+            deploymentUid: snapshot.deployment.uid,
+            deploymentGeneration: snapshot.deployment.generation,
+            versionUid: version.uid,
+            versionSourceOperationId: version.sourceOperationId,
+            versionGeneration: version.generation,
+            versionWeight: version.weight,
+            bindings: versionSpec.serviceBindings,
+          });
+          const prior = serviceProjection.versions.get(version.uid);
+          if (prior && prior.vector !== vector) {
+            throw new Error("ServiceBinding accepted Version graph changed");
+          }
+          if (!prior) {
+            const bindings = projectV2ResolvedServiceBindings(versionSpec.serviceBindings);
+            serviceProjection.versions.set(version.uid, { vector, bindings });
+            serviceBindings = await bindings;
+          } else {
+            serviceBindings = await prior.bindings;
+          }
+        }
         if (serviceBindings.length > 0) {
           const forward = options.v2ServiceBindingForward;
           if (!forward) throw new Error("native ServiceBinding forwarding is unavailable");
@@ -651,11 +694,13 @@ export function createV2WorkerPublication(options: {
               ),
             ),
           });
-          for (const [index, binding] of serviceBindings.entries()) {
-            await forward.issueBinding(claim, {
-              ...binding,
-              name: workerdVersionServiceBindingName(index, true),
-            });
+          if (issueServiceBindings) {
+            for (const [index, binding] of serviceBindings.entries()) {
+              await forward.issueBinding(claim, {
+                ...binding,
+                name: workerdVersionServiceBindingName(index, true),
+              });
+            }
           }
           if (!(await resolution.stillCurrent()))
             throw new Error("ServiceBinding reference graph changed");
@@ -928,7 +973,9 @@ export function createV2WorkerPublication(options: {
       const resolution = await resolveInitial(execution);
       if (resolution.kind !== "ready") return unknownResult();
       try {
-        const expected = await candidate(execution, resolution);
+        // Observation never creates a new Host broker for a graph it does not
+        // publish. Recovery reissues only sockets selected by the pinned graph.
+        const expected = await candidate(execution, resolution, false);
         // Reconciliation is read-only. A mismatch or missing proof remains unknown.
         return await resultFromReadback(expected, resolution);
       } catch {

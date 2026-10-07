@@ -224,6 +224,7 @@ test("real Host SQL accepts a settled same-owner service UID and verifies the he
       },
     };
     let serviceBindingProjectionRequests = 0;
+    const serviceBindingTokens: string[] = [];
     const publication = createV2WorkerPublication({
       targetKey,
       publicationState: state,
@@ -231,8 +232,9 @@ test("real Host SQL accepts a settled same-owner service UID and verifies the he
       // This suite checks SQL-held projection shape, not the native Host
       // broker; the pinned-workerd test covers that separate execution path.
       v2ServiceBindingForward: {
-        async issueBinding() {
+        async issueBinding(_claim, binding) {
           serviceBindingProjectionRequests += 1;
+          serviceBindingTokens.push(binding.unavailableToken);
         },
       },
     });
@@ -252,6 +254,12 @@ test("real Host SQL accepts a settled same-owner service UID and verifies the he
       targetKey,
       async execute(input) {
         const result = await publication.publish(input);
+        if (result.kind === "confirmed" && result.identity !== null) {
+          const forwarded = serviceBindingProjectionRequests;
+          expect(await publication.observe(input)).toMatchObject({ kind: "confirmed" });
+          // A read-only reconciliation cannot create another Host broker.
+          expect(serviceBindingProjectionRequests).toBe(forwarded);
+        }
         return result.kind === "confirmed" && result.identity !== null
           ? {
               kind: "complete",
@@ -333,6 +341,10 @@ test("real Host SQL accepts a settled same-owner service UID and verifies the he
       versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
     });
     expect(serviceBindingProjectionRequests).toBeGreaterThan(0);
+    // One accepted publication resolves its candidate twice around the native
+    // fence. Both passes must address the same broker socket in this owner.
+    expect(serviceBindingProjectionRequests).toBeGreaterThan(1);
+    expect(new Set(serviceBindingTokens).size).toBe(1);
     const callerPublication = published.get(await v2ServiceTargetName(caller.resourceUid));
     const callerVariant = callerPublication?.versions[0];
     if (!callerVariant || !("mainModule" in callerVariant.site))
