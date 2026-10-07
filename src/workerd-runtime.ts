@@ -30,6 +30,17 @@ import {
 } from "./providers/selfhost-v2-queue-transport.ts";
 import { normalizeWorkflowBindings } from "./providers/selfhost-version-bindings.ts";
 import {
+  hasWorkerdV2PrivateBindingProfile,
+  isWorkerdV2PrivateServiceBindingName,
+  isWorkerdV2PrivateWorkflowBindingName,
+  WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
+  WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING,
+  WORKERD_V2_PRIVATE_READINESS_BINDING,
+  workerdV2PrivateActorBindingName,
+  workerdV2PrivateWorkflowBindingIndex,
+  workerdV2PrivateWorkflowBindingName,
+} from "./providers/workerd-v2-private-binding-names.ts";
+import {
   canonicalSelfhostWeightedVersions,
   type SelfhostWeightedVersion,
   selectSelfhostWeightedVersion,
@@ -1538,7 +1549,10 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         }
         // Binding declarations come only from the authenticated immutable
         // manifest. The caller cannot supply a different target or token.
-        const bindings = validServiceBindings(selected.site.serviceBindings ?? []);
+        const bindings = validServiceBindings(
+          selected.site.serviceBindings ?? [],
+          hasWorkerdV2PrivateBindingProfile(selected.site),
+        );
         const routers = bindings.map(serviceRouterName);
         if (routers.some((router) => !renderedPrivateRouters.has(router))) throw unavailable();
         for (const router of routers) {
@@ -1701,7 +1715,10 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
                       workerResourceUid: actorPublication.workerResourceUid,
                       versionId: version.versionId,
                       workerVersionResourceUid: version.workerVersionUid,
-                      bindings: validActorForward(version.site.actorForward).bindings,
+                      bindings: validActorForward(
+                        version.site.actorForward,
+                        hasWorkerdV2PrivateBindingProfile(version.site),
+                      ).bindings,
                     },
                   ],
             );
@@ -1885,19 +1902,27 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       ) {
         throw new Error("unusable worker service identity");
       }
-      const serviceBindings = validServiceBindings(site.serviceBindings ?? []);
+      const serviceBindings = validServiceBindings(
+        site.serviceBindings ?? [],
+        hasWorkerdV2PrivateBindingProfile(site),
+      );
       if (serviceBindings.length > 0 && workerResourceUid === undefined) {
         throw new Error("unusable worker service binding");
       }
       const actorForward =
-        site.actorForward === undefined ? undefined : validActorForward(site.actorForward);
+        site.actorForward === undefined
+          ? undefined
+          : validActorForward(site.actorForward, hasWorkerdV2PrivateBindingProfile(site));
       const workflowForward =
-        site.workflowForward === undefined ? undefined : validWorkflowForward(site.workflowForward);
+        site.workflowForward === undefined
+          ? undefined
+          : validWorkflowForward(site.workflowForward, hasWorkerdV2PrivateBindingProfile(site));
       validActorForwardCollision(
         actorForward,
         validBindings(site.vars ?? []),
         serviceBindings,
         hostEntrypoint,
+        hasWorkerdV2PrivateBindingProfile(site),
       );
       validWorkflowForwardCollision(
         workflowForward,
@@ -1905,6 +1930,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         serviceBindings,
         actorForward,
         hostEntrypoint,
+        hasWorkerdV2PrivateBindingProfile(site),
       );
       if (workflowForward !== undefined) {
         throw new Error("Workflow forward requires an immutable weighted publication");
@@ -2372,7 +2398,12 @@ const ACTOR_FORWARD_MANIFEST_KEYS = new Set([
   "queueSettlement",
 ]);
 
-function actorForwardServiceName(kind: "HTTP" | "UPGRADE", index: number): string {
+function actorForwardServiceName(
+  kind: "HTTP" | "UPGRADE",
+  index: number,
+  v2PrivateNames = false,
+): string {
+  if (v2PrivateNames) return workerdV2PrivateActorBindingName(kind, index);
   return `__TAKOSERVER_ACTOR_${kind}_${index.toString(10).padStart(5, "0")}`;
 }
 
@@ -2388,7 +2419,7 @@ function actorForwardIdentity(
   );
 }
 
-function validActorForward(value: unknown): WorkerdActorForward {
+function validActorForward(value: unknown, v2PrivateNames = false): WorkerdActorForward {
   if (
     typeof value !== "object" ||
     value === null ||
@@ -2426,8 +2457,8 @@ function validActorForward(value: unknown): WorkerdActorForward {
       binding.tenantId.includes("\u0000") ||
       typeof binding.namespaceResourceUid !== "string" ||
       !RESOURCE_UID.test(binding.namespaceResourceUid) ||
-      binding.httpService !== actorForwardServiceName("HTTP", index) ||
-      binding.upgradeService !== actorForwardServiceName("UPGRADE", index) ||
+      binding.httpService !== actorForwardServiceName("HTTP", index, v2PrivateNames) ||
+      binding.upgradeService !== actorForwardServiceName("UPGRADE", index, v2PrivateNames) ||
       typeof binding.token !== "string" ||
       !ACTOR_FORWARD_TOKEN.test(binding.token)
     )
@@ -2504,12 +2535,13 @@ function validActorForwardCollision(
   vars: readonly WorkerdBinding[],
   serviceBindings: readonly WorkerdServiceBinding[],
   hostEntrypoint: string | undefined,
+  v2PrivateNames = false,
 ): void {
   if (!actorForward) return;
   if (hostEntrypoint === undefined) throw new Error("unusable Actor forward entrypoint");
   const names = new Set([
-    INTERNAL_READINESS_CAPABILITY_BINDING,
-    DATA_SERVICE_BINDING,
+    v2PrivateNames ? WORKERD_V2_PRIVATE_READINESS_BINDING : INTERNAL_READINESS_CAPABILITY_BINDING,
+    v2PrivateNames ? WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING : DATA_SERVICE_BINDING,
     ...vars.map((binding) => binding.name),
     ...serviceBindings.map((binding) => binding.name),
   ]);
@@ -2523,11 +2555,16 @@ function validActorForwardCollision(
   }
 }
 
-function workflowForwardServiceName(index: number): string {
+function workflowForwardServiceName(index: number, v2PrivateNames = false): string {
+  if (v2PrivateNames) return workerdV2PrivateWorkflowBindingName(index);
   return `__TAKOSERVER_WORKFLOW_BINDING_${index.toString(10).padStart(5, "0")}`;
 }
 
-function validWorkflowForwardBinding(value: unknown, index: number): WorkerdWorkflowForwardBinding {
+function validWorkflowForwardBinding(
+  value: unknown,
+  index: number,
+  v2PrivateNames = false,
+): WorkerdWorkflowForwardBinding {
   const keys =
     "bindingRef,publicName,runtimeClassRef,serviceName,tenantId,token,workflowFormRef,workflowResourceUid";
   if (
@@ -2542,8 +2579,8 @@ function validWorkflowForwardBinding(value: unknown, index: number): WorkerdWork
   if (
     typeof binding.publicName !== "string" ||
     !WORKFLOW_FORWARD_PUBLIC_NAME.test(binding.publicName) ||
-    binding.publicName.startsWith("__TAKOSERVER_") ||
-    binding.serviceName !== workflowForwardServiceName(index) ||
+    (!v2PrivateNames && binding.publicName.startsWith("__TAKOSERVER_")) ||
+    binding.serviceName !== workflowForwardServiceName(index, v2PrivateNames) ||
     typeof binding.tenantId !== "string" ||
     binding.tenantId.length === 0 ||
     binding.tenantId.includes("\u0000") ||
@@ -2582,7 +2619,7 @@ function validWorkflowForwardBinding(value: unknown, index: number): WorkerdWork
   };
 }
 
-function validWorkflowForward(value: unknown): WorkerdWorkflowForward {
+function validWorkflowForward(value: unknown, v2PrivateNames = false): WorkerdWorkflowForward {
   if (
     typeof value !== "object" ||
     value === null ||
@@ -2604,7 +2641,7 @@ function validWorkflowForward(value: unknown): WorkerdWorkflowForward {
   }
   const names = new Set<string>();
   const bindings = candidate.bindings.map((binding, index) => {
-    const normalized = validWorkflowForwardBinding(binding, index);
+    const normalized = validWorkflowForwardBinding(binding, index, v2PrivateNames);
     if (names.has(normalized.publicName)) throw new Error("unusable Workflow forward graph");
     names.add(normalized.publicName);
     capnpText(normalized.publicName);
@@ -2743,7 +2780,10 @@ function workflowForwardPublications(
       ) {
         throw new Error("Workflow forward requires an immutable weighted Version");
       }
-      const forward = validWorkflowForward(variant.manifest.workflowForward);
+      const forward = validWorkflowForward(
+        variant.manifest.workflowForward,
+        hasWorkerdV2PrivateBindingProfile(variant.manifest),
+      );
       const bindings = Object.freeze(
         forward.bindings.map((binding) =>
           Object.freeze({
@@ -2797,7 +2837,10 @@ function workflowForwardPublicationsForInput(
       throw new Error("unusable weighted worker deployment");
     }
     if (version.site.workflowForward === undefined) continue;
-    const forward = validWorkflowForward(version.site.workflowForward);
+    const forward = validWorkflowForward(
+      version.site.workflowForward,
+      hasWorkerdV2PrivateBindingProfile(version.site),
+    );
     const bindings = Object.freeze(
       forward.bindings.map((binding) =>
         Object.freeze({
@@ -2878,13 +2921,21 @@ function validateWorkflowForwardSockets(
       value.binding === null ||
       Array.isArray(value.binding) ||
       typeof value.binding.serviceName !== "string" ||
-      !WORKFLOW_FORWARD_SERVICE_NAME.test(value.binding.serviceName)
+      !(
+        WORKFLOW_FORWARD_SERVICE_NAME.test(value.binding.serviceName) ||
+        isWorkerdV2PrivateWorkflowBindingName(value.binding.serviceName)
+      )
     ) {
       throw new Error("unusable Workflow forward socket graph");
     }
     const binding = validWorkflowForwardBinding(
       value.binding,
-      Number.parseInt(value.binding.serviceName.slice("__TAKOSERVER_WORKFLOW_BINDING_".length), 10),
+      workerdV2PrivateWorkflowBindingIndex(value.binding.serviceName) ??
+        Number.parseInt(
+          value.binding.serviceName.slice("__TAKOSERVER_WORKFLOW_BINDING_".length),
+          10,
+        ),
+      isWorkerdV2PrivateWorkflowBindingName(value.binding.serviceName),
     );
     const identity = workflowForwardSocketIdentity({ ...value, binding });
     if (!identities.has(identity) || resolved.has(identity)) {
@@ -2956,12 +3007,13 @@ function validWorkflowForwardCollision(
   serviceBindings: readonly WorkerdServiceBinding[],
   actorForward: WorkerdActorForward | undefined,
   hostEntrypoint: string | undefined,
+  v2PrivateNames = false,
 ): void {
   if (!workflowForward) return;
   if (hostEntrypoint === undefined) throw new Error("unusable Workflow forward entrypoint");
   const names = new Set([
-    INTERNAL_READINESS_CAPABILITY_BINDING,
-    DATA_SERVICE_BINDING,
+    v2PrivateNames ? WORKERD_V2_PRIVATE_READINESS_BINDING : INTERNAL_READINESS_CAPABILITY_BINDING,
+    v2PrivateNames ? WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING : DATA_SERVICE_BINDING,
     ...vars.map((binding) => binding.name),
     ...serviceBindings.map((binding) => binding.name),
     ...(actorForward?.bindings.flatMap((binding) => [
@@ -3011,6 +3063,7 @@ function validWorkerResourceUid(value: unknown): string {
 
 function validServiceBindings(
   bindings: readonly WorkerdServiceBinding[],
+  v2PrivateNames = false,
 ): readonly WorkerdServiceBinding[] {
   if (!Array.isArray(bindings) || bindings.length > 64) {
     throw new Error("unusable worker service binding");
@@ -3024,7 +3077,9 @@ function validServiceBindings(
       Object.keys(candidate).sort().join(",") !==
         "name,target,targetResourceUid,unavailableToken" ||
       typeof candidate.name !== "string" ||
-      !INTERNAL_SERVICE_BINDING.test(candidate.name) ||
+      !(v2PrivateNames
+        ? isWorkerdV2PrivateServiceBindingName(candidate.name)
+        : INTERNAL_SERVICE_BINDING.test(candidate.name)) ||
       names.has(candidate.name) ||
       typeof candidate.target !== "string" ||
       !SCRIPT_NAME.test(candidate.target) ||
@@ -3608,19 +3663,27 @@ async function prepareWorkerdSite(
   ) {
     throw new Error("unusable worker service identity");
   }
-  const serviceBindings = validServiceBindings(site.serviceBindings ?? []);
+  const serviceBindings = validServiceBindings(
+    site.serviceBindings ?? [],
+    hasWorkerdV2PrivateBindingProfile(site),
+  );
   if (serviceBindings.length > 0 && workerResourceUid === undefined) {
     throw new Error("unusable worker service binding");
   }
   const actorForward =
-    site.actorForward === undefined ? undefined : validActorForward(site.actorForward);
+    site.actorForward === undefined
+      ? undefined
+      : validActorForward(site.actorForward, hasWorkerdV2PrivateBindingProfile(site));
   const workflowForward =
-    site.workflowForward === undefined ? undefined : validWorkflowForward(site.workflowForward);
+    site.workflowForward === undefined
+      ? undefined
+      : validWorkflowForward(site.workflowForward, hasWorkerdV2PrivateBindingProfile(site));
   validActorForwardCollision(
     actorForward,
     validBindings(site.vars ?? []),
     serviceBindings,
     hostEntrypoint,
+    hasWorkerdV2PrivateBindingProfile(site),
   );
   validWorkflowForwardCollision(
     workflowForward,
@@ -3628,6 +3691,7 @@ async function prepareWorkerdSite(
     serviceBindings,
     actorForward,
     hostEntrypoint,
+    hasWorkerdV2PrivateBindingProfile(site),
   );
   return {
     manifest: {
@@ -3739,7 +3803,10 @@ export async function writeWorkerdPrivateExecution(options: {
   if (!site.hostEntrypoint || site.hostEntrypoint === site.mainModule) {
     throw new Error("private execution requires a distinct Host entrypoint");
   }
-  const declaredServices = validServiceBindings(site.serviceBindings ?? []);
+  const declaredServices = validServiceBindings(
+    site.serviceBindings ?? [],
+    hasWorkerdV2PrivateBindingProfile(site),
+  );
   const serviceMappings = options.serviceBindings ?? [];
   const serviceNames = new Set(declaredServices.map((binding) => binding.name));
   const servicePaths = new Set<string>();
@@ -3822,7 +3889,11 @@ export async function writeWorkerdPrivateExecution(options: {
       (binding) =>
         binding.name === companionBinding ||
         declaredServices.some((service) => service.name === binding.name) ||
-        (prepared.manifest.dataPlane && binding.name === DATA_SERVICE_BINDING),
+        (prepared.manifest.dataPlane &&
+          binding.name ===
+            (hasWorkerdV2PrivateBindingProfile(prepared.manifest)
+              ? WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING
+              : DATA_SERVICE_BINDING)),
     )
   ) {
     throw new Error("private execution internal binding collision");
@@ -3839,7 +3910,9 @@ export async function writeWorkerdPrivateExecution(options: {
   if (prepared.manifest.dataPlane) {
     const plane = prepared.manifest.dataPlane;
     const module = requiredStoredModule(prepared.manifest.moduleFiles.hostPrivate, plane.module);
-    bindings.push(`(name = "${DATA_SERVICE_BINDING}", service = "data")`);
+    bindings.push(
+      `(name = "${hasWorkerdV2PrivateBindingProfile(prepared.manifest) ? WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING : DATA_SERVICE_BINDING}", service = "data")`,
+    );
     const facadeBindings = [
       `(name = "${DATA_PLANE_BINDING}", service = "data-origin")`,
       ...validBindings(plane.vars).map(
@@ -4361,23 +4434,35 @@ async function readValidatedManifest(
   ) {
     throw new Error("unusable worker service identity");
   }
-  const serviceBindings = validServiceBindings(manifest.serviceBindings ?? []);
+  const serviceBindings = validServiceBindings(
+    manifest.serviceBindings ?? [],
+    hasWorkerdV2PrivateBindingProfile(manifest),
+  );
   if (serviceBindings.length > 0 && manifest.workerResourceUid === undefined) {
     throw new Error("unusable worker service binding");
   }
   const actorForward =
-    manifest.actorForward === undefined ? undefined : validActorForward(manifest.actorForward);
+    manifest.actorForward === undefined
+      ? undefined
+      : validActorForward(manifest.actorForward, hasWorkerdV2PrivateBindingProfile(manifest));
   const workflowForward =
     manifest.workflowForward === undefined
       ? undefined
-      : validWorkflowForward(manifest.workflowForward);
-  validActorForwardCollision(actorForward, vars, serviceBindings, manifest.hostEntrypoint);
+      : validWorkflowForward(manifest.workflowForward, hasWorkerdV2PrivateBindingProfile(manifest));
+  validActorForwardCollision(
+    actorForward,
+    vars,
+    serviceBindings,
+    manifest.hostEntrypoint,
+    hasWorkerdV2PrivateBindingProfile(manifest),
+  );
   validWorkflowForwardCollision(
     workflowForward,
     vars,
     serviceBindings,
     actorForward,
     manifest.hostEntrypoint,
+    hasWorkerdV2PrivateBindingProfile(manifest),
   );
   if (actorForward) manifest = { ...manifest, actorForward };
   if (workflowForward) manifest = { ...manifest, workflowForward };
@@ -5313,7 +5398,10 @@ function collectServiceBindings(
   const bindings = new Map<string, WorkerdServiceBinding>();
   for (const deployment of published) {
     for (const entry of deployment.variants) {
-      for (const binding of validServiceBindings(entry.manifest.serviceBindings ?? [])) {
+      for (const binding of validServiceBindings(
+        entry.manifest.serviceBindings ?? [],
+        hasWorkerdV2PrivateBindingProfile(entry.manifest),
+      )) {
         bindings.set(serviceRouterName(binding), binding);
       }
     }
@@ -5370,7 +5458,10 @@ function actorForwardPublications(
           workerResourceUid: deployment.workerResourceUid,
           versionId: variant.versionId,
           workerVersionResourceUid: variant.workerVersionUid,
-          bindings: validActorForward(variant.manifest.actorForward).bindings,
+          bindings: validActorForward(
+            variant.manifest.actorForward,
+            hasWorkerdV2PrivateBindingProfile(variant.manifest),
+          ).bindings,
         },
       ];
     }),
@@ -5385,7 +5476,10 @@ function resolveActorForwardServices(
   const resolved = new Map<string, readonly ResolvedActorForwardService[]>();
   for (const variant of published.flatMap((deployment) => deployment.variants)) {
     if (variant.manifest.actorForward === undefined) continue;
-    const actorForward = validActorForward(variant.manifest.actorForward);
+    const actorForward = validActorForward(
+      variant.manifest.actorForward,
+      hasWorkerdV2PrivateBindingProfile(variant.manifest),
+    );
     const services = actorForward.bindings.map((binding, index) => {
       const current =
         sockets.get(
@@ -5560,18 +5654,23 @@ function renderConfig(
       const bindings = [
         ...(hasHostEntrypoint(entry)
           ? [
-              `(name = ${capnpText(INTERNAL_READINESS_CAPABILITY_BINDING)}, text = ${capnpText(internalReadinessCapability)})`,
+              `(name = ${capnpText(hasWorkerdV2PrivateBindingProfile(entry.manifest) ? WORKERD_V2_PRIVATE_READINESS_BINDING : INTERNAL_READINESS_CAPABILITY_BINDING)}, text = ${capnpText(internalReadinessCapability)})`,
             ]
           : []),
         ...(entry.manifest.dataPlane
-          ? [`(name = "${DATA_SERVICE_BINDING}", service = "${entry.name}-selfhost-data")`]
+          ? [
+              `(name = "${hasWorkerdV2PrivateBindingProfile(entry.manifest) ? WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING : DATA_SERVICE_BINDING}", service = "${entry.name}-selfhost-data")`,
+            ]
           : []),
         ...(entry.manifest.queueSettlement
           ? [
-              `(name = ${capnpText(V2_QUEUE_SETTLEMENT_SERVICE_BINDING)}, service = ${capnpText(`${entry.name}-v2-queue-settlement`)})`,
+              `(name = ${capnpText(hasWorkerdV2PrivateBindingProfile(entry.manifest) ? WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING : V2_QUEUE_SETTLEMENT_SERVICE_BINDING)}, service = ${capnpText(`${entry.name}-v2-queue-settlement`)})`,
             ]
           : []),
-        ...validServiceBindings(entry.manifest.serviceBindings ?? []).map(
+        ...validServiceBindings(
+          entry.manifest.serviceBindings ?? [],
+          hasWorkerdV2PrivateBindingProfile(entry.manifest),
+        ).map(
           (binding) =>
             `(name = ${capnpText(binding.name)}, service = ${capnpText(serviceRouterName(binding))})`,
         ),

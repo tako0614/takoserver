@@ -10,6 +10,11 @@ import {
   SELFHOST_DATA_PLANE_PROTOCOL,
   SELFHOST_DATA_PLANE_SQL_PATH,
 } from "../src/providers/selfhost-worker-wrapper.ts";
+import {
+  WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
+  WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING,
+  WORKERD_V2_PRIVATE_READINESS_BINDING,
+} from "../src/providers/workerd-v2-private-binding-names.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-database.ts";
@@ -28,7 +33,7 @@ const TARGET = "sqlite-binding-target";
 const BUNDLE_FORM = "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/";
 const WORKERD = nativeEvidenceBinary("workerd-artifact");
 
-async function fixture() {
+async function fixture(bindingName = "DB") {
   const root = mkdtempSync(join(tmpdir(), "v2-sqlite-binding-"));
   const control = new Database(join(root, "control.sqlite"));
   control.exec("PRAGMA foreign_keys = ON");
@@ -88,7 +93,7 @@ async function fixture() {
     worker: { resourceUid: "worker-one" },
     bundle: { resourceUid: "bundle-one" },
     handlers: ["fetch"],
-    sqliteBindings: [{ name: "DB", resource: { resourceUid: databaseUid } }],
+    sqliteBindings: [{ name: bindingName, resource: { resourceUid: databaseUid } }],
   });
   control
     .prepare(`INSERT INTO tf_v2_resources
@@ -137,7 +142,7 @@ async function fixture() {
     nativeVersionId: "v2-native-one",
     incarnationId: "incarnation-one",
     servingSourceOperationId: "source-operation-one",
-    bindings: [{ name: "DB", resourceUid: databaseUid }],
+    bindings: [{ name: bindingName, resourceUid: databaseUid }],
   };
   let nativeCurrent = true;
   let graphCurrent = true;
@@ -156,7 +161,7 @@ async function fixture() {
     },
   });
   const token = broker.issueGrant(grant);
-  async function call(op: string, statement?: unknown, binding = "DB") {
+  async function call(op: string, statement?: unknown, binding = bindingName) {
     const request = new Request(`http://localhost${SELFHOST_DATA_PLANE_SQL_PATH}`, {
       method: "POST",
       headers: { authorization: `Bearer ${token}` },
@@ -315,59 +320,75 @@ test("a changed private owner receipt refuses SQL even with a signed, current Co
   }
 });
 
-test.skipIf(WORKERD === undefined)(
-  "real workerd invokes the V2 SQLite facade against its UID file",
-  async () => {
-    const host = await fixture();
-    const plane = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch(request) {
-        return host.broker
-          .handle(request)
-          .then((response) => response ?? new Response(null, { status: 404 }));
-      },
-    });
-    const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
-    const port = Number(reserved.port);
-    reserved.stop(true);
-    let child: ReturnType<typeof Bun.spawn> | undefined;
-    try {
-      const artifact = await selectClosedGraphWorkerd({
-        binary: WORKERD,
-        privateRoot: join(host.root, "artifact"),
+for (const { bindingName, publicVar } of [
+  { bindingName: "DB", publicVar: undefined },
+  {
+    bindingName: "__TAKOSERVER_SELFHOST_DATA",
+    publicVar: "TAKOSERVER_SELFHOST_RUNTIME_READINESS",
+  },
+  { bindingName: "__TAKOSERVER_SELFHOST_RUNTIME_READINESS", publicVar: "TAKOSERVER_SELFHOST_DATA" },
+  { bindingName: "__TAKOSERVER_SELFHOST_DATA_TOKEN", publicVar: undefined },
+] as const) {
+  test.skipIf(WORKERD === undefined)(
+    `real workerd invokes the V2 SQLite facade with public names ${bindingName}/${publicVar ?? "none"}`,
+    async () => {
+      const host = await fixture(bindingName);
+      const plane = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch(request) {
+          return host.broker
+            .handle(request)
+            .then((response) => response ?? new Response(null, { status: 404 }));
+        },
       });
-      if (!artifact.binary) throw new Error(artifact.diagnostic ?? "pinned workerd unavailable");
-      const original = `import { className } from "./class-probe.js";
+      const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+      const port = Number(reserved.port);
+      reserved.stop(true);
+      let child: ReturnType<typeof Bun.spawn> | undefined;
+      try {
+        const artifact = await selectClosedGraphWorkerd({
+          binary: WORKERD,
+          privateRoot: join(host.root, "artifact"),
+        });
+        if (!artifact.binary) throw new Error(artifact.diagnostic ?? "pinned workerd unavailable");
+        const original = `import { className } from "./class-probe.js";
     export class Application {}
     export default { async fetch(request, env) {
-      const keys = Object.keys(env).sort();
+      const keys = Reflect.ownKeys(env).sort();
+      const database = env[${JSON.stringify(bindingName)}];
+      const publicValue = ${publicVar ? `env[${JSON.stringify(publicVar)}]` : "undefined"};
+      const privateVisible = [
+        ${JSON.stringify(WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING)},
+        ${JSON.stringify(WORKERD_V2_PRIVATE_READINESS_BINDING)},
+        ${JSON.stringify(WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING)}
+      ].some((name) => env[name] !== undefined);
       if (new URL(request.url).pathname === "/class") return Response.json({ className: className() });
       if (new URL(request.url).pathname === "/write") {
-        const result = await env.DB.execute("INSERT INTO records (id, body) VALUES (?, ?)", [7, "native"]);
-        return Response.json({ keys, result, hasRaw: "close" in env.DB || "database" in env.DB });
+        const result = await database.execute("INSERT INTO records (id, body) VALUES (?, ?)", [7, "native"]);
+        return Response.json({ keys, publicValue, privateVisible, result, hasRaw: "close" in database || "database" in database });
       }
       if (new URL(request.url).pathname === "/invalid") {
         const names = [];
         for (const invoke of [
-          () => env.DB.query(17),
-          () => env.DB.execute("SELECT 1", [], "extra"),
-          () => env.DB.query("SELECT 1", [], "extra"),
-          () => env.DB.transaction([], "extra"),
-          () => env.DB.query("SELECT ?", [undefined]),
-          () => env.DB.query("SELECT ?", [,]),
-          () => env.DB.transaction([{ sql: 17 }]),
+          () => database.query(17),
+          () => database.execute("SELECT 1", [], "extra"),
+          () => database.query("SELECT 1", [], "extra"),
+          () => database.transaction([], "extra"),
+          () => database.query("SELECT ?", [undefined]),
+          () => database.query("SELECT ?", [,]),
+          () => database.transaction([{ sql: 17 }]),
         ]) {
           try { await invoke(); } catch (error) { names.push(error.name); }
         }
         return Response.json({ names });
       }
       if (new URL(request.url).pathname === "/ledger") {
-        try { await env.DB.query("SELECT * FROM _takoform_sqlite_migrations"); }
+        try { await database.query("SELECT * FROM _takoform_sqlite_migrations"); }
         catch (error) { return Response.json({ name: error.name }); }
       }
       if (new URL(request.url).pathname === "/transaction") {
-        const result = await env.DB.transaction([
+        const result = await database.transaction([
           { sql: "INSERT INTO records (id, body) VALUES (?, ?)", params: [8, "committed"] },
           { sql: "SELECT body FROM records WHERE id = ?", params: [8] },
         ]);
@@ -375,141 +396,156 @@ test.skipIf(WORKERD === undefined)(
       }
       if (new URL(request.url).pathname === "/rollback") {
         try {
-          await env.DB.transaction([
+          await database.transaction([
             { sql: "INSERT INTO records (id, body) VALUES (?, ?)", params: [9, "rolled back"] },
             { sql: "INSERT INTO missing_table VALUES (1)" },
           ]);
         } catch (error) {
-          const absent = await env.DB.query("SELECT body FROM records WHERE id = ?", [9]);
+          const absent = await database.query("SELECT body FROM records WHERE id = ?", [9]);
           return Response.json({ name: error.name, absent });
         }
       }
-      return Response.json(await env.DB.query("SELECT body FROM records WHERE id = ?", [7]));
+      return Response.json(await database.query("SELECT body FROM records WHERE id = ?", [7]));
     } }`;
-      const projection = v2SqliteWorkerProjection({
-        originalMainModule: "app.js",
-        adapterModule: "v2-adapter.js",
-        intrinsicModule: "v2-intrinsics.js",
-        sqliteBindingNames: ["DB"],
-        declaredHandlers: ["fetch"],
-      });
-      const modules = new Map<string, Uint8Array>([
-        ["app.js", new TextEncoder().encode(original)],
-        [
-          "class-probe.js",
-          new TextEncoder().encode(
-            'import { Application } from "./v2-adapter.js"; export function className() { return Application.name; }',
-          ),
-        ],
-        ...projection,
-      ]);
-      const graph = compileWorkerdVersionGraph({
-        directory: "v2-sqlite-native",
-        mainModule: "v2-adapter.js",
-        modules,
-        moduleMediaTypes: {
-          "app.js": "application/javascript+module",
-          "class-probe.js": "application/javascript+module",
-          "v2-adapter.js": "application/javascript+module",
-          "v2-intrinsics.js": "application/javascript+module",
-        },
-        hostnames: [],
-        generation: "v2-sqlite-generation",
-        workerResourceUid: "worker-one",
-        declaredHandlers: ["fetch"],
-        readiness: { publication: "v2-sqlite-generation", probeHostname: "binding.localhost" },
-        environment: [],
-        serviceBindings: [],
-        dataPlane: {
-          address: `127.0.0.1:${plane.port}`,
-          token: host.token,
-          bindings: [{ kind: "edge.sql@1.0.0", publicName: "DB" }],
-        },
-      });
-      const runtime = createWorkerdRuntime({
-        root: host.root,
-        binary: artifact.binary,
-        port,
-        isReady: () => true,
-      });
-      if (!runtime.publish) throw new Error("workerd weighted publication unavailable");
-      await runtime.publish("v2-sqlite-native", {
-        generation: "v2-sqlite-generation",
-        workerResourceUid: "worker-one",
-        hostnames: ["binding.localhost"],
-        versions: [
-          { versionId: "v2-native-one", workerVersionUid: "version-one", weight: 10_000, ...graph },
-        ],
-      });
-      child = Bun.spawn([artifact.binary, "serve", join(host.root, "workers", "workerd.capnp")], {
-        stdout: "ignore",
-        stderr: "pipe",
-      });
-      const origin = `http://127.0.0.1:${port}`;
-      let ready = false;
-      for (let attempt = 0; attempt < 80; attempt++) {
-        try {
-          await fetch(origin, {
-            headers: { host: "binding.localhost" },
-            signal: AbortSignal.timeout(250),
-          });
-          ready = true;
-          break;
-        } catch {
-          await Bun.sleep(50);
-        }
-      }
-      expect(ready).toBe(true);
-      async function call(path: string) {
-        const response = await fetch(`${origin}${path}`, {
-          headers: { host: "binding.localhost" },
+        const projection = v2SqliteWorkerProjection({
+          originalMainModule: "app.js",
+          adapterModule: "v2-adapter.js",
+          intrinsicModule: "v2-intrinsics.js",
+          sqliteBindingNames: [bindingName],
+          declaredHandlers: ["fetch"],
         });
-        return { status: response.status, value: await response.json() };
-      }
-      expect(await call("/write")).toEqual({
-        status: 200,
-        value: { keys: ["DB"], result: { rows: [], rowsWritten: 1 }, hasRaw: false },
-      });
-      expect(await call("/read")).toEqual({
-        status: 200,
-        value: { rows: [{ body: "native" }], rowsWritten: 0 },
-      });
-      expect(await call("/class")).toEqual({ status: 200, value: { className: "Application" } });
-      expect(await call("/invalid")).toEqual({
-        status: 200,
-        value: {
-          names: [
-            "TypeError",
-            "TypeError",
-            "TypeError",
-            "TypeError",
-            "TypeError",
-            "TypeError",
-            "TypeError",
+        const modules = new Map<string, Uint8Array>([
+          ["app.js", new TextEncoder().encode(original)],
+          [
+            "class-probe.js",
+            new TextEncoder().encode(
+              'import { Application } from "./v2-adapter.js"; export function className() { return Application.name; }',
+            ),
           ],
-        },
-      });
-      expect(await call("/ledger")).toEqual({ status: 200, value: { name: "sql_error" } });
-      expect(await call("/transaction")).toEqual({
-        status: 200,
-        value: {
-          results: [
-            { rows: [], rowsWritten: 1 },
-            { rows: [{ body: "committed" }], rowsWritten: 0 },
+          ...projection,
+        ]);
+        const graph = compileWorkerdVersionGraph({
+          directory: "v2-sqlite-native",
+          mainModule: "v2-adapter.js",
+          modules,
+          moduleMediaTypes: {
+            "app.js": "application/javascript+module",
+            "class-probe.js": "application/javascript+module",
+            "v2-adapter.js": "application/javascript+module",
+            "v2-intrinsics.js": "application/javascript+module",
+          },
+          hostnames: [],
+          generation: "takoserver-v2-operation:11111111-1111-4111-8111-111111111111",
+          workerResourceUid: "worker-one",
+          declaredHandlers: ["fetch"],
+          readiness: { publication: "v2-sqlite-generation", probeHostname: "binding.localhost" },
+          environment: publicVar
+            ? [{ name: publicVar, value: "public-value", type: "plain_text" }]
+            : [],
+          serviceBindings: [],
+          dataPlane: {
+            address: `127.0.0.1:${plane.port}`,
+            token: host.token,
+            bindings: [{ kind: "edge.sql@1.0.0", publicName: bindingName }],
+          },
+        });
+        const runtime = createWorkerdRuntime({
+          root: host.root,
+          binary: artifact.binary,
+          port,
+          isReady: () => true,
+        });
+        if (!runtime.publish) throw new Error("workerd weighted publication unavailable");
+        await runtime.publish("v2-sqlite-native", {
+          generation: "takoserver-v2-operation:11111111-1111-4111-8111-111111111111",
+          workerResourceUid: "worker-one",
+          hostnames: ["binding.localhost"],
+          versions: [
+            {
+              versionId: "v2-native-one",
+              workerVersionUid: "version-one",
+              weight: 10_000,
+              ...graph,
+            },
           ],
-        },
-      });
-      expect(await call("/rollback")).toEqual({
-        status: 200,
-        value: { name: "sql_error", absent: { rows: [], rowsWritten: 0 } },
-      });
-    } finally {
-      if (child) {
-        child.kill();
-        await child.exited;
+        });
+        child = Bun.spawn([artifact.binary, "serve", join(host.root, "workers", "workerd.capnp")], {
+          stdout: "ignore",
+          stderr: "pipe",
+        });
+        const origin = `http://127.0.0.1:${port}`;
+        let ready = false;
+        for (let attempt = 0; attempt < 80; attempt++) {
+          try {
+            await fetch(origin, {
+              headers: { host: "binding.localhost" },
+              signal: AbortSignal.timeout(250),
+            });
+            ready = true;
+            break;
+          } catch {
+            await Bun.sleep(50);
+          }
+        }
+        expect(ready).toBe(true);
+        async function call(path: string) {
+          const response = await fetch(`${origin}${path}`, {
+            headers: { host: "binding.localhost" },
+          });
+          return { status: response.status, value: await response.json() };
+        }
+        expect(await call("/write")).toEqual({
+          status: 200,
+          value: {
+            keys: [bindingName, ...(publicVar ? [publicVar] : [])].sort(),
+            ...(publicVar ? { publicValue: "public-value" } : {}),
+            result: { rows: [], rowsWritten: 1 },
+            privateVisible: false,
+            hasRaw: false,
+          },
+        });
+        expect(await call("/read")).toEqual({
+          status: 200,
+          value: { rows: [{ body: "native" }], rowsWritten: 0 },
+        });
+        expect(await call("/class")).toEqual({ status: 200, value: { className: "Application" } });
+        expect(await call("/invalid")).toEqual({
+          status: 200,
+          value: {
+            names: [
+              "TypeError",
+              "TypeError",
+              "TypeError",
+              "TypeError",
+              "TypeError",
+              "TypeError",
+              "TypeError",
+            ],
+          },
+        });
+        expect(await call("/ledger")).toEqual({ status: 200, value: { name: "sql_error" } });
+        expect(await call("/transaction")).toEqual({
+          status: 200,
+          value: {
+            results: [
+              { rows: [], rowsWritten: 1 },
+              { rows: [{ body: "committed" }], rowsWritten: 0 },
+            ],
+          },
+        });
+        expect(await call("/rollback")).toEqual({
+          status: 200,
+          value: { name: "sql_error", absent: { rows: [], rowsWritten: 0 } },
+        });
+        expect(await runtime.restore()).toEqual(["v2-sqlite-native"]);
+      } finally {
+        if (child) {
+          child.kill();
+          await child.exited;
+        }
+        plane.stop(true);
+        host.close();
       }
-      plane.stop(true);
-      host.close();
-    }
-  },
-);
+    },
+  );
+}
