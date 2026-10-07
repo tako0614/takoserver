@@ -546,10 +546,18 @@ test("Core reader proves the exact sealed same-owner binding and survives immuta
         id: "fixture-worker-version-v1",
         targetKey: TARGET,
         async execute() {
-          return { kind: "complete", observed: { ready: true }, output: {} };
+          return {
+            kind: "complete",
+            observed: { ready: true, bundleVerified: true, resolvedBindings: true },
+            output: {},
+          };
         },
         async reconcile() {
-          return { kind: "complete", observed: { ready: true }, output: {} };
+          return {
+            kind: "complete",
+            observed: { ready: true, bundleVerified: true, resolvedBindings: true },
+            output: {},
+          };
         },
       },
     };
@@ -616,6 +624,23 @@ test("Core reader proves the exact sealed same-owner binding and survives immuta
         resourceUid: bucket.resourceUid,
       },
     });
+    // Readiness is a complete observation, not a boolean supplied by this fixture.
+    // Missing Binding or Bundle proof must not authorize a native call.
+    for (const observed of [
+      { ready: true },
+      { ready: true, bundleVerified: true, resolvedBindings: false },
+      { ready: true, bundleVerified: false, resolvedBindings: true },
+    ]) {
+      await sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+        canonicalJson(observed),
+        version.resourceUid,
+      ]);
+      expect(await authority.resolveCurrentBucketBinding(grant, "MEDIA")).toBeNull();
+    }
+    await sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+      canonicalJson({ ready: true, bundleVerified: true, resolvedBindings: true }),
+      version.resourceUid,
+    ]);
     expect(
       await authority.resolveCurrentBucketBinding(
         { ...grant, nativeVersionId: "v2-not-derived-from-the-accepted-version-operation" },
