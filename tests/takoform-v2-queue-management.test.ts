@@ -561,6 +561,59 @@ test("every weighted Version must be queue-ready in the accepted SQL graph", asy
   }
 });
 
+test("a reordered weighted Version set remains eligible for Consumer admission", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "reordered-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "reordered-worker", {});
+    const first = await f.create(WORKER_VERSION_FORM_URL, "reordered-first", {
+      worker: { resourceUid: worker.resourceUid },
+      handlers: ["queue"],
+    });
+    const second = await f.create(WORKER_VERSION_FORM_URL, "reordered-second", {
+      worker: { resourceUid: worker.resourceUid },
+      handlers: ["queue"],
+    });
+    f.setServingVersions([
+      { uid: second.resourceUid, generation: 1, weight: 4_000 },
+      { uid: first.resourceUid, generation: 1, weight: 6_000 },
+    ]);
+    await f.create(WORKER_DEPLOYMENT_FORM_URL, "reordered-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersions([
+      { uid: first.resourceUid, generation: 1, weight: 6_000 },
+      { uid: second.resourceUid, generation: 1, weight: 4_000 },
+    ]);
+    const accepted = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "reordered-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid),
+    );
+    expect((await f.engine.getOperation({ principal, id: accepted.id })).effect).toBe("complete");
+    f.setServingVersions([
+      { uid: first.resourceUid, generation: 1, weight: 5_000 },
+      { uid: second.resourceUid, generation: 1, weight: 5_000 },
+    ]);
+    await expect(
+      f.engine.acceptUpdate({
+        principal,
+        key: "reordered-weight-drift-update-0001",
+        uid: accepted.resourceUid,
+        expectedGeneration: 1,
+        spec: consumerSpec(queue.resourceUid, worker.resourceUid),
+      }),
+    ).rejects.toMatchObject({ code: "dependency_conflict", status: 409 });
+    expect((await f.engine.getResource({ principal, uid: accepted.resourceUid })).generation).toBe(
+      1,
+    );
+  } finally {
+    f.database.close();
+  }
+});
+
 test("a publication accepted while Queue admission awaits cannot win with the old source", async () => {
   const f = fixture();
   try {

@@ -1,4 +1,3 @@
-import { canonicalJson } from "../json.ts";
 import type { JsonObject } from "../ports.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "./forms/at-least-once-queue.ts";
 import { parseQueueConsumerSpec } from "./forms/queue-consumer.ts";
@@ -86,14 +85,6 @@ export async function prepareV2QueueConsumerAdmission(input: {
   )
     return null;
 
-  const deploymentSpec = canonicalJson({
-    worker: { resourceUid: spec.worker.resourceUid },
-    versions: versions.map((version) => ({
-      workerVersion: { resourceUid: version.uid },
-      weight: version.weight,
-    })),
-  });
-  if (typeof deploymentSpec !== "string") return null;
   const selectedJson = JSON.stringify(versions);
   return {
     sql: `EXISTS (SELECT 1 FROM tf_v2_resources worker
@@ -111,7 +102,15 @@ export async function prepareV2QueueConsumerAdmission(input: {
           AND deployment.target_key = ? AND deployment.deleted_at IS NULL
           AND deployment.phase = 'idle' AND deployment.busy_operation IS NULL
           AND deployment.generation = ? AND deployment.observed_generation = deployment.generation
-          AND deployment.spec_json = ? AND json_extract(deployment.observed_json, '$.active') = 1
+          AND json_extract(deployment.spec_json, '$.worker.resourceUid') = ?
+          AND json_array_length(deployment.spec_json, '$.versions') = ?
+          AND NOT EXISTS (SELECT 1 FROM json_each(?) selected
+            WHERE NOT EXISTS (SELECT 1 FROM json_each(deployment.spec_json, '$.versions') stored
+              WHERE json_extract(stored.value, '$.workerVersion.resourceUid') =
+                json_extract(selected.value, '$.uid')
+                AND json_extract(stored.value, '$.weight') =
+                  json_extract(selected.value, '$.weight')))
+          AND json_extract(deployment.observed_json, '$.active') = 1
           AND op.status = 'succeeded' AND op.effect = 'complete'
           AND op.action IN ('create','update') AND op.generation = deployment.generation
           AND op.accepted_spec_json = deployment.spec_json)
@@ -184,7 +183,9 @@ export async function prepareV2QueueConsumerAdmission(input: {
       input.space,
       input.targetKey,
       deploymentGeneration,
-      deploymentSpec,
+      spec.worker.resourceUid,
+      versions.length,
+      selectedJson,
       servingSourceOperationId,
       WORKER_DEPLOYMENT_FORM_URL,
       WORKER_ENDPOINT_FORM_URL,
