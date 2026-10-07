@@ -37,6 +37,16 @@ describe("WorkerCronTrigger 0.3", () => {
     expect(parsed.schedule.nextAfter(Date.UTC(2026, 0, 1, 0, 0))).toBe(Date.UTC(2027, 0, 1, 0, 0));
   });
 
+  test("accepts a field-width step even when its explicit range is narrower", () => {
+    const parsed = parseWorkerCronTriggerSpec({
+      worker: { resourceUid: "worker-1" },
+      cron: "0-5/60 * * * *",
+    });
+
+    expect(parsed.schedule.matches(Date.UTC(2026, 9, 7, 12, 0))).toBe(true);
+    expect(parsed.schedule.matches(Date.UTC(2026, 9, 7, 12, 1))).toBe(false);
+  });
+
   test.each([
     [{ worker: { resourceUid: "worker-1" }, cron: "0  0 * * *" }],
     [{ worker: { resourceUid: "worker-1" }, cron: "0\t0 * * *" }],

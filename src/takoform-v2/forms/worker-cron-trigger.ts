@@ -69,9 +69,7 @@ export function validateWorkerCronTriggerUpdate(
   return next;
 }
 
-export function workerCronTriggerReferences(
-  spec: WorkerCronTriggerSpec,
-): readonly [
+export function workerCronTriggerReferences(spec: WorkerCronTriggerSpec): readonly [
   {
     readonly resourceUid: string;
     readonly formUrl: typeof MODULE_WORKER_FORM_URL;
