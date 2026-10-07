@@ -72,7 +72,7 @@ function fixture() {
   });
   const runtime = createWorkflowRuntime({
     sql,
-    clock: () => new Date("2026-10-07T00:00:00.000Z"),
+    clock: () => new Date(),
     randomId: () => "unused-workflow-owner",
     waitUntil: async () => {},
     v2ResourceAuthority: createV2WorkflowResourceAuthority(sql),
@@ -134,7 +134,7 @@ function fixture() {
       }),
       [DURABLE_WORKFLOW_FORM_URL]: createDurableWorkflowForm({
         sql,
-        clock: () => new Date("2026-10-07T00:00:00.000Z"),
+        clock: () => new Date(),
         targetKey: TARGET,
         classAdmission: admission,
         runtime,

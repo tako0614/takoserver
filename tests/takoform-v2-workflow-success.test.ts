@@ -23,7 +23,7 @@ import { createWorkflowRuntime } from "../src/workflow-execution.ts";
 import { createV2WorkflowResourceAuthority } from "../src/workflow-v2-resource-authority.ts";
 
 const TARGET = "selfhost-workflow-test";
-const START = Date.UTC(2026, 9, 7);
+const START = Date.now();
 const dbs: Database[] = [];
 afterEach(() => {
   for (const db of dbs.splice(0)) db.close();
@@ -59,7 +59,11 @@ test("exact v2 Workflow spec is immutable and references only its accepted Worke
   );
 });
 
-function setup(sql: Sql, time: { now: number }, effects: { count: number; stops?: number }) {
+function setup(
+  sql: Sql,
+  time: { now: number },
+  effects: { count: number; stops?: number; stopFails?: boolean },
+) {
   const clock = () => new Date(time.now);
   let id = 0;
   const authority = createV2WorkflowResourceAuthority(sql);
@@ -103,6 +107,7 @@ function setup(sql: Sql, time: { now: number }, effects: { count: number; stops?
       },
       async stop() {
         if (typeof effects.stops === "number") effects.stops += 1;
+        if (effects.stopFails) throw new Error("synthetic physical stop refused");
         return "stopped" as const;
       },
     },
@@ -394,13 +399,95 @@ test("v2 instance INSERT loses atomically to accepted Resource DELETE without or
   ).toHaveLength(0);
 });
 
+test("v2 DELETE purge loses a held SQL batch when its Operation lease expires before statement execution", async () => {
+  const db = new Database(":memory:");
+  dbs.push(db);
+  migrateSqlite(db);
+  const base = createSqliteSql(db);
+  let reached!: () => void;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    reached = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let hold = true;
+  const sql: Sql = {
+    query: (statement, params) => base.query(statement, params),
+    run: (statement, params) => base.run(statement, params),
+    batch: async (statements) => {
+      if (
+        hold &&
+        statements.some((entry) => entry.sql.includes("DELETE FROM tf_workflow_instances WHERE"))
+      ) {
+        hold = false;
+        reached();
+        await gate;
+      }
+      return base.batch(statements);
+    },
+  };
+  const time = { now: Date.now() - 1_000 };
+  const { engine, runtime } = setup(sql, time, { count: 0 });
+  const worker = await engine.acceptCreate({
+    principal: "alice",
+    key: "lease-worker-create",
+    input: { form: MODULE_WORKER_FORM_URL, space: "default", name: "worker", spec: {} },
+  });
+  await engine.runNext();
+  const workflow = await engine.acceptCreate({
+    principal: "alice",
+    key: "lease-workflow-create",
+    input: {
+      form: DURABLE_WORKFLOW_FORM_URL,
+      space: "default",
+      name: "workflow",
+      spec: { worker: { resourceUid: worker.resourceUid }, className: "ReportWorkflow" },
+    },
+  });
+  await engine.runNext();
+  const scope = { tenantId: "alice", workflowResourceUid: workflow.resourceUid };
+  await runtime.instances.create(scope, { id: "held-purge" });
+  const deleted = await engine.acceptDelete({
+    principal: "alice",
+    key: "lease-workflow-delete",
+    uid: workflow.resourceUid,
+    expectedGeneration: 1,
+  });
+  const running = engine.runNext();
+  await held;
+  // The old pre-await clock guard would still see `time.now` and purge. The
+  // database's current clock sees this lease already expired, with no new owner.
+  await base.run("UPDATE tf_v2_operations SET lease_until_ms = ? WHERE id = ?", [
+    time.now + 1,
+    deleted.id,
+  ]);
+  release();
+  expect(await running).toMatchObject({ id: deleted.id, status: "reconciling" });
+  expect(
+    await base.query("SELECT 1 FROM tf_workflow_instances WHERE instance_id = ?", ["held-purge"]),
+  ).toHaveLength(1);
+  time.now += 60_001;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    time.now += 1_001;
+    if ((await engine.runNext())?.status === "succeeded") break;
+  }
+  expect(await engine.getOperation({ principal: "alice", id: deleted.id })).toMatchObject({
+    status: "succeeded",
+  });
+  expect(
+    await base.query("SELECT 1 FROM tf_workflow_instances WHERE instance_id = ?", ["held-purge"]),
+  ).toHaveLength(0);
+});
+
 test("v2 DELETE purges unswept expired terminal rows only after retained owners stop", async () => {
   const db = new Database(":memory:");
   dbs.push(db);
   migrateSqlite(db);
   const sql = createSqliteSql(db);
   const time = { now: START };
-  const effects = { count: 0, stops: 0 };
+  const effects = { count: 0, stops: 0, stopFails: false };
   const { engine, runtime } = setup(sql, time, effects);
   const worker = await engine.acceptCreate({
     principal: "alice",
@@ -445,10 +532,23 @@ test("v2 DELETE purges unswept expired terminal rows only after retained owners 
     uid: workflow.resourceUid,
     expectedGeneration: 1,
   });
-  await engine.runNext();
-  time.now += 1_001;
-  expect(await engine.runNext()).toMatchObject({ id: deleted.id, status: "succeeded" });
-  expect(effects.stops).toBe(1);
+  effects.stopFails = true;
+  expect(await engine.runNext()).toMatchObject({ id: deleted.id, status: "reconciling" });
+  expect(
+    await sql.query("SELECT 1 FROM tf_workflow_instances WHERE workflow_resource_uid = ?", [
+      workflow.resourceUid,
+    ]),
+  ).toHaveLength(2);
+  effects.stopFails = false;
+  time.now += 60_001;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    time.now += 1_001;
+    if ((await engine.runNext())?.status === "succeeded") break;
+  }
+  expect(await engine.getOperation({ principal: "alice", id: deleted.id })).toMatchObject({
+    status: "succeeded",
+  });
+  expect(effects.stops).toBe(2);
   expect(
     await sql.query("SELECT 1 FROM tf_workflow_instances WHERE instance_id = ?", [
       "expired-terminal",

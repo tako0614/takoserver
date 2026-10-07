@@ -19,6 +19,9 @@ cannot leave an orphan execution. No new schema or management ledger is added.
 An unswept instance past caller-visible retention is still retired by its
 physical row: the v2-only engine path stops any retained owner before the
 claimed purge, without reopening the expired instance to public callers.
+Every DELETE purge statement checks the accepted Operation lease against the
+database's current time inside that statement; a lease expiring while a batch
+is held cannot authorize a late purge.
 
 `createDurableWorkflowForm` requires a boot-selected class-admission port.
 `createV2WorkflowClassAdmission` now captures every active and pending weighted

@@ -50,6 +50,8 @@ const UNKNOWN: V2BackendResult = {
   message: "Workflow outcome is unconfirmed",
 };
 const PAGE = 64;
+const DB_NOW_MS =
+  "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
 
 function claimSql(): string {
   return `EXISTS (
@@ -66,12 +68,12 @@ function claimSql(): string {
       AND workflow_op.backend_id = ? AND workflow_op.target_key = ?
       AND workflow_op.generation = workflow_resource.generation
       AND workflow_op.action = ? AND workflow_op.status IN ('running','reconciling')
-      AND workflow_op.lease_token = ? AND workflow_op.lease_until_ms > ?
+      AND workflow_op.lease_token = ? AND workflow_op.lease_until_ms > ${DB_NOW_MS}
       AND workflow_op.accepted_spec_json = workflow_resource.spec_json
   )`;
 }
 
-function claimParams(input: V2Execution, timestamp: number): (string | number)[] {
+function claimParams(input: V2Execution): (string | number)[] {
   return [
     input.resourceUid,
     input.principal,
@@ -86,7 +88,6 @@ function claimParams(input: V2Execution, timestamp: number): (string | number)[]
     input.targetKey,
     input.action,
     input.leaseToken,
-    timestamp,
   ];
 }
 
@@ -124,10 +125,7 @@ export function createDurableWorkflowForm(options: {
     return value;
   };
   const owns = async (input: V2Execution): Promise<boolean> => {
-    const rows = await sql.query(
-      `SELECT 1 AS claimed WHERE ${claimSql()}`,
-      claimParams(input, now()),
-    );
+    const rows = await sql.query(`SELECT 1 AS claimed WHERE ${claimSql()}`, claimParams(input));
     return rows.length === 1;
   };
 
@@ -200,7 +198,7 @@ export function createDurableWorkflowForm(options: {
     const ids = rows.map((row) => row.instance_id as string);
     const slots = ids.map(() => "?").join(", ");
     const guard = claimSql();
-    const guardParams = claimParams(input, now());
+    const guardParams = claimParams(input);
     const parent = `tenant_id = ? AND workflow_resource_uid = ? AND instance_id IN (${slots})
       AND (status IN ('complete','errored','terminated') OR retention_until <= ?)
       AND run_owner IS NULL AND run_lease_until IS NULL`;
