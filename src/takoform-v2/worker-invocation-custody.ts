@@ -75,6 +75,10 @@ export interface V2WorkerInvocationCustody {
 
 type Row = Record<string, unknown>;
 
+function ownHandle(handle: V2WorkerInvocationHandle): V2WorkerInvocationHandle {
+  return Object.freeze({ invocationId: handle.invocationId, custodyToken: handle.custodyToken });
+}
+
 function record(
   row: Row | undefined,
   handle: V2WorkerInvocationHandle,
@@ -111,8 +115,8 @@ function record(
     (row.body_state !== null && row.body_state !== "finished" && row.body_state !== "canceled")
   )
     return null;
-  return {
-    handle,
+  return Object.freeze({
+    handle: Object.freeze({ invocationId: handle.invocationId, custodyToken: handle.custodyToken }),
     backendId: row.backend_id as string,
     targetKey: row.target_key as string,
     principal: row.principal as string,
@@ -131,7 +135,7 @@ function record(
     confirmedReceipt: row.confirmed_receipt as string,
     phase: row.phase,
     bodyState: row.body_state,
-  };
+  });
 }
 
 /** Common, provider-neutral lifecycle over the single invocation table. */
@@ -147,27 +151,30 @@ export function createV2WorkerInvocationLifecycle(options: {
     return value;
   }
   async function read(handle: V2WorkerInvocationHandle): Promise<V2WorkerInvocationRecord | null> {
+    const ownedHandle = ownHandle(handle);
     const rows = await sql.query(
       "SELECT * FROM tf_v2_worker_invocations WHERE invocation_id = ? AND custody_token = ? LIMIT 2",
-      [handle.invocationId, handle.custodyToken],
+      [ownedHandle.invocationId, ownedHandle.custodyToken],
     );
-    return rows.length === 1 ? record(rows[0], handle) : null;
+    return rows.length === 1 ? record(rows[0], ownedHandle) : null;
   }
   return {
     read,
     async beginSend(handle: V2WorkerInvocationHandle): Promise<boolean> {
+      const ownedHandle = ownHandle(handle);
       const result = await sql.run(
         `UPDATE tf_v2_worker_invocations SET phase = 'send_authorized', send_authorized_at_ms = ?
          WHERE invocation_id = ? AND custody_token = ? AND phase = 'admitted'`,
-        [instant(), handle.invocationId, handle.custodyToken],
+        [instant(), ownedHandle.invocationId, ownedHandle.custodyToken],
       );
       return result.changes === 1;
     },
     async refuseBeforeSend(handle: V2WorkerInvocationHandle): Promise<boolean> {
+      const ownedHandle = ownHandle(handle);
       const result = await sql.run(
         `UPDATE tf_v2_worker_invocations SET phase = 'pre_effect_refused', refused_at_ms = ?
          WHERE invocation_id = ? AND custody_token = ? AND phase = 'admitted'`,
-        [instant(), handle.invocationId, handle.custodyToken],
+        [instant(), ownedHandle.invocationId, ownedHandle.custodyToken],
       );
       return result.changes === 1;
     },
@@ -175,14 +182,15 @@ export function createV2WorkerInvocationLifecycle(options: {
       handle: V2WorkerInvocationHandle,
       state: "finished" | "canceled",
     ): Promise<boolean> {
+      const ownedHandle = ownHandle(handle);
       const result = await sql.run(
         `UPDATE tf_v2_worker_invocations SET body_state = ?, body_observed_at_ms = ?
          WHERE invocation_id = ? AND custody_token = ? AND phase = 'send_authorized'
            AND body_state IS NULL`,
-        [state, instant(), handle.invocationId, handle.custodyToken],
+        [state, instant(), ownedHandle.invocationId, ownedHandle.custodyToken],
       );
       if (result.changes === 1) return true;
-      return (await read(handle))?.bodyState === state;
+      return (await read(ownedHandle))?.bodyState === state;
     },
     async inspectDeployment(
       deploymentUid: string,

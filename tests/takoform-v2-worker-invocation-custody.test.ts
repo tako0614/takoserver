@@ -56,18 +56,30 @@ async function seed(sql: Sql) {
 async function exercise(sql: Sql) {
   await seed(sql);
   const owner = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(2000) });
+  const mutableHandle = { ...handle };
+  const pendingRead = owner.read(mutableHandle);
+  mutableHandle.invocationId = "other-invocation";
+  mutableHandle.custodyToken = "other-custody-token";
+  const ownedRecord = await pendingRead;
+  expect(ownedRecord?.handle).toEqual(handle);
+  expect(Object.isFrozen(ownedRecord)).toBe(true);
+  expect(Object.isFrozen(ownedRecord?.handle)).toBe(true);
+  expect(await owner.beginSend(ownedRecord?.handle ?? mutableHandle)).toBe(true);
   expect(await owner.read(handle)).toMatchObject({
-    phase: "admitted",
+    phase: "send_authorized",
     bodyState: null,
     versionUid: "version-one",
     nativeIdentity: "script-one",
     sourceOperationId: "op-deployment-one",
   });
-  expect(await owner.beginSend(handle)).toBe(true);
   expect(await owner.beginSend(handle)).toBe(false);
   expect(await owner.refuseBeforeSend(handle)).toBe(false);
   expect(await owner.observeBody(handle, "finished")).toBe(true);
-  expect(await owner.observeBody(handle, "finished")).toBe(true);
+  const mutableObservedHandle = { ...handle };
+  const pendingObservation = owner.observeBody(mutableObservedHandle, "finished");
+  mutableObservedHandle.invocationId = "other-invocation";
+  mutableObservedHandle.custodyToken = "other-custody-token";
+  expect(await pendingObservation).toBe(true);
   expect(await owner.observeBody(handle, "canceled")).toBe(false);
   expect(await owner.inspectDeployment("deployment-one")).toEqual({
     outstanding: 1,

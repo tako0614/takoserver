@@ -57,7 +57,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "v2-extension",
     match: /^src\/takoform-v2\/index\.ts$/u,
-    may: ["core", "v2-contract", "v2-form", "v2-runtime"],
+    may: ["core", "v2-contract", "v2-state", "v2-form", "v2-runtime"],
   },
   {
     name: "v2-contract",
@@ -66,7 +66,7 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "v2-state",
-    match: /^src\/takoform-v2\/store\.ts$/u,
+    match: /^src\/takoform-v2\/(?:store|worker-invocation-custody)\.ts$/u,
     may: ["core", "v2-contract"],
   },
   {

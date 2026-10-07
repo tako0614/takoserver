@@ -352,7 +352,7 @@ describe("production D1 fresh init", () => {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0076_unreviewed.sql"),
+            join(migrationDirectory, "0077_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }
@@ -365,7 +365,7 @@ describe("production D1 fresh init", () => {
         ).rejects.toThrow(
           drift === "changed"
             ? "exact audited migration SHA-256"
-            : "audited migration lineage must contain exactly 0001-0075",
+            : "audited migration lineage must contain exactly 0001-0076",
         );
         expect(fixture.calls).toEqual([]);
       } finally {
