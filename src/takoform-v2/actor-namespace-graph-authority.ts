@@ -12,6 +12,8 @@ import { ACTOR_NAMESPACE_FORM_URL, parseActorNamespaceSpec } from "./forms/actor
 import { MODULE_WORKER_FORM_URL, WORKER_DEPLOYMENT_FORM_URL } from "./forms/worker-specs.ts";
 
 type Scope = ActorExecutionGraph["scope"];
+const DB_NOW_MS =
+  "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
 
 interface NamespaceRow {
   readonly uid: unknown;
@@ -35,6 +37,9 @@ interface NamespaceRow {
   readonly op_target_key: unknown;
   readonly op_generation: unknown;
   readonly accepted_spec_json: unknown;
+  readonly op_lease_token: unknown;
+  readonly op_dispatch_possible: unknown;
+  readonly op_lease_live: unknown;
   readonly worker_form_url: unknown;
   readonly worker_uid: unknown;
   readonly worker_principal: unknown;
@@ -68,6 +73,20 @@ export interface V2ActorWorkerOwnerReader {
   > | null>;
 }
 
+/** Privileged read for one backend-held leased Namespace Operation. */
+export interface V2ActorAcceptedOperationGraphAuthority extends ActorGraphAuthority {
+  readAcceptedOperationGraph(
+    scope: Scope,
+    operation: { readonly operationId: string; readonly leaseToken: string },
+  ): Promise<ActorExecutionGraph | null>;
+  acceptedOperationRealization(
+    native: Extract<
+      Awaited<ReturnType<WorkerdWorkerRuntimeOwner["observeActorGraph"]>>,
+      { readonly kind: "ready" }
+    >,
+  ): ActorExecutionRealization;
+}
+
 /**
  * Reads accepted v2 Namespace/Worker SQL and the exact native owner. No v1
  * ResourceDeployment, package identity, or duplicate Actor ledger is involved.
@@ -77,7 +96,7 @@ export function createV2ActorNamespaceGraphAuthority(options: {
   readonly sql: Sql;
   readonly targetKey: string;
   readonly owner: V2ActorWorkerOwnerReader;
-}): ActorGraphAuthority {
+}): V2ActorAcceptedOperationGraphAuthority {
   if (!options.targetKey) throw new TypeError("Actor targetKey is required");
 
   const namespaceRow = async (scope: Scope): Promise<NamespaceRow | null> => {
@@ -95,6 +114,10 @@ export function createV2ActorNamespaceGraphAuthority(options: {
               op.target_key AS op_target_key,
               op.generation AS op_generation,
               op.accepted_spec_json,
+              op.lease_token AS op_lease_token,
+              op.dispatch_possible AS op_dispatch_possible,
+              CASE WHEN op.lease_until_ms > ${DB_NOW_MS} THEN 1 ELSE 0 END
+                AS op_lease_live,
               worker.uid AS worker_uid,
               worker.form_url AS worker_form_url,
               worker.principal AS worker_principal,
@@ -148,8 +171,12 @@ export function createV2ActorNamespaceGraphAuthority(options: {
     return rows.length === 1 ? (rows[0] ?? null) : null;
   };
 
-  const acceptedGraph = async (scope: Scope): Promise<ActorExecutionGraph | null> => {
+  const acceptedGraph = async (
+    scope: Scope,
+    heldOperation?: { readonly operationId: string; readonly leaseToken: string },
+  ): Promise<ActorExecutionGraph | null> => {
     const row = await namespaceRow(scope);
+    const held = heldOperation !== undefined;
     if (
       !row ||
       row.uid !== scope.namespaceResourceUid ||
@@ -157,14 +184,20 @@ export function createV2ActorNamespaceGraphAuthority(options: {
       typeof row.space !== "string" ||
       row.target_key !== options.targetKey ||
       row.deleted_at !== null ||
-      row.busy_operation !== null ||
-      row.phase !== "idle" ||
-      row.generation !== row.observed_generation ||
+      (heldOperation
+        ? row.busy_operation !== heldOperation.operationId ||
+          row.last_operation !== heldOperation.operationId ||
+          row.op_lease_token !== heldOperation.leaseToken ||
+          row.op_dispatch_possible !== 1 ||
+          row.op_lease_live !== 1
+        : row.busy_operation !== null ||
+          row.phase !== "idle" ||
+          row.generation !== row.observed_generation) ||
       row.last_operation === null ||
       row.action === "delete" ||
       (row.action !== "create" && row.action !== "update") ||
-      row.status !== "succeeded" ||
-      row.effect !== "complete" ||
+      row.status !== (held ? "reconciling" : "succeeded") ||
+      (!held && row.effect !== "complete") ||
       row.op_resource_uid !== row.uid ||
       row.op_principal !== row.principal ||
       row.op_backend_id !== row.backend_id ||
@@ -301,7 +334,24 @@ export function createV2ActorNamespaceGraphAuthority(options: {
       // Accepted DELETE withdraws delivery authority before physical removal.
       return !(row.busy_operation === row.last_operation && row.action === "delete");
     },
-    readGraph: acceptedGraph,
+    readGraph: (scope) => acceptedGraph(scope),
+    /** Own leased Operation only; ordinary delivery keeps the settled graph reader. */
+    readAcceptedOperationGraph(
+      scope: Scope,
+      operation: {
+        readonly operationId: string;
+        readonly leaseToken: string;
+      },
+    ) {
+      return acceptedGraph(scope, { ...operation });
+    },
+    acceptedOperationRealization(native) {
+      return {
+        script: native.script,
+        graph: native.graph,
+        authorityKey: realizationKey(native),
+      };
+    },
     hasRealization: activeDeployment,
     async readRealization(graph, signal) {
       signal.throwIfAborted();

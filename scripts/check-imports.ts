@@ -212,6 +212,21 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "adapter", "app", "v2-form", "v2-actor-binding-authority"],
   },
   {
+    // Exact app boot joins accepted SQL, the physical Actor owner, and the
+    // portable composition port; generic app/Form/native layers stay unchanged.
+    name: "v2-selfhost-actor-boot",
+    match: /^src\/selfhost-v2-actor-boot\.ts$/u,
+    may: [
+      "core",
+      "app",
+      "v2-actor-binding-authority",
+      "v2-actor-forward-runtime",
+      "v2-actor-physical-backend",
+      "v2-actor-graph-authority",
+      "v2-selfhost-composition",
+    ],
+  },
+  {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state"],
