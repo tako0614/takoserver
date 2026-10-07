@@ -18,7 +18,7 @@ import { createV2NativeEffectCustody } from "../src/takoform-v2/worker-native-ef
 const digest = `sha256:${"a".repeat(64)}` as const;
 const nativeIdentity = `v2w-${"b".repeat(48)}`;
 
-async function fixture(confirmUpload = true, secondSource = false) {
+async function fixture(confirmUpload = true, secondSource = false, deadReferrer = false) {
   const directory = mkdtempSync(join(tmpdir(), "v2-native-delete-"));
   const path = join(directory, "db.sqlite");
   const db = new Database(path);
@@ -140,14 +140,14 @@ async function fixture(confirmUpload = true, secondSource = false) {
     expect(
       await uploads.grant({
         execution: secondExecution,
-        nativeIdentity: `v2w-${"c".repeat(48)}`,
+        nativeIdentity,
         closureDigest: digest,
       }),
     ).toBe("granted");
     expect(
       await uploads.confirm({
         execution: secondExecution,
-        nativeIdentity: `v2w-${"c".repeat(48)}`,
+        nativeIdentity,
         closureDigest: digest,
         receipt: "etag-second",
       }),
@@ -168,6 +168,26 @@ async function fixture(confirmUpload = true, secondSource = false) {
       `UPDATE tf_v2_resources SET phase = 'idle', busy_operation = NULL,
       observed_generation = 2 WHERE uid = ?`,
       [resource.uid],
+    );
+  }
+  if (deadReferrer) {
+    await sql.run(
+      `INSERT INTO tf_v2_resources
+      (uid, principal, form_url, space, name, backend_id, target_key,
+       active_name, generation, observed_generation, phase, spec_json, last_operation)
+      VALUES ('dead-referrer','org-a',?,'production','dead-referrer',
+        'fixture-version-backend','target-a','dead-referrer',1,1,'idle','{}','dead-op')`,
+      [WORKER_VERSION_FORM_URL],
+    );
+    await sql.run(
+      `INSERT INTO tf_v2_resource_references (target_uid,referrer_uid)
+      VALUES (?,'dead-referrer')`,
+      [resource.uid],
+    );
+    await sql.run(
+      `UPDATE tf_v2_resources SET deleted_at = ?, active_name = NULL
+      WHERE uid = 'dead-referrer'`,
+      [now().toISOString()],
     );
   }
   const deletion = await engine.acceptDelete({
@@ -261,25 +281,52 @@ test("confirmed source stages, one DELETE grant persists across reopen, and lost
   }
 });
 
-test("every immutable old source requires its own one-shot deletion and absence receipt", async () => {
+test("historical reused script identity deletes the latest source once and accounts for every old grant", async () => {
   const f = await fixture(true, true);
   try {
     expect(await f.custody.stageNext(f.execution)).toBe("more");
     expect(await f.custody.stageNext(f.execution)).toBe("ready");
     const rows = await f.sql.query(
-      "SELECT source_generation FROM tf_v2_worker_native_deletions ORDER BY source_generation",
+      "SELECT source_operation_id, source_generation FROM tf_v2_worker_native_deletions ORDER BY source_generation",
     );
     expect(rows.map((row) => row.source_generation)).toEqual([1, 2]);
     const first = await f.custody.next(f.execution);
     if (!first) throw new Error("missing first source");
-    expect(await f.custody.grant(first, "etag-upload")).toBe("granted");
-    expect(await f.custody.confirmAbsent(first, "absence-first")).toBe(true);
+    expect(first.sourceGeneration).toBe(2);
+    const older = {
+      ...first,
+      sourceOperationId: String(rows[0]?.source_operation_id),
+      sourceGeneration: 1,
+      uploadReceipt: "etag-upload",
+    };
+    expect(await f.custody.grant(older, "etag-upload")).toBe("unknown");
+    expect(await f.custody.grant(first, "etag-second")).toBe("granted");
+    expect(await f.custody.confirmAbsent(first, "absence-latest")).toBe(true);
     expect(await f.custody.allAbsent(f.execution)).toBe(false);
     const second = await f.custody.next(f.execution);
     if (!second) throw new Error("missing second source");
-    expect(second.sourceGeneration).toBe(2);
-    expect(await f.custody.grant(second, "etag-second")).toBe("granted");
-    expect(await f.custody.confirmAbsent(second, "absence-second")).toBe(true);
+    expect(second.sourceGeneration).toBe(1);
+    expect(await f.custody.grant(second, "etag-upload")).toBe("unknown");
+    expect(await f.custody.confirmAbsent(second, "absence-latest")).toBe(true);
+    expect(await f.custody.allAbsent(f.execution)).toBe(true);
+  } finally {
+    f.close();
+  }
+});
+
+test("historical edge from a tombstoned referrer does not block accepted native cleanup", async () => {
+  const f = await fixture(true, false, true);
+  try {
+    expect(
+      await f.sql.query("SELECT 1 FROM tf_v2_resource_references WHERE target_uid = ?", [
+        f.execution.resourceUid,
+      ]),
+    ).toHaveLength(1);
+    expect(await f.custody.stageNext(f.execution)).toBe("more");
+    const item = await f.custody.next(f.execution);
+    if (!item) throw new Error("missing item");
+    expect(await f.custody.grant(item, "etag-upload")).toBe("granted");
+    expect(await f.custody.confirmAbsent(item, "owned-404-receipt")).toBe(true);
     expect(await f.custody.allAbsent(f.execution)).toBe(true);
   } finally {
     f.close();
@@ -331,6 +378,38 @@ test("unknown historical upload needs new exact source readback, not old lease r
     expect(await f.custody.grant(item, "qualified-owned-byte-readback")).toBe("granted");
     expect(await f.custody.confirmAbsent(item, "owned-404-receipt")).toBe(true);
     expect(await f.custody.allAbsent(f.execution)).toBe(true);
+  } finally {
+    f.close();
+  }
+});
+
+test("raw stage INSERT cannot smuggle an unverified source qualification", async () => {
+  const f = await fixture(false);
+  try {
+    await expect(
+      f.sql.run(
+        `INSERT INTO tf_v2_worker_native_deletions
+      (delete_operation_id, source_operation_id, resource_uid, principal, space,
+       backend_id, target_key, delete_generation, source_generation,
+       native_identity, closure_digest, upload_receipt, qualified_source_receipt,
+       qualification_lease_token, stage_lease_token, staged_at_ms)
+      SELECT ?, effect.operation_id, effect.resource_uid, effect.principal, effect.space,
+        effect.backend_id, effect.target_key, ?, effect.generation,
+        effect.native_identity, effect.closure_digest, effect.confirmed_receipt,
+        'forged-source-proof', ?, ?, ?
+      FROM tf_v2_worker_native_effects effect WHERE effect.resource_uid = ?`,
+        [
+          f.execution.operationId,
+          f.execution.generation,
+          f.execution.leaseToken,
+          f.execution.leaseToken,
+          Date.now(),
+          f.execution.resourceUid,
+        ],
+      ),
+    ).rejects.toThrow();
+    expect(await f.sql.query("SELECT 1 FROM tf_v2_worker_native_deletions")).toHaveLength(0);
+    expect(await f.custody.stageNext(f.execution)).toBe("more");
   } finally {
     f.close();
   }

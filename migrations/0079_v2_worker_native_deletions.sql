@@ -39,7 +39,6 @@ CREATE TABLE tf_v2_worker_native_deletions (
   ),
   absence_lease_token TEXT,
   PRIMARY KEY (delete_operation_id, source_operation_id),
-  UNIQUE (delete_operation_id, native_identity),
   CHECK ((qualified_source_receipt IS NULL) = (qualification_lease_token IS NULL)),
   CHECK ((grant_lease_token IS NULL) = (granted_at_ms IS NULL)),
   CHECK ((grant_lease_token IS NULL) = (predelete_source_receipt IS NULL)),
@@ -48,7 +47,7 @@ CREATE TABLE tf_v2_worker_native_deletions (
   CHECK (acknowledged_receipt IS NULL OR granted_at_ms IS NOT NULL)
 );
 CREATE INDEX tf_v2_worker_native_deletions_next
-  ON tf_v2_worker_native_deletions(delete_operation_id, source_generation, source_operation_id);
+  ON tf_v2_worker_native_deletions(delete_operation_id, source_generation DESC, source_operation_id);
 CREATE INDEX tf_v2_worker_native_effects_resource_generation
   ON tf_v2_worker_native_effects(resource_uid, generation, operation_id);
 
@@ -57,6 +56,8 @@ CREATE INDEX tf_v2_worker_native_effects_resource_generation
 CREATE TRIGGER tf_v2_worker_native_deletion_stage_guard
 BEFORE INSERT ON tf_v2_worker_native_deletions
 WHEN NEW.grant_lease_token IS NOT NULL OR NEW.granted_at_ms IS NOT NULL OR
+  NEW.qualified_source_receipt IS NOT NULL OR NEW.qualification_lease_token IS NOT NULL OR
+  NEW.predelete_source_receipt IS NOT NULL OR NEW.absence_lease_token IS NOT NULL OR
   NEW.acknowledged_receipt IS NOT NULL OR NEW.confirmed_absence_receipt IS NOT NULL OR
   NOT EXISTS (
     SELECT 1 FROM tf_v2_operations deletion
@@ -168,7 +169,13 @@ BEGIN
         AND version.phase = 'deleting' AND version.deleted_at IS NULL
         AND version.spec_json = deletion.accepted_spec_json
     ) OR
-    EXISTS (SELECT 1 FROM tf_v2_resource_references WHERE target_uid = OLD.resource_uid) OR
+    EXISTS (SELECT 1 FROM tf_v2_worker_native_deletions later
+      WHERE later.delete_operation_id = OLD.delete_operation_id
+        AND later.native_identity = OLD.native_identity
+        AND later.source_generation > OLD.source_generation) OR
+    EXISTS (SELECT 1 FROM tf_v2_resource_references reference
+      JOIN tf_v2_resources referrer ON referrer.uid = reference.referrer_uid
+      WHERE reference.target_uid = OLD.resource_uid AND referrer.deleted_at IS NULL) OR
     EXISTS (
       SELECT 1 FROM tf_v2_worker_invocations invocation
       WHERE invocation.version_uid = OLD.resource_uid
@@ -233,7 +240,9 @@ BEGIN
         AND version.last_operation = deletion.id AND version.busy_operation = deletion.id
         AND version.spec_json = deletion.accepted_spec_json
     ) OR
-    EXISTS (SELECT 1 FROM tf_v2_resource_references WHERE target_uid = OLD.resource_uid) OR
+    EXISTS (SELECT 1 FROM tf_v2_resource_references reference
+      JOIN tf_v2_resources referrer ON referrer.uid = reference.referrer_uid
+      WHERE reference.target_uid = OLD.resource_uid AND referrer.deleted_at IS NULL) OR
     EXISTS (SELECT 1 FROM tf_v2_worker_invocations invocation
       WHERE invocation.version_uid = OLD.resource_uid
         AND invocation.phase <> 'pre_effect_refused'

@@ -139,7 +139,9 @@ const MISSING = `EXISTS (
         AND (item.upload_receipt IS effect.confirmed_receipt OR
           item.qualified_source_receipt = effect.confirmed_receipt))
 )`;
-const UNSAFE = `EXISTS (SELECT 1 FROM tf_v2_resource_references ref WHERE ref.target_uid = op.resource_uid)
+const UNSAFE = `EXISTS (SELECT 1 FROM tf_v2_resource_references ref
+    JOIN tf_v2_resources referrer ON referrer.uid = ref.referrer_uid
+    WHERE ref.target_uid = op.resource_uid AND referrer.deleted_at IS NULL)
   OR EXISTS (SELECT 1 FROM tf_v2_worker_invocations invocation
     WHERE invocation.version_uid = op.resource_uid
       AND invocation.phase <> 'pre_effect_refused'
@@ -258,7 +260,7 @@ export function createV2NativeDeletionCustody(options: {
       const found = await sql.query(
         `SELECT * FROM tf_v2_worker_native_deletions
         WHERE delete_operation_id = ? AND confirmed_absence_receipt IS NULL
-        ORDER BY source_generation, source_operation_id LIMIT 1`,
+        ORDER BY source_generation DESC, source_operation_id LIMIT 1`,
         [e.operationId],
       );
       const record = (found[0] ?? null) as ItemRow | null;
@@ -321,6 +323,10 @@ export function createV2NativeDeletionCustody(options: {
           WHERE delete_operation_id = ? AND source_operation_id = ?
             AND grant_lease_token IS NULL AND confirmed_absence_receipt IS NULL
             AND (upload_receipt = ? OR qualified_source_receipt = ?)
+            AND NOT EXISTS (SELECT 1 FROM tf_v2_worker_native_deletions later
+              WHERE later.delete_operation_id = tf_v2_worker_native_deletions.delete_operation_id
+                AND later.native_identity = tf_v2_worker_native_deletions.native_identity
+                AND later.source_generation > tf_v2_worker_native_deletions.source_generation)
             AND EXISTS (SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r
               ON r.uid = op.resource_uid WHERE ${CLAIM}
                 AND NOT (${UNSAFE}) AND NOT (${MISSING}))`,

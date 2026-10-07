@@ -313,7 +313,7 @@ const AUDITED_MIGRATION_SHA256: Readonly<
   "0078_v2_worker_invocation_retirement.sql":
     "sha256:ba7f5ea649251011fcc88eb6e909f6e39202dda2052111ea6624be6c6b92af63",
   "0079_v2_worker_native_deletions.sql":
-    "sha256:fc9bd06cb4bbb1105f64065475bd13c747f70c8f0d607796e4901b7bebdeb9ee",
+    "sha256:37545e6e47aa4880111d2f0bd1e975528109998d3fddc8122a88f5a2fda00361",
 };
 // 0067-0079 are part of the exact source inventory only. None has an in-place apply wave.
 const INTEGRATION_APPLY_CEILING_COUNT = 66;
