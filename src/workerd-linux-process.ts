@@ -105,8 +105,22 @@ export async function linuxProcessLiveness(
     if ((error as NodeJS.ErrnoException).code === "ESRCH") return "stale";
     return "unknown";
   }
+  let statText: string;
   try {
-    const statText = await readFile(`/proc/${identity.pid}/stat`, "utf8");
+    statText = await readFile(`/proc/${identity.pid}/stat`, "utf8");
+  } catch (error) {
+    // A child can be reaped after kill(pid, 0) succeeded but before procfs
+    // opens its stat file. ENOENT alone is not absence: the PID may also have
+    // been reused, so require a fresh kernel ESRCH result before saying stale.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "unknown";
+    try {
+      process.kill(identity.pid, 0);
+      return "unknown";
+    } catch (recheckError) {
+      return (recheckError as NodeJS.ErrnoException).code === "ESRCH" ? "stale" : "unknown";
+    }
+  }
+  try {
     const actualStartTime = startTime(statText, identity.pid);
     if (actualStartTime === null) return "unknown";
     if (actualStartTime !== identity.startTimeTicks) return "stale";
