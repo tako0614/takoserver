@@ -386,7 +386,7 @@ test("synthetic selection accepts only the accepted Version's exact v2 SQLite ad
     f.selected.site.mainModule = V2_SQLITE_ADAPTER_MODULE;
     f.selected.site.modules.push("index.mjs", V2_SQLITE_INTRINSIC_MODULE);
     for (const [name, bytes] of projected) {
-      f.selected.modules.set(name, bytes);
+      f.selected.modules.set(name, new Uint8Array(bytes));
       Object.assign(f.selected.site.moduleMediaTypes, {
         [name]: "application/javascript+module",
       });
