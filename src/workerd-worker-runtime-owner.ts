@@ -917,6 +917,19 @@ async function releaseOwnerLock(
   }
 }
 
+// A failed successor must leave its lock file in place until PID death, but
+// must not abandon the open FileHandle to GC (Bun treats that as a fatal error).
+// Keep the handle strongly referenced only if close itself is uncertain.
+const failedRecoveryLockHandles = new Set<OpenedOwnerLock["handle"]>();
+
+async function retainOwnerLockAfterFailure(opened: OpenedOwnerLock): Promise<void> {
+  try {
+    await opened.handle.close();
+  } catch {
+    failedRecoveryLockHandles.add(opened.handle);
+  }
+}
+
 export function createSerializedWorkerdOwnerStateWriter<State>(
   initial: State,
   commit: (next: State) => Promise<State>,
@@ -1549,8 +1562,8 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
     if (hasServingIncarnations) await requireStaleIncarnationChildrenAndVacantListeners(state);
   } catch (error) {
-    if (!ownerLock.recoveredFromStaleOwner)
-      await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
+    if (ownerLock.recoveredFromStaleOwner) await retainOwnerLockAfterFailure(ownerLock);
+    else await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
     if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
@@ -1693,8 +1706,8 @@ export async function openWorkerdWorkerRuntimeOwner(
       }
     }
   } catch (error) {
-    if (!ownerLock.recoveredFromStaleOwner)
-      await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
+    if (ownerLock.recoveredFromStaleOwner) await retainOwnerLockAfterFailure(ownerLock);
+    else await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
     if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
@@ -2969,6 +2982,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       // An active record can never be reopened through the no-lock path. Keep
       // this successor lock (and its PID fingerprint) even when failure was
       // transient; a later Host may retry only after this PID is proven stale.
+      await retainOwnerLockAfterFailure(ownerLock);
       if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }

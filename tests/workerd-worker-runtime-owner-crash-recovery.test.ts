@@ -101,7 +101,7 @@ async function startHost(
       updateId,
       DELETE_ID,
     ],
-    { stdout: "pipe", stderr: "ignore" },
+    { stdout: mode === "active-recover-sql-unavailable" ? "ignore" : "pipe", stderr: "ignore" },
   );
 }
 
@@ -157,6 +157,17 @@ async function ownerState(root: string): Promise<Record<string, unknown>> {
   return JSON.parse(
     await readFile(join(ownerDirectory(root), "runtime-owner.json"), "utf8"),
   ) as Record<string, unknown>;
+}
+
+async function readSqlFailureMarker(root: string): Promise<{ code: string; pid: number }> {
+  const path = join(root, "owners", "sql-failure-ready.json");
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const text = await readFile(path, "utf8").catch(() => null);
+    if (text !== null) return JSON.parse(text) as { code: string; pid: number };
+    await Bun.sleep(10);
+  }
+  throw new Error("SQL failure marker was not written");
 }
 
 test("a new host process replays the exact DELETE proof after the old host crashes", async () => {
@@ -313,6 +324,7 @@ test("transient current-serving lookup failure preserves a retryable active owne
   const port = await unusedPort();
   let first: HostProcess | undefined;
   let failed: HostProcess | undefined;
+  let competing: HostProcess | undefined;
   let third: HostProcess | undefined;
   try {
     first = await startHost("active-create", owned.root, owned.binary, port);
@@ -322,16 +334,27 @@ test("transient current-serving lookup failure preserves a retryable active owne
     await waitForVacant(port);
 
     failed = await startHost("active-recover-sql-unavailable", owned.root, owned.binary, port);
-    expect(await readJsonLine(failed)).toMatchObject({
-      kind: "error",
+    expect(await readSqlFailureMarker(owned.root)).toEqual({
       code: "ownership_uncertain",
-      phase: "open-owner",
+      pid: failed.pid,
     });
     const lock = JSON.parse(
       await readFile(join(ownerDirectory(owned.root), "runtime-owner.lock"), "utf8"),
     ) as { pid: number };
     expect(lock.pid).toBe(failed.pid);
-    await failed.exited;
+    expect(failed.exitCode).toBeNull();
+    expect(
+      (await readFile(`/proc/${failed.pid}/stat`, "utf8")).split(") ")[1]?.startsWith("Z"),
+    ).toBe(false);
+    competing = await startHost("active-recover-only", owned.root, owned.binary, port);
+    expect(await readJsonLine(competing)).toMatchObject({
+      kind: "error",
+      code: "ownership_uncertain",
+      phase: "open-owner",
+    });
+    await terminateHost(competing);
+    competing = undefined;
+    await terminateHost(failed);
     failed = undefined;
 
     third = await startHost("active-recover", owned.root, owned.binary, port, UPDATE_ID);
@@ -339,6 +362,7 @@ test("transient current-serving lookup failure preserves a retryable active owne
   } finally {
     if (first) await terminateHost(first);
     if (failed) await terminateHost(failed);
+    if (competing) await terminateHost(competing);
     if (third) await terminateHost(third);
     await owned.cleanup();
   }

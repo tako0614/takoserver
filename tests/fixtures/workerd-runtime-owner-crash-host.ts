@@ -280,6 +280,7 @@ function execution(operationId: string, action: V2Execution["action"]): V2Execut
 
 let owner: Awaited<ReturnType<typeof openWorkerdWorkerRuntimeOwner>> | undefined;
 let _heldResponse: Response | undefined;
+let _failureHold: ReturnType<typeof Bun.serve> | undefined;
 let phase = "open-owner";
 try {
   owner = await openWorkerdWorkerRuntimeOwner({
@@ -297,13 +298,26 @@ try {
   });
   phase = "owner-opened";
 } catch (error) {
+  // Keep the failed owner PID observably live until the test kills it. Bun
+  // may exit a timer-only fixture after top-level recovery rejects.
+  if (mode === "active-recover-sql-unavailable") {
+    _failureHold = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("hold") });
+    _failureHold.ref();
+  }
   const code =
     error && typeof error === "object" && "code" in error ? String(error.code) : "fixture_failed";
   const detail = error instanceof Error ? error.message : "non-error rejection";
+  if (mode === "active-recover-sql-unavailable") {
+    await writeFile(
+      join(rootDirectory as string, "sql-failure-ready.json"),
+      JSON.stringify({ code, pid: process.pid }),
+      { mode: 0o600 },
+    );
+  }
   process.stdout.write(
     `${JSON.stringify({ kind: "error", code, detail, phase, pid: process.pid, port })}\n`,
   );
-  process.exitCode = 2;
+  if (mode !== "active-recover-sql-unavailable") process.exitCode = 2;
 }
 
 if (owner)
