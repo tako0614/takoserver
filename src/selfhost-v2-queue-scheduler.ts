@@ -8,15 +8,19 @@ import {
 } from "./takoform-v2/forms/queue-consumer.ts";
 import { v2QueueId } from "./takoform-v2/worker-queue-delivery.ts";
 
-/** One native event has a five-minute deadline; cap one shutdown drain pass. */
+/** One SQL page; native handlers are tracked but never awaited by the scan. */
 const PAGE = 16;
-/** At most one extra native wake after the ordinary Consumer page. */
+/** Keep one pass bounded even when many source notices remain pending. */
 const NOTICE_PAGE = 1;
+/** Process-local scheduling capacity, not send authority or an 0083 lease. */
+const MAX_IN_FLIGHT = 64;
 const DEFAULT_POLL_MILLIS = 1_000;
 const DB_NOW_MS =
   "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
 
 type Delivery = Pick<ReturnType<typeof createSelfhostV2QueueComposition>, "deliverOnce">;
+type DeliveryKind = Awaited<ReturnType<Delivery["deliverOnce"]>>["kind"];
+type DeliveryScope = Parameters<Delivery["deliverOnce"]>[0];
 
 export interface SelfhostV2QueueSchedulerOptions {
   readonly sql: Sql;
@@ -42,9 +46,30 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
   let inFlight: Promise<number> | undefined;
   let closePromise: Promise<void> | undefined;
   let closed = false;
+  const active = new Map<string, Promise<DeliveryKind>>();
+  const noticeWakes = new Set<string>();
+
+  const schedule = (scope: DeliveryScope): Promise<DeliveryKind> | null => {
+    if (closed || active.has(scope.consumerUid) || active.size >= MAX_IN_FLIGHT) return null;
+    // Publish the per-Consumer slot before any native work starts. A later
+    // poll in this process cannot send the same Consumer concurrently. A Host
+    // restart relies on durable 0082/0083 custody, never on this Map.
+    const work: Promise<DeliveryKind> = Promise.resolve()
+      .then(() =>
+        closed ? ({ kind: "unknown" } as const) : options.composition.deliverOnce(scope),
+      )
+      .then((outcome) => outcome.kind)
+      .catch(() => "unknown" as const);
+    active.set(scope.consumerUid, work);
+    void work.then(() => {
+      if (active.get(scope.consumerUid) === work) active.delete(scope.consumerUid);
+    });
+    return work;
+  };
 
   const pass = async (): Promise<number> => {
-    const outcomes = new Map<string, Awaited<ReturnType<Delivery["deliverOnce"]>>["kind"]>();
+    await wakeTransfers();
+    if (closed) return 0;
     const rows = await options.sql.query(
       `SELECT resource.uid, resource.principal, resource.space, resource.target_key
        FROM tf_v2_resources resource
@@ -69,40 +94,35 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
       [cursor, QUEUE_CONSUMER_FORM_URL, PAGE],
     );
     if (closed) return 0;
-    const visits = await Promise.all(
-      rows.map(async (row) => {
-        if (
-          closed ||
-          typeof row.uid !== "string" ||
-          typeof row.principal !== "string" ||
-          typeof row.space !== "string" ||
-          typeof row.target_key !== "string"
-        )
-          return 0;
-        // A candidate read is not a send grant. This call repeats the exact
-        // accepted graph and native owner checks before any event can be sent.
-        const outcome = await options.composition
-          .deliverOnce({
-            consumerUid: row.uid,
-            principal: row.principal,
-            space: row.space,
-            targetKey: row.target_key,
-          })
-          .catch(() => ({ kind: "unknown" as const }));
-        outcomes.set(row.uid, outcome.kind);
-        return 1;
-      }),
-    );
+    let scheduled = 0;
+    for (const row of rows) {
+      if (closed) break;
+      if (
+        typeof row.uid !== "string" ||
+        typeof row.principal !== "string" ||
+        typeof row.space !== "string" ||
+        typeof row.target_key !== "string"
+      )
+        continue;
+      // A candidate read is not a send grant. This call repeats the exact
+      // accepted graph and native owner checks before any event can be sent.
+      if (
+        schedule({
+          consumerUid: row.uid,
+          principal: row.principal,
+          space: row.space,
+          targetKey: row.target_key,
+        })
+      )
+        scheduled += 1;
+    }
     const last = rows.at(-1);
     cursor = rows.length === PAGE && typeof last?.uid === "string" ? last.uid : "";
-    await wakeTransfers(outcomes);
-    return visits.reduce<number>((sum, value) => sum + value, 0);
+    return scheduled;
   };
 
   /** A notice is not itself delivery authority or proof of a target wake. */
-  const wakeTransfers = async (
-    outcomes: Map<string, Awaited<ReturnType<Delivery["deliverOnce"]>>["kind"]>,
-  ): Promise<void> => {
+  const wakeTransfers = async (): Promise<void> => {
     if (closed || !timer) return;
     const after = noticeCursor ?? ["", "", 0, ""];
     const notices = await options.sql.query(
@@ -130,6 +150,14 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
         typeof noticeToken !== "string"
       )
         continue;
+      const noticeKey = JSON.stringify([
+        sourceQueueId,
+        sourceConsumerId,
+        sourceGeneration,
+        targetQueueId,
+        noticeToken,
+      ]);
+      if (noticeWakes.has(noticeKey)) continue;
       // Source may be retiring or soft-deleted. Its persisted v2 identity and
       // immutable Queue reference still distinguish this from legacy custody.
       const sourceRows = await options.sql.query(
@@ -201,11 +229,19 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
         );
       const targets = await readTarget();
       const target = targets.length === 1 ? targets[0] : null;
-      if (!target || typeof target.uid !== "string" || !Number.isSafeInteger(target.generation))
+      if (
+        !target ||
+        typeof target.uid !== "string" ||
+        typeof target.spec_json !== "string" ||
+        !Number.isSafeInteger(target.generation)
+      )
         continue;
+      const targetUid = target.uid;
+      const targetGeneration = target.generation as number;
+      const targetSpecJson = target.spec_json;
       let spec: ReturnType<typeof parseQueueConsumerSpec>;
       try {
-        spec = parseQueueConsumerSpec(JSON.parse(String(target.spec_json)));
+        spec = parseQueueConsumerSpec(JSON.parse(targetSpecJson));
         if (v2QueueId(spec.queue.resourceUid) !== targetQueueId) continue;
       } catch {
         continue;
@@ -224,8 +260,8 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
       const readiness = await options.custody
         .readiness({
           queueId: targetQueueId,
-          consumerId: target.uid,
-          generation: target.generation as number,
+          consumerId: targetUid,
+          generation: targetGeneration,
           maxBatchSize: spec.maxBatchSize,
           maxBatchTimeoutSeconds: spec.maxBatchTimeoutSeconds,
         })
@@ -234,7 +270,7 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
       const capacity = await options.sql.query(
         `SELECT count(*) AS occupied FROM queue_v2_batch_executions
          WHERE consumer_uid = ? AND state IN ('reserved','registered','send_authorized')`,
-        [target.uid],
+        [targetUid],
       );
       if (
         capacity.length !== 1 ||
@@ -242,70 +278,70 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
         capacity[0].occupied >= spec.maxConcurrency
       )
         continue;
-      let outcome = outcomes.get(target.uid);
-      if (!outcome) {
-        outcome = (
-          await options.composition
-            .deliverOnce({
-              consumerUid: target.uid,
-              principal: sourcePrincipal,
-              space: sourceSpace,
-              targetKey: sourceTargetKey,
-            })
-            .catch(() => ({ kind: "unknown" as const }))
-        ).kind;
-        outcomes.set(target.uid, outcome);
-      }
-      if (outcome === "unknown" || closed) continue;
-      // This process has actually visited an enabled target while its periodic
-      // scanner remains armed. Recheck exact target message or its durable ACK
-      // receipt: a stale/cross-tenant copy cannot release a source notice.
-      const currentTargets = await readTarget();
-      const current = currentTargets.length === 1 ? currentTargets[0] : null;
-      if (
-        !current ||
-        current.uid !== target.uid ||
-        current.generation !== target.generation ||
-        current.spec_json !== target.spec_json
-      )
-        continue;
-      const currentCapacity = await options.sql.query(
-        `SELECT count(*) AS occupied FROM queue_v2_batch_executions
+      const work = schedule({
+        consumerUid: targetUid,
+        principal: sourcePrincipal,
+        space: sourceSpace,
+        targetKey: sourceTargetKey,
+      });
+      if (!work) continue;
+      noticeWakes.add(noticeKey);
+      // A native handler may run indefinitely. The SQL scan and shutdown
+      // never await it, and an unknown completion cannot release the notice.
+      void work
+        .then(async (outcome) => {
+          if (outcome === "unknown" || closed || !timer) return;
+          // A completed wake is evidence only for this exact current target.
+          // Read it again after the native await, then check the copied row or
+          // its own durable settlement before deleting the source notice.
+          const currentTargets = await readTarget();
+          const current = currentTargets.length === 1 ? currentTargets[0] : null;
+          if (
+            !current ||
+            current.uid !== targetUid ||
+            current.generation !== targetGeneration ||
+            current.spec_json !== targetSpecJson
+          )
+            return;
+          const currentCapacity = await options.sql.query(
+            `SELECT count(*) AS occupied FROM queue_v2_batch_executions
          WHERE consumer_uid = ? AND state IN ('reserved','registered','send_authorized')`,
-        [target.uid],
-      );
-      if (
-        currentCapacity.length !== 1 ||
-        typeof currentCapacity[0]?.occupied !== "number" ||
-        currentCapacity[0].occupied >= spec.maxConcurrency
-      )
-        continue;
-      const stillPresent = await options.sql.query(
-        `SELECT 1 FROM selfhost_queue_messages
+            [targetUid],
+          );
+          if (
+            currentCapacity.length !== 1 ||
+            typeof currentCapacity[0]?.occupied !== "number" ||
+            currentCapacity[0].occupied >= spec.maxConcurrency
+          )
+            return;
+          const stillPresent = await options.sql.query(
+            `SELECT 1 FROM selfhost_queue_messages
          WHERE queue_id = ? AND message_id = ? AND lease_token IS NULL
            AND expires_at_ms > ${DB_NOW_MS}
          LIMIT 1`,
-        [targetQueueId, noticeToken],
-      );
-      const settled =
-        stillPresent.length === 1
-          ? []
-          : await options.sql.query(
-              `SELECT 1 FROM queue_v2_batch_settlements
+            [targetQueueId, noticeToken],
+          );
+          const settled =
+            stillPresent.length === 1
+              ? []
+              : await options.sql.query(
+                  `SELECT 1 FROM queue_v2_batch_settlements
                WHERE queue_id = ? AND message_id = ? AND state = 'settled'
                LIMIT 1`,
-              [targetQueueId, noticeToken],
-            );
-      if (stillPresent.length !== 1 && settled.length !== 1) continue;
-      await options.custody
-        .acknowledgeTransferNotice({
-          queueId: sourceQueueId,
-          consumerId: sourceConsumerId,
-          generation: sourceGeneration as number,
-          targetQueueId,
-          noticeToken,
+                  [targetQueueId, noticeToken],
+                );
+          if (stillPresent.length !== 1 && settled.length !== 1) return;
+          if (closed || !timer) return;
+          await options.custody.acknowledgeTransferNotice({
+            queueId: sourceQueueId,
+            consumerId: sourceConsumerId,
+            generation: sourceGeneration as number,
+            targetQueueId,
+            noticeToken,
+          });
         })
-        .catch(() => false);
+        .catch(() => undefined)
+        .finally(() => noticeWakes.delete(noticeKey));
     }
     const last = notices.at(-1);
     noticeCursor =

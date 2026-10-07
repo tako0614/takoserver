@@ -11,12 +11,20 @@ import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
 import { QUEUE_CONSUMER_FORM_URL } from "../src/takoform-v2/forms/queue-consumer.ts";
-import { MODULE_WORKER_FORM_URL } from "../src/takoform-v2/forms/worker-specs.ts";
+import {
+  MODULE_WORKER_FORM_URL,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_VERSION_FORM_URL,
+} from "../src/takoform-v2/forms/worker-specs.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
 import type { V2WorkerCurrentServingResolution } from "../src/takoform-v2/worker-publication-state.ts";
 import { createAtLeastOnceQueueForm } from "../src/takoform-v2/worker-queue-backend.ts";
 import { createQueueConsumerForm } from "../src/takoform-v2/worker-queue-consumer-backend.ts";
-import { v2QueueId } from "../src/takoform-v2/worker-queue-delivery.ts";
+import {
+  authorizeV2QueueBatchSend,
+  createV2QueueDelivery,
+  v2QueueId,
+} from "../src/takoform-v2/worker-queue-delivery.ts";
 
 const principal = "queue-scheduler-principal";
 const space = "default";
@@ -41,6 +49,8 @@ function consumerSpec(
 
 async function acceptedConsumer(database: Database) {
   const sql = createSqliteSql(database);
+  let servingSourceOperationId = "unassigned-source";
+  let selectedVersionUid = "unassigned-version";
   const worker: V2Form = {
     validateCreate() {},
     validateUpdate() {},
@@ -59,9 +69,9 @@ async function acceptedConsumer(database: Database) {
     async observeCurrentServing({ workerUid }: { workerUid: string }) {
       return {
         kind: "ready",
-        sourceOperationId: "scheduler-test-source",
+        sourceOperationId: servingSourceOperationId,
         snapshot: {
-          sourceOperationId: "scheduler-test-source",
+          sourceOperationId: servingSourceOperationId,
           worker: { uid: workerUid, principal, space, generation: 1 },
           deployment: {
             uid: "scheduler-test-deployment",
@@ -69,7 +79,7 @@ async function acceptedConsumer(database: Database) {
             spec: {},
             versions: [
               {
-                uid: "scheduler-test-version",
+                uid: selectedVersionUid,
                 generation: 1,
                 weight: 10_000,
                 spec: { handlers: ["queue"] },
@@ -93,6 +103,34 @@ async function acceptedConsumer(database: Database) {
     forms: {
       [AT_LEAST_ONCE_QUEUE_FORM_URL]: createAtLeastOnceQueueForm({ sql, targetKey }),
       [MODULE_WORKER_FORM_URL]: worker,
+      [WORKER_VERSION_FORM_URL]: {
+        validateCreate() {},
+        validateUpdate() {},
+        backend: {
+          id: "scheduler-test-version",
+          targetKey,
+          async execute() {
+            return { kind: "complete", observed: { ready: true }, output: {} };
+          },
+          async reconcile() {
+            return { kind: "unknown" };
+          },
+        },
+      },
+      [WORKER_DEPLOYMENT_FORM_URL]: {
+        validateCreate() {},
+        validateUpdate() {},
+        backend: {
+          id: "scheduler-test-deployment",
+          targetKey,
+          async execute() {
+            return { kind: "complete", observed: { active: true }, output: {} };
+          },
+          async reconcile() {
+            return { kind: "unknown" };
+          },
+        },
+      },
       [QUEUE_CONSUMER_FORM_URL]: createQueueConsumerForm({ sql, targetKey, capability }),
     },
   });
@@ -109,12 +147,33 @@ async function acceptedConsumer(database: Database) {
     messageRetentionSeconds: 3_600,
   });
   const workerUid = await create(MODULE_WORKER_FORM_URL, "worker", {});
+  selectedVersionUid = await create(WORKER_VERSION_FORM_URL, "version", {
+    worker: { resourceUid: workerUid },
+  });
+  const deploymentUid = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+    worker: { resourceUid: workerUid },
+  });
+  const [deployment] = await sql.query("SELECT last_operation FROM tf_v2_resources WHERE uid = ?", [
+    deploymentUid,
+  ]);
+  if (typeof deployment?.last_operation !== "string") throw new Error("Deployment not settled");
+  servingSourceOperationId = deployment.last_operation;
   const consumerUid = await create(
     QUEUE_CONSUMER_FORM_URL,
     "consumer",
     consumerSpec(queueUid, workerUid),
   );
-  return { sql, engine, queueUid, workerUid, consumerUid, create };
+  return {
+    sql,
+    engine,
+    capability,
+    queueUid,
+    workerUid,
+    versionUid: selectedVersionUid,
+    servingSourceOperationId,
+    consumerUid,
+    create,
+  };
 }
 
 test("accepted active Consumer is rediscovered from durable SQL after restart", async () => {
@@ -156,7 +215,89 @@ test("accepted active Consumer is rediscovered from durable SQL after restart", 
   }
 });
 
-test("overlapping ticks share one pass and close waits for its delivery", async () => {
+test("a persisted send-authorized slot prevents a second send after SQL handle restart", async () => {
+  const root = mkdtempSync(join(tmpdir(), "v2-queue-authorized-restart-"));
+  const path = join(root, "state.sqlite");
+  let database = new Database(path);
+  try {
+    for (const migration of MIGRATIONS) database.exec(migration.sql);
+    const accepted = await acceptedConsumer(database);
+    const custody = createQueueCustody({ sql: accepted.sql });
+    await custody.admit(
+      {
+        queueId: v2QueueId(accepted.queueUid),
+        messageRetentionSeconds: 3_600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId: "authorized-before-restart", body: new Uint8Array([1]) },
+    );
+    const selected = await createV2QueueDelivery({
+      sql: accepted.sql,
+      custody,
+      capability: accepted.capability,
+    }).claimRegisteredBatch({ consumerUid: accepted.consumerUid, principal, space, targetKey });
+    expect(selected.kind).toBe("ready");
+    if (selected.kind !== "ready") throw new Error("batch not registered");
+    const execution = {
+      batchId: selected.batchId,
+      reservationToken: selected.reservationToken,
+      queueUid: accepted.queueUid,
+      consumerUid: accepted.consumerUid,
+      generation: selected.generation,
+      workerUid: accepted.workerUid,
+      servingSourceOperationId: accepted.servingSourceOperationId,
+      workerVersionUid: accepted.versionUid,
+      workerVersionGeneration: 1,
+      incarnationOperationId: "scheduler-test-incarnation",
+    };
+    expect(await authorizeV2QueueBatchSend(accepted.sql, execution)).toBe("authorized");
+    database.close();
+
+    database = new Database(path);
+    const sql = createSqliteSql(database);
+    const seen: string[] = [];
+    const restarted = createSelfhostV2QueueScheduler({
+      sql,
+      custody: createQueueCustody({ sql }),
+      composition: {
+        async deliverOnce(input) {
+          seen.push(input.consumerUid);
+          const result = await createV2QueueDelivery({
+            sql,
+            custody: createQueueCustody({ sql }),
+            capability: accepted.capability,
+          }).claimRegisteredBatch(input);
+          return { kind: result.kind === "ready" ? "unknown" : result.kind };
+        },
+      },
+    });
+    try {
+      expect(await restarted.tick()).toBe(1);
+      for (let attempt = 0; attempt < 100 && seen.length === 0; attempt += 1) await Bun.sleep(1);
+      expect(seen).toEqual([accepted.consumerUid]);
+      expect(
+        await sql.query(
+          "SELECT state FROM queue_v2_batch_executions WHERE consumer_uid = ? ORDER BY reserved_at_ms",
+          [accepted.consumerUid],
+        ),
+      ).toEqual([{ state: "send_authorized" }]);
+      expect(
+        await createV2QueueDelivery({
+          sql,
+          custody: createQueueCustody({ sql }),
+          capability: accepted.capability,
+        }).claimRegisteredBatch({ consumerUid: accepted.consumerUid, principal, space, targetKey }),
+      ).toEqual({ kind: "idle" });
+    } finally {
+      await restarted.close();
+    }
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("one Consumer is not re-sent while its native handler remains in flight", async () => {
   const database = new Database(":memory:");
   try {
     for (const migration of MIGRATIONS) database.exec(migration.sql);
@@ -178,29 +319,85 @@ test("overlapping ticks share one pass and close waits for its delivery", async 
       },
     });
     const first = scheduler.tick();
-    const second = scheduler.tick();
-    expect(second).toBe(first);
-    for (let attempt = 0; attempt < 20 && entered === 0; attempt += 1) await Bun.sleep(1);
+    expect(scheduler.tick()).toBe(first);
+    expect(await first).toBe(1);
+    expect(entered).toBe(1);
+    expect(await scheduler.tick()).toBe(0);
+    expect(await scheduler.tick()).toBe(0);
     expect(entered).toBe(1);
     const close = scheduler.close();
     const secondClose = scheduler.close();
-    let closed = false;
-    void close.then(() => {
-      closed = true;
-    });
-    let secondClosed = false;
-    void secondClose.then(() => {
-      secondClosed = true;
-    });
-    await Bun.sleep(1);
-    expect(closed).toBe(false);
-    expect(secondClosed).toBe(false);
+    expect(
+      await Promise.race([close.then(() => "stopped"), Bun.sleep(100).then(() => "stuck")]),
+    ).toBe("stopped");
     release();
     await close;
     await secondClose;
-    expect(await first).toBe(1);
     expect(await scheduler.tick()).toBe(0);
     expect(entered).toBe(1);
+  } finally {
+    database.close();
+  }
+});
+
+test("one indefinitely running Consumer cannot block a later SQL page or scheduler stop", async () => {
+  const database = new Database(":memory:");
+  try {
+    for (const migration of MIGRATIONS) database.exec(migration.sql);
+    const first = await acceptedConsumer(database);
+    const consumerUids = [first.consumerUid];
+    for (let index = 1; index < 17; index += 1) {
+      const queueUid = await first.create(AT_LEAST_ONCE_QUEUE_FORM_URL, `queue-${index}`, {
+        messageRetentionSeconds: 3_600,
+      });
+      consumerUids.push(
+        await first.create(
+          QUEUE_CONSUMER_FORM_URL,
+          `consumer-${index}`,
+          consumerSpec(queueUid, first.workerUid),
+        ),
+      );
+    }
+    consumerUids.sort();
+    const blockedUid = consumerUids[0];
+    const laterPageUid = consumerUids[16];
+    if (!blockedUid || !laterPageUid) throw new Error("Consumer pages are incomplete");
+    let release!: () => void;
+    const neverEnding = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const visited: string[] = [];
+    const scheduler = createSelfhostV2QueueScheduler({
+      sql: first.sql,
+      custody: createQueueCustody({ sql: first.sql }),
+      composition: {
+        async deliverOnce(input) {
+          visited.push(input.consumerUid);
+          if (input.consumerUid === blockedUid) await neverEnding;
+          return { kind: "idle" as const };
+        },
+      },
+    });
+    try {
+      const initial = scheduler.tick();
+      expect(
+        await Promise.race([initial.then(() => "done"), Bun.sleep(100).then(() => "stuck")]),
+      ).toBe("done");
+      expect(await scheduler.tick()).toBe(1);
+      expect(visited).toContain(laterPageUid);
+      await scheduler.tick(); // pass the end and restart the bounded keyset
+      await scheduler.tick();
+      expect(visited.filter((uid) => uid === blockedUid)).toHaveLength(1);
+      const stopping = scheduler.close();
+      expect(
+        await Promise.race([stopping.then(() => "stopped"), Bun.sleep(100).then(() => "stuck")]),
+      ).toBe("stopped");
+      expect(await scheduler.tick()).toBe(0);
+      expect(visited.filter((uid) => uid === blockedUid)).toHaveLength(1);
+    } finally {
+      release();
+      await scheduler.close();
+    }
   } finally {
     database.close();
   }
@@ -301,6 +498,12 @@ test("dead-letter notice stays pending without a verified active target wake, th
     expect((await restartedCustody.listTransferNotices(source)).length).toBe(1);
     restarted.start();
     await restarted.tick();
+    for (
+      let attempt = 0;
+      attempt < 100 && (await restartedCustody.listTransferNotices(source)).length !== 0;
+      attempt += 1
+    )
+      await Bun.sleep(1);
     expect(await restartedCustody.listTransferNotices(source)).toEqual([]);
     await restarted.close();
   } finally {
