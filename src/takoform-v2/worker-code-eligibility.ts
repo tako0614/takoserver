@@ -78,7 +78,7 @@ export async function inspectV2WorkerCodeVersionEligibility(
   await verifyV2WorkerCodeProjection(input, true);
 }
 
-/** Native self-host adapter never projects a secret-required Version into env. */
+/** Native projection requires actual Resource-owned configured values, not inspection-only input. */
 export async function prepareV2WorkerCodeProjection(
   input: V2WorkerCodeEligibilityInput & {
     /** Exact Host-configured values; never a boolean presence assertion. */

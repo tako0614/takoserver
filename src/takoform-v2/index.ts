@@ -86,3 +86,9 @@ export {
   type V2WorkerVersionResolution,
   type V2WorkerVersionSnapshot,
 } from "./worker-publication-state.ts";
+export {
+  createV2WorkerVersionConfiguredInputSealer,
+  type V2WorkerVersionConfiguredKeyring,
+  type V2WorkerVersionPrivateIdentity,
+  type V2WorkerVersionSealedInputs,
+} from "./worker-version-configured-inputs.ts";
