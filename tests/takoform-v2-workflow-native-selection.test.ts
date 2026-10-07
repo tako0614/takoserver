@@ -5,11 +5,16 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import { v2SqliteWorkerProjection } from "../src/providers/selfhost-v2-sqlite-worker-projection.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
   parseWorkerDeploymentSpec,
   parseWorkerVersionSpec,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import {
+  V2_SQLITE_ADAPTER_MODULE,
+  V2_SQLITE_INTRINSIC_MODULE,
+} from "../src/takoform-v2/worker-code-runtime.ts";
 import { DURABLE_WORKFLOW_BACKEND_ID } from "../src/takoform-v2/workflow-backend.ts";
 import { createV2WorkflowForwardRuntime } from "../src/takoform-v2/workflow-forward-runtime.ts";
 import { createV2WorkflowNativeSelection } from "../src/takoform-v2/workflow-native-selection.ts";
@@ -155,7 +160,7 @@ function fixture() {
       generation: GENERATION,
       workerResourceUid: WORKER_UID,
       fetchHandler: false,
-      modules: [],
+      modules: [] as string[],
       moduleMediaTypes: { "index.mjs": "application/javascript+module" as const },
     },
     modules: new Map([["index.mjs", new Uint8Array(source)]]),
@@ -330,6 +335,66 @@ test("synthetic owner selection denies wrong Space, changed bytes, and deleting 
     });
     f.selected.modules.set("index.mjs", new Uint8Array(source));
     f.db.query("UPDATE tf_v2_resources SET phase = 'deleting' WHERE uid = ?").run(WORKFLOW_UID);
+    await expect(f.select(identity, new AbortController().signal)).rejects.toMatchObject({
+      code: "host_unavailable",
+    });
+  } finally {
+    f.db.close();
+  }
+});
+
+test("synthetic owner selection denies a native main or extra app module outside held Bundle", async () => {
+  const f = fixture();
+  try {
+    const rogue = new TextEncoder().encode(
+      "export default { fetch() { return new Response('rogue'); } }",
+    );
+    f.selected.site.mainModule = "rogue.mjs";
+    f.selected.site.modules.push("index.mjs");
+    f.selected.modules.set("rogue.mjs", rogue);
+    await expect(f.select(identity, new AbortController().signal)).rejects.toMatchObject({
+      code: "host_unavailable",
+    });
+    f.selected.site.mainModule = "index.mjs";
+    f.selected.site.modules.splice(0, 1, "rogue.mjs");
+    await expect(f.select(identity, new AbortController().signal)).rejects.toMatchObject({
+      code: "host_unavailable",
+    });
+  } finally {
+    f.db.close();
+  }
+});
+
+test("synthetic selection accepts only the accepted Version's exact v2 SQLite adapter", async () => {
+  const f = fixture();
+  try {
+    const version = f.snapshot.deployment.versions[0];
+    if (!version) throw new Error("missing synthetic Version");
+    version.spec = parseWorkerVersionSpec({
+      worker: { resourceUid: WORKER_UID },
+      bundle: { resourceUid: "bundle-uid" },
+      handlers: [],
+      sqliteBindings: [{ name: "DB", resource: { resourceUid: "database-uid" } }],
+    });
+    const projected = v2SqliteWorkerProjection({
+      originalMainModule: "index.mjs",
+      adapterModule: V2_SQLITE_ADAPTER_MODULE,
+      intrinsicModule: V2_SQLITE_INTRINSIC_MODULE,
+      sqliteBindingNames: ["DB"],
+      declaredHandlers: [],
+    });
+    f.selected.site.mainModule = V2_SQLITE_ADAPTER_MODULE;
+    f.selected.site.modules.push("index.mjs", V2_SQLITE_INTRINSIC_MODULE);
+    for (const [name, bytes] of projected) {
+      f.selected.modules.set(name, bytes);
+      Object.assign(f.selected.site.moduleMediaTypes, {
+        [name]: "application/javascript+module",
+      });
+    }
+    expect((await f.select(identity, new AbortController().signal)).selection.className).toBe(
+      "ReportWorkflow",
+    );
+    f.selected.modules.set(V2_SQLITE_ADAPTER_MODULE, new Uint8Array([1]));
     await expect(f.select(identity, new AbortController().signal)).rejects.toMatchObject({
       code: "host_unavailable",
     });

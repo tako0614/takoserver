@@ -1,6 +1,7 @@
 import { createHash, randomInt } from "node:crypto";
 import { canonicalJson } from "../json.ts";
 import type { JsonObject, Sql } from "../ports.ts";
+import { v2SqliteWorkerProjection } from "../providers/selfhost-v2-sqlite-worker-projection.ts";
 import { compareSelfhostWeightedVersions } from "../selfhost-weighted-deployment.ts";
 import type { WorkerModuleSemanticInspector } from "../worker-module-inspection-contract.ts";
 import type {
@@ -13,6 +14,7 @@ import type { WorkflowRunIdentity } from "../workflow-execution.ts";
 import type { WorkflowScope } from "../workflow-instances.ts";
 import { DURABLE_WORKFLOW_FORM_URL, parseDurableWorkflowSpec } from "./forms/durable-workflow.ts";
 import { MODULE_WORKER_FORM_URL } from "./forms/worker-specs.ts";
+import { V2_SQLITE_ADAPTER_MODULE, V2_SQLITE_INTRINSIC_MODULE } from "./worker-code-runtime.ts";
 import type {
   createV2WorkerPublicationState,
   V2WorkerCurrentServingIdentity,
@@ -366,9 +368,30 @@ export function createV2WorkflowNativeSelection(options: {
     });
     const bundle = materials.bundle;
     if (!bundle || bundle.manifest.files.length !== bundle.files.length) throw unavailable();
+    let sqliteProjected: ReadonlyMap<string, Uint8Array>;
+    try {
+      sqliteProjected =
+        version.spec.sqliteBindings.length === 0
+          ? new Map<string, Uint8Array>()
+          : v2SqliteWorkerProjection({
+              originalMainModule: bundle.manifest.entrypoint,
+              adapterModule: V2_SQLITE_ADAPTER_MODULE,
+              intrinsicModule: V2_SQLITE_INTRINSIC_MODULE,
+              sqliteBindingNames: version.spec.sqliteBindings.map((binding) => binding.name),
+              declaredHandlers: version.spec.handlers,
+            });
+    } catch {
+      throw unavailable();
+    }
+    const expectedModuleCount = bundle.manifest.files.length + sqliteProjected.size;
+    const expectedMainModule =
+      sqliteProjected.size === 0 ? bundle.manifest.entrypoint : V2_SQLITE_ADAPTER_MODULE;
     const declared = new Set([selected.site.mainModule, ...(selected.site.modules ?? [])]);
     if (
-      !declared.has(bundle.manifest.entrypoint) ||
+      selected.site.mainModule !== expectedMainModule ||
+      declared.size !== expectedModuleCount ||
+      selected.modules.size !== expectedModuleCount ||
+      Object.keys(selected.site.moduleMediaTypes ?? {}).length !== expectedModuleCount ||
       !selected.site.hostEntrypoint ||
       selected.site.hostEntrypoint === selected.site.mainModule
     )
@@ -383,6 +406,17 @@ export function createV2WorkflowNativeSelection(options: {
         selected.site.moduleMediaTypes?.[file.path] !== file.mediaType ||
         nativeBytes.length !== heldBytes.length ||
         createHash("sha256").update(nativeBytes).digest("hex") !== file.sha256
+      )
+        throw unavailable();
+    }
+    for (const [name, bytes] of sqliteProjected) {
+      const nativeBytes = selected.modules.get(name);
+      if (
+        !nativeBytes ||
+        !declared.has(name) ||
+        selected.site.moduleMediaTypes?.[name] !== "application/javascript+module" ||
+        nativeBytes.length !== bytes.length ||
+        !nativeBytes.every((value, index) => value === bytes[index])
       )
         throw unavailable();
     }
