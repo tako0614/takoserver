@@ -766,17 +766,21 @@ test("Actor namespace registration persists its UID and can be revoked without s
   const host = createSelfhostActorExecutionHost(options);
   try {
     await host.ready;
+    expect(await host.namespaceEmpty(scope)).toBe(false);
     await host.registerNamespace(scope);
     await host.registerNamespace(otherTenant);
     expect(await host.hasNamespace(scope)).toBe(true);
+    expect(await host.namespaceEmpty(scope)).toBe(true);
     expect(await host.hasNamespace(otherTenant)).toBe(true);
     await host.close();
     const restored = createSelfhostActorExecutionHost(options);
     try {
       await restored.ready;
       expect(await restored.hasNamespace(scope)).toBe(true);
+      expect(await restored.namespaceEmpty(scope)).toBe(true);
       await restored.forgetNamespace(scope);
       expect(await restored.hasNamespace(scope)).toBe(false);
+      expect(await restored.namespaceEmpty(scope)).toBe(false);
       expect(await restored.hasNamespace(otherTenant)).toBe(true);
     } finally {
       await restored.close();
