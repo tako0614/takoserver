@@ -102,7 +102,7 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "v2-queue-manager",
-    match: /^src\/takoform-v2\/worker-queue-(?:backend|consumer-backend|delivery)\.ts$/u,
+    match: /^src\/takoform-v2\/worker-queue-(?:admission|backend|consumer-backend|delivery)\.ts$/u,
     may: ["core", "domain", "v2-contract", "v2-form", "v2-runtime", "v2-queue-manager"],
   },
   {

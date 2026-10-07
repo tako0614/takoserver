@@ -1,7 +1,7 @@
 import type { Sql } from "../ports.ts";
 import type { V2ConfiguredPrivateInputs } from "./configured-private-inputs.ts";
 import type { V2SealedPrivateInputs } from "./private-inputs.ts";
-import type { V2Action, V2Effect, V2Status } from "./types.ts";
+import type { V2Action, V2AdmissionPredicate, V2Effect, V2Status } from "./types.ts";
 
 export interface ResourceRow {
   uid: string;
@@ -280,14 +280,19 @@ export function createV2Store(sql: Sql) {
       resource: { form: string; space: string; name: string },
       referencesJson: string | null = null,
       initialOutputJson = "{}",
-    ): Promise<void> {
-      await sql.batch([
+      admission?: V2AdmissionPredicate,
+    ): Promise<"accepted" | "dependency_conflict"> {
+      const writes = await sql.batch([
+        ...(admission
+          ? [{ sql: `SELECT 1 AS permitted WHERE (${admission.sql})`, params: admission.params }]
+          : []),
         {
           sql: `INSERT INTO tf_v2_resources
             (uid, principal, form_url, space, name, backend_id, target_key,
              active_name, generation, phase,
              spec_json, output_json, last_operation, busy_operation)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?, ?, ?)`,
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?, ?, ?
+            ${admission ? `WHERE (${admission.sql})` : ""}`,
           params: [
             record.resourceUid,
             record.principal,
@@ -301,21 +306,36 @@ export function createV2Store(sql: Sql) {
             initialOutputJson,
             record.id,
             record.id,
+            ...(admission?.params ?? []),
           ],
         },
-        { sql: opInsert, params: opParams(record) },
+        {
+          sql: admission ? opInsertIfAccepted : opInsert,
+          params: admission
+            ? [...opParams(record), record.resourceUid, record.id, record.id, record.generation]
+            : opParams(record),
+        },
         ...privateWrites(record),
         ...configuredPrivateWrites(record),
         ...referenceWrites(record, referencesJson),
       ]);
+      if (admission && writes[0]?.rows.length !== 1) return "dependency_conflict";
+      if (writes[admission ? 1 : 0]?.changes !== 1 || writes[admission ? 2 : 1]?.changes !== 1) {
+        throw new Error("v2 CREATE acceptance did not persist its Resource and Operation");
+      }
+      return "accepted";
     },
     async insertChange(
       record: AcceptRecord,
       referencesJson: string | null = null,
       serializeUpdatesWithPendingReferrers = false,
+      admission?: V2AdmissionPredicate,
     ): Promise<"accepted" | "dependency_conflict" | "conflict"> {
       const serialize = record.action === "update" && serializeUpdatesWithPendingReferrers;
       const writes = await sql.batch([
+        ...(admission
+          ? [{ sql: `SELECT 1 AS permitted WHERE (${admission.sql})`, params: admission.params }]
+          : []),
         {
           sql: `UPDATE tf_v2_resources SET generation = ?, spec_json = ?,
               phase = ?, last_operation = ?, busy_operation = ?
@@ -330,6 +350,7 @@ export function createV2Store(sql: Sql) {
                   : ""
               }
               ${serialize ? `AND NOT EXISTS (${pendingReferrersSql})` : ""}
+              ${admission ? `AND (${admission.sql})` : ""}
               ${
                 record.expectedConfiguredPrivateInputs
                   ? `AND EXISTS (
@@ -348,6 +369,7 @@ export function createV2Store(sql: Sql) {
             record.generation - 1,
             ...(record.action === "delete" ? [record.resourceUid] : []),
             ...(serialize ? [record.resourceUid] : []),
+            ...(admission?.params ?? []),
             ...(record.expectedConfiguredPrivateInputs
               ? [
                   record.resourceUid,
@@ -388,7 +410,10 @@ export function createV2Store(sql: Sql) {
             ]
           : []),
       ]);
-      if (writes[0]?.changes === 1 && writes[1]?.changes === 1) return "accepted";
+      const resourceIndex = admission ? 1 : 0;
+      if (writes[resourceIndex]?.changes === 1 && writes[resourceIndex + 1]?.changes === 1)
+        return "accepted";
+      if (admission && writes[0]?.rows.length !== 1) return "dependency_conflict";
       if (serialize && writes.at(-1)?.rows.length) return "dependency_conflict";
       return "conflict";
     },

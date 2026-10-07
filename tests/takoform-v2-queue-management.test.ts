@@ -56,6 +56,12 @@ function fixture(databasePath = ":memory:") {
   let capabilityAvailable = true;
   let servingSourceOperationId = "fixture-source";
   let servingVersionUid = "fixture-version";
+  let selectedVersions: readonly { uid: string; generation: number; weight: number }[] | null =
+    null;
+  const currentVersions = () =>
+    selectedVersions ?? [{ uid: servingVersionUid, generation: 1, weight: 10_000 }];
+  let admissionGate: Promise<void> | null = null;
+  let admissionEntered: (() => void) | null = null;
   const worker: V2Form = {
     validateCreate() {},
     validateUpdate() {},
@@ -74,6 +80,7 @@ function fixture(databasePath = ":memory:") {
     validateCreate() {},
     validateUpdate() {},
     references(spec) {
+      if (typeof spec.queueUid !== "string") return [];
       return [
         {
           resourceUid: String(spec.queueUid),
@@ -86,7 +93,11 @@ function fixture(databasePath = ":memory:") {
       id: "fixture-version",
       targetKey,
       async execute() {
-        return { kind: "complete", observed: { ready: true }, output: {} };
+        return {
+          kind: "complete",
+          observed: { ready: true, resolvedBindings: true, bundleVerified: true },
+          output: {},
+        };
       },
       async reconcile() {
         return { kind: "unknown" };
@@ -108,6 +119,29 @@ function fixture(databasePath = ":memory:") {
     },
   };
   const capability: V2QueueConsumerCapability = {
+    async observeQueueServingCapability() {
+      const source = servingSourceOperationId;
+      const deployment = servingDeploymentUid;
+      const versions = currentVersions().map((version) => ({ ...version }));
+      admissionEntered?.();
+      if (admissionGate) await admissionGate;
+      if (!capabilityAvailable || servingSourceOperationId === "fixture-source")
+        return { kind: "unknown" };
+      return {
+        kind: "confirmed",
+        servingSourceOperationId: source,
+        deploymentUid: deployment,
+        deploymentGeneration: 1,
+        versions: versions.map((version) => ({
+          workerVersionUid: version.uid,
+          generation: version.generation,
+          weight: version.weight,
+        })),
+        async stillCurrent() {
+          return capabilityAvailable;
+        },
+      };
+    },
     async observeCurrentServing({ workerUid }) {
       if (!capabilityAvailable)
         return { kind: "unresolved", code: "graph_unresolved", message: "offline" };
@@ -123,14 +157,12 @@ function fixture(databasePath = ":memory:") {
             uid: "fixture-deployment",
             generation: 1,
             spec: {},
-            versions: [
-              {
-                uid: servingVersionUid,
-                generation: 1,
-                weight: 10_000,
-                spec: { handlers: ["queue"] },
-              },
-            ],
+            versions: currentVersions().map((version) => ({
+              uid: version.uid,
+              generation: version.generation,
+              weight: version.weight,
+              spec: { handlers: ["queue"] },
+            })),
           },
           endpoint: null,
         },
@@ -143,6 +175,7 @@ function fixture(databasePath = ":memory:") {
       } as unknown as V2WorkerCurrentServingResolution;
     },
   };
+  let servingDeploymentUid = "fixture-deployment";
   const consumer = createQueueConsumerForm({ sql, targetKey, capability });
   const engine = createTakoformV2Engine({
     sql,
@@ -160,12 +193,39 @@ function fixture(databasePath = ":memory:") {
     },
   });
   const create = async (form: string, name: string, spec: JsonObject) => {
+    if (form === QUEUE_CONSUMER_FORM_URL && servingSourceOperationId === "fixture-source") {
+      const workerUid = String((spec.worker as { resourceUid: string }).resourceUid);
+      await create(WORKER_VERSION_FORM_URL, `${name}-admission-version`, {
+        worker: { resourceUid: workerUid },
+        handlers: ["queue"],
+      });
+      await create(WORKER_DEPLOYMENT_FORM_URL, `${name}-admission-deployment`, {
+        worker: { resourceUid: workerUid },
+      });
+    }
+    const acceptedSpec =
+      form === WORKER_DEPLOYMENT_FORM_URL
+        ? {
+            ...spec,
+            versions: currentVersions().map((version) => ({
+              workerVersion: { resourceUid: version.uid },
+              weight: version.weight,
+            })),
+          }
+        : form === WORKER_VERSION_FORM_URL && spec.worker
+          ? { handlers: ["queue"], ...spec }
+          : spec;
     const accepted = await engine.acceptCreate({
       principal,
       key: `create-${name}-key-00000001`,
-      input: { form, space, name, spec },
+      input: { form, space, name, spec: acceptedSpec },
     });
     expect((await engine.runNext())?.status).toBe("succeeded");
+    if (form === WORKER_VERSION_FORM_URL && spec.worker) servingVersionUid = accepted.resourceUid;
+    if (form === WORKER_DEPLOYMENT_FORM_URL) {
+      servingDeploymentUid = accepted.resourceUid;
+      servingSourceOperationId = accepted.id;
+    }
     return accepted;
   };
   return {
@@ -185,6 +245,27 @@ function fixture(databasePath = ":memory:") {
     },
     setServingVersion(uid: string) {
       servingVersionUid = uid;
+      selectedVersions = null;
+    },
+    setServingVersions(versions: readonly { uid: string; generation: number; weight: number }[]) {
+      selectedVersions = versions.map((version) => ({ ...version }));
+    },
+    holdAdmission() {
+      let release: (() => void) | null = null;
+      const entered = new Promise<void>((resolve) => {
+        admissionEntered = resolve;
+      });
+      admissionGate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return {
+        entered,
+        release() {
+          admissionGate = null;
+          admissionEntered = null;
+          release?.();
+        },
+      };
     },
   };
 }
@@ -363,7 +444,7 @@ test("Consumer target mismatch is rejected in the accepted SQL transaction", asy
   }
 });
 
-test("unavailable privileged serving proof leaves no Consumer custody write", async () => {
+test("unavailable privileged serving proof refuses Consumer before acceptance", async () => {
   const f = fixture();
   try {
     const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "orders", {
@@ -371,19 +452,209 @@ test("unavailable privileged serving proof leaves no Consumer custody write", as
     });
     const worker = await f.create(MODULE_WORKER_FORM_URL, "worker", {});
     f.setCapability(false);
-    const accepted = await f.engine.acceptCreate({
+    const before = await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations");
+    await expect(
+      f.engine.acceptCreate({
+        principal,
+        key: "create-consumer-key-00000001",
+        input: {
+          form: QUEUE_CONSUMER_FORM_URL,
+          space,
+          name: "consumer",
+          spec: consumerSpec(queue.resourceUid, worker.resourceUid),
+        },
+      }),
+    ).rejects.toMatchObject({ code: "dependency_conflict", status: 409 });
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual(before);
+    expect(await f.sql.query("SELECT 1 FROM queue_consumer_custody")).toEqual([]);
+  } finally {
+    f.database.close();
+  }
+});
+
+test("a weighted Version without queue handler is refused before Consumer acceptance", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "handler-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "handler-worker", {});
+    await f.create(WORKER_VERSION_FORM_URL, "fetch-only-version", {
+      worker: { resourceUid: worker.resourceUid },
+      handlers: ["fetch"],
+    });
+    await f.create(WORKER_DEPLOYMENT_FORM_URL, "handler-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    const before = await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations");
+    await expect(
+      f.engine.acceptCreate({
+        principal,
+        key: "missing-queue-handler-0001",
+        input: {
+          form: QUEUE_CONSUMER_FORM_URL,
+          space,
+          name: "missing-handler-consumer",
+          spec: consumerSpec(queue.resourceUid, worker.resourceUid),
+        },
+      }),
+    ).rejects.toMatchObject({ code: "dependency_conflict", status: 409 });
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual(before);
+  } finally {
+    f.database.close();
+  }
+});
+
+test("every weighted Version must be queue-ready in the accepted SQL graph", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "weighted-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "weighted-worker", {});
+    const first = await f.create(WORKER_VERSION_FORM_URL, "weighted-queue-version", {
+      worker: { resourceUid: worker.resourceUid },
+      handlers: ["queue"],
+    });
+    const second = await f.create(WORKER_VERSION_FORM_URL, "weighted-fetch-version", {
+      worker: { resourceUid: worker.resourceUid },
+      handlers: ["fetch"],
+    });
+    f.setServingVersions([
+      { uid: first.resourceUid, generation: 1, weight: 5_000 },
+      { uid: second.resourceUid, generation: 1, weight: 5_000 },
+    ]);
+    await f.create(WORKER_DEPLOYMENT_FORM_URL, "weighted-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    const request = {
       principal,
-      key: "create-consumer-key-00000001",
+      key: "weighted-consumer-create-0001",
       input: {
         form: QUEUE_CONSUMER_FORM_URL,
         space,
-        name: "consumer",
+        name: "weighted-consumer",
+        spec: consumerSpec(queue.resourceUid, worker.resourceUid),
+      },
+    };
+    const before = await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations");
+    await expect(f.engine.acceptCreate(request)).rejects.toMatchObject({
+      code: "dependency_conflict",
+      status: 409,
+    });
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual(before);
+    const updated = await f.engine.acceptUpdate({
+      principal,
+      key: "weighted-version-update-0001",
+      uid: second.resourceUid,
+      expectedGeneration: 1,
+      spec: { worker: { resourceUid: worker.resourceUid }, handlers: ["queue"] },
+    });
+    expect((await f.engine.runNext())?.id).toBe(updated.id);
+    f.setServingVersions([
+      { uid: first.resourceUid, generation: 1, weight: 5_000 },
+      { uid: second.resourceUid, generation: 2, weight: 5_000 },
+    ]);
+    expect((await f.engine.acceptCreate(request)).status).toBe("queued");
+  } finally {
+    f.database.close();
+  }
+});
+
+test("a publication accepted while Queue admission awaits cannot win with the old source", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "race-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "race-worker", {});
+    await f.create(WORKER_VERSION_FORM_URL, "race-version", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "race-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    const held = f.holdAdmission();
+    const pending = f.engine.acceptCreate({
+      principal,
+      key: "race-consumer-create-0001",
+      input: {
+        form: QUEUE_CONSUMER_FORM_URL,
+        space,
+        name: "race-consumer",
         spec: consumerSpec(queue.resourceUid, worker.resourceUid),
       },
     });
-    expect((await f.engine.runNext())?.status).toBe("reconciling");
-    expect(await f.sql.query("SELECT 1 FROM queue_consumer_custody")).toEqual([]);
-    expect((await f.engine.getOperation({ principal, id: accepted.id })).effect).toBe("unknown");
+    try {
+      await held.entered;
+      const current = await f.engine.getResource({ principal, uid: deployment.resourceUid });
+      const publisher = await f.engine.acceptUpdate({
+        principal,
+        key: "race-deployment-update-0001",
+        uid: deployment.resourceUid,
+        expectedGeneration: current.generation,
+        spec: current.spec,
+      });
+      held.release();
+      await expect(pending).rejects.toMatchObject({ code: "dependency_conflict", status: 409 });
+      expect(await f.engine.getOperation({ principal, id: publisher.id })).toMatchObject({
+        status: "queued",
+      });
+      expect(
+        await f.sql.query("SELECT uid FROM tf_v2_resources WHERE name = 'race-consumer'"),
+      ).toEqual([]);
+    } finally {
+      held.release();
+    }
+  } finally {
+    f.database.close();
+  }
+});
+
+test("settled Endpoint DELETE remains the latest serving source for Consumer admission", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "endpoint-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "endpoint-worker", {});
+    await f.create(WORKER_VERSION_FORM_URL, "endpoint-version", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    await f.create(WORKER_DEPLOYMENT_FORM_URL, "endpoint-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    const endpoint = await f.create(WORKER_ENDPOINT_FORM_URL, "endpoint-route", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    const before = await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations");
+    await expect(
+      f.engine.acceptCreate({
+        principal,
+        key: "stale-deployment-source-consumer-0001",
+        input: {
+          form: QUEUE_CONSUMER_FORM_URL,
+          space,
+          name: "stale-source-consumer",
+          spec: consumerSpec(queue.resourceUid, worker.resourceUid),
+        },
+      }),
+    ).rejects.toMatchObject({ code: "dependency_conflict", status: 409 });
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual(before);
+    const detached = await f.engine.acceptDelete({
+      principal,
+      key: "endpoint-detach-queue-source-0001",
+      uid: endpoint.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect((await f.engine.runNext())?.status).toBe("succeeded");
+    f.setServingSource(detached.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "endpoint-source-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid),
+    );
+    expect((await f.engine.getOperation({ principal, id: consumer.id })).effect).toBe("complete");
   } finally {
     f.database.close();
   }
