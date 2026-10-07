@@ -96,6 +96,11 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "v2-form", "v2-code-validation"],
   },
   {
+    name: "v2-queue-bridge",
+    match: /^src\/takoform-v2\/worker-queue-settlement\.ts$/u,
+    may: ["domain"],
+  },
+  {
     name: "v2-runtime",
     match:
       /^src\/takoform-v2\/(?:worker-bundle-runtime|worker-code-runtime|worker-cron-trigger-backend|worker-cron-trigger-scheduler|worker-deployment-backend|worker-endpoint-backend|worker-lifecycle-backend|worker-runtime-readers|worker-publication-state|worker-publication-sql-guard|worker-static-runtime|worker-static-publication|worker-native-effects|worker-native-deletions)\.ts$|^src\/workerd-worker-runtime-owner\.ts$/u,
