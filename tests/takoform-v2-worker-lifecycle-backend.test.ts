@@ -43,9 +43,7 @@ const FILE_URL = "https://artifacts.example.test/static/index.html";
 const FILE_BYTES = new TextEncoder().encode("<main>held asset</main>");
 const BUNDLE_MANIFEST_URL = "https://artifacts.example.test/code/manifest.json";
 const BUNDLE_FILE_URL = "https://artifacts.example.test/code/index.mjs";
-const BUNDLE_FILE_BYTES = new TextEncoder().encode(
-  "export default { fetch() { return new Response('held'); }, scheduled() {} };",
-);
+const BUNDLE_FILE_BYTES = new TextEncoder().encode("export default { scheduled() {} };\n");
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
 function fixture(options?: {
@@ -180,7 +178,7 @@ function fixture(options?: {
         retirement,
         inspectModule:
           options.inspectModule ??
-          (async () => ({ outcome: "valid", exportedHandlers: ["fetch", "scheduled"] })),
+          (async () => ({ outcome: "valid", exportedHandlers: ["scheduled"] })),
       })
     : createInternalV2StaticWorkerVersionForm({
         sql: backendSql,
@@ -1243,7 +1241,7 @@ test("scheduled code WorkerVersion settles from held bundle eligibility without 
       await f.engine.getResource({ principal: "org-1", uid: accepted.resourceUid }),
     ).toMatchObject({
       form: WORKER_VERSION_FORM_URL,
-      observed: { ready: true, codeVerified: true },
+      observed: { ready: true, resolvedBindings: true, bundleVerified: true },
       output: {},
     });
     expect(

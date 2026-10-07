@@ -740,7 +740,7 @@ export function createInternalV2CodeWorkerVersionForm(options: {
       }
       return {
         kind: "complete",
-        observed: { ready: true, codeVerified: true },
+        observed: { ready: true, resolvedBindings: true, bundleVerified: true },
         output: {},
       };
     } catch {

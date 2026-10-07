@@ -33,6 +33,10 @@ const MESSAGE_PATH = "message.txt";
 const MODULE_BYTES = encoder.encode(
   "export default { fetch(request, env) { return new Response(env.SETTINGS.label); } };\n",
 );
+const SCHEDULED_MODULE_BYTES = encoder.encode("export default { scheduled() {} };\n");
+const FETCH_AND_SCHEDULED_MODULE_BYTES = encoder.encode(
+  "export default { fetch(request) { return new Response('fetch'); }, scheduled() {} };\n",
+);
 const MESSAGE_BYTES = encoder.encode("verified bundle module dependency");
 const ASSET_UID = "asset-uid-001";
 const ASSET_BYTES = encoder.encode("<main>verified asset</main>");
@@ -188,7 +192,7 @@ test("projects verified code and JSON vars without changing v2 Worker identities
 });
 
 test("checks scheduled code eligibility without inventing an event-delivery token", async () => {
-  const held = await heldBundle();
+  const held = await heldBundle({ moduleBytes: SCHEDULED_MODULE_BYTES });
   const observed: WorkerModuleInspectionInput[] = [];
 
   await expect(
@@ -262,6 +266,16 @@ test("requires the bundle UID and inspection handler set to match the accepted V
       inspectModule: inspector({ outcome: "valid", exportedHandlers: [] }),
     }),
   ).rejects.toMatchObject({ code: "worker_handler_mismatch" });
+
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec: versionSpec({ handlers: ["scheduled"] }),
+      bundle: await heldBundle({ moduleBytes: FETCH_AND_SCHEDULED_MODULE_BYTES }),
+      inspectModule: inspector({ outcome: "valid", exportedHandlers: ["fetch", "scheduled"] }),
+      eventDelivery: { token: "c".repeat(64) },
+    }),
+  ).rejects.toMatchObject({ code: "worker_handler_mismatch" });
 });
 
 test("keeps valid fetch code separate from unsupported bindings, secrets, and events", async () => {
@@ -288,18 +302,19 @@ test("keeps valid fetch code separate from unsupported bindings, secrets, and ev
 
 test("scheduled code requires an explicit private delivery capability and exact handler export", async () => {
   const spec = versionSpec({ handlers: ["fetch", "scheduled"] });
+  const bundle = await heldBundle({ moduleBytes: FETCH_AND_SCHEDULED_MODULE_BYTES });
   await expect(
     projectV2WorkerCodeVersion({
       identity: identity(),
       spec,
-      bundle: await heldBundle(),
+      bundle,
       inspectModule: inspector({ outcome: "valid", exportedHandlers: ["fetch", "scheduled"] }),
     }),
   ).rejects.toMatchObject({ code: "worker_event_delivery_unavailable" });
   const projected = await projectV2WorkerCodeVersion({
     identity: identity(),
     spec,
-    bundle: await heldBundle(),
+    bundle,
     inspectModule: inspector({ outcome: "valid", exportedHandlers: ["fetch", "scheduled"] }),
     eventDelivery: { token: "a".repeat(64) },
   });

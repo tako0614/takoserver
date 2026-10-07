@@ -249,7 +249,10 @@ async function verifyV2WorkerCodeEligibility(input: {
   if (!isValidInspection(inspection)) {
     throw new V2WorkerCodeRuntimeError("worker_module_inspection_unavailable");
   }
-  if (spec.handlers.some((handler) => !inspection.exportedHandlers.includes(handler))) {
+  if (
+    inspection.exportedHandlers.length !== spec.handlers.length ||
+    spec.handlers.some((handler) => !inspection.exportedHandlers.includes(handler))
+  ) {
     throw new V2WorkerCodeRuntimeError("worker_handler_mismatch");
   }
   return {
