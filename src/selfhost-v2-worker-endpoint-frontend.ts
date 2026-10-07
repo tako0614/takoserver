@@ -449,7 +449,11 @@ export function createSelfhostV2WorkerEndpointFrontend(options: {
       endpoint.generation !== parsed.row.generation ||
       canonicalJson(endpoint.spec) !== canonicalJson(objectJson(parsed.row.spec_json)) ||
       canonicalJson(endpoint.output) !== canonicalJson(parsed.address) ||
-      canonicalJson(resolution.snapshot.acceptedEndpointOutput) !== canonicalJson(parsed.address)
+      // Only an Endpoint source operation carries an acceptedEndpointOutput.
+      // A later Deployment operation retains the exact selected Endpoint, whose
+      // UID, generation, spec and output were checked above.
+      (resolution.snapshot.acceptedEndpointOutput !== undefined &&
+        canonicalJson(resolution.snapshot.acceptedEndpointOutput) !== canonicalJson(parsed.address))
     ) {
       return null;
     }
