@@ -186,6 +186,7 @@ async function main(): Promise<void> {
           await runWorkerCronTriggerTick({
             sql,
             now: () => new Date(at),
+            targetKey: TARGET_KEY,
             delivery: {
               invokeScheduled: async (input) =>
                 (await ensureOwner(input.workerUid)).invokeScheduled(input),
