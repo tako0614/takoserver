@@ -582,11 +582,17 @@ Host journey covers durable ACK, retry, Consumer update and deletion refusal.
 External currentness preflight occurs outside the owner's serial lane; native
 identity, SQL source and one-send authorization remain checked inside it.
 
-The same integrated native candidate checks these Object and KV data paths,
-SQLite Binding and owner shutdown together. A valid SQLite transaction above the
-private transport's 40 MiB aggregate limit is rejected before any database write.
-That test records an implementation capacity gap, not support for the rejected
-request.
+SQLite calls now use a separate private streaming transport rather than the
+shared 40 MiB buffered companion path. The operator supplies a pre-existing
+private staging directory. Calls above the 1 MiB inline threshold write through
+an already-unlinked file descriptor. The transport validates statement and
+parameter bounds before one atomic transaction; the output budget is checked
+before commit. Native tests pass a
+42-statement transaction with 1,000,000-byte parameters and verify all 42 rows.
+Malformed or interrupted input is rejected before execution; a later SQL failure
+or excess output rolls back without retained named input files. The wrapper still serializes a whole call
+before sending it, so maximum legal aggregate input is not yet qualified. The
+KV and Queue transports retain their existing limits.
 
 The internal WorkerCronTrigger backend and scheduler use the published
 WorkerCronTrigger 0.3.0 contract. Admission seals the exact Worker, target and
@@ -621,8 +627,11 @@ the same SQL Worker inventory and refuses missing serving owners or unexplained
 directories. This is a boot/recovery path, not a new public Form registration:
 the reusable internal Form factory is exercised only by local integration tests
 through normal organization-authenticated `buildApp` HTTP. A complete Worker
-Form claim still needs the remaining typed Binding and queue-handler contracts and an
-independently qualified public HTTPS Endpoint route/TLS/absence observer. The
+Form claim still needs the remaining typed Binding and queue-handler contracts.
+The internal factory can compose ModuleWorker, WorkerVersion and WorkerDeployment
+without a WorkerEndpoint frontend; it registers no Endpoint Form in that case.
+Endpoint support separately requires all hostname, TLS and route-absence ports,
+and an incomplete frontend configuration refuses composition. The
 internal factory now accepts an already-created operator sealer and gives both
 Version admission and the native owner the same SQL-backed Resource-owned
 configured-input custody. A local test uses synthetic nonextractable keys and
@@ -656,8 +665,19 @@ An admitted old invocation also keeps its signed exact-incarnation SQLite
 Binding while a replacement Deployment is pending and while that incarnation
 drains; each call still checks the live native owner and current settled
 Version/Database references, and retirement ends that authority.
-That evidence does not qualify the 40 MiB companion transport boundary,
+That restart evidence does not qualify maximum legal SQLite input,
 public HTTPS/TLS, or complete WorkerVersion/SQLiteDatabase Form support.
+
+The native owner also exposes a private Actor graph observation port. It checks
+every weighted Version's verified graph, exact process incarnation and listener
+ownership under the owner lane, then fences accepted SQL currentness before
+returning the observation. The ActorNamespace parser uses the published singular
+`className` and exact Worker UID reference. An empty-namespace proof is scoped to
+the physical tenant and namespace identity; it is not a claim about future
+activity. These are internal foundations, not ActorNamespace Form registration
+or an executable Actor Binding. Admission against active and accepted pending
+Deployments, runtime counts, and service/data binding composition remain to be
+connected.
 
 ## Existing installations
 
