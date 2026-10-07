@@ -33,10 +33,12 @@ import {
   V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
   type V2QueueDispatchGrant,
 } from "./providers/selfhost-v2-queue-transport.ts";
+import type { V2SqliteBindingGrant } from "./providers/selfhost-v2-sqlite-binding-broker.ts";
 import {
   randomSelfhostDeploymentBasisPoint,
   selectSelfhostWeightedVersion,
 } from "./selfhost-weighted-deployment.ts";
+import type { SQLiteWorkerBindingClaim } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import {
   parseWorkerEndpointSpec,
   parseWorkerVersionSpec,
@@ -361,6 +363,15 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
       readonly versionId: string;
       readonly incarnationId: string;
     }): string;
+  };
+  /** Trusted SQL-only facade boot seam; exact selected Version grants are minted during publication. */
+  readonly v2SqliteBinding?: {
+    readonly address: string;
+    issueGrant(grant: V2SqliteBindingGrant): string;
+    resolveCurrentBinding(
+      claim: SQLiteWorkerBindingClaim,
+      binding: string,
+    ): Promise<{ readonly resourceUid: string; readonly vector: string } | null>;
   };
   readonly workerdBinary: string | null;
   /** Trusted code-module inspector; absent uses the WorkerdRuntime's pinned inspector. */
@@ -1737,6 +1748,17 @@ export async function openWorkerdWorkerRuntimeOwner(
   ) {
     throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
   }
+  if (
+    options.v2SqliteBinding !== undefined &&
+    (typeof options.v2SqliteBinding.issueGrant !== "function" ||
+      typeof options.v2SqliteBinding.resolveCurrentBinding !== "function" ||
+      !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(options.v2SqliteBinding.address) ||
+      Number(
+        options.v2SqliteBinding.address.slice(options.v2SqliteBinding.address.lastIndexOf(":") + 1),
+      ) > 65_535)
+  ) {
+    throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
+  }
 
   let canonicalRoot: string;
   try {
@@ -2152,6 +2174,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       runtime: candidateRuntime,
       ...(options.configuredInputs ? { configuredInputs: options.configuredInputs } : {}),
       ...(options.v2QueueSettlement ? { v2QueueSettlement: options.v2QueueSettlement } : {}),
+      ...(options.v2SqliteBinding ? { v2SqliteBinding: options.v2SqliteBinding } : {}),
       ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
     });
     const handle: IncarnationHandle = {
