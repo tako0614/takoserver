@@ -5,6 +5,8 @@ import { createSelfhostV2WorkflowComposition } from "./takoform-v2/selfhost-v2-w
 import { createV2WorkflowBindingAuthority } from "./takoform-v2/workflow-binding-authority.ts";
 import { createV2WorkflowForwardBoot } from "./takoform-v2/workflow-binding-boot.ts";
 
+type WorkflowRunOnce = ReturnType<typeof createSelfhostV2WorkflowComposition>["runtime"]["runOne"];
+
 /**
  * App-owned v2 Workflow boot. This joins one accepted Host SQL graph to the
  * existing guarded Workflow runtime; it creates neither a second ledger nor
@@ -87,11 +89,25 @@ export function createSelfhostV2WorkflowBoot(options: {
         instances: composition.runtime.instances,
         privateSocketDirectory: options.privateSocketDirectory,
       });
+      let closed = false;
       return Object.freeze({
         workflowForm: composition.form,
         bindingAuthority,
         forwardBoot,
-        close: () => composition.host.close(),
+        async runWorkflowOnce(
+          scope: Parameters<WorkflowRunOnce>[0],
+          id: Parameters<WorkflowRunOnce>[1],
+        ) {
+          if (closed) throw new Error("v2 Workflow execution is unavailable");
+          return await composition.runtime.runOne(
+            { tenantId: scope.tenantId, workflowResourceUid: scope.workflowResourceUid },
+            id,
+          );
+        },
+        async close() {
+          closed = true;
+          await composition.host.close();
+        },
       });
     },
   });

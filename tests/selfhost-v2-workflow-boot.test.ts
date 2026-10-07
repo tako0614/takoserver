@@ -59,6 +59,10 @@ test("normal Worker factory mounts Workflow only with the same trusted guarded b
     const absent = withoutBoot.internalFormFactory({ sql, objects, clock });
     expect(absent[DURABLE_WORKFLOW_FORM_URL]).toBeUndefined();
     expect(absent[WORKER_VERSION_FORM_URL]).toBeDefined();
+    const scope = { tenantId: "org:unavailable", workflowResourceUid: "workflow-one" };
+    await expect(withoutBoot.runWorkflowOnce(scope, "instance-one")).rejects.toThrow(
+      "v2 Workflow execution is unavailable",
+    );
 
     const boot = createSelfhostV2WorkflowBoot({
       sql,
@@ -77,6 +81,9 @@ test("normal Worker factory mounts Workflow only with the same trusted guarded b
       rootDirectory: join(root, "workflow-worker-owners"),
       v2Workflow: boot,
     });
+    await expect(withBoot.runWorkflowOnce(scope, "instance-one")).rejects.toThrow(
+      "v2 Workflow execution is unavailable",
+    );
     await withBoot.restoreOwners();
     const mounted = withBoot.internalFormFactory({ sql, objects, clock });
     expect(mounted[DURABLE_WORKFLOW_FORM_URL]?.backend.id).toBe("selfhost-v2-durable-workflow-v1");
@@ -94,6 +101,9 @@ test("normal Worker factory mounts Workflow only with the same trusted guarded b
       },
     ]);
     await withBoot.closeWorkflowHost();
+    await expect(withBoot.runWorkflowOnce(scope, "instance-one")).rejects.toThrow(
+      "v2 Workflow execution is unavailable",
+    );
     await withBoot.suspendOwnersRetainingCustody();
   } finally {
     database.close();

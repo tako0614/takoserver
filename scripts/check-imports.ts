@@ -299,7 +299,24 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "v2-selfhost-composition",
-    match: /^src\/(?:selfhost-v2-worker-composition|selfhost-v2-worker-endpoint-frontend)\.ts$/u,
+    match: /^src\/selfhost-v2-worker-composition\.ts$/u,
+    may: [
+      "core",
+      "adapter",
+      "v2-application",
+      "v2-config",
+      "v2-form",
+      "v2-runtime",
+      "v2-private",
+      "v2-code-validation",
+      "v2-selfhost-queue-worker-capability",
+      "v2-queue-manager",
+      "v2-selfhost-workflow-composition",
+    ],
+  },
+  {
+    name: "v2-selfhost-endpoint-frontend",
+    match: /^src\/selfhost-v2-worker-endpoint-frontend\.ts$/u,
     may: [
       "core",
       "adapter",

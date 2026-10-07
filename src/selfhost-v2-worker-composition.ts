@@ -41,6 +41,7 @@ import {
   WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "./takoform-v2/forms/worker-specs.ts";
+import type { createSelfhostV2WorkflowComposition } from "./takoform-v2/selfhost-v2-workflow-composition.ts";
 import { createWorkerCronTriggerAdmissionReader } from "./takoform-v2/worker-cron-trigger-backend.ts";
 import { createWorkerDeploymentForm } from "./takoform-v2/worker-deployment-backend.ts";
 import { createWorkerEndpointForm } from "./takoform-v2/worker-endpoint-backend.ts";
@@ -76,6 +77,7 @@ type ActorOwnerForward = NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2Act
 type ActorOwnerSource = Parameters<ActorOwnerForward["openIncarnation"]>[0];
 type ActorOwnerIncarnation = ReturnType<ActorOwnerForward["openIncarnation"]>;
 type WorkflowOwnerForward = NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2WorkflowForward"]>;
+type WorkflowRunOnce = ReturnType<typeof createSelfhostV2WorkflowComposition>["runtime"]["runOne"];
 
 /** Trusted app-layer boot; portable Worker composition only attaches its explicit ports. */
 export interface SelfhostV2ActorBootPort {
@@ -115,6 +117,8 @@ export interface SelfhostV2WorkflowBootPort {
       Parameters<typeof createInternalV2WorkerVersionForm>[0]["v2WorkflowBinding"]
     >;
     readonly forwardBoot: WorkflowOwnerForward;
+    /** One trusted execution call; the runtime retains SQL/native claim authority. */
+    readonly runWorkflowOnce: WorkflowRunOnce;
     /** Stop guarded Workflow children and release selected owner leases before owner suspension. */
     close(): Promise<void>;
   };
@@ -263,6 +267,8 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   ownerForWorkerUid(uid: string): Promise<WorkerdWorkerRuntimeOwner>;
   /** Real SQL publication plus restored native Queue export proof, absent without Queue boot. */
   readonly queueCapability?: V2QueueConsumerCapability;
+  /** Host-private one-shot execution, unavailable before restore or after shutdown. */
+  runWorkflowOnce: WorkflowRunOnce;
   /** Close guarded Workflow registrations before stopping selected Worker owners. */
   closeWorkflowHost(): Promise<void>;
   /** Stop exact known children but retain UID owner locks and durable accepted state. */
@@ -446,6 +452,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   });
   const inspectModule = moduleInspector.inspect;
   const owners = new Map<string, Promise<WorkerdWorkerRuntimeOwner>>();
+  let workflowHostClosing = false;
   const actor = options.v2Actor
     ? (() => {
         if (
@@ -500,6 +507,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           typeof prepared?.workflowForm?.backend?.execute !== "function" ||
           typeof prepared.bindingAuthority?.resolveTarget !== "function" ||
           typeof prepared.forwardBoot?.openIncarnation !== "function" ||
+          typeof prepared.runWorkflowOnce !== "function" ||
           typeof prepared.close !== "function"
         )
           throw new TypeError("v2 Workflow boot is incomplete");
@@ -1086,7 +1094,16 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       await restoration;
       return await openOwner(uid);
     },
+    async runWorkflowOnce(scope, id) {
+      if (!workflow || !restorationComplete || ownerAdmissionFrozen || workflowHostClosing)
+        throw new Error("v2 Workflow execution is unavailable");
+      return await workflow.runWorkflowOnce(
+        { tenantId: scope.tenantId, workflowResourceUid: scope.workflowResourceUid },
+        id,
+      );
+    },
     async closeWorkflowHost() {
+      workflowHostClosing = true;
       await workflow?.close();
     },
     suspendOwnersRetainingCustody() {
@@ -1096,6 +1113,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       // composition. Each owner then proves child exit and listener vacancy
       // while retaining its durable lock/state for a later Host process.
       ownerAdmissionFrozen = true;
+      workflowHostClosing = true;
       const attempt = (async () => {
         // A guarded Workflow run can hold the selected native owner lease.
         // Reap it before owner suspension; failure retains all owner custody.
