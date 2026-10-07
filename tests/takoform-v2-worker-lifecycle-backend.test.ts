@@ -38,7 +38,13 @@ const FILE_URL = "https://artifacts.example.test/static/index.html";
 const FILE_BYTES = new TextEncoder().encode("<main>held asset</main>");
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
-function fixture(options?: { backendQueryHook?: (statement: string, sql: Sql) => Promise<void> }) {
+function fixture(options?: {
+  backendQueryHook?: (
+    statement: string,
+    sql: Sql,
+    rows: readonly Record<string, unknown>[],
+  ) => Promise<void>;
+}) {
   const root = mkdtempSync(join(tmpdir(), "v2-worker-lifecycle-"));
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);
@@ -48,7 +54,7 @@ function fixture(options?: { backendQueryHook?: (statement: string, sql: Sql) =>
         ...sql,
         async query(statement, params) {
           const result = await sql.query(statement, params);
-          await options.backendQueryHook?.(statement, sql);
+          await options.backendQueryHook?.(statement, sql, result);
           return result;
         },
       }
@@ -526,6 +532,53 @@ test("ModuleWorker PUT will not mint readiness from a damaged selected Version e
     ).toMatchObject({
       observedGeneration: 1,
       observed: { activeDeploymentUid: null, ready: false },
+    });
+  } finally {
+    f.close();
+  }
+});
+
+test("ModuleWorker observation does not materialize historical publisher Operations", async () => {
+  let sourceQueries = 0;
+  const f = fixture({
+    backendQueryHook: async (statement, _sql, rows) => {
+      if (!statement.includes("FROM tf_v2_operations op JOIN tf_v2_resources r")) return;
+      sourceQueries += 1;
+      if (rows.length > 4) throw new Error("unbounded publisher history read");
+    },
+  });
+  try {
+    const { worker, spec } = await f.createWorkerAndAssets();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec);
+    const deploymentSpec: JsonObject = {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    };
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", deploymentSpec);
+    for (let generation = 1; generation <= 128; generation += 1) {
+      f.nowMs += 1;
+      const update = await f.engine.acceptUpdate({
+        principal: "org-1",
+        key: `deployment-history-${generation}`,
+        uid: deployment.resourceUid,
+        expectedGeneration: generation,
+        spec: deploymentSpec,
+      });
+      expect(await f.engine.runNext()).toMatchObject({ id: update.id, status: "succeeded" });
+    }
+    const workerUpdate = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "worker-after-deployment-history",
+      uid: worker.resourceUid,
+      expectedGeneration: 1,
+      spec: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: workerUpdate.id, status: "succeeded" });
+    expect(sourceQueries).toBeGreaterThan(0);
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({
+      observed: { activeDeploymentUid: deployment.resourceUid, ready: true },
     });
   } finally {
     f.close();

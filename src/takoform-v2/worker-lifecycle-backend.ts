@@ -63,7 +63,8 @@ interface V2WorkerServingTarget {
   readonly workerResourceUid: string;
   readonly deploymentUid: string;
   readonly deploymentGeneration: number;
-  readonly sourceOperationIds: readonly string[];
+  readonly latestPublisherCreatedAt: string;
+  readonly endpointUid: string | null;
   readonly hostnames: readonly string[];
   readonly principal: string;
   readonly space: string;
@@ -154,16 +155,16 @@ type ModuleGraph = {
 async function confirmedPublicationSource(
   sql: Sql,
   execution: V2Execution,
-  activeDeploymentUid: string,
-): Promise<{ sourceOperationIds: readonly string[]; hostnames: readonly string[] } | null> {
-  const operations = await sql.query(
-    `SELECT op.id, op.resource_uid, op.action, op.status, op.effect, op.created_at,
-       r.form_url, r.principal, r.space, r.target_key
-     FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
+): Promise<{
+  latestPublisherCreatedAt: string;
+  endpointUid: string | null;
+  hostnames: readonly string[];
+} | null> {
+  const pending = await sql.query(
+    `SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
      WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
-       AND r.target_key = ?
-       AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
-     ORDER BY op.created_at, op.id`,
+       AND r.target_key = ? AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
+       AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ? LIMIT 1`,
     [
       WORKER_DEPLOYMENT_FORM_URL,
       WORKER_ENDPOINT_FORM_URL,
@@ -173,22 +174,27 @@ async function confirmedPublicationSource(
       execution.resourceUid,
     ],
   );
-  if (
-    operations.some(
-      (op) =>
-        op.status === "queued" ||
-        op.status === "running" ||
-        op.status === "waiting_input" ||
-        op.status === "reconciling",
-    )
-  ) {
-    return null;
-  }
-  const succeeded = operations.filter(
-    (op) => op.status === "succeeded" && op.effect === "complete",
+  if (pending.length !== 0) return null;
+  // Current Resource rows collapse arbitrarily many same-UID PUTs to one
+  // last Operation. Include soft-deleted Endpoint rows: a confirmed DELETE
+  // may own the current publication marker after its active edge is removed.
+  const latest = await sql.query(
+    `SELECT MAX(op.created_at) AS created_at
+     FROM tf_v2_resources r JOIN tf_v2_operations op ON op.id = r.last_operation
+     WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
+       AND r.target_key = ? AND op.status = 'succeeded' AND op.effect = 'complete'
+       AND json_extract(r.spec_json, '$.worker.resourceUid') = ?`,
+    [
+      WORKER_DEPLOYMENT_FORM_URL,
+      WORKER_ENDPOINT_FORM_URL,
+      execution.principal,
+      execution.space,
+      execution.targetKey,
+      execution.resourceUid,
+    ],
   );
-  const latestCreatedAt = succeeded.at(-1)?.created_at;
-  if (typeof latestCreatedAt !== "string") return null;
+  const latestPublisherCreatedAt = latest[0]?.created_at;
+  if (typeof latestPublisherCreatedAt !== "string") return null;
   const endpointRows = await sql.query(
     `SELECT r.uid, r.principal, r.space, r.target_key, r.generation,
        r.observed_generation, r.phase, r.busy_operation, r.last_operation,
@@ -199,7 +205,7 @@ async function confirmedPublicationSource(
      FROM tf_v2_resources r
      LEFT JOIN tf_v2_operations op ON op.id = r.last_operation
      WHERE r.form_url = ? AND r.deleted_at IS NULL
-       AND json_extract(r.spec_json, '$.worker.resourceUid') = ?`,
+       AND json_extract(r.spec_json, '$.worker.resourceUid') = ? LIMIT 2`,
     [WORKER_ENDPOINT_FORM_URL, execution.resourceUid],
   );
   if (endpointRows.length > 1) return null;
@@ -259,7 +265,7 @@ async function confirmedPublicationSource(
            refs.target_spec_path, refs.target_spec_equals
          FROM tf_v2_operation_reference_sets set_row
          JOIN tf_v2_operation_references refs ON refs.operation_id = set_row.operation_id
-         WHERE set_row.operation_id = ? AND set_row.sealed = 1`,
+         WHERE set_row.operation_id = ? AND set_row.sealed = 1 LIMIT 2`,
         [endpoint.operation_id as string],
       ),
     ]);
@@ -276,25 +282,49 @@ async function confirmedPublicationSource(
     }
     hostname = address.hostname;
   }
-  // Created-at ties are possible. The independent owner snapshot identifies
-  // the actual pointer among same-time, SQL-confirmed publishers; hostnames and
-  // the exact weighted set still have to match the current graph.
-  const sourceOperationIds = succeeded
-    .filter((source) => {
-      if (source.created_at !== latestCreatedAt || typeof source.id !== "string") return false;
-      if (source.form_url === WORKER_DEPLOYMENT_FORM_URL) {
-        return source.resource_uid === activeDeploymentUid && source.action !== "delete";
-      }
-      if (source.form_url === WORKER_ENDPOINT_FORM_URL) {
-        return source.action === "delete"
-          ? endpoint === undefined
-          : endpoint?.uid === source.resource_uid;
-      }
-      return false;
-    })
-    .map((source) => source.id as string);
-  if (sourceOperationIds.length === 0) return null;
-  return { sourceOperationIds, hostnames: hostname ? [hostname] : [] };
+  return {
+    latestPublisherCreatedAt,
+    endpointUid: typeof endpoint?.uid === "string" ? endpoint.uid : null,
+    hostnames: hostname ? [hostname] : [],
+  };
+}
+
+/** A point lookup disambiguates same-millisecond publishers without loading ties. */
+async function isCurrentPublisher(
+  sql: Sql,
+  execution: V2Execution,
+  target: V2WorkerServingTarget,
+  sourceOperationId: string,
+): Promise<boolean> {
+  const rows = await sql.query(
+    `SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
+     WHERE op.id = ? AND op.created_at = ? AND op.status = 'succeeded'
+       AND op.effect = 'complete' AND op.principal = ? AND op.target_key = ?
+       AND r.last_operation = op.id AND r.principal = ? AND r.space = ?
+       AND r.target_key = ?
+       AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
+       AND ((r.form_url = ? AND r.uid = ? AND op.action IN ('create', 'update'))
+         OR (r.form_url = ? AND
+           ((? IS NULL AND op.action = 'delete') OR
+            (r.uid = ? AND r.deleted_at IS NULL AND op.action IN ('create', 'update')))))
+     LIMIT 1`,
+    [
+      sourceOperationId,
+      target.latestPublisherCreatedAt,
+      execution.principal,
+      execution.targetKey,
+      execution.principal,
+      execution.space,
+      execution.targetKey,
+      execution.resourceUid,
+      WORKER_DEPLOYMENT_FORM_URL,
+      target.deploymentUid,
+      WORKER_ENDPOINT_FORM_URL,
+      target.endpointUid,
+      target.endpointUid,
+    ],
+  );
+  return rows.length === 1;
 }
 
 /** SQL establishes the confirmed graph; live Host admission is checked later. */
@@ -314,9 +344,10 @@ async function confirmedModuleObservation(
      FROM tf_v2_resource_references edge
      JOIN tf_v2_resources d ON d.uid = edge.referrer_uid
      LEFT JOIN tf_v2_operations op ON op.id = d.last_operation
-     WHERE edge.target_uid = ? AND d.form_url = ? ORDER BY d.uid`,
+     WHERE edge.target_uid = ? AND d.form_url = ? ORDER BY d.uid LIMIT 2`,
     [execution.resourceUid, WORKER_DEPLOYMENT_FORM_URL],
   );
+  if (rows.length > 1) return null;
   let activeDeploymentUid: string | null = null;
   let servingTarget: V2WorkerServingTarget | null = null;
   for (const row of rows) {
@@ -385,12 +416,12 @@ async function confirmedModuleObservation(
            refs.target_spec_path, refs.target_spec_equals
          FROM tf_v2_operation_reference_sets set_row
          JOIN tf_v2_operation_references refs ON refs.operation_id = set_row.operation_id
-         WHERE set_row.operation_id = ? AND set_row.sealed = 1 ORDER BY refs.target_uid`,
+         WHERE set_row.operation_id = ? AND set_row.sealed = 1 ORDER BY refs.target_uid LIMIT 10`,
         [row.operation_id as string],
       ),
       sql.query(
         `SELECT target_uid FROM tf_v2_resource_references
-         WHERE referrer_uid = ? ORDER BY target_uid`,
+         WHERE referrer_uid = ? ORDER BY target_uid LIMIT 10`,
         [row.uid],
       ),
     ]);
@@ -419,7 +450,8 @@ async function confirmedModuleObservation(
         workerResourceUid: execution.resourceUid,
         deploymentUid: row.uid,
         deploymentGeneration: row.generation as number,
-        sourceOperationIds: [row.operation_id as string],
+        latestPublisherCreatedAt: "",
+        endpointUid: null,
         hostnames: [],
         principal: execution.principal,
         space: execution.space,
@@ -432,7 +464,7 @@ async function confirmedModuleObservation(
     }
   }
   if (activeDeploymentUid !== null) {
-    const publication = await confirmedPublicationSource(sql, execution, activeDeploymentUid);
+    const publication = await confirmedPublicationSource(sql, execution);
     if (!publication || !servingTarget) return null;
     servingTarget = { ...servingTarget, ...publication };
   }
@@ -549,10 +581,10 @@ export function createInternalV2ModuleWorkerForm(options: {
           proof.kind !== "serving" ||
           proof.workerResourceUid !== target.workerResourceUid ||
           proof.targetKey !== target.targetKey ||
-          !target.sourceOperationIds.includes(proof.sourceOperationId) ||
           proof.generation !== `takoserver-v2-operation:${proof.sourceOperationId}` ||
           canonicalJson(proof.hostnames) !== canonicalJson(target.hostnames) ||
-          canonicalJson(proof.versions) !== canonicalJson(target.versions)
+          canonicalJson(proof.versions) !== canonicalJson(target.versions) ||
+          !(await isCurrentPublisher(sql, execution, target, proof.sourceOperationId))
         ) {
           return unresolved();
         }
