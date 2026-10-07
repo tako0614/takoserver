@@ -811,6 +811,31 @@ async function requireExactEntries(path: string, expected: readonly string[]): P
   }
 }
 
+async function requireExactEntriesAfterRecoveryRace(
+  path: string,
+  expected: readonly string[],
+): Promise<void> {
+  const expectedSet = new Set(expected);
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const actual = await readdir(path).catch(() => {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    });
+    if (canonicalJson([...actual].sort()) === canonicalJson([...expected].sort())) return;
+    // A competing process may have linked the old lock just as this process
+    // replaced it. It must remove its own claim after noticing the new inode.
+    // Never accept an incomplete namespace; wait only for named claims and
+    // perform the same exact inventory check again before opening the owner.
+    if (
+      expected.some((name) => !actual.includes(name)) ||
+      actual.some((name) => !expectedSet.has(name) && parseRecoveryClaimName(name) === null) ||
+      attempt === 31
+    ) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    await Bun.sleep(10);
+  }
+}
+
 async function verifyKnownGroupContents(
   groupDirectory: string,
   record: IncarnationRecord,
@@ -861,6 +886,7 @@ async function verifyOwnerNamespace(
   directory: string,
   state: PersistedOwnerState,
   workerResourceUid: string,
+  recoveredFromStaleOwner = false,
 ): Promise<void> {
   const stateInfo = await lstat(join(directory, STATE_NAME)).catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -876,7 +902,8 @@ async function verifyOwnerNamespace(
     ...(stateInfo ? [STATE_NAME] : []),
     ...(incarnationInfo ? ["incarnations"] : []),
   ];
-  await requireExactEntries(directory, topLevel);
+  if (recoveredFromStaleOwner) await requireExactEntriesAfterRecoveryRace(directory, topLevel);
+  else await requireExactEntries(directory, topLevel);
   if (stateInfo && (!stateInfo.isFile() || stateInfo.isSymbolicLink())) {
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
@@ -2050,7 +2077,12 @@ export async function openWorkerdWorkerRuntimeOwner(
       throw error;
     });
     state = parseState(text, options.workerResourceUid);
-    await verifyOwnerNamespace(directory, state, options.workerResourceUid);
+    await verifyOwnerNamespace(
+      directory,
+      state,
+      options.workerResourceUid,
+      ownerLock.recoveredFromStaleOwner,
+    );
     const hasServingIncarnations = state.incarnations.some(
       (item) => item.status === "active" || item.status === "draining",
     );

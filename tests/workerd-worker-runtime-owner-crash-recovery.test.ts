@@ -193,6 +193,9 @@ test("a new host process replays the exact DELETE proof after the old host crash
     ]);
     const successes = [resultA, resultB].filter((result) => result.kind === "replayed");
     const refusals = [resultA, resultB].filter((result) => result.kind === "error");
+    if (successes.length !== 1) {
+      throw new Error(`unexpected DELETE replay outcomes: ${JSON.stringify({ resultA, resultB })}`);
+    }
     expect(successes).toHaveLength(1);
     expect(refusals).toHaveLength(1);
     expect(refusals[0]).toMatchObject({ code: "ownership_uncertain" });
