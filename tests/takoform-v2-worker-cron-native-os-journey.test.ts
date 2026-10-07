@@ -48,7 +48,33 @@ type OwnerState = {
   }[];
 };
 
-async function startHost(
+function requireGracefulStopProof(
+  events: readonly HostEvent[],
+  exitCode: number,
+  readerError: unknown,
+) {
+  if (
+    exitCode !== 0 ||
+    readerError !== undefined ||
+    events.filter((event) => event.stage === "stopped").length !== 1 ||
+    events.some((event) => event.stage === "shutdown_error")
+  )
+    throw new Error("native Cron Host exited without one confirmed owner-suspension receipt");
+}
+
+test("native Cron Host shutdown proof requires one stopped receipt and a zero exit", () => {
+  expect(() => requireGracefulStopProof([], 0, undefined)).toThrow();
+  expect(() => requireGracefulStopProof([{ stage: "stopped" }], 1, undefined)).toThrow();
+  expect(() =>
+    requireGracefulStopProof([{ stage: "stopped" }], 0, new Error("reader lost")),
+  ).toThrow();
+  expect(() =>
+    requireGracefulStopProof([{ stage: "stopped" }, { stage: "shutdown_error" }], 0, undefined),
+  ).toThrow();
+  expect(() => requireGracefulStopProof([{ stage: "stopped" }], 0, undefined)).not.toThrow();
+});
+
+function startHost(
   root: string,
   workerd: string,
   workerUid: string | null,
@@ -90,56 +116,117 @@ async function startHost(
   })().catch((error: unknown) => {
     readerError = error;
   });
-  const identity = await readLinuxProcessIdentity(child.pid);
-  for (let attempt = 0; attempt < 1_000; attempt += 1) {
-    const ready = events.find((event) => event.stage === "listening");
-    if (ready?.port) {
-      const origin = `http://127.0.0.1:${ready.port}`;
-      return {
-        child,
-        identity,
-        origin,
-        async killOwned() {
-          if (
-            child.exitCode !== null ||
-            (await linuxProcessLiveness(identity)) !== "live" ||
-            JSON.stringify(await readLinuxProcessIdentity(child.pid)) !== JSON.stringify(identity)
-          )
-            throw new Error("Host PID identity is not owned for SIGKILL");
-          child.kill("SIGKILL");
-          await child.exited;
-          await reading;
-          await stderr;
-          reader.releaseLock();
-        },
-        async stopGracefully() {
-          const response = await fetch(`${origin}/__fixture/shutdown`, {
-            method: "POST",
-            signal: AbortSignal.timeout(10_000),
-          });
-          if (response.status !== 202)
-            throw new Error(`native Cron Host shutdown refused: ${response.status}`);
-          await Promise.race([
-            child.exited,
-            Bun.sleep(10_000).then(() => {
-              throw new Error("native Cron Host did not exit");
-            }),
-          ]);
-          await reading;
-          await stderr;
-          reader.releaseLock();
-        },
-      };
+  const identityPromise = readLinuxProcessIdentity(child.pid);
+  let origin: string | undefined;
+  let readerReleased = false;
+  async function joinPipes(): Promise<void> {
+    await reading;
+    await stderr;
+    if (!readerReleased) {
+      reader.releaseLock();
+      readerReleased = true;
     }
-    const failed = events.find((event) => event.stage === "startup_error");
-    if (failed || readerError || child.exitCode !== null)
-      throw new Error(
-        `native Cron Host startup refused: ${JSON.stringify(failed)} ${await stderr}`,
-      );
-    await Bun.sleep(10);
   }
-  throw new Error("native Cron Host did not listen");
+  async function requireOwnedLivePid(): Promise<void> {
+    const identity = await identityPromise;
+    if (
+      child.exitCode !== null ||
+      (await linuxProcessLiveness(identity)) !== "live" ||
+      JSON.stringify(await readLinuxProcessIdentity(child.pid)) !== JSON.stringify(identity)
+    )
+      throw new Error("Host PID identity is not owned for signaling");
+  }
+  async function waitExit(): Promise<number> {
+    return await Promise.race([
+      child.exited,
+      Bun.sleep(10_000).then((): never => {
+        throw new Error("native Cron Host did not exit");
+      }),
+    ]);
+  }
+  return {
+    child,
+    get origin(): string {
+      if (!origin) throw new Error("native Cron Host is not listening");
+      return origin;
+    },
+    get isReady(): boolean {
+      return origin !== undefined;
+    },
+    async ready(): Promise<void> {
+      await identityPromise;
+      for (let attempt = 0; attempt < 1_000; attempt += 1) {
+        const ready = events.find((event) => event.stage === "listening");
+        if (ready?.port) {
+          origin = `http://127.0.0.1:${ready.port}`;
+          return;
+        }
+        const failed = events.find((event) => event.stage === "startup_error");
+        if (failed || readerError || child.exitCode !== null)
+          throw new Error(`native Cron Host startup refused: ${JSON.stringify(failed)}`);
+        await Bun.sleep(10);
+      }
+      throw new Error("native Cron Host did not listen");
+    },
+    async killOwned(): Promise<void> {
+      await requireOwnedLivePid();
+      child.kill("SIGKILL");
+      await waitExit();
+      await joinPipes();
+    },
+    async stopGracefully(): Promise<void> {
+      if (!origin) throw new Error("native Cron Host has no confirmed shutdown endpoint");
+      const response = await fetch(`${origin}/__fixture/shutdown`, {
+        method: "POST",
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (response.status !== 202)
+        throw new Error(`native Cron Host shutdown refused: ${response.status}`);
+      const exitCode = await waitExit();
+      await joinPipes();
+      requireGracefulStopProof(events, exitCode, readerError);
+    },
+    async stopFailedStartup(): Promise<void> {
+      if (child.exitCode === null) {
+        const identity = await identityPromise;
+        if ((await linuxProcessLiveness(identity)) === "live" && child.exitCode === null) {
+          let owned = false;
+          try {
+            await requireOwnedLivePid();
+            owned = true;
+          } catch (error) {
+            // A startup failure can exit between the liveness reads. Do not
+            // signal a PID that is no longer the captured process.
+            if (child.exitCode === null && (await linuxProcessLiveness(identity)) === "live")
+              throw error;
+          }
+          if (owned && child.exitCode === null) child.kill("SIGKILL");
+        }
+        await waitExit();
+      }
+      await joinPipes();
+      // No owner-suspension receipt exists; the fixture root remains retained.
+    },
+  };
 }
+
+test("native Cron startup failure retains the spawned Host handle for owned cleanup", async () => {
+  const host = startHost(
+    "/dev/null/cron-os-startup",
+    "/unused/workerd",
+    null,
+    "unused-manifest",
+    "unused-module",
+    "fixture-organization",
+  );
+  try {
+    await expect(host.ready()).rejects.toThrow("startup refused");
+  } finally {
+    if (host.isReady) await host.stopGracefully();
+    else await host.stopFailedStartup();
+  }
+  expect(host.child.exitCode).not.toBeNull();
+});
 
 async function request(
   origin: string,
@@ -239,8 +326,8 @@ test.skipIf(binary === undefined)(
   async () => {
     if (!binary) throw new Error("pinned Workerd binary missing");
     const root = await mkdtemp(join(tmpdir(), "v2-cron-native-os-"));
-    let first: Awaited<ReturnType<typeof startHost>> | undefined;
-    let second: Awaited<ReturnType<typeof startHost>> | undefined;
+    let first: ReturnType<typeof startHost> | undefined;
+    let second: ReturnType<typeof startHost> | undefined;
     let retained = true;
     let primaryError: unknown;
     const cleanupErrors: unknown[] = [];
@@ -306,7 +393,8 @@ export default {
       const objects = createFileObjectStore({ root: join(root, "objects") });
       await objects.create("cron/manifest", manifestBytes);
       await objects.create("cron/index.js", moduleBytes);
-      first = await startHost(root, selected.binary, null, manifestSha, moduleSha, organization.id);
+      first = startHost(root, selected.binary, null, manifestSha, moduleSha, organization.id);
+      await first.ready();
       const workerUid = await create(first.origin, MODULE_WORKER_FORM_URL, "worker", {});
       const bundleUid = await create(first.origin, WORKER_BUNDLE_FORM_URL, "bundle", {
         artifact: { url: MANIFEST_URL, sha256: manifestSha },
@@ -363,14 +451,8 @@ export default {
         await Bun.sleep(20);
       }
       expect(await linuxProcessLiveness(activeBefore.processIdentity)).toBe("stale");
-      second = await startHost(
-        root,
-        selected.binary,
-        workerUid,
-        manifestSha,
-        moduleSha,
-        organization.id,
-      );
+      second = startHost(root, selected.binary, workerUid, manifestSha, moduleSha, organization.id);
+      await second.ready();
       expect(second.child.pid).not.toBe(oldHostPid);
       const ownerAfter = JSON.parse(await readFile(ownerPath, "utf8")) as OwnerState;
       const activeAfter = ownerAfter.incarnations.find((item) => item.status === "active");
@@ -435,9 +517,13 @@ export default {
       primaryError = error;
     } finally {
       for (const host of [first, second]) {
-        if (!host || host.child.exitCode !== null) continue;
+        if (!host) continue;
         try {
-          await host.stopGracefully();
+          if (host.isReady) {
+            if (host.child.exitCode === null) await host.stopGracefully();
+          } else {
+            await host.stopFailedStartup();
+          }
         } catch (error) {
           cleanupErrors.push(error);
         }
