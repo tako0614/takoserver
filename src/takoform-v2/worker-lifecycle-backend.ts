@@ -63,7 +63,7 @@ interface V2WorkerServingTarget {
   readonly workerResourceUid: string;
   readonly deploymentUid: string;
   readonly deploymentGeneration: number;
-  readonly latestPublisherCreatedAt: string;
+  readonly latestPublisherAcceptanceOrder: number;
   readonly endpointUid: string | null;
   readonly hostnames: readonly string[];
   readonly principal: string;
@@ -156,7 +156,7 @@ async function confirmedPublicationSource(
   sql: Sql,
   execution: V2Execution,
 ): Promise<{
-  latestPublisherCreatedAt: string;
+  latestPublisherAcceptanceOrder: number;
   endpointUid: string | null;
   hostnames: readonly string[];
 } | null> {
@@ -179,7 +179,7 @@ async function confirmedPublicationSource(
   // last Operation. Include soft-deleted Endpoint rows: a confirmed DELETE
   // may own the current publication marker after its active edge is removed.
   const latest = await sql.query(
-    `SELECT MAX(op.created_at) AS created_at
+    `SELECT MAX(op.acceptance_order) AS acceptance_order
      FROM tf_v2_resources r JOIN tf_v2_operations op ON op.id = r.last_operation
      WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
        AND r.target_key = ? AND op.status = 'succeeded' AND op.effect = 'complete'
@@ -193,8 +193,13 @@ async function confirmedPublicationSource(
       execution.resourceUid,
     ],
   );
-  const latestPublisherCreatedAt = latest[0]?.created_at;
-  if (typeof latestPublisherCreatedAt !== "string") return null;
+  const latestPublisherAcceptanceOrder = latest[0]?.acceptance_order;
+  if (
+    typeof latestPublisherAcceptanceOrder !== "number" ||
+    !Number.isSafeInteger(latestPublisherAcceptanceOrder) ||
+    latestPublisherAcceptanceOrder <= 0
+  )
+    return null;
   const endpointRows = await sql.query(
     `SELECT r.uid, r.principal, r.space, r.target_key, r.generation,
        r.observed_generation, r.phase, r.busy_operation, r.last_operation,
@@ -283,13 +288,13 @@ async function confirmedPublicationSource(
     hostname = address.hostname;
   }
   return {
-    latestPublisherCreatedAt,
+    latestPublisherAcceptanceOrder,
     endpointUid: typeof endpoint?.uid === "string" ? endpoint.uid : null,
     hostnames: hostname ? [hostname] : [],
   };
 }
 
-/** A point lookup disambiguates same-millisecond publishers without loading ties. */
+/** A point lookup binds the owner marker to the durable accepted Operation order. */
 async function isCurrentPublisher(
   sql: Sql,
   execution: V2Execution,
@@ -298,7 +303,7 @@ async function isCurrentPublisher(
 ): Promise<boolean> {
   const rows = await sql.query(
     `SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
-     WHERE op.id = ? AND op.created_at = ? AND op.status = 'succeeded'
+     WHERE op.id = ? AND op.acceptance_order = ? AND op.status = 'succeeded'
        AND op.effect = 'complete' AND op.principal = ? AND op.target_key = ?
        AND r.last_operation = op.id AND r.principal = ? AND r.space = ?
        AND r.target_key = ?
@@ -310,7 +315,7 @@ async function isCurrentPublisher(
      LIMIT 1`,
     [
       sourceOperationId,
-      target.latestPublisherCreatedAt,
+      target.latestPublisherAcceptanceOrder,
       execution.principal,
       execution.targetKey,
       execution.principal,
@@ -450,7 +455,7 @@ async function confirmedModuleObservation(
         workerResourceUid: execution.resourceUid,
         deploymentUid: row.uid,
         deploymentGeneration: row.generation as number,
-        latestPublisherCreatedAt: "",
+        latestPublisherAcceptanceOrder: 0,
         endpointUid: null,
         hostnames: [],
         principal: execution.principal,

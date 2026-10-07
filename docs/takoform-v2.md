@@ -391,12 +391,22 @@ local lock after retirement. After a Host-process crash, a successor may replay
 the same DELETE only when the durable owner state proves deletion and every
 recorded incarnation has an exact retirement receipt, every recorded listener
 is vacant, and Linux boot/PID-start identity proves the prior lock owner exited
-within the same boot and PID namespace recorded by the lock. This private owner
-root is for one local Host/PID namespace, not a shared-volume or reboot-recovery
-protocol.
+within the same boot and PID namespace recorded by the lock. An active
+incarnation can also be reopened when the exact accepted SQL serving graph,
+stored publication copies and pinned configuration agree, its old child is
+stale, and its listener is vacant. Recovery re-renders the same graph with a
+new process-private readiness token; it durably pins the replacement child and
+configuration digest before admitting traffic. A draining predecessor is
+retired from its exact receipt, including when the group receipt preceded the
+owner-state checkpoint. A failed successor retains its fenced lock until its
+own PID dies, so a later Host can retry without a no-lock adoption path.
+An interrupted config write that does not match the group manifest remains
+unknown and requires manual recovery. This private owner root is for one local
+Host/PID namespace, not a shared-volume or reboot-recovery protocol.
 The successor pins and rechecks the exact lock inode before claiming it; competing
 successors cannot both acquire it. A legacy PID-only or malformed lock, an
-unavailable process identity, a foreign listener, or any unretired/uncertain
+unavailable process identity, a foreign listener, a missing/currently live
+child, an unrecognized incarnation directory, or any other uncertain
 incarnation remains an unknown manual-recovery case. The code never adopts a
 live child or removes a lock using only a PID. This recovery is not native
 workerd ABI qualification and remains distinct from successful same-process

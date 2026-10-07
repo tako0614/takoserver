@@ -14,15 +14,29 @@ import {
   unlink,
 } from "node:fs/promises";
 import { join } from "node:path";
-import { WORKER_DEPLOYMENT_FORM_URL } from "./takoform-v2/forms/worker-specs.ts";
+import {
+  parseWorkerEndpointSpec,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+} from "./takoform-v2/forms/worker-specs.ts";
 import type { V2Execution } from "./takoform-v2/types.ts";
-import type { V2WorkerPublicationResolution } from "./takoform-v2/worker-publication-state.ts";
+import type {
+  V2WorkerPublicationResolution,
+  V2WorkerPublicationSnapshot,
+} from "./takoform-v2/worker-publication-state.ts";
 import {
   createV2WorkerPublication,
+  type V2EndpointRouteAbsentReceipt,
   type V2WorkerPublicationResult,
 } from "./takoform-v2/worker-static-publication.ts";
-import { workerPortOwnership } from "./workerd-linux-process.ts";
+import {
+  type LinuxProcessIdentity,
+  linuxProcessLiveness,
+  readLinuxProcessIdentity,
+  workerPortOwnership,
+} from "./workerd-linux-process.ts";
 import type {
+  HostedWorkerdRuntime,
   WorkerdPublicationIdentity,
   WorkerdRuntime,
   WorkerdSite,
@@ -44,19 +58,37 @@ const LOCK_NAME = "runtime-owner.lock";
 const LEGACY_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@1";
 const PREVIOUS_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@2";
 const RETIRED_COPIES_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@3";
-const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@4";
+const CLEANUP_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@4";
+const ROUTE_RECEIPT_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@5";
+const PROCESS_PIN_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@6";
+const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@7";
 const LOCK_SCHEMA = "takoserver.v2-worker-runtime-owner-lock@2";
 const OPERATION_MARKER = "takoserver-v2-operation:";
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const DRAIN_GRACE_MS = 15 * 60 * 1000;
 const LOCK_MAX_BYTES = 2_048;
 const RECOVERY_PREFIX = ".runtime-owner-recovery.";
+const ENDPOINT_HOSTNAME =
+  /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/u;
 
 type PublicationState = {
   resolve(input: {
     execution: V2Execution;
     incumbentSourceOperationId?: string;
   }): Promise<V2WorkerPublicationResolution>;
+  resolveCurrentServing?(input: {
+    readonly workerUid: string;
+    readonly targetKey: string;
+    readonly sourceOperationId: string;
+    readonly expectedIdentity: WorkerdPublicationIdentity;
+  }): Promise<
+    | {
+        readonly kind: "ready";
+        readonly snapshot: V2WorkerPublicationSnapshot;
+        stillCurrent(): Promise<boolean>;
+      }
+    | { readonly kind: "unresolved"; readonly code: string; readonly message: string }
+  >;
 };
 
 type IncarnationStatus = "candidate" | "active" | "draining" | "retiring" | "retired" | "uncertain";
@@ -75,6 +107,12 @@ interface IncarnationRecord {
   readonly executionCopiesCleanupStarted: boolean;
   /** Exact pre-cleanup path/type/size/content-digest inventory pinned in owner state. */
   readonly executionCopiesCleanupManifestSha256: string | null;
+  /** Exact current OS child identity, persisted before readiness or publication. */
+  readonly processIdentity: LinuxProcessIdentity | null;
+  /** Exact config bytes pinned when this incarnation became active. */
+  readonly configurationSha256: string | null;
+  /** Recovery is re-rendering the same accepted graph with a new private readiness token. */
+  readonly configurationRefreshPending: boolean;
   readonly identity: WorkerdPublicationIdentity | null;
   readonly receipt: WorkerdWorkerRetirementReceipt | null;
 }
@@ -85,6 +123,8 @@ interface PersistedOwnerState {
   readonly activeOperationId: string | null;
   readonly admissionClosedBy: string | null;
   readonly deletionPublicationConfirmed: boolean;
+  /** Latest exact no-active-Deployment Endpoint absence proof in this owner record. */
+  readonly endpointRouteAbsence: V2WorkerEndpointRouteAbsentResult | null;
   readonly incarnations: readonly IncarnationRecord[];
 }
 
@@ -100,7 +140,7 @@ interface ActiveInvocation {
 interface IncarnationHandle {
   record: IncarnationRecord;
   readonly group: WorkerdWorkerExecutionGroup;
-  readonly runtime: WorkerdRuntime<WorkerdSite | WorkerdStaticSite>;
+  readonly runtime: HostedWorkerdRuntime;
   readonly publication: ReturnType<typeof createV2WorkerPublication>;
   readonly invocations: Set<ActiveInvocation>;
   retirementTimer?: () => void;
@@ -117,10 +157,17 @@ export class WorkerdWorkerRuntimeOwnerError extends Error {
   }
 }
 
+/** Explicit no-active-Deployment endpoint absence, never Worker teardown. */
+export type V2WorkerEndpointRouteAbsentResult = V2EndpointRouteAbsentReceipt;
+
+export type V2WorkerRuntimeOwnerExecutionResult =
+  | V2WorkerPublicationResult
+  | V2WorkerEndpointRouteAbsentResult;
+
 export interface WorkerdWorkerRuntimeOwner {
   readonly workerResourceUid: string;
-  /** Run one accepted WorkerDeployment Operation and switch only this UID's listener. */
-  execute(execution: V2Execution): Promise<V2WorkerPublicationResult>;
+  /** Run one accepted WorkerDeployment or WorkerEndpoint Operation for this UID. */
+  execute(execution: V2Execution): Promise<V2WorkerRuntimeOwnerExecutionResult>;
   /** Read exact current serving truth without changing publication state. */
   observeServing(input: {
     readonly workerResourceUid: string;
@@ -201,6 +248,7 @@ interface OwnerFileIdentity {
 interface OpenedOwnerLock {
   readonly handle: Awaited<ReturnType<typeof open>>;
   readonly record: RuntimeOwnerLockRecord;
+  readonly recoveredFromStaleOwner: boolean;
 }
 
 interface ReadOwnerLock {
@@ -458,6 +506,121 @@ async function requireVacantOwnerListeners(state: PersistedOwnerState): Promise<
   }
 }
 
+async function requirePrivateDirectory(path: string): Promise<void> {
+  const info = await lstat(path, { bigint: true }).catch(() => null);
+  if (!info?.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077n) !== 0n) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+}
+
+async function requireExactEntries(path: string, expected: readonly string[]): Promise<void> {
+  const actual = await readdir(path).catch(() => {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  if (canonicalJson([...actual].sort()) !== canonicalJson([...expected].sort())) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+}
+
+async function verifyKnownGroupContents(
+  groupDirectory: string,
+  record: IncarnationRecord,
+): Promise<void> {
+  const entries = await readdir(groupDirectory).catch(() => {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  const retired = record.status === "retired";
+  const draining = record.status === "draining";
+  const allowed =
+    retired || draining
+      ? new Set([
+          "group.json",
+          "retirement.json",
+          "workers",
+          "assets",
+          ...(retired || record.executionCopiesCleanupStarted ? [".retired-execution-copies"] : []),
+        ])
+      : new Set(["group.json", "workers", "assets"]);
+  if (
+    !entries.includes("group.json") ||
+    !entries.includes("workers") ||
+    (retired && !entries.includes("retirement.json")) ||
+    entries.some((entry) => !allowed.has(entry))
+  ) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+  for (const entry of entries) {
+    const path = join(groupDirectory, entry);
+    const info = await lstat(path, { bigint: true }).catch(() => null);
+    if (!info || info.isSymbolicLink() || (info.mode & 0o077n) !== 0n) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    if (entry === "group.json" || entry === "retirement.json") {
+      if (!info.isFile()) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    } else if (!info.isDirectory()) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+  }
+}
+
+/**
+ * Under the exact UID owner lock, prove that persisted incarnations are the
+ * complete namespace inventory. Unknown/orphan entries are evidence gaps,
+ * never garbage to clean up.
+ */
+async function verifyOwnerNamespace(
+  directory: string,
+  state: PersistedOwnerState,
+  workerResourceUid: string,
+): Promise<void> {
+  const stateInfo = await lstat(join(directory, STATE_NAME)).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  const incarnationRoot = join(directory, "incarnations");
+  const incarnationInfo = await lstat(incarnationRoot).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  const topLevel = [
+    LOCK_NAME,
+    ...(stateInfo ? [STATE_NAME] : []),
+    ...(incarnationInfo ? ["incarnations"] : []),
+  ];
+  await requireExactEntries(directory, topLevel);
+  if (stateInfo && (!stateInfo.isFile() || stateInfo.isSymbolicLink())) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+  if (incarnationInfo && (!incarnationInfo.isDirectory() || incarnationInfo.isSymbolicLink())) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+  const expectedOperations = state.incarnations.map((record) => record.operationId).sort();
+  if (expectedOperations.length === 0) {
+    if (incarnationInfo !== null) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    return;
+  }
+  if (incarnationInfo === null) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  await requirePrivateDirectory(incarnationRoot);
+  await requireExactEntries(incarnationRoot, expectedOperations);
+  const groupsName = "groups";
+  const workerKey = uidKey(workerResourceUid);
+  for (const operationId of expectedOperations) {
+    if (!OPERATION_ID.test(operationId))
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const record = state.incarnations.find((item) => item.operationId === operationId);
+    if (!record) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const operationRoot = join(incarnationRoot, operationId);
+    await requirePrivateDirectory(operationRoot);
+    await requireExactEntries(operationRoot, [groupsName]);
+    const groupsRoot = join(operationRoot, groupsName);
+    await requirePrivateDirectory(groupsRoot);
+    await requireExactEntries(groupsRoot, [workerKey]);
+    const groupDirectory = join(groupsRoot, workerKey);
+    await requirePrivateDirectory(groupDirectory);
+    await verifyKnownGroupContents(groupDirectory, record);
+  }
+}
+
 function recoveryClaimName(fingerprint: OwnerProcessFingerprint, ownerId: string): string {
   return `${RECOVERY_PREFIX}${process.pid}.${fingerprint.bootId}.${fingerprint.startTimeTicks}.${fingerprint.pidNamespace}.${ownerId}`;
 }
@@ -543,7 +706,7 @@ async function createOwnerLock(path: string, directory: string): Promise<OpenedO
     await handle.writeFile(canonicalJson(record), "utf8");
     await handle.sync();
     await syncDirectory(directory);
-    return { handle, record };
+    return { handle, record, recoveredFromStaleOwner: false };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST" && !handle) return null;
     if (identity) {
@@ -559,16 +722,75 @@ async function createOwnerLock(path: string, directory: string): Promise<OpenedO
 async function requireSafeStateForNewOwner(
   snapshot: OwnerStateSnapshot,
   allowDeleteReplayOnly: boolean,
+  allowProcessRecovery = false,
 ): Promise<void> {
-  if (!hasOnlyRetiredOrRetirementPendingIncarnations(snapshot.state))
-    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
-  if (
-    allowDeleteReplayOnly &&
-    (snapshot.state.admissionClosedBy === null || !snapshot.state.deletionPublicationConfirmed)
-  ) {
+  if (hasOnlyRetiredOrRetirementPendingIncarnations(snapshot.state)) {
+    if (
+      allowDeleteReplayOnly &&
+      (snapshot.state.admissionClosedBy === null || !snapshot.state.deletionPublicationConfirmed)
+    ) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    if (allowDeleteReplayOnly) await requireVacantOwnerListeners(snapshot.state);
+    return;
+  }
+  if (!allowProcessRecovery || !recoverableIncarnationSet(snapshot.state)) {
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
-  if (allowDeleteReplayOnly) await requireVacantOwnerListeners(snapshot.state);
+  await requireStaleIncarnationChildrenAndVacantListeners(snapshot.state);
+}
+
+function recoverableIncarnationSet(state: PersistedOwnerState): boolean {
+  const active = state.incarnations.filter((record) => record.status === "active");
+  if (
+    state.admissionClosedBy !== null ||
+    state.deletionPublicationConfirmed ||
+    state.endpointRouteAbsence !== null ||
+    !state.activeOperationId ||
+    active.length !== 1 ||
+    active[0]?.operationId !== state.activeOperationId
+  ) {
+    return false;
+  }
+  return state.incarnations.every((record) => {
+    if (record.status === "retired") {
+      return record.receipt !== null && record.retirementOperationId !== null;
+    }
+    return (
+      (record.status === "active" || record.status === "draining") &&
+      record.identity !== null &&
+      record.processIdentity !== null &&
+      record.configurationSha256 !== null &&
+      (record.status === "active"
+        ? record.receipt === null && !record.executionCopiesCleanupStarted
+        : record.retirementOperationId !== null &&
+          (record.executionCopiesCleanupStarted
+            ? record.receipt !== null && record.executionCopiesCleanupManifestSha256 !== null
+            : record.receipt === null))
+    );
+  });
+}
+
+async function requireStaleIncarnationChildrenAndVacantListeners(
+  state: PersistedOwnerState,
+): Promise<void> {
+  const ports = new Set<number>();
+  for (const record of state.incarnations) {
+    if (record.status !== "active" && record.status !== "draining") continue;
+    if (
+      !record.processIdentity ||
+      (await linuxProcessLiveness(record.processIdentity)) !== "stale" ||
+      ports.has(record.listenerPort)
+    ) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    ports.add(record.listenerPort);
+  }
+  for (const port of ports) {
+    if ((await workerPortOwnership(port, undefined)) !== "vacant") {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+  }
 }
 
 async function sameOwnerStateSnapshot(
@@ -607,7 +829,7 @@ async function acquireOwnerLock(
     const priorLiveness = await processLiveness(previous.record.pid, previous.record.process);
     if (priorLiveness !== "stale") throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     const stateSnapshot = await readOwnerStateSnapshot(statePath, workerResourceUid);
-    await requireSafeStateForNewOwner(stateSnapshot, true);
+    await requireSafeStateForNewOwner(stateSnapshot, true, true);
     const fingerprint = await currentOwnerFingerprint();
     if (!fingerprint) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     const claimPath = join(directory, recoveryClaimName(fingerprint, randomUUID()));
@@ -634,7 +856,7 @@ async function acquireOwnerLock(
       ) {
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       }
-      await requireSafeStateForNewOwner(stateSnapshot, true);
+      await requireSafeStateForNewOwner(stateSnapshot, true, true);
       const finalLock = await readOwnerLock(lockPath);
       const finalClaim = await lstat(claimPath, { bigint: true }).catch(() => null);
       if (
@@ -667,7 +889,7 @@ async function acquireOwnerLock(
 
     const successor = await createOwnerLock(lockPath, directory);
     if (!successor) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
-    return successor;
+    return { ...successor, recoveredFromStaleOwner: true };
   }
   throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
 }
@@ -692,6 +914,19 @@ async function releaseOwnerLock(
     await syncDirectory(directory);
   } finally {
     await opened.handle.close().catch(() => undefined);
+  }
+}
+
+// A failed successor must leave its lock file in place until PID death, but
+// must not abandon the open FileHandle to GC (Bun treats that as a fatal error).
+// Keep the handle strongly referenced only if close itself is uncertain.
+const failedRecoveryLockHandles = new Set<OpenedOwnerLock["handle"]>();
+
+async function retainOwnerLockAfterFailure(opened: OpenedOwnerLock): Promise<void> {
+  try {
+    await opened.handle.close();
+  } catch {
+    failedRecoveryLockHandles.add(opened.handle);
   }
 }
 
@@ -763,8 +998,46 @@ function emptyState(workerResourceUid: string): PersistedOwnerState {
     activeOperationId: null,
     admissionClosedBy: null,
     deletionPublicationConfirmed: false,
+    endpointRouteAbsence: null,
     incarnations: [],
   };
+}
+
+function validLinuxProcessIdentityRecord(value: unknown): value is LinuxProcessIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const processIdentity = value as Record<string, unknown>;
+  return (
+    Object.keys(processIdentity).sort().join(",") === "bootId,pid,pidNamespace,startTimeTicks" &&
+    Number.isSafeInteger(processIdentity.pid) &&
+    (processIdentity.pid as number) > 1 &&
+    typeof processIdentity.bootId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(
+      processIdentity.bootId,
+    ) &&
+    typeof processIdentity.pidNamespace === "string" &&
+    /^\d{1,32}:\d{1,32}$/u.test(processIdentity.pidNamespace) &&
+    typeof processIdentity.startTimeTicks === "string" &&
+    /^\d{1,32}$/u.test(processIdentity.startTimeTicks)
+  );
+}
+
+function validEndpointRouteAbsence(value: unknown): value is V2EndpointRouteAbsentReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as Record<string, unknown>;
+  return (
+    Object.keys(receipt).sort().join(",") ===
+      "assignedHostname,endpointResourceUid,kind,sourceOperationId,targetKey,workerResourceUid" &&
+    receipt.kind === "confirmed_route_absent" &&
+    typeof receipt.sourceOperationId === "string" &&
+    OPERATION_ID.test(receipt.sourceOperationId) &&
+    typeof receipt.endpointResourceUid === "string" &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(receipt.endpointResourceUid) &&
+    typeof receipt.workerResourceUid === "string" &&
+    typeof receipt.targetKey === "string" &&
+    receipt.targetKey.length > 0 &&
+    typeof receipt.assignedHostname === "string" &&
+    ENDPOINT_HOSTNAME.test(receipt.assignedHostname)
+  );
 }
 
 function validReceipt(value: unknown): value is WorkerdWorkerRetirementReceipt {
@@ -830,13 +1103,28 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
     const legacyStaticState = state.schema === LEGACY_STATE_SCHEMA;
     const previousState = state.schema === PREVIOUS_STATE_SCHEMA;
     const retiredCopiesState = state.schema === RETIRED_COPIES_STATE_SCHEMA;
+    const cleanupState = state.schema === CLEANUP_STATE_SCHEMA;
+    const routeReceiptState = state.schema === ROUTE_RECEIPT_STATE_SCHEMA;
+    const processPinState = state.schema === PROCESS_PIN_STATE_SCHEMA;
     const currentState = state.schema === STATE_SCHEMA;
     if (
-      (!legacyStaticState && !previousState && !retiredCopiesState && !currentState) ||
+      (!legacyStaticState &&
+        !previousState &&
+        !retiredCopiesState &&
+        !cleanupState &&
+        !routeReceiptState &&
+        !processPinState &&
+        !currentState) ||
       state.workerResourceUid !== workerResourceUid ||
       !(state.activeOperationId === null || typeof state.activeOperationId === "string") ||
       !(state.admissionClosedBy === null || typeof state.admissionClosedBy === "string") ||
       typeof state.deletionPublicationConfirmed !== "boolean" ||
+      (routeReceiptState || processPinState || currentState
+        ? !(
+            state.endpointRouteAbsence === null ||
+            validEndpointRouteAbsence(state.endpointRouteAbsence)
+          )
+        : state.endpointRouteAbsence !== undefined) ||
       !Array.isArray(state.incarnations)
     ) {
       throw new Error();
@@ -860,19 +1148,37 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         (legacyStaticState
           ? item.deferRetirementUntilDeadline !== undefined
           : typeof item.deferRetirementUntilDeadline !== "boolean") ||
-        (retiredCopiesState || currentState
+        (retiredCopiesState || cleanupState || routeReceiptState || processPinState || currentState
           ? typeof item.executionCopiesReleased !== "boolean"
           : item.executionCopiesReleased !== undefined) ||
-        (currentState
+        (cleanupState || routeReceiptState || processPinState || currentState
           ? typeof item.executionCopiesCleanupStarted !== "boolean"
           : item.executionCopiesCleanupStarted !== undefined) ||
-        (currentState
+        (cleanupState || routeReceiptState || processPinState || currentState
           ? !(
               item.executionCopiesCleanupManifestSha256 === null ||
               (typeof item.executionCopiesCleanupManifestSha256 === "string" &&
                 /^sha256:[0-9a-f]{64}$/u.test(item.executionCopiesCleanupManifestSha256))
             )
           : item.executionCopiesCleanupManifestSha256 !== undefined) ||
+        (processPinState || currentState
+          ? !(
+              item.processIdentity === null || validLinuxProcessIdentityRecord(item.processIdentity)
+            ) ||
+            !(
+              item.configurationSha256 === null ||
+              (typeof item.configurationSha256 === "string" &&
+                /^[0-9a-f]{64}$/u.test(item.configurationSha256))
+            )
+          : item.processIdentity !== undefined || item.configurationSha256 !== undefined) ||
+        (currentState
+          ? typeof item.configurationRefreshPending !== "boolean"
+          : item.configurationRefreshPending !== undefined) ||
+        (currentState &&
+          item.configurationRefreshPending === true &&
+          (item.status !== "active" ||
+            item.processIdentity === null ||
+            item.configurationSha256 === null)) ||
         !(item.identity === null || validIdentity(item.identity)) ||
         !(item.receipt === null || validReceipt(item.receipt))
       ) {
@@ -894,15 +1200,28 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
           ? false
           : (item.deferRetirementUntilDeadline as boolean),
         executionCopiesReleased:
-          retiredCopiesState || currentState ? (item.executionCopiesReleased as boolean) : false,
-        executionCopiesCleanupStarted: currentState
-          ? (item.executionCopiesCleanupStarted as boolean)
-          : retiredCopiesState
+          retiredCopiesState || cleanupState || routeReceiptState || processPinState || currentState
             ? (item.executionCopiesReleased as boolean)
             : false,
-        executionCopiesCleanupManifestSha256: currentState
-          ? (item.executionCopiesCleanupManifestSha256 as string | null)
-          : null,
+        executionCopiesCleanupStarted:
+          cleanupState || routeReceiptState || processPinState || currentState
+            ? (item.executionCopiesCleanupStarted as boolean)
+            : retiredCopiesState
+              ? (item.executionCopiesReleased as boolean)
+              : false,
+        executionCopiesCleanupManifestSha256:
+          cleanupState || routeReceiptState || processPinState || currentState
+            ? (item.executionCopiesCleanupManifestSha256 as string | null)
+            : null,
+        processIdentity:
+          processPinState || currentState
+            ? (item.processIdentity as LinuxProcessIdentity | null)
+            : null,
+        configurationSha256:
+          processPinState || currentState ? (item.configurationSha256 as string | null) : null,
+        configurationRefreshPending: currentState
+          ? (item.configurationRefreshPending as boolean)
+          : false,
       } as unknown as IncarnationRecord);
     }
     const result: PersistedOwnerState = {
@@ -911,6 +1230,10 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
       activeOperationId: state.activeOperationId as string | null,
       admissionClosedBy: state.admissionClosedBy as string | null,
       deletionPublicationConfirmed: state.deletionPublicationConfirmed,
+      endpointRouteAbsence:
+        routeReceiptState || processPinState || currentState
+          ? (state.endpointRouteAbsence as V2EndpointRouteAbsentReceipt | null)
+          : null,
       incarnations,
     };
     const activeRecords = incarnations.filter((item) => item.status === "active");
@@ -922,8 +1245,20 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
             (item) =>
               item.status !== "retired" ||
               item.receipt === null ||
-              ((retiredCopiesState || currentState) && !item.executionCopiesReleased),
+              ((retiredCopiesState ||
+                cleanupState ||
+                routeReceiptState ||
+                processPinState ||
+                currentState) &&
+                !item.executionCopiesReleased),
           ))) ||
+      (result.endpointRouteAbsence !== null &&
+        (result.activeOperationId !== null ||
+          result.incarnations.some(
+            (item) =>
+              item.status !== "retired" || item.receipt === null || !item.executionCopiesReleased,
+          ) ||
+          result.endpointRouteAbsence.workerResourceUid !== workerResourceUid)) ||
       (state.activeOperationId === null && activeRecords.length !== 0) ||
       (state.activeOperationId !== null &&
         !incarnations.some(
@@ -962,6 +1297,9 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
               executionCopiesReleased: _released,
               executionCopiesCleanupStarted: _cleanupStarted,
               executionCopiesCleanupManifestSha256: _cleanupManifestSha256,
+              processIdentity: _processIdentity,
+              configurationSha256: _configurationSha256,
+              configurationRefreshPending: _refreshPending,
               ...item
             }) => item,
           ),
@@ -978,6 +1316,9 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                 executionCopiesReleased: _released,
                 executionCopiesCleanupStarted: _cleanupStarted,
                 executionCopiesCleanupManifestSha256: _cleanupManifestSha256,
+                processIdentity: _processIdentity,
+                configurationSha256: _configurationSha256,
+                configurationRefreshPending: _refreshPending,
                 ...item
               }) => item,
             ),
@@ -993,11 +1334,59 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                 ({
                   executionCopiesCleanupStarted: _cleanupStarted,
                   executionCopiesCleanupManifestSha256: _cleanupManifestSha256,
+                  processIdentity: _processIdentity,
+                  configurationSha256: _configurationSha256,
+                  configurationRefreshPending: _refreshPending,
                   ...item
                 }) => item,
               ),
             }
-          : result;
+          : routeReceiptState
+            ? {
+                schema: ROUTE_RECEIPT_STATE_SCHEMA,
+                workerResourceUid: state.workerResourceUid,
+                activeOperationId: state.activeOperationId,
+                admissionClosedBy: state.admissionClosedBy,
+                deletionPublicationConfirmed: state.deletionPublicationConfirmed,
+                endpointRouteAbsence: result.endpointRouteAbsence,
+                incarnations: incarnations.map(
+                  ({
+                    processIdentity: _processIdentity,
+                    configurationSha256: _configurationSha256,
+                    configurationRefreshPending: _refreshPending,
+                    ...item
+                  }) => item,
+                ),
+              }
+            : processPinState
+              ? {
+                  schema: PROCESS_PIN_STATE_SCHEMA,
+                  workerResourceUid: state.workerResourceUid,
+                  activeOperationId: state.activeOperationId,
+                  admissionClosedBy: state.admissionClosedBy,
+                  deletionPublicationConfirmed: state.deletionPublicationConfirmed,
+                  endpointRouteAbsence: result.endpointRouteAbsence,
+                  incarnations: incarnations.map(
+                    ({ configurationRefreshPending: _refreshPending, ...item }) => item,
+                  ),
+                }
+              : cleanupState
+                ? {
+                    schema: CLEANUP_STATE_SCHEMA,
+                    workerResourceUid: state.workerResourceUid,
+                    activeOperationId: state.activeOperationId,
+                    admissionClosedBy: state.admissionClosedBy,
+                    deletionPublicationConfirmed: state.deletionPublicationConfirmed,
+                    incarnations: incarnations.map(
+                      ({
+                        processIdentity: _processIdentity,
+                        configurationSha256: _configurationSha256,
+                        configurationRefreshPending: _refreshPending,
+                        ...item
+                      }) => item,
+                    ),
+                  }
+                : result;
     if (canonicalJson(canonicalState) !== text) throw new Error();
     return result;
   } catch {
@@ -1045,6 +1434,15 @@ function workerFromExecution(execution: V2Execution): string | null {
 
 function expectedOperationMarker(operationId: string): string {
   return `${OPERATION_MARKER}${operationId}`;
+}
+
+function sourceOperationIdFromIdentity(identity: WorkerdPublicationIdentity): string | null {
+  if (!identity.generation.startsWith(OPERATION_MARKER)) return null;
+  const operationId = identity.generation.slice(OPERATION_MARKER.length);
+  return OPERATION_ID.test(operationId) &&
+    expectedOperationMarker(operationId) === identity.generation
+    ? operationId
+    : null;
 }
 
 function makeRequest(request: Request, signal: AbortSignal): Request {
@@ -1140,18 +1538,32 @@ export async function openWorkerdWorkerRuntimeOwner(
       throw error;
     });
     state = parseState(text, options.workerResourceUid);
+    await verifyOwnerNamespace(directory, state, options.workerResourceUid);
+    const hasServingIncarnations = state.incarnations.some(
+      (item) => item.status === "active" || item.status === "draining",
+    );
     if (
+      (state.endpointRouteAbsence !== null &&
+        state.endpointRouteAbsence.targetKey !== options.targetKey) ||
+      (hasServingIncarnations &&
+        (!ownerLock.recoveredFromStaleOwner || !recoverableIncarnationSet(state))) ||
       state.incarnations.some(
         (item) =>
           item.status !== "retired" &&
-          (!(item.status === "retiring" || item.status === "uncertain") ||
-            item.retirementOperationId === null),
+          !(
+            ((item.status === "retiring" || item.status === "uncertain") &&
+              item.retirementOperationId !== null) ||
+            (ownerLock.recoveredFromStaleOwner &&
+              (item.status === "active" || item.status === "draining"))
+          ),
       )
     ) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
+    if (hasServingIncarnations) await requireStaleIncarnationChildrenAndVacantListeners(state);
   } catch (error) {
-    await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
+    if (ownerLock.recoveredFromStaleOwner) await retainOwnerLockAfterFailure(ownerLock);
+    else await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
     if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
@@ -1180,6 +1592,7 @@ export async function openWorkerdWorkerRuntimeOwner(
   // cleanup under this owner's lock before exposing any replay/observation API.
   try {
     for (const record of [...state.incarnations]) {
+      if (record.status === "active" || record.status === "draining") continue;
       if (!record.retirementOperationId) {
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       }
@@ -1293,7 +1706,8 @@ export async function openWorkerdWorkerRuntimeOwner(
       }
     }
   } catch (error) {
-    await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
+    if (ownerLock.recoveredFromStaleOwner) await retainOwnerLockAfterFailure(ownerLock);
+    else await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
     if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
@@ -1460,45 +1874,15 @@ export async function openWorkerdWorkerRuntimeOwner(
   const incarnationDirectory = (operationId: string): string =>
     join(directory, "incarnations", operationId);
 
-  const createIncarnation = async (
-    execution: V2Execution,
+  const makeIncarnationHandle = (
+    record: IncarnationRecord,
+    group: WorkerdWorkerExecutionGroup,
     incumbent: WorkerdPublicationIdentity | null,
-  ): Promise<IncarnationHandle> => {
-    const operationId = execution.operationId;
-    const listenerPort = await options.listenerPortForOperation(operationId);
-    if (!Number.isSafeInteger(listenerPort) || listenerPort < 1 || listenerPort > 65_535)
-      throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
-    const candidateRecord: IncarnationRecord = {
-      operationId,
-      listenerPort,
-      status: "candidate",
-      retirementOperationId: null,
-      retireAtMs: null,
-      deferRetirementUntilDeadline: false,
-      executionCopiesReleased: false,
-      executionCopiesCleanupStarted: false,
-      executionCopiesCleanupManifestSha256: null,
-      identity: null,
-      receipt: null,
-    };
-    await transitionState((current) => ({
-      ...current,
-      incarnations: [...current.incarnations, candidateRecord],
-    }));
-    const base = incarnationDirectory(operationId);
-    const group = await openWorkerdWorkerExecutionGroup({
-      rootDirectory: join(base, "groups"),
-      workerResourceUid: options.workerResourceUid,
-      listenerPort,
-      configuration: new Uint8Array(),
-      configurationPath: "workers/workerd.capnp",
-      workerdBinary: options.workerdBinary,
-      ...(options.spawn === undefined ? {} : { spawn: options.spawn }),
-    });
+  ): IncarnationHandle => {
     const runtime = createWorkerdRuntime({
       root: group.runtimeRoot,
       configPath: group.configurationPath,
-      port: listenerPort,
+      port: record.listenerPort,
       binary: options.workerdBinary,
       onReload: async (configPath) => {
         if (configPath !== group.configurationPath)
@@ -1524,15 +1908,368 @@ export async function openWorkerdWorkerRuntimeOwner(
       runtime: candidateRuntime,
     });
     const handle: IncarnationHandle = {
-      record: candidateRecord,
+      record,
       group,
       runtime,
       publication,
       invocations: new Set(),
     };
-    handles.set(operationId, handle);
-    await runtime.reload();
+    handles.set(record.operationId, handle);
     return handle;
+  };
+
+  const persistSpawnedChild = async (operationId: string, child: WorkerdProcess): Promise<void> => {
+    if (!Number.isSafeInteger(child.pid) || !child.pid || child.pid <= 1) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    const processIdentity = await readLinuxProcessIdentity(child.pid);
+    if (processIdentity.pid !== child.pid) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    const spawningRecord = recordFor(operationId);
+    let refreshedDigest: string | null = null;
+    if (spawningRecord?.configurationRefreshPending) {
+      const groupDirectory = join(
+        incarnationDirectory(operationId),
+        "groups",
+        uidKey(options.workerResourceUid),
+      );
+      const config = await readFile(join(groupDirectory, "workers", "workerd.capnp"));
+      const manifest = JSON.parse(
+        await readFile(join(groupDirectory, "group.json"), "utf8"),
+      ) as Record<string, unknown>;
+      const digest = createHash("sha256").update(config).digest("hex");
+      if (
+        manifest.schema !== "takoserver.workerd-worker-group@1" ||
+        manifest.workerResourceUid !== options.workerResourceUid ||
+        manifest.listenerPort !== spawningRecord.listenerPort ||
+        manifest.configurationSha256 !== digest
+      ) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      refreshedDigest = digest;
+    }
+    await updateRecord(operationId, (current) => {
+      if (
+        current.status !== "candidate" &&
+        current.status !== "active" &&
+        current.status !== "draining"
+      ) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      return {
+        ...current,
+        processIdentity,
+        ...(refreshedDigest === null
+          ? {}
+          : { configurationSha256: refreshedDigest, configurationRefreshPending: false }),
+      };
+    });
+  };
+
+  const createIncarnation = async (
+    execution: V2Execution,
+    incumbent: WorkerdPublicationIdentity | null,
+  ): Promise<IncarnationHandle> => {
+    const operationId = execution.operationId;
+    const listenerPort = await options.listenerPortForOperation(operationId);
+    if (!Number.isSafeInteger(listenerPort) || listenerPort < 1 || listenerPort > 65_535)
+      throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
+    const candidateRecord: IncarnationRecord = {
+      operationId,
+      listenerPort,
+      status: "candidate",
+      retirementOperationId: null,
+      retireAtMs: null,
+      deferRetirementUntilDeadline: false,
+      executionCopiesReleased: false,
+      executionCopiesCleanupStarted: false,
+      executionCopiesCleanupManifestSha256: null,
+      processIdentity: null,
+      configurationSha256: null,
+      configurationRefreshPending: false,
+      identity: null,
+      receipt: null,
+    };
+    await transitionState((current) => ({
+      ...current,
+      // A route-absence receipt is scoped to the last accepted Endpoint
+      // DELETE. Once a new incarnation is durably staged, that historical
+      // receipt must no longer describe the current owner state.
+      endpointRouteAbsence: null,
+      incarnations: [...current.incarnations, candidateRecord],
+    }));
+    const base = incarnationDirectory(operationId);
+    const group = await openWorkerdWorkerExecutionGroup({
+      rootDirectory: join(base, "groups"),
+      workerResourceUid: options.workerResourceUid,
+      listenerPort,
+      configuration: new Uint8Array(),
+      configurationPath: "workers/workerd.capnp",
+      workerdBinary: options.workerdBinary,
+      ...(options.spawn === undefined ? {} : { spawn: options.spawn }),
+      onSpawned: async (child) => await persistSpawnedChild(operationId, child),
+    });
+    const handle = makeIncarnationHandle(candidateRecord, group, incumbent);
+    await handle.runtime.reload();
+    return handle;
+  };
+
+  const groupDirectoryFor = (record: IncarnationRecord): string =>
+    join(incarnationDirectory(record.operationId), "groups", uidKey(options.workerResourceUid));
+  let recoveringGroup: WorkerdWorkerExecutionGroup | null = null;
+
+  const readPinnedGroupConfiguration = async (record: IncarnationRecord): Promise<Uint8Array> => {
+    const expectedDigest = record.configurationSha256;
+    if (!expectedDigest) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const groupDirectory = groupDirectoryFor(record);
+    const configPath = join(groupDirectory, "workers", "workerd.capnp");
+    const info = await lstat(configPath).catch(() => null);
+    if (!info?.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    const bytes = await readFile(configPath);
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    if (digest !== expectedDigest && !record.configurationRefreshPending) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    if (record.configurationRefreshPending) {
+      const manifest = JSON.parse(
+        await readFile(join(groupDirectory, "group.json"), "utf8"),
+      ) as Record<string, unknown>;
+      if (
+        manifest.schema !== "takoserver.workerd-worker-group@1" ||
+        manifest.workerResourceUid !== options.workerResourceUid ||
+        manifest.listenerPort !== record.listenerPort ||
+        manifest.configurationSha256 !== digest
+      ) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+    }
+    return Uint8Array.from(bytes);
+  };
+
+  const openExistingRecoveryGroup = async (
+    record: IncarnationRecord,
+    configuration: Uint8Array,
+  ): Promise<WorkerdWorkerExecutionGroup> => {
+    if (!record.processIdentity || !record.configurationSha256) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    return await openWorkerdWorkerExecutionGroup({
+      rootDirectory: join(incarnationDirectory(record.operationId), "groups"),
+      workerResourceUid: options.workerResourceUid,
+      listenerPort: record.listenerPort,
+      configuration,
+      configurationPath: "workers/workerd.capnp",
+      workerdBinary: options.workerdBinary,
+      recoverExisting: true,
+      ...(options.spawn === undefined ? {} : { spawn: options.spawn }),
+      onSpawned: async (child) => await persistSpawnedChild(record.operationId, child),
+    });
+  };
+
+  const retireRecoveredDrainingIncarnation = async (record: IncarnationRecord): Promise<void> => {
+    if (
+      record.status !== "draining" ||
+      !record.retirementOperationId ||
+      !record.processIdentity ||
+      (await linuxProcessLiveness(record.processIdentity)) !== "stale" ||
+      (await workerPortOwnership(record.listenerPort, undefined)) !== "vacant"
+    ) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    const groupDirectory = groupDirectoryFor(record);
+    const operationId = record.retirementOperationId;
+    if (record.executionCopiesCleanupStarted) {
+      if (!record.receipt || !record.executionCopiesCleanupManifestSha256) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      const released = await releaseRetiredWorkerdWorkerExecutionCopies({
+        groupDirectory,
+        workerResourceUid: options.workerResourceUid,
+        operationId,
+        listenerPort: record.listenerPort,
+        scriptName: scriptName(options.workerResourceUid),
+        cleanupIntentPersisted: true,
+        cleanupManifestSha256: record.executionCopiesCleanupManifestSha256,
+      });
+      if (canonicalJson(released.receipt) !== canonicalJson(record.receipt)) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      await updateRecord(record.operationId, (current) => ({
+        ...current,
+        status: "retired",
+        executionCopiesReleased: true,
+      }));
+      return;
+    }
+
+    if (
+      !record.identity ||
+      !executionCopiesMatchRecord(
+        record,
+        await inspectWorkerdWorkerExecutionCopies({
+          groupDirectory,
+          workerResourceUid: options.workerResourceUid,
+          listenerPort: record.listenerPort,
+          scriptName: scriptName(options.workerResourceUid),
+        }),
+        true,
+      )
+    ) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+
+    const configuration = await readPinnedGroupConfiguration(record);
+    const receiptPath = join(groupDirectory, "retirement.json");
+    const receiptInfo = await lstat(receiptPath).catch(() => null);
+    if (receiptInfo && (!receiptInfo.isFile() || receiptInfo.isSymbolicLink())) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    if (!receiptInfo) {
+      const group = await openExistingRecoveryGroup(record, configuration);
+      await group.retire({ workerResourceUid: options.workerResourceUid, operationId });
+    }
+    const verified = await verifyRetiredWorkerdWorkerExecutionCopies({
+      groupDirectory,
+      workerResourceUid: options.workerResourceUid,
+      operationId,
+      listenerPort: record.listenerPort,
+      scriptName: scriptName(options.workerResourceUid),
+    });
+    if (!executionCopiesMatchRecord(record, verified.copies, true)) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    const prepared = await updateRecord(record.operationId, (current) => ({
+      ...current,
+      receipt: verified.receipt,
+      executionCopiesCleanupStarted: true,
+      executionCopiesCleanupManifestSha256: verified.cleanupManifestSha256,
+    }));
+    const released = await releaseRetiredWorkerdWorkerExecutionCopies({
+      groupDirectory,
+      workerResourceUid: options.workerResourceUid,
+      operationId,
+      listenerPort: record.listenerPort,
+      scriptName: scriptName(options.workerResourceUid),
+      cleanupIntentPersisted: true,
+      cleanupManifestSha256: prepared.executionCopiesCleanupManifestSha256,
+    });
+    if (canonicalJson(released.receipt) !== canonicalJson(verified.receipt)) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    await updateRecord(record.operationId, (current) => ({
+      ...current,
+      status: "retired",
+      receipt: released.receipt,
+      executionCopiesReleased: true,
+      executionCopiesCleanupStarted: true,
+    }));
+  };
+
+  const recoverActiveIncarnation = async (): Promise<void> => {
+    const currentServing = options.publicationState.resolveCurrentServing;
+    const activeRecord = state.incarnations.find(
+      (record) => record.operationId === state.activeOperationId && record.status === "active",
+    );
+    if (!currentServing || !activeRecord?.identity || !activeRecord.configurationSha256) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    const sourceOperationId = sourceOperationIdFromIdentity(activeRecord.identity);
+    if (!sourceOperationId) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const resolution = await currentServing({
+      workerUid: options.workerResourceUid,
+      targetKey: options.targetKey,
+      sourceOperationId,
+      expectedIdentity: activeRecord.identity,
+    });
+    if (
+      resolution.kind !== "ready" ||
+      resolution.snapshot.sourceOperationId !== sourceOperationId ||
+      resolution.snapshot.worker.uid !== options.workerResourceUid ||
+      !resolution.snapshot.deployment ||
+      canonicalJson(
+        resolution.snapshot.deployment.versions
+          .map(({ uid, weight }) => ({ workerVersionUid: uid, weight }))
+          .sort((left, right) => left.workerVersionUid.localeCompare(right.workerVersionUid)),
+      ) !==
+        canonicalJson(
+          activeRecord.identity.versions
+            .map(({ workerVersionUid, weight }) => ({ workerVersionUid, weight }))
+            .sort((left, right) => left.workerVersionUid.localeCompare(right.workerVersionUid)),
+        ) ||
+      canonicalJson(
+        resolution.snapshot.endpoint ? [resolution.snapshot.endpoint.output.hostname] : [],
+      ) !== canonicalJson(activeRecord.identity.hostnames) ||
+      !(await resolution.stillCurrent())
+    ) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+
+    for (const record of [...state.incarnations]) {
+      if (record.status === "draining") await retireRecoveredDrainingIncarnation(record);
+    }
+    await verifyOwnerNamespace(directory, state, options.workerResourceUid);
+    if (
+      canonicalJson(
+        state.incarnations.find((item) => item.operationId === activeRecord.operationId),
+      ) !== canonicalJson(activeRecord) ||
+      !(await resolution.stillCurrent())
+    ) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+
+    const configuration = await readPinnedGroupConfiguration(activeRecord);
+    const copies = await inspectWorkerdWorkerExecutionCopies({
+      groupDirectory: groupDirectoryFor(activeRecord),
+      workerResourceUid: options.workerResourceUid,
+      listenerPort: activeRecord.listenerPort,
+      scriptName: scriptName(options.workerResourceUid),
+    });
+    if (!executionCopiesMatchRecord(activeRecord, copies, true)) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    const group = await openExistingRecoveryGroup(activeRecord, configuration);
+    recoveringGroup = group;
+    const handle = makeIncarnationHandle(activeRecord, group, activeRecord.identity);
+    await updateRecord(activeRecord.operationId, (current) => ({
+      ...current,
+      configurationRefreshPending: true,
+    }));
+    const restoredNames = await handle.runtime.restore();
+    const nativeProof = await handle.runtime.observeExactPublication?.(
+      scriptName(options.workerResourceUid),
+      activeRecord.identity,
+    );
+    if (
+      !restoredNames.includes(scriptName(options.workerResourceUid)) ||
+      nativeProof !== "matches" ||
+      !(await resolution.stillCurrent()) ||
+      canonicalJson(
+        state.incarnations.find((item) => item.operationId === activeRecord.operationId)?.identity,
+      ) !== canonicalJson(activeRecord.identity)
+    ) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    group.sealConfiguration();
+    const recoveredRecord = recordFor(activeRecord.operationId);
+    if (
+      !recoveredRecord?.processIdentity ||
+      !recoveredRecord.configurationSha256 ||
+      recoveredRecord.configurationRefreshPending ||
+      recoveredRecord.configurationSha256 !== group.configurationSha256
+    ) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    handle.record = recoveredRecord;
+    active = handle;
+    admissionClosedBy = null;
+    await verifyOwnerNamespace(directory, state, options.workerResourceUid);
+    if (!(await resolution.stillCurrent())) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    recoveringGroup = null;
   };
 
   const runSerial = async <T>(work: () => Promise<T>): Promise<T> => {
@@ -1549,7 +2286,153 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
   };
 
-  const execute = (inputExecution: V2Execution): Promise<V2WorkerPublicationResult> => {
+  const confirmNoActiveEndpointRoute = async (
+    execution: V2Execution,
+  ): Promise<V2EndpointRouteAbsentReceipt | { kind: "unknown" } | null> => {
+    const resolution = await options.publicationState.resolve({ execution });
+    if (resolution.kind !== "ready") return { kind: "unknown" };
+    const snapshot = resolution.snapshot;
+    if (snapshot.deployment !== null) return null;
+    let endpointSpec: ReturnType<typeof parseWorkerEndpointSpec>;
+    try {
+      endpointSpec = parseWorkerEndpointSpec(execution.spec);
+    } catch {
+      return { kind: "unknown" };
+    }
+    const assigned = snapshot.acceptedEndpointOutput;
+    if (
+      execution.form !== WORKER_ENDPOINT_FORM_URL ||
+      execution.action !== "delete" ||
+      snapshot.sourceOperationId !== execution.operationId ||
+      snapshot.worker.uid !== options.workerResourceUid ||
+      snapshot.worker.principal !== execution.principal ||
+      snapshot.worker.space !== execution.space ||
+      endpointSpec.worker.resourceUid !== options.workerResourceUid ||
+      snapshot.endpoint !== null ||
+      !assigned ||
+      !ENDPOINT_HOSTNAME.test(assigned.hostname) ||
+      assigned.url !== `https://${assigned.hostname}/`
+    ) {
+      return { kind: "unknown" };
+    }
+
+    // A no-Deployment route absence is established either by exact retirement
+    // receipts for every known incarnation, or by a complete empty namespace
+    // inventory. The receipt proves child exit and listener absence; a stale
+    // metadata pointer inside that non-listening group is not a live route.
+    if (
+      closed ||
+      active !== null ||
+      state.activeOperationId !== null ||
+      state.incarnations.some(
+        (record) =>
+          record.status !== "retired" ||
+          record.receipt === null ||
+          record.retirementOperationId === null ||
+          !record.executionCopiesReleased ||
+          !record.executionCopiesCleanupStarted,
+      )
+    ) {
+      return { kind: "unknown" };
+    }
+
+    const capturedState = canonicalJson(state);
+    await verifyOwnerNamespace(directory, state, options.workerResourceUid);
+    for (const record of state.incarnations) {
+      const groupDirectory = join(
+        directory,
+        "incarnations",
+        record.operationId,
+        "groups",
+        uidKey(options.workerResourceUid),
+      );
+      const copies = await inspectWorkerdWorkerExecutionCopies({
+        groupDirectory,
+        workerResourceUid: options.workerResourceUid,
+        listenerPort: record.listenerPort,
+        scriptName: scriptName(options.workerResourceUid),
+      }).catch(() => null);
+      if (copies?.versionUids.length !== 0 || copies?.generationKeys.length !== 0) {
+        return { kind: "unknown" };
+      }
+      const physical = await releaseRetiredWorkerdWorkerExecutionCopies({
+        groupDirectory,
+        workerResourceUid: options.workerResourceUid,
+        operationId: record.retirementOperationId as string,
+        listenerPort: record.listenerPort,
+        scriptName: scriptName(options.workerResourceUid),
+        cleanupIntentPersisted: true,
+        cleanupManifestSha256: record.executionCopiesCleanupManifestSha256,
+        alreadyReleased: true,
+      }).catch(() => null);
+      if (!physical || canonicalJson(physical.receipt) !== canonicalJson(record.receipt)) {
+        return { kind: "unknown" };
+      }
+    }
+
+    if (
+      canonicalJson(state) !== capturedState ||
+      active !== null ||
+      state.activeOperationId !== null ||
+      state.incarnations.some(
+        (record) =>
+          record.status !== "retired" ||
+          record.receipt === null ||
+          !record.executionCopiesReleased ||
+          !record.executionCopiesCleanupStarted,
+      )
+    ) {
+      return { kind: "unknown" };
+    }
+    try {
+      await verifyOwnerNamespace(directory, state, options.workerResourceUid);
+    } catch {
+      return { kind: "unknown" };
+    }
+    if (!(await resolution.stillCurrent())) return { kind: "unknown" };
+
+    const receipt: V2EndpointRouteAbsentReceipt = {
+      kind: "confirmed_route_absent",
+      sourceOperationId: execution.operationId,
+      endpointResourceUid: execution.resourceUid,
+      workerResourceUid: options.workerResourceUid,
+      targetKey: options.targetKey,
+      assignedHostname: assigned.hostname,
+    };
+    const persisted = await transitionState((current) => {
+      if (
+        current.activeOperationId !== null ||
+        current.incarnations.some(
+          (record) =>
+            record.status !== "retired" ||
+            record.receipt === null ||
+            !record.executionCopiesReleased ||
+            !record.executionCopiesCleanupStarted,
+        )
+      ) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      return { ...current, endpointRouteAbsence: receipt };
+    });
+    if (
+      !validEndpointRouteAbsence(persisted.endpointRouteAbsence) ||
+      canonicalJson(persisted.endpointRouteAbsence) !== canonicalJson(receipt) ||
+      !(await resolution.stillCurrent())
+    ) {
+      return { kind: "unknown" };
+    }
+    try {
+      await verifyOwnerNamespace(directory, persisted, options.workerResourceUid);
+    } catch {
+      return { kind: "unknown" };
+    }
+    if (canonicalJson(state) !== canonicalJson(persisted) || !(await resolution.stillCurrent())) {
+      return { kind: "unknown" };
+    }
+    return receipt;
+  };
+
+  const execute = (inputExecution: V2Execution): Promise<V2WorkerRuntimeOwnerExecutionResult> => {
     let captured: V2Execution;
     try {
       captured = structuredClone(inputExecution);
@@ -1561,13 +2444,22 @@ export async function openWorkerdWorkerRuntimeOwner(
       if (closed) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       validateOperationId(execution.operationId);
       if (
-        execution.form !== WORKER_DEPLOYMENT_FORM_URL ||
+        (execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
+          execution.form !== WORKER_ENDPOINT_FORM_URL) ||
         execution.targetKey !== options.targetKey ||
         workerFromExecution(execution) !== options.workerResourceUid
       ) {
         return { kind: "not_dispatched", code: "worker_publication_target_mismatch" };
       }
-      if (execution.action === "delete") {
+      if (execution.form === WORKER_ENDPOINT_FORM_URL && execution.action === "delete") {
+        try {
+          const absence = await confirmNoActiveEndpointRoute(execution);
+          if (absence !== null) return absence;
+        } catch {
+          return { kind: "unknown" };
+        }
+      }
+      if (execution.form === WORKER_DEPLOYMENT_FORM_URL && execution.action === "delete") {
         try {
           return await deleteDeployment(execution);
         } catch {
@@ -1587,6 +2479,7 @@ export async function openWorkerdWorkerRuntimeOwner(
           ...current,
           admissionClosedBy: null,
           deletionPublicationConfirmed: false,
+          endpointRouteAbsence: null,
         }));
       }
 
@@ -1615,6 +2508,9 @@ export async function openWorkerdWorkerRuntimeOwner(
             execution.operationId,
           );
         }
+        if (execution.form === WORKER_ENDPOINT_FORM_URL && result.kind === "confirmed") {
+          return { kind: "unknown" };
+        }
         return result;
       }
       if (recordFor(execution.operationId)) return { kind: "unknown" };
@@ -1641,6 +2537,9 @@ export async function openWorkerdWorkerRuntimeOwner(
           if (result.kind === "not_dispatched")
             await retireCandidate(candidate, execution.operationId);
           else await retireCandidate(candidate, execution.operationId).catch(() => undefined);
+          if (execution.form === WORKER_ENDPOINT_FORM_URL && result.kind === "confirmed") {
+            return { kind: "unknown" };
+          }
           return result;
         }
         candidate.group.sealConfiguration();
@@ -1886,6 +2785,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         status: "active",
         identity,
         deferRetirementUntilDeadline,
+        configurationSha256: candidate.group.configurationSha256,
       };
       oldRecord = previous
         ? {
@@ -1902,6 +2802,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         activeOperationId: operationId,
         admissionClosedBy: null,
         deletionPublicationConfirmed: false,
+        endpointRouteAbsence: null,
         incarnations: current.incarnations.map((item) =>
           item.operationId === candidate.record.operationId
             ? nextCandidate
@@ -1971,6 +2872,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         ...current,
         admissionClosedBy,
         deletionPublicationConfirmed: false,
+        endpointRouteAbsence: null,
       }));
     }
     for (const incarnation of handles.values()) await cancelInvocations(incarnation);
@@ -2055,6 +2957,36 @@ export async function openWorkerdWorkerRuntimeOwner(
 
   const initial: PersistedOwnerState = state;
   if (!initial.incarnations.length) await transitionState((current) => current);
+  if (
+    ownerLock.recoveredFromStaleOwner &&
+    state.incarnations.some((item) => item.status === "active")
+  ) {
+    try {
+      await recoverActiveIncarnation();
+    } catch (error) {
+      // A failed recovery must never leave a newly started child serving. The
+      // recovery group stops only the exact child it spawned and retains all
+      // immutable owner custody for a later safe attempt.
+      const operationId = state.activeOperationId;
+      const failedRecoveryGroup = recoveringGroup as WorkerdWorkerExecutionGroup | null;
+      if (failedRecoveryGroup && operationId) {
+        try {
+          await failedRecoveryGroup.stopAfterFailedRecovery();
+        } catch {
+          // The child or listener is still unknown. The live successor lock
+          // remains the only proof that this process owns the attempted recovery.
+        }
+        handles.delete(operationId);
+        active = null;
+      }
+      // An active record can never be reopened through the no-lock path. Keep
+      // this successor lock (and its PID fingerprint) even when failure was
+      // transient; a later Host may retry only after this PID is proven stale.
+      await retainOwnerLockAfterFailure(ownerLock);
+      if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+  }
   // If this owner opens after all groups were retired, the durable state can
   // replay its delete proof. Unretired groups are rejected above and never adopted.
   return Object.freeze({

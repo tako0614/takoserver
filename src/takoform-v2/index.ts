@@ -45,6 +45,8 @@ export {
   type V2WorkerInvocationCustody,
   type V2WorkerInvocationHandle,
   type V2WorkerInvocationRecord,
+  type V2WorkerInvocationRetirementIdentity,
+  type V2WorkerInvocationRetirementInput,
   type V2WorkerInvocationSelection,
 } from "./worker-invocation-custody.ts";
 export {

@@ -10,7 +10,11 @@ import type {
 } from "../workerd-runtime.ts";
 import { internalHostname } from "../workerd-runtime.ts";
 import { compileWorkerdVersionGraph } from "../workerd-version-graph.ts";
-import { parseWorkerVersionSpec, WORKER_DEPLOYMENT_FORM_URL } from "./forms/worker-specs.ts";
+import {
+  parseWorkerVersionSpec,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+} from "./forms/worker-specs.ts";
 import type { V2Execution } from "./types.ts";
 import { projectV2WorkerCodeVersion } from "./worker-code-runtime.ts";
 import type { V2WorkerPublicationResolution } from "./worker-publication-state.ts";
@@ -50,6 +54,16 @@ export type V2WorkerPublicationResult =
   /** This invocation did not dispatch a runtime write; it proves no prior effect absent. */
   | { readonly kind: "not_dispatched"; readonly code: string }
   | { readonly kind: "unknown" };
+
+/** Durable owner receipt for a DELETE when no Worker Deployment is active. */
+export interface V2EndpointRouteAbsentReceipt {
+  readonly kind: "confirmed_route_absent";
+  readonly sourceOperationId: string;
+  readonly endpointResourceUid: string;
+  readonly workerResourceUid: string;
+  readonly targetKey: string;
+  readonly assignedHostname: string;
+}
 
 export interface V2WorkerPublication {
   publish(execution: V2Execution): Promise<V2WorkerPublicationResult>;
@@ -129,8 +143,9 @@ function unknownResult(): V2WorkerPublicationResult {
 }
 
 /**
- * Internal publication proof for accepted v2 Worker Deployments containing
- * static-only or currently supported fetch+vars code Versions.
+ * Internal publication proof for accepted v2 Worker Deployments and
+ * WorkerEndpoints containing static-only or currently supported fetch+vars
+ * code Versions.
  * A Form backend must combine it with the Form's complete lifecycle before
  * settling its Operation; this port proves publication only.
  */
@@ -277,7 +292,8 @@ export function createV2WorkerPublication(options: {
   return {
     async publish(execution) {
       if (
-        execution.form !== WORKER_DEPLOYMENT_FORM_URL ||
+        (execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
+          execution.form !== WORKER_ENDPOINT_FORM_URL) ||
         execution.targetKey !== options.targetKey
       ) {
         return notDispatched("worker_publication_target_mismatch");
@@ -358,7 +374,8 @@ export function createV2WorkerPublication(options: {
     },
     async observe(execution) {
       if (
-        execution.form !== WORKER_DEPLOYMENT_FORM_URL ||
+        (execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
+          execution.form !== WORKER_ENDPOINT_FORM_URL) ||
         execution.targetKey !== options.targetKey
       ) {
         return unknownResult();

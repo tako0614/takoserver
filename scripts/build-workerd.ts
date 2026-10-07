@@ -1,6 +1,16 @@
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, rename, symlink, writeFile } from "node:fs/promises";
+import { createReadStream, constants as fsConstants } from "node:fs";
+import {
+  chmod,
+  copyFile,
+  link,
+  lstat,
+  mkdir,
+  rename,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 
@@ -20,6 +30,116 @@ interface BuildArguments {
 
 const DEFAULT_JOBS = 2;
 const DEFAULT_MEMORY_MB = 8192;
+
+/** Internal post-compile verification seam; never qualifies a mismatched binary. */
+export async function verifyBuiltWorkerd(_input: {
+  readonly built: string;
+  readonly stateRoot: string;
+  readonly compilerVersion: string;
+  readonly jobs: number;
+  readonly memoryMB: number;
+}): Promise<string> {
+  const expected = WORKERD_CLOSED_GRAPH_ARTIFACT.sha256;
+  const actual = await fileSha256(_input.built);
+  if (actual !== expected) {
+    let quarantine: string;
+    try {
+      quarantine = await retainUnqualifiedCandidate(_input, actual);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "unknown error";
+      throw new Error(
+        `built workerd digest ${actual}; expected ${expected}; diagnostic preservation failed: ${detail}`,
+      );
+    }
+    throw new Error(
+      `built workerd digest ${actual}; expected ${expected}; unqualified candidate retained at ${quarantine}`,
+    );
+  }
+
+  const artifact = join(_input.stateRoot, "artifacts", `workerd-${expected}`);
+  await installVerifiedArtifact(_input.built, artifact, expected);
+  return artifact;
+}
+
+/** Verify private copied bytes before exposing the no-overwrite accepted name. */
+export async function installVerifiedArtifact(
+  built: string,
+  artifact: string,
+  expectedSha256: string,
+): Promise<void> {
+  const temporary = `${artifact}.unqualified-${crypto.randomUUID()}`;
+  let copied = false;
+  try {
+    await copyFile(built, temporary, fsConstants.COPYFILE_EXCL);
+    copied = true;
+    await chmod(temporary, 0o755);
+    await requireDigest(temporary, expectedSha256, "copied workerd artifact");
+    // Same-directory hard link is atomic and, unlike rename, cannot replace an
+    // existing accepted artifact. The temporary name is private until verified.
+    await link(temporary, artifact);
+  } finally {
+    if (copied) await unlink(temporary);
+  }
+}
+
+async function retainUnqualifiedCandidate(
+  input: Parameters<typeof verifyBuiltWorkerd>[0],
+  actualSha256: string,
+): Promise<string> {
+  const quarantineRoot = join(input.stateRoot, "quarantine");
+  await mkdir(quarantineRoot, { recursive: true, mode: 0o700 });
+  await chmod(quarantineRoot, 0o700);
+  const quarantine = join(quarantineRoot, `workerd-digest-mismatch-${actualSha256}`);
+  // An existing directory is not a destination: evidence from another build
+  // must never be silently replaced or merged with this unqualified candidate.
+  await mkdir(quarantine, { mode: 0o700 });
+  const candidate = join(quarantine, "candidate-workerd");
+  await copyFile(input.built, candidate, fsConstants.COPYFILE_EXCL);
+  await chmod(candidate, 0o600);
+  await requireDigest(candidate, actualSha256, "quarantined workerd candidate");
+  await writeFile(
+    join(quarantine, "evidence.json"),
+    `${JSON.stringify({
+      kind: "takoserver.workerd-unqualified-build-diagnostic",
+      acceptedArtifact: false,
+      nativeQualification: "not-run",
+      expectedSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.sha256,
+      actualSha256,
+      // These values describe the declared build recipe. They are not a
+      // measured digest of the prepared source tree or entire toolchain.
+      declaredPins: {
+        source: {
+          upstreamCommit: WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamCommit,
+          upstreamArchiveSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamArchiveSha256,
+          reviewedSourceSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.reviewedSourceSha256,
+        },
+        patch: {
+          overlaySha256: WORKERD_CLOSED_GRAPH_ARTIFACT.overlayPatchSha256,
+          v8Sha256: WORKERD_CLOSED_GRAPH_ARTIFACT.v8PatchSha256,
+        },
+        buildTools: {
+          bazeliskSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.bazeliskSha256,
+          bazelSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.bazelSha256,
+          clangVersionPrefix: WORKERD_CLOSED_GRAPH_ARTIFACT.clangVersion,
+        },
+      },
+      observed: { clangVersionLine: input.compilerVersion.split("\n")[0] },
+      unmeasured: {
+        preparedSourceTreeSha256: true,
+        compilerBinarySha256: true,
+        linkerAndSystemPackageDigests: true,
+      },
+      buildPlan: {
+        target: WORKERD_TARGET,
+        stateRoot: input.stateRoot,
+        resources: { jobs: input.jobs, memoryMB: input.memoryMB },
+        bazelResourceArgs: bazelResourceArgs(input),
+      },
+    })}\n`,
+    { mode: 0o600, flag: "wx" },
+  );
+  return quarantine;
+}
 
 async function main(): Promise<void> {
   const input = parseArguments(process.argv.slice(2));
@@ -175,10 +295,13 @@ async function main(): Promise<void> {
   );
 
   const built = join(source, "bazel-bin/src/workerd/server/workerd");
-  await requireDigest(built, WORKERD_CLOSED_GRAPH_ARTIFACT.sha256, "built workerd");
-  const artifact = join(artifacts, `workerd-${WORKERD_CLOSED_GRAPH_ARTIFACT.sha256}`);
-  await copyFile(built, artifact);
-  await chmod(artifact, 0o755);
+  const artifact = await verifyBuiltWorkerd({
+    built,
+    stateRoot,
+    compilerVersion: clangVersion,
+    jobs: input.jobs,
+    memoryMB: input.memoryMB,
+  });
   console.log(
     JSON.stringify({
       kind: "takoserver.workerd-build-report",
@@ -332,7 +455,9 @@ async function run(
   if (exitCode !== 0) throw new Error(`${command[0] ?? "command"} exited ${exitCode}`);
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : "workerd build failed");
-  process.exitCode = 1;
-});
+if (import.meta.main) {
+  main().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : "workerd build failed");
+    process.exitCode = 1;
+  });
+}

@@ -1,4 +1,4 @@
-import { readdir, readFile, readlink } from "node:fs/promises";
+import { readdir, readFile, readlink, stat } from "node:fs/promises";
 
 // setpriv registers the kernel signal before this shell inspects its parent.
 // The shell then execs the accepted binary in the same PID. All paths and
@@ -14,6 +14,113 @@ while read -r key value rest; do
 done < /proc/self/status
 exit 125
 `;
+
+export interface LinuxProcessIdentity {
+  readonly pid: number;
+  readonly bootId: string;
+  readonly pidNamespace: string;
+  readonly startTimeTicks: string;
+}
+
+export type LinuxProcessLiveness = "live" | "stale" | "unknown";
+
+function validLinuxProcessIdentity(value: LinuxProcessIdentity): boolean {
+  return (
+    Number.isSafeInteger(value.pid) &&
+    value.pid > 1 &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(value.bootId) &&
+    /^\d{1,32}:\d{1,32}$/u.test(value.pidNamespace) &&
+    /^\d{1,32}$/u.test(value.startTimeTicks)
+  );
+}
+
+function namespaceIdentity(info: { dev: bigint; ino: bigint }): string {
+  return `${info.dev}:${info.ino}`;
+}
+
+function startTime(statText: string, expectedPid: number): string | null {
+  const pidSeparator = statText.indexOf(" (");
+  const commandEnd = statText.lastIndexOf(")");
+  if (pidSeparator <= 0 || commandEnd <= pidSeparator) return null;
+  if (statText.slice(0, pidSeparator) !== String(expectedPid)) return null;
+  const fields = statText
+    .slice(commandEnd + 1)
+    .trim()
+    .split(/\s+/u);
+  const ticks = fields[19];
+  return ticks && /^\d{1,32}$/u.test(ticks) ? ticks : null;
+}
+
+/** Captures one exact live PID in this Linux boot and PID namespace. */
+export async function readLinuxProcessIdentity(pid: number): Promise<LinuxProcessIdentity> {
+  if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 1)
+    throw new Error("Linux process identity is unavailable");
+  try {
+    const [bootIdText, currentNamespace, targetNamespace, statText] = await Promise.all([
+      readFile("/proc/sys/kernel/random/boot_id", "utf8"),
+      stat("/proc/self/ns/pid", { bigint: true }),
+      stat(`/proc/${pid}/ns/pid`, { bigint: true }),
+      readFile(`/proc/${pid}/stat`, "utf8"),
+    ]);
+    const bootId = bootIdText.trim().toLowerCase();
+    const pidNamespace = namespaceIdentity(currentNamespace);
+    const startTimeTicks = startTime(statText, pid);
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(bootId) ||
+      pidNamespace !== namespaceIdentity(targetNamespace) ||
+      startTimeTicks === null
+    ) {
+      throw new Error();
+    }
+    return Object.freeze({ pid, bootId, pidNamespace, startTimeTicks });
+  } catch {
+    throw new Error("Linux process identity is unavailable");
+  }
+}
+
+/** Same-boot, same-PID-namespace proof for one recorded process identity. */
+export async function linuxProcessLiveness(
+  identity: LinuxProcessIdentity,
+): Promise<LinuxProcessLiveness> {
+  if (process.platform !== "linux" || !identity || !validLinuxProcessIdentity(identity))
+    return "unknown";
+  try {
+    const [bootIdText, namespace] = await Promise.all([
+      readFile("/proc/sys/kernel/random/boot_id", "utf8"),
+      stat("/proc/self/ns/pid", { bigint: true }),
+    ]);
+    if (
+      bootIdText.trim().toLowerCase() !== identity.bootId ||
+      namespaceIdentity(namespace) !== identity.pidNamespace
+    ) {
+      return "unknown";
+    }
+  } catch {
+    return "unknown";
+  }
+
+  try {
+    process.kill(identity.pid, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return "stale";
+    return "unknown";
+  }
+  try {
+    const statText = await readFile(`/proc/${identity.pid}/stat`, "utf8");
+    const actualStartTime = startTime(statText, identity.pid);
+    if (actualStartTime === null) return "unknown";
+    if (actualStartTime !== identity.startTimeTicks) return "stale";
+    const commandEnd = statText.lastIndexOf(")");
+    const state = statText
+      .slice(commandEnd + 1)
+      .trim()
+      .split(/\s+/u)[0];
+    if (!state) return "unknown";
+    return state === "Z" || state === "X" ? "stale" : "live";
+  } catch {
+    return "unknown";
+  }
+}
 
 export function spawnWorkerdWithParentDeath(
   command: readonly string[],

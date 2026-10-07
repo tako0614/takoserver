@@ -35,6 +35,18 @@ export interface V2EndpointTlsObservation {
   readonly ready: boolean;
 }
 
+/**
+ * Trusted frontend readback: `absent` means this Endpoint's route and assigned
+ * Attachment are released. A shared TLS certificate may remain installed.
+ */
+export interface V2EndpointRouteAbsenceObservation {
+  readonly endpointUid: string;
+  readonly workerUid: string;
+  readonly hostname: string;
+  readonly url: string;
+  readonly absent: boolean;
+}
+
 const hostnamePattern =
   /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/u;
 
@@ -61,7 +73,7 @@ function matchesExecution(snapshot: V2WorkerPublicationSnapshot, execution: V2Ex
     snapshot.sourceOperationId !== execution.operationId ||
     snapshot.worker.principal !== execution.principal ||
     snapshot.worker.space !== execution.space ||
-    !snapshot.deployment ||
+    (execution.action !== "delete" && !snapshot.deployment) ||
     !acceptedAddress(snapshot)
   )
     return false;
@@ -102,6 +114,12 @@ export function createWorkerEndpointForm(options: {
     readonly hostname: string;
     readonly url: string;
   }) => Promise<V2EndpointTlsObservation>;
+  readonly observeRouteAbsent?: (input: {
+    readonly endpointUid: string;
+    readonly workerUid: string;
+    readonly hostname: string;
+    readonly url: string;
+  }) => Promise<V2EndpointRouteAbsenceObservation>;
 }): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
 
@@ -143,11 +161,8 @@ export function createWorkerEndpointForm(options: {
     } catch {
       return unknown();
     }
-    // `not_dispatched` only describes this invocation, never earlier effects.
-    if (result.kind !== "confirmed" || result.identity === null) return unknown();
-
-    // Endpoint DELETE still has an active Deployment: a null Worker identity
-    // would be a Deployment teardown, not proof that one hostname was detached.
+    // `not_dispatched` describes this invocation only, never earlier effects.
+    // `confirmed` identity:null is Deployment teardown, not Endpoint proof.
     const after = await options.publicationState.resolve({
       execution,
       incumbentSourceOperationId: execution.operationId,
@@ -157,20 +172,59 @@ export function createWorkerEndpointForm(options: {
       !matchesExecution(after.snapshot, execution) ||
       canonicalJson(acceptedAddress(after.snapshot)) !== canonicalJson(address) ||
       !(await before.stillCurrent()) ||
-      !(await after.stillCurrent()) ||
-      !(await exactV2WorkerPublicationIdentity(
-        result.identity,
-        after.snapshot,
-        execution.operationId,
-      )) ||
       !(await after.stillCurrent())
     )
       return unknown();
 
+    if (result.kind === "confirmed_route_absent") {
+      if (
+        execution.action !== "delete" ||
+        before.snapshot.deployment !== null ||
+        after.snapshot.deployment !== null ||
+        result.sourceOperationId !== execution.operationId ||
+        result.endpointResourceUid !== execution.resourceUid ||
+        result.workerResourceUid !== spec.worker.resourceUid ||
+        result.targetKey !== execution.targetKey ||
+        result.assignedHostname !== address.hostname
+      )
+        return unknown();
+    } else if (
+      result.kind !== "confirmed" ||
+      result.identity === null ||
+      !(await exactV2WorkerPublicationIdentity(
+        result.identity,
+        after.snapshot,
+        execution.operationId,
+      ))
+    )
+      return unknown();
+    if (!(await after.stillCurrent())) return unknown();
+
     if (execution.action === "delete") {
-      // The native identity has no hostname but retains the exact weighted
-      // Deployment. A shared wildcard certificate may remain; do not infer
-      // TLS absence from route detachment.
+      // A caller without exact frontend readback can create/update internally,
+      // but cannot truthfully settle DELETE from native evidence alone.
+      if (!options.observeRouteAbsent) return unknown();
+      let route: V2EndpointRouteAbsenceObservation;
+      try {
+        route = await options.observeRouteAbsent({
+          endpointUid: execution.resourceUid,
+          workerUid: spec.worker.resourceUid,
+          ...address,
+        });
+      } catch {
+        return unknown();
+      }
+      if (
+        route.absent !== true ||
+        route.endpointUid !== execution.resourceUid ||
+        route.workerUid !== spec.worker.resourceUid ||
+        route.hostname !== address.hostname ||
+        route.url !== address.url ||
+        !(await after.stillCurrent())
+      )
+        return unknown();
+      // Attachment and route are absent. Shared TLS infrastructure may remain;
+      // do not infer tlsReady:false or certificate deletion.
       return { kind: "complete", observed: { activeDeploymentRouteReady: false }, output: address };
     }
 

@@ -78,16 +78,18 @@ function createVersionReceipt(database: Database, suffix: string): void {
 
 test("0068 is the exact source-only successor while the qualified 0001-0066 ceiling remains fixed", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
-  expect(source.names).toHaveLength(76);
-  expect(source.names.at(-9)).toBe(MIGRATION_NAME);
-  expect(source.names.at(-8)).toBe("0069_cloudflare_provider_invocation_delete_ack.sql");
-  expect(source.names.at(-7)).toBe("0070_takoform_v2.sql");
-  expect(source.names.at(-6)).toBe("0071_v2_sqlite_migration_set_custody.sql");
-  expect(source.names.at(-5)).toBe("0072_v2_artifact_custody.sql");
-  expect(source.names.at(-4)).toBe("0073_v2_reference_acceptance.sql");
-  expect(source.names.at(-3)).toBe("0074_v2_worker_native_effects.sql");
-  expect(source.names.at(-2)).toBe("0075_v2_artifact_progress.sql");
-  expect(source.names.at(-1)).toBe("0076_v2_worker_invocation_custody.sql");
+  expect(source.names).toHaveLength(78);
+  expect(source.names.at(-11)).toBe(MIGRATION_NAME);
+  expect(source.names.at(-10)).toBe("0069_cloudflare_provider_invocation_delete_ack.sql");
+  expect(source.names.at(-9)).toBe("0070_takoform_v2.sql");
+  expect(source.names.at(-8)).toBe("0071_v2_sqlite_migration_set_custody.sql");
+  expect(source.names.at(-7)).toBe("0072_v2_artifact_custody.sql");
+  expect(source.names.at(-6)).toBe("0073_v2_reference_acceptance.sql");
+  expect(source.names.at(-5)).toBe("0074_v2_worker_native_effects.sql");
+  expect(source.names.at(-4)).toBe("0075_v2_artifact_progress.sql");
+  expect(source.names.at(-3)).toBe("0076_v2_worker_invocation_custody.sql");
+  expect(source.names.at(-2)).toBe("0077_v2_operation_acceptance_order.sql");
+  expect(source.names.at(-1)).toBe("0078_v2_worker_invocation_retirement.sql");
   const qualified = projectApplyQualifiedMigrationArtifact(source);
   expect(qualified.names).toHaveLength(66);
   expect(qualified.names.at(-1)).toBe("0066_cloudflare_managed_actor_kv_capability_claims.sql");
@@ -99,9 +101,9 @@ test("0068 is the exact source-only successor while the qualified 0001-0066 ceil
     for (const file of source.files) copyFileSync(file.path, join(migrations, file.name));
     const tail = source.files.at(-1);
     if (!tail) throw new Error("audited source is missing its terminal migration");
-    copyFileSync(tail.path, join(migrations, "0077_unreviewed.sql"));
+    copyFileSync(tail.path, join(migrations, "0079_unreviewed.sql"));
     expect(() => readCurrentAuditedMigrationSourceArtifact(migrations)).toThrow(
-      "audited migration lineage must contain exactly 0001-0076",
+      "audited migration lineage must contain exactly 0001-0078",
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

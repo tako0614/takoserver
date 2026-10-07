@@ -26,7 +26,7 @@ import {
 import type { V2Execution, V2Form } from "../src/takoform-v2/types.ts";
 import { createWorkerEndpointForm } from "../src/takoform-v2/worker-endpoint-backend.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
-import type { V2WorkerPublicationResult } from "../src/takoform-v2/worker-static-publication.ts";
+import type { V2WorkerRuntimeOwnerExecutionResult } from "../src/workerd-worker-runtime-owner.ts";
 
 const TARGET_KEY = "fixture-v2-worker-endpoint";
 const HOSTNAME = "assigned.example.test";
@@ -35,7 +35,7 @@ function digest(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-test("accepted Endpoint retains its assigned HTTPS address across uncertain send, update and route-only delete", async () => {
+async function exerciseEndpoint(deleteDeploymentFirst: boolean): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "v2-endpoint-backend-"));
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);
@@ -74,10 +74,14 @@ test("accepted Endpoint retains its assigned HTTPS address across uncertain send
   const ownerCalls: string[] = [];
   let loseNextOwnerAcknowledgement = true;
   let returnDeploymentDeleteReceipt = false;
+  let routeAbsentReceiptReady = false;
+  let receiptHostname = HOSTNAME;
+  let routeAbsenceReady = false;
   let nativeRouteHostname = HOSTNAME;
   let tlsHostname = HOSTNAME;
   const tlsReady = true;
   let tlsCalls = 0;
+  let routeAbsenceCalls = 0;
   const endpointForm = createWorkerEndpointForm({
     targetKey: TARGET_KEY,
     publicationState,
@@ -90,7 +94,7 @@ test("accepted Endpoint retains its assigned HTTPS address across uncertain send
       expect(uid).toBe(workerUid);
       return {
         workerResourceUid: uid,
-        async execute(execution): Promise<V2WorkerPublicationResult> {
+        async execute(execution): Promise<V2WorkerRuntimeOwnerExecutionResult> {
           ownerCalls.push(execution.operationId);
           if (loseNextOwnerAcknowledgement) {
             loseNextOwnerAcknowledgement = false;
@@ -98,6 +102,16 @@ test("accepted Endpoint retains its assigned HTTPS address across uncertain send
           }
           if (returnDeploymentDeleteReceipt && execution.action === "delete") {
             return { kind: "confirmed", identity: null };
+          }
+          if (routeAbsentReceiptReady && execution.action === "delete") {
+            return {
+              kind: "confirmed_route_absent",
+              sourceOperationId: execution.operationId,
+              endpointResourceUid: execution.resourceUid,
+              workerResourceUid: uid,
+              targetKey: execution.targetKey,
+              assignedHostname: receiptHostname,
+            };
           }
           const versionId = `v2-${digest(new TextEncoder().encode(`${versionUid}\u00001`))}`;
           return {
@@ -121,6 +135,16 @@ test("accepted Endpoint retains its assigned HTTPS address across uncertain send
         hostname: tlsHostname,
         url,
         ready: tlsReady && hostname === HOSTNAME,
+      };
+    },
+    async observeRouteAbsent({ endpointUid, workerUid: observedWorkerUid, hostname, url }) {
+      routeAbsenceCalls += 1;
+      return {
+        endpointUid,
+        workerUid: observedWorkerUid,
+        hostname,
+        url,
+        absent: routeAbsenceReady,
       };
     },
   });
@@ -282,6 +306,20 @@ test("accepted Endpoint retains its assigned HTTPS address across uncertain send
     ).toMatchObject({
       output: { hostname: HOSTNAME, url: `https://${HOSTNAME}/` },
     });
+    if (deleteDeploymentFirst) {
+      const deploymentDelete = await engine.acceptDelete({
+        principal: "org-endpoint",
+        key: "delete-deployment-key-0001",
+        uid: deployment.resourceUid,
+        expectedGeneration: 1,
+      });
+      expect(await engine.runNext()).toMatchObject({
+        id: deploymentDelete.id,
+        status: "succeeded",
+      });
+      routeAbsentReceiptReady = true;
+      receiptHostname = "other.example.test";
+    }
     const deleted = await engine.acceptDelete({
       principal: "org-endpoint",
       key: "delete-endpoint-key-0001",
@@ -296,13 +334,37 @@ test("accepted Endpoint retains its assigned HTTPS address across uncertain send
     });
     returnDeploymentDeleteReceipt = false;
     clockMs += 2_000;
+    expect(await engine.runNext()).toMatchObject({
+      id: deleted.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    if (deleteDeploymentFirst) {
+      // A native no-publication receipt for a different accepted hostname
+      // cannot settle this Endpoint even when the Worker has no Deployment.
+      expect(routeAbsenceCalls).toBe(0);
+      receiptHostname = HOSTNAME;
+    } else {
+      expect(routeAbsenceCalls).toBe(1);
+    }
+    clockMs += 2_000;
+    if (deleteDeploymentFirst) {
+      expect(await engine.runNext()).toMatchObject({
+        id: deleted.id,
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(routeAbsenceCalls).toBe(1);
+      clockMs += 2_000;
+    }
+    routeAbsenceReady = true;
     expect(await engine.runNext()).toMatchObject({ id: deleted.id, status: "succeeded" });
     expect(tlsCalls).toBe(3); // create and both update attempts; delete does not infer TLS absence
-    expect(
-      await engine.getResource({ principal: "org-endpoint", uid: deployment.resourceUid }),
-    ).toMatchObject({
-      observed: { ready: true, active: true },
-    });
+    expect(routeAbsenceCalls).toBe(2);
+    if (!deleteDeploymentFirst)
+      expect(
+        await engine.getResource({ principal: "org-endpoint", uid: deployment.resourceUid }),
+      ).toMatchObject({ observed: { ready: true, active: true } });
     expect(await engine.getResource({ principal: "org-endpoint", uid: workerUid })).toMatchObject({
       observed: { ready: true },
     });
@@ -310,4 +372,8 @@ test("accepted Endpoint retains its assigned HTTPS address across uncertain send
     db.close();
     rmSync(root, { recursive: true, force: true });
   }
-});
+}
+
+test("accepted Endpoint deletes its route with an active Deployment", () =>
+  exerciseEndpoint(false));
+test("accepted Endpoint deletes its route after Deployment deletion", () => exerciseEndpoint(true));

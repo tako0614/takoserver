@@ -43,6 +43,22 @@ export interface V2WorkerInvocationRecord extends V2WorkerInvocationSelection {
   readonly space: string;
   readonly phase: "admitted" | "send_authorized" | "pre_effect_refused";
   readonly bodyState: "finished" | "canceled" | null;
+  /** Provider-origin terminal execution receipt, never inferred from body EOF. */
+  readonly retirement: {
+    readonly retiredAtMs: number;
+    readonly receiptDigest: `sha256:${string}`;
+  } | null;
+}
+
+export type V2WorkerInvocationRetirementIdentity = V2WorkerInvocationSelection &
+  Pick<V2WorkerInvocationRecord, "backendId" | "targetKey" | "principal" | "space">;
+
+export interface V2WorkerInvocationRetirementInput {
+  readonly handle: V2WorkerInvocationHandle;
+  /** Snapshot from the trusted native Tail receiver, not customer log fields. */
+  readonly expected: V2WorkerInvocationRetirementIdentity;
+  /** Stable fingerprint of the verified provider-origin terminal trace. */
+  readonly receiptDigest: `sha256:${string}`;
 }
 
 /**
@@ -58,6 +74,8 @@ export interface V2WorkerInvocationCustody {
   refuseBeforeSend(handle: V2WorkerInvocationHandle): Promise<boolean>;
   /** Gateway body observation, never a child-context or waitUntil retirement. */
   observeBody(handle: V2WorkerInvocationHandle, state: "finished" | "canceled"): Promise<boolean>;
+  /** Trusted internal receipt only; this is not exposed through the Host HTTP API. */
+  confirmNativeRetirement(input: V2WorkerInvocationRetirementInput): Promise<boolean>;
   /** Outstanding includes finished HTTP bodies until native context retirement is proved. */
   inspectDeployment(deploymentUid: string): Promise<{
     readonly outstanding: number;
@@ -66,6 +84,25 @@ export interface V2WorkerInvocationCustody {
 }
 
 type Row = Record<string, unknown>;
+const digestPattern = /^sha256:[0-9a-f]{64}$/u;
+const retirementIdentityKeys = [
+  "backendId",
+  "targetKey",
+  "principal",
+  "space",
+  "workerUid",
+  "deploymentUid",
+  "deploymentGeneration",
+  "sourceOperationId",
+  "endpointUid",
+  "endpointGeneration",
+  "versionUid",
+  "versionGeneration",
+  "versionOperationId",
+  "nativeIdentity",
+  "closureDigest",
+  "confirmedReceipt",
+] as const;
 
 function ownHandle(handle: V2WorkerInvocationHandle): V2WorkerInvocationHandle {
   return Object.freeze({ invocationId: handle.invocationId, custodyToken: handle.custodyToken });
@@ -104,7 +141,14 @@ function record(
     (row.phase !== "admitted" &&
       row.phase !== "send_authorized" &&
       row.phase !== "pre_effect_refused") ||
-    (row.body_state !== null && row.body_state !== "finished" && row.body_state !== "canceled")
+    (row.body_state !== null && row.body_state !== "finished" && row.body_state !== "canceled") ||
+    (row.retired_at_ms === null) !== (row.retirement_receipt_digest === null) ||
+    (row.retired_at_ms !== null &&
+      (typeof row.retired_at_ms !== "number" ||
+        !Number.isSafeInteger(row.retired_at_ms) ||
+        row.retired_at_ms < 0 ||
+        typeof row.retirement_receipt_digest !== "string" ||
+        !digestPattern.test(row.retirement_receipt_digest)))
   )
     return null;
   return Object.freeze({
@@ -127,6 +171,13 @@ function record(
     confirmedReceipt: row.confirmed_receipt as string,
     phase: row.phase,
     bodyState: row.body_state,
+    retirement:
+      row.retired_at_ms === null
+        ? null
+        : Object.freeze({
+            retiredAtMs: row.retired_at_ms as number,
+            receiptDigest: row.retirement_receipt_digest as `sha256:${string}`,
+          }),
   });
 }
 
@@ -184,6 +235,84 @@ export function createV2WorkerInvocationLifecycle(options: {
       if (result.changes === 1) return true;
       return (await read(ownedHandle))?.bodyState === state;
     },
+    async confirmNativeRetirement(input: V2WorkerInvocationRetirementInput): Promise<boolean> {
+      const handle = ownHandle(input.handle);
+      const receiptDigest = input.receiptDigest;
+      const raw = input.expected;
+      const expected: V2WorkerInvocationRetirementIdentity = Object.freeze({
+        backendId: raw.backendId,
+        targetKey: raw.targetKey,
+        principal: raw.principal,
+        space: raw.space,
+        workerUid: raw.workerUid,
+        deploymentUid: raw.deploymentUid,
+        deploymentGeneration: raw.deploymentGeneration,
+        sourceOperationId: raw.sourceOperationId,
+        endpointUid: raw.endpointUid,
+        endpointGeneration: raw.endpointGeneration,
+        versionUid: raw.versionUid,
+        versionGeneration: raw.versionGeneration,
+        versionOperationId: raw.versionOperationId,
+        nativeIdentity: raw.nativeIdentity,
+        closureDigest: raw.closureDigest,
+        confirmedReceipt: raw.confirmedReceipt,
+      });
+      if (
+        !digestPattern.test(receiptDigest) ||
+        !digestPattern.test(expected.closureDigest) ||
+        retirementIdentityKeys.some((key) =>
+          typeof expected[key] === "string"
+            ? expected[key].length === 0
+            : !Number.isSafeInteger(expected[key]) || expected[key] <= 0,
+        )
+      )
+        return false;
+      try {
+        const result = await sql.run(
+          `UPDATE tf_v2_worker_invocations
+           SET retired_at_ms = max(?, send_authorized_at_ms),
+               retirement_receipt_digest = ?
+           WHERE invocation_id = ? AND custody_token = ?
+             AND backend_id = ? AND target_key = ? AND principal = ? AND space = ?
+             AND worker_uid = ? AND deployment_uid = ? AND deployment_generation = ?
+             AND source_operation_id = ? AND endpoint_uid = ? AND endpoint_generation = ?
+             AND version_uid = ? AND version_generation = ? AND version_operation_id = ?
+             AND native_identity = ? AND closure_digest = ? AND confirmed_receipt = ?
+             AND phase = 'send_authorized' AND retired_at_ms IS NULL
+             AND retirement_receipt_digest IS NULL`,
+          [
+            instant(),
+            receiptDigest,
+            handle.invocationId,
+            handle.custodyToken,
+            expected.backendId,
+            expected.targetKey,
+            expected.principal,
+            expected.space,
+            expected.workerUid,
+            expected.deploymentUid,
+            expected.deploymentGeneration,
+            expected.sourceOperationId,
+            expected.endpointUid,
+            expected.endpointGeneration,
+            expected.versionUid,
+            expected.versionGeneration,
+            expected.versionOperationId,
+            expected.nativeIdentity,
+            expected.closureDigest,
+            expected.confirmedReceipt,
+          ],
+        );
+        if (result.changes === 1) return true;
+      } catch {
+        // A lost ACK is resolved by the exact row, never by another native send.
+      }
+      const current = await read(handle);
+      return (
+        current?.retirement?.receiptDigest === receiptDigest &&
+        retirementIdentityKeys.every((key) => current[key] === expected[key])
+      );
+    },
     async inspectDeployment(
       deploymentUid: string,
     ): Promise<{ readonly outstanding: number; readonly bodyFinished: number }> {
@@ -191,7 +320,8 @@ export function createV2WorkerInvocationLifecycle(options: {
         `SELECT count(*) AS outstanding,
            coalesce(sum(CASE WHEN body_state = 'finished' THEN 1 ELSE 0 END), 0) AS body_finished
          FROM tf_v2_worker_invocations
-         WHERE deployment_uid = ? AND phase <> 'pre_effect_refused'`,
+         WHERE deployment_uid = ? AND phase <> 'pre_effect_refused'
+           AND retired_at_ms IS NULL`,
         [deploymentUid],
       );
       const row = rows[0];

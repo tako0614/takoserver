@@ -470,6 +470,55 @@ test("ModuleWorker observation follows settled Endpoint publication and removal 
   }
 });
 
+test("ModuleWorker same-spec PUT follows Endpoint DELETE despite a rolled-back Host clock", async () => {
+  const f = fixture();
+  try {
+    const { worker, spec } = await f.createWorkerAndAssets();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    const deploymentOp = await f.sql.query("SELECT created_at FROM tf_v2_operations WHERE id = ?", [
+      deployment.id,
+    ]);
+    await f.create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    const endpoint = await f.sql.query(
+      "SELECT uid FROM tf_v2_resources WHERE form_url = ? AND name = 'endpoint'",
+      [WORKER_ENDPOINT_FORM_URL],
+    );
+    f.nowMs = Date.parse(String(deploymentOp[0]?.created_at)) - 1_000;
+    const deleted = await f.engine.acceptDelete({
+      principal: "org-1",
+      key: "rollback-endpoint-delete",
+      uid: String(endpoint[0]?.uid),
+      expectedGeneration: 1,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: deleted.id, status: "succeeded" });
+    const deletedOp = await f.sql.query("SELECT created_at FROM tf_v2_operations WHERE id = ?", [
+      deleted.id,
+    ]);
+    expect(String(deletedOp[0]?.created_at) < String(deploymentOp[0]?.created_at)).toBe(true);
+    const workerUpdate = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "worker-after-rollback-delete",
+      uid: worker.resourceUid,
+      expectedGeneration: 1,
+      spec: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: workerUpdate.id, status: "succeeded" });
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({
+      observed: { activeDeploymentUid: deployment.resourceUid, ready: true },
+    });
+  } finally {
+    f.close();
+  }
+});
+
 test("pending Endpoint publishes before a same-spec ModuleWorker PUT retries", async () => {
   const f = fixture({ gateEndpointWithPublicationReader: true });
   try {

@@ -89,9 +89,27 @@ export type V2WorkerPublicationResolution =
         | "stale_claim"
         | "graph_unresolved"
         | "publication_conflict"
-        | "incumbent_unresolved";
+        | "incumbent_unresolved"
+        | "source_unsettled";
       readonly message: string;
     };
+
+/** A persisted runtime pointer supplied for comparison, never SQL authority. */
+export interface V2WorkerCurrentServingIdentity {
+  readonly generation: string;
+  readonly workerResourceUid: string;
+  readonly hostnames: readonly string[];
+  readonly versions: readonly { readonly workerVersionUid: string; readonly weight: number }[];
+}
+
+export type V2WorkerCurrentServingResolution =
+  | {
+      readonly kind: "ready";
+      readonly snapshot: V2WorkerPublicationSnapshot;
+      stillCurrent(): Promise<boolean>;
+      readVersionMaterials(versionUid: string): Promise<V2WorkerVersionMaterials>;
+    }
+  | Extract<V2WorkerPublicationResolution, { kind: "unresolved" }>;
 
 /** A leased Version operation's accepted execution snapshot, not publication readiness. */
 export interface V2WorkerVersionSnapshot {
@@ -143,6 +161,8 @@ type ReadyCapture = {
   readonly materials: ReadonlyMap<string, VersionMaterialTargets>;
 };
 type Capture = ReadyCapture | Unresolved;
+type CurrentReadyCapture = Omit<ReadyCapture, "sqlGuard">;
+type CurrentCapture = CurrentReadyCapture | Unresolved;
 type VersionReadyCapture = {
   readonly kind: "ready";
   readonly snapshot: V2WorkerVersionSnapshot;
@@ -274,6 +294,8 @@ function settled(row: ResourceRow, op: OperationRow | null): boolean {
     op?.id === row.last_operation &&
     op.resource_uid === row.uid &&
     op.principal === row.principal &&
+    op.backend_id === row.backend_id &&
+    op.target_key === row.target_key &&
     op.generation === row.generation &&
     op.status === "succeeded" &&
     op.effect === "complete" &&
@@ -293,6 +315,73 @@ function outputHostname(row: ResourceRow): { hostname: string; url: string } | n
     url === `https://${hostname}/`
     ? { hostname, url }
     : null;
+}
+
+function confirmedServingSource(op: OperationRow, row: ResourceRow, targetKey: string): boolean {
+  return (
+    (row.form_url === WORKER_DEPLOYMENT_FORM_URL || row.form_url === WORKER_ENDPOINT_FORM_URL) &&
+    op.resource_uid === row.uid &&
+    op.principal === row.principal &&
+    op.backend_id === row.backend_id &&
+    op.target_key === row.target_key &&
+    op.target_key === targetKey &&
+    op.generation === row.generation &&
+    row.observed_generation === op.generation &&
+    row.last_operation === op.id &&
+    row.busy_operation === null &&
+    row.phase === "idle" &&
+    row.spec_json === op.accepted_spec_json &&
+    op.status === "succeeded" &&
+    op.effect === "complete" &&
+    ((op.action === "delete" &&
+      row.form_url === WORKER_ENDPOINT_FORM_URL &&
+      row.deleted_at !== null) ||
+      ((op.action === "create" || op.action === "update") && row.deleted_at === null))
+  );
+}
+
+function exactServingIdentity(
+  snapshot: V2WorkerPublicationSnapshot,
+  expected: V2WorkerCurrentServingIdentity,
+): boolean {
+  const deployment = snapshot.deployment;
+  if (
+    !deployment ||
+    expected.workerResourceUid !== snapshot.worker.uid ||
+    expected.generation !== `takoserver-v2-operation:${snapshot.sourceOperationId}` ||
+    !Array.isArray(expected.hostnames) ||
+    !Array.isArray(expected.versions)
+  )
+    return false;
+  const hostnames = snapshot.endpoint ? [snapshot.endpoint.output.hostname] : [];
+  if (
+    expected.hostnames.length !== hostnames.length ||
+    expected.hostnames.some((hostname, index) => hostname !== hostnames[index]) ||
+    expected.versions.length !== deployment.versions.length
+  )
+    return false;
+  const versions = expected.versions.map((version) => ({
+    uid: version.workerVersionUid,
+    weight: version.weight,
+  }));
+  if (
+    versions.some(
+      (version) =>
+        !uidPattern.test(version.uid) || !Number.isInteger(version.weight) || version.weight <= 0,
+    ) ||
+    new Set(versions.map((version) => version.uid)).size !== versions.length
+  )
+    return false;
+  const selected = deployment.versions.map((version) => ({
+    uid: version.uid,
+    weight: version.weight,
+  }));
+  versions.sort((left, right) => left.uid.localeCompare(right.uid));
+  selected.sort((left, right) => left.uid.localeCompare(right.uid));
+  return (
+    canonicalJson(versions as unknown as JsonObject) ===
+    canonicalJson(selected as unknown as JsonObject)
+  );
 }
 
 /** No separate desired-state ledger: every read starts from the accepted v2 Operation. */
@@ -394,13 +483,29 @@ export function createV2WorkerPublicationState(options: {
     workerUid: string,
     principal: string,
     space: string,
+    bounded = false,
   ): Promise<ResourceRow[]> {
     return (await sql.query(
       `SELECT * FROM tf_v2_resources
        WHERE form_url = ? AND principal = ? AND space = ? AND deleted_at IS NULL
-         AND json_extract(spec_json, '$.worker.resourceUid') = ? ORDER BY uid`,
+         AND json_extract(spec_json, '$.worker.resourceUid') = ? ORDER BY uid
+         ${bounded ? "LIMIT 2" : ""}`,
       [form, principal, space, workerUid],
     )) as unknown as ResourceRow[];
+  }
+  async function hasPendingPublication(workerUid: string): Promise<boolean> {
+    return (
+      (
+        await sql.query(
+          `SELECT 1 FROM tf_v2_operations op
+         JOIN tf_v2_resources r ON r.uid = op.resource_uid
+         WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
+           AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
+           AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ? LIMIT 1`,
+          [WORKER_DEPLOYMENT_FORM_URL, WORKER_ENDPOINT_FORM_URL, workerUid],
+        )
+      ).length !== 0
+    );
   }
   async function pendingPublication(workerUid: string): Promise<OperationRow[]> {
     return (await sql.query(
@@ -412,6 +517,91 @@ export function createV2WorkerPublicationState(options: {
        ORDER BY op.created_at, op.id`,
       [WORKER_DEPLOYMENT_FORM_URL, WORKER_ENDPOINT_FORM_URL, workerUid],
     )) as unknown as OperationRow[];
+  }
+
+  async function activeReferences(
+    referrerUid: string,
+    expected: readonly ReferenceRow[],
+  ): Promise<readonly unknown[] | null> {
+    const edges = await sql.query(
+      `SELECT target_uid, referrer_uid FROM tf_v2_resource_references
+       WHERE referrer_uid = ? ORDER BY target_uid`,
+      [referrerUid],
+    );
+    if (
+      edges.length !== expected.length ||
+      expected.some((reference, index) => edges[index]?.target_uid !== reference.target_uid)
+    )
+      return null;
+    return edges;
+  }
+
+  async function settledReferenceTargets(
+    rows: readonly ReferenceRow[],
+    principal: string,
+    space: string,
+  ): Promise<readonly unknown[] | null> {
+    const evidence: unknown[] = [];
+    for (const reference of rows) {
+      const target = await resource(reference.target_uid);
+      const last = target ? await operation(target.last_operation) : null;
+      const observed = target ? parseObject(target.observed_json) : null;
+      if (
+        !target ||
+        target.form_url !== reference.form_url ||
+        target.principal !== principal ||
+        target.space !== space ||
+        !settled(target, last) ||
+        (reference.readiness === "ready" && observed?.ready !== true)
+      )
+        return null;
+      if (reference.target_spec_path !== null) {
+        if (
+          reference.target_spec_equals === null ||
+          (
+            await sql.query(
+              `SELECT 1 FROM tf_v2_resources WHERE uid = ?
+             AND json_type(spec_json, ?) = 'text'
+             AND json_extract(spec_json, ?) = ? LIMIT 1`,
+              [
+                target.uid,
+                reference.target_spec_path,
+                reference.target_spec_path,
+                reference.target_spec_equals,
+              ],
+            )
+          ).length !== 1
+        )
+          return null;
+      }
+      evidence.push({ target, last });
+    }
+    return evidence;
+  }
+
+  async function currentPublisherRows(input: {
+    workerUid: string;
+    principal: string;
+    space: string;
+  }): Promise<readonly { readonly id: unknown; readonly acceptance_order: unknown }[]> {
+    return (await sql.query(
+      `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
+       JOIN tf_v2_operations op ON op.id = r.last_operation
+       WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
+         AND op.principal = r.principal
+         AND op.backend_id = r.backend_id AND op.target_key = r.target_key
+         AND op.status = 'succeeded' AND op.effect = 'complete'
+         AND r.observed_generation = op.generation AND r.busy_operation IS NULL
+         AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
+       ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2`,
+      [
+        WORKER_DEPLOYMENT_FORM_URL,
+        WORKER_ENDPOINT_FORM_URL,
+        input.principal,
+        input.space,
+        input.workerUid,
+      ],
+    )) as readonly { readonly id: unknown; readonly acceptance_order: unknown }[];
   }
 
   async function artifactTarget(input: {
@@ -604,29 +794,57 @@ export function createV2WorkerPublicationState(options: {
     };
   }
 
-  async function capture(input: {
+  type LivePublicationCaptureInput = {
     execution: V2Execution;
     incumbentSourceOperationId?: string;
-  }): Promise<Capture> {
-    const { execution } = input;
+  };
+  type CurrentServingCaptureInput = {
+    currentServing: {
+      workerUid: string;
+      targetKey: string;
+      sourceOperationId: string;
+      expectedIdentity: V2WorkerCurrentServingIdentity;
+    };
+  };
+  async function capture(input: LivePublicationCaptureInput): Promise<Capture>;
+  async function capture(input: CurrentServingCaptureInput): Promise<CurrentCapture>;
+  async function capture(
+    input: LivePublicationCaptureInput | CurrentServingCaptureInput,
+  ): Promise<Capture | CurrentCapture> {
+    const current = "currentServing" in input ? input.currentServing : null;
+    const execution = "execution" in input ? input.execution : null;
     if (
+      execution !== null &&
       execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
       execution.form !== WORKER_ENDPOINT_FORM_URL
     )
       return unresolved("graph_unresolved", "This operation is not a Worker publication");
-    const [op, own] = await Promise.all([
-      operation(execution.operationId),
-      resource(execution.resourceUid),
+    const [op, initialOwn] = await Promise.all([
+      operation(execution?.operationId ?? current?.sourceOperationId ?? ""),
+      execution ? resource(execution.resourceUid) : null,
     ]);
-    if (!op || !own || !isCurrentClaim(op, own, execution, now().getTime())) {
+    const own = initialOwn ?? (op ? await resource(op.resource_uid) : null);
+    if (!op || !own) {
+      return unresolved("graph_unresolved", "The accepted publication source is unavailable");
+    }
+    if (current && pendingStatuses.has(op.status)) {
+      return unresolved("source_unsettled", "The serving source Operation is not terminal");
+    }
+    if (
+      current
+        ? !confirmedServingSource(op, own, current.targetKey)
+        : !execution || !isCurrentClaim(op, own, execution, now().getTime())
+    ) {
       return unresolved("stale_claim", "The accepted operation lease is no longer current");
     }
+    const form = own.form_url;
+    const action = op.action;
     const accepted = parseObject(op.accepted_spec_json);
     if (!accepted) return unresolved("graph_unresolved", "Accepted Worker spec is unavailable");
     let workerUid: string;
     try {
       workerUid =
-        execution.form === WORKER_DEPLOYMENT_FORM_URL
+        form === WORKER_DEPLOYMENT_FORM_URL
           ? parseWorkerDeploymentSpec(accepted).worker.resourceUid
           : parseWorkerEndpointSpec(accepted).worker.resourceUid;
     } catch {
@@ -634,6 +852,12 @@ export function createV2WorkerPublicationState(options: {
     }
     if (!uidPattern.test(workerUid)) {
       return unresolved("graph_unresolved", "Accepted Worker UID is invalid");
+    }
+    if (
+      current &&
+      (current.workerUid !== workerUid || current.expectedIdentity.workerResourceUid !== workerUid)
+    ) {
+      return unresolved("graph_unresolved", "Serving identity has a different Worker UID");
     }
     const worker = await resource(workerUid);
     const workerOp = worker ? await operation(worker.last_operation) : null;
@@ -654,7 +878,8 @@ export function createV2WorkerPublicationState(options: {
       return unresolved("graph_unresolved", "Worker identity spec is invalid");
     }
 
-    const incumbentId = input.incumbentSourceOperationId;
+    const incumbentId =
+      "incumbentSourceOperationId" in input ? input.incumbentSourceOperationId : undefined;
     let incumbent: OperationRow | null = null;
     let incumbentResource: ResourceRow | null = null;
     if (incumbentId !== undefined) {
@@ -678,18 +903,27 @@ export function createV2WorkerPublicationState(options: {
       }
     }
 
-    const pending = await pendingPublication(workerUid);
-    if (!pending.some((item) => item.id === op.id)) {
-      return unresolved("stale_claim", "Publication operation is no longer pending");
-    }
-    if (pending[0]?.id !== op.id && incumbentId !== op.id) {
-      return unresolved("publication_conflict", "An earlier Worker publication is still pending");
+    const pending = current ? [] : await pendingPublication(workerUid);
+    if (current) {
+      if (await hasPendingPublication(workerUid)) {
+        return unresolved("source_unsettled", "A later Worker publication is unresolved");
+      }
+    } else {
+      if (!pending.some((item) => item.id === op.id)) {
+        return unresolved("stale_claim", "Publication operation is no longer pending");
+      }
+      if (pending[0]?.id !== op.id && incumbentId !== op.id) {
+        return unresolved("publication_conflict", "An earlier Worker publication is still pending");
+      }
     }
 
     const [deploymentRows, endpointRows] = await Promise.all([
-      matchingResources(WORKER_DEPLOYMENT_FORM_URL, workerUid, op.principal, own.space),
-      matchingResources(WORKER_ENDPOINT_FORM_URL, workerUid, op.principal, own.space),
+      matchingResources(WORKER_DEPLOYMENT_FORM_URL, workerUid, op.principal, own.space, !!current),
+      matchingResources(WORKER_ENDPOINT_FORM_URL, workerUid, op.principal, own.space, !!current),
     ]);
+    if (current && (deploymentRows.length > 1 || endpointRows.length > 1)) {
+      return unresolved("publication_conflict", "More than one Worker attachment is present");
+    }
     for (const row of [...deploymentRows, ...endpointRows]) {
       if (await hasUnresolvedPriorEffect(row)) {
         return unresolved(
@@ -706,8 +940,8 @@ export function createV2WorkerPublicationState(options: {
         confirmed.length > 1 ||
         (rows.some((row) => row.uid === own.uid) &&
           confirmedOthers.length > 0 &&
-          ((execution.form === WORKER_DEPLOYMENT_FORM_URL && rows === deploymentRows) ||
-            (execution.form === WORKER_ENDPOINT_FORM_URL && rows === endpointRows)))
+          ((form === WORKER_DEPLOYMENT_FORM_URL && rows === deploymentRows) ||
+            (form === WORKER_ENDPOINT_FORM_URL && rows === endpointRows)))
       ) {
         return unresolved(
           "publication_conflict",
@@ -718,10 +952,10 @@ export function createV2WorkerPublicationState(options: {
 
     async function chosen(
       rows: readonly ResourceRow[],
-      form: string,
+      chosenForm: string,
     ): Promise<{ row: ResourceRow; accepted: JsonObject; op: OperationRow } | null | Unresolved> {
-      const isOwnForm = execution.form === form;
-      if (isOwnForm && execution.action === "delete") return null;
+      const isOwnForm = form === chosenForm;
+      if (isOwnForm && action === "delete") return null;
       const row = isOwnForm ? own : rows.find((candidate) => candidate.observed_generation > 0);
       if (!row) return null;
       const chosenOp = isOwnForm
@@ -746,7 +980,7 @@ export function createV2WorkerPublicationState(options: {
         chosenOp.action !== "delete" &&
         chosenOp.status === "succeeded" &&
         chosenOp.effect === "complete";
-      if (!chosenOp || (!isOwnForm && !settled(row, chosenOp) && !confirmedPrior)) {
+      if (!chosenOp || ((current || !isOwnForm) && !settled(row, chosenOp) && !confirmedPrior)) {
         return unresolved("graph_unresolved", "A Worker attachment has unconfirmed effects");
       }
       const chosenSpec = parseObject(chosenOp.accepted_spec_json);
@@ -776,7 +1010,7 @@ export function createV2WorkerPublicationState(options: {
       } catch {
         return unresolved("graph_unresolved", "Deployment spec is invalid");
       }
-      if (chosenDeployment.op.id !== op.id) {
+      if (current || chosenDeployment.op.id !== op.id) {
         const observed = parseObject(chosenDeployment.row.observed_json);
         if (observed?.ready !== true || observed.active !== true) {
           return unresolved("graph_unresolved", "Deployment is not confirmed active and ready");
@@ -802,6 +1036,13 @@ export function createV2WorkerPublicationState(options: {
           "graph_unresolved",
           "Deployment accepted references are not sealed and exact",
         );
+      }
+      if (current) {
+        const active = await activeReferences(chosenDeployment.row.uid, refRows);
+        if (!active) {
+          return unresolved("graph_unresolved", "Deployment active references changed");
+        }
+        evidence.push(active);
       }
       evidence.push(refRows);
       referenceSetIds.push(chosenDeployment.op.id);
@@ -845,6 +1086,14 @@ export function createV2WorkerPublicationState(options: {
             "graph_unresolved",
             "A weighted Worker Version references are not sealed and exact",
           );
+        }
+        if (current) {
+          const active = await activeReferences(uid, versionReferences);
+          const targets = await settledReferenceTargets(versionReferences, op.principal, own.space);
+          if (!active || !targets) {
+            return unresolved("graph_unresolved", "Version active references changed");
+          }
+          versionEvidence.push(active, targets);
         }
         if (last) referenceSetIds.push(last.id);
         const bundle = versionSpec.bundle
@@ -902,7 +1151,7 @@ export function createV2WorkerPublicationState(options: {
       }
       const refRows = await references(chosenEndpoint.op.id);
       const output = outputHostname(chosenEndpoint.row);
-      if (chosenEndpoint.op.id !== op.id) {
+      if (current || chosenEndpoint.op.id !== op.id) {
         const observed = parseObject(chosenEndpoint.row.observed_json);
         if (observed?.tlsReady !== true || observed.activeDeploymentRouteReady !== true) {
           return unresolved("graph_unresolved", "Endpoint route is not confirmed ready");
@@ -915,6 +1164,13 @@ export function createV2WorkerPublicationState(options: {
       ) {
         return unresolved("graph_unresolved", "Endpoint accepted owner or address is unavailable");
       }
+      if (current) {
+        const active = await activeReferences(chosenEndpoint.row.uid, refRows);
+        if (!active) {
+          return unresolved("graph_unresolved", "Endpoint active references changed");
+        }
+        evidence.push(active);
+      }
       evidence.push(refRows);
       referenceSetIds.push(chosenEndpoint.op.id);
       endpoint = {
@@ -924,7 +1180,7 @@ export function createV2WorkerPublicationState(options: {
         output,
       };
     }
-    if (endpoint && !deployment && execution.action !== "delete") {
+    if (endpoint && !deployment && action !== "delete") {
       return unresolved("graph_unresolved", "Endpoint has no active Deployment");
     }
     if (
@@ -935,9 +1191,8 @@ export function createV2WorkerPublicationState(options: {
     ) {
       return unresolved("graph_unresolved", "Endpoint requires HTTP-capable weighted Versions");
     }
-    const acceptedEndpointOutput =
-      execution.form === WORKER_ENDPOINT_FORM_URL ? outputHostname(own) : null;
-    if (execution.form === WORKER_ENDPOINT_FORM_URL && !acceptedEndpointOutput) {
+    const acceptedEndpointOutput = form === WORKER_ENDPOINT_FORM_URL ? outputHostname(own) : null;
+    if (form === WORKER_ENDPOINT_FORM_URL && !acceptedEndpointOutput) {
       return unresolved("graph_unresolved", "Accepted Endpoint address is unavailable");
     }
     const snapshot = freezeDeep<V2WorkerPublicationSnapshot>({
@@ -952,6 +1207,9 @@ export function createV2WorkerPublicationState(options: {
       deployment,
       endpoint,
     });
+    if (current && !exactServingIdentity(snapshot, current.expectedIdentity)) {
+      return unresolved("graph_unresolved", "Persisted serving identity differs from SQL graph");
+    }
     // An accepted attachment or Binding can add an incoming edge without
     // altering a selected Resource row. Capture the complete inbound set, not
     // only the explicit Deployment/Endpoint rows projected above.
@@ -970,6 +1228,24 @@ export function createV2WorkerPublicationState(options: {
        ORDER BY target_uid, referrer_uid`,
       [JSON.stringify(inboundTargetIds)],
     );
+    const publisherRows = current
+      ? await currentPublisherRows({
+          workerUid,
+          principal: op.principal,
+          space: own.space,
+        })
+      : null;
+    if (
+      current &&
+      (publisherRows?.[0]?.id !== op.id ||
+        typeof publisherRows[0]?.acceptance_order !== "number" ||
+        !Number.isSafeInteger(publisherRows[0].acceptance_order) ||
+        publisherRows[0].acceptance_order <= 0 ||
+        (publisherRows.length > 1 &&
+          publisherRows[0].acceptance_order === publisherRows[1]?.acceptance_order))
+    ) {
+      return unresolved("graph_unresolved", "Serving source is not the unique latest publisher");
+    }
     // The vector includes every row read above, including the incumbent and
     // pending queue. A later acceptance, settlement, deletion, or lease change
     // invalidates the snapshot even when its projected public fields look equal.
@@ -987,6 +1263,7 @@ export function createV2WorkerPublicationState(options: {
       endpoint: chosenEndpoint,
       evidence,
       inboundEdges,
+      publisherRows,
       snapshot,
     };
     const guardEvidence = {
@@ -1007,10 +1284,14 @@ export function createV2WorkerPublicationState(options: {
     const vector = canonicalJson(graphEvidence as unknown as JsonObject);
     // SQL graph reads above may await after the first lease check. Do not
     // return a once-valid claim as ready after its known deadline elapsed.
+    if (current) {
+      return { kind: "ready", snapshot, vector, materials };
+    }
     const finalNow = now().getTime();
     if (!Number.isFinite(finalNow) || op.lease_until_ms === null || op.lease_until_ms <= finalNow) {
       return unresolved("stale_claim", "The accepted operation lease expired during graph read");
     }
+    if (!execution) return unresolved("stale_claim", "The accepted operation is unavailable");
     let sqlGuard: V2WorkerPublicationSqlGuard;
     try {
       sqlGuard = createWorkerPublicationSqlGuard({
@@ -1202,6 +1483,88 @@ export function createV2WorkerPublicationState(options: {
             initial.snapshot.worker.space,
             stillAuthorized,
           ),
+      };
+    },
+    /** Read-only SQL and held-material proof; native serving needs separate owner readback. */
+    async resolveCurrentServing(input: {
+      workerUid: string;
+      targetKey: string;
+      sourceOperationId: string;
+      expectedIdentity: V2WorkerCurrentServingIdentity;
+    }): Promise<V2WorkerCurrentServingResolution> {
+      // The owner can await while reading SQL. Sample its persisted marker once,
+      // before any await, so caller mutation cannot retarget this readback.
+      let captured: CurrentServingCaptureInput;
+      try {
+        captured = {
+          currentServing: freezeDeep({
+            workerUid: input.workerUid,
+            targetKey: input.targetKey,
+            sourceOperationId: input.sourceOperationId,
+            expectedIdentity: {
+              generation: input.expectedIdentity.generation,
+              workerResourceUid: input.expectedIdentity.workerResourceUid,
+              hostnames: [...input.expectedIdentity.hostnames],
+              versions: input.expectedIdentity.versions.map((version) => ({
+                workerVersionUid: version.workerVersionUid,
+                weight: version.weight,
+              })),
+            },
+          }),
+        };
+      } catch {
+        return unresolved("graph_unresolved", "Persisted serving identity is invalid");
+      }
+      let initial: CurrentCapture;
+      try {
+        initial = await capture(captured);
+      } catch {
+        return unresolved("graph_unresolved", "Current serving SQL graph is unavailable");
+      }
+      if (initial.kind === "unresolved") return initial;
+      const stillAuthorized = async (): Promise<boolean> => {
+        try {
+          const latest = await capture(captured);
+          return latest.kind === "ready" && latest.vector === initial.vector;
+        } catch {
+          return false;
+        }
+      };
+      const readVersionMaterials = async (
+        versionUid: string,
+      ): Promise<V2WorkerVersionMaterials> => {
+        const target = initial.materials.get(versionUid);
+        if (!target) {
+          throw new SqlError("unavailable", "Worker Version materials are not authorized");
+        }
+        return readMaterialsTargets(
+          target,
+          initial.snapshot.worker.principal,
+          initial.snapshot.worker.space,
+          stillAuthorized,
+        );
+      };
+      const verifyAllMaterials = async (): Promise<boolean> => {
+        try {
+          for (const version of initial.snapshot.deployment?.versions ?? []) {
+            await readVersionMaterials(version.uid);
+          }
+          return await stillAuthorized();
+        } catch {
+          return false;
+        }
+      };
+      if (!(await verifyAllMaterials())) {
+        return unresolved(
+          "graph_unresolved",
+          "Current serving graph or held bytes are unavailable",
+        );
+      }
+      return {
+        kind: "ready",
+        snapshot: initial.snapshot,
+        stillCurrent: verifyAllMaterials,
+        readVersionMaterials,
       };
     },
     async resolve(input: {
