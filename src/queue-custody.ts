@@ -55,6 +55,14 @@ export interface QueueCustodyClaimedMessage {
   readonly policy: QueueCustodyRetryPolicy;
 }
 
+/** Retained evidence for one exact v2 batch claim, not another message ledger. */
+export interface QueueCustodyBatchReceipt {
+  readonly messageId: string;
+  readonly state: "pending" | "settled";
+  readonly outcome: "ack" | "retry" | null;
+  readonly delaySeconds: number | null;
+}
+
 /**
  * A durable marker that a terminal delivery created one message in a
  * dead-letter Queue. The marker carries no body or transport address: a
@@ -124,6 +132,22 @@ export interface QueueCustody {
     message: QueueCustodyClaimedMessage,
     decision: { readonly outcome: "ack" | "retry"; readonly delaySeconds?: number },
   ): Promise<boolean>;
+  registerSettlementBatch(
+    batchId: string,
+    messages: readonly QueueCustodyClaimedMessage[],
+  ): Promise<void>;
+  readSettlementBatch(input: {
+    readonly batchId: string;
+    readonly queueId: string;
+    readonly consumerId: string;
+    readonly generation: number;
+  }): Promise<readonly QueueCustodyBatchReceipt[]>;
+  settleBatchMessage(input: {
+    readonly batchId: string;
+    readonly message: QueueCustodyClaimedMessage;
+    readonly decision: { readonly outcome: "ack" | "retry"; readonly delaySeconds?: number };
+    readonly settlementToken: string;
+  }): Promise<"settled" | "already_settled" | "unknown_batch" | "unknown_message" | "unavailable">;
   listTransferNotices(input: {
     readonly queueId: string;
     readonly consumerId: string;
@@ -310,6 +334,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       readonly leaseExpiresAtMillis?: number;
     },
     millis: number,
+    providedDeadLetterId?: string,
   ): readonly SqlStatement[] => {
     const target = lease.target;
     const expirySql =
@@ -348,7 +373,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       params: sourceParams,
     };
     if (!target) return [removal];
-    const deadLetterId = randomId();
+    const deadLetterId = providedDeadLetterId ?? randomId();
     messageId(deadLetterId);
     return [
       {
@@ -524,6 +549,38 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
     }
     if (statements.length > 0) await sql.batch(statements);
     return true;
+  };
+
+  const settlementRows = async (batchId: string) =>
+    await sql.query(
+      `SELECT batch_id, queue_id, consumer_id, generation, lease_token, message_id,
+              attempts, max_retries, retry_delay_seconds, dead_letter_queue_id,
+              dead_letter_delivery_delay_seconds, dead_letter_retention_seconds,
+              state, outcome, delay_seconds, settlement_token
+       FROM queue_v2_batch_settlements WHERE batch_id = ? ORDER BY message_id`,
+      [batchId],
+    );
+
+  const sameSettlementClaim = (
+    row: Readonly<Record<string, unknown>>,
+    batchId: string,
+    message: QueueCustodyClaimedMessage,
+  ): boolean => {
+    const deadLetter = message.policy.deadLetterQueue;
+    return (
+      row.batch_id === batchId &&
+      row.queue_id === message.queueId &&
+      row.consumer_id === message.consumerId &&
+      row.generation === message.generation &&
+      row.lease_token === message.leaseToken &&
+      row.message_id === message.messageId &&
+      row.attempts === message.attempts &&
+      row.max_retries === message.policy.maxRetries &&
+      row.retry_delay_seconds === message.policy.retryDelaySeconds &&
+      row.dead_letter_queue_id === (deadLetter?.queueId ?? null) &&
+      row.dead_letter_delivery_delay_seconds === (deadLetter?.deliveryDelaySeconds ?? null) &&
+      row.dead_letter_retention_seconds === (deadLetter?.messageRetentionSeconds ?? null)
+    );
   };
 
   const readUnleasedWindow = async (
@@ -1027,6 +1084,234 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       );
       const written = await sql.batch(statements);
       return written.at(-1)?.changes === 1;
+    },
+
+    async registerSettlementBatch(batchIdValue, messageValues) {
+      const batchId = token(batchIdValue, 256, "queue batch id");
+      if (
+        !Array.isArray(messageValues) ||
+        messageValues.length < 1 ||
+        messageValues.length > MAX_BATCH_MESSAGES
+      ) {
+        throw new TypeError("queue batch messages are invalid");
+      }
+      // Snapshot caller-owned bodies/policy before the first await. A claim is
+      // not authority until the SQL registration guard checks its live lease.
+      const messages = messageValues.map(claimedMessage);
+      const first = messages[0];
+      if (
+        !first ||
+        new Set(messages.map((message) => message.messageId)).size !== messages.length ||
+        messages.some(
+          (message) =>
+            message.queueId !== first.queueId ||
+            message.consumerId !== first.consumerId ||
+            message.generation !== first.generation ||
+            message.leaseToken !== first.leaseToken,
+        )
+      ) {
+        throw new TypeError("queue batch claim is invalid");
+      }
+      try {
+        await sql.batch(
+          messages.map((message) => ({
+            sql: `INSERT INTO queue_v2_batch_settlements
+            (batch_id, queue_id, consumer_id, generation, lease_token, message_id,
+             attempts, max_retries, retry_delay_seconds, dead_letter_queue_id,
+             dead_letter_delivery_delay_seconds, dead_letter_retention_seconds)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [
+              batchId,
+              message.queueId,
+              message.consumerId,
+              message.generation,
+              message.leaseToken,
+              message.messageId,
+              message.attempts,
+              message.policy.maxRetries,
+              message.policy.retryDelaySeconds,
+              message.policy.deadLetterQueue?.queueId ?? null,
+              message.policy.deadLetterQueue?.deliveryDelaySeconds ?? null,
+              message.policy.deadLetterQueue?.messageRetentionSeconds ?? null,
+            ],
+          })),
+        );
+      } catch {
+        // Includes a lost acknowledgement after the atomic batch committed.
+        // An identical complete registration is safe to reopen; a partial or
+        // differently scoped row set is never adopted.
+        const rows = await settlementRows(batchId);
+        if (
+          rows.length === messages.length &&
+          rows.every((row) => row.state === "pending" || row.state === "settled") &&
+          rows.every((row) =>
+            messages.some((message) => sameSettlementClaim(row, batchId, message)),
+          )
+        ) {
+          return;
+        }
+        throw new QueueCustodyConflictError("queue batch claim is unavailable");
+      }
+    },
+
+    async readSettlementBatch(input) {
+      const batchId = token(input.batchId, 256, "queue batch id");
+      const scope = generationIdentity(input);
+      const rows = await settlementRows(batchId);
+      if (
+        rows.some(
+          (row) =>
+            row.queue_id !== scope.queueId ||
+            row.consumer_id !== scope.consumerId ||
+            row.generation !== scope.generation,
+        )
+      )
+        return [];
+      return rows.map((row) => {
+        if (row.state !== "pending" && row.state !== "settled") {
+          throw new Error("queue batch receipt is corrupt");
+        }
+        if (
+          (row.state === "pending" && (row.outcome !== null || row.delay_seconds !== null)) ||
+          (row.state === "settled" && row.outcome !== "ack" && row.outcome !== "retry")
+        ) {
+          throw new Error("queue batch receipt is corrupt");
+        }
+        return Object.freeze({
+          messageId: messageId(row.message_id),
+          state: row.state,
+          outcome: row.outcome === "ack" || row.outcome === "retry" ? row.outcome : null,
+          delaySeconds:
+            row.delay_seconds === null ? null : nonNegativeStoredInteger(row.delay_seconds),
+        });
+      });
+    },
+
+    async settleBatchMessage(input) {
+      const batchId = token(input.batchId, 256, "queue batch id");
+      const message = claimedMessage(input.message);
+      const decision = settlementDecision(input.decision);
+      const settlementToken = token(input.settlementToken, 128, "queue settlement token");
+      const rows = await settlementRows(batchId);
+      if (rows.length === 0) return "unknown_batch";
+      const row = rows.find((candidate) => candidate.message_id === message.messageId);
+      if (!row || !sameSettlementClaim(row, batchId, message)) return "unknown_message";
+      if (row.state === "settled") return "already_settled";
+      if (row.state !== "pending") return "unavailable";
+
+      const millis = now();
+      const delay =
+        decision.outcome === "retry"
+          ? (decision.delaySeconds ?? message.policy.retryDelaySeconds)
+          : null;
+      const terminal =
+        decision.outcome === "retry" && message.attempts >= 1 + message.policy.maxRetries;
+      const deadLetterId = terminal && message.policy.deadLetterQueue ? randomId() : null;
+      if (deadLetterId !== null) messageId(deadLetterId);
+      const statements: SqlStatement[] = [
+        {
+          sql: `UPDATE queue_v2_batch_settlements
+          SET state = 'settling', outcome = ?, delay_seconds = ?,
+              settlement_token = ?, settled_at_ms = ?, dead_letter_message_id = ?
+          WHERE batch_id = ? AND message_id = ?`,
+          params: [
+            decision.outcome,
+            delay,
+            settlementToken,
+            millis,
+            deadLetterId,
+            batchId,
+            message.messageId,
+          ],
+        },
+      ];
+      if (decision.outcome === "ack") {
+        statements.push({
+          sql: `DELETE FROM selfhost_queue_messages
+            WHERE queue_id = ? AND message_id = ? AND lease_token = ?
+              AND lease_consumer_id = ? AND lease_generation = ?`,
+          params: [
+            message.queueId,
+            message.messageId,
+            message.leaseToken,
+            message.consumerId,
+            message.generation,
+          ],
+        });
+      } else if (!terminal) {
+        statements.push({
+          sql: `UPDATE selfhost_queue_messages
+            SET visible_at_ms = ?, lease_token = NULL, lease_expires_at_ms = NULL,
+                lease_consumer_id = NULL, lease_generation = NULL,
+                lease_max_retries = NULL, lease_retry_delay_seconds = NULL,
+                lease_dead_letter_queue_id = NULL,
+                lease_dead_letter_delivery_delay_seconds = NULL,
+                lease_dead_letter_retention_seconds = NULL
+            WHERE queue_id = ? AND message_id = ? AND lease_token = ?
+              AND lease_consumer_id = ? AND lease_generation = ?
+              AND deliveries = ? AND lease_max_retries = ?
+              AND lease_retry_delay_seconds = ?
+              AND lease_dead_letter_queue_id IS ?
+              AND lease_dead_letter_delivery_delay_seconds IS ?
+              AND lease_dead_letter_retention_seconds IS ?`,
+          params: [
+            millis + (delay ?? 0) * 1_000,
+            message.queueId,
+            message.messageId,
+            message.leaseToken,
+            message.consumerId,
+            message.generation,
+            message.attempts,
+            message.policy.maxRetries,
+            message.policy.retryDelaySeconds,
+            message.policy.deadLetterQueue?.queueId ?? null,
+            message.policy.deadLetterQueue?.deliveryDelaySeconds ?? null,
+            message.policy.deadLetterQueue?.messageRetentionSeconds ?? null,
+          ],
+        });
+      } else {
+        statements.push(
+          ...terminalLeaseStatements(
+            {
+              queueId: message.queueId,
+              messageId: message.messageId,
+              leaseToken: message.leaseToken,
+              consumerId: message.consumerId,
+              generation: message.generation,
+              attempts: message.attempts,
+              maxRetries: message.policy.maxRetries,
+              retryDelaySeconds: message.policy.retryDelaySeconds,
+              ...(message.policy.deadLetterQueue ? { target: message.policy.deadLetterQueue } : {}),
+            },
+            millis,
+            deadLetterId ?? undefined,
+          ),
+        );
+      }
+      statements.push({
+        sql: `UPDATE queue_v2_batch_settlements SET state = 'settled'
+          WHERE batch_id = ? AND message_id = ?`,
+        params: [batchId, message.messageId],
+      });
+      try {
+        const written = await sql.batch(statements);
+        if (written.at(-1)?.changes !== 1) return "unavailable";
+        return "settled";
+      } catch {
+        const after = (await settlementRows(batchId)).find(
+          (candidate) => candidate.message_id === message.messageId,
+        );
+        if (!after) return "unknown_batch";
+        if (!sameSettlementClaim(after, batchId, message)) return "unknown_message";
+        if (after.state === "settled") {
+          return after.settlement_token === settlementToken &&
+            after.outcome === decision.outcome &&
+            after.delay_seconds === delay
+            ? "settled"
+            : "already_settled";
+        }
+        return "unavailable";
+      }
     },
 
     async listTransferNotices(input) {

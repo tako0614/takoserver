@@ -47,16 +47,16 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0082_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0082_container_runtime_input_custody (id TEXT);\n",
+    "0083_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0083_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0083_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0083_container_runtime_input_rewrap (id TEXT);\n",
+    "0084_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0084_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0084_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0084_container_runtime_input_acceptance (id TEXT);\n",
+    "0085_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0085_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -702,7 +702,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0081");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0082");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1136,7 +1136,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0081");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0082");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1249,28 +1249,28 @@ describe("production-shaped D1 migration lane", () => {
   for (const drift of [
     {
       name: "missing",
-      expected: "selected D1 wave requires the exact audited source inventory 0001-0081",
+      expected: "selected D1 wave requires the exact audited source inventory 0001-0082",
     },
     { name: "changed", expected: "exact audited migration SHA-256" },
-    { name: "extra", expected: "exact audited source inventory 0001-0081" },
+    { name: "extra", expected: "exact audited source inventory 0001-0082" },
   ] as const) {
-    test(`current 0081 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
-      const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0081-${drift.name}-`));
+    test(`current 0082 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
+      const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0082-${drift.name}-`));
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const migration0081 = join(migrationDirectory, "0081_v2_private_inputs.sql");
+        const migration0082 = join(migrationDirectory, "0082_v2_queue_batch_settlements.sql");
         if (drift.name === "missing") {
-          rmSync(migration0081);
+          rmSync(migration0082);
         } else if (drift.name === "changed") {
           writeFileSync(
-            migration0081,
-            `${readFileSync(migration0081, "utf8")}\n-- mutated after source audit\n`,
+            migration0082,
+            `${readFileSync(migration0082, "utf8")}\n-- mutated after source audit\n`,
           );
         } else {
           writeFileSync(
-            join(migrationDirectory, "0082_unreviewed_extension.sql"),
-            "CREATE TABLE synthetic_0082_unreviewed_extension (id TEXT);\n",
+            join(migrationDirectory, "0083_unreviewed_extension.sql"),
+            "CREATE TABLE synthetic_0083_unreviewed_extension (id TEXT);\n",
             { mode: 0o600 },
           );
         }
