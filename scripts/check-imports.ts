@@ -171,7 +171,16 @@ const LAYERS: readonly Layer[] = [
   {
     name: "v2-selfhost-composition",
     match: /^src\/selfhost-v2-worker-composition\.ts$/u,
-    may: ["core", "adapter", "v2-application", "v2-config", "v2-form", "v2-runtime"],
+    may: [
+      "core",
+      "adapter",
+      "v2-application",
+      "v2-config",
+      "v2-form",
+      "v2-runtime",
+      "v2-private",
+      "v2-code-validation",
+    ],
   },
   {
     name: "v2-selfhost-queue-composition",
