@@ -254,9 +254,14 @@ for (const checkpoint of ["retired", "retiring"] as const) {
       const endpoint = await create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
         worker: { resourceUid: worker.resourceUid },
       });
-      expect(
-        (await request(first.port, key.secret, `/__fixture/serve/${worker.resourceUid}`)).status,
-      ).toBe(200);
+      const firstServe = await request(
+        first.port,
+        key.secret,
+        `/__fixture/serve/${worker.resourceUid}`,
+      );
+      expect(firstServe.status).toBe(200);
+      const firstConfigIdentity = await firstServe.text();
+      expect(firstConfigIdentity).toMatch(/^[0-9a-f]{64}$/u);
       const firstPid = first.pid;
       const ownerKey = createHash("sha256").update(worker.resourceUid).digest("hex");
       const statePath = join(root, "v2-worker-owners", ownerKey, "runtime-owner.json");
@@ -266,6 +271,7 @@ for (const checkpoint of ["retired", "retiring"] as const) {
           status: string;
           receipt: unknown;
           processIdentity: LinuxProcessIdentity | null;
+          executionCopiesReleased: boolean;
         }[];
       };
       let ownerState: OwnerState | null = null;
@@ -273,7 +279,8 @@ for (const checkpoint of ["retired", "retiring"] as const) {
         ownerState = JSON.parse(await readFile(statePath, "utf8")) as OwnerState;
         const atCheckpoint =
           checkpoint === "retired"
-            ? ownerState.incarnations.every(
+            ? ownerState.incarnations.some((record) => record.status === "retired") &&
+              ownerState.incarnations.every(
                 (record) => record.status === "active" || record.status === "retired",
               )
             : ownerState.incarnations.some((record) => record.status === "retiring") &&
@@ -284,12 +291,21 @@ for (const checkpoint of ["retired", "retiring"] as const) {
       if (
         !ownerState ||
         (checkpoint === "retired"
-          ? ownerState.incarnations.some(
+          ? !ownerState.incarnations.some((record) => record.status === "retired") ||
+            ownerState.incarnations.some(
               (record) => record.status !== "active" && record.status !== "retired",
             )
           : !ownerState.incarnations.some((record) => record.status === "retiring"))
       ) {
         throw new Error(`old incarnation did not reach the ${checkpoint} checkpoint`);
+      }
+      if (checkpoint === "retired") {
+        for (const retired of ownerState.incarnations.filter(
+          (record) => record.status === "retired",
+        )) {
+          expect(retired.receipt).not.toBeNull();
+          expect(retired.executionCopiesReleased).toBe(true);
+        }
       }
       if (checkpoint === "retiring") {
         const pending = ownerState.incarnations.find((record) => record.status === "retiring");
@@ -334,7 +350,11 @@ for (const checkpoint of ["retired", "retiring"] as const) {
         `/__fixture/serve/${worker.resourceUid}`,
       );
       expect(served.status).toBe(200);
-      expect((await served.text()).length).toBe(64);
+      const restoredConfigIdentity = await served.text();
+      expect(restoredConfigIdentity).toMatch(/^[0-9a-f]{64}$/u);
+      // The accepted graph identity stays exact across Host replacement;
+      // per-process private readiness credentials are not this public digest.
+      expect(restoredConfigIdentity).toBe(firstConfigIdentity);
       const endpointRead = await request(
         second.port,
         key.secret,
