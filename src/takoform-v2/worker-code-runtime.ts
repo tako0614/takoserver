@@ -1,4 +1,7 @@
 import { canonicalJson } from "../json.ts";
+import { SELFHOST_WORKER_DATA_SERVICE_MODULE } from "../providers/selfhost-data-service.ts";
+import { v2SqliteWorkerProjection } from "../providers/selfhost-v2-sqlite-worker-projection.ts";
+import { SELFHOST_WORKER_DATA_TOKEN_BINDING } from "../providers/selfhost-worker-wrapper.ts";
 import type {
   WorkerdBinding,
   WorkerdDeploymentVariant,
@@ -12,16 +15,23 @@ import type { WorkerBundleManifest } from "./forms/worker-bundle.ts";
 import {
   prepareV2WorkerCodeProjection,
   snapshotV2WorkerPrivateInputs,
+  type V2ResolvedSqliteBinding,
+  type V2SqliteNativeBoot,
   V2WorkerCodeRuntimeError,
 } from "./worker-code-eligibility.ts";
 import type { V2ResolvedServiceBinding } from "./worker-service-resolution.ts";
 
 export {
   inspectV2WorkerCodeVersionEligibility,
+  type V2ResolvedSqliteBinding,
+  type V2SqliteNativeBoot,
   V2WorkerCodeRuntimeError,
   type V2WorkerCodeRuntimeErrorCode,
   type V2WorkerModuleInspector,
 } from "./worker-code-eligibility.ts";
+
+export const V2_SQLITE_ADAPTER_MODULE = "__takoserver-v2-sqlite-adapter.js" as const;
+export const V2_SQLITE_INTRINSIC_MODULE = "__takoserver-v2-sqlite-intrinsics.js" as const;
 
 export type V2WorkerCodeVersionIdentity = {
   readonly directory: string;
@@ -53,6 +63,9 @@ export async function projectV2WorkerCodeVersion(input: {
   /** Actual configured values from the trusted Resource-owned custody reader. */
   readonly configuredPrivateInputs?: unknown;
   readonly resolvedServiceBindings?: readonly V2ResolvedServiceBinding[];
+  readonly resolvedSqliteBindings?: readonly V2ResolvedSqliteBinding[];
+  /** Signed by the fixed Host-private broker after selected native ID is known. */
+  readonly sqliteBoot?: V2SqliteNativeBoot;
   /** Non-optional private event gate capability composed by the owning Host. */
   readonly eventDelivery?: { readonly token: string };
   /** Exact private settlement binding selected before tenant materialization. */
@@ -75,6 +88,12 @@ export async function projectV2WorkerCodeVersion(input: {
   } catch {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
+  let resolvedSqliteBindings: readonly V2ResolvedSqliteBinding[] | undefined;
+  try {
+    resolvedSqliteBindings = input.resolvedSqliteBindings?.map((binding) => ({ ...binding }));
+  } catch {
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
+  }
   const verified = await prepareV2WorkerCodeProjection({
     workerResourceUid: identity.workerResourceUid,
     bundleResourceUid: identity.bundleResourceUid,
@@ -88,6 +107,8 @@ export async function projectV2WorkerCodeVersion(input: {
     privateInputs: input.privateInputs,
     ...(configuredPrivateInputs === undefined ? {} : { configuredPrivateInputs }),
     ...(resolvedServiceBindings === undefined ? {} : { resolvedServiceBindings }),
+    ...(resolvedSqliteBindings === undefined ? {} : { resolvedSqliteBindings }),
+    ...(input.sqliteBoot === undefined ? {} : { sqliteBoot: input.sqliteBoot }),
     requireEventDelivery: true,
     ...(input.eventDelivery === undefined ? {} : { eventDelivery: input.eventDelivery }),
     ...(input.queueSettlement === undefined ? {} : { queueSettlement: input.queueSettlement }),
@@ -98,13 +119,30 @@ export async function projectV2WorkerCodeVersion(input: {
     throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
   }
 
-  const entrypoint = manifest.entrypoint;
+  const originalEntrypoint = manifest.entrypoint;
+  const entrypoint = verified.sqliteBoot ? V2_SQLITE_ADAPTER_MODULE : originalEntrypoint;
   const modules = new Map<string, Uint8Array>();
   const moduleMediaTypes = Object.create(null) as Record<string, WorkerdModuleMediaType>;
   for (const file of files) {
     if (!file.bytes) throw bundleUnavailable();
     modules.set(file.path, new Uint8Array(file.bytes));
     moduleMediaTypes[file.path] = file.mediaType;
+  }
+  if (verified.sqliteBoot) {
+    if (modules.has(V2_SQLITE_ADAPTER_MODULE) || modules.has(V2_SQLITE_INTRINSIC_MODULE)) {
+      throw new V2WorkerCodeRuntimeError("worker_bundle_unavailable");
+    }
+    const projected = v2SqliteWorkerProjection({
+      originalMainModule: originalEntrypoint,
+      adapterModule: V2_SQLITE_ADAPTER_MODULE,
+      intrinsicModule: V2_SQLITE_INTRINSIC_MODULE,
+      sqliteBindingNames: spec.sqliteBindings.map((binding) => binding.name),
+      declaredHandlers: spec.handlers,
+    });
+    for (const [name, bytes] of projected) {
+      modules.set(name, new Uint8Array(bytes));
+      moduleMediaTypes[name] = "application/javascript+module";
+    }
   }
 
   const vars: WorkerdBinding[] = [
@@ -122,7 +160,7 @@ export async function projectV2WorkerCodeVersion(input: {
   const site: WorkerdSite = {
     directory: identity.directory,
     mainModule: entrypoint,
-    modules: files.filter((file) => file.path !== entrypoint).map((file) => file.path),
+    modules: [...modules.keys()].filter((name) => name !== entrypoint),
     moduleMediaTypes,
     hostnames: [...identity.hostnames],
     generation: identity.generation,
@@ -145,6 +183,21 @@ export async function projectV2WorkerCodeVersion(input: {
         }
       : {}),
     ...(vars.length === 0 ? {} : { vars }),
+    ...(verified.sqliteBoot
+      ? {
+          dataPlane: {
+            address: verified.sqliteBoot.address,
+            module: SELFHOST_WORKER_DATA_SERVICE_MODULE,
+            vars: [
+              {
+                name: SELFHOST_WORKER_DATA_TOKEN_BINDING,
+                value: verified.sqliteBoot.token,
+                kind: "text" as const,
+              },
+            ],
+          },
+        }
+      : {}),
   };
   return {
     versionId: identity.versionId,

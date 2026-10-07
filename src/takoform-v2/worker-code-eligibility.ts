@@ -26,6 +26,18 @@ export type V2WorkerModuleInspector = (
   input: WorkerModuleInspectionInput,
 ) => Promise<WorkerModuleInspectionResult>;
 
+/** Exact accepted Core reference graph; it is not a request-side readiness assertion. */
+export interface V2ResolvedSqliteBinding {
+  readonly name: string;
+  readonly resourceUid: string;
+}
+
+/** Host-private native companion destination and selected-Version signed grant. */
+export interface V2SqliteNativeBoot {
+  readonly address: string;
+  readonly token: string;
+}
+
 export type V2WorkerCodeRuntimeErrorCode =
   | "worker_version_unavailable"
   | "worker_bundle_unavailable"
@@ -55,6 +67,7 @@ export interface V2WorkerCodeEligibilityInput {
   readonly privateInputs?: unknown;
   /** Supplied only after the current accepted SQL reference graph was verified. */
   readonly resolvedServiceBindings?: readonly V2ResolvedServiceBinding[];
+  readonly resolvedSqliteBindings?: readonly V2ResolvedSqliteBinding[];
 }
 
 interface VerifiedV2WorkerCodeEligibility {
@@ -66,6 +79,7 @@ interface VerifiedV2WorkerCodeEligibility {
     readonly bytes: Uint8Array;
   }[];
   readonly assets?: V2VerifiedAssetMaterials;
+  readonly sqliteBoot?: V2SqliteNativeBoot;
 }
 
 /**
@@ -87,6 +101,7 @@ export async function prepareV2WorkerCodeProjection(
     readonly eventDelivery?: { readonly token: string };
     /** Real boot-composed private settlement plane, never a handler flag. */
     readonly queueSettlement?: { readonly address: string; readonly token: string };
+    readonly sqliteBoot?: V2SqliteNativeBoot;
   },
 ): Promise<VerifiedV2WorkerCodeEligibility> {
   return await verifyV2WorkerCodeProjection(input, false);
@@ -98,6 +113,7 @@ async function verifyV2WorkerCodeProjection(
     readonly requireEventDelivery?: boolean;
     readonly eventDelivery?: { readonly token: string };
     readonly queueSettlement?: { readonly address: string; readonly token: string };
+    readonly sqliteBoot?: V2SqliteNativeBoot;
   },
   inspectionOnly: boolean,
 ): Promise<VerifiedV2WorkerCodeEligibility> {
@@ -134,11 +150,28 @@ async function verifyV2WorkerCodeProjection(
   }
   if (
     spec.kvBindings.length > 0 ||
-    spec.sqliteBindings.length > 0 ||
     spec.bucketBindings.length > 0 ||
     spec.queueProducerBindings.length > 0 ||
     spec.actorBindings.length > 0 ||
     spec.workflowBindings.length > 0
+  ) {
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
+  }
+  // Snapshot the accepted graph and the private grant before any material or
+  // inspector await. A declaration alone never authorizes native projection.
+  const sqliteBindings = snapshotResolvedSqliteBindings(input.resolvedSqliteBindings);
+  const sqliteBoot = snapshotSqliteBoot(input.sqliteBoot);
+  if (
+    sqliteBindings === null ||
+    sqliteBoot === null ||
+    spec.sqliteBindings.length !== (sqliteBindings?.length ?? 0) ||
+    spec.sqliteBindings.some(
+      (binding, index) =>
+        binding.name !== sqliteBindings?.[index]?.name ||
+        binding.resource.resourceUid !== sqliteBindings[index]?.resourceUid,
+    ) ||
+    (spec.sqliteBindings.length > 0 && !inspectionOnly && sqliteBoot === undefined) ||
+    (spec.sqliteBindings.length === 0 && sqliteBoot !== undefined)
   ) {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
@@ -210,7 +243,58 @@ async function verifyV2WorkerCodeProjection(
       return { path: file.path, mediaType: file.mediaType, bytes: new Uint8Array(bytes) };
     }),
     ...(assets ? { assets } : {}),
+    ...(sqliteBoot ? { sqliteBoot } : {}),
   };
+}
+
+function snapshotResolvedSqliteBindings(
+  input: readonly V2ResolvedSqliteBinding[] | undefined,
+): readonly V2ResolvedSqliteBinding[] | null | undefined {
+  if (input === undefined) return undefined;
+  try {
+    if (!Array.isArray(input) || input.length > 64) return null;
+    const copied = input.map((binding) => ({
+      name: binding.name,
+      resourceUid: binding.resourceUid,
+    }));
+    if (
+      copied.some(
+        (binding) =>
+          typeof binding.name !== "string" ||
+          typeof binding.resourceUid !== "string" ||
+          !/^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u.test(binding.name) ||
+          !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(binding.resourceUid),
+      ) ||
+      copied.some((binding, index) => index > 0 && (copied[index - 1]?.name ?? "") >= binding.name)
+    )
+      return null;
+    return copied;
+  } catch {
+    return null;
+  }
+}
+
+function snapshotSqliteBoot(
+  input: V2SqliteNativeBoot | undefined,
+): V2SqliteNativeBoot | null | undefined {
+  if (input === undefined) return undefined;
+  try {
+    const address = input.address;
+    const token = input.token;
+    const port = Number(address.slice(address.lastIndexOf(":") + 1));
+    if (
+      typeof address !== "string" ||
+      !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(address) ||
+      port > 65_535 ||
+      typeof token !== "string" ||
+      token.length > 32_768 ||
+      !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/u.test(token)
+    )
+      return null;
+    return { address, token };
+  } catch {
+    return null;
+  }
 }
 
 interface BundleSnapshot {

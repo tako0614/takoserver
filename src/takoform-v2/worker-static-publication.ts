@@ -1,4 +1,6 @@
 import { bytesDigest, canonicalJson } from "../json.ts";
+import type { V2SqliteBindingGrant } from "../providers/selfhost-v2-sqlite-binding-broker.ts";
+import { SELFHOST_WORKER_EDGE_SQL_BINDING_KIND } from "../providers/selfhost-worker-wrapper.ts";
 import { canonicalSelfhostWeightedVersions } from "../selfhost-weighted-deployment.ts";
 import type {
   WorkerdDeploymentPublication,
@@ -10,6 +12,7 @@ import type {
 } from "../workerd-runtime.ts";
 import { internalHostname } from "../workerd-runtime.ts";
 import { compileWorkerdVersionGraph } from "../workerd-version-graph.ts";
+import type { SQLiteWorkerBindingClaim } from "./forms/sqlite-worker-binding-authority.ts";
 import {
   parseWorkerVersionSpec,
   WORKER_DEPLOYMENT_FORM_URL,
@@ -169,6 +172,15 @@ export function createV2WorkerPublication(options: {
       readonly incarnationId: string;
     }): string;
   };
+  /** Fixed Host-private broker, never selected by a Worker Version. */
+  readonly v2SqliteBinding?: {
+    readonly address: string;
+    issueGrant(grant: V2SqliteBindingGrant): string;
+    resolveCurrentBinding(
+      claim: SQLiteWorkerBindingClaim,
+      binding: string,
+    ): Promise<{ readonly resourceUid: string; readonly vector: string } | null>;
+  };
 }): V2WorkerPublication {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   const inspectModule = options.runtime.inspectModule;
@@ -209,6 +221,39 @@ export function createV2WorkerPublication(options: {
       let projection: WorkerdDeploymentVariant<WorkerdSite | WorkerdStaticSite>;
       const versionSpec = parseWorkerVersionSpec(version.spec);
       if (versionSpec.bundle) {
+        const sqliteBindings = versionSpec.sqliteBindings.map((binding) => ({
+          name: binding.name,
+          resourceUid: binding.resource.resourceUid,
+        }));
+        let sqliteBoot: { readonly address: string; readonly token: string } | undefined;
+        if (sqliteBindings.length > 0) {
+          const binder = options.v2SqliteBinding;
+          if (!binder) throw new Error("native SQLite binding is unavailable");
+          const claim: SQLiteWorkerBindingClaim = {
+            principal: snapshot.worker.principal,
+            space: snapshot.worker.space,
+            targetKey: options.targetKey,
+            workerUid: snapshot.worker.uid,
+            workerVersionUid: version.uid,
+            bindings: sqliteBindings,
+          };
+          for (const binding of sqliteBindings) {
+            const current = await binder.resolveCurrentBinding(claim, binding.name);
+            if (current?.resourceUid !== binding.resourceUid) {
+              throw new Error("current SQLite binding is unavailable");
+            }
+          }
+          if (!(await resolution.stillCurrent())) {
+            throw new Error("SQLite binding reference graph changed");
+          }
+          const grant: V2SqliteBindingGrant = {
+            ...claim,
+            nativeVersionId: identity.versionId,
+            incarnationId: execution.operationId,
+            servingSourceOperationId: execution.operationId,
+          };
+          sqliteBoot = { address: binder.address, token: binder.issueGrant(grant) };
+        }
         const queueSettlement =
           versionSpec.handlers.includes("queue") && options.v2QueueSettlement !== undefined
             ? {
@@ -249,6 +294,8 @@ export function createV2WorkerPublication(options: {
           inspectModule,
           ...(configuredPrivateInputs ? { configuredPrivateInputs } : {}),
           ...(serviceBindings.length > 0 ? { resolvedServiceBindings: serviceBindings } : {}),
+          ...(sqliteBindings.length > 0 ? { resolvedSqliteBindings: sqliteBindings } : {}),
+          ...(sqliteBoot === undefined ? {} : { sqliteBoot }),
           ...(options.scheduledEventToken === undefined
             ? {}
             : { eventDelivery: { token: options.scheduledEventToken } }),
@@ -280,6 +327,18 @@ export function createV2WorkerPublication(options: {
             targetResourceUid: binding.targetResourceUid,
             unavailableToken: binding.unavailableToken,
           })),
+          ...(sqliteBoot === undefined
+            ? {}
+            : {
+                dataPlane: {
+                  address: sqliteBoot.address,
+                  token: sqliteBoot.token,
+                  bindings: sqliteBindings.map((binding) => ({
+                    kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+                    publicName: binding.name,
+                  })),
+                },
+              }),
           hostnames: [],
           generation,
           workerResourceUid: snapshot.worker.uid,
