@@ -281,6 +281,26 @@ test("projects verified code+assets into one copied Version with exact routing p
   expect(projection.assets?.get("index.html")).toEqual(ASSET_BYTES);
 });
 
+test("bundle-backed assets permit no declared fetch without inventing a handler", async () => {
+  const projection = await projectV2WorkerCodeVersion({
+    identity: { ...identity(), assetResourceUid: ASSET_UID },
+    spec: versionSpec({
+      handlers: [],
+      assets: {
+        bundle: { resourceUid: ASSET_UID },
+        runWorkerFirst: false,
+        notFoundHandling: "none",
+      },
+    }),
+    bundle: await heldBundle({ moduleBytes: encoder.encode("export default {};\n") }),
+    assets: await heldAssets(),
+    inspectModule: inspector({ outcome: "valid", exportedHandlers: [] }),
+  });
+  expect(projection.site.fetchHandler).toBe(false);
+  expect(projection.site.assets?.runWorkerFirst).toBe(false);
+  expect(projection.assets?.get("index.html")).toEqual(ASSET_BYTES);
+});
+
 test("refuses missing, wrong-UID, or modified held assets before code inspection", async () => {
   const held = await heldAssets();
   const spec = versionSpec({

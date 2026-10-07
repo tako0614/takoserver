@@ -5565,6 +5565,7 @@ function renderConfig(
         ${isStaticManifest(entry.manifest) ? '(name = "STATIC_ONLY", text = "true"),' : `(name = "WORKER", service = "${entry.name}"),`}
         (name = "ASSETS", service = "${entry.name}-assets"),
         (name = "RUN_WORKER_FIRST", text = "${assets.runWorkerFirst ? "true" : "false"}"),
+        ${!isStaticManifest(entry.manifest) && assets.strictPaths === true && entry.manifest.fetchHandler === false ? '(name = "FETCH_HANDLER", text = "false"),' : ""}
       ],
       compatibilityDate = "2026-01-01",
     )
@@ -6096,7 +6097,10 @@ function finalStaticMiss(request) {
 
 export default {
   async fetch(request, env) {
-    if (env.STATIC_ONLY === "true") {
+    // Bundle-backed Versions may declare no fetch handler. Asset hits still
+    // serve, but misses and other HTTP methods must not dispatch Worker fetch.
+    // Retained v1 code sites omit FETCH_HANDLER and keep their existing path.
+    if (env.STATIC_ONLY === "true" || env.FETCH_HANDLER === "false") {
       if (!assetMethod(request)) return finalStaticMiss(request);
       const asset = await env.ASSETS.fetch(request);
       if (isAssetMiss(asset)) return finalStaticMiss(request);

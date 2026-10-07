@@ -726,6 +726,7 @@ test("persists private asset routing order through reload and restart", async ()
   const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
   expect(config).toContain('(name = "RUN_WORKER_FIRST", text = "true")');
   expect(config).toContain('(name = "NOT_FOUND", text = "single-page-application")');
+  expect(config).not.toContain('(name = "FETCH_HANDLER", text = "false")');
   expect(config).toContain('(name = "site-asset-router", service = "site-asset-router")');
   const tenant = config
     .split(/^ {2}\( name = /mu)
@@ -743,6 +744,8 @@ test("persists opt-in strict code+asset paths without changing legacy code manif
       mainModule: "index.js",
       hostnames: ["v2.localhost"],
       generation: "v2-generation",
+      workerResourceUid: "v2-worker-uid",
+      fetchHandler: false,
       assets: {
         notFoundHandling: "none",
         runWorkerFirst: false,
@@ -761,6 +764,7 @@ test("persists opt-in strict code+asset paths without changing legacy code manif
   expect(await restarted.restore()).toEqual(["v2-code-assets"]);
   const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
   expect(config).toContain('(name = "STRICT_PATHS", text = "true")');
+  expect(config).toContain('(name = "FETCH_HANDLER", text = "false")');
   expect(config).toContain('(name = "WORKER", service = "v2-code-assets")');
 });
 
@@ -1058,6 +1062,50 @@ test("strict code+assets routes index paths and treats malformed lookup as worke
   const workerFirstWins = await router.fetch(new Request("https://v2.test/"), env);
   expect(await workerFirstWins.text()).toBe("worker response");
   expect(fileReads).toHaveLength(fileReadsBefore);
+});
+
+test("code+assets without declared fetch serves assets but never dispatches Worker fetch", async () => {
+  const assets = await generatedFetchWorker(ASSETS_SOURCE, "generated-v2-no-fetch-assets.mjs");
+  const router = await generatedFetchWorker(
+    ASSET_ROUTER_SOURCE,
+    "generated-v2-no-fetch-asset-router.mjs",
+  );
+  let workerCalls = 0;
+  const env = {
+    RUN_WORKER_FIRST: "false",
+    FETCH_HANDLER: "false",
+    ASSETS: {
+      async fetch(request: Request) {
+        return await assets.fetch(request, {
+          STRICT_PATHS: "true",
+          NOT_FOUND: "none",
+          ASSET_MANIFEST: { "index.html": { key: "asset-00000", mediaType: "text/html" } },
+          FILES: {
+            async fetch() {
+              return new Response("asset", { status: 200 });
+            },
+          },
+        });
+      },
+    },
+    WORKER: {
+      async fetch() {
+        workerCalls += 1;
+        return new Response("undeclared fetch", { status: 200 });
+      },
+    },
+  };
+  expect(await (await router.fetch(new Request("https://v2.test/"), env)).text()).toBe("asset");
+  for (const request of [
+    new Request("https://v2.test/missing"),
+    rawRequest("https://v2.test/a//b"),
+    new Request("https://v2.test/", { method: "POST" }),
+  ]) {
+    expect((await router.fetch(request, env)).status).toBe(404);
+  }
+  env.RUN_WORKER_FIRST = "true";
+  expect(await (await router.fetch(new Request("https://v2.test/"), env)).text()).toBe("asset");
+  expect(workerCalls).toBe(0);
 });
 
 test("rejects unusable asset routing before damaging the active publication", async () => {
