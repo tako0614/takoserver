@@ -108,6 +108,37 @@ audited 0001–0066 lineage and verifies its canonical schema, then creates the
 new R2 bucket. Creating the bucket last means older object operations cannot
 reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
 
+For a **new, empty integration generation only**, the same sole writer has one
+fixed v2 artifact payload. The selector is required on both the diagnostic
+status and the one-way apply; omitting it still means 0001–0066:
+
+```sh
+bun run deploy -- takoserver-integration-storage-generation --status --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-artifacts-0075
+bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-artifacts-0075
+```
+
+This imports the exact audited 0001–0075 bytes only after a new D1 UUID/name
+and empty schema/ledger are read back, then verifies every application table,
+index and trigger against the sealed source before R2 creation. A selected
+generated target can be checked read-only with the separate exact-0075 v2
+artifact verifier; the existing v1 target verifier, in-place apply ceiling
+0066, fresh production ceiling 0069, and rehearsal create-only path do not
+change. This source path does not bind a Worker or authorize a live migration.
+An existing D1, even if empty, is never adopted.
+The operator-private target selects the candidate for that verifier; its
+current identity/schema proof is not historical proof of who created the D1.
+Retain the generation apply output as operator-private provenance.
+
+After a lost import acknowledgement or partial failure, never rerun `--apply`
+or mint a different generation as a retry. Selected `--status` reads the exact
+generated name/UUID and reports whether its ledger and canonical schema are
+complete 0075 or incomplete/divergent. It is diagnosis, not proof that the
+operator's earlier create owned that D1: correlate the original bounded
+database ID and source digest. Complete readback permits a separately reviewed
+forward continuation (for example, a missing R2); incomplete/divergent or
+unreadable state remains quarantined for owner-reviewed repair. Neither status
+nor this surface performs a second SQL import.
+
 Disposal is a separate, one-way operation for an exact target-selected pair:
 
 ```sh
@@ -305,6 +336,22 @@ readback, the normal source-declared cron schedule and a successful public
 product probe. Cleanup failures are reported explicitly; a failed cleanup must
 not be treated as proof that temporary secret material was removed. Later updates and secret
 changes use their existing lifecycle surfaces.
+
+An explicitly selected `takoformV2` integration target follows this **same**
+first-publication writer, not a second Host uploader. Its D1/R2 must be the
+exact generated `takoserver-i-<generation>` pair with the complete fixed
+0001–0075 migration ledger and every application schema object. That proof is
+read before upload, at the immediate upload fence, and after the acknowledged
+Version; identity, source digest, lineage and schema digest must stay equal.
+The v2 cursor key is an operator-private file named
+`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY` in the same exact secret directory. Apply
+validates the real key bytes with the selected public v2 config, seals it with
+the other required secrets, and sends one `--secrets-file` upload; it never
+generates, logs or returns key bytes. For an absent v2 Worker, status reports
+`state: not_published`, `ready: false`, and separate `nativeCreateEligible` /
+`storageQualified` booleans; native absence alone is not serving readiness.
+The default non-v2 bootstrap stays fixed at 0001–0066, and an existing or
+partially published Worker is never adopted by either path.
 
 The integration JIT credential authority instead accepts exactly one of
 `--issue`, `--status`, or `--revoke` through that same entrypoint, and the
@@ -875,7 +922,19 @@ The routine surfaces are:
 - `takoserver-worker`: one Worker code publication. Before any live read or
   upload it composes the selected target with the Worker's own startup path and
   refuses with that composition's exact words, so a target that parses and yet
-  cannot serve never reaches an upload. Every environment requires
+  cannot serve never reaches an upload. A serving apply requires
+  an explicit operator-private `takoformV2.config`. This
+  field holds the exact non-secret JSON accepted by the Worker's v2 startup
+  parser; realization copies those bytes into
+  `TAKOSERVER_TAKOFORM_V2_CONFIG`. The separately installed, stable
+  `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY` is inventoried by name only, never
+  generated, read into target data, or printed by deploy. The first v2 serving
+  composition is integration-only and requires the exact generated 0075 D1/R2
+  storage proof before publication and after readback, including an empty
+  artifact source map. A legacy `--status` remains read-only; explicit
+  maintenance profiles remain separate and do not claim v2 readiness. An
+  initial legacy 0066 storage bootstrap is not silently upgraded into 0075.
+  Every environment requires
   the resolved direct-REST credential path. In integration, an absent explicit
   token uses the exact Wrangler OAuth JSON resolver; its bearer is held only in
   process for the direct REST reader, while every Wrangler child gets no token

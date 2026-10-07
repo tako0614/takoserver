@@ -16,6 +16,8 @@ export interface V2ApplicationConfig {
   readonly staticAssetBundle?: V2HeldArtifactBackendConfig;
 }
 
+export type V2ApplicationPublicConfig = Omit<V2ApplicationConfig, "cursorSigningKey">;
+
 export interface V2HeldArtifactBackendConfig {
   readonly targetKey: string;
   readonly heldArtifacts: readonly V2HeldArtifactEntry[];
@@ -57,6 +59,14 @@ export function parseTakoformV2ApplicationConfig(
     throw new V2ApplicationConfigError("invalid_cursor_key");
   }
 
+  return { cursorSigningKey: new Uint8Array(cursorKey), ...parseTakoformV2PublicConfig(json) };
+}
+
+/** Parse only the exact non-secret JSON that deploy may realize as a plain-text binding. */
+export function parseTakoformV2PublicConfig(json: string): V2ApplicationPublicConfig {
+  if (typeof json !== "string" || json.length === 0) {
+    throw new V2ApplicationConfigError("missing_configuration");
+  }
   let parsed: unknown;
   try {
     if (json.length > MAX_CONFIG_BYTES) throw new StrictJsonError();
@@ -93,7 +103,6 @@ export function parseTakoformV2ApplicationConfig(
     staticAssetBundle = parseHeldArtifactBackendConfig(record.staticAssetBundle);
   }
   return {
-    cursorSigningKey: new Uint8Array(cursorKey),
     documentation: record.documentation,
     authenticationDocumentation: record.authenticationDocumentation,
     ...(sqliteMigrationSet ? { sqliteMigrationSet } : {}),

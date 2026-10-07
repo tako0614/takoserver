@@ -300,7 +300,7 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
     environment: "TAKOSERVER_V2_ENTRY_NATIVE",
     companionEnvironment: [],
     proves:
-      "two configured Bun entry process boots after an Accounts bootstrap boot against the same local SQLite database and FileObjectStore, with settled Resource readback and terminal Operation replay after restart and operator-held source deletion, followed by Takoform v2 SQLiteMigrationSet update/delete over loopback HTTP behind a configured HTTPS authority; it does not prove public TLS, Hosted/D1 execution, or forced lost-ACK recovery",
+      "actual Bun entry processes against the same local SQLite database and FileObjectStore: graceful restart and a separate SIGKILL after a durable nonterminal artifact checkpoint, same-key Operation replay, held-source removal, artifact Resource update/delete, staging cleanup and exact foreign-organization custody bytes over loopback HTTP behind a configured HTTPS authority; the crash test receives 202 headers before discarding response body and returned IDs, not loss of all response headers or TCP acknowledgement; it does not prove public TLS, Hosted/D1 execution, native Worker execution or host reboot",
     enable: "TAKOSERVER_V2_ENTRY_NATIVE=1 with Bun and isolated local test state",
     inspect: (configured) => {
       if (configured === undefined || configured.trim() === "") {

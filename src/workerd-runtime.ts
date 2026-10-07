@@ -725,6 +725,7 @@ const APPLICATION_COMPATIBILITY_FLAGS = ["disallow_importable_env"] as const;
  * after the customer routes so a claimed custom domain cannot capture it.
  */
 const INTERNAL_ROUTE_SUFFIX = ".selfhost-internal.invalid";
+const INTERNAL_HOST_DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 /**
  * The hostname this Host delivers a script's events on.
  *
@@ -3874,7 +3875,14 @@ export function internalHostname(script: string): string {
   if (!/^[a-z0-9][a-z0-9_-]{0,127}$/u.test(script)) {
     throw new Error(`unusable script name: ${script}`);
   }
-  return `${script}${INTERNAL_ROUTE_SUFFIX}`;
+  if (script.length <= 63 && INTERNAL_HOST_DNS_LABEL.test(script)) {
+    return `${script}${INTERNAL_ROUTE_SUFFIX}`;
+  }
+  const digest = createHash("sha256").update(script, "utf8").digest("hex");
+  // Accepted internal script names are single labels. This reserved two-label
+  // alias is therefore disjoint from every legacy hostname while remaining
+  // stable and collision-resistant without changing the script/path identity.
+  return `v2-${digest.slice(0, 32)}.${digest.slice(32)}${INTERNAL_ROUTE_SUFFIX}`;
 }
 
 /** The hostname a queue batch or a cron match is delivered on. */

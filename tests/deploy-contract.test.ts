@@ -589,6 +589,16 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(accepted.exitCode).toBe(2);
       expect(accepted.stderr).toContain("deploy target descriptor not found");
       expect(accepted.stderr).not.toContain("no target was touched");
+      const selected = await deploy([
+        surface,
+        action,
+        "--environment=integration",
+        commit,
+        generation,
+        "--fresh-lineage=v2-artifacts-0075",
+      ]);
+      expect(selected.stderr).toContain("deploy target descriptor not found");
+      expect(selected.stderr).not.toContain("no target was touched");
     }
     const malformed = [
       "",
@@ -616,6 +626,28 @@ describe("Takoserver split deploy entrypoint", () => {
         generation,
       ]),
       ...extras.map((extra) => [...base, generation, extra]),
+      [...base, generation, "--fresh-lineage=v2-artifacts-0074"],
+      [
+        ...base,
+        generation,
+        "--fresh-lineage=v2-artifacts-0075",
+        "--fresh-lineage=v2-artifacts-0075",
+      ],
+      [
+        surface,
+        "--apply",
+        "--environment=production",
+        commit,
+        generation,
+        "--fresh-lineage=v2-artifacts-0075",
+      ],
+      [
+        "takoserver-worker",
+        "--status",
+        "--environment=integration",
+        commit,
+        "--fresh-lineage=v2-artifacts-0075",
+      ],
       ["takoserver-worker", "--status", "--environment=integration", commit, generation],
       [
         "takoserver-org-api-key",

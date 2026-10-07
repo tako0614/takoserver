@@ -1,6 +1,8 @@
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { canonicalJson } from "../../src/json.ts";
+import { parseTakoformV2ApplicationConfig } from "../../src/takoform-v2/config.ts";
 import { probeArtifactBlobIoQuiescence } from "./artifact-blob-io-compatibility.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
@@ -8,6 +10,7 @@ import { type DeployPhase, mutationError, preflightError, verificationError } fr
 import {
   type IntegrationStorageGenerationTargetProof,
   type IntegrationStorageGenerationTargetVerificationOptions,
+  verifyFreshV2ArtifactIntegrationStorageTarget,
   verifyIntegrationStorageGenerationTarget,
 } from "./integration-storage-generation.ts";
 import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
@@ -152,6 +155,18 @@ export async function runWorkerClosureTransition(
     throw preflightError("closure predecessor Version ID must be one exact UUID");
   }
   const delta = normalizedWorkerClosureDelta(invocation.delta);
+  if (target.takoformV2 !== undefined) {
+    if (invocation.environment !== "integration") {
+      throw preflightError("v2 Worker closure transition is integration-only");
+    }
+    const addsConfig = delta.addedVars.includes("TAKOSERVER_TAKOFORM_V2_CONFIG");
+    const addsCursorKey = delta.addedSecrets.includes("TAKOSERVER_TAKOFORM_V2_CURSOR_KEY");
+    if (addsConfig !== addsCursorKey) {
+      throw preflightError(
+        "v2 Worker startup config and cursor secret must be added in one closure transition",
+      );
+    }
+  }
   assertStorageRebindIntegrationOnly("preflight", invocation.environment, delta);
   assertServiceBindingRefreshIntegrationOnly("preflight", invocation.environment, delta);
   if (workerClosureDeltaIsEmpty(delta)) {
@@ -176,9 +191,9 @@ export async function runWorkerClosureTransition(
   // correction composes before it can be uploaded.
   await assertTargetComposes("preflight", target);
   const initialStorageProof =
-    delta.storageRebind === undefined
+    delta.storageRebind === undefined && target.takoformV2 === undefined
       ? null
-      : await verifyIntegrationStorageGenerationTarget(target, invocation.environment, {
+      : await selectedStorageVerifier(target)(target, invocation.environment, {
           ...options.integrationStorageVerification,
           run,
           ...(options.cloudflareEnvironment === undefined
@@ -331,6 +346,21 @@ export async function runWorkerClosureTransition(
             options.secretDirectory ?? requireEnvironment(CLOSURE_SECRET_DIRECTORY_ENV),
             secretNames,
           );
+    if (
+      target.takoformV2 !== undefined &&
+      secretNames.includes("TAKOSERVER_TAKOFORM_V2_CURSOR_KEY")
+    ) {
+      try {
+        parseTakoformV2ApplicationConfig({
+          TAKOSERVER_TAKOFORM_V2_CONFIG: target.takoformV2.config,
+          TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: secretValues.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY,
+        });
+      } catch {
+        throw preflightError(
+          "v2 Worker cursor secret input is invalid; the closure transition was not uploaded",
+        );
+      }
+    }
     const source = await qualifySource({
       environment: invocation.environment === "integration" ? "integration" : "production",
       commit: invocation.commit,
@@ -458,7 +488,7 @@ export async function runWorkerClosureTransition(
       throw preflightError("D1 migration lineage changed before the closure transition upload");
     }
     if (initialStorageProof !== null) {
-      const finalStorageProof = await verifyIntegrationStorageGenerationTarget(
+      const finalStorageProof = await selectedStorageVerifier(target)(
         target,
         invocation.environment,
         {
@@ -535,6 +565,32 @@ export async function runWorkerClosureTransition(
         providerExecutorAfter,
         "verification",
       );
+    }
+    if (initialStorageProof !== null) {
+      const servedStorageProof = await selectedStorageVerifier(target)(
+        target,
+        invocation.environment,
+        {
+          ...options.integrationStorageVerification,
+          run,
+          ...(options.cloudflareEnvironment === undefined
+            ? {}
+            : { cloudflareEnvironment: options.cloudflareEnvironment }),
+          migrationDirectory:
+            options.integrationStorageVerification?.migrationDirectory ??
+            resolve(sourceRepositoryRoot, "migrations"),
+          ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+        },
+      ).catch(() => {
+        throw verificationError(
+          "closure transition storage readback no longer proves selected generated schema",
+        );
+      });
+      if (canonicalJson(initialStorageProof) !== canonicalJson(servedStorageProof)) {
+        throw verificationError(
+          "generated integration storage target or schema changed after closure transition",
+        );
+      }
     }
     const probe =
       target.schemaMaintenanceMode === "pre-0058-quiesced"
@@ -767,11 +823,17 @@ function assertIntegrationStorageProofUnchanged(
   before: IntegrationStorageGenerationTargetProof,
   after: IntegrationStorageGenerationTargetProof,
 ): void {
-  if (JSON.stringify(before) !== JSON.stringify(after)) {
+  if (canonicalJson(before) !== canonicalJson(after)) {
     throw preflightError(
       "generated integration storage target or schema changed before publication",
     );
   }
+}
+
+function selectedStorageVerifier(target: DeployTarget) {
+  return target.takoformV2 === undefined
+    ? verifyIntegrationStorageGenerationTarget
+    : verifyFreshV2ArtifactIntegrationStorageTarget;
 }
 
 function expectedClosureTransitionSecrets(

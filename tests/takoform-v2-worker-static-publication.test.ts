@@ -6,10 +6,16 @@ import { join } from "node:path";
 import { bytesDigest } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject } from "../src/ports.ts";
+import type {
+  WorkerModuleInspectionInput,
+  WorkerModuleInspectionResult,
+} from "../src/providers/worker-module-semantic-inspection.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { createStaticAssetBundleHost } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
+import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
+import { createWorkerBundleHost } from "../src/takoform-v2/forms/worker-bundle-backend.ts";
 import { referencesForWorkerVersion } from "../src/takoform-v2/forms/worker-references.ts";
 import {
   MODULE_WORKER_FORM_URL,
@@ -21,10 +27,11 @@ import {
 import { createV2Store } from "../src/takoform-v2/store.ts";
 import type { V2Backend, V2Execution, V2Form } from "../src/takoform-v2/types.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
-import { createV2StaticWorkerPublication } from "../src/takoform-v2/worker-static-publication.ts";
+import { createV2WorkerPublication } from "../src/takoform-v2/worker-static-publication.ts";
 import type {
   WorkerdDeploymentPublication,
   WorkerdPublicationIdentity,
+  WorkerdSite,
   WorkerdStaticSite,
 } from "../src/workerd-runtime.ts";
 
@@ -32,6 +39,11 @@ const TARGET_KEY = "fixture-worker-static-publication";
 const MANIFEST_URL = "https://artifacts.example.test/site/manifest.json";
 const FILE_URL = "https://artifacts.example.test/site/index.html";
 const ASSET_BYTES = new TextEncoder().encode("<main>verified static content</main>");
+const CODE_MANIFEST_URL = "https://artifacts.example.test/code/manifest.json";
+const CODE_FILE_URL = "https://artifacts.example.test/code/src/index.mjs";
+const CODE_MODULE_BYTES = new TextEncoder().encode(
+  "export default { fetch(_request, env) { return new Response(env.LABEL); } };\n",
+);
 
 function setup(runtime = fencedRuntime()) {
   const root = mkdtempSync(join(tmpdir(), "v2-static-publication-"));
@@ -64,6 +76,22 @@ function setup(runtime = fencedRuntime()) {
         return manifestBytes;
       }
       if (url === FILE_URL) return ASSET_BYTES;
+      if (url === CODE_MANIFEST_URL) {
+        return new TextEncoder().encode(
+          JSON.stringify({
+            entrypoint: "src/index.mjs",
+            files: [
+              {
+                path: "src/index.mjs",
+                url: CODE_FILE_URL,
+                sha256: await digest(CODE_MODULE_BYTES),
+                mediaType: "application/javascript+module",
+              },
+            ],
+          }),
+        );
+      }
+      if (url === CODE_FILE_URL) return CODE_MODULE_BYTES;
       throw new Error("unexpected fixture URL");
     },
   };
@@ -72,10 +100,12 @@ function setup(runtime = fencedRuntime()) {
     source: assetSource,
     targetKey: TARGET_KEY,
   });
+  const bundleHost = createWorkerBundleHost({ sql, source: assetSource, targetKey: TARGET_KEY });
   const publicationState = createV2WorkerPublicationState({
     sql,
     now,
     assetCustody: assetHost.custody,
+    bundleCustody: bundleHost.custody,
   });
   const ordinaryBackend: V2Backend = {
     id: "fixture-v2-worker-support-v1",
@@ -85,7 +115,13 @@ function setup(runtime = fencedRuntime()) {
         kind: "complete" as const,
         observed:
           input.form === WORKER_VERSION_FORM_URL
-            ? { ready: true, resolvedBindings: true }
+            ? {
+                ready: true,
+                resolvedBindings: true,
+                ...(typeof input.spec.bundle === "object" && input.spec.bundle !== null
+                  ? { bundleVerified: true }
+                  : {}),
+              }
             : input.form === WORKER_ENDPOINT_FORM_URL
               ? { tlsReady: true, activeDeploymentRouteReady: true }
               : { ready: true },
@@ -105,6 +141,7 @@ function setup(runtime = fencedRuntime()) {
   const forms = {
     [MODULE_WORKER_FORM_URL]: form(),
     [STATIC_ASSET_BUNDLE_FORM_URL]: assetHost.form,
+    [WORKER_BUNDLE_FORM_URL]: bundleHost.form,
     [WORKER_VERSION_FORM_URL]: form({
       references(spec) {
         return referencesForWorkerVersion(parseWorkerVersionSpec(spec));
@@ -150,7 +187,7 @@ function setup(runtime = fencedRuntime()) {
     authorize: async () => true,
     forms,
   });
-  const publication = createV2StaticWorkerPublication({
+  const publication = createV2WorkerPublication({
     targetKey: TARGET_KEY,
     publicationState,
     runtime,
@@ -219,16 +256,28 @@ function setup(runtime = fencedRuntime()) {
 
 function fencedRuntime(initial: WorkerdPublicationIdentity | null = null) {
   let identity = initial;
-  let publication: WorkerdDeploymentPublication<WorkerdStaticSite> | null = null;
+  let publication: WorkerdDeploymentPublication<WorkerdSite | WorkerdStaticSite> | null = null;
   let publishCalls = 0;
   let observe: "factual" | "unknown" = "factual";
   let fenceCurrent = true;
+  let inspection: WorkerModuleInspectionResult = {
+    outcome: "valid",
+    exportedHandlers: ["fetch"],
+  };
+  let inspectionBehavior:
+    | ((input: WorkerModuleInspectionInput) => Promise<WorkerModuleInspectionResult>)
+    | undefined;
+  const inspected: WorkerModuleInspectionInput[] = [];
   const runtime = {
+    async inspectModule(input: WorkerModuleInspectionInput) {
+      inspected.push(input);
+      return inspectionBehavior ? await inspectionBehavior(input) : inspection;
+    },
     async publishFenced(
       _name: string,
       resolve: (
         current: WorkerdPublicationIdentity | null,
-      ) => Promise<WorkerdDeploymentPublication<WorkerdStaticSite> | null>,
+      ) => Promise<WorkerdDeploymentPublication<WorkerdSite | WorkerdStaticSite> | null>,
       isFenceCurrent: () => Promise<boolean>,
     ) {
       // Match WorkerdRuntime's actual ordering: both pre-resolution checks
@@ -282,6 +331,17 @@ function fencedRuntime(initial: WorkerdPublicationIdentity | null = null) {
     setFenceCurrent(value: boolean) {
       fenceCurrent = value;
     },
+    setInspection(value: WorkerModuleInspectionResult) {
+      inspection = value;
+    },
+    setInspectionBehavior(
+      value: (input: WorkerModuleInspectionInput) => Promise<WorkerModuleInspectionResult>,
+    ) {
+      inspectionBehavior = value;
+    },
+    get inspected() {
+      return inspected;
+    },
     setCurrent(value: WorkerdPublicationIdentity | null) {
       identity = value;
     },
@@ -298,7 +358,7 @@ function fencedRuntime(initial: WorkerdPublicationIdentity | null = null) {
   return runtime;
 }
 
-async function deploymentFixture(f: ReturnType<typeof setup>) {
+async function deploymentFixture(f: ReturnType<typeof setup>, includeCode = false) {
   const worker = await f.create(MODULE_WORKER_FORM_URL, "worker", {});
   const assetDigest = await bytesDigest(
     new TextEncoder().encode(
@@ -326,16 +386,52 @@ async function deploymentFixture(f: ReturnType<typeof setup>) {
       notFoundHandling: "single_page_application",
     },
   });
+  const versions = [
+    {
+      workerVersion: { resourceUid: version.resourceUid },
+      weight: includeCode ? 5_000 : 10_000,
+    },
+  ];
+  let bundle: { resourceUid: string } | undefined;
+  let codeVersion: { resourceUid: string } | undefined;
+  if (includeCode) {
+    const manifestBytes = new TextEncoder().encode(
+      JSON.stringify({
+        entrypoint: "src/index.mjs",
+        files: [
+          {
+            path: "src/index.mjs",
+            url: CODE_FILE_URL,
+            sha256: await bytesDigest(CODE_MODULE_BYTES).then((value) => value.slice(7)),
+            mediaType: "application/javascript+module",
+          },
+        ],
+      }),
+    );
+    bundle = await f.create(WORKER_BUNDLE_FORM_URL, "bundle", {
+      artifact: {
+        url: CODE_MANIFEST_URL,
+        sha256: await bytesDigest(manifestBytes).then((value) => value.slice(7)),
+      },
+    });
+    codeVersion = await f.create(WORKER_VERSION_FORM_URL, "code-version", {
+      worker: { resourceUid: worker.resourceUid },
+      bundle: { resourceUid: bundle.resourceUid },
+      handlers: ["fetch"],
+      vars: { LABEL: "code-v2" },
+    });
+    versions.push({ workerVersion: { resourceUid: codeVersion.resourceUid }, weight: 5_000 });
+  }
   await f.create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
     worker: { resourceUid: worker.resourceUid },
   });
   f.disableSource();
   const spec = {
     worker: { resourceUid: worker.resourceUid },
-    versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    versions,
   };
   const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", spec, false);
-  return { worker, asset, version, deployment, spec };
+  return { worker, asset, version, bundle, codeVersion, deployment, spec };
 }
 
 test("publishes accepted static Worker material through the fenced runtime and reconciles exact readback", async () => {
@@ -374,6 +470,85 @@ test("publishes accepted static Worker material through the fenced runtime and r
     expect(runtime.publishCalls).toBe(1);
   } finally {
     f.close();
+  }
+});
+
+test("publishes mixed static and fetch-code Versions atomically and recovers unknown ACK without rewriting", async () => {
+  const runtime = fencedRuntime();
+  const f = setup(runtime);
+  try {
+    const { worker, version, codeVersion, deployment } = await deploymentFixture(f, true);
+    if (!codeVersion) throw new Error("code Version fixture missing");
+    const execution = await f.execution(deployment.id);
+    runtime.setObserve("unknown");
+
+    expect(await f.publication.publish(execution)).toMatchObject({ kind: "unknown" });
+    expect(runtime.publishCalls).toBe(1);
+    expect(runtime.publication?.versions).toHaveLength(2);
+    const staticVariant = runtime.publication?.versions.find(
+      (variant) => variant.workerVersionUid === version.resourceUid,
+    );
+    const codeVariant = runtime.publication?.versions.find(
+      (variant) => variant.workerVersionUid === codeVersion.resourceUid,
+    );
+    expect(staticVariant).toMatchObject({ weight: 5_000, site: { kind: "static" } });
+    expect(staticVariant?.assets?.get("index.html")).toEqual(ASSET_BYTES);
+    expect(codeVariant).toMatchObject({
+      weight: 5_000,
+      site: {
+        fetchHandler: true,
+        mainModule: "src/index.mjs",
+        vars: [{ name: "LABEL", value: '"code-v2"', kind: "json" }],
+      },
+    });
+    expect(codeVariant?.modules.get("src/index.mjs")).toEqual(CODE_MODULE_BYTES);
+    expect(runtime.inspected).toHaveLength(2);
+    expect(runtime.inspected[0]?.declaredHandlers).toEqual(["fetch"]);
+    expect(runtime.inspected[0]?.modules[0]?.bytes).toEqual(CODE_MODULE_BYTES);
+
+    runtime.setObserve("factual");
+    const recovered = await f.publication.observe(execution);
+    expect(recovered).toMatchObject({ kind: "confirmed", deferRetirementUntilDeadline: true });
+    expect(runtime.publishCalls).toBe(1);
+    expect(await f.publication.publish(execution)).toEqual(recovered);
+    expect(runtime.publishCalls).toBe(1);
+    expect(recovered.kind === "confirmed" && recovered.identity?.workerResourceUid).toBe(
+      worker.resourceUid,
+    );
+  } finally {
+    f.close();
+  }
+});
+
+test("code inspection failure and a changed acceptance fence never dispatch the mixed graph", async () => {
+  const failedRuntime = fencedRuntime();
+  failedRuntime.setInspection({ outcome: "unavailable", retryable: true });
+  const failed = setup(failedRuntime);
+  try {
+    const { deployment } = await deploymentFixture(failed, true);
+    expect(await failed.publication.publish(await failed.execution(deployment.id))).toMatchObject({
+      kind: "not_dispatched",
+      code: "worker_material_unavailable",
+    });
+    expect(failedRuntime.publishCalls).toBe(0);
+  } finally {
+    failed.close();
+  }
+
+  const staleRuntime = fencedRuntime();
+  const stale = setup(staleRuntime);
+  try {
+    const { deployment } = await deploymentFixture(stale, true);
+    staleRuntime.setInspectionBehavior(async () => {
+      staleRuntime.setFenceCurrent(false);
+      return { outcome: "valid", exportedHandlers: ["fetch"] };
+    });
+    expect(await stale.publication.publish(await stale.execution(deployment.id))).toMatchObject({
+      kind: "unknown",
+    });
+    expect(staleRuntime.publishCalls).toBe(0);
+  } finally {
+    stale.close();
   }
 });
 

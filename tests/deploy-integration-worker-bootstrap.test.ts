@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
+import type { IntegrationStorageGenerationTargetVerificationOptions } from "../scripts/deploy/integration-storage-generation.ts";
 import {
   type IntegrationWorkerBootstrapOptions,
   type IntegrationWorkerBootstrapSchemaReader,
@@ -26,6 +27,7 @@ import type {
   WranglerLifecycleDeployment,
   WranglerVersionPublicationLease,
 } from "../scripts/deploy/wrangler-state.ts";
+import { MIGRATIONS } from "../src/db-schema.ts";
 import {
   applyQualifiedMigrationNames,
   copyCurrentSchemaFixture,
@@ -95,6 +97,31 @@ const APPLIED = applyQualifiedMigrationNames();
 const EXPECTED_SHAPE = applicationShape(join(sourceRoot, "migrations"), APPLIED);
 const COMPLETE_SCHEMA = schemaState(APPLIED, EXPECTED_SHAPE);
 const WRONG_SCHEMA = schemaState(APPLIED, "[]\n");
+const V2_APPLIED = MIGRATIONS.map(({ name }) => name);
+const COMPLETE_V2_SCHEMA = schemaState(
+  V2_APPLIED,
+  applicationShape(join(sourceRoot, "migrations"), V2_APPLIED),
+);
+const WRONG_V2_SCHEMA = schemaState(V2_APPLIED, "[]\n");
+const V2_SCHEMA_WITH_SQL_TRIVIA = (() => {
+  const rows = JSON.parse(COMPLETE_V2_SCHEMA.shape) as Array<{
+    type: string;
+    name: string;
+    table: string;
+    sql: string;
+  }>;
+  return schemaState(
+    V2_APPLIED,
+    canonicalSchemaShape(
+      rows.map((row, index) => ({
+        type: row.type,
+        name: row.name,
+        tbl_name: row.table,
+        sql: index === 0 ? `${row.sql} /* equivalent readback trivia */` : row.sql,
+      })),
+    ),
+  );
+})();
 
 const keyMaterial = makeKeyMaterial();
 const signingRow: SigningPublicKeyRow = {
@@ -123,6 +150,23 @@ const cpeTarget = {
   objectBucketSupplies: objectBucketSuppliesFixture(),
   edgeSupplies: edgeSuppliesFixture(),
   cloudflareProviderExecutor: cloudflareProviderExecutorTarget(),
+} satisfies DeployTarget;
+
+const V2_GENERATION = "d".repeat(32);
+const v2Target = {
+  ...target,
+  d1: {
+    databaseName: `takoserver-i-${V2_GENERATION}`,
+    databaseId: "00000000-0000-4000-8000-000000000075",
+  },
+  r2: { bucketName: `takoserver-i-${V2_GENERATION}` },
+  takoformV2: {
+    config: JSON.stringify({
+      documentation: "https://docs.example.test/v2",
+      authenticationDocumentation: "https://docs.example.test/v2/authentication",
+      sqliteMigrationSet: { targetKey: "test-sqlite", heldArtifacts: [] },
+    }),
+  },
 } satisfies DeployTarget;
 
 const runtimeInputSealKeyring = JSON.stringify({
@@ -397,6 +441,140 @@ describe("Takoserver integration Worker bootstrap", () => {
     rmSync(secretDirectory, { recursive: true, force: true });
   });
 
+  test("v2 absent status separates native create eligibility from exact 0075 storage qualification", async () => {
+    const fixture = bootstrapFixture({ target: v2Target });
+    const input = {
+      run: fixture.run,
+      state: fixture.state,
+      sourceRepositoryRoot: sourceRoot,
+      v2StorageVerification: v2StorageOptions(v2Target),
+    } satisfies IntegrationWorkerBootstrapOptions;
+    const ready = await runIntegrationWorkerBootstrap(
+      { action: "status", environment: "integration", commit: COMMIT },
+      v2Target,
+      input,
+    );
+    expect(ready).toMatchObject({
+      state: "not_published",
+      ready: false,
+      nativeCreateEligible: true,
+      storageQualified: true,
+      mutationApplied: false,
+    });
+    const stale = await runIntegrationWorkerBootstrap(
+      { action: "status", environment: "integration", commit: COMMIT },
+      v2Target,
+      { ...input, v2StorageVerification: v2StorageOptions(v2Target, async () => WRONG_V2_SCHEMA) },
+    );
+    expect(stale).toMatchObject({ ready: false, storageQualified: false });
+    expect(fixture.lifecycleCalls).toHaveLength(0);
+    expect(fixture.commands).toHaveLength(0);
+  });
+
+  test("v2 first publication keeps complete 0075 proof and real cursor key in one sealed secret upload", async () => {
+    const fixture = bootstrapFixture({ target: v2Target });
+    const secretDirectory = writeSecretDirectory(v2Target);
+    try {
+      const result = await apply(fixture, { secretDirectory });
+      expect(result).toMatchObject({
+        mutationApplied: true,
+        appliedMigrations: V2_APPLIED,
+      });
+      expect(fixture.lifecycleCalls).toHaveLength(1);
+      expect(fixture.lifecycleSecrets).toEqual({
+        TAKOSERVER_SIGNING_KEY: keyMaterial.privateRaw,
+        TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: Buffer.alloc(32, 9).toString("base64url"),
+      });
+      expect(fixture.configContents).toContain("TAKOSERVER_TAKOFORM_V2_CONFIG");
+      expect(fixture.secretFileSeen && existsSync(fixture.secretFileSeen)).toBe(false);
+    } finally {
+      rmSync(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("v2 bootstrap refuses missing 0075 or malformed real cursor secret before upload", async () => {
+    const stale = bootstrapFixture({ target: v2Target });
+    const secretDirectory = writeSecretDirectory(v2Target);
+    try {
+      await expect(
+        apply(stale, {
+          secretDirectory,
+          v2StorageVerification: v2StorageOptions(v2Target, async () => COMPLETE_SCHEMA),
+        }),
+      ).rejects.toThrow("0001-0075 lineage");
+      expect(stale.lifecycleCalls).toHaveLength(0);
+
+      writeFileSync(join(secretDirectory, "TAKOSERVER_TAKOFORM_V2_CURSOR_KEY"), "invalid", {
+        mode: 0o600,
+      });
+      const malformed = bootstrapFixture({ target: v2Target });
+      await expect(apply(malformed, { secretDirectory })).rejects.toThrow(
+        "v2 Host cursor secret does not satisfy",
+      );
+      expect(malformed.lifecycleCalls).toHaveLength(0);
+    } finally {
+      rmSync(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("v2 storage drift at immediate fence or final readback cannot be called a successful bootstrap", async () => {
+    for (const driftAt of [2, 3]) {
+      const fixture = bootstrapFixture({ target: v2Target });
+      const secretDirectory = writeSecretDirectory(v2Target);
+      let reads = 0;
+      try {
+        const error = await rejectedError(
+          apply(fixture, {
+            secretDirectory,
+            v2StorageVerification: v2StorageOptions(v2Target, async () => {
+              reads += 1;
+              return reads >= driftAt ? WRONG_V2_SCHEMA : COMPLETE_V2_SCHEMA;
+            }),
+          }),
+        );
+        expect(error).toBeInstanceOf(DeployError);
+        expect(fixture.lifecycleCalls).toHaveLength(1);
+        expect(fixture.uploaded).toBe(driftAt === 3);
+      } finally {
+        rmSync(secretDirectory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("v2 rejects a different valid schema proof before upload even when SQL trivia is tolerated", async () => {
+    const fixture = bootstrapFixture({ target: v2Target });
+    const secretDirectory = writeSecretDirectory(v2Target);
+    let reads = 0;
+    try {
+      await expect(
+        apply(fixture, {
+          secretDirectory,
+          v2StorageVerification: v2StorageOptions(v2Target, async () => {
+            reads += 1;
+            return reads === 1 ? COMPLETE_V2_SCHEMA : V2_SCHEMA_WITH_SQL_TRIVIA;
+          }),
+        }),
+      ).rejects.toThrow("v2 artifact storage identity, lineage or schema changed");
+      expect(fixture.lifecycleCalls).toHaveLength(1);
+      expect(fixture.uploaded).toBe(false);
+    } finally {
+      rmSync(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("v2 lost first-upload acknowledgement is not retried or adopted", async () => {
+    const fixture = bootstrapFixture({ target: v2Target, lostAcknowledgement: true });
+    const secretDirectory = writeSecretDirectory(v2Target);
+    try {
+      await expect(apply(fixture, { secretDirectory })).rejects.toThrow();
+      expect(fixture.lifecycleCalls).toHaveLength(1);
+      await expect(apply(fixture, { secretDirectory })).rejects.toThrow("never adopted");
+      expect(fixture.lifecycleCalls).toHaveLength(1);
+    } finally {
+      rmSync(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
   test("retains a qualified CPE keyring in memory and carries it only in the exact secret closure", async () => {
     const fixture = bootstrapFixture({ target: cpeTarget, provider: providerQualification() });
     const secretDirectory = writeSecretDirectory(cpeTarget, runtimeInputSealKeyring);
@@ -665,8 +843,12 @@ function bootstrapFixture(options: FixtureOptions): BootstrapFixture {
     async read() {
       return options.schemaMode === "wrong" ||
         (control.postAckDrift === "schema" && control.published)
-        ? WRONG_SCHEMA
-        : COMPLETE_SCHEMA;
+        ? target.takoformV2 === undefined
+          ? WRONG_SCHEMA
+          : WRONG_V2_SCHEMA
+        : target.takoformV2 === undefined
+          ? COMPLETE_SCHEMA
+          : COMPLETE_V2_SCHEMA;
     },
   };
   const signingDatabase: Pick<SigningDatabase, "readKey"> = {
@@ -810,6 +992,9 @@ async function apply(
       cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
       review: "independent-reviewer",
       fetcher: publishedProductFetcher(fixture.target),
+      ...(fixture.target.takoformV2 === undefined
+        ? {}
+        : { v2StorageVerification: v2StorageOptions(fixture.target) }),
       ...extra,
     },
   );
@@ -826,8 +1011,28 @@ async function readPublishedStatus(fixture: BootstrapFixture): Promise<Record<st
       schemaReader: fixture.schemaReader,
       signingDatabase: fixture.signingDatabase,
       r2Identity: fixture.r2Identity,
+      ...(fixture.target.takoformV2 === undefined
+        ? {}
+        : { v2StorageVerification: v2StorageOptions(fixture.target) }),
     },
   );
+}
+
+function v2StorageOptions(
+  selectedTarget: DeployTarget,
+  readState: () => Promise<D1SchemaState> = async () => COMPLETE_V2_SCHEMA,
+): IntegrationStorageGenerationTargetVerificationOptions {
+  return {
+    provider: {
+      async getD1(id) {
+        return { uuid: id, name: selectedTarget.d1.databaseName };
+      },
+      async getR2(name) {
+        return { name };
+      },
+    },
+    reader: { read: readState },
+  };
 }
 
 function expectDefaultSigningReaderPath(commands: readonly string[][], wranglerPath: string): void {
@@ -888,6 +1093,9 @@ function writeSecretDirectory(
   const values: Record<string, string> = { TAKOSERVER_SIGNING_KEY: keyMaterial.privateRaw };
   if (selectedTarget.edgeSupplies !== undefined)
     values.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING = keyring;
+  if (selectedTarget.takoformV2 !== undefined) {
+    values.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY = Buffer.alloc(32, 9).toString("base64url");
+  }
   for (const name of expectedWorkerSecrets(selectedTarget)) {
     const value = values[name];
     if (value === undefined) throw new Error(`missing fixture secret ${name}`);

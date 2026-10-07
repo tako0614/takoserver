@@ -204,6 +204,9 @@ export function deploymentVariables(
     PUBLIC_ORIGIN: target.publicOrigin,
     TAKOSERVER_SIGNING_KEY_ID: signingKeyId,
   };
+  if (target.takoformV2 !== undefined) {
+    vars.TAKOSERVER_TAKOFORM_V2_CONFIG = target.takoformV2.config;
+  }
   if (target.artifactBlobIoMode !== undefined) {
     vars.TAKOSERVER_ARTIFACT_BLOB_IO_MODE = target.artifactBlobIoMode;
   }
@@ -279,6 +282,7 @@ function exactPublicWorkerProvenance(
 /** Names only; Cloudflare never returns or receives secret bytes here. */
 export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
   const names = new Set<string>(["TAKOSERVER_SIGNING_KEY"]);
+  if (target.takoformV2 !== undefined) names.add("TAKOSERVER_TAKOFORM_V2_CURSOR_KEY");
   if (target.edgeSupplies !== undefined) {
     names.add("TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING");
   }

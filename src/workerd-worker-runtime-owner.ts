@@ -18,13 +18,14 @@ import { WORKER_DEPLOYMENT_FORM_URL } from "./takoform-v2/forms/worker-specs.ts"
 import type { V2Execution } from "./takoform-v2/types.ts";
 import type { V2WorkerPublicationResolution } from "./takoform-v2/worker-publication-state.ts";
 import {
-  createV2StaticWorkerPublication,
-  type V2StaticWorkerPublicationResult,
+  createV2WorkerPublication,
+  type V2WorkerPublicationResult,
 } from "./takoform-v2/worker-static-publication.ts";
 import { workerPortOwnership } from "./workerd-linux-process.ts";
 import type {
   WorkerdPublicationIdentity,
   WorkerdRuntime,
+  WorkerdSite,
   WorkerdStaticSite,
 } from "./workerd-runtime.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
@@ -37,7 +38,8 @@ import {
 
 const STATE_NAME = "runtime-owner.json";
 const LOCK_NAME = "runtime-owner.lock";
-const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@1";
+const LEGACY_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@1";
+const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@2";
 const LOCK_SCHEMA = "takoserver.v2-worker-runtime-owner-lock@2";
 const OPERATION_MARKER = "takoserver-v2-operation:";
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -60,6 +62,8 @@ interface IncarnationRecord {
   readonly status: IncarnationStatus;
   readonly retirementOperationId: string | null;
   readonly retireAtMs: number | null;
+  /** Whether this exact candidate graph may have ctx.waitUntil work past response completion. */
+  readonly deferRetirementUntilDeadline: boolean;
   readonly identity: WorkerdPublicationIdentity | null;
   readonly receipt: WorkerdWorkerRetirementReceipt | null;
 }
@@ -85,10 +89,10 @@ interface ActiveInvocation {
 interface IncarnationHandle {
   record: IncarnationRecord;
   readonly group: WorkerdWorkerExecutionGroup;
-  readonly runtime: ReturnType<typeof createWorkerdRuntime>;
-  readonly publication: ReturnType<typeof createV2StaticWorkerPublication>;
+  readonly runtime: WorkerdRuntime<WorkerdSite | WorkerdStaticSite>;
+  readonly publication: ReturnType<typeof createV2WorkerPublication>;
   readonly invocations: Set<ActiveInvocation>;
-  retirementTimer?: ReturnType<typeof setTimeout>;
+  retirementTimer?: () => void;
   retiring?: Promise<WorkerdWorkerRetirementReceipt>;
 }
 
@@ -105,7 +109,7 @@ export class WorkerdWorkerRuntimeOwnerError extends Error {
 export interface WorkerdWorkerRuntimeOwner {
   readonly workerResourceUid: string;
   /** Run one accepted WorkerDeployment Operation and switch only this UID's listener. */
-  execute(execution: V2Execution): Promise<V2StaticWorkerPublicationResult>;
+  execute(execution: V2Execution): Promise<V2WorkerPublicationResult>;
   /** Route a Host-accepted request to the exact active incarnation. */
   fetch(request: Request): Promise<Response>;
   /** Release the owner lock only after every known incarnation has a durable receipt. */
@@ -119,6 +123,10 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
   readonly targetKey: string;
   readonly publicationState: PublicationState;
   readonly workerdBinary: string | null;
+  /** Trusted code-module inspector; absent uses the WorkerdRuntime's pinned inspector. */
+  readonly inspectModule?: WorkerdRuntime["inspectModule"];
+  /** Deterministic retirement scheduler; serving composition uses bounded real timers. */
+  readonly scheduleRetirement?: (run: () => void, delayMs: number) => () => void;
   /** Allocate a distinct private listener for each immutable Deployment incarnation. */
   readonly listenerPortForOperation: (operationId: string) => number | Promise<number>;
   readonly spawn?: (command: readonly string[]) => WorkerdProcess;
@@ -758,8 +766,9 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
     const value: unknown = JSON.parse(text);
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
     const state = value as Record<string, unknown>;
+    const legacyStaticState = state.schema === LEGACY_STATE_SCHEMA;
     if (
-      state.schema !== STATE_SCHEMA ||
+      (!legacyStaticState && state.schema !== STATE_SCHEMA) ||
       state.workerResourceUid !== workerResourceUid ||
       !(state.activeOperationId === null || typeof state.activeOperationId === "string") ||
       !(state.admissionClosedBy === null || typeof state.admissionClosedBy === "string") ||
@@ -784,6 +793,9 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         ) ||
         !(item.retirementOperationId === null || typeof item.retirementOperationId === "string") ||
         !(item.retireAtMs === null || Number.isSafeInteger(item.retireAtMs)) ||
+        (legacyStaticState
+          ? item.deferRetirementUntilDeadline !== undefined
+          : typeof item.deferRetirementUntilDeadline !== "boolean") ||
         !(item.identity === null || validIdentity(item.identity)) ||
         !(item.receipt === null || validReceipt(item.receipt))
       ) {
@@ -799,7 +811,12 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         throw new Error();
       }
       ids.add(item.operationId);
-      incarnations.push(item as unknown as IncarnationRecord);
+      incarnations.push({
+        ...item,
+        deferRetirementUntilDeadline: legacyStaticState
+          ? false
+          : (item.deferRetirementUntilDeadline as boolean),
+      } as unknown as IncarnationRecord);
     }
     const result: PersistedOwnerState = {
       schema: STATE_SCHEMA,
@@ -832,7 +849,19 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
     ) {
       throw new Error();
     }
-    if (canonicalJson(result) !== text) throw new Error();
+    const canonicalState = legacyStaticState
+      ? {
+          schema: LEGACY_STATE_SCHEMA,
+          workerResourceUid: state.workerResourceUid,
+          activeOperationId: state.activeOperationId,
+          admissionClosedBy: state.admissionClosedBy,
+          deletionPublicationConfirmed: state.deletionPublicationConfirmed,
+          incarnations: incarnations.map(
+            ({ deferRetirementUntilDeadline: _defer, ...item }) => item,
+          ),
+        }
+      : result;
+    if (canonicalJson(canonicalState) !== text) throw new Error();
     return result;
   } catch {
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
@@ -1030,7 +1059,11 @@ export async function openWorkerdWorkerRuntimeOwner(
     if (invocation.finished) return;
     invocation.finished = true;
     incarnation.invocations.delete(invocation);
-    if (incarnation.invocations.size === 0 && incarnation.record.status === "draining") {
+    if (
+      incarnation.invocations.size === 0 &&
+      incarnation.record.status === "draining" &&
+      !incarnation.record.deferRetirementUntilDeadline
+    ) {
       void retireIncarnation(incarnation).catch(() => undefined);
     }
   };
@@ -1061,7 +1094,8 @@ export async function openWorkerdWorkerRuntimeOwner(
           receipt,
         }));
         incarnation.record = retired;
-        if (incarnation.retirementTimer !== undefined) clearTimeout(incarnation.retirementTimer);
+        incarnation.retirementTimer?.();
+        delete incarnation.retirementTimer;
         return receipt;
       } catch {
         const uncertain = await updateRecord(incarnation.record.operationId, (current) => ({
@@ -1096,19 +1130,26 @@ export async function openWorkerdWorkerRuntimeOwner(
 
   const scheduleIncarnationRetirement = (incarnation: IncarnationHandle): void => {
     if (incarnation.record.status !== "draining") return;
-    if (incarnation.invocations.size === 0) {
+    if (incarnation.invocations.size === 0 && !incarnation.record.deferRetirementUntilDeadline) {
       void retireIncarnation(incarnation).catch(() => undefined);
       return;
     }
     const at = incarnation.record.retireAtMs;
     if (at === null) return;
     const delay = Math.max(0, at - Date.now());
-    incarnation.retirementTimer = setTimeout(() => {
+    const run = () => {
+      delete incarnation.retirementTimer;
       void cancelInvocations(incarnation)
         .then(() => retireIncarnation(incarnation))
         .catch(() => undefined);
-    }, delay);
-    incarnation.retirementTimer.unref?.();
+    };
+    if (options.scheduleRetirement) {
+      incarnation.retirementTimer = options.scheduleRetirement(run, delay);
+      return;
+    }
+    const timer = setTimeout(run, delay);
+    timer.unref?.();
+    incarnation.retirementTimer = () => clearTimeout(timer);
   };
 
   const incarnationDirectory = (operationId: string): string =>
@@ -1128,6 +1169,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       status: "candidate",
       retirementOperationId: null,
       retireAtMs: null,
+      deferRetirementUntilDeadline: false,
       identity: null,
       receipt: null,
     };
@@ -1157,8 +1199,9 @@ export async function openWorkerdWorkerRuntimeOwner(
       },
       isReady: () => group.isReady(),
     });
-    const candidateRuntime: WorkerdRuntime<WorkerdStaticSite> = {
+    const candidateRuntime: WorkerdRuntime<WorkerdSite | WorkerdStaticSite> = {
       ...runtime,
+      inspectModule: options.inspectModule ?? runtime.inspectModule,
       publishFenced: async (name, resolvePublication, isFenceCurrent) => {
         await runtime.publishFenced?.(
           name,
@@ -1167,7 +1210,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         );
       },
     };
-    const publication = createV2StaticWorkerPublication({
+    const publication = createV2WorkerPublication({
       targetKey: options.targetKey,
       publicationState: options.publicationState,
       runtime: candidateRuntime,
@@ -1198,7 +1241,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
   };
 
-  const execute = (inputExecution: V2Execution): Promise<V2StaticWorkerPublicationResult> => {
+  const execute = (inputExecution: V2Execution): Promise<V2WorkerPublicationResult> => {
     let captured: V2Execution;
     try {
       captured = structuredClone(inputExecution);
@@ -1245,7 +1288,8 @@ export async function openWorkerdWorkerRuntimeOwner(
           if (
             observed.kind === "confirmed" &&
             observed.identity !== null &&
-            canonicalJson(observed.identity) === canonicalJson(existing.record.identity)
+            canonicalJson(observed.identity) === canonicalJson(existing.record.identity) &&
+            observed.deferRetirementUntilDeadline === existing.record.deferRetirementUntilDeadline
           ) {
             return observed;
           }
@@ -1253,7 +1297,12 @@ export async function openWorkerdWorkerRuntimeOwner(
         }
         const result = await existing.publication.publish(execution);
         if (result.kind === "confirmed" && result.identity !== null) {
-          return await activateIncarnation(existing, result.identity, execution.operationId);
+          return await activateIncarnation(
+            existing,
+            result.identity,
+            result.deferRetirementUntilDeadline,
+            execution.operationId,
+          );
         }
         return result;
       }
@@ -1284,7 +1333,12 @@ export async function openWorkerdWorkerRuntimeOwner(
           return result;
         }
         candidate.group.sealConfiguration();
-        return await activateIncarnation(candidate, result.identity, execution.operationId);
+        return await activateIncarnation(
+          candidate,
+          result.identity,
+          result.deferRetirementUntilDeadline,
+          execution.operationId,
+        );
       } catch {
         if (candidate)
           await retireCandidate(candidate, execution.operationId).catch(() => undefined);
@@ -1318,9 +1372,14 @@ export async function openWorkerdWorkerRuntimeOwner(
   async function activateIncarnation(
     candidate: IncarnationHandle,
     identity: WorkerdPublicationIdentity,
+    deferRetirementUntilDeadline: boolean,
     operationId: string,
-  ): Promise<V2StaticWorkerPublicationResult> {
-    if (identity.workerResourceUid !== options.workerResourceUid) return { kind: "unknown" };
+  ): Promise<V2WorkerPublicationResult> {
+    if (
+      typeof deferRetirementUntilDeadline !== "boolean" ||
+      identity.workerResourceUid !== options.workerResourceUid
+    )
+      return { kind: "unknown" };
     if (identity.generation !== expectedOperationMarker(operationId)) return { kind: "unknown" };
     const previous = active;
     const now = Date.now();
@@ -1330,7 +1389,12 @@ export async function openWorkerdWorkerRuntimeOwner(
         (item) => item.operationId === candidate.record.operationId,
       );
       if (!candidateRecord) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
-      const nextCandidate: IncarnationRecord = { ...candidateRecord, status: "active", identity };
+      const nextCandidate: IncarnationRecord = {
+        ...candidateRecord,
+        status: "active",
+        identity,
+        deferRetirementUntilDeadline,
+      };
       oldRecord = previous
         ? {
             ...current.incarnations.find(
@@ -1366,12 +1430,10 @@ export async function openWorkerdWorkerRuntimeOwner(
       )!;
       scheduleIncarnationRetirement(previous);
     }
-    return { kind: "confirmed", identity };
+    return { kind: "confirmed", identity, deferRetirementUntilDeadline };
   }
 
-  async function deleteDeployment(
-    execution: V2Execution,
-  ): Promise<V2StaticWorkerPublicationResult> {
+  async function deleteDeployment(execution: V2Execution): Promise<V2WorkerPublicationResult> {
     if (admissionClosedBy !== null && admissionClosedBy !== execution.operationId) {
       return { kind: "unknown" };
     }
@@ -1420,7 +1482,8 @@ export async function openWorkerdWorkerRuntimeOwner(
 
     const live = [...handles.values()].filter((item) => item.record.status !== "retired");
     for (const incarnation of live) {
-      if (incarnation.retirementTimer !== undefined) clearTimeout(incarnation.retirementTimer);
+      incarnation.retirementTimer?.();
+      delete incarnation.retirementTimer;
       if (incarnation.record.retirementOperationId === null) {
         incarnation.record = await updateRecord(incarnation.record.operationId, (record) => ({
           ...record,
@@ -1481,7 +1544,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       if (state.incarnations.some((item) => item.status !== "retired" || item.receipt === null))
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       for (const item of handles.values()) {
-        if (item.retirementTimer !== undefined) clearTimeout(item.retirementTimer);
+        item.retirementTimer?.();
       }
       await releaseOwnerLock(lockPath, directory, ownerLock);
       closed = true;

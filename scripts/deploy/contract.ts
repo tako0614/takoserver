@@ -1052,11 +1052,12 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
           "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
-          "the fixed audited 0001-0066 names and bytes are sealed before creation. A separately " +
+          "the default fixed audited 0001-0066 names and bytes, or an explicit fixed " +
+          "--fresh-lineage=v2-artifacts-0075 payload, are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
-          "0001-0066 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
+          "selected 0001-0066 or fresh-v2 0001-0075 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",
         reversal:
@@ -1065,7 +1066,8 @@ export const DEPLOY_CONTRACT = {
         "failure-handling":
           "Pre-existing resources, even empty ones, are refused. After any creation attempt the command " +
           "stops on failure, reports only bounded identity/state diagnostics and never retries. Lost " +
-          "acknowledgements are indeterminate; --status is read-only and cannot adopt or repair them." +
+          "acknowledgements are indeterminate; selected v2 --status can classify exact schema " +
+          "readback for separate owner review but cannot re-import, adopt or repair it." +
           inputContract(applyReviewInput),
         "pre-mutation-proof":
           "Both derived names must be absent at inspection and at the creation fence. The new D1 " +

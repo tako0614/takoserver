@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DeployError, deployFailureAftermath, preflightError } from "../scripts/deploy/errors.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
+import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
   runWorker,
@@ -10,6 +11,7 @@ import {
   type WorkerProcess,
   type WorkerState,
 } from "../scripts/deploy/worker.ts";
+import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import {
   acquireWranglerVersionPublicationLease,
   deployExistingWranglerVersion,
@@ -24,6 +26,7 @@ import {
   publishWranglerVersion,
   WranglerWorkerState,
 } from "../scripts/deploy/wrangler-state.ts";
+import { integrationStorageVerificationOptions } from "./helpers/integration-storage-generation-verification.ts";
 
 const WORKER = "takoserver-api-integration";
 const VERSION = "00000000-0000-4000-8000-000000000001";
@@ -55,6 +58,22 @@ const target = {
   r2: { bucketName: "objects" },
   publicOrigin: `https://${WORKER}.example.workers.dev`,
   signing: { currentKeyId: "key-current" },
+} satisfies DeployTarget;
+
+const publicationStorageName = `takoserver-i-${"f".repeat(32)}`;
+const publicationTarget = {
+  ...target,
+  d1: {
+    databaseName: publicationStorageName,
+    databaseId: "00000000-0000-4000-8000-000000000075",
+  },
+  r2: { bucketName: publicationStorageName },
+  takoformV2: {
+    config: JSON.stringify({
+      documentation: "https://docs.example.test/v2",
+      authenticationDocumentation: "https://docs.example.test/v2/authentication",
+    }),
+  },
 } satisfies DeployTarget;
 
 function result(stdout: string, exitCode = 0): CommandResult {
@@ -1359,19 +1378,10 @@ async function routineVersionPublication(
           "workers/triggered_by": "version_upload",
         },
         resources: {
-          bindings: [
-            { type: "ai", name: "AI" },
-            { type: "version_metadata", name: "WORKER_VERSION" },
-            { type: "d1", name: "STATE_DB", id: target.d1.databaseId },
-            { type: "r2_bucket", name: "OBJECTS", bucket_name: target.r2.bucketName },
-            { type: "plain_text", name: "PUBLIC_ORIGIN", text: target.publicOrigin },
-            {
-              type: "plain_text",
-              name: "TAKOSERVER_SIGNING_KEY_ID",
-              text: target.signing.currentKeyId,
-            },
-            { type: "secret_text", name: "TAKOSERVER_SIGNING_KEY" },
-          ],
+          bindings: Object.entries(expectedExactBindingClosure(publicationTarget)).flatMap(
+            ([name, requirement]) =>
+              requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
+          ),
         },
       };
       if (
@@ -1384,7 +1394,10 @@ async function routineVersionPublication(
       return value;
     },
     async workerSecrets() {
-      return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
+      return expectedWorkerSecrets(publicationTarget).map((name) => ({
+        name,
+        type: "secret_text",
+      }));
     },
   };
   const migrations: WorkerMigrationReader = {
@@ -1400,13 +1413,14 @@ async function routineVersionPublication(
         environment: "integration",
         commit: "a".repeat(40),
       },
-      target,
+      publicationTarget,
       {
         run,
         state,
         migrations,
         outputDirectory: root,
         cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+        integrationStorageVerification: integrationStorageVerificationOptions(publicationTarget),
         fetcher: async (input) => {
           if (options.assertLeaseHeldDuringProbe === true) {
             try {
