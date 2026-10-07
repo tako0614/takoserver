@@ -35,6 +35,19 @@ export interface WorkerCronTriggerTickResult {
   readonly resolved: number;
   readonly rejected: number;
   readonly unknown: number;
+  readonly scanComplete: boolean;
+  readonly hasMore: boolean;
+  readonly continuation: WorkerCronTriggerScanContinuation | null;
+}
+
+export interface WorkerCronTriggerScanContinuation {
+  readonly targetKey: string;
+  readonly scheduledTime: number;
+  readonly afterUid: string;
+}
+
+interface ScanCursorRow extends WorkerCronTriggerScanContinuation {
+  readonly scan_complete: number;
 }
 
 interface TriggerRow {
@@ -90,10 +103,24 @@ export async function runWorkerCronTriggerTick(options: {
     throw new TypeError("clock must be valid UTC time");
   const scheduledTime = Math.floor(tickAt / MINUTE_MS) * MINUTE_MS;
   let recorded = 0;
-  let afterUid = "";
-  async function scanPage(after: string): Promise<readonly TriggerRow[]> {
-    return (await options.sql.query(
-      `SELECT r.uid, r.principal, r.space, r.target_key, r.generation, r.last_operation,
+  let scanComplete = false;
+  let hasMore = false;
+  let continuation: WorkerCronTriggerScanContinuation | null = null;
+  const savedCursor = await loadScanCursor(options.sql, options.targetKey);
+  if (savedCursor && savedCursor.scheduledTime > scheduledTime) {
+    // A backwards wall-clock adjustment cannot move durable scan progress back.
+    // Continue dispatching obligations below, but wait for time to catch up.
+    hasMore = true;
+    continuation = savedCursor;
+  } else if (savedCursor?.scheduledTime === scheduledTime && savedCursor.scan_complete === 1) {
+    scanComplete = true;
+  } else {
+    // When the minute changes, start at the beginning of only the new current
+    // minute; prior unrecorded minutes are deliberately not caught up.
+    const afterUid = savedCursor?.scheduledTime === scheduledTime ? savedCursor.afterUid : "";
+    async function scanPage(after: string): Promise<readonly TriggerRow[]> {
+      return (await options.sql.query(
+        `SELECT r.uid, r.principal, r.space, r.target_key, r.generation, r.last_operation,
               op.updated_at, r.spec_json
      FROM tf_v2_resources r
      JOIN tf_v2_operations op ON op.id = r.last_operation
@@ -113,11 +140,12 @@ export async function runWorkerCronTriggerTick(options: {
        AND op.action IN ('create', 'update') AND op.status = 'succeeded'
        AND op.generation = r.generation AND op.accepted_spec_json = r.spec_json
      ORDER BY r.uid LIMIT ?`,
-      [WORKER_CRON_TRIGGER_FORM_URL, options.targetKey, after, SCAN_PAGE_SIZE],
-    )) as unknown as readonly TriggerRow[];
-  }
-  let candidates = await scanPage(afterUid);
-  while (candidates.length > 0) {
+        [WORKER_CRON_TRIGGER_FORM_URL, options.targetKey, after, SCAN_PAGE_SIZE + 1],
+      )) as unknown as readonly TriggerRow[];
+    }
+    const page = await scanPage(afterUid);
+    hasMore = page.length > SCAN_PAGE_SIZE;
+    const candidates = page.slice(0, SCAN_PAGE_SIZE);
     for (const row of candidates) {
       let spec: ReturnType<typeof parseWorkerCronTriggerSpec>;
       try {
@@ -195,9 +223,26 @@ export async function runWorkerCronTriggerTick(options: {
         // A graph that changed or was unavailable is not recorded as a match.
       }
     }
-    if (candidates.length < SCAN_PAGE_SIZE) break;
-    afterUid = candidates.at(-1)?.uid ?? afterUid;
-    candidates = await scanPage(afterUid);
+    const lastUid = candidates.at(-1)?.uid ?? afterUid;
+    scanComplete = !hasMore;
+    await advanceScanCursor(
+      options.sql,
+      savedCursor,
+      {
+        targetKey: options.targetKey,
+        scheduledTime,
+        afterUid: lastUid,
+        scan_complete: scanComplete ? 1 : 0,
+      },
+      tickAt,
+    );
+    const currentCursor = await loadScanCursor(options.sql, options.targetKey);
+    if (currentCursor && currentCursor.scheduledTime >= scheduledTime) {
+      scanComplete =
+        currentCursor.scheduledTime === scheduledTime && currentCursor.scan_complete === 1;
+      hasMore = !scanComplete;
+      continuation = hasMore ? currentCursor : null;
+    }
   }
 
   let claimed = 0;
@@ -299,5 +344,60 @@ export async function runWorkerCronTriggerTick(options: {
     }
   }
 
-  return { recorded, claimed, resolved, rejected, unknown };
+  return {
+    recorded,
+    claimed,
+    resolved,
+    rejected,
+    unknown,
+    scanComplete: !hasMore,
+    hasMore,
+    continuation,
+  };
+}
+
+async function loadScanCursor(sql: Sql, targetKey: string): Promise<ScanCursorRow | null> {
+  const rows = (await sql.query(
+    `SELECT target_key AS targetKey, scheduled_time_ms AS scheduledTime,
+            after_uid AS afterUid, scan_complete
+     FROM tf_v2_worker_cron_scan_cursors WHERE target_key = ? LIMIT 2`,
+    [targetKey],
+  )) as unknown as readonly ScanCursorRow[];
+  return rows.length === 1 ? (rows[0] ?? null) : null;
+}
+
+async function advanceScanCursor(
+  sql: Sql,
+  previous: ScanCursorRow | null,
+  next: Omit<ScanCursorRow, "scheduledTime" | "afterUid"> & {
+    readonly scheduledTime: number;
+    readonly afterUid: string;
+  },
+  updatedAtMs: number,
+): Promise<void> {
+  if (!previous) {
+    await sql.run(
+      `INSERT INTO tf_v2_worker_cron_scan_cursors
+       (target_key, scheduled_time_ms, after_uid, scan_complete, updated_at_ms)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(target_key) DO NOTHING`,
+      [next.targetKey, next.scheduledTime, next.afterUid, next.scan_complete, updatedAtMs],
+    );
+    return;
+  }
+  await sql.run(
+    `UPDATE tf_v2_worker_cron_scan_cursors
+     SET scheduled_time_ms = ?, after_uid = ?, scan_complete = ?, updated_at_ms = ?
+     WHERE target_key = ? AND scheduled_time_ms = ? AND after_uid = ? AND scan_complete = ?`,
+    [
+      next.scheduledTime,
+      next.afterUid,
+      next.scan_complete,
+      updatedAtMs,
+      previous.targetKey,
+      previous.scheduledTime,
+      previous.afterUid,
+      previous.scan_complete,
+    ],
+  );
 }

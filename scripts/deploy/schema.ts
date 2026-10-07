@@ -316,7 +316,7 @@ const AUDITED_MIGRATION_SHA256: Readonly<
   "0079_v2_worker_native_deletions.sql":
     "sha256:f8b4fdd60608f4c71a28c2d888c85457104905dffb48826f9a8ddccede0199c4",
   "0080_v2_worker_cron_trigger_matches.sql":
-    "sha256:9410e2886d8f2b6fa3cd51800f3f8d9f5a14823dc01973d0a8830a076b8d6f6a",
+    "sha256:e073edc5605f20ff8c39450777f39bd85547f59cd7148d4051fdab3c90f27e68",
 };
 // 0067-0080 are part of the exact source inventory only. None has an in-place apply wave.
 const INTEGRATION_APPLY_CEILING_COUNT = 66;

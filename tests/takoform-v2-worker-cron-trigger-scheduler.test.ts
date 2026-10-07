@@ -232,7 +232,16 @@ test("records one exact match, redelivers the same id after unknown ACK and SQL 
         targetKey: TARGET_KEY,
         retryMilliseconds: 1_000,
       }),
-    ).toEqual({ recorded: 1, claimed: 1, resolved: 0, rejected: 0, unknown: 1 });
+    ).toEqual({
+      recorded: 1,
+      claimed: 1,
+      resolved: 0,
+      rejected: 0,
+      unknown: 1,
+      scanComplete: true,
+      hasMore: false,
+      continuation: null,
+    });
     first.close();
 
     const restarted = openDb(path);
@@ -245,7 +254,16 @@ test("records one exact match, redelivers the same id after unknown ACK and SQL 
           targetKey: TARGET_KEY,
           retryMilliseconds: 1_000,
         }),
-      ).toEqual({ recorded: 0, claimed: 1, resolved: 1, rejected: 0, unknown: 0 });
+      ).toEqual({
+        recorded: 0,
+        claimed: 1,
+        resolved: 1,
+        rejected: 0,
+        unknown: 0,
+        scanComplete: true,
+        hasMore: false,
+        continuation: null,
+      });
       expect(calls).toHaveLength(2);
       expect(calls[0]).toBe(calls[1]);
       expect(
@@ -285,25 +303,145 @@ test("does not catch up an unrecorded minute after a late tick", async () => {
   }
 });
 
-test("records every current-minute match across bounded pages for only its target", async () => {
-  const db = openDb();
-  seedGraph(db, ["scheduled"], SETTLED_BEFORE_MATCH, TARGET_KEY, 130, TARGET_KEY, "other-target");
+test("continues bounded current-minute pages while delivering due matches", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "v2-cron-scan-cursor-"));
+  const path = join(directory, "state.sqlite");
+  let db = openDb(path);
+  const graph = seedGraph(
+    db,
+    ["scheduled"],
+    SETTLED_BEFORE_MATCH,
+    TARGET_KEY,
+    130,
+    TARGET_KEY,
+    "other-target",
+  );
   try {
-    const result = await runWorkerCronTriggerTick({
-      sql: createSqliteSql(db),
-      now: () => new Date(MATCH_AT + 10_000),
-      delivery: {
-        async invokeScheduled() {
-          return { kind: "unknown" };
-        },
+    let tickAt = MATCH_AT + 10_000;
+    const deliveredMatchIds: string[] = [];
+    const delivery = {
+      async invokeScheduled(input: { readonly matchId: string }) {
+        deliveredMatchIds.push(input.matchId);
+        return deliveredMatchIds.length === 1
+          ? { kind: "unknown" as const }
+          : { kind: "handler_resolved" as const, workerVersionUid: graph.versionUid };
       },
+    };
+    const firstPage = await runWorkerCronTriggerTick({
+      sql: createSqliteSql(db),
+      now: () => new Date(tickAt),
+      delivery,
       targetKey: TARGET_KEY,
       limit: 1,
     });
-    expect(result.recorded).toBe(130);
+    expect(firstPage).toMatchObject({
+      recorded: 128,
+      claimed: 1,
+      unknown: 1,
+      scanComplete: false,
+      hasMore: true,
+    });
+    expect(firstPage.continuation).toMatchObject({
+      targetKey: TARGET_KEY,
+      scheduledTime: MATCH_AT,
+    });
+
+    db.close();
+    db = openDb(path);
+    tickAt += 1_001;
+    const secondPage = await runWorkerCronTriggerTick({
+      sql: createSqliteSql(db),
+      now: () => new Date(tickAt),
+      delivery,
+      targetKey: TARGET_KEY,
+      limit: 1,
+    });
+    expect(secondPage).toMatchObject({
+      recorded: 2,
+      claimed: 1,
+      resolved: 1,
+      scanComplete: true,
+      hasMore: false,
+      continuation: null,
+    });
+    expect(deliveredMatchIds).toHaveLength(2);
+    expect(deliveredMatchIds[0]).toBe(deliveredMatchIds[1]);
     expect(db.query("SELECT count(*) AS count FROM tf_v2_worker_cron_matches").get()).toEqual({
       count: 130,
     });
+  } finally {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a new UTC minute starts a fresh bounded scan without catching up old pages", async () => {
+  const db = openDb();
+  const graph = seedGraph(
+    db,
+    ["scheduled"],
+    SETTLED_BEFORE_MATCH,
+    TARGET_KEY,
+    130,
+    TARGET_KEY,
+    "other-target",
+  );
+  const delivery: WorkerCronTriggerDelivery = {
+    async invokeScheduled() {
+      return { kind: "handler_resolved", workerVersionUid: graph.versionUid };
+    },
+  };
+  try {
+    const priorMinute = await runWorkerCronTriggerTick({
+      sql: createSqliteSql(db),
+      now: () => new Date(MATCH_AT + 10_000),
+      delivery,
+      targetKey: TARGET_KEY,
+      limit: 100,
+    });
+    expect(priorMinute).toMatchObject({
+      recorded: 128,
+      scanComplete: false,
+      hasMore: true,
+    });
+
+    const currentMinute = await runWorkerCronTriggerTick({
+      sql: createSqliteSql(db),
+      now: () => new Date(MATCH_AT + 70_000),
+      delivery,
+      targetKey: TARGET_KEY,
+      limit: 100,
+    });
+    expect(currentMinute).toMatchObject({
+      recorded: 100,
+      scanComplete: false,
+      hasMore: true,
+      continuation: { targetKey: TARGET_KEY, scheduledTime: MATCH_AT + 60_000 },
+    });
+
+    const finalPage = await runWorkerCronTriggerTick({
+      sql: createSqliteSql(db),
+      now: () => new Date(MATCH_AT + 71_000),
+      delivery,
+      targetKey: TARGET_KEY,
+      limit: 100,
+    });
+    expect(finalPage).toMatchObject({
+      recorded: 2,
+      scanComplete: true,
+      hasMore: false,
+      continuation: null,
+    });
+    expect(
+      db
+        .query(
+          "SELECT scheduled_time_ms, count(*) AS count FROM tf_v2_worker_cron_matches GROUP BY scheduled_time_ms ORDER BY scheduled_time_ms",
+        )
+        .all(),
+    ).toEqual([
+      { scheduled_time_ms: MATCH_AT, count: 128 },
+      { scheduled_time_ms: MATCH_AT + 60_000, count: 102 },
+    ]);
   } finally {
     db.close();
   }

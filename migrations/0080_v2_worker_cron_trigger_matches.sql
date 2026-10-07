@@ -36,6 +36,53 @@ CREATE INDEX tf_v2_worker_cron_matches_due
 CREATE INDEX tf_v2_worker_cron_matches_trigger
   ON tf_v2_worker_cron_matches(trigger_uid, state, scheduled_time_ms);
 
+-- Durable keyset progress keeps each scheduler call bounded while allowing a
+-- same-minute continuation after another call or Host restart. This is scan
+-- metadata, not Resource/Operation authority or a delivery obligation.
+CREATE TABLE tf_v2_worker_cron_scan_cursors (
+  target_key TEXT PRIMARY KEY,
+  scheduled_time_ms INTEGER NOT NULL CHECK (
+    scheduled_time_ms >= 0 AND scheduled_time_ms % 60000 = 0
+  ),
+  after_uid TEXT NOT NULL CHECK (
+    after_uid = '' OR (
+      length(after_uid) BETWEEN 1 AND 128 AND
+      substr(after_uid, 1, 1) GLOB '[A-Za-z0-9]' AND
+      after_uid NOT GLOB '*[^A-Za-z0-9._-]*'
+    )
+  ),
+  scan_complete INTEGER NOT NULL CHECK (scan_complete IN (0, 1)),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0)
+);
+
+CREATE TRIGGER tf_v2_worker_cron_scan_cursor_identity_immutable
+BEFORE UPDATE ON tf_v2_worker_cron_scan_cursors
+WHEN NEW.target_key IS NOT OLD.target_key
+BEGIN
+  SELECT RAISE(ABORT, 'tf_v2_worker_cron_scan_cursor_immutable');
+END;
+
+CREATE TRIGGER tf_v2_worker_cron_scan_cursor_transition
+BEFORE UPDATE ON tf_v2_worker_cron_scan_cursors
+WHEN NOT (
+  NEW.scheduled_time_ms > OLD.scheduled_time_ms
+  OR (
+    NEW.scheduled_time_ms = OLD.scheduled_time_ms AND OLD.scan_complete = 0 AND (
+      NEW.after_uid > OLD.after_uid
+      OR (NEW.after_uid = OLD.after_uid AND NEW.scan_complete = 1)
+    )
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'tf_v2_worker_cron_scan_cursor_transition');
+END;
+
+CREATE TRIGGER tf_v2_worker_cron_scan_cursor_no_delete
+BEFORE DELETE ON tf_v2_worker_cron_scan_cursors
+BEGIN
+  SELECT RAISE(ABORT, 'tf_v2_worker_cron_scan_cursor_immutable');
+END;
+
 -- Serialize CronTrigger acceptance against a pending Deployment acceptance.
 -- Both acceptance paths insert their immutable reference sets in the same
 -- database batch as the queued Operation, so this guard closes the interval
