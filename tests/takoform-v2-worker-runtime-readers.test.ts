@@ -237,7 +237,9 @@ test("Host HTTP lifecycle and UID-owned runtime require physical Version retirem
     sql,
     now: () => new Date(nowMs),
     replayWindowSeconds: 3_600,
-    leaseMilliseconds: 1_000,
+    // Leave room for real SQLite's conservative next-second lease fence while
+    // the injected runtime owner starts and reads back its child process.
+    leaseMilliseconds: 30_000,
     authorize: async () => true,
     forms: {
       [MODULE_WORKER_FORM_URL]: createInternalV2ModuleWorkerForm({
@@ -421,7 +423,7 @@ test("Host HTTP lifecycle and UID-owned runtime require physical Version retirem
         (await owner?.observeRetirement({ workerVersionUid: firstVersion.resourceUid }))?.kind ===
         "confirmed_absent",
     );
-    nowMs += 2_000;
+    nowMs += 31_000;
     expect(await engine.runNext()).toMatchObject({ id: firstDelete.id, status: "succeeded" });
     expect(
       await (await http(`/operations/${firstDelete.id}`, { method: "GET" })).json(),
