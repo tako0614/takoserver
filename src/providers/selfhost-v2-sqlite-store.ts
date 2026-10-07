@@ -215,6 +215,20 @@ export function createSelfhostV2SQLiteStore(options: {
     return owner?.resourceUid === uid && owner.targetKey === options.targetKey;
   }
 
+  async function matchesAcceptedCreate(uid: string, owner: OwnerReceipt | null): Promise<boolean> {
+    if (!matchesOwner(owner, uid)) return false;
+    const rows = await options.sql.query(
+      `SELECT created.id FROM tf_v2_resources r
+       JOIN tf_v2_operations created ON created.resource_uid = r.uid
+       WHERE r.uid = ? AND r.target_key = ? AND r.deleted_at IS NULL
+         AND created.action = 'create' AND created.generation = 1
+         AND created.principal = r.principal AND created.backend_id = r.backend_id
+         AND created.target_key = r.target_key LIMIT 2`,
+      [uid, options.targetKey],
+    );
+    return rows.length === 1 && rows[0]?.id === owner.createOperationId;
+  }
+
   function completeDirectory(directory: string, uid: string): boolean {
     if (!privateDirectory(directory) || !matchesOwner(ownerAt(directory), uid)) return false;
     if (!regular(join(directory, DATABASE_FILE))) return false;
@@ -378,6 +392,12 @@ export function createSelfhostV2SQLiteStore(options: {
     return withLock(input.resourceUid, async () => {
       if (!(await ownsClaim(input))) return "unknown";
       const state = presence(input.resourceUid);
+      if (
+        state === "present" &&
+        !(await matchesAcceptedCreate(input.resourceUid, ownerAt(resourceDir(input.resourceUid))))
+      ) {
+        return "unknown";
+      }
       if (state !== "absent") return state;
       if (input.action === "create" && directoryExists(stageDir(input.operationId)))
         return "unknown";
@@ -394,6 +414,13 @@ export function createSelfhostV2SQLiteStore(options: {
       const tombstone = deletedDir(input.resourceUid, input.operationId);
       const current = presence(input.resourceUid);
       const heldComplete = completeDirectory(tombstone, input.resourceUid);
+      if (
+        (current === "present" &&
+          !(await matchesAcceptedCreate(input.resourceUid, ownerAt(destination)))) ||
+        (heldComplete && !(await matchesAcceptedCreate(input.resourceUid, ownerAt(tombstone))))
+      ) {
+        return "unknown";
+      }
       if (current === "unknown" && !heldComplete) return "unknown";
       if (current === "absent" && !entryExists(tombstone)) return "absent";
       if (entryExists(tombstone) && !directoryExists(tombstone)) return "unknown";
@@ -472,7 +499,11 @@ export function createSelfhostV2SQLiteStore(options: {
     if (!(await input.stillAuthorized()))
       throw new SelfhostV2SQLiteStoreError("backend_unavailable");
     return withLock(uid, async () => {
-      if (!(await input.stillAuthorized()) || presence(uid) !== "present") {
+      if (
+        !(await input.stillAuthorized()) ||
+        presence(uid) !== "present" ||
+        !(await matchesAcceptedCreate(uid, ownerAt(resourceDir(uid))))
+      ) {
         throw new SelfhostV2SQLiteStoreError("backend_unavailable");
       }
       const database = new DatabaseSync(join(resourceDir(uid), DATABASE_FILE));

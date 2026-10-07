@@ -10,6 +10,7 @@ import {
   rmSync,
   symlinkSync,
   unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -398,6 +399,39 @@ test("DELETE treats a replaced Resource directory as unknown, not confirmed abse
     expect((await engine.runNext())?.status).toBe("reconciling");
     expect(existsSync(join(secondDir, "database.sqlite"))).toBe(true);
     expect(existsSync(join(saved, "database.sqlite"))).toBe(true);
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sidecar create receipt must match the accepted core create Operation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "v2-sqlite-db-receipt-"));
+  const database = control(root, true);
+  const clock = () => new Date("2026-10-07T00:00:00Z");
+  try {
+    const { engine, store } = host(root, database, clock);
+    const accepted = await created(engine);
+    expect((await engine.runNext())?.status).toBe("succeeded");
+    const resourceDir = join(root, "native", "resources", accepted.resourceUid);
+    const ownerPath = join(resourceDir, "owner.json");
+    const owner = JSON.parse(readFileSync(ownerPath, "utf8"));
+    writeFileSync(ownerPath, JSON.stringify({ ...owner, createOperationId: "foreign-operation" }));
+    await expect(
+      store.withAuthorizedDatabase({
+        resourceUid: accepted.resourceUid,
+        stillAuthorized: async () => true,
+        use: () => "not authorized",
+      }),
+    ).rejects.toMatchObject({ code: "backend_unavailable" });
+    await engine.acceptDelete({
+      principal: "alice",
+      key: "sqlite-receipt-delete-000001",
+      uid: accepted.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect((await engine.runNext())?.status).toBe("reconciling");
+    expect(existsSync(join(resourceDir, "database.sqlite"))).toBe(true);
   } finally {
     database.close();
     rmSync(root, { recursive: true, force: true });
