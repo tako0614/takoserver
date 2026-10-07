@@ -588,6 +588,15 @@ export interface WorkerdPrivateServiceLease {
     readonly upstreamSocket: string;
     readonly unavailableToken: string;
   }[];
+  /** Exact selected-incarnation Workflow brokers, pinned until child reap. */
+  readonly workflowServices: readonly {
+    readonly name: string;
+    readonly publicName: string;
+    readonly workflowResourceUid: string;
+    readonly token: string;
+    readonly snapshotDigest: `sha256:${string}`;
+    readonly upstreamSocket: string;
+  }[];
   /**
    * Release only before a child starts or after child/gateway reap and ingress
    * drain. Artifact removal is an independent cleanup obligation: its failure
@@ -1621,6 +1630,89 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
             throw unavailable();
           }
         }
+        let workflowReservation: { release(): Promise<void> } | undefined;
+        let workflowServices: WorkerdPrivateServiceLease["workflowServices"] = [];
+        try {
+          if (selected.site.workflowForward?.schema === V2_WORKFLOW_FORWARD_SCHEMA) {
+            const lifecycle = options.workflowForwardLifecycle;
+            if (!lifecycle || !options.workflowForwardSockets || !lifecycle.isRestored()) {
+              throw unavailable();
+            }
+            const forward = validWorkflowForward(
+              selected.site.workflowForward,
+              hasWorkerdV2PrivateBindingProfile(selected.site),
+              selected.site.hostEntrypoint === WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
+            );
+            if (forward.schema !== V2_WORKFLOW_FORWARD_SCHEMA) throw unavailable();
+            const published = await readPublished(scriptsRoot, assetsRoot);
+            const deployment = published.find(
+              (entry) =>
+                entry.name === requested.script &&
+                entry.weighted &&
+                entry.generation === requested.generation &&
+                entry.workerResourceUid === requested.workerResourceUid,
+            );
+            const variant = deployment?.variants.find(
+              (entry) =>
+                entry.versionId === requested.versionId &&
+                entry.workerVersionUid === requested.workerVersionUid,
+            );
+            if (!variant || variant.manifest.workflowForward === undefined) throw unavailable();
+            const publications = workflowForwardPublications(published);
+            const selectedPublication = publications.find(
+              (entry) =>
+                entry.script === requested.script &&
+                entry.workerResourceUid === requested.workerResourceUid &&
+                entry.versionId === requested.versionId &&
+                entry.workerVersionResourceUid === requested.workerVersionUid &&
+                entry.snapshotDigest === forward.snapshotDigest,
+            );
+            if (
+              !selectedPublication ||
+              JSON.stringify(selectedPublication.bindings) !== JSON.stringify(forward.bindings)
+            ) {
+              throw unavailable();
+            }
+            workflowReservation = await lifecycle.reserve([selectedPublication]);
+            if (!lifecycle.isRestored()) throw unavailable();
+            const workflowGraph = await workflowSocketSnapshot(published);
+            if (!(await renderedConfirmed(published, workflowGraph))) throw unavailable();
+            const sockets = validateWorkflowForwardSockets(
+              workflowGraph.publications,
+              workflowGraph.sockets,
+            );
+            const mapped = await Promise.all(
+              selectedPublication.bindings.map(async (binding) => {
+                if ("workflowFormRef" in binding) throw unavailable();
+                const socket = sockets.get(
+                  workflowForwardSocketIdentity({ ...selectedPublication, binding }),
+                );
+                if (!socket) throw unavailable();
+                await requirePrivateSocketDirectory(dirname(socket.socketPath));
+                const before = await privateSocketMetadata(socket.socketPath);
+                if (!before) throw unavailable();
+                return {
+                  name: binding.serviceName,
+                  publicName: binding.publicName,
+                  workflowResourceUid: binding.workflowResourceUid,
+                  token: binding.token,
+                  snapshotDigest: selectedPublication.snapshotDigest,
+                  upstreamSocket: socket.socketPath,
+                  before,
+                };
+              }),
+            );
+            for (const entry of mapped) {
+              const after = await privateSocketMetadata(entry.upstreamSocket);
+              if (!after || !samePrivateSocketIdentity(entry.before, after)) throw unavailable();
+            }
+            if (!lifecycle.isRestored() || options.isReady?.() !== true) throw unavailable();
+            workflowServices = mapped.map(({ before: _before, ...entry }) => entry);
+          }
+        } catch (error) {
+          await workflowReservation?.release();
+          throw error;
+        }
         let released = false;
         const lease: WorkerdPrivateServiceLease = {
           services: bindings.map((binding) => ({
@@ -1631,9 +1723,11 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
             ),
             unavailableToken: binding.unavailableToken,
           })),
+          workflowServices,
           release: () =>
             exclusiveActivation(async () => {
               if (released) return;
+              await workflowReservation?.release();
               released = true;
               for (const router of routers) {
                 const pin = servicePins.get(router);
@@ -1651,7 +1745,12 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           binding,
           router: serviceRouterName(binding),
         }));
-        signal?.throwIfAborted();
+        try {
+          signal?.throwIfAborted();
+        } catch (error) {
+          await workflowReservation?.release();
+          throw error;
+        }
         for (const { binding, router } of additions) {
           const existing = servicePins.get(router);
           if (existing) existing.count += 1;
@@ -4049,6 +4148,10 @@ export async function writeWorkerdPrivateExecution(options: {
   readonly dataPlaneAddress?: string;
   /** Exact child-local guard listeners, not shared sockets or public endpoints. */
   readonly serviceBindings?: readonly { readonly name: string; readonly socketPath: string }[];
+  /** The selected Version's active v2 wrapper, before the guarded class entrypoint replaces it. */
+  readonly workflowSourceEntrypoint?: string;
+  /** Exact selected-incarnation broker UDS mappings, not caller-defined targets. */
+  readonly workflowBindings?: readonly { readonly name: string; readonly socketPath: string }[];
 }): Promise<string> {
   const { root, site, runSocketPath } = options;
   if (
@@ -4088,6 +4191,53 @@ export async function writeWorkerdPrivateExecution(options: {
     ) {
       throw new Error("unusable private execution service binding bridge");
     }
+    servicePaths.add(mapping.socketPath);
+  }
+  const hasV2Workflow = site.workflowForward?.schema === V2_WORKFLOW_FORWARD_SCHEMA;
+  const workflowMappings = options.workflowBindings ?? [];
+  if (
+    !Array.isArray(workflowMappings) ||
+    (hasV2Workflow &&
+      (options.workflowSourceEntrypoint !== WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE ||
+        site.hostEntrypoint === options.workflowSourceEntrypoint ||
+        !site.hostModules?.includes(options.workflowSourceEntrypoint) ||
+        !options.hostModules.has(options.workflowSourceEntrypoint))) ||
+    (!hasV2Workflow &&
+      (options.workflowSourceEntrypoint !== undefined || workflowMappings.length !== 0))
+  ) {
+    throw new Error("unusable private Workflow execution declaration");
+  }
+  const workflowForward = hasV2Workflow
+    ? validWorkflowForward(site.workflowForward, true, true)
+    : undefined;
+  const workflowNames = new Set(workflowForward?.bindings.map((binding) => binding.serviceName));
+  const workflowSocketProofs: { path: string; identity: PrivateSocketIdentity }[] = [];
+  if (workflowMappings.length !== workflowNames.size) {
+    throw new Error("private Workflow execution broker unavailable");
+  }
+  for (const mapping of workflowMappings) {
+    if (
+      !mapping ||
+      !workflowNames.delete(mapping.name) ||
+      typeof mapping.socketPath !== "string" ||
+      !isAbsolute(mapping.socketPath) ||
+      resolve(mapping.socketPath) !== mapping.socketPath ||
+      mapping.socketPath.includes("\u0000") ||
+      Buffer.byteLength(mapping.socketPath) > 100 ||
+      !/^[a-f0-9]{22}\.sock$/u.test(
+        mapping.socketPath.slice(dirname(mapping.socketPath).length + 1),
+      ) ||
+      mapping.socketPath === runSocketPath ||
+      servicePaths.has(mapping.socketPath)
+    ) {
+      throw new Error("unusable private Workflow execution broker");
+    }
+    await requirePrivateSocketDirectory(dirname(mapping.socketPath));
+    const identity = await privateSocketMetadata(mapping.socketPath);
+    if (!identity) {
+      throw new Error("private Workflow execution broker unavailable");
+    }
+    workflowSocketProofs.push({ path: mapping.socketPath, identity });
     servicePaths.add(mapping.socketPath);
   }
   const actor = options.actor;
@@ -4133,12 +4283,40 @@ export async function writeWorkerdPrivateExecution(options: {
     queueSettlement: _queueSettlement,
     ...classSite
   } = site;
+  // Validate the selected v2 outer wrapper as active before replacing only
+  // the guarded class entrypoint. Ordinary publication has no such exception.
+  const validationSite: WorkerdSite = hasV2Workflow
+    ? {
+        ...classSite,
+        hostnames: [],
+        hostEntrypoint: options.workflowSourceEntrypoint as string,
+        hostModules: [
+          ...(classSite.hostModules ?? []).filter(
+            (name) => name !== options.workflowSourceEntrypoint,
+          ),
+          site.hostEntrypoint,
+        ],
+      }
+    : { ...classSite, hostnames: [] };
   const prepared = await prepareWorkerdSite(
-    { ...classSite, hostnames: [] },
+    validationSite,
     options.modules,
     undefined,
     options.hostModules,
   );
+  const classPrepared: PreparedWorkerdSite<Manifest> = hasV2Workflow
+    ? {
+        ...prepared,
+        manifest: { ...prepared.manifest, hostEntrypoint: site.hostEntrypoint },
+      }
+    : prepared;
+  for (const proof of workflowSocketProofs) {
+    await requirePrivateSocketDirectory(dirname(proof.path));
+    const current = await privateSocketMetadata(proof.path);
+    if (!current || !samePrivateSocketIdentity(proof.identity, current)) {
+      throw new Error("private Workflow execution broker changed");
+    }
+  }
   const bindings = validBindings(prepared.manifest.vars ?? []).map(
     (binding) =>
       `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
@@ -4162,6 +4340,13 @@ export async function writeWorkerdPrivateExecution(options: {
   const serviceExternals = serviceMappings
     .map((mapping, index) => {
       const name = `service-${index}`;
+      bindings.push(`(name = ${capnpText(mapping.name)}, service = ${capnpText(name)})`);
+      return `\n  (name = ${capnpText(name)}, external = (address = ${capnpText(`unix:${mapping.socketPath}`)}, http = (style = proxy))),`;
+    })
+    .join("");
+  const workflowExternals = workflowMappings
+    .map((mapping, index) => {
+      const name = `workflow-broker-${index}`;
       bindings.push(`(name = ${capnpText(mapping.name)}, service = ${capnpText(name)})`);
       return `\n  (name = ${capnpText(name)}, external = (address = ${capnpText(`unix:${mapping.socketPath}`)}, http = (style = proxy))),`;
     })
@@ -4267,19 +4452,19 @@ export async function writeWorkerdPrivateExecution(options: {
 const config :Workerd.Config = (
  services = [
   (name = "application", worker = (
-    modules = [${renderWorkerdModules(prepared.manifest, ".")}],
+    modules = [${renderWorkerdModules(classPrepared.manifest, ".")}],
     bindings = [${[...bindings, ...(actor ? ['(name = "__TAKOSERVER_ACTOR_ALARM_OWNER", service = "actor-owner")'] : [])].join(", ")}],
     modulePolicy = (applicationMain = ${capnpText(prepared.manifest.mainModule)}),
     compatibilityDate = "2026-01-01",
     compatibilityFlags = [${(actor ? [...APPLICATION_COMPATIBILITY_FLAGS, "experimental"] : APPLICATION_COMPATIBILITY_FLAGS).map(capnpText).join(", ")}],
     globalOutbound = "deny"
   )),
-  ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${serviceExternals}${actorVersionServices}${actorServices}
+  ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${serviceExternals}${workflowExternals}${actorVersionServices}${actorServices}
   (name = "deny", network = (allow = []))
  ],
  sockets = [(name = ${capnpText(actor ? "actor" : "workflow")}, address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = ${capnpText(actor ? "actor-owner" : "application")})${actor ? `, (name = "actor-duplex", address = ${capnpText(`unix:${actorProxySocketPath}`)}, http = (style = proxy), service = "actor-owner")` : ""}]
 );`;
-  await writePreparedWorkerdSite(root, prepared);
+  await writePreparedWorkerdSite(root, classPrepared);
   for (const { root: versionRoot, version } of actorPrepared) {
     await writePreparedWorkerdSite(versionRoot, version);
   }

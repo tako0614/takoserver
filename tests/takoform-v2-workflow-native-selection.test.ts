@@ -193,7 +193,11 @@ function fixture() {
         incarnationId: "physical-incarnation-1",
         selected,
         stillCurrent: async () => ownerCurrent,
-        acquirePrivateServiceBindings: async () => ({ services: [], async release() {} }),
+        acquirePrivateServiceBindings: async () => ({
+          services: [],
+          workflowServices: [],
+          async release() {},
+        }),
       };
     },
   };

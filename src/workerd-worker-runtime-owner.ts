@@ -3957,6 +3957,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         let released = false;
         return {
           services: lease.services,
+          workflowServices: lease.workflowServices,
           async release() {
             if (released) return;
             await lease.release();

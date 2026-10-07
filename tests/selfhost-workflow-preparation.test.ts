@@ -410,6 +410,7 @@ test("pins the selected service binding and releases it only after prepared disp
   let acquiredIdentity: WorkerdSelectedVersionIdentity | undefined;
   let releaseCount = 0;
   const lease: WorkerdPrivateServiceLease = {
+    workflowServices: [],
     services: [
       {
         name: SERVICE_BINDING.name,
@@ -473,6 +474,7 @@ test("releases a service lease when mapping fails or cancellation arrives after 
     serviceRuntime: {
       async acquirePrivateServiceBindings() {
         return {
+          workflowServices: [],
           services: [
             {
               name: "__TAKOSERVER_SELFHOST_SERVICE_00002",
@@ -501,6 +503,7 @@ test("releases a service lease when mapping fails or cancellation arrives after 
       async acquirePrivateServiceBindings() {
         abortDuringAcquire.abort();
         return {
+          workflowServices: [],
           services: [
             {
               name: SERVICE_BINDING.name,
