@@ -285,10 +285,12 @@ before its grant and requires exact-ID absence after its single send. Losing a
 CREATE acknowledgement without its ID remains unknown and never authorizes a
 second create. The source migration does not change the live apply ceilings.
 
-The private Cloudflare adapter exercises this management path through the public
-Host and real SQLite with a simulated external API. This is not complete Form
-support: native Worker Binding execution and provider error semantics remain
-unqualified. EdgeKVNamespace 0.2.0 gives bounds for TTL, list limit and prefix,
+The private Cloudflare adapter exercises accepted Core Host operations with
+explicit organization principals and real SQLite, using a simulated external
+API. This does not prove HTTP authentication or complete Form support. Native
+Worker Binding execution remains unqualified, as does the client's assumption
+that an exact-ID GET HTTP 404 proves absence rather than an account or permission
+failure. EdgeKVNamespace 0.2.0 gives bounds for TTL, list limit and prefix,
 but does not name their out-of-range errors despite requiring named errors.
 The implementation must not invent those names or revise the published Form in
 place; the SDK gap requires an owning successor contract decision.
