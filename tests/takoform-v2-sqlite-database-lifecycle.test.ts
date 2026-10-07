@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -367,6 +368,36 @@ test("the UID-owned native handle feeds the guarded Worker SQL plane without led
         }
       },
     });
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("DELETE treats a replaced Resource directory as unknown, not confirmed absence", async () => {
+  const root = mkdtempSync(join(tmpdir(), "v2-sqlite-db-dir-"));
+  const database = control(root, true);
+  const clock = () => new Date("2026-10-07T00:00:00Z");
+  try {
+    const { engine } = host(root, database, clock);
+    const first = await created(engine, "first", "sqlite-dir-first-00000001");
+    const second = await created(engine, "second", "sqlite-dir-second-0000001");
+    expect((await engine.runNext())?.status).toBe("succeeded");
+    expect((await engine.runNext())?.status).toBe("succeeded");
+    const firstDir = join(root, "native", "resources", first.resourceUid);
+    const secondDir = join(root, "native", "resources", second.resourceUid);
+    const saved = join(root, "saved-first");
+    renameSync(firstDir, saved);
+    symlinkSync(secondDir, firstDir);
+    await engine.acceptDelete({
+      principal: "alice",
+      key: "sqlite-dir-delete-00000001",
+      uid: first.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect((await engine.runNext())?.status).toBe("reconciling");
+    expect(existsSync(join(secondDir, "database.sqlite"))).toBe(true);
+    expect(existsSync(join(saved, "database.sqlite"))).toBe(true);
   } finally {
     database.close();
     rmSync(root, { recursive: true, force: true });

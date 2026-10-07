@@ -251,7 +251,8 @@ export function createSelfhostV2SQLiteStore(options: {
 
   function presence(uid: string): Presence {
     const directory = resourceDir(uid);
-    if (!directoryExists(directory)) return "absent";
+    if (!entryExists(directory)) return "absent";
+    if (!directoryExists(directory)) return "unknown";
     return completeDirectory(directory, uid) ? "present" : "unknown";
   }
 
@@ -394,7 +395,8 @@ export function createSelfhostV2SQLiteStore(options: {
       const current = presence(input.resourceUid);
       const heldComplete = completeDirectory(tombstone, input.resourceUid);
       if (current === "unknown" && !heldComplete) return "unknown";
-      if (current === "absent" && !directoryExists(tombstone)) return "absent";
+      if (current === "absent" && !entryExists(tombstone)) return "absent";
+      if (entryExists(tombstone) && !directoryExists(tombstone)) return "unknown";
       if (directoryExists(tombstone) && !privateDirectory(tombstone)) return "unknown";
       if (!directoryExists(tombstone)) {
         const parent = join(deleted, checkedId(input.resourceUid));
