@@ -1663,6 +1663,10 @@ export async function openWorkerdWorkerRuntimeOwner(
     };
     await transitionState((current) => ({
       ...current,
+      // A route-absence receipt is scoped to the last accepted Endpoint
+      // DELETE. Once a new incarnation is durably staged, that historical
+      // receipt must no longer describe the current owner state.
+      endpointRouteAbsence: null,
       incarnations: [...current.incarnations, candidateRecord],
     }));
     const base = incarnationDirectory(operationId);
@@ -1862,6 +1866,14 @@ export async function openWorkerdWorkerRuntimeOwner(
       canonicalJson(persisted.endpointRouteAbsence) !== canonicalJson(receipt) ||
       !(await resolution.stillCurrent())
     ) {
+      return { kind: "unknown" };
+    }
+    try {
+      await verifyOwnerNamespace(directory, persisted, options.workerResourceUid);
+    } catch {
+      return { kind: "unknown" };
+    }
+    if (canonicalJson(state) !== canonicalJson(persisted) || !(await resolution.stillCurrent())) {
       return { kind: "unknown" };
     }
     return receipt;

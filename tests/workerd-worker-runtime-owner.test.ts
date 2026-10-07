@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
   chmod,
   cp,
@@ -428,6 +429,7 @@ async function endpointPublicationState(workerResourceUid: string) {
   let currentOperationId: string | undefined;
   let deploymentPresent = true;
   let fenceCurrent = true;
+  let namespaceMutationAfterSecondFence: (() => Promise<void>) | undefined;
   const source = {
     async resolve({
       execution: candidateExecution,
@@ -448,6 +450,7 @@ async function endpointPublicationState(workerResourceUid: string) {
         };
       }
       const endpointOperation = candidateExecution.form === WORKER_ENDPOINT_FORM_URL;
+      let fenceChecks = 0;
       const workerDelete =
         candidateExecution.form === WORKER_DEPLOYMENT_FORM_URL &&
         candidateExecution.action === "delete";
@@ -507,6 +510,12 @@ async function endpointPublicationState(workerResourceUid: string) {
         },
         sqlGuard: { sql: "SELECT 1", params: [] },
         async stillCurrent() {
+          fenceChecks += 1;
+          if (fenceChecks === 2 && namespaceMutationAfterSecondFence) {
+            const mutate = namespaceMutationAfterSecondFence;
+            namespaceMutationAfterSecondFence = undefined;
+            await mutate();
+          }
           return fenceCurrent;
         },
         async readVersionMaterials(versionUid: string) {
@@ -527,6 +536,9 @@ async function endpointPublicationState(workerResourceUid: string) {
     },
     setDeploymentPresent(value: boolean) {
       deploymentPresent = value;
+    },
+    mutateNamespaceAfterSecondFence(mutate: () => Promise<void>) {
+      namespaceMutationAfterSecondFence = mutate;
     },
     output,
     deploymentSpec,
@@ -741,6 +753,9 @@ test("no-Deployment Endpoint delete proves a complete empty owner namespace and 
   const workerUid = "worker-endpoint-empty-owner";
   const publication = await endpointPublicationState(workerUid);
   publication.setDeploymentPresent(false);
+  const workerKey = createHash("sha256").update(workerUid, "utf8").digest("hex");
+  const ownerDirectory = join(owned.root, "owners", workerKey);
+  let routeAbsenceAtSpawn: unknown = "not-observed";
   const ownerOptions = {
     rootDirectory: join(owned.root, "owners"),
     workerResourceUid: workerUid,
@@ -748,7 +763,12 @@ test("no-Deployment Endpoint delete proves a complete empty owner namespace and 
     publicationState: publication.source,
     workerdBinary: owned.binary,
     listenerPortForOperation: unusedPort,
-    spawn: owned.spawn,
+    spawn(command: readonly string[]) {
+      routeAbsenceAtSpawn = JSON.parse(
+        readFileSync(join(ownerDirectory, "runtime-owner.json"), "utf8"),
+      ).endpointRouteAbsence;
+      return owned.spawn(command);
+    },
   };
   const endpointDelete = endpointExecution(
     workerUid,
@@ -773,8 +793,6 @@ test("no-Deployment Endpoint delete proves a complete empty owner namespace and 
     const reopened = await openWorkerdWorkerRuntimeOwner(ownerOptions);
     try {
       expect(await reopened.execute(endpointDelete)).toEqual(first);
-      const workerKey = createHash("sha256").update(workerUid, "utf8").digest("hex");
-      const ownerDirectory = join(ownerOptions.rootDirectory, workerKey);
       const incarnationRoot = join(ownerDirectory, "incarnations");
       const orphanId = "a2b12db3-3e26-489a-b6f6-0844e88a1158";
       const orphanPath = join(incarnationRoot, orphanId);
@@ -794,6 +812,58 @@ test("no-Deployment Endpoint delete proves a complete empty owner namespace and 
 
       expect(await reopened.execute(endpointDelete)).toEqual(first);
       expect(owned.children).toHaveLength(0);
+
+      const postPersistOrphanId = "d72f799c-04bb-4c2b-95ce-96af11412f3c";
+      const racedRouteDelete = endpointExecution(
+        workerUid,
+        "3a6c3bde-537d-425d-8b97-689ae1fbb5f1",
+        "delete",
+      );
+      publication.setCurrent(racedRouteDelete.operationId);
+      publication.mutateNamespaceAfterSecondFence(async () => {
+        await mkdir(join(incarnationRoot, postPersistOrphanId), {
+          recursive: true,
+          mode: 0o700,
+        });
+      });
+      expect(await reopened.execute(racedRouteDelete)).toEqual({ kind: "unknown" });
+      expect(await pathExists(join(incarnationRoot, postPersistOrphanId))).toBe(true);
+      await rm(incarnationRoot, { recursive: true });
+      await reopened.close();
+      const afterInventoryRace = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+      try {
+        expect(await afterInventoryRace.execute(racedRouteDelete)).toMatchObject({
+          kind: "confirmed_route_absent",
+          sourceOperationId: racedRouteDelete.operationId,
+        });
+      } finally {
+        await afterInventoryRace.close();
+      }
+
+      // A later publication clears the historical receipt in the same
+      // durable transition that stages its candidate incarnation.
+      const candidatePublication = staticPublicationState(workerUid);
+      const candidateOwner = await openWorkerdWorkerRuntimeOwner({
+        ...ownerOptions,
+        publicationState: candidatePublication.source,
+      });
+      try {
+        const deploymentCreate = execution(
+          workerUid,
+          "68231ca5-c3a0-460b-974f-c89ca69358d2",
+          "create",
+        );
+        expect(await candidateOwner.execute(deploymentCreate)).toMatchObject({ kind: "confirmed" });
+        expect(routeAbsenceAtSpawn).toBeNull();
+        candidatePublication.setCurrent(deploymentCreate.operationId);
+        expect(
+          await candidateOwner.execute(
+            execution(workerUid, "d148c455-1910-4c9d-9869-451a8768f635", "delete"),
+          ),
+        ).toMatchObject({ kind: "confirmed", identity: null });
+      } finally {
+        await candidateOwner.close();
+      }
     } finally {
       await reopened.close();
     }
