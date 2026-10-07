@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -9,8 +9,13 @@ import {
 } from "../src/providers/selfhost-worker-prelude.ts";
 import { selfhostWorkerEntrypointSource } from "../src/providers/selfhost-worker-wrapper.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
+import { openWorkerdActorNamespace } from "../src/selfhost-actor-native-process.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
-import { createWorkerdRuntime, type WorkerdDeploymentPublication } from "../src/workerd-runtime.ts";
+import {
+  createWorkerdRuntime,
+  type WorkerdActiveActorGraph,
+  type WorkerdDeploymentPublication,
+} from "../src/workerd-runtime.ts";
 import { fixture, scope } from "./helpers/actor-resource-fixture.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
@@ -170,7 +175,7 @@ export class Counter extends Base {
       let settled = await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
       for (
         let attempt = 0;
-        attempt < 100 && settled.kind === "confirmed" && settled.activeActorCount !== 0;
+        attempt < 100 && (settled.kind !== "confirmed" || settled.activeActorCount !== 0);
         attempt += 1
       ) {
         await Bun.sleep(25);
@@ -259,6 +264,124 @@ export class Counter extends Base {
       await host.close();
       f.database.close();
       await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(binary === undefined)(
+  "Actor startup refuses a foreign listener's pre-readiness 204 while its selected child is alive",
+  async () => {
+    if (!binary || !digest) throw new Error("candidate required");
+    expect(
+      createHash("sha256")
+        .update(await readFile(binary))
+        .digest("hex"),
+    ).toBe(digest);
+    const root = await mkdtemp(join(tmpdir(), "actor-foreign-startup-"));
+    const configPathFile = join(root, "child-config");
+    const startGate = join(root, "start-gate");
+    const wrapper = join(root, "delayed-child");
+    await writeFile(startGate, "held");
+    await writeFile(
+      wrapper,
+      `#!/bin/sh\nprintf '%s\\n' "$2" > '${configPathFile}'\nwhile test -e '${startGate}'; do sleep 0.01; done\nexec '${binary}' "$@"\n`,
+      { mode: 0o700 },
+    );
+    const main = "main.mjs";
+    const host = "__host.mjs";
+    const graph: WorkerdActiveActorGraph = {
+      generation: "foreign-startup-generation",
+      generationKey: createHash("sha256").update("foreign-startup-generation").digest("hex"),
+      workerResourceUid: "foreign-startup-worker",
+      versions: [
+        {
+          versionId: "foreign-startup-version",
+          workerVersionUid: "foreign-startup-version-uid",
+          weight: 10_000,
+          variantKey: "foreign-startup-variant",
+          site: {
+            directory: "worker",
+            mainModule: main,
+            hostEntrypoint: host,
+            hostModules: [host, SELFHOST_WORKER_PRELUDE_MODULE],
+            hostnames: [],
+            generation: "foreign-startup-generation",
+            workerResourceUid: "foreign-startup-worker",
+            fetchHandler: true,
+          },
+          modules: new Map([
+            [main, encoder.encode("export class Actor { fetch() { return new Response('ok'); } }")],
+          ]),
+          hostModules: new Map([
+            [SELFHOST_WORKER_PRELUDE_MODULE, encoder.encode(selfhostWorkerPreludeSource())],
+            [
+              host,
+              encoder.encode(
+                selfhostWorkerEntrypointSource({
+                  originalMainModule: main,
+                  declaredHandlers: ["fetch"],
+                  bindings: [],
+                  publication: "foreign-startup-generation",
+                  probeHostname: "probe.invalid",
+                }),
+              ),
+            ],
+          ]),
+        },
+      ],
+    };
+    const controller = new AbortController();
+    const opening = openWorkerdActorNamespace(wrapper, {
+      namespaceKey: "a".repeat(64),
+      storagePath: join(root, "state"),
+      className: "Actor",
+      graph,
+      signal: controller.signal,
+      admitAlarm: async () => null,
+      completeAlarm() {},
+      admitSocket: async () => null,
+      completeSocket() {},
+    });
+    let foreign: ReturnType<typeof Bun.serve> | undefined;
+    let socket = "";
+    try {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (
+          await access(configPathFile).then(
+            () => true,
+            () => false,
+          )
+        )
+          break;
+        await Bun.sleep(10);
+      }
+      const config = (await readFile(configPathFile, "utf8")).trim();
+      socket = join(dirname(config), "run.sock");
+      foreign = Bun.serve({ unix: socket, fetch: () => new Response(null, { status: 204 }) });
+      const state = await Promise.race([
+        opening.then(
+          () => "admitted",
+          () => "refused",
+        ),
+        Bun.sleep(300).then(() => "pending"),
+      ]);
+      expect(state).not.toBe("admitted");
+    } finally {
+      controller.abort(new Error("foreign startup probe finished"));
+      await unlink(startGate);
+      const namespace = await opening.catch(() => null);
+      await namespace?.close();
+      try {
+        if (foreign && socket)
+          expect((await fetch("http://actor.invalid/", { unix: socket })).status).toBe(204);
+      } finally {
+        foreign?.stop(true);
+        if (socket)
+          await unlink(socket).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "ENOENT") throw error;
+          });
+        await rm(root, { recursive: true, force: true });
+      }
     }
   },
 );
