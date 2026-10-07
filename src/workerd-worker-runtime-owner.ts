@@ -475,6 +475,111 @@ async function requireVacantOwnerListeners(state: PersistedOwnerState): Promise<
   }
 }
 
+async function requirePrivateDirectory(path: string): Promise<void> {
+  const info = await lstat(path, { bigint: true }).catch(() => null);
+  if (!info?.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077n) !== 0n) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+}
+
+async function requireExactEntries(path: string, expected: readonly string[]): Promise<void> {
+  const actual = await readdir(path).catch(() => {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  if (canonicalJson([...actual].sort()) !== canonicalJson([...expected].sort())) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+}
+
+async function verifyKnownRetiredGroupContents(groupDirectory: string): Promise<void> {
+  const entries = await readdir(groupDirectory).catch(() => {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  const allowed = new Set([
+    "group.json",
+    "retirement.json",
+    "workers",
+    "assets",
+    ".retired-execution-copies",
+  ]);
+  if (
+    !entries.includes("group.json") ||
+    !entries.includes("retirement.json") ||
+    !entries.includes("workers") ||
+    entries.some((entry) => !allowed.has(entry))
+  ) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+  for (const entry of entries) {
+    const path = join(groupDirectory, entry);
+    const info = await lstat(path, { bigint: true }).catch(() => null);
+    if (!info || info.isSymbolicLink() || (info.mode & 0o077n) !== 0n) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    if (entry === "group.json" || entry === "retirement.json") {
+      if (!info.isFile()) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    } else if (!info.isDirectory()) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+  }
+}
+
+/**
+ * Under the exact UID owner lock, prove that persisted incarnations are the
+ * complete namespace inventory. Unknown/orphan entries are evidence gaps,
+ * never garbage to clean up.
+ */
+async function verifyOwnerNamespace(
+  directory: string,
+  state: PersistedOwnerState,
+  workerResourceUid: string,
+): Promise<void> {
+  const stateInfo = await lstat(join(directory, STATE_NAME)).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  const incarnationRoot = join(directory, "incarnations");
+  const incarnationInfo = await lstat(incarnationRoot).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  const topLevel = [
+    LOCK_NAME,
+    ...(stateInfo ? [STATE_NAME] : []),
+    ...(incarnationInfo ? ["incarnations"] : []),
+  ];
+  await requireExactEntries(directory, topLevel);
+  if (stateInfo && (!stateInfo.isFile() || stateInfo.isSymbolicLink())) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+  if (incarnationInfo && (!incarnationInfo.isDirectory() || incarnationInfo.isSymbolicLink())) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+  const expectedOperations = state.incarnations.map((record) => record.operationId).sort();
+  if (expectedOperations.length === 0) {
+    if (incarnationInfo !== null) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    return;
+  }
+  if (incarnationInfo === null) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  await requirePrivateDirectory(incarnationRoot);
+  await requireExactEntries(incarnationRoot, expectedOperations);
+  const groupsName = "groups";
+  const workerKey = uidKey(workerResourceUid);
+  for (const operationId of expectedOperations) {
+    if (!OPERATION_ID.test(operationId))
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const operationRoot = join(incarnationRoot, operationId);
+    await requirePrivateDirectory(operationRoot);
+    await requireExactEntries(operationRoot, [groupsName]);
+    const groupsRoot = join(operationRoot, groupsName);
+    await requirePrivateDirectory(groupsRoot);
+    await requireExactEntries(groupsRoot, [workerKey]);
+    const groupDirectory = join(groupsRoot, workerKey);
+    await requirePrivateDirectory(groupDirectory);
+    await verifyKnownRetiredGroupContents(groupDirectory);
+  }
+}
+
 function recoveryClaimName(fingerprint: OwnerProcessFingerprint, ownerId: string): string {
   return `${RECOVERY_PREFIX}${process.pid}.${fingerprint.bootId}.${fingerprint.startTimeTicks}.${fingerprint.pidNamespace}.${ownerId}`;
 }
@@ -982,8 +1087,6 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
           ))) ||
       (result.endpointRouteAbsence !== null &&
         (result.activeOperationId !== null ||
-          result.admissionClosedBy === null ||
-          !result.deletionPublicationConfirmed ||
           result.incarnations.some(
             (item) =>
               item.status !== "retired" || item.receipt === null || !item.executionCopiesReleased,
@@ -1214,6 +1317,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       throw error;
     });
     state = parseState(text, options.workerResourceUid);
+    await verifyOwnerNamespace(directory, state, options.workerResourceUid);
     if (
       (state.endpointRouteAbsence !== null &&
         state.endpointRouteAbsence.targetKey !== options.targetKey) ||
@@ -1655,18 +1759,14 @@ export async function openWorkerdWorkerRuntimeOwner(
       return { kind: "unknown" };
     }
 
-    // A no-Deployment route absence is only established after this exact owner
-    // previously closed its Deployment and retired every incarnation. The exact
-    // retirement receipt proves the child exited and its listener is absent; a
-    // stale metadata pointer inside that non-listening group is not a live route.
-    // Empty or uncertain owner state cannot prove absence for an unobserved runtime.
+    // A no-Deployment route absence is established either by exact retirement
+    // receipts for every known incarnation, or by a complete empty namespace
+    // inventory. The receipt proves child exit and listener absence; a stale
+    // metadata pointer inside that non-listening group is not a live route.
     if (
       closed ||
       active !== null ||
       state.activeOperationId !== null ||
-      admissionClosedBy === null ||
-      !state.deletionPublicationConfirmed ||
-      state.incarnations.length === 0 ||
       state.incarnations.some(
         (record) =>
           record.status !== "retired" ||
@@ -1680,6 +1780,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
 
     const capturedState = canonicalJson(state);
+    await verifyOwnerNamespace(directory, state, options.workerResourceUid);
     for (const record of state.incarnations) {
       const groupDirectory = join(
         directory,
@@ -1716,11 +1817,22 @@ export async function openWorkerdWorkerRuntimeOwner(
       canonicalJson(state) !== capturedState ||
       active !== null ||
       state.activeOperationId !== null ||
-      !state.deletionPublicationConfirmed ||
-      !(await resolution.stillCurrent())
+      state.incarnations.some(
+        (record) =>
+          record.status !== "retired" ||
+          record.receipt === null ||
+          !record.executionCopiesReleased ||
+          !record.executionCopiesCleanupStarted,
+      )
     ) {
       return { kind: "unknown" };
     }
+    try {
+      await verifyOwnerNamespace(directory, state, options.workerResourceUid);
+    } catch {
+      return { kind: "unknown" };
+    }
+    if (!(await resolution.stillCurrent())) return { kind: "unknown" };
 
     const receipt: V2EndpointRouteAbsentReceipt = {
       kind: "confirmed_route_absent",
@@ -1733,7 +1845,6 @@ export async function openWorkerdWorkerRuntimeOwner(
     const persisted = await transitionState((current) => {
       if (
         current.activeOperationId !== null ||
-        !current.deletionPublicationConfirmed ||
         current.incarnations.some(
           (record) =>
             record.status !== "retired" ||

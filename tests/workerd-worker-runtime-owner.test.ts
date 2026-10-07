@@ -659,6 +659,23 @@ test("Endpoint create/update/delete publish only its route through the same weig
     });
     await owner.close();
 
+    const workerKey = createHash("sha256").update(workerUid, "utf8").digest("hex");
+    const groupDirectory = join(
+      ownerOptions.rootDirectory,
+      workerKey,
+      "incarnations",
+      deploymentCreate.operationId,
+      "groups",
+      workerKey,
+    );
+    const unexpectedEntry = join(groupDirectory, "unknown-owner-entry");
+    await writeFile(unexpectedEntry, "preserve unknown entry");
+    await expect(openWorkerdWorkerRuntimeOwner(ownerOptions)).rejects.toMatchObject({
+      code: "ownership_uncertain",
+    });
+    expect(await Bun.file(unexpectedEntry).text()).toBe("preserve unknown entry");
+    await rm(unexpectedEntry);
+
     const reopened = await openWorkerdWorkerRuntimeOwner(ownerOptions);
     try {
       expect(await reopened.execute(deploymentDelete)).toMatchObject({
@@ -710,6 +727,73 @@ test("Endpoint create/update/delete publish only its route through the same weig
         sourceOperationId: staleRouteDelete.operationId,
       });
       expect(await reopened.execute(staleRouteDelete)).toEqual(retriedRouteAbsent);
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await owner.close().catch(() => undefined);
+    await owned.cleanup();
+  }
+});
+
+test("no-Deployment Endpoint delete proves a complete empty owner namespace and refuses orphans", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-endpoint-empty-owner";
+  const publication = await endpointPublicationState(workerUid);
+  publication.setDeploymentPresent(false);
+  const ownerOptions = {
+    rootDirectory: join(owned.root, "owners"),
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+  };
+  const endpointDelete = endpointExecution(
+    workerUid,
+    "30d5ff3d-d20d-42e3-86bc-d3cff6a1ba35",
+    "delete",
+  );
+  publication.setCurrent(endpointDelete.operationId);
+  const owner = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+  try {
+    const first = await owner.execute(endpointDelete);
+    expect(first).toEqual({
+      kind: "confirmed_route_absent",
+      sourceOperationId: endpointDelete.operationId,
+      endpointResourceUid: endpointDelete.resourceUid,
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      assignedHostname: publication.output.hostname,
+    });
+    expect(owned.children).toHaveLength(0);
+    await owner.close();
+
+    const reopened = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+    try {
+      expect(await reopened.execute(endpointDelete)).toEqual(first);
+      const workerKey = createHash("sha256").update(workerUid, "utf8").digest("hex");
+      const ownerDirectory = join(ownerOptions.rootDirectory, workerKey);
+      const incarnationRoot = join(ownerDirectory, "incarnations");
+      const orphanId = "a2b12db3-3e26-489a-b6f6-0844e88a1158";
+      const orphanPath = join(incarnationRoot, orphanId);
+      await mkdir(orphanPath, { recursive: true, mode: 0o700 });
+      expect(await reopened.execute(endpointDelete)).toEqual({ kind: "unknown" });
+      expect((await lstat(orphanPath)).isDirectory()).toBe(true);
+      await rm(incarnationRoot, { recursive: true });
+
+      const foreign = join(owned.root, "foreign-incarnation-root");
+      await mkdir(foreign, { mode: 0o700 });
+      await writeFile(join(foreign, "untouched"), "foreign");
+      await symlink(foreign, incarnationRoot);
+      expect(await reopened.execute(endpointDelete)).toEqual({ kind: "unknown" });
+      expect(await Bun.file(join(foreign, "untouched")).text()).toBe("foreign");
+      await unlink(incarnationRoot);
+      await rm(foreign, { recursive: true });
+
+      expect(await reopened.execute(endpointDelete)).toEqual(first);
+      expect(owned.children).toHaveLength(0);
     } finally {
       await reopened.close();
     }
