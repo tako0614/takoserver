@@ -284,6 +284,22 @@ test("scheduled code requires an explicit private delivery capability and exact 
   ).rejects.toMatchObject({ code: "worker_handler_mismatch" });
 });
 
+test("handler-only scheduled code projects before a Cron attachment exists", async () => {
+  const projection = await projectV2WorkerCodeVersion({
+    identity: identity(),
+    spec: versionSpec({ handlers: ["scheduled"] }),
+    bundle: await heldBundle({
+      moduleBytes: encoder.encode("export default { scheduled() {} };\n"),
+    }),
+    inspectModule: inspector({ outcome: "valid", exportedHandlers: ["scheduled"] }),
+    eventDelivery: { token: "b".repeat(64) },
+  });
+  expect(projection.site.fetchHandler).toBe(false);
+  expect(projection.modules.get(MODULE_PATH)).toEqual(
+    encoder.encode("export default { scheduled() {} };\n"),
+  );
+});
+
 test("projects verified code+assets into one copied Version with exact routing policy", async () => {
   const held = await heldAssets();
   const projection = await projectV2WorkerCodeVersion({

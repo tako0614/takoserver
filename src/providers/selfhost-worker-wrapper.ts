@@ -994,14 +994,20 @@ function createServiceAdapter(rawEnv, descriptor) {
   return SafeApply(SafeObjectFreeze, SafeObject, [portable]);
 }
 
-function createPortableContext(rawContext) {
+function createPortableContext(rawContext, onRegistrationFailure) {
   const portable = SafeObjectCreate(null);
   const nativeWaitUntil =
     rawContext && typeof rawContext.waitUntil === "function" ? rawContext.waitUntil : undefined;
   portable.waitUntil = (value) => {
     const promise = SafeApply(SafePromiseResolve, SafePromise, [value]);
-    if (nativeWaitUntil) {
-      try { SafeApply(nativeWaitUntil, rawContext, [promise]); } catch {}
+    if (!nativeWaitUntil) {
+      if (onRegistrationFailure) onRegistrationFailure();
+      throw portableError("context_expired");
+    }
+    try { SafeApply(nativeWaitUntil, rawContext, [promise]); }
+    catch {
+      if (onRegistrationFailure) onRegistrationFailure();
+      throw portableError("context_expired");
     }
   };
   return SafeApply(SafeObjectFreeze, SafeObject, [portable]);
@@ -1182,7 +1188,11 @@ function decision(messageId, outcome, delaySeconds) {
 
 async function invokeScheduled(event, rawEnv, rawContext) {
   const env = projectEnv(rawEnv);
-  const context = createPortableContext(rawContext);
+  // A native refusal means this invocation's background lifetime could not be
+  // retained. Even if tenant code catches context_expired, its return cannot
+  // authenticate a completed delivery to the scheduler.
+  let registrationFailed = false;
+  const context = createPortableContext(rawContext, () => { registrationFailed = true; });
   const original = await loadOriginal();
   const scheduled = SafeObjectCreate(null);
   scheduled.cron = event.cron;
@@ -1193,8 +1203,9 @@ async function invokeScheduled(event, rawEnv, rawContext) {
   try {
     await SafeApply(original.handlers.scheduled, original.target, [scheduled, env, context]);
   } catch {
-    return scheduleResult("rejected", 500);
+    return registrationFailed ? statusResponse(500) : scheduleResult("rejected", 500);
   }
+  if (registrationFailed) return statusResponse(500);
   return scheduleResult("ack", 200);
 }
 

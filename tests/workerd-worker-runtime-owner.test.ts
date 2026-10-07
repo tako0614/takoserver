@@ -1502,6 +1502,19 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         code: "ownership_uncertain",
       });
       for (const record of previousV7.incarnations) delete record.eventToken;
+      const incompleteV7 = structuredClone(previousV7);
+      const incompleteCopy = incompleteV7.incarnations[0];
+      if (!incompleteCopy) throw new Error("retired v7 incarnation missing");
+      (incompleteV7 as typeof incompleteV7 & Record<string, unknown>).activeOperationId = null;
+      (incompleteV7 as typeof incompleteV7 & Record<string, unknown>).admissionClosedBy = deleteId;
+      (incompleteV7 as typeof incompleteV7 & Record<string, unknown>).deletionPublicationConfirmed =
+        true;
+      (incompleteV7 as typeof incompleteV7 & Record<string, unknown>).endpointRouteAbsence = null;
+      incompleteCopy.executionCopiesReleased = false;
+      await writeFile(statePath, `${JSON.stringify(incompleteV7)}\n`, { mode: 0o600 });
+      await expect(openWorkerdWorkerRuntimeOwner(ownerOptions)).rejects.toMatchObject({
+        code: "ownership_uncertain",
+      });
       await writeFile(statePath, `${JSON.stringify(previousV7)}\n`, { mode: 0o600 });
       const migratedV7 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
       await migratedV7.close();
@@ -1678,6 +1691,8 @@ test("scheduled port delivers the exact match through the current private Versio
   try {
     const created = await owner.execute(execution(workerUid, createId, "create"));
     expect(created.kind).toBe("confirmed");
+    if (created.kind !== "confirmed" || !created.identity)
+      throw new Error("scheduled publication identity missing");
     publication.setCurrent(createId);
     const capability = await owner.observeScheduledCapability({
       workerUid,
@@ -1716,6 +1731,7 @@ test("scheduled port delivers the exact match through the current private Versio
     expect(observed.event).toMatchObject({
       protocol: "takoserver.managed-worker-event@v1",
       kind: "schedule",
+      deploymentId: created.identity.versions[0]?.versionId,
       cron: match.cron,
       scheduledTime: match.scheduledTime,
     });

@@ -1341,6 +1341,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                 cleanupState ||
                 routeReceiptState ||
                 processPinState ||
+                eventlessState ||
                 currentState) &&
                 !item.executionCopiesReleased),
           ))) ||

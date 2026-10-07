@@ -1387,6 +1387,54 @@ test("scheduled event reports exact handler settlement without leaking thrown de
   }
 });
 
+test("scheduled waitUntil registration refusal is unknown even when the handler catches context_expired", async () => {
+  const generated = await loadGenerated(
+    `export default { async scheduled(event, env, ctx) {
+      try { ctx.waitUntil(Promise.resolve()); }
+      catch (error) {
+        if (error.name !== "context_expired") throw error;
+      }
+    } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["scheduled"],
+      bindings: [],
+      events: true,
+    },
+  );
+  try {
+    const response = await generated.eventEntrypoint?.fetch(
+      new Request(`http://takoserver-selfhost-events.invalid${SELFHOST_WORKER_EVENT_PATH}`, {
+        method: "POST",
+        headers: {
+          "content-type": SELFHOST_WORKER_EVENT_CONTENT_TYPE,
+          [SELFHOST_WORKER_EVENT_HEADER]: SELFHOST_WORKER_EVENT_PROTOCOL,
+        },
+        body: JSON.stringify(
+          selfhostScheduleEvent({
+            script: "worker-001",
+            publication: "v2-selected",
+            cron: "0 * * * *",
+            scheduledTime: 1_700_000_000_000,
+          }),
+        ),
+      }),
+      {},
+      {
+        waitUntil() {
+          throw new Error("private native context detail");
+        },
+      },
+    );
+    expect(response?.status).toBe(500);
+    expect(await response?.text()).toBe("");
+  } finally {
+    await generated.dispose();
+  }
+});
+
 test("the edge.objects facade offers exactly the nine methods the Binding fixes", async () => {
   const { service } = objectPlane([]);
   const generated = await loadGenerated(
