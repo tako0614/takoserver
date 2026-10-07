@@ -13,6 +13,7 @@ const MAX_BODY_QUERY_MESSAGES = 99;
 const MAX_TRANSFER_NOTICE_LIST = 100;
 const MAX_BATCH_TIMEOUT_SECONDS = 60;
 const MAX_SAFE_GENERATION = Number.MAX_SAFE_INTEGER;
+const SQL_NOW_MILLIS = `(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))`;
 const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 
 export interface QueueCustodyTarget {
@@ -61,6 +62,20 @@ export interface QueueCustodyBatchReceipt {
   readonly state: "pending" | "settled";
   readonly outcome: "ack" | "retry" | null;
   readonly delaySeconds: number | null;
+}
+
+/** Host-private 0083 identity. This is a CAS selector, never tenant authority. */
+export interface QueueCustodyV2ExecutionIdentity {
+  readonly batchId: string;
+  readonly reservationToken: string;
+  readonly queueId: string;
+  readonly consumerUid: string;
+  readonly generation: number;
+  readonly workerUid: string;
+  readonly servingSourceOperationId: string;
+  readonly workerVersionUid: string;
+  readonly workerVersionGeneration: number;
+  readonly incarnationOperationId: string;
 }
 
 /**
@@ -170,6 +185,10 @@ export interface QueueCustody {
     readonly decision: { readonly outcome: "ack" | "retry"; readonly delaySeconds?: number };
     readonly settlementToken: string;
   }): Promise<"settled" | "already_settled" | "unknown_batch" | "unknown_message" | "unavailable">;
+  /** Extend only all still-live pending 0082 leases of one exact sent 0083 execution. */
+  renewRegisteredV2BatchLeases(
+    execution: QueueCustodyV2ExecutionIdentity,
+  ): Promise<"renewed" | "no_pending" | "unknown">;
   listTransferNotices(input: {
     readonly queueId: string;
     readonly consumerId: string;
@@ -521,7 +540,6 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
     identity: Pick<QueueCustodyConsumerGeneration, "queueId" | "consumerId" | "generation">,
     millis: number,
     limit: number,
-    v2Execution = false,
     v2OperationClaim?: V2ReapClaim,
   ): Promise<boolean> => {
     const rows = await sql.query(
@@ -531,9 +549,6 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
               lease_dead_letter_queue_id,
               lease_dead_letter_delivery_delay_seconds,
               lease_dead_letter_retention_seconds,
-              ${
-                v2Execution
-                  ? `
               (SELECT execution.state FROM queue_v2_batch_executions execution
                WHERE execution.queue_id = message.queue_id
                  AND execution.consumer_uid = message.lease_consumer_id
@@ -543,9 +558,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                WHERE execution.queue_id = message.queue_id
                  AND execution.consumer_uid = message.lease_consumer_id
                  AND execution.consumer_generation = message.lease_generation
-                 AND execution.lease_token = message.lease_token) AS execution_until_ms`
-                  : `NULL AS execution_state, NULL AS execution_until_ms`
-              }
+                 AND execution.lease_token = message.lease_token) AS execution_until_ms
        FROM selfhost_queue_messages AS message INDEXED BY selfhost_queue_messages_custody_lease
        WHERE queue_id = ? AND lease_consumer_id = ? AND lease_generation = ?
          AND lease_expires_at_ms <= ?
@@ -567,7 +580,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       const target = leaseTargetFromRow(row);
       // An unconfirmed native handler may still be using this exact message.
       // Expired delivery time is not proof of handler+waitUntil retirement.
-      if (v2Execution && row.execution_state === "send_authorized") continue;
+      if (row.execution_state === "send_authorized") continue;
       const snapshotParams = [
         identity.queueId,
         id,
@@ -1063,8 +1076,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         return [];
       }
       const millis = now();
-      if (await reapExpiredLeases(current, millis, MAX_REAP_MESSAGES, v2Reservation !== undefined))
-        return [];
+      if (await reapExpiredLeases(current, millis, MAX_REAP_MESSAGES)) return [];
       const rows = await readUnleasedWindow(current.queueId);
       if (await progressActiveWindow(current, millis, rows)) return [];
       const candidateMetadata = rows
@@ -1663,6 +1675,108 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       return await this.settleBatchMessage({ batchId, message, decision, settlementToken });
     },
 
+    async renewRegisteredV2BatchLeases(value) {
+      // Capture the native-selected identity before SQL I/O. Only the 0083 row,
+      // exact 0082 receipt set, and still-live message leases can authorize a
+      // renewal. A Host clock or tenant-provided batch name has no authority.
+      const execution = {
+        batchId: token(value.batchId, 256, "v2 batch id"),
+        reservationToken: token(value.reservationToken, 128, "v2 reservation token"),
+        queueId: token(value.queueId, 512, "v2 queue id"),
+        consumerUid: token(value.consumerUid, 128, "v2 consumer uid"),
+        generation: positiveInteger(value.generation, MAX_SAFE_GENERATION, "v2 generation"),
+        workerUid: token(value.workerUid, 128, "v2 worker uid"),
+        servingSourceOperationId: token(value.servingSourceOperationId, 128, "v2 source operation"),
+        workerVersionUid: token(value.workerVersionUid, 128, "v2 Version uid"),
+        workerVersionGeneration: positiveInteger(
+          value.workerVersionGeneration,
+          MAX_SAFE_GENERATION,
+          "v2 Version generation",
+        ),
+        incarnationOperationId: token(value.incarnationOperationId, 128, "v2 incarnation"),
+      };
+      const identity = [
+        execution.batchId,
+        execution.reservationToken,
+        execution.queueId,
+        execution.consumerUid,
+        execution.generation,
+        execution.workerUid,
+        execution.servingSourceOperationId,
+        execution.workerVersionUid,
+        execution.workerVersionGeneration,
+        execution.incarnationOperationId,
+      ] as const;
+      // The count equality makes this all-or-none: if even one pending lease
+      // was reclaimed or expired, no member of this batch is silently revived.
+      const updated = await sql.run(
+        `UPDATE selfhost_queue_messages AS message
+         SET lease_expires_at_ms = MIN(message.expires_at_ms,
+           MAX(message.lease_expires_at_ms, ${SQL_NOW_MILLIS} + ?))
+         WHERE message.queue_id = ? AND message.lease_consumer_id = ?
+           AND message.lease_generation = ?
+           AND message.lease_expires_at_ms > ${SQL_NOW_MILLIS}
+           AND message.expires_at_ms > ${SQL_NOW_MILLIS}
+           AND EXISTS (SELECT 1 FROM queue_v2_batch_executions execution
+             WHERE execution.batch_id = ? AND execution.reservation_token = ?
+               AND execution.queue_id = ? AND execution.consumer_uid = ?
+               AND execution.consumer_generation = ? AND execution.worker_uid = ?
+               AND execution.serving_source_operation_id = ?
+               AND execution.worker_version_uid = ?
+               AND execution.worker_version_generation = ?
+               AND execution.incarnation_operation_id = ?
+               AND execution.state = 'send_authorized'
+               AND execution.lease_token = message.lease_token
+               AND execution.message_count = (SELECT count(*) FROM queue_v2_batch_settlements all_receipts
+                 WHERE all_receipts.batch_id = execution.batch_id)
+               AND (SELECT count(*) FROM queue_v2_batch_settlements pending
+                 WHERE pending.batch_id = execution.batch_id AND pending.state = 'pending') =
+                 (SELECT count(*) FROM queue_v2_batch_settlements pending
+                   JOIN selfhost_queue_messages live
+                     ON live.queue_id = pending.queue_id AND live.message_id = pending.message_id
+                   WHERE pending.batch_id = execution.batch_id AND pending.state = 'pending'
+                     AND pending.queue_id = execution.queue_id
+                     AND pending.consumer_id = execution.consumer_uid
+                     AND pending.generation = execution.consumer_generation
+                     AND pending.lease_token = execution.lease_token
+                     AND live.lease_token = pending.lease_token
+                     AND live.lease_consumer_id = pending.consumer_id
+                     AND live.lease_generation = pending.generation
+                     AND live.lease_expires_at_ms > ${SQL_NOW_MILLIS}
+                     AND live.expires_at_ms > ${SQL_NOW_MILLIS}))
+           AND EXISTS (SELECT 1 FROM queue_v2_batch_settlements receipt
+             WHERE receipt.batch_id = ? AND receipt.queue_id = message.queue_id
+               AND receipt.consumer_id = message.lease_consumer_id
+               AND receipt.generation = message.lease_generation
+               AND receipt.lease_token = message.lease_token
+               AND receipt.message_id = message.message_id AND receipt.state = 'pending')`,
+        [
+          MAX_LEASE_MILLIS,
+          execution.queueId,
+          execution.consumerUid,
+          execution.generation,
+          ...identity,
+          execution.batchId,
+        ],
+      );
+      if (updated.changes > 0) return "renewed";
+      const rows = await sql.query(
+        `SELECT (SELECT count(*) FROM queue_v2_batch_settlements receipt
+           WHERE receipt.batch_id = execution.batch_id AND receipt.state = 'pending') AS pending
+         FROM queue_v2_batch_executions execution
+         WHERE execution.batch_id = ? AND execution.reservation_token = ?
+           AND execution.queue_id = ? AND execution.consumer_uid = ?
+           AND execution.consumer_generation = ? AND execution.worker_uid = ?
+           AND execution.serving_source_operation_id = ?
+           AND execution.worker_version_uid = ?
+           AND execution.worker_version_generation = ?
+           AND execution.incarnation_operation_id = ?
+           AND execution.state = 'send_authorized' LIMIT 1`,
+        identity,
+      );
+      return rows.length === 1 && rows[0]?.pending === 0 ? "no_pending" : "unknown";
+    },
+
     async listTransferNotices(input) {
       const selected = generationIdentity(input);
       const limit = positiveInteger(
@@ -1720,7 +1834,13 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                WHERE queue_id = ? AND message_id = ? AND enqueued_at_ms = ?
                  AND visible_at_ms = ? AND expires_at_ms = ? AND deliveries = ?
                  AND lease_token IS ? AND lease_expires_at_ms IS ?
-                 AND expires_at_ms <= ?`,
+                 AND expires_at_ms <= ?
+                 AND NOT EXISTS (SELECT 1 FROM queue_v2_batch_executions execution
+                 WHERE execution.queue_id = selfhost_queue_messages.queue_id
+                   AND execution.consumer_uid = selfhost_queue_messages.lease_consumer_id
+                   AND execution.consumer_generation = selfhost_queue_messages.lease_generation
+                   AND execution.lease_token = selfhost_queue_messages.lease_token
+                   AND execution.state = 'send_authorized')`,
             params: [
               token(row.queue_id, 512, "queue custody queue id"),
               messageId(row.message_id),
@@ -1795,7 +1915,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         MAX_REAP_MESSAGES,
         "queue custody reap limit",
       );
-      await reapExpiredLeases(current, millis, limit, true, input.operationClaim);
+      await reapExpiredLeases(current, millis, limit, input.operationClaim);
       return await retirementStatus(current, millis);
     },
 

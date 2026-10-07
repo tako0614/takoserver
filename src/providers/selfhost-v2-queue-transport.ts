@@ -78,7 +78,6 @@ export interface V2QueueDispatchGrant {
   readonly generation: number;
   /** Exact per-message lease token from the registered 0082 receipt. */
   readonly leaseToken: string;
-  readonly expiresAtMillis: number;
 }
 
 export interface V2QueueSettlementAuth {
@@ -193,7 +192,7 @@ export function createV2QueueSettlementScopeVerifier(input: {
 }
 
 /**
- * Stateless short-lived invocation proof, backed by a boot-required private
+ * Stateless execution-scoped invocation proof, backed by a boot-required private
  * key. It is not the durable authority: the required native and Core readers
  * prove the exact owner/Version/Consumer/Queue scope, and SQL checks the
  * registered 0082 receipt plus live lease on every new decision. A Host
@@ -202,7 +201,6 @@ export function createV2QueueSettlementScopeVerifier(input: {
  */
 export function createV2QueueSettlementAuthority(input: {
   readonly key: Uint8Array;
-  readonly now: () => number;
   readonly scope: {
     readonly native: V2QueueNativeTargetReader;
     readonly core: V2QueueCoreScopeReader;
@@ -213,14 +211,8 @@ export function createV2QueueSettlementAuthority(input: {
     grant: Pick<V2QueueDispatchGrant, "workerUid" | "versionId" | "incarnationId">,
   ): string;
 } {
-  if (
-    !(input.key instanceof Uint8Array) ||
-    input.key.byteLength < 32 ||
-    typeof input.now !== "function"
-  ) {
-    throw new TypeError(
-      "v2 Queue settlement authority requires a private key, clock, and durable scope reader",
-    );
+  if (!(input.key instanceof Uint8Array) || input.key.byteLength < 32) {
+    throw new TypeError("v2 Queue settlement authority requires a private key and scope readers");
   }
   const isLiveScope = createV2QueueSettlementScopeVerifier(input.scope);
   const key = Buffer.from(input.key);
@@ -253,20 +245,11 @@ export function createV2QueueSettlementAuthority(input: {
       grant.leaseToken,
     ].every((value) => typeof value === "string" && value.length > 0 && value.length <= 256) &&
     Number.isSafeInteger(grant.generation) &&
-    grant.generation >= 1 &&
-    Number.isSafeInteger(grant.expiresAtMillis);
+    grant.generation >= 1;
   return {
     bindingToken,
     mint(grant) {
-      const now = input.now();
-      if (
-        !validGrant(grant) ||
-        !Number.isSafeInteger(now) ||
-        grant.expiresAtMillis <= now ||
-        grant.expiresAtMillis > now + 300_000
-      ) {
-        throw new TypeError("v2 Queue invocation scope is invalid or expired");
-      }
+      if (!validGrant(grant)) throw new TypeError("v2 Queue invocation scope is invalid");
       const payload = Buffer.from(JSON.stringify(grant), "utf8").toString("base64url");
       return `${payload}.${mac("invocation/v2", payload).toString("base64url")}`;
     },
@@ -295,7 +278,7 @@ export function createV2QueueSettlementAuthority(input: {
         supplied.byteLength !== expected.byteLength ||
         !timingSafeEqual(supplied, expected) ||
         !isRecord(grant) ||
-        Object.keys(grant).length !== 11 ||
+        Object.keys(grant).length !== 10 ||
         ![
           "batchId",
           "messageId",
@@ -307,13 +290,10 @@ export function createV2QueueSettlementAuthority(input: {
           "queueUid",
           "generation",
           "leaseToken",
-          "expiresAtMillis",
         ].every((name) => Object.hasOwn(grant, name)) ||
         !validGrant(grant)
       )
         return null;
-      const now = input.now();
-      if (!Number.isSafeInteger(now) || grant.expiresAtMillis <= now) return null;
       const expectedBearer = Buffer.from(bindingToken(grant), "utf8");
       const suppliedBearer = Buffer.from(bearer, "utf8");
       if (

@@ -77,11 +77,9 @@ test.skipIf(binary === undefined)(
       queueUid: "queue-native-1",
       generation: 1,
       leaseToken: "lease-native-1",
-      expiresAtMillis: Date.now() + 30_000,
     };
     const authority = createV2QueueSettlementAuthority({
       key,
-      now: Date.now,
       scope: {
         native: {
           async observeQueueTarget(scope) {

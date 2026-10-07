@@ -50,7 +50,10 @@ const waitUntilMillis = pidFixtureMode === "first" || pidFixtureMode === "recove
 const moduleBytes = new TextEncoder().encode(`
 export default {
   async queue(batch, _env, ctx) {
-    if (batch.messages[0].id === "message-retry" && batch.messages[0].attempts === 1)
+    if (batch.messages[0].id.startsWith("message-late-"))
+      await new Promise((resolve) => setTimeout(resolve, 450));
+    if ((batch.messages[0].id === "message-retry" ||
+         batch.messages[0].id === "message-late-retry") && batch.messages[0].attempts === 1)
       throw new Error("retry once");
     await batch.acknowledgeAll();
     ctx.waitUntil(new Promise((resolve) => setTimeout(resolve, ${waitUntilMillis})));
@@ -251,6 +254,7 @@ test.skipIf(binary === undefined)(
         capability,
         settlementKey,
         privatePort,
+        renewalIntervalMillis: 50,
         ownerForWorkerUid: async (uid) => {
           if (!owner || uid !== workerUid) throw new Error("unknown owner");
           return owner;
@@ -405,6 +409,106 @@ test.skipIf(binary === undefined)(
       expect(await sql.query("SELECT count(*) AS n FROM selfhost_queue_messages")).toEqual([
         { n: 0 },
       ]);
+      // Compress the 120s lease to 180ms while the real native handler is
+      // blocked. The owner must renew from exact 0083/0082 SQL custody; both
+      // tenant ACK and handler-throw default retry land after that first lease.
+      for (const [id, expected] of [
+        ["message-late-ack", "handler_resolved"],
+        ["message-late-retry", "handler_rejected"],
+      ] as const) {
+        await custody.admit(
+          {
+            queueId: v2QueueId(queue.resourceUid),
+            messageRetentionSeconds: 3600,
+            deliveryDelaySeconds: 0,
+          },
+          { messageId: id, body: new TextEncoder().encode(id) },
+        );
+        const invoked = queueComposition.deliverOnce(scope);
+        const sentDeadline = Date.now() + 5_000;
+        while (Date.now() < sentDeadline) {
+          const rows = await sql.query(
+            "SELECT state FROM queue_v2_batch_executions ORDER BY reserved_at_ms DESC LIMIT 1",
+          );
+          if (rows[0]?.state === "send_authorized") break;
+          await Bun.sleep(10);
+        }
+        const shortLease = Date.now() + 180;
+        expect(
+          (
+            await sql.run(
+              "UPDATE selfhost_queue_messages SET lease_expires_at_ms = ? WHERE message_id = ? AND lease_token IS NOT NULL",
+              [shortLease, id],
+            )
+          ).changes,
+        ).toBe(1);
+        const [sent] = await sql.query(
+          `SELECT batch_id, reservation_token, queue_id, consumer_uid,
+                  consumer_generation, worker_uid, serving_source_operation_id,
+                  worker_version_uid, worker_version_generation, incarnation_operation_id
+           FROM queue_v2_batch_executions WHERE state = 'send_authorized'
+           ORDER BY reserved_at_ms DESC LIMIT 1`,
+        );
+        const exactExecution = {
+          batchId: String(sent?.batch_id),
+          reservationToken: String(sent?.reservation_token),
+          queueId: String(sent?.queue_id),
+          consumerUid: String(sent?.consumer_uid),
+          generation: Number(sent?.consumer_generation),
+          workerUid: String(sent?.worker_uid),
+          servingSourceOperationId: String(sent?.serving_source_operation_id),
+          workerVersionUid: String(sent?.worker_version_uid),
+          workerVersionGeneration: Number(sent?.worker_version_generation),
+          incarnationOperationId: String(sent?.incarnation_operation_id),
+        };
+        expect(
+          await custody.renewRegisteredV2BatchLeases({
+            ...exactExecution,
+            workerVersionUid: "foreign-version",
+          }),
+        ).toBe("unknown");
+        expect(
+          await custody.renewRegisteredV2BatchLeases({
+            ...exactExecution,
+            incarnationOperationId: "foreign-incarnation",
+          }),
+        ).toBe("unknown");
+        await Bun.sleep(230);
+        const lease = await sql.query(
+          "SELECT lease_expires_at_ms FROM selfhost_queue_messages WHERE message_id = ?",
+          [id],
+        );
+        expect(Number(lease[0]?.lease_expires_at_ms)).toBeGreaterThan(shortLease);
+        if (id === "message-late-ack") {
+          const renewedLease = Number(lease[0]?.lease_expires_at_ms);
+          await sql.run(
+            "UPDATE selfhost_queue_messages SET lease_expires_at_ms = ? WHERE message_id = ?",
+            [Date.now() - 1, id],
+          );
+          expect(await custody.renewRegisteredV2BatchLeases(exactExecution)).toBe("unknown");
+          await sql.run(
+            "UPDATE selfhost_queue_messages SET lease_expires_at_ms = ? WHERE message_id = ?",
+            [renewedLease, id],
+          );
+          // A global retention sweep is not proof of native handler completion.
+          await sql.run(
+            "UPDATE selfhost_queue_messages SET expires_at_ms = ? WHERE message_id = ?",
+            [Date.now() - 1, id],
+          );
+          expect(await custody.sweepExpired(1)).toBe(0);
+          await sql.run(
+            "UPDATE selfhost_queue_messages SET expires_at_ms = ? WHERE message_id = ?",
+            [Date.now() + 3_600_000, id],
+          );
+        }
+        expect(await invoked).toEqual({ kind: expected });
+        if (expected === "handler_rejected") {
+          expect(await queueComposition.deliverOnce(scope)).toEqual({ kind: "handler_resolved" });
+        }
+      }
+      expect(await sql.query("SELECT count(*) AS n FROM selfhost_queue_messages")).toEqual([
+        { n: 0 },
+      ]);
       const nativeVersionId = `v2-${sha(new TextEncoder().encode(`${versionUid}\u00001`))}`;
       expect(
         await owner.observeQueueTarget({
@@ -445,6 +549,8 @@ test.skipIf(binary === undefined)(
           ...reserved,
           versions,
           mintCapability: () => "unreachable",
+          renewalIntervalMillis: 30_000,
+          renewLease: async () => false,
           authorizeSend: async () => {
             authorizeCalls++;
             return "authorized" as const;

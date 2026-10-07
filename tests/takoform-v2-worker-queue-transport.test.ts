@@ -24,7 +24,6 @@ const grant = {
   queueUid: "queue-uid-1",
   generation: 7,
   leaseToken: "lease-1",
-  expiresAtMillis: 100_000,
 };
 
 function request(overrides: Record<string, unknown> = {}, bearer = "owner-version-token"): Request {
@@ -115,12 +114,10 @@ test("private endpoint never confirms an unknown or unavailable SQL effect", asy
 
 test("HMAC invocation proof survives authority recreation but requires live durable scope", async () => {
   const key = new Uint8Array(32).fill(7);
-  let now = 99_000;
   let live = true;
   const build = () =>
     createV2QueueSettlementAuthority({
       key,
-      now: () => now,
       scope: {
         native: {
           async observeQueueTarget(scope) {
@@ -154,8 +151,11 @@ test("HMAC invocation proof survives authority recreation but requires live dura
   live = false;
   expect(await afterRestart.authenticate({ bearer, invocationCapability: capability })).toBeNull();
   live = true;
-  now = 100_001;
-  expect(await afterRestart.authenticate({ bearer, invocationCapability: capability })).toBeNull();
+  // The signed proof is scoped to the durable execution, not a fixed wall-clock
+  // TTL that can expire while a legitimate native handler is still running.
+  expect(await afterRestart.authenticate({ bearer, invocationCapability: capability })).toEqual(
+    grant,
+  );
 });
 
 test("signed capability binds one exact message and both persisted scope readers", async () => {
@@ -165,7 +165,6 @@ test("signed capability binds one exact message and both persisted scope readers
   let wrongCoreQueue = false;
   const authority = createV2QueueSettlementAuthority({
     key,
-    now: () => 99_000,
     scope: {
       native: {
         async observeQueueTarget(scope) {

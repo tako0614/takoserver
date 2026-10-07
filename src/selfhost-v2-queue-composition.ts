@@ -26,6 +26,8 @@ export interface SelfhostV2QueueCompositionOptions {
   readonly ownerForWorkerUid: (uid: string) => Promise<WorkerdWorkerRuntimeOwner>;
   /** Operator-owned stable port; a recovered native graph retains this address. */
   readonly privatePort: number;
+  /** Internal deterministic-test cadence; production defaults to 30s. */
+  readonly renewalIntervalMillis?: number;
 }
 
 /**
@@ -43,7 +45,11 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
     options.settlementKey.byteLength < 32 ||
     !Number.isInteger(options.privatePort) ||
     options.privatePort < 1 ||
-    options.privatePort > 65_535
+    options.privatePort > 65_535 ||
+    (options.renewalIntervalMillis !== undefined &&
+      (!Number.isSafeInteger(options.renewalIntervalMillis) ||
+        options.renewalIntervalMillis < 10 ||
+        options.renewalIntervalMillis > 30_000))
   )
     throw new TypeError("v2 Queue requires SQL, custody, native owner and private authority");
   const key = new Uint8Array(options.settlementKey);
@@ -54,7 +60,6 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
   });
   const auth = createV2QueueSettlementAuthority({
     key,
-    now: Date.now,
     scope: {
       native: {
         async observeQueueTarget(input) {
@@ -136,6 +141,22 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
         mintCapability: auth.mint,
         authorizeSend: async (target) =>
           await authorizeV2QueueBatchSend(options.sql, execution(target)),
+        renewalIntervalMillis: options.renewalIntervalMillis ?? 30_000,
+        renewLease: async (target) => {
+          const native = await owner.observeQueueTarget({
+            workerUid: batch.workerUid,
+            versionId: target.versionId,
+            incarnationId: target.incarnationOperationId,
+            servingSourceOperationId: batch.servingSourceOperationId,
+          });
+          if (native.kind !== "confirmed") return false;
+          return (
+            (await options.custody.renewRegisteredV2BatchLeases({
+              ...execution(target),
+              queueId: v2QueueId(batch.queueUid),
+            })) === "renewed"
+          );
+        },
       })
       .catch(() => ({ kind: "unknown" as const }));
     if (outcome.kind === "unknown") {

@@ -500,7 +500,10 @@ export interface WorkerdRuntime<S extends WorkerdSite | WorkerdStaticSite = Work
        * front of it, which is the only way an event may enter.
        */
       readonly route?: "internal" | "events";
-      readonly timeoutMillis?: number;
+      /** null is reserved for an explicitly execution-scoped trusted invocation. */
+      readonly timeoutMillis?: number | null;
+      /** Owner cancellation means unknown delivery, never 0083 retirement. */
+      readonly abortSignal?: AbortSignal;
     },
   ): Promise<{ readonly status: number; readonly body: string } | null>;
 }
@@ -2165,10 +2168,21 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
             headers,
             ...(init.body === undefined ? {} : { body: init.body }),
             ...(options.tls ? { tls: { rejectUnauthorized: false } } : {}),
-            // A readiness question is answered by this Host's own module and is
-            // over in milliseconds. An event runs a customer's handler, so the
-            // caller says how long it is willing to wait for one.
-            signal: AbortSignal.timeout(init.timeoutMillis ?? 2_000),
+            // Readiness has a 2s default. A trusted Queue invocation may opt
+            // into no Host deadline because SQL 0083, not a fetch timeout,
+            // owns handler lifetime and maxConcurrency.
+            ...(init.timeoutMillis === null
+              ? init.abortSignal
+                ? { signal: init.abortSignal }
+                : {}
+              : {
+                  signal: init.abortSignal
+                    ? AbortSignal.any([
+                        init.abortSignal,
+                        AbortSignal.timeout(init.timeoutMillis ?? 2_000),
+                      ])
+                    : AbortSignal.timeout(init.timeoutMillis ?? 2_000),
+                }),
           },
         );
         // Bounded because the answer is this Host's own small envelope and the

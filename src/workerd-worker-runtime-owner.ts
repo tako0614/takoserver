@@ -302,6 +302,15 @@ export interface WorkerdWorkerRuntimeOwner {
       readonly workerVersionGeneration: number;
       readonly incarnationOperationId: string;
     }): Promise<"authorized" | "already_authorized" | "unknown">;
+    /** Host-private guarded SQL renewal; no tenant-visible completion/lease port. */
+    renewLease(target: {
+      readonly workerVersionUid: string;
+      readonly workerVersionGeneration: number;
+      readonly incarnationOperationId: string;
+      readonly versionId: string;
+    }): Promise<boolean>;
+    /** Internal bounded cadence, normally 30s; test fixtures may compress time. */
+    readonly renewalIntervalMillis: number;
     stillCurrent(): Promise<boolean>;
   }): Promise<
     | {
@@ -3662,9 +3671,14 @@ export async function openWorkerdWorkerRuntimeOwner(
   const invokeQueue: WorkerdWorkerRuntimeOwner["invokeQueue"] = async (input) => {
     const unknown = { kind: "unknown" } as const;
     const queueBinding = options.v2QueueSettlement;
-    let batch: Omit<typeof input, "mintCapability" | "authorizeSend" | "stillCurrent">;
+    let batch: Omit<
+      typeof input,
+      "mintCapability" | "authorizeSend" | "renewLease" | "renewalIntervalMillis" | "stillCurrent"
+    >;
     const mintCapability = input.mintCapability;
     const authorizeSend = input.authorizeSend;
+    const renewLease = input.renewLease;
+    const renewalIntervalMillis = input.renewalIntervalMillis;
     const stillCurrent = input.stillCurrent;
     try {
       // Caller-owned arrays and bytes cannot change while native/SQL I/O waits.
@@ -3715,6 +3729,10 @@ export async function openWorkerdWorkerRuntimeOwner(
       batch.claims.length > 100 ||
       typeof mintCapability !== "function" ||
       typeof authorizeSend !== "function" ||
+      typeof renewLease !== "function" ||
+      !Number.isSafeInteger(renewalIntervalMillis) ||
+      renewalIntervalMillis < 10 ||
+      renewalIntervalMillis > 30_000 ||
       typeof stillCurrent !== "function" ||
       batch.claims.some(
         (claim) =>
@@ -3853,7 +3871,6 @@ export async function openWorkerdWorkerRuntimeOwner(
       };
       let event: ReturnType<typeof selfhostV2QueueEvent>;
       try {
-        const expiresAtMillis = Date.now() + 240_000;
         event = selfhostV2QueueEvent({
           batchId: batch.batchId,
           script: scriptName(batch.workerUid),
@@ -3879,7 +3896,6 @@ export async function openWorkerdWorkerRuntimeOwner(
               queueUid: batch.queueUid,
               generation: batch.generation,
               leaseToken: claim.leaseToken,
-              expiresAtMillis,
             }),
           })),
         });
@@ -3926,12 +3942,36 @@ export async function openWorkerdWorkerRuntimeOwner(
             [SELFHOST_WORKER_EVENT_TOKEN_HEADER]: record.eventToken,
           },
           body: JSON.stringify(event),
-          timeoutMillis: 300_000,
+          timeoutMillis: null,
+          abortSignal: invocation.abort.signal,
         },
       );
       return { invocation, response, target, incarnation, event };
     }).catch(() => null);
     if (!admitted) return unknown;
+    let renewing: Promise<void> | null = null;
+    let renewalClosed = false;
+    const renew = () => {
+      if (renewalClosed || renewing) return;
+      renewing = (async () => {
+        const target = {
+          ...admitted.target,
+          versionId: admitted.event.deploymentId,
+        };
+        const native = await observeQueueTarget({
+          workerUid: batch.workerUid,
+          versionId: target.versionId,
+          incarnationId: target.incarnationOperationId,
+          servingSourceOperationId: batch.servingSourceOperationId,
+        });
+        if (!renewalClosed && native.kind === "confirmed") await renewLease(target);
+      })()
+        .catch(() => undefined)
+        .finally(() => {
+          renewing = null;
+        });
+    };
+    const renewalTimer = setInterval(renew, renewalIntervalMillis);
     try {
       const answer = await admitted.response;
       const outcome = answer ? selfhostV2QueueCompletionAnswer(answer) : null;
@@ -3960,6 +4000,11 @@ export async function openWorkerdWorkerRuntimeOwner(
     } catch {
       return unknown;
     } finally {
+      renewalClosed = true;
+      clearInterval(renewalTimer);
+      // An in-flight observer can be waiting behind lifecycle's serial lane.
+      // Never wait for it while retiring this invocation; the SQL CAS refuses
+      // any renewal after 0083 becomes terminal.
       admitted.invocation.finish();
     }
   };
