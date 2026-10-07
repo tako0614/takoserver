@@ -3,7 +3,7 @@ import type { JsonObject } from "../ports.ts";
 import type {
   WorkerModuleInspectionInput,
   WorkerModuleInspectionResult,
-} from "../providers/worker-module-semantic-inspection.ts";
+} from "../worker-module-inspection-contract.ts";
 import type { SqlArtifactCustodyRead } from "./forms/artifact-custody.ts";
 import type { StaticAssetBundleManifest } from "./forms/static-asset-bundle.ts";
 import {

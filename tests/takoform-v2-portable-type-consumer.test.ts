@@ -19,6 +19,14 @@ test("the public v2 eligibility export does not pull native Workerd modules into
   expect(sourceFiles.some((path) => path.endsWith("/src/workerd-worker-module-inspector.ts"))).toBe(
     false,
   );
+  expect(
+    sourceFiles.some((path) =>
+      path.endsWith("/src/providers/worker-module-semantic-inspection.ts"),
+    ),
+  ).toBe(false);
+  expect(
+    sourceFiles.some((path) => path.endsWith("/src/worker-module-inspection-contract.ts")),
+  ).toBe(true);
 
   const diagnostics = ts.getPreEmitDiagnostics(program);
   const unexpectedDiagnostics = diagnostics.filter((diagnostic) => {
