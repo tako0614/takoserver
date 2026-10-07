@@ -77,17 +77,37 @@ export async function createSelfhostV2WorkerEndpointBoot(
     !options.targetKey ||
     typeof options.publicOrigin !== "string" ||
     typeof options.ownerForWorkerUid !== "function" ||
-    !options.publicationState
+    !options.publicationState ||
+    !options.configuration ||
+    !options.certificateChain ||
+    !options.privateKey
   ) {
     throw new TypeError("self-host Worker Endpoint boot requires SQL, target and owner authority");
   }
 
+  // Capture every caller-selected authority/configuration before the first
+  // await. In particular, the shared listener validates and closes over its
+  // own suffix while probing SNI; rereading a mutable options object afterward
+  // could otherwise split listener, frontend and assigned-hostname identity.
+  const sql = options.sql;
+  const targetKey = options.targetKey;
+  const publicOrigin = options.publicOrigin;
+  const configuration = Object.freeze({
+    workerEndpointSuffix: options.configuration.workerEndpointSuffix,
+    port: options.configuration.port,
+  });
+  const certificateChain = options.certificateChain;
+  const privateKey = options.privateKey;
+  const publicationState = options.publicationState;
+  const ownerForWorkerUid = options.ownerForWorkerUid;
+  const factories = options.factories ? Object.freeze({ ...options.factories }) : undefined;
+
   let frontend: ReturnType<typeof createSelfhostV2WorkerEndpointFrontend> | undefined;
   let closed = false;
   const listener = await createSelfhostV2WorkerEndpointHttpsListener({
-    configuration: options.configuration,
-    certificateChain: options.certificateChain,
-    privateKey: options.privateKey,
+    configuration,
+    certificateChain,
+    privateKey,
     fetch: async (request) => {
       if (closed || !frontend) return new Response(null, { status: 503 });
       return await frontend.fetch(request);
@@ -96,17 +116,17 @@ export async function createSelfhostV2WorkerEndpointBoot(
       if (closed || !frontend) return false;
       return await frontend.routeDenies(address);
     },
-    ...(options.factories ? { factories: options.factories } : {}),
+    ...(factories ? { factories } : {}),
   });
 
   try {
     frontend = createSelfhostV2WorkerEndpointFrontend({
-      sql: options.sql,
-      targetKey: options.targetKey,
-      publicOrigin: options.publicOrigin,
-      workerEndpointSuffix: options.configuration.workerEndpointSuffix,
-      publicationState: options.publicationState,
-      ownerForWorkerUid: options.ownerForWorkerUid,
+      sql,
+      targetKey,
+      publicOrigin,
+      workerEndpointSuffix: configuration.workerEndpointSuffix,
+      publicationState,
+      ownerForWorkerUid,
       witness: listener.witness,
     });
   } catch (error) {
@@ -132,7 +152,7 @@ export async function createSelfhostV2WorkerEndpointBoot(
       readonly name: string;
     }) {
       if (closed) throw new Error("self-host Worker Endpoint boot is closed");
-      return assignedHostname(resourceUid, options.configuration.workerEndpointSuffix);
+      return assignedHostname(resourceUid, configuration.workerEndpointSuffix);
     },
     async observeTls(input: V2WorkerEndpointAddress, execution: V2Execution) {
       if (closed || !frontend) return unavailableTls(input);

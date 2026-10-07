@@ -284,6 +284,60 @@ test("self-host Endpoint boot joins the SQL route, owner witness and shared loca
   }
 });
 
+test("self-host Endpoint boot keeps the listener suffix when caller configuration changes during startup", async () => {
+  const tls = await certificateFixture();
+  const state = stateFixture();
+  const fixture = loopbackFactories();
+  let notifyProbeStarted!: () => void;
+  let releaseProbe!: () => void;
+  const probeStarted = new Promise<void>((resolve) => {
+    notifyProbeStarted = resolve;
+  });
+  const probeGate = new Promise<void>((resolve) => {
+    releaseProbe = resolve;
+  });
+  const originalProbe = fixture.factories.proveSni;
+  const factories: NonNullable<SelfhostV2WorkerEndpointBootOptions["factories"]> = {
+    ...fixture.factories,
+    async proveSni(input) {
+      notifyProbeStarted();
+      await probeGate;
+      await originalProbe(input);
+    },
+  };
+  const config: { workerEndpointSuffix: string; port: 443 } = {
+    workerEndpointSuffix: SUFFIX,
+    port: 443,
+  };
+  let boot: Awaited<ReturnType<typeof createSelfhostV2WorkerEndpointBoot>> | undefined;
+  try {
+    const input = bootOptions({
+      sql: state.sql,
+      publicationState: state.publicationState,
+      ...tls,
+      factories,
+    });
+    const starting = createSelfhostV2WorkerEndpointBoot({ ...input, configuration: config });
+    await probeStarted;
+    config.workerEndpointSuffix = "changed.example.test";
+    releaseProbe();
+    boot = await starting;
+
+    expect(
+      boot.endpoint.assignHostname({
+        resourceUid: ENDPOINT_UID,
+        space: "org:acme",
+        name: "endpoint",
+      }),
+    ).toBe(`v2-${ENDPOINT_UID.replaceAll("-", "")}.${SUFFIX}`);
+  } finally {
+    releaseProbe();
+    await boot?.close().catch(() => undefined);
+    state.database.close();
+    await rm(tls.directory, { recursive: true, force: true });
+  }
+});
+
 test("self-host Endpoint boot closes a bound listener when frontend composition is rejected", async () => {
   const tls = await certificateFixture();
   const state = stateFixture();
