@@ -33,6 +33,7 @@ import {
   WORKER_ENDPOINT_FORM_URL,
 } from "./takoform-v2/forms/worker-specs.ts";
 import type { V2Execution } from "./takoform-v2/types.ts";
+import type { V2CodeConfiguredInputReader } from "./takoform-v2/worker-lifecycle-backend.ts";
 import type {
   V2WorkerPublicationResolution,
   V2WorkerPublicationSnapshot,
@@ -259,6 +260,8 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
   readonly workerResourceUid: string;
   readonly targetKey: string;
   readonly publicationState: PublicationState;
+  /** Exact Resource-owned configured input reader, shared with Version eligibility. */
+  readonly configuredInputs?: V2CodeConfiguredInputReader;
   readonly workerdBinary: string | null;
   /** Trusted code-module inspector; absent uses the WorkerdRuntime's pinned inspector. */
   readonly inspectModule?: WorkerdRuntime["inspectModule"];
@@ -2020,6 +2023,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       targetKey: options.targetKey,
       publicationState: options.publicationState,
       runtime: candidateRuntime,
+      ...(options.configuredInputs ? { configuredInputs: options.configuredInputs } : {}),
       ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
     });
     const handle: IncarnationHandle = {
