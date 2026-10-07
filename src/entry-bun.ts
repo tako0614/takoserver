@@ -87,6 +87,11 @@ import {
 import { createSelfhostV2ConfiguredInputSealer } from "./selfhost-v2-configured-input-sealer.ts";
 import { createSelfhostV2QueueComposition } from "./selfhost-v2-queue-composition.ts";
 import { createSelfhostV2QueueScheduler } from "./selfhost-v2-queue-scheduler.ts";
+import {
+  createSelfhostV2RuntimeBoot,
+  parseSelfhostV2RuntimeBoot,
+  startSelfhostV2WorkflowDuePass,
+} from "./selfhost-v2-runtime-boot.ts";
 import { createSelfhostV2WorkerComposition } from "./selfhost-v2-worker-composition.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
@@ -178,6 +183,9 @@ const takoformV2Config = parseTakoformV2ApplicationConfig({
   TAKOSERVER_TAKOFORM_V2_CONFIG: process.env.TAKOSERVER_TAKOFORM_V2_CONFIG,
   TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: process.env.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY,
 });
+const v2RuntimeSelection = parseSelfhostV2RuntimeBoot(
+  process.env.TAKOSERVER_V2_WORKER_RUNTIME_BOOT,
+);
 const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN;
 if (!publicOrigin || !runtimeInputCanonicalOriginSupported(publicOrigin)) {
   throw new Error("TAKOSERVER_PUBLIC_ORIGIN must be a canonical HTTPS bare origin");
@@ -682,6 +690,7 @@ let queueCapability:
   | undefined;
 let ownersRestored = false;
 let v2QueueComposition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+let v2RuntimeBoot: ReturnType<typeof createSelfhostV2RuntimeBoot> | undefined;
 let restoredV2WorkerUids: readonly string[];
 const clearV2BootKeys = () => {
   for (const plane of [
@@ -695,6 +704,24 @@ const clearV2BootKeys = () => {
   }
 };
 try {
+  if (v2RuntimeSelection) {
+    if (!takoformV2Config.workerBundle) {
+      throw new Error("v2 Actor/Workflow boot requires the configured held WorkerBundle backend");
+    }
+    v2RuntimeBoot = createSelfhostV2RuntimeBoot({
+      selection: v2RuntimeSelection,
+      sql,
+      clock,
+      targetKey: v2WorkerTargetKey,
+      dataRoot,
+      workerdBinary,
+      ...(process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY
+        ? { guardBinary: process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY }
+        : {}),
+      ownerForWorkerUid: async (uid) => (workers ? await workers.ownerForWorkerUid(uid) : null),
+      ...(dataPlanes ? { dataPlaneAddress: dataPlanes.address } : {}),
+    });
+  }
   if (v2PrivatePlaneBoot?.queue && v2QueueCustody) {
     const requireQueueCapability = (): NonNullable<
       ReturnType<typeof createSelfhostV2WorkerComposition>["queueCapability"]
@@ -730,6 +757,8 @@ try {
     rootDirectory: join(dataRoot === ":memory:" ? ".takoserver" : dataRoot, "v2-worker-owners"),
     targetKey: v2WorkerTargetKey,
     workerdBinary,
+    ...(v2RuntimeBoot?.v2Actor ? { v2Actor: v2RuntimeBoot.v2Actor } : {}),
+    ...(v2RuntimeBoot?.v2Workflow ? { v2Workflow: v2RuntimeBoot.v2Workflow } : {}),
     ...(v2ConfiguredInputSealer ? { configuredInputSealer: v2ConfiguredInputSealer } : {}),
     ...(v2SqliteStore && v2PrivatePlaneBoot?.sqlite
       ? {
@@ -781,6 +810,8 @@ try {
   ownersRestored = true;
 } catch (error) {
   clearV2BootKeys();
+  await workers?.closeWorkflowHost();
+  await v2RuntimeBoot?.closeActor();
   await v2QueueComposition?.close();
   throw error;
 }
@@ -1152,6 +1183,8 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
         mayCloseDependents: () => shutdownClean,
         v2WorkerSuspend: async () => {
           await v2QueueScheduler?.close();
+          await v2WorkerComposition.closeWorkflowHost();
+          await v2RuntimeBoot?.closeActor();
           await v2WorkerComposition.suspendOwnersRetainingCustody();
           await v2QueueComposition?.close();
         },
@@ -1252,6 +1285,11 @@ entryShutdown.startInterval(
   },
   (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
 );
+if (v2RuntimeBoot?.v2Workflow) {
+  startSelfhostV2WorkflowDuePass(entryShutdown, v2WorkerComposition, (name) =>
+    process.stderr.write(`self-host background pass failed: ${name}\n`),
+  );
+}
 entryShutdown.startInterval(
   "queue-wake",
   1_000,
