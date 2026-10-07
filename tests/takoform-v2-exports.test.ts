@@ -24,6 +24,7 @@ import { inspectV2WorkerCodeVersionEligibility } from "../src/takoform-v2/worker
 import { createV2NativeDeletionCustody } from "../src/takoform-v2/worker-native-deletions.ts";
 import { createV2NativeEffectCustody } from "../src/takoform-v2/worker-native-effects.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
+import { createV2WorkerVersionConfiguredInputSealer } from "../src/takoform-v2/worker-version-configured-inputs.ts";
 
 const RUNTIME_EXPORTS = [
   "MODULE_WORKER_FORM_URL",
@@ -35,6 +36,7 @@ const RUNTIME_EXPORTS = [
   "createV2NativeDeletionCustody",
   "createV2WorkerInvocationLifecycle",
   "createV2WorkerPublicationState",
+  "createV2WorkerVersionConfiguredInputSealer",
   "inspectV2WorkerCodeVersionEligibility",
   "parseModuleWorkerSpec",
   "parseWorkerDeploymentSpec",
@@ -55,6 +57,9 @@ const RUNTIME_EXPORTS = [
 test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
+  expect(extension.createV2WorkerVersionConfiguredInputSealer).toBe(
+    createV2WorkerVersionConfiguredInputSealer,
+  );
   expect(extension.inspectV2WorkerCodeVersionEligibility).toBe(
     inspectV2WorkerCodeVersionEligibility,
   );

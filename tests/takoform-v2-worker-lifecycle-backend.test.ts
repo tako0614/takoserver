@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { readV2ConfiguredPrivateInputs } from "../src/takoform-v2/configured-private-inputs.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { createStaticAssetBundleHost } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
@@ -20,22 +21,38 @@ import {
   MODULE_WORKER_FORM_URL,
   parseWorkerDeploymentSpec,
   parseWorkerEndpointSpec,
+  parseWorkerVersionSpec,
   validateWorkerDeploymentUpdate,
   validateWorkerEndpointUpdate,
   WORKER_DEPLOYMENT_FORM_URL,
   WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import type { V2PrivateInputCustody } from "../src/takoform-v2/private-inputs.ts";
+import { createV2Store } from "../src/takoform-v2/store.ts";
 import type { V2Execution } from "../src/takoform-v2/types.ts";
+import { projectV2WorkerCodeVersion } from "../src/takoform-v2/worker-code-runtime.ts";
 import {
   createInternalV2CodeWorkerVersionForm,
   createInternalV2ModuleWorkerForm,
   createInternalV2StaticWorkerVersionForm,
+  createInternalV2WorkerVersionForm,
+  createV2CodeConfiguredInputReader,
+  type V2CodeConfiguredInputCustody,
   type V2WorkerRetirementProof,
   type V2WorkerRetirementTarget,
+  WORKER_VERSION_UNIFIED_BACKEND_ID,
 } from "../src/takoform-v2/worker-lifecycle-backend.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
-import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
+import { createV2WorkerPublication } from "../src/takoform-v2/worker-static-publication.ts";
+import { createV2WorkerVersionConfiguredInputSealer } from "../src/takoform-v2/worker-version-configured-inputs.ts";
+import type {
+  WorkerdDeploymentPublication,
+  WorkerdPublicationIdentity,
+  WorkerdRuntime,
+  WorkerdSite,
+  WorkerdStaticSite,
+} from "../src/workerd-runtime.ts";
 
 const TARGET_KEY = "internal-static-worker-management";
 const MANIFEST_URL = "https://artifacts.example.test/static/manifest.json";
@@ -49,6 +66,10 @@ const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest(
 function fixture(options?: {
   gateEndpointWithPublicationReader?: boolean;
   codeWorkerVersion?: boolean;
+  unifiedWorkerVersion?: boolean;
+  configuredInputSealer?: ReturnType<typeof createV2WorkerVersionConfiguredInputSealer>;
+  configuredInputCustody?: V2CodeConfiguredInputCustody;
+  privateInputCustody?: V2PrivateInputCustody;
   inspectModule?: WorkerdRuntime["inspectModule"];
   backendQueryHook?: (
     statement: string,
@@ -170,8 +191,11 @@ function fixture(options?: {
     retirement,
     serving,
   });
-  const versionForm = options?.codeWorkerVersion
-    ? createInternalV2CodeWorkerVersionForm({
+  const configuredInputCustody: V2CodeConfiguredInputCustody = options?.configuredInputCustody ?? {
+    read: async (identity) => await readV2ConfiguredPrivateInputs(sql, identity),
+  };
+  const versionForm = options?.unifiedWorkerVersion
+    ? createInternalV2WorkerVersionForm({
         sql: backendSql,
         targetKey: TARGET_KEY,
         publicationState,
@@ -179,13 +203,30 @@ function fixture(options?: {
         inspectModule:
           options.inspectModule ??
           (async () => ({ outcome: "valid", exportedHandlers: ["scheduled"] })),
+        ...(options.configuredInputSealer
+          ? { configuredInputSealer: options.configuredInputSealer, configuredInputCustody }
+          : {}),
       })
-    : createInternalV2StaticWorkerVersionForm({
-        sql: backendSql,
-        targetKey: TARGET_KEY,
-        publicationState,
-        retirement,
-      });
+    : options?.codeWorkerVersion
+      ? createInternalV2CodeWorkerVersionForm({
+          sql: backendSql,
+          targetKey: TARGET_KEY,
+          publicationState,
+          retirement,
+          inspectModule:
+            options.inspectModule ??
+            (async () => ({ outcome: "valid", exportedHandlers: ["scheduled"] })),
+          ...(options.configuredInputSealer
+            ? { configuredInputSealer: options.configuredInputSealer }
+            : {}),
+          ...(options.configuredInputSealer ? { configuredInputCustody } : {}),
+        })
+      : createInternalV2StaticWorkerVersionForm({
+          sql: backendSql,
+          targetKey: TARGET_KEY,
+          publicationState,
+          retirement,
+        });
   const confirmedDeployment = async (execution: { spec: JsonObject; operationId: string }) => {
     const spec = parseWorkerDeploymentSpec(execution.spec);
     served = {
@@ -244,6 +285,7 @@ function fixture(options?: {
     replayWindowSeconds: 3_600,
     leaseMilliseconds: 60_000,
     authorize: async () => true,
+    ...(options?.privateInputCustody ? { privateInputCustody: options.privateInputCustody } : {}),
     forms: {
       [MODULE_WORKER_FORM_URL]: workerForm,
       [WORKER_VERSION_FORM_URL]: versionForm,
@@ -321,13 +363,14 @@ function fixture(options?: {
   async function createWorkerAndBundle(
     handlers: readonly string[] = ["scheduled"],
     withAssets = false,
+    suffix = "",
   ) {
-    const worker = await create(MODULE_WORKER_FORM_URL, "code-worker", {});
-    const bundle = await create(WORKER_BUNDLE_FORM_URL, "code-bundle", {
+    const worker = await create(MODULE_WORKER_FORM_URL, `code-worker${suffix}`, {});
+    const bundle = await create(WORKER_BUNDLE_FORM_URL, `code-bundle${suffix}`, {
       artifact: { url: BUNDLE_MANIFEST_URL, sha256: sha256(bundleManifest) },
     });
     const assets = withAssets
-      ? await create(STATIC_ASSET_BUNDLE_FORM_URL, "code-assets", {
+      ? await create(STATIC_ASSET_BUNDLE_FORM_URL, `code-assets${suffix}`, {
           artifact: { url: MANIFEST_URL, sha256: sha256(manifest) },
         })
       : undefined;
@@ -354,6 +397,8 @@ function fixture(options?: {
     engine,
     workerForm,
     versionForm,
+    publicationState,
+    configuredInputCustody,
     retirement,
     serving,
     create,
@@ -426,6 +471,92 @@ test("ModuleWorker allocation and isolated same-spec update never claim runtime 
     });
     expect(replay.id).toBe(update.id);
     expect(f.retirementCalls).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("one internal WorkerVersion Form routes static, code, and code-with-assets through a pinned backend", async () => {
+  const f = fixture({ unifiedWorkerVersion: true });
+  try {
+    const staticVersionSpec = (await f.createWorkerAndAssets()).spec;
+    const staticVersion = await f.create(
+      WORKER_VERSION_FORM_URL,
+      "unified-static",
+      staticVersionSpec,
+    );
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: staticVersion.resourceUid }),
+    ).toMatchObject({ observed: { ready: true, resolvedBindings: true } });
+
+    const codeVersionSpec = (await f.createWorkerAndBundle()).spec;
+    const codeVersion = await f.create(WORKER_VERSION_FORM_URL, "unified-code", codeVersionSpec);
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: codeVersion.resourceUid }),
+    ).toMatchObject({ observed: { ready: true, resolvedBindings: true, bundleVerified: true } });
+
+    const mixedVersionSpec = (await f.createWorkerAndBundle(["scheduled"], true, "-mixed")).spec;
+    const mixedVersion = await f.create(WORKER_VERSION_FORM_URL, "unified-mixed", mixedVersionSpec);
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: mixedVersion.resourceUid }),
+    ).toMatchObject({ observed: { ready: true, resolvedBindings: true, bundleVerified: true } });
+
+    const rows = await f.sql.query(
+      "SELECT backend_id FROM tf_v2_operations WHERE resource_uid IN (?, ?, ?) ORDER BY resource_uid",
+      [staticVersion.resourceUid, codeVersion.resourceUid, mixedVersion.resourceUid],
+    );
+    expect(rows).toHaveLength(3);
+    expect(rows.every((row) => row.backend_id === WORKER_VERSION_UNIFIED_BACKEND_ID)).toBe(true);
+    await expect(
+      f.engine.acceptCreate({
+        principal: "org-1",
+        key: "unsupported-unified-handler-key",
+        input: {
+          form: WORKER_VERSION_FORM_URL,
+          space: "prod",
+          name: "unsupported-unified-handler",
+          spec: { ...codeVersionSpec, handlers: ["queue"] },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "capability_required", status: 422 });
+    expect(
+      await f.sql.query("SELECT id FROM tf_v2_operations WHERE replay_key = ?", [
+        "unsupported-unified-handler-key",
+      ]),
+    ).toHaveLength(0);
+
+    const staticUpdate = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "update-unified-static-key",
+      uid: staticVersion.resourceUid,
+      expectedGeneration: 1,
+      spec: staticVersionSpec,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: staticUpdate.id, status: "succeeded" });
+    const codeUpdate = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "update-unified-code-key",
+      uid: codeVersion.resourceUid,
+      expectedGeneration: 1,
+      spec: codeVersionSpec,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: codeUpdate.id, status: "succeeded" });
+
+    f.retirementMode = "confirmed";
+    const staticDelete = await f.engine.acceptDelete({
+      principal: "org-1",
+      key: "delete-unified-static-key",
+      uid: staticVersion.resourceUid,
+      expectedGeneration: 2,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: staticDelete.id, status: "succeeded" });
+    const mixedDelete = await f.engine.acceptDelete({
+      principal: "org-1",
+      key: "delete-unified-mixed-key",
+      uid: mixedVersion.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: mixedDelete.id, status: "succeeded" });
   } finally {
     f.close();
   }
@@ -1269,6 +1400,416 @@ test("scheduled code WorkerVersion settles from held bundle eligibility without 
       status: "succeeded",
       effect: "complete",
     });
+  } finally {
+    f.close();
+  }
+});
+
+test("configured code Version seals exact UID inputs, retains them on omitted PUT, and refuses drift before acceptance", async () => {
+  const [configuredKey, transferKey, comparisonKey] = await Promise.all([
+    crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]),
+    crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]),
+    crypto.subtle.generateKey({ name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]),
+  ]);
+  const sealer = createV2WorkerVersionConfiguredInputSealer({
+    current: { keyId: "test-configured", key: configuredKey },
+    keyForDecryption(id) {
+      return id === "test-configured" ? configuredKey : undefined;
+    },
+  });
+  const f = fixture({
+    unifiedWorkerVersion: true,
+    configuredInputSealer: sealer,
+    privateInputCustody: {
+      transfer: { current: { id: "test-transfer", key: transferKey } },
+      comparison: { current: { id: "test-comparison", key: comparisonKey } },
+      transferTtlSeconds: 300,
+    },
+  });
+  try {
+    const { worker, spec: baseSpec } = await f.createWorkerAndBundle();
+    const spec: JsonObject = { ...baseSpec, requiredSensitiveVars: ["TOKEN"] };
+    const parsedSpec = parseWorkerVersionSpec(spec);
+    if (!parsedSpec.bundle) throw new Error("configured code fixture has no Bundle");
+    expect(() => f.versionForm.privateInputs?.validateCreate(baseSpec, null as never)).toThrow();
+    const emptyInputsVersion = await f.engine.acceptCreate({
+      principal: "org-1",
+      key: "create-no-secret-version-empty-inputs",
+      input: {
+        form: WORKER_VERSION_FORM_URL,
+        space: "prod",
+        name: "no-secret-version",
+        spec: baseSpec,
+        privateInputs: {},
+      },
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: emptyInputsVersion.id,
+      status: "succeeded",
+    });
+    const emptyInputsUpdate = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "update-no-secret-version-empty-inputs",
+      uid: emptyInputsVersion.resourceUid,
+      expectedGeneration: 1,
+      spec: baseSpec,
+      privateInputs: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: emptyInputsUpdate.id,
+      status: "succeeded",
+    });
+    const staticSpec = (await f.createWorkerAndAssets()).spec;
+    const emptyStatic = await f.engine.acceptCreate({
+      principal: "org-1",
+      key: "create-static-version-empty-inputs",
+      input: {
+        form: WORKER_VERSION_FORM_URL,
+        space: "prod",
+        name: "empty-static-version",
+        spec: staticSpec,
+        privateInputs: {},
+      },
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: emptyStatic.id, status: "succeeded" });
+    const emptyStaticUpdate = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "update-static-version-empty-inputs",
+      uid: emptyStatic.resourceUid,
+      expectedGeneration: 1,
+      spec: staticSpec,
+      privateInputs: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: emptyStaticUpdate.id,
+      status: "succeeded",
+    });
+    await expect(
+      f.engine.acceptUpdate({
+        principal: "org-1",
+        key: "update-static-version-nonempty-inputs",
+        uid: emptyStatic.resourceUid,
+        expectedGeneration: 2,
+        spec: staticSpec,
+        privateInputs: { TOKEN: "not-declared" },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_spec", status: 422 });
+    f.sourceAvailable = false;
+    const accepted = await f.engine.acceptCreate({
+      principal: "org-1",
+      key: "create-configured-version-key",
+      input: {
+        form: WORKER_VERSION_FORM_URL,
+        space: "prod",
+        name: "configured-version",
+        spec,
+        privateInputs: { TOKEN: "test-only-original-value" },
+      },
+    });
+    const held = await readV2ConfiguredPrivateInputs(f.sql, {
+      principal: "org-1",
+      space: "prod",
+      name: "configured-version",
+      form: WORKER_VERSION_FORM_URL,
+      resourceUid: accepted.resourceUid,
+    });
+    expect(held?.ciphertext).toBeString();
+    expect(JSON.stringify(held)).not.toContain("test-only-original-value");
+    expect(await f.engine.runNext()).toMatchObject({ id: accepted.id, status: "succeeded" });
+    const publicResource = await f.engine.getResource({
+      principal: "org-1",
+      uid: accepted.resourceUid,
+    });
+    expect(publicResource).toMatchObject({
+      observed: { ready: true, resolvedBindings: true, bundleVerified: true },
+    });
+    expect(JSON.stringify(publicResource)).not.toContain("test-only-original-value");
+    const reader = createV2CodeConfiguredInputReader({
+      sql: f.sql,
+      sealer,
+      custody: f.configuredInputCustody,
+    });
+    expect(
+      await reader.read({
+        resourceUid: accepted.resourceUid,
+        principal: "org-1",
+        space: "prod",
+        targetKey: TARGET_KEY,
+        spec: parsedSpec,
+        stillCurrent: async () => true,
+      }),
+    ).toEqual({ TOKEN: "test-only-original-value" });
+    await expect(
+      f.engine.acceptUpdate({
+        principal: "org-1",
+        key: "changed-configured-value-key",
+        uid: accepted.resourceUid,
+        expectedGeneration: 1,
+        spec,
+        privateInputs: { TOKEN: "changed-value" },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_spec", status: 422 });
+    expect(
+      await f.sql.query("SELECT id FROM tf_v2_operations WHERE replay_key = ?", [
+        "changed-configured-value-key",
+      ]),
+    ).toHaveLength(0);
+    const update = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "omitted-configured-value-key",
+      uid: accepted.resourceUid,
+      expectedGeneration: 1,
+      spec,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: update.id, status: "succeeded" });
+    expect(
+      await readV2ConfiguredPrivateInputs(f.sql, {
+        principal: "org-1",
+        space: "prod",
+        name: "configured-version",
+        form: WORKER_VERSION_FORM_URL,
+        resourceUid: accepted.resourceUid,
+      }),
+    ).toEqual(held);
+    const deployment = await f.engine.acceptCreate({
+      principal: "org-1",
+      key: "configured-deployment-key",
+      input: {
+        form: WORKER_DEPLOYMENT_FORM_URL,
+        space: "prod",
+        name: "configured-deployment",
+        spec: {
+          worker: { resourceUid: worker.resourceUid },
+          versions: [{ workerVersion: { resourceUid: accepted.resourceUid }, weight: 10_000 }],
+        },
+      },
+    });
+    const store = createV2Store(f.sql);
+    const op = await store.operation(deployment.id);
+    const resource = op ? await store.resource(op.resource_uid) : null;
+    if (!op || !resource) throw new Error("accepted Deployment is missing");
+    const leaseToken = `fixture-lease-${deployment.id}`;
+    const claimNow = Date.now();
+    expect(await store.claim(op.id, leaseToken, claimNow, claimNow + 60_000)).toBe(true);
+    expect(await store.markDispatch(op.id, leaseToken, new Date(claimNow).toISOString())).toBe(
+      true,
+    );
+    const execution: V2Execution = {
+      operationId: op.id,
+      leaseToken,
+      backendKey: op.backend_key,
+      backendId: op.backend_id,
+      targetKey: op.target_key,
+      resourceUid: resource.uid,
+      principal: op.principal,
+      action: op.action,
+      generation: op.generation,
+      form: resource.form_url,
+      space: resource.space,
+      name: resource.name,
+      spec: JSON.parse(op.accepted_spec_json),
+      previousObserved: JSON.parse(resource.observed_json),
+      previousOutput: JSON.parse(resource.output_json),
+    };
+    let candidate: WorkerdDeploymentPublication<WorkerdSite | WorkerdStaticSite> | null = null;
+    let identity: WorkerdPublicationIdentity | null = null;
+    const runtime: Parameters<typeof createV2WorkerPublication>[0]["runtime"] = {
+      inspectModule: async () => ({ outcome: "valid", exportedHandlers: ["scheduled"] }),
+      async publishFenced(_name, resolve, stillCurrent) {
+        expect(await stillCurrent()).toBe(true);
+        candidate = await resolve(null);
+        expect(await stillCurrent()).toBe(true);
+        identity = candidate && {
+          generation: candidate.generation,
+          workerResourceUid: candidate.workerResourceUid,
+          hostnames: [...candidate.hostnames],
+          versions: candidate.versions.map((version) => ({
+            versionId: version.versionId,
+            workerVersionUid: version.workerVersionUid,
+            weight: version.weight,
+          })),
+        };
+        // A native write reached the exact graph but its acknowledgement was lost.
+        throw new Error("fixture lost native acknowledgement");
+      },
+      async observeExactPublication(_name, expected) {
+        return JSON.stringify(identity) === JSON.stringify(expected) ? "matches" : "different";
+      },
+    };
+    const publication = createV2WorkerPublication({
+      targetKey: TARGET_KEY,
+      publicationState: f.publicationState,
+      runtime,
+      configuredInputs: reader,
+      scheduledEventToken: "a".repeat(64),
+    });
+    const resolved = await f.publicationState.resolve({ execution });
+    expect(resolved.kind).toBe("ready");
+    if (resolved.kind !== "ready") throw new Error("fixture graph is not ready");
+    if (!resolved.snapshot.deployment) throw new Error("fixture Deployment is missing");
+    expect(
+      (await resolved.readVersionMaterials(accepted.resourceUid)).bundle?.manifest,
+    ).toBeTruthy();
+    expect(
+      await reader.read({
+        resourceUid: accepted.resourceUid,
+        principal: resolved.snapshot.worker.principal,
+        space: resolved.snapshot.worker.space,
+        targetKey: TARGET_KEY,
+        spec: resolved.snapshot.deployment.versions[0]?.spec as never,
+        stillCurrent: resolved.stillCurrent,
+      }),
+    ).toEqual({ TOKEN: "test-only-original-value" });
+    const materials = await resolved.readVersionMaterials(accepted.resourceUid);
+    expect(
+      await projectV2WorkerCodeVersion({
+        identity: {
+          versionId: "diagnostic-version",
+          workerVersionUid: accepted.resourceUid,
+          workerResourceUid: worker.resourceUid,
+          bundleResourceUid: parsedSpec.bundle.resourceUid,
+          weight: 10_000,
+          generation: `takoserver-v2-operation:${deployment.id}`,
+          directory: "diagnostic-directory",
+          hostnames: [],
+        },
+        spec,
+        bundle: materials.bundle,
+        assets: materials.assets,
+        inspectModule: async () => ({ outcome: "valid", exportedHandlers: ["scheduled"] }),
+        configuredPrivateInputs: { TOKEN: "test-only-original-value" },
+        eventDelivery: { token: "a".repeat(64) },
+      }),
+    ).toBeTruthy();
+    const publicationResult = await publication.publish(execution);
+    expect(publicationResult).toMatchObject({ kind: "confirmed" });
+    expect(JSON.stringify(publicationResult)).not.toContain("test-only-original-value");
+    const published = candidate as WorkerdDeploymentPublication<
+      WorkerdSite | WorkerdStaticSite
+    > | null;
+    if (!published) throw new Error("runtime publication was not dispatched");
+    expect(published.versions[0]?.site.vars).toContainEqual({
+      name: "TOKEN",
+      value: "test-only-original-value",
+      kind: "text",
+    });
+    expect(
+      [...(published.versions[0]?.hostModules?.values() ?? [])].some((bytes) =>
+        new TextDecoder().decode(bytes).includes('"secret_text"'),
+      ),
+    ).toBe(true);
+    expect(
+      (
+        await f.engine.acceptUpdate({
+          principal: "org-1",
+          key: "omitted-configured-value-key",
+          uid: accepted.resourceUid,
+          expectedGeneration: 1,
+          spec,
+        })
+      ).id,
+    ).toBe(update.id);
+    const sameValues = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "identical-configured-value-key",
+      uid: accepted.resourceUid,
+      expectedGeneration: 2,
+      spec,
+      privateInputs: { TOKEN: "test-only-original-value" },
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: sameValues.id, status: "succeeded" });
+    expect(
+      await readV2ConfiguredPrivateInputs(f.sql, {
+        principal: "org-1",
+        space: "prod",
+        name: "configured-version",
+        form: WORKER_VERSION_FORM_URL,
+        resourceUid: accepted.resourceUid,
+      }),
+    ).toEqual(held);
+    expect(
+      await reader.read({
+        resourceUid: accepted.resourceUid,
+        principal: "org-other",
+        space: "prod",
+        targetKey: TARGET_KEY,
+        spec: parsedSpec,
+        stillCurrent: async () => true,
+      }),
+    ).toBeNull();
+    expect(
+      await reader.read({
+        resourceUid: accepted.resourceUid,
+        principal: "org-1",
+        space: "prod",
+        targetKey: "another-target",
+        spec: parsedSpec,
+        stillCurrent: async () => true,
+      }),
+    ).toBeNull();
+    const otherKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+      "encrypt",
+      "decrypt",
+    ]);
+    const otherReader = createV2CodeConfiguredInputReader({
+      sql: f.sql,
+      sealer: createV2WorkerVersionConfiguredInputSealer({
+        current: { keyId: "other-configured", key: otherKey },
+        keyForDecryption(id) {
+          return id === "other-configured" ? otherKey : undefined;
+        },
+      }),
+      custody: f.configuredInputCustody,
+    });
+    expect(
+      await otherReader.read({
+        resourceUid: accepted.resourceUid,
+        principal: "org-1",
+        space: "prod",
+        targetKey: TARGET_KEY,
+        spec: parsedSpec,
+        stillCurrent: async () => true,
+      }),
+    ).toBeNull();
+    let fenceReads = 0;
+    expect(
+      await reader.read({
+        resourceUid: accepted.resourceUid,
+        principal: "org-1",
+        space: "prod",
+        targetKey: TARGET_KEY,
+        spec: parsedSpec,
+        stillCurrent: async () => ++fenceReads === 1,
+      }),
+    ).toBeNull();
+    expect(fenceReads).toBe(2);
+  } finally {
+    f.close();
+  }
+});
+
+test("code Version without configured custody never accepts a secret-required Resource", async () => {
+  const f = fixture({ unifiedWorkerVersion: true });
+  try {
+    const { spec: baseSpec } = await f.createWorkerAndBundle();
+    const spec: JsonObject = { ...baseSpec, requiredSensitiveVars: ["TOKEN"] };
+    await expect(
+      f.engine.acceptCreate({
+        principal: "org-1",
+        key: "no-configured-custody-key",
+        input: {
+          form: WORKER_VERSION_FORM_URL,
+          space: "prod",
+          name: "no-configured-custody",
+          spec,
+        },
+      }),
+    ).rejects.toMatchObject({ code: "capability_required", status: 422 });
+    expect(
+      await f.sql.query("SELECT uid FROM tf_v2_resources WHERE name = ?", [
+        "no-configured-custody",
+      ]),
+    ).toHaveLength(0);
   } finally {
     f.close();
   }

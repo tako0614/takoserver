@@ -350,6 +350,24 @@ test("inspection accepts only an exact complete private-input map without projec
   ).rejects.toMatchObject({ code: "worker_private_inputs_unavailable" });
 });
 
+test("an explicitly configured private map projects exact native text bindings from an owned snapshot", async () => {
+  const privateInputs = { TOKEN: "first-secret", SECOND: "second-secret" };
+  const projected = projectV2WorkerCodeVersion({
+    identity: identity(),
+    spec: versionSpec({ requiredSensitiveVars: ["TOKEN", "SECOND"] }),
+    bundle: await heldBundle(),
+    inspectModule: inspector(),
+    configuredPrivateInputs: privateInputs,
+  });
+  privateInputs.TOKEN = "later-mutation";
+  expect((await projected).site.vars).toEqual([
+    { name: "RETRIES", value: "3", kind: "json" },
+    { name: "SECOND", value: "second-secret", kind: "text" },
+    { name: "SETTINGS", value: '{"enabled":true,"label":"v2"}', kind: "json" },
+    { name: "TOKEN", value: "first-secret", kind: "text" },
+  ]);
+});
+
 test("scheduled code requires an explicit private delivery capability and exact handler export", async () => {
   const spec = versionSpec({ handlers: ["fetch", "scheduled"] });
   const bundle = await heldBundle({ moduleBytes: FETCH_AND_SCHEDULED_MODULE_BYTES });

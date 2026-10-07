@@ -11,6 +11,7 @@ import type { StaticAssetBundleManifest } from "./forms/static-asset-bundle.ts";
 import type { WorkerBundleManifest } from "./forms/worker-bundle.ts";
 import {
   prepareV2WorkerCodeProjection,
+  snapshotV2WorkerPrivateInputs,
   V2WorkerCodeRuntimeError,
 } from "./worker-code-eligibility.ts";
 import type { V2ResolvedServiceBinding } from "./worker-service-resolution.ts";
@@ -49,6 +50,8 @@ export async function projectV2WorkerCodeVersion(input: {
   readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
   readonly inspectModule: WorkerdRuntime["inspectModule"];
   readonly privateInputs?: unknown;
+  /** Actual configured values from the trusted Resource-owned custody reader. */
+  readonly configuredPrivateInputs?: unknown;
   readonly resolvedServiceBindings?: readonly V2ResolvedServiceBinding[];
   /** Non-optional private event gate capability composed by the owning Host. */
   readonly eventDelivery?: { readonly token: string };
@@ -60,6 +63,10 @@ export async function projectV2WorkerCodeVersion(input: {
   }
 
   const identity = snapshotIdentity(input.identity);
+  const configuredPrivateInputs = snapshotV2WorkerPrivateInputs(input.configuredPrivateInputs);
+  if (configuredPrivateInputs === null) {
+    throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
+  }
   let resolvedServiceBindings: readonly V2ResolvedServiceBinding[] | undefined;
   try {
     resolvedServiceBindings = input.resolvedServiceBindings?.map((binding) => ({ ...binding }));
@@ -77,14 +84,14 @@ export async function projectV2WorkerCodeVersion(input: {
     ...(input.assets === undefined ? {} : { assets: input.assets }),
     inspectModule,
     privateInputs: input.privateInputs,
+    ...(configuredPrivateInputs === undefined ? {} : { configuredPrivateInputs }),
     ...(resolvedServiceBindings === undefined ? {} : { resolvedServiceBindings }),
     requireEventDelivery: true,
     ...(input.eventDelivery === undefined ? {} : { eventDelivery: input.eventDelivery }),
   });
   const { spec, manifest, files, assets } = verified;
-  // Portable inspection may verify a private map, but this native projector
-  // has no secret_text env projection and must never claim that Version ready.
-  if (spec.requiredSensitiveVars.length > 0) {
+  // The portable inspection-only map cannot authorize native env projection.
+  if (spec.requiredSensitiveVars.length > 0 && configuredPrivateInputs === undefined) {
     throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
   }
 
@@ -97,9 +104,18 @@ export async function projectV2WorkerCodeVersion(input: {
     moduleMediaTypes[file.path] = file.mediaType;
   }
 
-  const vars: WorkerdBinding[] = Object.entries(spec.vars)
-    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-    .map(([name, value]) => ({ name, value: canonicalJson(value), kind: "json" }));
+  const vars: WorkerdBinding[] = [
+    ...Object.entries(spec.vars).map(([name, value]) => ({
+      name,
+      value: canonicalJson(value),
+      kind: "json" as const,
+    })),
+    ...Object.entries(configuredPrivateInputs ?? {}).map(([name, value]) => ({
+      name,
+      value,
+      kind: "text" as const,
+    })),
+  ].sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
   const site: WorkerdSite = {
     directory: identity.directory,
     mainModule: entrypoint,

@@ -509,14 +509,42 @@ public Worker deletion. The primitive is not registered in the normal runtime.
 
 ## Code Version and scheduled delivery composition
 
-The internal code WorkerVersion backend requires a semantic module inspector.
+The internal `createInternalV2WorkerVersionForm` uses one backend identity for
+static-only, code-only and code-plus-assets Versions. It selects the existing
+lifecycle manager from the accepted spec's Bundle presence without changing an
+execution identity or maintaining another ledger. Each Version's normalized
+spec remains immutable; updates cannot switch a UID between these cases. The
+older static/code constructors retain their identities for existing internal
+compositions, not separate public Form profiles.
+
+The code lifecycle manager requires a semantic module inspector.
 It validates held Bundle bytes and the exact declared/exported handler set,
 without publishing a Deployment or granting event delivery. The software
 extension exports the same `inspectV2WorkerCodeVersionEligibility` check and
 `V2WorkerModuleInspector` port for private execution adapters. It does not ship
 a native runtime or qualify an inspector supplied by the embedding Host.
-Unsupported resource Bindings, secrets and queue delivery remain explicit
-refusals in this code projection, not claims of complete WorkerVersion support.
+An embedding operator may supply
+`createV2WorkerVersionConfiguredInputSealer` through the software extension.
+It requires an explicit nonextractable AES-256-GCM keyring; no key or secret
+setting is inferred from the public configuration. The code Version Form seals
+the complete private map for its exact UID, owner, Space and normalized spec in
+the original CREATE acceptance batch. An omitted or equal-map UPDATE retains
+that ciphertext; a different map is rejected before acceptance. A secret-free
+Version accepts omission or an empty private map. Missing or unusable retained
+ciphertext is not repaired by assigning new values to the same UID.
+
+The runtime reader composes the existing Core UID-custody reader with exact
+Resource/target/spec checks and a final publication-vector fence. Decrypted
+values enter only the private Workerd `text` environment; the internal wrapper
+descriptor calls those entries `secret_text` without adding a WfP binding or
+disclosing their values in Resource, Operation, observation or output. Confirmed
+deletion releases the UID's configured ciphertext through the same Core ledger.
+Tests cover real SQLite acceptance and publication with a synthetic runtime,
+including a lost runtime acknowledgement. They do not prove OS-process restart,
+native workerd ABI, normal Form registration or live provider behavior.
+
+Other typed resource Bindings and queue delivery remain explicit refusals in
+this internal code projection, not claims of complete WorkerVersion support.
 
 The internal WorkerCronTrigger backend and scheduler use the published
 WorkerCronTrigger 0.3.0 contract. Admission seals the exact Worker, target and

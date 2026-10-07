@@ -17,6 +17,7 @@ import {
 } from "./forms/worker-specs.ts";
 import type { V2Execution } from "./types.ts";
 import { projectV2WorkerCodeVersion } from "./worker-code-runtime.ts";
+import type { V2CodeConfiguredInputReader } from "./worker-lifecycle-backend.ts";
 import type { V2WorkerPublicationResolution } from "./worker-publication-state.ts";
 import {
   projectV2ResolvedServiceBindings,
@@ -155,6 +156,8 @@ export function createV2WorkerPublication(options: {
   readonly targetKey: string;
   readonly publicationState: PublicationState;
   readonly runtime: WorkerRuntime;
+  /** Trusted Resource-owned configured ciphertext reader, absent by default. */
+  readonly configuredInputs?: V2CodeConfiguredInputReader;
   /** Incarnation-pinned private gate credential, absent for read-only projections. */
   readonly scheduledEventToken?: string;
 }): V2WorkerPublication {
@@ -197,6 +200,20 @@ export function createV2WorkerPublication(options: {
       let projection: WorkerdDeploymentVariant<WorkerdSite | WorkerdStaticSite>;
       const versionSpec = parseWorkerVersionSpec(version.spec);
       if (versionSpec.bundle) {
+        const configuredPrivateInputs =
+          versionSpec.requiredSensitiveVars.length > 0
+            ? await options.configuredInputs?.read({
+                resourceUid: version.uid,
+                principal: snapshot.worker.principal,
+                space: snapshot.worker.space,
+                targetKey: options.targetKey,
+                spec: versionSpec,
+                stillCurrent: resolution.stillCurrent,
+              })
+            : undefined;
+        if (versionSpec.requiredSensitiveVars.length > 0 && !configuredPrivateInputs) {
+          throw new Error("configured Worker Version input is unavailable");
+        }
         const serviceBindings = await projectV2ResolvedServiceBindings(versionSpec.serviceBindings);
         const codeProjection = await projectV2WorkerCodeVersion({
           identity: {
@@ -210,6 +227,7 @@ export function createV2WorkerPublication(options: {
           bundle: materials.bundle,
           assets: materials.assets,
           inspectModule,
+          ...(configuredPrivateInputs ? { configuredPrivateInputs } : {}),
           ...(serviceBindings.length > 0 ? { resolvedServiceBindings: serviceBindings } : {}),
           ...(options.scheduledEventToken === undefined
             ? {}
@@ -231,7 +249,9 @@ export function createV2WorkerPublication(options: {
           environment: (codeProjection.site.vars ?? []).map((binding) => ({
             name: binding.name,
             value: binding.value,
-            type: "json" as const,
+            type: versionSpec.requiredSensitiveVars.includes(binding.name)
+              ? ("secret_text" as const)
+              : ("json" as const),
           })),
           serviceBindings: serviceBindings.map((binding) => ({
             publicName: binding.name,

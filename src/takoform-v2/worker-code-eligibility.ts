@@ -78,9 +78,11 @@ export async function inspectV2WorkerCodeVersionEligibility(
   await verifyV2WorkerCodeProjection(input, true);
 }
 
-/** Native self-host adapter never projects a secret-required Version into env. */
+/** Native projection requires actual Resource-owned configured values, not inspection-only input. */
 export async function prepareV2WorkerCodeProjection(
   input: V2WorkerCodeEligibilityInput & {
+    /** Exact Host-configured values; never a boolean presence assertion. */
+    readonly configuredPrivateInputs?: unknown;
     readonly requireEventDelivery?: boolean;
     readonly eventDelivery?: { readonly token: string };
   },
@@ -90,6 +92,7 @@ export async function prepareV2WorkerCodeProjection(
 
 async function verifyV2WorkerCodeProjection(
   input: V2WorkerCodeEligibilityInput & {
+    readonly configuredPrivateInputs?: unknown;
     readonly requireEventDelivery?: boolean;
     readonly eventDelivery?: { readonly token: string };
   },
@@ -115,10 +118,14 @@ async function verifyV2WorkerCodeProjection(
     throw bundleUnavailable();
   }
   // Copy and validate all own values before the first material/inspector await.
-  // This map is deliberately never included in the verified projection.
+  // Neither map is included in the verified projection.
+  const configured = snapshotV2WorkerPrivateInputs(input.configuredPrivateInputs);
+  const candidate = configured === undefined ? input.privateInputs : configured;
   if (
-    !exactPrivateInputs(input.privateInputs, spec.requiredSensitiveVars) ||
-    (!inspectionOnly && spec.requiredSensitiveVars.length > 0)
+    configured === null ||
+    (configured !== undefined && input.privateInputs !== undefined) ||
+    !exactPrivateInputs(candidate, spec.requiredSensitiveVars) ||
+    (!inspectionOnly && spec.requiredSensitiveVars.length > 0 && configured === undefined)
   ) {
     throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
   }
@@ -311,32 +318,45 @@ function isValidInspection(
   );
 }
 
-function exactPrivateInputs(input: unknown, names: readonly string[]): boolean {
-  if (input === undefined) return names.length === 0;
-  if (input === null || typeof input !== "object" || Array.isArray(input)) return false;
+/** Snapshot only own data-property strings; no getters, proxies or caller references survive an await. */
+export function snapshotV2WorkerPrivateInputs(
+  input: unknown,
+): Readonly<Record<string, string>> | undefined | null {
+  if (input === undefined) return undefined;
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
   try {
     const prototype = Object.getPrototypeOf(input);
-    if (prototype !== Object.prototype && prototype !== null) return false;
-    if (Object.getOwnPropertySymbols(input).length > 0) return false;
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    if (Object.getOwnPropertySymbols(input).length > 0) return null;
     const descriptors = Object.getOwnPropertyDescriptors(input);
     const keys = Object.keys(descriptors);
-    if (keys.length !== names.length || Reflect.ownKeys(descriptors).length !== names.length)
-      return false;
+    if (keys.length !== Reflect.ownKeys(descriptors).length) return null;
     const snapshot = Object.create(null) as Record<string, string>;
-    for (const name of names) {
+    for (const name of keys) {
       const descriptor = descriptors[name];
-      if (!descriptor?.enumerable) return false;
+      if (!descriptor?.enumerable) return null;
       if (
         !("value" in descriptor) ||
         typeof descriptor.value !== "string" ||
         descriptor.value.length === 0
       ) {
-        return false;
+        return null;
       }
       snapshot[name] = descriptor.value;
     }
-    return Object.keys(snapshot).length === names.length;
+    return Object.freeze(snapshot);
   } catch {
-    return false;
+    return null;
   }
+}
+
+function exactPrivateInputs(input: unknown, names: readonly string[]): boolean {
+  const snapshot = snapshotV2WorkerPrivateInputs(input);
+  return (
+    snapshot !== null &&
+    (snapshot === undefined
+      ? names.length === 0
+      : Object.keys(snapshot).length === names.length &&
+        names.every((name) => Object.hasOwn(snapshot, name)))
+  );
 }
