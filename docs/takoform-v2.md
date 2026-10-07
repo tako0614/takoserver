@@ -552,8 +552,7 @@ owner before it restores any Worker. Each call rechecks the current accepted
 serving graph and native selected Version; neither a Form URL nor an in-memory
 name grants SQL access. Without that complete boot capability the Version is
 refused. The ordinary Bun entry does not supply it or register Worker Forms.
-Other uncomposed typed Bindings and queue delivery remain explicit refusals
-in this factory, not claims of complete WorkerVersion support.
+Other uncomposed typed Bindings remain explicit refusals in this factory.
 
 The same internal factory can compose a separately keyed ObjectBucket broker at
 an operator-selected stable loopback port. Its grants bind the exact organization,
@@ -566,11 +565,22 @@ workerd artifact for Bucket create, Worker put/get, Worker update, deletion and
 orderly termination. This is an internal composition, not normal-entry registration,
 public HTTPS delivery or Hosted qualification.
 
-A separate KV native Binding journey passes a full 25 MiB value through the private
-broker and pinned workerd artifact. Linear Base64 validation preserves the accepted
-encoding grammar without overflowing on this legal value. Its settled Core records
-are constructed by the test; it does not prove normal Host/factory connection or
-the published KV Form's worldwide replicated eventual-consistency semantics.
+The internal factory also composes a separately keyed KV broker and private service.
+Linear Base64 validation passes the full 25 MiB value limit through pinned workerd.
+An organization-authenticated Host journey creates accepted KV, SQLite and Object
+references and uses all three from one Worker. A separate process test discards an
+accepted Version response, retries the same operation, SIGKILLs the Host, and
+restores the same Worker and stored values under new Host and native child PIDs.
+It checks update and deletion, then proves the child is gone while the recovered
+Host is still alive. These tests manually register the Forms in an isolated Host;
+they do not qualify normal-entry registration, public TLS, Hosted execution or
+the KV Form's worldwide replicated eventual-consistency semantics.
+
+Queue boot precedes Worker restoration. Its capability joins the current accepted
+SQL graph and held bytes to the exact native owner and selected Version. A native
+Host journey covers durable ACK, retry, Consumer update and deletion refusal.
+External currentness preflight occurs outside the owner's serial lane; native
+identity, SQL source and one-send authorization remain checked inside it.
 
 The same integrated native candidate checks these Object and KV data paths,
 SQLite Binding and owner shutdown together. A valid SQLite transaction above the

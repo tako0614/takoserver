@@ -101,7 +101,12 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
     } catch {
       return null;
     }
-    if (offered.length !== signature.length || !timingSafeEqual(offered, signature)) return null;
+    if (
+      offered.length !== signature.length ||
+      offered.toString("base64url") !== parts[1] ||
+      !timingSafeEqual(offered, signature)
+    )
+      return null;
     try {
       return checkedGrant(
         JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")),

@@ -299,8 +299,19 @@ test("forged, foreign, unselected, and non-current grants cannot open the UID fi
       );
       return response ? { status: response.status, value: await response.json() } : null;
     }
-    const forged = `${host.token.slice(0, -1)}${host.token.endsWith("A") ? "B" : "A"}`;
+    const [payload, signature] = host.token.split(".");
+    if (!payload || !signature) throw new Error("fixture grant is incomplete");
+    const forged = `${payload}.${signature.startsWith("A") ? "B" : "A"}${signature.slice(1)}`;
     expect(await request(forged)).toEqual({
+      status: 401,
+      value: { ok: false, error: { code: "backend_unavailable" } },
+    });
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const last = alphabet.indexOf(signature.at(-1) ?? "");
+    expect(last % 4).toBe(0);
+    const alias = `${signature.slice(0, -1)}${alphabet[last | 1]}`;
+    expect(Buffer.from(alias, "base64url")).toEqual(Buffer.from(signature, "base64url"));
+    expect(await request(`${payload}.${alias}`)).toEqual({
       status: 401,
       value: { ok: false, error: { code: "backend_unavailable" } },
     });
