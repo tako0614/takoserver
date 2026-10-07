@@ -72,7 +72,9 @@ function publicationSnapshot(routeDelete = false, deploymentPublication = false)
       : deploymentPublication
         ? DEPLOYMENT_OPERATION_ID
         : OPERATION_ID,
-    acceptedEndpointOutput: ADDRESS,
+    // The accepted address belongs only to an Endpoint source operation.
+    // A later Deployment publisher keeps the same selected Endpoint below.
+    ...(deploymentPublication ? {} : { acceptedEndpointOutput: ADDRESS }),
     worker: { uid: WORKER_UID, principal: "org:acme", space: "org:acme", generation: 1 },
     deployment: {
       uid: "deployment-one",
