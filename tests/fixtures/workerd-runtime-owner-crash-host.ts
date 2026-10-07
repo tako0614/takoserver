@@ -303,8 +303,7 @@ try {
   process.stdout.write(
     `${JSON.stringify({ kind: "error", code, detail, phase, pid: process.pid, port })}\n`,
   );
-  if (mode === "active-recover-reject-after-spawn") setInterval(() => undefined, 60_000);
-  else process.exitCode = 2;
+  process.exitCode = 2;
 }
 
 if (owner)

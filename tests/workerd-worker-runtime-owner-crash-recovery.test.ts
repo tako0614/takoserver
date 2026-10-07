@@ -295,7 +295,7 @@ test("failed successor keeps its fenced lock until dead, then a third host retri
     ) as { pid: number };
     expect(lock.pid).toBe(failed.pid);
     await waitForVacant(port);
-    await failed.exited;
+    await terminateHost(failed);
     failed = undefined;
 
     third = await startHost("active-recover", owned.root, owned.binary, port, UPDATE_ID);
