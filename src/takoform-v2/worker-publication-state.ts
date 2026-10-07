@@ -57,6 +57,8 @@ export interface V2WorkerPublicationSnapshot {
     readonly spec: WorkerDeploymentSpec;
     readonly versions: readonly {
       readonly uid: string;
+      /** Exact settled WorkerVersion Operation used as the selected spec source. */
+      readonly sourceOperationId: string;
       readonly generation: number;
       readonly weight: number;
       readonly spec: WorkerVersionSpec;
@@ -1149,6 +1151,7 @@ export function createV2WorkerPublicationState(options: {
         versionEvidence.push({ row, last, versionReferences });
         versions.push({
           uid,
+          sourceOperationId: last.id,
           generation: row.generation,
           weight: weighted.weight,
           spec: versionSpec,
