@@ -43,6 +43,8 @@ export interface V2WorkerInvocationRecord extends V2WorkerInvocationSelection {
   readonly space: string;
   readonly phase: "admitted" | "send_authorized" | "pre_effect_refused";
   readonly bodyState: "finished" | "canceled" | null;
+  /** Trusted owner proved the native fetch was never invoked after beginSend. */
+  readonly noNativeDispatchAtMs: number | null;
   /** Provider-origin terminal execution receipt, never inferred from body EOF. */
   readonly retirement: {
     readonly retiredAtMs: number;
@@ -72,6 +74,8 @@ export interface V2WorkerInvocationCustody {
   beginSend(handle: V2WorkerInvocationHandle): Promise<boolean>;
   /** Only a proven pre-effect refusal may become terminal. */
   refuseBeforeSend(handle: V2WorkerInvocationHandle): Promise<boolean>;
+  /** Trusted physical owner only, while it still proves no native fetch occurred. */
+  confirmNoNativeDispatch(handle: V2WorkerInvocationHandle): Promise<boolean>;
   /** Gateway body observation, never a child-context or waitUntil retirement. */
   observeBody(handle: V2WorkerInvocationHandle, state: "finished" | "canceled"): Promise<boolean>;
   /** Trusted internal receipt only; this is not exposed through the Host HTTP API. */
@@ -142,6 +146,15 @@ function record(
       row.phase !== "send_authorized" &&
       row.phase !== "pre_effect_refused") ||
     (row.body_state !== null && row.body_state !== "finished" && row.body_state !== "canceled") ||
+    (row.no_native_dispatch_at_ms !== null &&
+      (typeof row.no_native_dispatch_at_ms !== "number" ||
+        !Number.isSafeInteger(row.no_native_dispatch_at_ms) ||
+        row.no_native_dispatch_at_ms < 0 ||
+        row.phase !== "send_authorized" ||
+        typeof row.send_authorized_at_ms !== "number" ||
+        row.no_native_dispatch_at_ms < row.send_authorized_at_ms ||
+        row.body_state !== null ||
+        row.retired_at_ms !== null)) ||
     (row.retired_at_ms === null) !== (row.retirement_receipt_digest === null) ||
     (row.retired_at_ms !== null &&
       (typeof row.retired_at_ms !== "number" ||
@@ -171,6 +184,7 @@ function record(
     confirmedReceipt: row.confirmed_receipt as string,
     phase: row.phase,
     bodyState: row.body_state,
+    noNativeDispatchAtMs: row.no_native_dispatch_at_ms as number | null,
     retirement:
       row.retired_at_ms === null
         ? null
@@ -221,6 +235,25 @@ export function createV2WorkerInvocationLifecycle(options: {
       );
       return result.changes === 1;
     },
+    async confirmNoNativeDispatch(handle: V2WorkerInvocationHandle): Promise<boolean> {
+      const ownedHandle = ownHandle(handle);
+      try {
+        const result = await sql.run(
+          `UPDATE tf_v2_worker_invocations
+           SET no_native_dispatch_at_ms = max(?, send_authorized_at_ms)
+           WHERE invocation_id = ? AND custody_token = ?
+             AND phase = 'send_authorized' AND send_authorized_at_ms IS NOT NULL
+             AND no_native_dispatch_at_ms IS NULL AND body_state IS NULL
+             AND body_observed_at_ms IS NULL AND retired_at_ms IS NULL
+             AND retirement_receipt_digest IS NULL`,
+          [instant(), ownedHandle.invocationId, ownedHandle.custodyToken],
+        );
+        if (result.changes === 1) return true;
+      } catch {
+        // The exact row read resolves a lost acknowledgement without a new send.
+      }
+      return typeof (await read(ownedHandle))?.noNativeDispatchAtMs === "number";
+    },
     async observeBody(
       handle: V2WorkerInvocationHandle,
       state: "finished" | "canceled",
@@ -229,7 +262,7 @@ export function createV2WorkerInvocationLifecycle(options: {
       const result = await sql.run(
         `UPDATE tf_v2_worker_invocations SET body_state = ?, body_observed_at_ms = ?
          WHERE invocation_id = ? AND custody_token = ? AND phase = 'send_authorized'
-           AND body_state IS NULL`,
+           AND body_state IS NULL AND no_native_dispatch_at_ms IS NULL`,
         [state, instant(), ownedHandle.invocationId, ownedHandle.custodyToken],
       );
       if (result.changes === 1) return true;
@@ -279,7 +312,7 @@ export function createV2WorkerInvocationLifecycle(options: {
              AND version_uid = ? AND version_generation = ? AND version_operation_id = ?
              AND native_identity = ? AND closure_digest = ? AND confirmed_receipt = ?
              AND phase = 'send_authorized' AND retired_at_ms IS NULL
-             AND retirement_receipt_digest IS NULL`,
+             AND retirement_receipt_digest IS NULL AND no_native_dispatch_at_ms IS NULL`,
           [
             instant(),
             receiptDigest,
@@ -321,7 +354,7 @@ export function createV2WorkerInvocationLifecycle(options: {
            coalesce(sum(CASE WHEN body_state = 'finished' THEN 1 ELSE 0 END), 0) AS body_finished
          FROM tf_v2_worker_invocations
          WHERE deployment_uid = ? AND phase <> 'pre_effect_refused'
-           AND retired_at_ms IS NULL`,
+           AND retired_at_ms IS NULL AND no_native_dispatch_at_ms IS NULL`,
         [deploymentUid],
       );
       const row = rows[0];

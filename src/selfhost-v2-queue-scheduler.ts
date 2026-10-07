@@ -175,7 +175,9 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
 
   /** A notice is not itself delivery authority or proof of a target wake. */
   const wakeTransfers = async (): Promise<void> => {
-    if (closed || !timer) return;
+    // The normal Host drives tick() from its owned interval without start().
+    // Only close(), not the optional timer, fences a pending notice wake.
+    if (closed) return;
     const after = noticeCursor ?? ["", "", 0, ""];
     const notices = await options.sql.query(
       `SELECT source_queue_id,source_consumer_id,source_generation,
@@ -279,7 +281,7 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
         [targetQueueId, noticeToken, sourcePrincipal, sourceSpace, sourceTargetKey],
       );
       if (terminalCopy.length === 1) {
-        if (!closed && timer)
+        if (!closed)
           await options.custody
             .acknowledgeTransferNotice({
               queueId: sourceQueueId,
@@ -403,7 +405,7 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
       // never await it, and an unknown completion cannot release the notice.
       void work
         .then(async (outcome) => {
-          if (outcome === "unknown" || closed || !timer) return;
+          if (outcome === "unknown" || closed) return;
           // A completed wake is evidence only for this exact current target.
           // Read it again after the native await, then check the copied row or
           // its own durable settlement before deleting the source notice.
@@ -444,7 +446,7 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
                   [targetQueueId, noticeToken],
                 );
           if (stillPresent.length !== 1 && settled.length !== 1) return;
-          if (closed || !timer) return;
+          if (closed) return;
           await options.custody.acknowledgeTransferNotice({
             queueId: sourceQueueId,
             consumerId: sourceConsumerId,

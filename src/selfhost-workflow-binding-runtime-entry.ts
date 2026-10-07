@@ -42,9 +42,34 @@ const SafeTypedArrayByteLengthGet = Object.getOwnPropertyDescriptor(
   "byteLength",
 )?.get;
 const SafeTextDecoderDecode = TextDecoder.prototype.decode;
-const SafeResponseStatusGet = Object.getOwnPropertyDescriptor(Response.prototype, "status")?.get;
-const SafeResponseHeadersGet = Object.getOwnPropertyDescriptor(Response.prototype, "headers")?.get;
-const SafeResponseBodyGet = Object.getOwnPropertyDescriptor(Response.prototype, "body")?.get;
+// Capture native getters before importing tenant code. Workerd puts Response.body
+// on an ancestor prototype, while other runtimes put it on Response.prototype.
+// A data-property shadow, cyclic chain, or excessive chain is not a native getter.
+function captureResponseGetter<T>(name: string): ((this: Response) => T) | undefined {
+  let prototype: object | null = Response.prototype;
+  const seen: object[] = [];
+  for (let depth = 0; prototype !== null && depth < 16; depth += 1) {
+    for (let index = 0; index < seen.length; index += 1) {
+      if (seen[index] === prototype) return undefined;
+    }
+    seen[seen.length] = prototype;
+    try {
+      const descriptor = SafeObjectGetOwnPropertyDescriptor(prototype, name);
+      if (descriptor !== undefined) {
+        return typeof descriptor.get === "function"
+          ? (descriptor.get as (this: Response) => T)
+          : undefined;
+      }
+      prototype = SafeObjectGetPrototypeOf(prototype);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+const SafeResponseStatusGet = captureResponseGetter<number>("status");
+const SafeResponseHeadersGet = captureResponseGetter<Headers>("headers");
+const SafeResponseBodyGet = captureResponseGetter<ReadableStream<Uint8Array> | null>("body");
 const SafeHeadersGet = Headers.prototype.get;
 const SafeReadableStreamGetReader = ReadableStream.prototype.getReader;
 const SafeReaderRead = ReadableStreamDefaultReader.prototype.read;

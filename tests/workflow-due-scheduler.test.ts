@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createWorkflowDueScheduler } from "../src/workflow-due-scheduler.ts";
@@ -10,6 +11,7 @@ import {
   type WorkflowRunOutcome,
 } from "../src/workflow-execution.ts";
 import { createWorkflowInstances, type WorkflowScope } from "../src/workflow-instances.ts";
+import { DURABLE_WORKFLOW_FORM_URL } from "../src/workflow-v2-resource-authority.ts";
 
 const START = Date.UTC(2026, 0, 1);
 const SCOPE = { tenantId: "tenant", workflowResourceUid: "workflow" };
@@ -63,6 +65,86 @@ function fixture() {
   };
 }
 
+function v2Fixture() {
+  const db = new Database(":memory:");
+  migrateSqlite(db);
+  databases.push(db);
+  const sql = createSqliteSql(db);
+  let timestamp = START;
+  let sequence = 0;
+  const clock = () => new Date(timestamp);
+  const instances = createWorkflowInstances({
+    sql,
+    clock,
+    randomId: () => `fixture-execution-${++sequence}`,
+  });
+  return {
+    db,
+    sql,
+    clock,
+    at(value: number) {
+      timestamp = value;
+    },
+    async create(scope: WorkflowScope, id: string) {
+      await instances.create(scope, { id });
+    },
+    set(id: string, patch: string, params: readonly (string | number | null)[] = []) {
+      db.query(`UPDATE tf_workflow_instances SET ${patch} WHERE instance_id = ?`).run(
+        ...params,
+        id,
+      );
+    },
+    acceptedResource(input: {
+      uid: string;
+      principal: string;
+      targetKey: string;
+      form?: string;
+      phase?: "idle" | "deleting";
+    }) {
+      const operationId = `accepted-${input.uid}`;
+      const form = input.form ?? DURABLE_WORKFLOW_FORM_URL;
+      const phase = input.phase ?? "idle";
+      db.query(
+        `INSERT INTO tf_v2_resources
+          (uid, principal, form_url, space, name, backend_id, target_key, active_name,
+           generation, observed_generation, phase, spec_json, observed_json, last_operation)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, '{}', '{"ready":true}', ?)`,
+      ).run(
+        input.uid,
+        input.principal,
+        form,
+        "production",
+        input.uid,
+        "fixture-backend",
+        input.targetKey,
+        input.uid,
+        phase,
+        operationId,
+      );
+      const instant = new Date(START).toISOString();
+      db.query(
+        `INSERT INTO tf_v2_operations
+          (id, resource_uid, principal, replay_key, request_fingerprint, action,
+           generation, status, effect, created_at, updated_at, retain_until,
+           backend_id, target_key, backend_key, accepted_spec_json)
+         VALUES (?, ?, ?, ?, ?, 'create', 1, 'succeeded', 'complete', ?, ?, ?, ?, ?, ?, '{}')`,
+      ).run(
+        operationId,
+        input.uid,
+        input.principal,
+        `replay-${input.uid}`,
+        `fingerprint-${input.uid}`,
+        instant,
+        instant,
+        instant,
+        "fixture-backend",
+        input.targetKey,
+        `backend-${input.uid}`,
+      );
+    },
+  };
+}
+
 function recorder() {
   const calls: string[] = [];
   return {
@@ -77,6 +159,90 @@ function recorder() {
 }
 
 describe("private Workflow due-row scheduler", () => {
+  test("v2 target poll executes only accepted same-principal Workflow rows when queued or awake", async () => {
+    const f = v2Fixture();
+    const principal = "org:workflow-owner";
+    const targetKey = "selfhost-v2-workflow-primary";
+    const accepted = { tenantId: principal, workflowResourceUid: "workflow-accepted" };
+    await f.create(accepted, "queued");
+    await f.create(accepted, "sleeping");
+    f.set("sleeping", "status = 'sleeping', wake_at = ?", [START + 1_000]);
+    for (const [uid, id] of [
+      ["workflow-legacy", "legacy"],
+      ["workflow-foreign-target", "foreign-target"],
+      ["workflow-foreign-owner", "foreign-owner"],
+      ["workflow-other-form", "other-form"],
+      ["workflow-deleting", "deleting"],
+    ] as const) {
+      await f.create({ tenantId: principal, workflowResourceUid: uid }, id);
+    }
+    f.acceptedResource({ uid: accepted.workflowResourceUid, principal, targetKey });
+    f.acceptedResource({ uid: "workflow-foreign-target", principal, targetKey: "other-target" });
+    f.acceptedResource({ uid: "workflow-foreign-owner", principal: "org:another", targetKey });
+    f.acceptedResource({
+      uid: "workflow-other-form",
+      principal,
+      targetKey,
+      form: "https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/",
+    });
+    f.acceptedResource({ uid: "workflow-deleting", principal, targetKey, phase: "deleting" });
+    const r = recorder();
+    const scheduler = createWorkflowDueScheduler({
+      sql: f.sql,
+      clock: f.clock,
+      runtime: r.runtime,
+      acceptedV2TargetKey: targetKey,
+    });
+    expect((await scheduler.pollDue()).selected).toBe(1);
+    expect(r.calls).toEqual([`${principal}/workflow-accepted/queued`]);
+    f.at(START + 1_000);
+    r.calls.length = 0;
+    expect((await scheduler.pollDue()).selected).toBe(2);
+    expect(r.calls).toEqual([
+      `${principal}/workflow-accepted/queued`,
+      `${principal}/workflow-accepted/sleeping`,
+    ]);
+  });
+
+  test("v2 target poll advances fairly through bounded legacy rows to a due accepted tail", async () => {
+    const f = v2Fixture();
+    const principal = "org:workflow-owner";
+    const targetKey = "selfhost-v2-workflow-primary";
+    for (let index = 0; index < 17; index += 1) {
+      await f.create(
+        { tenantId: principal, workflowResourceUid: "a-retained-v1" },
+        `legacy-${String(index).padStart(2, "0")}`,
+      );
+    }
+    await f.create({ tenantId: principal, workflowResourceUid: "z-v2-workflow" }, "due");
+    f.acceptedResource({ uid: "z-v2-workflow", principal, targetKey });
+    const observed: number[] = [];
+    const sql: Sql = {
+      ...f.sql,
+      async query(statement, params) {
+        const rows = await f.sql.query(statement, params);
+        if (statement.includes("FROM tf_workflow_instances")) observed.push(rows.length);
+        return rows;
+      },
+    };
+    const r = recorder();
+    const scheduler = createWorkflowDueScheduler({
+      sql,
+      clock: f.clock,
+      runtime: r.runtime,
+      acceptedV2TargetKey: targetKey,
+      batchSize: 1,
+      scanLimit: 4,
+    });
+    const results = [];
+    for (let poll = 0; poll < 8 && r.calls.length === 0; poll += 1) {
+      results.push(await scheduler.pollDue());
+    }
+    expect(r.calls).toEqual([`${principal}/z-v2-workflow/due`]);
+    expect(results.every((result) => result.examined <= 4)).toBe(true);
+    expect(observed.every((rows) => rows <= 4)).toBe(true);
+    expect(results.some((result) => result.selected === 0)).toBe(true);
+  });
   test("selects due, expired-lease, and deadline rows, but not future wake or live lease", async () => {
     const f = fixture();
     const r = recorder();

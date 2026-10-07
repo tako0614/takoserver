@@ -1,8 +1,20 @@
 import { createHash, randomBytes, randomInt } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { link, lstat, mkdir, mkdtemp, open, readdir, readFile, rm, unlink } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  opendir,
+  readdir,
+  readFile,
+  rm,
+  unlink,
+} from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import type { ActorResourceGraph, ActorResourceGraphReader } from "./actor-resource-graph.ts";
+import { canonicalJson } from "./json.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
 import {
   type ActorExecutionGraph,
@@ -14,6 +26,7 @@ import {
 import {
   openWorkerdActorNamespace,
   type WorkerdActorNamespace,
+  type WorkerdActorRuntimeObservation,
 } from "./selfhost-actor-native-process.ts";
 import type { WorkerdActiveActorGraph, WorkerdSelectedActiveVersion } from "./workerd-runtime.ts";
 
@@ -64,6 +77,39 @@ export interface ActorColdStartFailure extends ActorScope {
     | "version_snapshot_unavailable"
     | "recovery_unavailable";
   readonly attempts: number;
+}
+
+export type ActorNamespaceRuntimeObservation =
+  | { readonly kind: "unknown" }
+  | {
+      readonly kind: "confirmed";
+      readonly epoch: string;
+      readonly observedAt: number;
+      readonly activeActorCount: number;
+      readonly pendingAlarmCount: number;
+      readonly openSocketCount: number;
+    };
+
+/** Backend-held exact native selection; this does not itself confer SQL authority. */
+export interface ActorAcceptedOperationRuntimeTarget {
+  readonly workerUid: string;
+  readonly className: string;
+  readonly sourceOperationId: string;
+  readonly incarnationId: string;
+  readonly generationKey: string;
+  readonly versions: readonly {
+    readonly versionId: string;
+    readonly workerVersionUid: string;
+    readonly weight: number;
+  }[];
+}
+
+/** A backend-held, leased candidate for inspection only, never event admission. */
+export interface ActorAcceptedOperationWarmCandidate {
+  readonly graph: ActorExecutionGraph;
+  readonly realization: ActorExecutionRealization;
+  readonly expected: ActorAcceptedOperationRuntimeTarget;
+  readonly stillAuthorized: (signal: AbortSignal) => Promise<boolean>;
 }
 
 /**
@@ -117,6 +163,10 @@ export function createSelfhostActorExecutionHost(options: {
   let stopped = false;
   let stopping: Promise<void> | undefined;
   const registrations = join(options.storageRoot, "registrations");
+  const actorIdsRoot = join(options.storageRoot, "actor-id-index-v1");
+  const actorIdsDirectory = (key: string): string => join(actorIdsRoot, key);
+  const MAX_OBSERVED_ACTOR_IDS = 10_000;
+  const MAX_ACTOR_ID_RECORD_BYTES = 2_048;
   const keyOf = (tenantId: string, uid: string): string =>
     createHash("sha256")
       .update(JSON.stringify([tenantId, uid]))
@@ -149,12 +199,66 @@ export function createSelfhostActorExecutionHost(options: {
       throw error;
     }
   };
+  const readActorIdRecord = async (path: string): Promise<string | null> => {
+    const file = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      const before = await file.stat();
+      if (
+        !before.isFile() ||
+        before.uid !== process.getuid?.() ||
+        before.size < 8 ||
+        before.size > MAX_ACTOR_ID_RECORD_BYTES ||
+        (before.mode & 0o077) !== 0
+      )
+        return null;
+      const bytes = Buffer.alloc(MAX_ACTOR_ID_RECORD_BYTES + 1);
+      let length = 0;
+      while (length < bytes.length) {
+        const next = await file.read(bytes, length, bytes.length - length, length);
+        if (next.bytesRead === 0) break;
+        length += next.bytesRead;
+      }
+      const after = await file.stat();
+      if (
+        length !== before.size ||
+        after.size !== before.size ||
+        after.dev !== before.dev ||
+        after.ino !== before.ino ||
+        after.mtimeMs !== before.mtimeMs ||
+        after.ctimeMs !== before.ctimeMs
+      )
+        return null;
+      const value: unknown = JSON.parse(bytes.subarray(0, length).toString("utf8"));
+      return value &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        Object.keys(value).join(",") === "id" &&
+        typeof (value as { id?: unknown }).id === "string"
+        ? (value as { id: string }).id
+        : null;
+    } finally {
+      await file.close();
+    }
+  };
   const persistScope = async (key: string, scope: ActorScope): Promise<void> => {
     await mkdir(options.storageRoot, { recursive: true, mode: 0o700 });
     await syncDirectory(dirname(options.storageRoot));
     await mkdir(registrations, { recursive: true, mode: 0o700 });
     await syncDirectory(options.storageRoot);
     const path = registrationPath(key);
+    // A new registration is the only point where a complete ID index can be
+    // established. Historical namespaces with native data but no index remain
+    // unknown; a page-cache absence is never treated as a zero count.
+    if (
+      !(await pathExists(path)) &&
+      !(await pathExists(join(options.storageRoot, "namespaces", key))) &&
+      !(await pathExists(join(options.storageRoot, "leases", key)))
+    ) {
+      await mkdir(actorIdsRoot, { recursive: true, mode: 0o700 });
+      await syncDirectory(options.storageRoot);
+      await mkdir(actorIdsDirectory(key), { recursive: true, mode: 0o700 });
+      await syncDirectory(actorIdsRoot);
+    }
     const bytes = JSON.stringify({
       tenantId: scope.tenantId,
       namespaceResourceUid: scope.namespaceResourceUid,
@@ -215,6 +319,88 @@ export function createSelfhostActorExecutionHost(options: {
     )
       throw new Error("Actor namespace registration changed");
     return true;
+  };
+  const rememberActorId = async (scope: ActorScope & { readonly id: string }): Promise<void> => {
+    const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
+    const directory = actorIdsDirectory(key);
+    if (!(await pathExists(directory))) return;
+    const metadata = await lstat(directory);
+    if (
+      !metadata.isDirectory() ||
+      metadata.isSymbolicLink() ||
+      metadata.uid !== process.getuid?.() ||
+      (metadata.mode & 0o077) !== 0
+    )
+      throw new Error("Actor identity index unavailable");
+    if (!(await registeredScope(key, scope))) return;
+    if (!scope.id || Buffer.byteLength(scope.id, "utf8") > 1_024)
+      throw new Error("Actor identity unavailable");
+    const name = `${createHash("sha256").update(scope.id).digest("hex")}.json`;
+    const path = join(directory, name);
+    const bytes = JSON.stringify({ id: scope.id });
+    const temporary = await mkdtemp(join(options.storageRoot, "actor-id-"));
+    try {
+      const source = join(temporary, "entry.json");
+      const file = await open(
+        source,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        await file.writeFile(bytes);
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+      try {
+        await link(source, path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if ((await readActorIdRecord(path)) !== scope.id)
+          throw new Error("Actor identity index changed");
+        const existing = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+        try {
+          await existing.sync();
+        } finally {
+          await existing.close();
+        }
+      }
+      await syncDirectory(directory);
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+      await syncDirectory(options.storageRoot);
+    }
+  };
+  const readActorIds = async (key: string): Promise<readonly string[] | null> => {
+    const directory = actorIdsDirectory(key);
+    let metadata: Awaited<ReturnType<typeof lstat>>;
+    try {
+      metadata = await lstat(directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+    if (
+      !metadata.isDirectory() ||
+      metadata.isSymbolicLink() ||
+      metadata.uid !== process.getuid?.() ||
+      (metadata.mode & 0o077) !== 0
+    )
+      return null;
+    const names: string[] = [];
+    for await (const entry of await opendir(directory)) {
+      if (!entry.isFile() || names.length >= MAX_OBSERVED_ACTOR_IDS) return null;
+      names.push(entry.name);
+    }
+    names.sort();
+    const ids: string[] = [];
+    for (const name of names) {
+      if (!/^[a-f0-9]{64}\.json$/u.test(name)) return null;
+      const id = await readActorIdRecord(join(directory, name));
+      if (!id || createHash("sha256").update(id).digest("hex") !== name.slice(0, 64)) return null;
+      ids.push(id);
+    }
+    return ids;
   };
   const exclusive = <T>(owner: Owner, callback: () => Promise<T>): Promise<T> => {
     const result = owner.tail.then(callback);
@@ -295,7 +481,12 @@ export function createSelfhostActorExecutionHost(options: {
   const activate = async (
     identity: ActorScope,
     signal: AbortSignal,
-  ): Promise<{ readonly session: Session; readonly variantKey: string }> => {
+    warm?: ActorAcceptedOperationWarmCandidate,
+  ): Promise<{
+    readonly session: Session;
+    readonly variantKey: string;
+    readonly observation?: ActorNamespaceRuntimeObservation;
+  }> => {
     if (stopped || !identity.tenantId || !identity.namespaceResourceUid)
       throw new Error("Actor namespace unavailable");
     const key = keyOf(identity.tenantId, identity.namespaceResourceUid);
@@ -312,22 +503,26 @@ export function createSelfhostActorExecutionHost(options: {
       if (stopped || current.revoked || revoked.has(key)) throw new Error("Actor owner stopped");
       if (!(await registeredScope(key, identity)))
         throw new ActorAuthorityUnavailable("Actor namespace is not registered");
-      const graph = await authority.readGraph(identity, signal);
+      if (warm && (current.session || !(await warm.stillAuthorized(signal))))
+        throw new ActorAuthorityUnavailable("Actor warm candidate unavailable");
+      const graph = warm?.graph ?? (await authority.readGraph(identity, signal));
       if (
         !graph ||
         graph.scope.tenantId !== identity.tenantId ||
         graph.scope.namespaceResourceUid !== identity.namespaceResourceUid
       ) {
-        await retire(current);
+        if (!warm) await retire(current);
         throw new ActorAuthorityUnavailable("Actor Resource unavailable");
       }
-      if (!(await authority.hasRealization(graph))) {
+      if (!warm && !(await authority.hasRealization(graph))) {
         await retire(current);
         throw new ActorAuthorityUnavailable("Actor Worker realization unavailable");
       }
-      const realized = await currentRealization(graph, signal);
+      const realized: ActorRealizationRead = warm
+        ? { kind: "ready", realization: warm.realization }
+        : await currentRealization(graph, signal);
       if (realized.kind === "authority_changed") {
-        await retire(current);
+        if (!warm) await retire(current);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
       if (realized.kind !== "ready") {
@@ -337,8 +532,12 @@ export function createSelfhostActorExecutionHost(options: {
       const residentGraph = realization.graph;
       // A publication read cannot confer authority after Resource deletion
       // or deployment replacement during that read.
-      if (!(await authority.stillCurrent(graph, realization, signal))) {
-        await retire(current);
+      if (
+        !(await (warm
+          ? warm.stillAuthorized(signal)
+          : authority.stillCurrent(graph, realization, signal)))
+      ) {
+        if (!warm) await retire(current);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
       signal.throwIfAborted();
@@ -560,6 +759,46 @@ export function createSelfhostActorExecutionHost(options: {
             .catch(() => {});
         });
       }
+      if (warm) {
+        try {
+          signal.throwIfAborted();
+          const candidate = current.session;
+          if (
+            stopped ||
+            !candidate ||
+            candidate.dead ||
+            candidate.retiring ||
+            !(await warm.stillAuthorized(signal))
+          )
+            throw new ActorAuthorityUnavailable("Actor warm candidate changed");
+          // Native startup only; normal readGraph/stillCurrent remains the
+          // sole gate for every application, alarm, and socket invocation.
+          candidate.process.disableAlarmAdmission();
+          const observation = await observeSession(
+            identity,
+            signal,
+            async (session, checkSignal) =>
+              acceptedOperationMatches(
+                session.authorityGraph,
+                session.realization,
+                warm.expected,
+              ) && (await warm.stillAuthorized(checkSignal)),
+          );
+          if (
+            observation.kind !== "confirmed" ||
+            !(await warm.stillAuthorized(signal)) ||
+            current.session !== candidate
+          )
+            throw new ActorAuthorityUnavailable("Actor warm inspection unavailable");
+          return { session: candidate, variantKey: "", observation };
+        } catch (error) {
+          // A failed candidate is not a Resource DELETE. Stop only the child
+          // opened by this warm attempt; registration, ID index and Actor SQL
+          // remain held for a later exact retry.
+          await retire(current);
+          throw error;
+        }
+      }
       // Retirement can wait on an old response stream, and native startup
       // can also yield. A Resource or publication selected before either
       // wait must not be dispatched afterward without another readback.
@@ -675,10 +914,210 @@ export function createSelfhostActorExecutionHost(options: {
   const ready = restore();
   void ready.catch(() => {});
 
+  const acceptedOperationMatches = (
+    graph: ActorExecutionGraph,
+    realization: ActorExecutionRealization,
+    expected: ActorAcceptedOperationRuntimeTarget,
+  ): boolean => {
+    if (
+      graph.workerUid !== expected.workerUid ||
+      graph.className !== expected.className ||
+      realization.graph.workerResourceUid !== expected.workerUid ||
+      realization.graph.generationKey !== expected.generationKey ||
+      !realization.script ||
+      !expected.sourceOperationId ||
+      !expected.incarnationId ||
+      !Array.isArray(expected.versions)
+    )
+      return false;
+    const parsed: unknown = JSON.parse(realization.authorityKey);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const record = parsed as Record<string, unknown>;
+    if (
+      Object.keys(record).sort().join(",") !==
+        "generationKey,incarnationId,sourceOperationId,versions" ||
+      record.sourceOperationId !== expected.sourceOperationId ||
+      record.incarnationId !== expected.incarnationId ||
+      record.generationKey !== expected.generationKey
+    )
+      return false;
+    const residentVersions = realization.graph.versions.map(
+      ({ versionId, workerVersionUid, weight }) => ({ versionId, workerVersionUid, weight }),
+    );
+    return (
+      canonicalJson(record.versions) === canonicalJson(residentVersions) &&
+      canonicalJson(expected.versions) === canonicalJson(residentVersions)
+    );
+  };
+
+  const observeSession = async (
+    scope: ActorScope,
+    signal: AbortSignal,
+    eligible: (session: Session, signal: AbortSignal) => Promise<boolean>,
+  ): Promise<ActorNamespaceRuntimeObservation> => {
+    const unknown = { kind: "unknown" } as const;
+    try {
+      const identity = {
+        tenantId: scope.tenantId,
+        namespaceResourceUid: scope.namespaceResourceUid,
+      };
+      await ready;
+      signal.throwIfAborted();
+      if (stopped || !validScope(identity)) return unknown;
+      const key = keyOf(identity.tenantId, identity.namespaceResourceUid);
+      const owner = owners.get(key);
+      const session = owner?.session;
+      if (
+        revoked.has(key) ||
+        owner?.revoked ||
+        !session ||
+        session.dead ||
+        session.retiring ||
+        !(await registeredScope(key, identity))
+      )
+        return unknown;
+      const observationSignal = AbortSignal.any([signal, AbortSignal.timeout(5_000)]);
+      const current = async (): Promise<boolean> => {
+        observationSignal.throwIfAborted();
+        if (
+          stopped ||
+          revoked.has(key) ||
+          owner.revoked ||
+          owner.session !== session ||
+          session.dead ||
+          session.retiring ||
+          !(await registeredScope(key, identity)) ||
+          !(await eligible(session, observationSignal))
+        )
+          return false;
+        observationSignal.throwIfAborted();
+        return (
+          !stopped &&
+          !revoked.has(key) &&
+          !owner.revoked &&
+          owner.session === session &&
+          !session.dead &&
+          !session.retiring &&
+          (await registeredScope(key, identity))
+        );
+      };
+      if (!(await current())) return unknown;
+      const ids = await readActorIds(key);
+      const observeActor = session.process.observeActor;
+      const probeRuntime = session.process.probeRuntime;
+      if (!ids || !observeActor || !probeRuntime || !(await current())) return unknown;
+      const readPass = async (): Promise<readonly WorkerdActorRuntimeObservation[]> => {
+        await probeRuntime.call(session.process, observationSignal);
+        const values: WorkerdActorRuntimeObservation[] = [];
+        for (const id of ids) {
+          observationSignal.throwIfAborted();
+          const value = await observeActor.call(session.process, id, observationSignal);
+          if (
+            value.actorId !== id ||
+            value.epoch !== session.epoch ||
+            value.generationKey !== session.graph.generationKey
+          )
+            throw new Error("Actor native observation identity changed");
+          values.push(value);
+        }
+        return values;
+      };
+      const before = await readPass();
+      const observedAt = Date.now();
+      const after = await readPass();
+      if (
+        !(await current()) ||
+        JSON.stringify(ids) !== JSON.stringify(await readActorIds(key)) ||
+        before.some((entry, index) => JSON.stringify(entry) !== JSON.stringify(after[index]))
+      )
+        return unknown;
+      return {
+        kind: "confirmed",
+        epoch: session.epoch,
+        observedAt,
+        activeActorCount: before.filter((entry) => entry.activeActor).length,
+        pendingAlarmCount: before.reduce((count, entry) => count + entry.pendingAlarmCount, 0),
+        openSocketCount: before.reduce((count, entry) => count + entry.openSocketCount, 0),
+      };
+    } catch {
+      return unknown;
+    }
+  };
+
   return {
     ready,
     coldStartFailures: (): readonly ActorColdStartFailure[] =>
       [...coldStartFailures.values()].map((failure) => ({ ...failure })),
+    /** Physical native observation only; no Form readiness or SQL acceptance claim. */
+    async observeNamespaceRuntime(
+      scope: ActorScope,
+      signal: AbortSignal,
+    ): Promise<ActorNamespaceRuntimeObservation> {
+      return observeSession(scope, signal, async (session, observationSignal) => {
+        if (
+          !(await authority.stillCurrent(
+            session.authorityGraph,
+            session.realization,
+            observationSignal,
+          ))
+        )
+          return false;
+        const realization = await currentRealization(session.authorityGraph, observationSignal);
+        return (
+          realization.kind === "ready" &&
+          realization.realization.authorityKey === session.realization.authorityKey &&
+          realization.realization.graph.generationKey === session.graph.generationKey
+        );
+      });
+    },
+    /** Physical read for a backend-held accepted Operation, not SQL authority or warm admission. */
+    async observeNamespaceRuntimeForAcceptedOperation(
+      scope: ActorScope,
+      expected: ActorAcceptedOperationRuntimeTarget,
+      signal: AbortSignal,
+    ): Promise<ActorNamespaceRuntimeObservation> {
+      try {
+        const captured = structuredClone(expected);
+        return observeSession(scope, signal, async (session) =>
+          acceptedOperationMatches(session.authorityGraph, session.realization, captured),
+        );
+      } catch {
+        return { kind: "unknown" };
+      }
+    },
+    /** Initial native readback under a held accepted Operation; never admits an application event. */
+    async warmNamespaceForAcceptedOperation(
+      scope: ActorScope,
+      candidate: ActorAcceptedOperationWarmCandidate,
+      signal: AbortSignal,
+    ): Promise<ActorNamespaceRuntimeObservation> {
+      try {
+        const identity = {
+          tenantId: scope.tenantId,
+          namespaceResourceUid: scope.namespaceResourceUid,
+        };
+        const captured: ActorAcceptedOperationWarmCandidate = {
+          graph: structuredClone(candidate.graph),
+          realization: structuredClone(candidate.realization),
+          expected: structuredClone(candidate.expected),
+          stillAuthorized: candidate.stillAuthorized,
+        };
+        await ready;
+        signal.throwIfAborted();
+        if (stopped || !validScope(identity) || typeof captured.stillAuthorized !== "function")
+          return { kind: "unknown" };
+        if (
+          captured.graph.scope.tenantId !== identity.tenantId ||
+          captured.graph.scope.namespaceResourceUid !== identity.namespaceResourceUid ||
+          !acceptedOperationMatches(captured.graph, captured.realization, captured.expected)
+        )
+          return { kind: "unknown" };
+        const warmed = await activate(identity, signal, captured);
+        return warmed.observation ?? { kind: "unknown" };
+      } catch {
+        return { kind: "unknown" };
+      }
+    },
     async readCurrentGraph(
       scope: ActorScope,
       signal: AbortSignal,
@@ -821,6 +1260,12 @@ export function createSelfhostActorExecutionHost(options: {
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
+        await rm(actorIdsDirectory(key), { recursive: true, force: true });
+        try {
+          await syncDirectory(actorIdsRoot);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
         await rm(join(options.storageRoot, "leases", key), { recursive: true });
         await options.afterLeaseUnlinkBeforeSync?.();
         await syncDirectory(join(options.storageRoot, "leases"));
@@ -836,7 +1281,11 @@ export function createSelfhostActorExecutionHost(options: {
       await ready;
       // Capture caller-owned identity before any asynchronous resolution.
       const identity = { ...scope };
-      const acquired = await activate(identity, request.signal);
+      await rememberActorId(identity);
+      const acquired = await activate(
+        { tenantId: identity.tenantId, namespaceResourceUid: identity.namespaceResourceUid },
+        request.signal,
+      );
       let released = false;
       const releaseOnce = (): void => {
         if (released) return;
@@ -915,7 +1364,11 @@ export function createSelfhostActorExecutionHost(options: {
       if (!scope.id || scope.id.includes("\u0000")) throw new Error("Actor namespace unavailable");
       await ready;
       const identity = { ...scope };
-      const acquired = await activate(identity, request.signal);
+      await rememberActorId(identity);
+      const acquired = await activate(
+        { tenantId: identity.tenantId, namespaceResourceUid: identity.namespaceResourceUid },
+        request.signal,
+      );
       let settled = false;
       const finish = (): void => {
         if (settled) return;

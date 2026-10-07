@@ -8,6 +8,8 @@ import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql } from "../src/ports.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { createV2ActorBindingAuthority } from "../src/takoform-v2/actor-binding-authority.ts";
+import { createV2ActorForwardBoot } from "../src/takoform-v2/actor-forward-runtime.ts";
 import { prepareV2ActorNamespaceAdmission } from "../src/takoform-v2/actor-namespace-admission.ts";
 import { createV2ActorNamespaceForm } from "../src/takoform-v2/actor-namespace-backend.ts";
 import { createV2ActorNamespaceGraphAuthority } from "../src/takoform-v2/actor-namespace-graph-authority.ts";
@@ -416,6 +418,161 @@ test("pre-Deployment Actor backend settles only after durable physical namespace
     });
     expect(await f.engine.runNext()).toMatchObject({ id: deleted.id, status: "succeeded" });
     expect(await f.physical.namespaceAbsent(scope)).toBe(true);
+    const authority = createV2ActorBindingAuthority({
+      sql: f.sql,
+      targetKey: TARGET,
+      namespaceGraph: createV2ActorNamespaceGraphAuthority({
+        sql: f.sql,
+        targetKey: TARGET,
+        owner: { ownerForWorker: async () => null },
+      }),
+      physical: f.physical,
+    });
+    const target = {
+      principal: PRINCIPAL,
+      space: SPACE,
+      targetKey: TARGET,
+      workerUid: worker.resourceUid,
+      namespaceResourceUid: created.resourceUid,
+    };
+    expect(await authority.resolveTarget(target)).toBeNull();
+    const replacement = await f.create(ACTOR_NAMESPACE_FORM_URL, "replacement-namespace", spec);
+    expect(replacement.resourceUid).not.toBe(created.resourceUid);
+    expect(await authority.resolveTarget(target)).toBeNull();
+    expect(
+      await authority.resolveTarget({ ...target, namespaceResourceUid: replacement.resourceUid }),
+    ).not.toBeNull();
+  } finally {
+    await f.physical.close();
+    f.db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("accepted sealed WorkerVersion Actor binding resolves its exact physical namespace", async () => {
+  const root = mkdtempSync(join(tmpdir(), "actor-v2-binding-"));
+  const f = fixture(root);
+  if (!f.physical) throw new Error("physical Actor host fixture missing");
+  try {
+    const worker = await f.worker();
+    const namespace = await f.create(ACTOR_NAMESPACE_FORM_URL, "bound-namespace", {
+      worker: { resourceUid: worker.resourceUid },
+      className: "CounterActor",
+    });
+    const sourceVersion = await f.version(worker.resourceUid, "bound-source");
+    const row = (
+      await f.sql.query("SELECT spec_json FROM tf_v2_resources WHERE uid = ?", [
+        sourceVersion.resourceUid,
+      ])
+    )[0];
+    const bundleUid = parseWorkerVersionSpec(JSON.parse(String(row?.spec_json))).bundle
+      ?.resourceUid;
+    if (!bundleUid) throw new Error("fixture Bundle missing");
+    const binding = { name: "ACTOR", resource: { resourceUid: namespace.resourceUid } };
+    const version = await f.create(WORKER_VERSION_FORM_URL, "bound-version", {
+      worker: { resourceUid: worker.resourceUid },
+      bundle: { resourceUid: bundleUid },
+      handlers: ["fetch"],
+      actorBindings: [binding],
+    });
+    const graph = createV2ActorNamespaceGraphAuthority({
+      sql: f.sql,
+      targetKey: TARGET,
+      owner: { ownerForWorker: async () => null },
+    });
+    const authority = createV2ActorBindingAuthority({
+      sql: f.sql,
+      targetKey: TARGET,
+      namespaceGraph: graph,
+      physical: f.physical,
+    });
+    expect(
+      await authority.resolveTarget({
+        principal: PRINCIPAL,
+        space: SPACE,
+        targetKey: TARGET,
+        workerUid: worker.resourceUid,
+        namespaceResourceUid: namespace.resourceUid,
+      }),
+    ).toMatchObject({
+      tenantId: PRINCIPAL,
+      namespaceResourceUid: namespace.resourceUid,
+      className: "CounterActor",
+    });
+    const nativeVersionId = `v2-${createHash("sha256")
+      .update(`${version.resourceUid}\u00001`)
+      .digest("hex")}`;
+    const claim = {
+      principal: PRINCIPAL,
+      space: SPACE,
+      targetKey: TARGET,
+      workerUid: worker.resourceUid,
+      workerVersionUid: version.resourceUid,
+      workerVersionOperationId: version.id,
+      nativeVersionId,
+      bindings: [{ name: "ACTOR", resourceUid: namespace.resourceUid }],
+    };
+    expect(await authority.resolveCurrentBinding(claim, "ACTOR")).toMatchObject({
+      tenantId: PRINCIPAL,
+      namespaceResourceUid: namespace.resourceUid,
+      className: "CounterActor",
+    });
+    const forward = createV2ActorForwardBoot({
+      sql: f.sql,
+      targetKey: TARGET,
+      authority,
+      physical: f.physical,
+      privateSocketDirectory: join(root, "brokers"),
+    }).openIncarnation({
+      principal: PRINCIPAL,
+      space: SPACE,
+      workerUid: worker.resourceUid,
+      sourceOperationId: "8c44e450-1765-4366-919a-4c022f48d97c",
+      eventToken: "a".repeat(64),
+      scriptName: "actor-binding-test-script",
+    });
+    const issued = await forward.issueBinding(claim, "ACTOR");
+    expect(issued).toMatchObject({
+      publicName: "ACTOR",
+      tenantId: PRINCIPAL,
+      namespaceResourceUid: namespace.resourceUid,
+    });
+    expect(issued?.token).toMatch(/^[a-f0-9]{64}$/u);
+    if (!issued) throw new Error("Actor private grant unavailable");
+    const publication = {
+      script: "actor-binding-test-script",
+      workerResourceUid: worker.resourceUid,
+      versionId: nativeVersionId,
+      workerVersionResourceUid: version.resourceUid,
+      bindings: [
+        {
+          publicName: issued.publicName,
+          tenantId: issued.tenantId,
+          namespaceResourceUid: issued.namespaceResourceUid,
+          httpService: "actor-test-http",
+          upgradeService: "actor-test-upgrade",
+          token: issued.token,
+          runtimeClassRef: issued.runtimeClassRef,
+        },
+      ],
+    };
+    await forward.actorForwardLifecycle.prepare([publication]);
+    expect(forward.actorForwardSockets()).toMatchObject([
+      {
+        tenantId: PRINCIPAL,
+        namespaceResourceUid: namespace.resourceUid,
+        token: issued.token,
+      },
+    ]);
+    forward.actorForwardLifecycle.activated([publication]);
+    await f.sql.run(
+      "DELETE FROM tf_v2_resource_references WHERE referrer_uid = ? AND target_uid = ?",
+      [version.resourceUid, namespace.resourceUid],
+    );
+    expect(await authority.resolveCurrentBinding(claim, "ACTOR")).toBeNull();
+    await expect(forward.actorForwardLifecycle.prepare([publication])).rejects.toThrow();
+    forward.actorForwardLifecycle.uncertain();
+    await forward.close();
   } finally {
     await f.physical.close();
     f.db.close();

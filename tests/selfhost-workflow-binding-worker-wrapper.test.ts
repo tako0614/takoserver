@@ -38,9 +38,9 @@ type GeneratedRuntime = {
   }) => { readonly rawEnv: Record<string, unknown> };
 };
 
-async function loadGeneratedRuntime(): Promise<GeneratedRuntime> {
+async function loadGeneratedRuntime(cacheKey = ""): Promise<GeneratedRuntime> {
   const source = renderSelfhostWorkflowBindingRuntimeModuleSource();
-  const encoded = Buffer.from(source, "utf8").toString("base64");
+  const encoded = Buffer.from(`${source}\n// ${cacheKey}`, "utf8").toString("base64");
   return (await import(`data:text/javascript;base64,${encoded}`)) as GeneratedRuntime;
 }
 
@@ -50,6 +50,77 @@ function result(value: unknown): Response {
     { status: 200, headers: { "content-type": "application/json" } },
   );
 }
+
+test("generated Workflow binding captures inherited native Response getters before tenant poisoning", async () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "Response");
+  const NativeResponse = Response;
+  class InheritedResponse extends NativeResponse {}
+  expect(Object.getOwnPropertyDescriptor(InheritedResponse.prototype, "body")).toBeUndefined();
+  Object.defineProperty(globalThis, "Response", {
+    configurable: true,
+    writable: true,
+    value: InheritedResponse,
+  });
+  try {
+    const runtime = await loadGeneratedRuntime("inherited-response-getters");
+    Object.defineProperty(InheritedResponse.prototype, "body", {
+      configurable: true,
+      get() {
+        throw new Error("tenant-poisoned body getter must not be used");
+      },
+    });
+    const service = {
+      async fetch(): Promise<Response> {
+        return new InheritedResponse(
+          JSON.stringify({
+            schema: "takoserver.selfhost-workflow-binding-result@v1",
+            value: { id: "inherited-run", status: "queued" },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    };
+    const env = runtime.createSelfhostWorkflowBindingContext({
+      rawEnv: { [selectedBinding.serviceName]: service },
+      bindings: [selectedBinding],
+    }).rawEnv;
+    const binding = env.ORDERS as { create(input: unknown): Promise<WorkflowInstance> };
+    expect((await binding.create({ id: "inherited-run" })).id).toBe("inherited-run");
+  } finally {
+    if (original) Object.defineProperty(globalThis, "Response", original);
+  }
+});
+
+test("generated Workflow binding refuses a cyclic Response prototype without unbounded lookup", async () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "Response");
+  let cyclicPrototype: object;
+  cyclicPrototype = new Proxy({}, { getPrototypeOf: () => cyclicPrototype });
+  class CyclicResponse {}
+  Object.setPrototypeOf(CyclicResponse.prototype, cyclicPrototype);
+  Object.defineProperty(globalThis, "Response", {
+    configurable: true,
+    writable: true,
+    value: CyclicResponse,
+  });
+  try {
+    const runtime = await loadGeneratedRuntime("cyclic-response-prototype");
+    const service = {
+      async fetch(): Promise<Response> {
+        return result({ id: "run-1" });
+      },
+    };
+    const env = runtime.createSelfhostWorkflowBindingContext({
+      rawEnv: { [selectedBinding.serviceName]: service },
+      bindings: [selectedBinding],
+    }).rawEnv;
+    const binding = env.ORDERS as { create(input: unknown): Promise<WorkflowInstance> };
+    await expect(binding.create({ id: "run-1" })).rejects.toMatchObject({
+      name: "backend_unavailable",
+    });
+  } finally {
+    if (original) Object.defineProperty(globalThis, "Response", original);
+  }
+});
 
 test("generated Workflow binding exposes nested immutable instances over bounded private POSTs", async () => {
   const calls: Array<{ path: string; token: string | null; body: string }> = [];

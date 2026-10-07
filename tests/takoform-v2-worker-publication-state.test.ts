@@ -5,14 +5,18 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { bytesDigest } from "../src/json.ts";
+import { bytesDigest, canonicalJson } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { createStaticAssetBundleHost } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
-import { createWorkerBundleHost } from "../src/takoform-v2/forms/worker-bundle-backend.ts";
+import {
+  createWorkerBundleHost,
+  WORKER_BUNDLE_BACKEND_ID,
+} from "../src/takoform-v2/forms/worker-bundle-backend.ts";
+import { referencesForWorkerForm } from "../src/takoform-v2/forms/worker-references.ts";
 import {
   MODULE_WORKER_FORM_URL,
   WORKER_DEPLOYMENT_FORM_URL,
@@ -20,10 +24,129 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { createV2Store } from "../src/takoform-v2/store.ts";
-import type { V2Execution, V2Form } from "../src/takoform-v2/types.ts";
+import type { V2Backend, V2Execution, V2Form } from "../src/takoform-v2/types.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
 
 const BUNDLE_FORM_URL = "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/";
+const ACCEPTANCE_ORDER_MIGRATION = "0077_v2_operation_acceptance_order.sql";
+const historicalMigrationCount = MIGRATIONS.findIndex(
+  (migration) => migration.name === ACCEPTANCE_ORDER_MIGRATION,
+);
+if (historicalMigrationCount < 0) throw new Error("missing acceptance-order migration");
+
+// Current acceptance code expects columns added after 0077. Use the 0076 SQL
+// claims, reference guards, terminal projection and real Bundle byte custody.
+async function insertHistoricalResource(
+  db: Database,
+  store: ReturnType<typeof createV2Store>,
+  input: {
+    form: string;
+    name: string;
+    spec: JsonObject;
+    observed?: JsonObject;
+    output?: JsonObject;
+    backendId?: string;
+    materialize?: V2Backend["execute"];
+  },
+) {
+  const resourceUid = crypto.randomUUID();
+  const id = crypto.randomUUID();
+  const at = new Date().toISOString();
+  const output = input.output ?? {};
+  const backendId = input.backendId ?? "fixture-worker-publication-v1";
+  db.query(
+    `INSERT INTO tf_v2_resources
+      (uid, principal, form_url, space, name, backend_id, target_key,
+       active_name, generation, phase, spec_json, output_json, last_operation, busy_operation)
+     VALUES (?, 'org-1', ?, 'prod', ?, ?,
+             'fixture-workerd-root', ?, 1, 'pending', ?, ?, ?, ?)`,
+  ).run(
+    resourceUid,
+    input.form,
+    input.name,
+    backendId,
+    input.name,
+    canonicalJson(input.spec),
+    JSON.stringify(output),
+    id,
+    id,
+  );
+  db.query(
+    `INSERT INTO tf_v2_operations
+      (id, resource_uid, principal, replay_key, request_fingerprint, action, generation,
+       status, effect, created_at, updated_at, retain_until, backend_id, target_key,
+       backend_key, accepted_spec_json)
+     VALUES (?, ?, 'org-1', ?, ?, 'create', 1, 'queued', 'none', ?, ?, ?,
+             ?, 'fixture-workerd-root', ?, ?)`,
+  ).run(
+    id,
+    resourceUid,
+    `historical-${input.name}`,
+    `historical-${id}`,
+    at,
+    at,
+    new Date(Date.now() + 3_600_000).toISOString(),
+    backendId,
+    `historical-${id}`,
+    canonicalJson(input.spec),
+  );
+  const references =
+    input.form === BUNDLE_FORM_URL ? [] : referencesForWorkerForm(input.form, input.spec);
+  if (references.length > 0) {
+    db.query("INSERT INTO tf_v2_operation_reference_sets (operation_id) VALUES (?)").run(id);
+    for (const reference of references) {
+      db.query(
+        `INSERT INTO tf_v2_operation_references
+          (operation_id, target_uid, form_url, readiness, target_spec_path, target_spec_equals)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id,
+        reference.resourceUid,
+        reference.formUrl,
+        reference.readiness,
+        reference.targetSpecMatch ? `$.${reference.targetSpecMatch.path.join(".")}` : null,
+        reference.targetSpecMatch?.equals ?? null,
+      );
+    }
+    db.query("UPDATE tf_v2_operation_reference_sets SET sealed = 1 WHERE operation_id = ?").run(id);
+  }
+  const token = `historical-lease-${id}`;
+  expect(await store.claim(id, token, Date.now(), Date.now() + 60_000)).toBe(true);
+  expect(await store.markDispatch(id, token, at)).toBe(true);
+  const result = input.materialize
+    ? await input.materialize({
+        operationId: id,
+        leaseToken: token,
+        backendKey: `historical-${id}`,
+        backendId,
+        targetKey: "fixture-workerd-root",
+        resourceUid,
+        principal: "org-1",
+        action: "create",
+        generation: 1,
+        form: input.form,
+        space: "prod",
+        name: input.name,
+        spec: input.spec,
+        previousObserved: {},
+        previousOutput: output,
+      })
+    : { kind: "complete" as const, observed: input.observed ?? {}, output };
+  if (result.kind !== "complete") throw new Error("historical fixture did not settle");
+  expect(
+    await store.settle({
+      id,
+      token,
+      status: "succeeded",
+      effect: "complete",
+      at,
+      retainUntil: new Date(Date.now() + 3_600_000).toISOString(),
+      observedJson: canonicalJson(result.observed),
+      outputJson: canonicalJson(result.output),
+    }),
+  ).toBe(true);
+  return { id, resourceUid };
+}
 
 // The Version backend below is a graph-only substitute, not ABI qualification;
 // its Bundle dependency uses real verified SQL byte custody.
@@ -35,11 +158,9 @@ function fixture(distinctFormBackends = false, legacySchema = false) {
     db.exec(`CREATE TABLE applied_migrations (
       name TEXT PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL
     )`);
-    for (const migration of MIGRATIONS.filter(
-      (item) =>
-        item.name !== "0077_v2_operation_acceptance_order.sql" &&
-        item.name !== "0078_v2_worker_invocation_retirement.sql",
-    )) {
+    // A real pre-0077 database has only the prefix. Later migrations depend on
+    // 0077/0078 and must run through the normal migrator after the old row exists.
+    for (const migration of MIGRATIONS.slice(0, historicalMigrationCount)) {
       db.exec(migration.sql);
       db.query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, datetime('now'))").run(
         migration.name,
@@ -234,6 +355,11 @@ function fixture(distinctFormBackends = false, legacySchema = false) {
     engine,
     store,
     reader,
+    historicalBundle: {
+      spec: { artifact: { url: manifestUrl, sha256: digest(manifestBytes) } },
+      materialize: bundleHost.custody.execute,
+      custody: bundleHost.custody,
+    },
     create,
     basics,
     claim,
@@ -685,43 +811,144 @@ test("a fresh SQL handle reconstructs a terminal current serving graph without a
 test("a historical source without acceptance order is unresolved after additive migration", async () => {
   const f = fixture(false, true);
   try {
-    const { worker, version } = await f.basics();
-    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
-      worker: { resourceUid: worker.resourceUid },
-      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    const worker = await insertHistoricalResource(f.db, f.store, {
+      form: MODULE_WORKER_FORM_URL,
+      name: "worker",
+      spec: {},
+      observed: { activeDeploymentUid: null, ready: false },
     });
-    expect(migrateSqlite(f.db).applied).toEqual([
-      "0077_v2_operation_acceptance_order.sql",
-      "0078_v2_worker_invocation_retirement.sql",
-    ]);
+    expect(await f.store.resource(worker.resourceUid)).toMatchObject({
+      observed_json: canonicalJson({ activeDeploymentUid: null, ready: false }),
+    });
+    const bundle = await insertHistoricalResource(f.db, f.store, {
+      form: BUNDLE_FORM_URL,
+      name: "bundle",
+      spec: f.historicalBundle.spec,
+      backendId: WORKER_BUNDLE_BACKEND_ID,
+      materialize: f.historicalBundle.materialize,
+    });
+    const version = await insertHistoricalResource(f.db, f.store, {
+      form: WORKER_VERSION_FORM_URL,
+      name: "version",
+      spec: {
+        worker: { resourceUid: worker.resourceUid },
+        bundle: { resourceUid: bundle.resourceUid },
+        handlers: ["fetch"],
+      },
+      observed: { ready: true, resolvedBindings: true, bundleVerified: true },
+    });
+    const deployment = await insertHistoricalResource(f.db, f.store, {
+      form: WORKER_DEPLOYMENT_FORM_URL,
+      name: "deployment",
+      spec: {
+        worker: { resourceUid: worker.resourceUid },
+        versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+      },
+      observed: {
+        ready: true,
+        active: true,
+        selectedVersions: [{ resourceUid: version.resourceUid, weight: 10_000 }],
+      },
+    });
+    f.db
+      .query("UPDATE tf_v2_resources SET observed_json = ?, observed_at = ? WHERE uid = ?")
+      .run(
+        canonicalJson({ activeDeploymentUid: deployment.resourceUid, ready: true }),
+        new Date().toISOString(),
+        worker.resourceUid,
+      );
+    const endpointSpec = { worker: { resourceUid: worker.resourceUid } };
+    const endpoint = await insertHistoricalResource(f.db, f.store, {
+      form: WORKER_ENDPOINT_FORM_URL,
+      name: "endpoint",
+      spec: endpointSpec,
+      observed: { tlsReady: true, activeDeploymentRouteReady: true },
+      output: { hostname: "assigned.example.test", url: "https://assigned.example.test/" },
+    });
+    expect(
+      f.db
+        .query(
+          `SELECT deployment.uid FROM tf_v2_resources worker
+           JOIN tf_v2_resources deployment
+             ON deployment.uid = json_extract(worker.observed_json, '$.activeDeploymentUid')
+           JOIN tf_v2_resources version
+             ON version.uid = json_extract(deployment.spec_json,
+               '$.versions[0].workerVersion.resourceUid')
+           JOIN tf_v2_resources bundle
+             ON bundle.uid = json_extract(version.spec_json, '$.bundle.resourceUid')
+           JOIN tf_v2_artifact_owners held ON held.resource_uid = bundle.uid
+           WHERE worker.uid = ? AND json_extract(worker.observed_json, '$.ready') = 1
+             AND deployment.form_url = ? AND deployment.phase = 'idle'
+             AND json_extract(deployment.observed_json, '$.active') = 1
+             AND json_extract(deployment.spec_json, '$.versions[0].weight') = 10000
+             AND version.form_url = ? AND json_extract(version.observed_json, '$.ready') = 1
+             AND json_extract(version.observed_json, '$.bundleVerified') = 1
+             AND bundle.form_url = ? AND held.state = 'verified'
+             AND held.observation_json = bundle.observed_json`,
+        )
+        .all(
+          worker.resourceUid,
+          WORKER_DEPLOYMENT_FORM_URL,
+          WORKER_VERSION_FORM_URL,
+          BUNDLE_FORM_URL,
+        ),
+    ).toHaveLength(1);
+    expect(migrateSqlite(f.db).applied).toEqual(
+      MIGRATIONS.slice(historicalMigrationCount).map((migration) => migration.name),
+    );
     expect(
       await f.sql.query("SELECT acceptance_order FROM tf_v2_operations WHERE id = ?", [
-        deployment.id,
+        endpoint.id,
       ]),
     ).toEqual([{ acceptance_order: null }]);
     const oldInput = {
       workerUid: worker.resourceUid,
       targetKey: "fixture-workerd-root",
-      sourceOperationId: deployment.id,
+      sourceOperationId: endpoint.id,
       expectedIdentity: {
-        generation: `takoserver-v2-operation:${deployment.id}`,
+        generation: `takoserver-v2-operation:${endpoint.id}`,
         workerResourceUid: worker.resourceUid,
-        hostnames: [],
+        hostnames: ["assigned.example.test"],
         versions: [{ workerVersionUid: version.resourceUid, weight: 10_000 }],
       },
     };
-    expect(await f.reader.resolveCurrentServing(oldInput)).toMatchObject({ kind: "unresolved" });
-    const endpoint = await f.create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
-      worker: { resourceUid: worker.resourceUid },
+    expect(await f.reader.resolveCurrentServing(oldInput)).toMatchObject({
+      kind: "unresolved",
+      code: "graph_unresolved",
+      message: "Serving source is not the unique latest publisher",
     });
+    const current = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "update-historical-endpoint-key",
+      uid: endpoint.resourceUid,
+      expectedGeneration: 1,
+      spec: endpointSpec,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: current.id, status: "succeeded" });
+    expect(
+      await f.sql.query("SELECT acceptance_order FROM tf_v2_operations WHERE id = ?", [current.id]),
+    ).toEqual([{ acceptance_order: expect.any(Number) }]);
+    const bundleRow = await f.store.resource(bundle.resourceUid);
+    if (!bundleRow) throw new Error("historical Bundle disappeared");
+    expect(
+      (
+        await f.historicalBundle.custody.readHeldVerified({
+          targetResourceUid: bundle.resourceUid,
+          principal: "org-1",
+          space: "prod",
+          expectedSpec: f.historicalBundle.spec,
+          expectedObserved: JSON.parse(bundleRow.observed_json),
+          stillAuthorized: async () => true,
+        })
+      ).files,
+    ).toHaveLength(1);
     expect(
       await f.reader.resolveCurrentServing({
         ...oldInput,
-        sourceOperationId: endpoint.id,
+        sourceOperationId: current.id,
         expectedIdentity: {
           ...oldInput.expectedIdentity,
-          generation: `takoserver-v2-operation:${endpoint.id}`,
-          hostnames: ["assigned.example.test"],
+          generation: `takoserver-v2-operation:${current.id}`,
         },
       }),
     ).toMatchObject({ kind: "ready" });

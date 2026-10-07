@@ -6,6 +6,7 @@ import {
   type WorkerModuleHandlerName,
   type WorkerModuleInspectionInput,
   type WorkerModuleInspectionModule,
+  type WorkerWorkflowClassInspectionInput,
 } from "../worker-module-inspection-contract.ts";
 
 export {
@@ -25,7 +26,30 @@ export {
   type WorkerModuleLoadError,
   type WorkerModuleMediaType,
   type WorkerModuleSemanticInspector,
+  type WorkerWorkflowClassInspectionInput,
+  type WorkerWorkflowClassInspectionResult,
 } from "../worker-module-inspection-contract.ts";
+
+export function snapshotWorkerWorkflowClassInspectionInput(
+  input: WorkerWorkflowClassInspectionInput,
+): WorkerWorkflowClassInspectionInput {
+  if (
+    typeof input.className !== "string" ||
+    !/^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u.test(input.className)
+  ) {
+    throw new TypeError("Workflow class inspection contract is unavailable");
+  }
+  const snapshot = snapshotWorkerModuleInspectionInput({
+    mainModule: input.mainModule,
+    modules: input.modules,
+    declaredHandlers: [],
+  });
+  return Object.freeze({
+    mainModule: snapshot.mainModule,
+    modules: snapshot.modules,
+    className: input.className,
+  });
+}
 
 /**
  * Provider-side worker.runtime@1.1.0 module-load inspection.

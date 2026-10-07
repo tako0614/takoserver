@@ -1,5 +1,5 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { resolveActorAbiProfile } from "./actor-class-execution.ts";
@@ -40,7 +40,7 @@ export interface WorkerdActorNamespaceOptions {
 type WorkerdActorNativeChild = Pick<
   ReturnType<typeof Bun.spawn>,
   "exitCode" | "signalCode" | "exited" | "kill"
->;
+> & { readonly pid?: number };
 
 function isActorNativeChildTerminal(child: WorkerdActorNativeChild | undefined): boolean {
   return child !== undefined && (child.exitCode !== null || child.signalCode !== null);
@@ -58,6 +58,10 @@ export interface WorkerdActorNativeProcessAdapter {
 
 export interface WorkerdActorNamespace {
   fetch(id: string, request: Request, variantKey: string): Promise<Response>;
+  /** Authenticated child read even when no Actor ID has yet been dispatched. */
+  probeRuntime?(signal: AbortSignal): Promise<void>;
+  /** Authenticated physical per-ID read; an unreadable child never means zero. */
+  observeActor?(id: string, signal: AbortSignal): Promise<WorkerdActorRuntimeObservation>;
   /** Private workerd-to-workerd duplex socket; never an untrusted URL or binding. */
   readonly actorProxySocketPath: string;
   /** Host-private target after live Resource and Version admission. */
@@ -77,6 +81,18 @@ export interface WorkerdActorNamespace {
   disableAlarmAdmission(): void;
   /** Ordinary retirement drains responses; a dead child can be reaped immediately. */
   close(): Promise<void>;
+}
+
+export interface WorkerdActorRuntimeObservation {
+  readonly actorId: string;
+  readonly epoch: string;
+  readonly generationKey: string;
+  readonly instance: string;
+  readonly revision: number;
+  readonly activeActor: boolean;
+  readonly pendingAlarmCount: number;
+  readonly openSocketCount: number;
+  readonly socketIds: readonly string[];
 }
 
 type AlarmGrant = NonNullable<Awaited<ReturnType<WorkerdActorNamespaceOptions["admitAlarm"]>>>;
@@ -349,7 +365,7 @@ export class ActorChild {
     }
     const headers = new SafeHeaders(incoming);
     const nonce = SafeApply(SafeHeadersGet, headers, [UPGRADE_NONCE]);
-    const privateNames = ["x-takoserver-private-actor-delivery", "x-takoserver-private-actor-variant", UPGRADE_NONCE, UPGRADE_DECISION, UPGRADE_SOCKET_ID, EVENT_SECRET, SOCKET_ACTION, SOCKET_NONCE, SOCKET_ID, SOCKET_KIND];
+    const privateNames = ["x-takoserver-private-actor-delivery", "x-takoserver-private-actor-variant", "x-takoserver-private-actor-observation", UPGRADE_NONCE, UPGRADE_DECISION, UPGRADE_SOCKET_ID, EVENT_SECRET, SOCKET_ACTION, SOCKET_NONCE, SOCKET_ID, SOCKET_KIND];
     for (let index = 0; index < privateNames.length; index += 1)
       SafeApply(SafeHeadersDelete, headers, [privateNames[index]]);
     const appRequest = new SafeRequest(SafeRequestUrl ? SafeApply(SafeRequestUrl, request, []) : request.url, { method: SafeApply(SafeRequestMethod, request, []), headers, body: SafeRequestBody ? SafeApply(SafeRequestBody, request, []) : request.body, signal: SafeApply(SafeRequestSignal, request, []), redirect: "manual" });
@@ -403,7 +419,7 @@ export default { fetch(request) { return inspectVersion(request); } };`),
     owner,
     encoder.encode(`import { createActorNativeOwner, createActorNativeIngress, resolveActorAbiProfile } from ${literal(`./${first.helper}`)};
 const ABI_PROFILE = ${runtimeClassRef ? `resolveActorAbiProfile(${literal(runtimeClassRef)})` : "undefined"};
-export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)}, ${literal(admissionToken)}, ${JSON.stringify({ generationKey: graph.generationKey, epoch, variantKeys })}, ${options.ownerDeadlines ? JSON.stringify(options.ownerDeadlines) : "undefined"}, undefined, undefined, ABI_PROFILE);
+export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)}, ${literal(admissionToken)}, ${JSON.stringify({ generationKey: graph.generationKey, epoch, variantKeys })}, ${options.ownerDeadlines ? JSON.stringify(options.ownerDeadlines) : "undefined"}, undefined, undefined, ABI_PROFILE, ${literal(alarmToken)});
 const ingress = createActorNativeIngress(${literal(token)}, ${literal(alarmToken)});
 const inspectionTokens = ${JSON.stringify(inspectionTokens)};
 let inspections;
@@ -465,6 +481,30 @@ export default {
   let child: WorkerdActorNativeChild | undefined;
   let closing: Promise<void> | undefined;
   let verified = false;
+  let acceptedRunListener: Awaited<ReturnType<typeof lstat>> | null = null;
+  let acceptedUpgradeListener: Awaited<ReturnType<typeof lstat>> | null = null;
+  const sameListener = (
+    left: Awaited<ReturnType<typeof lstat>>,
+    right: Awaited<ReturnType<typeof lstat>>,
+  ): boolean =>
+    left.isSocket() &&
+    right.isSocket() &&
+    left.uid === right.uid &&
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.ctimeMs === right.ctimeMs;
+  const mayRemoveOwnedSocket = async (
+    path: string,
+    accepted: Awaited<ReturnType<typeof lstat>> | null,
+  ): Promise<boolean> => {
+    try {
+      const current = await lstat(path);
+      return accepted !== null && sameListener(accepted, current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      return false;
+    }
+  };
   const attempts = createActorAlarmAttemptRegistry(options.completeAlarm);
   const socketAttempts = createActorAlarmAttemptRegistry(options.completeSocket);
   const validAttemptNonce = (value: unknown): value is string =>
@@ -550,10 +590,21 @@ export default {
     closing ??= (async () => {
       verified = false;
       admission.stop(true);
+      const originalSockets =
+        (await mayRemoveOwnedSocket(join(root, "run.sock"), acceptedRunListener)) &&
+        (await mayRemoveOwnedSocket(join(root, "upgrade.sock"), acceptedUpgradeListener));
       if (child) {
         if (!isActorNativeChildTerminal(child)) child.kill("SIGKILL");
         await child.exited;
       }
+      // Never unlink a pathname substituted by another Unix listener. Leaving
+      // a private temporary root is safer than adopting or deleting its peer.
+      if (
+        !originalSockets ||
+        !(await mayRemoveOwnedSocket(join(root, "run.sock"), acceptedRunListener)) ||
+        !(await mayRemoveOwnedSocket(join(root, "upgrade.sock"), acceptedUpgradeListener))
+      )
+        return;
       // Retained namespace storage is deliberately outside this directory.
       await rm(root, { recursive: true, force: true });
     })();
@@ -563,6 +614,90 @@ export default {
     await mkdir(options.storagePath, { recursive: true, mode: 0o700 });
     const socket = join(root, "run.sock");
     const actorProxySocketPath = join(root, "upgrade.sock");
+    const processBirth = async (pid: number): Promise<string | null> => {
+      try {
+        const record = await readFile(`/proc/${pid}/stat`, "utf8");
+        const commandEnd = record.lastIndexOf(") ");
+        if (commandEnd < 0) return null;
+        const suffix = record
+          .slice(commandEnd + 2)
+          .trim()
+          .split(/\s+/u);
+        // Linux proc stat field 22 is starttime; suffix[0] is field 3.
+        const birth = suffix[19];
+        return record.startsWith(`${pid} (`) && birth && /^[1-9][0-9]*$/u.test(birth)
+          ? birth
+          : null;
+      } catch {
+        return null;
+      }
+    };
+    let launchedBirth: string | null = null;
+    const childOwnedListener = async (
+      selectedChild: WorkerdActorNativeChild,
+      path: string,
+    ): Promise<Awaited<ReturnType<typeof lstat>> | null> => {
+      // A pathname and a bare HTTP 204 do not establish the native peer. The
+      // kernel socket must also be held open by the exact spawned workerd PID.
+      const pid = selectedChild.pid;
+      if (
+        !Number.isSafeInteger(pid) ||
+        !pid ||
+        pid <= 0 ||
+        !launchedBirth ||
+        isActorNativeChildTerminal(selectedChild) ||
+        (await processBirth(pid)) !== launchedBirth
+      )
+        return null;
+      try {
+        const pathEntry = await lstat(path);
+        if (!pathEntry.isSocket() || pathEntry.uid !== process.getuid?.()) return null;
+        const matches = (await readFile("/proc/net/unix", "utf8"))
+          .split("\n")
+          .map((line) =>
+            line.match(
+              /^\S+\s+\S+\s+\S+\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+(\d+)\s+(.+)$/u,
+            ),
+          )
+          // Connected Unix sockets can briefly retain the same pathname in
+          // procfs. Only the unique AF_UNIX STREAM listening inode is a peer.
+          .filter(
+            (match) =>
+              match?.[4] === path &&
+              (Number.parseInt(match[1] ?? "0", 16) & 0x10000) !== 0 &&
+              Number.parseInt(match[2] ?? "0", 16) === 1,
+          );
+        if (matches.length !== 1) return null;
+        const inode = matches[0]?.[3];
+        if (!inode) return null;
+        const names = await readdir(`/proc/${pid}/fd`);
+        if (names.length > 4_096) return null;
+        let owned = false;
+        for (const name of names) {
+          let target: string;
+          try {
+            target = await readlink(`/proc/${pid}/fd/${name}`);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+            throw error;
+          }
+          if (target === `socket:[${inode}]`) {
+            owned = true;
+            break;
+          }
+        }
+        if (
+          !owned ||
+          isActorNativeChildTerminal(selectedChild) ||
+          (await processBirth(pid)) !== launchedBirth
+        )
+          return null;
+        const again = await lstat(path);
+        return sameListener(pathEntry, again) ? again : null;
+      } catch {
+        return null;
+      }
+    };
     const config = await writeWorkerdPrivateExecution({
       root,
       site: {
@@ -602,13 +737,26 @@ export default {
     options.signal.throwIfAborted();
     const startingChild = processAdapter.spawn(binary, config);
     child = startingChild;
+    if (!options.processAdapter) {
+      const pid = startingChild.pid;
+      launchedBirth = pid && Number.isSafeInteger(pid) ? await processBirth(pid) : null;
+      if (!launchedBirth) throw new Error("Actor native child identity unavailable");
+    }
     let ready = false;
+    let verifiedListener: Awaited<ReturnType<typeof lstat>> | null = null;
     let lastReadinessStatus: number | undefined;
     const startupDeadlineAt = Date.now() + 20_000;
     for (let attempt = 0; attempt < 200 && Date.now() < startupDeadlineAt; attempt += 1) {
       options.signal.throwIfAborted();
       if (isActorNativeChildTerminal(startingChild))
         throw new Error("Actor native child exited during startup");
+      const beforeListener = options.processAdapter
+        ? null
+        : await childOwnedListener(startingChild, socket);
+      if (!options.processAdapter && !beforeListener) {
+        await Bun.sleep(10);
+        continue;
+      }
       let response: Response;
       try {
         response = await processAdapter.probeReadiness({
@@ -626,8 +774,17 @@ export default {
         continue;
       }
       if (response.status === 204) {
-        ready = true;
-        break;
+        const afterListener = options.processAdapter
+          ? null
+          : await childOwnedListener(startingChild, socket);
+        if (
+          options.processAdapter ||
+          (beforeListener && afterListener && sameListener(beforeListener, afterListener))
+        ) {
+          verifiedListener = afterListener;
+          ready = true;
+          break;
+        }
       }
       await response.body?.cancel();
       if (response.status === 422) throw new Error("Actor Version class inspection failed");
@@ -638,11 +795,45 @@ export default {
         `Actor native child readiness unavailable${lastReadinessStatus === undefined ? "" : ` (${lastReadinessStatus})`}`,
       );
     options.signal.throwIfAborted();
+    // A successful HTTP readiness reply authenticates the request, not the
+    // pathname's future listener. Record the original native Unix inode;
+    // test adapters without a real listener cannot qualify observation.
+    const originalListener = verifiedListener;
+    if (
+      originalListener &&
+      (!originalListener.isSocket() || originalListener.uid !== process.getuid?.())
+    )
+      throw new Error("Actor native listener unavailable");
+    acceptedRunListener = originalListener;
+    acceptedUpgradeListener = options.processAdapter
+      ? null
+      : await childOwnedListener(startingChild, actorProxySocketPath);
+    const requireOriginalListener = async (): Promise<void> => {
+      if (!originalListener) throw new Error("Actor native observation unavailable");
+      const current = await childOwnedListener(startingChild, socket);
+      if (!current || !sameListener(originalListener, current))
+        throw new Error("Actor native observation unavailable");
+    };
     const runningChild = startingChild;
     return {
       exited: runningChild.exited.then(() => {
         verified = false;
       }),
+      async probeRuntime(signal) {
+        if (closing || isActorNativeChildTerminal(runningChild))
+          throw new Error("Actor native observation unavailable");
+        await requireOriginalListener();
+        const response = await processAdapter.probeReadiness({
+          socketPath: socket,
+          token,
+          signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+        });
+        await response.body?.cancel();
+        await requireOriginalListener();
+        signal.throwIfAborted();
+        if (response.status !== 204 || closing || isActorNativeChildTerminal(runningChild))
+          throw new Error("Actor native observation unavailable");
+      },
       enableAlarmAdmission() {
         if (!closing && !isActorNativeChildTerminal(runningChild)) verified = true;
       },
@@ -664,6 +855,85 @@ export default {
           unix: socket,
           redirect: "manual",
         });
+      },
+      async observeActor(id, signal) {
+        if (closing || isActorNativeChildTerminal(child) || !id || id.includes("\u0000"))
+          throw new Error("Actor native observation unavailable");
+        await requireOriginalListener();
+        const encodedId = encodeURIComponent(id);
+        const controlToken = createHmac("sha256", alarmToken).update(encodedId).digest("hex");
+        const response = await fetch("http://actor.invalid/__actor_observe__", {
+          unix: socket,
+          method: "POST",
+          headers: {
+            "x-takoserver-private-actor-token": controlToken,
+            "x-takoserver-private-actor-id": encodedId,
+            "x-takoserver-private-actor-observation": "snapshot-v1",
+          },
+          redirect: "manual",
+          signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+        });
+        if (response.status !== 200 || !response.body)
+          throw new Error("Actor native observation unavailable");
+        const reader = response.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let size = 0;
+        try {
+          while (true) {
+            const next = await reader.read();
+            if (next.done) break;
+            size += next.value.byteLength;
+            if (size > 1_048_576) throw new Error("Actor native observation unavailable");
+            chunks.push(next.value);
+          }
+        } finally {
+          await reader.cancel().catch(() => {});
+        }
+        await requireOriginalListener();
+        const raw = new Uint8Array(size);
+        let offset = 0;
+        for (const chunk of chunks) {
+          raw.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+        } catch {
+          throw new Error("Actor native observation unavailable");
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+          throw new Error("Actor native observation unavailable");
+        const record = parsed as Record<string, unknown>;
+        const socketIds = record.socketIds;
+        if (
+          Object.keys(record).sort().join(",") !==
+            "activeActor,actorId,epoch,generationKey,instance,openSocketCount,pendingAlarmCount,revision,socketIds" ||
+          record.actorId !== id ||
+          record.epoch !== epoch ||
+          record.generationKey !== graph.generationKey ||
+          typeof record.instance !== "string" ||
+          !/^[a-f0-9]{64}$/u.test(record.instance) ||
+          !Number.isSafeInteger(record.revision) ||
+          (record.revision as number) < 0 ||
+          typeof record.activeActor !== "boolean" ||
+          !Number.isSafeInteger(record.pendingAlarmCount) ||
+          (record.pendingAlarmCount as number) < 0 ||
+          (record.pendingAlarmCount as number) > 2 ||
+          !Array.isArray(socketIds) ||
+          socketIds.length > 10_000 ||
+          !Number.isSafeInteger(record.openSocketCount) ||
+          record.openSocketCount !== socketIds.length ||
+          socketIds.some(
+            (value, index) =>
+              typeof value !== "string" || !value || (index > 0 && value <= socketIds[index - 1]),
+          )
+        )
+          throw new Error("Actor native observation unavailable");
+        signal.throwIfAborted();
+        if (closing || isActorNativeChildTerminal(child))
+          throw new Error("Actor native observation unavailable");
+        return parsed as WorkerdActorRuntimeObservation;
       },
       duplexTarget(id, variantKey) {
         if (closing || isActorNativeChildTerminal(child))

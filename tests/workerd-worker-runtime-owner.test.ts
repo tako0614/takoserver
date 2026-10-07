@@ -39,6 +39,7 @@ import {
   WORKER_ENDPOINT_BACKEND_ID,
 } from "../src/takoform-v2/worker-endpoint-backend.ts";
 import type { V2WorkerPublicationResolution } from "../src/takoform-v2/worker-publication-state.ts";
+import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { spawnWorkerdWithParentDeath, workerPortOwnership } from "../src/workerd-linux-process.ts";
 import type { WorkerdPublicationIdentity } from "../src/workerd-runtime.ts";
 import type { WorkerdProcess } from "../src/workerd-supervisor.ts";
@@ -50,6 +51,7 @@ import {
   createSerializedWorkerdOwnerStateWriter,
   openWorkerdWorkerRuntimeOwner,
 } from "../src/workerd-worker-runtime-owner.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 const TARGET_KEY = "fixture-v2-worker-runtime-owner";
 const CHILD_SOURCE = `
@@ -1640,8 +1642,15 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
       targetKey: TARGET_KEY,
       sourceOperationId: createId,
     });
+  const readPhysical = () =>
+    owner.observeActorGraphForAcceptedOperation({
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      sourceOperationId: createId,
+    });
   try {
     expect(await read()).toEqual({ kind: "unknown" });
+    expect(await readPhysical()).toEqual({ kind: "unknown" });
     expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
       kind: "confirmed",
     });
@@ -1657,9 +1666,17 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
       },
     });
     if (exact.kind !== "ready") throw new Error("native Actor graph not observed");
+    expect(await readPhysical()).toEqual(exact);
     expect(exact.graph.versions[0]?.modules.get("index.mjs")).toBeInstanceOf(Uint8Array);
     expect(
       await owner.observeActorGraph({
+        workerResourceUid: workerUid,
+        targetKey: TARGET_KEY,
+        sourceOperationId: deleteId,
+      }),
+    ).toEqual({ kind: "unknown" });
+    expect(
+      await owner.observeActorGraphForAcceptedOperation({
         workerResourceUid: workerUid,
         targetKey: TARGET_KEY,
         sourceOperationId: deleteId,
@@ -1675,20 +1692,160 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
     expect(await staleRequest).toEqual({ kind: "unknown" });
     publication.setFenceCurrent(false);
     expect(await read()).toEqual({ kind: "unknown" });
+    expect(await readPhysical()).toEqual(exact);
+    expect(
+      await owner.observeActorGraphForAcceptedOperation({
+        workerResourceUid: workerUid,
+        targetKey: "foreign-target",
+        sourceOperationId: createId,
+      }),
+    ).toEqual({ kind: "unknown" });
     publication.setFenceCurrent(true);
     publication.failAfterFenceChecks(2);
     expect(await read()).toEqual({ kind: "unknown" });
+    expect(await readPhysical()).toEqual(exact);
     publication.failAfterFenceChecks(null);
     expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
       kind: "confirmed",
       identity: null,
     });
     expect(await read()).toEqual({ kind: "unknown" });
+    expect(await readPhysical()).toEqual({ kind: "unknown" });
   } finally {
     await owner.close().catch(() => undefined);
     await owned.cleanup();
   }
 });
+
+test("Workflow selection returns only the exact live SQL-held code Version and a bounded private lease", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-workflow-selection";
+  const createId = "0cfebc3b-3b9a-4a5b-a897-6713df09121e";
+  const deleteId = "f1840189-4a30-41c2-bae2-9c086a5327c4";
+  const publication = staticPublicationState(workerUid, true);
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: join(owned.root, "owners"),
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+    inspectModule: async (): Promise<WorkerModuleInspectionResult> => ({
+      outcome: "valid",
+      exportedHandlers: ["fetch"],
+    }),
+  });
+  const request = {
+    workerUid,
+    targetKey: TARGET_KEY,
+    servingSourceOperationId: createId,
+    basisPoint: 0,
+  };
+  try {
+    expect(await owner.selectWorkflowExecution(request)).toEqual({ kind: "unknown" });
+    expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
+      kind: "confirmed",
+    });
+    publication.setCurrent(createId);
+    const selection = await owner.selectWorkflowExecution(request);
+    expect(selection).toMatchObject({
+      kind: "selected",
+      sourceOperationId: createId,
+      selected: {
+        workerResourceUid: workerUid,
+        workerVersionUid: `version-${createId}`,
+      },
+    });
+    if (selection.kind !== "selected") throw new Error("Workflow Version was not selected");
+    expect(selection.selected.modules.get("index.mjs")).toEqual((await heldCodeBundle()).files[0]);
+    expect(selection.selected.hostModules.size).toBeGreaterThan(0);
+    expect(await selection.stillCurrent()).toBe(true);
+    const lease = await selection.acquirePrivateServiceBindings(new AbortController().signal);
+    expect(lease.services).toEqual([]);
+    const mutable = { ...request };
+    const pending = owner.selectWorkflowExecution(mutable);
+    mutable.servingSourceOperationId = deleteId;
+    expect((await pending).kind).toBe("selected");
+    expect(await owner.selectWorkflowExecution({ ...request, basisPoint: 10_000 })).toEqual({
+      kind: "unknown",
+    });
+    publication.setFenceCurrent(false);
+    expect(await selection.stillCurrent()).toBe(false);
+    expect(await owner.selectWorkflowExecution(request)).toEqual({ kind: "unknown" });
+    publication.setFenceCurrent(true);
+    let deleteFinished = false;
+    const deletion = owner.execute(execution(workerUid, deleteId, "delete")).then((result) => {
+      deleteFinished = true;
+      return result;
+    });
+    await Bun.sleep(30);
+    expect(deleteFinished).toBe(false);
+    expect(await selection.stillCurrent()).toBe(false);
+    await lease.release();
+    expect(await deletion).toMatchObject({
+      kind: "confirmed",
+      identity: null,
+    });
+    expect(await selection.stillCurrent()).toBe(false);
+  } finally {
+    await owner.close().catch(() => undefined);
+    await owned.cleanup();
+  }
+});
+
+const nativeWorkerd = nativeEvidenceBinary("workerd-artifact");
+test.skipIf(nativeWorkerd === undefined)(
+  "pinned native owner selects the serving Workflow code Version and acquires its private bridge",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "takoserver-workflow-owner-native-"));
+    const artifact = await selectClosedGraphWorkerd({
+      binary: nativeWorkerd as string,
+      privateRoot: join(root, "artifact"),
+    });
+    if (!artifact.binary) throw new Error(artifact.diagnostic ?? "pinned workerd unavailable");
+    const workerUid = "worker-workflow-native";
+    const createId = "0cfebc3b-3b9a-4a5b-a897-6713df09122e";
+    const deleteId = "f1840189-4a30-41c2-bae2-9c086a5327d4";
+    const publication = staticPublicationState(workerUid, true);
+    const owner = await openWorkerdWorkerRuntimeOwner({
+      rootDirectory: join(root, "owners"),
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      publicationState: publication.source,
+      workerdBinary: artifact.binary,
+      listenerPortForOperation: unusedPort,
+      inspectModule: async (): Promise<WorkerModuleInspectionResult> => ({
+        outcome: "valid",
+        exportedHandlers: ["fetch"],
+      }),
+    });
+    try {
+      expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
+        kind: "confirmed",
+      });
+      publication.setCurrent(createId);
+      const selection = await owner.selectWorkflowExecution({
+        workerUid,
+        targetKey: TARGET_KEY,
+        servingSourceOperationId: createId,
+        basisPoint: 0,
+      });
+      expect(selection.kind).toBe("selected");
+      if (selection.kind !== "selected") throw new Error("native Workflow Version unavailable");
+      const lease = await selection.acquirePrivateServiceBindings(new AbortController().signal);
+      expect(lease.services).toEqual([]);
+      await lease.release();
+      expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
+        kind: "confirmed",
+        identity: null,
+      });
+    } finally {
+      await owner.close().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("Actor graph readback refuses a foreign listener while native bytes remain", async () => {
   const owned = await fixture();
@@ -1745,6 +1902,7 @@ test("Actor graph readback refuses a foreign listener while native bytes remain"
       fetch: () => new Response("foreign"),
     });
     expect(await owner.observeActorGraph(request)).toEqual({ kind: "unknown" });
+    expect(await owner.observeActorGraphForAcceptedOperation(request)).toEqual({ kind: "unknown" });
   } finally {
     await foreign?.stop(true);
     try {

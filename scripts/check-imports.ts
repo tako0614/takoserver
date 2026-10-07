@@ -106,6 +106,36 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "v2-contract", "v2-form", "v2-runtime", "v2-queue-manager"],
   },
   {
+    name: "v2-workflow-manager",
+    match: /^src\/takoform-v2\/workflow-(?:backend|class-admission)\.ts$/u,
+    may: ["core", "domain", "v2-contract", "v2-form", "v2-workflow-manager"],
+  },
+  {
+    name: "v2-workflow-native-selection",
+    match: /^src\/takoform-v2\/workflow-native-selection\.ts$/u,
+    may: ["core", "domain", "adapter", "app", "v2-form", "v2-runtime", "v2-workflow-manager"],
+  },
+  {
+    name: "v2-workflow-forward-runtime",
+    match: /^src\/takoform-v2\/workflow-forward-runtime\.ts$/u,
+    may: ["core", "domain", "app", "v2-workflow-native-selection"],
+  },
+  {
+    name: "v2-selfhost-workflow-composition",
+    match: /^src\/takoform-v2\/selfhost-v2-workflow-composition\.ts$/u,
+    may: [
+      "core",
+      "domain",
+      "app",
+      "package-surface",
+      "v2-form",
+      "v2-runtime",
+      "v2-workflow-manager",
+      "v2-workflow-native-selection",
+      "v2-workflow-forward-runtime",
+    ],
+  },
+  {
     name: "v2-runtime",
     match:
       /^src\/takoform-v2\/(?:module-worker-lifecycle-backend|worker-bundle-runtime|worker-code-runtime|worker-cron-trigger-backend|worker-cron-trigger-scheduler|worker-deployment-backend|worker-endpoint-backend|worker-lifecycle-backend|worker-runtime-readers|worker-publication-state|worker-publication-sql-guard|worker-static-runtime|worker-static-publication|worker-native-effects|worker-native-deletions)\.ts$|^src\/workerd-worker-runtime-owner\.ts$/u,
@@ -116,7 +146,41 @@ const LAYERS: readonly Layer[] = [
       "v2-form",
       "v2-code-validation",
       "v2-runtime",
+      "v2-workflow-binding-authority",
+      "v2-workflow-binding-projection",
       "adapter",
+    ],
+  },
+  {
+    // Core-only immutable caller binding authority for native ServiceBinding.
+    name: "v2-service-binding-authority",
+    match: /^src\/takoform-v2\/service-binding-authority\.ts$/u,
+    may: ["core", "v2-form"],
+  },
+  {
+    // Accepted Core Workflow/Version graph, never legacy Workflow Resource lookup.
+    name: "v2-workflow-binding-authority",
+    match: /^src\/takoform-v2\/workflow-binding-authority\.ts$/u,
+    may: ["core", "v2-form", "v2-workflow-manager"],
+  },
+  {
+    // Host-private exact grant projection, below the native graph adapter.
+    name: "v2-workflow-binding-projection",
+    match: /^src\/takoform-v2\/workflow-binding-projection\.ts$/u,
+    may: ["core", "v2-form"],
+  },
+  {
+    // Per-incarnation broker wires accepted authority to existing Workflow instances.
+    name: "v2-workflow-binding-boot",
+    match: /^src\/takoform-v2\/workflow-binding-boot\.ts$/u,
+    may: [
+      "core",
+      "domain",
+      "adapter",
+      "app",
+      "v2-form",
+      "v2-workflow-binding-authority",
+      "v2-workflow-binding-projection",
     ],
   },
   {
@@ -140,6 +204,48 @@ const LAYERS: readonly Layer[] = [
     name: "v2-actor-physical-backend",
     match: /^src\/takoform-v2\/actor-namespace-backend\.ts$/u,
     may: ["core", "app", "v2-contract", "v2-form", "v2-actor-admission"],
+  },
+  {
+    // Exact v2 accepted-reference adapter for the existing physical Actor port.
+    name: "v2-actor-binding-authority",
+    match: /^src\/takoform-v2\/actor-binding-authority\.ts$/u,
+    may: ["core", "app", "v2-form", "v2-actor-physical-backend"],
+  },
+  {
+    // Outer Host-private v2 Actor forward boot, never a pure Form/parser layer.
+    name: "v2-actor-forward-runtime",
+    match: /^src\/takoform-v2\/actor-forward-runtime\.ts$/u,
+    may: ["core", "adapter", "app", "v2-form", "v2-actor-binding-authority"],
+  },
+  {
+    // Exact app boot joins accepted SQL, the physical Actor owner, and the
+    // portable composition port; generic app/Form/native layers stay unchanged.
+    name: "v2-selfhost-actor-boot",
+    match: /^src\/selfhost-v2-actor-boot\.ts$/u,
+    may: [
+      "core",
+      "app",
+      "v2-actor-binding-authority",
+      "v2-actor-forward-runtime",
+      "v2-actor-physical-backend",
+      "v2-actor-graph-authority",
+      "v2-selfhost-composition",
+    ],
+  },
+  {
+    // Exact app boot joins the accepted Worker graph and existing guarded
+    // Workflow runtime. The pure Form/native layers gain no app import edge.
+    name: "v2-selfhost-workflow-boot",
+    match: /^src\/selfhost-v2-workflow-boot\.ts$/u,
+    may: [
+      "core",
+      "app",
+      "domain",
+      "v2-selfhost-composition",
+      "v2-selfhost-workflow-composition",
+      "v2-workflow-binding-authority",
+      "v2-workflow-binding-boot",
+    ],
   },
   {
     name: "v2-engine",
@@ -187,12 +293,37 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "app",
+    // This exact HTTPS listener adapts the v2 Endpoint observation contract
+    // to a local TLS socket; it is not a general app permission to import the
+    // v2 runtime layer.
+    match: /^src\/selfhost-v2-worker-endpoint-https\.ts$/u,
+    may: ["core", "adapter", "v2-runtime"],
+  },
+  {
+    name: "app",
     match: /^src\/selfhost-takoform-v2-ingress\.ts$/u,
     may: ["v2-contract"],
   },
   {
     name: "v2-selfhost-composition",
     match: /^src\/selfhost-v2-worker-composition\.ts$/u,
+    may: [
+      "core",
+      "adapter",
+      "v2-application",
+      "v2-config",
+      "v2-form",
+      "v2-runtime",
+      "v2-private",
+      "v2-code-validation",
+      "v2-selfhost-queue-worker-capability",
+      "v2-queue-manager",
+      "v2-selfhost-workflow-composition",
+    ],
+  },
+  {
+    name: "v2-selfhost-endpoint-frontend",
+    match: /^src\/selfhost-v2-worker-endpoint-frontend\.ts$/u,
     may: [
       "core",
       "adapter",
@@ -235,7 +366,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|artifact-path|cron|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|artifact-path|cron|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.
@@ -244,7 +375,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "adapter",
     match:
-      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-object-store|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-object-store|selfhost-endpoint-https-tls|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
     may: ["core", "adapter"],
   },
   {
@@ -297,6 +428,7 @@ const LAYERS: readonly Layer[] = [
       "v2-config",
       "v2-selfhost-composition",
       "v2-selfhost-queue-composition",
+      "v2-selfhost-queue-scheduler",
       "v2-selfhost-configured-input-sealer",
     ],
   },
@@ -336,7 +468,17 @@ for (const path of walk("src")) {
       violations.push(`${path} (${layer.name}) imports unclassified module ${target}`);
       continue;
     }
-    if (!layer.may.includes(targetLayer.name)) {
+    // This Host-only callback carries the exact accepted execution into
+    // private lifecycle readbacks. Permit only this single type-only edge;
+    // do not widen the general self-host composition layer to v2-contract.
+    const exactExecutionTypeEdge =
+      path === "src/selfhost-v2-worker-endpoint-frontend.ts" &&
+      target === "src/takoform-v2/types.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      /import\s+type\s+\{\s*V2Execution\s*\}\s+from\s+["']\.\/takoform-v2\/types\.ts["'];/u.test(
+        readFileSync(path, "utf8"),
+      );
+    if (!layer.may.includes(targetLayer.name) && !exactExecutionTypeEdge) {
       violations.push(
         `${path} (${layer.name}) imports ${target} (${targetLayer.name}); ` +
           `${layer.name} may import only ${layer.may.join(", ")}`,

@@ -46,6 +46,7 @@ import {
   WORKERD_V2_PRIVATE_KV_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
   WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING,
+  WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
   workerdV2PrivateActorBindingName,
   workerdV2PrivateServiceBindingName,
   workerdV2PrivateWorkflowBindingName,
@@ -63,10 +64,11 @@ import {
 import type {
   WorkerdActorForward,
   WorkerdActorForwardBinding,
+  WorkerdLegacyWorkflowForwardBinding,
   WorkerdModuleMediaType,
   WorkerdSite,
+  WorkerdV2WorkflowForwardBinding,
   WorkerdWorkflowForward,
-  WorkerdWorkflowForwardBinding,
 } from "./workerd-runtime.ts";
 
 const SELFHOST_ACTOR_FORWARD_ENTRYPOINT_MODULE =
@@ -153,13 +155,24 @@ export interface WorkerdVersionGraphInput {
     readonly runtimeClassRef?: WorkerdActorForwardBinding["runtimeClassRef"];
   }[];
   /** Unpublished opt-in bindings projected from one exact immutable V10 snapshot. */
-  readonly workflowForward?: {
-    readonly snapshotDigest: `sha256:${string}`;
-    readonly bindings: readonly (Omit<SelfhostVersionWorkflowBinding, "name"> & {
-      readonly publicName: string;
-      readonly token: string;
-    })[];
-  };
+  readonly workflowForward?:
+    | {
+        readonly schema: "takoserver.v2-workflow-binding-forward@1";
+        readonly snapshotDigest: `sha256:${string}`;
+        readonly bindings: readonly {
+          readonly publicName: string;
+          readonly tenantId: string;
+          readonly workflowResourceUid: string;
+          readonly token: string;
+        }[];
+      }
+    | {
+        readonly snapshotDigest: `sha256:${string}`;
+        readonly bindings: readonly (Omit<SelfhostVersionWorkflowBinding, "name"> & {
+          readonly publicName: string;
+          readonly token: string;
+        })[];
+      };
   readonly hostnames: readonly string[];
   readonly generation?: string;
   readonly workerResourceUid?: string;
@@ -328,9 +341,13 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
   const wrapperModule = v2PrivateNames
     ? WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE
     : SELFHOST_WORKER_ENTRYPOINT_MODULE;
+  const workflowEntrypoint =
+    workflowForward?.schema === "takoserver.v2-workflow-binding-forward@1"
+      ? WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE
+      : SELFHOST_WORKFLOW_BINDING_ENTRYPOINT_MODULE;
   const hostEntrypoint =
     workflowForward !== undefined
-      ? SELFHOST_WORKFLOW_BINDING_ENTRYPOINT_MODULE
+      ? workflowEntrypoint
       : actorForward === undefined
         ? wrapperModule
         : SELFHOST_ACTOR_FORWARD_ENTRYPOINT_MODULE;
@@ -357,7 +374,9 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
           queue: input.declaredHandlers.includes("queue"),
           scheduled: input.declaredHandlers.includes("scheduled"),
           ...(eventToken === undefined ? {} : { events: true }),
-          ...(workflowForward === undefined ? {} : { projectEnvironment: true }),
+          // The Actor child imports this Host-private projector even when no
+          // Workflow wrapper surrounds the Actor forwarding entrypoint.
+          projectEnvironment: true,
         }),
       ),
     );
@@ -368,7 +387,7 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
   }
   if (workflowForward !== undefined) {
     hostModules.set(
-      SELFHOST_WORKFLOW_BINDING_ENTRYPOINT_MODULE,
+      workflowEntrypoint,
       encoder.encode(
         selfhostWorkflowBindingEntrypointSource({
           runtimeModule: SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
@@ -750,6 +769,65 @@ function projectWorkflowForward(
   } catch {
     invalid();
   }
+  if (isRecord(snapshot) && snapshot.schema === "takoserver.v2-workflow-binding-forward@1") {
+    if (
+      !v2PrivateNames ||
+      !exactKeys(snapshot, ["schema", "bindings", "snapshotDigest"]) ||
+      typeof snapshot.snapshotDigest !== "string" ||
+      !/^sha256:[a-f0-9]{64}$/u.test(snapshot.snapshotDigest) ||
+      !Array.isArray(snapshot.bindings) ||
+      snapshot.bindings.length === 0 ||
+      snapshot.bindings.length > 64
+    )
+      invalid();
+    const colliding = new Set<string>([
+      ...existing.environment.map((entry) => entry.name),
+      ...(existing.dataPlane?.descriptors.flatMap((binding) =>
+        "publicName" in binding ? [binding.publicName] : [],
+      ) ?? []),
+      ...existing.serviceBindings.map((binding) => binding.publicName),
+      ...existing.serviceBindings.map((_, index) => serviceBindingName(index, true)),
+      ...(existing.actorForward?.bindings.flatMap((binding) => [
+        binding.publicName,
+        binding.httpService,
+        binding.upgradeService,
+      ]) ?? []),
+      WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
+    ]);
+    const bindings: WorkerdV2WorkflowForwardBinding[] = [];
+    for (const candidate of snapshot.bindings) {
+      if (
+        !isRecord(candidate) ||
+        !exactKeys(candidate, ["publicName", "tenantId", "workflowResourceUid", "token"]) ||
+        typeof candidate.publicName !== "string" ||
+        !ACTOR_FORWARD_PUBLIC_NAME.test(candidate.publicName) ||
+        typeof candidate.tenantId !== "string" ||
+        candidate.tenantId.length === 0 ||
+        typeof candidate.workflowResourceUid !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(candidate.workflowResourceUid) ||
+        typeof candidate.token !== "string" ||
+        !ACTOR_FORWARD_TOKEN.test(candidate.token) ||
+        colliding.has(candidate.publicName)
+      )
+        invalid();
+      const serviceName = workerdV2PrivateWorkflowBindingName(bindings.length);
+      if (colliding.has(serviceName)) invalid();
+      colliding.add(candidate.publicName);
+      colliding.add(serviceName);
+      bindings.push({
+        publicName: candidate.publicName,
+        serviceName,
+        tenantId: candidate.tenantId,
+        workflowResourceUid: candidate.workflowResourceUid,
+        token: candidate.token,
+      });
+    }
+    return {
+      schema: "takoserver.v2-workflow-binding-forward@1",
+      snapshotDigest: snapshot.snapshotDigest as `sha256:${string}`,
+      bindings,
+    };
+  }
   if (
     !isRecord(snapshot) ||
     !exactKeys(snapshot, ["bindings", "snapshotDigest"]) ||
@@ -846,7 +924,7 @@ function projectWorkflowForward(
   return {
     schema: "takoserver.selfhost-workflow-binding-forward@v1",
     snapshotDigest: snapshot.snapshotDigest as `sha256:${string}`,
-    bindings: normalized.map((binding, index): WorkerdWorkflowForwardBinding => {
+    bindings: normalized.map((binding, index): WorkerdLegacyWorkflowForwardBinding => {
       const token = tokenByPublicName.get(binding.name);
       if (token === undefined) invalid();
       return {

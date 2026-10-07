@@ -23,10 +23,13 @@ import { createSelfhostV2QueueWorkerCapability } from "./selfhost-v2-queue-worke
 import type { V2OperatorFormFactory } from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
 import { readV2ConfiguredPrivateInputs } from "./takoform-v2/configured-private-inputs.ts";
+import { ACTOR_NAMESPACE_FORM_URL } from "./takoform-v2/forms/actor-namespace.ts";
 import { createV2HeldArtifactSource } from "./takoform-v2/forms/artifact-source.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "./takoform-v2/forms/at-least-once-queue.ts";
+import { DURABLE_WORKFLOW_FORM_URL } from "./takoform-v2/forms/durable-workflow.ts";
 import { createKvWorkerBindingAuthority } from "./takoform-v2/forms/kv-worker-binding-authority.ts";
 import { createObjectBucketWorkerBindingAuthority } from "./takoform-v2/forms/object-bucket-worker-binding-authority.ts";
+import { QUEUE_CONSUMER_FORM_URL } from "./takoform-v2/forms/queue-consumer.ts";
 import { createQueueWorkerBindingAuthority } from "./takoform-v2/forms/queue-worker-binding-authority.ts";
 import { createSQLiteWorkerBindingAuthority } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { createStaticAssetBundleCustody } from "./takoform-v2/forms/static-asset-bundle-backend.ts";
@@ -38,6 +41,7 @@ import {
   WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "./takoform-v2/forms/worker-specs.ts";
+import type { createSelfhostV2WorkflowComposition } from "./takoform-v2/selfhost-v2-workflow-composition.ts";
 import { createWorkerCronTriggerAdmissionReader } from "./takoform-v2/worker-cron-trigger-backend.ts";
 import { createWorkerDeploymentForm } from "./takoform-v2/worker-deployment-backend.ts";
 import { createWorkerEndpointForm } from "./takoform-v2/worker-endpoint-backend.ts";
@@ -49,7 +53,10 @@ import {
 } from "./takoform-v2/worker-lifecycle-backend.ts";
 import { createV2WorkerPublicationState } from "./takoform-v2/worker-publication-state.ts";
 import { createAtLeastOnceQueueForm } from "./takoform-v2/worker-queue-backend.ts";
-import type { V2QueueConsumerCapability } from "./takoform-v2/worker-queue-consumer-backend.ts";
+import {
+  createQueueConsumerForm,
+  type V2QueueConsumerCapability,
+} from "./takoform-v2/worker-queue-consumer-backend.ts";
 import { createV2WorkerdWorkerRuntimeReaders } from "./takoform-v2/worker-runtime-readers.ts";
 import type { createV2WorkerVersionConfiguredInputSealer } from "./takoform-v2/worker-version-configured-inputs.ts";
 import { spawnWorkerdWithParentDeath } from "./workerd-linux-process.ts";
@@ -66,6 +73,64 @@ type EndpointPorts = Pick<
   "assignHostname" | "observeTls" | "observeRouteAbsent"
 >;
 
+type ActorOwnerForward = NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2ActorForward"]>;
+type ActorOwnerSource = Parameters<ActorOwnerForward["openIncarnation"]>[0];
+type ActorOwnerIncarnation = ReturnType<ActorOwnerForward["openIncarnation"]>;
+type WorkflowOwnerForward = NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2WorkflowForward"]>;
+type WorkflowRunOnce = ReturnType<typeof createSelfhostV2WorkflowComposition>["runtime"]["runOne"];
+type WorkflowDuePoll = {
+  readonly examined: number;
+  readonly selected: number;
+  readonly outcomes: readonly Awaited<ReturnType<WorkflowRunOnce>>[];
+};
+
+/** Trusted app-layer boot; portable Worker composition only attaches its explicit ports. */
+export interface SelfhostV2ActorBootPort {
+  prepare(input: {
+    readonly sql: Sql;
+    readonly targetKey: string;
+    readonly bundleCustody: NonNullable<ReturnType<typeof createWorkerBundleCustody>>;
+    readonly inspector: ReturnType<typeof createWorkerdWorkerModuleInspector>;
+    readonly ownerForWorker: (uid: string) => Promise<WorkerdWorkerRuntimeOwner | null>;
+  }): {
+    readonly namespaceForm: ReturnType<V2OperatorFormFactory>[string];
+    readonly bindingAuthority: NonNullable<
+      Parameters<typeof createInternalV2WorkerVersionForm>[0]["v2ActorBinding"]
+    >;
+    readonly forwardBoot: {
+      openIncarnation(
+        identity: ActorOwnerSource & { readonly principal: string; readonly space: string },
+      ): ActorOwnerIncarnation;
+    };
+  };
+}
+
+/** The Workflow Host and its forward broker share this composition's accepted SQL graph. */
+export interface SelfhostV2WorkflowBootPort {
+  prepare(input: {
+    readonly sql: Sql;
+    readonly clock: Clock;
+    readonly targetKey: string;
+    readonly workerdBinary: string;
+    readonly bundleCustody: NonNullable<ReturnType<typeof createWorkerBundleCustody>>;
+    readonly assetCustody?: NonNullable<ReturnType<typeof createStaticAssetBundleCustody>>;
+    readonly inspector: ReturnType<typeof createWorkerdWorkerModuleInspector>;
+    readonly ownerForWorker: (uid: string) => Promise<WorkerdWorkerRuntimeOwner | null>;
+  }): {
+    readonly workflowForm: ReturnType<V2OperatorFormFactory>[string];
+    readonly bindingAuthority: NonNullable<
+      Parameters<typeof createInternalV2WorkerVersionForm>[0]["v2WorkflowBinding"]
+    >;
+    readonly forwardBoot: WorkflowOwnerForward;
+    /** Bounded, exact-v2-target due poll; the runtime owns final execution authority. */
+    pollWorkflowDue(): Promise<WorkflowDuePoll>;
+    /** One trusted execution call; the runtime retains SQL/native claim authority. */
+    readonly runWorkflowOnce: WorkflowRunOnce;
+    /** Stop guarded Workflow children and release selected owner leases before owner suspension. */
+    close(): Promise<void>;
+  };
+}
+
 export interface SelfhostV2WorkerCompositionOptions {
   readonly sql: Sql;
   readonly objects: ObjectStoreAccess;
@@ -76,6 +141,10 @@ export interface SelfhostV2WorkerCompositionOptions {
   readonly targetKey: string;
   /** Already selected and pinned by the normal Bun entry. */
   readonly workerdBinary: string | null;
+  /** Already-composed private v2 Actor authority, native Host and physical readback. */
+  readonly v2Actor?: SelfhostV2ActorBootPort;
+  /** Explicitly boot-composed guarded Workflow runtime and accepted Binding authority. */
+  readonly v2Workflow?: SelfhostV2WorkflowBootPort;
   /** Explicitly boot-composed Host-private Queue settlement service. */
   readonly queueSettlement?: NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2QueueSettlement"]>;
   /** Already-created operator key authority; absent refuses sensitive Worker Versions. */
@@ -205,6 +274,12 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   ownerForWorkerUid(uid: string): Promise<WorkerdWorkerRuntimeOwner>;
   /** Real SQL publication plus restored native Queue export proof, absent without Queue boot. */
   readonly queueCapability?: V2QueueConsumerCapability;
+  /** Host-private one-shot due scan, unavailable before restore or after shutdown. */
+  pollWorkflowDue(): Promise<WorkflowDuePoll>;
+  /** Host-private one-shot execution, unavailable before restore or after shutdown. */
+  runWorkflowOnce: WorkflowRunOnce;
+  /** Close guarded Workflow registrations before stopping selected Worker owners. */
+  closeWorkflowHost(): Promise<void>;
   /** Stop exact known children but retain UID owner locks and durable accepted state. */
   suspendOwnersRetainingCustody(): Promise<void>;
   /** Close retired owners, then stop the private broker; active owners refuse. */
@@ -381,10 +456,74 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     ...(bundleCustody ? { bundleCustody } : {}),
     ...(assetCustody ? { assetCustody } : {}),
   });
-  const inspectModule = createWorkerdWorkerModuleInspector({
+  const moduleInspector = createWorkerdWorkerModuleInspector({
     binary: options.workerdBinary,
-  }).inspect;
+  });
+  const inspectModule = moduleInspector.inspect;
   const owners = new Map<string, Promise<WorkerdWorkerRuntimeOwner>>();
+  let workflowHostClosing = false;
+  const actor = options.v2Actor
+    ? (() => {
+        if (
+          !bundleCustody ||
+          !options.workerdBinary ||
+          typeof options.v2Actor?.prepare !== "function" ||
+          typeof moduleInspector.inspectActorClass !== "function"
+        )
+          throw new TypeError("v2 Actor boot requires held bytes, native binary, and inspector");
+        const prepared = options.v2Actor.prepare({
+          sql,
+          targetKey,
+          bundleCustody,
+          inspector: moduleInspector,
+          ownerForWorker: async (uid) => {
+            if (!restorationComplete) return null;
+            return await openOwner(uid);
+          },
+        });
+        if (
+          typeof prepared?.namespaceForm?.backend?.execute !== "function" ||
+          typeof prepared.bindingAuthority?.resolveTarget !== "function" ||
+          typeof prepared.forwardBoot?.openIncarnation !== "function"
+        )
+          throw new TypeError("v2 Actor boot is incomplete");
+        return prepared;
+      })()
+    : undefined;
+  const workflow = options.v2Workflow
+    ? (() => {
+        if (
+          !bundleCustody ||
+          !options.workerdBinary ||
+          typeof options.v2Workflow?.prepare !== "function" ||
+          typeof moduleInspector.inspectWorkflowClass !== "function"
+        )
+          throw new TypeError("v2 Workflow boot requires held bytes, native binary, and inspector");
+        const prepared = options.v2Workflow.prepare({
+          sql,
+          clock,
+          targetKey,
+          workerdBinary: options.workerdBinary,
+          bundleCustody,
+          ...(assetCustody ? { assetCustody } : {}),
+          inspector: moduleInspector,
+          ownerForWorker: async (uid) => {
+            if (!restorationComplete) return null;
+            return await openOwner(uid);
+          },
+        });
+        if (
+          typeof prepared?.workflowForm?.backend?.execute !== "function" ||
+          typeof prepared.bindingAuthority?.resolveTarget !== "function" ||
+          typeof prepared.forwardBoot?.openIncarnation !== "function" ||
+          typeof prepared.pollWorkflowDue !== "function" ||
+          typeof prepared.runWorkflowOnce !== "function" ||
+          typeof prepared.close !== "function"
+        )
+          throw new TypeError("v2 Workflow boot is incomplete");
+        return prepared;
+      })()
+    : undefined;
   const sqliteAuthority = sqliteBinding
     ? createSQLiteWorkerBindingAuthority({ sql, targetKey })
     : undefined;
@@ -631,17 +770,25 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     if (existing) return await existing;
     const opening = (async () => {
       const rows = await sql.query(
-        `SELECT uid, deleted_at FROM tf_v2_resources
+        `SELECT uid, principal, space, backend_id, target_key, deleted_at FROM tf_v2_resources
          WHERE uid = ? AND form_url = ? AND target_key = ?`,
         [uid, MODULE_WORKER_FORM_URL, targetKey],
       );
+      const row = rows[0];
       if (
         rows.length !== 1 ||
-        rows[0]?.uid !== uid ||
-        (!allowRetiredSqlResource && rows[0]?.deleted_at !== null)
+        row?.uid !== uid ||
+        typeof row.principal !== "string" ||
+        !row.principal ||
+        typeof row.space !== "string" ||
+        !row.space ||
+        row.backend_id !== MODULE_WORKER_LIFECYCLE_BACKEND_ID ||
+        row.target_key !== targetKey ||
+        (!allowRetiredSqlResource && row.deleted_at !== null)
       ) {
         throw new Error("v2 Worker UID is not current in this Host target");
       }
+      const actorIdentity = Object.freeze({ principal: row.principal, space: row.space });
       return await openWorkerdWorkerRuntimeOwner({
         rootDirectory: options.rootDirectory,
         workerResourceUid: uid,
@@ -653,6 +800,16 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
         ...(kvBoot ? { v2KvBinding: kvBoot } : {}),
         ...(queueProducerBoot ? { v2QueueProducerBinding: queueProducerBoot } : {}),
+        ...(actor && row.deleted_at === null
+          ? {
+              v2ActorForward: {
+                openIncarnation(source) {
+                  return actor.forwardBoot.openIncarnation({ ...source, ...actorIdentity });
+                },
+              },
+            }
+          : {}),
+        ...(workflow && row.deleted_at === null ? { v2WorkflowForward: workflow.forwardBoot } : {}),
         workerdBinary: options.workerdBinary,
         inspectModule,
         listenerPortForOperation,
@@ -885,6 +1042,8 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
         ...(kvBoot ? { v2KvBinding: kvBoot } : {}),
         ...(queueProducerBoot ? { v2QueueProducerBinding: queueProducerBoot } : {}),
+        ...(actor ? { v2ActorBinding: actor.bindingAuthority } : {}),
+        ...(workflow ? { v2WorkflowBinding: workflow.bindingAuthority } : {}),
         ...(configuredInputSealer && configuredInputCustody
           ? { configuredInputSealer, configuredInputCustody }
           : {}),
@@ -898,9 +1057,24 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           return await openOwner(uid);
         },
       }),
+      ...(actor
+        ? {
+            [ACTOR_NAMESPACE_FORM_URL]: actor.namespaceForm,
+          }
+        : {}),
+      ...(workflow ? { [DURABLE_WORKFLOW_FORM_URL]: workflow.workflowForm } : {}),
       ...(queueProducerBoot && queueSettlement
         ? {
             [AT_LEAST_ONCE_QUEUE_FORM_URL]: createAtLeastOnceQueueForm({ sql, targetKey }),
+          }
+        : {}),
+      ...(queueCapability && queueSettlement
+        ? {
+            [QUEUE_CONSUMER_FORM_URL]: createQueueConsumerForm({
+              sql,
+              targetKey,
+              capability: queueCapability,
+            }),
           }
         : {}),
       ...(endpoint
@@ -930,6 +1104,23 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       await restoration;
       return await openOwner(uid);
     },
+    pollWorkflowDue() {
+      if (!workflow || !restorationComplete || ownerAdmissionFrozen || workflowHostClosing)
+        return Promise.reject(new Error("v2 Workflow execution is unavailable"));
+      return workflow.pollWorkflowDue();
+    },
+    async runWorkflowOnce(scope, id) {
+      if (!workflow || !restorationComplete || ownerAdmissionFrozen || workflowHostClosing)
+        throw new Error("v2 Workflow execution is unavailable");
+      return await workflow.runWorkflowOnce(
+        { tenantId: scope.tenantId, workflowResourceUid: scope.workflowResourceUid },
+        id,
+      );
+    },
+    async closeWorkflowHost() {
+      workflowHostClosing = true;
+      await workflow?.close();
+    },
     suspendOwnersRetainingCustody() {
       if (suspension) return suspension;
       // This synchronous transition closes the only path that creates a new
@@ -937,7 +1128,11 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       // composition. Each owner then proves child exit and listener vacancy
       // while retaining its durable lock/state for a later Host process.
       ownerAdmissionFrozen = true;
-      suspension = (async () => {
+      workflowHostClosing = true;
+      const attempt = (async () => {
+        // A guarded Workflow run can hold the selected native owner lease.
+        // Reap it before owner suspension; failure retains all owner custody.
+        await workflow?.close();
         if (restoration) await restoration;
         const pending = [...owners.entries()];
         const opened = await Promise.all(
@@ -998,6 +1193,12 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         await queueProducerServer?.stop(true);
         queueProducerServer = undefined;
       })();
+      suspension = attempt.catch((error) => {
+        // A failed guarded stop retains custody and can be retried; never
+        // turn one transient close failure into a permanently cached refusal.
+        suspension = undefined;
+        throw error;
+      });
       return suspension;
     },
     async closePrivateBindingServices() {

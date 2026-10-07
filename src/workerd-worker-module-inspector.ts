@@ -8,6 +8,7 @@ import {
   semanticInspectionTestWrapperSource,
   snapshotWorkerActorClassInspectionInput,
   snapshotWorkerModuleInspectionInput,
+  snapshotWorkerWorkflowClassInspectionInput,
   WORKER_MODULE_AUXILIARY_MEDIA_TYPES,
   WORKER_MODULE_HANDLER_NAMES,
   WORKER_MODULE_IMPORTABLE_MEDIA_TYPES,
@@ -18,6 +19,8 @@ import {
   type WorkerModuleInspectionModule,
   type WorkerModuleInspectionResult,
   type WorkerModuleSemanticInspector,
+  type WorkerWorkflowClassInspectionInput,
+  type WorkerWorkflowClassInspectionResult,
 } from "./providers/worker-module-semantic-inspection.ts";
 import { TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES } from "./takoform/limits.ts";
 import { findWorkerd } from "./workerd-supervisor.ts";
@@ -105,6 +108,21 @@ export function createWorkerdWorkerModuleInspector(
         return Promise.resolve(unavailableActorClass());
       }
       return inspectActorClassSnapshot({
+        binary,
+        snapshot,
+        wallTimeoutMs,
+        outputLimitBytes,
+        ...(options.temporaryRoot === undefined ? {} : { temporaryRoot: options.temporaryRoot }),
+      });
+    },
+    inspectWorkflowClass(input) {
+      let snapshot: WorkerWorkflowClassInspectionInput;
+      try {
+        snapshot = snapshotWorkerWorkflowClassInspectionInput(input);
+      } catch {
+        return Promise.resolve(unavailableWorkflowClass());
+      }
+      return inspectWorkflowClassSnapshot({
         binary,
         snapshot,
         wallTimeoutMs,
@@ -245,6 +263,7 @@ async function inspectActorClassSnapshot(input: {
       admitted.importableModules,
       semanticInspectionPreludeSource({ startupReportNonce: nonce }),
       wrapper,
+      ACTOR_NATIVE_BOOTSTRAP_SOURCE,
     );
     const execution = await runWorkerd({
       binary: input.binary,
@@ -268,6 +287,155 @@ async function inspectActorClassSnapshot(input: {
     }
   }
   return result;
+}
+
+// Evaluated as HOST_PRIVATE before tenant main. It captures inspection intrinsics
+// and never invokes the constructor or run method while checking the class ABI.
+const WORKFLOW_CLASS_HELPER_SOURCE = `const apply = Reflect.apply;
+const construct = Reflect.construct;
+const log = console.log;
+const logReceiver = console;
+const getOwn = Object.getOwnPropertyDescriptor;
+const getProto = Object.getPrototypeOf;
+const hasOwn = Object.prototype.hasOwnProperty;
+const objectPrototype = Object.prototype;
+const arrayIsArray = Array.isArray;
+const visited = new WeakSet();
+const visitedHas = WeakSet.prototype.has;
+const visitedAdd = WeakSet.prototype.add;
+function inert() {}
+export function reportWorkflowClassVerdict(value) { apply(log, logReceiver, [value]); }
+function ownValue(record, name) {
+  const descriptor = getOwn(record, name);
+  return descriptor && apply(hasOwn, descriptor, ["value"]) ? descriptor.value : undefined;
+}
+export function inspectWorkflowClass(namespace, className) {
+  try {
+    if ((typeof namespace !== "object" && typeof namespace !== "function") ||
+        namespace === null || arrayIsArray(namespace)) return false;
+    const exported = ownValue(namespace, className);
+    if (typeof exported !== "function") return false;
+    const prototype = ownValue(exported, "prototype");
+    if ((typeof prototype !== "object" && typeof prototype !== "function") ||
+        prototype === null) return false;
+    construct(inert, [], exported);
+    let current = prototype;
+    while (current !== null) {
+      if (current === objectPrototype || apply(visitedHas, visited, [current])) return false;
+      apply(visitedAdd, visited, [current]);
+      const descriptor = getOwn(current, "run");
+      if (descriptor) return apply(hasOwn, descriptor, ["value"]) &&
+        typeof descriptor.value === "function";
+      current = getProto(current);
+    }
+  } catch {}
+  return false;
+}
+`;
+
+async function inspectWorkflowClassSnapshot(input: {
+  readonly binary: string | null;
+  readonly snapshot: WorkerWorkflowClassInspectionInput;
+  readonly wallTimeoutMs: number;
+  readonly outputLimitBytes: number;
+  readonly temporaryRoot?: string;
+}): Promise<WorkerWorkflowClassInspectionResult> {
+  const admitted = admitSnapshot({
+    mainModule: input.snapshot.mainModule,
+    modules: input.snapshot.modules,
+    declaredHandlers: [],
+  });
+  if ("outcome" in admitted || input.binary === null) return unavailableWorkflowClass();
+  let root: string;
+  try {
+    const temporaryRoot = input.temporaryRoot ?? tmpdir();
+    await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
+    await chmod(temporaryRoot, 0o700);
+    root = await mkdtemp(join(temporaryRoot, "takoserver-workflow-class-inspection-"));
+    await chmod(root, 0o700);
+  } catch {
+    return unavailableWorkflowClass();
+  }
+  let childExited = true;
+  let result: WorkerWorkflowClassInspectionResult = unavailableWorkflowClass();
+  try {
+    const generated = generatedNames(admitted.mainModule);
+    const nonce = `${randomBytes(32).toString("base64url")}:`;
+    const helperName = workflowHelperName(admitted.modules);
+    const wrapper = workflowClassInspectionWrapperSource({
+      preludeModuleSpecifier: `./${generated.preludeName}`,
+      helperModuleSpecifier: `./${helperName}`,
+      tenantModuleSpecifier: `./${admitted.mainModule}`,
+      className: input.snapshot.className,
+      nonce,
+    });
+    await writeActorClassInspection(
+      root,
+      generated,
+      helperName,
+      admitted.mainModule,
+      admitted.importableModules,
+      semanticInspectionPreludeSource({ startupReportNonce: nonce }),
+      wrapper,
+      WORKFLOW_CLASS_HELPER_SOURCE,
+    );
+    const execution = await runWorkerd({
+      binary: input.binary,
+      root,
+      wallTimeoutMs: input.wallTimeoutMs,
+      outputLimitBytes: input.outputLimitBytes,
+    });
+    childExited = execution.childExited;
+    result = classifyWorkflowClassExecution(execution, nonce);
+  } catch {
+    result = unavailableWorkflowClass();
+  } finally {
+    if (childExited) {
+      try {
+        await rm(root, { recursive: true, force: true });
+      } catch {
+        result = unavailableWorkflowClass();
+      }
+    } else {
+      result = unavailableWorkflowClass();
+    }
+  }
+  return result;
+}
+
+function workflowHelperName(modules: readonly WorkerModuleInspectionModule[]): string {
+  const names = new Set(modules.map((entry) => entry.name));
+  let name = "__takoserver-workflow-class-inspection-helper.mjs";
+  for (let ordinal = 1; names.has(name); ordinal += 1) {
+    name = `__takoserver-workflow-class-inspection-helper-${ordinal}.mjs`;
+  }
+  return name;
+}
+
+function workflowClassInspectionWrapperSource(input: {
+  readonly preludeModuleSpecifier: string;
+  readonly helperModuleSpecifier: string;
+  readonly tenantModuleSpecifier: string;
+  readonly className: string;
+  readonly nonce: string;
+}): string {
+  if (
+    !isSafeModuleSpecifier(input.helperModuleSpecifier) ||
+    !isSafeModuleSpecifier(input.preludeModuleSpecifier) ||
+    !isSafeModuleSpecifier(input.tenantModuleSpecifier) ||
+    !/^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u.test(input.className) ||
+    !/^[A-Za-z0-9_-]{32,160}:$/u.test(input.nonce)
+  )
+    throw new TypeError("Workflow class inspection wrapper input is invalid");
+  return `import ${JSON.stringify(input.preludeModuleSpecifier)};
+import { inspectWorkflowClass, reportWorkflowClassVerdict } from ${JSON.stringify(input.helperModuleSpecifier)};
+import * as workflowNamespace from ${JSON.stringify(input.tenantModuleSpecifier)};
+const verdict = inspectWorkflowClass(workflowNamespace, ${JSON.stringify(input.className)})
+  ? "valid" : "invalid";
+export default {
+  test() { reportWorkflowClassVerdict(${JSON.stringify(input.nonce)} + verdict); },
+};
+`;
 }
 
 function actorHelperName(modules: readonly WorkerModuleInspectionModule[]): string {
@@ -325,6 +493,7 @@ async function writeActorClassInspection(
   modules: readonly WorkerModuleInspectionModule[],
   preludeSource: string,
   wrapperSource: string,
+  helperSource: string,
 ): Promise<void> {
   const entries: string[] = [];
   const hostRoot = join(root, "host-private");
@@ -336,7 +505,7 @@ async function writeActorClassInspection(
     mode: 0o600,
   });
   await writeFile(join(hostRoot, "prelude.mjs"), preludeSource, { encoding: "utf8", mode: 0o600 });
-  await writeFile(join(hostRoot, "actor-helper.mjs"), ACTOR_NATIVE_BOOTSTRAP_SOURCE, {
+  await writeFile(join(hostRoot, "actor-helper.mjs"), helperSource, {
     encoding: "utf8",
     mode: 0o600,
   });
@@ -392,6 +561,30 @@ export function classifyActorClassExecution(
   return reports[1] === "invalid"
     ? { outcome: "invalid", error: "actor_class_invalid" }
     : unavailableActorClass();
+}
+
+export function classifyWorkflowClassExecution(
+  execution: WorkerdExecution,
+  nonce: string,
+): WorkerWorkflowClassInspectionResult {
+  if (
+    !execution.childExited ||
+    execution.exitCode === null ||
+    execution.timedOut ||
+    execution.outputExceeded
+  )
+    return unavailableWorkflowClass();
+  const reports = inspectionReports(execution.stdout, nonce);
+  if (reports[0] !== "start" || execution.exitCode !== 0 || reports.length !== 2)
+    return unavailableWorkflowClass();
+  if (reports[1] === "valid") return { outcome: "valid" };
+  return reports[1] === "invalid"
+    ? { outcome: "invalid", error: "workflow_class_invalid" }
+    : unavailableWorkflowClass();
+}
+
+function unavailableWorkflowClass(): WorkerWorkflowClassInspectionResult {
+  return { outcome: "unavailable", retryable: true };
 }
 
 function unavailableActorClass(): WorkerActorClassInspectionResult {

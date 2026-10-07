@@ -160,6 +160,7 @@ async function exercise(sql: Sql) {
   expect(await owner.read(handle)).toMatchObject({
     retirement: { receiptDigest: terminalReceipt, retiredAtMs: 2000 },
   });
+  expect(await owner.confirmNoNativeDispatch(handle)).toBe(false);
   expect(await owner.inspectDeployment("deployment-one")).toEqual({
     outstanding: 0,
     bodyFinished: 0,
@@ -265,6 +266,118 @@ test("a lost retirement ACK resolves from the exact row and cannot reassign the 
   }
 });
 
+test("proven no-native-dispatch after send authorization is a durable terminal, not retirement", async () => {
+  const db = new Database(":memory:");
+  try {
+    migrateSqlite(db);
+    const sql = createSqliteSql(db);
+    await seed(sql);
+    const custody = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(2000) });
+    expect(await custody.confirmNoNativeDispatch(handle)).toBe(false);
+    expect(await custody.beginSend(handle)).toBe(true);
+    expect(
+      await custody.confirmNoNativeDispatch({
+        invocationId: handle.invocationId,
+        custodyToken: "wrong-token",
+      }),
+    ).toBe(false);
+    expect(await custody.inspectDeployment("deployment-one")).toEqual({
+      outstanding: 1,
+      bodyFinished: 0,
+    });
+    expect(await custody.confirmNoNativeDispatch(handle)).toBe(true);
+    await expect(
+      sql.run(
+        "UPDATE tf_v2_worker_invocations SET no_native_dispatch_at_ms = ? WHERE invocation_id = ?",
+        [2001, handle.invocationId],
+      ),
+    ).rejects.toThrow();
+    expect(await custody.read(handle)).toMatchObject({
+      phase: "send_authorized",
+      noNativeDispatchAtMs: 2000,
+      bodyState: null,
+      retirement: null,
+    });
+    expect(await custody.inspectDeployment("deployment-one")).toEqual({
+      outstanding: 0,
+      bodyFinished: 0,
+    });
+    expect(await custody.confirmNoNativeDispatch(handle)).toBe(true);
+    expect(await custody.observeBody(handle, "canceled")).toBe(false);
+    expect(
+      await custody.confirmNativeRetirement({
+        handle,
+        expected: retirementIdentity,
+        receiptDigest: terminalReceipt,
+      }),
+    ).toBe(false);
+  } finally {
+    db.close();
+  }
+});
+
+test("0084 forward migration preserves old sent rows and exact lost-ACK terminal readback", async () => {
+  const db = new Database(":memory:");
+  try {
+    for (const migration of MIGRATIONS.filter(({ name }) => !name.startsWith("0084_")))
+      db.exec(migration.sql);
+    const sql = createSqliteSql(db);
+    await seed(sql);
+    await sql.run(
+      "UPDATE tf_v2_worker_invocations SET phase = 'send_authorized', send_authorized_at_ms = 1500 WHERE invocation_id = ?",
+      [handle.invocationId],
+    );
+    const forward = MIGRATIONS.find(({ name }) => name.startsWith("0084_"));
+    if (!forward) throw new Error("missing 0084 source");
+    db.exec(forward.sql);
+    const owner = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(2000) });
+    expect(await owner.inspectDeployment("deployment-one")).toEqual({
+      outstanding: 1,
+      bodyFinished: 0,
+    });
+    const versionDelete = `INSERT INTO tf_v2_operations
+      (id, resource_uid, principal, replay_key, request_fingerprint, action,
+       generation, status, effect, created_at, updated_at, retain_until,
+       backend_id, target_key, backend_key, accepted_spec_json)
+      VALUES ('op-delete-after-0084', 'version-one', 'org-1', 'delete-after-0084',
+       'fp', 'delete', 2, 'queued', 'none', '2026-10-07T00:00:00Z',
+       '2026-10-07T00:00:00Z', '2026-10-08T00:00:00Z',
+       'backend-one', 'target-one', 'key-delete-after-0084', '{}')`;
+    await expect(sql.run(versionDelete)).rejects.toThrow();
+    const lostAckSql: Sql = {
+      query: (statement, params) => sql.query(statement, params),
+      batch: (statements) => sql.batch(statements),
+      async run(statement, params) {
+        const result = await sql.run(statement, params);
+        if (statement.includes("SET no_native_dispatch_at_ms"))
+          throw new Error("no-dispatch ACK lost");
+        return result;
+      },
+    };
+    const uncertain = createV2WorkerInvocationLifecycle({
+      sql: lostAckSql,
+      now: () => new Date(2000),
+    });
+    expect(await uncertain.confirmNoNativeDispatch(handle)).toBe(true);
+    expect(await owner.confirmNoNativeDispatch(handle)).toBe(true);
+    expect(await owner.inspectDeployment("deployment-one")).toEqual({
+      outstanding: 0,
+      bodyFinished: 0,
+    });
+    expect(await owner.read(handle)).toMatchObject({
+      phase: "send_authorized",
+      noNativeDispatchAtMs: 2000,
+      retirement: null,
+    });
+    await sql.run(versionDelete);
+    expect(
+      await sql.query("SELECT id FROM tf_v2_operations WHERE id = ?", ["op-delete-after-0084"]),
+    ).toHaveLength(1);
+  } finally {
+    db.close();
+  }
+});
+
 test("native D1 enforces the same monotonic invocation lifetime", async () => {
   const runtime = new Miniflare({
     workers: [
@@ -293,14 +406,41 @@ test("native D1 enforces the same monotonic invocation lifetime", async () => {
     for (const migration of MIGRATIONS.filter(
       ({ name }) =>
         name === "0070_takoform_v2.sql" ||
+        name === "0074_v2_worker_native_effects.sql" ||
         name === "0076_v2_worker_invocation_custody.sql" ||
         name === "0077_v2_operation_acceptance_order.sql" ||
-        name === "0078_v2_worker_invocation_retirement.sql",
+        name === "0078_v2_worker_invocation_retirement.sql" ||
+        name === "0079_v2_worker_native_deletions.sql" ||
+        name === "0084_v2_worker_invocation_no_native_dispatch.sql",
     )) {
       for (const statement of splitMigration(migration.sql))
         await database.prepare(statement).run();
     }
-    await exercise(createD1Sql(database));
+    const sql = createD1Sql(database);
+    await exercise(sql);
+    const second = { invocationId: "d1-no-native-invocation", custodyToken: "d1-no-native-token" };
+    await sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+       (invocation_id, custody_token, backend_id, target_key, principal, space,
+        worker_uid, deployment_uid, deployment_generation, source_operation_id,
+        endpoint_uid, endpoint_generation, version_uid, version_generation,
+        version_operation_id, native_identity, closure_digest, confirmed_receipt,
+        admitted_at_ms)
+       SELECT ?, ?, backend_id, target_key, principal, space,
+        worker_uid, deployment_uid, deployment_generation, source_operation_id,
+        endpoint_uid, endpoint_generation, version_uid, version_generation,
+        version_operation_id, native_identity, closure_digest, confirmed_receipt,
+        admitted_at_ms FROM tf_v2_worker_invocations WHERE invocation_id = ?`,
+      [second.invocationId, second.custodyToken, handle.invocationId],
+    );
+    const owner = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(2000) });
+    expect(await owner.beginSend(second)).toBe(true);
+    expect(await owner.confirmNoNativeDispatch(second)).toBe(true);
+    expect(await owner.read(second)).toMatchObject({
+      phase: "send_authorized",
+      noNativeDispatchAtMs: 2000,
+      retirement: null,
+    });
   } finally {
     await runtime.dispose();
   }

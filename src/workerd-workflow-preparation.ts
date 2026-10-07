@@ -115,6 +115,62 @@ function privateServiceMappings(
   return { bindings: mappedBindings, gateways };
 }
 
+/** The lease may name only the selected v2 forward graph, never a caller URI. */
+function privateWorkflowMappings(
+  tenantId: string,
+  forward: WorkerdSite["workflowForward"],
+  lease: WorkerdPrivateServiceLease,
+): readonly { readonly name: string; readonly socketPath: string }[] {
+  const leased = lease.workflowServices;
+  if (forward === undefined) {
+    if (!Array.isArray(leased) || leased.length !== 0) {
+      throw new Error("private Workflow lease exceeds selected Version");
+    }
+    return [];
+  }
+  if (
+    forward.schema !== "takoserver.v2-workflow-binding-forward@1" ||
+    !Array.isArray(leased) ||
+    leased.length !== forward.bindings.length
+  ) {
+    throw new Error("private Workflow lease does not match selected Version");
+  }
+  const byName = new Map<string, (typeof leased)[number]>();
+  const sockets = new Set<string>();
+  for (const service of leased) {
+    if (
+      typeof service?.name !== "string" ||
+      typeof service.publicName !== "string" ||
+      typeof service.workflowResourceUid !== "string" ||
+      typeof service.token !== "string" ||
+      typeof service.snapshotDigest !== "string" ||
+      typeof service.upstreamSocket !== "string" ||
+      !isAbsolute(service.upstreamSocket) ||
+      service.upstreamSocket.includes("\u0000") ||
+      byName.has(service.name) ||
+      sockets.has(service.upstreamSocket)
+    ) {
+      throw new Error("invalid private Workflow lease");
+    }
+    byName.set(service.name, service);
+    sockets.add(service.upstreamSocket);
+  }
+  return forward.bindings.map((binding) => {
+    const service = byName.get(binding.serviceName);
+    if (
+      !service ||
+      binding.tenantId !== tenantId ||
+      service.publicName !== binding.publicName ||
+      service.workflowResourceUid !== binding.workflowResourceUid ||
+      service.token !== binding.token ||
+      service.snapshotDigest !== forward.snapshotDigest
+    ) {
+      throw new Error("private Workflow lease does not match selected Version");
+    }
+    return { name: service.name, socketPath: service.upstreamSocket };
+  });
+}
+
 /**
  * Prepare one guarded workerd execution without evaluating application code.
  * Call only from the execution Host's run-time prepare callback, after fresh
@@ -129,13 +185,14 @@ export async function prepareWorkerdWorkflowExecution(
   signal.throwIfAborted();
   const temporaryRoot = options.temporaryRoot ?? tmpdir();
   const selected = options.selection;
+  const selectedTenantId = selected.tenantId;
   const runtimeClassRef = selected.runtimeClassRef;
   if (runtimeClassRef !== undefined && !isExactWorkflowV3InterfaceRef(runtimeClassRef)) {
     throw new WorkflowRuntimeError("invalid_runtime_input");
   }
   if (
     !isAbsolute(temporaryRoot) ||
-    selected.tenantId !== options.identity.scope.tenantId ||
+    selectedTenantId !== options.identity.scope.tenantId ||
     selected.workflowResourceUid !== options.identity.scope.workflowResourceUid ||
     [
       selected.workerResourceUid,
@@ -153,6 +210,12 @@ export async function prepareWorkerdWorkflowExecution(
   // the first asynchronous materialization/lease call. A later publication or
   // caller mutation cannot change this execution's captured selection.
   const site = structuredClone(selected.site);
+  if (
+    site.workflowForward !== undefined &&
+    site.workflowForward.schema !== "takoserver.v2-workflow-binding-forward@1"
+  ) {
+    throw new WorkflowRuntimeError("invalid_runtime_input");
+  }
   const modules = snapshotModules(selected.modules);
   const hostModules = snapshotModules(selected.hostModules);
   const channel = { ...options.channel };
@@ -225,16 +288,25 @@ export async function prepareWorkerdWorkflowExecution(
           | readonly { readonly name: string; readonly socketPath: string }[]
           | undefined;
         let serviceGateways: readonly WorkerdExecutionServiceGateway[] | undefined;
+        let workflowBindings: readonly { readonly name: string; readonly socketPath: string }[] =
+          [];
         const selectedBindings = site.serviceBindings ?? [];
-        if (selectedBindings.length > 0) {
+        if (selectedBindings.length > 0 || site.workflowForward !== undefined) {
           if (!acquireServiceBindings) {
             throw new Error("private execution service binding bridge is unavailable");
           }
           serviceLease = await acquireServiceBindings(configureSignal);
           configureSignal.throwIfAborted();
           const mapped = privateServiceMappings(root, selectedBindings, serviceLease);
-          serviceBindings = mapped.bindings;
-          serviceGateways = mapped.gateways;
+          workflowBindings = privateWorkflowMappings(
+            selectedTenantId,
+            site.workflowForward,
+            serviceLease,
+          );
+          if (selectedBindings.length > 0) {
+            serviceBindings = mapped.bindings;
+            serviceGateways = mapped.gateways;
+          }
         }
         const dataPlaneAddress = site.dataPlane ? readDataPlaneAddress?.() : undefined;
         const configPath = await writeWorkerdPrivateExecution({
@@ -251,6 +323,9 @@ export async function prepareWorkerdWorkflowExecution(
           companionAddress,
           runSocketPath,
           ...(serviceBindings === undefined ? {} : { serviceBindings }),
+          ...(workflowBindings.length === 0
+            ? {}
+            : { workflowBindings, workflowSourceEntrypoint: wrapper }),
           ...(dataPlaneAddress === undefined ? {} : { dataPlaneAddress }),
         });
         configureSignal.throwIfAborted();

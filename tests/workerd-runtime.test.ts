@@ -26,7 +26,15 @@ import {
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_ORIGIN_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_TOKEN_BINDING,
+  WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
+  workerdV2PrivateWorkflowBindingName,
 } from "../src/providers/workerd-v2-private-binding-names.ts";
+import {
+  renderSelfhostWorkflowBindingRuntimeModuleSource,
+  SELFHOST_WORKFLOW_BINDING_ENTRYPOINT_MODULE,
+  SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
+  selfhostWorkflowBindingEntrypointSource,
+} from "../src/selfhost-workflow-binding-worker-wrapper.ts";
 import { forwardTakoformCandidates } from "../src/takoform/forward-candidates.ts";
 import {
   ASSET_ROUTER_SOURCE,
@@ -39,6 +47,7 @@ import {
   readWorkerdSelectedActiveVersion,
   type WorkerdBinding,
   type WorkerdDeploymentPublication,
+  type WorkerdLegacyWorkflowForwardBinding,
   type WorkerdWorkflowForward,
   type WorkerdWorkflowForwardBinding,
   type WorkerdWorkflowForwardPublication,
@@ -2009,6 +2018,158 @@ test("renders exact Workflow broker sockets for weighted Versions and restores t
   for (const socket of sockets) expect(restoredConfig).toContain(`unix:${socket.socketPath}`);
 });
 
+test("v2 private Workflow forwarding uses exact five-field grants without legacy FormRefs", async () => {
+  const legacy = workflowForwardPublication(root);
+  const withWorkflow: WorkerdDeploymentPublication = {
+    ...legacy.withWorkflow,
+    versions: legacy.withWorkflow.versions.map((version) => {
+      const token = version.versionId.endsWith("-a") ? "a".repeat(64) : "b".repeat(64);
+      const legacyHostModule = version.hostModules?.get(HOST_ENTRYPOINT);
+      if (!legacyHostModule) throw new Error("legacy Host module fixture unavailable");
+      const binding = {
+        publicName: "ORDERS",
+        serviceName: workerdV2PrivateWorkflowBindingName(0),
+        tenantId: "tenant-workflow-1",
+        workflowResourceUid: "uid-DurableWorkflow-orders",
+        token,
+      };
+      const workflowWrapper = new TextEncoder().encode(
+        selfhostWorkflowBindingEntrypointSource({
+          runtimeModule: SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
+          innerModule: WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+          bindings: [{ publicName: binding.publicName, serviceName: binding.serviceName, token }],
+        }),
+      );
+      return {
+        ...version,
+        site: {
+          ...version.site,
+          hostEntrypoint: WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
+          hostModules: [
+            WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+            SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
+          ],
+          workflowForward: {
+            schema: "takoserver.v2-workflow-binding-forward@1" as const,
+            snapshotDigest: `sha256:${"c".repeat(64)}` as const,
+            bindings: [binding],
+          },
+        },
+        hostModules: new Map([
+          [WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE, workflowWrapper],
+          [WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE, legacyHostModule],
+          [
+            SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
+            new TextEncoder().encode(renderSelfhostWorkflowBindingRuntimeModuleSource()),
+          ],
+        ]),
+      };
+    }),
+  };
+  const sockets = withWorkflow.versions.map((version) => {
+    const forward = version.site.workflowForward;
+    if (forward?.schema !== "takoserver.v2-workflow-binding-forward@1")
+      throw new Error("v2 Workflow fixture unavailable");
+    const binding = forward.bindings[0];
+    if (!binding) throw new Error("v2 Workflow binding fixture unavailable");
+    return {
+      script: "workflow-site",
+      workerResourceUid: withWorkflow.workerResourceUid,
+      versionId: version.versionId,
+      workerVersionResourceUid: version.workerVersionUid,
+      snapshotDigest: forward.snapshotDigest,
+      binding,
+      socketPath: join(root, `${version.versionId}-v2-workflow.sock`),
+    };
+  });
+  const runtime = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    workflowForwardSockets: () => sockets,
+  });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+  await runtime.publish("workflow-site", withWorkflow);
+  const selected = await readWorkerdSelectedActiveVersion(root, "workflow-site", {
+    expectedWorkerResourceUid: withWorkflow.workerResourceUid,
+    basisPoint: 0,
+  });
+  expect(selected?.site.workflowForward).toEqual(
+    withWorkflow.versions.find((version) => version.versionId.endsWith("-a"))?.site.workflowForward,
+  );
+  const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  for (const socket of sockets) expect(config).toContain(`unix:${socket.socketPath}`);
+  const legacyProfile = {
+    ...withWorkflow,
+    versions: withWorkflow.versions.map((version) => {
+      const v2HostModule = version.hostModules?.get(WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE);
+      if (!v2HostModule) throw new Error("v2 Host module fixture unavailable");
+      return {
+        ...version,
+        site: { ...version.site, hostEntrypoint: HOST_ENTRYPOINT, hostModules: [] },
+        hostModules: new Map([[HOST_ENTRYPOINT, v2HostModule]]),
+      };
+    }),
+  };
+  const refused = createWorkerdRuntime({ root: join(root, "legacy-profile"), isReady: () => true });
+  if (!refused.publish) throw new Error("weighted publication unavailable");
+  await expect(refused.publish("workflow-site", legacyProfile)).rejects.toThrow(
+    "unusable Workflow forward graph",
+  );
+  const mixedProfile = {
+    ...withWorkflow,
+    versions: withWorkflow.versions.map((version) => {
+      const v2HostModule = version.hostModules?.get(WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE);
+      if (!v2HostModule) throw new Error("v2 Host module fixture unavailable");
+      const forward = version.site.workflowForward;
+      if (forward?.schema !== "takoserver.v2-workflow-binding-forward@1")
+        throw new Error("v2 Workflow fixture unavailable");
+      return {
+        ...version,
+        site: {
+          ...version.site,
+          hostEntrypoint: SELFHOST_WORKFLOW_BINDING_ENTRYPOINT_MODULE,
+          hostModules: [
+            HOST_ENTRYPOINT,
+            WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+            SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
+          ],
+        },
+        hostModules: new Map([
+          [HOST_ENTRYPOINT, v2HostModule],
+          [WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE, v2HostModule],
+          [
+            SELFHOST_WORKFLOW_BINDING_ENTRYPOINT_MODULE,
+            new TextEncoder().encode(
+              selfhostWorkflowBindingEntrypointSource({
+                runtimeModule: SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
+                innerModule: HOST_ENTRYPOINT,
+                bindings: forward.bindings.map(({ publicName, serviceName, token }) => ({
+                  publicName,
+                  serviceName,
+                  token,
+                })),
+              }),
+            ),
+          ],
+          [
+            SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
+            new TextEncoder().encode(renderSelfhostWorkflowBindingRuntimeModuleSource()),
+          ],
+        ]),
+      };
+    }),
+  };
+  const mixed = createWorkerdRuntime({
+    root: join(root, "mixed-profile"),
+    isReady: () => true,
+    workflowForwardSockets: () => sockets,
+  });
+  if (!mixed.publish) throw new Error("weighted publication unavailable");
+  await expect(mixed.publish("workflow-site", mixedProfile)).rejects.toThrow(
+    "unusable Workflow forward graph",
+  );
+});
+
 test("reserves the complete Workflow graph before Actor desired-state commit", async () => {
   const probe = createConfigProbe();
   const { withWorkflow, sockets } = workflowForwardPublication(root);
@@ -2776,12 +2937,16 @@ test("owns the Workflow socket snapshot across asynchronous lifecycle hooks", as
   const { withWorkflow, sockets } = workflowForwardPublication(root);
   const suppliedSockets = sockets.map((socket) => ({
     ...socket,
-    binding: {
-      ...socket.binding,
-      workflowFormRef: { ...socket.binding.workflowFormRef },
-      bindingRef: { ...socket.binding.bindingRef },
-      runtimeClassRef: { ...socket.binding.runtimeClassRef },
-    },
+    binding: (() => {
+      if (!("workflowFormRef" in socket.binding))
+        throw new Error("legacy Workflow socket fixture unavailable");
+      return {
+        ...socket.binding,
+        workflowFormRef: { ...socket.binding.workflowFormRef },
+        bindingRef: { ...socket.binding.bindingRef },
+        runtimeClassRef: { ...socket.binding.runtimeClassRef },
+      };
+    })(),
   }));
   const originalSockets = [...suppliedSockets];
   const prepareEntered = deferred();
@@ -2851,7 +3016,8 @@ test("rejects Workflow binding names in the complete Host-reserved namespace", a
     ...withWorkflow,
     versions: withWorkflow.versions.map((version) => {
       const forward = version.site.workflowForward;
-      if (!forward) throw new Error("Workflow forward fixture unavailable");
+      if (forward?.schema !== "takoserver.selfhost-workflow-binding-forward@v1")
+        throw new Error("legacy Workflow forward fixture unavailable");
       return {
         ...version,
         site: {
@@ -2966,7 +3132,7 @@ test("refuses missing or mismatched Workflow sockets and malformed later Version
       const malformedBindings = forward.bindings.map((binding) => ({
         ...binding,
         bindingRef: { ...binding.bindingRef, schemaDigest: "not-a-digest" },
-      })) as unknown as WorkerdWorkflowForwardBinding[];
+      })) as unknown as WorkerdLegacyWorkflowForwardBinding[];
       return {
         ...version,
         site: {

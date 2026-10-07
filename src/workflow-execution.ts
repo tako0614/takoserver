@@ -34,6 +34,11 @@ import {
   type WorkflowResourceDeletionContribution,
   workflowResourceLiveSql,
 } from "./workflow-resource-lifecycle.ts";
+import {
+  requireV2WorkflowResourceAuthority,
+  type V2WorkflowResourceAuthority,
+  v2WorkflowLiveSql,
+} from "./workflow-v2-resource-authority.ts";
 
 export {
   type WorkflowApplicationOutcome,
@@ -114,6 +119,8 @@ export interface WorkflowRuntimeOptions {
   readonly workflowInterfaceRef?: TakoformInterfaceRef;
   /** Source-only Resource admission on the same durable Sql as this runtime. */
   readonly workflowResourceDeletion?: WorkflowResourceDeletionContribution;
+  /** Boot-resolved v2 authority; never supplied from an application Binding. */
+  readonly v2ResourceAuthority?: V2WorkflowResourceAuthority;
 }
 
 export type WorkflowRunOutcome =
@@ -126,6 +133,8 @@ export type WorkflowRunOutcome =
 export interface WorkflowRuntime {
   readonly instances: WorkflowInstances;
   runOne(scope: WorkflowScope, id: string): Promise<WorkflowRunOutcome>;
+  /** v2 DELETE only: prove an expired physical row has no running child owner. */
+  retireExpiredForResourceDelete(scope: WorkflowScope, id: string): Promise<void>;
 }
 
 const ACTIVE = "'queued', 'running', 'sleeping', 'waiting'";
@@ -152,18 +161,29 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
   ) {
     throw new WorkflowRuntimeError("invalid_runtime_input");
   }
+  if (options.workflowResourceDeletion && options.v2ResourceAuthority) {
+    throw new WorkflowRuntimeError("invalid_runtime_input");
+  }
   if (options.workflowResourceDeletion) {
     if (options.workflowInterfaceRef === undefined) {
       throw new WorkflowRuntimeError("invalid_runtime_input");
     }
     requireWorkflowResourceDeletionContribution(options.workflowResourceDeletion, options.sql);
   }
-  const liveInstance = options.workflowResourceDeletion
-    ? workflowResourceLiveSql(
+  if (options.v2ResourceAuthority) {
+    requireV2WorkflowResourceAuthority(options.v2ResourceAuthority, options.sql);
+  }
+  const liveInstance = options.v2ResourceAuthority
+    ? v2WorkflowLiveSql(
         "tf_workflow_instances.tenant_id",
         "tf_workflow_instances.workflow_resource_uid",
       )
-    : "1 = 1";
+    : options.workflowResourceDeletion
+      ? workflowResourceLiveSql(
+          "tf_workflow_instances.tenant_id",
+          "tf_workflow_instances.workflow_resource_uid",
+        )
+      : "1 = 1";
   const RUNNABLE = `${RUNNABLE_BASE} AND ${liveInstance}`;
   const RUN_EXISTS = `EXISTS (SELECT 1 FROM tf_workflow_instances WHERE ${RUNNABLE})`;
   const sql: Sql = {
@@ -188,6 +208,9 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     ...(options.workflowResourceDeletion === undefined
       ? {}
       : { workflowResourceDeletion: options.workflowResourceDeletion }),
+    ...(options.v2ResourceAuthority === undefined
+      ? {}
+      : { v2ResourceAuthority: options.v2ResourceAuthority }),
   });
   const now = (): number => {
     const value = options.clock().getTime();
@@ -259,6 +282,24 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
   ): Promise<void> {
     await stop(identity, reason);
     await clearOwner(identity);
+  }
+
+  async function retireExpiredForResourceDelete(scope: WorkflowScope, id: string): Promise<void> {
+    if (!options.v2ResourceAuthority) throw new WorkflowRuntimeError("invalid_runtime_input");
+    const normalizedScope = normalizeScope(scope);
+    const normalizedId = inputIdentifier(id, "instance id");
+    const current = await read(normalizedScope, normalizedId);
+    if (!current || current.retentionUntil > now()) throw new WorkflowRuntimeError("stale_claim");
+    if (current.owner !== null) await stopAndClear(identityOf(current), "termination");
+    const after = await read(normalizedScope, normalizedId);
+    if (
+      !after ||
+      !sameIncarnation(after, current) ||
+      after.retentionUntil > now() ||
+      after.owner !== null ||
+      after.leaseUntil !== null
+    )
+      throw new WorkflowRuntimeError("stale_claim");
   }
 
   /**
@@ -1252,7 +1293,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     return rows[0] ? parseStep(rows[0]) : null;
   }
 
-  return { instances, runOne };
+  return { instances, runOne, retireExpiredForResourceDelete };
 }
 
 interface InstanceRow {

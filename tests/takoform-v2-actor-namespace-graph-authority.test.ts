@@ -20,6 +20,7 @@ const CREATE_WORKER = "85a3ff88-8c24-4802-91b5-861e134546dd";
 const CREATE_NAMESPACE = "f63bc8f8-880c-4d06-83a1-cc82403979f2";
 const CREATE_DEPLOYMENT = "d76bbd33-87e9-42ec-902d-c0c15097e530";
 const DELETE_NAMESPACE = "4a925f71-b1ab-4abd-b9b0-d9850aca4e6d";
+const UPDATE_NAMESPACE = "a1e4cc39-30bd-4734-83b7-0674e7bda664";
 
 function fixture(options: { namespaceReferences?: boolean } = {}) {
   const db = new Database(":memory:");
@@ -141,6 +142,82 @@ test("v2 Actor graph refuses an accepted Namespace without its sealed Worker ref
     expect(await authority.readGraph(scope, AbortSignal.timeout(1000))).toBeNull();
   } finally {
     lostEdge.db.close();
+  }
+});
+
+test("held Namespace PUT has an exact private graph without opening ordinary busy delivery", async () => {
+  const f = fixture();
+  const scope = { tenantId: PRINCIPAL, namespaceResourceUid: NAMESPACE };
+  const authority = createV2ActorNamespaceGraphAuthority({
+    sql: f.sql,
+    targetKey: TARGET,
+    owner: { ownerForWorker: async () => null },
+  });
+  try {
+    const before = await authority.readGraph(scope, AbortSignal.timeout(1000));
+    expect(before).not.toBeNull();
+    const spec = JSON.stringify({ worker: { resourceUid: WORKER }, className: "CounterActor" });
+    const leaseToken = "a".repeat(64);
+    f.db
+      .query(
+        `INSERT INTO tf_v2_operations
+       (id, resource_uid, principal, replay_key, request_fingerprint,
+        action, generation, status, effect, created_at, updated_at,
+        retain_until, backend_id, target_key, backend_key, accepted_spec_json)
+       VALUES (?, ?, ?, 'update-replay', 'update-fingerprint', 'update', 2,
+         'queued', 'none', '2026-10-07T00:00:00Z', '2026-10-07T00:00:00Z',
+         '2027-10-07T00:00:00Z', 'actor-fixture-backend', ?, 'update-backend', ?)`,
+      )
+      .run(UPDATE_NAMESPACE, NAMESPACE, PRINCIPAL, TARGET, spec);
+    f.db
+      .query(
+        `UPDATE tf_v2_resources SET generation = 2, phase = 'pending',
+       busy_operation = ?, last_operation = ? WHERE uid = ?`,
+      )
+      .run(UPDATE_NAMESPACE, UPDATE_NAMESPACE, NAMESPACE);
+    f.db
+      .query("INSERT INTO tf_v2_operation_reference_sets (operation_id) VALUES (?)")
+      .run(UPDATE_NAMESPACE);
+    f.db
+      .query(
+        `INSERT INTO tf_v2_operation_references
+       (operation_id, target_uid, form_url, readiness)
+       VALUES (?, ?, ?, 'observed')`,
+      )
+      .run(UPDATE_NAMESPACE, WORKER, MODULE_WORKER_FORM_URL);
+    f.db
+      .query("UPDATE tf_v2_operation_reference_sets SET sealed = 1 WHERE operation_id = ?")
+      .run(UPDATE_NAMESPACE);
+    f.db.query("UPDATE tf_v2_operations SET status = 'running' WHERE id = ?").run(UPDATE_NAMESPACE);
+    f.db
+      .query(
+        `UPDATE tf_v2_operations SET status = 'reconciling', effect = 'unknown',
+       dispatch_possible = 1, lease_token = ?, lease_until_ms = ? WHERE id = ?`,
+      )
+      .run(leaseToken, Date.now() + 60_000, UPDATE_NAMESPACE);
+    expect(await authority.readGraph(scope, AbortSignal.timeout(1000))).toBeNull();
+    expect(
+      await authority.readAcceptedOperationGraph(scope, {
+        operationId: UPDATE_NAMESPACE,
+        leaseToken: "b".repeat(64),
+      }),
+    ).toBeNull();
+    const held = await authority.readAcceptedOperationGraph(scope, {
+      operationId: UPDATE_NAMESPACE,
+      leaseToken,
+    });
+    expect(held).toMatchObject({ scope, workerUid: WORKER, className: "CounterActor" });
+    f.db
+      .query("DELETE FROM tf_v2_resource_references WHERE referrer_uid = ? AND target_uid = ?")
+      .run(NAMESPACE, WORKER);
+    expect(
+      await authority.readAcceptedOperationGraph(scope, {
+        operationId: UPDATE_NAMESPACE,
+        leaseToken,
+      }),
+    ).toBeNull();
+  } finally {
+    f.db.close();
   }
 });
 

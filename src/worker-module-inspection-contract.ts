@@ -54,6 +54,18 @@ export type WorkerActorClassInspectionResult =
   | { readonly outcome: "invalid"; readonly error: "actor_class_invalid" }
   | { readonly outcome: "unavailable"; readonly retryable: true };
 
+/** Exact DurableWorkflow/0.3.0 class candidate evaluated in a disposable workerd. */
+export interface WorkerWorkflowClassInspectionInput {
+  readonly mainModule: string;
+  readonly modules: readonly WorkerModuleInspectionModule[];
+  readonly className: string;
+}
+
+export type WorkerWorkflowClassInspectionResult =
+  | { readonly outcome: "valid" }
+  | { readonly outcome: "invalid"; readonly error: "workflow_class_invalid" }
+  | { readonly outcome: "unavailable"; readonly retryable: true };
+
 export type WorkerModuleLoadError =
   | "module_not_found"
   | "unsupported_media_type"
@@ -85,4 +97,7 @@ export interface WorkerModuleSemanticInspector {
   inspectActorClass(
     input: WorkerActorClassInspectionInput,
   ): Promise<WorkerActorClassInspectionResult>;
+  inspectWorkflowClass(
+    input: WorkerWorkflowClassInspectionInput,
+  ): Promise<WorkerWorkflowClassInspectionResult>;
 }

@@ -350,6 +350,7 @@ test("compiles the opt-in Actor forward outer Host entrypoint without changing t
       queue: true,
       scheduled: true,
       events: true,
+      projectEnvironment: true,
     }),
   );
   expect(graph.site.actorForward).toEqual({

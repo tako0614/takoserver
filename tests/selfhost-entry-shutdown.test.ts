@@ -142,6 +142,77 @@ test("shutdown fences new work and drains an accepted response body and pass", a
   }
 });
 
+test("one wake timer keeps stalled and rejected Queue lanes independent while shutdown drains them", async () => {
+  const held = deferred();
+  const heldStarted = deferred();
+  const failureReported = deferred();
+  const independentDelivery = deferred();
+  const ingressStopped = deferred();
+  let v2Starts = 0;
+  let legacyStarts = 0;
+  let finished = false;
+  let succeeded = false;
+  const failures: string[] = [];
+  const lifecycle = createSelfhostEntryShutdown({
+    stopIngress: async () => ingressStopped.resolve(),
+    finishShutdown: async () => {
+      finished = true;
+    },
+    onFailure: (stage) => failures.push(stage),
+    onSuccess: () => {
+      succeeded = true;
+    },
+  });
+  const report = (name: string) => {
+    failures.push(name);
+    failureReported.resolve();
+  };
+  lifecycle.startInterval(
+    "queue-wake",
+    5,
+    () => {
+      void lifecycle
+        .runPass("takoform-v2-queue-delivery", async () => {
+          v2Starts += 1;
+          if (v2Starts === 1) throw new Error("v2 recovery query failed");
+          heldStarted.resolve();
+          await held.promise;
+        })
+        .catch(() => report("takoform-v2-queue-delivery"));
+      void lifecycle
+        .runPass("queue-pump", async () => {
+          legacyStarts += 1;
+          if (legacyStarts >= 3) independentDelivery.resolve();
+        })
+        .catch(() => report("queue-pump"));
+    },
+    report,
+  );
+  try {
+    await Promise.all([failureReported.promise, heldStarted.promise, independentDelivery.promise]);
+    expect(failures).toEqual(["takoform-v2-queue-delivery"]);
+    expect(v2Starts).toBe(2);
+    expect(legacyStarts).toBeGreaterThanOrEqual(3);
+    const shutdown = lifecycle.shutdown();
+    await ingressStopped.promise;
+    expect(lifecycle.isStopping()).toBe(true);
+    expect(finished).toBe(false);
+    expect(succeeded).toBe(false);
+    const startsAtShutdown = legacyStarts;
+    await lifecycle.runPass("queue-pump", async () => {
+      legacyStarts += 1;
+    });
+    expect(legacyStarts).toBe(startsAtShutdown);
+    held.resolve();
+    expect(await shutdown).toBe(true);
+    expect(finished).toBe(true);
+    expect(succeeded).toBe(true);
+  } finally {
+    held.resolve();
+    await lifecycle.shutdown();
+  }
+});
+
 test("failed cleanup reports failure without invoking successful exit", async () => {
   const result: string[] = [];
   const lifecycle = createSelfhostEntryShutdown({
