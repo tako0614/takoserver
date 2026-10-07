@@ -255,6 +255,19 @@ const LAYERS: readonly Layer[] = [
     ],
   },
   {
+    // The normal entry selects the existing v2 Actor and Workflow boots here;
+    // no pure Form/runtime layer gains a composition-root dependency.
+    name: "v2-selfhost-runtime-boot",
+    match: /^src\/selfhost-v2-runtime-boot\.ts$/u,
+    may: [
+      "core",
+      "app",
+      "v2-selfhost-actor-boot",
+      "v2-selfhost-workflow-boot",
+      "v2-actor-graph-authority",
+    ],
+  },
+  {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state"],
@@ -438,6 +451,7 @@ const LAYERS: readonly Layer[] = [
       "v2-selfhost-queue-composition",
       "v2-selfhost-queue-scheduler",
       "v2-selfhost-configured-input-sealer",
+      "v2-selfhost-runtime-boot",
     ],
   },
   // The published package surface re-exports the product for an embedder. It
