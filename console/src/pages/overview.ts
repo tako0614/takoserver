@@ -70,16 +70,18 @@ export function overviewPage(organization: Organization): Child {
         whenReady(
           resources.get(),
           ({ resources: all }) => {
-            const failing = all.filter((entry) => health(entry).phase === "Failed").length;
+            const attention = all.filter((entry) =>
+              ["Failed", "NotReady"].includes(health(entry).phase),
+            ).length;
             return stat(
               tr("リソース", "Resources"),
               String(all.length),
-              failing === 0
+              attention === 0
                 ? tr("読み込み済みページの件数", "count from loaded page")
                 : h(
                     "span",
-                    { style: { color: "var(--bad)" } },
-                    tr(`${failing}件が失敗`, `${failing} failing`),
+                    { style: { color: "var(--warn)" } },
+                    tr(`${attention}件に確認が必要`, `${attention} need attention`),
                   ),
             );
           },
@@ -123,13 +125,16 @@ export function overviewPage(organization: Organization): Child {
                           { class: "card__body" },
                           h("div", { class: "stat__label" }, entry.form),
                           h("div", { class: "stat__value" }, String(entry.total)),
-                          entry.failing > 0
+                          entry.attention > 0
                             ? h(
                                 "div",
                                 { style: { marginTop: "6px" } },
                                 badge(
-                                  tr(`${entry.failing}件が失敗`, `${entry.failing} failing`),
-                                  "bad",
+                                  tr(
+                                    `${entry.attention}件に確認が必要`,
+                                    `${entry.attention} need attention`,
+                                  ),
+                                  "warn",
                                   true,
                                 ),
                               )
@@ -155,7 +160,7 @@ export function overviewPage(organization: Organization): Child {
         ({ resources: all }) => {
           const attention = all.filter((entry) => {
             const state = health(entry);
-            return state.phase === "Failed" || state.stale;
+            return state.phase === "Failed" || state.phase === "NotReady" || state.stale;
           });
           if (attention.length === 0) return h("div", { style: { display: "none" } });
           return card(
@@ -207,7 +212,12 @@ export function overviewPage(organization: Organization): Child {
                                 "最新の宣言がまだ適用されていません",
                                 "the latest declaration has not been applied",
                               )
-                            : "—"),
+                            : state.phase === "NotReady"
+                              ? tr(
+                                  "最新の観測でReadyではありません",
+                                  "latest observation reports not ready",
+                                )
+                              : "—"),
                       ),
                     );
                   }),
@@ -277,6 +287,7 @@ export function overviewPage(organization: Organization): Child {
 function phaseLabel(phase: ReturnType<typeof health>["phase"]): string {
   const japanese = {
     Ready: "稼働中",
+    NotReady: "非稼働",
     Pending: "処理中",
     Failed: "失敗",
     Deleting: "削除中",

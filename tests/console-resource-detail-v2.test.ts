@@ -131,3 +131,58 @@ test("resource detail uses direct UID GET and shows declared versus observed gen
   expect(body.textContent).toContain("Observed generation");
   expect(body.textContent).toContain("not yet been observed");
 });
+
+test("confirmed ready:false is NotReady and visible in overview attention", async () => {
+  const body = installDom();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { overviewPage } = await import("../console/src/pages/overview.ts");
+  const { byForm, health } = await import("../console/src/resource-state.ts");
+  const item = {
+    uid: "uid-not-ready",
+    form: "https://forms.example.test/WorkerVersion/1.0.0",
+    space: "org-one",
+    name: "not-ready",
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: "2026-10-07T00:00:00Z",
+    phase: "idle" as const,
+    spec: {},
+    observed: { ready: false },
+    output: {},
+    lastOperation: "op-one",
+  };
+  expect(health(item)).toMatchObject({ phase: "NotReady", tone: "warn", stale: false });
+  expect(health({ ...item, observedAt: null })).toMatchObject({ phase: "Unknown" });
+  expect(byForm([item])).toMatchObject([{ form: item.form, attention: 1 }]);
+  consoleLocale.set("en");
+  setApiOrigin("https://api.example.test");
+  const organization = {
+    id: "org-one",
+    name: "One",
+    ownerPrincipalId: "owner",
+    createdAt: "2026-10-07",
+  };
+  organizations.set([organization]);
+  selectOrganization(organization.id);
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/wallet"))
+        return Response.json({
+          wallet: { availableMinor: 0, heldMinor: 0, settledMinor: 0, currency: "USD" },
+        });
+      if (path.endsWith("/operations")) return Response.json({ operations: [] });
+      return Response.json({ items: [item], nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(overviewPage(organization) as unknown as NodeStub);
+  await settle();
+  expect(body.textContent).toContain("Needs attention");
+  expect(body.textContent).toContain("NotReady");
+  expect(body.textContent).toContain("latest observation reports not ready");
+  expect(body.textContent).not.toContain("Unknown");
+});

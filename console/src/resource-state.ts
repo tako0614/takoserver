@@ -1,7 +1,7 @@
 import type { ResourceSummary } from "./api.ts";
 
 /** Display only states the v2 Resource actually reports. */
-export type Phase = "Ready" | "Pending" | "Failed" | "Deleting" | "Unknown";
+export type Phase = "Ready" | "NotReady" | "Pending" | "Failed" | "Deleting" | "Unknown";
 
 export interface Health {
   readonly phase: Phase;
@@ -22,8 +22,11 @@ export function health(resource: ResourceSummary): Health {
   if (resource.phase === "pending" || stale) {
     return { phase: "Pending", tone: "warn", reason: null, message: null, stale };
   }
-  if (resource.observed.ready === true) {
+  if (resource.observedAt !== null && resource.observed.ready === true) {
     return { phase: "Ready", tone: "ok", reason: null, message: null, stale };
+  }
+  if (resource.observedAt !== null && resource.observed.ready === false) {
+    return { phase: "NotReady", tone: "warn", reason: null, message: null, stale };
   }
   return { phase: "Unknown", tone: "idle", reason: null, message: null, stale };
 }
@@ -32,13 +35,13 @@ export function health(resource: ResourceSummary): Health {
 export function byForm(resources: readonly ResourceSummary[]): readonly {
   readonly form: string;
   readonly total: number;
-  readonly failing: number;
+  readonly attention: number;
 }[] {
-  const counts = new Map<string, { total: number; failing: number }>();
+  const counts = new Map<string, { total: number; attention: number }>();
   for (const resource of resources) {
-    const entry = counts.get(resource.form) ?? { total: 0, failing: 0 };
+    const entry = counts.get(resource.form) ?? { total: 0, attention: 0 };
     entry.total += 1;
-    if (health(resource).phase === "Failed") entry.failing += 1;
+    if (["Failed", "NotReady"].includes(health(resource).phase)) entry.attention += 1;
     counts.set(resource.form, entry);
   }
   return [...counts.entries()]

@@ -120,6 +120,13 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
           ),
         )
       : null,
+    state.phase === "NotReady"
+      ? h(
+          "div",
+          { class: "notice notice--warn" },
+          tr("最新の観測でReadyではありません。", "The latest observation reports not ready."),
+        )
+      : null,
     card(
       tr("識別情報", "Identity"),
       h(
@@ -172,6 +179,7 @@ function field(label: string, value: Child): Child {
 function phaseLabel(phase: ReturnType<typeof health>["phase"]): string {
   const japanese = {
     Ready: "稼働中",
+    NotReady: "非稼働",
     Pending: "処理中",
     Failed: "失敗",
     Deleting: "削除中",

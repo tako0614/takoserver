@@ -223,6 +223,20 @@ export function createApi(options: ApiOptions) {
   });
 
   return {
+    async replayWindowSeconds(): Promise<number> {
+      const path = "/.well-known/takoform/v2";
+      const { payload, status } = await request<unknown>("GET", path);
+      const seconds =
+        isRecord(payload) && isRecord(payload.limits) ? payload.limits.replayWindowSeconds : null;
+      if (
+        status !== 200 ||
+        !Number.isSafeInteger(seconds) ||
+        typeof seconds !== "number" ||
+        seconds < 1
+      )
+        throw new ApiError("invalid_response", status, path);
+      return seconds;
+    },
     identityProviders: () =>
       call<{ providers: readonly IdentityProvider[] }>("GET", "/v1/identity/providers"),
 

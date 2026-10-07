@@ -126,6 +126,14 @@ test("v2 support checks only the exact operator-supplied Form URL", async () => 
   expect(await client().formSupport(org, form)).toBe(false);
 });
 
+test("Host discovery supplies the replay window; absent limits cannot authorize retry", async () => {
+  const seen = transport(() => Response.json({ limits: { replayWindowSeconds: 7200 } }));
+  expect(await client().replayWindowSeconds()).toBe(7200);
+  expect(new URL(seen[0]?.url ?? origin).pathname).toBe("/.well-known/takoform/v2");
+  transport(() => Response.json({ limits: {} }));
+  await expect(client().replayWindowSeconds()).rejects.toMatchObject({ code: "invalid_response" });
+});
+
 test("ambiguous ACK stays unknown; client does not replay the mutation", async () => {
   const seen = transport(() => {
     throw new Error("connection reset after send");

@@ -99,6 +99,7 @@ test("console accepts a v2 Resource through the normal organization-authenticate
   expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
     "/apis/forms.takoform.com/v2/resources",
   ]);
+  expect(await client.replayWindowSeconds()).toBeGreaterThan(0);
   expect(await app.tickTakoformV2()).toMatchObject({ id: accepted.id, status: "succeeded" });
   expect(await client.resourceOperation(organization.id, accepted.id)).toMatchObject({
     id: accepted.id,

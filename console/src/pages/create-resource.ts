@@ -1,9 +1,16 @@
 import { ApiError, type ResourceSummary } from "../api.ts";
 import { h } from "../dom.ts";
 import { tr } from "../i18n.ts";
+import {
+  isUnknownAcceptance,
+  prepareResourceIntent,
+  type ResourceIntent,
+  resourceIntentRequestBody,
+  sendResourceIntent,
+} from "../resource-intent.ts";
 import { navigate } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
-import { explain, openModal, toast } from "../ui.ts";
+import { copyable, explain, openModal, toast } from "../ui.ts";
 
 function jsonSpec(text: string): Record<string, unknown> | null {
   try {
@@ -14,28 +21,6 @@ function jsonSpec(text: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
-}
-
-function ambiguous(error: unknown): boolean {
-  return (
-    error instanceof ApiError &&
-    (error.code === "unreachable" ||
-      error.code === "invalid_response" ||
-      error.status >= 500 ||
-      error.status === 408)
-  );
-}
-
-function mutationFailure(error: unknown): void {
-  toast(
-    ambiguous(error)
-      ? tr(
-          "受理結果を確認できません。同じ操作を自動再送しません。リソース一覧を確認し、この画面から再試行する場合は同じキーを使います。",
-          "Acceptance is unknown. Nothing was resent automatically. Check Resources; retrying here keeps the same operation key.",
-        )
-      : explain(error as Error),
-    "bad",
-  );
 }
 
 function sameOrganization(organizationId: string): boolean {
@@ -50,8 +35,67 @@ function sameOrganization(organizationId: string): boolean {
   return false;
 }
 
+function recoveryDetails(
+  key: string,
+  method: string,
+  path: string,
+  body: string | null,
+  generation?: number,
+): HTMLElement {
+  return h(
+    "div",
+    { class: "field" },
+    h(
+      "small",
+      null,
+      tr(
+        "送信前に正確なキーと本文を確認・コピーできます。ページ再読み込み後はConsoleから再送できません。結果が不明なら読み取りで確認してください。",
+        "Review or copy the exact key and body before sending. After a full reload the Console cannot replay; reconcile by reading if acceptance is unknown.",
+      ),
+    ),
+    h("div", { class: "mono" }, `${method} ${path}`),
+    generation === undefined
+      ? null
+      : h("div", { class: "mono" }, `takoform-expected-generation: ${generation}`),
+    h("div", null, "idempotency-key: ", copyable(key)),
+    body === null
+      ? null
+      : h(
+          "div",
+          null,
+          tr("正確なJSON本文", "Exact JSON body"),
+          " ",
+          copyable(body, tr("本文をコピー", "Copy body")),
+          h("pre", { class: "mono" }, body),
+        ),
+  );
+}
+
+async function submit(intent: ResourceIntent, close: () => void): Promise<void> {
+  try {
+    const accepted = await sendResourceIntent(intent.id);
+    close();
+    if (currentOrganization()?.id === intent.organizationId)
+      navigate(
+        `/resources?operation=${encodeURIComponent(accepted.id)}&intent=${encodeURIComponent(intent.id)}`,
+      );
+  } catch (error) {
+    if (
+      isUnknownAcceptance(error) ||
+      (error instanceof ApiError && error.code === "replay_window_expired")
+    ) {
+      close();
+      if (currentOrganization()?.id === intent.organizationId)
+        navigate(`/resources?acceptance=unknown&intent=${encodeURIComponent(intent.id)}`);
+      return;
+    }
+    toast(explain(error as Error), "bad");
+  }
+}
+
 /** Create only against the exact Form URL supplied by the operator. */
 export function createResource(organizationId: string): void {
+  const key = `console-create-${crypto.randomUUID()}`;
   const form = h("input", {
     class: "input",
     placeholder: "https://…/forms/…/0.1.0/",
@@ -60,8 +104,24 @@ export function createResource(organizationId: string): void {
   const name = h("input", { class: "input", placeholder: "my-resource", autocomplete: "off" });
   const spec = h("textarea", { class: "textarea", spellcheck: "false" });
   spec.value = "{}";
-  let attempt: { form: string; name: string; spec: Record<string, unknown>; key: string } | null =
-    null;
+  const details = h("div");
+  const showDetails = (): void => {
+    const parsed = jsonSpec(spec.value);
+    const body = parsed
+      ? JSON.stringify({
+          form: form.value.trim(),
+          space: organizationId,
+          name: name.value.trim(),
+          spec: parsed,
+        })
+      : null;
+    details.replaceChildren(
+      recoveryDetails(key, "POST", "/apis/forms.takoform.com/v2/resources", body),
+    );
+  };
+  for (const field of [form, name, spec]) field.addEventListener("input", showDetails);
+  showDetails();
+  let intent: ResourceIntent | null = null;
   const close = openModal({
     title: tr("リソースを作成", "New resource"),
     confirmLabel: tr("受け付ける", "Accept create"),
@@ -77,18 +137,19 @@ export function createResource(organizationId: string): void {
           "small",
           null,
           tr(
-            "運用者が提供したForm URLを入力してください。Hostの対応状況を確認します。",
-            "Paste the operator-provided Form URL. The Host will confirm support.",
+            "運用者が提供したForm URLを入力してください。",
+            "Paste the operator-provided Form URL.",
           ),
         ),
       ),
       h("div", { class: "field" }, h("label", null, tr("名前", "Name")), name),
       h("div", { class: "field" }, h("label", null, tr("スペース", "Space")), organizationId),
       h("div", { class: "field" }, h("label", null, tr("設定 (JSON)", "Spec (JSON)")), spec),
+      details,
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
-      if (!attempt) {
+      if (!intent) {
         const selectedForm = form.value.trim();
         const selectedName = name.value.trim();
         const parsed = jsonSpec(spec.value);
@@ -102,54 +163,76 @@ export function createResource(organizationId: string): void {
           );
           return;
         }
+        form.disabled = true;
+        name.disabled = true;
+        spec.disabled = true;
+        showDetails();
         try {
           if (!(await api.formSupport(organizationId, selectedForm))) {
             toast(
               tr(
-                "このHostはそのFormをサポートしていません",
-                "This Host does not support that exact Form",
+                "このHostはそのFormの作成をサポートしていません",
+                "This Host does not support create for that exact Form",
               ),
               "bad",
             );
+            form.disabled = false;
+            name.disabled = false;
+            spec.disabled = false;
             return;
           }
+          if (!sameOrganization(organizationId)) return;
+          const replayWindowSeconds = await api.replayWindowSeconds();
+          if (!sameOrganization(organizationId)) return;
+          intent = prepareResourceIntent(
+            organizationId,
+            { action: "create", form: selectedForm, name: selectedName, spec: parsed },
+            replayWindowSeconds,
+            key,
+          );
+          details.replaceChildren(
+            recoveryDetails(
+              key,
+              "POST",
+              "/apis/forms.takoform.com/v2/resources",
+              resourceIntentRequestBody(intent),
+            ),
+          );
         } catch (error) {
+          form.disabled = false;
+          name.disabled = false;
+          spec.disabled = false;
           toast(explain(error as Error), "bad");
           return;
         }
-        if (!sameOrganization(organizationId)) return;
-        attempt = {
-          form: selectedForm,
-          name: selectedName,
-          spec: parsed,
-          key: `console-create-${crypto.randomUUID()}`,
-        };
-        form.disabled = true;
-        name.disabled = true;
-        spec.disabled = true;
       }
-      if (!sameOrganization(organizationId)) return;
-      try {
-        const accepted = await api.createResource(
-          organizationId,
-          { form: attempt.form, space: organizationId, name: attempt.name, spec: attempt.spec },
-          attempt.key,
-        );
-        close();
-        if (currentOrganization()?.id === organizationId)
-          navigate(`/resources?operation=${encodeURIComponent(accepted.id)}`);
-      } catch (error) {
-        mutationFailure(error);
-      }
+      await submit(intent, close);
     },
   });
 }
 
 /** Update one observed UID, fenced on the generation the person last read. */
 export function updateResource(organizationId: string, resource: ResourceSummary): void {
+  const key = `console-update-${crypto.randomUUID()}`;
+  const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
   const spec = h("textarea", { class: "textarea", spellcheck: "false" });
   spec.value = JSON.stringify(resource.spec, null, 2);
-  let attempt: { spec: Record<string, unknown>; key: string } | null = null;
+  const details = h("div");
+  const showDetails = (): void => {
+    const parsed = jsonSpec(spec.value);
+    details.replaceChildren(
+      recoveryDetails(
+        key,
+        "PUT",
+        path,
+        parsed ? JSON.stringify({ spec: parsed }) : null,
+        resource.generation,
+      ),
+    );
+  };
+  spec.addEventListener("input", showDetails);
+  showDetails();
+  let intent: ResourceIntent | null = null;
   const close = openModal({
     title: tr(`${resource.name}を更新`, `Update ${resource.name}`),
     confirmLabel: tr("更新を受け付ける", "Accept update"),
@@ -158,40 +241,43 @@ export function updateResource(organizationId: string, resource: ResourceSummary
       { class: "field" },
       h("label", null, tr("設定 (JSON)", "Spec (JSON)")),
       spec,
-      h(
-        "small",
-        null,
-        tr(
-          "現在の世代で競合を防ぎます。受理後に操作状態を確認してください。",
-          "The current generation fences this change. Check the Operation after acceptance.",
-        ),
-      ),
+      details,
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
-      if (!attempt) {
+      if (!intent) {
         const parsed = jsonSpec(spec.value);
         if (!parsed) {
           toast(tr("JSONオブジェクトを入力してください", "Enter a JSON object"), "bad");
           return;
         }
-        attempt = { spec: parsed, key: `console-update-${crypto.randomUUID()}` };
         spec.disabled = true;
+        showDetails();
+        try {
+          const replayWindowSeconds = await api.replayWindowSeconds();
+          if (!sameOrganization(organizationId)) return;
+          intent = prepareResourceIntent(
+            organizationId,
+            { action: "update", uid: resource.uid, generation: resource.generation, spec: parsed },
+            replayWindowSeconds,
+            key,
+          );
+          details.replaceChildren(
+            recoveryDetails(
+              key,
+              "PUT",
+              path,
+              resourceIntentRequestBody(intent),
+              resource.generation,
+            ),
+          );
+        } catch (error) {
+          spec.disabled = false;
+          toast(explain(error as Error), "bad");
+          return;
+        }
       }
-      try {
-        const accepted = await api.updateResource(
-          organizationId,
-          resource.uid,
-          resource.generation,
-          attempt.spec,
-          attempt.key,
-        );
-        close();
-        if (currentOrganization()?.id === organizationId)
-          navigate(`/resources?operation=${encodeURIComponent(accepted.id)}`);
-      } catch (error) {
-        mutationFailure(error);
-      }
+      await submit(intent, close);
     },
   });
 }
@@ -199,33 +285,43 @@ export function updateResource(organizationId: string, resource: ResourceSummary
 /** Destructive delete requires a separate explicit confirmation. */
 export function deleteResource(organizationId: string, resource: ResourceSummary): void {
   const key = `console-delete-${crypto.randomUUID()}`;
+  const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
+  let intent: ResourceIntent | null = null;
   const close = openModal({
     title: tr(`${resource.name}を削除しますか？`, `Delete ${resource.name}?`),
     confirmLabel: tr("リソースを削除", "Delete resource"),
     confirmTone: "danger",
     body: h(
       "div",
-      { class: "notice notice--bad" },
-      tr(
-        "実体と保存されているデータが削除されます。この操作は元に戻せません。",
-        "The backend resource and its data may be destroyed. This cannot be undone.",
+      { style: { display: "grid", gap: "14px" } },
+      h(
+        "div",
+        { class: "notice notice--bad" },
+        tr(
+          "実体と保存されているデータが削除されます。この操作は元に戻せません。",
+          "The backend resource and its data may be destroyed. This cannot be undone.",
+        ),
       ),
+      recoveryDetails(key, "DELETE", path, null, resource.generation),
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
-      try {
-        const accepted = await api.deleteResource(
-          organizationId,
-          resource.uid,
-          resource.generation,
-          key,
-        );
-        close();
-        if (currentOrganization()?.id === organizationId)
-          navigate(`/resources?operation=${encodeURIComponent(accepted.id)}`);
-      } catch (error) {
-        mutationFailure(error);
+      if (!intent) {
+        try {
+          const replayWindowSeconds = await api.replayWindowSeconds();
+          if (!sameOrganization(organizationId)) return;
+          intent = prepareResourceIntent(
+            organizationId,
+            { action: "delete", uid: resource.uid, generation: resource.generation },
+            replayWindowSeconds,
+            key,
+          );
+        } catch (error) {
+          toast(explain(error as Error), "bad");
+          return;
+        }
       }
+      await submit(intent, close);
     },
   });
 }

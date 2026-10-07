@@ -42,6 +42,9 @@ class TestNode {
   click(): void {
     if (!this.disabled) for (const listener of this.listeners.get("click") ?? []) listener();
   }
+  emit(name: string): void {
+    for (const listener of this.listeners.get(name) ?? []) listener();
+  }
   focus(): void {}
   querySelector(): TestNode | null {
     return (
@@ -136,11 +139,12 @@ const op = {
   updatedAt: "2026-10-07T00:00:00Z",
   retainUntil: "2026-10-08T00:00:00Z",
 };
+const discovery = { limits: { replayWindowSeconds: 3600 } };
 
 async function setup(path = "/resources") {
   const body = installDom(path);
   const { consoleLocale } = await import("../console/src/i18n.ts");
-  const { organizations, selectOrganization, setApiOrigin } = await import(
+  const { organizations, principal, selectOrganization, setApiOrigin } = await import(
     "../console/src/state.ts"
   );
   const { route } = await import("../console/src/router.ts");
@@ -151,10 +155,16 @@ async function setup(path = "/resources") {
     { id: "org-console", name: "Console", ownerPrincipalId: "owner", createdAt: "2026-10-07" },
     { id: "other", name: "Other", ownerPrincipalId: "owner", createdAt: "2026-10-07" },
   ]);
+  principal.set({
+    id: "console-owner",
+    provider: "google",
+    email: "owner@example.test",
+    displayName: "Owner",
+  });
   selectOrganization("org-console");
   route.set({ path, segments: path.split("/").filter(Boolean), query: new URLSearchParams() });
   body.append(mountToasts() as unknown as TestNode);
-  return { body, route, selectOrganization };
+  return { body, route, selectOrganization, principal };
 }
 
 test("accepted create is not shown as complete and checking it never re-sends", async () => {
@@ -170,6 +180,7 @@ test("accepted create is not shown as complete and checking it never re-sends", 
       const url = new URL(request.url);
       if (url.pathname.endsWith("/support"))
         return Response.json({ form, supported: true, operations: ["create"] });
+      if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
       if (request.method === "POST") return Response.json(op, { status: 202 });
       if (url.pathname.includes("/operations/")) {
         checks += 1;
@@ -186,6 +197,10 @@ test("accepted create is not shown as complete and checking it never re-sends", 
   if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
   inputs[0].value = form;
   inputs[1].value = "one";
+  inputs[1].emit("input");
+  expect(body.textContent).toContain(
+    JSON.stringify({ form, space: "org-console", name: "one", spec: {} }),
+  );
   button(body, "Accept create").click();
   await settle();
   expect(route().query.get("operation")).toBe(op.id);
@@ -201,16 +216,20 @@ test("accepted create is not shown as complete and checking it never re-sends", 
 });
 
 test.each(["connection lost", "malformed accepted reply"] as const)(
-  "%s never auto-resends and explicit retry retains the same key and body",
+  "%s keeps exact same-key retry across Console navigation",
   async (failure) => {
     const { body, route } = await setup();
     const { createResource } = await import("../console/src/pages/create-resource.ts");
+    const { resourcesPage } = await import("../console/src/pages/resources.ts");
     const writes: Request[] = [];
     globalThis.fetch = Object.assign(
       async (input: RequestInfo | URL, init?: RequestInit) => {
         const request = new Request(input, init);
-        if (new URL(request.url).pathname.endsWith("/support"))
+        const path = new URL(request.url).pathname;
+        if (path.endsWith("/support"))
           return Response.json({ form, supported: true, operations: ["create"] });
+        if (path === "/.well-known/takoform/v2") return Response.json(discovery);
+        if (request.method === "GET") return Response.json({ items: [], nextCursor: null });
         writes.push(request.clone());
         if (writes.length === 1) {
           if (failure === "connection lost") throw new Error("ACK lost");
@@ -221,6 +240,7 @@ test.each(["connection lost", "malformed accepted reply"] as const)(
       { preconnect: globalThis.fetch.preconnect },
     );
     createResource("org-console");
+    expect(body.textContent).toContain("idempotency-key");
     const inputs = body.all().filter((node) => node.tag === "input");
     if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
     inputs[0].value = form;
@@ -229,8 +249,16 @@ test.each(["connection lost", "malformed accepted reply"] as const)(
     await settle();
     expect(writes).toHaveLength(1);
     expect(route().query.get("operation")).toBeNull();
+    expect(route().query.get("acceptance")).toBe("unknown");
+    expect(
+      body.all().some((node) => node.tag === "button" && node.textContent === "Accept create"),
+    ).toBe(false);
+    body.append(resourcesPage("org-console") as unknown as TestNode);
+    await settle();
     expect(body.textContent).toContain("Acceptance is unknown");
-    button(body, "Accept create").click();
+    expect(body.textContent).toContain("Retry exact request");
+    expect(writes).toHaveLength(1);
+    button(body, "Retry exact request").click();
     await settle();
     expect(writes).toHaveLength(2);
     expect(writes[0]?.headers.get("idempotency-key")).toBe(
@@ -248,6 +276,7 @@ test("delete requires explicit confirmation and retains the UID/generation fence
   globalThis.fetch = Object.assign(
     async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
+      if (request.method === "GET") return Response.json(discovery);
       seen.push(request);
       return Response.json({ ...op, action: "delete" }, { status: 202 });
     },
@@ -274,6 +303,7 @@ test("update uses the observed UID and generation rather than a name-based path"
   globalThis.fetch = Object.assign(
     async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
+      if (request.method === "GET") return Response.json(discovery);
       seen.push(request);
       return Response.json({ ...op, action: "update", generation: 2 }, { status: 202 });
     },
@@ -306,6 +336,7 @@ test("organization switch during support read prevents a stale create send", asy
         return new Promise<Response>((resolve) => {
           release = resolve;
         });
+      if (request.method === "GET") return Response.json(discovery);
       writes.push(request);
       return Response.json(op, { status: 202 });
     },
@@ -373,4 +404,91 @@ test("list appends the next v2 cursor page without repeating the request on rapi
   expect(body.textContent).toContain("one");
   expect(body.textContent).toContain("two");
   expect(body.textContent).not.toContain("Load more");
+});
+
+test("expired Host replay window refuses a second native mutation send", async () => {
+  await setup();
+  const {
+    prepareResourceIntent,
+    sendResourceIntent,
+    canReplayResourceIntent,
+    discardResourceIntent,
+  } = await import("../console/src/resource-intent.ts");
+  const intent = prepareResourceIntent(
+    "org-console",
+    { action: "delete", uid: one.uid, generation: 1 },
+    60,
+  );
+  const writes: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      writes.push(request);
+      throw new Error("ACK lost");
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  await expect(sendResourceIntent(intent.id, 10_000)).rejects.toMatchObject({
+    code: "unreachable",
+  });
+  expect(canReplayResourceIntent(intent, 70_000)).toBe(false);
+  await expect(sendResourceIntent(intent.id, 70_000)).rejects.toMatchObject({
+    code: "replay_window_expired",
+  });
+  expect(writes).toHaveLength(1);
+  discardResourceIntent(intent.id);
+});
+
+test("a different signed-in principal cannot inherit an in-memory replay handle", async () => {
+  const { principal } = await setup();
+  const { prepareResourceIntent, sendResourceIntent, discardResourceIntent } = await import(
+    "../console/src/resource-intent.ts"
+  );
+  const intent = prepareResourceIntent(
+    "org-console",
+    { action: "delete", uid: one.uid, generation: 1 },
+    60,
+  );
+  principal.set({
+    id: "different-owner",
+    provider: "google",
+    email: "other@example.test",
+    displayName: "Other",
+  });
+  const writes: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      writes.push(new Request(input, init));
+      return Response.json({ ...op, action: "delete" }, { status: 202 });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  await expect(sendResourceIntent(intent.id)).rejects.toMatchObject({ code: "principal_changed" });
+  expect(writes).toHaveLength(0);
+  discardResourceIntent(intent.id);
+});
+
+test("after a full reload without the in-memory exact intent, warning remains read-only", async () => {
+  const { body, route, selectOrganization } = await setup();
+  const { resourcesPage } = await import("../console/src/pages/resources.ts");
+  selectOrganization("other");
+  route.set({
+    path: "/resources",
+    segments: ["resources"],
+    query: new URLSearchParams("acceptance=unknown&intent=lost-on-reload"),
+  });
+  const requests: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(new Request(input, init));
+      return Response.json({ items: [], nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(resourcesPage("other") as unknown as TestNode);
+  await settle();
+  expect(body.textContent).toContain("Acceptance is unknown");
+  expect(body.textContent).toContain("After a full reload without the exact request");
+  expect(body.textContent).not.toContain("Retry exact request");
+  expect(requests.every((request) => request.method === "GET")).toBe(true);
 });

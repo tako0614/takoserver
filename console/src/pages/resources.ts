@@ -2,6 +2,12 @@ import type { ResourceSummary } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { tr } from "../i18n.ts";
 import { resource, signal } from "../reactive.ts";
+import {
+  canReplayResourceIntent,
+  sendResourceIntent,
+  settleResourceIntent,
+  uncertainResourceIntents,
+} from "../resource-intent.ts";
 import { health } from "../resource-state.ts";
 import { linkProps, navigate, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
@@ -32,12 +38,35 @@ export function resourcesPage(organizationId: string): Child {
     page.reload();
   };
   const operationId = route().query.get("operation");
+  const intentId = route().query.get("intent");
+  const outstanding = uncertainResourceIntents(organizationId);
+  const acceptanceUnknown = route().query.get("acceptance") === "unknown" || outstanding.length > 0;
+  const recovering = signal(false);
+  const recoveryError = signal<Error | null>(null);
+  const retryExact = async (id: string): Promise<void> => {
+    if (recovering() || currentOrganization()?.id !== organizationId) return;
+    recovering.set(true);
+    recoveryError.set(null);
+    try {
+      const accepted = await sendResourceIntent(id);
+      if (currentOrganization()?.id === organizationId)
+        navigate(
+          `/resources?operation=${encodeURIComponent(accepted.id)}&intent=${encodeURIComponent(id)}`,
+        );
+    } catch (error) {
+      recoveryError.set(error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      recovering.set(false);
+    }
+  };
   // Keep the accepted handle in the URL across refreshes. Checking status is
   // explicit: it never resubmits create/delete or claims acceptance is done.
   const operation = operationId
     ? resource(async () => {
         try {
-          return await api.resourceOperation(organizationId, operationId);
+          const observed = await api.resourceOperation(organizationId, operationId);
+          if (intentId) settleResourceIntent(intentId, observed);
+          return observed;
         } finally {
           reloadResources();
         }
@@ -132,6 +161,56 @@ export function resourcesPage(organizationId: string): Child {
         ),
       ),
     ),
+    acceptanceUnknown
+      ? card(
+          tr("受理結果が不明です", "Acceptance is unknown"),
+          h(
+            "div",
+            { class: "card__body", style: { display: "grid", gap: "12px" } },
+            h(
+              "div",
+              { class: "notice notice--warn" },
+              tr(
+                "この一覧と対象リソースを読み直してください。表示がないことだけでは未受理を証明できません。ページ再読み込み後に正確な再送情報がない場合や再送期限後は運用者に確認してください。新しいキーで同じ操作を送らないでください。",
+                "Read this inventory and the affected Resource. Absence here does not prove rejection. After a full reload without the exact request, or after the replay deadline, ask the operator to reconcile; do not submit the same intent under a new key.",
+              ),
+            ),
+            ...outstanding.map((intent) =>
+              h(
+                "div",
+                { class: "toolbar" },
+                h(
+                  "span",
+                  { class: "mono" },
+                  `${intent.body.action} · ${intent.body.action === "create" ? intent.body.name : intent.body.uid}`,
+                ),
+                live(() =>
+                  h(
+                    "button",
+                    {
+                      class: "btn",
+                      type: "button",
+                      ...(recovering() || !canReplayResourceIntent(intent)
+                        ? { disabled: true }
+                        : {}),
+                      onClick: () => void retryExact(intent.id),
+                    },
+                    tr("同じ要求を再送", "Retry exact request"),
+                  ),
+                ),
+                !canReplayResourceIntent(intent)
+                  ? tr("再送期限を過ぎました", "Replay window expired")
+                  : null,
+              ),
+            ),
+            live(() =>
+              recoveryError()
+                ? h("div", { class: "notice notice--bad" }, explain(recoveryError() as Error))
+                : null,
+            ),
+          ),
+        )
+      : null,
     operation && operationId
       ? card(
           tr("受け付けた操作", "Accepted operation"),
@@ -321,6 +400,7 @@ function row(entry: ResourceSummary): Child {
 function phaseLabel(phase: ReturnType<typeof health>["phase"]): string {
   const japanese = {
     Ready: "稼働中",
+    NotReady: "非稼働",
     Pending: "処理中",
     Failed: "失敗",
     Deleting: "削除中",
