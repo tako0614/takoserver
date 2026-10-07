@@ -444,8 +444,11 @@ export function createV2QueueSettlementEndpoint(input: {
     if (grant.messageId !== body.messageId || grant.leaseToken !== body.leaseToken)
       return envelope("unknown_message", 404);
     let queueId: string;
-    try { queueId = queueIdForUid(grant.queueUid); }
-    catch { return envelope("backend_unavailable", 503); }
+    try {
+      queueId = queueIdForUid(grant.queueUid);
+    } catch {
+      return envelope("backend_unavailable", 503);
+    }
     if (typeof queueId !== "string" || queueId.length === 0)
       return envelope("backend_unavailable", 503);
     let result: Awaited<ReturnType<RegisteredSettlement["settleRegisteredBatchMessage"]>>;

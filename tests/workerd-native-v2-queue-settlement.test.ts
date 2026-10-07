@@ -30,8 +30,8 @@ import {
   SELFHOST_WORKER_ENTRYPOINT_MODULE,
   selfhostWorkerEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
-import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 import { v2QueueId } from "../src/takoform-v2/worker-queue-delivery.ts";
+import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 const binary = nativeEvidenceBinary("workerd-artifact");
