@@ -1,0 +1,313 @@
+import { Database } from "bun:sqlite";
+import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import type { JsonObject } from "../src/ports.ts";
+import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
+import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
+import { createStaticAssetBundleHost } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
+import {
+  referencesForWorkerDeployment,
+  referencesForWorkerVersion,
+} from "../src/takoform-v2/forms/worker-references.ts";
+import {
+  MODULE_WORKER_FORM_URL,
+  parseModuleWorkerSpec,
+  parseWorkerDeploymentSpec,
+  parseWorkerVersionSpec,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+  WORKER_VERSION_FORM_URL,
+} from "../src/takoform-v2/forms/worker-specs.ts";
+import type { V2Execution, V2Form } from "../src/takoform-v2/types.ts";
+import { createWorkerEndpointForm } from "../src/takoform-v2/worker-endpoint-backend.ts";
+import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
+import type { V2WorkerPublicationResult } from "../src/takoform-v2/worker-static-publication.ts";
+
+const TARGET_KEY = "fixture-v2-worker-endpoint";
+const HOSTNAME = "assigned.example.test";
+
+function digest(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+test("accepted Endpoint retains its assigned HTTPS address across uncertain send, update and route-only delete", async () => {
+  const root = mkdtempSync(join(tmpdir(), "v2-endpoint-backend-"));
+  const db = new Database(join(root, "state.sqlite"));
+  migrateSqlite(db);
+  const sql = createSqliteSql(db);
+  let clockMs = Date.now();
+  const now = () => new Date(clockMs);
+  const fileUrl = "https://artifacts.example.test/endpoint/index.html";
+  const manifestUrl = "https://artifacts.example.test/endpoint/manifest.json";
+  const fileBytes = new TextEncoder().encode("<h1>fixture</h1>");
+  const manifestBytes = new TextEncoder().encode(
+    JSON.stringify({
+      files: [
+        { path: "index.html", url: fileUrl, sha256: digest(fileBytes), mediaType: "text/html" },
+      ],
+    }),
+  );
+  const assets = createStaticAssetBundleHost({
+    sql,
+    targetKey: TARGET_KEY,
+    source: {
+      async read({ url }) {
+        if (url === manifestUrl) return manifestBytes;
+        if (url === fileUrl) return fileBytes;
+        throw new Error("unknown fixture artifact");
+      },
+    },
+  });
+  const publicationState = createV2WorkerPublicationState({
+    sql,
+    now,
+    assetCustody: assets.custody,
+  });
+  let workerUid = "";
+  let versionUid = "";
+  let allocationCalls = 0;
+  const ownerCalls: string[] = [];
+  let loseNextOwnerAcknowledgement = true;
+  let returnDeploymentDeleteReceipt = false;
+  let nativeRouteHostname = HOSTNAME;
+  let tlsHostname = HOSTNAME;
+  const tlsReady = true;
+  let tlsCalls = 0;
+  const endpointForm = createWorkerEndpointForm({
+    targetKey: TARGET_KEY,
+    publicationState,
+    assignHostname({ resourceUid }) {
+      allocationCalls += 1;
+      expect(resourceUid).toMatch(/^[0-9a-f-]{36}$/u);
+      return HOSTNAME;
+    },
+    ownerForWorker(uid) {
+      expect(uid).toBe(workerUid);
+      return {
+        workerResourceUid: uid,
+        async execute(execution): Promise<V2WorkerPublicationResult> {
+          ownerCalls.push(execution.operationId);
+          if (loseNextOwnerAcknowledgement) {
+            loseNextOwnerAcknowledgement = false;
+            return { kind: "unknown" };
+          }
+          if (returnDeploymentDeleteReceipt && execution.action === "delete") {
+            return { kind: "confirmed", identity: null };
+          }
+          const versionId = `v2-${digest(new TextEncoder().encode(`${versionUid}\u00001`))}`;
+          return {
+            kind: "confirmed",
+            deferRetirementUntilDeadline: false,
+            identity: {
+              generation: `takoserver-v2-operation:${execution.operationId}`,
+              workerResourceUid: uid,
+              hostnames: execution.action === "delete" ? [] : [nativeRouteHostname],
+              versions: [{ versionId, workerVersionUid: versionUid, weight: 10_000 }],
+            },
+          };
+        },
+      };
+    },
+    async observeTls({ endpointUid, workerUid: observedWorkerUid, hostname, url }) {
+      tlsCalls += 1;
+      return {
+        endpointUid,
+        workerUid: observedWorkerUid,
+        hostname: tlsHostname,
+        url,
+        ready: tlsReady && hostname === HOSTNAME,
+      };
+    },
+  });
+  const foundationBackend = {
+    id: "fixture-confirmed-foundation",
+    targetKey: TARGET_KEY,
+    async execute(input: V2Execution) {
+      const observed =
+        input.form === WORKER_VERSION_FORM_URL
+          ? { ready: true, resolvedBindings: true }
+          : input.form === WORKER_DEPLOYMENT_FORM_URL
+            ? {
+                ready: true,
+                active: true,
+                selectedVersions: [{ resourceUid: versionUid, weight: 10_000 }],
+              }
+            : { ready: true };
+      return { kind: "complete" as const, observed, output: {} };
+    },
+    async reconcile() {
+      return { kind: "unknown" as const };
+    },
+  };
+  const forms: Record<string, V2Form> = {
+    [MODULE_WORKER_FORM_URL]: {
+      validateCreate: parseModuleWorkerSpec,
+      validateUpdate: (_previous, next) => {
+        parseModuleWorkerSpec(next);
+      },
+      backend: foundationBackend,
+    },
+    [STATIC_ASSET_BUNDLE_FORM_URL]: assets.form,
+    [WORKER_VERSION_FORM_URL]: {
+      validateCreate: parseWorkerVersionSpec,
+      validateUpdate: (_previous, next) => {
+        parseWorkerVersionSpec(next);
+      },
+      references: (spec) => referencesForWorkerVersion(parseWorkerVersionSpec(spec)),
+      backend: foundationBackend,
+    },
+    [WORKER_DEPLOYMENT_FORM_URL]: {
+      validateCreate: parseWorkerDeploymentSpec,
+      validateUpdate: (_previous, next) => {
+        parseWorkerDeploymentSpec(next);
+      },
+      references: (spec) => referencesForWorkerDeployment(parseWorkerDeploymentSpec(spec)),
+      backend: foundationBackend,
+    },
+    [WORKER_ENDPOINT_FORM_URL]: endpointForm,
+  };
+  const engine = createTakoformV2Engine({
+    sql,
+    now,
+    leaseMilliseconds: 1_000,
+    replayWindowSeconds: 3600,
+    authorize: async () => true,
+    forms,
+  });
+  const create = async (form: string, name: string, spec: JsonObject) => {
+    const accepted = await engine.acceptCreate({
+      principal: "org-endpoint",
+      key: `create-${name}-key-0001`,
+      input: { form, space: "prod", name, spec },
+    });
+    expect(await engine.runNext()).toMatchObject({ id: accepted.id, status: "succeeded" });
+    return accepted;
+  };
+  try {
+    const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
+    workerUid = worker.resourceUid;
+    const asset = await create(STATIC_ASSET_BUNDLE_FORM_URL, "assets", {
+      artifact: { url: manifestUrl, sha256: digest(manifestBytes) },
+    });
+    const version = await create(WORKER_VERSION_FORM_URL, "version", {
+      worker: { resourceUid: workerUid },
+      handlers: [],
+      assets: {
+        bundle: { resourceUid: asset.resourceUid },
+        runWorkerFirst: false,
+        notFoundHandling: "none",
+      },
+    });
+    versionUid = version.resourceUid;
+    const deployment = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: workerUid },
+      versions: [{ workerVersion: { resourceUid: versionUid }, weight: 10_000 }],
+    });
+    const endpointSpec = { worker: { resourceUid: workerUid } };
+    const endpoint = await engine.acceptCreate({
+      principal: "org-endpoint",
+      key: "create-endpoint-key-0001",
+      input: {
+        form: WORKER_ENDPOINT_FORM_URL,
+        space: "prod",
+        name: "endpoint",
+        spec: endpointSpec,
+      },
+    });
+    expect(allocationCalls).toBe(1);
+    expect(
+      await engine.getResource({ principal: "org-endpoint", uid: endpoint.resourceUid }),
+    ).toMatchObject({
+      observed: {},
+      output: { hostname: HOSTNAME, url: `https://${HOSTNAME}/` },
+    });
+    expect(await engine.runNext()).toMatchObject({
+      id: endpoint.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    const replay = await engine.acceptCreate({
+      principal: "org-endpoint",
+      key: "create-endpoint-key-0001",
+      input: {
+        form: WORKER_ENDPOINT_FORM_URL,
+        space: "prod",
+        name: "endpoint",
+        spec: endpointSpec,
+      },
+    });
+    expect(replay.id).toBe(endpoint.id);
+    expect(allocationCalls).toBe(1);
+    clockMs += 2_000;
+    expect(await engine.runNext()).toMatchObject({ id: endpoint.id, status: "succeeded" });
+    expect(ownerCalls).toEqual([endpoint.id, endpoint.id]);
+    expect(
+      await engine.getResource({ principal: "org-endpoint", uid: endpoint.resourceUid }),
+    ).toMatchObject({
+      observed: { tlsReady: true, activeDeploymentRouteReady: true },
+      output: { hostname: HOSTNAME, url: `https://${HOSTNAME}/` },
+    });
+    const update = await engine.acceptUpdate({
+      principal: "org-endpoint",
+      key: "update-endpoint-key-0001",
+      uid: endpoint.resourceUid,
+      expectedGeneration: 1,
+      spec: endpointSpec,
+    });
+    nativeRouteHostname = "wrong.example.test";
+    expect(await engine.runNext()).toMatchObject({
+      id: update.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    nativeRouteHostname = HOSTNAME;
+    tlsHostname = "wrong.example.test";
+    clockMs += 2_000;
+    expect(await engine.runNext()).toMatchObject({
+      id: update.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    tlsHostname = HOSTNAME;
+    clockMs += 2_000;
+    expect(await engine.runNext()).toMatchObject({ id: update.id, status: "succeeded" });
+    expect(allocationCalls).toBe(1);
+    expect(
+      await engine.getResource({ principal: "org-endpoint", uid: endpoint.resourceUid }),
+    ).toMatchObject({
+      output: { hostname: HOSTNAME, url: `https://${HOSTNAME}/` },
+    });
+    const deleted = await engine.acceptDelete({
+      principal: "org-endpoint",
+      key: "delete-endpoint-key-0001",
+      uid: endpoint.resourceUid,
+      expectedGeneration: 2,
+    });
+    returnDeploymentDeleteReceipt = true;
+    expect(await engine.runNext()).toMatchObject({
+      id: deleted.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    returnDeploymentDeleteReceipt = false;
+    clockMs += 2_000;
+    expect(await engine.runNext()).toMatchObject({ id: deleted.id, status: "succeeded" });
+    expect(tlsCalls).toBe(3); // create and both update attempts; delete does not infer TLS absence
+    expect(
+      await engine.getResource({ principal: "org-endpoint", uid: deployment.resourceUid }),
+    ).toMatchObject({
+      observed: { ready: true, active: true },
+    });
+    expect(await engine.getResource({ principal: "org-endpoint", uid: workerUid })).toMatchObject({
+      observed: { ready: true },
+    });
+  } finally {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

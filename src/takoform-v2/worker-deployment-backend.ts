@@ -118,7 +118,11 @@ export function createWorkerDeploymentForm(options: {
     }
     if (
       result.identity === null ||
-      !(await exactIdentity(result.identity, after.snapshot, execution.operationId)) ||
+      !(await exactV2WorkerPublicationIdentity(
+        result.identity,
+        after.snapshot,
+        execution.operationId,
+      )) ||
       !(await after.stillCurrent())
     )
       return unknown();
@@ -201,7 +205,8 @@ function matchesExecution(
   );
 }
 
-async function exactIdentity(
+/** Compare one native receipt with the complete SQL-resolved Worker graph. */
+export async function exactV2WorkerPublicationIdentity(
   identity: WorkerdPublicationIdentity,
   snapshot: V2WorkerPublicationSnapshot,
   operationId: string,

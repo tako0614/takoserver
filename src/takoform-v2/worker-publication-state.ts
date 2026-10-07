@@ -43,6 +43,8 @@ export type { V2WorkerPublicationSqlGuard } from "./worker-publication-sql-guard
 /** A read-only SQL authority for one fenced private Worker publication. */
 export interface V2WorkerPublicationSnapshot {
   readonly sourceOperationId: string;
+  /** Host-assigned, SQL-held address of this accepted Endpoint op, including DELETE. */
+  readonly acceptedEndpointOutput?: { readonly hostname: string; readonly url: string };
   readonly worker: {
     readonly uid: string;
     readonly principal: string;
@@ -283,7 +285,9 @@ function outputHostname(row: ResourceRow): { hostname: string; url: string } | n
   const output = parseObject(row.output_json);
   const hostname = output?.hostname;
   const url = output?.url;
-  return typeof hostname === "string" &&
+  return output !== null &&
+    typeof hostname === "string" &&
+    Object.keys(output).sort().join(",") === "hostname,url" &&
     hostnamePattern.test(hostname) &&
     typeof url === "string" &&
     url === `https://${hostname}/`
@@ -931,8 +935,14 @@ export function createV2WorkerPublicationState(options: {
     ) {
       return unresolved("graph_unresolved", "Endpoint requires HTTP-capable weighted Versions");
     }
+    const acceptedEndpointOutput =
+      execution.form === WORKER_ENDPOINT_FORM_URL ? outputHostname(own) : null;
+    if (execution.form === WORKER_ENDPOINT_FORM_URL && !acceptedEndpointOutput) {
+      return unresolved("graph_unresolved", "Accepted Endpoint address is unavailable");
+    }
     const snapshot = freezeDeep<V2WorkerPublicationSnapshot>({
       sourceOperationId: op.id,
+      ...(acceptedEndpointOutput ? { acceptedEndpointOutput } : {}),
       worker: {
         uid: worker.uid,
         principal: worker.principal,
