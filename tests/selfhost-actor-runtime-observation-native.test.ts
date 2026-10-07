@@ -1,0 +1,237 @@
+import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  SELFHOST_WORKER_PRELUDE_MODULE,
+  selfhostWorkerPreludeSource,
+} from "../src/providers/selfhost-worker-prelude.ts";
+import { selfhostWorkerEntrypointSource } from "../src/providers/selfhost-worker-wrapper.ts";
+import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
+import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
+import { createWorkerdRuntime, type WorkerdDeploymentPublication } from "../src/workerd-runtime.ts";
+import { fixture, scope } from "./helpers/actor-resource-fixture.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
+
+const binary = nativeEvidenceBinary("actor-qualification");
+const digest = process.env.TAKOSERVER_ACTOR_QUALIFICATION_SHA256;
+const encoder = new TextEncoder();
+
+test.skipIf(binary === undefined)(
+  "real native Actor namespace observes distinct live contexts and retained alarm state under one epoch",
+  async () => {
+    if (!binary || !digest || !/^[a-f0-9]{64}$/u.test(digest))
+      throw new Error("candidate SHA required");
+    expect(
+      createHash("sha256")
+        .update(await readFile(binary))
+        .digest("hex"),
+    ).toBe(digest);
+    expect(WORKERD_CLOSED_GRAPH_ARTIFACT.sha256).toBe(
+      "c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52",
+    );
+    const root = await mkdtemp(join(tmpdir(), "actor-native-observe-"));
+    const f = fixture();
+    const runtimeRoot = join(root, "runtime");
+    const storageRoot = join(root, "state");
+    const childPidFile = join(root, "child.pid");
+    const denySpawnFile = join(root, "deny-spawn");
+    const childWrapper = join(root, "child-wrapper");
+    await writeFile(
+      childWrapper,
+      `#!/bin/sh\nif test -e '${denySpawnFile}'; then exit 65; fi\nprintf '%s\\n' "$$" > '${childPidFile}'\nexec '${binary}' "$@"\n`,
+      { mode: 0o700 },
+    );
+    const runtime = createWorkerdRuntime({ root: runtimeRoot, isReady: () => true });
+    const source = await readFile(join(import.meta.dir, "fixtures/actor-host/counter.mjs"), "utf8");
+    const main = `import { Counter as Base } from './counter.mjs';
+export class Counter extends Base {
+  async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === '/alarm-set') {
+      await this.context.alarm.set(Date.now() + 60000);
+      return Response.json({ pending: await this.context.alarm.get() });
+    }
+    if (path === '/stream') return new Response(new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode('head'));
+      setTimeout(() => controller.close(), 2000);
+    } }));
+    return super.fetch(request);
+  }
+}`;
+    const publication: WorkerdDeploymentPublication = {
+      generation: "observation-one",
+      workerResourceUid: f.target.metadata.uid,
+      hostnames: [],
+      versions: [
+        {
+          versionId: "native-version-one",
+          workerVersionUid: "version-uid-one",
+          weight: 10_000,
+          site: {
+            directory: "worker",
+            mainModule: "main.mjs",
+            hostEntrypoint: "__host.mjs",
+            hostModules: [SELFHOST_WORKER_PRELUDE_MODULE],
+            hostnames: [],
+            generation: "observation-one",
+            workerResourceUid: f.target.metadata.uid,
+            fetchHandler: true,
+            modules: ["counter.mjs"],
+            vars: [{ name: "VERSION", value: "one", kind: "text" }],
+          },
+          modules: new Map([
+            ["main.mjs", encoder.encode(main)],
+            ["counter.mjs", encoder.encode(source)],
+          ]),
+          hostModules: new Map([
+            [SELFHOST_WORKER_PRELUDE_MODULE, encoder.encode(selfhostWorkerPreludeSource())],
+            [
+              "__host.mjs",
+              encoder.encode(
+                selfhostWorkerEntrypointSource({
+                  originalMainModule: "main.mjs",
+                  declaredHandlers: ["fetch"],
+                  bindings: [{ name: "VERSION", type: "plain_text" }],
+                  publication: "observation-one",
+                  probeHostname: "probe.invalid",
+                }),
+              ),
+            ],
+          ]),
+        },
+      ],
+    };
+    const host = createSelfhostActorExecutionHost({
+      runtimeRoot,
+      storageRoot,
+      binary: childWrapper,
+      graph: f.read,
+      deployments: f.deployments,
+      providerPackRef: "selfhost",
+      providerInstallationRef: "local.primary",
+      basisPoint: () => 0,
+    });
+    try {
+      await f.deployments.create({
+        tenantId: scope.tenantId,
+        id: "deployment-worker",
+        resourceUid: f.target.metadata.uid,
+        offeringId: "worker-local",
+        providerPackRef: "selfhost",
+        providerInstallationRef: "local.primary",
+        nativeId: "selfhost-worker:worker:operation-1",
+        state: "active",
+        observed: {},
+        outputs: { scriptName: "worker" },
+      });
+      await runtime.publish?.("worker", publication);
+      await host.registerNamespace(scope);
+      const identity = { ...scope, id: "actor-one" };
+      expect(
+        await (await host.fetch(identity, new Request("http://actor.invalid/value"))).json(),
+      ).toEqual({
+        id: identity.id,
+        value: 0,
+        version: "one",
+      });
+      const initial = await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      expect(initial).toMatchObject({
+        kind: "confirmed",
+        activeActorCount: 0,
+        pendingAlarmCount: 0,
+        openSocketCount: 0,
+      });
+      const armed = await host.fetch(identity, new Request("http://actor.invalid/alarm-set"));
+      expect(((await armed.json()) as { pending: number }).pending).toBeGreaterThan(Date.now());
+      const pending = await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      expect(pending).toMatchObject({
+        kind: "confirmed",
+        activeActorCount: 0,
+        pendingAlarmCount: 1,
+        openSocketCount: 0,
+      });
+      const stream = await host.fetch(
+        { ...scope, id: "actor-two" },
+        new Request("http://actor.invalid/stream"),
+      );
+      const reader = stream.body?.getReader();
+      expect(await reader?.read()).toMatchObject({ done: false });
+      const active = await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      expect(active).toMatchObject({
+        kind: "confirmed",
+        activeActorCount: 1,
+        pendingAlarmCount: 1,
+        openSocketCount: 0,
+      });
+      await reader?.cancel();
+      let settled = await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      for (
+        let attempt = 0;
+        attempt < 100 && settled.kind === "confirmed" && settled.activeActorCount !== 0;
+        attempt += 1
+      ) {
+        await Bun.sleep(25);
+        settled = await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      }
+      expect(settled).toMatchObject({
+        kind: "confirmed",
+        activeActorCount: 0,
+        pendingAlarmCount: 1,
+        openSocketCount: 0,
+      });
+      expect(await host.observeNamespaceRuntime(scope, AbortSignal.abort("cancelled"))).toEqual({
+        kind: "unknown",
+      });
+      expect(
+        await host.observeNamespaceRuntime(
+          { ...scope, tenantId: "another-tenant" },
+          AbortSignal.timeout(5_000),
+        ),
+      ).toEqual({ kind: "unknown" });
+      await writeFile(denySpawnFile, "blocked");
+      const childPid = Number((await readFile(childPidFile, "utf8")).trim());
+      expect(Number.isSafeInteger(childPid) && childPid > 0).toBe(true);
+      process.kill(childPid, "SIGKILL");
+      let lost = await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      for (let attempt = 0; attempt < 100 && lost.kind !== "unknown"; attempt += 1) {
+        await Bun.sleep(10);
+        lost = await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      }
+      expect(lost).toEqual({ kind: "unknown" });
+      await unlink(denySpawnFile);
+      expect(
+        await (await host.fetch(identity, new Request("http://actor.invalid/value"))).json(),
+      ).toEqual({
+        id: identity.id,
+        value: 0,
+        version: "one",
+      });
+      const recovered = await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      expect(recovered).toMatchObject({ kind: "confirmed", pendingAlarmCount: 1 });
+      if (initial.kind !== "confirmed" || recovered.kind !== "confirmed")
+        throw new Error("native observation was not confirmed");
+      expect(recovered.epoch).not.toBe(initial.epoch);
+      await runtime.publish?.("worker", {
+        ...publication,
+        generation: "observation-two",
+        versions: publication.versions.map((version) => ({
+          ...version,
+          site: { ...version.site, generation: "observation-two" },
+        })),
+      });
+      expect(await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000))).toEqual({
+        kind: "unknown",
+      });
+      await host.close();
+      expect(await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000))).toEqual({
+        kind: "unknown",
+      });
+    } finally {
+      await host.close();
+      f.database.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);

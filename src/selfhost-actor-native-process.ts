@@ -58,6 +58,10 @@ export interface WorkerdActorNativeProcessAdapter {
 
 export interface WorkerdActorNamespace {
   fetch(id: string, request: Request, variantKey: string): Promise<Response>;
+  /** Authenticated child read even when no Actor ID has yet been dispatched. */
+  probeRuntime?(signal: AbortSignal): Promise<void>;
+  /** Authenticated physical per-ID read; an unreadable child never means zero. */
+  observeActor?(id: string, signal: AbortSignal): Promise<WorkerdActorRuntimeObservation>;
   /** Private workerd-to-workerd duplex socket; never an untrusted URL or binding. */
   readonly actorProxySocketPath: string;
   /** Host-private target after live Resource and Version admission. */
@@ -77,6 +81,18 @@ export interface WorkerdActorNamespace {
   disableAlarmAdmission(): void;
   /** Ordinary retirement drains responses; a dead child can be reaped immediately. */
   close(): Promise<void>;
+}
+
+export interface WorkerdActorRuntimeObservation {
+  readonly actorId: string;
+  readonly epoch: string;
+  readonly generationKey: string;
+  readonly instance: string;
+  readonly revision: number;
+  readonly activeActor: boolean;
+  readonly pendingAlarmCount: number;
+  readonly openSocketCount: number;
+  readonly socketIds: readonly string[];
 }
 
 type AlarmGrant = NonNullable<Awaited<ReturnType<WorkerdActorNamespaceOptions["admitAlarm"]>>>;
@@ -349,7 +365,7 @@ export class ActorChild {
     }
     const headers = new SafeHeaders(incoming);
     const nonce = SafeApply(SafeHeadersGet, headers, [UPGRADE_NONCE]);
-    const privateNames = ["x-takoserver-private-actor-delivery", "x-takoserver-private-actor-variant", UPGRADE_NONCE, UPGRADE_DECISION, UPGRADE_SOCKET_ID, EVENT_SECRET, SOCKET_ACTION, SOCKET_NONCE, SOCKET_ID, SOCKET_KIND];
+    const privateNames = ["x-takoserver-private-actor-delivery", "x-takoserver-private-actor-variant", "x-takoserver-private-actor-observation", UPGRADE_NONCE, UPGRADE_DECISION, UPGRADE_SOCKET_ID, EVENT_SECRET, SOCKET_ACTION, SOCKET_NONCE, SOCKET_ID, SOCKET_KIND];
     for (let index = 0; index < privateNames.length; index += 1)
       SafeApply(SafeHeadersDelete, headers, [privateNames[index]]);
     const appRequest = new SafeRequest(SafeRequestUrl ? SafeApply(SafeRequestUrl, request, []) : request.url, { method: SafeApply(SafeRequestMethod, request, []), headers, body: SafeRequestBody ? SafeApply(SafeRequestBody, request, []) : request.body, signal: SafeApply(SafeRequestSignal, request, []), redirect: "manual" });
@@ -403,7 +419,7 @@ export default { fetch(request) { return inspectVersion(request); } };`),
     owner,
     encoder.encode(`import { createActorNativeOwner, createActorNativeIngress, resolveActorAbiProfile } from ${literal(`./${first.helper}`)};
 const ABI_PROFILE = ${runtimeClassRef ? `resolveActorAbiProfile(${literal(runtimeClassRef)})` : "undefined"};
-export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)}, ${literal(admissionToken)}, ${JSON.stringify({ generationKey: graph.generationKey, epoch, variantKeys })}, ${options.ownerDeadlines ? JSON.stringify(options.ownerDeadlines) : "undefined"}, undefined, undefined, ABI_PROFILE);
+export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)}, ${literal(admissionToken)}, ${JSON.stringify({ generationKey: graph.generationKey, epoch, variantKeys })}, ${options.ownerDeadlines ? JSON.stringify(options.ownerDeadlines) : "undefined"}, undefined, undefined, ABI_PROFILE, ${literal(alarmToken)});
 const ingress = createActorNativeIngress(${literal(token)}, ${literal(alarmToken)});
 const inspectionTokens = ${JSON.stringify(inspectionTokens)};
 let inspections;
@@ -643,6 +659,19 @@ export default {
       exited: runningChild.exited.then(() => {
         verified = false;
       }),
+      async probeRuntime(signal) {
+        if (closing || isActorNativeChildTerminal(runningChild))
+          throw new Error("Actor native observation unavailable");
+        const response = await processAdapter.probeReadiness({
+          socketPath: socket,
+          token,
+          signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+        });
+        await response.body?.cancel();
+        signal.throwIfAborted();
+        if (response.status !== 204 || closing || isActorNativeChildTerminal(runningChild))
+          throw new Error("Actor native observation unavailable");
+      },
       enableAlarmAdmission() {
         if (!closing && !isActorNativeChildTerminal(runningChild)) verified = true;
       },
@@ -664,6 +693,83 @@ export default {
           unix: socket,
           redirect: "manual",
         });
+      },
+      async observeActor(id, signal) {
+        if (closing || isActorNativeChildTerminal(child) || !id || id.includes("\u0000"))
+          throw new Error("Actor native observation unavailable");
+        const encodedId = encodeURIComponent(id);
+        const controlToken = createHmac("sha256", alarmToken).update(encodedId).digest("hex");
+        const response = await fetch("http://actor.invalid/__actor_observe__", {
+          unix: socket,
+          method: "POST",
+          headers: {
+            "x-takoserver-private-actor-token": controlToken,
+            "x-takoserver-private-actor-id": encodedId,
+            "x-takoserver-private-actor-observation": "snapshot-v1",
+          },
+          redirect: "manual",
+          signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+        });
+        if (response.status !== 200 || !response.body)
+          throw new Error("Actor native observation unavailable");
+        const reader = response.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let size = 0;
+        try {
+          while (true) {
+            const next = await reader.read();
+            if (next.done) break;
+            size += next.value.byteLength;
+            if (size > 1_048_576) throw new Error("Actor native observation unavailable");
+            chunks.push(next.value);
+          }
+        } finally {
+          await reader.cancel().catch(() => {});
+        }
+        const raw = new Uint8Array(size);
+        let offset = 0;
+        for (const chunk of chunks) {
+          raw.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+        } catch {
+          throw new Error("Actor native observation unavailable");
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+          throw new Error("Actor native observation unavailable");
+        const record = parsed as Record<string, unknown>;
+        const socketIds = record.socketIds;
+        if (
+          Object.keys(record).sort().join(",") !==
+            "activeActor,actorId,epoch,generationKey,instance,openSocketCount,pendingAlarmCount,revision,socketIds" ||
+          record.actorId !== id ||
+          record.epoch !== epoch ||
+          record.generationKey !== graph.generationKey ||
+          typeof record.instance !== "string" ||
+          !/^[a-f0-9]{64}$/u.test(record.instance) ||
+          !Number.isSafeInteger(record.revision) ||
+          (record.revision as number) < 0 ||
+          typeof record.activeActor !== "boolean" ||
+          !Number.isSafeInteger(record.pendingAlarmCount) ||
+          (record.pendingAlarmCount as number) < 0 ||
+          (record.pendingAlarmCount as number) > 2 ||
+          !Array.isArray(socketIds) ||
+          socketIds.length > 10_000 ||
+          !Number.isSafeInteger(record.openSocketCount) ||
+          record.openSocketCount !== socketIds.length ||
+          socketIds.some(
+            (value, index) =>
+              typeof value !== "string" || !value || (index > 0 && value <= socketIds[index - 1]),
+          )
+        )
+          throw new Error("Actor native observation unavailable");
+        signal.throwIfAborted();
+        if (closing || isActorNativeChildTerminal(child))
+          throw new Error("Actor native observation unavailable");
+        return parsed as WorkerdActorRuntimeObservation;
       },
       duplexTarget(id, variantKey) {
         if (closing || isActorNativeChildTerminal(child))

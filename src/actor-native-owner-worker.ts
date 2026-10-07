@@ -51,6 +51,7 @@ const UPGRADE_SOCKET_ID_HEADER = "x-takoserver-private-actor-upgrade-socket-id";
 const EVENT_SECRET_HEADER = "x-takoserver-private-actor-event-secret";
 const RESERVATION_HEADER = "x-takoserver-private-actor-reservation";
 const RESERVATION_ACTION_HEADER = "x-takoserver-private-actor-reservation-action";
+const OBSERVATION_HEADER = "x-takoserver-private-actor-observation";
 const RESERVATION_MS = 30_000;
 // Host-owned inbound policy, not portable capacity or a native transport bound.
 // Count empty messages too, and retain charges through callback settlement.
@@ -554,8 +555,11 @@ export function createActorNativeOwner(
   ) => Promise<unknown>,
   readCurrentGraph?: (env: Record<string, unknown>) => Promise<ActorOwnerGraph>,
   selected?: ActorAbiProfile,
+  observationSecret?: string,
 ) {
   const profile = actorAbiProfile(selected);
+  const expectedObservationBearer =
+    observationSecret === undefined ? undefined : actorAlarmBearer(observationSecret);
   if (
     (deliveryToken !== undefined && !/^[a-f0-9]{64}$/u.test(deliveryToken)) ||
     (admissionToken !== undefined && !/^[a-f0-9]{64}$/u.test(admissionToken))
@@ -609,6 +613,9 @@ export function createActorNativeOwner(
         }
       | undefined;
     private readonly sockets = new Map<string, SocketRecord>();
+    private readonly observationInstance = randomBearer();
+    private observationRevision = 0;
+    private activeContext = false;
     private readonly suppressedCloses = new WeakSet<NativeActorWebSocket>();
     private readonly stoppedInbound = new WeakSet<NativeActorWebSocket>();
     private readonly closingInbound = new WeakSet<NativeActorWebSocket>();
@@ -689,6 +696,68 @@ export function createActorNativeOwner(
         variantKeys[index] = selected.variantKeys[index] as string;
       return { generationKey: selected.generationKey, epoch: selected.epoch, variantKeys };
     }
+    private async observeControl(request: Request): Promise<Response> {
+      if (
+        request.method !== "POST" ||
+        request.url !== "http://actor.invalid/__actor_observe__" ||
+        request.headers.get(OBSERVATION_HEADER) !== "snapshot-v1"
+      )
+        return new Response(null, { status: 404 });
+      try {
+        await this.ready;
+        if (this.poisoned || !this.state.getWebSockets) return new Response(null, { status: 503 });
+        const encodedId = request.headers.get(ID_HEADER);
+        if (!encodedId) return new Response(null, { status: 503 });
+        if (
+          !expectedObservationBearer ||
+          request.headers.get(TOKEN_HEADER) !== (await expectedObservationBearer(encodedId))
+        )
+          return new Response(null, { status: 404 });
+        const actorId = decodeURIComponent(encodedId);
+        if (!actorId || actorId.includes("\u0000")) return new Response(null, { status: 503 });
+        const graph = await this.currentGraph();
+        const alarm = this.readAlarm();
+        if (alarm.actorId !== null && alarm.actorId !== actorId)
+          return new Response(null, { status: 503 });
+        const sockets = this.state.getWebSockets();
+        if (sockets.length > SOCKET_ID_LIMIT) return new Response(null, { status: 503 });
+        const socketIds: string[] = [];
+        for (const socket of sockets) {
+          if (this.suppressedCloses.has(socket)) continue;
+          const metadata = socketMetadata(socket);
+          if (!metadata || metadata.actorId !== actorId) return new Response(null, { status: 503 });
+          if (metadata.reservationBearer === undefined) socketIds.push(metadata.socketId);
+        }
+        socketIds.sort();
+        for (let index = 1; index < socketIds.length; index += 1)
+          if (socketIds[index] === socketIds[index - 1]) return new Response(null, { status: 503 });
+        const again = await this.currentGraph();
+        if (
+          this.poisoned ||
+          again.epoch !== graph.epoch ||
+          again.generationKey !== graph.generationKey
+        )
+          return new Response(null, { status: 503 });
+        return Response.json({
+          actorId,
+          epoch: graph.epoch,
+          generationKey: graph.generationKey,
+          instance: this.observationInstance,
+          revision: this.observationRevision,
+          activeActor: this.activeContext,
+          pendingAlarmCount: Number(alarm.pending !== null) + Number(alarm.obligation),
+          openSocketCount: socketIds.length,
+          socketIds,
+        });
+      } catch {
+        return new Response(null, { status: 503 });
+      }
+    }
+    private contextRetired(): void {
+      if (!this.activeContext) return;
+      this.activeContext = false;
+      this.observationRevision += 1;
+    }
     private async selectedChild(
       actorId: string,
       key: string,
@@ -711,7 +780,11 @@ export function createActorNativeOwner(
           : undefined;
       if (selectedClass === undefined || selectedClass === null)
         throw new Error("Actor variant unavailable");
-      return this.state.facets.get("actor", () => ({ class: selectedClass, id: actorId }));
+      const child = this.state.facets.get("actor", () => ({ class: selectedClass, id: actorId }));
+      if (this.activeContext) throw new Error("Actor context overlap");
+      this.activeContext = true;
+      this.observationRevision += 1;
+      return child;
     }
     private readAlarm(): AlarmState {
       const rows = this.requireStorage().sql.exec(
@@ -785,9 +858,11 @@ export function createActorNativeOwner(
           if (!before.obligation && (before.pending === null || at < before.pending))
             await storage.setAlarm(at);
           storage.sql.exec("UPDATE actor_alarm_state SET pending_at = ? WHERE id = 1", at);
+          this.observationRevision += 1;
           await this.reconcile();
         } else if (action === "clear") {
           storage.sql.exec("UPDATE actor_alarm_state SET pending_at = NULL WHERE id = 1");
+          this.observationRevision += 1;
           await this.reconcile();
         }
         return Response.json({ at: this.readAlarm().pending });
@@ -1272,6 +1347,7 @@ export function createActorNativeOwner(
             state.obligation ? state.pending : null,
             watchdog,
           );
+          this.observationRevision += 1;
           return state.actorId;
         });
         if (claimed === null) return;
@@ -1385,6 +1461,7 @@ export function createActorNativeOwner(
         } else {
           try {
             SafeReflectApply(abortFacet, this.state.facets, ["actor", "actor-alarm-retirement"]);
+            this.contextRetired();
           } catch {
             retirementFailed = true;
           }
@@ -1401,6 +1478,7 @@ export function createActorNativeOwner(
               this.requireStorage().sql.exec(
                 "UPDATE actor_alarm_state SET obligation = 0, retry_at = NULL WHERE id = 1",
               );
+              this.observationRevision += 1;
             } else {
               const retryAt = Date.now() + ALARM_RETRY_MS;
               // An early wake before this write sees the old watchdog and
@@ -1410,6 +1488,7 @@ export function createActorNativeOwner(
                 "UPDATE actor_alarm_state SET retry_at = ? WHERE id = 1",
                 retryAt,
               );
+              this.observationRevision += 1;
             }
             await this.reconcile();
           });
@@ -1751,6 +1830,7 @@ export function createActorNativeOwner(
           } else {
             try {
               SafeReflectApply(abortFacet, this.state.facets, ["actor", "actor-socket-retirement"]);
+              this.contextRetired();
               retired = true;
             } catch (error) {
               this.poisoned = true;
@@ -1768,6 +1848,7 @@ export function createActorNativeOwner(
           else {
             try {
               SafeReflectApply(abortFacet, this.state.facets, ["actor", "actor-socket-retirement"]);
+              this.contextRetired();
               retired = true;
             } catch {
               this.poisoned = true;
@@ -1832,6 +1913,7 @@ export function createActorNativeOwner(
       return this.webSocketClose(socket, 1006, "transport_error", false);
     }
     fetch(request: Request): Promise<Response> {
+      if (request.headers.has(OBSERVATION_HEADER)) return this.observeControl(request);
       if (request.headers.has(ALARM_ACTION_HEADER)) return this.alarmControl(request);
       if (request.headers.has(SOCKET_ACTION_HEADER)) return this.socketControl(request);
       if (request.headers.has(RESERVATION_ACTION_HEADER)) return this.reservationControl(request);
@@ -2039,6 +2121,7 @@ export function createActorNativeOwner(
           } else {
             try {
               SafeReflectApply(abortFacet, this.state.facets, ["actor", "actor-event-retirement"]);
+              this.contextRetired();
             } catch (error) {
               retirementError = error;
               this.poisoned = true;
@@ -2156,6 +2239,7 @@ export function createActorNativeIngress(token: string, alarmSecret?: string) {
       headers.delete(TOKEN_HEADER);
       // Only the separate host-private port can carry a control action.
       if (!control) {
+        headers.delete(OBSERVATION_HEADER);
         headers.delete(ALARM_ACTION_HEADER);
         headers.delete(ALARM_AT_HEADER);
         headers.delete(DELIVERY_HEADER);
@@ -2175,6 +2259,7 @@ export function createActorNativeIngress(token: string, alarmSecret?: string) {
           headers.delete(name);
       } else {
         headers.delete(VARIANT_HEADER);
+        if (headers.get(OBSERVATION_HEADER) === "snapshot-v1") headers.set(TOKEN_HEADER, supplied);
       }
       return env.NAMESPACE.get(env.NAMESPACE.idFromName(id)).fetch(withHeaders(request, headers));
     },
