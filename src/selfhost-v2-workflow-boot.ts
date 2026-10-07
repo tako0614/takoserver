@@ -4,6 +4,7 @@ import type { SelfhostV2WorkflowBootPort } from "./selfhost-v2-worker-compositio
 import { createSelfhostV2WorkflowComposition } from "./takoform-v2/selfhost-v2-workflow-composition.ts";
 import { createV2WorkflowBindingAuthority } from "./takoform-v2/workflow-binding-authority.ts";
 import { createV2WorkflowForwardBoot } from "./takoform-v2/workflow-binding-boot.ts";
+import { createWorkflowDueScheduler } from "./workflow-due-scheduler.ts";
 
 type WorkflowRunOnce = ReturnType<typeof createSelfhostV2WorkflowComposition>["runtime"]["runOne"];
 
@@ -89,11 +90,36 @@ export function createSelfhostV2WorkflowBoot(options: {
         instances: composition.runtime.instances,
         privateSocketDirectory: options.privateSocketDirectory,
       });
+      const due = createWorkflowDueScheduler({
+        sql,
+        clock,
+        runtime: composition.runtime,
+        acceptedV2TargetKey: targetKey,
+      });
       let closed = false;
+      let poll: ReturnType<typeof due.pollDue> | null = null;
+      let closing: Promise<void> | undefined;
       return Object.freeze({
         workflowForm: composition.form,
         bindingAuthority,
         forwardBoot,
+        pollWorkflowDue() {
+          if (closed) return Promise.reject(new Error("v2 Workflow execution is unavailable"));
+          if (poll) return poll;
+          // Register before invoking SQL or runtime ports; close must observe
+          // even a poll that reenters shutdown during its first query.
+          const started = Promise.resolve().then(() => {
+            if (closed) throw new Error("v2 Workflow execution is unavailable");
+            return due.pollDue();
+          });
+          poll = started;
+          void started
+            .finally(() => {
+              if (poll === started) poll = null;
+            })
+            .catch(() => {});
+          return started;
+        },
         async runWorkflowOnce(
           scope: Parameters<WorkflowRunOnce>[0],
           id: Parameters<WorkflowRunOnce>[1],
@@ -104,9 +130,18 @@ export function createSelfhostV2WorkflowBoot(options: {
             id,
           );
         },
-        async close() {
+        close() {
           closed = true;
-          await composition.host.close();
+          if (closing) return closing;
+          const attempt = (async () => {
+            if (poll) await Promise.allSettled([poll]);
+            await composition.host.close();
+          })();
+          closing = attempt.catch((error) => {
+            closing = undefined;
+            throw error;
+          });
+          return closing;
         },
       });
     },

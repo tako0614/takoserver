@@ -78,6 +78,11 @@ type ActorOwnerSource = Parameters<ActorOwnerForward["openIncarnation"]>[0];
 type ActorOwnerIncarnation = ReturnType<ActorOwnerForward["openIncarnation"]>;
 type WorkflowOwnerForward = NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2WorkflowForward"]>;
 type WorkflowRunOnce = ReturnType<typeof createSelfhostV2WorkflowComposition>["runtime"]["runOne"];
+type WorkflowDuePoll = {
+  readonly examined: number;
+  readonly selected: number;
+  readonly outcomes: readonly Awaited<ReturnType<WorkflowRunOnce>>[];
+};
 
 /** Trusted app-layer boot; portable Worker composition only attaches its explicit ports. */
 export interface SelfhostV2ActorBootPort {
@@ -117,6 +122,8 @@ export interface SelfhostV2WorkflowBootPort {
       Parameters<typeof createInternalV2WorkerVersionForm>[0]["v2WorkflowBinding"]
     >;
     readonly forwardBoot: WorkflowOwnerForward;
+    /** Bounded, exact-v2-target due poll; the runtime owns final execution authority. */
+    pollWorkflowDue(): Promise<WorkflowDuePoll>;
     /** One trusted execution call; the runtime retains SQL/native claim authority. */
     readonly runWorkflowOnce: WorkflowRunOnce;
     /** Stop guarded Workflow children and release selected owner leases before owner suspension. */
@@ -267,6 +274,8 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   ownerForWorkerUid(uid: string): Promise<WorkerdWorkerRuntimeOwner>;
   /** Real SQL publication plus restored native Queue export proof, absent without Queue boot. */
   readonly queueCapability?: V2QueueConsumerCapability;
+  /** Host-private one-shot due scan, unavailable before restore or after shutdown. */
+  pollWorkflowDue(): Promise<WorkflowDuePoll>;
   /** Host-private one-shot execution, unavailable before restore or after shutdown. */
   runWorkflowOnce: WorkflowRunOnce;
   /** Close guarded Workflow registrations before stopping selected Worker owners. */
@@ -507,6 +516,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           typeof prepared?.workflowForm?.backend?.execute !== "function" ||
           typeof prepared.bindingAuthority?.resolveTarget !== "function" ||
           typeof prepared.forwardBoot?.openIncarnation !== "function" ||
+          typeof prepared.pollWorkflowDue !== "function" ||
           typeof prepared.runWorkflowOnce !== "function" ||
           typeof prepared.close !== "function"
         )
@@ -1093,6 +1103,11 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       if (!restoration) throw new Error("v2 Worker owners have not restored");
       await restoration;
       return await openOwner(uid);
+    },
+    pollWorkflowDue() {
+      if (!workflow || !restorationComplete || ownerAdmissionFrozen || workflowHostClosing)
+        return Promise.reject(new Error("v2 Workflow execution is unavailable"));
+      return workflow.pollWorkflowDue();
     },
     async runWorkflowOnce(scope, id) {
       if (!workflow || !restorationComplete || ownerAdmissionFrozen || workflowHostClosing)

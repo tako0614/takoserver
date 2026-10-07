@@ -8,6 +8,7 @@ import { createAccounts } from "../src/auth.ts";
 import { bytesDigest } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import type { Sql } from "../src/ports.ts";
 import { createSelfhostV2WorkerComposition } from "../src/selfhost-v2-worker-composition.ts";
 import { createSelfhostV2WorkflowBoot } from "../src/selfhost-v2-workflow-boot.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -20,6 +21,8 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
+import { createWorkflowInstances } from "../src/workflow-instances.ts";
+import { createV2WorkflowResourceAuthority } from "../src/workflow-v2-resource-authority.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 const TARGET = "selfhost-v2-workflow-boot-test";
@@ -63,6 +66,9 @@ test("normal Worker factory mounts Workflow only with the same trusted guarded b
     await expect(withoutBoot.runWorkflowOnce(scope, "instance-one")).rejects.toThrow(
       "v2 Workflow execution is unavailable",
     );
+    await expect(withoutBoot.pollWorkflowDue()).rejects.toThrow(
+      "v2 Workflow execution is unavailable",
+    );
 
     const boot = createSelfhostV2WorkflowBoot({
       sql,
@@ -84,6 +90,9 @@ test("normal Worker factory mounts Workflow only with the same trusted guarded b
     await expect(withBoot.runWorkflowOnce(scope, "instance-one")).rejects.toThrow(
       "v2 Workflow execution is unavailable",
     );
+    await expect(withBoot.pollWorkflowDue()).rejects.toThrow(
+      "v2 Workflow execution is unavailable",
+    );
     await withBoot.restoreOwners();
     const mounted = withBoot.internalFormFactory({ sql, objects, clock });
     expect(mounted[DURABLE_WORKFLOW_FORM_URL]?.backend.id).toBe("selfhost-v2-durable-workflow-v1");
@@ -101,6 +110,9 @@ test("normal Worker factory mounts Workflow only with the same trusted guarded b
       },
     ]);
     await withBoot.closeWorkflowHost();
+    await expect(withBoot.pollWorkflowDue()).rejects.toThrow(
+      "v2 Workflow execution is unavailable",
+    );
     await expect(withBoot.runWorkflowOnce(scope, "instance-one")).rejects.toThrow(
       "v2 Workflow execution is unavailable",
     );
@@ -187,6 +199,86 @@ test("Workflow boot rejects a mismatched graph or native binary before Form regi
   }
 });
 
+test("a reentrant shutdown joins the already-admitted due poll before owner suspension", async () => {
+  const root = await mkdtemp(join(tmpdir(), "selfhost-v2-workflow-poll-close-"));
+  const database = new Database(join(root, "host.sqlite"));
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let entered!: () => void;
+  const queryEntered = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  try {
+    migrateSqlite(database);
+    const baseSql = createSqliteSql(database);
+    let composition!: ReturnType<typeof createSelfhostV2WorkerComposition>;
+    let suspension: Promise<void> | undefined;
+    let triggered = false;
+    const sql: Sql = {
+      ...baseSql,
+      async query(statement, params) {
+        if (!triggered && statement.includes("FROM tf_workflow_instances AS instance")) {
+          triggered = true;
+          suspension = composition.suspendOwnersRetainingCustody();
+          entered();
+          await held;
+        }
+        return await baseSql.query(statement, params);
+      },
+    };
+    const clock = () => new Date();
+    const boot = createSelfhostV2WorkflowBoot({
+      sql,
+      clock,
+      targetKey: TARGET,
+      randomId: () => crypto.randomUUID(),
+      waitUntil: async () => {},
+      guardBinary: process.execPath,
+      workerdBinary: process.execPath,
+      maximumRegistrations: 1,
+      privateSocketDirectory: join(root, "private-sockets"),
+    });
+    composition = createSelfhostV2WorkerComposition({
+      sql,
+      objects: createMemoryObjectStore(),
+      clock,
+      config: {
+        cursorSigningKey: new Uint8Array(32).fill(0x52),
+        documentation: "https://docs.example.test/v2",
+        authenticationDocumentation: "https://docs.example.test/v2/authentication",
+        workerBundle: { targetKey: TARGET, heldArtifacts: [] },
+      },
+      rootDirectory: join(root, "worker-owners"),
+      targetKey: TARGET,
+      workerdBinary: process.execPath,
+      v2Workflow: boot,
+    });
+    await composition.restoreOwners();
+    const first = composition.pollWorkflowDue();
+    expect(composition.pollWorkflowDue()).toBe(first);
+    await queryEntered;
+    let stopped = false;
+    void suspension?.then(() => {
+      stopped = true;
+    });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    await expect(composition.pollWorkflowDue()).rejects.toThrow(
+      "v2 Workflow execution is unavailable",
+    );
+    release();
+    expect(await first).toEqual({ examined: 0, selected: 0, outcomes: [] });
+    await suspension;
+    expect(stopped).toBe(true);
+  } finally {
+    release();
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test.skipIf(artifactBinary === undefined || guardBinary === undefined)(
   "normal org HTTP accepts a Workflow and its sealed WorkerVersion Binding through one boot",
   async () => {
@@ -206,7 +298,12 @@ test.skipIf(artifactBinary === undefined || guardBinary === undefined)(
       const moduleUrl = "https://artifacts.example.test/workflow-boot/index.mjs";
       const manifestUrl = "https://artifacts.example.test/workflow-boot/manifest.json";
       const module = new TextEncoder().encode(`
-export class ExampleWorkflow { async run() { return "ok"; } }
+export class ExampleWorkflow {
+  async run(_event, step) {
+    await step.sleep("pause", 1);
+    return { done: true };
+  }
+}
 export default { fetch() { return new Response("ok"); } };
 `);
       const moduleSha = (await bytesDigest(module)).slice(7);
@@ -355,6 +452,29 @@ export default { fetch() { return new Response("ok"); } };
         worker: { resourceUid: worker.resourceUid },
         className: "ExampleWorkflow",
       });
+      const scope = {
+        tenantId: `org:${organization.id}`,
+        workflowResourceUid: workflow.resourceUid,
+      };
+      const instances = createWorkflowInstances({
+        sql,
+        clock,
+        randomId: () => crypto.randomUUID(),
+        v2ResourceAuthority: createV2WorkflowResourceAuthority(sql),
+      });
+      await instances.create(scope, { id: "due-from-accepted-v2" });
+      expect((await composition.pollWorkflowDue()).outcomes).toEqual([{ kind: "parked" }]);
+      expect(await instances.status(scope, "due-from-accepted-v2")).toMatchObject({
+        status: "sleeping",
+      });
+      await Bun.sleep(1_200);
+      expect((await composition.pollWorkflowDue()).outcomes).toEqual([
+        { kind: "complete", output: { done: true } },
+      ]);
+      expect(await instances.status(scope, "due-from-accepted-v2")).toMatchObject({
+        status: "complete",
+        output: { done: true },
+      });
       const bound = await create(WORKER_VERSION_FORM_URL, "bound-version", {
         ...source,
         workflowBindings: [{ name: "FLOW", resource: { resourceUid: workflow.resourceUid } }],
@@ -382,4 +502,5 @@ export default { fetch() { return new Response("ok"); } };
       await rm(root, { recursive: true, force: true });
     }
   },
+  60_000,
 );

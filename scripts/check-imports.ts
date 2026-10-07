@@ -240,6 +240,7 @@ const LAYERS: readonly Layer[] = [
     may: [
       "core",
       "app",
+      "domain",
       "v2-selfhost-composition",
       "v2-selfhost-workflow-composition",
       "v2-workflow-binding-authority",
