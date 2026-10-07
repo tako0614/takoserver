@@ -493,6 +493,7 @@ export function createSelfhostV2WorkerEndpointFrontend(options: {
     if (
       snapshot.sourceOperationId !== execution.operationId ||
       snapshot.worker.uid !== spec.worker.resourceUid ||
+      snapshot.worker.uid !== input.workerUid ||
       snapshot.worker.principal !== execution.principal ||
       snapshot.worker.space !== execution.space ||
       !address ||

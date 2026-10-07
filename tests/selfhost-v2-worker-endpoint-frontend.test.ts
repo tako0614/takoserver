@@ -469,6 +469,16 @@ describe("self-host v2 Worker Endpoint frontend adapter", () => {
     expect(observation.ready).toBe(false);
   });
 
+  test("does not echo TLS readiness for a mismatched observer Worker UID", async () => {
+    const { frontend } = fixture();
+    const observation = await frontend.observeTls(
+      { endpointUid: ENDPOINT_UID, workerUid: "worker-foreign", ...ADDRESS },
+      execution(),
+    );
+
+    expect(observation.ready).toBe(false);
+  });
+
   test("confirms route absence only for the exact in-flight delete and both native/frontend readbacks", async () => {
     const { frontend } = fixture({ routeDelete: true, routeRows: [] });
     const observation = await frontend.observeRouteAbsent(
@@ -482,6 +492,16 @@ describe("self-host v2 Worker Endpoint frontend adapter", () => {
       ...ADDRESS,
       absent: true,
     });
+  });
+
+  test("does not echo route absence for a mismatched observer Worker UID", async () => {
+    const { frontend } = fixture({ routeDelete: true, routeRows: [] });
+    const observation = await frontend.observeRouteAbsent(
+      { endpointUid: ENDPOINT_UID, workerUid: "worker-foreign", ...ADDRESS },
+      execution("delete"),
+    );
+
+    expect(observation.absent).toBe(false);
   });
 
   test("does not confirm route absence while another current SQL route claims the hostname", async () => {
