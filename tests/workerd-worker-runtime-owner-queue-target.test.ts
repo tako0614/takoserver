@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -24,6 +24,15 @@ const WORKER_UID = "worker-queue-target";
 const CREATE_ID = "0f2e9831-691d-41d8-b5ce-983e052a14c3";
 const UPDATE_ID = "6cb38324-f2ad-4acc-acd8-b314e891dc54";
 const DELETE_ID = "84ed6745-0688-4201-8372-0c26ddcce0f4";
+
+afterAll(async () => {
+  // Flush FileHandle finalizers here, rather than letting a later unrelated
+  // test discover that a fixture swallowed an owner.close() refusal.
+  for (let turn = 0; turn < 3; turn += 1) {
+    Bun.gc(true);
+    await Bun.sleep(0);
+  }
+});
 
 // A real child/listener and exact on-disk publication, but no tenant handler execution.
 const CHILD_SOURCE = `
@@ -68,6 +77,26 @@ async function unusedPort(): Promise<number> {
   const port = Number(server.port);
   await server.stop(true);
   return port;
+}
+
+async function closeFixtureOwner(
+  owner: Awaited<ReturnType<typeof openWorkerdWorkerRuntimeOwner>>,
+  children: readonly WorkerdProcess[],
+  root: string,
+): Promise<void> {
+  try {
+    expect(await owner.execute(execution(DELETE_ID, "delete"))).toMatchObject({
+      kind: "confirmed",
+      identity: null,
+    });
+    expect(await owner.observeRetirement({})).toMatchObject({ kind: "confirmed_absent" });
+    await owner.close();
+  } finally {
+    for (const child of children)
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await Promise.all(children.map((child) => child.exited));
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 function execution(operationId: string, action: V2Execution["action"]): V2Execution {
@@ -352,11 +381,7 @@ test("Queue target observation confirms only the exact live active or draining n
     expect(await owner.observeQueueTarget(newTarget)).toEqual({ kind: "unknown" });
   } finally {
     await heldReader?.cancel().catch(() => undefined);
-    await owner.close().catch(() => undefined);
-    for (const child of children)
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    await Promise.all(children.map((child) => child.exited));
-    await rm(root, { recursive: true, force: true });
+    await closeFixtureOwner(owner, children, root);
   }
 });
 
@@ -422,10 +447,7 @@ test("Queue target observation refuses a live child that lost its listener and a
     expect(await linuxProcessLiveness(identity)).toBe("stale");
     expect(await owner.observeQueueTarget(target)).toEqual({ kind: "unknown" });
   } finally {
-    await owner.close().catch(() => undefined);
-    if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    if (child) await child.exited;
-    await rm(root, { recursive: true, force: true });
+    await closeFixtureOwner(owner, child ? [child] : [], root);
   }
 });
 
@@ -456,6 +478,7 @@ test("a candidate whose first child spawn fails can retry the same accepted Oper
     expect(await owner.execute(execution(CREATE_ID, "create"))).toMatchObject({
       kind: "confirmed",
     });
+    publication.setCurrent(CREATE_ID);
     // The latch is private to the group: assert its source ordering as well as
     // the behavioral retry above, without adding a production test-only port.
     const source = await Bun.file(
@@ -470,9 +493,6 @@ test("a candidate whose first child spawn fails can retry the same accepted Oper
     expect(seal).toBeGreaterThan(0);
     expect(durableActive).toBeGreaterThan(seal);
   } finally {
-    await owner.close().catch(() => undefined);
-    if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    if (child) await child.exited;
-    await rm(root, { recursive: true, force: true });
+    await closeFixtureOwner(owner, child ? [child] : [], root);
   }
 });
