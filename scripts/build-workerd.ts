@@ -105,19 +105,29 @@ async function retainUnqualifiedCandidate(
       nativeQualification: "not-run",
       expectedSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.sha256,
       actualSha256,
-      source: {
-        upstreamCommit: WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamCommit,
-        upstreamArchiveSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamArchiveSha256,
-        reviewedSourcePinSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.reviewedSourceSha256,
+      // These values describe the declared build recipe. They are not a
+      // measured digest of the prepared source tree or entire toolchain.
+      declaredPins: {
+        source: {
+          upstreamCommit: WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamCommit,
+          upstreamArchiveSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamArchiveSha256,
+          reviewedSourceSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.reviewedSourceSha256,
+        },
+        patch: {
+          overlaySha256: WORKERD_CLOSED_GRAPH_ARTIFACT.overlayPatchSha256,
+          v8Sha256: WORKERD_CLOSED_GRAPH_ARTIFACT.v8PatchSha256,
+        },
+        buildTools: {
+          bazeliskSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.bazeliskSha256,
+          bazelSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.bazelSha256,
+          clangVersionPrefix: WORKERD_CLOSED_GRAPH_ARTIFACT.clangVersion,
+        },
       },
-      patch: {
-        overlaySha256: WORKERD_CLOSED_GRAPH_ARTIFACT.overlayPatchSha256,
-        v8Sha256: WORKERD_CLOSED_GRAPH_ARTIFACT.v8PatchSha256,
-      },
-      compiler: {
-        version: input.compilerVersion.split("\n")[0],
-        bazeliskSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.bazeliskSha256,
-        bazelSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.bazelSha256,
+      observed: { clangVersionLine: input.compilerVersion.split("\n")[0] },
+      unmeasured: {
+        preparedSourceTreeSha256: true,
+        compilerBinarySha256: true,
+        linkerAndSystemPackageDigests: true,
       },
       buildPlan: {
         target: WORKERD_TARGET,

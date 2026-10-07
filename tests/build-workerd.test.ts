@@ -34,7 +34,7 @@ test("a mismatched compiled binary is quarantined with build evidence and never 
       verifyBuiltWorkerd({
         built,
         stateRoot: root,
-        compilerVersion: WORKERD_CLOSED_GRAPH_ARTIFACT.clangVersion,
+        compilerVersion: "fixture-observed-clang 9.9.9\nTarget: fixture",
         jobs: 2,
         memoryMB: 8192,
       }),
@@ -55,18 +55,33 @@ test("a mismatched compiled binary is quarantined with build evidence and never 
       acceptedArtifact: false,
       expectedSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.sha256,
       actualSha256: MISMATCH_SHA256,
-      source: {
-        upstreamCommit: WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamCommit,
-        upstreamArchiveSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamArchiveSha256,
+      declaredPins: {
+        source: {
+          upstreamCommit: WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamCommit,
+          upstreamArchiveSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamArchiveSha256,
+          reviewedSourceSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.reviewedSourceSha256,
+        },
+        patch: { overlaySha256: WORKERD_CLOSED_GRAPH_ARTIFACT.overlayPatchSha256 },
+        buildTools: {
+          bazeliskSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.bazeliskSha256,
+          bazelSha256: WORKERD_CLOSED_GRAPH_ARTIFACT.bazelSha256,
+          clangVersionPrefix: WORKERD_CLOSED_GRAPH_ARTIFACT.clangVersion,
+        },
       },
-      patch: { overlaySha256: WORKERD_CLOSED_GRAPH_ARTIFACT.overlayPatchSha256 },
-      compiler: { version: WORKERD_CLOSED_GRAPH_ARTIFACT.clangVersion },
+      observed: { clangVersionLine: "fixture-observed-clang 9.9.9" },
+      unmeasured: {
+        preparedSourceTreeSha256: true,
+        compilerBinarySha256: true,
+        linkerAndSystemPackageDigests: true,
+      },
       buildPlan: {
         target: "//src/workerd/server:workerd",
         stateRoot: root,
         resources: { jobs: 2, memoryMB: 8192 },
       },
     });
+    expect(report).not.toHaveProperty("source");
+    expect(report).not.toHaveProperty("compiler");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
