@@ -78,20 +78,9 @@ function createVersionReceipt(database: Database, suffix: string): void {
 
 test("0068 is the exact source-only successor while the qualified 0001-0066 ceiling remains fixed", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
-  expect(source.names).toHaveLength(79);
-  expect(source.names.slice(-12)).toEqual([
+  expect(source.names.slice(67, 69)).toEqual([
     MIGRATION_NAME,
     "0069_cloudflare_provider_invocation_delete_ack.sql",
-    "0070_takoform_v2.sql",
-    "0071_v2_sqlite_migration_set_custody.sql",
-    "0072_v2_artifact_custody.sql",
-    "0073_v2_reference_acceptance.sql",
-    "0074_v2_worker_native_effects.sql",
-    "0075_v2_artifact_progress.sql",
-    "0076_v2_worker_invocation_custody.sql",
-    "0077_v2_operation_acceptance_order.sql",
-    "0078_v2_worker_invocation_retirement.sql",
-    "0079_v2_worker_native_deletions.sql",
   ]);
   const qualified = projectApplyQualifiedMigrationArtifact(source);
   expect(qualified.names).toHaveLength(66);
@@ -104,9 +93,12 @@ test("0068 is the exact source-only successor while the qualified 0001-0066 ceil
     for (const file of source.files) copyFileSync(file.path, join(migrations, file.name));
     const tail = source.files.at(-1);
     if (!tail) throw new Error("audited source is missing its terminal migration");
-    copyFileSync(tail.path, join(migrations, "0080_unreviewed.sql"));
+    copyFileSync(
+      tail.path,
+      join(migrations, `${String(source.names.length + 1).padStart(4, "0")}_unreviewed.sql`),
+    );
     expect(() => readCurrentAuditedMigrationSourceArtifact(migrations)).toThrow(
-      "audited migration lineage must contain exactly 0001-0079",
+      "audited migration lineage must contain exactly",
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

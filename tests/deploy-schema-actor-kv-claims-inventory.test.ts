@@ -9,7 +9,7 @@ import {
 } from "../scripts/deploy/schema.ts";
 
 const MIGRATION = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
-const CURRENT_SOURCE_TAIL = "0079_v2_worker_native_deletions.sql";
+const CURRENT_SOURCE_TAIL = "0080_v2_worker_cron_trigger_matches.sql";
 const ROOT = mkdtempSync(
   join(process.env.TMPDIR ?? "/tmp", "takoserver-actor-kv-schema-inventory-"),
 );
@@ -18,10 +18,10 @@ afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 test("the current source closure projects to an explicit 0066 apply artifact", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
   const artifact = projectApplyQualifiedMigrationArtifact(source);
-  expect(source.names).toHaveLength(79);
+  expect(source.names.at(-2)).toBe("0079_v2_worker_native_deletions.sql");
   expect(source.names.at(-1)).toBe(CURRENT_SOURCE_TAIL);
-  expect(source.files.at(-1)).toMatchObject({
-    name: CURRENT_SOURCE_TAIL,
+  expect(source.files.at(-2)).toMatchObject({
+    name: "0079_v2_worker_native_deletions.sql",
     digest: "sha256:f8b4fdd60608f4c71a28c2d888c85457104905dffb48826f9a8ddccede0199c4",
   });
   expect(artifact.names).toHaveLength(66);
@@ -65,12 +65,12 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
     cpSync(resolve(import.meta.dir, "../migrations"), directory, { recursive: true });
     if (drift === "missing") rmSync(join(directory, CURRENT_SOURCE_TAIL));
     else
-      writeFileSync(join(directory, "0080_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+      writeFileSync(join(directory, "0081_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     expect(() => readCurrentAuditedMigrationSourceArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0079",
+      "audited migration lineage must contain exactly 0001-0080",
     );
     expect(() => readAuditedMigrationArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0079",
+      "audited migration lineage must contain exactly 0001-0080",
     );
   }
 });

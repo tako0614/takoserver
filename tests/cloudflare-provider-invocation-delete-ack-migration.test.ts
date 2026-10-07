@@ -273,21 +273,7 @@ function seedLegacyInvocation(
 
 test("0069 is source inventory only and leaves the 0066 apply ceiling unchanged", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
-  expect(source.names).toHaveLength(79);
-  expect(source.names.slice(-12)).toEqual([
-    PREDECESSOR,
-    MIGRATION_NAME,
-    "0070_takoform_v2.sql",
-    "0071_v2_sqlite_migration_set_custody.sql",
-    "0072_v2_artifact_custody.sql",
-    "0073_v2_reference_acceptance.sql",
-    "0074_v2_worker_native_effects.sql",
-    "0075_v2_artifact_progress.sql",
-    "0076_v2_worker_invocation_custody.sql",
-    "0077_v2_operation_acceptance_order.sql",
-    "0078_v2_worker_invocation_retirement.sql",
-    "0079_v2_worker_native_deletions.sql",
-  ]);
+  expect(source.names.slice(67, 70)).toEqual([PREDECESSOR, MIGRATION_NAME, "0070_takoform_v2.sql"]);
   const qualified = projectApplyQualifiedMigrationArtifact(source);
   expect(qualified.names).toHaveLength(66);
   expect(qualified.names.at(-1)).toBe("0066_cloudflare_managed_actor_kv_capability_claims.sql");
@@ -299,9 +285,12 @@ test("0069 is source inventory only and leaves the 0066 apply ceiling unchanged"
     for (const file of source.files) copyFileSync(file.path, join(migrations, file.name));
     const tail = source.files.at(-1);
     if (!tail) throw new Error("audited source is missing its terminal migration");
-    copyFileSync(tail.path, join(migrations, "0080_unreviewed.sql"));
+    copyFileSync(
+      tail.path,
+      join(migrations, `${String(source.names.length + 1).padStart(4, "0")}_unreviewed.sql`),
+    );
     expect(() => readCurrentAuditedMigrationSourceArtifact(migrations)).toThrow(
-      "audited migration lineage must contain exactly 0001-0079",
+      "audited migration lineage must contain exactly",
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
