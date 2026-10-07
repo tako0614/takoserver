@@ -175,6 +175,11 @@ describe("published API description", () => {
       { method: "put", pattern: "/resources/{uid}", operation: "takoformUpdateResource" },
       { method: "delete", pattern: "/resources/{uid}", operation: "takoformDeleteResource" },
       { method: "get", pattern: "/operations/{operationId}", operation: "takoformReadOperation" },
+      {
+        method: "put",
+        pattern: "/operations/{operationId}/private-inputs",
+        operation: "takoformReplenishPrivateInputs",
+      },
     ]);
     expect(openApiPaths()).toContain("/apis/forms.takoform.com/v2/resources");
     expect(openApiPaths()).toContain("/apis/forms.takoform.com/v2/resources/{uid}");

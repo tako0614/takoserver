@@ -23,6 +23,7 @@ function fixture(options?: {
       "0070_takoform_v2.sql",
       "0071_v2_sqlite_migration_set_custody.sql",
       "0073_v2_reference_acceptance.sql",
+      "0081_v2_private_inputs.sql",
     ]) {
       db.exec(readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8"));
     }

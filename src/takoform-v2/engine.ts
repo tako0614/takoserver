@@ -92,6 +92,15 @@ function canonicalRequest(value: unknown): string {
   return encoded;
 }
 
+/** Keep authorization, replay comparison and persistence on one owned request. */
+function snapshotRequest<T>(request: T): T {
+  try {
+    return structuredClone(request);
+  } catch {
+    fail("invalid_request", 400);
+  }
+}
+
 function snapshotPrivateInputs(
   inputs: V2PrivateInputMap | undefined,
 ): V2PrivateInputMap | undefined {
@@ -330,11 +339,12 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       return privateInputsCapability && boundForm(target).privateInputs !== undefined;
     },
     /** Known-key lookup precedes all fresh-request capability and shape checks. */
-    async replayExistingCreate(input: {
+    async replayExistingCreate(request: {
       principal: string;
       key: string;
       body: Readonly<Record<string, unknown>>;
     }): Promise<V2Operation | null> {
+      const input = snapshotRequest(request);
       const body = input.body;
       return replay(
         input.principal,
@@ -350,13 +360,14 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           : undefined,
       );
     },
-    async replayExistingUpdate(input: {
+    async replayExistingUpdate(request: {
       principal: string;
       key: string;
       uid: string;
       expectedGeneration: number;
       body: Readonly<Record<string, unknown>>;
     }): Promise<V2Operation | null> {
+      const input = snapshotRequest(request);
       const body = input.body;
       return replay(
         input.principal,
@@ -373,11 +384,12 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           : undefined,
       );
     },
-    async acceptCreate(input: {
+    async acceptCreate(request: {
       principal: string;
       key: string;
       input: V2CreateInput;
     }): Promise<V2Operation> {
+      const input = snapshotRequest(request);
       const { principal, key } = input;
       if (!tokenPattern.test(key)) fail("invalid_request", 400);
       const desired = input.input;
@@ -482,7 +494,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       }
       return operation(await storedOperation(record.id));
     },
-    async acceptUpdate(input: {
+    async acceptUpdate(request: {
       principal: string;
       key: string;
       uid: string;
@@ -490,6 +502,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       spec: JsonObject;
       privateInputs?: V2PrivateInputMap;
     }): Promise<V2Operation> {
+      const input = snapshotRequest(request);
       if (!tokenPattern.test(input.key) || !validName(input.uid)) fail("invalid_request", 400);
       const privateInputs = snapshotPrivateInputs(input.privateInputs);
       const target = await ownedResource(input.principal, input.uid, "write");
@@ -584,12 +597,13 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       if (latest.busy_operation) fail("resource_busy", 409);
       fail("generation_conflict", 409);
     },
-    async acceptDelete(input: {
+    async acceptDelete(request: {
       principal: string;
       key: string;
       uid: string;
       expectedGeneration: number;
     }): Promise<V2Operation> {
+      const input = snapshotRequest(request);
       if (!tokenPattern.test(input.key) || !validName(input.uid)) fail("invalid_request", 400);
       const target = await ownedResource(input.principal, input.uid, "write");
       const fingerprint = canonicalRequest({
