@@ -132,6 +132,10 @@ async function verifyV2WorkerCodeProjection(
   ) {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
+  // The service target digest is asynchronous. Hold the accepted bytes before
+  // that await so the caller cannot replace a Bundle during validation.
+  if (!input.bundle) throw bundleUnavailable();
+  const bundle = snapshotBundle(input.bundle);
   if (
     !(await exactV2ResolvedServiceBindings(spec.serviceBindings, input.resolvedServiceBindings))
   ) {
@@ -151,9 +155,6 @@ async function verifyV2WorkerCodeProjection(
   if (!spec.assets && input.assets) {
     throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
   }
-  if (!input.bundle) throw bundleUnavailable();
-
-  const bundle = snapshotBundle(input.bundle);
   const manifest = await verifyBundle(bundle);
   let assets: V2VerifiedAssetMaterials | undefined;
   if (spec.assets) {

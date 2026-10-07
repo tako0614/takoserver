@@ -116,6 +116,14 @@ test("a declared service Binding needs exact resolved UID proof before code proj
   if (!first) throw new Error("missing expected service binding");
   const projection = await projectV2WorkerCodeVersion({ ...input, resolvedServiceBindings });
   expect(projection.site.serviceBindings).toEqual(resolvedServiceBindings);
+  const mutableBundle = await heldBundle();
+  const projectedBeforeMutation = projectV2WorkerCodeVersion({
+    ...input,
+    bundle: mutableBundle,
+    resolvedServiceBindings,
+  });
+  mutableBundle.files[0]?.fill(0x20);
+  expect((await projectedBeforeMutation).modules.get("index.js")).toEqual(file);
   await expect(
     projectV2WorkerCodeVersion({
       ...input,
