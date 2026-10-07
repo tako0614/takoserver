@@ -330,15 +330,31 @@ export function createSelfhostV2SQLiteStore(options: {
   function publishStage(input: SQLiteNativeExecution): Presence {
     const source = stageDir(input.operationId);
     const destination = resourceDir(input.resourceUid);
-    if (!completeDirectory(source, input.resourceUid)) return "unknown";
+    if (
+      !completeDirectory(source, input.resourceUid) ||
+      ownerAt(source)?.createOperationId !== input.operationId
+    ) {
+      return "unknown";
+    }
     if (!directoryExists(destination)) {
       mkdirSync(destination, { mode: 0o700 });
       syncDir(resources);
     }
     if (!privateDirectory(destination)) return "unknown";
+    if (readdirSync(destination).some((name) => name !== OWNER_FILE && name !== DATABASE_FILE)) {
+      return "unknown";
+    }
     const existing = ownerAt(destination);
     if (existing && JSON.stringify(existing) !== JSON.stringify(ownerAt(source))) return "unknown";
-    if (!existing && existsSync(join(destination, OWNER_FILE))) return "unknown";
+    for (const name of [OWNER_FILE, DATABASE_FILE]) {
+      const candidate = join(destination, name);
+      if (
+        entryExists(candidate) &&
+        (!regular(candidate) || !sameFile(join(source, name), candidate))
+      ) {
+        return "unknown";
+      }
+    }
     for (const name of [OWNER_FILE, DATABASE_FILE]) {
       const dest = join(destination, name);
       if (!existsSync(dest)) {
@@ -355,11 +371,32 @@ export function createSelfhostV2SQLiteStore(options: {
 
   function cleanupStage(input: SQLiteNativeExecution): void {
     const source = stageDir(input.operationId);
-    if (!directoryExists(source)) return;
-    if (!completeDirectory(source, input.resourceUid)) return;
+    if (!privateDirectory(source)) return;
     const final = resourceDir(input.resourceUid);
     if (!completeDirectory(final, input.resourceUid)) return;
-    if (!sameFile(join(source, DATABASE_FILE), join(final, DATABASE_FILE))) return;
+    const entries = readdirSync(source);
+    if (entries.length === 0) {
+      rmdirSync(source);
+      syncDir(staging);
+      return;
+    }
+    if (
+      entries.length === 1 &&
+      entries[0] === OWNER_FILE &&
+      sameFile(join(source, OWNER_FILE), join(final, OWNER_FILE))
+    ) {
+      unlinkSync(join(source, OWNER_FILE));
+      rmdirSync(source);
+      syncDir(staging);
+      return;
+    }
+    if (
+      !completeDirectory(source, input.resourceUid) ||
+      !sameFile(join(source, OWNER_FILE), join(final, OWNER_FILE)) ||
+      !sameFile(join(source, DATABASE_FILE), join(final, DATABASE_FILE))
+    ) {
+      return;
+    }
     for (const name of [DATABASE_FILE, OWNER_FILE]) {
       const path = join(source, name);
       if (existsSync(path)) unlinkSync(path);
@@ -377,10 +414,26 @@ export function createSelfhostV2SQLiteStore(options: {
       if (current === "present") {
         const owner = ownerAt(resourceDir(input.resourceUid));
         if (owner?.createOperationId !== input.operationId) return "unknown";
+        const stage = stageDir(input.operationId);
+        if (
+          completeDirectory(stage, input.resourceUid) &&
+          (!sameFile(join(stage, OWNER_FILE), join(resourceDir(input.resourceUid), OWNER_FILE)) ||
+            !sameFile(
+              join(stage, DATABASE_FILE),
+              join(resourceDir(input.resourceUid), DATABASE_FILE),
+            ))
+        ) {
+          return "unknown";
+        }
         cleanupStage(input);
         return "present";
       }
-      if (current === "unknown") return "unknown";
+      if (current === "unknown") {
+        // Only the exact stage hard links can complete a crash-interrupted
+        // publication. A foreign file or extra directory entry stays unknown.
+        if (!(await ownsClaim(input))) return "unknown";
+        return publishStage(input);
+      }
       createStage(input);
       if (!(await ownsClaim(input))) return "unknown";
       return publishStage(input);
@@ -412,6 +465,8 @@ export function createSelfhostV2SQLiteStore(options: {
       if (!(await ownsClaim(input))) return "unknown";
       const destination = resourceDir(input.resourceUid);
       const tombstone = deletedDir(input.resourceUid, input.operationId);
+      const parent = join(deleted, checkedId(input.resourceUid));
+      if (entryExists(parent) && !privateDirectory(parent)) return "unknown";
       const current = presence(input.resourceUid);
       const heldComplete = completeDirectory(tombstone, input.resourceUid);
       if (
@@ -421,12 +476,27 @@ export function createSelfhostV2SQLiteStore(options: {
       ) {
         return "unknown";
       }
-      if (current === "unknown" && !heldComplete) return "unknown";
       if (current === "absent" && !entryExists(tombstone)) return "absent";
       if (entryExists(tombstone) && !directoryExists(tombstone)) return "unknown";
       if (directoryExists(tombstone) && !privateDirectory(tombstone)) return "unknown";
+      if (current === "absent" && privateDirectory(tombstone) && !heldComplete) {
+        const entries = readdirSync(tombstone);
+        if (
+          entries.length === 0 ||
+          (entries.length === 1 &&
+            entries[0] === OWNER_FILE &&
+            (await matchesAcceptedCreate(input.resourceUid, ownerAt(tombstone))))
+        ) {
+          if (entries.length === 1) unlinkSync(join(tombstone, OWNER_FILE));
+          rmdirSync(tombstone);
+          if (readdirSync(parent).length === 0) rmdirSync(parent);
+          syncDir(deleted);
+          return "absent";
+        }
+        return "unknown";
+      }
+      if (current === "unknown" && !heldComplete) return "unknown";
       if (!directoryExists(tombstone)) {
-        const parent = join(deleted, checkedId(input.resourceUid));
         if (!directoryExists(parent)) {
           mkdirSync(parent, { mode: 0o700 });
           syncDir(deleted);
@@ -483,7 +553,6 @@ export function createSelfhostV2SQLiteStore(options: {
       }
       if (readdirSync(tombstone).length !== 0) return "unknown";
       rmdirSync(tombstone);
-      const parent = join(deleted, checkedId(input.resourceUid));
       if (readdirSync(parent).length === 0) rmdirSync(parent);
       syncDir(deleted);
       return "absent";

@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -435,5 +436,96 @@ test("sidecar create receipt must match the accepted core create Operation", asy
   } finally {
     database.close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("crash during publish or stage cleanup resumes only original hard links", async () => {
+  for (const partial of ["empty", "owner-only", "cleanup-owner-only"] as const) {
+    const root = mkdtempSync(join(tmpdir(), "v2-sqlite-db-publish-"));
+    const database = control(root, true);
+    let clockMs = Date.parse("2026-10-07T00:00:00Z");
+    const clock = () => new Date(clockMs);
+    try {
+      const base = host(root, database, clock);
+      let once = true;
+      const form = createSQLiteDatabaseForm({
+        store: {
+          ...base.store,
+          async ensureCreated(input) {
+            const result = await base.store.ensureCreated(input);
+            if (!once) return result;
+            once = false;
+            const final = join(root, "native", "resources", input.resourceUid);
+            const stage = join(root, "native", "staging", input.operationId);
+            mkdirSync(stage, { mode: 0o700 });
+            for (const name of partial === "cleanup-owner-only"
+              ? ["owner.json"]
+              : ["owner.json", "database.sqlite"]) {
+              linkSync(join(final, name), join(stage, name));
+            }
+            if (partial !== "cleanup-owner-only") {
+              unlinkSync(join(final, "database.sqlite"));
+              if (partial === "empty") unlinkSync(join(final, "owner.json"));
+            }
+            throw new Error("process stopped during native publication");
+          },
+        },
+      });
+      const engine = createTakoformV2Engine({
+        sql: createSqliteSql(database),
+        now: clock,
+        leaseMilliseconds: 1_000,
+        replayWindowSeconds: 120,
+        async authorize(principal, space) {
+          return principal === "alice" && space === "default";
+        },
+        forms: { [SQLITE_DATABASE_FORM_URL]: form },
+      });
+      const accepted = await created(engine, `db-${partial}`, `sqlite-publish-${partial}-key-01`);
+      expect((await engine.runNext())?.status).toBe("reconciling");
+      clockMs += 1_001;
+      expect((await base.engine.runNext())?.status).toBe("succeeded");
+      expect(
+        existsSync(join(root, "native", "resources", accepted.resourceUid, "database.sqlite")),
+      ).toBe(true);
+      expect(existsSync(join(root, "native", "staging", accepted.id))).toBe(false);
+    } finally {
+      database.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("crash during tombstone teardown resumes from owner-only or empty tombstone", async () => {
+  for (const partial of ["owner-only", "empty"] as const) {
+    const root = mkdtempSync(join(tmpdir(), "v2-sqlite-db-tomb-teardown-"));
+    const database = control(root, true);
+    const clock = () => new Date("2026-10-07T00:00:00Z");
+    try {
+      const { engine } = host(root, database, clock);
+      const accepted = await created(engine, `db-${partial}`, `sqlite-tomb-${partial}-create-01`);
+      expect((await engine.runNext())?.status).toBe("succeeded");
+      const deletion = await engine.acceptDelete({
+        principal: "alice",
+        key: `sqlite-tomb-${partial}-delete-01`,
+        uid: accepted.resourceUid,
+        expectedGeneration: 1,
+      });
+      const live = join(root, "native", "resources", accepted.resourceUid);
+      const tomb = join(root, "native", "deleted", accepted.resourceUid, deletion.id);
+      mkdirSync(tomb, { recursive: true, mode: 0o700 });
+      for (const name of ["owner.json", "database.sqlite"]) {
+        linkSync(join(live, name), join(tomb, name));
+        unlinkSync(join(live, name));
+      }
+      rmdirSync(live);
+      unlinkSync(join(tomb, "database.sqlite"));
+      if (partial === "empty") unlinkSync(join(tomb, "owner.json"));
+      expect((await engine.runNext())?.status).toBe("succeeded");
+      expect(existsSync(tomb)).toBe(false);
+    } finally {
+      database.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
