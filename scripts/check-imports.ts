@@ -138,7 +138,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "v2-runtime",
     match:
-      /^src\/takoform-v2\/(?:module-worker-lifecycle-backend|worker-bundle-runtime|worker-code-runtime|worker-cron-trigger-backend|worker-cron-trigger-scheduler|worker-deployment-backend|worker-endpoint-backend|worker-lifecycle-backend|worker-runtime-readers|worker-publication-state|worker-publication-sql-guard|worker-static-runtime|worker-static-publication|worker-native-effects|worker-native-deletions)\.ts$|^src\/workerd-worker-runtime-owner\.ts$/u,
+      /^src\/takoform-v2\/(?:edge-kv-native-custody|module-worker-lifecycle-backend|worker-bundle-runtime|worker-code-runtime|worker-cron-trigger-backend|worker-cron-trigger-scheduler|worker-deployment-backend|worker-endpoint-backend|worker-lifecycle-backend|worker-runtime-readers|worker-publication-state|worker-publication-sql-guard|worker-static-runtime|worker-static-publication|worker-native-effects|worker-native-deletions)\.ts$|^src\/workerd-worker-runtime-owner\.ts$/u,
     may: [
       "core",
       "v2-contract",
@@ -148,6 +148,7 @@ const LAYERS: readonly Layer[] = [
       "v2-runtime",
       "v2-workflow-binding-authority",
       "v2-workflow-binding-projection",
+      "v2-service-binding-broker",
       "adapter",
     ],
   },
@@ -156,6 +157,12 @@ const LAYERS: readonly Layer[] = [
     name: "v2-service-binding-authority",
     match: /^src\/takoform-v2\/service-binding-authority\.ts$/u,
     may: ["core", "v2-form"],
+  },
+  {
+    // Host-private streaming bridge for one exact v2 ServiceBinding claim.
+    name: "v2-service-binding-broker",
+    match: /^src\/selfhost-v2-service-binding-broker\.ts$/u,
+    may: ["core", "v2-service-binding-authority"],
   },
   {
     // Accepted Core Workflow/Version graph, never legacy Workflow Resource lookup.
@@ -248,6 +255,21 @@ const LAYERS: readonly Layer[] = [
     ],
   },
   {
+    // The normal entry selects the existing v2 Actor and Workflow boots here;
+    // no pure Form/runtime layer gains a composition-root dependency.
+    name: "v2-selfhost-runtime-boot",
+    match: /^src\/selfhost-v2-runtime-boot\.ts$/u,
+    may: [
+      "core",
+      "app",
+      "v2-selfhost-actor-boot",
+      "v2-selfhost-workflow-boot",
+      "v2-actor-graph-authority",
+      "v2-selfhost-composition",
+      "v2-runtime",
+    ],
+  },
+  {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state"],
@@ -292,12 +314,25 @@ const LAYERS: readonly Layer[] = [
     may: [],
   },
   {
-    name: "app",
+    name: "v2-selfhost-endpoint-https",
     // This exact HTTPS listener adapts the v2 Endpoint observation contract
     // to a local TLS socket; it is not a general app permission to import the
     // v2 runtime layer.
     match: /^src\/selfhost-v2-worker-endpoint-https\.ts$/u,
     may: ["core", "adapter", "v2-runtime"],
+  },
+  {
+    // The exact outer boot joins the existing TLS witness and SQL/native
+    // frontend; it does not broaden generic Form/runtime import authority.
+    name: "v2-selfhost-endpoint-boot",
+    match: /^src\/selfhost-v2-worker-endpoint-boot\.ts$/u,
+    may: [
+      "core",
+      "v2-contract",
+      "v2-runtime",
+      "v2-selfhost-endpoint-frontend",
+      "v2-selfhost-endpoint-https",
+    ],
   },
   {
     name: "app",
@@ -319,6 +354,7 @@ const LAYERS: readonly Layer[] = [
       "v2-selfhost-queue-worker-capability",
       "v2-queue-manager",
       "v2-selfhost-workflow-composition",
+      "v2-service-binding-authority",
     ],
   },
   {
@@ -430,6 +466,8 @@ const LAYERS: readonly Layer[] = [
       "v2-selfhost-queue-composition",
       "v2-selfhost-queue-scheduler",
       "v2-selfhost-configured-input-sealer",
+      "v2-selfhost-runtime-boot",
+      "v2-selfhost-endpoint-boot",
     ],
   },
   // The published package surface re-exports the product for an embedder. It

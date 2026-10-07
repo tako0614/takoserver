@@ -12,6 +12,30 @@ export {
   type V2ConfiguredPrivateInputs,
 } from "./configured-private-inputs.ts";
 export {
+  createV2EdgeKvNativeCustody,
+  type V2EdgeKvConfirmedIdentity,
+  type V2EdgeKvCreateInspection,
+  type V2EdgeKvCreateIntent,
+  type V2EdgeKvDeleteGrant,
+  type V2EdgeKvDeleteInspection,
+  type V2EdgeKvSettledTarget,
+  type V2EdgeKvSettledTargetInput,
+} from "./edge-kv-native-custody.ts";
+export {
+  EDGE_KV_NAMESPACE_FORM_URL,
+  EDGE_KV_NAMESPACE_LIMITS,
+  EdgeKVNamespaceValidationError,
+  parseEdgeKVNamespaceSpec,
+  validateEdgeKVNamespaceUpdate,
+} from "./forms/edge-kv-namespace.ts";
+export {
+  createEdgeKVNamespaceForm,
+  EDGE_KV_NAMESPACE_BACKEND_ID,
+  type EdgeKVNamespaceFormOptions,
+  type EdgeKVNamespaceIdentity,
+  type EdgeKVNamespaceStore,
+} from "./forms/edge-kv-namespace-backend.ts";
+export {
   referencesForModuleWorker,
   referencesForWorkerDeployment,
   referencesForWorkerEndpoint,

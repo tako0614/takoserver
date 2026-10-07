@@ -42,6 +42,7 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "./takoform-v2/forms/worker-specs.ts";
 import type { createSelfhostV2WorkflowComposition } from "./takoform-v2/selfhost-v2-workflow-composition.ts";
+import { createV2ServiceBindingAuthority } from "./takoform-v2/service-binding-authority.ts";
 import { createWorkerCronTriggerAdmissionReader } from "./takoform-v2/worker-cron-trigger-backend.ts";
 import { createWorkerDeploymentForm } from "./takoform-v2/worker-deployment-backend.ts";
 import { createWorkerEndpointForm } from "./takoform-v2/worker-endpoint-backend.ts";
@@ -272,6 +273,11 @@ async function unusedPrivatePort(excluded: Set<number>): Promise<number> {
 export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompositionOptions): {
   restoreOwners(): Promise<readonly string[]>;
   ownerForWorkerUid(uid: string): Promise<WorkerdWorkerRuntimeOwner>;
+  /** Read-only Endpoint routing view; does not register WorkerEndpoint in the normal Host. */
+  readonly endpointPublicationState: Pick<
+    ReturnType<typeof createV2WorkerPublicationState>,
+    "resolve" | "resolveCurrentServing"
+  >;
   /** Real SQL publication plus restored native Queue export proof, absent without Queue boot. */
   readonly queueCapability?: V2QueueConsumerCapability;
   /** Host-private one-shot due scan, unavailable before restore or after shutdown. */
@@ -534,6 +540,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   const queueProducerAuthority = v2QueueProducerBinding
     ? createQueueWorkerBindingAuthority({ sql, targetKey })
     : undefined;
+  const serviceBindingAuthority = createV2ServiceBindingAuthority({ sql, targetKey });
   const sqliteBroker =
     sqliteBinding && sqliteAuthority
       ? createSelfhostV2SqliteBindingBroker({
@@ -656,6 +663,84 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   let restorationComplete = false;
   let ownerAdmissionFrozen = false;
   let suspension: Promise<void> | undefined;
+  const endpointPublicationUnavailable = () => ({
+    kind: "unresolved" as const,
+    code: "graph_unresolved" as const,
+    message: "v2 Worker publication reader is unavailable before restore or during shutdown",
+  });
+  const endpointPublicationAvailable = () => restorationComplete && !ownerAdmissionFrozen;
+  const endpointPublicationState: ReturnType<
+    typeof createSelfhostV2WorkerComposition
+  >["endpointPublicationState"] = Object.freeze({
+    async resolve(input) {
+      if (!endpointPublicationAvailable()) return endpointPublicationUnavailable();
+      const resolution = await publicationState.resolve(input);
+      if (!endpointPublicationAvailable()) return endpointPublicationUnavailable();
+      if (resolution.kind !== "ready") return resolution;
+      return Object.freeze({
+        ...resolution,
+        async stillCurrent() {
+          if (!endpointPublicationAvailable()) return false;
+          try {
+            return (await resolution.stillCurrent()) && endpointPublicationAvailable();
+          } catch {
+            return false;
+          }
+        },
+        async readVersionMaterials(versionUid: string) {
+          if (!endpointPublicationAvailable()) {
+            throw new Error("v2 Worker publication reader is unavailable");
+          }
+          const materials = await resolution.readVersionMaterials(versionUid);
+          if (!endpointPublicationAvailable()) {
+            throw new Error("v2 Worker publication reader is unavailable");
+          }
+          return materials;
+        },
+        ...(resolution.openVersionMaterialsUnverified
+          ? {
+              async openVersionMaterialsUnverified(versionUid: string) {
+                if (!endpointPublicationAvailable()) {
+                  throw new Error("v2 Worker publication reader is unavailable");
+                }
+                const materials = await resolution.openVersionMaterialsUnverified?.(versionUid);
+                if (!endpointPublicationAvailable() || !materials) {
+                  throw new Error("v2 Worker publication reader is unavailable");
+                }
+                return materials;
+              },
+            }
+          : {}),
+      });
+    },
+    async resolveCurrentServing(input) {
+      if (!endpointPublicationAvailable()) return endpointPublicationUnavailable();
+      const resolution = await publicationState.resolveCurrentServing(input);
+      if (!endpointPublicationAvailable()) return endpointPublicationUnavailable();
+      if (resolution.kind !== "ready") return resolution;
+      return Object.freeze({
+        ...resolution,
+        async stillCurrent() {
+          if (!endpointPublicationAvailable()) return false;
+          try {
+            return (await resolution.stillCurrent()) && endpointPublicationAvailable();
+          } catch {
+            return false;
+          }
+        },
+        async readVersionMaterials(versionUid: string) {
+          if (!endpointPublicationAvailable()) {
+            throw new Error("v2 Worker publication reader is unavailable");
+          }
+          const materials = await resolution.readVersionMaterials(versionUid);
+          if (!endpointPublicationAvailable()) {
+            throw new Error("v2 Worker publication reader is unavailable");
+          }
+          return materials;
+        },
+      });
+    },
+  });
 
   async function sqliteGrantGraphStillCurrent(grant: V2SqliteBindingGrant): Promise<boolean> {
     try {
@@ -800,6 +885,21 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
         ...(kvBoot ? { v2KvBinding: kvBoot } : {}),
         ...(queueProducerBoot ? { v2QueueProducerBinding: queueProducerBoot } : {}),
+        v2ServiceBinding: {
+          authority: serviceBindingAuthority,
+          ownerForResourceUid: async (resourceUid) => {
+            if (!restorationComplete) return null;
+            try {
+              const targetOwner = await openOwner(resourceUid);
+              return {
+                workerResourceUid: targetOwner.workerResourceUid,
+                dispatchServiceBinding: targetOwner.dispatchServiceBinding.bind(targetOwner),
+              };
+            } catch {
+              return null;
+            }
+          },
+        },
         ...(actor && row.deleted_at === null
           ? {
               v2ActorForward: {
@@ -1095,6 +1195,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
 
   return {
     ...(queueCapability ? { queueCapability } : {}),
+    endpointPublicationState,
     restoreOwners() {
       restoration ??= restore();
       return restoration;

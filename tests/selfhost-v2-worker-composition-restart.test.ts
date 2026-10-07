@@ -17,6 +17,7 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { type LinuxProcessIdentity, linuxProcessLiveness } from "../src/workerd-linux-process.ts";
+import type { WorkerdPublicationIdentity } from "../src/workerd-runtime.ts";
 
 const API = "/apis/forms.takoform.com/v2";
 const HOST = "api.example.test";
@@ -266,9 +267,11 @@ for (const checkpoint of ["retired", "retiring"] as const) {
       const ownerKey = createHash("sha256").update(worker.resourceUid).digest("hex");
       const statePath = join(root, "v2-worker-owners", ownerKey, "runtime-owner.json");
       type OwnerState = {
+        activeOperationId: string | null;
         incarnations: {
           operationId: string;
           status: string;
+          identity: WorkerdPublicationIdentity | null;
           receipt: unknown;
           processIdentity: LinuxProcessIdentity | null;
           executionCopiesReleased: boolean;
@@ -326,6 +329,12 @@ for (const checkpoint of ["retired", "retiring"] as const) {
       const priorChildren = ownerState.incarnations.flatMap((record) =>
         record.processIdentity ? [record.processIdentity] : [],
       );
+      const priorActive = ownerState.incarnations.filter((record) => record.status === "active");
+      expect(priorActive).toHaveLength(1);
+      const priorActiveRecord = priorActive[0];
+      if (!priorActiveRecord?.identity) throw new Error("active publication identity missing");
+      expect(ownerState.activeOperationId).toBe(priorActiveRecord.operationId);
+      const acceptedIdentity = structuredClone(priorActiveRecord.identity);
       if (priorChildren.length === 0) throw new Error("child identity was not persisted");
       await first.close();
       first = undefined;
@@ -352,9 +361,17 @@ for (const checkpoint of ["retired", "retiring"] as const) {
       expect(served.status).toBe(200);
       const restoredConfigIdentity = await served.text();
       expect(restoredConfigIdentity).toMatch(/^[0-9a-f]{64}$/u);
-      // The accepted graph identity stays exact across Host replacement;
-      // per-process private readiness credentials are not this public digest.
-      expect(restoredConfigIdentity).toBe(firstConfigIdentity);
+      // The accepted SQL graph below stays exact; the private Service dispatch
+      // credential is re-keyed per Host process and changes the rendered config.
+      expect(restoredConfigIdentity).not.toBe(firstConfigIdentity);
+      const restoredOwner = JSON.parse(await readFile(statePath, "utf8")) as OwnerState;
+      const restoredActive = restoredOwner.incarnations.filter(
+        (record) => record.status === "active",
+      );
+      expect(restoredActive).toHaveLength(1);
+      expect(restoredOwner.activeOperationId).toBe(priorActiveRecord.operationId);
+      expect(restoredActive[0]?.operationId).toBe(priorActiveRecord.operationId);
+      expect(restoredActive[0]?.identity).toEqual(acceptedIdentity);
       const endpointRead = await request(
         second.port,
         key.secret,

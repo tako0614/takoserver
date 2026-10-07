@@ -43,6 +43,7 @@ const operationUid = createId ?? "";
 const servingPath = join(rootDirectory, "current-serving.json");
 type CurrentServing = {
   sourceOperationId: string;
+  generation: number;
   identity: {
     generation: string;
     workerResourceUid: string;
@@ -197,14 +198,14 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
       },
       deployment: {
         uid: `deployment-${workerResourceUid}`,
-        generation: 1,
+        generation: current.generation,
         spec: parsedSpec,
         versions: current.identity.versions.map(({ workerVersionUid, weight }) => ({
           uid: workerVersionUid,
           // The crash fixture has no WorkerVersion Resource ledger; this is
           // synthetic provenance, not a Deployment Operation ID.
           sourceOperationId: "fixture-worker-version-operation",
-          generation: 1,
+          generation: current.generation,
           weight,
           spec: {
             worker: { resourceUid: workerResourceUid },
@@ -349,6 +350,7 @@ if (owner)
           servingPath,
           canonicalJson({
             sourceOperationId: createId,
+            generation: execution(createId, "create").generation,
             identity: created.identity,
             configIdentity,
             spec: execution(createId, "create").spec,
@@ -367,6 +369,7 @@ if (owner)
             servingPath,
             canonicalJson({
               sourceOperationId: updateId,
+              generation: execution(updateId, "update").generation,
               identity: updated.identity,
               configIdentity: updatedConfigIdentity,
               spec: execution(updateId, "update").spec,
@@ -405,6 +408,7 @@ if (owner)
           servingPath,
           canonicalJson({
             sourceOperationId: updateId,
+            generation: execution(updateId, "update").generation,
             identity: updated.identity,
             configIdentity: body,
             spec: execution(updateId, "update").spec,

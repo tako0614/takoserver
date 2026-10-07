@@ -52,6 +52,7 @@ import {
   compileWorkerdVersionGraph,
   type WorkerdVersionGraph,
   type WorkerdVersionGraphInput,
+  workerdVersionServiceBindingName,
 } from "../src/workerd-version-graph.ts";
 
 const encoder = new TextEncoder();
@@ -886,6 +887,29 @@ test("compiles data, service, event, and asset projections with explicit publica
   expect(source(graph.hostModules.get(SELFHOST_WORKER_ENTRYPOINT_MODULE))).toContain(
     "weighted-publication",
   );
+});
+
+test("uses one ordinal map for accepted public and v2-private service names", () => {
+  const binding = {
+    publicName: "TARGET",
+    target: "target-worker",
+    targetResourceUid: "uid-target-worker",
+    unavailableToken: SERVICE_TOKEN,
+  };
+  const graph = compileWorkerdVersionGraph(
+    graphInput({
+      generation: "takoserver-v2-operation:123e4567-e89b-42d3-a456-426614174000",
+      serviceBindings: [binding],
+    }),
+  );
+  expect(workerdVersionServiceBindingName(0, true)).toBe(
+    "__TAKOSERVER_V2_PRIVATE_SELFHOST_SERVICE_BINDING_000000000000000000000_00000",
+  );
+  expect(graph.site.serviceBindings?.map(({ name }) => name)).toEqual([
+    workerdVersionServiceBindingName(0, true),
+  ]);
+  expect(graph.site.hostEntrypoint).toBe(WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE);
+  expect(workerdVersionServiceBindingName(0, false)).toBe("__TAKOSERVER_SELFHOST_SERVICE_00000");
 });
 
 test("projects the opt-in edge.vector descriptor into the generated entrypoint", () => {

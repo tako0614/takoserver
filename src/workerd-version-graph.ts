@@ -277,7 +277,7 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
     invalid();
 
   const services = serviceBindings.map((binding, index) => ({
-    name: serviceBindingName(index, v2PrivateNames),
+    name: workerdVersionServiceBindingName(index, v2PrivateNames),
     target: binding.target,
     targetResourceUid: binding.targetResourceUid,
     unavailableToken: binding.unavailableToken,
@@ -786,7 +786,7 @@ function projectWorkflowForward(
         "publicName" in binding ? [binding.publicName] : [],
       ) ?? []),
       ...existing.serviceBindings.map((binding) => binding.publicName),
-      ...existing.serviceBindings.map((_, index) => serviceBindingName(index, true)),
+      ...existing.serviceBindings.map((_, index) => workerdVersionServiceBindingName(index, true)),
       ...(existing.actorForward?.bindings.flatMap((binding) => [
         binding.publicName,
         binding.httpService,
@@ -900,7 +900,9 @@ function projectWorkflowForward(
   if (normalized === undefined || normalized.length !== snapshot.bindings.length) invalid();
   const collidingBindingNames = new Set<string>([
     ...collidingPublicNames,
-    ...existing.serviceBindings.map((_, index) => serviceBindingName(index, v2PrivateNames)),
+    ...existing.serviceBindings.map((_, index) =>
+      workerdVersionServiceBindingName(index, v2PrivateNames),
+    ),
     ...(existing.actorForward?.bindings.flatMap((binding) => [
       binding.httpService,
       binding.upgradeService,
@@ -955,7 +957,9 @@ function projectOpaqueToken(value: string | undefined): string | undefined {
   return value;
 }
 
-function serviceBindingName(index: number, v2PrivateNames: boolean): string {
+/** Native name for one accepted Service Binding ordinal in this Version profile. */
+export function workerdVersionServiceBindingName(index: number, v2PrivateNames: boolean): string {
+  if (!Number.isInteger(index) || index < 0 || index > 99_999) invalid();
   if (v2PrivateNames) return workerdV2PrivateServiceBindingName(index);
   return `${SELFHOST_WORKER_INTERNAL_BINDING_PREFIX}SELFHOST_SERVICE_${index
     .toString(10)

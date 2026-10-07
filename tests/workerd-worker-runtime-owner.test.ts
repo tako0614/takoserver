@@ -8,6 +8,7 @@ import {
   mkdir,
   mkdtemp,
   readdir,
+  readFile,
   rm,
   symlink,
   unlink,
@@ -1089,6 +1090,86 @@ test("the same accepted DELETE can retry retirement after the sealed config is r
   }
 });
 
+test("a service caller lease can observe DELETE retirement and release without serial deadlock", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-service-binding-delete-race";
+  const createId = "f83b58b6-b83c-4c10-b3d1-30cce63a34ea";
+  const deleteId = "1e8601af-0a17-4de4-a994-c7284b0caebc";
+  const publication = staticPublicationState(workerUid);
+  const ownerRoot = join(owned.root, "owners");
+  const workerKey = createHash("sha256").update(workerUid, "utf8").digest("hex");
+  const statePath = join(ownerRoot, workerKey, "runtime-owner.json");
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: ownerRoot,
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+  });
+  let lease: Awaited<ReturnType<typeof owner.acquireServiceBindingRequest>> = null;
+  try {
+    const created = await owner.execute(execution(workerUid, createId, "create"));
+    expect(created).toMatchObject({ kind: "confirmed" });
+    if (created.kind !== "confirmed" || !created.identity)
+      throw new Error("service lease fixture Worker was not published");
+    publication.setCurrent(createId);
+    lease = await owner.acquireServiceBindingRequest({
+      workerUid,
+      versionId: created.identity.versions[0]?.versionId ?? "missing-version",
+      incarnationId: createId,
+      servingSourceOperationId: createId,
+    });
+    expect(lease?.status).toBe("active");
+    if (!lease) throw new Error("service lease fixture did not acquire its caller pin");
+
+    let finishSqlRecheck!: () => void;
+    const sqlRecheck = new Promise<void>((resolve) => {
+      finishSqlRecheck = resolve;
+    });
+    const postAuthorityLeaseCheck = sqlRecheck.then(() => lease?.stillCurrent() ?? false);
+    const deleting = owner.execute(execution(workerUid, deleteId, "delete"));
+    const deadline = Date.now() + 3_000;
+    let retirementStarted = false;
+    while (Date.now() < deadline) {
+      const state = JSON.parse(await readFile(statePath, "utf8")) as {
+        incarnations?: readonly { operationId?: string; status?: string }[];
+      };
+      if (
+        state.incarnations?.some(
+          (record) => record.operationId === createId && record.status === "retiring",
+        )
+      ) {
+        retirementStarted = true;
+        break;
+      }
+      await Bun.sleep(10);
+    }
+    expect(retirementStarted).toBe(true);
+    // Model the broker waiting on its SQL authority recheck while DELETE has
+    // entered retirement and is waiting for this exact caller lease.
+    finishSqlRecheck();
+
+    const leaseCheck = await Promise.race([
+      postAuthorityLeaseCheck.then((current) => ({ kind: "settled" as const, current })),
+      Bun.sleep(1_000).then(() => ({ kind: "timeout" as const })),
+    ]);
+    expect(leaseCheck.kind).toBe("settled");
+    if (leaseCheck.kind !== "settled") throw new Error("lease check deadlocked behind DELETE");
+    expect(leaseCheck.current).toBe(false);
+    await lease.release();
+    lease = null;
+    expect(await deleting).toMatchObject({ kind: "confirmed", identity: null });
+    publication.setCurrent(deleteId);
+    expect(owned.children).toHaveLength(1);
+  } finally {
+    await lease?.release();
+    await owner.close().catch(() => undefined);
+    await owned.cleanup();
+  }
+});
+
 test("one Worker update switches only its child, pins an open stream, and replays its exact operation", async () => {
   const owned = await fixture();
   const stateA = staticPublicationState("worker-a");
@@ -1127,11 +1208,21 @@ test("one Worker update switches only its child, pins an open stream, and replay
   const updateA = "85dc7fd7-07f5-40da-8d2d-253e0eea18c3";
   const deleteA = "6f71ca2a-15a8-47cd-86b2-fc66b3d47df5";
   let oldReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let releaseServiceBindingLease: (() => Promise<void>) | undefined;
   try {
-    expect(await ownerA.execute(execution("worker-a", createA, "create"))).toMatchObject({
-      kind: "confirmed",
-    });
+    const createdA = await ownerA.execute(execution("worker-a", createA, "create"));
+    expect(createdA).toMatchObject({ kind: "confirmed" });
+    if (createdA.kind !== "confirmed") throw new Error("initial Worker create was not confirmed");
+    if (!createdA.identity) throw new Error("initial Worker identity missing");
     stateA.setCurrent(createA);
+    const serviceBindingLease = await ownerA.acquireServiceBindingRequest({
+      workerUid: "worker-a",
+      versionId: createdA.identity.versions[0]?.versionId ?? "missing-version",
+      incarnationId: createA,
+      servingSourceOperationId: createA,
+    });
+    if (serviceBindingLease) releaseServiceBindingLease = () => serviceBindingLease.release();
+    expect(serviceBindingLease?.status).toBe("active");
     expect(await ownerB.execute(execution("worker-b", createB, "create"))).toMatchObject({
       kind: "confirmed",
     });
@@ -1169,8 +1260,13 @@ test("one Worker update switches only its child, pins an open stream, and replay
     const replay = await ownerA.execute(execution("worker-a", updateA, "update"));
     expect(replay).toMatchObject({ kind: "confirmed" });
     expect(owned.children).toHaveLength(3);
+    expect(await serviceBindingLease?.stillCurrent()).toBe(true);
     await oldReader.cancel();
     oldReader = undefined;
+    expect(childAOld.exitCode).toBeNull();
+    expect(childAOld.signalCode).toBeNull();
+    await serviceBindingLease?.release();
+    releaseServiceBindingLease = undefined;
     await until(() => childAOld.exitCode !== null || childAOld.signalCode !== null);
 
     const deleteReader = (
@@ -1218,6 +1314,7 @@ test("one Worker update switches only its child, pins an open stream, and replay
     await replayOwner.close();
   } finally {
     await oldReader?.cancel().catch(() => undefined);
+    await releaseServiceBindingLease?.().catch(() => undefined);
     await ownerA.close().catch(() => undefined);
     await ownerB
       .execute(execution("worker-b", "c7b001f1-2fe7-42a2-aa33-e6fd8c97bd5e", "delete"))

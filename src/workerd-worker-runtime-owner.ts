@@ -37,6 +37,10 @@ import {
 } from "./providers/selfhost-v2-queue-transport.ts";
 import type { V2SqliteBindingGrant } from "./providers/selfhost-v2-sqlite-binding-broker.ts";
 import {
+  openSelfhostV2ServiceBindingBroker,
+  type SelfhostV2ServiceBindingTargetOwner,
+} from "./selfhost-v2-service-binding-broker.ts";
+import {
   randomSelfhostDeploymentBasisPoint,
   selectSelfhostWeightedVersion,
 } from "./selfhost-weighted-deployment.ts";
@@ -64,9 +68,14 @@ import type {
   V2WorkerVersionMaterials,
 } from "./takoform-v2/worker-publication-state.ts";
 import {
+  exactV2ResolvedServiceBindings,
+  v2ServiceTargetName,
+} from "./takoform-v2/worker-service-resolution.ts";
+import {
   createV2WorkerPublication,
   type V2EndpointRouteAbsentReceipt,
   type V2WorkerPublicationResult,
+  type V2WorkerServiceBindingClaim,
 } from "./takoform-v2/worker-static-publication.ts";
 import {
   type LinuxProcessIdentity,
@@ -82,19 +91,28 @@ import type {
   WorkerdPublicationIdentity,
   WorkerdRuntime,
   WorkerdSelectedActiveVersion,
+  WorkerdServiceBinding,
   WorkerdSite,
   WorkerdStaticSite,
+  WorkerdV2ServiceBindingBrokerSocket,
   WorkerdWorkflowForwardLifecycle,
   WorkerdWorkflowForwardPublication,
   WorkerdWorkflowForwardSocket,
 } from "./workerd-runtime.ts";
 import {
   createWorkerdRuntime,
+  internalHostname,
   readWorkerdActiveActorGraph,
   readWorkerdActiveDeployment,
   readWorkerdSelectedActiveVersion,
+  readWorkerdSelectedPinnedVersionForRecovery,
+  V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER,
+  V2_SERVICE_BINDING_ORIGINAL_URL_HEADER,
+  workerdServiceBindingRouterName,
+  workerdV2ServiceBindingBrokerSocketPath,
 } from "./workerd-runtime.ts";
 import type { WorkerdProcess } from "./workerd-supervisor.ts";
+import { workerdVersionServiceBindingName } from "./workerd-version-graph.ts";
 import {
   inspectWorkerdWorkerExecutionCopies,
   openWorkerdWorkerExecutionGroup,
@@ -216,9 +234,19 @@ interface IncarnationHandle {
   readonly workflowForward?: V2WorkflowForwardIncarnation;
   readonly invocations: Set<ActiveInvocation>;
   readonly workflowLeases: Set<Promise<void>>;
+  /** Native ServiceBinding calls pin the exact caller incarnation through body drain. */
+  readonly serviceBindingLeases: Set<Promise<void>>;
+  readonly serviceBindingForward?: V2ServiceBindingForwardIncarnation;
+  readonly serviceBindingDispatchToken: string;
   retirementTimer?: () => void;
   retiring?: Promise<WorkerdWorkerRetirementReceipt>;
 }
+
+type V2ServiceBindingForwardIncarnation = {
+  issueBinding(claim: V2WorkerServiceBindingClaim, binding: WorkerdServiceBinding): Promise<void>;
+  socket(binding: WorkerdServiceBinding): WorkerdV2ServiceBindingBrokerSocket | undefined;
+  close(): Promise<void>;
+};
 
 type V2ActorForwardIncarnation = NonNullable<
   ReturnType<NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2ActorForward"]>["openIncarnation"]>
@@ -360,6 +388,23 @@ export interface WorkerdWorkerRuntimeOwner {
   >;
   /** Route a Host-accepted request to the exact active incarnation. */
   fetch(request: Request): Promise<Response>;
+  /** Begin one logical ServiceBinding dispatch without waiting for its body. */
+  dispatchServiceBinding(
+    request: Request,
+  ):
+    | { readonly kind: "not_dispatched" }
+    | { readonly kind: "dispatched"; readonly response: Promise<Response> };
+  /** Pin one exact active/draining caller Version until its binding call drains. */
+  acquireServiceBindingRequest(input: {
+    readonly workerUid: string;
+    readonly versionId: string;
+    readonly incarnationId: string;
+    readonly servingSourceOperationId: string;
+  }): Promise<{
+    readonly status: "active" | "draining";
+    stillCurrent(): Promise<boolean>;
+    release(): Promise<void>;
+  } | null>;
   /** Deliver one persisted cron match through the selected current private Version gate. */
   invokeScheduled(input: {
     readonly triggerUid: string;
@@ -464,6 +509,27 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
   readonly workerResourceUid: string;
   readonly targetKey: string;
   readonly publicationState: PublicationState;
+  /** Trusted Core reference authority and dynamic logical Worker owner lookup. */
+  readonly v2ServiceBinding?: {
+    readonly authority: {
+      resolveCurrentBinding(
+        claim: V2WorkerServiceBindingClaim,
+        bindingName: string,
+      ): Promise<{
+        readonly identity: {
+          readonly targetKey: string;
+          readonly principal: string;
+          readonly space: string;
+          readonly resourceUid: string;
+        };
+        readonly vector: string;
+        stillCurrent(): Promise<boolean>;
+      } | null>;
+    };
+    readonly ownerForResourceUid: (
+      resourceUid: string,
+    ) => Promise<SelfhostV2ServiceBindingTargetOwner | null>;
+  };
   /** Exact per-incarnation private Workflow broker; no tenant-provided socket paths. */
   readonly v2WorkflowForward?: {
     openIncarnation(input: {
@@ -1982,10 +2048,6 @@ function sourceOperationIdFromIdentity(identity: WorkerdPublicationIdentity): st
     : null;
 }
 
-function makeRequest(request: Request, signal: AbortSignal): Request {
-  return new Request(request, { signal });
-}
-
 function responseWithTrackedBody(response: Response, invocation: ActiveInvocation): Response {
   if (!response.body) {
     invocation.finish();
@@ -2123,6 +2185,23 @@ export async function openWorkerdWorkerRuntimeOwner(
         resolveCurrentBinding: options.v2QueueProducerBinding.resolveCurrentBinding.bind(
           options.v2QueueProducerBinding,
         ),
+      })
+    : undefined;
+  if (
+    options.v2ServiceBinding !== undefined &&
+    (typeof options.v2ServiceBinding.authority?.resolveCurrentBinding !== "function" ||
+      typeof options.v2ServiceBinding.ownerForResourceUid !== "function")
+  ) {
+    throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
+  }
+  const v2ServiceBinding = options.v2ServiceBinding
+    ? Object.freeze({
+        authority: Object.freeze({
+          resolveCurrentBinding: options.v2ServiceBinding.authority.resolveCurrentBinding.bind(
+            options.v2ServiceBinding.authority,
+          ),
+        }),
+        ownerForResourceUid: options.v2ServiceBinding.ownerForResourceUid,
       })
     : undefined;
 
@@ -2561,13 +2640,14 @@ export async function openWorkerdWorkerRuntimeOwner(
         // A Workflow child may still be using an exact private Service socket.
         // Do not stop its upstream or release the socket namespace until the
         // caller's lease has completed; no elapsed timeout proves retirement.
-        await Promise.all([...incarnation.workflowLeases]);
+        await Promise.all([...incarnation.workflowLeases, ...incarnation.serviceBindingLeases]);
         const receipt = await incarnation.group.retire({
           workerResourceUid: options.workerResourceUid,
           operationId,
         });
         // No private Actor broker may outlive the child whose immutable graph
         // carried its token. A failed drain retains this UID's owner lock.
+        await incarnation.serviceBindingForward?.close();
         await incarnation.actorForward?.close();
         await incarnation.workflowForward?.close();
         await persistPhysicalAbsence(incarnation.record);
@@ -2685,6 +2765,10 @@ export async function openWorkerdWorkerRuntimeOwner(
     group: WorkerdWorkerExecutionGroup,
     incumbent: WorkerdPublicationIdentity | null,
   ): IncarnationHandle => {
+    // Re-key private service dispatch for every native incarnation, including
+    // recovery. The credential is in this closure and the private Host config,
+    // never in a Version's tenant-visible bindings.
+    const serviceBindingDispatchToken = randomBytes(32).toString("hex");
     const actorForward =
       options.v2ActorForward && record.eventToken
         ? options.v2ActorForward.openIncarnation({
@@ -2703,6 +2787,140 @@ export async function openWorkerdWorkerRuntimeOwner(
             eventToken: record.eventToken,
           })
         : undefined;
+    const serviceBindingBrokers = new Map<
+      string,
+      {
+        readonly binding: WorkerdServiceBinding;
+        readonly socket: WorkerdV2ServiceBindingBrokerSocket;
+        readonly close: () => Promise<void>;
+      }
+    >();
+    const serviceBindingForward: V2ServiceBindingForwardIncarnation | undefined = v2ServiceBinding
+      ? {
+          async issueBinding(claim, binding) {
+            // The publication callback issues the broker before activateIncarnation
+            // stores the candidate's serving identity. Validate the immutable
+            // accepted Version through Core instead of requiring that future
+            // identity to exist already. Runtime names are ordinal private aliases;
+            // the claim continues to carry the accepted public binding name.
+            const bindingIndex = claim.bindings.findIndex(
+              (_item, index) => workerdVersionServiceBindingName(index, true) === binding.name,
+            );
+            const selected = claim.bindings[bindingIndex];
+            const currentRecord = () => recordFor(record.operationId);
+            const recordOwnsVersion = (): boolean => {
+              const latest = currentRecord();
+              if (
+                !latest ||
+                latest.operationId !== claim.incarnationId ||
+                latest.operationId !== claim.servingSourceOperationId ||
+                latest.status === "uncertain" ||
+                latest.status === "retiring" ||
+                latest.status === "retired"
+              ) {
+                return false;
+              }
+              if (latest.identity === null) return latest.status === "candidate";
+              return latest.identity.versions.some(
+                (item) =>
+                  item.workerVersionUid === claim.workerVersionUid &&
+                  item.versionId === claim.nativeVersionId,
+              );
+            };
+            if (
+              claim.workerUid !== options.workerResourceUid ||
+              claim.incarnationId !== record.operationId ||
+              claim.servingSourceOperationId !== record.operationId ||
+              bindingIndex < 0 ||
+              selected?.resourceUid !== binding.targetResourceUid ||
+              binding.target !== (await v2ServiceTargetName(binding.targetResourceUid)) ||
+              !recordOwnsVersion()
+            ) {
+              throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+            }
+            const accepted = await v2ServiceBinding.authority.resolveCurrentBinding(
+              claim,
+              selected.name,
+            );
+            if (
+              !accepted ||
+              accepted.identity.targetKey !== options.targetKey ||
+              accepted.identity.principal !== claim.principal ||
+              accepted.identity.space !== claim.space ||
+              accepted.identity.resourceUid !== selected.resourceUid ||
+              !(await accepted.stillCurrent()) ||
+              !recordOwnsVersion()
+            ) {
+              throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+            }
+            const router = workerdServiceBindingRouterName(binding);
+            const existing = serviceBindingBrokers.get(router);
+            if (existing) {
+              if (
+                existing.binding.name !== binding.name ||
+                existing.binding.target !== binding.target ||
+                existing.binding.targetResourceUid !== binding.targetResourceUid ||
+                existing.binding.unavailableToken !== binding.unavailableToken
+              ) {
+                throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+              }
+              return;
+            }
+            const broker = await openSelfhostV2ServiceBindingBroker({
+              socketPath: workerdV2ServiceBindingBrokerSocketPath(
+                privateSocketDirectoryFor(record.operationId),
+                binding,
+              ),
+              routerToken: binding.unavailableToken,
+              originalUrlHeader: V2_SERVICE_BINDING_ORIGINAL_URL_HEADER,
+              claim,
+              // The native graph alias is private/ordinal; the broker verifies
+              // the accepted public name in the immutable Core claim.
+              bindingName: selected.name,
+              authority: v2ServiceBinding.authority,
+              async acquireCallerLease(capturedClaim) {
+                const lease = await acquireServiceBindingRequest({
+                  workerUid: capturedClaim.workerUid,
+                  versionId: capturedClaim.nativeVersionId,
+                  incarnationId: capturedClaim.incarnationId,
+                  servingSourceOperationId: capturedClaim.servingSourceOperationId,
+                });
+                return lease ? { stillCurrent: lease.stillCurrent, release: lease.release } : null;
+              },
+              ownerForResourceUid: v2ServiceBinding.ownerForResourceUid,
+            });
+            if (!(await accepted.stillCurrent()) || !recordOwnsVersion()) {
+              await broker.close();
+              throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+            }
+            serviceBindingBrokers.set(router, {
+              binding: { ...binding },
+              socket: { socketPath: broker.socketPath, identity: { ...broker.identity } },
+              close: broker.close,
+            });
+          },
+          socket(binding) {
+            const current = serviceBindingBrokers.get(workerdServiceBindingRouterName(binding));
+            if (
+              !current ||
+              current.binding.name !== binding.name ||
+              current.binding.target !== binding.target ||
+              current.binding.targetResourceUid !== binding.targetResourceUid ||
+              current.binding.unavailableToken !== binding.unavailableToken
+            ) {
+              return undefined;
+            }
+            return {
+              socketPath: current.socket.socketPath,
+              identity: { ...current.socket.identity },
+            };
+          },
+          async close() {
+            for (const broker of serviceBindingBrokers.values()) await broker.close();
+            serviceBindingBrokers.clear();
+          },
+        }
+      : undefined;
     const runtime = createWorkerdRuntime({
       root: group.runtimeRoot,
       configPath: group.configurationPath,
@@ -2715,6 +2933,17 @@ export async function openWorkerdWorkerRuntimeOwner(
       },
       isReady: () => group.isReady(),
       serviceBindingSocketDirectory: privateSocketDirectoryFor(record.operationId),
+      ...(v2ServiceBinding
+        ? {
+            v2ServiceBindingDispatch: {
+              token: serviceBindingDispatchToken,
+              internalHostname: internalHostname(scriptName(options.workerResourceUid)),
+            },
+          }
+        : {}),
+      ...(serviceBindingForward
+        ? { v2ServiceBindingBrokerSocket: serviceBindingForward.socket }
+        : {}),
       ...(workflowForward
         ? {
             workflowForwardLifecycle: workflowForward.workflowForwardLifecycle,
@@ -2749,6 +2978,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       ...(v2ObjectBucketBinding ? { v2ObjectBucketBinding } : {}),
       ...(v2KvBinding ? { v2KvBinding } : {}),
       ...(v2QueueProducerBinding ? { v2QueueProducerBinding } : {}),
+      ...(serviceBindingForward ? { v2ServiceBindingForward: serviceBindingForward } : {}),
       ...(actorForward ? { v2ActorForward: actorForward } : {}),
       ...(workflowForward ? { v2WorkflowForward: workflowForward } : {}),
       ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
@@ -2758,10 +2988,13 @@ export async function openWorkerdWorkerRuntimeOwner(
       group,
       runtime,
       publication,
+      serviceBindingDispatchToken,
       ...(actorForward ? { actorForward } : {}),
       ...(workflowForward ? { workflowForward } : {}),
+      ...(serviceBindingForward ? { serviceBindingForward } : {}),
       invocations: new Set(),
       workflowLeases: new Set(),
+      serviceBindingLeases: new Set(),
     };
     handles.set(record.operationId, handle);
     return handle;
@@ -2872,6 +3105,13 @@ export async function openWorkerdWorkerRuntimeOwner(
       onSpawned: async (child) => await persistSpawnedChild(operationId, child),
     });
     const handle = makeIncarnationHandle(candidateRecord, group, incumbent);
+    if (!handle.runtime.preparePrivateServiceBindingSockets) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    // Establish the empty-directory identity before issueBinding can start a
+    // broker. The runtime's later config render then verifies the same root
+    // instead of mistaking our newly created socket for an untrusted entry.
+    await handle.runtime.preparePrivateServiceBindingSockets();
     // Preserve the pre-publication supervised child start. This bootstrap has
     // no publication authority or private Service sockets: a failed initial
     // spawn cannot poison the candidate's still-unused socket-enabled runtime.
@@ -3050,6 +3290,95 @@ export async function openWorkerdWorkerRuntimeOwner(
     }));
   };
 
+  const restoreServiceBindingBrokers = async (
+    handle: IncarnationHandle,
+    record: IncarnationRecord,
+    snapshot: V2WorkerPublicationSnapshot,
+    phase: "pinned" | "active",
+  ): Promise<void> => {
+    const deployment = snapshot.deployment;
+    if (!deployment || !record.identity) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    let basisPoint = 0;
+    for (const version of deployment.versions) {
+      const selected =
+        phase === "pinned"
+          ? await readWorkerdSelectedPinnedVersionForRecovery(
+              handle.group.runtimeRoot,
+              scriptName(options.workerResourceUid),
+              {
+                expectedWorkerResourceUid: options.workerResourceUid,
+                expectedGeneration: record.identity.generation,
+                basisPoint,
+              },
+            )
+          : await readWorkerdSelectedActiveVersion(
+              handle.group.runtimeRoot,
+              scriptName(options.workerResourceUid),
+              {
+                expectedWorkerResourceUid: options.workerResourceUid,
+                basisPoint,
+                includeStatic: true,
+              },
+            );
+      const expectedVersionId = `v2-${createHash("sha256")
+        .update(`${version.uid}\u0000${version.generation}`, "utf8")
+        .digest("hex")}`;
+      if (
+        !selected ||
+        selected.workerResourceUid !== options.workerResourceUid ||
+        selected.workerVersionUid !== version.uid ||
+        selected.versionId !== expectedVersionId ||
+        selected.generation !== record.identity.generation
+      ) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      const declared = parseWorkerVersionSpec(version.spec).serviceBindings;
+      const persisted =
+        selected.site.kind === "static" ? [] : (selected.site.serviceBindings ?? []);
+      const hasExactPrivateOrdinals = persisted.every(
+        (binding, index) => binding.name === workerdVersionServiceBindingName(index, true),
+      );
+      const persistedWithAcceptedNames = persisted.map((binding, index) => ({
+        ...binding,
+        name: declared[index]?.name ?? "",
+      }));
+      if (
+        !hasExactPrivateOrdinals ||
+        !(await exactV2ResolvedServiceBindings(declared, persistedWithAcceptedNames))
+      ) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      if (persisted.length > 0) {
+        const forward = handle.serviceBindingForward;
+        if (!forward) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        const claim: V2WorkerServiceBindingClaim = Object.freeze({
+          principal: snapshot.worker.principal,
+          space: snapshot.worker.space,
+          targetKey: options.targetKey,
+          workerUid: snapshot.worker.uid,
+          workerVersionUid: version.uid,
+          workerVersionOperationId: version.sourceOperationId,
+          nativeVersionId: expectedVersionId,
+          incarnationId: record.operationId,
+          servingSourceOperationId: record.operationId,
+          bindings: Object.freeze(
+            declared.map((binding) =>
+              Object.freeze({
+                name: binding.name,
+                resourceUid: binding.resource.resourceUid,
+              }),
+            ),
+          ),
+        });
+        for (const binding of persisted) await forward.issueBinding(claim, binding);
+      }
+      basisPoint += version.weight;
+    }
+    if (basisPoint !== 10_000) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  };
+
   const recoverActiveIncarnation = async (): Promise<void> => {
     // An old Queue grant may remain send-authorized. Record exact physical
     // absence before restore can replace the active record's process identity.
@@ -3072,6 +3401,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     if (
       resolution.kind !== "ready" ||
       resolution.snapshot.sourceOperationId !== sourceOperationId ||
+      activeRecord.operationId !== sourceOperationId ||
       resolution.snapshot.worker.uid !== options.workerResourceUid ||
       !resolution.snapshot.deployment ||
       canonicalJson(
@@ -3121,11 +3451,19 @@ export async function openWorkerdWorkerRuntimeOwner(
     const group = await openExistingRecoveryGroup(activeRecord, configuration);
     recoveringGroup = group;
     const handle = makeIncarnationHandle(activeRecord, group, activeRecord.identity);
+    if (!handle.runtime.preparePrivateServiceBindingSockets) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    // Recovery removed only the previously proved-dead child's config-declared
+    // sockets above. Pin the now-empty directory before recreating its brokers.
+    await handle.runtime.preparePrivateServiceBindingSockets();
+    await restoreServiceBindingBrokers(handle, activeRecord, resolution.snapshot, "pinned");
     await updateRecord(activeRecord.operationId, (current) => ({
       ...current,
       configurationRefreshPending: true,
     }));
     const restoredNames = await handle.runtime.restore();
+    await restoreServiceBindingBrokers(handle, activeRecord, resolution.snapshot, "active");
     const nativeProof = await handle.runtime.observeExactPublication?.(
       scriptName(options.workerResourceUid),
       activeRecord.identity,
@@ -4074,6 +4412,92 @@ export async function openWorkerdWorkerRuntimeOwner(
   };
   const observeVersionTarget: WorkerdWorkerRuntimeOwner["observeVersionTarget"] = (input) =>
     observeVersionTargetCore(input, false);
+  const acquireServiceBindingRequest: WorkerdWorkerRuntimeOwner["acquireServiceBindingRequest"] =
+    async (input) => {
+      const target = {
+        workerUid: input.workerUid,
+        versionId: input.versionId,
+        incarnationId: input.incarnationId,
+        servingSourceOperationId: input.servingSourceOperationId,
+      };
+      const first = await observeVersionTargetCore(target, false);
+      if (first.kind !== "confirmed") return null;
+      let finish!: () => void;
+      const done = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const captured = await runSerial(async () => {
+        const incarnation = handles.get(target.incarnationId);
+        const record = recordFor(target.incarnationId);
+        if (
+          closed ||
+          suspending ||
+          admissionClosedBy !== null ||
+          !incarnation ||
+          !record ||
+          (incarnation.record !== record &&
+            canonicalJson(incarnation.record) !== canonicalJson(record)) ||
+          (record.status !== "active" && record.status !== "draining") ||
+          record.receipt !== null ||
+          record.executionCopiesCleanupStarted ||
+          record.executionCopiesReleased ||
+          !record.identity?.versions.some((version) => version.versionId === target.versionId) ||
+          !incarnation.group.isReady()
+        ) {
+          return null;
+        }
+        incarnation.serviceBindingLeases.add(done);
+        return { incarnation, status: record.status };
+      });
+      if (!captured) return null;
+
+      const stillCurrent = async (): Promise<boolean> => {
+        // Retirement enters the serial lane and then waits for this lease to
+        // drain. Do not re-enter that lane here: a post-SQL authority check
+        // from the broker must be able to observe the retirement fence and
+        // release the lease while DELETE is waiting. JavaScript state reads
+        // are synchronous, and the exact handle remains pinned by `done`.
+        const incarnation = handles.get(target.incarnationId);
+        const record = recordFor(target.incarnationId);
+        return (
+          !closed &&
+          !suspending &&
+          admissionClosedBy === null &&
+          incarnation === captured.incarnation &&
+          record !== undefined &&
+          (record.status === "active" || record.status === "draining") &&
+          (captured.status !== "draining" || record.status === "draining") &&
+          record.receipt === null &&
+          !record.executionCopiesCleanupStarted &&
+          !record.executionCopiesReleased &&
+          record.identity?.versions.some((version) => version.versionId === target.versionId) ===
+            true &&
+          canonicalJson(incarnation.record) === canonicalJson(record) &&
+          incarnation.group.isReady() &&
+          incarnation.serviceBindingLeases.has(done)
+        );
+      };
+      let released = false;
+      return {
+        status: captured.status,
+        stillCurrent,
+        async release() {
+          if (released) return;
+          released = true;
+          captured.incarnation.serviceBindingLeases.delete(done);
+          finish();
+          if (
+            !suspending &&
+            captured.incarnation.record.status === "draining" &&
+            captured.incarnation.serviceBindingLeases.size === 0 &&
+            captured.incarnation.invocations.size === 0 &&
+            !captured.incarnation.record.deferRetirementUntilDeadline
+          ) {
+            void retireIncarnation(captured.incarnation).catch(() => undefined);
+          }
+        },
+      };
+    };
   const observeQueueTarget: WorkerdWorkerRuntimeOwner["observeQueueTarget"] = (input) =>
     observeVersionTargetCore(input, true);
   const observeQueuePhysicalAbsence: WorkerdWorkerRuntimeOwner["observeQueuePhysicalAbsence"] = (
@@ -4373,10 +4797,10 @@ export async function openWorkerdWorkerRuntimeOwner(
     return { kind: "confirmed", identity: null };
   }
 
-  const fetchRequest = async (request: Request): Promise<Response> => {
-    if (closed || suspending) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
-    if (admissionClosedBy !== null || !active)
-      throw new WorkerdWorkerRuntimeOwnerError("admission_closed");
+  const dispatchServiceBinding: WorkerdWorkerRuntimeOwner["dispatchServiceBinding"] = (request) => {
+    if (closed || suspending || admissionClosedBy !== null || !active) {
+      return { kind: "not_dispatched" };
+    }
     const incarnation = active;
     let doneResolve!: () => void;
     const done = new Promise<void>((resolve) => {
@@ -4394,13 +4818,75 @@ export async function openWorkerdWorkerRuntimeOwner(
     incarnation.invocations.add(invocation);
     let forwarded: Request;
     try {
-      forwarded = makeRequest(request, AbortSignal.any([request.signal, invocation.abort.signal]));
-      const response = await incarnation.group.fetch(forwarded);
-      return responseWithTrackedBody(response, invocation);
-    } catch (error) {
+      const originalUrl = new URL(request.url);
+      if (
+        (originalUrl.protocol !== "http:" && originalUrl.protocol !== "https:") ||
+        !originalUrl.hostname ||
+        originalUrl.username ||
+        originalUrl.password ||
+        originalUrl.hash ||
+        originalUrl.href.length > 8192
+      ) {
+        throw new TypeError("invalid ServiceBinding request URL");
+      }
+      const internalHost = internalHostname(scriptName(options.workerResourceUid));
+      const internalUrl = new URL(
+        `${originalUrl.pathname}${originalUrl.search}`,
+        `http://${internalHost}`,
+      );
+      const headers = new Headers(request.headers);
+      // Never let caller-controlled metadata survive into the private route.
+      // The trusted Host runtime remints both values for this incarnation.
+      headers.delete(V2_SERVICE_BINDING_ORIGINAL_URL_HEADER);
+      headers.delete(V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER);
+      headers.set("host", internalHost);
+      headers.set(V2_SERVICE_BINDING_ORIGINAL_URL_HEADER, originalUrl.href);
+      headers.set(
+        V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER,
+        incarnation.serviceBindingDispatchToken,
+      );
+      const signal = AbortSignal.any([request.signal, invocation.abort.signal]);
+      forwarded = new Request(internalUrl, {
+        method: request.method,
+        headers,
+        signal,
+        redirect: request.redirect,
+        ...(request.method === "GET" || request.method === "HEAD"
+          ? {}
+          : { body: request.body, duplex: "half" as const }),
+      } as RequestInit);
+    } catch {
       invocation.finish();
-      throw error;
+      return { kind: "not_dispatched" };
     }
+    let response: Promise<Response>;
+    try {
+      // Calling the group is the dispatch boundary. If that Promise later
+      // rejects, the target may already have observed the request.
+      response = incarnation.group.fetch(forwarded);
+    } catch {
+      invocation.finish();
+      return { kind: "not_dispatched" };
+    }
+    return {
+      kind: "dispatched",
+      response: response.then(
+        (value) => responseWithTrackedBody(value, invocation),
+        (error: unknown) => {
+          invocation.finish();
+          throw error;
+        },
+      ),
+    };
+  };
+
+  const fetchRequest = async (request: Request): Promise<Response> => {
+    const dispatched = dispatchServiceBinding(request);
+    if (dispatched.kind === "not_dispatched") {
+      if (closed || suspending) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      throw new WorkerdWorkerRuntimeOwnerError("admission_closed");
+    }
+    return await dispatched.response;
   };
 
   const observeScheduledCapability: WorkerdWorkerRuntimeOwner["observeScheduledCapability"] = (
@@ -5317,12 +5803,13 @@ export async function openWorkerdWorkerRuntimeOwner(
         }
         for (const handle of handles.values()) {
           await cancelInvocations(handle);
-          await Promise.all([...handle.workflowLeases]);
+          await Promise.all([...handle.workflowLeases, ...handle.serviceBindingLeases]);
         }
         for (const handle of handles.values()) {
           if (handle.record.status === "active" || handle.record.status === "draining") {
             await handle.group.suspendRetainingCustody();
           }
+          await handle.serviceBindingForward?.close();
           await handle.actorForward?.close();
           await handle.workflowForward?.close();
         }
@@ -5352,12 +5839,15 @@ export async function openWorkerdWorkerRuntimeOwner(
       const operationId = state.activeOperationId;
       const failedRecoveryGroup = recoveringGroup as WorkerdWorkerExecutionGroup | null;
       if (failedRecoveryGroup && operationId) {
+        let stopped = false;
         try {
           await failedRecoveryGroup.stopAfterFailedRecovery();
+          stopped = true;
         } catch {
           // The child or listener is still unknown. The live successor lock
           // remains the only proof that this process owns the attempted recovery.
         }
+        if (stopped) await handles.get(operationId)?.serviceBindingForward?.close();
         handles.delete(operationId);
         active = null;
       }
@@ -5383,6 +5873,8 @@ export async function openWorkerdWorkerRuntimeOwner(
     observeQueuePhysicalAbsence,
     observeRetirement,
     fetch: fetchRequest,
+    dispatchServiceBinding,
+    acquireServiceBindingRequest,
     observeScheduledCapability,
     observeQueueServingCapability,
     invokeQueue,

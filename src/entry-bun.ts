@@ -9,6 +9,7 @@ import {
   parseSelfhostV2PrivatePlaneBoot,
   prepareSelfhostV2PrivatePlaneRoots,
 } from "./entry-v2-private-plane-boot.ts";
+import { parseSelfhostV2WorkerEndpointHttpsSelection } from "./entry-v2-worker-endpoint-boot.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import { migrateSqlite } from "./migrate-sqlite.ts";
 import { createFileObjectStore } from "./objects-fs.ts";
@@ -87,7 +88,16 @@ import {
 import { createSelfhostV2ConfiguredInputSealer } from "./selfhost-v2-configured-input-sealer.ts";
 import { createSelfhostV2QueueComposition } from "./selfhost-v2-queue-composition.ts";
 import { createSelfhostV2QueueScheduler } from "./selfhost-v2-queue-scheduler.ts";
+import {
+  createSelfhostV2RuntimeBoot,
+  parseSelfhostV2RuntimeBoot,
+  startSelfhostV2WorkflowDuePass,
+} from "./selfhost-v2-runtime-boot.ts";
 import { createSelfhostV2WorkerComposition } from "./selfhost-v2-worker-composition.ts";
+import {
+  createSelfhostV2WorkerEndpointBoot,
+  type SelfhostV2WorkerEndpointBoot,
+} from "./selfhost-v2-worker-endpoint-boot.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import {
@@ -178,6 +188,9 @@ const takoformV2Config = parseTakoformV2ApplicationConfig({
   TAKOSERVER_TAKOFORM_V2_CONFIG: process.env.TAKOSERVER_TAKOFORM_V2_CONFIG,
   TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: process.env.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY,
 });
+const v2RuntimeSelection = parseSelfhostV2RuntimeBoot(
+  process.env.TAKOSERVER_V2_WORKER_RUNTIME_BOOT,
+);
 const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN;
 if (!publicOrigin || !runtimeInputCanonicalOriginSupported(publicOrigin)) {
   throw new Error("TAKOSERVER_PUBLIC_ORIGIN must be a canonical HTTPS bare origin");
@@ -256,6 +269,20 @@ if (containerEndpointHttpsConfiguration) {
     privateKey: workerdTls.privateKey,
   });
 }
+const v2WorkerEndpointHttpsSelection = parseSelfhostV2WorkerEndpointHttpsSelection(
+  process.env.TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS,
+  {
+    workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
+    tlsConfigured: workerdTls !== undefined,
+    containerEndpointHttpsConfigured: containerEndpointHttpsConfiguration !== undefined,
+    reservedPorts: [
+      port,
+      workerdPort,
+      workerEndpointPort,
+      ...(process.env.TAKOSERVER_DATA_PLANE_PORT?.trim() === "443" ? [443] : []),
+    ],
+  },
+);
 const providerMode = resolveStandaloneProviderMode({
   retiredProviderMode: process.env.TAKOSERVER_RETIRED_PROVIDER_MODE,
   cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID,
@@ -280,6 +307,7 @@ const v2PrivatePlaneBoot = parseSelfhostV2PrivatePlaneBoot(
       ...(process.env.TAKOSERVER_DATA_PLANE_PORT
         ? [Number(process.env.TAKOSERVER_DATA_PLANE_PORT)]
         : []),
+      ...(v2WorkerEndpointHttpsSelection ? [v2WorkerEndpointHttpsSelection.port] : []),
     ],
   },
 );
@@ -682,6 +710,7 @@ let queueCapability:
   | undefined;
 let ownersRestored = false;
 let v2QueueComposition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+let v2RuntimeBoot: ReturnType<typeof createSelfhostV2RuntimeBoot> | undefined;
 let restoredV2WorkerUids: readonly string[];
 const clearV2BootKeys = () => {
   for (const plane of [
@@ -695,6 +724,24 @@ const clearV2BootKeys = () => {
   }
 };
 try {
+  if (v2RuntimeSelection) {
+    if (!takoformV2Config.workerBundle) {
+      throw new Error("v2 Actor/Workflow boot requires the configured held WorkerBundle backend");
+    }
+    v2RuntimeBoot = createSelfhostV2RuntimeBoot({
+      selection: v2RuntimeSelection,
+      sql,
+      clock,
+      targetKey: v2WorkerTargetKey,
+      dataRoot,
+      workerdBinary,
+      ...(process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY
+        ? { guardBinary: process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY }
+        : {}),
+      ownerForWorkerUid: async (uid) => (workers ? await workers.ownerForWorkerUid(uid) : null),
+      ...(dataPlanes ? { dataPlaneAddress: dataPlanes.address } : {}),
+    });
+  }
   if (v2PrivatePlaneBoot?.queue && v2QueueCustody) {
     const requireQueueCapability = (): NonNullable<
       ReturnType<typeof createSelfhostV2WorkerComposition>["queueCapability"]
@@ -730,6 +777,8 @@ try {
     rootDirectory: join(dataRoot === ":memory:" ? ".takoserver" : dataRoot, "v2-worker-owners"),
     targetKey: v2WorkerTargetKey,
     workerdBinary,
+    ...(v2RuntimeBoot?.v2Actor ? { v2Actor: v2RuntimeBoot.v2Actor } : {}),
+    ...(v2RuntimeBoot?.v2Workflow ? { v2Workflow: v2RuntimeBoot.v2Workflow } : {}),
     ...(v2ConfiguredInputSealer ? { configuredInputSealer: v2ConfiguredInputSealer } : {}),
     ...(v2SqliteStore && v2PrivatePlaneBoot?.sqlite
       ? {
@@ -781,6 +830,8 @@ try {
   ownersRestored = true;
 } catch (error) {
   clearV2BootKeys();
+  await workers?.closeWorkflowHost();
+  await v2RuntimeBoot?.closeActor();
   await v2QueueComposition?.close();
   throw error;
 }
@@ -1135,6 +1186,7 @@ const bunFetch = createSelfhostBunFetchHandler({
   appFetch: takoformV2Ingress,
 });
 let bunServer: ReturnType<typeof Bun.serve> | undefined;
+let selfhostV2WorkerEndpointBoot: SelfhostV2WorkerEndpointBoot | undefined;
 let shutdownClean = true;
 let closeSequenceFinished = false;
 const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
@@ -1152,6 +1204,8 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
         mayCloseDependents: () => shutdownClean,
         v2WorkerSuspend: async () => {
           await v2QueueScheduler?.close();
+          await v2WorkerComposition.closeWorkflowHost();
+          await v2RuntimeBoot?.closeActor();
           await v2WorkerComposition.suspendOwnersRetainingCustody();
           await v2QueueComposition?.close();
         },
@@ -1176,12 +1230,19 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
 );
 const entryShutdown = createSelfhostEntryShutdown({
   stopIngress: async () => {
-    let endpointClosing: Promise<void> = Promise.resolve();
+    const endpointClosings: Promise<void>[] = [];
     if (selfhostContainerEndpointHttps) {
       try {
-        endpointClosing = selfhostContainerEndpointHttps.close(false);
+        endpointClosings.push(selfhostContainerEndpointHttps.close(false));
       } catch {
-        endpointClosing = Promise.reject(new Error("endpoint ingress close failed"));
+        endpointClosings.push(Promise.reject(new Error("Container Endpoint ingress close failed")));
+      }
+    }
+    if (selfhostV2WorkerEndpointBoot) {
+      try {
+        endpointClosings.push(selfhostV2WorkerEndpointBoot.close(false));
+      } catch {
+        endpointClosings.push(Promise.reject(new Error("v2 Worker Endpoint ingress close failed")));
       }
     }
 
@@ -1193,7 +1254,7 @@ const entryShutdown = createSelfhostEntryShutdown({
       serverStopping = Promise.reject(new Error("Bun ingress stop failed"));
     }
 
-    const stopped = await Promise.allSettled([endpointClosing, serverStopping]);
+    const stopped = await Promise.allSettled([...endpointClosings, serverStopping]);
     if (stopped.some((result) => result.status === "rejected")) {
       throw new Error("one or more self-host ingress listeners did not stop cleanly");
     }
@@ -1220,13 +1281,49 @@ process.on("exit", () => {
   workerd.stop();
 });
 
-bunServer = Bun.serve({
-  port,
-  // Longer than the default, because publishing a site means uploading its
-  // files and a request that is doing real work is not an idle one.
-  idleTimeout: 120,
-  fetch: (request) => entryShutdown.fetch(request, bunFetch),
-});
+if (v2WorkerEndpointHttpsSelection) {
+  if (!workerdTls) throw new Error("selected v2 Worker Endpoint HTTPS lost its TLS inputs");
+  try {
+    selfhostV2WorkerEndpointBoot = await createSelfhostV2WorkerEndpointBoot({
+      sql,
+      targetKey: v2WorkerTargetKey,
+      publicOrigin,
+      configuration: v2WorkerEndpointHttpsSelection,
+      certificateChain: workerdTls.certificateChain,
+      privateKey: workerdTls.privateKey,
+      publicationState: v2WorkerComposition.endpointPublicationState,
+      ownerForWorkerUid: async (uid) => {
+        if (!ownersRestored) throw new Error("v2 Worker owners are not restored");
+        return await v2WorkerComposition.ownerForWorkerUid(uid);
+      },
+    });
+    process.once("exit", () => {
+      void selfhostV2WorkerEndpointBoot?.close();
+    });
+  } catch (error) {
+    throw new Error("selected v2 Worker Endpoint HTTPS could not start", { cause: error });
+  }
+}
+
+try {
+  bunServer = Bun.serve({
+    port,
+    // Longer than the default, because publishing a site means uploading its
+    // files and a request that is doing real work is not an idle one.
+    idleTimeout: 120,
+    fetch: (request) => entryShutdown.fetch(request, bunFetch),
+  });
+} catch (error) {
+  try {
+    await selfhostV2WorkerEndpointBoot?.close(true);
+  } catch (closeError) {
+    throw new AggregateError(
+      [error, closeError],
+      "self-host Bun listener failed and v2 Worker Endpoint cleanup was not confirmed",
+    );
+  }
+  throw error;
+}
 
 // Background settlement. The shutdown owner retains each timer and each pass
 // promise, so no new work starts past the signal fence and accepted work drains.
@@ -1252,6 +1349,11 @@ entryShutdown.startInterval(
   },
   (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
 );
+if (v2RuntimeBoot?.v2Workflow) {
+  startSelfhostV2WorkflowDuePass(entryShutdown, v2WorkerComposition, (name) =>
+    process.stderr.write(`self-host background pass failed: ${name}\n`),
+  );
+}
 entryShutdown.startInterval(
   "queue-wake",
   1_000,

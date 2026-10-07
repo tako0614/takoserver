@@ -266,9 +266,37 @@ The initial candidate,
 [`EdgeKVNamespace 0.2.0`](https://edge.forms.takoform.com/forms/EdgeKVNamespace/0.2.0/),
 cannot be qualified by a local SQL namespace alone: it defines replicated
 eventual-consistency storage and a WorkerVersion JavaScript Binding. The existing
-Cloudflare namespace-create path also cannot safely reconcile a lost create
-acknowledgement. Neither path becomes compatible by wrapping its old request in
-a new HTTP envelope.
+Cloudflare namespace-create path cannot safely adopt a namespace when its
+acknowledgement loses the provider ID. Neither path becomes compatible by
+wrapping its old request in a new HTTP envelope.
+
+The canonical Form constructor now accepts either its existing local Store or
+an operator-selected native `V2Backend`, never both. Both modes retain the same
+Form validation and target identity. The native adapter receives the full
+accepted execution and must return the exact Form observation with empty output;
+a malformed completion or authority change remains unknown.
+
+Migration `0085` adds Operation-owned native KV custody, not a second Resource
+ledger. CREATE and DELETE each receive a durable one-shot send grant. A trusted
+CREATE acknowledgement preserves the provider ID, original Operation and
+generation; reconciliation reads that ID, never a matching title. Same-spec
+UPDATE keeps the confirmed namespace. DELETE resolves the original identity
+before its grant and requires exact-ID absence after its single send. Losing a
+CREATE acknowledgement without its ID remains unknown and never authorizes a
+second create. The source migration does not change the live apply ceilings.
+
+The private Cloudflare adapter exercises accepted Core Host operations with
+explicit organization principals and real SQLite, using a simulated external
+API. The separate `buildApp.fetch` journey exercises stored organization API-key
+authentication, the same UID across two writer keys, read-only mutation refusal
+and cross-organization read refusal. It still uses a simulated identity provider
+and Cloudflare API and does not prove complete Form support. Native
+Worker Binding execution remains unqualified, as does the client's assumption
+that an exact-ID GET HTTP 404 proves absence rather than an account or permission
+failure. EdgeKVNamespace 0.2.0 gives bounds for TTL, list limit and prefix,
+but does not name their out-of-range errors despite requiring named errors.
+The implementation must not invent those names or revise the published Form in
+place; the SDK gap requires an owning successor contract decision.
 
 An artifact-only Form such as
 [`SQLiteMigrationSet 0.2.0`](https://edge.forms.takoform.com/forms/SQLiteMigrationSet/0.2.0/)
@@ -711,6 +739,29 @@ semantic-inspector stand-in, not native active Actor ABI proof. Active runtime
 counts and the executable Actor Binding remain incomplete; these internal paths
 do not register or advertise ActorNamespace Form support.
 
+The normal Bun entry can now opt in to its existing private v2 Actor and
+Workflow boot ports with `TAKOSERVER_V2_WORKER_RUNTIME_BOOT`, for example
+`{"actor":true,"workflow":{"maximumRegistrations":4}}`. The exact JSON
+selection requires the configured held WorkerBundle backend and selected
+workerd executable; Workflow additionally requires the operator's absolute
+`TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY`. Native roots stay under the
+existing private data root. Boot restores the single SQL-backed Worker owner
+before opening ingress, polls Workflow due work as a separate tracked pass, and
+closes Workflow/Actor execution before suspending that owner. This is private
+source assembly only: the ordinary Host still does not register incomplete
+Worker Forms. `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` explicitly selects the
+existing v2 Worker Endpoint HTTPS boot in the ordinary Bun entry. It reuses
+`TAKOSERVER_WORKER_ENDPOINT_SUFFIX` and the existing Worker TLS certificate/key
+inputs, binds the shared listener on TCP 443, and rejects conflicts with the
+ordinary control, Workerd, data-plane, or legacy Container Endpoint HTTPS
+listener. Leaving the selection unset preserves the existing boot path. The
+selected listener is closed during ordered shutdown and if the ordinary Bun
+listener cannot start. This starts the SQL/native Endpoint frontend only; it
+does not mount the incomplete Worker Forms into the normal registry or mark
+them Ready. Local certificate/SNI and route checks are not public DNS, external
+CA trust, or reachability qualification, and this selection does not make
+complete Worker support live.
+
 ## Existing installations
 
 The additive v2 tables do not convert or delete existing v1 records. Preserving
@@ -740,6 +791,22 @@ failure recovery and delete. Concurrency and lost responses must preserve the
 same operation and resource identities. A restart test must terminate an OS
 process and reopen the same persistent state, not merely construct another
 JavaScript handle.
+
+The pinned-workerd Service Binding journey accepts caller and target resources
+through the authenticated Host fixture, then kills that Host process and proves
+both previous native children stale. A distinct Host and native PIDs reopen the
+same SQLite, file object store and owner roots. Service calls retain the original
+URL/Host and exclude private transport headers; a target-only Deployment change
+is visible without republishing the caller, followed by dependency-ordered
+deletion. This is loopback fixture evidence, not public TLS, normal Form
+registration or a long-stream interruption proof.
+
+Within one accepted publication, candidate revalidation reuses the exact
+Operation/Version/ordered-Binding token projection instead of opening an orphan
+broker for each pass. A different incarnation receives fresh credentials.
+Read-only publication observation rechecks the current graph and existing
+native/socket proof without opening another broker. Unknown legacy socket
+custody is not adopted or deleted by this repair.
 
 The opt-in normal Bun entry test also exercises one interrupted artifact
 create: it discards the HTTP response body and returned IDs, observes a

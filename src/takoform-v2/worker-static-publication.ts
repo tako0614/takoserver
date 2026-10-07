@@ -17,7 +17,10 @@ import type {
   WorkerdStaticSite,
 } from "../workerd-runtime.ts";
 import { internalHostname } from "../workerd-runtime.ts";
-import { compileWorkerdVersionGraph } from "../workerd-version-graph.ts";
+import {
+  compileWorkerdVersionGraph,
+  workerdVersionServiceBindingName,
+} from "../workerd-version-graph.ts";
 import type { ObjectBucketWorkerBindingClaim } from "./forms/object-bucket-worker-binding-authority.ts";
 import type { SQLiteWorkerBindingClaim } from "./forms/sqlite-worker-binding-authority.ts";
 import {
@@ -29,6 +32,7 @@ import type { V2Execution } from "./types.ts";
 import { projectV2WorkerCodeVersion } from "./worker-code-runtime.ts";
 import type { V2CodeConfiguredInputReader } from "./worker-lifecycle-backend.ts";
 import type { V2WorkerPublicationResolution } from "./worker-publication-state.ts";
+import type { V2ResolvedServiceBinding } from "./worker-service-resolution.ts";
 import {
   projectV2ResolvedServiceBindings,
   v2ServiceTargetName,
@@ -58,6 +62,20 @@ type Candidate = {
   readonly publication: WorkerdDeploymentPublication<WorkerdSite | WorkerdStaticSite> | null;
   readonly deferRetirementUntilDeadline: boolean;
 };
+
+/** Immutable accepted caller-Version provenance passed only to the Host broker. */
+export interface V2WorkerServiceBindingClaim {
+  readonly principal: string;
+  readonly space: string;
+  readonly targetKey: string;
+  readonly workerUid: string;
+  readonly workerVersionUid: string;
+  readonly workerVersionOperationId: string;
+  readonly nativeVersionId: string;
+  readonly incarnationId: string;
+  readonly servingSourceOperationId: string;
+  readonly bindings: readonly { readonly name: string; readonly resourceUid: string }[];
+}
 
 /** Exact serving-publication evidence, deliberately separate from Form settlement. */
 export type V2WorkerPublicationResult =
@@ -233,6 +251,13 @@ export function createV2WorkerPublication(options: {
       binding: string,
     ): Promise<V2QueueProducerBindingResolution | null>;
   };
+  /** Per-incarnation Host broker, opened before the native Version is published. */
+  readonly v2ServiceBindingForward?: {
+    issueBinding(
+      claim: V2WorkerServiceBindingClaim,
+      binding: V2ResolvedServiceBinding,
+    ): Promise<void>;
+  };
   /** Same incarnation-scoped Actor grant source used by the native private brokers. */
   readonly v2ActorForward?: {
     issueBinding(
@@ -271,10 +296,24 @@ export function createV2WorkerPublication(options: {
 }): V2WorkerPublication {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   const inspectModule = options.runtime.inspectModule;
+  // A fenced publication resolves its candidate before and inside the native
+  // write. Reuse only this incarnation's exact accepted Version/Binding vector:
+  // each resolution otherwise mints a different broker token and leaves a
+  // socket outside the final pinned native configuration after Host SIGKILL.
+  let serviceProjection:
+    | {
+        operationId: string;
+        versions: Map<
+          string,
+          { vector: string; bindings: Promise<readonly V2ResolvedServiceBinding[]> }
+        >;
+      }
+    | undefined;
 
   async function candidate(
     execution: V2Execution,
     resolution: Extract<V2WorkerPublicationResolution, { kind: "ready" }>,
+    issueServiceBindings = true,
   ): Promise<Candidate> {
     const snapshot = resolution.snapshot;
     const name = await scriptName(snapshot.worker.uid);
@@ -603,7 +642,69 @@ export function createV2WorkerPublication(options: {
         if (versionSpec.requiredSensitiveVars.length > 0 && !configuredPrivateInputs) {
           throw new Error("configured Worker Version input is unavailable");
         }
-        const serviceBindings = await projectV2ResolvedServiceBindings(versionSpec.serviceBindings);
+        let serviceBindings: readonly V2ResolvedServiceBinding[];
+        if (!issueServiceBindings || versionSpec.serviceBindings.length === 0) {
+          serviceBindings = await projectV2ResolvedServiceBindings(versionSpec.serviceBindings);
+        } else {
+          if (serviceProjection?.operationId !== execution.operationId) {
+            serviceProjection = { operationId: execution.operationId, versions: new Map() };
+          }
+          const vector = canonicalJson({
+            sourceOperationId: snapshot.sourceOperationId,
+            worker: snapshot.worker,
+            deploymentUid: snapshot.deployment.uid,
+            deploymentGeneration: snapshot.deployment.generation,
+            versionUid: version.uid,
+            versionSourceOperationId: version.sourceOperationId,
+            versionGeneration: version.generation,
+            versionWeight: version.weight,
+            bindings: versionSpec.serviceBindings,
+          });
+          const prior = serviceProjection.versions.get(version.uid);
+          if (prior && prior.vector !== vector) {
+            throw new Error("ServiceBinding accepted Version graph changed");
+          }
+          if (!prior) {
+            const bindings = projectV2ResolvedServiceBindings(versionSpec.serviceBindings);
+            serviceProjection.versions.set(version.uid, { vector, bindings });
+            serviceBindings = await bindings;
+          } else {
+            serviceBindings = await prior.bindings;
+          }
+        }
+        if (serviceBindings.length > 0) {
+          const forward = options.v2ServiceBindingForward;
+          if (!forward) throw new Error("native ServiceBinding forwarding is unavailable");
+          const claim: V2WorkerServiceBindingClaim = Object.freeze({
+            principal: snapshot.worker.principal,
+            space: snapshot.worker.space,
+            targetKey: options.targetKey,
+            workerUid: snapshot.worker.uid,
+            workerVersionUid: version.uid,
+            workerVersionOperationId: version.sourceOperationId,
+            nativeVersionId: identity.versionId,
+            incarnationId: execution.operationId,
+            servingSourceOperationId: execution.operationId,
+            bindings: Object.freeze(
+              versionSpec.serviceBindings.map((binding) =>
+                Object.freeze({
+                  name: binding.name,
+                  resourceUid: binding.resource.resourceUid,
+                }),
+              ),
+            ),
+          });
+          if (issueServiceBindings) {
+            for (const [index, binding] of serviceBindings.entries()) {
+              await forward.issueBinding(claim, {
+                ...binding,
+                name: workerdVersionServiceBindingName(index, true),
+              });
+            }
+          }
+          if (!(await resolution.stillCurrent()))
+            throw new Error("ServiceBinding reference graph changed");
+        }
         const codeProjection = await projectV2WorkerCodeVersion({
           identity: {
             ...identity,
@@ -768,7 +869,8 @@ export function createV2WorkerPublication(options: {
     } catch {
       return unknownResult();
     }
-    if (proof !== "matches" || !(await resolution.stillCurrent())) return unknownResult();
+    if (proof !== "matches") return unknownResult();
+    if (!(await resolution.stillCurrent())) return unknownResult();
     if (candidateValue.identity === null) return { kind: "confirmed", identity: null };
     return {
       kind: "confirmed",
@@ -871,7 +973,9 @@ export function createV2WorkerPublication(options: {
       const resolution = await resolveInitial(execution);
       if (resolution.kind !== "ready") return unknownResult();
       try {
-        const expected = await candidate(execution, resolution);
+        // Observation never creates a new Host broker for a graph it does not
+        // publish. Recovery reissues only sockets selected by the pinned graph.
+        const expected = await candidate(execution, resolution, false);
         // Reconciliation is read-only. A mismatch or missing proof remains unknown.
         return await resultFromReadback(expected, resolution);
       } catch {

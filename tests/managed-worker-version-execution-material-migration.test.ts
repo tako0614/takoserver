@@ -39,6 +39,7 @@ const V2_PRIVATE_INPUTS = "0081_v2_private_inputs.sql";
 const V2_QUEUE_BATCH_SETTLEMENTS = "0082_v2_queue_batch_settlements.sql";
 const V2_QUEUE_CONSUMER_ACCEPTANCE = "0083_v2_queue_consumer_acceptance.sql";
 const V2_INVOCATION_NO_NATIVE_DISPATCH = "0084_v2_worker_invocation_no_native_dispatch.sql";
+const V2_EDGE_KV_NATIVE_CUSTODY = "0085_v2_edge_kv_native_custody.sql";
 
 const DOMAIN_MIGRATION = "0058_cloudflare_managed_worker_domain_receipts.sql";
 const APPLY_PROVIDER_SELECTION_MIGRATION = "0059_takoform_apply_provider_selection.sql";
@@ -175,6 +176,7 @@ test("0058 interrupted receipt rebuild rolls back with exact ciphertext and line
     V2_QUEUE_BATCH_SETTLEMENTS,
     V2_QUEUE_CONSUMER_ACCEPTANCE,
     V2_INVOCATION_NO_NATIVE_DISPATCH,
+    V2_EDGE_KV_NATIVE_CUSTODY,
   ]);
   expect(preservedRows(database)).toEqual(rows);
   database.close();
