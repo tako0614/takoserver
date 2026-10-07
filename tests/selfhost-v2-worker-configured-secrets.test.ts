@@ -168,6 +168,9 @@ test.skipIf(binary === null)(
         },
       });
       expect(await composition.restoreOwners()).toEqual([]);
+      // The Host owns the sealer passed at boot, even if a caller mutates the
+      // original object before the application composes its Form map.
+      sealer.open = async () => null;
       const app = buildApp({
         sql,
         objects,

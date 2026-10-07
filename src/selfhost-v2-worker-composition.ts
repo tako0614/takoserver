@@ -93,15 +93,24 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     throw new TypeError("v2 Worker composition requires SQL, objects, target and private root");
   }
   const { sql, objects, clock, config, targetKey } = options;
-  const configuredInputSealer = options.configuredInputSealer;
+  const suppliedSealer = options.configuredInputSealer;
   if (
-    configuredInputSealer &&
-    (typeof configuredInputSealer.seal !== "function" ||
-      typeof configuredInputSealer.open !== "function" ||
-      typeof configuredInputSealer.compare !== "function")
+    suppliedSealer &&
+    (typeof suppliedSealer.seal !== "function" ||
+      typeof suppliedSealer.open !== "function" ||
+      typeof suppliedSealer.compare !== "function")
   ) {
     throw new TypeError("v2 Worker configured input sealer is incomplete");
   }
+  // Keep admission and runtime on the same methods selected at boot. The
+  // sealer's compare() calls this.open(), so bind it to this frozen snapshot.
+  const configuredInputSealer = suppliedSealer
+    ? Object.freeze({
+        seal: suppliedSealer.seal.bind(suppliedSealer),
+        open: suppliedSealer.open.bind(suppliedSealer),
+        compare: suppliedSealer.compare,
+      })
+    : undefined;
   const configuredInputCustody = configuredInputSealer
     ? {
         read: (identity: Parameters<typeof readV2ConfiguredPrivateInputs>[1]) =>
