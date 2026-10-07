@@ -27,6 +27,7 @@ import { createV2HeldArtifactSource } from "./takoform-v2/forms/artifact-source.
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "./takoform-v2/forms/at-least-once-queue.ts";
 import { createKvWorkerBindingAuthority } from "./takoform-v2/forms/kv-worker-binding-authority.ts";
 import { createObjectBucketWorkerBindingAuthority } from "./takoform-v2/forms/object-bucket-worker-binding-authority.ts";
+import { QUEUE_CONSUMER_FORM_URL } from "./takoform-v2/forms/queue-consumer.ts";
 import { createQueueWorkerBindingAuthority } from "./takoform-v2/forms/queue-worker-binding-authority.ts";
 import { createSQLiteWorkerBindingAuthority } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { createStaticAssetBundleCustody } from "./takoform-v2/forms/static-asset-bundle-backend.ts";
@@ -49,7 +50,10 @@ import {
 } from "./takoform-v2/worker-lifecycle-backend.ts";
 import { createV2WorkerPublicationState } from "./takoform-v2/worker-publication-state.ts";
 import { createAtLeastOnceQueueForm } from "./takoform-v2/worker-queue-backend.ts";
-import type { V2QueueConsumerCapability } from "./takoform-v2/worker-queue-consumer-backend.ts";
+import {
+  createQueueConsumerForm,
+  type V2QueueConsumerCapability,
+} from "./takoform-v2/worker-queue-consumer-backend.ts";
 import { createV2WorkerdWorkerRuntimeReaders } from "./takoform-v2/worker-runtime-readers.ts";
 import type { createV2WorkerVersionConfiguredInputSealer } from "./takoform-v2/worker-version-configured-inputs.ts";
 import { spawnWorkerdWithParentDeath } from "./workerd-linux-process.ts";
@@ -901,6 +905,15 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       ...(queueProducerBoot && queueSettlement
         ? {
             [AT_LEAST_ONCE_QUEUE_FORM_URL]: createAtLeastOnceQueueForm({ sql, targetKey }),
+          }
+        : {}),
+      ...(queueCapability && queueSettlement
+        ? {
+            [QUEUE_CONSUMER_FORM_URL]: createQueueConsumerForm({
+              sql,
+              targetKey,
+              capability: queueCapability,
+            }),
           }
         : {}),
       ...(endpoint
