@@ -5,6 +5,11 @@ import { isAbsolute, join } from "node:path";
 import { resolveActorAbiProfile } from "./actor-class-execution.ts";
 import { ACTOR_NATIVE_BOOTSTRAP_SOURCE } from "./generated/actor-native-bootstrap.ts";
 import { SELFHOST_WORKER_PROJECT_ENV_EXPORT } from "./providers/selfhost-worker-wrapper.ts";
+import {
+  type LinuxProcessIdentity,
+  spawnWorkerdWithParentDeath,
+  waitForStoppedWorkerdChild,
+} from "./workerd-linux-process.ts";
 import { type WorkerdActiveActorGraph, writeWorkerdPrivateExecution } from "./workerd-runtime.ts";
 
 /** Internal, selected bytes only. Never accepted as provider desired state. */
@@ -35,6 +40,8 @@ export interface WorkerdActorNamespaceOptions {
   readonly ownerDeadlines?: { readonly handlerMs: number; readonly producerMs: number };
   /** Native process lifecycle test seam only; production uses Bun and Unix readiness. */
   readonly processAdapter?: WorkerdActorNativeProcessAdapter;
+  /** Host custody ACK must be durable before the stopped native child can exec. */
+  readonly beforeNativeExec?: (identity: LinuxProcessIdentity) => Promise<void>;
 }
 
 type WorkerdActorNativeChild = Pick<
@@ -57,6 +64,7 @@ export interface WorkerdActorNativeProcessAdapter {
 }
 
 export interface WorkerdActorNamespace {
+  readonly processIdentity?: LinuxProcessIdentity | null;
   fetch(id: string, request: Request, variantKey: string): Promise<Response>;
   /** Authenticated child read even when no Actor ID has yet been dispatched. */
   probeRuntime?(signal: AbortSignal): Promise<void>;
@@ -458,11 +466,11 @@ export default {
     options.processAdapter ??
     ({
       spawn: (selectedBinary: string, selectedConfig: string) =>
-        Bun.spawn([selectedBinary, "serve", selectedConfig, "--experimental"], {
-          env: {},
-          stdout: "ignore",
-          stderr: "ignore",
-        }),
+        spawnWorkerdWithParentDeath(
+          [selectedBinary, "serve", selectedConfig, "--experimental"],
+          { stdout: "ignore", stderr: "ignore" },
+          { env: {}, ...(options.beforeNativeExec ? { pauseBeforeExec: true as const } : {}) },
+        ),
       probeReadiness: ({
         socketPath,
         token: readinessToken,
@@ -479,6 +487,7 @@ export default {
         }),
     } satisfies WorkerdActorNativeProcessAdapter);
   let child: WorkerdActorNativeChild | undefined;
+  let childIdentity: LinuxProcessIdentity | null = null;
   let closing: Promise<void> | undefined;
   let verified = false;
   let acceptedRunListener: Awaited<ReturnType<typeof lstat>> | null = null;
@@ -739,8 +748,21 @@ export default {
     child = startingChild;
     if (!options.processAdapter) {
       const pid = startingChild.pid;
+      if (options.beforeNativeExec) {
+        const stopped = await waitForStoppedWorkerdChild(
+          startingChild as ReturnType<typeof Bun.spawn>,
+          options.signal,
+        );
+        await options.beforeNativeExec(stopped);
+        if (isActorNativeChildTerminal(startingChild))
+          throw new Error("Actor native child exited before custody ACK");
+        childIdentity = stopped;
+        startingChild.kill("SIGCONT");
+      }
       launchedBirth = pid && Number.isSafeInteger(pid) ? await processBirth(pid) : null;
       if (!launchedBirth) throw new Error("Actor native child identity unavailable");
+      if (childIdentity && childIdentity.startTimeTicks !== launchedBirth)
+        throw new Error("Actor native child identity changed before exec");
     }
     let ready = false;
     let verifiedListener: Awaited<ReturnType<typeof lstat>> | null = null;
@@ -816,6 +838,7 @@ export default {
     };
     const runningChild = startingChild;
     return {
+      processIdentity: childIdentity,
       exited: runningChild.exited.then(() => {
         verified = false;
       }),

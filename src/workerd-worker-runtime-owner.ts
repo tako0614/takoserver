@@ -286,6 +286,8 @@ export type WorkerdActorNativeGraphObservation =
 
 export interface WorkerdWorkerRuntimeOwner {
   readonly workerResourceUid: string;
+  /** Trusted post-restore proof; no caller admission is opened by an unproven broker. */
+  completeActorRestore(): Promise<void>;
   /** Run one accepted WorkerDeployment or WorkerEndpoint Operation for this UID. */
   execute(execution: V2Execution): Promise<V2WorkerRuntimeOwnerExecutionResult>;
   /** Read exact current serving truth without changing publication state. */
@@ -613,6 +615,7 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
       readonly sourceOperationId: string;
       readonly eventToken: string;
       readonly scriptName: string;
+      readonly restoring?: true;
     }): {
       readonly actorForwardLifecycle: NonNullable<
         Parameters<typeof createWorkerdRuntime>[0]["actorForwardLifecycle"]
@@ -621,9 +624,12 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
       readonly issueBinding: NonNullable<
         Parameters<typeof createV2WorkerPublication>[0]["v2ActorForward"]
       >["issueBinding"];
+      completeRestoration(): Promise<void>;
       close(): Promise<void>;
     };
   };
+  /** Composition alone defers the Actor postpass until every UID owner is recovered. */
+  readonly deferActorRestoreAdmission?: boolean;
   readonly workerdBinary: string | null;
   /** Trusted code-module inspector; absent uses the WorkerdRuntime's pinned inspector. */
   readonly inspectModule?: WorkerdRuntime["inspectModule"];
@@ -2764,6 +2770,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     record: IncarnationRecord,
     group: WorkerdWorkerExecutionGroup,
     incumbent: WorkerdPublicationIdentity | null,
+    restoring = false,
   ): IncarnationHandle => {
     // Re-key private service dispatch for every native incarnation, including
     // recovery. The credential is in this closure and the private Host config,
@@ -2776,6 +2783,7 @@ export async function openWorkerdWorkerRuntimeOwner(
             sourceOperationId: record.operationId,
             eventToken: record.eventToken,
             scriptName: scriptName(options.workerResourceUid),
+            ...(restoring ? { restoring: true as const } : {}),
           })
         : undefined;
     const workflowForward =
@@ -3322,14 +3330,20 @@ export async function openWorkerdWorkerRuntimeOwner(
                 includeStatic: true,
               },
             );
-      const expectedVersionId = `v2-${createHash("sha256")
-        .update(`${version.uid}\u0000${version.generation}`, "utf8")
-        .digest("hex")}`;
+      // The accepted Deployment pins an immutable native Version. A later
+      // same-spec WorkerVersion PUT advances SQL generation, not that native
+      // source identity. Compare the selected child to the persisted exact
+      // publication; current SQL/spec and binding proof are checked below.
+      const pinnedVersion = record.identity.versions.find(
+        (item) => item.workerVersionUid === version.uid,
+      );
       if (
         !selected ||
+        !pinnedVersion ||
+        pinnedVersion.weight !== version.weight ||
         selected.workerResourceUid !== options.workerResourceUid ||
         selected.workerVersionUid !== version.uid ||
-        selected.versionId !== expectedVersionId ||
+        selected.versionId !== pinnedVersion.versionId ||
         selected.generation !== record.identity.generation
       ) {
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
@@ -3360,7 +3374,7 @@ export async function openWorkerdWorkerRuntimeOwner(
           workerUid: snapshot.worker.uid,
           workerVersionUid: version.uid,
           workerVersionOperationId: version.sourceOperationId,
-          nativeVersionId: expectedVersionId,
+          nativeVersionId: pinnedVersion.versionId,
           incarnationId: record.operationId,
           servingSourceOperationId: record.operationId,
           bindings: Object.freeze(
@@ -3450,7 +3464,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
     const group = await openExistingRecoveryGroup(activeRecord, configuration);
     recoveringGroup = group;
-    const handle = makeIncarnationHandle(activeRecord, group, activeRecord.identity);
+    const handle = makeIncarnationHandle(activeRecord, group, activeRecord.identity, true);
     if (!handle.runtime.preparePrivateServiceBindingSockets) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
@@ -3498,6 +3512,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     if (state.suspended) {
       await transitionState((current) => ({ ...current, suspended: false }));
     }
+    if (!options.deferActorRestoreAdmission) await handle.actorForward?.completeRestoration();
     recoveringGroup = null;
   };
 
@@ -5863,6 +5878,10 @@ export async function openWorkerdWorkerRuntimeOwner(
   // replay its delete proof. Unretired groups are rejected above and never adopted.
   return Object.freeze({
     workerResourceUid: options.workerResourceUid,
+    async completeActorRestore() {
+      if (closed || suspending) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      await active?.actorForward?.completeRestoration();
+    },
     execute,
     observeServing,
     observeActorGraph,

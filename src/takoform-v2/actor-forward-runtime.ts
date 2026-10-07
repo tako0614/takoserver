@@ -19,7 +19,7 @@ import { WORKER_VERSION_FORM_URL } from "./forms/worker-specs.ts";
 
 type ActorBindingAuthority = Pick<
   ReturnType<typeof createV2ActorBindingAuthority>,
-  "resolveCurrentBinding"
+  "resolveCurrentBinding" | "recoverableBinding"
 >;
 type PhysicalActorHost = Pick<
   ReturnType<typeof createSelfhostActorExecutionHost>,
@@ -33,6 +33,8 @@ export interface V2ActorForwardIncarnationIdentity {
   readonly sourceOperationId: string;
   readonly eventToken: string;
   readonly scriptName: string;
+  /** Only a persisted native incarnation may select provisional restore. */
+  readonly restoring?: true;
 }
 
 /** Host-private workerd binding; never a Resource output or tenant env secret. */
@@ -56,11 +58,14 @@ export function createV2ActorForwardBoot(options: {
   readonly authority: ActorBindingAuthority;
   readonly physical: PhysicalActorHost;
   readonly privateSocketDirectory: string;
+  /** Shared Host restore barrier; no broker admits while any owner is unproved. */
+  readonly canInvoke?: () => boolean;
 }) {
   if (
     !options.sql ||
     !options.targetKey ||
     typeof options.authority?.resolveCurrentBinding !== "function" ||
+    typeof options.authority?.recoverableBinding !== "function" ||
     typeof options.physical?.fetch !== "function" ||
     typeof options.physical?.reserveDuplex !== "function" ||
     !isAbsolute(options.privateSocketDirectory)
@@ -70,6 +75,7 @@ export function createV2ActorForwardBoot(options: {
   const authority = options.authority;
   const sql = options.sql;
   const physical = options.physical;
+  const canInvoke = options.canInvoke ?? (() => true);
   const privateRoot = options.privateSocketDirectory;
   return Object.freeze({
     openIncarnation(source: V2ActorForwardIncarnationIdentity) {
@@ -89,6 +95,8 @@ export function createV2ActorForwardBoot(options: {
         throw new TypeError("Actor forward incarnation identity unavailable");
       }
       let closed = false;
+      let restoring = identity.restoring === true;
+      let pendingRestoredPublications: readonly WorkerdActorForwardPublication[] | null = null;
       let uncertain = false;
       let socketDirectory: string | null = null;
       let admitted = new Set<string>();
@@ -119,7 +127,7 @@ export function createV2ActorForwardBoot(options: {
         sourceClaim: V2ActorBindingClaim,
         bindingName: string,
       ): Promise<V2IssuedActorForwardBinding | null> => {
-        if (closed) return null;
+        if (closed || restoring) return null;
         const claim: V2ActorBindingClaim = {
           ...sourceClaim,
           bindings: sourceClaim.bindings.map((binding) => ({ ...binding })),
@@ -249,6 +257,18 @@ export function createV2ActorForwardBoot(options: {
           readonly claim: V2ActorBindingClaim;
         }[] = [];
         for (const binding of publication.bindings) {
+          if (restoring) {
+            if (
+              binding.tenantId !== identity.principal ||
+              binding.namespaceResourceUid === "" ||
+              !/^[a-f0-9]{64}$/u.test(binding.token) ||
+              parseActorAbiRef(binding.runtimeClassRef)?.kind !== "v2" ||
+              !(await authority.recoverableBinding(claim, binding.publicName, binding))
+            )
+              throw new Error("retained Actor binding is not recoverable");
+            proven.push({ key: bindingKey(binding), binding, claim });
+            continue;
+          }
           const issued = await issueBinding(claim, binding.publicName);
           if (
             !issued ||
@@ -321,14 +341,16 @@ export function createV2ActorForwardBoot(options: {
               upgradeSocketPath,
               executionHost: {
                 async fetch(scope, request) {
-                  if (!admitted.has(key)) throw new Error("Actor Version not active");
+                  if (!admitted.has(key) || !canInvoke())
+                    throw new Error("Actor Version not active");
                   const current = await issueBinding(item.claim, item.binding.publicName);
                   if (!current || current.token !== item.binding.token)
                     throw new Error("Actor Version relation changed");
                   return physical.fetch(scope, request);
                 },
                 async reserveDuplex(scope, request) {
-                  if (!admitted.has(key)) throw new Error("Actor Version not active");
+                  if (!admitted.has(key) || !canInvoke())
+                    throw new Error("Actor Version not active");
                   const current = await issueBinding(item.claim, item.binding.publicName);
                   if (!current || current.token !== item.binding.token)
                     throw new Error("Actor Version relation changed");
@@ -412,6 +434,11 @@ export function createV2ActorForwardBoot(options: {
         },
         activated(publications: readonly WorkerdActorForwardPublication[]) {
           if (closed) return;
+          if (restoring) {
+            pendingRestoredPublications = structuredClone(publications);
+            admitted = new Set();
+            return;
+          }
           const keys = new Set(
             publications.flatMap((publication) => publication.bindings.map(bindingKey)),
           );
@@ -439,6 +466,28 @@ export function createV2ActorForwardBoot(options: {
       return Object.freeze({
         issueBinding,
         actorForwardLifecycle,
+        completeRestoration(): Promise<void> {
+          return exclusive(async () => {
+            if (!restoring) return;
+            const publications = pendingRestoredPublications;
+            if (!publications || closed || uncertain)
+              throw new Error("Actor restore graph unavailable");
+            // No broker becomes callable until every retained token is reissued
+            // by current caller SQL and the target's live native graph.
+            restoring = false;
+            try {
+              const keys = await prepareGraph(publications);
+              if ([...keys].some((key) => !brokers.has(key)))
+                throw new Error("Actor restore broker unavailable");
+              admitted = keys;
+              pendingRestoredPublications = null;
+            } catch (error) {
+              uncertain = true;
+              admitted = new Set();
+              throw error;
+            }
+          });
+        },
         actorForwardSockets(): readonly WorkerdActorForwardSocket[] {
           return closed ? [] : [...brokers.values()].map((pair) => pair.socketMapping);
         },

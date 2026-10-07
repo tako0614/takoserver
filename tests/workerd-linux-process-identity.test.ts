@@ -2,7 +2,36 @@ import { expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { linuxProcessLiveness, readLinuxProcessIdentity } from "../src/workerd-linux-process.ts";
+import {
+  linuxProcessLiveness,
+  readLinuxProcessIdentity,
+  spawnWorkerdWithParentDeath,
+  waitForStoppedWorkerdChild,
+} from "../src/workerd-linux-process.ts";
+
+test("parent-bound child cannot execute before its exact stopped identity is ACKed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "workerd-stopped-custody-"));
+  const marker = join(root, "executed");
+  const child = spawnWorkerdWithParentDeath(
+    ["/bin/sh", "-c", 'printf executed > "$1"', "custody-child", marker],
+    { stdout: "ignore", stderr: "ignore" },
+    { pauseBeforeExec: true, env: {} },
+  );
+  try {
+    const identity = await waitForStoppedWorkerdChild(child, AbortSignal.timeout(5_000));
+    expect(identity.pid).toBe(child.pid);
+    expect(await Bun.file(marker).exists()).toBe(false);
+    expect(await linuxProcessLiveness(identity)).toBe("live");
+    child.kill("SIGCONT");
+    expect(await child.exited).toBe(0);
+    expect(await readFile(marker, "utf8")).toBe("executed");
+    expect(await linuxProcessLiveness(identity)).toBe("stale");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await child.exited;
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 for (const mode of ["reaped", "still-live", "permission-denied", "malformed-after-reap"] as const) {
   test(`proc stat ${mode} after a live PID check has a fenced result`, async () => {

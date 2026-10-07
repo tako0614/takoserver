@@ -82,6 +82,7 @@ export function createSelfhostV2ActorBoot(options: {
         authority: bindingAuthority,
         physical,
         privateSocketDirectory,
+        canInvoke: input.actorInvocationReady,
       });
       const namespaceForm = createV2ActorNamespaceForm({
         sql,

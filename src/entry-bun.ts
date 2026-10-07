@@ -739,7 +739,7 @@ try {
       ...(process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY
         ? { guardBinary: process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY }
         : {}),
-      ownerForWorkerUid: async (uid) => (workers ? await workers.ownerForWorkerUid(uid) : null),
+      ownerForWorkerUid: async (uid) => (workers ? await workers.actorOwnerForRecovery(uid) : null),
       ...(dataPlanes ? { dataPlaneAddress: dataPlanes.address } : {}),
     });
   }

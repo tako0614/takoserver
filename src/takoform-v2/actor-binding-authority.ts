@@ -1,3 +1,4 @@
+import { parseActorAbiRef } from "../actor-abi-ref.ts";
 import { bytesDigest, canonicalJson } from "../json.ts";
 import type { Sql } from "../ports.ts";
 import type { createSelfhostActorExecutionHost } from "../selfhost-actor-execution-host.ts";
@@ -199,15 +200,17 @@ export function createV2ActorBindingAuthority(options: {
         if (
           !namespace ||
           namespace.backend_id !== V2_ACTOR_NAMESPACE_BACKEND_ID ||
-          typeof namespace.spec_json !== "string" ||
-          parseActorNamespaceSpec(JSON.parse(namespace.spec_json)).worker.resourceUid !==
-            target.workerUid
+          typeof namespace.spec_json !== "string"
         )
           return null;
+        // The caller's Version and the Actor class provider may be different
+        // Workers. The Namespace's accepted Worker reference owns class code.
+        const namespaceWorkerUid = parseActorNamespaceSpec(JSON.parse(namespace.spec_json)).worker
+          .resourceUid;
         const graph = await options.namespaceGraph.readGraph(scope, AbortSignal.timeout(30_000));
         if (
           !graph ||
-          graph.workerUid !== target.workerUid ||
+          graph.workerUid !== namespaceWorkerUid ||
           graph.scope.tenantId !== target.principal ||
           graph.scope.namespaceResourceUid !== target.namespaceResourceUid
         )
@@ -298,5 +301,65 @@ export function createV2ActorBindingAuthority(options: {
     }
   }
 
-  return Object.freeze({ resolveTarget, resolveCurrentBinding });
+  /** Recovery-only check for a retained native token. It does not issue a grant. */
+  async function recoverableBinding(
+    source: V2ActorBindingClaim,
+    bindingName: string,
+    persisted: {
+      readonly tenantId: string;
+      readonly namespaceResourceUid: string;
+      readonly runtimeClassRef?: unknown;
+    },
+  ): Promise<boolean> {
+    try {
+      const claim = structuredClone(source);
+      if (
+        claim.targetKey !== options.targetKey ||
+        persisted.tenantId !== claim.principal ||
+        parseActorAbiRef(persisted.runtimeClassRef)?.kind !== "v2"
+      )
+        return false;
+      const selected = claim.bindings.filter((item) => item.name === bindingName);
+      if (selected.length !== 1 || selected[0]?.resourceUid !== persisted.namespaceResourceUid)
+        return false;
+      const before = await captureVersion(claim);
+      if (!before) return false;
+      const rows = await options.sql.query(
+        `SELECT r.spec_json, r.backend_id, r.generation, r.observed_generation, r.phase,
+                r.busy_operation, r.deleted_at, op.action, op.status, op.effect,
+                op.accepted_spec_json
+         FROM tf_v2_resources r JOIN tf_v2_operations op ON op.id = r.last_operation
+         WHERE r.uid = ? AND r.form_url = ? AND r.principal = ? AND r.space = ?
+           AND r.target_key = ? LIMIT 2`,
+        [
+          persisted.namespaceResourceUid,
+          ACTOR_NAMESPACE_FORM_URL,
+          claim.principal,
+          claim.space,
+          claim.targetKey,
+        ],
+      );
+      const row = rows.length === 1 ? rows[0] : null;
+      if (
+        !row ||
+        row.backend_id !== V2_ACTOR_NAMESPACE_BACKEND_ID ||
+        row.deleted_at !== null ||
+        row.busy_operation !== null ||
+        row.phase !== "idle" ||
+        row.observed_generation !== row.generation ||
+        row.status !== "succeeded" ||
+        row.effect !== "complete" ||
+        (row.action !== "create" && row.action !== "update") ||
+        typeof row.spec_json !== "string" ||
+        row.accepted_spec_json !== row.spec_json ||
+        !parseActorNamespaceSpec(JSON.parse(row.spec_json)).className
+      )
+        return false;
+      return (await captureVersion(claim)) === before;
+    } catch {
+      return false;
+    }
+  }
+
+  return Object.freeze({ resolveTarget, resolveCurrentBinding, recoverableBinding });
 }
