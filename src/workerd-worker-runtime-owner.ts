@@ -14,11 +14,16 @@ import {
   unlink,
 } from "node:fs/promises";
 import { join } from "node:path";
-import { WORKER_DEPLOYMENT_FORM_URL } from "./takoform-v2/forms/worker-specs.ts";
+import {
+  parseWorkerEndpointSpec,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+} from "./takoform-v2/forms/worker-specs.ts";
 import type { V2Execution } from "./takoform-v2/types.ts";
 import type { V2WorkerPublicationResolution } from "./takoform-v2/worker-publication-state.ts";
 import {
   createV2WorkerPublication,
+  type V2EndpointRouteAbsentReceipt,
   type V2WorkerPublicationResult,
 } from "./takoform-v2/worker-static-publication.ts";
 import { workerPortOwnership } from "./workerd-linux-process.ts";
@@ -44,13 +49,16 @@ const LOCK_NAME = "runtime-owner.lock";
 const LEGACY_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@1";
 const PREVIOUS_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@2";
 const RETIRED_COPIES_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@3";
-const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@4";
+const CLEANUP_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@4";
+const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@5";
 const LOCK_SCHEMA = "takoserver.v2-worker-runtime-owner-lock@2";
 const OPERATION_MARKER = "takoserver-v2-operation:";
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const DRAIN_GRACE_MS = 15 * 60 * 1000;
 const LOCK_MAX_BYTES = 2_048;
 const RECOVERY_PREFIX = ".runtime-owner-recovery.";
+const ENDPOINT_HOSTNAME =
+  /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/u;
 
 type PublicationState = {
   resolve(input: {
@@ -85,6 +93,8 @@ interface PersistedOwnerState {
   readonly activeOperationId: string | null;
   readonly admissionClosedBy: string | null;
   readonly deletionPublicationConfirmed: boolean;
+  /** Latest exact no-active-Deployment Endpoint absence proof in this owner record. */
+  readonly endpointRouteAbsence: V2WorkerEndpointRouteAbsentResult | null;
   readonly incarnations: readonly IncarnationRecord[];
 }
 
@@ -117,10 +127,17 @@ export class WorkerdWorkerRuntimeOwnerError extends Error {
   }
 }
 
+/** Explicit no-active-Deployment endpoint absence, never Worker teardown. */
+export type V2WorkerEndpointRouteAbsentResult = V2EndpointRouteAbsentReceipt;
+
+export type V2WorkerRuntimeOwnerExecutionResult =
+  | V2WorkerPublicationResult
+  | V2WorkerEndpointRouteAbsentResult;
+
 export interface WorkerdWorkerRuntimeOwner {
   readonly workerResourceUid: string;
-  /** Run one accepted WorkerDeployment Operation and switch only this UID's listener. */
-  execute(execution: V2Execution): Promise<V2WorkerPublicationResult>;
+  /** Run one accepted WorkerDeployment or WorkerEndpoint Operation for this UID. */
+  execute(execution: V2Execution): Promise<V2WorkerRuntimeOwnerExecutionResult>;
   /** Read exact current serving truth without changing publication state. */
   observeServing(input: {
     readonly workerResourceUid: string;
@@ -763,8 +780,28 @@ function emptyState(workerResourceUid: string): PersistedOwnerState {
     activeOperationId: null,
     admissionClosedBy: null,
     deletionPublicationConfirmed: false,
+    endpointRouteAbsence: null,
     incarnations: [],
   };
+}
+
+function validEndpointRouteAbsence(value: unknown): value is V2EndpointRouteAbsentReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as Record<string, unknown>;
+  return (
+    Object.keys(receipt).sort().join(",") ===
+      "assignedHostname,endpointResourceUid,kind,sourceOperationId,targetKey,workerResourceUid" &&
+    receipt.kind === "confirmed_route_absent" &&
+    typeof receipt.sourceOperationId === "string" &&
+    OPERATION_ID.test(receipt.sourceOperationId) &&
+    typeof receipt.endpointResourceUid === "string" &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(receipt.endpointResourceUid) &&
+    typeof receipt.workerResourceUid === "string" &&
+    typeof receipt.targetKey === "string" &&
+    receipt.targetKey.length > 0 &&
+    typeof receipt.assignedHostname === "string" &&
+    ENDPOINT_HOSTNAME.test(receipt.assignedHostname)
+  );
 }
 
 function validReceipt(value: unknown): value is WorkerdWorkerRetirementReceipt {
@@ -830,13 +867,24 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
     const legacyStaticState = state.schema === LEGACY_STATE_SCHEMA;
     const previousState = state.schema === PREVIOUS_STATE_SCHEMA;
     const retiredCopiesState = state.schema === RETIRED_COPIES_STATE_SCHEMA;
+    const cleanupState = state.schema === CLEANUP_STATE_SCHEMA;
     const currentState = state.schema === STATE_SCHEMA;
     if (
-      (!legacyStaticState && !previousState && !retiredCopiesState && !currentState) ||
+      (!legacyStaticState &&
+        !previousState &&
+        !retiredCopiesState &&
+        !cleanupState &&
+        !currentState) ||
       state.workerResourceUid !== workerResourceUid ||
       !(state.activeOperationId === null || typeof state.activeOperationId === "string") ||
       !(state.admissionClosedBy === null || typeof state.admissionClosedBy === "string") ||
       typeof state.deletionPublicationConfirmed !== "boolean" ||
+      (currentState
+        ? !(
+            state.endpointRouteAbsence === null ||
+            validEndpointRouteAbsence(state.endpointRouteAbsence)
+          )
+        : state.endpointRouteAbsence !== undefined) ||
       !Array.isArray(state.incarnations)
     ) {
       throw new Error();
@@ -860,13 +908,13 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         (legacyStaticState
           ? item.deferRetirementUntilDeadline !== undefined
           : typeof item.deferRetirementUntilDeadline !== "boolean") ||
-        (retiredCopiesState || currentState
+        (retiredCopiesState || cleanupState || currentState
           ? typeof item.executionCopiesReleased !== "boolean"
           : item.executionCopiesReleased !== undefined) ||
-        (currentState
+        (cleanupState || currentState
           ? typeof item.executionCopiesCleanupStarted !== "boolean"
           : item.executionCopiesCleanupStarted !== undefined) ||
-        (currentState
+        (cleanupState || currentState
           ? !(
               item.executionCopiesCleanupManifestSha256 === null ||
               (typeof item.executionCopiesCleanupManifestSha256 === "string" &&
@@ -894,15 +942,19 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
           ? false
           : (item.deferRetirementUntilDeadline as boolean),
         executionCopiesReleased:
-          retiredCopiesState || currentState ? (item.executionCopiesReleased as boolean) : false,
-        executionCopiesCleanupStarted: currentState
-          ? (item.executionCopiesCleanupStarted as boolean)
-          : retiredCopiesState
+          retiredCopiesState || cleanupState || currentState
             ? (item.executionCopiesReleased as boolean)
             : false,
-        executionCopiesCleanupManifestSha256: currentState
-          ? (item.executionCopiesCleanupManifestSha256 as string | null)
-          : null,
+        executionCopiesCleanupStarted:
+          cleanupState || currentState
+            ? (item.executionCopiesCleanupStarted as boolean)
+            : retiredCopiesState
+              ? (item.executionCopiesReleased as boolean)
+              : false,
+        executionCopiesCleanupManifestSha256:
+          cleanupState || currentState
+            ? (item.executionCopiesCleanupManifestSha256 as string | null)
+            : null,
       } as unknown as IncarnationRecord);
     }
     const result: PersistedOwnerState = {
@@ -911,6 +963,9 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
       activeOperationId: state.activeOperationId as string | null,
       admissionClosedBy: state.admissionClosedBy as string | null,
       deletionPublicationConfirmed: state.deletionPublicationConfirmed,
+      endpointRouteAbsence: currentState
+        ? (state.endpointRouteAbsence as V2EndpointRouteAbsentReceipt | null)
+        : null,
       incarnations,
     };
     const activeRecords = incarnations.filter((item) => item.status === "active");
@@ -922,8 +977,18 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
             (item) =>
               item.status !== "retired" ||
               item.receipt === null ||
-              ((retiredCopiesState || currentState) && !item.executionCopiesReleased),
+              ((retiredCopiesState || cleanupState || currentState) &&
+                !item.executionCopiesReleased),
           ))) ||
+      (result.endpointRouteAbsence !== null &&
+        (result.activeOperationId !== null ||
+          result.admissionClosedBy === null ||
+          !result.deletionPublicationConfirmed ||
+          result.incarnations.some(
+            (item) =>
+              item.status !== "retired" || item.receipt === null || !item.executionCopiesReleased,
+          ) ||
+          result.endpointRouteAbsence.workerResourceUid !== workerResourceUid)) ||
       (state.activeOperationId === null && activeRecords.length !== 0) ||
       (state.activeOperationId !== null &&
         !incarnations.some(
@@ -997,7 +1062,16 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                 }) => item,
               ),
             }
-          : result;
+          : cleanupState
+            ? {
+                schema: CLEANUP_STATE_SCHEMA,
+                workerResourceUid: state.workerResourceUid,
+                activeOperationId: state.activeOperationId,
+                admissionClosedBy: state.admissionClosedBy,
+                deletionPublicationConfirmed: state.deletionPublicationConfirmed,
+                incarnations,
+              }
+            : result;
     if (canonicalJson(canonicalState) !== text) throw new Error();
     return result;
   } catch {
@@ -1141,6 +1215,8 @@ export async function openWorkerdWorkerRuntimeOwner(
     });
     state = parseState(text, options.workerResourceUid);
     if (
+      (state.endpointRouteAbsence !== null &&
+        state.endpointRouteAbsence.targetKey !== options.targetKey) ||
       state.incarnations.some(
         (item) =>
           item.status !== "retired" &&
@@ -1549,7 +1625,138 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
   };
 
-  const execute = (inputExecution: V2Execution): Promise<V2WorkerPublicationResult> => {
+  const confirmNoActiveEndpointRoute = async (
+    execution: V2Execution,
+  ): Promise<V2EndpointRouteAbsentReceipt | { kind: "unknown" } | null> => {
+    const resolution = await options.publicationState.resolve({ execution });
+    if (resolution.kind !== "ready") return { kind: "unknown" };
+    const snapshot = resolution.snapshot;
+    if (snapshot.deployment !== null) return null;
+    let endpointSpec: ReturnType<typeof parseWorkerEndpointSpec>;
+    try {
+      endpointSpec = parseWorkerEndpointSpec(execution.spec);
+    } catch {
+      return { kind: "unknown" };
+    }
+    const assigned = snapshot.acceptedEndpointOutput;
+    if (
+      execution.form !== WORKER_ENDPOINT_FORM_URL ||
+      execution.action !== "delete" ||
+      snapshot.sourceOperationId !== execution.operationId ||
+      snapshot.worker.uid !== options.workerResourceUid ||
+      snapshot.worker.principal !== execution.principal ||
+      snapshot.worker.space !== execution.space ||
+      endpointSpec.worker.resourceUid !== options.workerResourceUid ||
+      snapshot.endpoint !== null ||
+      !assigned ||
+      !ENDPOINT_HOSTNAME.test(assigned.hostname) ||
+      assigned.url !== `https://${assigned.hostname}/`
+    ) {
+      return { kind: "unknown" };
+    }
+
+    // A no-Deployment route absence is only established after this exact owner
+    // previously closed its Deployment and retired every incarnation. The exact
+    // retirement receipt proves the child exited and its listener is absent; a
+    // stale metadata pointer inside that non-listening group is not a live route.
+    // Empty or uncertain owner state cannot prove absence for an unobserved runtime.
+    if (
+      closed ||
+      active !== null ||
+      state.activeOperationId !== null ||
+      admissionClosedBy === null ||
+      !state.deletionPublicationConfirmed ||
+      state.incarnations.length === 0 ||
+      state.incarnations.some(
+        (record) =>
+          record.status !== "retired" ||
+          record.receipt === null ||
+          record.retirementOperationId === null ||
+          !record.executionCopiesReleased ||
+          !record.executionCopiesCleanupStarted,
+      )
+    ) {
+      return { kind: "unknown" };
+    }
+
+    const capturedState = canonicalJson(state);
+    for (const record of state.incarnations) {
+      const groupDirectory = join(
+        directory,
+        "incarnations",
+        record.operationId,
+        "groups",
+        uidKey(options.workerResourceUid),
+      );
+      const copies = await inspectWorkerdWorkerExecutionCopies({
+        groupDirectory,
+        workerResourceUid: options.workerResourceUid,
+        listenerPort: record.listenerPort,
+        scriptName: scriptName(options.workerResourceUid),
+      }).catch(() => null);
+      if (copies?.versionUids.length !== 0 || copies?.generationKeys.length !== 0) {
+        return { kind: "unknown" };
+      }
+      const physical = await releaseRetiredWorkerdWorkerExecutionCopies({
+        groupDirectory,
+        workerResourceUid: options.workerResourceUid,
+        operationId: record.retirementOperationId as string,
+        listenerPort: record.listenerPort,
+        scriptName: scriptName(options.workerResourceUid),
+        cleanupIntentPersisted: true,
+        cleanupManifestSha256: record.executionCopiesCleanupManifestSha256,
+        alreadyReleased: true,
+      }).catch(() => null);
+      if (!physical || canonicalJson(physical.receipt) !== canonicalJson(record.receipt)) {
+        return { kind: "unknown" };
+      }
+    }
+
+    if (
+      canonicalJson(state) !== capturedState ||
+      active !== null ||
+      state.activeOperationId !== null ||
+      !state.deletionPublicationConfirmed ||
+      !(await resolution.stillCurrent())
+    ) {
+      return { kind: "unknown" };
+    }
+
+    const receipt: V2EndpointRouteAbsentReceipt = {
+      kind: "confirmed_route_absent",
+      sourceOperationId: execution.operationId,
+      endpointResourceUid: execution.resourceUid,
+      workerResourceUid: options.workerResourceUid,
+      targetKey: options.targetKey,
+      assignedHostname: assigned.hostname,
+    };
+    const persisted = await transitionState((current) => {
+      if (
+        current.activeOperationId !== null ||
+        !current.deletionPublicationConfirmed ||
+        current.incarnations.some(
+          (record) =>
+            record.status !== "retired" ||
+            record.receipt === null ||
+            !record.executionCopiesReleased ||
+            !record.executionCopiesCleanupStarted,
+        )
+      ) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      return { ...current, endpointRouteAbsence: receipt };
+    });
+    if (
+      !validEndpointRouteAbsence(persisted.endpointRouteAbsence) ||
+      canonicalJson(persisted.endpointRouteAbsence) !== canonicalJson(receipt) ||
+      !(await resolution.stillCurrent())
+    ) {
+      return { kind: "unknown" };
+    }
+    return receipt;
+  };
+
+  const execute = (inputExecution: V2Execution): Promise<V2WorkerRuntimeOwnerExecutionResult> => {
     let captured: V2Execution;
     try {
       captured = structuredClone(inputExecution);
@@ -1561,13 +1768,22 @@ export async function openWorkerdWorkerRuntimeOwner(
       if (closed) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       validateOperationId(execution.operationId);
       if (
-        execution.form !== WORKER_DEPLOYMENT_FORM_URL ||
+        (execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
+          execution.form !== WORKER_ENDPOINT_FORM_URL) ||
         execution.targetKey !== options.targetKey ||
         workerFromExecution(execution) !== options.workerResourceUid
       ) {
         return { kind: "not_dispatched", code: "worker_publication_target_mismatch" };
       }
-      if (execution.action === "delete") {
+      if (execution.form === WORKER_ENDPOINT_FORM_URL && execution.action === "delete") {
+        try {
+          const absence = await confirmNoActiveEndpointRoute(execution);
+          if (absence !== null) return absence;
+        } catch {
+          return { kind: "unknown" };
+        }
+      }
+      if (execution.form === WORKER_DEPLOYMENT_FORM_URL && execution.action === "delete") {
         try {
           return await deleteDeployment(execution);
         } catch {
@@ -1587,6 +1803,7 @@ export async function openWorkerdWorkerRuntimeOwner(
           ...current,
           admissionClosedBy: null,
           deletionPublicationConfirmed: false,
+          endpointRouteAbsence: null,
         }));
       }
 
@@ -1615,6 +1832,9 @@ export async function openWorkerdWorkerRuntimeOwner(
             execution.operationId,
           );
         }
+        if (execution.form === WORKER_ENDPOINT_FORM_URL && result.kind === "confirmed") {
+          return { kind: "unknown" };
+        }
         return result;
       }
       if (recordFor(execution.operationId)) return { kind: "unknown" };
@@ -1641,6 +1861,9 @@ export async function openWorkerdWorkerRuntimeOwner(
           if (result.kind === "not_dispatched")
             await retireCandidate(candidate, execution.operationId);
           else await retireCandidate(candidate, execution.operationId).catch(() => undefined);
+          if (execution.form === WORKER_ENDPOINT_FORM_URL && result.kind === "confirmed") {
+            return { kind: "unknown" };
+          }
           return result;
         }
         candidate.group.sealConfiguration();
@@ -1902,6 +2125,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         activeOperationId: operationId,
         admissionClosedBy: null,
         deletionPublicationConfirmed: false,
+        endpointRouteAbsence: null,
         incarnations: current.incarnations.map((item) =>
           item.operationId === candidate.record.operationId
             ? nextCandidate
@@ -1971,6 +2195,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         ...current,
         admissionClosedBy,
         deletionPublicationConfirmed: false,
+        endpointRouteAbsence: null,
       }));
     }
     for (const incarnation of handles.values()) await cancelInvocations(incarnation);

@@ -27,9 +27,16 @@ import {
 } from "../src/takoform-v2/forms/worker-bundle.ts";
 import {
   parseWorkerDeploymentSpec,
+  parseWorkerEndpointSpec,
+  parseWorkerVersionSpec,
   WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import type { V2Execution } from "../src/takoform-v2/types.ts";
+import {
+  createWorkerEndpointForm,
+  WORKER_ENDPOINT_BACKEND_ID,
+} from "../src/takoform-v2/worker-endpoint-backend.ts";
 import type { V2WorkerPublicationResolution } from "../src/takoform-v2/worker-publication-state.ts";
 import { spawnWorkerdWithParentDeath } from "../src/workerd-linux-process.ts";
 import type { WorkerdProcess } from "../src/workerd-supervisor.ts";
@@ -332,6 +339,385 @@ function execution(
     previousOutput: {},
   };
 }
+
+function endpointExecution(
+  workerResourceUid: string,
+  operationId: string,
+  action: "create" | "update" | "delete",
+): V2Execution {
+  return {
+    operationId,
+    leaseToken: `lease-${operationId}`,
+    backendKey: `backend-${operationId}`,
+    backendId: WORKER_ENDPOINT_BACKEND_ID,
+    targetKey: TARGET_KEY,
+    resourceUid: `endpoint-${workerResourceUid}`,
+    principal: "org-runtime-owner",
+    action,
+    generation: action === "create" ? 1 : action === "update" ? 2 : 3,
+    form: WORKER_ENDPOINT_FORM_URL,
+    space: "production",
+    name: "assigned-runtime-endpoint",
+    spec: { worker: { resourceUid: workerResourceUid } },
+    previousObserved: {},
+    previousOutput: {},
+  };
+}
+
+async function endpointPublicationState(workerResourceUid: string) {
+  const codeUid = `version-code-${workerResourceUid}`;
+  const staticUid = `version-static-${workerResourceUid}`;
+  const codeSpec = parseWorkerVersionSpec({
+    worker: { resourceUid: workerResourceUid },
+    bundle: { resourceUid: `bundle-${workerResourceUid}` },
+    handlers: ["fetch"],
+    vars: { SETTINGS: { mode: "endpoint-test" } },
+  });
+  const staticSpec = parseWorkerVersionSpec({
+    worker: { resourceUid: workerResourceUid },
+    handlers: [],
+    assets: {
+      bundle: { resourceUid: `assets-${workerResourceUid}` },
+      runWorkerFirst: false,
+      notFoundHandling: "none",
+    },
+  });
+  const deploymentSpec = parseWorkerDeploymentSpec({
+    worker: { resourceUid: workerResourceUid },
+    versions: [
+      { workerVersion: { resourceUid: codeUid }, weight: 4_000 },
+      { workerVersion: { resourceUid: staticUid }, weight: 6_000 },
+    ],
+  });
+  const assetBytes = new TextEncoder().encode("endpoint fixture asset");
+  const assetSha256 = (await bytesDigest(assetBytes)).slice("sha256:".length);
+  const assetsManifest = {
+    files: [
+      {
+        path: "index.html",
+        url: "https://artifacts.example.test/endpoint-index.html",
+        sha256: assetSha256,
+        mediaType: "text/html",
+      },
+    ],
+  };
+  const assetsManifestBytes = new TextEncoder().encode(JSON.stringify(assetsManifest));
+  const assetsManifestSha256 = (await bytesDigest(assetsManifestBytes)).slice("sha256:".length);
+  const assets = {
+    manifest: assetsManifest,
+    manifestBytes: assetsManifestBytes,
+    files: [assetBytes],
+    observed: {
+      manifestSha256: assetsManifestSha256,
+      fileCount: 1,
+      totalBytes: assetBytes.byteLength,
+      files: [
+        {
+          path: "index.html",
+          sha256: assetSha256,
+          mediaType: "text/html",
+          byteSize: assetBytes.byteLength,
+        },
+      ],
+    },
+  };
+  const codeBundle = await heldCodeBundle();
+  const endpointResourceUid = `endpoint-${workerResourceUid}`;
+  const hostname = `${endpointResourceUid}.assigned.example.test`;
+  const output = { hostname, url: `https://${hostname}/` };
+  let currentOperationId: string | undefined;
+  let deploymentPresent = true;
+  let fenceCurrent = true;
+  const source = {
+    async resolve({
+      execution: candidateExecution,
+      incumbentSourceOperationId,
+    }: {
+      execution: V2Execution;
+      incumbentSourceOperationId?: string;
+    }): Promise<V2WorkerPublicationResolution> {
+      if (
+        incumbentSourceOperationId !== undefined &&
+        incumbentSourceOperationId !== candidateExecution.operationId &&
+        currentOperationId !== incumbentSourceOperationId
+      ) {
+        return {
+          kind: "unresolved",
+          code: "incumbent_unresolved",
+          message: "fixture did not observe the exact published owner identity",
+        };
+      }
+      const endpointOperation = candidateExecution.form === WORKER_ENDPOINT_FORM_URL;
+      const workerDelete =
+        candidateExecution.form === WORKER_DEPLOYMENT_FORM_URL &&
+        candidateExecution.action === "delete";
+      const endpoint =
+        endpointOperation && candidateExecution.action !== "delete"
+          ? {
+              uid: endpointResourceUid,
+              generation: candidateExecution.generation,
+              spec: parseWorkerEndpointSpec(candidateExecution.spec),
+              output: {
+                hostname: `${endpointResourceUid}.assigned.example.test`,
+                url: `https://${endpointResourceUid}.assigned.example.test/`,
+              },
+            }
+          : null;
+      return {
+        kind: "ready",
+        snapshot: {
+          sourceOperationId: candidateExecution.operationId,
+          ...(endpointOperation
+            ? {
+                acceptedEndpointOutput: {
+                  hostname: `${endpointResourceUid}.assigned.example.test`,
+                  url: `https://${endpointResourceUid}.assigned.example.test/`,
+                },
+              }
+            : {}),
+          worker: {
+            uid: workerResourceUid,
+            principal: candidateExecution.principal,
+            space: candidateExecution.space,
+            generation: 1,
+          },
+          deployment:
+            workerDelete || !deploymentPresent
+              ? null
+              : {
+                  uid: `deployment-${workerResourceUid}`,
+                  generation: 1,
+                  spec: deploymentSpec,
+                  versions: [
+                    {
+                      uid: codeUid,
+                      generation: 1,
+                      weight: 4_000,
+                      spec: codeSpec,
+                    },
+                    {
+                      uid: staticUid,
+                      generation: 1,
+                      weight: 6_000,
+                      spec: staticSpec,
+                    },
+                  ],
+                },
+          endpoint,
+        },
+        sqlGuard: { sql: "SELECT 1", params: [] },
+        async stillCurrent() {
+          return fenceCurrent;
+        },
+        async readVersionMaterials(versionUid: string) {
+          if (versionUid === codeUid) return { bundle: codeBundle, assets: null };
+          if (versionUid === staticUid) return { bundle: null, assets };
+          throw new Error("unexpected fixture WorkerVersion UID");
+        },
+      } as V2WorkerPublicationResolution;
+    },
+  };
+  return {
+    source,
+    setCurrent(operationId: string) {
+      currentOperationId = operationId;
+    },
+    setFenceCurrent(value: boolean) {
+      fenceCurrent = value;
+    },
+    setDeploymentPresent(value: boolean) {
+      deploymentPresent = value;
+    },
+    output,
+    deploymentSpec,
+    versions: [
+      { workerVersionUid: codeUid, weight: 4_000 },
+      { workerVersionUid: staticUid, weight: 6_000 },
+    ],
+  };
+}
+
+test("Endpoint create/update/delete publish only its route through the same weighted Worker owner", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-endpoint-route-owner";
+  const publication = await endpointPublicationState(workerUid);
+  const ownerOptions = {
+    rootDirectory: join(owned.root, "owners"),
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+    inspectModule: async (
+      _input: WorkerModuleInspectionInput,
+    ): Promise<WorkerModuleInspectionResult> => ({
+      outcome: "valid",
+      exportedHandlers: ["fetch"],
+    }),
+  };
+  const owner = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+  const endpointCreate = endpointExecution(
+    workerUid,
+    "96d53f6b-14b6-4415-8bf9-2ab9ef07e052",
+    "create",
+  );
+  const endpointUpdate = endpointExecution(
+    workerUid,
+    "b50345a2-f742-4b64-8e9c-cf172986e1f0",
+    "update",
+  );
+  const endpointDelete = endpointExecution(
+    workerUid,
+    "c67f84e1-cda2-49ae-8f25-f9befd10ee33",
+    "delete",
+  );
+  const deploymentCreate = execution(workerUid, "1a2105fc-41f4-4865-b160-8e72fcdb1fc4", "create");
+  const deploymentDelete = execution(workerUid, "fe2f26df-2b6f-4f30-a29c-3e6d9859fbc8", "delete");
+  const endpointDeleteAfterDeployment = endpointExecution(
+    workerUid,
+    "71d7a92e-551c-4978-9708-20c5af433720",
+    "delete",
+  );
+  const endpointForm = createWorkerEndpointForm({
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    ownerForWorker: () => owner,
+    assignHostname: ({ resourceUid }) => `${resourceUid}.assigned.example.test`,
+    observeTls: async (input) => ({ ...input, ready: true }),
+  });
+
+  try {
+    const deployed = await owner.execute(deploymentCreate);
+    expect(deployed).toMatchObject({
+      kind: "confirmed",
+      identity: { hostnames: [], versions: publication.versions },
+      deferRetirementUntilDeadline: true,
+    });
+    publication.setCurrent(deploymentCreate.operationId);
+
+    // TLS may lag after the Workerd route has been published. This first
+    // caller result is intentionally unknown; retrying the same accepted
+    // Operation must observe the exact existing owner identity.
+    let firstTlsObservation = true;
+    const reconcileForm = createWorkerEndpointForm({
+      targetKey: TARGET_KEY,
+      publicationState: publication.source,
+      ownerForWorker: () => owner,
+      assignHostname: ({ resourceUid }) => `${resourceUid}.assigned.example.test`,
+      observeTls: async (input) => {
+        const ready = !firstTlsObservation;
+        firstTlsObservation = false;
+        return { ...input, ready };
+      },
+    });
+    expect(await reconcileForm.backend.execute(endpointCreate)).toMatchObject({
+      kind: "unknown",
+    });
+    const afterUnknownAck = owned.children.length;
+    publication.setCurrent(endpointCreate.operationId);
+    expect(await reconcileForm.backend.reconcile(endpointCreate)).toMatchObject({
+      kind: "complete",
+      observed: { tlsReady: true, activeDeploymentRouteReady: true },
+      output: publication.output,
+    });
+    expect(owned.children).toHaveLength(afterUnknownAck);
+
+    publication.setCurrent(endpointCreate.operationId);
+    expect(await endpointForm.backend.execute(endpointUpdate)).toMatchObject({
+      kind: "complete",
+      observed: { tlsReady: true, activeDeploymentRouteReady: true },
+      output: publication.output,
+    });
+    publication.setCurrent(endpointUpdate.operationId);
+
+    expect(await endpointForm.backend.execute(endpointDelete)).toMatchObject({
+      kind: "complete",
+      observed: { activeDeploymentRouteReady: false },
+      output: publication.output,
+    });
+    publication.setCurrent(endpointDelete.operationId);
+    expect(
+      await owner.observeServing({ workerResourceUid: workerUid, targetKey: TARGET_KEY }),
+    ).toMatchObject({
+      kind: "serving",
+      sourceOperationId: endpointDelete.operationId,
+      generation: `takoserver-v2-operation:${endpointDelete.operationId}`,
+      hostnames: [],
+      versions: publication.versions,
+    });
+    const stillServing = await (
+      await owner.fetch(new Request(`https://${workerUid}.example.test/`))
+    ).text();
+    expect(stillServing).toMatch(/^[0-9a-f]{64}$/u);
+
+    // Endpoint DELETE is route-only. The Worker continues serving the same
+    // weighted Deployment until an explicit WorkerDeployment DELETE follows.
+    expect(await owner.execute(deploymentDelete)).toMatchObject({
+      kind: "confirmed",
+      identity: null,
+    });
+    await owner.close();
+
+    const reopened = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+    try {
+      expect(await reopened.execute(deploymentDelete)).toMatchObject({
+        kind: "confirmed",
+        identity: null,
+      });
+      const versionUid = publication.versions[0]?.workerVersionUid;
+      if (!versionUid) throw new Error("fixture WorkerVersion UID missing");
+      expect(await reopened.observeRetirement({ workerVersionUid: versionUid })).toMatchObject({
+        kind: "confirmed_absent",
+        workerVersionUid: versionUid,
+      });
+      publication.setCurrent(endpointDeleteAfterDeployment.operationId);
+      publication.setDeploymentPresent(false);
+      const routeAbsent = await reopened.execute(endpointDeleteAfterDeployment);
+      expect(routeAbsent).toEqual({
+        kind: "confirmed_route_absent",
+        sourceOperationId: endpointDeleteAfterDeployment.operationId,
+        endpointResourceUid: endpointDeleteAfterDeployment.resourceUid,
+        workerResourceUid: workerUid,
+        targetKey: TARGET_KEY,
+        assignedHostname: publication.output.hostname,
+      });
+      const childCountAfterDeploymentDelete = owned.children.length;
+      expect(await reopened.execute(endpointDeleteAfterDeployment)).toEqual(routeAbsent);
+      expect(owned.children).toHaveLength(childCountAfterDeploymentDelete);
+      const workerKey = createHash("sha256").update(workerUid, "utf8").digest("hex");
+      const persistedOwnerState = JSON.parse(
+        await Bun.file(join(ownerOptions.rootDirectory, workerKey, "runtime-owner.json")).text(),
+      ) as { endpointRouteAbsence: unknown };
+      expect(persistedOwnerState.endpointRouteAbsence).toEqual(routeAbsent);
+      const staleRouteDelete = endpointExecution(
+        workerUid,
+        "5d8cc6bf-51b0-42d9-87af-5d9a75f0c4a2",
+        "delete",
+      );
+      publication.setCurrent(staleRouteDelete.operationId);
+      publication.setFenceCurrent(false);
+      expect(await reopened.execute(staleRouteDelete)).toEqual({ kind: "unknown" });
+      expect(
+        JSON.parse(
+          await Bun.file(join(ownerOptions.rootDirectory, workerKey, "runtime-owner.json")).text(),
+        ).endpointRouteAbsence,
+      ).toEqual(routeAbsent);
+      publication.setFenceCurrent(true);
+      const retriedRouteAbsent = await reopened.execute(staleRouteDelete);
+      expect(retriedRouteAbsent).toMatchObject({
+        kind: "confirmed_route_absent",
+        sourceOperationId: staleRouteDelete.operationId,
+      });
+      expect(await reopened.execute(staleRouteDelete)).toEqual(retriedRouteAbsent);
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await owner.close().catch(() => undefined);
+    await owned.cleanup();
+  }
+});
 
 test("serialized owner state transitions rebase after a delayed durable write", async () => {
   let releaseFirst!: () => void;
@@ -849,7 +1235,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
           executionCopiesCleanupStarted: boolean;
         }>;
       };
-      expect(finalState.schema).toBe("takoserver.v2-worker-runtime-owner@4");
+      expect(finalState.schema).toBe("takoserver.v2-worker-runtime-owner@5");
       expect(
         finalState.incarnations.every(
           (record) => record.executionCopiesReleased && record.executionCopiesCleanupStarted,
@@ -872,6 +1258,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         incarnations: Array<Record<string, unknown>>;
       };
       previousV2.schema = "takoserver.v2-worker-runtime-owner@2";
+      delete (previousV2 as Record<string, unknown>).endpointRouteAbsence;
       for (const record of previousV2.incarnations) {
         delete record.executionCopiesReleased;
         delete record.executionCopiesCleanupStarted;
@@ -882,6 +1269,16 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
       const migratedV2 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
       await migratedV2.close();
       expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
+        "takoserver.v2-worker-runtime-owner@5",
+      );
+
+      const previousV4 = JSON.parse(await Bun.file(statePath).text()) as Record<string, unknown>;
+      previousV4.schema = "takoserver.v2-worker-runtime-owner@4";
+      delete previousV4.endpointRouteAbsence;
+      await writeFile(statePath, `${JSON.stringify(previousV4)}\n`, { mode: 0o600 });
+      const migratedV4 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+      await migratedV4.close();
+      expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
         "takoserver.v2-worker-runtime-owner@4",
       );
 
@@ -890,6 +1287,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         incarnations: Array<Record<string, unknown>>;
       };
       previousV3.schema = "takoserver.v2-worker-runtime-owner@3";
+      delete (previousV3 as Record<string, unknown>).endpointRouteAbsence;
       for (const record of previousV3.incarnations) {
         delete record.executionCopiesCleanupStarted;
         delete record.executionCopiesCleanupManifestSha256;
@@ -907,6 +1305,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         incarnations: Array<Record<string, unknown>>;
       };
       previousV1.schema = "takoserver.v2-worker-runtime-owner@1";
+      delete (previousV1 as Record<string, unknown>).endpointRouteAbsence;
       for (const record of previousV1.incarnations) {
         delete record.executionCopiesReleased;
         delete record.executionCopiesCleanupStarted;
@@ -917,7 +1316,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
       const migratedV1 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
       await migratedV1.close();
       expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
-        "takoserver.v2-worker-runtime-owner@4",
+        "takoserver.v2-worker-runtime-owner@5",
       );
       expect(owned.children).toHaveLength(1);
     } finally {
