@@ -48,10 +48,19 @@ const consumerSpec = (
   ...extras,
 });
 
-function fixture(databasePath = ":memory:") {
+function fixture(databasePath = ":memory:", beforeRetentionWrite?: () => Promise<void>) {
   const database = new Database(databasePath);
   for (const migration of MIGRATIONS) database.exec(migration.sql);
   const sql = createSqliteSql(database);
+  const queueSql = beforeRetentionWrite
+    ? {
+        ...sql,
+        async run(statement: string, params?: readonly SqlParam[]) {
+          if (statement.includes("SET expires_at_ms")) await beforeRetentionWrite();
+          return sql.run(statement, params);
+        },
+      }
+    : sql;
   let nowMs = Date.now();
   let capabilityAvailable = true;
   let servingSourceOperationId = "fixture-source";
@@ -184,7 +193,7 @@ function fixture(databasePath = ":memory:") {
     leaseMilliseconds: 1_000,
     authorize: async (who, where) => who === principal && where === space,
     forms: {
-      [AT_LEAST_ONCE_QUEUE_FORM_URL]: createAtLeastOnceQueueForm({ sql, targetKey }),
+      [AT_LEAST_ONCE_QUEUE_FORM_URL]: createAtLeastOnceQueueForm({ sql: queueSql, targetKey }),
       [MODULE_WORKER_FORM_URL]: worker,
       [WORKER_VERSION_FORM_URL]: version,
       [WORKER_DEPLOYMENT_FORM_URL]: deployment,
@@ -1834,6 +1843,126 @@ test("Queue retention update never revives a message already expired", async () 
         [v2QueueId(queue.resourceUid), "expired-message"],
       ),
     ).toEqual([{ expires_at_ms: expiredAt }]);
+  } finally {
+    f.database.close();
+  }
+});
+
+test("Queue retention PUT preserves sent leases and updates only undelivered messages", async () => {
+  let authorizeDuringWrite: (() => Promise<void>) | undefined;
+  const f = fixture(":memory:", async () => {
+    const authorize = authorizeDuringWrite;
+    authorizeDuringWrite = undefined;
+    await authorize?.();
+  });
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "retention-sent-queue", {
+      messageRetentionSeconds: 60,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "retention-sent-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "retention-sent-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "retention-sent-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "retention-sent-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid, {
+        maxBatchSize: 1,
+        maxConcurrency: 4,
+      }),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    const delivery = createV2QueueDelivery({ sql: f.sql, custody, capability: f.capability });
+    const admit = async (messageId: string) => {
+      await custody.admit(
+        {
+          queueId: v2QueueId(queue.resourceUid),
+          messageRetentionSeconds: 60,
+          deliveryDelaySeconds: 0,
+        },
+        { messageId, body: new Uint8Array([1]) },
+      );
+    };
+    const register = async () => {
+      const result = await delivery.claimRegisteredBatch({
+        consumerUid: consumer.resourceUid,
+        principal,
+        space,
+        targetKey,
+      });
+      if (result.kind !== "ready") throw new Error("expected an exact registered batch");
+      return result;
+    };
+    const authorize = async (batch: Awaited<ReturnType<typeof register>>) => {
+      expect(
+        await authorizeV2QueueBatchSend(f.sql, {
+          batchId: batch.batchId,
+          reservationToken: batch.reservationToken,
+          queueUid: queue.resourceUid,
+          consumerUid: consumer.resourceUid,
+          generation: batch.generation,
+          workerUid: worker.resourceUid,
+          servingSourceOperationId: deployment.id,
+          workerVersionUid: version.resourceUid,
+          workerVersionGeneration: 1,
+          incarnationOperationId: `incarnation-${batch.batchId}`,
+        }),
+      ).toBe("authorized");
+    };
+
+    await admit("already-sent");
+    await authorize(await register());
+    await admit("sent-during-put");
+    const racing = await register();
+    await admit("claimed-unsent");
+    await register();
+    await admit("unclaimed");
+    const before = await f.sql.query(
+      "SELECT message_id,enqueued_at_ms,expires_at_ms,lease_expires_at_ms FROM selfhost_queue_messages WHERE queue_id = ?",
+      [v2QueueId(queue.resourceUid)],
+    );
+    expect(before).toHaveLength(4);
+    authorizeDuringWrite = () => authorize(racing);
+    const update = await f.engine.acceptUpdate({
+      principal,
+      key: "retention-sent-update-key-0001",
+      uid: queue.resourceUid,
+      expectedGeneration: 1,
+      spec: { messageRetentionSeconds: 120 },
+    });
+    expect((await f.engine.runNext())?.status).toBe("reconciling");
+    f.advance(1_000);
+    expect((await f.engine.runNext())?.status).toBe("succeeded");
+    expect((await f.engine.getOperation({ principal, id: update.id })).effect).toBe("complete");
+    const after = await f.sql.query(
+      "SELECT message_id,enqueued_at_ms,expires_at_ms,lease_expires_at_ms FROM selfhost_queue_messages WHERE queue_id = ?",
+      [v2QueueId(queue.resourceUid)],
+    );
+    const expiration = (rows: typeof before, messageId: string): number => {
+      const row = rows.find((item) => item.message_id === messageId);
+      if (!row || typeof row.expires_at_ms !== "number" || typeof row.enqueued_at_ms !== "number")
+        throw new Error(`missing retention evidence for ${messageId}`);
+      return row.expires_at_ms;
+    };
+    for (const messageId of ["already-sent", "sent-during-put"]) {
+      expect(expiration(after, messageId)).toBe(expiration(before, messageId));
+    }
+    for (const messageId of ["claimed-unsent", "unclaimed"]) {
+      const row = after.find((item) => item.message_id === messageId);
+      if (!row || typeof row.enqueued_at_ms !== "number") throw new Error("missing message");
+      expect(expiration(after, messageId)).toBe(row.enqueued_at_ms + 120_000);
+    }
+    for (const row of before) {
+      expect(after.find((item) => item.message_id === row.message_id)?.lease_expires_at_ms).toBe(
+        row.lease_expires_at_ms,
+      );
+    }
   } finally {
     f.database.close();
   }
