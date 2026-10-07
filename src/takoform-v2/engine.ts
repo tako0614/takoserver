@@ -92,6 +92,18 @@ function canonicalRequest(value: unknown): string {
   return encoded;
 }
 
+function snapshotPrivateInputs(
+  inputs: V2PrivateInputMap | undefined,
+): V2PrivateInputMap | undefined {
+  if (inputs === undefined) return undefined;
+  const snapshot: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const [name, value] of Object.entries(inputs)) {
+    if (typeof value !== "string") fail("invalid_request", 400);
+    snapshot[name] = value;
+  }
+  return Object.freeze(snapshot);
+}
+
 export function createTakoformV2Engine(options: V2EngineOptions) {
   if (options.privateInputCustody) validatePrivateInputCustody(options.privateInputCustody);
   if (!Number.isSafeInteger(options.replayWindowSeconds) || options.replayWindowSeconds < 1) {
@@ -307,6 +319,10 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
     supportsPrivateInputs(formUrl: string): boolean {
       return privateInputsCapability && options.forms[formUrl]?.privateInputs !== undefined;
     },
+    async supportsPrivateInputsForUpdate(principal: string, uid: string): Promise<boolean> {
+      const target = await ownedResource(principal, uid, "write");
+      return privateInputsCapability && boundForm(target).privateInputs !== undefined;
+    },
     async acceptCreate(input: {
       principal: string;
       key: string;
@@ -315,6 +331,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       const { principal, key } = input;
       if (!tokenPattern.test(key)) fail("invalid_request", 400);
       const desired = input.input;
+      const privateInputs = snapshotPrivateInputs(desired.privateInputs);
       if (!validName(desired.space) || !validName(desired.name) || !isV2FormUrl(desired.form)) {
         fail("invalid_request", 400);
       }
@@ -328,10 +345,10 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           space: desired.space,
           name: desired.name,
           spec: desired.spec,
-          ...(desired.privateInputs === undefined ? {} : { privateInputs: true }),
+          ...(privateInputs === undefined ? {} : { privateInputs: true }),
         },
       });
-      const prior = await replay(principal, key, fingerprint, desired.privateInputs);
+      const prior = await replay(principal, key, fingerprint, privateInputs);
       if (prior) return prior;
       if (
         Object.keys(desired).some(
@@ -341,13 +358,10 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         fail("capability_required", 422);
       }
       const selected = form(desired.form);
-      if (
-        desired.privateInputs !== undefined &&
-        (!privateInputsCapability || !selected.privateInputs)
-      )
+      if (privateInputs !== undefined && (!privateInputsCapability || !selected.privateInputs))
         fail("capability_required", 422);
       selected.validateCreate(desired.spec);
-      selected.privateInputs?.validateCreate(desired.spec, desired.privateInputs);
+      selected.privateInputs?.validateCreate(desired.spec, privateInputs);
       const referencesJson = prepareV2References(selected, desired.spec);
       if (referencesJson !== null) await permitted(principal, desired.space, "read");
       let record = await seal(
@@ -360,7 +374,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           spec: desired.spec,
           formUrl: desired.form,
         }),
-        desired.privateInputs,
+        privateInputs,
       );
       if (selected.privateInputs?.prepareCreate) {
         const configured = await selected.privateInputs.prepareCreate({
@@ -372,18 +386,25 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           operationId: record.id,
           generation: record.generation,
           spec: JSON.parse(record.specJson) as JsonObject,
-          privateInputs: desired.privateInputs,
+          privateInputs,
         });
         if (configured !== null) {
           if (
-            desired.privateInputs === undefined ||
+            privateInputs === undefined ||
             !configured.keyId ||
             !configured.nonce ||
             !configured.ciphertext
           ) {
             throw new TypeError("invalid configured private input preparation");
           }
-          record = { ...record, configuredPrivateInputs: configured };
+          record = {
+            ...record,
+            configuredPrivateInputs: Object.freeze({
+              keyId: configured.keyId,
+              nonce: configured.nonce,
+              ciphertext: configured.ciphertext,
+            }),
+          };
         }
       }
       const output = selected.initialOutput
@@ -401,7 +422,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       try {
         await store.insertCreate(record, desired, referencesJson, initialOutputJson);
       } catch (error) {
-        const winner = await winnerAfterRace(principal, key, fingerprint, desired.privateInputs);
+        const winner = await winnerAfterRace(principal, key, fingerprint, privateInputs);
         if (winner) return winner;
         if (await store.activeName(desired.space, desired.name)) {
           fail("name_conflict", 409);
@@ -420,6 +441,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       privateInputs?: V2PrivateInputMap;
     }): Promise<V2Operation> {
       if (!tokenPattern.test(input.key) || !validName(input.uid)) fail("invalid_request", 400);
+      const privateInputs = snapshotPrivateInputs(input.privateInputs);
       const target = await ownedResource(input.principal, input.uid, "write");
       const fingerprint = canonicalRequest({
         method: "PUT",
@@ -428,20 +450,17 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         expectedGeneration: input.expectedGeneration,
         body: {
           spec: input.spec,
-          ...(input.privateInputs === undefined ? {} : { privateInputs: true }),
+          ...(privateInputs === undefined ? {} : { privateInputs: true }),
         },
       });
-      const prior = await replay(input.principal, input.key, fingerprint, input.privateInputs);
+      const prior = await replay(input.principal, input.key, fingerprint, privateInputs);
       if (prior) return prior;
       if (target.deleted_at) fail("gone", 410);
       if (target.busy_operation) fail("resource_busy", 409);
       if (target.generation !== input.expectedGeneration) fail("generation_conflict", 409);
       if (target.generation >= Number.MAX_SAFE_INTEGER) fail("invalid_request", 400);
       const selectedForm = boundForm(target);
-      if (
-        input.privateInputs !== undefined &&
-        (!privateInputsCapability || !selectedForm.privateInputs)
-      )
+      if (privateInputs !== undefined && (!privateInputsCapability || !selectedForm.privateInputs))
         fail("capability_required", 422);
       const serializeUpdatesWithPendingReferrers =
         selectedForm.serializeUpdatesWithPendingReferrers === true;
@@ -449,7 +468,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       selectedForm.privateInputs?.validateUpdate(
         JSON.parse(target.spec_json) as JsonObject,
         input.spec,
-        input.privateInputs,
+        privateInputs,
       );
       const referencesJson = prepareV2References(selectedForm, input.spec);
       if (referencesJson !== null) await permitted(input.principal, target.space, "read");
@@ -463,16 +482,17 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           spec: input.spec,
           formUrl: target.form_url,
         }),
-        input.privateInputs,
+        privateInputs,
       );
       if (selectedForm.privateInputs?.prepareUpdate) {
-        const configured = await readV2ConfiguredPrivateInputs(options.sql, {
+        const configuredRow = await readV2ConfiguredPrivateInputs(options.sql, {
           principal: input.principal,
           space: target.space,
           name: target.name,
           form: target.form_url,
           resourceUid: target.uid,
         });
+        const configured = configuredRow ? Object.freeze({ ...configuredRow }) : null;
         await selectedForm.privateInputs.prepareUpdate({
           principal: input.principal,
           space: target.space,
@@ -483,10 +503,10 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           generation: record.generation,
           previousSpec: JSON.parse(target.spec_json) as JsonObject,
           spec: JSON.parse(record.specJson) as JsonObject,
-          privateInputs: input.privateInputs,
+          privateInputs,
           configured,
         });
-        if (configured) record = { ...record, requiresConfiguredPrivateInputs: true };
+        if (configured) record = { ...record, expectedConfiguredPrivateInputs: configured };
       }
       let result: Awaited<ReturnType<typeof store.insertChange>>;
       try {
@@ -501,18 +521,13 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           input.principal,
           input.key,
           fingerprint,
-          input.privateInputs,
+          privateInputs,
         );
         if (winner) return winner;
         if (referenceUnavailable(error)) fail("dependency_conflict", 409);
         throw error;
       }
-      const winner = await winnerAfterRace(
-        input.principal,
-        input.key,
-        fingerprint,
-        input.privateInputs,
-      );
+      const winner = await winnerAfterRace(input.principal, input.key, fingerprint, privateInputs);
       if (winner) return winner;
       if (result === "dependency_conflict") fail("dependency_conflict", 409);
       const latest = await ownedResource(input.principal, input.uid, "write");
@@ -620,11 +635,13 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       id: string;
       privateInputs: V2PrivateInputMap;
     }): Promise<V2Operation> {
+      const privateInputs = snapshotPrivateInputs(input.privateInputs);
+      if (privateInputs === undefined) fail("invalid_request", 400);
       const row = await store.operation(input.id);
       if (!row || row.principal !== input.principal) fail("not_found", 404);
       await ownedResource(input.principal, row.resource_uid, "write");
       if (row.private_inputs_present !== 1) fail("private_inputs_conflict", 409, row.id);
-      if (!(await comparePrivate(row, input.privateInputs))) {
+      if (!(await comparePrivate(row, privateInputs))) {
         fail("private_inputs_conflict", 409, row.id);
       }
       if (row.status === "succeeded" || row.status === "failed") {
@@ -636,7 +653,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       const sealed = await sealPrivateInputs(
         options.privateInputCustody,
         privateBinding(row),
-        input.privateInputs,
+        privateInputs,
         now().getTime(),
       );
       await store.replenish(row.id, sealed, now().toISOString());

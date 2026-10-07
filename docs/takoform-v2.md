@@ -203,8 +203,12 @@ wave must precede enabling any of the three Form blocks in a deployment.
 Neither entry advertises WfP or Worker execution through this configuration.
 These Forms are management and custody surfaces only; they do not serve assets
 or execute Workers.
-Discovery declares offerings, previews and privateInputs unavailable. Common
-limits are a 1 MiB request, 100 items per page and a 24-hour replay window.
+Discovery always declares offerings and previews unavailable. It declares
+`privateInputs` only when `buildApp` receives an explicit operator-selected
+`v2PrivateInputCustody` keyring; the default public entries omit it and still
+declare the capability unavailable. Per-Form support additionally requires an
+exact Form private-input policy and complete backend. Common limits are a 1 MiB
+request, 100 items per page and a 24-hour replay window.
 
 The Bun API listener remains HTTP behind an operator-controlled HTTPS front end.
 For v2 paths it checks the incoming URL and `Host` authority against the configured
@@ -216,10 +220,35 @@ the exact public Host header. Non-v2 routes keep their existing handling.
 
 ## First implementation slice
 
-The initial slice covers the required common HTTP operations and durable
-acceptance. Offerings, previews and private inputs are not yet enabled and must
-be reported as unavailable. In particular, a backend that requires private
-inputs cannot be advertised while that capability is absent.
+The initial slice covered the required common HTTP operations and durable
+acceptance. Offerings and previews remain unavailable. The optional private-input
+foundation now accepts a complete, non-coerced map only with both operator
+custody and a Form declaration; absent and `{}` are distinct. Public Resource,
+Operation, replay fingerprints, diagnostics and logs contain neither plaintext
+nor a simple secret hash. The Host seals temporary transfer separately from a
+retained keyed comparison, binds both to the accepted Operation/owner/UID/
+generation, and commits them atomically with acceptance. The operator must keep
+historical comparison keys through the promised replay window and while an
+Operation remains unfinished; lost comparison material yields an authorized
+`private_inputs_unverifiable` conflict, not a guessed match. Temporary transfer
+keys can rotate separately.
+
+Before any possible backend send, expired or unavailable transfer enters
+`waiting_input`. The same authorized Operation accepts only a complete original
+map for replenishment and then queues again; terminal Operations refuse it.
+The dispatch marker erases transfer atomically. Once dispatch may have happened,
+the backend must reconcile the accepted identity and cannot infer unsent from a
+timeout or ask the Host to resend. A Form requiring preservation across UPDATE
+must also seal configured values for the stable Resource UID in the CREATE
+acceptance batch and validate an UPDATE against that exact retained row. The
+per-Operation transfer does not serve as permanent configured-value storage.
+
+Migration 0081 and these keys are source-only: no live D1 schema, operator key,
+or deployment has changed. Tests prove public HTTP acceptance, lost responses,
+replenishment and recovery after an actual Host process restart on SQLite;
+they do not qualify a live D1 deployment, native provider custody or a specific
+secret-bearing Form. A backend that requires private inputs must not be
+advertised until its Form-specific policy and recovery path are complete.
 
 Tests may configure a local fixture Form and a persistent test backend. Those
 tests exercise the real HTTP and SQL implementation, but do not qualify an Edge

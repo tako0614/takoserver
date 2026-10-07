@@ -191,6 +191,9 @@ async function authenticatedRoute(
     if (Object.hasOwn(input, "offering")) throw capabilityRequired();
     exactKeys(input, ["form", "space", "name", "spec"], ["privateInputs"]);
     if (typeof input.form !== "string" || !isFormUrl(input.form)) throw invalidRequest();
+    if (Object.hasOwn(input, "privateInputs") && !engine.supportsPrivateInputs(input.form)) {
+      throw capabilityRequired();
+    }
     const space = identifier(input.space);
     const name = identifier(input.name);
     const spec = jsonObject(input.spec);
@@ -258,6 +261,12 @@ async function authenticatedRoute(
       const expectedGeneration = expectedGenerationHeader(request);
       const body = await readJsonObject(request, options.maxRequestBytes);
       exactKeys(body, ["spec"], ["privateInputs"]);
+      if (
+        Object.hasOwn(body, "privateInputs") &&
+        !(await engine.supportsPrivateInputsForUpdate(principal, uid))
+      ) {
+        throw capabilityRequired();
+      }
       const spec = jsonObject(body.spec);
       const privateInputs = Object.hasOwn(body, "privateInputs")
         ? privateInputMap(body.privateInputs)

@@ -80,7 +80,7 @@ export interface AcceptRecord {
   specJson: string;
   privateInputs?: V2SealedPrivateInputs;
   configuredPrivateInputs?: V2ConfiguredPrivateInputs;
-  requiresConfiguredPrivateInputs?: true;
+  expectedConfiguredPrivateInputs?: V2ConfiguredPrivateInputs;
 }
 
 const opInsert = `INSERT INTO tf_v2_operations
@@ -331,10 +331,10 @@ export function createV2Store(sql: Sql) {
               }
               ${serialize ? `AND NOT EXISTS (${pendingReferrersSql})` : ""}
               ${
-                record.requiresConfiguredPrivateInputs
+                record.expectedConfiguredPrivateInputs
                   ? `AND EXISTS (
                 SELECT 1 FROM tf_v2_configured_private_inputs
-                WHERE resource_uid = ?)`
+                WHERE resource_uid = ? AND key_id = ? AND nonce = ? AND ciphertext = ?)`
                   : ""
               }`,
           params: [
@@ -348,7 +348,14 @@ export function createV2Store(sql: Sql) {
             record.generation - 1,
             ...(record.action === "delete" ? [record.resourceUid] : []),
             ...(serialize ? [record.resourceUid] : []),
-            ...(record.requiresConfiguredPrivateInputs ? [record.resourceUid] : []),
+            ...(record.expectedConfiguredPrivateInputs
+              ? [
+                  record.resourceUid,
+                  record.expectedConfiguredPrivateInputs.keyId,
+                  record.expectedConfiguredPrivateInputs.nonce,
+                  record.expectedConfiguredPrivateInputs.ciphertext,
+                ]
+              : []),
           ],
         },
         {

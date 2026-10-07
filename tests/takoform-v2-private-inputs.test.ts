@@ -35,7 +35,13 @@ async function keys(previous?: V2PrivateInputCustody): Promise<V2PrivateInputCus
   };
 }
 
-function fixture(database: Database, custody?: V2PrivateInputCustody, configuredKey?: CryptoKey) {
+function fixture(
+  database: Database,
+  custody?: V2PrivateInputCustody,
+  configuredKey?: CryptoKey,
+  beforePreparedUpdate?: () => Promise<void>,
+  formPrivateInputs = true,
+) {
   let nowMs = Date.parse("2026-10-07T00:00:00.000Z");
   const sent: Array<{ action: string; values: Readonly<Record<string, string>> | undefined }> = [];
   const reconciled: Array<Readonly<Record<string, string>> | undefined> = [];
@@ -114,45 +120,56 @@ function fixture(database: Database, custody?: V2PrivateInputCustody, configured
     validateUpdate(_previous, spec) {
       if (spec.mode !== "secret") throw new Error("fixture requires secret mode");
     },
-    privateInputs: {
-      validateCreate(_spec, inputs) {
-        if (!inputs || Object.keys(inputs).sort().join(",") !== "password,token") {
-          throw new Error("fixture requires the exact private names");
-        }
-      },
-      validateUpdate(_previous, _spec, inputs) {
-        if (inputs !== undefined && Object.keys(inputs).sort().join(",") !== "password,token") {
-          throw new Error("fixture rejects extra private names");
-        }
-      },
-      ...(configuredKey
-        ? ({
-            async prepareCreate(input) {
-              if (!input.privateInputs) throw new TakoformV2Error("invalid_spec", 422);
-              const nonce = crypto.getRandomValues(new Uint8Array(12));
-              const ciphertext = await crypto.subtle.encrypt(
-                { name: "AES-GCM", iv: nonce, additionalData: stableAad(input) },
-                configuredKey,
-                new TextEncoder().encode(JSON.stringify(input.privateInputs)),
-              );
-              return {
-                keyId: "configured-fixture-key",
-                nonce: encode64(nonce),
-                ciphertext: encode64(ciphertext),
-              };
-            },
-            async prepareUpdate(input) {
-              const retained = await decryptConfigured(input, input.configured);
-              if (
-                input.privateInputs !== undefined &&
-                JSON.stringify(input.privateInputs) !== JSON.stringify(retained)
-              ) {
-                throw new TakoformV2Error("invalid_spec", 422);
+    ...(formPrivateInputs
+      ? {
+          privateInputs: {
+            validateCreate(_spec, inputs) {
+              if (!inputs || Object.keys(inputs).sort().join(",") !== "password,token") {
+                throw new Error("fixture requires the exact private names");
               }
             },
-          } satisfies Pick<NonNullable<V2Form["privateInputs"]>, "prepareCreate" | "prepareUpdate">)
-        : {}),
-    },
+            validateUpdate(_previous, _spec, inputs) {
+              if (
+                inputs !== undefined &&
+                Object.keys(inputs).sort().join(",") !== "password,token"
+              ) {
+                throw new Error("fixture rejects extra private names");
+              }
+            },
+            ...(configuredKey
+              ? ({
+                  async prepareCreate(input) {
+                    if (!input.privateInputs) throw new TakoformV2Error("invalid_spec", 422);
+                    const nonce = crypto.getRandomValues(new Uint8Array(12));
+                    const ciphertext = await crypto.subtle.encrypt(
+                      { name: "AES-GCM", iv: nonce, additionalData: stableAad(input) },
+                      configuredKey,
+                      new TextEncoder().encode(JSON.stringify(input.privateInputs)),
+                    );
+                    return {
+                      keyId: "configured-fixture-key",
+                      nonce: encode64(nonce),
+                      ciphertext: encode64(ciphertext),
+                    };
+                  },
+                  async prepareUpdate(input) {
+                    const retained = await decryptConfigured(input, input.configured);
+                    if (
+                      input.privateInputs !== undefined &&
+                      JSON.stringify(input.privateInputs) !== JSON.stringify(retained)
+                    ) {
+                      throw new TakoformV2Error("invalid_spec", 422);
+                    }
+                    await beforePreparedUpdate?.();
+                  },
+                } satisfies Pick<
+                  NonNullable<V2Form["privateInputs"]>,
+                  "prepareCreate" | "prepareUpdate"
+                >)
+              : {}),
+          },
+        }
+      : {}),
     backend,
   };
   const host = createTakoformV2Host({
@@ -531,7 +548,43 @@ test("private field presence, even empty, is distinct from omission and requires
       disabled.host,
       request("/resources", "POST", createBody({ password: 1 }), KEY),
     );
-    expect(malformed.body.code).toBe("invalid_spec");
+    expect(malformed.body.code).toBe("capability_required");
+    const nullMap = await fetch(
+      disabled.host,
+      request("/resources", "POST", createBody(null), KEY),
+    );
+    expect(nullMap.body.code).toBe("capability_required");
+    const formDisabled = fixture(database, await keys(), undefined, undefined, false);
+    const formNull = await fetch(
+      formDisabled.host,
+      request("/resources", "POST", createBody(null), KEY),
+    );
+    expect(formNull.body.code).toBe("capability_required");
+    const plain = await fetch(
+      formDisabled.host,
+      request(
+        "/resources",
+        "POST",
+        { form: FORM, space: "one", name: "plain", spec: { mode: "secret" } },
+        KEY,
+      ),
+    );
+    expect(plain.status).toBe(202);
+    expect(await formDisabled.host.runNext()).toMatchObject({ status: "succeeded" });
+    const formUpdateNull = await fetch(
+      formDisabled.host,
+      new Request(`${BASE}/resources/${plain.body.resourceUid}`, {
+        method: "PUT",
+        headers: {
+          authorization: "Bearer old",
+          "content-type": "application/json",
+          "idempotency-key": "form-disabled-update-0001",
+          "takoform-expected-generation": "1",
+        },
+        body: JSON.stringify({ spec: { mode: "secret" }, privateInputs: null }),
+      }),
+    );
+    expect(formUpdateNull.body.code).toBe("capability_required");
   } finally {
     database.close();
   }
@@ -682,6 +735,162 @@ test("Form-sealed configured values commit with CREATE, survive transfer erasure
       database.query("SELECT COUNT(*) AS count FROM tf_v2_configured_private_inputs").get(),
     ).toEqual({ count: 0 });
   } finally {
+    database.close();
+  }
+});
+
+test("direct engine snapshots private maps before async Form policy mutates caller aliases", async () => {
+  const database = new Database(":memory:");
+  migrateSqlite(database);
+  const createMap = { password: "create-original" };
+  const updateMap = { password: "update-original" };
+  const sent: Array<string | undefined> = [];
+  const engine = createTakoformV2Engine({
+    sql: createSqliteSql(database),
+    replayWindowSeconds: 300,
+    authorize: async () => true,
+    privateInputCustody: await keys(),
+    forms: {
+      [FORM]: {
+        validateCreate() {},
+        validateUpdate() {},
+        privateInputs: {
+          validateCreate() {},
+          validateUpdate() {},
+          async prepareCreate(input) {
+            expect(Object.isFrozen(input.privateInputs)).toBe(true);
+            createMap.password = "changed-after-seal";
+            await Promise.resolve();
+            expect(input.privateInputs?.password).toBe("create-original");
+            return { keyId: "form-key", nonce: "form-nonce", ciphertext: "form-cipher" };
+          },
+          async prepareUpdate(input) {
+            expect(Object.isFrozen(input.privateInputs)).toBe(true);
+            expect(Object.isFrozen(input.configured)).toBe(true);
+            expect(input.configured?.ciphertext).toBe("form-cipher");
+            updateMap.password = "changed-after-seal";
+            await Promise.resolve();
+            expect(input.privateInputs?.password).toBe("update-original");
+          },
+        },
+        backend: {
+          id: "snapshot-fixture",
+          targetKey: "snapshot-target",
+          async execute(input) {
+            sent.push(input.privateInputs?.password);
+            return { kind: "complete", observed: {}, output: {} };
+          },
+          async reconcile() {
+            return { kind: "complete", observed: {}, output: {} };
+          },
+        },
+      },
+    },
+  });
+  try {
+    const created = await engine.acceptCreate({
+      principal: "org:one",
+      key: KEY,
+      input: {
+        form: FORM,
+        space: "one",
+        name: "snapshot",
+        spec: {},
+        privateInputs: createMap,
+      },
+    });
+    expect(await engine.runNext()).toMatchObject({ status: "succeeded" });
+    expect(sent).toEqual(["create-original"]);
+    expect(
+      await engine.acceptCreate({
+        principal: "org:one",
+        key: KEY,
+        input: {
+          form: FORM,
+          space: "one",
+          name: "snapshot",
+          spec: {},
+          privateInputs: { password: "create-original" },
+        },
+      }),
+    ).toMatchObject({ id: created.id });
+    const updated = await engine.acceptUpdate({
+      principal: "org:one",
+      key: "snapshot-update-key-0001",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: {},
+      privateInputs: updateMap,
+    });
+    expect(await engine.runNext()).toMatchObject({ id: updated.id, status: "succeeded" });
+    expect(sent).toEqual(["create-original", "update-original"]);
+    expect(
+      await engine.acceptUpdate({
+        principal: "org:one",
+        key: "snapshot-update-key-0001",
+        uid: created.resourceUid,
+        expectedGeneration: 1,
+        spec: {},
+        privateInputs: { password: "update-original" },
+      }),
+    ).toMatchObject({ id: updated.id });
+  } finally {
+    database.close();
+  }
+});
+
+test("configured custody replacement during async UPDATE policy cannot pass acceptance CAS", async () => {
+  const database = new Database(":memory:");
+  migrateSqlite(database);
+  const configuredKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+    "encrypt",
+    "decrypt",
+  ]);
+  let entered!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let resume!: () => void;
+  const held = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+  const runtime = fixture(database, await keys(), configuredKey, async () => {
+    entered();
+    await held;
+  });
+  try {
+    const created = await fetch(runtime.host, request("/resources", "POST", createBody(), KEY));
+    expect(created.status).toBe(202);
+    expect(await runtime.host.runNext()).toMatchObject({ status: "succeeded" });
+    const uid = created.body.resourceUid as string;
+    const pending = fetch(
+      runtime.host,
+      new Request(`${BASE}/resources/${uid}`, {
+        method: "PUT",
+        headers: {
+          authorization: "Bearer old",
+          "content-type": "application/json",
+          "idempotency-key": "interleaved-update-key-0001",
+          "takoform-expected-generation": "1",
+        },
+        body: JSON.stringify({ spec: { mode: "secret" } }),
+      }),
+    );
+    await ready;
+    database.exec("DROP TRIGGER tf_v2_configured_private_immutable");
+    database
+      .query("UPDATE tf_v2_configured_private_inputs SET ciphertext = ? WHERE resource_uid = ?")
+      .run("replaced-by-privileged-sql", uid);
+    resume();
+    expect((await pending).status).toBe(409);
+    expect(database.query("SELECT generation FROM tf_v2_resources WHERE uid = ?").get(uid)).toEqual(
+      { generation: 1 },
+    );
+    expect(database.query("SELECT COUNT(*) AS count FROM tf_v2_operations").get()).toEqual({
+      count: 1,
+    });
+  } finally {
+    resume();
     database.close();
   }
 });
