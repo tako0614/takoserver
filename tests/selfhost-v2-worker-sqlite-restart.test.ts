@@ -278,6 +278,20 @@ test.skipIf(binary === null)(
       const beforeRead = await request(initial.port, key.secret, `/__fixture/serve/${workerUid}/`);
       expect(beforeRead.status).toBe(200);
       expect(await beforeRead.json()).toEqual([{ value: "before-restart" }]);
+      const deniedClose = await request(
+        initial.port,
+        key.secret,
+        "/__fixture/close-private-bindings",
+        "POST",
+      );
+      expect(deniedClose.status).toBe(409);
+      const afterCloseAttempt = await request(
+        initial.port,
+        key.secret,
+        `/__fixture/serve/${workerUid}/`,
+      );
+      expect(afterCloseAttempt.status).toBe(200);
+      expect(await afterCloseAttempt.json()).toEqual([{ value: "before-restart" }]);
       const ownerKey = createHash("sha256").update(workerUid).digest("hex");
       const state = JSON.parse(
         await readFile(join(root, "v2-worker-owners", ownerKey, "runtime-owner.json"), "utf8"),

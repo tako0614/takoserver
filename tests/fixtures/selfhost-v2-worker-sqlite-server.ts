@@ -193,6 +193,14 @@ try {
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
+      if (new URL(request.url).pathname === "/__fixture/close-private-bindings") {
+        try {
+          await composition.closePrivateBindingServices();
+          return new Response(null, { status: 204 });
+        } catch {
+          return new Response(null, { status: 409 });
+        }
+      }
       const match = /^\/__fixture\/serve\/([0-9a-f-]{36})(\/.*)?$/u.exec(
         new URL(request.url).pathname,
       );
