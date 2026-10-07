@@ -110,7 +110,14 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
     proves:
       "native Durable Object SQL, alarm and WebSocket persistence, Actor facets and sockets, module inspection, Workflow execution, and Queue Host PID restart custody against the exact pinned bytes",
     enable: `${"TAKOSERVER_WORKERD_BINARY"}=/absolute/path/to/pinned/workerd`,
-    inspect: (configured, _environment, probe) => {
+    inspect: (configured, environment, probe) => {
+      if (environment.TAKOSERVER_QUEUE_PID_FIXTURE !== undefined) {
+        return {
+          state: "invalid",
+          detail:
+            "TAKOSERVER_QUEUE_PID_FIXTURE is an internal child mode, not a top-level native evidence run",
+        };
+      }
       if (configured === undefined || configured.trim() === "") {
         return {
           state: "unconfigured",

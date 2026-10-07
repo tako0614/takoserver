@@ -764,6 +764,42 @@ test("the pinned artifact on its own platform is ready and is not a failure", ()
   expect(nativeEvidenceExitCode({ summaries, gates })).toBe(pinnedHost ? 0 : 1);
 });
 
+test("an internal Queue PID fixture mode never qualifies a top-level native evidence run", () => {
+  const gates: NativeEvidenceGate[] = [
+    {
+      file: "queue.test.ts",
+      environments: ["TAKOSERVER_WORKERD_BINARY", "TAKOSERVER_QUEUE_PID_FIXTURE"],
+      capability: "workerd-artifact",
+    },
+  ];
+  for (const mode of ["first", "recover", "bogus", ""]) {
+    const summaries = summarizeNativeEvidence({
+      gates,
+      environment: {
+        TAKOSERVER_WORKERD_BINARY: "/opt/workerd",
+        TAKOSERVER_QUEUE_PID_FIXTURE: mode,
+      },
+      probe: probe({ digests: { "/opt/workerd": WORKERD_DIGEST } }),
+    });
+    const workerd = summaries.find((entry) => entry.capability === "workerd-artifact");
+    expect(workerd?.state).toBe("invalid");
+    expect(workerd?.detail).toContain("TAKOSERVER_QUEUE_PID_FIXTURE");
+    expect(nativeEvidenceExitCode({ summaries, gates })).toBe(1);
+    expect(renderNativeEvidenceReport({ summaries, gates }).join("\n")).not.toContain(
+      "proven by this run: 1 tests",
+    );
+  }
+  const unconfigured = summarizeNativeEvidence({
+    gates,
+    environment: { TAKOSERVER_QUEUE_PID_FIXTURE: "bogus" },
+    probe: probe(),
+  });
+  expect(unconfigured.find((entry) => entry.capability === "workerd-artifact")?.state).toBe(
+    "invalid",
+  );
+  expect(nativeEvidenceExitCode({ summaries: unconfigured, gates })).toBe(1);
+});
+
 test("a gate no capability claims fails the report instead of passing by silence", () => {
   const gates: NativeEvidenceGate[] = [
     { file: "d.test.ts", environments: ["TAKOSERVER_SOMETHING_ELSE"], capability: null },
