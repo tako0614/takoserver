@@ -191,6 +191,75 @@ test("projects verified code and JSON vars without changing v2 Worker identities
   expect(projection.modules.get(MODULE_PATH)).toEqual(MODULE_BYTES);
 });
 
+test("Queue producer code requires exact accepted refs and a private signed native boot", async () => {
+  const held = await heldBundle();
+  const spec = versionSpec({
+    queueProducerBindings: [{ name: "TASKS", resource: { resourceUid: "queue-uid-001" } }],
+  });
+  const resolvedQueueProducerBindings = [{ name: "TASKS", resourceUid: "queue-uid-001" }];
+  await expect(
+    inspectV2WorkerCodeVersionEligibility({
+      workerResourceUid: WORKER_UID,
+      bundleResourceUid: BUNDLE_UID,
+      spec,
+      bundle: held,
+      inspectModule: inspector(),
+    }),
+  ).rejects.toMatchObject({ code: "worker_binding_unavailable" });
+  await expect(
+    inspectV2WorkerCodeVersionEligibility({
+      workerResourceUid: WORKER_UID,
+      bundleResourceUid: BUNDLE_UID,
+      spec,
+      bundle: held,
+      inspectModule: inspector(),
+      resolvedQueueProducerBindings,
+    }),
+  ).resolves.toBeUndefined();
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec,
+      bundle: held,
+      inspectModule: inspector(),
+      resolvedQueueProducerBindings,
+    }),
+  ).rejects.toMatchObject({ code: "worker_binding_unavailable" });
+  const queueProducerBoot = {
+    address: "127.0.0.1:48361",
+    token: `${"A".repeat(43)}.${"B".repeat(43)}`,
+    bindings: [{ publicName: "TASKS" }],
+  };
+  const projected = await projectV2WorkerCodeVersion({
+    identity: identity(),
+    spec,
+    bundle: held,
+    inspectModule: inspector(),
+    resolvedQueueProducerBindings,
+    queueProducerBoot,
+  });
+  expect(projected.site).toMatchObject({
+    v2QueueProducerBinding: {
+      address: queueProducerBoot.address,
+      token: queueProducerBoot.token,
+      bindings: [{ publicName: "TASKS" }],
+    },
+  });
+  expect(projected.site.vars?.some((variable) => variable.value === queueProducerBoot.token)).toBe(
+    false,
+  );
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec,
+      bundle: held,
+      inspectModule: inspector(),
+      resolvedQueueProducerBindings,
+      queueProducerBoot: { ...queueProducerBoot, bindings: [{ publicName: "FOREIGN" }] },
+    }),
+  ).rejects.toMatchObject({ code: "worker_binding_unavailable" });
+});
+
 test("checks scheduled code eligibility without inventing an event-delivery token", async () => {
   const held = await heldBundle({ moduleBytes: SCHEDULED_MODULE_BYTES });
   const observed: WorkerModuleInspectionInput[] = [];

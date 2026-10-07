@@ -4,7 +4,7 @@ import {
   selfhostDataServiceSource,
 } from "./providers/selfhost-data-service.ts";
 import {
-  type SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND,
+  SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND,
   SELFHOST_WORKER_EVENT_SERVICE_MODULE,
   SELFHOST_WORKER_EVENT_TARGET_BINDING,
   SELFHOST_WORKER_EVENT_TOKEN_BINDING,
@@ -45,6 +45,7 @@ import {
   WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
   WORKERD_V2_PRIVATE_KV_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+  WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING,
   workerdV2PrivateActorBindingName,
   workerdV2PrivateServiceBindingName,
   workerdV2PrivateWorkflowBindingName,
@@ -132,6 +133,12 @@ export interface WorkerdVersionGraphInput {
   };
   /** Exact selected-Version signed KV grant, separate from the generic SQL plane. */
   readonly v2KvBinding?: {
+    readonly address: string;
+    readonly token: string;
+    readonly bindings: readonly { readonly publicName: string }[];
+  };
+  /** Exact selected-Version Queue producer grant, separate from settlement. */
+  readonly v2QueueProducerBinding?: {
     readonly address: string;
     readonly token: string;
     readonly bindings: readonly { readonly publicName: string }[];
@@ -228,6 +235,7 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
     v2PrivateNames,
   );
   const v2KvBinding = projectV2KvBinding(input.v2KvBinding, v2PrivateNames);
+  const v2QueueProducerBinding = projectV2KvBinding(input.v2QueueProducerBinding, v2PrivateNames);
   const serviceBindings = projectServiceBindings(input.serviceBindings);
   const actorForward = projectActorForward(input.actorForward, v2PrivateNames);
   const workflowForward = projectWorkflowForward(
@@ -277,6 +285,13 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
           kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
           publicName: binding.publicName,
           internalName: WORKERD_V2_PRIVATE_KV_BINDING,
+        }))),
+    ...(v2QueueProducerBinding === undefined
+      ? []
+      : v2QueueProducerBinding.bindings.map((binding) => ({
+          kind: SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND,
+          publicName: binding.publicName,
+          internalName: WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING,
         }))),
     ...services.map((service, index) => ({
       kind: SELFHOST_WORKER_SERVICE_BINDING_KIND,
@@ -374,7 +389,11 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
       encoder.encode(renderSelfhostWorkflowBindingRuntimeModuleSource()),
     );
   }
-  if (dataPlane !== undefined || v2KvBinding !== undefined) {
+  if (
+    dataPlane !== undefined ||
+    v2KvBinding !== undefined ||
+    v2QueueProducerBinding !== undefined
+  ) {
     hostModules.set(
       SELFHOST_WORKER_DATA_SERVICE_MODULE,
       encoder.encode(selfhostDataServiceSource()),
@@ -452,6 +471,14 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
           v2KvPlane: {
             address: v2KvBinding.address,
             token: v2KvBinding.token,
+          },
+        }),
+    ...(v2QueueProducerBinding === undefined
+      ? {}
+      : {
+          v2QueueProducerPlane: {
+            address: v2QueueProducerBinding.address,
+            token: v2QueueProducerBinding.token,
           },
         }),
     ...(eventToken === undefined

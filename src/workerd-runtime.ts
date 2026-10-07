@@ -44,6 +44,7 @@ import {
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_ORIGIN_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_TOKEN_BINDING,
+  WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING,
   WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING,
   WORKERD_V2_PRIVATE_READINESS_BINDING,
   workerdV2PrivateActorBindingName,
@@ -321,6 +322,8 @@ export interface WorkerdSite {
   readonly v2ObjectBucketPlane?: WorkerdV2ObjectBucketPlane;
   /** Opt-in v2 KV binding service; grant is never on the tenant service. */
   readonly v2KvPlane?: WorkerdV2KvPlane;
+  /** Opt-in v2 Queue producer service; not the handler settlement service. */
+  readonly v2QueueProducerPlane?: WorkerdV2KvPlane;
 }
 
 /** A module-less Worker Version served only by the Host-owned asset router. */
@@ -346,6 +349,7 @@ export interface WorkerdStaticSite {
   readonly queueSettlement?: never;
   readonly v2ObjectBucketPlane?: never;
   readonly v2KvPlane?: never;
+  readonly v2QueueProducerPlane?: never;
 }
 
 /** One exact private Version in a single logical Worker publication. */
@@ -698,6 +702,7 @@ interface Manifest {
   readonly queueSettlement?: WorkerdQueueSettlement;
   readonly v2ObjectBucketPlane?: WorkerdV2ObjectBucketPlane;
   readonly v2KvPlane?: WorkerdV2KvPlane;
+  readonly v2QueueProducerPlane?: WorkerdV2KvPlane;
 }
 
 interface StaticManifest {
@@ -723,6 +728,7 @@ interface StaticManifest {
   readonly queueSettlement?: never;
   readonly v2ObjectBucketPlane?: never;
   readonly v2KvPlane?: never;
+  readonly v2QueueProducerPlane?: never;
 }
 
 type StoredManifest = Manifest | StaticManifest;
@@ -1954,11 +1960,18 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           ? undefined
           : validV2ObjectBucketPlane(site.v2ObjectBucketPlane);
       const v2KvPlane = site.v2KvPlane === undefined ? undefined : validV2KvPlane(site.v2KvPlane);
+      const v2QueueProducerPlane =
+        site.v2QueueProducerPlane === undefined
+          ? undefined
+          : validV2KvPlane(site.v2QueueProducerPlane);
       if (v2ObjectBucketPlane && !hasWorkerdV2PrivateBindingProfile(site)) {
         throw new Error("v2 ObjectBucket service requires the private v2 Worker profile");
       }
       if (v2KvPlane && !hasWorkerdV2PrivateBindingProfile(site)) {
         throw new Error("v2 KV service requires the private v2 Worker profile");
+      }
+      if (v2QueueProducerPlane && !hasWorkerdV2PrivateBindingProfile(site)) {
+        throw new Error("v2 Queue producer service requires the private v2 Worker profile");
       }
       validActorForwardCollision(
         actorForward,
@@ -2040,6 +2053,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
             : {}),
           ...(v2ObjectBucketPlane === undefined ? {} : { v2ObjectBucketPlane }),
           ...(v2KvPlane === undefined ? {} : { v2KvPlane }),
+          ...(v2QueueProducerPlane === undefined ? {} : { v2QueueProducerPlane }),
         }),
         "utf8",
       );
@@ -2443,6 +2457,7 @@ const ACTOR_FORWARD_MANIFEST_KEYS = new Set([
   "queueSettlement",
   "v2ObjectBucketPlane",
   "v2KvPlane",
+  "v2QueueProducerPlane",
 ]);
 
 function actorForwardServiceName(
@@ -3174,14 +3189,22 @@ function validModules(modules: readonly string[], mainModule?: string): readonly
 function validHostModuleNames(
   site: Pick<
     WorkerdSite,
-    "hostModules" | "dataPlane" | "events" | "queueSettlement" | "v2ObjectBucketPlane" | "v2KvPlane"
+    | "hostModules"
+    | "dataPlane"
+    | "events"
+    | "queueSettlement"
+    | "v2ObjectBucketPlane"
+    | "v2KvPlane"
+    | "v2QueueProducerPlane"
   >,
   hostEntrypoint: string | undefined,
 ): readonly string[] {
   return validModules([
     ...(hostEntrypoint === undefined ? [] : [hostEntrypoint]),
     ...(site.hostModules ?? []),
-    ...(site.dataPlane === undefined && site.v2KvPlane === undefined
+    ...(site.dataPlane === undefined &&
+    site.v2KvPlane === undefined &&
+    site.v2QueueProducerPlane === undefined
       ? []
       : [
           site.dataPlane === undefined
@@ -3774,11 +3797,16 @@ async function prepareWorkerdSite(
       ? undefined
       : validV2ObjectBucketPlane(site.v2ObjectBucketPlane);
   const v2KvPlane = site.v2KvPlane === undefined ? undefined : validV2KvPlane(site.v2KvPlane);
+  const v2QueueProducerPlane =
+    site.v2QueueProducerPlane === undefined ? undefined : validV2KvPlane(site.v2QueueProducerPlane);
   if (v2ObjectBucketPlane && !hasWorkerdV2PrivateBindingProfile(site)) {
     throw new Error("v2 ObjectBucket service requires the private v2 Worker profile");
   }
   if (v2KvPlane && !hasWorkerdV2PrivateBindingProfile(site)) {
     throw new Error("v2 KV service requires the private v2 Worker profile");
+  }
+  if (v2QueueProducerPlane && !hasWorkerdV2PrivateBindingProfile(site)) {
+    throw new Error("v2 Queue producer service requires the private v2 Worker profile");
   }
   validActorForwardCollision(
     actorForward,
@@ -3825,6 +3853,7 @@ async function prepareWorkerdSite(
         : {}),
       ...(v2ObjectBucketPlane === undefined ? {} : { v2ObjectBucketPlane }),
       ...(v2KvPlane === undefined ? {} : { v2KvPlane }),
+      ...(v2QueueProducerPlane === undefined ? {} : { v2QueueProducerPlane }),
     },
     application: applicationSnapshot.entries,
     hostPrivate: hostSnapshot.entries,
@@ -4585,6 +4614,12 @@ async function readValidatedManifest(
       throw new Error("v2 KV service requires the private v2 Worker profile");
     }
   }
+  if (manifest.v2QueueProducerPlane !== undefined) {
+    validV2KvPlane(manifest.v2QueueProducerPlane);
+    if (!hasWorkerdV2PrivateBindingProfile(manifest)) {
+      throw new Error("v2 Queue producer service requires the private v2 Worker profile");
+    }
+  }
   return manifest;
 }
 
@@ -5109,6 +5144,9 @@ export async function readWorkerdSelectedActiveVersion(
             ? {}
             : { v2ObjectBucketPlane: { ...manifest.v2ObjectBucketPlane } }),
           ...(manifest.v2KvPlane === undefined ? {} : { v2KvPlane: { ...manifest.v2KvPlane } }),
+          ...(manifest.v2QueueProducerPlane === undefined
+            ? {}
+            : { v2QueueProducerPlane: { ...manifest.v2QueueProducerPlane } }),
         };
   } catch {
     // Validators normally reject these shapes earlier. Keep the reader's
@@ -5305,6 +5343,9 @@ export async function readWorkerdActiveActorGraph(
           ? {}
           : { v2ObjectBucketPlane: { ...manifest.v2ObjectBucketPlane } }),
         ...(manifest.v2KvPlane === undefined ? {} : { v2KvPlane: { ...manifest.v2KvPlane } }),
+        ...(manifest.v2QueueProducerPlane === undefined
+          ? {}
+          : { v2QueueProducerPlane: { ...manifest.v2QueueProducerPlane } }),
         ...(manifest.assets === undefined
           ? {}
           : {
@@ -5801,6 +5842,11 @@ function renderConfig(
               `(name = ${capnpText(WORKERD_V2_PRIVATE_KV_BINDING)}, service = ${capnpText(`${entry.name}-v2-kv`)})`,
             ]
           : []),
+        ...(entry.manifest.v2QueueProducerPlane
+          ? [
+              `(name = ${capnpText(WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING)}, service = ${capnpText(`${entry.name}-v2-queue-producer`)})`,
+            ]
+          : []),
         ...validServiceBindings(
           entry.manifest.serviceBindings ?? [],
           hasWorkerdV2PrivateBindingProfile(entry.manifest),
@@ -6056,6 +6102,32 @@ function renderConfig(
     })
     .join("\n");
 
+  const v2QueueProducerServices = variants
+    .filter((entry) => entry.manifest.v2QueueProducerPlane)
+    .map((entry) => {
+      if (isStaticManifest(entry.manifest))
+        throw new Error("static Version cannot bind v2 Queue producer");
+      const plane = validV2KvPlane(entry.manifest.v2QueueProducerPlane as WorkerdV2KvPlane);
+      const module = requiredStoredModule(
+        entry.manifest.moduleFiles.hostPrivate,
+        SELFHOST_WORKER_DATA_SERVICE_MODULE,
+      );
+      return `  ( name = ${capnpText(`${entry.name}-v2-queue-producer`)},
+    worker = (
+      modules = [ (name = ${capnpText(SELFHOST_WORKER_DATA_SERVICE_MODULE)}, esModule = embed ${capnpText(`${entry.storagePrefix}/${HOST_PRIVATE_MODULE_DIRECTORY}/${module.key}`)}) ],
+      bindings = [
+        (name = ${capnpText(SELFHOST_WORKER_DATA_PLANE_BINDING)}, service = ${capnpText(`${entry.name}-v2-queue-producer-origin`)}),
+        (name = ${capnpText(SELFHOST_WORKER_DATA_TOKEN_BINDING)}, text = ${capnpText(plane.token)})
+      ],
+      compatibilityDate = "2026-01-01", globalOutbound = "v2-queue-producer-deny"
+    )
+  ),
+  ( name = ${capnpText(`${entry.name}-v2-queue-producer-origin`)},
+    external = ( address = ${capnpText(plane.address)}, http = () )
+  ),`;
+    })
+    .join("\n");
+
   // One gate per script that receives events. It holds the token and the only
   // binding on this machine that names the script's event entrypoint; the
   // script itself is not reachable on the event hostname at all, and the
@@ -6206,7 +6278,7 @@ function renderConfig(
 const config :Workerd.Config = (
   services = [
 ${services}
-${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${queueSettlementServices === "" ? "" : `\n${queueSettlementServices}\n  (name = "queue-settlement-deny", network = (allow = [])),`}${v2ObjectBucketServices === "" ? "" : `\n${v2ObjectBucketServices}\n  (name = "object-bucket-deny", network = (allow = [])),`}${v2KvServices === "" ? "" : `\n${v2KvServices}\n  (name = "v2-kv-deny", network = (allow = [])),`}${actorExternalServices === "" ? "" : `\n${actorExternalServices}`}${workflowExternalServices === "" ? "" : `\n${workflowExternalServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
+${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${queueSettlementServices === "" ? "" : `\n${queueSettlementServices}\n  (name = "queue-settlement-deny", network = (allow = [])),`}${v2ObjectBucketServices === "" ? "" : `\n${v2ObjectBucketServices}\n  (name = "object-bucket-deny", network = (allow = [])),`}${v2KvServices === "" ? "" : `\n${v2KvServices}\n  (name = "v2-kv-deny", network = (allow = [])),`}${v2QueueProducerServices === "" ? "" : `\n${v2QueueProducerServices}\n  (name = "v2-queue-producer-deny", network = (allow = [])),`}${actorExternalServices === "" ? "" : `\n${actorExternalServices}`}${workflowExternalServices === "" ? "" : `\n${workflowExternalServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
   ( name = "router",
     worker = (
       modules = [ (name = "router.js", esModule = embed "router.js") ],

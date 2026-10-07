@@ -33,6 +33,7 @@ import {
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
   WORKERD_V2_PRIVATE_KV_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+  WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING,
   WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING,
   WORKERD_V2_PRIVATE_READINESS_BINDING,
 } from "./workerd-v2-private-binding-names.ts";
@@ -1012,7 +1013,7 @@ function projectEnv(rawEnv) {
         descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_KV_BINDING_KIND)}
           ? createKvAdapter(call, descriptor.publicName, descriptor.internalName !== undefined)
           : descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND)}
-            ? createQueueAdapter(call, descriptor.publicName)
+            ? createQueueAdapter(call, descriptor.publicName, descriptor.internalName !== undefined)
             : descriptor.kind === VECTOR_KIND
               ? createEdgeVectorAdapter((operation, input, project) => {
                   const payload = planeRequest(descriptor.publicName, operation);
@@ -1499,17 +1500,17 @@ function projectEncodedBody(value) {
  * acceptance id this returns is the Host's own, not a provider dedupe id, which
  * is exactly what the managed adapter promises.
  */
-function createQueueAdapter(call, binding) {
+function createQueueAdapter(call, binding, strictTypes) {
   const portable = SafeObjectCreate(null);
   portable.send = async (body, options) => {
     const bytes = runtimeBytes(body, "invalid_body");
     if (viewByteLength(bytes) > MAX_QUEUE_MESSAGE_BYTES) throw portableError("message_too_large");
-    const normalized = validateQueueSendOptions(options);
+    const normalized = validateQueueSendOptions(options, strictTypes);
     const payload = planeRequest(binding, "send");
     payload.body = encodeBase64(bytes);
     if (normalized.delaySeconds !== undefined) payload.delaySeconds = normalized.delaySeconds;
     const value = await call(QUEUE_URL, payload, QUEUE_ERROR_CODES);
-    if (!isRecord(value) || !exactKeys(value, ["messageId"]) || !boundedText(value.messageId, 512)) {
+    if (!isRecord(value) || !exactKeys(value, ["messageId"]) || !boundedText(value.messageId, strictTypes ? 256 : 512)) {
       throw portableError("backend_unavailable");
     }
     return value.messageId;
@@ -1530,6 +1531,7 @@ function createQueueAdapter(call, binding) {
       if (message.delaySeconds !== undefined) optionInput.delaySeconds = message.delaySeconds;
       const normalized = validateQueueSendOptions(
         message.delaySeconds === undefined ? undefined : optionInput,
+        strictTypes,
       );
       const entry = SafeObjectCreate(null);
       entry.body = encodeBase64(bytes);
@@ -1548,23 +1550,23 @@ function createQueueAdapter(call, binding) {
       throw portableError("backend_unavailable");
     }
     return mapArray(value.messageIds, (id) => {
-      if (!boundedText(id, 512)) throw portableError("backend_unavailable");
+      if (!boundedText(id, strictTypes ? 256 : 512)) throw portableError("backend_unavailable");
       return id;
     });
   };
   return portable;
 }
 
-function validateQueueSendOptions(options) {
+function validateQueueSendOptions(options, strictTypes) {
   if (options === undefined) return SafeObjectCreate(null);
-  if (!isRecord(options) || !onlyKeys(options, ["delaySeconds"])) throw portableError("invalid_argument");
+  if (!isRecord(options) || !onlyKeys(options, ["delaySeconds"])) throw portableError(strictTypes ? "invalid_body" : "invalid_argument");
   if (options.delaySeconds === undefined) return SafeObjectCreate(null);
   if (
     !SafeNumberIsSafeInteger(options.delaySeconds) ||
     options.delaySeconds < 0 ||
     options.delaySeconds > MAX_QUEUE_DELAY_SECONDS
   ) {
-    throw portableError("invalid_argument");
+    throw portableError(strictTypes ? "invalid_body" : "invalid_argument");
   }
   const result = SafeObjectCreate(null);
   result.delaySeconds = options.delaySeconds;
@@ -3238,9 +3240,12 @@ function normalizeSourceInput(
       const privateKvService =
         binding.kind === SELFHOST_WORKER_EDGE_KV_BINDING_KIND &&
         Object.hasOwn(binding, "internalName");
+      const privateQueueProducerService =
+        binding.kind === SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND &&
+        Object.hasOwn(binding, "internalName");
       exactNormalizedKeys(
         binding,
-        privateObjectService || privateKvService
+        privateObjectService || privateKvService || privateQueueProducerService
           ? ["kind", "publicName", "internalName"]
           : ["kind", "publicName"],
         "bindings",
@@ -3260,11 +3265,17 @@ function normalizeSourceInput(
       ) {
         invalid("bindings");
       }
+      if (
+        privateQueueProducerService &&
+        (!v2PrivateNames || binding.internalName !== WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING)
+      ) {
+        invalid("bindings");
+      }
       validatePublicName(binding.publicName, publicNames, false, v2PrivateNames);
       bindings.push({
         kind: binding.kind as SelfhostWorkerDataBindingDescriptor["kind"],
         publicName: binding.publicName as string,
-        ...(privateObjectService || privateKvService
+        ...(privateObjectService || privateKvService || privateQueueProducerService
           ? { internalName: binding.internalName as string }
           : {}),
       });

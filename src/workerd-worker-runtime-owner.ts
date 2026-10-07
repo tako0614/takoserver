@@ -44,6 +44,10 @@ import type {
   ObjectBucketWorkerBindingClaim,
   ObjectBucketWorkerBindingResolution,
 } from "./takoform-v2/forms/object-bucket-worker-binding-authority.ts";
+import type {
+  QueueWorkerBindingClaim,
+  QueueWorkerBindingResolution,
+} from "./takoform-v2/forms/queue-worker-binding-authority.ts";
 import type { SQLiteWorkerBindingClaim } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import {
   parseWorkerEndpointSpec,
@@ -462,6 +466,15 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
       };
       readonly vector: string;
     } | null>;
+  };
+  /** Fixed private Queue producer broker and Core authority, not handler settlement. */
+  readonly v2QueueProducerBinding?: {
+    readonly address: string;
+    issueGrant(grant: QueueWorkerBindingClaim): string;
+    resolveCurrentBinding(
+      claim: QueueWorkerBindingClaim,
+      binding: string,
+    ): Promise<QueueWorkerBindingResolution | null>;
   };
   readonly workerdBinary: string | null;
   /** Trusted code-module inspector; absent uses the WorkerdRuntime's pinned inspector. */
@@ -1982,6 +1995,27 @@ export async function openWorkerdWorkerRuntimeOwner(
         resolveCurrentBinding: options.v2KvBinding.resolveCurrentBinding.bind(options.v2KvBinding),
       })
     : undefined;
+  if (
+    options.v2QueueProducerBinding !== undefined &&
+    (typeof options.v2QueueProducerBinding.issueGrant !== "function" ||
+      typeof options.v2QueueProducerBinding.resolveCurrentBinding !== "function" ||
+      !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(options.v2QueueProducerBinding.address) ||
+      Number(
+        options.v2QueueProducerBinding.address.slice(
+          options.v2QueueProducerBinding.address.lastIndexOf(":") + 1,
+        ),
+      ) > 65_535)
+  )
+    throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
+  const v2QueueProducerBinding = options.v2QueueProducerBinding
+    ? Object.freeze({
+        address: options.v2QueueProducerBinding.address,
+        issueGrant: options.v2QueueProducerBinding.issueGrant.bind(options.v2QueueProducerBinding),
+        resolveCurrentBinding: options.v2QueueProducerBinding.resolveCurrentBinding.bind(
+          options.v2QueueProducerBinding,
+        ),
+      })
+    : undefined;
 
   let canonicalRoot: string;
   try {
@@ -2465,6 +2499,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       ...(options.v2SqliteBinding ? { v2SqliteBinding: options.v2SqliteBinding } : {}),
       ...(v2ObjectBucketBinding ? { v2ObjectBucketBinding } : {}),
       ...(v2KvBinding ? { v2KvBinding } : {}),
+      ...(v2QueueProducerBinding ? { v2QueueProducerBinding } : {}),
       ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
     });
     const handle: IncarnationHandle = {
