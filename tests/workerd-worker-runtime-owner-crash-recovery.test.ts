@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { canonicalJson } from "../src/json.ts";
 import { spawnWorkerdWithParentDeath, workerPortOwnership } from "../src/workerd-linux-process.ts";
 import type { WorkerdProcess } from "../src/workerd-supervisor.ts";
 
@@ -67,10 +68,11 @@ async function readJsonLine(child: HostProcess): Promise<Record<string, unknown>
 }
 
 async function startHost(
-  mode: "retire" | "empty-delete" | "replay",
+  mode: "retire" | "empty-delete" | "replay" | "active-create" | "active-recover",
   root: string,
   binary: string,
   port: number,
+  updateId = "",
 ): Promise<HostProcess> {
   return Bun.spawn(
     [
@@ -82,11 +84,14 @@ async function startHost(
       binary,
       String(port),
       CREATE_ID,
+      updateId,
       DELETE_ID,
     ],
     { stdout: "pipe", stderr: "ignore" },
   );
 }
+
+const UPDATE_ID = "8a7f7aa3-c782-44b4-8f02-201dab446c2d";
 
 type TestChild = ReturnType<typeof spawnWorkerdWithParentDeath>;
 
@@ -134,6 +139,12 @@ function ownerDirectory(root: string): string {
   return join(root, "owners", uidHash);
 }
 
+async function ownerState(root: string): Promise<Record<string, unknown>> {
+  return JSON.parse(
+    await readFile(join(ownerDirectory(root), "runtime-owner.json"), "utf8"),
+  ) as Record<string, unknown>;
+}
+
 test("a new host process replays the exact DELETE proof after the old host crashes", async () => {
   const owned = await fixture();
   const port = await unusedPort();
@@ -166,6 +177,81 @@ test("a new host process replays the exact DELETE proof after the old host crash
     if (oldHost) await terminateHost(oldHost);
     if (successorA) await terminateHost(successorA);
     if (successorB) await terminateHost(successorB);
+    await owned.cleanup();
+  }
+});
+
+test("a successor host reopens and serves the exact active incarnation before update and DELETE", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let oldHost: HostProcess | undefined;
+  let successor: HostProcess | undefined;
+  try {
+    oldHost = await startHost("active-create", owned.root, owned.binary, port);
+    const created = await readJsonLine(oldHost);
+    expect(created).toMatchObject({ kind: "active-created", port });
+    const oldPid = created.pid;
+    const before = await ownerState(owned.root);
+    const beforeIncarnations = before.incarnations as Record<string, unknown>[];
+    const originalIncarnation = beforeIncarnations.find((item) => item.operationId === CREATE_ID);
+    expect(originalIncarnation?.processIdentity).toMatchObject({ pid: expect.any(Number) });
+    await terminateHost(oldHost);
+    oldHost = undefined;
+    await waitForVacant(port);
+
+    successor = await startHost("active-recover", owned.root, owned.binary, port, UPDATE_ID);
+    const recovered = await readJsonLine(successor);
+    expect(recovered).toMatchObject({ kind: "recovered-updated-deleted", port });
+    expect(recovered.pid).not.toBe(oldPid);
+    expect(typeof recovered.body).toBe("string");
+    const after = await ownerState(owned.root);
+    const afterIncarnations = after.incarnations as Record<string, unknown>[];
+    const reopenedIncarnation = afterIncarnations.find((item) => item.operationId === CREATE_ID);
+    expect(reopenedIncarnation?.status).toBe("retired");
+    expect((reopenedIncarnation?.processIdentity as { pid?: number })?.pid).not.toBe(
+      (originalIncarnation?.processIdentity as { pid?: number })?.pid,
+    );
+  } finally {
+    if (oldHost) await terminateHost(oldHost);
+    if (successor) await terminateHost(successor);
+    await owned.cleanup();
+  }
+});
+
+test("an active record without its persisted child fingerprint remains unknown after restart", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let oldHost: HostProcess | undefined;
+  let successor: HostProcess | undefined;
+  try {
+    oldHost = await startHost("active-create", owned.root, owned.binary, port);
+    expect(await readJsonLine(oldHost)).toMatchObject({ kind: "active-created", port });
+    await terminateHost(oldHost);
+    oldHost = undefined;
+    await waitForVacant(port);
+
+    const path = join(ownerDirectory(owned.root), "runtime-owner.json");
+    const state = JSON.parse(await readFile(path, "utf8")) as {
+      incarnations: Record<string, unknown>[];
+    };
+    state.incarnations = state.incarnations.map((item) =>
+      item.operationId === CREATE_ID
+        ? { ...item, processIdentity: null, configurationSha256: null }
+        : item,
+    );
+    const tamperedState = canonicalJson(state);
+    await writeFile(path, tamperedState, { mode: 0o600 });
+
+    successor = await startHost("active-recover", owned.root, owned.binary, port, UPDATE_ID);
+    expect(await readJsonLine(successor)).toMatchObject({
+      kind: "error",
+      code: "ownership_uncertain",
+    });
+    expect(await readFile(path, "utf8")).toBe(tamperedState);
+    expect(await workerPortOwnership(port, undefined)).toBe("vacant");
+  } finally {
+    if (oldHost) await terminateHost(oldHost);
+    if (successor) await terminateHost(successor);
     await owned.cleanup();
   }
 });

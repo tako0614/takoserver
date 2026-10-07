@@ -1390,12 +1390,24 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         incarnations: Array<{
           executionCopiesReleased: boolean;
           executionCopiesCleanupStarted: boolean;
+          processIdentity: {
+            pid: number;
+            bootId: string;
+            pidNamespace: string;
+            startTimeTicks: string;
+          } | null;
+          configurationSha256: string | null;
         }>;
       };
-      expect(finalState.schema).toBe("takoserver.v2-worker-runtime-owner@5");
+      expect(finalState.schema).toBe("takoserver.v2-worker-runtime-owner@6");
       expect(
         finalState.incarnations.every(
-          (record) => record.executionCopiesReleased && record.executionCopiesCleanupStarted,
+          (record) =>
+            record.executionCopiesReleased &&
+            record.executionCopiesCleanupStarted &&
+            record.processIdentity !== null &&
+            record.configurationSha256 !== null &&
+            /^[0-9a-f]{64}$/u.test(record.configurationSha256),
         ),
       ).toBe(true);
       expect(owned.children).toHaveLength(1);
@@ -1420,18 +1432,24 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         delete record.executionCopiesReleased;
         delete record.executionCopiesCleanupStarted;
         delete record.executionCopiesCleanupManifestSha256;
+        delete record.processIdentity;
+        delete record.configurationSha256;
       }
       await rm(join(groupRoot, ".retired-execution-copies"), { recursive: true, force: true });
       await writeFile(statePath, `${JSON.stringify(previousV2)}\n`, { mode: 0o600 });
       const migratedV2 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
       await migratedV2.close();
       expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
-        "takoserver.v2-worker-runtime-owner@5",
+        "takoserver.v2-worker-runtime-owner@6",
       );
 
       const previousV4 = JSON.parse(await Bun.file(statePath).text()) as Record<string, unknown>;
       previousV4.schema = "takoserver.v2-worker-runtime-owner@4";
       delete previousV4.endpointRouteAbsence;
+      for (const record of previousV4.incarnations as Array<Record<string, unknown>>) {
+        delete record.processIdentity;
+        delete record.configurationSha256;
+      }
       await writeFile(statePath, `${JSON.stringify(previousV4)}\n`, { mode: 0o600 });
       const migratedV4 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
       await migratedV4.close();
@@ -1448,6 +1466,8 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
       for (const record of previousV3.incarnations) {
         delete record.executionCopiesCleanupStarted;
         delete record.executionCopiesCleanupManifestSha256;
+        delete record.processIdentity;
+        delete record.configurationSha256;
       }
       await rm(join(groupRoot, ".retired-execution-copies"), { recursive: true, force: true });
       await writeFile(statePath, `${JSON.stringify(previousV3)}\n`, { mode: 0o600 });
@@ -1468,12 +1488,14 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         delete record.executionCopiesCleanupStarted;
         delete record.executionCopiesCleanupManifestSha256;
         delete record.deferRetirementUntilDeadline;
+        delete record.processIdentity;
+        delete record.configurationSha256;
       }
       await writeFile(statePath, `${JSON.stringify(previousV1)}\n`, { mode: 0o600 });
       const migratedV1 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
       await migratedV1.close();
       expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
-        "takoserver.v2-worker-runtime-owner@5",
+        "takoserver.v2-worker-runtime-owner@6",
       );
       expect(owned.children).toHaveLength(1);
     } finally {

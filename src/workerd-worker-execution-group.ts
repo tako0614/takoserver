@@ -53,6 +53,8 @@ export interface WorkerdWorkerExecutionGroup {
   readonly runtimeRoot: string;
   /** Exact config watched by this incarnation's one supervisor. */
   readonly configurationPath: string;
+  /** Current group-manifest pin for the exact immutable Workerd config bytes. */
+  readonly configurationSha256: string;
   start(): Promise<void>;
   /** Reconcile a renderer's atomic config replacement through the same supervisor. */
   reloadConfiguration(): Promise<void>;
@@ -60,6 +62,8 @@ export interface WorkerdWorkerExecutionGroup {
   sealConfiguration(): void;
   isReady(): boolean;
   fetch(request: Request): Promise<Response>;
+  /** Stop a failed recovery child without writing retirement or deleting custody. */
+  stopAfterFailedRecovery(): Promise<void>;
   /**
    * The trusted caller supplies the durable accepted Operation ID. This local
    * primitive binds its receipt to that identity but does not resolve/authorize
@@ -137,6 +141,10 @@ export interface OpenWorkerdWorkerExecutionGroupOptions {
   readonly configurationPath?: string;
   readonly workerdBinary: string | null;
   readonly spawn?: (command: readonly string[]) => WorkerdProcess;
+  /** Persist exact child identity before readiness admits this incarnation. */
+  readonly onSpawned?: (child: WorkerdProcess) => Promise<void> | void;
+  /** Reopen exact stored config/copies after the owner proves its prior child stale. */
+  readonly recoverExisting?: true;
 }
 
 type GroupManifest = {
@@ -305,6 +313,7 @@ function makeGroup(input: {
           options.spawn ??
           ((command) =>
             spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" })),
+        ...(options.onSpawned === undefined ? {} : { onSpawned: options.onSpawned }),
         readiness: async (_configPath, child, mode) => {
           const attempts = mode === "startup" ? 20 : 1;
           for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -506,6 +515,9 @@ function makeGroup(input: {
     workerResourceUid: options.workerResourceUid,
     runtimeRoot: directory,
     configurationPath,
+    get configurationSha256() {
+      return currentManifest.configurationSha256;
+    },
     start,
     reloadConfiguration,
     sealConfiguration() {
@@ -513,6 +525,19 @@ function makeGroup(input: {
     },
     isReady() {
       return state === "serving" && supervisor?.isReady() === true;
+    },
+    async stopAfterFailedRecovery() {
+      if (options.recoverExisting !== true || retirementStarted) {
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      }
+      await startPromise?.catch(() => undefined);
+      await configurationReload?.catch(() => undefined);
+      await supervisor?.shutdown();
+      if ((await workerPortOwnership(options.listenerPort, undefined)) !== "vacant") {
+        state = "uncertain";
+        throw new WorkerdWorkerExecutionGroupError("retirement_uncertain");
+      }
+      state = "uncertain";
     },
     fetch: fetchRequest,
     retire,
@@ -597,7 +622,15 @@ export async function openWorkerdWorkerExecutionGroup(
   )
     throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
   const receiptText = await readText(join(directory, RECEIPT_NAME));
-  if (receiptText === null) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  if (receiptText === null) {
+    if (options.recoverExisting === true) {
+      return makeGroup({ options, directory, manifest, initialState: "idle" });
+    }
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  if (options.recoverExisting === true) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
   let parsedReceipt: unknown;
   try {
     parsedReceipt = JSON.parse(receiptText);
