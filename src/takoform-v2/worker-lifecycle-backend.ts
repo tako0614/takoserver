@@ -46,10 +46,15 @@ import {
   type V2ResolvedObjectBucketBinding,
   type V2ResolvedQueueProducerBinding,
   type V2ResolvedSqliteBinding,
+  type V2ResolvedWorkflowBinding,
 } from "./worker-code-runtime.ts";
 import type { V2WorkerVersionResolution } from "./worker-publication-state.ts";
 import { projectV2ResolvedServiceBindings } from "./worker-service-resolution.ts";
 import { projectV2StaticWorkerVersion } from "./worker-static-runtime.ts";
+import type {
+  V2WorkflowBindingResolution,
+  V2WorkflowBindingTarget,
+} from "./workflow-binding-authority.ts";
 
 const V2_QUEUE_BACKEND_ID = "selfhost-v2-at-least-once-queue-sql-v1";
 
@@ -91,6 +96,7 @@ function codeOnly(
   kvBinding: V2CodeKvBindingBoot | undefined,
   queueProducerBinding: V2CodeQueueProducerBindingBoot | undefined,
   actorBinding: V2CodeActorBindingAuthority | undefined,
+  workflowBinding: V2CodeWorkflowBindingAuthority | undefined,
 ): WorkerVersionSpec {
   if (
     !spec.bundle ||
@@ -104,7 +110,7 @@ function codeOnly(
     (spec.bucketBindings.length > 0 && !objectBucketBinding) ||
     (spec.queueProducerBindings.length > 0 && !queueProducerBinding) ||
     (spec.actorBindings.length > 0 && !actorBinding) ||
-    spec.workflowBindings.length > 0
+    (spec.workflowBindings.length > 0 && !workflowBinding)
   ) {
     throw new TakoformV2Error("capability_required", 422);
   }
@@ -120,6 +126,11 @@ export interface V2CodeActorBindingAuthority {
     readonly workerUid: string;
     readonly namespaceResourceUid: string;
   }): Promise<{ readonly className: string; readonly vector: string } | null>;
+}
+
+/** SQL-backed accepted v2 Workflow authority; never a caller-provided readiness flag. */
+export interface V2CodeWorkflowBindingAuthority {
+  resolveTarget(input: V2WorkflowBindingTarget): Promise<V2WorkflowBindingResolution | null>;
 }
 
 type ConfiguredInputSealer = ReturnType<typeof createV2WorkerVersionConfiguredInputSealer>;
@@ -566,6 +577,7 @@ type CodeWorkerVersionOptions = {
   readonly v2KvBinding?: V2CodeKvBindingBoot;
   readonly v2QueueProducerBinding?: V2CodeQueueProducerBindingBoot;
   readonly v2ActorBinding?: V2CodeActorBindingAuthority;
+  readonly v2WorkflowBinding?: V2CodeWorkflowBindingAuthority;
   readonly configuredInputSealer?: ConfiguredInputSealer;
   readonly configuredInputCustody?: V2CodeConfiguredInputCustody;
 };
@@ -609,6 +621,9 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
   if (options.v2ActorBinding && typeof options.v2ActorBinding.resolveTarget !== "function") {
     throw new TypeError("Code WorkerVersion requires an Actor namespace authority");
   }
+  if (options.v2WorkflowBinding && typeof options.v2WorkflowBinding.resolveTarget !== "function") {
+    throw new TypeError("Code WorkerVersion requires a v2 Workflow target authority");
+  }
   const { sql, targetKey } = options;
   const queueSettlement = options.queueSettlement;
   const sqliteBinding = options.v2SqliteBinding;
@@ -616,6 +631,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
   const kvBinding = options.v2KvBinding;
   const queueProducerBinding = options.v2QueueProducerBinding;
   const actorBinding = options.v2ActorBinding;
+  const workflowBinding = options.v2WorkflowBinding;
   const resolveVersion = options.publicationState.resolveVersion.bind(options.publicationState);
   const observeRetired = options.retirement.observeRetired.bind(options.retirement);
   const inspectModule = options.inspectModule;
@@ -653,6 +669,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
           kvBinding,
           queueProducerBinding,
           actorBinding,
+          workflowBinding,
         );
         return (await retired(sql, observeRetired, execution, spec.worker.resourceUid, "version"))
           ? { kind: "complete", observed: {}, output: {} }
@@ -671,6 +688,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
         kvBinding,
         queueProducerBinding,
         actorBinding,
+        workflowBinding,
       );
       if (!(await currentClaim(sql, execution))) return unresolved();
       const resolution = await resolveVersion({ execution });
@@ -761,6 +779,27 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
           vector: target.vector,
         });
       }
+      const resolvedWorkflows: (V2ResolvedWorkflowBinding & { readonly vector: string })[] = [];
+      for (const binding of spec.workflowBindings) {
+        const target = await workflowBinding?.resolveTarget({
+          principal: execution.principal,
+          space: execution.space,
+          targetKey: execution.targetKey,
+          workflowResourceUid: binding.resource.resourceUid,
+        });
+        if (
+          !target ||
+          target.tenantId !== execution.principal ||
+          target.workflowResourceUid !== binding.resource.resourceUid ||
+          target.workerUid !== spec.worker.resourceUid
+        )
+          return unresolved();
+        resolvedWorkflows.push({
+          name: binding.name,
+          resourceUid: binding.resource.resourceUid,
+          vector: target.vector,
+        });
+      }
       await inspectV2WorkerCodeVersionEligibility({
         workerResourceUid: snapshot.worker.uid,
         ...(spec.bundle ? { bundleResourceUid: spec.bundle.resourceUid } : {}),
@@ -778,6 +817,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
           ? { resolvedQueueProducerBindings: resolvedQueueProducers }
           : {}),
         ...(resolvedActors.length > 0 ? { resolvedActorBindings: resolvedActors } : {}),
+        ...(resolvedWorkflows.length > 0 ? { resolvedWorkflowBindings: resolvedWorkflows } : {}),
       });
       for (const binding of resolvedActors) {
         const target = await actorBinding?.resolveTarget({
@@ -788,6 +828,21 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
           namespaceResourceUid: binding.resourceUid,
         });
         if (!target || target.vector !== binding.vector || target.className !== binding.className)
+          return unresolved();
+      }
+      for (const binding of resolvedWorkflows) {
+        const target = await workflowBinding?.resolveTarget({
+          principal: execution.principal,
+          space: execution.space,
+          targetKey: execution.targetKey,
+          workflowResourceUid: binding.resourceUid,
+        });
+        if (
+          !target ||
+          target.tenantId !== execution.principal ||
+          target.workerUid !== spec.worker.resourceUid ||
+          target.vector !== binding.vector
+        )
           return unresolved();
       }
       if (!(await resolution.stillCurrent()) || !(await currentClaim(sql, execution))) {
@@ -814,6 +869,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
         kvBinding,
         queueProducerBinding,
         actorBinding,
+        workflowBinding,
       );
     },
     validateUpdate(previous, spec) {
@@ -826,6 +882,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
         kvBinding,
         queueProducerBinding,
         actorBinding,
+        workflowBinding,
       );
     },
     references(spec) {
@@ -839,6 +896,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
           kvBinding,
           queueProducerBinding,
           actorBinding,
+          workflowBinding,
         ),
       );
     },

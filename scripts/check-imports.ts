@@ -146,7 +146,35 @@ const LAYERS: readonly Layer[] = [
       "v2-form",
       "v2-code-validation",
       "v2-runtime",
+      "v2-workflow-binding-authority",
+      "v2-workflow-binding-projection",
       "adapter",
+    ],
+  },
+  {
+    // Accepted Core Workflow/Version graph, never legacy Workflow Resource lookup.
+    name: "v2-workflow-binding-authority",
+    match: /^src\/takoform-v2\/workflow-binding-authority\.ts$/u,
+    may: ["core", "v2-form", "v2-workflow-manager"],
+  },
+  {
+    // Host-private exact grant projection, below the native graph adapter.
+    name: "v2-workflow-binding-projection",
+    match: /^src\/takoform-v2\/workflow-binding-projection\.ts$/u,
+    may: ["core", "v2-form"],
+  },
+  {
+    // Per-incarnation broker wires accepted authority to existing Workflow instances.
+    name: "v2-workflow-binding-boot",
+    match: /^src\/takoform-v2\/workflow-binding-boot\.ts$/u,
+    may: [
+      "core",
+      "domain",
+      "adapter",
+      "app",
+      "v2-form",
+      "v2-workflow-binding-authority",
+      "v2-workflow-binding-projection",
     ],
   },
   {

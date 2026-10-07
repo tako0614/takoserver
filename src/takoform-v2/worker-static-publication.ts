@@ -34,6 +34,8 @@ import {
   v2ServiceTargetName,
 } from "./worker-service-resolution.ts";
 import { projectV2StaticWorkerVersion } from "./worker-static-runtime.ts";
+import type { V2WorkflowBindingClaim } from "./workflow-binding-authority.ts";
+import { projectV2WorkflowForward } from "./workflow-binding-projection.ts";
 
 const OPERATION_MARKER = "takoserver-v2-operation:";
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -254,6 +256,18 @@ export function createV2WorkerPublication(options: {
       readonly runtimeClassRef: NonNullable<WorkerdActorForwardBinding["runtimeClassRef"]>;
     } | null>;
   };
+  /** Incarnation-scoped signed grants from the accepted v2 Workflow authority. */
+  readonly v2WorkflowForward?: {
+    issueBinding(
+      claim: V2WorkflowBindingClaim,
+      bindingName: string,
+    ): Promise<{
+      readonly publicName: string;
+      readonly tenantId: string;
+      readonly workflowResourceUid: string;
+      readonly token: string;
+    } | null>;
+  };
 }): V2WorkerPublication {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   const inspectModule = options.runtime.inspectModule;
@@ -331,6 +345,43 @@ export function createV2WorkerPublication(options: {
             actorForward.push(issued);
           }
           if (!(await resolution.stillCurrent())) throw new Error("Actor reference graph changed");
+        }
+        const workflowClaims = versionSpec.workflowBindings.map((binding) => ({
+          name: binding.name,
+          resourceUid: binding.resource.resourceUid,
+        }));
+        const workflowGrants = [] as {
+          readonly publicName: string;
+          readonly tenantId: string;
+          readonly workflowResourceUid: string;
+          readonly token: string;
+        }[];
+        if (workflowClaims.length > 0) {
+          const binder = options.v2WorkflowForward;
+          if (!binder) throw new Error("native Workflow forwarding is unavailable");
+          const claim: V2WorkflowBindingClaim = {
+            principal: snapshot.worker.principal,
+            space: snapshot.worker.space,
+            targetKey: options.targetKey,
+            workerUid: snapshot.worker.uid,
+            workerVersionUid: version.uid,
+            workerVersionOperationId: version.sourceOperationId,
+            nativeVersionId: identity.versionId,
+            bindings: workflowClaims,
+          };
+          for (const binding of workflowClaims) {
+            const issued = await binder.issueBinding(claim, binding.name);
+            if (
+              !issued ||
+              issued.publicName !== binding.name ||
+              issued.tenantId !== claim.principal ||
+              issued.workflowResourceUid !== binding.resourceUid
+            )
+              throw new Error("current Workflow binding is unavailable");
+            workflowGrants.push(issued);
+          }
+          if (!(await resolution.stillCurrent()))
+            throw new Error("Workflow reference graph changed");
         }
         const sqliteBindings = versionSpec.sqliteBindings.map((binding) => ({
           name: binding.name,
@@ -577,6 +628,12 @@ export function createV2WorkerPublication(options: {
                 actorForward,
               }
             : {}),
+          ...(workflowGrants.length > 0
+            ? {
+                resolvedWorkflowBindings: workflowClaims,
+                workflowForward: workflowGrants,
+              }
+            : {}),
           ...(sqliteBindings.length > 0 ? { resolvedSqliteBindings: sqliteBindings } : {}),
           ...(codeObjectBucketBoot
             ? {
@@ -624,6 +681,19 @@ export function createV2WorkerPublication(options: {
             unavailableToken: binding.unavailableToken,
           })),
           ...(actorForward.length > 0 ? { actorForward } : {}),
+          ...(workflowGrants.length > 0
+            ? {
+                workflowForward: await projectV2WorkflowForward({
+                  workerUid: snapshot.worker.uid,
+                  versionUid: version.uid,
+                  sourceOperationId: version.sourceOperationId,
+                  nativeVersionId: identity.versionId,
+                  principal: snapshot.worker.principal,
+                  declarations: versionSpec.workflowBindings,
+                  grants: workflowGrants,
+                }),
+              }
+            : {}),
           ...(sqliteBoot === undefined
             ? {}
             : {

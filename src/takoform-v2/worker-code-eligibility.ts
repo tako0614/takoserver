@@ -51,6 +51,20 @@ export interface V2ResolvedQueueProducerBinding {
   readonly resourceUid: string;
 }
 
+/** Exact accepted v2 Workflow Resource reference, checked by the SQL authority. */
+export interface V2ResolvedWorkflowBinding {
+  readonly name: string;
+  readonly resourceUid: string;
+}
+
+/** Host-private grant for one immutable selected native Version. */
+export interface V2WorkflowForwardGrant {
+  readonly publicName: string;
+  readonly tenantId: string;
+  readonly workflowResourceUid: string;
+  readonly token: string;
+}
+
 /** Host-private native companion destination and selected-Version signed grant. */
 export interface V2SqliteNativeBoot {
   readonly address: string;
@@ -110,6 +124,8 @@ export interface V2WorkerCodeEligibilityInput {
   readonly resolvedObjectBucketBindings?: readonly V2ResolvedObjectBucketBinding[];
   readonly resolvedKvBindings?: readonly V2ResolvedKvBinding[];
   readonly resolvedQueueProducerBindings?: readonly V2ResolvedQueueProducerBinding[];
+  readonly resolvedWorkflowBindings?: readonly V2ResolvedWorkflowBinding[];
+  readonly workflowForward?: readonly V2WorkflowForwardGrant[];
   /** Exact accepted Actor Namespace target proof, not a readiness boolean. */
   readonly resolvedActorBindings?: readonly {
     readonly name: string;
@@ -212,9 +228,39 @@ async function verifyV2WorkerCodeProjection(
   ) {
     throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
   }
-  if (spec.workflowBindings.length > 0) {
+  let workflowBindings: readonly V2ResolvedWorkflowBinding[] | null | undefined;
+  let workflowForward: readonly V2WorkflowForwardGrant[] | null | undefined;
+  try {
+    workflowBindings = snapshotResolvedSqliteBindings(input.resolvedWorkflowBindings);
+    workflowForward = input.workflowForward?.map((binding) => ({
+      publicName: binding.publicName,
+      tenantId: binding.tenantId,
+      workflowResourceUid: binding.workflowResourceUid,
+      token: binding.token,
+    }));
+  } catch {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
+  if (
+    workflowBindings === null ||
+    spec.workflowBindings.length !== (workflowBindings?.length ?? 0) ||
+    spec.workflowBindings.some(
+      (binding, index) =>
+        binding.name !== workflowBindings?.[index]?.name ||
+        binding.resource.resourceUid !== workflowBindings[index]?.resourceUid,
+    ) ||
+    (inspectionOnly && workflowForward !== undefined) ||
+    (!inspectionOnly && spec.workflowBindings.length !== (workflowForward?.length ?? 0)) ||
+    workflowForward?.some(
+      (binding, index) =>
+        binding.publicName !== spec.workflowBindings[index]?.name ||
+        binding.workflowResourceUid !== spec.workflowBindings[index]?.resource.resourceUid ||
+        typeof binding.tenantId !== "string" ||
+        binding.tenantId.length === 0 ||
+        !/^[a-f0-9]{64}$/u.test(binding.token),
+    )
+  )
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   const actorBindings = input.resolvedActorBindings;
   let actorForward:
     | readonly {

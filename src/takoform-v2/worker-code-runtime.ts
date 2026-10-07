@@ -20,6 +20,7 @@ import {
   type V2ResolvedObjectBucketBinding,
   type V2ResolvedQueueProducerBinding,
   type V2ResolvedSqliteBinding,
+  type V2ResolvedWorkflowBinding,
   type V2SqliteNativeBoot,
   V2WorkerCodeRuntimeError,
 } from "./worker-code-eligibility.ts";
@@ -32,6 +33,7 @@ export {
   type V2ResolvedObjectBucketBinding,
   type V2ResolvedQueueProducerBinding,
   type V2ResolvedSqliteBinding,
+  type V2ResolvedWorkflowBinding,
   type V2SqliteNativeBoot,
   V2WorkerCodeRuntimeError,
   type V2WorkerCodeRuntimeErrorCode,
@@ -75,6 +77,8 @@ export async function projectV2WorkerCodeVersion(input: {
   readonly resolvedObjectBucketBindings?: readonly V2ResolvedObjectBucketBinding[];
   readonly resolvedKvBindings?: readonly V2ResolvedKvBinding[];
   readonly resolvedQueueProducerBindings?: readonly V2ResolvedQueueProducerBinding[];
+  readonly resolvedWorkflowBindings?: readonly V2ResolvedWorkflowBinding[];
+  readonly workflowForward?: import("./worker-code-eligibility.ts").V2WorkerCodeEligibilityInput["workflowForward"];
   /** Exact Host-issued Actor grants, projected by graph compiler after this guard. */
   readonly actorForward?: import("./worker-code-eligibility.ts").V2WorkerCodeEligibilityInput["actorForward"];
   readonly resolvedActorBindings?: import("./worker-code-eligibility.ts").V2WorkerCodeEligibilityInput["resolvedActorBindings"];
@@ -140,6 +144,22 @@ export async function projectV2WorkerCodeVersion(input: {
   } catch {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
+  let resolvedWorkflowBindings: readonly V2ResolvedWorkflowBinding[] | undefined;
+  let workflowForward: NonNullable<typeof input.workflowForward> | undefined;
+  try {
+    resolvedWorkflowBindings = input.resolvedWorkflowBindings?.map((binding) => ({
+      name: binding.name,
+      resourceUid: binding.resourceUid,
+    }));
+    workflowForward = input.workflowForward?.map((binding) => ({
+      publicName: binding.publicName,
+      tenantId: binding.tenantId,
+      workflowResourceUid: binding.workflowResourceUid,
+      token: binding.token,
+    }));
+  } catch {
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
+  }
   const verified = await prepareV2WorkerCodeProjection({
     workerResourceUid: identity.workerResourceUid,
     bundleResourceUid: identity.bundleResourceUid,
@@ -157,6 +177,8 @@ export async function projectV2WorkerCodeVersion(input: {
     ...(resolvedObjectBucketBindings === undefined ? {} : { resolvedObjectBucketBindings }),
     ...(resolvedKvBindings === undefined ? {} : { resolvedKvBindings }),
     ...(resolvedQueueProducerBindings === undefined ? {} : { resolvedQueueProducerBindings }),
+    ...(resolvedWorkflowBindings === undefined ? {} : { resolvedWorkflowBindings }),
+    ...(workflowForward === undefined ? {} : { workflowForward }),
     ...(input.resolvedActorBindings === undefined
       ? {}
       : { resolvedActorBindings: input.resolvedActorBindings }),
