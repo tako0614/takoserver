@@ -46,19 +46,11 @@ export interface V2WorkerInvocationRecord extends V2WorkerInvocationSelection {
 }
 
 /**
- * The backend implements admit with one INSERT ... SELECT against its current
- * native publication pointer and the public accepted graph. No caller-supplied
- * SQL guard, route JSON or tenant input is accepted by this portable port.
+ * Portable custody of an already admitted invocation. Admission itself is a
+ * backend-owned atomic comparison with its current native publication pointer;
+ * this interface neither accepts route JSON nor promises a generic adapter.
  */
 export interface V2WorkerInvocationCustody {
-  admit(
-    input: V2WorkerInvocationHandle & {
-      readonly hostname: string;
-      readonly workerUid: string;
-      readonly versionUid: string;
-      readonly nativeIdentity: string;
-    },
-  ): Promise<V2WorkerInvocationAdmission>;
   read(handle: V2WorkerInvocationHandle): Promise<V2WorkerInvocationRecord | null>;
   /** One authorization to initiate the native dispatch; no retry after uncertainty. */
   beginSend(handle: V2WorkerInvocationHandle): Promise<boolean>;
@@ -142,7 +134,7 @@ function record(
 export function createV2WorkerInvocationLifecycle(options: {
   readonly sql: Sql;
   readonly now?: Clock;
-}) {
+}): V2WorkerInvocationCustody {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
   function instant(): number {
