@@ -711,20 +711,6 @@ semantic-inspector stand-in, not native active Actor ABI proof. Active runtime
 counts and the executable Actor Binding remain incomplete; these internal paths
 do not register or advertise ActorNamespace Form support.
 
-The normal Bun entry can now opt in to its existing private v2 Actor and
-Workflow boot ports with `TAKOSERVER_V2_WORKER_RUNTIME_BOOT`, for example
-`{"actor":true,"workflow":{"maximumRegistrations":4}}`. The exact JSON
-selection requires the configured held WorkerBundle backend and selected
-workerd executable; Workflow additionally requires the operator's absolute
-`TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY`. Native roots stay under the
-existing private data root. Boot restores the single SQL-backed Worker owner
-before opening ingress, polls Workflow due work as a separate tracked pass, and
-closes Workflow/Actor execution before suspending that owner. This is private
-source assembly only: the ordinary Host still does not register incomplete
-Worker Forms. In particular, the v2 Endpoint frontend lacks this composition's
-single publication-state port and an explicitly qualified HTTPS/TLS address,
-so this setting does not make v2 WorkerEndpoint or complete Worker support live.
-
 ## Existing installations
 
 The additive v2 tables do not convert or delete existing v1 records. Preserving
