@@ -26,6 +26,7 @@ import { readV2ConfiguredPrivateInputs } from "./takoform-v2/configured-private-
 import { ACTOR_NAMESPACE_FORM_URL } from "./takoform-v2/forms/actor-namespace.ts";
 import { createV2HeldArtifactSource } from "./takoform-v2/forms/artifact-source.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "./takoform-v2/forms/at-least-once-queue.ts";
+import { DURABLE_WORKFLOW_FORM_URL } from "./takoform-v2/forms/durable-workflow.ts";
 import { createKvWorkerBindingAuthority } from "./takoform-v2/forms/kv-worker-binding-authority.ts";
 import { createObjectBucketWorkerBindingAuthority } from "./takoform-v2/forms/object-bucket-worker-binding-authority.ts";
 import { QUEUE_CONSUMER_FORM_URL } from "./takoform-v2/forms/queue-consumer.ts";
@@ -74,6 +75,7 @@ type EndpointPorts = Pick<
 type ActorOwnerForward = NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2ActorForward"]>;
 type ActorOwnerSource = Parameters<ActorOwnerForward["openIncarnation"]>[0];
 type ActorOwnerIncarnation = ReturnType<ActorOwnerForward["openIncarnation"]>;
+type WorkflowOwnerForward = NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2WorkflowForward"]>;
 
 /** Trusted app-layer boot; portable Worker composition only attaches its explicit ports. */
 export interface SelfhostV2ActorBootPort {
@@ -96,6 +98,28 @@ export interface SelfhostV2ActorBootPort {
   };
 }
 
+/** The Workflow Host and its forward broker share this composition's accepted SQL graph. */
+export interface SelfhostV2WorkflowBootPort {
+  prepare(input: {
+    readonly sql: Sql;
+    readonly clock: Clock;
+    readonly targetKey: string;
+    readonly workerdBinary: string;
+    readonly bundleCustody: NonNullable<ReturnType<typeof createWorkerBundleCustody>>;
+    readonly assetCustody?: NonNullable<ReturnType<typeof createStaticAssetBundleCustody>>;
+    readonly inspector: ReturnType<typeof createWorkerdWorkerModuleInspector>;
+    readonly ownerForWorker: (uid: string) => Promise<WorkerdWorkerRuntimeOwner | null>;
+  }): {
+    readonly workflowForm: ReturnType<V2OperatorFormFactory>[string];
+    readonly bindingAuthority: NonNullable<
+      Parameters<typeof createInternalV2WorkerVersionForm>[0]["v2WorkflowBinding"]
+    >;
+    readonly forwardBoot: WorkflowOwnerForward;
+    /** Stop guarded Workflow children and release selected owner leases before owner suspension. */
+    close(): Promise<void>;
+  };
+}
+
 export interface SelfhostV2WorkerCompositionOptions {
   readonly sql: Sql;
   readonly objects: ObjectStoreAccess;
@@ -108,6 +132,8 @@ export interface SelfhostV2WorkerCompositionOptions {
   readonly workerdBinary: string | null;
   /** Already-composed private v2 Actor authority, native Host and physical readback. */
   readonly v2Actor?: SelfhostV2ActorBootPort;
+  /** Explicitly boot-composed guarded Workflow runtime and accepted Binding authority. */
+  readonly v2Workflow?: SelfhostV2WorkflowBootPort;
   /** Explicitly boot-composed Host-private Queue settlement service. */
   readonly queueSettlement?: NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2QueueSettlement"]>;
   /** Already-created operator key authority; absent refuses sensitive Worker Versions. */
@@ -237,6 +263,8 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   ownerForWorkerUid(uid: string): Promise<WorkerdWorkerRuntimeOwner>;
   /** Real SQL publication plus restored native Queue export proof, absent without Queue boot. */
   readonly queueCapability?: V2QueueConsumerCapability;
+  /** Close guarded Workflow registrations before stopping selected Worker owners. */
+  closeWorkflowHost(): Promise<void>;
   /** Stop exact known children but retain UID owner locks and durable accepted state. */
   suspendOwnersRetainingCustody(): Promise<void>;
   /** Close retired owners, then stop the private broker; active owners refuse. */
@@ -443,6 +471,38 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           typeof prepared.forwardBoot?.openIncarnation !== "function"
         )
           throw new TypeError("v2 Actor boot is incomplete");
+        return prepared;
+      })()
+    : undefined;
+  const workflow = options.v2Workflow
+    ? (() => {
+        if (
+          !bundleCustody ||
+          !options.workerdBinary ||
+          typeof options.v2Workflow?.prepare !== "function" ||
+          typeof moduleInspector.inspectWorkflowClass !== "function"
+        )
+          throw new TypeError("v2 Workflow boot requires held bytes, native binary, and inspector");
+        const prepared = options.v2Workflow.prepare({
+          sql,
+          clock,
+          targetKey,
+          workerdBinary: options.workerdBinary,
+          bundleCustody,
+          ...(assetCustody ? { assetCustody } : {}),
+          inspector: moduleInspector,
+          ownerForWorker: async (uid) => {
+            if (!restorationComplete) return null;
+            return await openOwner(uid);
+          },
+        });
+        if (
+          typeof prepared?.workflowForm?.backend?.execute !== "function" ||
+          typeof prepared.bindingAuthority?.resolveTarget !== "function" ||
+          typeof prepared.forwardBoot?.openIncarnation !== "function" ||
+          typeof prepared.close !== "function"
+        )
+          throw new TypeError("v2 Workflow boot is incomplete");
         return prepared;
       })()
     : undefined;
@@ -731,6 +791,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
               },
             }
           : {}),
+        ...(workflow && row.deleted_at === null ? { v2WorkflowForward: workflow.forwardBoot } : {}),
         workerdBinary: options.workerdBinary,
         inspectModule,
         listenerPortForOperation,
@@ -964,6 +1025,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         ...(kvBoot ? { v2KvBinding: kvBoot } : {}),
         ...(queueProducerBoot ? { v2QueueProducerBinding: queueProducerBoot } : {}),
         ...(actor ? { v2ActorBinding: actor.bindingAuthority } : {}),
+        ...(workflow ? { v2WorkflowBinding: workflow.bindingAuthority } : {}),
         ...(configuredInputSealer && configuredInputCustody
           ? { configuredInputSealer, configuredInputCustody }
           : {}),
@@ -982,6 +1044,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
             [ACTOR_NAMESPACE_FORM_URL]: actor.namespaceForm,
           }
         : {}),
+      ...(workflow ? { [DURABLE_WORKFLOW_FORM_URL]: workflow.workflowForm } : {}),
       ...(queueProducerBoot && queueSettlement
         ? {
             [AT_LEAST_ONCE_QUEUE_FORM_URL]: createAtLeastOnceQueueForm({ sql, targetKey }),
@@ -1023,6 +1086,9 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       await restoration;
       return await openOwner(uid);
     },
+    async closeWorkflowHost() {
+      await workflow?.close();
+    },
     suspendOwnersRetainingCustody() {
       if (suspension) return suspension;
       // This synchronous transition closes the only path that creates a new
@@ -1030,7 +1096,10 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       // composition. Each owner then proves child exit and listener vacancy
       // while retaining its durable lock/state for a later Host process.
       ownerAdmissionFrozen = true;
-      suspension = (async () => {
+      const attempt = (async () => {
+        // A guarded Workflow run can hold the selected native owner lease.
+        // Reap it before owner suspension; failure retains all owner custody.
+        await workflow?.close();
         if (restoration) await restoration;
         const pending = [...owners.entries()];
         const opened = await Promise.all(
@@ -1091,6 +1160,12 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         await queueProducerServer?.stop(true);
         queueProducerServer = undefined;
       })();
+      suspension = attempt.catch((error) => {
+        // A failed guarded stop retains custody and can be retried; never
+        // turn one transient close failure into a permanently cached refusal.
+        suspension = undefined;
+        throw error;
+      });
       return suspension;
     },
     async closePrivateBindingServices() {

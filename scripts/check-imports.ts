@@ -227,6 +227,20 @@ const LAYERS: readonly Layer[] = [
     ],
   },
   {
+    // Exact app boot joins the accepted Worker graph and existing guarded
+    // Workflow runtime. The pure Form/native layers gain no app import edge.
+    name: "v2-selfhost-workflow-boot",
+    match: /^src\/selfhost-v2-workflow-boot\.ts$/u,
+    may: [
+      "core",
+      "app",
+      "v2-selfhost-composition",
+      "v2-selfhost-workflow-composition",
+      "v2-workflow-binding-authority",
+      "v2-workflow-binding-boot",
+    ],
+  },
+  {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state"],
