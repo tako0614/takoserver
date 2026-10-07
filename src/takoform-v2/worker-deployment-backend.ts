@@ -4,11 +4,16 @@ import type { WorkerdWorkerRuntimeOwner } from "../workerd-worker-runtime-owner.
 import { referencesForWorkerDeployment } from "./forms/worker-references.ts";
 import {
   parseWorkerDeploymentSpec,
+  parseWorkerVersionSpec,
   validateWorkerDeploymentUpdate,
   WORKER_DEPLOYMENT_FORM_URL,
   WorkerFormValidationError,
 } from "./forms/worker-specs.ts";
 import { TakoformV2Error, type V2BackendResult, type V2Execution, type V2Form } from "./types.ts";
+import type {
+  WorkerCronTriggerAdmissionInput,
+  WorkerCronTriggerAdmissionResolution,
+} from "./worker-cron-trigger-backend.ts";
 import type {
   V2WorkerPublicationResolution,
   V2WorkerPublicationSnapshot,
@@ -26,6 +31,13 @@ type PublicationState = {
 
 type RuntimeOwner = Pick<WorkerdWorkerRuntimeOwner, "workerResourceUid" | "execute">;
 
+/** Cron authority reads live and accepted-pending attachments without a runtime effect. */
+export interface V2ScheduledAttachmentRequirementReader {
+  requiresScheduledHandler(
+    input: WorkerCronTriggerAdmissionInput,
+  ): Promise<WorkerCronTriggerAdmissionResolution>;
+}
+
 const unknown = (): V2BackendResult => ({
   kind: "unknown",
   code: "worker_publication_unconfirmed",
@@ -41,8 +53,11 @@ export function createWorkerDeploymentForm(options: {
   readonly targetKey: string;
   readonly publicationState: PublicationState;
   readonly ownerForWorker: (workerUid: string) => Promise<RuntimeOwner> | RuntimeOwner;
+  /** A missing reader is refusal, never evidence that no Cron attachment exists. */
+  readonly scheduledAttachments: V2ScheduledAttachmentRequirementReader;
 }): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
+  if (!options.scheduledAttachments) throw new TypeError("scheduledAttachments is required");
 
   async function run(execution: V2Execution): Promise<V2BackendResult> {
     if (
@@ -69,13 +84,62 @@ export function createWorkerDeploymentForm(options: {
       return unknown();
     if (!(await before.stillCurrent())) return unknown();
 
+    let attachment: Extract<
+      Awaited<ReturnType<V2ScheduledAttachmentRequirementReader["requiresScheduledHandler"]>>,
+      { kind: "ready" }
+    > | null = null;
+    if (execution.action !== "delete") {
+      const result = await options.scheduledAttachments
+        .requiresScheduledHandler({
+          workerUid: spec.worker.resourceUid,
+          principal: execution.principal,
+          space: execution.space,
+          targetKey: options.targetKey,
+          sourceOperationId: execution.operationId,
+          leaseToken: execution.leaseToken,
+          backendId: execution.backendId,
+          backendKey: execution.backendKey,
+        })
+        .catch(() => ({ kind: "unknown" as const }));
+      if (result.kind !== "ready" || !(await result.stillCurrent().catch(() => false)))
+        return unknown();
+      attachment = result;
+      let missingScheduledHandler = false;
+      try {
+        missingScheduledHandler =
+          result.required &&
+          (before.snapshot.deployment?.versions.some(
+            (version) => !parseWorkerVersionSpec(version.spec).handlers.includes("scheduled"),
+          ) ??
+            true);
+      } catch {
+        return unknown();
+      }
+      if (missingScheduledHandler) {
+        if (
+          !(await before.stillCurrent().catch(() => false)) ||
+          !(await result.stillCurrent().catch(() => false))
+        )
+          return unknown();
+        return {
+          kind: "no_effect",
+          code: "worker_scheduled_handler_missing",
+          message: "Every selected Worker Version must declare the scheduled handler",
+        };
+      }
+    }
+
     let owner: RuntimeOwner;
     try {
       owner = await options.ownerForWorker(spec.worker.resourceUid);
     } catch {
       return unknown();
     }
-    if (owner.workerResourceUid !== spec.worker.resourceUid || !(await before.stillCurrent()))
+    if (
+      owner.workerResourceUid !== spec.worker.resourceUid ||
+      !(await before.stillCurrent()) ||
+      (attachment && !(await attachment.stillCurrent().catch(() => false)))
+    )
       return unknown();
 
     // The owner persists the exact Operation's incarnation before the native
@@ -101,7 +165,8 @@ export function createWorkerDeploymentForm(options: {
       after.kind !== "ready" ||
       !matchesExecution(after.snapshot, execution, spec) ||
       !(await before.stillCurrent()) ||
-      !(await after.stillCurrent())
+      !(await after.stillCurrent()) ||
+      (attachment && !(await attachment.stillCurrent().catch(() => false)))
     )
       return unknown();
 

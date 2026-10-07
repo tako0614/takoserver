@@ -16,6 +16,7 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../../src/takoform-v2/forms/worker-specs.ts";
 import { createTakoformV2Host } from "../../src/takoform-v2/host.ts";
+import { createWorkerCronTriggerAdmissionReader } from "../../src/takoform-v2/worker-cron-trigger-backend.ts";
 import { createWorkerDeploymentForm } from "../../src/takoform-v2/worker-deployment-backend.ts";
 import { createWorkerEndpointForm } from "../../src/takoform-v2/worker-endpoint-backend.ts";
 import {
@@ -150,6 +151,7 @@ async function main(): Promise<void> {
     [WORKER_DEPLOYMENT_FORM_URL]: createWorkerDeploymentForm({
       targetKey: TARGET_KEY,
       publicationState,
+      scheduledAttachments: createWorkerCronTriggerAdmissionReader({ sql }),
       ownerForWorker: ensureOwner,
     }),
     [WORKER_ENDPOINT_FORM_URL]: createWorkerEndpointForm({

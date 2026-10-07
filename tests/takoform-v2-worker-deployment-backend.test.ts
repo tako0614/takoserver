@@ -21,6 +21,7 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import type { V2Execution, V2Form } from "../src/takoform-v2/types.ts";
+import { createWorkerCronTriggerAdmissionReader } from "../src/takoform-v2/worker-cron-trigger-backend.ts";
 import { createWorkerDeploymentForm } from "../src/takoform-v2/worker-deployment-backend.ts";
 import type { V2WorkerPublicationResolution } from "../src/takoform-v2/worker-publication-state.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
@@ -108,6 +109,10 @@ test("accepted Deployment create, update, replay and delete settle only through 
   const deploymentForm = createWorkerDeploymentForm({
     targetKey: TARGET_KEY,
     publicationState,
+    scheduledAttachments: createWorkerCronTriggerAdmissionReader({
+      sql,
+      now: () => new Date(clockMs),
+    }),
     ownerForWorker(workerUid) {
       const selectedOwner = owner;
       if (!selectedOwner || selectedOwner.workerResourceUid !== workerUid)
@@ -330,7 +335,11 @@ test("an unconfirmed send, mismatched receipt, or lost SQL fence never settles a
     endpoint: null,
   };
   let fenceCurrent = true;
+  let attachmentRequired = false;
+  let attachmentCurrent = true;
+  let attachmentReads = 0;
   let loseFenceDuringOwnerCall = false;
+  let loseAttachmentDuringOwnerCall = false;
   let ownerCalls = 0;
   let result: Awaited<ReturnType<WorkerdWorkerRuntimeOwner["execute"]>> = {
     kind: "not_dispatched",
@@ -343,19 +352,75 @@ test("an unconfirmed send, mismatched receipt, or lost SQL fence never settles a
     stillCurrent: async () => fenceCurrent,
     readVersionMaterials: async () => ({ bundle: null, assets: null }),
   });
+  // Reopening the Deployment backend without composing the canonical Cron
+  // reader must fail at construction; accepted attachments can outlive Cron
+  // registration in a Host process, so absence is never an empty set.
+  expect(() =>
+    createWorkerDeploymentForm({
+      targetKey: TARGET_KEY,
+      publicationState: { resolve: async () => resolution() },
+      ownerForWorker: () => {
+        ownerCalls += 1;
+        throw new Error("missing attachment reader must not reach owner");
+      },
+    } as unknown as Parameters<typeof createWorkerDeploymentForm>[0]),
+  ).toThrow("scheduledAttachments is required");
+  expect(ownerCalls).toBe(0);
   const form = createWorkerDeploymentForm({
     targetKey: TARGET_KEY,
     publicationState: { resolve: async () => resolution() },
+    scheduledAttachments: {
+      async requiresScheduledHandler(input) {
+        attachmentReads += 1;
+        expect(input).toMatchObject({
+          workerUid,
+          principal: execution.principal,
+          space: execution.space,
+          targetKey: TARGET_KEY,
+          sourceOperationId: operationId,
+          leaseToken: execution.leaseToken,
+          backendId: execution.backendId,
+          backendKey: execution.backendKey,
+        });
+        return {
+          kind: "ready" as const,
+          required: attachmentRequired,
+          attachmentUids: attachmentRequired ? ["cron-backend-fence"] : [],
+          stillCurrent: async () => attachmentCurrent,
+        };
+      },
+    },
     ownerForWorker: () => ({
       workerResourceUid: workerUid,
       async execute() {
         ownerCalls += 1;
         if (loseFenceDuringOwnerCall) fenceCurrent = false;
+        if (loseAttachmentDuringOwnerCall) attachmentCurrent = false;
         return result;
       },
     }),
   });
   expect(form.references?.(execution.spec)).toHaveLength(3);
+  attachmentRequired = true;
+  expect(await form.backend.execute(execution)).toMatchObject({
+    kind: "no_effect",
+    code: "worker_scheduled_handler_missing",
+  });
+  expect(ownerCalls).toBe(0);
+  snapshot.deployment.generation = 2;
+  expect(
+    await form.backend.execute({ ...execution, action: "update", generation: 2 }),
+  ).toMatchObject({
+    kind: "no_effect",
+    code: "worker_scheduled_handler_missing",
+  });
+  expect(ownerCalls).toBe(0);
+  snapshot.deployment.generation = 1;
+  attachmentRequired = false;
+  attachmentCurrent = false;
+  expect(await form.backend.execute(execution)).toMatchObject({ kind: "unknown" });
+  expect(ownerCalls).toBe(0);
+  attachmentCurrent = true;
   expect(await form.backend.execute(execution)).toMatchObject({ kind: "unknown" });
   expect(await form.backend.reconcile(execution)).toMatchObject({ kind: "unknown" });
   expect(ownerCalls).toBe(2); // same accepted Operation reaches the same owner seam
@@ -417,6 +482,10 @@ test("an unconfirmed send, mismatched receipt, or lost SQL fence never settles a
   expect(await form.backend.reconcile(execution)).toMatchObject({ kind: "unknown" });
   loseFenceDuringOwnerCall = false;
   fenceCurrent = true;
+  loseAttachmentDuringOwnerCall = true;
+  expect(await form.backend.reconcile(execution)).toMatchObject({ kind: "unknown" });
+  loseAttachmentDuringOwnerCall = false;
+  attachmentCurrent = true;
   expect(await form.backend.reconcile(execution)).toMatchObject({
     kind: "complete",
     observed: {
@@ -432,5 +501,24 @@ test("an unconfirmed send, mismatched receipt, or lost SQL fence never settles a
   expect(await form.backend.execute({ ...execution, backendId: "wrong-backend" })).toMatchObject({
     kind: "unknown",
   });
-  expect(ownerCalls).toBe(7);
+  expect(ownerCalls).toBe(8);
+  const scheduledVersionSpec = parseWorkerVersionSpec({
+    worker: { resourceUid: workerUid },
+    bundle: { resourceUid: "bundle-scheduled-backend-fence" },
+    handlers: ["scheduled"],
+  });
+  const first = snapshot.deployment.versions[0];
+  const second = snapshot.deployment.versions[1];
+  if (!first || !second) throw new Error("weighted fixture versions missing");
+  first.spec = scheduledVersionSpec;
+  attachmentRequired = true;
+  expect(await form.backend.reconcile(execution)).toMatchObject({
+    kind: "no_effect",
+    code: "worker_scheduled_handler_missing",
+  });
+  expect(ownerCalls).toBe(8);
+  second.spec = scheduledVersionSpec;
+  expect(await form.backend.reconcile(execution)).toMatchObject({ kind: "complete" });
+  expect(ownerCalls).toBe(9);
+  expect(attachmentReads).toBeGreaterThan(7);
 });
