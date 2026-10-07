@@ -428,6 +428,7 @@ for (const path of walk("src")) {
     const exactExecutionTypeEdge =
       path === "src/selfhost-v2-worker-endpoint-frontend.ts" &&
       target === "src/takoform-v2/types.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
       /import\s+type\s+\{\s*V2Execution\s*\}\s+from\s+["']\.\/takoform-v2\/types\.ts["'];/u.test(
         readFileSync(path, "utf8"),
       );
