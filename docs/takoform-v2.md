@@ -644,6 +644,16 @@ matches; it does not catch up. Recorded matches retain their stable identity
 across restart and unknown acknowledgements. Explicit handler rejection is
 terminal for that match, while an unknown result may be delivered again.
 
+The self-host Worker composition connects this existing match custody to its
+restored UID-bound native owners. Its internal Form factory includes the Cron
+Attachment, and the ordinary Bun entry drives `pollScheduledDue` as a separate
+tracked one-second pass. A stalled delivery does not block management settlement,
+Queue work, or Workflow polling. The pass is unavailable before restoration or
+after closure. Shutdown freezes scheduled admission and joins the active scan
+before suspending native owners or closing SQL; a native result arriving after
+that freeze remains unknown and retryable. This connection does not register
+incomplete Worker Forms in the public entry or claim exactly-once execution.
+
 The owner projects a private, incarnation-bound scheduled-event capability
 before publication. Delivery checks the current serving graph and does not use
 an HTTP response as proof that `waitUntil` work has retired. The integration
