@@ -14,6 +14,7 @@ import type {
   V2WorkerVersionMaterials,
 } from "@takoserver/core/takoform-v2";
 import * as extension from "@takoserver/core/takoform-v2";
+import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
 import { referencesForWorkerForm } from "../src/takoform-v2/forms/worker-references.ts";
 import {
   MODULE_WORKER_FORM_URL,
@@ -28,18 +29,25 @@ import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-public
 import { createV2WorkerVersionConfiguredInputSealer } from "../src/takoform-v2/worker-version-configured-inputs.ts";
 
 const RUNTIME_EXPORTS = [
+  "EDGE_KV_NAMESPACE_BACKEND_ID",
+  "EDGE_KV_NAMESPACE_FORM_URL",
+  "EDGE_KV_NAMESPACE_LIMITS",
+  "EdgeKVNamespaceValidationError",
   "MODULE_WORKER_FORM_URL",
   "WORKER_DEPLOYMENT_FORM_URL",
   "WORKER_ENDPOINT_FORM_URL",
   "WORKER_VERSION_FORM_URL",
   "WorkerFormValidationError",
+  "createEdgeKVNamespaceForm",
   "createInternalV2ModuleWorkerForm",
+  "createV2EdgeKvNativeCustody",
   "createV2NativeEffectCustody",
   "createV2NativeDeletionCustody",
   "createV2WorkerInvocationLifecycle",
   "createV2WorkerPublicationState",
   "createV2WorkerVersionConfiguredInputSealer",
   "inspectV2WorkerCodeVersionEligibility",
+  "parseEdgeKVNamespaceSpec",
   "parseModuleWorkerSpec",
   "parseWorkerDeploymentSpec",
   "parseWorkerEndpointSpec",
@@ -50,6 +58,7 @@ const RUNTIME_EXPORTS = [
   "referencesForWorkerEndpoint",
   "referencesForWorkerForm",
   "referencesForWorkerVersion",
+  "validateEdgeKVNamespaceUpdate",
   "validateModuleWorkerUpdate",
   "validateWorkerDeploymentUpdate",
   "validateWorkerEndpointUpdate",
@@ -59,6 +68,7 @@ const RUNTIME_EXPORTS = [
 test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
+  expect(extension.createV2EdgeKvNativeCustody).toBe(createV2EdgeKvNativeCustody);
   expect(extension.createInternalV2ModuleWorkerForm).toBe(createInternalV2ModuleWorkerForm);
   expect(extension.createV2WorkerVersionConfiguredInputSealer).toBe(
     createV2WorkerVersionConfiguredInputSealer,

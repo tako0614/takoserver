@@ -12,6 +12,16 @@ export {
   type V2ConfiguredPrivateInputs,
 } from "./configured-private-inputs.ts";
 export {
+  createV2EdgeKvNativeCustody,
+  type V2EdgeKvConfirmedIdentity,
+  type V2EdgeKvCreateInspection,
+  type V2EdgeKvCreateIntent,
+  type V2EdgeKvDeleteGrant,
+  type V2EdgeKvDeleteInspection,
+  type V2EdgeKvSettledTarget,
+  type V2EdgeKvSettledTargetInput,
+} from "./edge-kv-native-custody.ts";
+export {
   EDGE_KV_NAMESPACE_FORM_URL,
   EDGE_KV_NAMESPACE_LIMITS,
   EdgeKVNamespaceValidationError,
