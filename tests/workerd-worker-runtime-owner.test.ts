@@ -1604,6 +1604,70 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
   }
 });
 
+test("Actor graph readback is pinned to current SQL and the live native incarnation", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-actor-readback";
+  const createId = "0cfebc3b-3b9a-4a5b-a897-6713df09120e";
+  const deleteId = "f1840189-4a30-41c2-bae2-9c086a5327c3";
+  const publication = staticPublicationState(workerUid, true);
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: join(owned.root, "owners"),
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+    inspectModule: async (): Promise<WorkerModuleInspectionResult> => ({
+      outcome: "valid",
+      exportedHandlers: ["fetch"],
+    }),
+  });
+  const read = () =>
+    owner.observeActorGraph({
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      sourceOperationId: createId,
+    });
+  try {
+    expect(await read()).toEqual({ kind: "unknown" });
+    expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
+      kind: "confirmed",
+    });
+    publication.setCurrent(createId);
+    const exact = await read();
+    expect(exact).toMatchObject({
+      kind: "ready",
+      sourceOperationId: createId,
+      graph: {
+        workerResourceUid: workerUid,
+        generation: `takoserver-v2-operation:${createId}`,
+        versions: [{ workerVersionUid: `version-${createId}`, weight: 10_000 }],
+      },
+    });
+    if (exact.kind !== "ready") throw new Error("native Actor graph not observed");
+    expect(exact.graph.versions[0]?.modules.get("index.mjs")).toBeInstanceOf(Uint8Array);
+    expect(
+      await owner.observeActorGraph({
+        workerResourceUid: workerUid,
+        targetKey: TARGET_KEY,
+        sourceOperationId: deleteId,
+      }),
+    ).toEqual({ kind: "unknown" });
+    publication.setFenceCurrent(false);
+    expect(await read()).toEqual({ kind: "unknown" });
+    publication.setFenceCurrent(true);
+    expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
+      kind: "confirmed",
+      identity: null,
+    });
+    expect(await read()).toEqual({ kind: "unknown" });
+  } finally {
+    await owner.close().catch(() => undefined);
+    await owned.cleanup();
+  }
+});
+
 test("code incarnation retirement waits for its persisted grace deadline after response completion", async () => {
   const owned = await fixture();
   const workerUid = "worker-code-grace";
