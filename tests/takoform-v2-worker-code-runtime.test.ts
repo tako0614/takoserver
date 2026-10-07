@@ -300,6 +300,56 @@ test("keeps valid fetch code separate from unsupported bindings, secrets, and ev
   }
 });
 
+test("inspection accepts only an exact complete private-input map without projecting it to selfhost", async () => {
+  const spec = versionSpec({ requiredSensitiveVars: ["TOKEN", "SECOND"] });
+  const held = await heldBundle();
+  const privateInputs = { TOKEN: "first-secret", SECOND: "second-secret" };
+  const inspection = inspectV2WorkerCodeVersionEligibility({
+    workerResourceUid: WORKER_UID,
+    bundleResourceUid: BUNDLE_UID,
+    spec,
+    bundle: held,
+    inspectModule: inspector(),
+    privateInputs,
+  });
+  privateInputs.TOKEN = "";
+  await expect(inspection).resolves.toBeUndefined();
+
+  for (const value of [
+    undefined,
+    null,
+    {},
+    { TOKEN: "first-secret" },
+    { TOKEN: "", SECOND: "second-secret" },
+    { TOKEN: "first-secret", SECOND: "second-secret", EXTRA: "extra" },
+    { TOKEN: true, SECOND: "second-secret" },
+    Object.defineProperty({ SECOND: "second-secret" }, "TOKEN", {
+      enumerable: true,
+      get: () => "first-secret",
+    }),
+  ]) {
+    await expect(
+      inspectV2WorkerCodeVersionEligibility({
+        workerResourceUid: WORKER_UID,
+        bundleResourceUid: BUNDLE_UID,
+        spec,
+        bundle: held,
+        inspectModule: inspector(),
+        privateInputs: value,
+      }),
+    ).rejects.toMatchObject({ code: "worker_private_inputs_unavailable" });
+  }
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec,
+      bundle: held,
+      inspectModule: inspector(),
+      privateInputs: { TOKEN: "first-secret", SECOND: "second-secret" },
+    }),
+  ).rejects.toMatchObject({ code: "worker_private_inputs_unavailable" });
+});
+
 test("scheduled code requires an explicit private delivery capability and exact handler export", async () => {
   const spec = versionSpec({ handlers: ["fetch", "scheduled"] });
   const bundle = await heldBundle({ moduleBytes: FETCH_AND_SCHEDULED_MODULE_BYTES });

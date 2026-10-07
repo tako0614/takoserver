@@ -73,6 +73,11 @@ export async function projectV2WorkerCodeVersion(input: {
     ...(input.eventDelivery === undefined ? {} : { eventDelivery: input.eventDelivery }),
   });
   const { spec, manifest, files, assets } = verified;
+  // Portable inspection may verify a private map, but this native projector
+  // has no secret_text env projection and must never claim that Version ready.
+  if (spec.requiredSensitiveVars.length > 0) {
+    throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
+  }
 
   const entrypoint = manifest.entrypoint;
   const modules = new Map<string, Uint8Array>();

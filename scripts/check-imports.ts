@@ -57,17 +57,30 @@ const LAYERS: readonly Layer[] = [
   {
     name: "v2-extension",
     match: /^src\/takoform-v2\/index\.ts$/u,
-    may: ["core", "v2-contract", "v2-state", "v2-form", "v2-code-validation", "v2-runtime"],
+    may: [
+      "core",
+      "v2-contract",
+      "v2-private",
+      "v2-state",
+      "v2-form",
+      "v2-code-validation",
+      "v2-runtime",
+    ],
+  },
+  {
+    name: "v2-private",
+    match: /^src\/takoform-v2\/(?:private-inputs|configured-private-inputs)\.ts$/u,
+    may: ["core"],
   },
   {
     name: "v2-contract",
     match: /^src\/takoform-v2\/(?:types|identity|references)\.ts$/u,
-    may: ["core", "v2-contract"],
+    may: ["core", "v2-contract", "v2-private"],
   },
   {
     name: "v2-state",
     match: /^src\/takoform-v2\/(?:store|worker-invocation-custody)\.ts$/u,
-    may: ["core", "v2-contract"],
+    may: ["core", "v2-contract", "v2-private"],
   },
   {
     name: "v2-form",
@@ -98,12 +111,12 @@ const LAYERS: readonly Layer[] = [
   {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
-    may: ["core", "v2-contract", "v2-state"],
+    may: ["core", "v2-contract", "v2-private", "v2-state"],
   },
   {
     name: "v2-http",
     match: /^src\/takoform-v2\/routes\.ts$/u,
-    may: ["core", "v2-contract", "v2-engine"],
+    may: ["core", "v2-contract", "v2-private", "v2-engine"],
   },
   {
     name: "v2-host",
@@ -123,7 +136,16 @@ const LAYERS: readonly Layer[] = [
   {
     name: "v2-application",
     match: /^src\/takoform-v2\/application\.ts$/u,
-    may: ["core", "domain", "v2-contract", "v2-config", "v2-accounts", "v2-form", "v2-host"],
+    may: [
+      "core",
+      "domain",
+      "v2-contract",
+      "v2-private",
+      "v2-config",
+      "v2-accounts",
+      "v2-form",
+      "v2-host",
+    ],
   },
   {
     name: "v2-documentation",
@@ -184,6 +206,7 @@ const LAYERS: readonly Layer[] = [
       "v2-application",
       "v2-config",
       "v2-contract",
+      "v2-private",
     ],
   },
   // An entry chooses concrete implementations — that is its whole job. What it

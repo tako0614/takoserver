@@ -7,6 +7,11 @@
  */
 export type { JsonObject, Sql } from "../ports.ts";
 export {
+  readV2ConfiguredPrivateInputs,
+  type V2ConfiguredPrivateInputIdentity,
+  type V2ConfiguredPrivateInputs,
+} from "./configured-private-inputs.ts";
+export {
   referencesForModuleWorker,
   referencesForWorkerDeployment,
   referencesForWorkerEndpoint,
@@ -32,6 +37,11 @@ export {
   WorkerFormValidationError,
   type WorkerVersionSpec,
 } from "./forms/worker-specs.ts";
+export type {
+  V2PrivateInputCustody,
+  V2PrivateInputKey,
+  V2PrivateInputMap,
+} from "./private-inputs.ts";
 export type {
   V2Backend,
   V2BackendResult,

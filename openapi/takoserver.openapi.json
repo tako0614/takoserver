@@ -47,6 +47,10 @@
           },
           "code": {
             "type": "string"
+          },
+          "operationId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
           }
         }
       },
@@ -206,6 +210,28 @@
               },
               "message": {
                 "type": "string"
+              }
+            }
+          },
+          "inputRequired": {
+            "type": "object",
+            "required": [
+              "names",
+              "reason"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "names": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "reason": {
+                "enum": [
+                  "expired",
+                  "unavailable"
+                ]
               }
             }
           }
@@ -3149,7 +3175,7 @@
                       }
                     },
                     "privateInputs": {
-                      "const": false
+                      "type": "boolean"
                     }
                   }
                 }
@@ -3320,6 +3346,12 @@
                   "spec": {
                     "type": "object",
                     "additionalProperties": true
+                  },
+                  "privateInputs": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -3494,6 +3526,12 @@
                   "spec": {
                     "type": "object",
                     "additionalProperties": true
+                  },
+                  "privateInputs": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -3678,6 +3716,76 @@
         "responses": {
           "200": {
             "description": "Current Operation status and effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Operation"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Request refused; code classifies the failure without provider or secret payloads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TakoformV2Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/apis/forms.takoform.com/v2/operations/{operationId}/private-inputs": {
+      "put": {
+        "summary": "Replenish the entire original private-input map for the same unfinished Operation",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Takoform-Organization",
+            "required": false,
+            "description": "Required for an owner session. An API key uses its authenticated organization, never this header.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          },
+          {
+            "in": "path",
+            "name": "operationId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "privateInputs"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "privateInputs": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Current same Operation; only waiting_input may return to queued.",
             "content": {
               "application/json": {
                 "schema": {

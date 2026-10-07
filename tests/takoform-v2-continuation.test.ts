@@ -10,6 +10,9 @@ const FORM = "https://forms.example.test/bounded/1.0.0/";
 function fixture(backend: Pick<V2Backend, "execute" | "reconcile">) {
   const db = new Database(":memory:");
   db.exec(readFileSync(new URL("../migrations/0070_takoform_v2.sql", import.meta.url), "utf8"));
+  db.exec(
+    readFileSync(new URL("../migrations/0081_v2_private_inputs.sql", import.meta.url), "utf8"),
+  );
   let milliseconds = Date.now();
   const engine = () =>
     createTakoformV2Engine({

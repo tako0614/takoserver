@@ -246,7 +246,7 @@ test("normal Worker entry exposes only configured artifact Forms through authent
   }
 }, 120_000);
 
-test("configured artifact Forms refuse stale or table-only partial 0075 before accepting work", async () => {
+test("configured artifact Forms refuse incomplete 0075 or 0081 before accepting work", async () => {
   const runtime = await entryRuntime(
     JSON.stringify({
       documentation: "https://docs.example.test/v2",
@@ -343,12 +343,64 @@ test("configured artifact Forms refuse stale or table-only partial 0075 before a
       await refuseBeforeAcceptance();
       await database.prepare(definition).run();
     }
+    const privateIndex = MIGRATIONS.findIndex(({ name }) => name === "0081_v2_private_inputs.sql");
+    if (privateIndex <= progressIndex) throw new Error("missing 0081 fixture migration");
+    for (const migration of MIGRATIONS.slice(progressIndex + 1, privateIndex)) {
+      for (const statement of splitMigration(migration.sql)) {
+        await database.prepare(statement).run();
+      }
+    }
+    await refuseBeforeAcceptance();
+    const privateStatements = splitMigration(MIGRATIONS[privateIndex]?.sql ?? "");
+    for (const statement of privateStatements.slice(0, 5)) {
+      await database.prepare(statement).run();
+    }
+    await refuseBeforeAcceptance();
+    for (const statement of privateStatements.slice(5)) {
+      await database.prepare(statement).run();
+    }
+    for (const trigger of [
+      "tf_v2_private_transfer_dispatched",
+      "tf_v2_configured_private_immutable",
+      "tf_v2_operation_transition",
+    ]) {
+      const definition = privateStatements.find((statement) =>
+        statement.startsWith(`CREATE TRIGGER ${trigger} `),
+      );
+      if (!definition) throw new Error(`missing ${trigger} fixture definition`);
+      await database.prepare(`DROP TRIGGER ${trigger}`).run();
+      await refuseBeforeAcceptance();
+      await database.prepare(definition).run();
+    }
     const qualified = await runtime.dispatchFetch(
       `${BASE}/support?form=${encodeURIComponent(SQLITE_MIGRATION_SET_FORM_URL)}`,
       { headers: { authorization: `Bearer ${TOKEN}` } },
     );
     expect(qualified.status).toBe(200);
     expect(await qualified.json()).toMatchObject({ supported: true });
+    const accepted = await runtime.dispatchFetch(`${BASE}/resources`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+        "idempotency-key": "artifact-entry-stale-create-0001",
+      },
+      body: JSON.stringify({
+        form: SQLITE_MIGRATION_SET_FORM_URL,
+        space: ORGANIZATION,
+        name: "stale-refused",
+        spec: {
+          artifact: {
+            url: "https://artifacts.example.test/stale/manifest.json",
+            sha256: "a".repeat(64),
+          },
+        },
+      }),
+    });
+    expect(accepted.status).toBe(202);
+    expect(await sql.query("SELECT count(*) AS count FROM tf_v2_operations")).toEqual([
+      { count: 1 },
+    ]);
   } finally {
     await runtime.dispose();
   }

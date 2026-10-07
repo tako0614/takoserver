@@ -5,8 +5,38 @@ import { createSqliteSql } from "../../src/sql-sqlite.ts";
 import { createTakoformV2Host } from "../../src/takoform-v2/host.ts";
 import type { V2BackendResult, V2Execution } from "../../src/takoform-v2/types.ts";
 
-const [statePath, effectPath, stopAt, clockOffset] = process.argv.slice(2);
+const [statePath, effectPath, stopAt, clockOffset, fixtureMode] = process.argv.slice(2);
 if (!statePath || !effectPath || !stopAt) throw new Error("fixture arguments required");
+const privateMode = fixtureMode === "private-inputs";
+if (fixtureMode !== undefined && !privateMode) throw new Error("unknown fixture mode");
+const privateInputCustody = privateMode
+  ? await (async () => {
+      // Fixture-only material is re-imported as non-extractable keys in each PID.
+      // No production key or operator state is read by this subprocess.
+      const transferBytes = new Uint8Array(32).fill(0x23);
+      const comparisonBytes = new Uint8Array(32).fill(0x64);
+      try {
+        const [transfer, comparison] = await Promise.all([
+          crypto.subtle.importKey("raw", transferBytes, "AES-GCM", false, ["encrypt", "decrypt"]),
+          crypto.subtle.importKey(
+            "raw",
+            comparisonBytes,
+            { name: "HMAC", hash: "SHA-256" },
+            false,
+            ["sign", "verify"],
+          ),
+        ]);
+        return {
+          transfer: { current: { id: "fixture-transfer-1", key: transfer } },
+          comparison: { current: { id: "fixture-comparison-1", key: comparison } },
+          transferTtlSeconds: 30,
+        };
+      } finally {
+        transferBytes.fill(0);
+        comparisonBytes.fill(0);
+      }
+    })()
+  : undefined;
 const state = new Database(statePath);
 migrateSqlite(state);
 // A separate durable system: a Host SQL transaction cannot commit these effects.
@@ -27,12 +57,23 @@ async function pause(stage: string, operationId?: string): Promise<void> {
   await new Promise<void>(() => {}); // Parent deliberately SIGKILLs this process.
 }
 
-function resolveSameOperation(input: V2Execution): V2BackendResult {
+function resolveSameOperation(input: V2Execution, mode: "send" | "reconcile"): V2BackendResult {
   return effects.transaction((): V2BackendResult => {
     const prior = effects
       .query("SELECT result FROM fixture_receipts WHERE operation_id = ?")
       .get(input.operationId) as { result: string } | null;
     if (prior) return JSON.parse(prior.result) as V2BackendResult;
+    if (privateMode && mode === "reconcile") {
+      // No receipt after an uncertain dispatch is not proof of no send.
+      return { kind: "unknown", code: "outcome_unconfirmed", message: "Outcome unconfirmed" };
+    }
+    if (
+      privateMode &&
+      input.action === "create" &&
+      input.privateInputs?.password !== "fixture-only-secret-値"
+    ) {
+      throw new Error("private input was not delivered on initial send");
+    }
     if (input.action === "create") {
       effects
         .query("INSERT INTO fixture_resources(uid, generation, value) VALUES (?, ?, ?)")
@@ -52,7 +93,13 @@ function resolveSameOperation(input: V2Execution): V2BackendResult {
     }
     const result: V2BackendResult = {
       kind: "complete",
-      observed: input.action === "delete" ? {} : { value: input.spec.value ?? null },
+      observed:
+        input.action === "delete"
+          ? {}
+          : {
+              value: input.spec.value ?? null,
+              ...(privateMode ? { privateApplied: true } : {}),
+            },
       output: {},
     };
     effects
@@ -72,23 +119,37 @@ const host = createTakoformV2Host({
     "https://forms.example/restart-fixture/1": {
       validateCreate() {},
       validateUpdate() {},
+      ...(privateMode
+        ? {
+            privateInputs: {
+              validateCreate(_spec: unknown, inputs: Readonly<Record<string, string>> | undefined) {
+                if (!inputs || Object.keys(inputs).join(",") !== "password")
+                  throw new Error("fixture private input required");
+              },
+              validateUpdate() {},
+            },
+          }
+        : {}),
       backend: {
         id: "persistent-fixture-v1",
         targetKey: "isolated-test-database",
         async execute(input) {
           if (stopAt === "after_dispatch") await pause(stopAt, input.operationId);
-          const result = resolveSameOperation(input);
+          const result = resolveSameOperation(input, "send");
           if (stopAt === "after_effect") await pause(stopAt, input.operationId);
           return result;
         },
         async reconcile(input) {
+          if (privateMode && input.privateInputs !== undefined)
+            throw new Error("reconcile received private input");
           // This fixture supports atomic, exact-operation-keyed effects. Do not
           // copy this retry into a backend whose idempotency is unproven.
-          return resolveSameOperation(input);
+          return resolveSameOperation(input, "reconcile");
         },
       },
     },
   },
+  ...(privateInputCustody ? { privateInputCustody } : {}),
   baseUrl: "https://fixture.example/apis/forms.takoform.com/v2",
   documentation: "https://fixture.example/docs",
   authenticationDocumentation: "https://fixture.example/auth",
@@ -97,7 +158,9 @@ const host = createTakoformV2Host({
   maxRequestBytes: 4_096,
   maxPageSize: 20,
   authenticate: async (request) =>
-    request.headers.get("authorization") === "Bearer test-only"
+    ["Bearer test-only", "Bearer test-only-rotated"].includes(
+      request.headers.get("authorization") ?? "",
+    )
       ? { principal: "owner", access: "write" }
       : null,
 });

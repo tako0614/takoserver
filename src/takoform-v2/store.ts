@@ -1,4 +1,6 @@
 import type { Sql } from "../ports.ts";
+import type { V2ConfiguredPrivateInputs } from "./configured-private-inputs.ts";
+import type { V2SealedPrivateInputs } from "./private-inputs.ts";
 import type { V2Action, V2Effect, V2Status } from "./types.ts";
 
 export interface ResourceRow {
@@ -47,6 +49,20 @@ export interface OperationRow {
   error_message: string | null;
   result_observed_json: string | null;
   result_output_json: string | null;
+  private_inputs_present: number;
+  input_required_names_json: string | null;
+  input_required_reason: "expired" | "unavailable" | null;
+}
+
+export interface PrivateInputRow {
+  operation_id: string;
+  names_json: string;
+  comparison_key_id: string;
+  comparison_tag: string;
+  transfer_key_id: string | null;
+  transfer_nonce: string | null;
+  transfer_ciphertext: string | null;
+  transfer_expires_at_ms: number | null;
 }
 
 export interface AcceptRecord {
@@ -62,18 +78,21 @@ export interface AcceptRecord {
   backendId: string;
   targetKey: string;
   specJson: string;
+  privateInputs?: V2SealedPrivateInputs;
+  configuredPrivateInputs?: V2ConfiguredPrivateInputs;
+  expectedConfiguredPrivateInputs?: V2ConfiguredPrivateInputs;
 }
 
 const opInsert = `INSERT INTO tf_v2_operations
   (id, resource_uid, principal, replay_key, request_fingerprint, action, generation,
    status, effect, created_at, updated_at, retain_until, backend_id, target_key,
-   backend_key, accepted_spec_json)
-  VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 'none', ?, ?, ?, ?, ?, ?, ?)`;
+   backend_key, accepted_spec_json, private_inputs_present)
+  VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 'none', ?, ?, ?, ?, ?, ?, ?, ?)`;
 const opInsertIfAccepted = `INSERT INTO tf_v2_operations
   (id, resource_uid, principal, replay_key, request_fingerprint, action, generation,
    status, effect, created_at, updated_at, retain_until, backend_id, target_key,
-   backend_key, accepted_spec_json)
-  SELECT ?, ?, ?, ?, ?, ?, ?, 'queued', 'none', ?, ?, ?, ?, ?, ?, ?
+   backend_key, accepted_spec_json, private_inputs_present)
+  SELECT ?, ?, ?, ?, ?, ?, ?, 'queued', 'none', ?, ?, ?, ?, ?, ?, ?, ?
   WHERE EXISTS (SELECT 1 FROM tf_v2_resources
     WHERE uid = ? AND last_operation = ? AND busy_operation = ? AND generation = ?)`;
 
@@ -104,7 +123,55 @@ function opParams(record: AcceptRecord) {
     record.targetKey,
     record.id,
     record.specJson,
+    record.privateInputs ? 1 : 0,
   ] as const;
+}
+
+function privateWrites(record: AcceptRecord) {
+  const sealed = record.privateInputs;
+  if (!sealed) return [];
+  return [
+    {
+      sql: `INSERT INTO tf_v2_private_inputs
+        (operation_id, names_json, comparison_key_id, comparison_tag, transfer_key_id,
+         transfer_nonce, transfer_ciphertext, transfer_expires_at_ms)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS
+          (SELECT 1 FROM tf_v2_operations WHERE id = ? AND private_inputs_present = 1)`,
+      params: [
+        record.id,
+        sealed.namesJson,
+        sealed.comparisonKeyId,
+        sealed.comparisonTag,
+        sealed.transferKeyId,
+        sealed.transferNonce,
+        sealed.transferCiphertext,
+        sealed.transferExpiresAtMs,
+        record.id,
+      ],
+    },
+  ];
+}
+
+function configuredPrivateWrites(record: AcceptRecord) {
+  const sealed = record.configuredPrivateInputs;
+  if (!sealed) return [];
+  return [
+    {
+      sql: `INSERT INTO tf_v2_configured_private_inputs
+      (resource_uid, key_id, nonce, ciphertext)
+      SELECT ?, ?, ?, ? WHERE EXISTS (
+        SELECT 1 FROM tf_v2_operations WHERE id = ? AND resource_uid = ?
+          AND action = 'create' AND status = 'queued')`,
+      params: [
+        record.resourceUid,
+        sealed.keyId,
+        sealed.nonce,
+        sealed.ciphertext,
+        record.id,
+        record.resourceUid,
+      ],
+    },
+  ];
 }
 
 function referenceWrites(record: AcceptRecord, referencesJson: string | null) {
@@ -143,6 +210,11 @@ export function createV2Store(sql: Sql) {
     async operation(id: string): Promise<OperationRow | null> {
       return ((await sql.query("SELECT * FROM tf_v2_operations WHERE id = ?", [id]))[0] ??
         null) as OperationRow | null;
+    },
+    async privateInputs(id: string): Promise<PrivateInputRow | null> {
+      return ((
+        await sql.query("SELECT * FROM tf_v2_private_inputs WHERE operation_id = ?", [id])
+      )[0] ?? null) as PrivateInputRow | null;
     },
     async replay(principal: string, key: string): Promise<OperationRow | null> {
       return ((
@@ -232,6 +304,8 @@ export function createV2Store(sql: Sql) {
           ],
         },
         { sql: opInsert, params: opParams(record) },
+        ...privateWrites(record),
+        ...configuredPrivateWrites(record),
         ...referenceWrites(record, referencesJson),
       ]);
     },
@@ -255,7 +329,14 @@ export function createV2Store(sql: Sql) {
                       WHERE edge.target_uid = ? AND referrer.deleted_at IS NULL)`
                   : ""
               }
-              ${serialize ? `AND NOT EXISTS (${pendingReferrersSql})` : ""}`,
+              ${serialize ? `AND NOT EXISTS (${pendingReferrersSql})` : ""}
+              ${
+                record.expectedConfiguredPrivateInputs
+                  ? `AND EXISTS (
+                SELECT 1 FROM tf_v2_configured_private_inputs
+                WHERE resource_uid = ? AND key_id = ? AND nonce = ? AND ciphertext = ?)`
+                  : ""
+              }`,
           params: [
             record.generation,
             record.specJson,
@@ -267,6 +348,14 @@ export function createV2Store(sql: Sql) {
             record.generation - 1,
             ...(record.action === "delete" ? [record.resourceUid] : []),
             ...(serialize ? [record.resourceUid] : []),
+            ...(record.expectedConfiguredPrivateInputs
+              ? [
+                  record.resourceUid,
+                  record.expectedConfiguredPrivateInputs.keyId,
+                  record.expectedConfiguredPrivateInputs.nonce,
+                  record.expectedConfiguredPrivateInputs.ciphertext,
+                ]
+              : []),
           ],
         },
         {
@@ -279,6 +368,7 @@ export function createV2Store(sql: Sql) {
             record.generation,
           ],
         },
+        ...privateWrites(record),
         ...referenceWrites(record, referencesJson),
         ...(serialize
           ? [
@@ -354,6 +444,71 @@ export function createV2Store(sql: Sql) {
           )
         ).length === 1
       );
+    },
+    async waitForInputs(
+      id: string,
+      token: string,
+      at: string,
+      namesJson: string,
+      reason: "expired" | "unavailable",
+    ): Promise<boolean> {
+      const write = await sql.run(
+        `UPDATE tf_v2_operations SET status = 'waiting_input', updated_at = ?,
+          input_required_names_json = ?, input_required_reason = ?,
+          lease_token = NULL, lease_until_ms = NULL
+         WHERE id = ? AND lease_token = ? AND status = 'running'
+           AND dispatch_possible = 0 AND private_inputs_present = 1
+           AND EXISTS (SELECT 1 FROM tf_v2_private_inputs WHERE operation_id = ?)`,
+        [at, namesJson, reason, id, token, id],
+      );
+      return write.changes === 1;
+    },
+    async failUnverifiable(
+      id: string,
+      token: string,
+      at: string,
+      retainUntil: string,
+    ): Promise<boolean> {
+      const write = await sql.run(
+        `UPDATE tf_v2_operations SET status = 'failed', effect = 'none', updated_at = ?,
+          retain_until = CASE WHEN retain_until > ? THEN retain_until ELSE ? END,
+          error_code = 'private_inputs_unverifiable',
+          error_message = 'Private input comparison material is unavailable',
+          lease_token = NULL, lease_until_ms = NULL
+         WHERE id = ? AND lease_token = ? AND status = 'running' AND dispatch_possible = 0`,
+        [at, retainUntil, retainUntil, id, token],
+      );
+      return write.changes === 1;
+    },
+    async replenish(id: string, sealed: V2SealedPrivateInputs, at: string): Promise<boolean> {
+      const writes = await sql.batch([
+        {
+          sql: `UPDATE tf_v2_private_inputs SET transfer_key_id = ?, transfer_nonce = ?,
+            transfer_ciphertext = ?, transfer_expires_at_ms = ?
+           WHERE operation_id = ? AND EXISTS (
+             SELECT 1 FROM tf_v2_operations WHERE id = ? AND status = 'waiting_input'
+               AND dispatch_possible = 0 AND lease_token IS NULL)`,
+          params: [
+            sealed.transferKeyId,
+            sealed.transferNonce,
+            sealed.transferCiphertext,
+            sealed.transferExpiresAtMs,
+            id,
+            id,
+          ],
+        },
+        {
+          sql: `UPDATE tf_v2_operations SET status = 'queued', updated_at = ?,
+            next_attempt_at_ms = 0, input_required_names_json = NULL,
+            input_required_reason = NULL
+           WHERE id = ? AND status = 'waiting_input' AND dispatch_possible = 0
+             AND lease_token IS NULL AND EXISTS (
+               SELECT 1 FROM tf_v2_private_inputs WHERE operation_id = ?
+                 AND transfer_ciphertext = ?)`,
+          params: [at, id, id, sealed.transferCiphertext],
+        },
+      ]);
+      return writes[0]?.changes === 1 && writes[1]?.changes === 1;
     },
     async settle(input: {
       id: string;

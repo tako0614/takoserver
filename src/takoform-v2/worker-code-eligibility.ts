@@ -69,15 +69,25 @@ interface VerifiedV2WorkerCodeEligibility {
 export async function inspectV2WorkerCodeVersionEligibility(
   input: V2WorkerCodeEligibilityInput,
 ): Promise<void> {
-  await prepareV2WorkerCodeProjection(input);
+  await verifyV2WorkerCodeProjection(input, true);
 }
 
-/** Native runtime adapter uses this portable verified projection input. */
+/** Native self-host adapter never projects a secret-required Version into env. */
 export async function prepareV2WorkerCodeProjection(
   input: V2WorkerCodeEligibilityInput & {
     readonly requireEventDelivery?: boolean;
     readonly eventDelivery?: { readonly token: string };
   },
+): Promise<VerifiedV2WorkerCodeEligibility> {
+  return await verifyV2WorkerCodeProjection(input, false);
+}
+
+async function verifyV2WorkerCodeProjection(
+  input: V2WorkerCodeEligibilityInput & {
+    readonly requireEventDelivery?: boolean;
+    readonly eventDelivery?: { readonly token: string };
+  },
+  inspectionOnly: boolean,
 ): Promise<VerifiedV2WorkerCodeEligibility> {
   const versionUnavailable = () => new V2WorkerCodeRuntimeError("worker_version_unavailable");
   const bundleUnavailable = () => new V2WorkerCodeRuntimeError("worker_bundle_unavailable");
@@ -98,7 +108,12 @@ export async function prepareV2WorkerCodeProjection(
   ) {
     throw bundleUnavailable();
   }
-  if (spec.requiredSensitiveVars.length > 0 || hasPrivateInputs(input.privateInputs)) {
+  // Copy and validate all own values before the first material/inspector await.
+  // This map is deliberately never included in the verified projection.
+  if (
+    !exactPrivateInputs(input.privateInputs, spec.requiredSensitiveVars) ||
+    (!inspectionOnly && spec.requiredSensitiveVars.length > 0)
+  ) {
     throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
   }
   if (
@@ -285,17 +300,32 @@ function isValidInspection(
   );
 }
 
-function hasPrivateInputs(input: unknown): boolean {
-  if (input === undefined) return false;
-  if (input === null || typeof input !== "object" || Array.isArray(input)) return true;
+function exactPrivateInputs(input: unknown, names: readonly string[]): boolean {
+  if (input === undefined) return names.length === 0;
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return false;
   try {
     const prototype = Object.getPrototypeOf(input);
-    return (
-      (prototype !== Object.prototype && prototype !== null) ||
-      Object.keys(input).length > 0 ||
-      Object.getOwnPropertySymbols(input).length > 0
-    );
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    if (Object.getOwnPropertySymbols(input).length > 0) return false;
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    const keys = Object.keys(descriptors);
+    if (keys.length !== names.length || Reflect.ownKeys(descriptors).length !== names.length)
+      return false;
+    const snapshot = Object.create(null) as Record<string, string>;
+    for (const name of names) {
+      const descriptor = descriptors[name];
+      if (!descriptor?.enumerable) return false;
+      if (
+        !("value" in descriptor) ||
+        typeof descriptor.value !== "string" ||
+        descriptor.value.length === 0
+      ) {
+        return false;
+      }
+      snapshot[name] = descriptor.value;
+    }
+    return Object.keys(snapshot).length === names.length;
   } catch {
-    return true;
+    return false;
   }
 }

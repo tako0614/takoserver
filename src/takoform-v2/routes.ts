@@ -2,7 +2,8 @@ import type { JsonObject } from "../ports.ts";
 import { parseStrictJson, StrictJsonError } from "../strict-json.ts";
 import type { TakoformV2Engine } from "./engine.ts";
 import { isV2FormUrl, isV2HttpsUrl, parseV2BaseUrl } from "./identity.ts";
-import type { TakoformV2Error, V2Operation } from "./types.ts";
+import { parsePrivateInputMap, type V2PrivateInputMap } from "./private-inputs.ts";
+import { TakoformV2Error, type V2Operation } from "./types.ts";
 
 const API = "forms.takoform.com/v2" as const;
 const DISCOVERY_PATH = "/.well-known/takoform/v2";
@@ -108,7 +109,11 @@ async function route(
         schemes: [...options.authenticationSchemes],
         documentation: options.authenticationDocumentation,
       },
-      capabilities: { offerings: false, previews: false, privateInputs: false },
+      capabilities: {
+        offerings: false,
+        previews: false,
+        privateInputs: engine.privateInputsCapability,
+      },
       limits: {
         maxRequestBytes: options.maxRequestBytes,
         maxPageSize: options.maxPageSize,
@@ -162,11 +167,7 @@ async function authenticatedRoute(
   // Copy the authenticated grant before any body read or asynchronous engine call.
   // The stable owner may have several credentials with different permissions.
   const { principal, access } = identity;
-  if (
-    path === "/offerings" ||
-    path === "/previews" ||
-    /^\/operations\/[^/]+\/private-inputs$/u.test(path)
-  ) {
+  if (path === "/offerings" || path === "/previews") {
     return problem(404, "capability_unavailable");
   }
   if (path === "/support") {
@@ -174,12 +175,12 @@ async function authenticatedRoute(
     const query = strictQuery(url, ["form"]);
     const form = query.get("form");
     if (form === undefined || !isFormUrl(form)) throw invalidRequest();
-    const supported = engine.formUrls.includes(form);
+    const supported = engine.supportsForm(form);
     return json({
       form,
       supported,
       operations: supported ? ["create", "read", "update", "delete"] : [],
-      privateInputs: false,
+      privateInputs: supported && engine.supportsPrivateInputs(form),
     });
   }
   if (path === "/resources" && request.method === "POST") {
@@ -187,17 +188,30 @@ async function authenticatedRoute(
     rejectQuery(url);
     const key = idempotencyKey(request);
     const input = await readJsonObject(request, options.maxRequestBytes);
-    if (Object.hasOwn(input, "privateInputs")) throw capabilityRequired();
+    const prior = await engine.replayExistingCreate({ principal, key, body: input });
+    if (prior) return operationResponse(prior, config);
     if (Object.hasOwn(input, "offering")) throw capabilityRequired();
-    exactKeys(input, ["form", "space", "name", "spec"]);
+    exactKeys(input, ["form", "space", "name", "spec"], ["privateInputs"]);
     if (typeof input.form !== "string" || !isFormUrl(input.form)) throw invalidRequest();
+    if (Object.hasOwn(input, "privateInputs") && !engine.supportsPrivateInputs(input.form)) {
+      throw capabilityRequired();
+    }
     const space = identifier(input.space);
     const name = identifier(input.name);
     const spec = jsonObject(input.spec);
+    const privateInputs = Object.hasOwn(input, "privateInputs")
+      ? privateInputMap(input.privateInputs)
+      : undefined;
     const operation = await engine.acceptCreate({
       principal,
       key,
-      input: { form: input.form, space, name, spec },
+      input: {
+        form: input.form,
+        space,
+        name,
+        spec,
+        ...(privateInputs === undefined ? {} : { privateInputs }),
+      },
     });
     return operationResponse(operation, config);
   }
@@ -248,15 +262,32 @@ async function authenticatedRoute(
       const key = idempotencyKey(request);
       const expectedGeneration = expectedGenerationHeader(request);
       const body = await readJsonObject(request, options.maxRequestBytes);
-      if (Object.hasOwn(body, "privateInputs")) throw capabilityRequired();
-      exactKeys(body, ["spec"]);
+      const prior = await engine.replayExistingUpdate({
+        principal,
+        key,
+        uid,
+        expectedGeneration,
+        body,
+      });
+      if (prior) return operationResponse(prior, config);
+      exactKeys(body, ["spec"], ["privateInputs"]);
+      if (
+        Object.hasOwn(body, "privateInputs") &&
+        !(await engine.supportsPrivateInputsForUpdate(principal, uid))
+      ) {
+        throw capabilityRequired();
+      }
       const spec = jsonObject(body.spec);
+      const privateInputs = Object.hasOwn(body, "privateInputs")
+        ? privateInputMap(body.privateInputs)
+        : undefined;
       const operation = await engine.acceptUpdate({
         principal,
         key,
         uid,
         expectedGeneration,
         spec,
+        ...(privateInputs === undefined ? {} : { privateInputs }),
       });
       return operationResponse(operation, config);
     }
@@ -279,6 +310,29 @@ async function authenticatedRoute(
     const id = decodedIdentifier(operationMatch[1] ?? "");
     if (request.method !== "GET") return problem(405, "method_not_allowed", { allow: "GET" });
     return json(await engine.getOperation({ principal, id }));
+  }
+  const replenishMatch = /^\/operations\/([^/]+)\/private-inputs$/u.exec(path);
+  if (replenishMatch) {
+    const id = decodedIdentifier(replenishMatch[1] ?? "");
+    if (!engine.privateInputsCapability) return problem(404, "capability_unavailable");
+    if (request.method !== "PUT") return problem(405, "method_not_allowed", { allow: "PUT" });
+    if (access !== "write") return problem(403, "forbidden");
+    rejectQuery(url);
+    if (
+      request.headers.has("idempotency-key") ||
+      request.headers.has("takoform-expected-generation")
+    ) {
+      throw invalidRequest();
+    }
+    const body = await readJsonObject(request, options.maxRequestBytes);
+    exactKeys(body, ["privateInputs"]);
+    return json(
+      await engine.replenishPrivateInputs({
+        principal,
+        id,
+        privateInputs: privateInputMap(body.privateInputs),
+      }),
+    );
   }
   return problem(404, "not_found");
 }
@@ -313,11 +367,14 @@ function asProblem(error: unknown, options: TakoformV2HttpOptions): Response {
       typeof candidate.code === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(candidate.code)
         ? candidate.code
         : "internal_error";
-    return problem(
-      status,
-      code,
-      status === 401 ? { wwwAuthenticate: options.authenticationSchemes.join(", ") } : {},
-    );
+    return problem(status, code, {
+      ...(status === 401 ? { wwwAuthenticate: options.authenticationSchemes.join(", ") } : {}),
+      ...(error instanceof TakoformV2Error &&
+      typeof candidate.operationId === "string" &&
+      ID.test(candidate.operationId)
+        ? { operationId: candidate.operationId }
+        : {}),
+    });
   }
   return problem(500, "internal_error");
 }
@@ -325,7 +382,7 @@ function asProblem(error: unknown, options: TakoformV2HttpOptions): Response {
 function problem(
   status: number,
   code: string,
-  headers: { allow?: string; wwwAuthenticate?: string } = {},
+  headers: { allow?: string; wwwAuthenticate?: string; operationId?: string } = {},
 ): Response {
   const title = statusTitle(status);
   const responseHeaders = new Headers({
@@ -334,10 +391,19 @@ function problem(
   });
   if (headers.allow) responseHeaders.set("allow", headers.allow);
   if (headers.wwwAuthenticate) responseHeaders.set("www-authenticate", headers.wwwAuthenticate);
-  return new Response(JSON.stringify({ type: "about:blank", title, status, code }), {
-    status,
-    headers: responseHeaders,
-  });
+  return new Response(
+    JSON.stringify({
+      type: "about:blank",
+      title,
+      status,
+      code,
+      ...(headers.operationId ? { operationId: headers.operationId } : {}),
+    }),
+    {
+      status,
+      headers: responseHeaders,
+    },
+  );
 }
 
 function json(value: unknown): Response {
@@ -500,9 +566,22 @@ async function rejectDeleteBody(request: Request): Promise<void> {
   }
 }
 
-function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): void {
-  if (Object.keys(value).some((key) => !allowed.includes(key))) throw invalidRequest();
-  if (allowed.some((key) => !Object.hasOwn(value, key))) throw invalidRequest();
+function exactKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): void {
+  if (Object.keys(value).some((key) => !required.includes(key) && !optional.includes(key)))
+    throw invalidRequest();
+  if (required.some((key) => !Object.hasOwn(value, key))) throw invalidRequest();
+}
+
+function privateInputMap(value: unknown): V2PrivateInputMap {
+  try {
+    return parsePrivateInputMap(value);
+  } catch {
+    throw new HttpInputError(422, "invalid_spec");
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
