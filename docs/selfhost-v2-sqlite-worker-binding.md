@@ -21,6 +21,9 @@ companion service. The tenant service receives only `env[name]` with
 `execute`, `query`, and `transaction`; it gets no bearer, address, raw SQLite
 handle, `close`, or migration authority. The execution-copy adapter adds V2
 argument-shape `TypeError` behavior without changing the retained V1 SQL facade.
+Composition must choose two collision-free root-level `.js` module names for
+the adapter and its captured-intrinsics helper, then add both returned modules
+and their JavaScript media types to the execution copy before graph compilation.
 
 Every SQL call rechecks the native selected Version and Core current graph, the
 settled Version/Operation and sealed exact reference set, the active edge, and

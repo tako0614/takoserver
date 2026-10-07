@@ -1,6 +1,7 @@
 import { selfhostWorkerPreludeSource } from "./selfhost-worker-prelude.ts";
 
 const NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
+const ROOT_MODULE = /^[A-Za-z0-9_$][A-Za-z0-9_$.-]{0,127}\.js$/u;
 
 /**
  * A scoped v2 execution-copy adapter. The existing workerd SQL transport is
@@ -17,8 +18,8 @@ export function v2SqliteWorkerProjection(input: {
 }): ReadonlyMap<string, Uint8Array> {
   if (
     !input.originalMainModule ||
-    !input.adapterModule ||
-    !input.intrinsicModule ||
+    !ROOT_MODULE.test(input.adapterModule) ||
+    !ROOT_MODULE.test(input.intrinsicModule) ||
     new Set([input.originalMainModule, input.adapterModule, input.intrinsicModule]).size !== 3 ||
     !input.sqliteBindingNames.every((name) => NAME.test(name)) ||
     new Set(input.sqliteBindingNames).size !== input.sqliteBindingNames.length ||
@@ -111,16 +112,19 @@ function statement(sql, values) {
 }
 function facade(base) {
   const projected = create(null);
-  projected.execute = async (sql, values) => {
-    const [s, p] = statement(sql, values);
+  projected.execute = async (...args) => {
+    if (args.length > 2) typeError();
+    const [s, p] = statement(args[0], args[1]);
     return await apply(base.execute, base, [s, p]);
   };
-  projected.query = async (sql, values) => {
-    const [s, p] = statement(sql, values);
+  projected.query = async (...args) => {
+    if (args.length > 2) typeError();
+    const [s, p] = statement(args[0], args[1]);
     return await apply(base.query, base, [s, p]);
   };
-  projected.transaction = async (statements) => {
-    const values = dense(statements, 100);
+  projected.transaction = async (...args) => {
+    if (args.length > 1) typeError();
+    const values = dense(args[0], 100);
     if (values.length === 0) typeError();
     const normalized = [];
     for (const value of values) {

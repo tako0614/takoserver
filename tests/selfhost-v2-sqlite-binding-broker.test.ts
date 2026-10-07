@@ -345,7 +345,19 @@ test.skipIf(WORKERD === undefined)(
         return Response.json({ keys, result, hasRaw: "close" in env.DB || "database" in env.DB });
       }
       if (new URL(request.url).pathname === "/invalid") {
-        try { await env.DB.query(17); } catch (error) { return Response.json({ name: error.name }); }
+        const names = [];
+        for (const invoke of [
+          () => env.DB.query(17),
+          () => env.DB.execute("SELECT 1", [], "extra"),
+          () => env.DB.query("SELECT 1", [], "extra"),
+          () => env.DB.transaction([], "extra"),
+          () => env.DB.query("SELECT ?", [undefined]),
+          () => env.DB.query("SELECT ?", [,]),
+          () => env.DB.transaction([{ sql: 17 }]),
+        ]) {
+          try { await invoke(); } catch (error) { names.push(error.name); }
+        }
+        return Response.json({ names });
       }
       if (new URL(request.url).pathname === "/ledger") {
         try { await env.DB.query("SELECT * FROM _takoform_sqlite_migrations"); }
@@ -452,7 +464,20 @@ test.skipIf(WORKERD === undefined)(
         status: 200,
         value: { rows: [{ body: "native" }], rowsWritten: 0 },
       });
-      expect(await call("/invalid")).toEqual({ status: 200, value: { name: "TypeError" } });
+      expect(await call("/invalid")).toEqual({
+        status: 200,
+        value: {
+          names: [
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+          ],
+        },
+      });
       expect(await call("/ledger")).toEqual({ status: 200, value: { name: "sql_error" } });
       expect(await call("/transaction")).toEqual({
         status: 200,
