@@ -172,8 +172,9 @@ version-graph compiler. The compiler adds the Host-owned readiness wrapper; the
 shared Deployment publisher can stage the resulting code graph alongside
 static-only Versions. It invokes inspection on the same owned snapshot. This is
 an internal publication building block, not Worker Form registration or support.
-Bindings, private inputs, assets and scheduled/queue delivery remain explicit
-internal refusals, and this portable path is not native qualification.
+Uncomposed capabilities remain explicit refusals. The internal factory connections
+and their separate native evidence are described below; this portable projection
+alone does not qualify them.
 
 The published ModuleWorker 0.3 text describes auxiliary source maps but does
 not name their MIME token, while WorkerBundle 0.2 defers its closed media-type
@@ -554,6 +555,29 @@ refused. The ordinary Bun entry does not supply it or register Worker Forms.
 Other uncomposed typed Bindings and queue delivery remain explicit refusals
 in this factory, not claims of complete WorkerVersion support.
 
+The same internal factory can compose a separately keyed ObjectBucket broker at
+an operator-selected stable loopback port. Its grants bind the exact organization,
+Space, selected Version Operation, Worker incarnation and settled Bucket reference.
+The broker checks both the Core graph and native owner around each awaited call.
+Native descriptors use a distinct internal service name; multiple Object service
+descriptors retain separate callers rather than sharing whichever endpoint was
+initialized first. A local organization-authenticated Host journey uses the pinned
+workerd artifact for Bucket create, Worker put/get, Worker update, deletion and
+orderly termination. This is an internal composition, not normal-entry registration,
+public HTTPS delivery or Hosted qualification.
+
+A separate KV native Binding journey passes a full 25 MiB value through the private
+broker and pinned workerd artifact. Linear Base64 validation preserves the accepted
+encoding grammar without overflowing on this legal value. Its settled Core records
+are constructed by the test; it does not prove normal Host/factory connection or
+the published KV Form's worldwide replicated eventual-consistency semantics.
+
+The same integrated native candidate checks these Object and KV data paths,
+SQLite Binding and owner shutdown together. A valid SQLite transaction above the
+private transport's 40 MiB aggregate limit is rejected before any database write.
+That test records an implementation capacity gap, not support for the rejected
+request.
+
 The internal WorkerCronTrigger backend and scheduler use the published
 WorkerCronTrigger 0.3.0 contract. Admission seals the exact Worker, target and
 selected Deployment/Versions. Deployment changes must keep every selected
@@ -602,6 +626,15 @@ once under the same HTTPS/non-drain gate and passes its current and retained
 nonextractable keys to the v2 owner sealer before restoration. An absent or
 unavailable key still refuses sensitive Versions without deleting ciphertext;
 no key is generated from local ciphertext or public configuration.
+
+Orderly Bun shutdown freezes new v2 owner admission and awaits pending owner opens.
+An active serving owner is suspended with retained custody, rather than treated as
+a deleted Worker. An exact completed ModuleWorker deletion, or SQL proof that no
+current publication exists, permits retirement-only closure; closure still requires
+each recorded incarnation to be retired. An uncertain proof stops shutdown before
+the dependent data planes and SQL are closed. A failed suspend never falls back to
+destructive closure. Native owner/entry tests cover this dependency order, but do
+not make the ordinary entry advertise the internal Worker Forms.
 
 A separate normal-`buildApp` local journey composes the
 existing SQLiteDatabase, held SQLiteMigrationSet/Application, and this private
