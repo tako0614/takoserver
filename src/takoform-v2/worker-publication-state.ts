@@ -540,6 +540,8 @@ export function createV2WorkerPublicationState(options: {
     rows: readonly ReferenceRow[],
     principal: string,
     space: string,
+    serviceTargets: ReadonlySet<string>,
+    targetKey: string,
   ): Promise<readonly unknown[] | null> {
     const evidence: unknown[] = [];
     for (const reference of rows) {
@@ -551,10 +553,18 @@ export function createV2WorkerPublicationState(options: {
         target.form_url !== reference.form_url ||
         target.principal !== principal ||
         target.space !== space ||
+        (serviceTargets.has(reference.target_uid) && target.target_key !== targetKey) ||
         !settled(target, last) ||
         (reference.readiness === "ready" && observed?.ready !== true)
       )
         return null;
+      if (serviceTargets.has(reference.target_uid)) {
+        try {
+          parseModuleWorkerSpec(parseObject(target.spec_json));
+        } catch {
+          return null;
+        }
+      }
       if (reference.target_spec_path !== null) {
         if (
           reference.target_spec_equals === null ||
@@ -712,6 +722,7 @@ export function createV2WorkerPublicationState(options: {
       );
     }
     const referenceEvidence: unknown[] = [];
+    const serviceTargets = new Set(spec.serviceBindings.map((item) => item.resource.resourceUid));
     for (const ref of refRows) {
       const target = await resource(ref.target_uid);
       const last = target ? await operation(target.last_operation) : null;
@@ -727,6 +738,7 @@ export function createV2WorkerPublicationState(options: {
         target.form_url !== ref.form_url ||
         target.principal !== own.principal ||
         target.space !== own.space ||
+        (serviceTargets.has(ref.target_uid) && target.target_key !== op.target_key) ||
         !settled(target, last) ||
         !edge
       ) {
@@ -734,6 +746,13 @@ export function createV2WorkerPublicationState(options: {
           "graph_unresolved",
           "A Version reference is not current in this owner and Space",
         );
+      }
+      if (serviceTargets.has(ref.target_uid)) {
+        try {
+          parseModuleWorkerSpec(parseObject(target.spec_json));
+        } catch {
+          return versionUnresolved("graph_unresolved", "A service Worker identity spec is invalid");
+        }
       }
       referenceEvidence.push({ target, last, edge });
     }
@@ -1087,14 +1106,18 @@ export function createV2WorkerPublicationState(options: {
             "A weighted Worker Version references are not sealed and exact",
           );
         }
-        if (current) {
-          const active = await activeReferences(uid, versionReferences);
-          const targets = await settledReferenceTargets(versionReferences, op.principal, own.space);
-          if (!active || !targets) {
-            return unresolved("graph_unresolved", "Version active references changed");
-          }
-          versionEvidence.push(active, targets);
+        const active = await activeReferences(uid, versionReferences);
+        const targets = await settledReferenceTargets(
+          versionReferences,
+          op.principal,
+          own.space,
+          new Set(versionSpec.serviceBindings.map((item) => item.resource.resourceUid)),
+          op.target_key,
+        );
+        if (!active || !targets) {
+          return unresolved("graph_unresolved", "Version active references changed");
         }
+        versionEvidence.push(active, targets);
         if (last) referenceSetIds.push(last.id);
         const bundle = versionSpec.bundle
           ? await artifactTarget({

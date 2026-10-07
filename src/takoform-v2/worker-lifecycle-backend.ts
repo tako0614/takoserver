@@ -22,6 +22,7 @@ import {
 import { TakoformV2Error, type V2BackendResult, type V2Execution, type V2Form } from "./types.ts";
 import { inspectV2WorkerCodeVersionEligibility } from "./worker-code-runtime.ts";
 import type { V2WorkerVersionResolution } from "./worker-publication-state.ts";
+import { projectV2ResolvedServiceBindings } from "./worker-service-resolution.ts";
 import { projectV2StaticWorkerVersion } from "./worker-static-runtime.ts";
 
 export const MODULE_WORKER_LIFECYCLE_BACKEND_ID = "selfhost-v2-module-worker-identity-v1";
@@ -654,7 +655,6 @@ function codeOnly(spec: WorkerVersionSpec): WorkerVersionSpec {
     spec.sqliteBindings.length > 0 ||
     spec.bucketBindings.length > 0 ||
     spec.queueProducerBindings.length > 0 ||
-    spec.serviceBindings.length > 0 ||
     spec.actorBindings.length > 0 ||
     spec.workflowBindings.length > 0
   ) {
@@ -726,6 +726,9 @@ export function createInternalV2CodeWorkerVersionForm(options: {
         return unresolved();
       }
       const materials = await resolution.readMaterials();
+      const resolvedServiceBindings = await projectV2ResolvedServiceBindings(
+        snapshot.version.spec.serviceBindings,
+      );
       await inspectV2WorkerCodeVersionEligibility({
         workerResourceUid: snapshot.worker.uid,
         ...(spec.bundle ? { bundleResourceUid: spec.bundle.resourceUid } : {}),
@@ -734,6 +737,7 @@ export function createInternalV2CodeWorkerVersionForm(options: {
         bundle: materials.bundle,
         assets: materials.assets,
         inspectModule,
+        ...(resolvedServiceBindings.length > 0 ? { resolvedServiceBindings } : {}),
       });
       if (!(await resolution.stillCurrent()) || !(await currentClaim(sql, execution))) {
         return unresolved();

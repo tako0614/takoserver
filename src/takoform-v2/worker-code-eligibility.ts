@@ -17,6 +17,10 @@ import {
   type V2VerifiedAssetMaterials,
   verifyV2AssetMaterials,
 } from "./worker-material-validation.ts";
+import {
+  exactV2ResolvedServiceBindings,
+  type V2ResolvedServiceBinding,
+} from "./worker-service-resolution.ts";
 
 export type V2WorkerModuleInspector = (
   input: WorkerModuleInspectionInput,
@@ -49,6 +53,8 @@ export interface V2WorkerCodeEligibilityInput {
   readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
   readonly inspectModule: V2WorkerModuleInspector;
   readonly privateInputs?: unknown;
+  /** Supplied only after the current accepted SQL reference graph was verified. */
+  readonly resolvedServiceBindings?: readonly V2ResolvedServiceBinding[];
 }
 
 interface VerifiedV2WorkerCodeEligibility {
@@ -121,9 +127,17 @@ async function verifyV2WorkerCodeProjection(
     spec.sqliteBindings.length > 0 ||
     spec.bucketBindings.length > 0 ||
     spec.queueProducerBindings.length > 0 ||
-    spec.serviceBindings.length > 0 ||
     spec.actorBindings.length > 0 ||
     spec.workflowBindings.length > 0
+  ) {
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
+  }
+  // The service target digest is asynchronous. Hold the accepted bytes before
+  // that await so the caller cannot replace a Bundle during validation.
+  if (!input.bundle) throw bundleUnavailable();
+  const bundle = snapshotBundle(input.bundle);
+  if (
+    !(await exactV2ResolvedServiceBindings(spec.serviceBindings, input.resolvedServiceBindings))
   ) {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
@@ -141,9 +155,6 @@ async function verifyV2WorkerCodeProjection(
   if (!spec.assets && input.assets) {
     throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
   }
-  if (!input.bundle) throw bundleUnavailable();
-
-  const bundle = snapshotBundle(input.bundle);
   const manifest = await verifyBundle(bundle);
   let assets: V2VerifiedAssetMaterials | undefined;
   if (spec.assets) {
