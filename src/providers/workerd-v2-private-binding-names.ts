@@ -5,6 +5,8 @@
  */
 export const WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE =
   "__takoserver-selfhost-entrypoint-v2-private-names.js" as const;
+export const WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE =
+  "__takoserver-v2-private-workflow-binding-entrypoint.js" as const;
 
 export function hasWorkerdV2PrivateBindingProfile(site: {
   readonly hostEntrypoint?: string;

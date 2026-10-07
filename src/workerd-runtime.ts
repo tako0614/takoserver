@@ -47,6 +47,7 @@ import {
   WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING,
   WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING,
   WORKERD_V2_PRIVATE_READINESS_BINDING,
+  WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
   workerdV2PrivateActorBindingName,
   workerdV2PrivateWorkflowBindingIndex,
   workerdV2PrivateWorkflowBindingName,
@@ -1973,7 +1974,11 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       const workflowForward =
         site.workflowForward === undefined
           ? undefined
-          : validWorkflowForward(site.workflowForward, hasWorkerdV2PrivateBindingProfile(site));
+          : validWorkflowForward(
+              site.workflowForward,
+              hasWorkerdV2PrivateBindingProfile(site),
+              site.hostEntrypoint === WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
+            );
       const v2ObjectBucketPlane =
         site.v2ObjectBucketPlane === undefined
           ? undefined
@@ -2730,7 +2735,11 @@ function validV2WorkflowForwardBinding(
   return { ...binding };
 }
 
-function validWorkflowForward(value: unknown, v2PrivateNames = false): WorkerdWorkflowForward {
+function validWorkflowForward(
+  value: unknown,
+  v2PrivateNames = false,
+  activeV2PrivateEntrypoint = false,
+): WorkerdWorkflowForward {
   if (
     typeof value !== "object" ||
     value === null ||
@@ -2743,7 +2752,8 @@ function validWorkflowForward(value: unknown, v2PrivateNames = false): WorkerdWo
   if (
     (candidate.schema !== WORKFLOW_FORWARD_SCHEMA &&
       candidate.schema !== V2_WORKFLOW_FORWARD_SCHEMA) ||
-    (candidate.schema === V2_WORKFLOW_FORWARD_SCHEMA && !v2PrivateNames) ||
+    (candidate.schema === V2_WORKFLOW_FORWARD_SCHEMA &&
+      (!v2PrivateNames || !activeV2PrivateEntrypoint)) ||
     typeof candidate.snapshotDigest !== "string" ||
     !/^sha256:[a-f0-9]{64}$/u.test(candidate.snapshotDigest) ||
     !Array.isArray(candidate.bindings) ||
@@ -2940,6 +2950,7 @@ function workflowForwardPublications(
       const forward = validWorkflowForward(
         variant.manifest.workflowForward,
         hasWorkerdV2PrivateBindingProfile(variant.manifest),
+        variant.manifest.hostEntrypoint === WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
       );
       const bindings = Object.freeze(
         forward.bindings.map((binding) =>
@@ -3001,6 +3012,7 @@ function workflowForwardPublicationsForInput(
     const forward = validWorkflowForward(
       version.site.workflowForward,
       hasWorkerdV2PrivateBindingProfile(version.site),
+      version.site.hostEntrypoint === WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
     );
     const bindings = Object.freeze(
       forward.bindings.map((binding) =>
@@ -3902,7 +3914,11 @@ async function prepareWorkerdSite(
   const workflowForward =
     site.workflowForward === undefined
       ? undefined
-      : validWorkflowForward(site.workflowForward, hasWorkerdV2PrivateBindingProfile(site));
+      : validWorkflowForward(
+          site.workflowForward,
+          hasWorkerdV2PrivateBindingProfile(site),
+          site.hostEntrypoint === WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
+        );
   const v2ObjectBucketPlane =
     site.v2ObjectBucketPlane === undefined
       ? undefined
@@ -4692,7 +4708,11 @@ async function readValidatedManifest(
   const workflowForward =
     manifest.workflowForward === undefined
       ? undefined
-      : validWorkflowForward(manifest.workflowForward, hasWorkerdV2PrivateBindingProfile(manifest));
+      : validWorkflowForward(
+          manifest.workflowForward,
+          hasWorkerdV2PrivateBindingProfile(manifest),
+          manifest.hostEntrypoint === WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
+        );
   validActorForwardCollision(
     actorForward,
     vars,
