@@ -77,6 +77,8 @@ export interface SelfhostV2WorkerCompositionOptions {
   readonly sqliteBinding?: {
     readonly store: SelfhostV2SQLiteStore;
     readonly signingKey: Uint8Array;
+    /** Pre-existing operator-private real directory for SQL input staging. */
+    readonly stagingRoot: string;
     /** Stable operator-selected loopback port, retained across Host restarts. */
     readonly privatePort: number;
   };
@@ -266,6 +268,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     ? Object.freeze({
         store: Object.freeze({ ...options.sqliteBinding.store }),
         signingKey: new Uint8Array(options.sqliteBinding.signingKey),
+        stagingRoot: options.sqliteBinding.stagingRoot,
         privatePort: options.sqliteBinding.privatePort,
       })
     : undefined;
@@ -355,6 +358,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       ? createSelfhostV2SqliteBindingBroker({
           store: sqliteBinding.store,
           signingKey: sqliteBinding.signingKey,
+          stagingRoot: sqliteBinding.stagingRoot,
           resolveCurrentBinding: sqliteAuthority.resolveCurrentBinding,
           async observeVersionTarget(input) {
             try {

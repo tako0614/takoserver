@@ -2,6 +2,7 @@
 // selected private custody across process replacement; no public Worker Form
 // support, tenant credential, or production key is configured here.
 import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { buildApp } from "../../src/app.ts";
 import { migrateSqlite } from "../../src/migrate-sqlite.ts";
@@ -99,6 +100,8 @@ try {
     targetKey: TARGET,
     now: clock,
   });
+  const stagingRoot = join(root, "sql-input-staging");
+  mkdirSync(stagingRoot, { recursive: true, mode: 0o700 });
   const migrationSource = createV2HeldArtifactSource({
     objects,
     entries: config.sqliteMigrationSet.heldArtifacts,
@@ -119,6 +122,7 @@ try {
     workerdBinary: binary,
     sqliteBinding: {
       store,
+      stagingRoot,
       signingKey: new Uint8Array(32).fill(0x58),
       privatePort,
     },

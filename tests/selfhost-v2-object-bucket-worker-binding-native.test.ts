@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildApp } from "../src/app.ts";
@@ -193,6 +193,8 @@ export default {
         return port;
       };
       const sqlitePrivatePort = await reservePrivatePort();
+      const sqliteStagingRoot = join(root, "sql-input-staging");
+      await mkdir(sqliteStagingRoot, { mode: 0o700 });
       const kvPrivatePort = await reservePrivatePort();
       const portReservation = Bun.serve({
         hostname: "127.0.0.1",
@@ -220,6 +222,7 @@ export default {
         },
         sqliteBinding: {
           store: sqliteStore,
+          stagingRoot: sqliteStagingRoot,
           signingKey: new Uint8Array(32).fill(0x64),
           privatePort: sqlitePrivatePort,
         },

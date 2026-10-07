@@ -234,6 +234,34 @@ export default {
     const token = env[TOKEN];
     const plane = env[PLANE];
     if (typeof token !== "string" || token.length === 0 || !plane) return refuse(503);
+    if (pathname === SQL_PATH) {
+      // SQL's published input limits are per statement/value, not an aggregate
+      // 40 MiB cap. Stream only this fixed route to the Host-private staged
+      // reader; the other JSON data planes retain their existing ceiling.
+      if (!request.body) return refuse(400);
+      let response;
+      try {
+        response = await plane.fetch(SQL_URL, {
+          method: "POST",
+          headers: { authorization: "Bearer " + token, "content-type": CONTENT_TYPE },
+          body: request.body,
+          duplex: "half",
+        });
+      } catch {
+        return refuse(502);
+      }
+      let text;
+      try {
+        text = await response.text();
+      } catch {
+        return refuse(502);
+      }
+      if (text.length > MAX_BYTES) return refuse(502);
+      return new Response(text, {
+        status: response.status,
+        headers: { "content-type": "application/json" },
+      });
+    }
     let body;
     if (pathname === VECTOR_PATH) {
       body = await readVectorBody(request);

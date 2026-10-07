@@ -50,6 +50,10 @@ export interface SelfhostV2SqlitePlane {
   transaction(
     statements: readonly SelfhostV2SqliteStatement[],
   ): Promise<Readonly<{ results: readonly SelfhostV2SqliteResult[] }>>;
+  /** Host-private staged input: read one statement at a time inside one transaction. */
+  transactionStaged(
+    statements: () => Iterable<unknown>,
+  ): Promise<Readonly<{ results: readonly SelfhostV2SqliteResult[] }>>;
   /** Closes the injected Host-selected connection; it never removes its file. */
   close(): void;
 }
@@ -345,6 +349,22 @@ export function createSelfhostV2SqlitePlane(
       const outputBudget = { serializedRowsBytes: 0 };
       return withTransaction(true, () => {
         const results = input.map((statement) => runStatement(statement, "changes", outputBudget));
+        return checkEnvelope(Object.freeze({ results: Object.freeze(results) }));
+      });
+    },
+
+    async transactionStaged(
+      statements: () => Iterable<unknown>,
+    ): Promise<Readonly<{ results: readonly SelfhostV2SqliteResult[] }>> {
+      if (typeof statements !== "function") throw new TypeError("staged statements are required");
+      const outputBudget = { serializedRowsBytes: 0 };
+      return withTransaction(true, () => {
+        const results: SelfhostV2SqliteResult[] = [];
+        for (const raw of statements()) {
+          if (results.length >= MAX_STATEMENTS) throw new TypeError("too many staged statements");
+          results.push(runStatement(snapshotStatement(raw), "changes", outputBudget));
+        }
+        if (results.length === 0) throw new TypeError("staged transaction cannot be empty");
         return checkEnvelope(Object.freeze({ results: Object.freeze(results) }));
       });
     },

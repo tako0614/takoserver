@@ -47,8 +47,18 @@ SQLiteDatabase 0.2.0 behavior is qualified. The production composition must
 provide the persistent signing key and exact graph resolver; test stubs for
 those ports are never authority.
 
-The retained Host-private JSON companion has a 40 MiB request ceiling. A
-transaction whose individually valid statements/values exceed that aggregate
-size is still a conformance gap; this internal connection must not be labeled
-full SQLiteDatabase 0.2.0 support until the transport and boundary tests cover
-that case as well.
+The Host-private companion streams SQL requests separately from the retained
+40 MiB KV/Queue JSON path. The SQLite broker first stages an input larger than
+1 MiB beneath an operator-selected private root, opens a mode-0600 file in a
+fresh mode-0700 call directory, then unlinks the file before reading it through
+its private descriptor. Normal, malformed, and interrupted calls close that
+descriptor and remove their own directory; process death cannot leave named SQL
+input bytes, although an empty directory may remain. Each staged statement is
+read and executed in order under one UID lock and SQLite transaction, with the
+published combined-output limit checked before commit.
+
+The native 42-by-1-MB transaction journey now succeeds. This does not establish
+the full maximum legal input size: the Worker adapter still serializes a whole
+call to JSON before sending it, and resource exhaustion may return
+`backend_unavailable`. Do not advertise full SQLiteDatabase 0.2.0 support from
+this bounded evidence alone.

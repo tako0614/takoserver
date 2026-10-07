@@ -2,6 +2,7 @@
 // All keys and ports are fixed test inputs; this does not mount Worker Forms
 // into the normal application registry or claim public Support.
 import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { buildApp } from "../../src/app.ts";
 import { migrateSqlite } from "../../src/migrate-sqlite.ts";
@@ -106,6 +107,8 @@ const objectBucketStore = createSelfhostV2ObjectBucketStore({
 
 let composition: ReturnType<typeof createSelfhostV2WorkerComposition>;
 try {
+  const stagingRoot = join(root, "sql-input-staging");
+  mkdirSync(stagingRoot, { recursive: true, mode: 0o700 });
   composition = createSelfhostV2WorkerComposition({
     sql,
     objects,
@@ -116,6 +119,7 @@ try {
     workerdBinary: binary,
     sqliteBinding: {
       store: sqliteStore,
+      stagingRoot,
       signingKey: new Uint8Array(32).fill(0x72),
       privatePort: sqlitePort,
     },
