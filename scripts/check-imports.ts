@@ -174,6 +174,11 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "adapter", "v2-application", "v2-config", "v2-form", "v2-runtime"],
   },
   {
+    name: "v2-selfhost-queue-composition",
+    match: /^src\/selfhost-v2-queue-composition\.ts$/u,
+    may: ["core", "domain", "adapter", "v2-queue-manager", "v2-runtime"],
+  },
+  {
     name: "release-data",
     match:
       /^(?:vendor\/takoform\/.*\.json|src\/generated\/takoform-(?:stable-v1-catalog|stable-error-taxonomy|integration-form-packages|publisher-set-receipt|publisher-set-authority-closure)\.ts)$/u,
