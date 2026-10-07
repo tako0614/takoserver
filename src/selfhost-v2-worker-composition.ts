@@ -3,6 +3,7 @@ import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
 import type { V2OperatorFormFactory } from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
+import { readV2ConfiguredPrivateInputs } from "./takoform-v2/configured-private-inputs.ts";
 import { createV2HeldArtifactSource } from "./takoform-v2/forms/artifact-source.ts";
 import { createStaticAssetBundleCustody } from "./takoform-v2/forms/static-asset-bundle-backend.ts";
 import { createWorkerBundleCustody } from "./takoform-v2/forms/worker-bundle-backend.ts";
@@ -19,9 +20,11 @@ import { createWorkerEndpointForm } from "./takoform-v2/worker-endpoint-backend.
 import {
   createInternalV2ModuleWorkerForm,
   createInternalV2WorkerVersionForm,
+  createV2CodeConfiguredInputReader,
 } from "./takoform-v2/worker-lifecycle-backend.ts";
 import { createV2WorkerPublicationState } from "./takoform-v2/worker-publication-state.ts";
 import { createV2WorkerdWorkerRuntimeReaders } from "./takoform-v2/worker-runtime-readers.ts";
+import type { createV2WorkerVersionConfiguredInputSealer } from "./takoform-v2/worker-version-configured-inputs.ts";
 import { spawnWorkerdWithParentDeath } from "./workerd-linux-process.ts";
 import type { WorkerdProcess } from "./workerd-supervisor.ts";
 import { createWorkerdWorkerModuleInspector } from "./workerd-worker-module-inspector.ts";
@@ -45,6 +48,8 @@ export interface SelfhostV2WorkerCompositionOptions {
   readonly targetKey: string;
   /** Already selected and pinned by the normal Bun entry. */
   readonly workerdBinary: string | null;
+  /** Already-created operator key authority; absent refuses sensitive Worker Versions. */
+  readonly configuredInputSealer?: ReturnType<typeof createV2WorkerVersionConfiguredInputSealer>;
   /** Exact frontend authority; absent on the ordinary public entry today. */
   readonly endpoint?: EndpointPorts;
   /** Tests may substitute a child, but production uses parent-death-fenced Workerd. */
@@ -88,6 +93,29 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     throw new TypeError("v2 Worker composition requires SQL, objects, target and private root");
   }
   const { sql, objects, clock, config, targetKey } = options;
+  const configuredInputSealer = options.configuredInputSealer;
+  if (
+    configuredInputSealer &&
+    (typeof configuredInputSealer.seal !== "function" ||
+      typeof configuredInputSealer.open !== "function" ||
+      typeof configuredInputSealer.compare !== "function")
+  ) {
+    throw new TypeError("v2 Worker configured input sealer is incomplete");
+  }
+  const configuredInputCustody = configuredInputSealer
+    ? {
+        read: (identity: Parameters<typeof readV2ConfiguredPrivateInputs>[1]) =>
+          readV2ConfiguredPrivateInputs(sql, identity),
+      }
+    : undefined;
+  const configuredInputs =
+    configuredInputSealer && configuredInputCustody
+      ? createV2CodeConfiguredInputReader({
+          sql,
+          sealer: configuredInputSealer,
+          custody: configuredInputCustody,
+        })
+      : undefined;
   const bundleCustody = config.workerBundle
     ? createWorkerBundleCustody({
         sql,
@@ -151,6 +179,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         workerResourceUid: uid,
         targetKey,
         publicationState,
+        ...(configuredInputs ? { configuredInputs } : {}),
         workerdBinary: options.workerdBinary,
         inspectModule,
         listenerPortForOperation,
@@ -269,6 +298,9 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         publicationState,
         retirement: readers.retirement,
         inspectModule,
+        ...(configuredInputSealer && configuredInputCustody
+          ? { configuredInputSealer, configuredInputCustody }
+          : {}),
       }),
       [WORKER_DEPLOYMENT_FORM_URL]: createWorkerDeploymentForm({
         targetKey,
