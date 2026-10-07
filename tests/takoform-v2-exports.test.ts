@@ -19,6 +19,7 @@ import {
   MODULE_WORKER_FORM_URL,
   parseModuleWorkerSpec,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import { inspectV2WorkerCodeVersionEligibility as portableEligibility } from "../src/takoform-v2/worker-code-eligibility.ts";
 import { inspectV2WorkerCodeVersionEligibility } from "../src/takoform-v2/worker-code-runtime.ts";
 import { createV2NativeDeletionCustody } from "../src/takoform-v2/worker-native-deletions.ts";
 import { createV2NativeEffectCustody } from "../src/takoform-v2/worker-native-effects.ts";
@@ -56,6 +57,7 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(extension.inspectV2WorkerCodeVersionEligibility).toBe(
     inspectV2WorkerCodeVersionEligibility,
   );
+  expect(inspectV2WorkerCodeVersionEligibility).toBe(portableEligibility);
   expect(extension.createV2NativeEffectCustody).toBe(createV2NativeEffectCustody);
   expect(extension.createV2NativeDeletionCustody).toBe(createV2NativeDeletionCustody);
   expect(extension.parseModuleWorkerSpec).toBe(parseModuleWorkerSpec);

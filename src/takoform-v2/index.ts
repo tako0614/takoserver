@@ -42,7 +42,7 @@ export type {
 export {
   inspectV2WorkerCodeVersionEligibility,
   type V2WorkerModuleInspector,
-} from "./worker-code-runtime.ts";
+} from "./worker-code-eligibility.ts";
 export {
   createV2WorkerInvocationLifecycle,
   type V2WorkerInvocationAdmission,

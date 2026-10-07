@@ -57,7 +57,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "v2-extension",
     match: /^src\/takoform-v2\/index\.ts$/u,
-    may: ["core", "v2-contract", "v2-state", "v2-form", "v2-runtime"],
+    may: ["core", "v2-contract", "v2-state", "v2-form", "v2-code-validation", "v2-runtime"],
   },
   {
     name: "v2-contract",
@@ -75,10 +75,25 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "v2-contract", "v2-form"],
   },
   {
+    name: "v2-code-validation",
+    match: /^src\/takoform-v2\/(?:worker-code-eligibility|worker-material-validation)\.ts$/u,
+    // Eligibility accepts a host-supplied semantic inspector. Its adapter
+    // contract is imported as a type only; this layer never loads an adapter.
+    may: ["core", "v2-form", "v2-code-validation", "adapter"],
+  },
+  {
     name: "v2-runtime",
     match:
       /^src\/takoform-v2\/(?:worker-bundle-runtime|worker-code-runtime|worker-cron-trigger-backend|worker-cron-trigger-scheduler|worker-deployment-backend|worker-endpoint-backend|worker-lifecycle-backend|worker-runtime-readers|worker-publication-state|worker-publication-sql-guard|worker-static-runtime|worker-static-publication|worker-native-effects|worker-native-deletions)\.ts$|^src\/workerd-worker-runtime-owner\.ts$/u,
-    may: ["core", "v2-contract", "v2-state", "v2-form", "v2-runtime", "adapter"],
+    may: [
+      "core",
+      "v2-contract",
+      "v2-state",
+      "v2-form",
+      "v2-code-validation",
+      "v2-runtime",
+      "adapter",
+    ],
   },
   {
     name: "v2-engine",
