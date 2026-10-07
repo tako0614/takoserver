@@ -2422,13 +2422,14 @@ function freezeObject(value) {
 function createPlaneCaller(rawEnv, internalName) {
   const service = rawEnv[internalName || DATA_SERVICE];
   const send = captureMethod(service, "fetch");
-  return async (url, payload, codes, project) => {
+  return async (url, payload, codes, project, requestBody) => {
     const headers = SafeObjectCreate(null);
     headers["content-type"] = CONTENT_TYPE;
     const init = SafeObjectCreate(null);
     init.method = "POST";
     init.headers = headers;
-    init.body = SafeJSONStringify(payload);
+    init.body = requestBody === undefined ? SafeJSONStringify(payload) : requestBody;
+    if (requestBody !== undefined) init.duplex = "half";
     let response;
     try {
       response = await SafeApply(send, service, [url, init]);
@@ -2584,23 +2585,25 @@ function createSqlAdapter(call, binding) {
   portable.execute = async (sql, params) => {
     const payload = planeRequest(binding, "execute");
     payload.statement = sqlInput(sql, params);
-    return projectSqlResult(await call(SQL_URL, payload, SQL_ERROR_CODES));
+    return projectSqlResult(await callSql(payload));
   };
   portable.query = async (sql, params) => {
     const payload = planeRequest(binding, "query");
     payload.statement = sqlInput(sql, params);
-    const result = projectSqlResult(await call(SQL_URL, payload, SQL_ERROR_CODES));
+    const result = projectSqlResult(await callSql(payload));
     if (result.rowsWritten !== 0) throw portableError("backend_unavailable");
     return result;
   };
   portable.transaction = async (statements) => {
-    if (!SafeArrayIsArray(statements) || statements.length < 1 || statements.length > MAX_SQL_STATEMENTS) {
+    if (!SafeArrayIsArray(statements)) throw portableError("sql_error");
+    const statementCount = statements.length;
+    if (statementCount < 1 || statementCount > MAX_SQL_STATEMENTS) {
       throw portableError("sql_error");
     }
-    const normalized = mapArray(statements, normalizeSqlStatement);
+    const normalized = snapshotSqlArray(statements, statementCount, normalizeSqlStatement);
     const payload = planeRequest(binding, "transaction");
     payload.statements = normalized;
-    const value = await call(SQL_URL, payload, SQL_ERROR_CODES);
+    const value = await callSql(payload);
     if (
       !isRecord(value) ||
       !exactKeys(value, ["results"]) ||
@@ -2617,7 +2620,137 @@ function createSqlAdapter(call, binding) {
     }
     return envelope;
   };
+  function callSql(payload) {
+    return call(SQL_URL, payload, SQL_ERROR_CODES, undefined, createSqlRequestBody(payload));
+  }
   return portable;
+}
+
+/**
+ * SQL's published per-field bounds allow a transaction body much larger than
+ * the ordinary data-plane buffer. The inputs here are already validated and
+ * copied by sqlInput, so later tenant mutations cannot change an async pull.
+ * Only this SQL route uses a streaming request body; other facades retain their
+ * existing buffered transport.
+ */
+function createSqlRequestBody(payload) {
+  const tasks = SafeObjectCreate(null);
+  let taskCount = 0;
+  function push(kind, value, index) {
+    const task = SafeObjectCreate(null);
+    task.kind = kind;
+    task.value = value;
+    task.index = index;
+    tasks[taskCount] = task;
+    taskCount += 1;
+  }
+  function bytes(value) {
+    return SafeApply(SafeTextEncoderEncode, encoder, [value]);
+  }
+  function quotedFragment(value, start) {
+    let end = start + 4096;
+    if (end > value.length) end = value.length;
+    // JSON.stringify must see both halves of a pair together. A lone
+    // surrogate remains lone and is escaped by the captured intrinsic.
+    if (end < value.length) {
+      const last = SafeApply(SafeStringCharCodeAt, value, [end - 1]);
+      const next = SafeApply(SafeStringCharCodeAt, value, [end]);
+      if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+        end -= 1;
+      }
+    }
+    const units = SafeObjectCreate(null);
+    units.length = end - start;
+    for (let at = start; at < end; at += 1) {
+      units[at - start] = SafeApply(SafeStringCharCodeAt, value, [at]);
+    }
+    const fragment = SafeApply(SafeStringFromCharCode, undefined, units);
+    const encoded = bytes(SafeJSONStringify(fragment));
+    const buffer = SafeApply(SafeTypedArrayBufferGet, encoded, []);
+    const offset = SafeApply(SafeTypedArrayByteOffsetGet, encoded, []);
+    const length = SafeApply(SafeTypedArrayByteLengthGet, encoded, []);
+    return {
+      next: end,
+      bytes: new SafeUint8Array(buffer, offset + 1, length - 2),
+    };
+  }
+  push("literal", payload.op === "transaction" ? "]}" : "}");
+  if (payload.op === "transaction") {
+    push("statements", payload.statements, 0);
+    push("literal", ',"statements":[');
+  } else {
+    push("statement", payload.statement);
+    push("literal", ',"statement":');
+  }
+  push("literal", '{"protocol":' + SafeJSONStringify(payload.protocol) +
+    ',"binding":' + SafeJSONStringify(payload.binding) +
+    ',"op":' + SafeJSONStringify(payload.op));
+  return new SafeReadableStream({
+    pull(controller) {
+      while (taskCount > 0) {
+        taskCount -= 1;
+        const task = tasks[taskCount];
+        delete tasks[taskCount];
+        let chunk;
+        if (task.kind === "literal") {
+          chunk = bytes(task.value);
+        } else if (task.kind === "quoted") {
+          push("literal", '"');
+          push("string", task.value, 0);
+          push("literal", '"');
+        } else if (task.kind === "string") {
+          if (task.index < task.value.length) {
+            const fragment = quotedFragment(task.value, task.index);
+            if (fragment.next < task.value.length) {
+              push("string", task.value, fragment.next);
+            }
+            chunk = fragment.bytes;
+          }
+        } else if (task.kind === "statement") {
+          push("literal", SafeObjectHasOwn(task.value, "params") ? "]}" : "}");
+          if (SafeObjectHasOwn(task.value, "params")) {
+            push("params", task.value.params, 0);
+            push("literal", ',"params":[');
+          }
+          push("quoted", task.value.sql);
+          push("literal", '{"sql":');
+        } else if (task.kind === "statements") {
+          if (task.index < task.value.length) {
+            push("statements", task.value, task.index + 1);
+            push("statement", task.value[task.index]);
+            if (task.index > 0) push("literal", ",");
+          }
+        } else if (task.kind === "params") {
+          if (task.index < task.value.length) {
+            push("params", task.value, task.index + 1);
+            push("value", task.value[task.index]);
+            if (task.index > 0) push("literal", ",");
+          }
+        } else if (task.kind === "value") {
+          if (typeof task.value === "string") {
+            push("quoted", task.value);
+          } else if (task.value !== null && typeof task.value === "object") {
+            push("literal", "}");
+            push("quoted", task.value.data);
+            push("literal", '{"encoding":"base64","data":');
+          } else {
+            chunk = bytes(SafeJSONStringify(task.value));
+          }
+        }
+        if (chunk !== undefined) {
+          SafeApply(SafeReadableStreamControllerEnqueue, controller, [chunk]);
+          return;
+        }
+      }
+      SafeApply(SafeReadableStreamControllerClose, controller, []);
+    },
+    cancel() {
+      while (taskCount > 0) {
+        taskCount -= 1;
+        delete tasks[taskCount];
+      }
+    },
+  });
 }
 
 ${renderEdgeVectorWorkerFacadeSource()}
@@ -2627,12 +2760,24 @@ function sqlInput(sql, params) {
   const input = SafeObjectCreate(null);
   input.sql = sql;
   if (params !== undefined) {
-    if (!SafeArrayIsArray(params) || params.length > MAX_SQL_PARAMETERS) {
+    if (!SafeArrayIsArray(params)) throw portableError("sql_error");
+    const parameterCount = params.length;
+    if (parameterCount > MAX_SQL_PARAMETERS) {
       throw portableError("sql_error");
     }
-    input.params = mapArray(params, projectSqlValue);
+    input.params = snapshotSqlArray(params, parameterCount, projectSqlValue);
   }
   return input;
+}
+
+function snapshotSqlArray(values, length, project) {
+  const output = [];
+  for (let index = 0; index < length; index += 1) {
+    SafeApply(SafeObjectDefineProperty, SafeObject, [output, index, {
+      value: project(values[index]), enumerable: true, configurable: true, writable: true,
+    }]);
+  }
+  return output;
 }
 
 function normalizeSqlStatement(statement) {
