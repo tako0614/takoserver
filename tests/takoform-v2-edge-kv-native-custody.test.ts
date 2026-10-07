@@ -238,6 +238,24 @@ test("confirmed exact ID survives same-spec UPDATE and DELETE one-send/absence p
       f.create.operationId,
     ]);
     expect(await f.custody.readSettledTarget(settledCreate)).toEqual(expectedTarget);
+    const numericTrue = JSON.stringify({ ...JSON.parse(originalObserved), namespaceExists: 1 });
+    await f.sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+      numericTrue,
+      f.create.resourceUid,
+    ]);
+    await f.sql.run("UPDATE tf_v2_operations SET result_observed_json = ? WHERE id = ?", [
+      numericTrue,
+      f.create.operationId,
+    ]);
+    expect(await f.custody.readSettledTarget(settledCreate)).toBeNull();
+    await f.sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+      originalObserved,
+      f.create.resourceUid,
+    ]);
+    await f.sql.run("UPDATE tf_v2_operations SET result_observed_json = ? WHERE id = ?", [
+      originalObserved,
+      f.create.operationId,
+    ]);
     const update = await f.engine.acceptUpdate({
       principal: "org-a",
       key: "update-edge-kv-native-0001",
@@ -252,6 +270,7 @@ test("confirmed exact ID survives same-spec UPDATE and DELETE one-send/absence p
       plannedTitle: TITLE,
       closureDigest: DIGEST,
       sourceOperationId: f.create.operationId,
+      sourceGeneration: 1,
     });
     expect(await f.custody.confirmedForUpdate({ ...updateExecution, space: "other" })).toBeNull();
     await f.settle(updateExecution);
@@ -275,11 +294,15 @@ test("confirmed exact ID survives same-spec UPDATE and DELETE one-send/absence p
       plannedTitle: TITLE,
       closureDigest: DIGEST,
       sourceOperationId: f.create.operationId,
+      sourceGeneration: 1,
     });
     if (!prepared) throw new Error("missing confirmed source");
     expect(await f.custody.inspectDelete(deleteExecution)).toEqual({ kind: "never_granted" });
     expect(
       await f.custody.grantDelete(deleteExecution, { ...prepared, nativeId: "c".repeat(32) }),
+    ).toEqual({ kind: "conflict" });
+    expect(
+      await f.custody.grantDelete(deleteExecution, { ...prepared, sourceGeneration: 2 }),
     ).toEqual({ kind: "conflict" });
     expect(await f.custody.inspectDelete(deleteExecution)).toEqual({ kind: "never_granted" });
     expect(await f.custody.grantDelete(deleteExecution, prepared)).toEqual({
@@ -288,6 +311,7 @@ test("confirmed exact ID survives same-spec UPDATE and DELETE one-send/absence p
       plannedTitle: TITLE,
       closureDigest: DIGEST,
       sourceOperationId: f.create.operationId,
+      sourceGeneration: 1,
     });
     expect(await f.custody.grantDelete(deleteExecution, prepared)).toMatchObject({
       kind: "already_granted",
@@ -354,6 +378,7 @@ test("DELETE cannot adopt a title or unconfirmed CREATE intent as a native names
         plannedTitle: TITLE,
         closureDigest: DIGEST,
         sourceOperationId: f.create.operationId,
+        sourceGeneration: 1,
       }),
     ).toEqual({ kind: "conflict" });
     expect(await f.custody.inspectDelete(execution)).toEqual({ kind: "never_granted" });

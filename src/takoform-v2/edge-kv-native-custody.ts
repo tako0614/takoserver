@@ -41,6 +41,7 @@ export interface V2EdgeKvConfirmedIdentity {
   readonly plannedTitle: string;
   readonly closureDigest: `sha256:${string}`;
   readonly sourceOperationId: string;
+  readonly sourceGeneration: number;
 }
 
 export interface V2EdgeKvSettledTargetInput {
@@ -151,22 +152,13 @@ function same(row: CustodyRow, e: V2Execution): boolean {
 }
 
 function confirmed(row: CustodyRow): V2EdgeKvConfirmedIdentity | null {
-  if (!row.native_id || !row.confirmed_receipt) return null;
+  if (row.action !== "create" || !row.native_id || !row.confirmed_receipt) return null;
   return {
     nativeId: row.native_id,
     plannedTitle: row.planned_title,
     closureDigest: row.closure_digest as `sha256:${string}`,
-    sourceOperationId: row.action === "create" ? row.operation_id : (row.source_operation_id ?? ""),
-  };
-}
-
-function deleteIdentity(row: CustodyRow): V2EdgeKvConfirmedIdentity | null {
-  if (row.action !== "delete" || !row.native_id || !row.source_operation_id) return null;
-  return {
-    nativeId: row.native_id,
-    plannedTitle: row.planned_title,
-    closureDigest: row.closure_digest as `sha256:${string}`,
-    sourceOperationId: row.source_operation_id,
+    sourceOperationId: row.operation_id,
+    sourceGeneration: row.generation,
   };
 }
 
@@ -258,6 +250,11 @@ export function createV2EdgeKvNativeCustody(options: { readonly sql: Sql; readon
            AND json_valid(resource.observed_json) = 1
            AND json_type(resource.observed_json) = 'object'
            AND (SELECT COUNT(*) FROM json_each(resource.observed_json)) = 5
+           AND json_type(resource.observed_json, '$.namespaceExists') = 'true'
+           AND json_type(resource.observed_json, '$.maxKeyBytes') = 'integer'
+           AND json_type(resource.observed_json, '$.maxValueBytes') = 'integer'
+           AND json_type(resource.observed_json, '$.maxMetadataBytes') = 'integer'
+           AND json_type(resource.observed_json, '$.consistency') = 'text'
            AND json_extract(resource.observed_json, '$.namespaceExists') = 1
            AND json_extract(resource.observed_json, '$.maxKeyBytes') = ?
            AND json_extract(resource.observed_json, '$.maxValueBytes') = ?
@@ -526,7 +523,9 @@ export function createV2EdgeKvNativeCustody(options: { readonly sql: Sql; readon
         !validText(expected.nativeId, 255) ||
         !validText(expected.plannedTitle, 512) ||
         !DIGEST.test(expected.closureDigest) ||
-        !validText(expected.sourceOperationId, 128)
+        !validText(expected.sourceOperationId, 128) ||
+        !Number.isSafeInteger(expected.sourceGeneration) ||
+        expected.sourceGeneration < 1
       )
         return { kind: "conflict" };
       const at = time();
@@ -549,7 +548,8 @@ export function createV2EdgeKvNativeCustody(options: { readonly sql: Sql; readon
            AND source.space = resource.space AND source.backend_id = op.backend_id
            AND source.target_key = op.target_key AND source.generation < op.generation
            AND source.native_id IS NOT NULL AND source.confirmed_receipt IS NOT NULL
-           AND source.operation_id = ? AND source.native_id = ?
+           AND source.operation_id = ? AND source.generation = ?
+           AND source.native_id = ?
            AND source.planned_title = ? AND source.closure_digest = ?
            AND NOT EXISTS (SELECT 1 FROM tf_v2_resource_references ref
              JOIN tf_v2_resources referrer ON referrer.uid = ref.referrer_uid
@@ -558,6 +558,7 @@ export function createV2EdgeKvNativeCustody(options: { readonly sql: Sql; readon
         [
           ...params(e, at),
           expected.sourceOperationId,
+          expected.sourceGeneration,
           expected.nativeId,
           expected.plannedTitle,
           expected.closureDigest,
@@ -566,13 +567,27 @@ export function createV2EdgeKvNativeCustody(options: { readonly sql: Sql; readon
       if (!(await current(e))) return { kind: "conflict" };
       const prior = await row(e.operationId);
       if (!prior || !same(prior, e) || prior.action !== "delete") return { kind: "conflict" };
-      const identity = deleteIdentity(prior);
-      if (!identity) return { kind: "conflict" };
+      const source = prior.source_operation_id ? await row(prior.source_operation_id) : null;
+      const identity = source && confirmed(source);
+      if (
+        !identity ||
+        !source ||
+        source.resource_uid !== prior.resource_uid ||
+        source.principal !== prior.principal ||
+        source.space !== prior.space ||
+        source.backend_id !== prior.backend_id ||
+        source.target_key !== prior.target_key ||
+        identity.nativeId !== prior.native_id ||
+        identity.plannedTitle !== prior.planned_title ||
+        identity.closureDigest !== prior.closure_digest
+      )
+        return { kind: "conflict" };
       if (
         identity.nativeId !== expected.nativeId ||
         identity.plannedTitle !== expected.plannedTitle ||
         identity.closureDigest !== expected.closureDigest ||
-        identity.sourceOperationId !== expected.sourceOperationId
+        identity.sourceOperationId !== expected.sourceOperationId ||
+        identity.sourceGeneration !== expected.sourceGeneration
       )
         return { kind: "conflict" };
       return { kind: result.changes === 1 ? "granted" : "already_granted", ...identity };
