@@ -1127,11 +1127,21 @@ test("one Worker update switches only its child, pins an open stream, and replay
   const updateA = "85dc7fd7-07f5-40da-8d2d-253e0eea18c3";
   const deleteA = "6f71ca2a-15a8-47cd-86b2-fc66b3d47df5";
   let oldReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let releaseServiceBindingLease: (() => Promise<void>) | undefined;
   try {
-    expect(await ownerA.execute(execution("worker-a", createA, "create"))).toMatchObject({
-      kind: "confirmed",
-    });
+    const createdA = await ownerA.execute(execution("worker-a", createA, "create"));
+    expect(createdA).toMatchObject({ kind: "confirmed" });
+    if (createdA.kind !== "confirmed") throw new Error("initial Worker create was not confirmed");
+    if (!createdA.identity) throw new Error("initial Worker identity missing");
     stateA.setCurrent(createA);
+    const serviceBindingLease = await ownerA.acquireServiceBindingRequest({
+      workerUid: "worker-a",
+      versionId: createdA.identity.versions[0]?.versionId ?? "missing-version",
+      incarnationId: createA,
+      servingSourceOperationId: createA,
+    });
+    if (serviceBindingLease) releaseServiceBindingLease = () => serviceBindingLease.release();
+    expect(serviceBindingLease?.status).toBe("active");
     expect(await ownerB.execute(execution("worker-b", createB, "create"))).toMatchObject({
       kind: "confirmed",
     });
@@ -1169,8 +1179,13 @@ test("one Worker update switches only its child, pins an open stream, and replay
     const replay = await ownerA.execute(execution("worker-a", updateA, "update"));
     expect(replay).toMatchObject({ kind: "confirmed" });
     expect(owned.children).toHaveLength(3);
+    expect(await serviceBindingLease?.stillCurrent()).toBe(true);
     await oldReader.cancel();
     oldReader = undefined;
+    expect(childAOld.exitCode).toBeNull();
+    expect(childAOld.signalCode).toBeNull();
+    await serviceBindingLease?.release();
+    releaseServiceBindingLease = undefined;
     await until(() => childAOld.exitCode !== null || childAOld.signalCode !== null);
 
     const deleteReader = (
@@ -1218,6 +1233,7 @@ test("one Worker update switches only its child, pins an open stream, and replay
     await replayOwner.close();
   } finally {
     await oldReader?.cancel().catch(() => undefined);
+    await releaseServiceBindingLease?.().catch(() => undefined);
     await ownerA.close().catch(() => undefined);
     await ownerB
       .execute(execution("worker-b", "c7b001f1-2fe7-42a2-aa33-e6fd8c97bd5e", "delete"))

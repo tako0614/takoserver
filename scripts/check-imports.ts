@@ -158,6 +158,12 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "v2-form"],
   },
   {
+    // Host-private streaming bridge for one exact v2 ServiceBinding claim.
+    name: "v2-service-binding-broker",
+    match: /^src\/selfhost-v2-service-binding-broker\.ts$/u,
+    may: ["core", "v2-service-binding-authority"],
+  },
+  {
     // Accepted Core Workflow/Version graph, never legacy Workflow Resource lookup.
     name: "v2-workflow-binding-authority",
     match: /^src\/takoform-v2\/workflow-binding-authority\.ts$/u,

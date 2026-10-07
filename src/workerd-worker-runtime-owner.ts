@@ -216,6 +216,8 @@ interface IncarnationHandle {
   readonly workflowForward?: V2WorkflowForwardIncarnation;
   readonly invocations: Set<ActiveInvocation>;
   readonly workflowLeases: Set<Promise<void>>;
+  /** Native ServiceBinding calls pin the exact caller incarnation through body drain. */
+  readonly serviceBindingLeases: Set<Promise<void>>;
   retirementTimer?: () => void;
   retiring?: Promise<WorkerdWorkerRetirementReceipt>;
 }
@@ -360,6 +362,23 @@ export interface WorkerdWorkerRuntimeOwner {
   >;
   /** Route a Host-accepted request to the exact active incarnation. */
   fetch(request: Request): Promise<Response>;
+  /** Begin one logical ServiceBinding dispatch without waiting for its body. */
+  dispatchServiceBinding(
+    request: Request,
+  ):
+    | { readonly kind: "not_dispatched" }
+    | { readonly kind: "dispatched"; readonly response: Promise<Response> };
+  /** Pin one exact active/draining caller Version until its binding call drains. */
+  acquireServiceBindingRequest(input: {
+    readonly workerUid: string;
+    readonly versionId: string;
+    readonly incarnationId: string;
+    readonly servingSourceOperationId: string;
+  }): Promise<{
+    readonly status: "active" | "draining";
+    stillCurrent(): Promise<boolean>;
+    release(): Promise<void>;
+  } | null>;
   /** Deliver one persisted cron match through the selected current private Version gate. */
   invokeScheduled(input: {
     readonly triggerUid: string;
@@ -2561,7 +2580,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         // A Workflow child may still be using an exact private Service socket.
         // Do not stop its upstream or release the socket namespace until the
         // caller's lease has completed; no elapsed timeout proves retirement.
-        await Promise.all([...incarnation.workflowLeases]);
+        await Promise.all([...incarnation.workflowLeases, ...incarnation.serviceBindingLeases]);
         const receipt = await incarnation.group.retire({
           workerResourceUid: options.workerResourceUid,
           operationId,
@@ -2762,6 +2781,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       ...(workflowForward ? { workflowForward } : {}),
       invocations: new Set(),
       workflowLeases: new Set(),
+      serviceBindingLeases: new Set(),
     };
     handles.set(record.operationId, handle);
     return handle;
@@ -4074,6 +4094,91 @@ export async function openWorkerdWorkerRuntimeOwner(
   };
   const observeVersionTarget: WorkerdWorkerRuntimeOwner["observeVersionTarget"] = (input) =>
     observeVersionTargetCore(input, false);
+  const acquireServiceBindingRequest: WorkerdWorkerRuntimeOwner["acquireServiceBindingRequest"] =
+    async (input) => {
+      const target = {
+        workerUid: input.workerUid,
+        versionId: input.versionId,
+        incarnationId: input.incarnationId,
+        servingSourceOperationId: input.servingSourceOperationId,
+      };
+      const first = await observeVersionTargetCore(target, false);
+      if (first.kind !== "confirmed") return null;
+      let finish!: () => void;
+      const done = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const captured = await runSerial(async () => {
+        const incarnation = handles.get(target.incarnationId);
+        const record = recordFor(target.incarnationId);
+        if (
+          closed ||
+          suspending ||
+          admissionClosedBy !== null ||
+          !incarnation ||
+          !record ||
+          (incarnation.record !== record &&
+            canonicalJson(incarnation.record) !== canonicalJson(record)) ||
+          (record.status !== "active" && record.status !== "draining") ||
+          record.receipt !== null ||
+          record.executionCopiesCleanupStarted ||
+          record.executionCopiesReleased ||
+          !record.identity?.versions.some((version) => version.versionId === target.versionId) ||
+          !incarnation.group.isReady()
+        ) {
+          return null;
+        }
+        incarnation.serviceBindingLeases.add(done);
+        return { incarnation, status: record.status };
+      });
+      if (!captured) return null;
+
+      const stillCurrent = async (): Promise<boolean> => {
+        const current = await observeVersionTargetCore(target, false).catch(() => ({
+          kind: "unknown" as const,
+        }));
+        if (
+          current.kind !== "confirmed" ||
+          (current.status !== captured.status && captured.status === "draining")
+        ) {
+          return false;
+        }
+        return await runSerial(async () => {
+          const incarnation = handles.get(target.incarnationId);
+          const record = recordFor(target.incarnationId);
+          return (
+            !closed &&
+            !suspending &&
+            admissionClosedBy === null &&
+            incarnation === captured.incarnation &&
+            record !== undefined &&
+            (record.status === "active" || record.status === "draining") &&
+            (captured.status !== "draining" || record.status === "draining") &&
+            incarnation.serviceBindingLeases.has(done)
+          );
+        });
+      };
+      let released = false;
+      return {
+        status: captured.status,
+        stillCurrent,
+        async release() {
+          if (released) return;
+          released = true;
+          captured.incarnation.serviceBindingLeases.delete(done);
+          finish();
+          if (
+            !suspending &&
+            captured.incarnation.record.status === "draining" &&
+            captured.incarnation.serviceBindingLeases.size === 0 &&
+            captured.incarnation.invocations.size === 0 &&
+            !captured.incarnation.record.deferRetirementUntilDeadline
+          ) {
+            void retireIncarnation(captured.incarnation).catch(() => undefined);
+          }
+        },
+      };
+    };
   const observeQueueTarget: WorkerdWorkerRuntimeOwner["observeQueueTarget"] = (input) =>
     observeVersionTargetCore(input, true);
   const observeQueuePhysicalAbsence: WorkerdWorkerRuntimeOwner["observeQueuePhysicalAbsence"] = (
@@ -4373,10 +4478,10 @@ export async function openWorkerdWorkerRuntimeOwner(
     return { kind: "confirmed", identity: null };
   }
 
-  const fetchRequest = async (request: Request): Promise<Response> => {
-    if (closed || suspending) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
-    if (admissionClosedBy !== null || !active)
-      throw new WorkerdWorkerRuntimeOwnerError("admission_closed");
+  const dispatchServiceBinding: WorkerdWorkerRuntimeOwner["dispatchServiceBinding"] = (request) => {
+    if (closed || suspending || admissionClosedBy !== null || !active) {
+      return { kind: "not_dispatched" };
+    }
     const incarnation = active;
     let doneResolve!: () => void;
     const done = new Promise<void>((resolve) => {
@@ -4395,12 +4500,38 @@ export async function openWorkerdWorkerRuntimeOwner(
     let forwarded: Request;
     try {
       forwarded = makeRequest(request, AbortSignal.any([request.signal, invocation.abort.signal]));
-      const response = await incarnation.group.fetch(forwarded);
-      return responseWithTrackedBody(response, invocation);
-    } catch (error) {
+    } catch {
       invocation.finish();
-      throw error;
+      return { kind: "not_dispatched" };
     }
+    let response: Promise<Response>;
+    try {
+      // Calling the group is the dispatch boundary. If that Promise later
+      // rejects, the target may already have observed the request.
+      response = incarnation.group.fetch(forwarded);
+    } catch {
+      invocation.finish();
+      return { kind: "not_dispatched" };
+    }
+    return {
+      kind: "dispatched",
+      response: response.then(
+        (value) => responseWithTrackedBody(value, invocation),
+        (error: unknown) => {
+          invocation.finish();
+          throw error;
+        },
+      ),
+    };
+  };
+
+  const fetchRequest = async (request: Request): Promise<Response> => {
+    const dispatched = dispatchServiceBinding(request);
+    if (dispatched.kind === "not_dispatched") {
+      if (closed || suspending) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      throw new WorkerdWorkerRuntimeOwnerError("admission_closed");
+    }
+    return await dispatched.response;
   };
 
   const observeScheduledCapability: WorkerdWorkerRuntimeOwner["observeScheduledCapability"] = (
@@ -5317,7 +5448,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         }
         for (const handle of handles.values()) {
           await cancelInvocations(handle);
-          await Promise.all([...handle.workflowLeases]);
+          await Promise.all([...handle.workflowLeases, ...handle.serviceBindingLeases]);
         }
         for (const handle of handles.values()) {
           if (handle.record.status === "active" || handle.record.status === "draining") {
@@ -5383,6 +5514,8 @@ export async function openWorkerdWorkerRuntimeOwner(
     observeQueuePhysicalAbsence,
     observeRetirement,
     fetch: fetchRequest,
+    dispatchServiceBinding,
+    acquireServiceBindingRequest,
     observeScheduledCapability,
     observeQueueServingCapability,
     invokeQueue,

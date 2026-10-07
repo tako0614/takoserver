@@ -105,6 +105,16 @@ export interface WorkerdServiceBinding {
   readonly unavailableToken: string;
 }
 
+/** Host-owned broker socket for one exact v2 caller Binding router. */
+export interface WorkerdV2ServiceBindingBrokerSocket {
+  readonly socketPath: string;
+  readonly identity: {
+    readonly dev: number;
+    readonly ino: number;
+    readonly uid: number;
+  };
+}
+
 /** Media types workerd can use for a module declaration in this runtime. */
 export type WorkerdModuleMediaType =
   | "application/javascript+module"
@@ -673,6 +683,10 @@ export interface WorkerdRuntimeOptions {
    * Requires immutable weighted publish(); legacy write()/remove() are refused.
    */
   readonly serviceBindingSocketDirectory?: string;
+  /** Optional private cross-Worker bridge. It is consulted only for v2 Forms. */
+  readonly v2ServiceBindingBrokerSocket?: (
+    binding: WorkerdServiceBinding,
+  ) => WorkerdV2ServiceBindingBrokerSocket | undefined;
   /** Static legacy snapshot or live owner graph, sampled once per render. */
   readonly actorForwardSockets?:
     | readonly WorkerdActorForwardSocket[]
@@ -807,6 +821,7 @@ const DATA_PLANE_BINDING = "__TAKOSERVER_SELFHOST_DATA_PLANE";
 const EVENT_TARGET_BINDING = "__TAKOSERVER_SELFHOST_EVENT_TARGET";
 const EVENT_ENTRYPOINT = "takoserverSelfhostEvents";
 const SERVICE_UNAVAILABLE_TOKEN_BINDING = "UNAVAILABLE_TOKEN";
+const PRIVATE_SERVICE_BINDING_TOKEN_HEADER = "x-takoserver-private-service-binding-token";
 /**
  * Compatibility flags for a script published through a generated entrypoint.
  *
@@ -910,7 +925,10 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
   // Host-originated readiness path and is never bound into tenant code.
   const internalReadinessCapability = privateRuntimeToken();
   let activationTail: Promise<void> = Promise.resolve();
-  const servicePins = new Map<string, { readonly binding: WorkerdServiceBinding; count: number }>();
+  const servicePins = new Map<
+    string,
+    { readonly binding: WorkerdServiceBinding; readonly v2Private: boolean; count: number }
+  >();
   let renderedPrivateRouters = new Set<string>();
   let privateSocketRoot: PrivateSocketIdentity | undefined;
   const ownedPrivateSockets = new Map<string, PrivateSocketIdentity>();
@@ -921,13 +939,39 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
   const privateServiceGraph = (published: readonly PublishedDeployment[]) =>
     serviceSocketDirectory === undefined
       ? undefined
-      : {
-          socketDirectory: serviceSocketDirectory,
-          bindings: collectServiceBindings(
+      : (() => {
+          const bindings = collectServiceBindings(
             published,
             [...servicePins.values()].map((pin) => pin.binding),
-          ),
-        };
+          );
+          const v2Routers = new Set(
+            published.flatMap((deployment) =>
+              deployment.variants.flatMap((variant) =>
+                hasWorkerdV2PrivateBindingProfile(variant.manifest)
+                  ? validServiceBindings(variant.manifest.serviceBindings ?? [], true).map(
+                      serviceRouterName,
+                    )
+                  : [],
+              ),
+            ),
+          );
+          for (const [router, pin] of servicePins) {
+            if (pin.v2Private) v2Routers.add(router);
+          }
+          const brokerSockets = new Map<string, WorkerdV2ServiceBindingBrokerSocket>();
+          for (const [router, binding] of bindings) {
+            if (!v2Routers.has(router)) continue;
+            const socket = options.v2ServiceBindingBrokerSocket?.(binding);
+            if (socket !== undefined) {
+              validV2ServiceBindingBrokerSocket(socket);
+              brokerSockets.set(router, {
+                socketPath: socket.socketPath,
+                identity: { ...socket.identity },
+              });
+            }
+          }
+          return { socketDirectory: serviceSocketDirectory, bindings, brokerSockets };
+        })();
   const retainRenderedRouters = (published: readonly PublishedDeployment[]) => {
     renderedPrivateRouters = new Set(privateServiceGraph(published)?.bindings.keys());
   };
@@ -1190,6 +1234,8 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     );
     await privateDirectory(dirname(configPath));
     await assertFence?.();
+    const privateServices = privateServiceGraph(published);
+    await verifyV2ServiceBindingBrokerSockets(privateServices);
     // The rendered configuration contains every binding value, sensitive ones
     // included, so it is created `0600` and moved into place atomically.
     await writePrivate(
@@ -1202,7 +1248,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         configProbeToken,
         internalReadinessCapability,
         dataPlaneAddress,
-        privateServiceGraph(published),
+        privateServices,
         actorSockets,
         exactActorSockets,
         workflowGraph.services,
@@ -1210,6 +1256,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       "utf8",
       () => transitionPrivateSockets(published),
     );
+    await verifyV2ServiceBindingBrokerSockets(privateServices);
   };
 
   const activated = (published: readonly PublishedDeployment[]) =>
@@ -1220,15 +1267,17 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     workflowGraph: WorkflowForwardRuntimeGraph,
   ): Promise<boolean> => {
     const actorSockets = actorForwardSockets();
+    const privateServices = privateServiceGraph(published);
     const expected = publishedGraphIdentity(
       published,
-      privateServiceGraph(published),
+      privateServices,
       actorSockets,
       exactActorSockets,
       workflowGraph.services,
     );
     let confirmed = false;
     try {
+      await verifyV2ServiceBindingBrokerSockets(privateServices);
       const response = await fetch(
         `${options.tls ? "https" : "http"}://127.0.0.1:${port}${CONFIG_PROBE_PATH}`,
         {
@@ -1754,7 +1803,12 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         for (const { binding, router } of additions) {
           const existing = servicePins.get(router);
           if (existing) existing.count += 1;
-          else servicePins.set(router, { binding, count: 1 });
+          else
+            servicePins.set(router, {
+              binding,
+              v2Private: hasWorkerdV2PrivateBindingProfile(selected.site),
+              count: 1,
+            });
         }
         leaseAcquired = true;
         return lease;
@@ -5799,6 +5853,14 @@ function serviceRouterName(binding: WorkerdServiceBinding): string {
   return `selfhost-service-${digest}`;
 }
 
+function serviceBindingBrokerTargetName(router: string): string {
+  const digest = createHash("sha256")
+    .update("takoserver.v2-service-binding-broker-target@1\u0000", "utf8")
+    .update(router, "utf8")
+    .digest("hex");
+  return `selfhost-service-target-${digest}`;
+}
+
 function validPrivateSocketDirectory(path: string): void {
   if (
     typeof path !== "string" ||
@@ -5815,6 +5877,26 @@ interface PrivateSocketIdentity {
   readonly dev: number;
   readonly ino: number;
   readonly uid: number;
+}
+
+function validV2ServiceBindingBrokerSocket(value: WorkerdV2ServiceBindingBrokerSocket): void {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    !isAbsolute(value.socketPath) ||
+    resolve(value.socketPath) !== value.socketPath ||
+    value.socketPath.includes("\u0000") ||
+    Buffer.byteLength(value.socketPath) > 100 ||
+    !value.identity ||
+    !Number.isSafeInteger(value.identity.dev) ||
+    !Number.isSafeInteger(value.identity.ino) ||
+    !Number.isSafeInteger(value.identity.uid) ||
+    value.identity.dev < 0 ||
+    value.identity.ino < 1 ||
+    value.identity.uid < 0
+  ) {
+    throw new Error("unusable v2 ServiceBinding broker socket");
+  }
 }
 
 function samePrivateSocketIdentity(
@@ -5839,6 +5921,19 @@ async function privateSocketMetadata(path: string): Promise<PrivateSocketIdentit
   }
 }
 
+async function verifyV2ServiceBindingBrokerSockets(
+  graph: PrivateServiceGraph | undefined,
+): Promise<void> {
+  if (!graph) return;
+  for (const socket of graph.brokerSockets.values()) {
+    await requirePrivateSocketDirectory(dirname(socket.socketPath));
+    const metadata = await privateSocketMetadata(socket.socketPath);
+    if (!metadata || !samePrivateSocketIdentity(metadata, socket.identity)) {
+      throw new Error("v2 ServiceBinding broker socket changed");
+    }
+  }
+}
+
 async function requirePrivateSocketDirectory(path: string): Promise<PrivateSocketIdentity> {
   const metadata = await lstat(path);
   if (
@@ -5859,6 +5954,7 @@ function privateServiceSocket(directory: string, router: string): string {
 interface PrivateServiceGraph {
   readonly socketDirectory: string;
   readonly bindings: ReadonlyMap<string, WorkerdServiceBinding>;
+  readonly brokerSockets: ReadonlyMap<string, WorkerdV2ServiceBindingBrokerSocket>;
 }
 
 function collectServiceBindings(
@@ -6011,6 +6107,7 @@ function publishedGraphIdentity(
       JSON.stringify({
         directory: privateServices.socketDirectory,
         routers: [...privateServices.bindings.keys()],
+        brokerSockets: [...privateServices.brokerSockets.entries()],
       }),
     );
   }
@@ -6265,6 +6362,7 @@ function renderConfig(
   // the request URL and Host header are never consulted.
   const publishedByName = new Map(published.map((entry) => [entry.name, entry] as const));
   const routedBindings = privateServices?.bindings ?? collectServiceBindings(published);
+  const v2BrokerExternalServices: string[] = [];
   const serviceBindingServices = [...routedBindings]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, binding]) => {
@@ -6274,13 +6372,25 @@ function renderConfig(
         target.variants.every(
           (variant) => variant.manifest.fetchHandler === true || isStaticManifest(variant.manifest),
         );
-      const targetService = target ? logicalFetchService(target) : binding.target;
+      const brokerSocket = privateServices?.brokerSockets.get(name);
+      const brokerTargetService = brokerSocket ? serviceBindingBrokerTargetName(name) : undefined;
+      if (brokerSocket && brokerTargetService) {
+        v2BrokerExternalServices.push(
+          `  (name = ${capnpText(brokerTargetService)}, external = (address = ${capnpText(`unix:${brokerSocket.socketPath}`)}, http = (style = proxy))),`,
+        );
+      }
+      const targetService =
+        brokerTargetService ?? (target ? logicalFetchService(target) : binding.target);
       return `  ( name = ${capnpText(name)},
     worker = (
       modules = [ (name = ${capnpText(SERVICE_ROUTER_MODULE)}, esModule = embed ${capnpText(SERVICE_ROUTER_MODULE)}) ],
       bindings = [
         (name = "${SERVICE_UNAVAILABLE_TOKEN_BINDING}", text = ${capnpText(binding.unavailableToken)}),${
-          active ? `\n        (name = "TARGET", service = ${capnpText(targetService)}),` : ""
+          brokerSocket
+            ? `\n        (name = "BROKER_TOKEN", text = ${capnpText(binding.unavailableToken)}),\n        (name = "TARGET", service = ${capnpText(targetService)}),`
+            : active
+              ? `\n        (name = "TARGET", service = ${capnpText(targetService)}),`
+              : ""
         }
       ],
       compatibilityDate = "2026-01-01",
@@ -6288,6 +6398,7 @@ function renderConfig(
   ),`;
     })
     .join("\n");
+  const v2BrokerExternalServiceConfig = v2BrokerExternalServices.join("\n");
 
   // Each script contributes its own service pair. Service membership derives
   // from manifests on disk: a script that binds no data plane contributes
@@ -6583,7 +6694,7 @@ function renderConfig(
 const config :Workerd.Config = (
   services = [
 ${services}
-${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${queueSettlementServices === "" ? "" : `\n${queueSettlementServices}\n  (name = "queue-settlement-deny", network = (allow = [])),`}${v2ObjectBucketServices === "" ? "" : `\n${v2ObjectBucketServices}\n  (name = "object-bucket-deny", network = (allow = [])),`}${v2KvServices === "" ? "" : `\n${v2KvServices}\n  (name = "v2-kv-deny", network = (allow = [])),`}${v2QueueProducerServices === "" ? "" : `\n${v2QueueProducerServices}\n  (name = "v2-queue-producer-deny", network = (allow = [])),`}${actorExternalServices === "" ? "" : `\n${actorExternalServices}`}${workflowExternalServices === "" ? "" : `\n${workflowExternalServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
+${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${v2BrokerExternalServiceConfig === "" ? "" : `\n${v2BrokerExternalServiceConfig}`}${dataServices === "" ? "" : `\n${dataServices}`}${queueSettlementServices === "" ? "" : `\n${queueSettlementServices}\n  (name = "queue-settlement-deny", network = (allow = [])),`}${v2ObjectBucketServices === "" ? "" : `\n${v2ObjectBucketServices}\n  (name = "object-bucket-deny", network = (allow = [])),`}${v2KvServices === "" ? "" : `\n${v2KvServices}\n  (name = "v2-kv-deny", network = (allow = [])),`}${v2QueueProducerServices === "" ? "" : `\n${v2QueueProducerServices}\n  (name = "v2-queue-producer-deny", network = (allow = [])),`}${actorExternalServices === "" ? "" : `\n${actorExternalServices}`}${workflowExternalServices === "" ? "" : `\n${workflowExternalServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
   ( name = "router",
     worker = (
       modules = [ (name = "router.js", esModule = embed "router.js") ],
@@ -6847,6 +6958,7 @@ export default {
  * same status and header name intentionally.
  */
 export const SERVICE_ROUTER_SOURCE = `const HEADER = ${JSON.stringify(SERVICE_UNAVAILABLE_HEADER)};
+const BROKER_TOKEN_HEADER = ${JSON.stringify(PRIVATE_SERVICE_BINDING_TOKEN_HEADER)};
 
 function unavailable(env) {
   return new Response(null, {
@@ -6858,6 +6970,16 @@ function unavailable(env) {
 export default {
   async fetch(request, env) {
     if (!env.TARGET || typeof env.TARGET.fetch !== "function") return unavailable(env);
+    if (typeof env.BROKER_TOKEN === "string") {
+      const headers = new Headers(request.headers);
+      headers.set(BROKER_TOKEN_HEADER, env.BROKER_TOKEN);
+      const response = await env.TARGET.fetch(new Request(request, { headers }));
+      if (response.status === 530 && response.headers.get(HEADER) === env.BROKER_TOKEN) {
+        await response.body?.cancel();
+        throw new Error("backend_unavailable");
+      }
+      return response;
+    }
     // Native cancellation and request/response stream aborts are transport
     // outcomes, not evidence that target selection failed. Let them propagate;
     // the target wrapper has already converted an actual handler throw to 500.
