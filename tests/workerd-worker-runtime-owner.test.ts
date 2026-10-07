@@ -39,7 +39,7 @@ import {
   WORKER_ENDPOINT_BACKEND_ID,
 } from "../src/takoform-v2/worker-endpoint-backend.ts";
 import type { V2WorkerPublicationResolution } from "../src/takoform-v2/worker-publication-state.ts";
-import { spawnWorkerdWithParentDeath } from "../src/workerd-linux-process.ts";
+import { spawnWorkerdWithParentDeath, workerPortOwnership } from "../src/workerd-linux-process.ts";
 import type { WorkerdPublicationIdentity } from "../src/workerd-runtime.ts";
 import type { WorkerdProcess } from "../src/workerd-supervisor.ts";
 import {
@@ -99,6 +99,7 @@ const server = Bun.serve({ hostname: "127.0.0.1", port: initial.port, async fetc
   return new Response(current.generation);
 } });
 process.on("SIGTERM", () => server.stop(true));
+process.on("SIGUSR1", () => { server.stop(true); setInterval(() => {}, 1000); });
 `;
 
 type TestChild = ReturnType<typeof spawnWorkerdWithParentDeath>;
@@ -1681,6 +1682,64 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
     });
     expect(await read()).toEqual({ kind: "unknown" });
   } finally {
+    await owner.close().catch(() => undefined);
+    await owned.cleanup();
+  }
+});
+
+test("Actor graph readback refuses a foreign listener while native bytes remain", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-actor-lost-listener";
+  const createId = "03448a40-4525-4d4b-8da0-8cebfcedaf88";
+  const publication = staticPublicationState(workerUid, true);
+  const ownerRoot = join(owned.root, "owners");
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: ownerRoot,
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+    inspectModule: async (): Promise<WorkerModuleInspectionResult> => ({
+      outcome: "valid",
+      exportedHandlers: ["fetch"],
+    }),
+  });
+  let foreign: ReturnType<typeof Bun.serve> | undefined;
+  try {
+    expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
+      kind: "confirmed",
+    });
+    publication.setCurrent(createId);
+    const request = {
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      sourceOperationId: createId,
+    };
+    expect((await owner.observeActorGraph(request)).kind).toBe("ready");
+    const workerKey = createHash("sha256").update(workerUid).digest("hex");
+    const groupRoot = join(ownerRoot, workerKey, "incarnations", createId, "groups", workerKey);
+    const group = JSON.parse(await Bun.file(join(groupRoot, "group.json")).text()) as {
+      listenerPort: number;
+    };
+    const child = owned.children[0];
+    if (!child?.pid) throw new Error("native child PID missing");
+    child.kill("SIGUSR1");
+    let listener = await workerPortOwnership(group.listenerPort, child.pid);
+    for (let attempt = 0; listener === "owned" && attempt < 150; attempt += 1) {
+      await Bun.sleep(20);
+      listener = await workerPortOwnership(group.listenerPort, child.pid);
+    }
+    expect(listener).not.toBe("owned");
+    foreign = Bun.serve({
+      hostname: "127.0.0.1",
+      port: group.listenerPort,
+      fetch: () => new Response("foreign"),
+    });
+    expect(await owner.observeActorGraph(request)).toEqual({ kind: "unknown" });
+  } finally {
+    await foreign?.stop(true);
     await owner.close().catch(() => undefined);
     await owned.cleanup();
   }
