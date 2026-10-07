@@ -43,6 +43,8 @@ export interface SelfhostV2ServiceBindingBrokerOptions {
   readonly socketPath: string;
   /** Same secret already held by the internal Workerd service router. */
   readonly routerToken: string;
+  /** Trusted router metadata carrying the caller's canonical absolute URL. */
+  readonly originalUrlHeader: string;
   readonly claim: V2ServiceBindingClaim;
   readonly bindingName: string;
   readonly authority: {
@@ -202,6 +204,7 @@ export async function openSelfhostV2ServiceBindingBroker(
   const claim = copyClaim(options.claim);
   const socketPath = options.socketPath;
   const routerToken = options.routerToken;
+  const originalUrlHeader = options.originalUrlHeader.toLowerCase();
   const bindingName = options.bindingName;
   const resolveCurrentBinding = options.authority.resolveCurrentBinding.bind(options.authority);
   const acquireCallerLease = options.acquireCallerLease;
@@ -214,7 +217,10 @@ export async function openSelfhostV2ServiceBindingBroker(
     socketPath.includes("\u0000") ||
     Buffer.byteLength(socketPath) > 100 ||
     typeof routerToken !== "string" ||
-    !/^[0-9a-f]{64}$/u.test(routerToken)
+    !/^[0-9a-f]{64}$/u.test(routerToken) ||
+    typeof originalUrlHeader !== "string" ||
+    !/^[a-z0-9-]{1,128}$/u.test(originalUrlHeader) ||
+    originalUrlHeader === TOKEN_HEADER
   ) {
     throw new TypeError("Worker service binding broker configuration is invalid");
   }
@@ -244,22 +250,58 @@ export async function openSelfhostV2ServiceBindingBroker(
     const task = (async () => {
       try {
         let tokenCount = 0;
+        let originalUrlCount = 0;
         for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
           if (incoming.rawHeaders[index]?.toLowerCase() === TOKEN_HEADER) tokenCount += 1;
+          if (incoming.rawHeaders[index]?.toLowerCase() === originalUrlHeader)
+            originalUrlCount += 1;
         }
         const offered = incoming.headers[TOKEN_HEADER];
+        const suppliedOriginalUrl = incoming.headers[originalUrlHeader];
         if (
           closing ||
           uncertain ||
           tokenCount !== 1 ||
+          originalUrlCount !== 1 ||
           typeof offered !== "string" ||
-          !validToken(offered, routerToken)
+          !validToken(offered, routerToken) ||
+          typeof suppliedOriginalUrl !== "string" ||
+          suppliedOriginalUrl.length > 8192
         ) {
           outgoing.writeHead(404).end();
           return;
         }
         if (incoming.headers.upgrade || !incoming.method || !incoming.url) {
           outgoing.writeHead(501).end();
+          return;
+        }
+        let originalUrl: URL;
+        let requestUrl: URL;
+        try {
+          originalUrl = new URL(suppliedOriginalUrl);
+          if (!incoming.url.startsWith("/") || incoming.url.startsWith("//")) {
+            outgoing.writeHead(400).end();
+            return;
+          }
+          requestUrl = new URL(incoming.url, originalUrl);
+        } catch {
+          outgoing.writeHead(404).end();
+          return;
+        }
+        const requestHost = incoming.headers.host;
+        if (
+          originalUrl.href !== suppliedOriginalUrl ||
+          (originalUrl.protocol !== "http:" && originalUrl.protocol !== "https:") ||
+          !originalUrl.hostname ||
+          originalUrl.username ||
+          originalUrl.password ||
+          originalUrl.hash ||
+          requestUrl.pathname !== originalUrl.pathname ||
+          requestUrl.search !== originalUrl.search ||
+          typeof requestHost !== "string" ||
+          requestHost.toLowerCase() !== originalUrl.host.toLowerCase()
+        ) {
+          outgoing.writeHead(400).end();
           return;
         }
 
@@ -304,20 +346,21 @@ export async function openSelfhostV2ServiceBindingBroker(
           for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
             const name = incoming.rawHeaders[index]?.toLowerCase();
             const value = incoming.rawHeaders[index + 1];
-            if (!name || value === undefined || name === TOKEN_HEADER || HOP_HEADERS.has(name))
+            if (
+              !name ||
+              value === undefined ||
+              name === TOKEN_HEADER ||
+              name === originalUrlHeader ||
+              HOP_HEADERS.has(name)
+            )
               continue;
             headers.append(name, value);
-          }
-          const url = new URL(incoming.url, "http://worker-service.invalid");
-          if (url.username || url.password || url.hash) {
-            outgoing.writeHead(400).end();
-            return;
           }
           const body =
             incoming.method === "GET" || incoming.method === "HEAD"
               ? undefined
               : (Readable.toWeb(incoming) as unknown as ReadableStream<Uint8Array>);
-          const request = new Request(url, {
+          const request = new Request(originalUrl, {
             method: incoming.method,
             headers,
             signal: abort.signal,

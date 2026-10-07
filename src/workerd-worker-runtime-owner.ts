@@ -101,9 +101,12 @@ import type {
 } from "./workerd-runtime.ts";
 import {
   createWorkerdRuntime,
+  internalHostname,
   readWorkerdActiveActorGraph,
   readWorkerdActiveDeployment,
   readWorkerdSelectedActiveVersion,
+  V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER,
+  V2_SERVICE_BINDING_ORIGINAL_URL_HEADER,
   workerdServiceBindingRouterName,
   workerdV2ServiceBindingBrokerSocketPath,
 } from "./workerd-runtime.ts";
@@ -233,6 +236,7 @@ interface IncarnationHandle {
   /** Native ServiceBinding calls pin the exact caller incarnation through body drain. */
   readonly serviceBindingLeases: Set<Promise<void>>;
   readonly serviceBindingForward?: V2ServiceBindingForwardIncarnation;
+  readonly serviceBindingDispatchToken: string;
   retirementTimer?: () => void;
   retiring?: Promise<WorkerdWorkerRetirementReceipt>;
 }
@@ -2043,10 +2047,6 @@ function sourceOperationIdFromIdentity(identity: WorkerdPublicationIdentity): st
     : null;
 }
 
-function makeRequest(request: Request, signal: AbortSignal): Request {
-  return new Request(request, { signal });
-}
-
 function responseWithTrackedBody(response: Response, invocation: ActiveInvocation): Response {
   if (!response.body) {
     invocation.finish();
@@ -2764,6 +2764,10 @@ export async function openWorkerdWorkerRuntimeOwner(
     group: WorkerdWorkerExecutionGroup,
     incumbent: WorkerdPublicationIdentity | null,
   ): IncarnationHandle => {
+    // Re-key private service dispatch for every native incarnation, including
+    // recovery. The credential is in this closure and the private Host config,
+    // never in a Version's tenant-visible bindings.
+    const serviceBindingDispatchToken = randomBytes(32).toString("hex");
     const actorForward =
       options.v2ActorForward && record.eventToken
         ? options.v2ActorForward.openIncarnation({
@@ -2867,6 +2871,7 @@ export async function openWorkerdWorkerRuntimeOwner(
                 binding,
               ),
               routerToken: binding.unavailableToken,
+              originalUrlHeader: V2_SERVICE_BINDING_ORIGINAL_URL_HEADER,
               claim,
               // The native graph alias is private/ordinal; the broker verifies
               // the accepted public name in the immutable Core claim.
@@ -2927,6 +2932,10 @@ export async function openWorkerdWorkerRuntimeOwner(
       },
       isReady: () => group.isReady(),
       serviceBindingSocketDirectory: privateSocketDirectoryFor(record.operationId),
+      v2ServiceBindingDispatch: {
+        token: serviceBindingDispatchToken,
+        internalHostname: internalHostname(scriptName(options.workerResourceUid)),
+      },
       ...(serviceBindingForward
         ? { v2ServiceBindingBrokerSocket: serviceBindingForward.socket }
         : {}),
@@ -2974,6 +2983,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       group,
       runtime,
       publication,
+      serviceBindingDispatchToken,
       ...(actorForward ? { actorForward } : {}),
       ...(workflowForward ? { workflowForward } : {}),
       ...(serviceBindingForward ? { serviceBindingForward } : {}),
@@ -3090,6 +3100,13 @@ export async function openWorkerdWorkerRuntimeOwner(
       onSpawned: async (child) => await persistSpawnedChild(operationId, child),
     });
     const handle = makeIncarnationHandle(candidateRecord, group, incumbent);
+    if (!handle.runtime.preparePrivateServiceBindingSockets) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    // Establish the empty-directory identity before issueBinding can start a
+    // broker. The runtime's later config render then verifies the same root
+    // instead of mistaking our newly created socket for an untrusted entry.
+    await handle.runtime.preparePrivateServiceBindingSockets();
     // Preserve the pre-publication supervised child start. This bootstrap has
     // no publication authority or private Service sockets: a failed initial
     // spawn cannot poison the candidate's still-unused socket-enabled runtime.
@@ -3412,6 +3429,12 @@ export async function openWorkerdWorkerRuntimeOwner(
     const group = await openExistingRecoveryGroup(activeRecord, configuration);
     recoveringGroup = group;
     const handle = makeIncarnationHandle(activeRecord, group, activeRecord.identity);
+    if (!handle.runtime.preparePrivateServiceBindingSockets) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    // Recovery removed only the previously proved-dead child's config-declared
+    // sockets above. Pin the now-empty directory before recreating its brokers.
+    await handle.runtime.preparePrivateServiceBindingSockets();
     await restoreServiceBindingBrokers(handle, activeRecord, resolution.snapshot);
     await updateRecord(activeRecord.operationId, (current) => ({
       ...current,
@@ -4772,7 +4795,43 @@ export async function openWorkerdWorkerRuntimeOwner(
     incarnation.invocations.add(invocation);
     let forwarded: Request;
     try {
-      forwarded = makeRequest(request, AbortSignal.any([request.signal, invocation.abort.signal]));
+      const originalUrl = new URL(request.url);
+      if (
+        (originalUrl.protocol !== "http:" && originalUrl.protocol !== "https:") ||
+        !originalUrl.hostname ||
+        originalUrl.username ||
+        originalUrl.password ||
+        originalUrl.hash ||
+        originalUrl.href.length > 8192
+      ) {
+        throw new TypeError("invalid ServiceBinding request URL");
+      }
+      const internalHost = internalHostname(scriptName(options.workerResourceUid));
+      const internalUrl = new URL(
+        `${originalUrl.pathname}${originalUrl.search}`,
+        `http://${internalHost}`,
+      );
+      const headers = new Headers(request.headers);
+      // Never let caller-controlled metadata survive into the private route.
+      // The trusted Host runtime remints both values for this incarnation.
+      headers.delete(V2_SERVICE_BINDING_ORIGINAL_URL_HEADER);
+      headers.delete(V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER);
+      headers.set("host", internalHost);
+      headers.set(V2_SERVICE_BINDING_ORIGINAL_URL_HEADER, originalUrl.href);
+      headers.set(
+        V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER,
+        incarnation.serviceBindingDispatchToken,
+      );
+      const signal = AbortSignal.any([request.signal, invocation.abort.signal]);
+      forwarded = new Request(internalUrl, {
+        method: request.method,
+        headers,
+        signal,
+        redirect: request.redirect,
+        ...(request.method === "GET" || request.method === "HEAD"
+          ? {}
+          : { body: request.body, duplex: "half" as const }),
+      } as RequestInit);
     } catch {
       invocation.finish();
       return { kind: "not_dispatched" };

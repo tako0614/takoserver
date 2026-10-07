@@ -223,7 +223,19 @@ test("real Host SQL accepts a settled same-owner service UID and verifies the he
           : "different";
       },
     };
-    const publication = createV2WorkerPublication({ targetKey, publicationState: state, runtime });
+    let serviceBindingProjectionRequests = 0;
+    const publication = createV2WorkerPublication({
+      targetKey,
+      publicationState: state,
+      runtime,
+      // This suite checks SQL-held projection shape, not the native Host
+      // broker; the pinned-workerd test covers that separate execution path.
+      v2ServiceBindingForward: {
+        async issueBinding() {
+          serviceBindingProjectionRequests += 1;
+        },
+      },
+    });
     const versionForm = createInternalV2CodeWorkerVersionForm({
       sql,
       targetKey,
@@ -320,6 +332,7 @@ test("real Host SQL accepts a settled same-owner service UID and verifies the he
       worker: { resourceUid: caller.resourceUid },
       versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
     });
+    expect(serviceBindingProjectionRequests).toBeGreaterThan(0);
     const callerPublication = published.get(await v2ServiceTargetName(caller.resourceUid));
     const callerVariant = callerPublication?.versions[0];
     if (!callerVariant || !("mainModule" in callerVariant.site))

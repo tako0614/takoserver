@@ -824,7 +824,8 @@ export function createV2WorkerPublication(options: {
     } catch {
       return unknownResult();
     }
-    if (proof !== "matches" || !(await resolution.stillCurrent())) return unknownResult();
+    if (proof !== "matches") return unknownResult();
+    if (!(await resolution.stillCurrent())) return unknownResult();
     if (candidateValue.identity === null) return { kind: "confirmed", identity: null };
     return {
       kind: "confirmed",

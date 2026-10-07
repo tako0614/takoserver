@@ -8,6 +8,8 @@ import type { V2ServiceBindingClaim } from "../src/takoform-v2/service-binding-a
 
 const TOKEN = "ab".repeat(32);
 const BROKER_TOKEN_HEADER = "x-takoserver-private-service-binding-token";
+const ORIGINAL_URL_HEADER = "x-takoserver-private-service-original-url";
+const ORIGINAL_URL = "https://catalog.example/items/one?view=full";
 const UNAVAILABLE_HEADER = "x-takoserver-selfhost-service-unavailable";
 
 const claim: V2ServiceBindingClaim = Object.freeze({
@@ -45,9 +47,11 @@ function requestBroker(
       {
         socketPath,
         method: options.method ?? "GET",
-        path: options.path ?? "https://catalog.example/items/one?view=full",
+        path: options.path ?? "/items/one?view=full",
         headers: {
           [BROKER_TOKEN_HEADER]: TOKEN,
+          [ORIGINAL_URL_HEADER]: ORIGINAL_URL,
+          host: "catalog.example",
           ...options.headers,
         },
       },
@@ -90,6 +94,7 @@ async function brokerFixture(
   const broker = await openSelfhostV2ServiceBindingBroker({
     socketPath,
     routerToken: TOKEN,
+    originalUrlHeader: ORIGINAL_URL_HEADER,
     claim,
     bindingName: "CATALOG",
     authority: {
@@ -180,8 +185,34 @@ test("v2 ServiceBinding bridge authenticates, strips its private token, and stre
     expect(fixture.released).toBe(1);
     expect(fixture.targetRequest?.url).toBe("https://catalog.example/items/one?view=full");
     expect(fixture.targetRequest?.headers.get(BROKER_TOKEN_HEADER)).toBeNull();
+    expect(fixture.targetRequest?.headers.get(ORIGINAL_URL_HEADER)).toBeNull();
     expect(fixture.targetRequest?.headers.get("authorization")).toBe("Bearer tenant-request-value");
     expect(await fixture.targetBody).toBe("request-body");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("v2 ServiceBinding broker rejects forged or inconsistent original URL metadata before dispatch", async () => {
+  const fixture = await brokerFixture();
+  try {
+    const forged = await requestBroker(fixture.socketPath, {
+      headers: { [ORIGINAL_URL_HEADER]: "https://catalog.example/forged?view=full" },
+    });
+    expect(forged.status).toBe(400);
+    expect(fixture.dispatches).toBe(0);
+
+    const wrongAuthority = await requestBroker(fixture.socketPath, {
+      headers: { host: "foreign.example" },
+    });
+    expect(wrongAuthority.status).toBe(400);
+    expect(fixture.dispatches).toBe(0);
+
+    const missing = await requestBroker(fixture.socketPath, {
+      headers: { [ORIGINAL_URL_HEADER]: "" },
+    });
+    expect(missing.status).toBe(404);
+    expect(fixture.dispatches).toBe(0);
   } finally {
     await fixture.cleanup();
   }

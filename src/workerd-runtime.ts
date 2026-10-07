@@ -500,6 +500,12 @@ export interface WorkerdRuntime<S extends WorkerdSite | WorkerdStaticSite = Work
   /** Load one credential-free module snapshot in a fresh bounded runtime. */
   readonly inspectModule: ReturnType<typeof createWorkerdWorkerModuleInspector>["inspect"];
   /**
+   * Pin this incarnation's fresh private Service socket directory before any
+   * broker is allowed to create a socket inside it. Implementations without a
+   * private Service socket directory may leave this absent.
+   */
+  preparePrivateServiceBindingSockets?(): Promise<void>;
+  /**
    * Atomically activates one complete weighted deployment, or removes its
    * logical routes. Implementations without this capability must leave this
    * absent; a provider may then refuse weighted publication before mutation.
@@ -683,6 +689,11 @@ export interface WorkerdRuntimeOptions {
    * Requires immutable weighted publish(); legacy write()/remove() are refused.
    */
   readonly serviceBindingSocketDirectory?: string;
+  /** Per-incarnation target-side proof for routing Service calls via its private alias. */
+  readonly v2ServiceBindingDispatch?: {
+    readonly token: string;
+    readonly internalHostname: string;
+  };
   /** Optional private cross-Worker bridge. It is consulted only for v2 Forms. */
   readonly v2ServiceBindingBrokerSocket?: (
     binding: WorkerdServiceBinding,
@@ -876,6 +887,10 @@ const DEPLOYMENT_ROUTER_MODULE = "deployment-router.js";
 const STATIC_READINESS_MODULE = "static-readiness.js";
 const EVENT_DISPATCHER_MODULE = "event-dispatcher.js";
 const SERVICE_UNAVAILABLE_HEADER = "x-takoserver-selfhost-service-unavailable";
+/** Host-only Service transport metadata; the trusted router strips both headers. */
+export const V2_SERVICE_BINDING_ORIGINAL_URL_HEADER = "x-takoserver-private-service-original-url";
+export const V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER =
+  "x-takoserver-private-service-dispatch-token";
 
 function privateRuntimeToken(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
@@ -1257,6 +1272,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         actorSockets,
         exactActorSockets,
         workflowGraph.services,
+        options.v2ServiceBindingDispatch,
       ),
       "utf8",
       () => transitionPrivateSockets(published),
@@ -1279,6 +1295,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       actorSockets,
       exactActorSockets,
       workflowGraph.services,
+      options.v2ServiceBindingDispatch,
     );
     let confirmed = false;
     try {
@@ -1621,6 +1638,9 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
 
   return {
     inspectModule: (input) => moduleInspector.inspect(input),
+    ...(serviceSocketDirectory === undefined
+      ? {}
+      : { preparePrivateServiceBindingSockets: async () => await requireSocketRoot() }),
     acquirePrivateServiceBindings(identity, signal) {
       // Copy before entering the queue so a caller cannot change the requested
       // identity while another publication owns the activation lock.
@@ -6097,6 +6117,7 @@ function publishedGraphIdentity(
     string,
     readonly ResolvedWorkflowForwardService[]
   > = new Map(),
+  serviceBindingDispatch?: WorkerdRuntimeOptions["v2ServiceBindingDispatch"],
 ): string {
   const hash = createHash("sha256").update(
     JSON.stringify(
@@ -6130,6 +6151,13 @@ function publishedGraphIdentity(
         v2PrivateRouters: [...privateServices.v2PrivateRouters].sort(),
       }),
     );
+  }
+  if (serviceBindingDispatch) {
+    hash
+      .update("\u0000private-service-dispatch\u0000")
+      .update(serviceBindingDispatch.internalHostname)
+      .update("\u0000")
+      .update(serviceBindingDispatch.token);
   }
   const actorServices = resolveActorForwardServices(
     published,
@@ -6208,6 +6236,7 @@ function renderConfig(
     string,
     readonly ResolvedWorkflowForwardService[]
   > = new Map(),
+  serviceBindingDispatch?: WorkerdRuntimeOptions["v2ServiceBindingDispatch"],
 ): string {
   const variants = published.flatMap((deployment) => deployment.variants);
   const actorServices = resolveActorForwardServices(
@@ -6221,6 +6250,7 @@ function renderConfig(
     actorForwardSockets,
     exactActorSockets,
     workflowForwardServices,
+    serviceBindingDispatch,
   );
   const services = variants
     .map((entry) => {
@@ -6413,7 +6443,7 @@ function renderConfig(
       const brokerTargetService = brokerSocket ? serviceBindingBrokerTargetName(name) : undefined;
       if (brokerSocket && brokerTargetService) {
         v2BrokerExternalServices.push(
-          `  (name = ${capnpText(brokerTargetService)}, external = (address = ${capnpText(`unix:${brokerSocket.socketPath}`)}, http = (style = proxy))),`,
+          `  (name = ${capnpText(brokerTargetService)}, external = (address = ${capnpText(`unix:${brokerSocket.socketPath}`)}, http = ())),`,
         );
       }
       const targetService =
@@ -6742,6 +6772,8 @@ ${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServic
         (name = "INTERNAL_READINESS_CAPABILITY", text = ${capnpText(internalReadinessCapability)}),
         (name = "CONFIG_IDENTITY", text = ${capnpText(graphIdentity)}),
         (name = "CONFIG_PROBE_TOKEN", text = ${capnpText(configProbeToken ?? "")}),
+        (name = "V2_SERVICE_DISPATCH_HOST", text = ${capnpText(serviceBindingDispatch?.internalHostname ?? "")}),
+        (name = "V2_SERVICE_DISPATCH_TOKEN", text = ${capnpText(serviceBindingDispatch?.token ?? "")}),
 ${bindings}
       ],
       compatibilityDate = "2026-01-01",
@@ -6782,6 +6814,21 @@ const CONFIG_PROBE_PATH = ${JSON.stringify(CONFIG_PROBE_PATH)};
 const CONFIG_PROBE_HEADER = ${JSON.stringify(CONFIG_PROBE_HEADER)};
 const CONFIG_IDENTITY_HEADER = ${JSON.stringify(CONFIG_IDENTITY_HEADER)};
 const INTERNAL_READINESS_CAPABILITY_HEADER = ${JSON.stringify(INTERNAL_READINESS_CAPABILITY_HEADER)};
+const SERVICE_ORIGINAL_URL_HEADER = ${JSON.stringify(V2_SERVICE_BINDING_ORIGINAL_URL_HEADER)};
+const SERVICE_DISPATCH_TOKEN_HEADER = ${JSON.stringify(V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER)};
+
+function restoreServiceRequest(request, original) {
+  const headers = new Headers(request.headers);
+  headers.delete(SERVICE_ORIGINAL_URL_HEADER);
+  headers.delete(SERVICE_DISPATCH_TOKEN_HEADER);
+  headers.set("host", original.host);
+  const init = { method: request.method, headers, redirect: request.redirect };
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    init.body = request.body;
+    init.duplex = "half";
+  }
+  return new Request(original.href, init);
+}
 
 function refuse() {
   return new Response(null, { status: 404 });
@@ -6810,6 +6857,36 @@ export default {
         status: 404,
         headers: { "content-type": "text/plain; charset=utf-8" },
       });
+    }
+    const suppliedOriginal = request.headers.get(SERVICE_ORIGINAL_URL_HEADER);
+    const suppliedDispatchToken = request.headers.get(SERVICE_DISPATCH_TOKEN_HEADER);
+    if (suppliedOriginal !== null || suppliedDispatchToken !== null) {
+      if (
+        url.protocol !== "http:" ||
+        url.host !== env.V2_SERVICE_DISPATCH_HOST ||
+        request.headers.get("host") !== env.V2_SERVICE_DISPATCH_HOST ||
+        !/^[0-9a-f]{64}$/u.test(env.V2_SERVICE_DISPATCH_TOKEN) ||
+        suppliedDispatchToken !== env.V2_SERVICE_DISPATCH_TOKEN ||
+        suppliedOriginal === null ||
+        suppliedOriginal.length > 8192
+      ) return refuse();
+      let original;
+      try {
+        original = new URL(suppliedOriginal);
+      } catch {
+        return refuse();
+      }
+      if (
+        original.href !== suppliedOriginal ||
+        (original.protocol !== "http:" && original.protocol !== "https:") ||
+        !original.hostname ||
+        original.username ||
+        original.password ||
+        original.hash ||
+        original.pathname !== url.pathname ||
+        original.search !== url.search
+      ) return refuse();
+      return env[service].fetch(restoreServiceRequest(request, original));
     }
     const capability = request.headers.get(INTERNAL_READINESS_CAPABILITY_HEADER);
     if (capability !== null) {
@@ -6997,6 +7074,7 @@ export default {
  */
 export const SERVICE_ROUTER_SOURCE = `const HEADER = ${JSON.stringify(SERVICE_UNAVAILABLE_HEADER)};
 const BROKER_TOKEN_HEADER = ${JSON.stringify(PRIVATE_SERVICE_BINDING_TOKEN_HEADER)};
+const ORIGINAL_URL_HEADER = ${JSON.stringify(V2_SERVICE_BINDING_ORIGINAL_URL_HEADER)};
 
 function unavailable(env) {
   return new Response(null, {
@@ -7011,6 +7089,7 @@ export default {
     if (typeof env.BROKER_TOKEN === "string") {
       const headers = new Headers(request.headers);
       headers.set(BROKER_TOKEN_HEADER, env.BROKER_TOKEN);
+      headers.set(ORIGINAL_URL_HEADER, request.url);
       const response = await env.TARGET.fetch(new Request(request, { headers }));
       if (response.status === 530 && response.headers.get(HEADER) === env.BROKER_TOKEN) {
         await response.body?.cancel();

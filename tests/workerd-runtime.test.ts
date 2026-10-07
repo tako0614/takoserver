@@ -45,6 +45,8 @@ import {
   ROUTER_SOURCE,
   readWorkerdActiveDeployment,
   readWorkerdSelectedActiveVersion,
+  V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER,
+  V2_SERVICE_BINDING_ORIGINAL_URL_HEADER,
   type WorkerdBinding,
   type WorkerdDeploymentPublication,
   type WorkerdLegacyWorkflowForwardBinding,
@@ -1722,6 +1724,64 @@ test("keeps weighted readiness private from public and service-binding requests"
   });
   expect(tenantRequests).toHaveLength(2);
   expect(readinessRequests).toHaveLength(2);
+});
+
+test("trusted v2 service dispatch restores the caller URL and strips transport proof before tenant code", async () => {
+  const outer = await generatedFetchWorker(ROUTER_SOURCE, "generated-v2-service-router.mjs");
+  const targetRequests: Request[] = [];
+  const target = {
+    async fetch(request: Request) {
+      targetRequests.push(request);
+      return new Response(await request.text(), { status: 202 });
+    },
+  };
+  const internalHost = "target.selfhost-internal.invalid";
+  const dispatchToken = "8a".repeat(32);
+  const outerEnv = {
+    CONFIG_IDENTITY: "identity",
+    CONFIG_PROBE_TOKEN: "",
+    V2_SERVICE_DISPATCH_HOST: internalHost,
+    V2_SERVICE_DISPATCH_TOKEN: dispatchToken,
+    INTERNAL_READINESS_CAPABILITY: "",
+    INTERNAL_READINESS_ROUTES: "{}",
+    ROUTES: JSON.stringify({ [internalHost]: "target" }),
+    target,
+  };
+
+  const response = await outer.fetch(
+    new Request(`http://${internalHost}/items/one?view=full`, {
+      method: "POST",
+      headers: {
+        host: internalHost,
+        [V2_SERVICE_BINDING_ORIGINAL_URL_HEADER]: "https://caller.example:8443/items/one?view=full",
+        [V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER]: dispatchToken,
+        authorization: "Bearer caller-value",
+      },
+      body: "streamed-payload",
+    }),
+    outerEnv,
+  );
+  expect(response.status).toBe(202);
+  expect(await response.text()).toBe("streamed-payload");
+  expect(targetRequests).toHaveLength(1);
+  expect(targetRequests[0]?.url).toBe("https://caller.example:8443/items/one?view=full");
+  expect(targetRequests[0]?.headers.get("host")).toBe("caller.example:8443");
+  expect(targetRequests[0]?.headers.get("authorization")).toBe("Bearer caller-value");
+  expect(targetRequests[0]?.headers.get(V2_SERVICE_BINDING_ORIGINAL_URL_HEADER)).toBeNull();
+  expect(targetRequests[0]?.headers.get(V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER)).toBeNull();
+
+  const forged = await outer.fetch(
+    new Request(`http://${internalHost}/items/one?view=full`, {
+      headers: {
+        host: internalHost,
+        [V2_SERVICE_BINDING_ORIGINAL_URL_HEADER]: "https://victim.example/items/one?view=full",
+        [V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER]: "00".repeat(32),
+      },
+    }),
+    outerEnv,
+  );
+  expect(forged.status).toBe(404);
+  expect(targetRequests).toHaveLength(1);
 });
 
 test("publishes one canonical immutable weighted graph and retains old generations", async () => {
