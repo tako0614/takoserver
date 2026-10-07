@@ -68,7 +68,10 @@ import type {
   TakoformStandardServiceResolver,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
-import { createTakoformV2Application } from "./takoform-v2/application.ts";
+import {
+  createTakoformV2Application,
+  type V2OperatorFormFactory,
+} from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
 import type { V2Operation } from "./takoform-v2/types.ts";
 import { tenantRunPrincipalId } from "./tenant-run-principal.ts";
@@ -116,6 +119,8 @@ export interface AppPorts {
   readonly publicOrigin: string;
   /** Required, explicit v2 wire identity and supported Form composition. */
   readonly v2: V2ApplicationConfig;
+  /** Operator-selected complete v2 backends, composed against this app's SQL, objects and clock. */
+  readonly v2FormFactory?: V2OperatorFormFactory;
   /** Current Cloudflare Worker Version, retained only as operation and audit provenance. */
   readonly publicWorkerVersionId?: string;
   /** Current semantic Form implementation identity. */
@@ -306,6 +311,7 @@ export function buildApp(ports: AppPorts): App {
     publicOrigin: ports.publicOrigin,
     config: ports.v2,
     clock,
+    ...(ports.v2FormFactory === undefined ? {} : { formFactory: ports.v2FormFactory }),
   });
   const integrationE2eCredentialRoute = integrationE2eCredentialAuthority
     ? createIntegrationE2eCredentialAuthority({
