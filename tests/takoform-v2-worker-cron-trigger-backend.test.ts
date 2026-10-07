@@ -229,6 +229,7 @@ test("Deployment admission reader proves the current claim and settled attachmen
     });
     let admission: Awaited<ReturnType<typeof reader.requiresScheduledHandler>> | undefined;
     let currentDuringLease = false;
+    let reopenedAdmission: Awaited<ReturnType<typeof reader.requiresScheduledHandler>> | undefined;
     f.onDeploymentExecution(async (execution) => {
       expect(execution.resourceUid).toBe(deployment.resourceUid);
       admission = await reader.requiresScheduledHandler({
@@ -242,10 +243,29 @@ test("Deployment admission reader proves the current claim and settled attachmen
         backendKey: execution.backendKey,
       });
       currentDuringLease = admission.kind === "ready" ? await admission.stillCurrent() : false;
+      const reopenedReader = createWorkerCronTriggerAdmissionReader({
+        sql: createSqliteSql(f.db),
+        now: () => new Date("2026-10-07T12:00:00.000Z"),
+      });
+      reopenedAdmission = await reopenedReader.requiresScheduledHandler({
+        workerUid: worker.resourceUid,
+        principal: execution.principal,
+        space: execution.space,
+        targetKey: execution.targetKey,
+        sourceOperationId: execution.operationId,
+        leaseToken: execution.leaseToken,
+        backendId: execution.backendId,
+        backendKey: execution.backendKey,
+      });
     });
     f.keepDeploymentPending(true);
     await f.engine.runNext();
     expect(admission).toMatchObject({
+      kind: "ready",
+      required: true,
+      attachmentUids: [cron.resourceUid],
+    });
+    expect(reopenedAdmission).toMatchObject({
       kind: "ready",
       required: true,
       attachmentUids: [cron.resourceUid],
