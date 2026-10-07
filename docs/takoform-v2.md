@@ -579,7 +579,8 @@ reader and signed-grant broker are passed to Version admission and the native
 owner before it restores any Worker. Each call rechecks the current accepted
 serving graph and native selected Version; neither a Form URL nor an in-memory
 name grants SQL access. Without that complete boot capability the Version is
-refused. The ordinary Bun entry does not supply it or register Worker Forms.
+refused. The ordinary Bun entry supplies it when its private SQLite plane is
+configured, but still does not register Worker Forms.
 Other uncomposed typed Bindings remain explicit refusals in this factory.
 
 The same internal factory can compose a separately keyed ObjectBucket broker at
@@ -762,6 +763,13 @@ them Ready. Local certificate/SNI and route checks are not public DNS, external
 CA trust, or reachability qualification, and this selection does not make
 complete Worker support live.
 
+After owner restoration, `internalFormFactoryForEndpoint(boot.endpoint)` composes
+the same internal Form map against the existing Endpoint boot. It captures the
+three Endpoint ports and retains the exact SQL, object store and clock checks.
+It refuses composition before restoration or after owner suspension; a closed
+boot cannot supply a positive TLS witness. This resolves the composition cycle
+without changing normal-entry Form registration.
+
 ## Existing installations
 
 The additive v2 tables do not convert or delete existing v1 records. Preserving
@@ -791,6 +799,19 @@ failure recovery and delete. Concurrency and lost responses must preserve the
 same operation and resource identities. A restart test must terminate an OS
 process and reopen the same persistent state, not merely construct another
 JavaScript handle.
+
+The pinned-workerd asset journey uses `buildApp` organization sign-in and API-key
+authentication with the internal Form factory. It accepts a module-less static
+Version, serves it through local HTTPS/SNI, and checks assets-first, worker-first,
+SPA, GET, HEAD and POST behavior. A later PUT to the same Deployment keeps the
+Endpoint hostname and serves the updated Version. This exposed an incorrect
+requirement for Endpoint-only accepted output on a Deployment publication; the
+frontend now checks the selected Endpoint identity and optional accepted output
+without dropping its SQL or native currentness fences. Removing an accepted
+execution asset copy makes native observation unknown and HTTPS return 503;
+restoring its exact bytes restores serving. These are local self-signed TLS and
+native execution checks, not public CA/DNS, normal-entry registration or an
+OS-process restart test.
 
 The pinned-workerd Service Binding journey accepts caller and target resources
 through the authenticated Host fixture, then kills that Host process and proves
