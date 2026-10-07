@@ -346,13 +346,13 @@ describe("production D1 fresh init", () => {
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const tail = join(migrationDirectory, "0080_v2_worker_cron_trigger_matches.sql");
+        const tail = join(migrationDirectory, "0081_v2_private_inputs.sql");
         if (drift === "missing") rmSync(tail);
         else if (drift === "changed") {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0081_unreviewed.sql"),
+            join(migrationDirectory, "0082_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }
@@ -365,7 +365,7 @@ describe("production D1 fresh init", () => {
         ).rejects.toThrow(
           drift === "changed"
             ? "exact audited migration SHA-256"
-            : "audited migration lineage must contain exactly 0001-0080",
+            : "audited migration lineage must contain exactly 0001-0081",
         );
         expect(fixture.calls).toEqual([]);
       } finally {

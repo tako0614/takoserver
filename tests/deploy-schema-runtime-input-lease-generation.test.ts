@@ -315,12 +315,12 @@ describe("0064 to 0065 runtime-input lease generation transition", () => {
     const unreviewed = join(root, "unreviewed");
     cpSync(migrations, unreviewed, { recursive: true });
     writeFileSync(
-      join(unreviewed, "0081_unreviewed_extension.sql"),
+      join(unreviewed, "0082_unreviewed_extension.sql"),
       "CREATE TABLE unreviewed(value TEXT);\n",
     );
     const f = fixture({ migrationDirectory: unreviewed });
     try {
-      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0080");
+      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0081");
       expect(f.applies()).toBe(0);
     } finally {
       f.db.close();
