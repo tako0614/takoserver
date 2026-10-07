@@ -28,6 +28,12 @@ import {
   WORKER_MODULE_HANDLER_NAMES,
   type WorkerModuleHandlerName,
 } from "./worker-module-semantic-inspection.ts";
+import {
+  isWorkerdV2PrivateServiceBindingName,
+  WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
+  WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING,
+  WORKERD_V2_PRIVATE_READINESS_BINDING,
+} from "./workerd-v2-private-binding-names.ts";
 
 /**
  * The entrypoint a self-hosted Worker Version is actually published as.
@@ -382,8 +388,20 @@ const HANDLER_NAMES = new Set<string>(SELFHOST_WORKER_HANDLER_NAMES);
  * string can become an import specifier or a property name in the emitted
  * source.
  */
-export function selfhostWorkerEntrypointSource(input: SelfhostWorkerEntrypointSourceInput): string {
-  const normalized = normalizeSourceInput(input);
+export function selfhostWorkerEntrypointSource(
+  input: SelfhostWorkerEntrypointSourceInput,
+  v2PrivateNames = false,
+): string {
+  const normalized = normalizeSourceInput(input, v2PrivateNames);
+  const dataServiceBinding = v2PrivateNames
+    ? WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING
+    : SELFHOST_WORKER_DATA_SERVICE_BINDING;
+  const readinessBinding = v2PrivateNames
+    ? WORKERD_V2_PRIVATE_READINESS_BINDING
+    : SELFHOST_WORKER_INTERNAL_READINESS_CAPABILITY_BINDING;
+  const queueSettlementBinding = v2PrivateNames
+    ? WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING
+    : V2_QUEUE_SETTLEMENT_SERVICE_BINDING;
   const moduleSpecifier = `./${normalized.originalMainModule}`;
   const preludeSpecifier = `./${selfhostWorkerPreludeModuleName(normalized.originalMainModule)}`;
   const configuration = {
@@ -539,12 +557,12 @@ export const ${SELFHOST_WORKER_EVENT_ENTRYPOINT} = SafeApply(SafeObjectFreeze, S
 import * as TenantWorkerModule from ${JSON.stringify(moduleSpecifier)};
 
 const RAW_CONFIGURATION = ${JSON.stringify(configuration)};
-const DATA_SERVICE = ${JSON.stringify(SELFHOST_WORKER_DATA_SERVICE_BINDING)};
+const DATA_SERVICE = ${JSON.stringify(dataServiceBinding)};
 const READINESS_PATH = ${JSON.stringify(SELFHOST_WORKER_READINESS_PATH)};
 const READINESS_PROTOCOL = ${JSON.stringify(SELFHOST_WORKER_READINESS_PROTOCOL)};
 const READINESS_RESULT_SCHEMA = ${JSON.stringify(SELFHOST_WORKER_READINESS_RESULT_SCHEMA)};
 const READINESS_HEADER = ${JSON.stringify(SELFHOST_WORKER_READINESS_HEADER)};
-const INTERNAL_READINESS_CAPABILITY_BINDING = ${JSON.stringify(SELFHOST_WORKER_INTERNAL_READINESS_CAPABILITY_BINDING)};
+const INTERNAL_READINESS_CAPABILITY_BINDING = ${JSON.stringify(readinessBinding)};
 const INTERNAL_READINESS_CAPABILITY_HEADER = ${JSON.stringify(SELFHOST_WORKER_INTERNAL_READINESS_CAPABILITY_HEADER)};
 const PUBLICATION = ${JSON.stringify(normalized.publication)};
 const PROBE_HOSTNAME = ${JSON.stringify(normalized.probeHostname)};
@@ -573,7 +591,7 @@ const EVENT_CONTENT_TYPE = ${JSON.stringify(SELFHOST_WORKER_EVENT_CONTENT_TYPE)}
 const V2_QUEUE_EVENT_PATH = ${JSON.stringify(SELFHOST_V2_QUEUE_EVENT_PATH)};
 const V2_QUEUE_EVENT_PROTOCOL = ${JSON.stringify(SELFHOST_V2_QUEUE_EVENT_PROTOCOL)};
 const V2_QUEUE_EVENT_CONTENT_TYPE = ${JSON.stringify(SELFHOST_V2_QUEUE_EVENT_CONTENT_TYPE)};
-const V2_SETTLEMENT_SERVICE = ${JSON.stringify(V2_QUEUE_SETTLEMENT_SERVICE_BINDING)};
+const V2_SETTLEMENT_SERVICE = ${JSON.stringify(queueSettlementBinding)};
 const V2_SETTLEMENT_URL = ${JSON.stringify(`http://takoserver-selfhost-queue.invalid${V2_QUEUE_SETTLEMENT_PATH}`)};
 const V2_SETTLEMENT_PROTOCOL = ${JSON.stringify(V2_QUEUE_SETTLEMENT_PROTOCOL)};
 const V2_SETTLEMENT_CONTENT_TYPE = ${JSON.stringify(V2_QUEUE_SETTLEMENT_CONTENT_TYPE)};
@@ -2856,7 +2874,10 @@ function viewByteLength(value) {
 `;
 }
 
-function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
+function normalizeSourceInput(
+  input: SelfhostWorkerEntrypointSourceInput,
+  v2PrivateNames: boolean,
+): {
   readonly originalMainModule: string;
   readonly declaredHandlers: SelfhostWorkerHandlerName[];
   readonly bindings: SelfhostWorkerBindingDescriptor[];
@@ -2918,10 +2939,12 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
           ["kind", "publicName", "internalName", "unavailableToken"],
           "bindings",
         );
-        validatePublicName(binding.publicName, publicNames, false);
+        validatePublicName(binding.publicName, publicNames, false, v2PrivateNames);
         if (
           typeof binding.internalName !== "string" ||
-          !INTERNAL_SERVICE_BINDING_NAME.test(binding.internalName) ||
+          !(v2PrivateNames
+            ? isWorkerdV2PrivateServiceBindingName(binding.internalName)
+            : INTERNAL_SERVICE_BINDING_NAME.test(binding.internalName)) ||
           typeof binding.unavailableToken !== "string" ||
           !UNAVAILABLE_TOKEN.test(binding.unavailableToken)
         ) {
@@ -2939,7 +2962,7 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
       if (typeof binding.kind !== "string" || !DATA_BINDING_KINDS.has(binding.kind)) {
         invalid("bindings");
       }
-      validatePublicName(binding.publicName, publicNames, false);
+      validatePublicName(binding.publicName, publicNames, false, v2PrivateNames);
       bindings.push({
         kind: binding.kind as SelfhostWorkerDataBindingDescriptor["kind"],
         publicName: binding.publicName as string,
@@ -2950,7 +2973,7 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
     if (typeof binding.type !== "string" || !NATIVE_BINDING_TYPES.has(binding.type)) {
       invalid("bindings");
     }
-    validatePublicName(binding.name, publicNames, true);
+    validatePublicName(binding.name, publicNames, true, v2PrivateNames);
     bindings.push({
       name: binding.name as string,
       type: binding.type as SelfhostWorkerNativeBindingDescriptor["type"],
@@ -2988,12 +3011,19 @@ function validateArtifactPartName(value: unknown): asserts value is string {
   }
 }
 
-function validatePublicName(value: unknown, seen: Set<string>, variable: boolean): void {
+function validatePublicName(
+  value: unknown,
+  seen: Set<string>,
+  variable: boolean,
+  v2PrivateNames: boolean,
+): void {
   if (
     typeof value !== "string" ||
     value.length > 64 ||
-    !(variable ? VARIABLE_NAME : BINDING_NAME).test(value) ||
-    value.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX) ||
+    !(v2PrivateNames && variable
+      ? VARIABLE_NAME.test(value) || BINDING_NAME.test(value)
+      : (variable ? VARIABLE_NAME : BINDING_NAME).test(value)) ||
+    (!v2PrivateNames && value.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX)) ||
     seen.has(value)
   ) {
     invalid("bindings");

@@ -1,4 +1,4 @@
-import type { Clock, JsonObject, Sql } from "../ports.ts";
+import type { Clock, JsonObject, Sql, SqlParam } from "../ports.ts";
 import type { V2ConfiguredPrivateInputs } from "./configured-private-inputs.ts";
 import type { V2PrivateInputCustody, V2PrivateInputMap } from "./private-inputs.ts";
 
@@ -108,9 +108,30 @@ export interface V2ReferenceRequirement {
   };
 }
 
+/** A trusted Form's parameterized acceptance predicate, never request SQL. */
+export interface V2AdmissionPredicate {
+  /** A boolean SQL expression embedded in the Resource acceptance statement. */
+  readonly sql: string;
+  readonly params: readonly SqlParam[];
+}
+
 export interface V2Form {
   validateCreate(spec: JsonObject): void;
   validateUpdate(previousSpec: JsonObject, spec: JsonObject): void;
+  /**
+   * Read external readiness after authorization/replay, then bind its exact
+   * SQL proof to the same atomic Resource/Operation acceptance batch. A null
+   * result refuses acceptance without writing a replay key. Trusted Forms
+   * alone supply SQL; untrusted request values may only become parameters.
+   */
+  prepareAdmission?(input: {
+    readonly action: "create" | "update";
+    readonly principal: string;
+    readonly space: string;
+    readonly form: string;
+    readonly resourceUid: string;
+    readonly spec: JsonObject;
+  }): Promise<V2AdmissionPredicate | null>;
   /** Exact Form-owned names, requiredness, and omission/update preservation semantics. */
   readonly privateInputs?: {
     /** If no secret-free instance is valid, a Host without custody must not claim support. */

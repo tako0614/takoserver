@@ -1,4 +1,5 @@
 import { SELFHOST_WORKFLOW_BINDING_RUNTIME_SOURCE } from "./generated/selfhost-workflow-binding-runtime-source.ts";
+import { isWorkerdV2PrivateWorkflowBindingName } from "./providers/workerd-v2-private-binding-names.ts";
 
 const MODULE_NAME = /^[A-Za-z0-9_.][A-Za-z0-9._-]*$/u;
 const PUBLIC_BINDING = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
@@ -76,7 +77,7 @@ export function selfhostWorkflowBindingEntrypointSource(input: {
       !PUBLIC_BINDING.test(publicName) ||
       names.has(publicName) ||
       typeof serviceName !== "string" ||
-      !PRIVATE_SERVICE.test(serviceName) ||
+      !(PRIVATE_SERVICE.test(serviceName) || isWorkerdV2PrivateWorkflowBindingName(serviceName)) ||
       services.has(serviceName) ||
       typeof token !== "string" ||
       !TOKEN.test(token)

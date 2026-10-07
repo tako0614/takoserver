@@ -17,6 +17,20 @@ export const V2_QUEUE_BACKEND_ID = "selfhost-v2-at-least-once-queue-sql-v1";
 const PAGE = 64;
 const DB_NOW_MS =
   "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
+const UNDELIVERED_RETENTION_SQL = `NOT EXISTS (
+  SELECT 1 FROM queue_v2_batch_settlements receipt
+  JOIN queue_v2_batch_executions execution
+    ON execution.batch_id = receipt.batch_id
+   AND execution.reservation_token = receipt.execution_reservation_token
+   AND execution.queue_id = receipt.queue_id
+   AND execution.consumer_uid = receipt.consumer_id
+   AND execution.consumer_generation = receipt.generation
+   AND execution.lease_token = receipt.lease_token
+  WHERE receipt.queue_id = message.queue_id
+    AND receipt.message_id = message.message_id
+    AND receipt.lease_token = message.lease_token
+    AND execution.state IN ('send_authorized','retired')
+)`;
 const UNKNOWN: V2BackendResult = {
   kind: "unknown",
   code: "queue_unconfirmed",
@@ -72,9 +86,10 @@ export function createAtLeastOnceQueueForm(options: {
         `UPDATE selfhost_queue_messages
          SET expires_at_ms = enqueued_at_ms + ? * 1000
          WHERE rowid IN (
-           SELECT rowid FROM selfhost_queue_messages
-           WHERE queue_id = ? AND expires_at_ms > ${DB_NOW_MS}
-             AND expires_at_ms <> enqueued_at_ms + ? * 1000
+           SELECT message.rowid FROM selfhost_queue_messages message
+           WHERE message.queue_id = ? AND message.expires_at_ms > ${DB_NOW_MS}
+             AND message.expires_at_ms <> message.enqueued_at_ms + ? * 1000
+             AND ${UNDELIVERED_RETENTION_SQL}
            ORDER BY message_id LIMIT ?
          ) AND ${V2_QUEUE_CLAIM_SQL}`,
         [
@@ -101,9 +116,10 @@ export function createAtLeastOnceQueueForm(options: {
     const remaining = await sql.query(
       execution.action === "delete"
         ? "SELECT 1 FROM selfhost_queue_messages WHERE queue_id = ? LIMIT 1"
-        : `SELECT 1 FROM selfhost_queue_messages WHERE queue_id = ?
-           AND expires_at_ms > ${DB_NOW_MS}
-           AND expires_at_ms <> enqueued_at_ms + ? * 1000 LIMIT 1`,
+        : `SELECT 1 FROM selfhost_queue_messages message WHERE message.queue_id = ?
+           AND message.expires_at_ms > ${DB_NOW_MS}
+           AND message.expires_at_ms <> message.enqueued_at_ms + ? * 1000
+           AND ${UNDELIVERED_RETENTION_SQL} LIMIT 1`,
       execution.action === "delete" ? [queueId] : [queueId, spec.messageRetentionSeconds],
     );
     if (!(await ownsV2QueueClaim(sql, claim))) return UNKNOWN;

@@ -37,6 +37,13 @@ import {
   selfhostWorkerEntrypointSource,
 } from "./providers/selfhost-worker-wrapper.ts";
 import {
+  WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
+  WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+  workerdV2PrivateActorBindingName,
+  workerdV2PrivateServiceBindingName,
+  workerdV2PrivateWorkflowBindingName,
+} from "./providers/workerd-v2-private-binding-names.ts";
+import {
   renderSelfhostActorForwardRuntimeModuleSource,
   selfhostActorForwardEntrypointSource,
 } from "./selfhost-actor-forward-worker-wrapper.ts";
@@ -60,6 +67,7 @@ const SELFHOST_ACTOR_FORWARD_ENTRYPOINT_MODULE =
 const SELFHOST_ACTOR_FORWARD_RUNTIME_MODULE =
   "__takoserver-selfhost-actor-forward-runtime.js" as const;
 const ACTOR_FORWARD_PUBLIC_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
+const PUBLIC_VAR_NAME = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/u;
 const ACTOR_FORWARD_RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u;
 const ACTOR_FORWARD_TOKEN = /^[a-f0-9]{64}$/u;
 
@@ -183,6 +191,11 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
     invalid();
   }
   if (input.hostnames.some((hostname) => typeof hostname !== "string")) invalid();
+  const v2PrivateNames =
+    typeof input.generation === "string" &&
+    /^takoserver-v2-operation:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+      input.generation,
+    );
 
   const { modules, moduleMediaTypes } = snapshotModules(
     input.mainModule,
@@ -193,13 +206,17 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
   const environment = projectEnvironment(input.environment);
   const dataPlane = projectDataPlane(input.dataPlane);
   const serviceBindings = projectServiceBindings(input.serviceBindings);
-  const actorForward = projectActorForward(input.actorForward);
-  const workflowForward = projectWorkflowForward(input.workflowForward, {
-    environment: environment.vars,
-    dataPlane,
-    serviceBindings,
-    actorForward,
-  });
+  const actorForward = projectActorForward(input.actorForward, v2PrivateNames);
+  const workflowForward = projectWorkflowForward(
+    input.workflowForward,
+    {
+      environment: environment.vars,
+      dataPlane,
+      serviceBindings,
+      actorForward,
+    },
+    v2PrivateNames,
+  );
   if (serviceBindings.length > 0 && input.workerResourceUid === undefined) invalid();
   const eventToken = projectOpaqueToken(input.eventToken);
   const v2QueueSettlement = input.v2QueueSettlement;
@@ -216,7 +233,7 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
     invalid();
 
   const services = serviceBindings.map((binding, index) => ({
-    name: serviceBindingName(index),
+    name: serviceBindingName(index, v2PrivateNames),
     target: binding.target,
     targetResourceUid: binding.targetResourceUid,
     unavailableToken: binding.unavailableToken,
@@ -231,49 +248,53 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
       unavailableToken: service.unavailableToken,
     })),
   ];
-  const wrapperSource = selfhostWorkerEntrypointSource({
-    originalMainModule: input.mainModule,
-    declaredHandlers: input.declaredHandlers,
-    bindings: [
-      ...bindings,
-      ...(actorForward?.bindings.map((binding) => ({
-        name: binding.publicName,
-        type: "json" as const,
-      })) ?? []),
-      ...(workflowForward?.bindings.map((binding) => ({
-        name: binding.publicName,
-        type: "json" as const,
-      })) ?? []),
-    ],
-    publication: input.readiness.publication,
-    probeHostname: input.readiness.probeHostname,
-    ...(eventToken === undefined ? {} : { events: true }),
-    ...(v2QueueSettlement === undefined ? {} : { v2Queue: true }),
-  });
+  const wrapperSource = selfhostWorkerEntrypointSource(
+    {
+      originalMainModule: input.mainModule,
+      declaredHandlers: input.declaredHandlers,
+      bindings: [
+        ...bindings,
+        ...(actorForward?.bindings.map((binding) => ({
+          name: binding.publicName,
+          type: "json" as const,
+        })) ?? []),
+        ...(workflowForward?.bindings.map((binding) => ({
+          name: binding.publicName,
+          type: "json" as const,
+        })) ?? []),
+      ],
+      publication: input.readiness.publication,
+      probeHostname: input.readiness.probeHostname,
+      ...(eventToken === undefined ? {} : { events: true }),
+      ...(v2QueueSettlement === undefined ? {} : { v2Queue: true }),
+    },
+    v2PrivateNames,
+  );
 
   const preludeModule = selfhostWorkerPreludeModuleName(input.mainModule);
   const encoder = new TextEncoder();
+  const wrapperModule = v2PrivateNames
+    ? WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE
+    : SELFHOST_WORKER_ENTRYPOINT_MODULE;
   const hostEntrypoint =
     workflowForward !== undefined
       ? SELFHOST_WORKFLOW_BINDING_ENTRYPOINT_MODULE
       : actorForward === undefined
-        ? SELFHOST_WORKER_ENTRYPOINT_MODULE
+        ? wrapperModule
         : SELFHOST_ACTOR_FORWARD_ENTRYPOINT_MODULE;
   const hostModules = new Map<string, Uint8Array>([
-    [SELFHOST_WORKER_ENTRYPOINT_MODULE, encoder.encode(wrapperSource)],
+    [wrapperModule, encoder.encode(wrapperSource)],
     [preludeModule, encoder.encode(selfhostWorkerPreludeSource())],
   ]);
   const innerEntrypoint =
-    actorForward === undefined
-      ? SELFHOST_WORKER_ENTRYPOINT_MODULE
-      : SELFHOST_ACTOR_FORWARD_ENTRYPOINT_MODULE;
+    actorForward === undefined ? wrapperModule : SELFHOST_ACTOR_FORWARD_ENTRYPOINT_MODULE;
   if (actorForward !== undefined) {
     hostModules.set(
       SELFHOST_ACTOR_FORWARD_ENTRYPOINT_MODULE,
       encoder.encode(
         selfhostActorForwardEntrypointSource({
           runtimeModule: SELFHOST_ACTOR_FORWARD_RUNTIME_MODULE,
-          innerModule: SELFHOST_WORKER_ENTRYPOINT_MODULE,
+          innerModule: wrapperModule,
           bindings: actorForward.bindings,
           queue: input.declaredHandlers.includes("queue"),
           scheduled: input.declaredHandlers.includes("scheduled"),
@@ -335,9 +356,7 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
     hostEntrypoint,
     hostModules: [
       preludeModule,
-      ...(actorForward === undefined && workflowForward === undefined
-        ? []
-        : [SELFHOST_WORKER_ENTRYPOINT_MODULE]),
+      ...(actorForward === undefined && workflowForward === undefined ? [] : [wrapperModule]),
       ...(actorForward === undefined ? [] : [SELFHOST_ACTOR_FORWARD_RUNTIME_MODULE]),
       ...(workflowForward === undefined
         ? []
@@ -432,6 +451,7 @@ function projectEnvironment(environment: readonly WorkerdEnvironmentEntry[]): {
     if (
       !isRecord(entry) ||
       typeof entry.name !== "string" ||
+      !PUBLIC_VAR_NAME.test(entry.name) ||
       typeof entry.value !== "string" ||
       (entry.type !== "plain_text" && entry.type !== "json" && entry.type !== "secret_text")
     ) {
@@ -506,6 +526,7 @@ function projectServiceBindings(
 
 function projectActorForward(
   actorForward: WorkerdVersionGraphInput["actorForward"],
+  v2PrivateNames: boolean,
 ): WorkerdActorForward | undefined {
   if (actorForward === undefined) return undefined;
   if (!Array.isArray(actorForward) || actorForward.length === 0 || actorForward.length > 64)
@@ -540,8 +561,12 @@ function projectActorForward(
       publicName: binding.publicName,
       tenantId: binding.tenantId,
       namespaceResourceUid: binding.namespaceResourceUid,
-      httpService: `__TAKOSERVER_ACTOR_HTTP_${index.toString(10).padStart(5, "0")}`,
-      upgradeService: `__TAKOSERVER_ACTOR_UPGRADE_${index.toString(10).padStart(5, "0")}`,
+      httpService: v2PrivateNames
+        ? workerdV2PrivateActorBindingName("HTTP", index)
+        : `__TAKOSERVER_ACTOR_HTTP_${index.toString(10).padStart(5, "0")}`,
+      upgradeService: v2PrivateNames
+        ? workerdV2PrivateActorBindingName("UPGRADE", index)
+        : `__TAKOSERVER_ACTOR_UPGRADE_${index.toString(10).padStart(5, "0")}`,
       token: binding.token,
       ...(runtimeClassRef === undefined ? {} : { runtimeClassRef }),
     };
@@ -557,6 +582,7 @@ function projectWorkflowForward(
     readonly serviceBindings: readonly WorkerdServiceBinding[];
     readonly actorForward: WorkerdActorForward | undefined;
   },
+  v2PrivateNames: boolean,
 ): WorkerdWorkflowForward | undefined {
   if (workflowForward === undefined) return undefined;
   let snapshot: unknown;
@@ -594,7 +620,8 @@ function projectWorkflowForward(
       ]) ||
       typeof candidate.publicName !== "string" ||
       !ACTOR_FORWARD_PUBLIC_NAME.test(candidate.publicName) ||
-      candidate.publicName.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX) ||
+      (!v2PrivateNames &&
+        candidate.publicName.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX)) ||
       typeof candidate.token !== "string" ||
       !ACTOR_FORWARD_TOKEN.test(candidate.token) ||
       publicNames.has(candidate.publicName)
@@ -636,20 +663,22 @@ function projectWorkflowForward(
   if (normalized === undefined || normalized.length !== snapshot.bindings.length) invalid();
   const collidingBindingNames = new Set<string>([
     ...collidingPublicNames,
-    ...existing.serviceBindings.map((_, index) => serviceBindingName(index)),
+    ...existing.serviceBindings.map((_, index) => serviceBindingName(index, v2PrivateNames)),
     ...(existing.actorForward?.bindings.flatMap((binding) => [
       binding.httpService,
       binding.upgradeService,
     ]) ?? []),
-    SELFHOST_WORKER_DATA_SERVICE_BINDING,
-    SELFHOST_WORKER_EVENT_TARGET_BINDING,
+    v2PrivateNames ? WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING : SELFHOST_WORKER_DATA_SERVICE_BINDING,
+    ...(v2PrivateNames ? [] : [SELFHOST_WORKER_EVENT_TARGET_BINDING]),
   ]);
   for (let index = 0; index < normalized.length; index += 1) {
     const binding = normalized[index];
     if (binding === undefined || collidingBindingNames.has(binding.name)) invalid();
     if (
       collidingBindingNames.has(
-        `__TAKOSERVER_WORKFLOW_BINDING_${index.toString(10).padStart(5, "0")}`,
+        v2PrivateNames
+          ? workerdV2PrivateWorkflowBindingName(index)
+          : `__TAKOSERVER_WORKFLOW_BINDING_${index.toString(10).padStart(5, "0")}`,
       )
     ) {
       invalid();
@@ -663,7 +692,9 @@ function projectWorkflowForward(
       if (token === undefined) invalid();
       return {
         publicName: binding.name,
-        serviceName: `__TAKOSERVER_WORKFLOW_BINDING_${index.toString(10).padStart(5, "0")}`,
+        serviceName: v2PrivateNames
+          ? workerdV2PrivateWorkflowBindingName(index)
+          : `__TAKOSERVER_WORKFLOW_BINDING_${index.toString(10).padStart(5, "0")}`,
         tenantId: binding.tenantId,
         workflowResourceUid: binding.workflowResourceUid,
         workflowFormRef: binding.workflowFormRef,
@@ -687,7 +718,8 @@ function projectOpaqueToken(value: string | undefined): string | undefined {
   return value;
 }
 
-function serviceBindingName(index: number): string {
+function serviceBindingName(index: number, v2PrivateNames: boolean): string {
+  if (v2PrivateNames) return workerdV2PrivateServiceBindingName(index);
   return `${SELFHOST_WORKER_INTERNAL_BINDING_PREFIX}SELFHOST_SERVICE_${index
     .toString(10)
     .padStart(5, "0")}`;

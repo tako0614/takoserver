@@ -1,5 +1,5 @@
 import { canonicalJson } from "../json.ts";
-import { type JsonObject, SqlError } from "../ports.ts";
+import { type JsonObject, SqlError, type SqlParam } from "../ports.ts";
 import { readV2ConfiguredPrivateInputs } from "./configured-private-inputs.ts";
 import { isV2FormUrl } from "./identity.ts";
 import {
@@ -15,6 +15,7 @@ import { prepareV2References } from "./references.ts";
 import { type AcceptRecord, createV2Store, type OperationRow, type ResourceRow } from "./store.ts";
 import {
   TakoformV2Error,
+  type V2AdmissionPredicate,
   type V2BackendResult,
   type V2CreateInput,
   type V2EngineOptions,
@@ -99,6 +100,25 @@ function snapshotRequest<T>(request: T): T {
   } catch {
     fail("invalid_request", 400);
   }
+}
+
+function snapshotAdmission(value: V2AdmissionPredicate | null): V2AdmissionPredicate | null {
+  if (value === null) return null;
+  const sql = value.sql;
+  if (typeof sql !== "string" || !sql.trim() || sql.includes(";") || !Array.isArray(value.params)) {
+    throw new TypeError("invalid trusted Form admission predicate");
+  }
+  const params: SqlParam[] = value.params.map((param) => {
+    if (param instanceof ArrayBuffer) return param.slice(0);
+    if (
+      param === null ||
+      typeof param === "string" ||
+      (typeof param === "number" && Number.isFinite(param))
+    )
+      return param;
+    throw new TypeError("invalid trusted Form admission parameter");
+  });
+  return Object.freeze({ sql, params: Object.freeze(params) });
 }
 
 function snapshotPrivateInputs(
@@ -469,6 +489,19 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           };
         }
       }
+      const admission = selected.prepareAdmission
+        ? snapshotAdmission(
+            await selected.prepareAdmission({
+              action: "create",
+              principal,
+              space: desired.space,
+              form: desired.form,
+              resourceUid: record.resourceUid,
+              spec: JSON.parse(record.specJson) as JsonObject,
+            }),
+          )
+        : undefined;
+      if (admission === null) fail("dependency_conflict", 409);
       const output = selected.initialOutput
         ? selected.initialOutput({
             resourceUid: record.resourceUid,
@@ -482,7 +515,14 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       }
       const initialOutputJson = canonicalRequest(output);
       try {
-        await store.insertCreate(record, desired, referencesJson, initialOutputJson);
+        const result = await store.insertCreate(
+          record,
+          desired,
+          referencesJson,
+          initialOutputJson,
+          admission,
+        );
+        if (result === "dependency_conflict") fail("dependency_conflict", 409);
       } catch (error) {
         const winner = await winnerAfterRace(principal, key, fingerprint, privateInputs);
         if (winner) return winner;
@@ -571,12 +611,26 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         });
         if (configured) record = { ...record, expectedConfiguredPrivateInputs: configured };
       }
+      const admission = selectedForm.prepareAdmission
+        ? snapshotAdmission(
+            await selectedForm.prepareAdmission({
+              action: "update",
+              principal: input.principal,
+              space: target.space,
+              form: target.form_url,
+              resourceUid: target.uid,
+              spec: JSON.parse(record.specJson) as JsonObject,
+            }),
+          )
+        : undefined;
+      if (admission === null) fail("dependency_conflict", 409);
       let result: Awaited<ReturnType<typeof store.insertChange>>;
       try {
         result = await store.insertChange(
           record,
           referencesJson,
           serializeUpdatesWithPendingReferrers,
+          admission,
         );
         if (result === "accepted") return operation(await storedOperation(record.id));
       } catch (error) {

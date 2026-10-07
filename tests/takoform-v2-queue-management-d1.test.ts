@@ -12,6 +12,7 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import type { V2WorkerCurrentServingResolution } from "../src/takoform-v2/worker-publication-state.ts";
+import { prepareV2QueueConsumerAdmission } from "../src/takoform-v2/worker-queue-admission.ts";
 import { createAtLeastOnceQueueForm } from "../src/takoform-v2/worker-queue-backend.ts";
 import {
   createQueueConsumerForm,
@@ -84,7 +85,20 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
     const targetKey = "d1-queue-target";
     let servingSourceOperationId = "fixture-serving";
     let selectedVersionUid = "fixture-version";
+    let selectedDeploymentUid = "fixture-deployment";
     const capability: V2QueueConsumerCapability = {
+      async observeQueueServingCapability() {
+        return {
+          kind: "confirmed",
+          servingSourceOperationId,
+          deploymentUid: selectedDeploymentUid,
+          deploymentGeneration: 1,
+          versions: [{ workerVersionUid: selectedVersionUid, generation: 1, weight: 10_000 }],
+          async stillCurrent() {
+            return true;
+          },
+        };
+      },
       async observeCurrentServing({ workerUid }) {
         return {
           kind: "ready",
@@ -140,7 +154,11 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
           id: "fixture-version",
           targetKey,
           async execute() {
-            return { kind: "complete" as const, observed: { ready: true }, output: {} };
+            return {
+              kind: "complete" as const,
+              observed: { ready: true, resolvedBindings: true, bundleVerified: true },
+              output: {},
+            };
           },
           async reconcile() {
             return { kind: "unknown" as const };
@@ -193,7 +211,7 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
         form: WORKER_VERSION_FORM_URL,
         space,
         name: "version",
-        spec: { worker: { resourceUid: selectedWorker.resourceUid } },
+        spec: { worker: { resourceUid: selectedWorker.resourceUid }, handlers: ["queue"] },
       },
     });
     expect((await engine.runNext())?.status).toBe("succeeded");
@@ -205,11 +223,15 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
         form: WORKER_DEPLOYMENT_FORM_URL,
         space,
         name: "deployment",
-        spec: { worker: { resourceUid: selectedWorker.resourceUid } },
+        spec: {
+          worker: { resourceUid: selectedWorker.resourceUid },
+          versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+        },
       },
     });
     expect((await engine.runNext())?.status).toBe("succeeded");
     servingSourceOperationId = deployment.id;
+    selectedDeploymentUid = deployment.resourceUid;
     const spec = {
       queue: { resourceUid: queue.resourceUid },
       worker: { resourceUid: selectedWorker.resourceUid },
@@ -219,6 +241,17 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
       maxRetries: 2,
       retryDelaySeconds: 5,
     };
+    const admission = await prepareV2QueueConsumerAdmission({
+      capability,
+      principal,
+      space,
+      targetKey,
+      spec,
+    });
+    if (!admission) throw new Error("expected privileged admission proof");
+    expect(
+      await sql.query(`SELECT 1 AS permitted WHERE (${admission.sql})`, admission.params),
+    ).toEqual([{ permitted: 1 }]);
     const results = await Promise.allSettled([
       engine.acceptCreate({
         principal,
@@ -261,6 +294,15 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
       [QUEUE_CONSUMER_FORM_URL],
     );
     if (typeof consumer?.uid !== "string") throw new Error("Consumer not settled");
+    const updated = await engine.acceptUpdate({
+      principal,
+      key: "d1-consumer-update-0001",
+      uid: consumer.uid,
+      expectedGeneration: 1,
+      spec: { ...spec, maxBatchSize: 2 },
+    });
+    expect((await engine.runNext())?.id).toBe(updated.id);
+    expect((await engine.getOperation({ principal, id: updated.id })).effect).toBe("complete");
     const custody = createQueueCustody({ sql });
     await custody.admit(
       {

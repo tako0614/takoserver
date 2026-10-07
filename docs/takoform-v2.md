@@ -543,8 +543,16 @@ Tests cover real SQLite acceptance and publication with a synthetic runtime,
 including a lost runtime acknowledgement. They do not prove OS-process restart,
 native workerd ABI, normal Form registration or live provider behavior.
 
-Other typed resource Bindings and queue delivery remain explicit refusals in
-this internal code projection, not claims of complete WorkerVersion support.
+The internal code path admits a SQLite Binding only when one boot-selected
+SQLite store, a persistent Host-private signing key of at least 32 bytes, and
+a fixed loopback port are composed together. The same captured Core binding
+reader and signed-grant broker are passed to Version admission and the native
+owner before it restores any Worker. Each call rechecks the current accepted
+serving graph and native selected Version; neither a Form URL nor an in-memory
+name grants SQL access. Without that complete boot capability the Version is
+refused. The ordinary Bun entry does not supply it or register Worker Forms.
+Other uncomposed typed Bindings and queue delivery remain explicit refusals
+in this factory, not claims of complete WorkerVersion support.
 
 The internal WorkerCronTrigger backend and scheduler use the published
 WorkerCronTrigger 0.3.0 contract. Admission seals the exact Worker, target and
@@ -590,6 +598,19 @@ PUT, mismatch refusal, configured fetch, and Host-PID restart without putting
 the secret in public Resource output. It does not register the Worker Forms on
 the normal public entry or qualify live HTTPS delivery. The existing Bun-child
 scheduled/asset tests remain stand-ins, not native workerd evidence.
+
+A separate normal-`buildApp` local journey composes the
+existing SQLiteDatabase, held SQLiteMigrationSet/Application, and this private
+SQLite binding. It accepts the exact UID reference over organization HTTP,
+executes native Worker SQL writes and reads, SIGKILLs the Host, restores the
+same accepted graph with a different Host/native PID, then reads the same rows
+and continues after a same-spec Database PUT. All test keys are synthetic.
+An admitted old invocation also keeps its signed exact-incarnation SQLite
+Binding while a replacement Deployment is pending and while that incarnation
+drains; each call still checks the live native owner and current settled
+Version/Database references, and retirement ends that authority.
+That evidence does not qualify the 40 MiB companion transport boundary,
+public HTTPS/TLS, or complete WorkerVersion/SQLiteDatabase Form support.
 
 ## Existing installations
 

@@ -1,10 +1,16 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
+import {
+  createSelfhostV2SqliteBindingBroker,
+  type V2SqliteBindingGrant,
+} from "./providers/selfhost-v2-sqlite-binding-broker.ts";
+import type { SelfhostV2SQLiteStore } from "./providers/selfhost-v2-sqlite-store.ts";
 import type { V2OperatorFormFactory } from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
 import { readV2ConfiguredPrivateInputs } from "./takoform-v2/configured-private-inputs.ts";
 import { createV2HeldArtifactSource } from "./takoform-v2/forms/artifact-source.ts";
+import { createSQLiteWorkerBindingAuthority } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { createStaticAssetBundleCustody } from "./takoform-v2/forms/static-asset-bundle-backend.ts";
 import { createWorkerBundleCustody } from "./takoform-v2/forms/worker-bundle-backend.ts";
 import {
@@ -50,6 +56,13 @@ export interface SelfhostV2WorkerCompositionOptions {
   readonly workerdBinary: string | null;
   /** Already-created operator key authority; absent refuses sensitive Worker Versions. */
   readonly configuredInputSealer?: ReturnType<typeof createV2WorkerVersionConfiguredInputSealer>;
+  /** Already-created Resource custody and pre-existing private signing authority. */
+  readonly sqliteBinding?: {
+    readonly store: SelfhostV2SQLiteStore;
+    readonly signingKey: Uint8Array;
+    /** Stable operator-selected loopback port, retained across Host restarts. */
+    readonly privatePort: number;
+  };
   /** Exact frontend authority; absent on the ordinary public entry today. */
   readonly endpoint?: EndpointPorts;
   /** Tests may substitute a child, but production uses parent-death-fenced Workerd. */
@@ -86,6 +99,8 @@ async function unusedPrivatePort(excluded: Set<number>): Promise<number> {
 export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompositionOptions): {
   restoreOwners(): Promise<readonly string[]>;
   ownerForWorkerUid(uid: string): Promise<WorkerdWorkerRuntimeOwner>;
+  /** Close retired owners, then stop the private broker; active owners refuse. */
+  closePrivateBindingServices(): Promise<void>;
   /** Internal acceptance seam only. The normal entry must not register it yet. */
   readonly internalFormFactory: V2OperatorFormFactory;
 } {
@@ -93,6 +108,27 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     throw new TypeError("v2 Worker composition requires SQL, objects, target and private root");
   }
   const { sql, objects, clock, config, targetKey } = options;
+  if (
+    options.sqliteBinding &&
+    (options.sqliteBinding.store?.targetKey !== targetKey ||
+      typeof options.sqliteBinding.store.withAuthorizedDatabase !== "function" ||
+      !(options.sqliteBinding.signingKey instanceof Uint8Array) ||
+      options.sqliteBinding.signingKey.byteLength < 32 ||
+      !Number.isSafeInteger(options.sqliteBinding.privatePort) ||
+      options.sqliteBinding.privatePort < 1 ||
+      options.sqliteBinding.privatePort > 65_535)
+  ) {
+    throw new TypeError("v2 SQLite binding requires exact store, private key and fixed port");
+  }
+  // A caller cannot retarget the private listener, signing bytes, or custody
+  // methods between factory construction and the first owner restoration.
+  const sqliteBinding = options.sqliteBinding
+    ? Object.freeze({
+        store: Object.freeze({ ...options.sqliteBinding.store }),
+        signingKey: new Uint8Array(options.sqliteBinding.signingKey),
+        privatePort: options.sqliteBinding.privatePort,
+      })
+    : undefined;
   const suppliedSealer = options.configuredInputSealer;
   if (
     suppliedSealer &&
@@ -153,6 +189,38 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     binary: options.workerdBinary,
   }).inspect;
   const owners = new Map<string, Promise<WorkerdWorkerRuntimeOwner>>();
+  const sqliteAuthority = sqliteBinding
+    ? createSQLiteWorkerBindingAuthority({ sql, targetKey })
+    : undefined;
+  const sqliteBroker =
+    sqliteBinding && sqliteAuthority
+      ? createSelfhostV2SqliteBindingBroker({
+          store: sqliteBinding.store,
+          signingKey: sqliteBinding.signingKey,
+          resolveCurrentBinding: sqliteAuthority.resolveCurrentBinding,
+          async observeVersionTarget(input) {
+            try {
+              if (!restorationComplete) return { kind: "unknown" };
+              const owner = await openOwner(input.workerUid);
+              return await owner.observeVersionTarget(input);
+            } catch {
+              return { kind: "unknown" };
+            }
+          },
+          async graphStillCurrent(grant) {
+            return await sqliteGrantGraphStillCurrent(grant);
+          },
+        })
+      : undefined;
+  const sqliteBoot =
+    sqliteBinding && sqliteBroker && sqliteAuthority
+      ? Object.freeze({
+          address: `127.0.0.1:${sqliteBinding.privatePort}`,
+          issueGrant: sqliteBroker.issueGrant,
+          resolveCurrentBinding: sqliteAuthority.resolveCurrentBinding,
+        })
+      : undefined;
+  let sqliteServer: ReturnType<typeof Bun.serve> | undefined;
   const reservedPorts = new Set<number>();
   const listenerPortForOperation =
     options.listenerPortForOperation ?? (() => unusedPrivatePort(reservedPorts));
@@ -162,6 +230,109 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" }));
   let restoration: Promise<readonly string[]> | undefined;
   let restorationComplete = false;
+
+  async function sqliteGrantGraphStillCurrent(grant: V2SqliteBindingGrant): Promise<boolean> {
+    try {
+      if (!restorationComplete || grant.targetKey !== targetKey) return false;
+      const owner = await openOwner(grant.workerUid);
+      const nativeTarget = {
+        workerUid: grant.workerUid,
+        versionId: grant.nativeVersionId,
+        incarnationId: grant.incarnationId,
+        servingSourceOperationId: grant.servingSourceOperationId,
+      };
+      const observedTarget = await owner.observeVersionTarget(nativeTarget);
+      if (
+        observedTarget.kind !== "confirmed" ||
+        observedTarget.workerUid !== grant.workerUid ||
+        observedTarget.versionId !== grant.nativeVersionId ||
+        observedTarget.incarnationId !== grant.incarnationId ||
+        observedTarget.servingSourceOperationId !== grant.servingSourceOperationId
+      )
+        return false;
+      let beforeServing =
+        observedTarget.status === "active"
+          ? await owner.observeServing({ workerResourceUid: grant.workerUid, targetKey })
+          : null;
+      if (
+        beforeServing &&
+        (beforeServing.kind !== "serving" ||
+          beforeServing.sourceOperationId !== grant.servingSourceOperationId ||
+          !beforeServing.versions.some(
+            (version) => version.workerVersionUid === grant.workerVersionUid,
+          ))
+      ) {
+        const transitioned = await owner.observeVersionTarget(nativeTarget);
+        if (
+          transitioned.kind !== "confirmed" ||
+          transitioned.status !== "draining" ||
+          transitioned.workerUid !== grant.workerUid ||
+          transitioned.versionId !== grant.nativeVersionId ||
+          transitioned.incarnationId !== grant.incarnationId ||
+          transitioned.servingSourceOperationId !== grant.servingSourceOperationId
+        )
+          return false;
+        beforeServing = null;
+      }
+
+      // The grant is minted only from a preflighted accepted publication and
+      // bound to one native owner incarnation. A pending replacement may make
+      // current-serving SQL unavailable *before* that old owner drains. Existing
+      // contexts still retain their selected Version through both states; this
+      // gate cannot admit a new invocation or select a stale Version for one.
+      if (!sqliteAuthority || grant.bindings.length === 0) return false;
+      const worker = await sql.query(
+        `SELECT uid FROM tf_v2_resources
+         WHERE uid = ? AND form_url = ? AND principal = ? AND space = ?
+           AND target_key = ? AND deleted_at IS NULL`,
+        [grant.workerUid, MODULE_WORKER_FORM_URL, grant.principal, grant.space, targetKey],
+      );
+      if (worker.length !== 1 || worker[0]?.uid !== grant.workerUid) return false;
+      for (const binding of grant.bindings) {
+        const current = await sqliteAuthority.resolveCurrentBinding(grant, binding.name);
+        if (current?.resourceUid !== binding.resourceUid) return false;
+      }
+      const afterTarget = await owner.observeVersionTarget(nativeTarget);
+      if (
+        afterTarget.kind !== "confirmed" ||
+        (observedTarget.status === "draining" && afterTarget.status !== "draining") ||
+        (afterTarget.status !== "active" && afterTarget.status !== "draining") ||
+        afterTarget.workerUid !== observedTarget.workerUid ||
+        afterTarget.versionId !== observedTarget.versionId ||
+        afterTarget.incarnationId !== observedTarget.incarnationId ||
+        afterTarget.servingSourceOperationId !== observedTarget.servingSourceOperationId
+      )
+        return false;
+      if (afterTarget.status === "draining") return true;
+      if (!beforeServing) return false;
+      const afterServing = await owner.observeServing({
+        workerResourceUid: grant.workerUid,
+        targetKey,
+      });
+      const finalTarget = await owner.observeVersionTarget(nativeTarget);
+      if (
+        finalTarget.kind === "confirmed" &&
+        finalTarget.status === "draining" &&
+        finalTarget.workerUid === grant.workerUid &&
+        finalTarget.versionId === grant.nativeVersionId &&
+        finalTarget.incarnationId === grant.incarnationId &&
+        finalTarget.servingSourceOperationId === grant.servingSourceOperationId
+      )
+        return true;
+      return (
+        afterServing.kind === "serving" &&
+        JSON.stringify(afterServing) === JSON.stringify(beforeServing) &&
+        finalTarget.kind === "confirmed" &&
+        finalTarget.status === "active" &&
+        finalTarget.workerUid === grant.workerUid &&
+        finalTarget.versionId === grant.nativeVersionId &&
+        finalTarget.incarnationId === grant.incarnationId &&
+        finalTarget.servingSourceOperationId === grant.servingSourceOperationId
+      );
+    } catch {
+      return false;
+    }
+  }
 
   async function openOwner(
     uid: string,
@@ -189,6 +360,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         targetKey,
         publicationState,
         ...(configuredInputs ? { configuredInputs } : {}),
+        ...(sqliteBoot ? { v2SqliteBinding: sqliteBoot } : {}),
         workerdBinary: options.workerdBinary,
         inspectModule,
         listenerPortForOperation,
@@ -262,12 +434,32 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     for (const key of expectedServing) {
       if (!names.has(key)) throw new Error("v2 Worker serving owner is missing");
     }
+    if (sqliteBroker && sqliteBinding) {
+      sqliteServer = Bun.serve({
+        hostname: "127.0.0.1",
+        port: sqliteBinding.privatePort,
+        async fetch(request) {
+          return (await sqliteBroker.handle(request)) ?? new Response(null, { status: 404 });
+        },
+      });
+      if (sqliteServer.port !== sqliteBinding.privatePort) {
+        await sqliteServer.stop(true);
+        sqliteServer = undefined;
+        throw new Error("v2 SQLite private listener address changed");
+      }
+    }
     const restored: string[] = [];
-    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-      const uid = byOwnerKey.get(entry.name);
-      if (!uid) throw new Error("v2 Worker owner inventory changed");
-      await openOwner(uid, true);
-      restored.push(uid);
+    try {
+      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        const uid = byOwnerKey.get(entry.name);
+        if (!uid) throw new Error("v2 Worker owner inventory changed");
+        await openOwner(uid, true);
+        restored.push(uid);
+      }
+    } catch (error) {
+      await sqliteServer?.stop(true);
+      sqliteServer = undefined;
+      throw error;
     }
     restorationComplete = true;
     return restored;
@@ -307,6 +499,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         publicationState,
         retirement: readers.retirement,
         inspectModule,
+        ...(sqliteBoot ? { v2SqliteBinding: sqliteBoot } : {}),
         ...(configuredInputSealer && configuredInputCustody
           ? { configuredInputSealer, configuredInputCustody }
           : {}),
@@ -341,6 +534,14 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       if (!restoration) throw new Error("v2 Worker owners have not restored");
       await restoration;
       return await openOwner(uid);
+    },
+    async closePrivateBindingServices() {
+      if (!sqliteServer) return;
+      // A private companion address is pinned in every live native graph.
+      // Refuse to remove it while any owner still has an active/draining copy.
+      for (const opening of owners.values()) await (await opening).close();
+      await sqliteServer?.stop(true);
+      sqliteServer = undefined;
     },
     internalFormFactory,
   };

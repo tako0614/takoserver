@@ -15,6 +15,10 @@ import {
 import type { V2BackendResult, V2Execution, V2Form } from "./types.ts";
 import type { V2WorkerCurrentServingResolution } from "./worker-publication-state.ts";
 import {
+  prepareV2QueueConsumerAdmission,
+  type V2InspectedQueueServingCapability,
+} from "./worker-queue-admission.ts";
+import {
   ownsV2QueueClaim,
   snapshotV2QueueClaim,
   V2_QUEUE_CLAIM_SQL,
@@ -30,7 +34,7 @@ const UNKNOWN: V2BackendResult = {
 };
 
 /** Privileged owner supplies the canonical current SQL + held-byte publication proof. */
-export interface V2QueueConsumerCapability {
+export interface V2QueueConsumerCapability extends V2InspectedQueueServingCapability {
   observeCurrentServing(input: {
     readonly workerUid: string;
     readonly principal: string;
@@ -408,6 +412,15 @@ export function createQueueConsumerForm(options: {
     },
     references(spec) {
       return queueConsumerReferences(parseQueueConsumerSpec(spec));
+    },
+    prepareAdmission(input) {
+      return prepareV2QueueConsumerAdmission({
+        capability,
+        principal: input.principal,
+        space: input.space,
+        targetKey,
+        spec: input.spec,
+      });
     },
     privateInputs: {
       validateCreate(_spec, inputs) {

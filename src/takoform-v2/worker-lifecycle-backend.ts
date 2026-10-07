@@ -1,6 +1,9 @@
 import { canonicalJson } from "../json.ts";
 import type { JsonObject, Sql } from "../ports.ts";
+import type { V2SqliteBindingGrant } from "../providers/selfhost-v2-sqlite-binding-broker.ts";
 import type { WorkerdRuntime } from "../workerd-runtime.ts";
+import { parseSQLiteDatabaseSpec, SQLITE_DATABASE_FORM_URL } from "./forms/sqlite-database.ts";
+import type { SQLiteWorkerBindingClaim } from "./forms/sqlite-worker-binding-authority.ts";
 import {
   referencesForWorkerDeployment,
   referencesForWorkerVersion,
@@ -21,7 +24,10 @@ import {
 } from "./forms/worker-specs.ts";
 import { TakoformV2Error, type V2BackendResult, type V2Execution, type V2Form } from "./types.ts";
 import { snapshotV2WorkerPrivateInputs } from "./worker-code-eligibility.ts";
-import { inspectV2WorkerCodeVersionEligibility } from "./worker-code-runtime.ts";
+import {
+  inspectV2WorkerCodeVersionEligibility,
+  type V2ResolvedSqliteBinding,
+} from "./worker-code-runtime.ts";
 import type { V2WorkerVersionResolution } from "./worker-publication-state.ts";
 import { projectV2ResolvedServiceBindings } from "./worker-service-resolution.ts";
 import { projectV2StaticWorkerVersion } from "./worker-static-runtime.ts";
@@ -652,13 +658,21 @@ function staticOnly(spec: WorkerVersionSpec): WorkerVersionSpec {
   return spec;
 }
 
-function codeOnly(spec: WorkerVersionSpec, configuredInputs: boolean): WorkerVersionSpec {
+function codeOnly(
+  spec: WorkerVersionSpec,
+  configuredInputs: boolean,
+  queueSettlement: V2CodeQueueSettlementBoot | undefined,
+  sqliteBinding: V2CodeSqliteBindingBoot | undefined,
+): WorkerVersionSpec {
   if (
     !spec.bundle ||
-    spec.handlers.some((handler) => handler !== "fetch" && handler !== "scheduled") ||
+    spec.handlers.some(
+      (handler) => handler !== "fetch" && handler !== "scheduled" && handler !== "queue",
+    ) ||
+    (spec.handlers.includes("queue") && !queueSettlement) ||
     (spec.requiredSensitiveVars.length > 0 && !configuredInputs) ||
     spec.kvBindings.length > 0 ||
-    spec.sqliteBindings.length > 0 ||
+    (spec.sqliteBindings.length > 0 && !sqliteBinding) ||
     spec.bucketBindings.length > 0 ||
     spec.queueProducerBindings.length > 0 ||
     spec.actorBindings.length > 0 ||
@@ -670,6 +684,87 @@ function codeOnly(spec: WorkerVersionSpec, configuredInputs: boolean): WorkerVer
 }
 
 type ConfiguredInputSealer = ReturnType<typeof createV2WorkerVersionConfiguredInputSealer>;
+
+/** The initialized Host-private Queue plane shared with the native owner. */
+export interface V2CodeQueueSettlementBoot {
+  readonly address: string;
+  queueIdForUid(queueUid: string): string;
+  bindingToken(input: {
+    readonly workerUid: string;
+    readonly versionId: string;
+    readonly incarnationId: string;
+  }): string;
+}
+
+/** The initialized Host-private SQLite broker and current-binding authority. */
+export interface V2CodeSqliteBindingBoot {
+  readonly address: string;
+  issueGrant(grant: V2SqliteBindingGrant): string;
+  resolveCurrentBinding(
+    claim: SQLiteWorkerBindingClaim,
+    binding: string,
+  ): Promise<{ readonly resourceUid: string; readonly vector: string } | null>;
+}
+
+function validQueueSettlementBoot(value: V2CodeQueueSettlementBoot): boolean {
+  if (!value || typeof value.address !== "string") return false;
+  const port = value.address.slice(value.address.lastIndexOf(":") + 1);
+  return (
+    /^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(value.address) &&
+    Number(port) <= 65_535 &&
+    typeof value.queueIdForUid === "function" &&
+    typeof value.bindingToken === "function"
+  );
+}
+
+function validSqliteBindingBoot(value: V2CodeSqliteBindingBoot): boolean {
+  if (!value || typeof value.address !== "string") return false;
+  const port = value.address.slice(value.address.lastIndexOf(":") + 1);
+  return (
+    /^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(value.address) &&
+    Number(port) <= 65_535 &&
+    typeof value.issueGrant === "function" &&
+    typeof value.resolveCurrentBinding === "function"
+  );
+}
+
+async function resolvedSqliteBindings(
+  sql: Sql,
+  spec: WorkerVersionSpec,
+  identity: { readonly principal: string; readonly space: string; readonly targetKey: string },
+): Promise<readonly V2ResolvedSqliteBinding[] | null> {
+  const resolved: V2ResolvedSqliteBinding[] = [];
+  for (const binding of spec.sqliteBindings) {
+    const rows = await sql.query(
+      `SELECT r.spec_json, r.observed_json FROM tf_v2_resources r
+       JOIN tf_v2_operations op ON op.id = r.last_operation
+       WHERE r.uid = ? AND r.form_url = ? AND r.principal = ? AND r.space = ?
+         AND r.target_key = ? AND r.deleted_at IS NULL AND r.busy_operation IS NULL
+         AND r.phase = 'idle' AND r.observed_generation = r.generation
+         AND op.resource_uid = r.uid AND op.principal = r.principal
+         AND op.backend_id = r.backend_id AND op.target_key = r.target_key
+         AND op.generation = r.generation AND op.status = 'succeeded'
+         AND op.effect = 'complete' AND op.accepted_spec_json = r.spec_json`,
+      [
+        binding.resource.resourceUid,
+        SQLITE_DATABASE_FORM_URL,
+        identity.principal,
+        identity.space,
+        identity.targetKey,
+      ],
+    );
+    const row = rows.length === 1 ? rows[0] : null;
+    if (typeof row?.spec_json !== "string" || typeof row.observed_json !== "string") return null;
+    try {
+      parseSQLiteDatabaseSpec(JSON.parse(row.spec_json));
+      if (JSON.parse(row.observed_json)?.databaseExists !== true) return null;
+    } catch {
+      return null;
+    }
+    resolved.push({ name: binding.name, resourceUid: binding.resource.resourceUid });
+  }
+  return resolved;
+}
 
 /** Existing Core UID custody is injected; this runtime never reinterprets its row authority. */
 export interface V2CodeConfiguredInputCustody {
@@ -771,6 +866,10 @@ type CodeWorkerVersionOptions = {
   readonly publicationState: VersionState;
   readonly retirement: V2WorkerRetirementReader;
   readonly inspectModule: WorkerdRuntime["inspectModule"];
+  /** Actual initialized private Queue settlement plane, also given to the native owner. */
+  readonly queueSettlement?: V2CodeQueueSettlementBoot;
+  /** Same initialized broker and authority given to the native owner/publication path. */
+  readonly v2SqliteBinding?: V2CodeSqliteBindingBoot;
   readonly configuredInputSealer?: ConfiguredInputSealer;
   readonly configuredInputCustody?: V2CodeConfiguredInputCustody;
 };
@@ -790,7 +889,15 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
       "Code WorkerVersion requires targetKey, publication state, exact retirement reader and module inspector",
     );
   }
+  if (options.queueSettlement && !validQueueSettlementBoot(options.queueSettlement)) {
+    throw new TypeError("Code WorkerVersion requires a valid private Queue settlement boot");
+  }
+  if (options.v2SqliteBinding && !validSqliteBindingBoot(options.v2SqliteBinding)) {
+    throw new TypeError("Code WorkerVersion requires a valid private SQLite binding boot");
+  }
   const { sql, targetKey } = options;
+  const queueSettlement = options.queueSettlement;
+  const sqliteBinding = options.v2SqliteBinding;
   const resolveVersion = options.publicationState.resolveVersion.bind(options.publicationState);
   const observeRetired = options.retirement.observeRetired.bind(options.retirement);
   const inspectModule = options.inspectModule;
@@ -822,6 +929,8 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
         const spec = codeOnly(
           parseWorkerVersionSpec(execution.spec),
           configuredInputSealer !== undefined,
+          queueSettlement,
+          sqliteBinding,
         );
         return (await retired(sql, observeRetired, execution, spec.worker.resourceUid, "version"))
           ? { kind: "complete", observed: {}, output: {} }
@@ -834,6 +943,8 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
       const spec = codeOnly(
         parseWorkerVersionSpec(execution.spec),
         configuredInputSealer !== undefined,
+        queueSettlement,
+        sqliteBinding,
       );
       if (!(await currentClaim(sql, execution))) return unresolved();
       const resolution = await resolveVersion({ execution });
@@ -866,6 +977,15 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
       const resolvedServiceBindings = await projectV2ResolvedServiceBindings(
         snapshot.version.spec.serviceBindings,
       );
+      const resolvedSQLite =
+        spec.sqliteBindings.length > 0
+          ? await resolvedSqliteBindings(sql, snapshot.version.spec, {
+              principal: execution.principal,
+              space: execution.space,
+              targetKey: execution.targetKey,
+            })
+          : [];
+      if (resolvedSQLite === null) return unresolved();
       await inspectV2WorkerCodeVersionEligibility({
         workerResourceUid: snapshot.worker.uid,
         ...(spec.bundle ? { bundleResourceUid: spec.bundle.resourceUid } : {}),
@@ -876,6 +996,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
         inspectModule,
         ...(configuredPrivateInputs ? { privateInputs: configuredPrivateInputs } : {}),
         ...(resolvedServiceBindings.length > 0 ? { resolvedServiceBindings } : {}),
+        ...(resolvedSQLite.length > 0 ? { resolvedSqliteBindings: resolvedSQLite } : {}),
       });
       if (!(await resolution.stillCurrent()) || !(await currentClaim(sql, execution))) {
         return unresolved();
@@ -895,12 +1016,16 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
       codeOnly(
         validated(() => parseWorkerVersionSpec(spec)),
         configuredInputSealer !== undefined,
+        queueSettlement,
+        sqliteBinding,
       );
     },
     validateUpdate(previous, spec) {
       codeOnly(
         validated(() => validateWorkerVersionUpdate(previous, spec)),
         configuredInputSealer !== undefined,
+        queueSettlement,
+        sqliteBinding,
       );
     },
     references(spec) {
@@ -908,6 +1033,8 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
         codeOnly(
           validated(() => parseWorkerVersionSpec(spec)),
           configuredInputSealer !== undefined,
+          queueSettlement,
+          sqliteBinding,
         ),
       );
     },
