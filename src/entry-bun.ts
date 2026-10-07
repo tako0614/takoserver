@@ -671,6 +671,10 @@ const v2ObjectBucketStore = v2PrivatePlaneBoot?.objectBucket
       clock,
     })
   : undefined;
+const v2QueueCustody =
+  v2PrivatePlaneBoot?.queue || v2PrivatePlaneBoot?.queueProducer
+    ? createQueueCustody({ sql })
+    : undefined;
 let workers: ReturnType<typeof createSelfhostV2WorkerComposition> | undefined;
 let queueCapability:
   | NonNullable<ReturnType<typeof createSelfhostV2WorkerComposition>["queueCapability"]>
@@ -684,12 +688,13 @@ const clearV2BootKeys = () => {
     v2PrivatePlaneBoot?.kv,
     v2PrivatePlaneBoot?.objectBucket,
     v2PrivatePlaneBoot?.queue,
+    v2PrivatePlaneBoot?.queueProducer,
   ]) {
     plane?.signingKey.fill(0);
   }
 };
 try {
-  if (v2PrivatePlaneBoot?.queue) {
+  if (v2PrivatePlaneBoot?.queue && v2QueueCustody) {
     const requireQueueCapability = (): NonNullable<
       ReturnType<typeof createSelfhostV2WorkerComposition>["queueCapability"]
     > => {
@@ -700,7 +705,7 @@ try {
     };
     v2QueueComposition = createSelfhostV2QueueComposition({
       sql,
-      custody: createQueueCustody({ sql }),
+      custody: v2QueueCustody,
       capability: {
         observeQueueServingCapability: (input) =>
           requireQueueCapability().observeQueueServingCapability(input),
@@ -754,6 +759,15 @@ try {
         }
       : {}),
     ...(v2QueueComposition ? { queueSettlement: v2QueueComposition.settlementBinding } : {}),
+    ...(v2PrivatePlaneBoot?.queueProducer && v2QueueCustody
+      ? {
+          v2QueueProducerBinding: {
+            custody: v2QueueCustody,
+            signingKey: v2PrivatePlaneBoot.queueProducer.signingKey,
+            privatePort: v2PrivatePlaneBoot.queueProducer.privatePort,
+          },
+        }
+      : {}),
   });
   if (v2QueueComposition) {
     if (!workers.queueCapability) throw new Error("v2 Queue native capability is unavailable");

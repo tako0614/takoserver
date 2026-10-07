@@ -20,7 +20,7 @@ const TARGET_DIRECTORY = {
   objectBucket: "v2-object-buckets",
 } as const;
 
-type PlaneName = "sqlite" | "kv" | "objectBucket" | "queue";
+type PlaneName = "sqlite" | "kv" | "objectBucket" | "queue" | "queueProducer";
 type PlaneBoot = {
   readonly privatePort: number;
   readonly signingKey: Uint8Array;
@@ -31,6 +31,7 @@ export interface SelfhostV2PrivatePlaneBoot {
   readonly kv?: PlaneBoot & { readonly root: string };
   readonly objectBucket?: PlaneBoot & { readonly root: string };
   readonly queue?: PlaneBoot;
+  readonly queueProducer?: PlaneBoot;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -170,7 +171,7 @@ export function parseSelfhostV2PrivatePlaneBoot(
   }
   const names = Object.keys(parsed);
   for (const name of names) {
-    if (!["sqlite", "kv", "objectBucket", "queue"].includes(name)) {
+    if (!["sqlite", "kv", "objectBucket", "queue", "queueProducer"].includes(name)) {
       throw new TypeError(`${CONFIG_NAME} has an unknown plane`);
     }
   }
@@ -215,6 +216,7 @@ export function parseSelfhostV2PrivatePlaneBoot(
     const kv = readPlane("kv");
     const objectBucket = readPlane("objectBucket");
     const queue = readPlane("queue");
+    const queueProducer = readPlane("queueProducer");
     let stagingRoot: string | undefined;
     if (sqlite) {
       const sqliteRecord = exactFields(parsed.sqlite, "sqlite", [
@@ -241,6 +243,7 @@ export function parseSelfhostV2PrivatePlaneBoot(
         ? { objectBucket: { ...objectBucket, root: join(dataRoot, TARGET_DIRECTORY.objectBucket) } }
         : {}),
       ...(queue ? { queue } : {}),
+      ...(queueProducer ? { queueProducer } : {}),
     };
   } catch (error) {
     for (const key of keys) key.fill(0);

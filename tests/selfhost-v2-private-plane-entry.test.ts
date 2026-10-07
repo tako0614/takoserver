@@ -179,6 +179,7 @@ test("normal Bun empty-owner opt-in reopens fixed private v2 planes and closes t
   const kvPort = await unusedPort(chosen);
   const objectPort = await unusedPort(chosen);
   const queuePort = await unusedPort(chosen);
+  const queueProducerPort = await unusedPort(chosen);
   await mkdir(keyRoot, { mode: 0o700 });
   await mkdir(stagingRoot, { mode: 0o700 });
   const keys = {
@@ -186,6 +187,7 @@ test("normal Bun empty-owner opt-in reopens fixed private v2 planes and closes t
     kv: join(keyRoot, "kv.key"),
     objectBucket: join(keyRoot, "object-bucket.key"),
     queue: join(keyRoot, "queue.key"),
+    queueProducer: join(keyRoot, "queue-producer.key"),
   };
   await Promise.all(
     Object.values(keys).map((path, index) =>
@@ -197,6 +199,7 @@ test("normal Bun empty-owner opt-in reopens fixed private v2 planes and closes t
     kv: { privatePort: kvPort, signingKeyFile: keys.kv },
     objectBucket: { privatePort: objectPort, signingKeyFile: keys.objectBucket },
     queue: { privatePort: queuePort, signingKeyFile: keys.queue },
+    queueProducer: { privatePort: queueProducerPort, signingKeyFile: keys.queueProducer },
   });
   const env = {
     PATH: process.env.PATH ?? "/usr/bin:/bin",
@@ -217,7 +220,7 @@ test("normal Bun empty-owner opt-in reopens fixed private v2 planes and closes t
     TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: base64UrlEncode(new Uint8Array(32).fill(0x74)),
     TAKOSERVER_V2_WORKER_PRIVATE_PLANES: privateBoot,
   };
-  const privatePorts = [sqlitePort, kvPort, objectPort, queuePort];
+  const privatePorts = [sqlitePort, kvPort, objectPort, queuePort, queueProducerPort];
   const assertPrivateListeners = async () => {
     for (const privatePort of privatePorts) {
       const response = await fetch(`http://127.0.0.1:${privatePort}/`, {
