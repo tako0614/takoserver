@@ -177,3 +177,144 @@ test("owner-pinned v2 Workflow socket dispatches via existing facade only while 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("an accepted three-Version graph opens all 192 Workflow brokers, above the former arbitrary cap", async () => {
+  const root = await mkdtemp(join(tmpdir(), "v2-wfb-many-"));
+  const specifications = new Map<
+    string,
+    {
+      readonly operationId: string;
+      readonly spec: typeof versionSpec;
+    }
+  >();
+  for (let version = 1; version <= 3; version++) {
+    const uid = `version-${version}`;
+    specifications.set(uid, {
+      operationId: `${version}1234567-89ab-4cde-8f01-23456789abcd`,
+      spec: {
+        ...versionSpec,
+        workflowBindings: Array.from({ length: 64 }, (_, index) => ({
+          name: `FLOW_${index.toString().padStart(2, "0")}`,
+          resource: { resourceUid: `workflow-${version}-${index}` },
+        })),
+      },
+    });
+  }
+  const sql = {
+    async query(query: string, params: readonly unknown[]) {
+      const uid = params[0];
+      const source = typeof uid === "string" ? specifications.get(uid) : undefined;
+      if (!source) return [];
+      if (query.includes("FROM tf_v2_resources"))
+        return [
+          {
+            spec_json: JSON.stringify(source.spec),
+            backend_id: "test-backend",
+            generation: 1,
+            principal: "org:one",
+            space: "production",
+          },
+        ];
+      if (query.includes("FROM tf_v2_operations"))
+        return [{ id: source.operationId, generation: 1 }];
+      throw new Error("unrecognized SQL");
+    },
+  } as unknown as Sql;
+  const instances = {
+    async create() {
+      throw new Error("unexpected create");
+    },
+    async get() {
+      throw new Error("unexpected get");
+    },
+    async status() {
+      throw new Error("unexpected status");
+    },
+    async sendEvent() {
+      throw new Error("unexpected sendEvent");
+    },
+    async terminate() {
+      throw new Error("unexpected terminate");
+    },
+  } as unknown as WorkflowRuntime["instances"];
+  try {
+    const boot = createV2WorkflowForwardBoot({
+      sql,
+      targetKey: "target-one",
+      privateSocketDirectory: root,
+      instances,
+      authority: {
+        async resolveCurrentBinding(claim, name) {
+          const selected = claim.bindings.find((binding) => binding.name === name);
+          if (!selected) return null;
+          return {
+            tenantId: claim.principal,
+            workflowResourceUid: selected.resourceUid,
+            workerUid: claim.workerUid,
+            vector: `current:${selected.resourceUid}`,
+          };
+        },
+      },
+    });
+    const incarnation = boot.openIncarnation({
+      workerUid: "worker-one",
+      sourceOperationId: OPERATION,
+      scriptName: "script-one",
+      eventToken: "c".repeat(64),
+    });
+    try {
+      const publications: WorkerdWorkflowForwardPublication[] = [];
+      for (const [uid, source] of specifications) {
+        const nativeVersionId = `v2-${createHash("sha256").update(`${uid}\u00001`).digest("hex")}`;
+        const declarations = source.spec.workflowBindings;
+        const claim = {
+          principal: "org:one",
+          space: "production",
+          targetKey: "target-one",
+          workerUid: "worker-one",
+          workerVersionUid: uid,
+          workerVersionOperationId: source.operationId,
+          nativeVersionId,
+          bindings: declarations.map((binding) => ({
+            name: binding.name,
+            resourceUid: binding.resource.resourceUid,
+          })),
+        };
+        const grants = [];
+        for (const binding of declarations) {
+          const grant = await incarnation.issueBinding(claim, binding.name);
+          if (!grant) throw new Error("Workflow grant unavailable");
+          grants.push(grant);
+        }
+        const projection = await projectV2WorkflowForward({
+          workerUid: "worker-one",
+          versionUid: uid,
+          sourceOperationId: source.operationId,
+          nativeVersionId,
+          principal: "org:one",
+          declarations,
+          grants,
+        });
+        publications.push({
+          script: "script-one",
+          workerResourceUid: "worker-one",
+          versionId: nativeVersionId,
+          workerVersionResourceUid: uid,
+          snapshotDigest: projection.snapshotDigest,
+          bindings: grants.map((grant, index) => ({
+            ...grant,
+            serviceName: workerdV2PrivateWorkflowBindingName(index),
+          })),
+        });
+      }
+      const lease = await incarnation.workflowForwardLifecycle.reserve(publications);
+      expect(incarnation.workflowForwardSockets(publications)).toHaveLength(192);
+      expect(incarnation.workflowForwardLifecycle.activated(publications)).toBe(true);
+      await lease.release();
+    } finally {
+      await incarnation.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

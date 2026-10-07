@@ -36,6 +36,11 @@ type Authority = {
 
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const V2_SCHEMA = "takoserver.v2-workflow-binding-forward@1";
+// WorkerDeployment 0.4.0 selects at most eight Versions; WorkerVersion 0.5.0
+// declares at most 64 Workflow bindings per Version. A fenced replacement may
+// hold the prior complete graph while the next complete graph is reserved.
+const MAX_CURRENT_WORKFLOW_BINDINGS = 8 * 64;
+const MAX_RESERVED_WORKFLOW_BROKERS = 2 * MAX_CURRENT_WORKFLOW_BINDINGS;
 
 export interface V2WorkflowForwardIncarnation {
   readonly workerUid: string;
@@ -285,7 +290,11 @@ export function createV2WorkflowForwardBoot(options: {
           if (keys.has(entry.key)) throw new Error("duplicate v2 Workflow binding");
           keys.add(entry.key);
         }
-        if (brokers.size + entries.length > 128)
+        const newKeys = [...keys].filter((key) => !brokers.has(key));
+        if (
+          keys.size > MAX_CURRENT_WORKFLOW_BINDINGS ||
+          brokers.size + newKeys.length > MAX_RESERVED_WORKFLOW_BROKERS
+        )
           throw new Error("v2 Workflow broker capacity exceeded");
         const opened: string[] = [];
         try {
