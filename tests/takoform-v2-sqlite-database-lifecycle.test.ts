@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createSelfhostV2SqlitePlane } from "../src/providers/selfhost-v2-sqlite-plane.ts";
 import { createSelfhostV2SQLiteStore } from "../src/providers/selfhost-v2-sqlite-store.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
@@ -311,6 +312,61 @@ test("DELETE refuses a substituted symlink and preserves another UID's database"
     expect((await engine.runNext())?.status).toBe("reconciling");
     expect(existsSync(secondFile)).toBe(true);
     expect(existsSync(saved)).toBe(true);
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the UID-owned native handle feeds the guarded Worker SQL plane without ledger access", async () => {
+  const root = mkdtempSync(join(tmpdir(), "v2-sqlite-db-plane-"));
+  const database = control(root, true);
+  const clock = () => new Date("2026-10-07T00:00:00Z");
+  try {
+    const { engine, store } = host(root, database, clock);
+    const accepted = await created(engine);
+    expect((await engine.runNext())?.status).toBe("succeeded");
+    await store.withAuthorizedDatabase({
+      resourceUid: accepted.resourceUid,
+      stillAuthorized: async () => true,
+      use(native) {
+        native.exec("CREATE TABLE item (value TEXT NOT NULL)");
+      },
+    });
+    await store.withAuthorizedDatabase({
+      resourceUid: accepted.resourceUid,
+      stillAuthorized: async () => true,
+      async use(native) {
+        const plane = createSelfhostV2SqlitePlane({
+          database: native,
+          migrationLedger: { schema: "main", table: "_takoform_sqlite_migrations" },
+        });
+        try {
+          const worker = {
+            execute: plane.execute,
+            query: plane.query,
+            transaction: plane.transaction,
+          };
+          expect(Object.keys(worker)).toEqual(["execute", "query", "transaction"]);
+          expect(await worker.execute("INSERT INTO item VALUES (?)", ["tenant-row"])).toMatchObject(
+            {
+              rowsWritten: 1,
+            },
+          );
+          expect(await worker.query("SELECT value FROM item")).toMatchObject({
+            rows: [{ value: "tenant-row" }],
+            rowsWritten: 0,
+          });
+          await expect(
+            worker.query("SELECT * FROM _takoform_sqlite_migrations"),
+          ).rejects.toMatchObject({
+            name: "sql_error",
+          });
+        } finally {
+          plane.close();
+        }
+      },
+    });
   } finally {
     database.close();
     rmSync(root, { recursive: true, force: true });
