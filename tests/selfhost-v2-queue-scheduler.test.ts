@@ -794,7 +794,7 @@ test("dead-letter notice stays pending without a verified active target wake, th
     expect(await custody.settle(claimed, { outcome: "retry" })).toBe(true);
     expect((await custody.listTransferNotices(source)).length).toBe(1);
 
-    let available = true;
+    let available = false;
     const scheduler = createSelfhostV2QueueScheduler({
       sql: accepted.sql,
       custody,
@@ -806,10 +806,9 @@ test("dead-letter notice stays pending without a verified active target wake, th
       },
       pollMillis: 60_000,
     });
-    // A copied target row alone, without a running wake path, is not an ACK.
+    // A copied target row alone, with its native wake unavailable, is not an ACK.
     await scheduler.tick();
     expect((await custody.listTransferNotices(source)).length).toBe(1);
-    available = false;
     scheduler.start();
     await scheduler.tick();
     expect((await custody.listTransferNotices(source)).length).toBe(1);
@@ -852,6 +851,98 @@ test("dead-letter notice stays pending without a verified active target wake, th
     expect(await restartedCustody.listTransferNotices(source)).toEqual([]);
     await restarted.close();
   } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("externally driven tick wakes an exact dead-letter target without starting an internal timer", async () => {
+  const root = mkdtempSync(join(tmpdir(), "v2-queue-manual-notice-"));
+  const database = new Database(join(root, "state.sqlite"));
+  let scheduler: ReturnType<typeof createSelfhostV2QueueScheduler> | undefined;
+  try {
+    for (const migration of MIGRATIONS) database.exec(migration.sql);
+    const accepted = await acceptedConsumer(database);
+    const sourceQueueUid = await accepted.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "manual-source", {
+      messageRetentionSeconds: 3_600,
+    });
+    const sourceConsumerUid = await accepted.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "manual-source-consumer",
+      consumerSpec(sourceQueueUid, accepted.workerUid, {
+        maxRetries: 0,
+        retryDelaySeconds: 0,
+        deadLetterQueue: { resourceUid: accepted.queueUid },
+      }),
+    );
+    const source = {
+      queueId: v2QueueId(sourceQueueUid),
+      consumerId: sourceConsumerUid,
+      generation: 1,
+      policy: {
+        maxRetries: 0,
+        retryDelaySeconds: 0,
+        deadLetterQueue: {
+          queueId: v2QueueId(accepted.queueUid),
+          messageRetentionSeconds: 3_600,
+          deliveryDelaySeconds: 0,
+        },
+      },
+    };
+    const custody = createQueueCustody({
+      sql: accepted.sql,
+      randomId: () => "manual-tick-copied-message",
+    });
+    await custody.admit(
+      { queueId: source.queueId, messageRetentionSeconds: 3_600, deliveryDelaySeconds: 0 },
+      { messageId: "manual-source-message", body: new Uint8Array([7]) },
+    );
+    const [claimed] = await custody.claim({ ...source, limit: 1 });
+    if (!claimed) throw new Error("source claim is missing");
+    expect(await custody.settle(claimed, { outcome: "retry" })).toBe(true);
+    expect((await custody.listTransferNotices(source)).length).toBe(1);
+    const visited: string[] = [];
+    let releaseWake!: () => void;
+    const heldWake = new Promise<{ readonly kind: "idle" }>((resolve) => {
+      releaseWake = () => resolve({ kind: "idle" });
+    });
+    scheduler = createSelfhostV2QueueScheduler({
+      sql: accepted.sql,
+      custody,
+      composition: {
+        async deliverOnce(input) {
+          visited.push(input.consumerUid);
+          return await heldWake;
+        },
+      },
+    });
+    await scheduler.tick();
+    expect(visited).toContain(accepted.consumerUid);
+    // close() ends scheduling without waiting for an unbounded native handler
+    // or pretending that its eventual response authorizes notice deletion.
+    await scheduler.close();
+    releaseWake();
+    await Bun.sleep(1);
+    expect((await custody.listTransferNotices(source)).length).toBe(1);
+    scheduler = createSelfhostV2QueueScheduler({
+      sql: accepted.sql,
+      custody,
+      composition: {
+        async deliverOnce() {
+          return { kind: "idle" as const };
+        },
+      },
+    });
+    await scheduler.tick();
+    for (
+      let attempt = 0;
+      attempt < 100 && (await custody.listTransferNotices(source)).length > 0;
+      attempt += 1
+    )
+      await Bun.sleep(1);
+    expect(await custody.listTransferNotices(source)).toEqual([]);
+  } finally {
+    await scheduler?.close();
     database.close();
     rmSync(root, { recursive: true, force: true });
   }

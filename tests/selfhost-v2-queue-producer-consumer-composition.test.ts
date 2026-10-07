@@ -10,6 +10,7 @@ import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { createQueueCustody } from "../src/queue-custody.ts";
 import { createSelfhostV2QueueComposition } from "../src/selfhost-v2-queue-composition.ts";
+import { createSelfhostV2QueueScheduler } from "../src/selfhost-v2-queue-scheduler.ts";
 import { createSelfhostV2WorkerComposition } from "../src/selfhost-v2-worker-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
@@ -39,13 +40,14 @@ async function unusedPort(): Promise<number> {
 }
 
 test.skipIf(binary === undefined)(
-  "internal normal Host connects native Queue Producer and Consumer through durable ACK and retry",
+  "internal normal Host automatically delivers native Queue Producer messages through durable ACK and retry",
   async () => {
     if (!binary) throw new Error("pinned Workerd binary missing");
     const root = await mkdtemp(join(tmpdir(), "selfhost-v2-producer-consumer-"));
     const db = new Database(join(root, "state.sqlite"));
     let workers: ReturnType<typeof createSelfhostV2WorkerComposition> | undefined;
     let queue: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+    let scheduler: ReturnType<typeof createSelfhostV2QueueScheduler> | undefined;
     let primaryFailed = false;
     let primaryError: unknown;
     let cleanupFailed = false;
@@ -316,8 +318,33 @@ test.skipIf(binary === undefined)(
         space: organization.id,
         targetKey,
       };
-      expect(await queue.deliverOnce(scope)).toEqual({ kind: "handler_resolved" });
-      expect(await queue.deliverOnce(scope)).toEqual({ kind: "handler_resolved" });
+      scheduler = createSelfhostV2QueueScheduler({
+        sql,
+        custody,
+        composition: queue,
+        workerComposition: workers,
+      });
+      const waitForDrained = async (remaining: number) => {
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          const messages = await sql.query(
+            "SELECT count(*) AS n FROM selfhost_queue_messages WHERE queue_id = ?",
+            [v2QueueId(queueUid)],
+          );
+          const active = await sql.query(
+            "SELECT count(*) AS n FROM queue_v2_batch_executions WHERE state = 'send_authorized'",
+          );
+          if (messages[0]?.n === remaining && active[0]?.n === 0) return;
+          await Bun.sleep(10);
+        }
+        throw new Error(`automatic Queue delivery did not drain to ${remaining}`);
+      };
+      // No caller invokes deliverOnce for these messages. The Host-owned
+      // bounded scanner discovers the accepted Consumer and invokes Workerd.
+      expect(await scheduler.tick()).toBe(1);
+      await waitForDrained(1);
+      expect(await scheduler.tick()).toBe(1);
+      await waitForDrained(0);
       expect(
         await sql.query("SELECT count(*) AS n FROM selfhost_queue_messages WHERE queue_id = ?", [
           v2QueueId(queueUid),
@@ -345,7 +372,17 @@ test.skipIf(binary === undefined)(
       const afterUpdate = await owner.fetch(new Request(`${origin}/one`));
       const afterUpdateBody = (await afterUpdate.json()) as { id: string };
       expect(typeof afterUpdateBody.id).toBe("string");
-      expect(await queue.deliverOnce(scope)).toEqual({ kind: "handler_resolved" });
+      // A stale accepted-scope read is a candidate, never dispatch authority.
+      await sql.run("UPDATE tf_v2_resources SET phase = 'pending' WHERE uid = ?", [consumerUid]);
+      expect(await scheduler.tick()).toBe(0);
+      expect(
+        await sql.query("SELECT count(*) AS n FROM selfhost_queue_messages WHERE queue_id = ?", [
+          v2QueueId(queueUid),
+        ]),
+      ).toEqual([{ n: 1 }]);
+      await sql.run("UPDATE tf_v2_resources SET phase = 'idle' WHERE uid = ?", [consumerUid]);
+      expect(await scheduler.tick()).toBe(1);
+      await waitForDrained(0);
       expect(
         await sql.query(
           "SELECT generation,state FROM queue_v2_batch_settlements WHERE message_id = ?",
@@ -354,6 +391,7 @@ test.skipIf(binary === undefined)(
       ).toEqual([{ generation: 2, state: "settled" }]);
       await remove(consumerUid, "consumer", 2);
       expect(await queue.deliverOnce(scope)).toEqual({ kind: "unknown" });
+      expect(await scheduler.tick()).toBe(0);
       await remove(deploymentUid, "deployment");
       await remove(versionUid, "version");
       await remove(bundleUid, "bundle");
@@ -375,6 +413,7 @@ test.skipIf(binary === undefined)(
       primaryError = error;
     } finally {
       try {
+        await scheduler?.close();
         await workers?.suspendOwnersRetainingCustody();
         await workers?.closePrivateBindingServices();
         await queue?.close();
