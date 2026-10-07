@@ -587,8 +587,7 @@ the same SQL Worker inventory and refuses missing serving owners or unexplained
 directories. This is a boot/recovery path, not a new public Form registration:
 the reusable internal Form factory is exercised only by local integration tests
 through normal organization-authenticated `buildApp` HTTP. A complete Worker
-Form claim still needs the remaining typed Binding and queue-handler contracts,
-operator-configured sensitive-input keys in the ordinary entry, and an
+Form claim still needs the remaining typed Binding and queue-handler contracts and an
 independently qualified public HTTPS Endpoint route/TLS/absence observer. The
 internal factory now accepts an already-created operator sealer and gives both
 Version admission and the native owner the same SQL-backed Resource-owned
@@ -598,6 +597,11 @@ PUT, mismatch refusal, configured fetch, and Host-PID restart without putting
 the secret in public Resource output. It does not register the Worker Forms on
 the normal public entry or qualify live HTTPS delivery. The existing Bun-child
 scheduled/asset tests remain stand-ins, not native workerd evidence.
+The ordinary Bun entry now parses its existing operator runtime-input keyring
+once under the same HTTPS/non-drain gate and passes its current and retained
+nonextractable keys to the v2 owner sealer before restoration. An absent or
+unavailable key still refuses sensitive Versions without deleting ciphertext;
+no key is generated from local ciphertext or public configuration.
 
 A separate normal-`buildApp` local journey composes the
 existing SQLiteDatabase, held SQLiteMigrationSet/Application, and this private

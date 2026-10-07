@@ -183,6 +183,11 @@ const LAYERS: readonly Layer[] = [
     ],
   },
   {
+    name: "v2-selfhost-configured-input-sealer",
+    match: /^src\/selfhost-v2-configured-input-sealer\.ts$/u,
+    may: ["app", "v2-code-validation"],
+  },
+  {
     name: "v2-selfhost-queue-composition",
     match: /^src\/selfhost-v2-queue-composition\.ts$/u,
     may: ["core", "domain", "adapter", "v2-queue-manager", "v2-runtime"],
@@ -262,6 +267,7 @@ const LAYERS: readonly Layer[] = [
       "entry",
       "v2-config",
       "v2-selfhost-composition",
+      "v2-selfhost-configured-input-sealer",
     ],
   },
   // The published package surface re-exports the product for an embedder. It
