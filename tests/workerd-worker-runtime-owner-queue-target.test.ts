@@ -25,6 +25,11 @@ const CREATE_ID = "0f2e9831-691d-41d8-b5ce-983e052a14c3";
 const UPDATE_ID = "6cb38324-f2ad-4acc-acd8-b314e891dc54";
 const DELETE_ID = "84ed6745-0688-4201-8372-0c26ddcce0f4";
 
+async function nativeVersionId(operationId: string, generation: number): Promise<string> {
+  const seed = new TextEncoder().encode(`version-${operationId}\u0000${generation}`);
+  return `v2-${(await bytesDigest(seed)).slice("sha256:".length)}`;
+}
+
 // A real child/listener and exact on-disk publication, but no tenant handler execution.
 const CHILD_SOURCE = `
 import { readFileSync } from "node:fs";
@@ -258,11 +263,16 @@ test("Queue target observation confirms only the exact live active or draining n
     publication.setCurrent(CREATE_ID);
     const oldTarget = {
       workerUid: WORKER_UID,
-      versionId: `version-${CREATE_ID}`,
+      versionId: await nativeVersionId(CREATE_ID, 1),
       incarnationId: CREATE_ID,
       servingSourceOperationId: CREATE_ID,
     };
     expect(await owner.observeQueueTarget(oldTarget)).toEqual({
+      kind: "confirmed",
+      ...oldTarget,
+      status: "active",
+    });
+    expect(await owner.observeVersionTarget(oldTarget)).toEqual({
       kind: "confirmed",
       ...oldTarget,
       status: "active",
@@ -325,7 +335,7 @@ test("Queue target observation confirms only the exact live active or draining n
     publication.setCurrent(UPDATE_ID);
     const newTarget = {
       workerUid: WORKER_UID,
-      versionId: `version-${UPDATE_ID}`,
+      versionId: await nativeVersionId(UPDATE_ID, 2),
       incarnationId: UPDATE_ID,
       servingSourceOperationId: UPDATE_ID,
     };
@@ -390,7 +400,7 @@ test("Queue target observation refuses a live child that lost its listener and a
     publication.setCurrent(CREATE_ID);
     const target = {
       workerUid: WORKER_UID,
-      versionId: `version-${CREATE_ID}`,
+      versionId: await nativeVersionId(CREATE_ID, 1),
       incarnationId: CREATE_ID,
       servingSourceOperationId: CREATE_ID,
     };

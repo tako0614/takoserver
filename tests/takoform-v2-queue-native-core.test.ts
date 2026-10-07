@@ -1,0 +1,441 @@
+import { Database } from "bun:sqlite";
+import { expect, test } from "bun:test";
+import { createHash, randomBytes } from "node:crypto";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import type { JsonObject } from "../src/ports.ts";
+import { createQueueCustody } from "../src/queue-custody.ts";
+import { createSelfhostV2QueueComposition } from "../src/selfhost-v2-queue-composition.ts";
+import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
+import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
+import { QUEUE_CONSUMER_FORM_URL } from "../src/takoform-v2/forms/queue-consumer.ts";
+import {
+  parseWorkerBundleManifest,
+  validateWorkerBundlePayload,
+} from "../src/takoform-v2/forms/worker-bundle.ts";
+import {
+  MODULE_WORKER_FORM_URL,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_VERSION_FORM_URL,
+} from "../src/takoform-v2/forms/worker-specs.ts";
+import { createV2Store } from "../src/takoform-v2/store.ts";
+import type { V2Execution, V2Form } from "../src/takoform-v2/types.ts";
+import type { V2WorkerPublicationResolution } from "../src/takoform-v2/worker-publication-state.ts";
+import { createAtLeastOnceQueueForm } from "../src/takoform-v2/worker-queue-backend.ts";
+import { createQueueConsumerForm } from "../src/takoform-v2/worker-queue-consumer-backend.ts";
+import {
+  cancelV2QueueBatchBeforeSend,
+  createV2QueueDelivery,
+  v2QueueId,
+} from "../src/takoform-v2/worker-queue-delivery.ts";
+import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
+import { spawnWorkerdWithParentDeath } from "../src/workerd-linux-process.ts";
+import { createWorkerdWorkerModuleInspector } from "../src/workerd-worker-module-inspector.ts";
+import {
+  openWorkerdWorkerRuntimeOwner,
+  type WorkerdWorkerRuntimeOwner,
+} from "../src/workerd-worker-runtime-owner.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
+
+const binary = nativeEvidenceBinary("workerd-artifact");
+const principal = "native-queue-principal";
+const space = "default";
+const targetKey = "native-queue-target";
+const modulePath = "app.mjs";
+const moduleBytes = new TextEncoder().encode(`
+export default {
+  async queue(batch, _env, ctx) {
+    if (batch.messages[0].id === "message-retry" && batch.messages[0].attempts === 1)
+      throw new Error("retry once");
+    await batch.acknowledgeAll();
+    ctx.waitUntil(new Promise((resolve) => setTimeout(resolve, 180)));
+  },
+};
+`);
+const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+
+async function unusedPort(): Promise<number> {
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+  const port = Number(server.port);
+  await server.stop(true);
+  return port;
+}
+
+test.skipIf(binary === undefined)(
+  "real 0082/0083 custody + exact native owner holds maxConcurrency after early ACK until waitUntil completes",
+  async () => {
+    if (!binary) throw new Error("pinned Workerd missing");
+    const root = await mkdtemp(join(tmpdir(), "v2-queue-native-core-"));
+    await chmod(root, 0o700);
+    const db = new Database(join(root, "state.sqlite"));
+    const children: ReturnType<typeof spawnWorkerdWithParentDeath>[] = [];
+    let owner: WorkerdWorkerRuntimeOwner | undefined;
+    let queueComposition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+    try {
+      const selected = await selectClosedGraphWorkerd({
+        binary,
+        privateRoot: join(root, "binary"),
+      });
+      if (!selected.binary) throw new Error(selected.diagnostic ?? "native binary unavailable");
+      migrateSqlite(db);
+      const sql = createSqliteSql(db);
+      const custody = createQueueCustody({ sql });
+      const store = createV2Store(sql);
+      const manifestUrl = "https://artifacts.example.test/native-queue/manifest.json";
+      const moduleUrl = "https://artifacts.example.test/native-queue/app.mjs";
+      const manifestBytes = new TextEncoder().encode(
+        JSON.stringify({
+          entrypoint: modulePath,
+          files: [
+            {
+              path: modulePath,
+              url: moduleUrl,
+              sha256: sha(moduleBytes),
+              mediaType: "application/javascript+module",
+            },
+          ],
+        }),
+      );
+      const held = {
+        manifest: parseWorkerBundleManifest(manifestBytes),
+        manifestBytes,
+        files: [moduleBytes],
+        observed: (
+          await validateWorkerBundlePayload({
+            spec: { artifact: { url: manifestUrl, sha256: sha(manifestBytes) } },
+            manifestBytes,
+            fileBytes: [moduleBytes],
+          })
+        ).observed,
+      };
+      let workerUid = "";
+      let versionUid = "";
+      let deploymentUid = "";
+      let sourceOperationId = "";
+      const versionSpec = () => ({
+        worker: { resourceUid: workerUid },
+        bundle: { resourceUid: "native-queue-bundle" },
+        handlers: ["queue"],
+      });
+      const snapshot = () => ({
+        sourceOperationId,
+        worker: { uid: workerUid, principal, space, generation: 1 },
+        deployment: {
+          uid: deploymentUid,
+          generation: 1,
+          spec: {
+            worker: { resourceUid: workerUid },
+            versions: [{ workerVersion: { resourceUid: versionUid }, weight: 10_000 }],
+          },
+          versions: [{ uid: versionUid, generation: 1, weight: 10_000, spec: versionSpec() }],
+        },
+        endpoint: null,
+      });
+      const serving = () => ({
+        kind: "ready" as const,
+        snapshot: snapshot(),
+        sqlGuard: { sql: "SELECT 1", params: [] },
+        stillCurrent: async () => true,
+        readVersionMaterials: async () => ({ bundle: held, assets: null }),
+      });
+      const publicationState = {
+        async resolve({
+          execution,
+        }: {
+          execution: V2Execution;
+        }): Promise<V2WorkerPublicationResolution> {
+          return execution.operationId === sourceOperationId
+            ? (serving() as unknown as V2WorkerPublicationResolution)
+            : { kind: "unresolved", code: "stale_claim", message: "wrong operation" };
+        },
+        async resolveCurrentServing(input: {
+          workerUid: string;
+          targetKey: string;
+          sourceOperationId: string;
+        }) {
+          return input.workerUid === workerUid &&
+            input.targetKey === targetKey &&
+            input.sourceOperationId === sourceOperationId
+            ? (serving() as unknown as V2WorkerPublicationResolution)
+            : {
+                kind: "unresolved" as const,
+                code: "graph_unresolved" as const,
+                message: "wrong source",
+              };
+        },
+      };
+      const capability = {
+        async observeCurrentServing(input: {
+          workerUid: string;
+          principal: string;
+          space: string;
+          targetKey: string;
+        }) {
+          return input.workerUid === workerUid &&
+            input.principal === principal &&
+            input.space === space &&
+            input.targetKey === targetKey
+            ? (serving() as never)
+            : {
+                kind: "unresolved" as const,
+                code: "graph_unresolved" as const,
+                message: "wrong scope",
+              };
+        },
+      };
+      const ordinary: V2Form = {
+        validateCreate() {},
+        validateUpdate() {},
+        backend: {
+          id: "native-queue-ordinary",
+          targetKey,
+          async execute() {
+            return { kind: "complete" as const, observed: { ready: true }, output: {} };
+          },
+          async reconcile() {
+            return { kind: "unknown" as const };
+          },
+        },
+      };
+      const engine = createTakoformV2Engine({
+        sql,
+        now: () => new Date(),
+        replayWindowSeconds: 3600,
+        leaseMilliseconds: 60_000,
+        authorize: async () => true,
+        forms: {
+          [MODULE_WORKER_FORM_URL]: ordinary,
+          [WORKER_VERSION_FORM_URL]: ordinary,
+          [WORKER_DEPLOYMENT_FORM_URL]: ordinary,
+          [AT_LEAST_ONCE_QUEUE_FORM_URL]: createAtLeastOnceQueueForm({ sql, targetKey }),
+          [QUEUE_CONSUMER_FORM_URL]: createQueueConsumerForm({ sql, targetKey, capability }),
+        },
+      });
+      const create = async (form: string, name: string, spec: JsonObject) => {
+        const accepted = await engine.acceptCreate({
+          principal,
+          key: `native-queue-create-${name}-key-00000001`,
+          input: { form, space, name, spec },
+        });
+        expect((await engine.runNext())?.status).toBe("succeeded");
+        return accepted;
+      };
+      const queue = await create(AT_LEAST_ONCE_QUEUE_FORM_URL, "queue", {
+        messageRetentionSeconds: 3600,
+      });
+      const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
+      workerUid = worker.resourceUid;
+      const version = await create(WORKER_VERSION_FORM_URL, "version", versionSpec());
+      versionUid = version.resourceUid;
+      const deployment = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+        worker: { resourceUid: workerUid },
+        versions: [{ workerVersion: { resourceUid: versionUid }, weight: 10_000 }],
+      });
+      deploymentUid = deployment.resourceUid;
+      sourceOperationId = deployment.id;
+      const inspector = createWorkerdWorkerModuleInspector({ binary: selected.binary });
+      queueComposition = createSelfhostV2QueueComposition({
+        sql,
+        custody,
+        capability,
+        settlementKey: randomBytes(32),
+        privatePort: await unusedPort(),
+        ownerForWorkerUid: async (uid) => {
+          if (!owner || uid !== workerUid) throw new Error("unknown owner");
+          return owner;
+        },
+      });
+      owner = await openWorkerdWorkerRuntimeOwner({
+        rootDirectory: join(root, "owner"),
+        workerResourceUid: workerUid,
+        targetKey,
+        publicationState,
+        workerdBinary: selected.binary,
+        inspectModule: inspector.inspect.bind(inspector),
+        v2QueueSettlement: queueComposition.settlementBinding,
+        listenerPortForOperation: unusedPort,
+        spawn(command) {
+          const child = spawnWorkerdWithParentDeath(command, {
+            stdout: "ignore",
+            stderr: "ignore",
+          });
+          children.push(child);
+          return child;
+        },
+      });
+      const op = await store.operation(deployment.id);
+      const resource = op && (await store.resource(op.resource_uid));
+      if (!op || !resource) throw new Error("accepted Deployment missing");
+      const execution: V2Execution = {
+        operationId: op.id,
+        leaseToken: "native-queue-execution-lease",
+        backendKey: op.backend_key,
+        backendId: op.backend_id,
+        targetKey: op.target_key,
+        resourceUid: resource.uid,
+        principal: op.principal,
+        action: op.action,
+        generation: op.generation,
+        form: resource.form_url,
+        space: resource.space,
+        name: resource.name,
+        spec: JSON.parse(op.accepted_spec_json),
+        previousObserved: {},
+        previousOutput: {},
+      };
+      expect(await owner.execute(execution)).toMatchObject({ kind: "confirmed" });
+      const admitted = await owner.observeQueueServingCapability({
+        workerUid,
+        principal,
+        space,
+        targetKey,
+      });
+      expect(admitted).toMatchObject({
+        kind: "confirmed",
+        servingSourceOperationId: sourceOperationId,
+        versions: [{ workerVersionUid: versionUid, generation: 1, weight: 10_000 }],
+      });
+      if (admitted.kind !== "confirmed") throw new Error("Queue native serving capability missing");
+      expect(await admitted.stillCurrent()).toBe(true);
+      expect(
+        await owner.observeQueueServingCapability({
+          workerUid,
+          principal: "foreign",
+          space,
+          targetKey,
+        }),
+      ).toEqual({ kind: "unknown" });
+      const consumer = await create(QUEUE_CONSUMER_FORM_URL, "consumer", {
+        queue: { resourceUid: queue.resourceUid },
+        worker: { resourceUid: workerUid },
+        maxBatchSize: 1,
+        maxBatchTimeoutSeconds: 0,
+        maxConcurrency: 1,
+        maxRetries: 1,
+        retryDelaySeconds: 0,
+      });
+      for (const id of ["message-one", "message-two"]) {
+        await custody.admit(
+          {
+            queueId: v2QueueId(queue.resourceUid),
+            messageRetentionSeconds: 3600,
+            deliveryDelaySeconds: 0,
+          },
+          { messageId: id, body: new TextEncoder().encode(id) },
+        );
+      }
+      const scope = { consumerUid: consumer.resourceUid, principal, space, targetKey };
+      const first = queueComposition.deliverOnce(scope);
+      const deadline = Date.now() + 5_000;
+      let occupiedAfterAck = false;
+      while (Date.now() < deadline) {
+        const [executions, receipts] = await Promise.all([
+          sql.query("SELECT state FROM queue_v2_batch_executions ORDER BY reserved_at_ms"),
+          sql.query("SELECT state FROM queue_v2_batch_settlements ORDER BY batch_id"),
+        ]);
+        if (executions[0]?.state === "send_authorized" && receipts[0]?.state === "settled") {
+          occupiedAfterAck = true;
+          break;
+        }
+        await Bun.sleep(10);
+      }
+      expect(occupiedAfterAck).toBe(true);
+      expect(await queueComposition.deliverOnce(scope)).toEqual({ kind: "idle" });
+      const firstResult = await first;
+      expect(firstResult).toEqual({ kind: "handler_resolved" });
+      expect(
+        await sql.query(
+          "SELECT state, retirement_kind FROM queue_v2_batch_executions ORDER BY reserved_at_ms LIMIT 1",
+        ),
+      ).toEqual([{ state: "retired", retirement_kind: "handler_and_wait_until" }]);
+      expect(await queueComposition.deliverOnce(scope)).toEqual({ kind: "handler_resolved" });
+      expect(await sql.query("SELECT count(*) AS n FROM selfhost_queue_messages")).toEqual([
+        { n: 0 },
+      ]);
+      await custody.admit(
+        {
+          queueId: v2QueueId(queue.resourceUid),
+          messageRetentionSeconds: 3600,
+          deliveryDelaySeconds: 0,
+        },
+        { messageId: "message-retry", body: new TextEncoder().encode("retry") },
+      );
+      expect(await queueComposition.deliverOnce(scope)).toEqual({ kind: "handler_rejected" });
+      expect(
+        await sql.query(
+          "SELECT deliveries FROM selfhost_queue_messages WHERE message_id = 'message-retry'",
+        ),
+      ).toEqual([{ deliveries: 1 }]);
+      expect(await queueComposition.deliverOnce(scope)).toEqual({ kind: "handler_resolved" });
+      expect(await sql.query("SELECT count(*) AS n FROM selfhost_queue_messages")).toEqual([
+        { n: 0 },
+      ]);
+      const nativeVersionId = `v2-${sha(new TextEncoder().encode(`${versionUid}\u00001`))}`;
+      expect(
+        await owner.observeQueueTarget({
+          workerUid,
+          versionId: nativeVersionId,
+          incarnationId: sourceOperationId,
+          servingSourceOperationId: sourceOperationId,
+        }),
+      ).toMatchObject({ kind: "confirmed", status: "active" });
+      expect(
+        await owner.observeQueueTarget({
+          workerUid,
+          versionId: versionUid,
+          incarnationId: sourceOperationId,
+          servingSourceOperationId: sourceOperationId,
+        }),
+      ).toEqual({ kind: "unknown" });
+      await custody.admit(
+        {
+          queueId: v2QueueId(queue.resourceUid),
+          messageRetentionSeconds: 3600,
+          deliveryDelaySeconds: 0,
+        },
+        { messageId: "message-wrong-vector", body: new TextEncoder().encode("wrong-vector") },
+      );
+      const reserved = await createV2QueueDelivery({
+        sql,
+        custody,
+        capability,
+      }).claimRegisteredBatch(scope);
+      expect(reserved.kind).toBe("ready");
+      if (reserved.kind !== "ready") throw new Error("Queue reservation missing");
+      const invokedOwner = owner;
+      if (!invokedOwner) throw new Error("native owner missing");
+      let authorizeCalls = 0;
+      const rejectWrongVector = async (versions: typeof reserved.versions) =>
+        await invokedOwner.invokeQueue({
+          ...reserved,
+          versions,
+          mintCapability: () => "unreachable",
+          authorizeSend: async () => {
+            authorizeCalls++;
+            return "authorized" as const;
+          },
+        });
+      expect(
+        await rejectWrongVector([
+          { workerVersionUid: "foreign-version", generation: 1, weight: 10_000 },
+        ]),
+      ).toEqual({ kind: "unknown" });
+      expect(
+        await rejectWrongVector([{ workerVersionUid: versionUid, generation: 2, weight: 10_000 }]),
+      ).toEqual({ kind: "unknown" });
+      expect(authorizeCalls).toBe(0);
+      expect(await cancelV2QueueBatchBeforeSend(sql, reserved)).toBe(true);
+    } finally {
+      await queueComposition?.close().catch(() => undefined);
+      await owner?.close().catch(() => undefined);
+      for (const child of children)
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await Promise.all(children.map((child) => child.exited));
+      db.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);

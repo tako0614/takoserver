@@ -85,6 +85,8 @@ export async function prepareV2WorkerCodeProjection(
     readonly configuredPrivateInputs?: unknown;
     readonly requireEventDelivery?: boolean;
     readonly eventDelivery?: { readonly token: string };
+    /** Real boot-composed private settlement plane, never a handler flag. */
+    readonly queueSettlement?: { readonly address: string; readonly token: string };
   },
 ): Promise<VerifiedV2WorkerCodeEligibility> {
   return await verifyV2WorkerCodeProjection(input, false);
@@ -95,6 +97,7 @@ async function verifyV2WorkerCodeProjection(
     readonly configuredPrivateInputs?: unknown;
     readonly requireEventDelivery?: boolean;
     readonly eventDelivery?: { readonly token: string };
+    readonly queueSettlement?: { readonly address: string; readonly token: string };
   },
   inspectionOnly: boolean,
 ): Promise<VerifiedV2WorkerCodeEligibility> {
@@ -149,10 +152,20 @@ async function verifyV2WorkerCodeProjection(
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
   if (
-    spec.handlers.some((handler) => handler !== "fetch" && handler !== "scheduled") ||
+    spec.handlers.some(
+      (handler) => handler !== "fetch" && handler !== "scheduled" && handler !== "queue",
+    ) ||
     (input.requireEventDelivery === true &&
-      spec.handlers.includes("scheduled") &&
-      (!input.eventDelivery || !/^[0-9a-f]{64}$/u.test(input.eventDelivery.token)))
+      (spec.handlers.includes("scheduled") || spec.handlers.includes("queue")) &&
+      (!input.eventDelivery || !/^[0-9a-f]{64}$/u.test(input.eventDelivery.token))) ||
+    (!inspectionOnly &&
+      spec.handlers.includes("queue") &&
+      (!input.queueSettlement ||
+        !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(input.queueSettlement.address) ||
+        Number(
+          input.queueSettlement.address.slice(input.queueSettlement.address.lastIndexOf(":") + 1),
+        ) > 65_535 ||
+        !/^[A-Za-z0-9_-]{43}$/u.test(input.queueSettlement.token)))
   ) {
     throw new V2WorkerCodeRuntimeError("worker_event_delivery_unavailable");
   }

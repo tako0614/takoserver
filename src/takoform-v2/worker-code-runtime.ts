@@ -55,6 +55,8 @@ export async function projectV2WorkerCodeVersion(input: {
   readonly resolvedServiceBindings?: readonly V2ResolvedServiceBinding[];
   /** Non-optional private event gate capability composed by the owning Host. */
   readonly eventDelivery?: { readonly token: string };
+  /** Exact private settlement binding selected before tenant materialization. */
+  readonly queueSettlement?: { readonly address: string; readonly token: string };
 }): Promise<V2WorkerCodeDeploymentVariant> {
   const bundleUnavailable = () => new V2WorkerCodeRuntimeError("worker_bundle_unavailable");
   const inspectModule = input.inspectModule;
@@ -88,6 +90,7 @@ export async function projectV2WorkerCodeVersion(input: {
     ...(resolvedServiceBindings === undefined ? {} : { resolvedServiceBindings }),
     requireEventDelivery: true,
     ...(input.eventDelivery === undefined ? {} : { eventDelivery: input.eventDelivery }),
+    ...(input.queueSettlement === undefined ? {} : { queueSettlement: input.queueSettlement }),
   });
   const { spec, manifest, files, assets } = verified;
   // The portable inspection-only map cannot authorize native env projection.

@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
@@ -15,13 +16,23 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  SELFHOST_V2_QUEUE_EVENT_CONTENT_TYPE,
+  SELFHOST_V2_QUEUE_EVENT_PATH,
+  SELFHOST_V2_QUEUE_EVENT_PROTOCOL,
   SELFHOST_WORKER_EVENT_CONTENT_TYPE,
   SELFHOST_WORKER_EVENT_HEADER,
   SELFHOST_WORKER_EVENT_PATH,
   SELFHOST_WORKER_EVENT_PROTOCOL,
+  SELFHOST_WORKER_EVENT_TOKEN_BINDING,
   SELFHOST_WORKER_EVENT_TOKEN_HEADER,
   selfhostScheduleEvent,
+  selfhostV2QueueCompletionAnswer,
+  selfhostV2QueueEvent,
 } from "./providers/selfhost-events.ts";
+import {
+  V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+  type V2QueueDispatchGrant,
+} from "./providers/selfhost-v2-queue-transport.ts";
 import {
   randomSelfhostDeploymentBasisPoint,
   selectSelfhostWeightedVersion,
@@ -56,7 +67,11 @@ import type {
   WorkerdSite,
   WorkerdStaticSite,
 } from "./workerd-runtime.ts";
-import { createWorkerdRuntime } from "./workerd-runtime.ts";
+import {
+  createWorkerdRuntime,
+  readWorkerdActiveDeployment,
+  readWorkerdSelectedActiveVersion,
+} from "./workerd-runtime.ts";
 import type { WorkerdProcess } from "./workerd-supervisor.ts";
 import {
   inspectWorkerdWorkerExecutionCopies,
@@ -204,8 +219,8 @@ export interface WorkerdWorkerRuntimeOwner {
       }
     | { readonly kind: "unknown" }
   >;
-  /** Observe a previously qualified live native Queue target; Core owns SQL serving and receipt scope. */
-  observeQueueTarget(input: {
+  /** Neutral exact native Version proof; SQL and binding authority remain with each caller. */
+  observeVersionTarget(input: {
     readonly workerUid: string;
     readonly versionId: string;
     readonly incarnationId: string;
@@ -221,6 +236,13 @@ export interface WorkerdWorkerRuntimeOwner {
       }
     | { readonly kind: "unknown" }
   >;
+  /** Queue-specific live gate proof; Core owns SQL serving and receipt scope. */
+  observeQueueTarget(input: {
+    readonly workerUid: string;
+    readonly versionId: string;
+    readonly incarnationId: string;
+    readonly servingSourceOperationId: string;
+  }): ReturnType<WorkerdWorkerRuntimeOwner["observeVersionTarget"]>;
   /** Prove absence only after the exact active inventory or all retired receipts. */
   observeRetirement(input: { readonly workerVersionUid?: string }): Promise<
     | {
@@ -246,6 +268,49 @@ export interface WorkerdWorkerRuntimeOwner {
     | { readonly kind: "handler_rejected"; readonly workerVersionUid: string }
     | { readonly kind: "unknown" }
   >;
+  /** One selected active incarnation, one SQL send authorization, one native Queue event. */
+  invokeQueue(input: {
+    readonly batchId: string;
+    readonly workerUid: string;
+    readonly consumerUid: string;
+    readonly queueUid: string;
+    readonly queueName: string;
+    readonly generation: number;
+    readonly servingSourceOperationId: string;
+    readonly versions: readonly {
+      readonly workerVersionUid: string;
+      readonly generation: number;
+      readonly weight: number;
+    }[];
+    readonly claims: readonly {
+      readonly queueId: string;
+      readonly consumerId: string;
+      readonly generation: number;
+      readonly leaseToken: string;
+      readonly messageId: string;
+      readonly body: Uint8Array;
+      readonly enqueuedAtMillis: number;
+      readonly attempts: number;
+    }[];
+    /** Trusted Host authority, never tenant code or an HTTP DTO. */
+    mintCapability(grant: V2QueueDispatchGrant): string;
+    /** SQL 0083 CAS. Only a new authorization may precede a send. */
+    authorizeSend(target: {
+      readonly workerVersionUid: string;
+      readonly workerVersionGeneration: number;
+      readonly incarnationOperationId: string;
+    }): Promise<"authorized" | "already_authorized" | "unknown">;
+    stillCurrent(): Promise<boolean>;
+  }): Promise<
+    | {
+        readonly kind: "handler_resolved" | "handler_rejected";
+        readonly workerVersionUid: string;
+        readonly workerVersionGeneration: number;
+        readonly incarnationOperationId: string;
+        readonly receiptDigest: string;
+      }
+    | { readonly kind: "unknown" }
+  >;
   /** Non-effecting proof that every current weighted Version can receive scheduled events. */
   observeScheduledCapability(input: {
     readonly workerUid: string;
@@ -267,6 +332,13 @@ export interface WorkerdWorkerRuntimeOwner {
       }
     | { readonly kind: "unknown" }
   >;
+  /** Preaccept proof of the whole inspected, Queue-enabled current native graph. */
+  observeQueueServingCapability(input: {
+    readonly workerUid: string;
+    readonly principal: string;
+    readonly space: string;
+    readonly targetKey: string;
+  }): ReturnType<WorkerdWorkerRuntimeOwner["observeScheduledCapability"]>;
   /** Release the owner lock only after every known incarnation has a durable receipt. */
   close(): Promise<void>;
 }
@@ -279,6 +351,17 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
   readonly publicationState: PublicationState;
   /** Exact Resource-owned configured input reader, shared with Version eligibility. */
   readonly configuredInputs?: V2CodeConfiguredInputReader;
+  /** Boot-composed Host-private settlement plane; no tenant input or use-time fallback. */
+  readonly v2QueueSettlement?: {
+    readonly address: string;
+    /** Exact boot-composed Core physical namespace codec. */
+    queueIdForUid(queueUid: string): string;
+    bindingToken(input: {
+      readonly workerUid: string;
+      readonly versionId: string;
+      readonly incarnationId: string;
+    }): string;
+  };
   readonly workerdBinary: string | null;
   /** Trusted code-module inspector; absent uses the WorkerdRuntime's pinned inspector. */
   readonly inspectModule?: WorkerdRuntime["inspectModule"];
@@ -1641,6 +1724,19 @@ export async function openWorkerdWorkerRuntimeOwner(
   ) {
     throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
   }
+  if (
+    options.v2QueueSettlement !== undefined &&
+    (typeof options.v2QueueSettlement.bindingToken !== "function" ||
+      typeof options.v2QueueSettlement.queueIdForUid !== "function" ||
+      !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(options.v2QueueSettlement.address) ||
+      Number(
+        options.v2QueueSettlement.address.slice(
+          options.v2QueueSettlement.address.lastIndexOf(":") + 1,
+        ),
+      ) > 65_535)
+  ) {
+    throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
+  }
 
   let canonicalRoot: string;
   try {
@@ -2055,6 +2151,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       publicationState: options.publicationState,
       runtime: candidateRuntime,
       ...(options.configuredInputs ? { configuredInputs: options.configuredInputs } : {}),
+      ...(options.v2QueueSettlement ? { v2QueueSettlement: options.v2QueueSettlement } : {}),
       ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
     });
     const handle: IncarnationHandle = {
@@ -2794,7 +2891,10 @@ export async function openWorkerdWorkerRuntimeOwner(
       };
     });
 
-  const observeQueueTarget: WorkerdWorkerRuntimeOwner["observeQueueTarget"] = (input) => {
+  const observeVersionTargetCore = (
+    input: Parameters<WorkerdWorkerRuntimeOwner["observeVersionTarget"]>[0],
+    requireEventToken: boolean,
+  ): ReturnType<WorkerdWorkerRuntimeOwner["observeVersionTarget"]> => {
     // Capture caller-owned input before waiting for the serial lane or I/O.
     const target = {
       workerUid: input.workerUid,
@@ -2823,7 +2923,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         record.receipt !== null ||
         record.executionCopiesCleanupStarted ||
         record.executionCopiesReleased ||
-        !record.eventToken ||
+        (requireEventToken && !record.eventToken) ||
         !record.processIdentity ||
         !record.configurationSha256 ||
         record.configurationRefreshPending ||
@@ -2832,7 +2932,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         !identity ||
         identity.workerResourceUid !== options.workerResourceUid ||
         identity.generation !== expectedOperationMarker(target.incarnationId) ||
-        !identity.versions.some((version) => version.workerVersionUid === target.versionId) ||
+        !identity.versions.some((version) => version.versionId === target.versionId) ||
         !incarnation.group.isReady() ||
         (record.status === "active"
           ? active !== incarnation || state.activeOperationId !== target.incarnationId
@@ -2887,6 +2987,10 @@ export async function openWorkerdWorkerRuntimeOwner(
       };
     });
   };
+  const observeVersionTarget: WorkerdWorkerRuntimeOwner["observeVersionTarget"] = (input) =>
+    observeVersionTargetCore(input, false);
+  const observeQueueTarget: WorkerdWorkerRuntimeOwner["observeQueueTarget"] = (input) =>
+    observeVersionTargetCore(input, true);
 
   const observeRetirement: WorkerdWorkerRuntimeOwner["observeRetirement"] = (input) =>
     runSerial(async () => {
@@ -3322,6 +3426,521 @@ export async function openWorkerdWorkerRuntimeOwner(
       };
     }).catch(() => ({ kind: "unknown" as const }));
 
+  const observeQueueServingCapability: WorkerdWorkerRuntimeOwner["observeQueueServingCapability"] =
+    (input) => {
+      const requested = {
+        workerUid: input.workerUid,
+        principal: input.principal,
+        space: input.space,
+        targetKey: input.targetKey,
+      };
+      return runSerial(async () => {
+        const unknown = { kind: "unknown" } as const;
+        const source = options.publicationState.resolveCurrentServing;
+        const queueBinding = options.v2QueueSettlement;
+        const incarnation = active;
+        const operationId = state.activeOperationId;
+        if (
+          closed ||
+          admissionClosedBy !== null ||
+          !source ||
+          !queueBinding ||
+          !incarnation ||
+          !operationId ||
+          requested.workerUid !== options.workerResourceUid ||
+          requested.targetKey !== options.targetKey ||
+          incarnation.record.operationId !== operationId ||
+          incarnation.record.status !== "active" ||
+          !incarnation.record.eventToken ||
+          !incarnation.record.identity ||
+          !incarnation.record.processIdentity ||
+          !incarnation.group.isReady()
+        )
+          return unknown;
+        const record = cloneRecord(incarnation.record);
+        const identity = record.identity;
+        const processIdentity = record.processIdentity;
+        if (
+          !identity ||
+          !processIdentity ||
+          identity.generation !== expectedOperationMarker(operationId)
+        )
+          return unknown;
+        const resolution = await source({
+          workerUid: requested.workerUid,
+          targetKey: requested.targetKey,
+          sourceOperationId: operationId,
+          expectedIdentity: identity,
+        }).catch(() => null);
+        if (resolution?.kind !== "ready") return unknown;
+        const snapshot = resolution.snapshot;
+        const versions = snapshot.deployment?.versions.map(({ uid, generation, weight, spec }) => ({
+          workerVersionUid: uid,
+          generation,
+          weight,
+          spec,
+        }));
+        if (
+          snapshot.sourceOperationId !== operationId ||
+          snapshot.worker.uid !== requested.workerUid ||
+          snapshot.worker.principal !== requested.principal ||
+          snapshot.worker.space !== requested.space ||
+          !snapshot.deployment ||
+          !versions ||
+          versions.length === 0 ||
+          versions.length !== identity.versions.length ||
+          canonicalJson(snapshot.endpoint ? [snapshot.endpoint.output.hostname] : []) !==
+            canonicalJson(identity.hostnames)
+        )
+          return unknown;
+        const expected = [...versions].sort((a, b) =>
+          a.workerVersionUid.localeCompare(b.workerVersionUid),
+        );
+        const installed = [...identity.versions].sort((a, b) =>
+          a.workerVersionUid.localeCompare(b.workerVersionUid),
+        );
+        if (
+          expected.some((version, index) => {
+            const native = installed[index];
+            return (
+              !native ||
+              !Number.isSafeInteger(version.generation) ||
+              version.generation < 1 ||
+              native.workerVersionUid !== version.workerVersionUid ||
+              native.weight !== version.weight ||
+              native.versionId !==
+                `v2-${createHash("sha256")
+                  .update(`${version.workerVersionUid}\u0000${version.generation}`)
+                  .digest("hex")}` ||
+              !parseWorkerVersionSpec(version.spec).handlers.includes("queue")
+            );
+          })
+        )
+          return unknown;
+        const activeDeployment = await readWorkerdActiveDeployment(
+          incarnation.group.runtimeRoot,
+          scriptName(requested.workerUid),
+        ).catch(() => null);
+        if (
+          !activeDeployment?.events ||
+          activeDeployment.generation !== identity.generation ||
+          canonicalJson(activeDeployment.versions) !== canonicalJson(identity.versions)
+        )
+          return unknown;
+        let basisPoint = 0;
+        for (const version of identity.versions) {
+          const selected = await readWorkerdSelectedActiveVersion(
+            incarnation.group.runtimeRoot,
+            scriptName(requested.workerUid),
+            { expectedWorkerResourceUid: requested.workerUid, basisPoint },
+          ).catch(() => null);
+          if (
+            !selected ||
+            selected.versionId !== version.versionId ||
+            selected.workerVersionUid !== version.workerVersionUid ||
+            selected.generation !== identity.generation ||
+            selected.site.events?.vars.length !== 1 ||
+            selected.site.events.vars[0]?.name !== SELFHOST_WORKER_EVENT_TOKEN_BINDING ||
+            selected.site.events.vars[0]?.value !== record.eventToken ||
+            selected.site.queueSettlement?.address !== queueBinding.address ||
+            selected.site.queueSettlement.vars.length !== 1 ||
+            selected.site.queueSettlement.vars[0]?.name !== V2_QUEUE_SETTLEMENT_TOKEN_BINDING ||
+            selected.site.queueSettlement.vars[0]?.value !==
+              queueBinding.bindingToken({
+                workerUid: requested.workerUid,
+                versionId: version.versionId,
+                incarnationId: operationId,
+              })
+          )
+            return unknown;
+          basisPoint += version.weight;
+        }
+        if (basisPoint !== 10_000) return unknown;
+        const copies = await inspectWorkerdWorkerExecutionCopies({
+          groupDirectory: incarnation.group.runtimeRoot,
+          workerResourceUid: requested.workerUid,
+          listenerPort: record.listenerPort,
+          scriptName: scriptName(requested.workerUid),
+        }).catch(() => null);
+        if (
+          !copies ||
+          !executionCopiesMatchRecord(record, copies, true) ||
+          identity.versions.some(
+            (version) => !copies.versionUids.includes(version.workerVersionUid),
+          ) ||
+          (await incarnation.runtime.observeExactPublication?.(
+            scriptName(requested.workerUid),
+            identity,
+          )) !== "matches" ||
+          (await linuxProcessLiveness(processIdentity)) !== "live" ||
+          (await workerPortOwnership(record.listenerPort, processIdentity.pid).catch(
+            () => "foreign",
+          )) !== "owned" ||
+          !(await resolution.stillCurrent().catch(() => false))
+        )
+          return unknown;
+        const stillCurrent = async (): Promise<boolean> =>
+          await runSerial(async () => {
+            if (
+              closed ||
+              admissionClosedBy !== null ||
+              active !== incarnation ||
+              state.activeOperationId !== operationId ||
+              !incarnation.group.isReady() ||
+              canonicalJson(recordFor(operationId)) !== canonicalJson(record) ||
+              !(await resolution.stillCurrent().catch(() => false))
+            )
+              return false;
+            const current = await readWorkerdActiveDeployment(
+              incarnation.group.runtimeRoot,
+              scriptName(requested.workerUid),
+            ).catch(() => null);
+            const currentCopies = await inspectWorkerdWorkerExecutionCopies({
+              groupDirectory: incarnation.group.runtimeRoot,
+              workerResourceUid: requested.workerUid,
+              listenerPort: record.listenerPort,
+              scriptName: scriptName(requested.workerUid),
+            }).catch(() => null);
+            return (
+              current?.generation === identity.generation &&
+              current.events &&
+              canonicalJson(current.versions) === canonicalJson(identity.versions) &&
+              !!currentCopies &&
+              executionCopiesMatchRecord(record, currentCopies, true) &&
+              identity.versions.every((version) =>
+                currentCopies.versionUids.includes(version.workerVersionUid),
+              ) &&
+              (await incarnation.runtime.observeExactPublication?.(
+                scriptName(requested.workerUid),
+                identity,
+              )) === "matches" &&
+              (await linuxProcessLiveness(processIdentity)) === "live" &&
+              (await workerPortOwnership(record.listenerPort, processIdentity.pid).catch(
+                () => "foreign",
+              )) === "owned" &&
+              (await resolution.stillCurrent().catch(() => false))
+            );
+          }).catch(() => false);
+        return {
+          kind: "confirmed" as const,
+          servingSourceOperationId: operationId,
+          deploymentUid: snapshot.deployment.uid,
+          deploymentGeneration: snapshot.deployment.generation,
+          versions: versions.map(({ workerVersionUid, generation, weight }) => ({
+            workerVersionUid,
+            generation,
+            weight,
+          })),
+          stillCurrent,
+        };
+      }).catch(() => ({ kind: "unknown" as const }));
+    };
+
+  const invokeQueue: WorkerdWorkerRuntimeOwner["invokeQueue"] = async (input) => {
+    const unknown = { kind: "unknown" } as const;
+    const queueBinding = options.v2QueueSettlement;
+    let batch: Omit<typeof input, "mintCapability" | "authorizeSend" | "stillCurrent">;
+    const mintCapability = input.mintCapability;
+    const authorizeSend = input.authorizeSend;
+    const stillCurrent = input.stillCurrent;
+    try {
+      // Caller-owned arrays and bytes cannot change while native/SQL I/O waits.
+      batch = {
+        batchId: input.batchId,
+        workerUid: input.workerUid,
+        consumerUid: input.consumerUid,
+        queueUid: input.queueUid,
+        queueName: input.queueName,
+        generation: input.generation,
+        servingSourceOperationId: input.servingSourceOperationId,
+        versions: input.versions.map((version) => ({
+          workerVersionUid: version.workerVersionUid,
+          generation: version.generation,
+          weight: version.weight,
+        })),
+        claims: input.claims.map((claim) => ({
+          queueId: claim.queueId,
+          consumerId: claim.consumerId,
+          generation: claim.generation,
+          leaseToken: claim.leaseToken,
+          messageId: claim.messageId,
+          body: claim.body.slice(),
+          enqueuedAtMillis: claim.enqueuedAtMillis,
+          attempts: claim.attempts,
+        })),
+      };
+    } catch {
+      return unknown;
+    }
+    let physicalQueueId: string;
+    try {
+      physicalQueueId = queueBinding?.queueIdForUid(batch.queueUid) ?? "";
+    } catch {
+      return unknown;
+    }
+    if (
+      !queueBinding ||
+      physicalQueueId.length === 0 ||
+      !options.publicationState.resolveCurrentServing ||
+      batch.workerUid !== options.workerResourceUid ||
+      !OPERATION_ID.test(batch.servingSourceOperationId) ||
+      !Number.isSafeInteger(batch.generation) ||
+      batch.generation < 1 ||
+      batch.versions.length < 1 ||
+      batch.versions.length > 8 ||
+      batch.claims.length < 1 ||
+      batch.claims.length > 100 ||
+      typeof mintCapability !== "function" ||
+      typeof authorizeSend !== "function" ||
+      typeof stillCurrent !== "function" ||
+      batch.claims.some(
+        (claim) =>
+          claim.queueId !== physicalQueueId ||
+          claim.consumerId !== batch.consumerUid ||
+          claim.generation !== batch.generation ||
+          !(claim.body instanceof Uint8Array) ||
+          claim.body.byteLength > 127_000,
+      )
+    )
+      return unknown;
+    const source = options.publicationState.resolveCurrentServing;
+    const admitted = await runSerial(async () => {
+      if (closed || admissionClosedBy !== null || !(await stillCurrent().catch(() => false)))
+        return null;
+      const incarnation = active;
+      const operationId = state.activeOperationId;
+      const record = operationId ? recordFor(operationId) : undefined;
+      const identity = record?.identity;
+      if (
+        !incarnation ||
+        !operationId ||
+        operationId !== batch.servingSourceOperationId ||
+        incarnation.record.operationId !== operationId ||
+        record?.status !== "active" ||
+        !record.eventToken ||
+        !record.processIdentity ||
+        !identity ||
+        identity.generation !== expectedOperationMarker(operationId) ||
+        !incarnation.group.isReady() ||
+        canonicalJson(record) !== canonicalJson(incarnation.record)
+      )
+        return null;
+      const resolution = await source({
+        workerUid: batch.workerUid,
+        targetKey: options.targetKey,
+        sourceOperationId: operationId,
+        expectedIdentity: identity,
+      }).catch(() => null);
+      if (resolution?.kind !== "ready") return null;
+      const snapshot = resolution.snapshot;
+      const selectedCore = [...batch.versions].sort((a, b) =>
+        a.workerVersionUid.localeCompare(b.workerVersionUid),
+      );
+      const selectedNative = [...identity.versions].sort((a, b) =>
+        a.workerVersionUid.localeCompare(b.workerVersionUid),
+      );
+      if (
+        !snapshot ||
+        snapshot.sourceOperationId !== operationId ||
+        snapshot.worker.uid !== batch.workerUid ||
+        !snapshot.deployment ||
+        selectedCore.length !== selectedNative.length ||
+        selectedCore.reduce((sum, item) => sum + item.weight, 0) !== 10_000 ||
+        selectedCore.some(
+          (item, index) =>
+            item.workerVersionUid !== selectedNative[index]?.workerVersionUid ||
+            item.weight !== selectedNative[index]?.weight ||
+            !Number.isSafeInteger(item.generation) ||
+            item.generation < 1,
+        ) ||
+        canonicalJson(
+          snapshot.deployment.versions
+            .map((version) => ({
+              workerVersionUid: version.uid,
+              generation: version.generation,
+              weight: version.weight,
+            }))
+            .sort((a, b) => a.workerVersionUid.localeCompare(b.workerVersionUid)),
+        ) !== canonicalJson(selectedCore) ||
+        snapshot.deployment.versions.some(
+          (version) => !parseWorkerVersionSpec(version.spec).handlers.includes("queue"),
+        ) ||
+        !(await resolution.stillCurrent().catch(() => false)) ||
+        (await incarnation.runtime.observeExactPublication?.(
+          scriptName(batch.workerUid),
+          identity,
+        )) !== "matches"
+      )
+        return null;
+      const copies = await inspectWorkerdWorkerExecutionCopies({
+        groupDirectory: incarnation.group.runtimeRoot,
+        workerResourceUid: batch.workerUid,
+        listenerPort: record.listenerPort,
+        scriptName: scriptName(batch.workerUid),
+      }).catch(() => null);
+      if (!copies || !executionCopiesMatchRecord(record, copies, true)) return null;
+      let selected: ReturnType<typeof selectSelfhostWeightedVersion>;
+      let basisPoint: number;
+      try {
+        basisPoint = randomSelfhostDeploymentBasisPoint();
+        selected = selectSelfhostWeightedVersion(identity.versions, basisPoint);
+      } catch {
+        return null;
+      }
+      const version = selectedCore.find(
+        (item) => item.workerVersionUid === selected.workerVersionUid,
+      );
+      if (
+        !version ||
+        !copies.versionUids.includes(version.workerVersionUid) ||
+        selected.versionId !==
+          `v2-${createHash("sha256")
+            .update(`${version.workerVersionUid}\u0000${version.generation}`)
+            .digest("hex")}`
+      )
+        return null;
+      const selectedGraph = await readWorkerdSelectedActiveVersion(
+        incarnation.group.runtimeRoot,
+        scriptName(batch.workerUid),
+        { expectedWorkerResourceUid: batch.workerUid, basisPoint },
+      ).catch(() => null);
+      if (
+        !selectedGraph ||
+        selectedGraph.versionId !== selected.versionId ||
+        selectedGraph.workerVersionUid !== version.workerVersionUid ||
+        selectedGraph.generation !== identity.generation ||
+        selectedGraph.site.events?.vars.length !== 1 ||
+        selectedGraph.site.events.vars[0]?.name !== SELFHOST_WORKER_EVENT_TOKEN_BINDING ||
+        selectedGraph.site.events.vars[0]?.value !== record.eventToken ||
+        selectedGraph.site.queueSettlement?.address !== queueBinding.address ||
+        selectedGraph.site.queueSettlement.vars.length !== 1 ||
+        selectedGraph.site.queueSettlement.vars[0]?.name !== V2_QUEUE_SETTLEMENT_TOKEN_BINDING ||
+        selectedGraph.site.queueSettlement.vars[0]?.value !==
+          queueBinding.bindingToken({
+            workerUid: batch.workerUid,
+            versionId: selected.versionId,
+            incarnationId: operationId,
+          })
+      )
+        return null;
+      const target = {
+        workerVersionUid: version.workerVersionUid,
+        workerVersionGeneration: version.generation,
+        incarnationOperationId: operationId,
+      };
+      let event: ReturnType<typeof selfhostV2QueueEvent>;
+      try {
+        const expiresAtMillis = Date.now() + 240_000;
+        event = selfhostV2QueueEvent({
+          batchId: batch.batchId,
+          script: scriptName(batch.workerUid),
+          publication: selected.versionId,
+          workerUid: batch.workerUid,
+          consumerUid: batch.consumerUid,
+          queueUid: batch.queueUid,
+          queue: batch.queueName,
+          messages: batch.claims.map((claim) => ({
+            messageId: claim.messageId,
+            timestampMillis: claim.enqueuedAtMillis,
+            attempts: claim.attempts,
+            body: { encoding: "base64" as const, data: Buffer.from(claim.body).toString("base64") },
+            leaseToken: claim.leaseToken,
+            invocationCapability: mintCapability({
+              batchId: batch.batchId,
+              messageId: claim.messageId,
+              workerUid: batch.workerUid,
+              versionId: selected.versionId,
+              incarnationId: operationId,
+              servingSourceOperationId: operationId,
+              consumerUid: batch.consumerUid,
+              queueUid: batch.queueUid,
+              generation: batch.generation,
+              leaseToken: claim.leaseToken,
+              expiresAtMillis,
+            }),
+          })),
+        });
+      } catch {
+        return null;
+      }
+      if (
+        !(await stillCurrent().catch(() => false)) ||
+        !(await resolution.stillCurrent().catch(() => false)) ||
+        active !== incarnation ||
+        state.activeOperationId !== operationId ||
+        canonicalJson(recordFor(operationId)) !== canonicalJson(record) ||
+        !incarnation.group.isReady()
+      )
+        return null;
+      // A lost authorization ACK is not a permission to resend. The SQL row
+      // remains occupied until an exact terminal or physical-absence proof.
+      if ((await authorizeSend(target).catch(() => "unknown")) !== "authorized") return null;
+      let doneResolve!: () => void;
+      const done = new Promise<void>((resolve) => {
+        doneResolve = resolve;
+      });
+      const invocation: ActiveInvocation = {
+        abort: new AbortController(),
+        done,
+        finish() {
+          finishInvocation(incarnation, invocation);
+          doneResolve();
+        },
+        finished: false,
+      };
+      incarnation.invocations.add(invocation);
+      // Start the one-shot private event while still holding the owner serial
+      // lane. The returned promise is awaited outside it, so lifecycle may drain.
+      const response = incarnation.runtime.probe?.(
+        scriptName(batch.workerUid),
+        SELFHOST_V2_QUEUE_EVENT_PATH,
+        {
+          route: "events",
+          method: "POST",
+          headers: {
+            "content-type": SELFHOST_V2_QUEUE_EVENT_CONTENT_TYPE,
+            [SELFHOST_WORKER_EVENT_HEADER]: SELFHOST_V2_QUEUE_EVENT_PROTOCOL,
+            [SELFHOST_WORKER_EVENT_TOKEN_HEADER]: record.eventToken,
+          },
+          body: JSON.stringify(event),
+          timeoutMillis: 300_000,
+        },
+      );
+      return { invocation, response, target, incarnation, event };
+    }).catch(() => null);
+    if (!admitted) return unknown;
+    try {
+      const answer = await admitted.response;
+      const outcome = answer ? selfhostV2QueueCompletionAnswer(answer) : null;
+      if (!outcome || admitted.invocation.abort.signal.aborted) return unknown;
+      const native = await observeVersionTargetCore(
+        {
+          workerUid: batch.workerUid,
+          versionId: admitted.event.deploymentId,
+          incarnationId: admitted.target.incarnationOperationId,
+          servingSourceOperationId: batch.servingSourceOperationId,
+        },
+        false,
+      );
+      if (native.kind !== "confirmed") return unknown;
+      const receiptDigest = createHash("sha256")
+        .update(
+          canonicalJson({
+            batchId: batch.batchId,
+            target: admitted.target,
+            outcome,
+            protocol: SELFHOST_V2_QUEUE_EVENT_PROTOCOL,
+          }),
+        )
+        .digest("hex");
+      return { kind: outcome, ...admitted.target, receiptDigest };
+    } catch {
+      return unknown;
+    } finally {
+      admitted.invocation.finish();
+    }
+  };
+
   const invokeScheduled: WorkerdWorkerRuntimeOwner["invokeScheduled"] = async (input) => {
     const unknown = { kind: "unknown" } as const;
     if (
@@ -3551,10 +4170,13 @@ export async function openWorkerdWorkerRuntimeOwner(
     workerResourceUid: options.workerResourceUid,
     execute,
     observeServing,
+    observeVersionTarget,
     observeQueueTarget,
     observeRetirement,
     fetch: fetchRequest,
     observeScheduledCapability,
+    observeQueueServingCapability,
+    invokeQueue,
     invokeScheduled,
     close,
   });

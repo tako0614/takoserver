@@ -414,6 +414,45 @@ test("handler-only scheduled code projects before a Cron attachment exists", asy
   );
 });
 
+test("Queue code inspection is non-authorizing, while native projection requires both real private planes", async () => {
+  const spec = versionSpec({ handlers: ["queue"] });
+  const bundle = await heldBundle({
+    moduleBytes: encoder.encode("export default { queue() {} };\n"),
+  });
+  const inspectModule = inspector({ outcome: "valid", exportedHandlers: ["queue"] });
+  await expect(
+    inspectV2WorkerCodeVersionEligibility({
+      workerResourceUid: WORKER_UID,
+      bundleResourceUid: BUNDLE_UID,
+      spec,
+      bundle,
+      inspectModule,
+    }),
+  ).resolves.toBeUndefined();
+  const base = { identity: identity(), spec, bundle, inspectModule };
+  await expect(
+    projectV2WorkerCodeVersion({
+      ...base,
+      eventDelivery: { token: "a".repeat(64) },
+    }),
+  ).rejects.toMatchObject({ code: "worker_event_delivery_unavailable" });
+  await expect(
+    projectV2WorkerCodeVersion({
+      ...base,
+      queueSettlement: { address: "127.0.0.1:12345", token: "b".repeat(43) },
+    }),
+  ).rejects.toMatchObject({ code: "worker_event_delivery_unavailable" });
+  const projected = await projectV2WorkerCodeVersion({
+    ...base,
+    eventDelivery: { token: "a".repeat(64) },
+    queueSettlement: { address: "127.0.0.1:12345", token: "b".repeat(43) },
+  });
+  expect(projected.site.fetchHandler).toBe(false);
+  expect(projected.modules.get(MODULE_PATH)).toEqual(
+    encoder.encode("export default { queue() {} };\n"),
+  );
+});
+
 test("projects verified code+assets into one copied Version with exact routing policy", async () => {
   const held = await heldAssets();
   const projection = await projectV2WorkerCodeVersion({

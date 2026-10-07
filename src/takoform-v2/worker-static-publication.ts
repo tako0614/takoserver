@@ -160,6 +160,15 @@ export function createV2WorkerPublication(options: {
   readonly configuredInputs?: V2CodeConfiguredInputReader;
   /** Incarnation-pinned private gate credential, absent for read-only projections. */
   readonly scheduledEventToken?: string;
+  /** Boot-resolved private plane; the tenant Version spec cannot name it. */
+  readonly v2QueueSettlement?: {
+    readonly address: string;
+    bindingToken(input: {
+      readonly workerUid: string;
+      readonly versionId: string;
+      readonly incarnationId: string;
+    }): string;
+  };
 }): V2WorkerPublication {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   const inspectModule = options.runtime.inspectModule;
@@ -200,6 +209,17 @@ export function createV2WorkerPublication(options: {
       let projection: WorkerdDeploymentVariant<WorkerdSite | WorkerdStaticSite>;
       const versionSpec = parseWorkerVersionSpec(version.spec);
       if (versionSpec.bundle) {
+        const queueSettlement =
+          versionSpec.handlers.includes("queue") && options.v2QueueSettlement !== undefined
+            ? {
+                address: options.v2QueueSettlement.address,
+                token: options.v2QueueSettlement.bindingToken({
+                  workerUid: snapshot.worker.uid,
+                  versionId: identity.versionId,
+                  incarnationId: execution.operationId,
+                }),
+              }
+            : undefined;
         const configuredPrivateInputs =
           versionSpec.requiredSensitiveVars.length > 0
             ? await options.configuredInputs?.read({
@@ -232,6 +252,7 @@ export function createV2WorkerPublication(options: {
           ...(options.scheduledEventToken === undefined
             ? {}
             : { eventDelivery: { token: options.scheduledEventToken } }),
+          ...(queueSettlement === undefined ? {} : { queueSettlement }),
         });
         const graph = compileWorkerdVersionGraph({
           directory: name,
@@ -263,9 +284,10 @@ export function createV2WorkerPublication(options: {
           generation,
           workerResourceUid: snapshot.worker.uid,
           declaredHandlers: versionSpec.handlers,
-          ...(versionSpec.handlers.includes("scheduled")
+          ...(versionSpec.handlers.includes("scheduled") || versionSpec.handlers.includes("queue")
             ? { eventToken: options.scheduledEventToken }
             : {}),
+          ...(queueSettlement === undefined ? {} : { v2QueueSettlement: queueSettlement }),
           readiness: {
             publication: codeProjection.versionId,
             probeHostname: internalHostname(name),
