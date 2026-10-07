@@ -18,6 +18,7 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { MODULE_WORKER_LIFECYCLE_BACKEND_ID } from "../src/takoform-v2/worker-lifecycle-backend.ts";
+import type { WorkerdWorkerRuntimeOwner } from "../src/workerd-worker-runtime-owner.ts";
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "selfhost-v2-worker-suspend-"));
@@ -188,6 +189,7 @@ test("composition closes a live Worker owner only after SQL proves no serving De
 
 test("composition refuses to close an owner while SQL still has an active Deployment", async () => {
   const f = await fixture();
+  let openedOwner: WorkerdWorkerRuntimeOwner | undefined;
   try {
     expect(await f.composition.restoreOwners()).toEqual([]);
     const worker = await f.engine.acceptCreate({
@@ -221,13 +223,16 @@ test("composition refuses to close an owner while SQL still has an active Deploy
       },
     });
     expect(await f.engine.runNext()).toMatchObject({ id: deployment.id, status: "succeeded" });
-    await f.composition.ownerForWorkerUid(worker.resourceUid);
+    openedOwner = await f.composition.ownerForWorkerUid(worker.resourceUid);
 
     await expect(f.composition.suspendOwnersRetainingCustody()).rejects.toThrow(
       "v2 Worker serving state is uncertain during shutdown",
     );
   } finally {
-    await f.composition.closePrivateBindingServices().catch(() => undefined);
+    // The expected shutdown refusal must not leave an owner lock behind. This
+    // path closes only after the owner itself proves no child/custody remains.
+    if (openedOwner) await openedOwner.close();
+    await f.composition.closePrivateBindingServices();
     f.database.close();
     await rm(f.root, { recursive: true, force: true });
   }
@@ -235,6 +240,7 @@ test("composition refuses to close an owner while SQL still has an active Deploy
 
 test("composition refuses to stop services when current Worker SQL is ambiguous", async () => {
   const f = await fixture();
+  let openedOwner: WorkerdWorkerRuntimeOwner | undefined;
   try {
     expect(await f.composition.restoreOwners()).toEqual([]);
     const created = await f.engine.acceptCreate({
@@ -243,14 +249,17 @@ test("composition refuses to stop services when current Worker SQL is ambiguous"
       input: { form: MODULE_WORKER_FORM_URL, space: "prod", name: "worker", spec: {} },
     });
     expect(await f.engine.runNext()).toMatchObject({ id: created.id, status: "succeeded" });
-    await f.composition.ownerForWorkerUid(created.resourceUid);
+    openedOwner = await f.composition.ownerForWorkerUid(created.resourceUid);
     f.makeShutdownReadAmbiguous();
 
     await expect(f.composition.suspendOwnersRetainingCustody()).rejects.toThrow(
       "v2 Worker SQL state is not settled for shutdown",
     );
   } finally {
-    await f.composition.closePrivateBindingServices().catch(() => undefined);
+    // The ambiguous SQL answer refuses coordinated shutdown, but the opened
+    // empty owner can still independently prove retirement-only closure.
+    if (openedOwner) await openedOwner.close();
+    await f.composition.closePrivateBindingServices();
     f.database.close();
     await rm(f.root, { recursive: true, force: true });
   }

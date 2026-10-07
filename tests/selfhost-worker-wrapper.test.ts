@@ -53,7 +53,10 @@ import {
   selfhostReadinessFailureMessage,
   selfhostWorkerEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
-import { WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING } from "../src/providers/workerd-v2-private-binding-names.ts";
+import {
+  WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
+  WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+} from "../src/providers/workerd-v2-private-binding-names.ts";
 
 /**
  * The generated entrypoint is the only thing standing between a tenant's module
@@ -2167,6 +2170,64 @@ test("v2 ObjectBucket uses its private service and streams a 10,000-part manifes
     expect(recorded.parts).toHaveLength(10_000);
     expect((recorded.parts[0] as { partNumber: number }).partNumber).toBe(1);
     expect((recorded.parts[9_999] as { partNumber: number }).partNumber).toBe(10_000);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("generic and private ObjectBucket bindings use their own services in one Worker", async () => {
+  const genericRequests: string[] = [];
+  const privateRequests: string[] = [];
+  const genericService = {
+    async fetch(url: string) {
+      genericRequests.push(url);
+      return Response.json({ ok: true, value: { found: false } });
+    },
+  };
+  const privateService = {
+    async fetch(url: string) {
+      privateRequests.push(url);
+      return Response.json({ ok: true, value: { found: false } });
+    },
+  };
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const legacy = await env.LEGACY.head("legacy-key");
+       const bucket = await env.MEDIA.head("bucket-key");
+       return Response.json({ legacy, bucket });
+     } };`,
+    {
+      ...OBJECTS_ONLY,
+      publication: "mixed-object-services",
+      bindings: [
+        { kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND, publicName: "LEGACY" },
+        {
+          kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
+          publicName: "MEDIA",
+          internalName: WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+        },
+      ],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(genericService, {
+        [WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING]: genericService,
+        [WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING]: privateService,
+      }),
+      context,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ legacy: null, bucket: null });
+    expect(genericRequests).toHaveLength(1);
+    expect(privateRequests).toHaveLength(1);
+    expect(genericRequests[0]).toBe(
+      `${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`,
+    );
+    expect(privateRequests[0]).toBe(
+      `${SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN}${SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH}`,
+    );
   } finally {
     await generated.dispose();
   }

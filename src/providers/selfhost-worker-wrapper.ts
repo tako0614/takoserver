@@ -977,7 +977,7 @@ function projectEnv(rawEnv) {
   }
   const projected = SafeObjectCreate(null);
   let call;
-  let objectCall;
+  const objectCalls = new SafeMap();
   for (let index = 0; index < CONFIGURATION.bindings.length; index += 1) {
     const descriptor = CONFIGURATION.bindings[index];
     if (SafeObjectHasOwn(descriptor, "kind")) {
@@ -988,7 +988,12 @@ function projectEnv(rawEnv) {
       // The object facade streams, so it has a caller of its own: everything
       // else on this seam is one JSON envelope in and one out.
       if (descriptor.kind === OBJECTS_KIND) {
-        if (!objectCall) objectCall = createObjectCaller(rawEnv, descriptor.internalName);
+        const objectService = descriptor.internalName || DATA_SERVICE;
+        let objectCall = SafeApply(SafeMapGet, objectCalls, [objectService]);
+        if (!objectCall) {
+          objectCall = createObjectCaller(rawEnv, descriptor.internalName);
+          SafeApply(SafeMapSet, objectCalls, [objectService, objectCall]);
+        }
         projected[descriptor.publicName] = createObjectsAdapter(
           objectCall,
           descriptor.publicName,
@@ -2546,7 +2551,7 @@ async function kvRead(call, binding, key, op) {
     throw portableError("backend_unavailable");
   }
   if (!value.found) return null;
-  if (!isCanonicalBase64(value.value, MAX_KV_VALUE_BYTES)) {
+  if (!isCanonicalKvBase64(value.value, MAX_KV_VALUE_BYTES)) {
     throw portableError("backend_unavailable");
   }
   const result = SafeObjectCreate(null);
@@ -2786,6 +2791,50 @@ function isCanonicalBase64(value, maximumBytes) {
     const decoded = SafeAtob(value);
     return decoded.length <= maximumBytes && SafeBtoa(decoded) === value;
   } catch { return false; }
+}
+
+/**
+ * KV values may be the full 25 MiB contract limit. Validate their base64
+ * spelling with bounded linear scans rather than a backtracking expression,
+ * which can overflow the runtime stack on a valid large response.
+ */
+function isCanonicalKvBase64(value, maximumBytes) {
+  if (typeof value !== "string" || value.length % 4 !== 0) return false;
+  const length = value.length;
+  let padding = 0;
+  if (length > 0 && SafeApply(SafeStringCharCodeAt, value, [length - 1]) === 61) {
+    padding = 1;
+    if (length > 1 && SafeApply(SafeStringCharCodeAt, value, [length - 2]) === 61) padding = 2;
+  }
+  const dataLength = length - padding;
+  if (
+    (padding === 1 && dataLength % 4 !== 3) ||
+    (padding === 2 && dataLength % 4 !== 2) ||
+    (padding === 0 && dataLength % 4 !== 0) ||
+    (length / 4) * 3 - padding > maximumBytes
+  ) {
+    return false;
+  }
+  for (let index = 0; index < dataLength; index += 1) {
+    if (base64Sextet(SafeApply(SafeStringCharCodeAt, value, [index])) < 0) return false;
+  }
+  if (padding === 1) {
+    const finalSextet = base64Sextet(SafeApply(SafeStringCharCodeAt, value, [dataLength - 1]));
+    if ((finalSextet & 0b11) !== 0) return false;
+  } else if (padding === 2) {
+    const finalSextet = base64Sextet(SafeApply(SafeStringCharCodeAt, value, [dataLength - 1]));
+    if ((finalSextet & 0b1111) !== 0) return false;
+  }
+  return true;
+}
+
+function base64Sextet(code) {
+  if (code >= 65 && code <= 90) return code - 65;
+  if (code >= 97 && code <= 122) return code - 71;
+  if (code >= 48 && code <= 57) return code + 4;
+  if (code === 43) return 62;
+  if (code === 47) return 63;
+  return -1;
 }
 
 // Metadata that is the wrong kind of thing is invalid_value; only too much of
