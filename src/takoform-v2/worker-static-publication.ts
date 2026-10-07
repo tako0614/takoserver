@@ -169,7 +169,7 @@ export function createV2WorkerPublication(options: {
     bindingToken(input: {
       readonly workerUid: string;
       readonly versionId: string;
-      readonly incarnationId: string;
+      readonly servingSourceOperationId: string;
     }): string;
   };
   /** Fixed Host-private broker, never selected by a Worker Version. */
@@ -261,7 +261,7 @@ export function createV2WorkerPublication(options: {
                 token: options.v2QueueSettlement.bindingToken({
                   workerUid: snapshot.worker.uid,
                   versionId: identity.versionId,
-                  incarnationId: execution.operationId,
+                  servingSourceOperationId: execution.operationId,
                 }),
               }
             : undefined;

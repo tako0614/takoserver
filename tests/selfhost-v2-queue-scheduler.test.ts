@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import type { JsonObject } from "../src/ports.ts";
+import type { JsonObject, SqlParam } from "../src/ports.ts";
 import { createQueueCustody } from "../src/queue-custody.ts";
 import { createSelfhostV2QueueScheduler } from "../src/selfhost-v2-queue-scheduler.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -320,6 +320,86 @@ test("accepted active Consumer is rediscovered from durable SQL after restart", 
   } finally {
     database.close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("real Queue delivery cannot claim before the native owner restore completes", async () => {
+  const database = new Database(":memory:");
+  try {
+    for (const migration of MIGRATIONS) database.exec(migration.sql);
+    const accepted = await acceptedConsumer(database);
+    let releaseRestore!: (uids: readonly string[]) => void;
+    const restore = new Promise<readonly string[]>((resolve) => {
+      releaseRestore = resolve;
+    });
+    let deliveries = 0;
+    let recoveryPages = 0;
+    const scheduler = createSelfhostV2QueueScheduler({
+      sql: accepted.sql,
+      custody: createQueueCustody({ sql: accepted.sql }),
+      workerComposition: { restoreOwners: () => restore },
+      composition: {
+        async reconcileWorkerAuthorizedAbsence() {
+          recoveryPages++;
+          return { kind: "reconciled" as const, retired: 0, nextCursor: null };
+        },
+        async deliverOnce() {
+          deliveries++;
+          return { kind: "idle" as const };
+        },
+      },
+    });
+    const tick = scheduler.tick();
+    await Bun.sleep(10);
+    expect(deliveries).toBe(0);
+    expect(recoveryPages).toBe(0);
+    releaseRestore([accepted.workerUid]);
+    expect(await tick).toBe(1);
+    expect(deliveries).toBe(1);
+    await scheduler.close();
+  } finally {
+    database.close();
+  }
+});
+
+test("worker-wide recovery retains its 32-row cursor across scheduler ticks", async () => {
+  const database = new Database(":memory:");
+  try {
+    for (const migration of MIGRATIONS) database.exec(migration.sql);
+    const accepted = await acceptedConsumer(database);
+    const cursors: (string | undefined)[] = [];
+    const sql = {
+      ...accepted.sql,
+      async query(statement: string, params?: readonly SqlParam[]) {
+        if (statement.includes("SELECT DISTINCT worker_uid FROM queue_v2_batch_executions"))
+          return [{ worker_uid: accepted.workerUid }];
+        return accepted.sql.query(statement, params);
+      },
+    };
+    const scheduler = createSelfhostV2QueueScheduler({
+      sql,
+      custody: createQueueCustody({ sql }),
+      workerComposition: { restoreOwners: async () => [accepted.workerUid] },
+      composition: {
+        async reconcileWorkerAuthorizedAbsence(input) {
+          cursors.push(input.afterBatchId);
+          return {
+            kind: "reconciled" as const,
+            retired: 0,
+            nextCursor: cursors.length === 1 ? "batch-032" : null,
+          };
+        },
+        async deliverOnce() {
+          return { kind: "idle" as const };
+        },
+      },
+    });
+    await scheduler.tick();
+    await scheduler.tick();
+    expect(cursors).toEqual([undefined, "batch-032"]);
+    await scheduler.close();
+  } finally {
+    database.close();
   }
 });
 

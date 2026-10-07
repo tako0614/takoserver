@@ -115,13 +115,14 @@ test("private endpoint never confirms an unknown or unavailable SQL effect", asy
 test("HMAC invocation proof survives authority recreation but requires live durable scope", async () => {
   const key = new Uint8Array(32).fill(7);
   let live = true;
+  let currentPhysicalIncarnation = grant.incarnationId;
   const build = () =>
     createV2QueueSettlementAuthority({
       key,
       scope: {
         native: {
           async observeQueueTarget(scope) {
-            return live
+            return live && scope.incarnationId === currentPhysicalIncarnation
               ? ({ kind: "confirmed", ...scope, status: "active" } as const)
               : ({ kind: "unknown" } as const);
           },
@@ -138,6 +139,10 @@ test("HMAC invocation proof survives authority recreation but requires live dura
   const beforeRestart = build();
   const capability = beforeRestart.mint(grant);
   const bearer = beforeRestart.bindingToken(grant);
+  const physicalBearer = beforeRestart.bindingToken({
+    ...grant,
+    servingSourceOperationId: grant.incarnationId,
+  });
   const afterRestart = build();
   expect(await afterRestart.authenticate({ bearer, invocationCapability: capability })).toEqual(
     grant,
@@ -146,8 +151,21 @@ test("HMAC invocation proof survives authority recreation but requires live dura
     await afterRestart.authenticate({ bearer: `${bearer}x`, invocationCapability: capability }),
   ).toBeNull();
   expect(
+    await afterRestart.authenticate({ bearer: physicalBearer, invocationCapability: capability }),
+  ).toBeNull();
+  expect(
     await afterRestart.authenticate({ bearer, invocationCapability: `${capability}x` }),
   ).toBeNull();
+  currentPhysicalIncarnation = "owner-incarnation-2";
+  expect(await afterRestart.authenticate({ bearer, invocationCapability: capability })).toBeNull();
+  const newPhysicalGrant = { ...grant, incarnationId: currentPhysicalIncarnation };
+  expect(
+    await afterRestart.authenticate({
+      bearer,
+      invocationCapability: afterRestart.mint(newPhysicalGrant),
+    }),
+  ).toEqual(newPhysicalGrant);
+  currentPhysicalIncarnation = grant.incarnationId;
   live = false;
   expect(await afterRestart.authenticate({ bearer, invocationCapability: capability })).toBeNull();
   live = true;

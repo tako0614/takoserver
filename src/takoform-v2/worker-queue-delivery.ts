@@ -14,13 +14,14 @@ import type { V2QueueConsumerCapability } from "./worker-queue-consumer-backend.
 
 const DB_NOW_MS =
   "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
+const V2_QUEUE_ID_PREFIX = "takoform-v2-queue:";
 
 /** A private physical namespace, pinned only to the accepted Resource UID. */
 export function v2QueueId(queueUid: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(queueUid)) {
     throw new TypeError("Queue Resource UID is invalid");
   }
-  return `takoform-v2-queue:${queueUid}`;
+  return `${V2_QUEUE_ID_PREFIX}${queueUid}`;
 }
 
 export interface V2QueueClaim {
@@ -309,6 +310,108 @@ export interface V2QueueBatchExecutionIdentity {
   readonly workerVersionUid: string;
   readonly workerVersionGeneration: number;
   readonly incarnationOperationId: string;
+}
+
+/**
+ * Read only the bounded, immutable 0083 send-authorized identities for one
+ * Consumer. This is a recovery candidate list, never physical-absence proof.
+ * The native owner must separately prove the exact old process is gone before
+ * any row can be retired. maxConcurrency is at most 250 across generations.
+ */
+export async function listV2AuthorizedQueueExecutions(
+  sql: Sql,
+  input: {
+    readonly consumerUid: string;
+    readonly principal: string;
+    readonly space: string;
+    readonly targetKey: string;
+  },
+): Promise<readonly V2QueueBatchExecutionIdentity[]> {
+  const uid = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+  if (
+    !sql ||
+    !uid.test(input.consumerUid) ||
+    typeof input.principal !== "string" ||
+    !input.principal ||
+    typeof input.space !== "string" ||
+    !input.space ||
+    typeof input.targetKey !== "string" ||
+    !input.targetKey
+  )
+    throw new TypeError("Queue execution scan scope is invalid");
+  const rows = await sql.query(
+    `SELECT batch_id, reservation_token, queue_id, consumer_uid, consumer_generation,
+            worker_uid, serving_source_operation_id, worker_version_uid,
+            worker_version_generation, incarnation_operation_id
+     FROM queue_v2_batch_executions INDEXED BY queue_v2_batch_executions_open_consumer
+     WHERE consumer_uid = ? AND state = 'send_authorized'
+       AND principal = ? AND space = ? AND target_key = ?
+     ORDER BY reserved_at_ms, batch_id LIMIT 251`,
+    [input.consumerUid, input.principal, input.space, input.targetKey],
+  );
+  if (rows.length > 250) throw new Error("Queue execution scan exceeds maxConcurrency");
+  return decodeAuthorizedExecutions(rows);
+}
+
+/** A bounded private recovery page, including a deleting Consumer's rows. */
+export async function listV2AuthorizedQueueExecutionsForWorker(
+  sql: Sql,
+  input: { readonly workerUid: string; readonly afterBatchId?: string },
+): Promise<{
+  readonly executions: readonly V2QueueBatchExecutionIdentity[];
+  readonly nextCursor: string | null;
+}> {
+  const uid = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+  if (!sql || !uid.test(input.workerUid) || (input.afterBatchId && !uid.test(input.afterBatchId)))
+    throw new TypeError("Queue worker recovery scope is invalid");
+  const rows = await sql.query(
+    `SELECT batch_id, reservation_token, queue_id, consumer_uid, consumer_generation,
+            worker_uid, serving_source_operation_id, worker_version_uid,
+            worker_version_generation, incarnation_operation_id
+     FROM queue_v2_batch_executions
+     WHERE worker_uid = ? AND state = 'send_authorized' AND batch_id > ?
+     ORDER BY batch_id LIMIT 33`,
+    [input.workerUid, input.afterBatchId ?? ""],
+  );
+  const page = rows.slice(0, 32);
+  const executions = decodeAuthorizedExecutions(page);
+  return {
+    executions,
+    nextCursor:
+      rows.length === 33 && executions.length === 32 ? (executions[31]?.batchId ?? null) : null,
+  };
+}
+
+function decodeAuthorizedExecutions(rows: readonly Record<string, unknown>[]) {
+  const storedString = (value: unknown): string => {
+    if (typeof value !== "string") throw new Error("Queue execution identity is corrupt");
+    return value;
+  };
+  const storedGeneration = (value: unknown): number => {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1)
+      throw new Error("Queue execution generation is corrupt");
+    return value;
+  };
+  return rows.map((row) => {
+    const queueId = storedString(row.queue_id);
+    const prefix = V2_QUEUE_ID_PREFIX;
+    if (!queueId.startsWith(prefix) || queueId.length <= prefix.length)
+      throw new Error("Queue execution namespace is corrupt");
+    const queueUid = queueId.slice(prefix.length);
+    if (v2QueueId(queueUid) !== queueId) throw new Error("Queue execution namespace is corrupt");
+    return executionIdentity({
+      batchId: storedString(row.batch_id),
+      reservationToken: storedString(row.reservation_token),
+      queueUid,
+      consumerUid: storedString(row.consumer_uid),
+      generation: storedGeneration(row.consumer_generation),
+      workerUid: storedString(row.worker_uid),
+      servingSourceOperationId: storedString(row.serving_source_operation_id),
+      workerVersionUid: storedString(row.worker_version_uid),
+      workerVersionGeneration: storedGeneration(row.worker_version_generation),
+      incarnationOperationId: storedString(row.incarnation_operation_id),
+    });
+  });
 }
 
 function executionIdentity(input: V2QueueBatchExecutionIdentity): V2QueueBatchExecutionIdentity {

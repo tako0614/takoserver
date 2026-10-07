@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import type { Sql } from "./ports.ts";
 import {
   createV2QueueSettlementAuthority,
@@ -11,6 +11,8 @@ import {
   cancelV2QueueBatchBeforeSend,
   confirmV2QueueBatchRetirement,
   createV2QueueDelivery,
+  listV2AuthorizedQueueExecutions,
+  listV2AuthorizedQueueExecutionsForWorker,
   type V2QueueBatchExecutionIdentity,
   v2QueueId,
   verifyV2QueueSettlementScope,
@@ -103,6 +105,105 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
       .update(JSON.stringify([batchId, messageId, outcome]))
       .digest("base64url");
 
+  /** SQL 0083 is a candidate, never native absence authority. */
+  async function retireOnlyIfPhysicallyAbsent(
+    execution: V2QueueBatchExecutionIdentity,
+  ): Promise<boolean> {
+    try {
+      const owner = await options.ownerForWorkerUid(execution.workerUid);
+      const absence = await owner.observeQueuePhysicalAbsence({
+        workerUid: execution.workerUid,
+        incarnationId: execution.incarnationOperationId,
+        servingSourceOperationId: execution.servingSourceOperationId,
+      });
+      if (
+        absence.kind !== "confirmed_absent" ||
+        absence.workerUid !== execution.workerUid ||
+        absence.incarnationId !== execution.incarnationOperationId ||
+        absence.servingSourceOperationId !== execution.servingSourceOperationId ||
+        !/^[a-f0-9]{64}$/u.test(absence.receiptDigest)
+      )
+        return false;
+      // The owner receipt is per physical child, but SQL requires a unique
+      // retirement receipt per batch. A lost ACK repeats this exact digest.
+      const receiptDigest = createHash("sha256")
+        .update("queue-physical-absence-batch/v1\0")
+        .update(
+          JSON.stringify([
+            absence.receiptDigest,
+            execution.batchId,
+            execution.reservationToken,
+            execution.queueUid,
+            execution.consumerUid,
+            execution.generation,
+            execution.workerUid,
+            execution.servingSourceOperationId,
+            execution.workerVersionUid,
+            execution.workerVersionGeneration,
+            execution.incarnationOperationId,
+          ]),
+        )
+        .digest("hex");
+      const result = await confirmV2QueueBatchRetirement(options.sql, {
+        execution,
+        kind: "incarnation_absent",
+        receiptDigest,
+      });
+      return result === "retired" || result === "already_retired";
+    } catch {
+      return false;
+    }
+  }
+
+  /** Includes Consumers in UPDATE/DELETE reconciliation, never sends events. */
+  async function reconcileWorkerAuthorizedAbsence(input: {
+    readonly workerUid: string;
+    readonly afterBatchId?: string;
+  }): Promise<{
+    readonly kind: "reconciled" | "unknown";
+    readonly retired: number;
+    readonly nextCursor: string | null;
+  }> {
+    let page: Awaited<ReturnType<typeof listV2AuthorizedQueueExecutionsForWorker>>;
+    try {
+      page = await listV2AuthorizedQueueExecutionsForWorker(options.sql, input);
+    } catch {
+      return { kind: "unknown", retired: 0, nextCursor: null };
+    }
+    let retired = 0;
+    let unknown = false;
+    for (const execution of page.executions) {
+      if (await retireOnlyIfPhysicallyAbsent(execution)) retired += 1;
+      else unknown = true;
+    }
+    return {
+      kind: unknown ? "unknown" : "reconciled",
+      retired,
+      nextCursor: page.nextCursor,
+    };
+  }
+
+  async function reconcileAuthorizedAbsence(input: {
+    readonly consumerUid: string;
+    readonly principal: string;
+    readonly space: string;
+    readonly targetKey: string;
+  }): Promise<{ readonly kind: "reconciled" | "unknown"; readonly retired: number }> {
+    let executions: readonly V2QueueBatchExecutionIdentity[];
+    try {
+      executions = await listV2AuthorizedQueueExecutions(options.sql, input);
+    } catch {
+      return { kind: "unknown", retired: 0 };
+    }
+    let retired = 0;
+    let unknown = false;
+    for (const execution of executions) {
+      if (await retireOnlyIfPhysicallyAbsent(execution)) retired += 1;
+      else unknown = true;
+    }
+    return { kind: unknown ? "unknown" : "reconciled", retired };
+  }
+
   async function deliverOnce(input: {
     readonly consumerUid: string;
     readonly principal: string;
@@ -110,6 +211,10 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
     readonly targetKey: string;
   }): Promise<{ readonly kind: "idle" | "unknown" | "handler_resolved" | "handler_rejected" }> {
     const scope = { ...input };
+    // Recovery may have replaced a physical child while retaining its logical
+    // serving Operation. First retire only provably absent old executions;
+    // unresolved sends stay occupied and are never resent here.
+    await reconcileAuthorizedAbsence(scope);
     const batch = await delivery
       .claimRegisteredBatch(scope)
       .catch(() => ({ kind: "unknown" as const }));
@@ -198,6 +303,8 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
   return Object.freeze({
     /** Pass this exact boot object to every v2 native UID owner. */
     settlementBinding,
+    reconcileAuthorizedAbsence,
+    reconcileWorkerAuthorizedAbsence,
     deliverOnce,
     close: async () => {
       await server.stop(true);

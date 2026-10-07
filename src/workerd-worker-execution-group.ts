@@ -64,6 +64,8 @@ export interface WorkerdWorkerExecutionGroup {
   fetch(request: Request): Promise<Response>;
   /** Stop a failed recovery child without writing retirement or deleting custody. */
   stopAfterFailedRecovery(): Promise<void>;
+  /** Stop the owned child and listener, retaining the exact execution copies for reopen. */
+  suspendRetainingCustody(): Promise<void>;
   /**
    * The trusted caller supplies the durable accepted Operation ID. This local
    * primitive binds its receipt to that identity but does not resolve/authorize
@@ -538,6 +540,25 @@ function makeGroup(input: {
         throw new WorkerdWorkerExecutionGroupError("retirement_uncertain");
       }
       state = "uncertain";
+    },
+    async suspendRetainingCustody() {
+      if (retirementStarted || state === "retired") {
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      }
+      // Freeze admission before the first await. This does not write a
+      // retirement receipt or release any execution copy.
+      state = "frozen";
+      try {
+        await startPromise?.catch(() => undefined);
+        await configurationReload?.catch(() => undefined);
+        await supervisor?.shutdown();
+        if ((await workerPortOwnership(options.listenerPort, undefined)) !== "vacant") {
+          throw new WorkerdWorkerExecutionGroupError("retirement_uncertain");
+        }
+      } catch {
+        state = "uncertain";
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      }
     },
     fetch: fetchRequest,
     retire,

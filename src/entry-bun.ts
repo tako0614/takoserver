@@ -72,6 +72,7 @@ import {
   assertSelfhostTenantRunCredentialKeyConfiguration,
   createSelfhostTenantRunCredentials,
 } from "./selfhost-tenant-run-credentials.ts";
+import { createSelfhostV2ConfiguredInputSealer } from "./selfhost-v2-configured-input-sealer.ts";
 import { createSelfhostV2WorkerComposition } from "./selfhost-v2-worker-composition.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
@@ -453,15 +454,19 @@ if (process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING && !runtimeInputsAvailable
       : `sensitive Worker runtime inputs are disabled: TAKOSERVER_PUBLIC_ORIGIN must be an https bare origin (got ${publicOrigin})`,
   );
 }
-const runtimeInputs = runtimeInputsAvailable
+const runtimeInputSealKeyRing = runtimeInputsAvailable
+  ? await parseRuntimeInputSealKeyRing(process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING as string)
+  : undefined;
+const runtimeInputs = runtimeInputSealKeyRing
   ? createRuntimeInputAuthority({
       sql,
-      sealKeys: await parseRuntimeInputSealKeyRing(
-        process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING as string,
-      ),
+      sealKeys: runtimeInputSealKeyRing,
       canonicalPublicOrigin: publicOrigin,
       clock,
     })
+  : undefined;
+const v2ConfiguredInputSealer = runtimeInputSealKeyRing
+  ? createSelfhostV2ConfiguredInputSealer(runtimeInputSealKeyRing)
   : undefined;
 
 /**
@@ -618,6 +623,7 @@ const v2WorkerComposition = createSelfhostV2WorkerComposition({
   rootDirectory: join(dataRoot === ":memory:" ? ".takoserver" : dataRoot, "v2-worker-owners"),
   targetKey: "selfhost-v2-worker-primary",
   workerdBinary,
+  ...(v2ConfiguredInputSealer ? { configuredInputSealer: v2ConfiguredInputSealer } : {}),
 });
 const restoredV2WorkerUids = await v2WorkerComposition.restoreOwners();
 if (restoredV2WorkerUids.length > 0) {

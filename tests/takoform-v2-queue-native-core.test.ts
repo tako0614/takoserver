@@ -392,6 +392,13 @@ test.skipIf(binary === undefined)(
       }
       expect(occupiedAfterAck).toBe(true);
       if (pidFixtureMode === "first") {
+        const [authorized] = await sql.query(
+          "SELECT batch_id,incarnation_operation_id FROM queue_v2_batch_executions WHERE state = 'send_authorized' LIMIT 2",
+        );
+        const physicalIncarnationId = authorized?.incarnation_operation_id;
+        const oldBatchId = authorized?.batch_id;
+        if (typeof physicalIncarnationId !== "string" || typeof oldBatchId !== "string")
+          throw new Error("physical Queue invocation identity missing");
         await writeFile(join(root, "settlement.key"), settlementKey, { mode: 0o600 });
         await writeFile(
           join(root, "queue-pid-meta.json"),
@@ -404,6 +411,8 @@ test.skipIf(binary === undefined)(
             queueUid: queue.resourceUid,
             privatePort,
             nativePid: children[0]?.pid,
+            physicalIncarnationId,
+            oldBatchId,
           }),
           { mode: 0o600 },
         );
@@ -580,11 +589,17 @@ test.skipIf(binary === undefined)(
         { n: 0 },
       ]);
       const nativeVersionId = `v2-${sha(new TextEncoder().encode(`${versionUid}\u00001`))}`;
+      const [lastExecution] = await sql.query(
+        "SELECT incarnation_operation_id FROM queue_v2_batch_executions WHERE state IN ('retired','send_authorized') ORDER BY send_authorized_at_ms DESC LIMIT 1",
+      );
+      const physicalIncarnationId = lastExecution?.incarnation_operation_id;
+      if (typeof physicalIncarnationId !== "string")
+        throw new Error("physical Queue invocation identity missing");
       expect(
         await owner.observeQueueTarget({
           workerUid,
           versionId: nativeVersionId,
-          incarnationId: sourceOperationId,
+          incarnationId: physicalIncarnationId,
           servingSourceOperationId: sourceOperationId,
         }),
       ).toMatchObject({ kind: "confirmed", status: "active" });
@@ -592,7 +607,7 @@ test.skipIf(binary === undefined)(
         await owner.observeQueueTarget({
           workerUid,
           versionId: versionUid,
-          incarnationId: sourceOperationId,
+          incarnationId: physicalIncarnationId,
           servingSourceOperationId: sourceOperationId,
         }),
       ).toEqual({ kind: "unknown" });
@@ -674,18 +689,23 @@ test.skipIf(binary === undefined)(
       expect(unknownSends).toBe(1);
     } finally {
       await queueComposition?.close().catch(() => undefined);
-      await owner?.close().catch(() => undefined);
-      for (const child of children)
-        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-      await Promise.all(children.map((child) => child.exited));
-      db.close();
-      await rm(root, { recursive: true, force: true });
+      try {
+        // close() intentionally refuses an active serving graph. Suspend the
+        // real owner so its child exits and its private lock is released.
+        await owner?.suspend();
+      } finally {
+        for (const child of children)
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        await Promise.all(children.map((child) => child.exited));
+        db.close();
+        await rm(root, { recursive: true, force: true });
+      }
     }
   },
 );
 
 test.skipIf(binary === undefined || pidFixtureMode !== "recover")(
-  "recover reserved Queue batch in a different Host PID without resending",
+  "recover old Queue execution in a different Host PID without same-batch resend",
   async () => {
     if (!binary) throw new Error("pinned Workerd missing");
     const root = process.env.TAKOSERVER_QUEUE_PID_ROOT;
@@ -699,6 +719,8 @@ test.skipIf(binary === undefined || pidFixtureMode !== "recover")(
       queueUid: string;
       privatePort: number;
       nativePid: number;
+      physicalIncarnationId: string;
+      oldBatchId: string;
     };
     const db = new Database(join(root, "state.sqlite"));
     const children: ReturnType<typeof spawnWorkerdWithParentDeath>[] = [];
@@ -858,10 +880,17 @@ test.skipIf(binary === undefined || pidFixtureMode !== "recover")(
         await owner.observeQueueTarget({
           workerUid: meta.workerUid,
           versionId: nativeVersionId,
-          incarnationId: meta.sourceOperationId,
+          incarnationId: meta.physicalIncarnationId,
           servingSourceOperationId: meta.sourceOperationId,
         }),
-      ).toMatchObject({ kind: "confirmed", status: "active" });
+      ).toEqual({ kind: "unknown" });
+      expect(
+        await owner.observeQueuePhysicalAbsence({
+          workerUid: meta.workerUid,
+          incarnationId: meta.physicalIncarnationId,
+          servingSourceOperationId: meta.sourceOperationId,
+        }),
+      ).toMatchObject({ kind: "confirmed_absent", incarnationId: meta.physicalIncarnationId });
       expect(
         await owner.observeQueueServingCapability({
           workerUid: meta.workerUid,
@@ -871,24 +900,58 @@ test.skipIf(binary === undefined || pidFixtureMode !== "recover")(
         }),
       ).toMatchObject({ kind: "confirmed", servingSourceOperationId: meta.sourceOperationId });
       expect(
-        await sql.query(
-          "SELECT state FROM queue_v2_batch_executions WHERE state = 'send_authorized'",
-        ),
-      ).toEqual([{ state: "send_authorized" }]);
+        await composition.reconcileWorkerAuthorizedAbsence({ workerUid: meta.workerUid }),
+      ).toEqual({
+        kind: "reconciled",
+        retired: 1,
+        nextCursor: null,
+      });
       expect(
-        await composition.deliverOnce({
-          consumerUid: meta.consumerUid,
-          principal,
-          space,
-          targetKey,
-        }),
-      ).toEqual({ kind: "idle" });
+        await sql.query("SELECT state,retirement_kind FROM queue_v2_batch_executions"),
+      ).toEqual([{ state: "retired", retirement_kind: "incarnation_absent" }]);
+      // The original immutable module includes a 30s waitUntil. A different
+      // ready message may be sent after *old physical absence* releases the
+      // slot, but its new handler must remain live; do not await or infer
+      // completion from its early ACK.
+      const nextDelivery = composition.deliverOnce({
+        consumerUid: meta.consumerUid,
+        principal,
+        space,
+        targetKey,
+      });
+      let rows = await sql.query(
+        "SELECT batch_id,state,retirement_kind,incarnation_operation_id FROM queue_v2_batch_executions",
+      );
+      for (let attempt = 0; attempt < 500; attempt++) {
+        const settled = await sql.query(
+          "SELECT state FROM queue_v2_batch_settlements WHERE message_id = 'message-two'",
+        );
+        rows = await sql.query(
+          "SELECT batch_id,state,retirement_kind,incarnation_operation_id FROM queue_v2_batch_executions",
+        );
+        if (rows.length === 2 && settled[0]?.state === "settled") break;
+        await Bun.sleep(10);
+      }
+      void nextDelivery;
+      expect(rows).toHaveLength(2);
+      const oldRow = rows.find((row) => row.batch_id === meta.oldBatchId);
+      const newRow = rows.find((row) => row.batch_id !== meta.oldBatchId);
+      expect(oldRow).toMatchObject({
+        batch_id: meta.oldBatchId,
+        state: "retired",
+        retirement_kind: "incarnation_absent",
+        incarnation_operation_id: meta.physicalIncarnationId,
+      });
+      expect(newRow).toMatchObject({ state: "send_authorized", retirement_kind: null });
+      expect(newRow?.incarnation_operation_id).not.toBe(meta.physicalIncarnationId);
       await writeFile(
         join(root, "queue-pid-recovered.json"),
         JSON.stringify({
           hostPid: process.pid,
           nativePid: children[0]?.pid,
           servingSourceOperationId: meta.sourceOperationId,
+          physicalIncarnationId: meta.physicalIncarnationId,
+          oldBatchId: meta.oldBatchId,
         }),
         { mode: 0o600 },
       );
@@ -902,10 +965,11 @@ test.skipIf(binary === undefined || pidFixtureMode !== "recover")(
       db.close();
     }
   },
+  20_000,
 );
 
 test.skipIf(binary === undefined || pidFixtureMode !== undefined)(
-  "OS Host PID restart retains authorized Queue batch and forbids second send",
+  "OS Host PID restart retires only old physical batch and permits a distinct next batch",
   async () => {
     if (!binary) throw new Error("pinned Workerd missing");
     const root = await mkdtemp(join(tmpdir(), "v2-queue-host-pid-restart-"));
@@ -918,7 +982,7 @@ test.skipIf(binary === undefined || pidFixtureMode !== undefined)(
           "test",
           import.meta.path,
           "-t",
-          mode === "first" ? "real 0082/0083 custody" : "recover reserved Queue batch",
+          mode === "first" ? "real 0082/0083 custody" : "recover old Queue execution",
         ],
         {
           stdin: "ignore",
@@ -959,16 +1023,27 @@ test.skipIf(binary === undefined || pidFixtureMode !== undefined)(
       expect(recovered.hostPid).not.toBe(firstHostPid);
       expect(recovered.nativePid).not.toBe(firstNativePid);
       expect(recovered.servingSourceOperationId).toBe(meta.sourceOperationId);
+      expect(recovered.physicalIncarnationId).toBe(meta.physicalIncarnationId);
+      expect(recovered.oldBatchId).toBe(meta.oldBatchId);
       const db = new Database(join(root, "state.sqlite"), { readonly: true });
       try {
         const sql = createSqliteSql(db);
+        const executions = await sql.query(
+          "SELECT batch_id,state,retirement_kind,incarnation_operation_id FROM queue_v2_batch_executions",
+        );
+        expect(executions.find((row) => row.batch_id === meta.oldBatchId)).toMatchObject({
+          state: "retired",
+          retirement_kind: "incarnation_absent",
+          incarnation_operation_id: meta.physicalIncarnationId,
+        });
+        expect(executions.find((row) => row.batch_id !== meta.oldBatchId)).toMatchObject({
+          state: "send_authorized",
+        });
         expect(
-          await sql.query(
-            "SELECT state FROM queue_v2_batch_executions WHERE state = 'send_authorized'",
-          ),
-        ).toEqual([{ state: "send_authorized" }]);
+          executions.find((row) => row.batch_id !== meta.oldBatchId)?.incarnation_operation_id,
+        ).not.toBe(meta.physicalIncarnationId);
         expect(await sql.query("SELECT count(*) AS n FROM queue_v2_batch_executions")).toEqual([
-          { n: 1 },
+          { n: 2 },
         ]);
       } finally {
         db.close();
@@ -980,4 +1055,5 @@ test.skipIf(binary === undefined || pidFixtureMode !== undefined)(
       await rm(root, { recursive: true, force: true });
     }
   },
+  20_000,
 );

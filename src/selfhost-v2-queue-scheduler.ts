@@ -18,7 +18,12 @@ const DEFAULT_POLL_MILLIS = 1_000;
 const DB_NOW_MS =
   "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
 
-type Delivery = Pick<ReturnType<typeof createSelfhostV2QueueComposition>, "deliverOnce">;
+type Recovery = Pick<
+  ReturnType<typeof createSelfhostV2QueueComposition>,
+  "reconcileWorkerAuthorizedAbsence"
+>;
+type Delivery = Pick<ReturnType<typeof createSelfhostV2QueueComposition>, "deliverOnce"> &
+  Partial<Recovery>;
 type DeliveryKind = Awaited<ReturnType<Delivery["deliverOnce"]>>["kind"];
 type DeliveryScope = Parameters<Delivery["deliverOnce"]>[0];
 
@@ -26,6 +31,8 @@ export interface SelfhostV2QueueSchedulerOptions {
   readonly sql: Sql;
   readonly custody: QueueCustody;
   readonly composition: Delivery;
+  /** Required with the real Queue composition: native owners restore before claims. */
+  readonly workerComposition?: { restoreOwners(): Promise<readonly string[]> };
   readonly pollMillis?: number;
 }
 
@@ -36,6 +43,9 @@ export interface SelfhostV2QueueSchedulerOptions {
 export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueSchedulerOptions) {
   if (!options.sql || !options.custody || typeof options.composition?.deliverOnce !== "function")
     throw new TypeError("v2 Queue scheduler needs SQL, custody and native delivery");
+  const recovering = typeof options.composition.reconcileWorkerAuthorizedAbsence === "function";
+  if (recovering !== (typeof options.workerComposition?.restoreOwners === "function"))
+    throw new TypeError("v2 Queue delivery requires exact native-owner restore and recovery");
   const pollMillis = options.pollMillis ?? DEFAULT_POLL_MILLIS;
   if (!Number.isSafeInteger(pollMillis) || pollMillis < 1 || pollMillis > 60_000)
     throw new TypeError("v2 Queue polling interval is invalid");
@@ -46,8 +56,43 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
   let inFlight: Promise<number> | undefined;
   let closePromise: Promise<void> | undefined;
   let closed = false;
+  let ownersRestored: Promise<readonly string[]> | undefined;
+  let recoveryWorkerCursor = "";
+  const recoveryBatchCursors = new Map<string, string>();
   const active = new Map<string, Promise<DeliveryKind>>();
   const noticeWakes = new Set<string>();
+
+  const recoverOnePage = async (): Promise<void> => {
+    const reconcile = options.composition.reconcileWorkerAuthorizedAbsence;
+    if (!reconcile) return;
+    // This query includes UPDATE/DELETE Consumers and tombstones; the normal
+    // active-Consumer delivery scan below intentionally does not.
+    const rows = await options.sql.query(
+      `SELECT DISTINCT worker_uid FROM queue_v2_batch_executions
+       WHERE state = 'send_authorized' AND worker_uid >= ?
+       ORDER BY worker_uid LIMIT 1`,
+      [recoveryWorkerCursor],
+    );
+    const workerUid = rows[0]?.worker_uid;
+    if (typeof workerUid !== "string") {
+      recoveryWorkerCursor = "";
+      return;
+    }
+    const afterBatchId = recoveryBatchCursors.get(workerUid);
+    const result = await reconcile({
+      workerUid,
+      ...(afterBatchId ? { afterBatchId } : {}),
+    });
+    if (result.nextCursor) {
+      recoveryBatchCursors.set(workerUid, result.nextCursor);
+      recoveryWorkerCursor = workerUid;
+    } else {
+      recoveryBatchCursors.delete(workerUid);
+      // SQLite text ordering is bytewise. A NUL suffix excludes this exact UID
+      // without excluding any later legal UID on the next bounded scan.
+      recoveryWorkerCursor = `${workerUid}\0`;
+    }
+  };
 
   const schedule = (scope: DeliveryScope): Promise<DeliveryKind> | null => {
     if (closed || active.has(scope.consumerUid) || active.size >= MAX_IN_FLIGHT) return null;
@@ -68,6 +113,13 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
   };
 
   const pass = async (): Promise<number> => {
+    if (options.workerComposition) {
+      ownersRestored ??= options.workerComposition.restoreOwners();
+      await ownersRestored;
+      if (closed) return 0;
+      await recoverOnePage();
+      if (closed) return 0;
+    }
     await wakeTransfers();
     if (closed) return 0;
     const rows = await options.sql.query(
