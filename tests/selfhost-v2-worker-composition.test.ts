@@ -67,7 +67,19 @@ test("normal Worker composition restores an empty private owner inventory", asyn
       targetKey: "selfhost-v2-worker-primary",
       workerdBinary: null,
     });
+    await expect(composition.pollScheduledDue()).rejects.toThrow("unavailable");
     expect(await composition.restoreOwners()).toEqual([]);
+    expect(await composition.pollScheduledDue()).toMatchObject({
+      recorded: 0,
+      claimed: 0,
+      resolved: 0,
+      rejected: 0,
+      unknown: 0,
+    });
+    await composition.closeScheduledHost();
+    await expect(composition.pollScheduledDue()).rejects.toThrow("closed");
+    await composition.suspendOwnersRetainingCustody();
+    await expect(composition.pollScheduledDue()).rejects.toThrow("unavailable");
   } finally {
     database.close();
     await rm(root, { recursive: true, force: true });
