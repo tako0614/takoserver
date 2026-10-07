@@ -400,6 +400,18 @@ for (const { bindingName, publicVar } of [
         const result = await database.execute("INSERT INTO records (id, body) VALUES (?, ?)", [7, "native"]);
         return Response.json({ keys, publicValue, privateVisible, result, hasRaw: "close" in database || "database" in database });
       }
+      if (new URL(request.url).pathname === "/oversize") {
+        // Each value and statement is legal; only the aggregate body exceeds 40 MiB.
+        const body = "x".repeat(1000000);
+        let name = "unexpected_success";
+        try {
+          await database.transaction(Array.from({ length: 42 }, (_, index) => ({
+            sql: "INSERT INTO records (id, body) VALUES (?, ?)", params: [100 + index, body]
+          })));
+        } catch (error) { name = error.name; }
+        const state = await database.query("SELECT count(*) AS count FROM records WHERE id >= 100");
+        return Response.json({ name, state });
+      }
       if (new URL(request.url).pathname === "/invalid") {
         const names = [];
         for (const invoke of [
@@ -569,6 +581,15 @@ for (const { bindingName, publicVar } of [
           status: 200,
           value: { name: "sql_error", absent: { rows: [], rowsWritten: 0 } },
         });
+        if (bindingName === "DB" && publicVar === undefined) {
+          expect(await call("/oversize")).toEqual({
+            status: 200,
+            value: {
+              name: "backend_unavailable",
+              state: { rows: [{ count: 0 }], rowsWritten: 0 },
+            },
+          });
+        }
         expect(await runtime.restore()).toEqual(["v2-sqlite-native"]);
       } finally {
         if (child) {
