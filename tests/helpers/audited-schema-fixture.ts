@@ -3,21 +3,34 @@ import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { canonicalSchemaShape, type D1SchemaState } from "../../scripts/deploy/migrations.ts";
-import { MIGRATIONS } from "../../src/db-schema.ts";
+import { readCurrentAuditedMigrationSourceArtifact } from "../../scripts/deploy/schema.ts";
+import { MIGRATIONS, type Migration } from "../../src/db-schema.ts";
 
 const APPLY_QUALIFIED_MIGRATION_END = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
-const CURRENT_SOURCE_MIGRATION_END = "0079_v2_worker_native_deletions.sql";
+
+/** The source auditor owns the current tail; this independently checks generated SQL bytes. */
+export function currentAuditedSchemaMigrations(): readonly Migration[] {
+  const source = readCurrentAuditedMigrationSourceArtifact();
+  if (
+    MIGRATIONS.length !== source.files.length ||
+    MIGRATIONS.some(
+      (migration, index) =>
+        migration.name !== source.files[index]?.name ||
+        migration.sql !== readFileSync(source.files[index].path, "utf8"),
+    )
+  ) {
+    throw new Error("generated schema fixture differs from the exact audited current source");
+  }
+  return MIGRATIONS;
+}
 
 function applyQualifiedMigrations() {
-  const endIndex = MIGRATIONS.findIndex(({ name }) => name === APPLY_QUALIFIED_MIGRATION_END);
-  if (
-    endIndex !== 65 ||
-    MIGRATIONS.length !== 79 ||
-    MIGRATIONS.at(-1)?.name !== CURRENT_SOURCE_MIGRATION_END
-  ) {
+  const migrations = currentAuditedSchemaMigrations();
+  const endIndex = migrations.findIndex(({ name }) => name === APPLY_QUALIFIED_MIGRATION_END);
+  if (endIndex !== 65) {
     throw new Error("apply-qualified schema fixture requires the exact audited 0001-0066 prefix");
   }
-  return MIGRATIONS.slice(0, endIndex + 1);
+  return migrations.slice(0, endIndex + 1);
 }
 
 /** Names present in deployed D1 under the existing 0001-0066 apply qualification. */
@@ -60,7 +73,7 @@ export function applyQualifiedSchemaState(): D1SchemaState {
 
 /** Frozen catch-up-wave source, distinct from the current integration schema. */
 export function copyAuditedSchemaFixture(directory: string): string {
-  const prefix = MIGRATIONS.slice(0, 49);
+  const prefix = currentAuditedSchemaMigrations().slice(0, 49);
   if (prefix.at(-1)?.name !== "0049_artifact_consumer_active_resolution.sql") {
     throw new Error("audited schema fixture requires the historical 0001-0049 prefix");
   }
@@ -89,13 +102,12 @@ export function copyAuditedSchemaFixture(directory: string): string {
  * Worker native-effect custody, source-only 0075 artifact progress,
  * source-only 0076 Worker invocation custody, and source-only 0077
  * Operation acceptance order, and source-only 0078 provider-confirmed Worker
- * invocation retirement, and source-only 0079 Worker native deletion custody. */
+ * invocation retirement, source-only 0079 Worker native deletion custody,
+ * and later source-only additions validated by the current source auditor. */
 export function copyCurrentSchemaFixture(directory: string): string {
-  if (MIGRATIONS.length !== 79 || MIGRATIONS.at(-1)?.name !== CURRENT_SOURCE_MIGRATION_END) {
-    throw new Error("current schema fixture requires the audited 0001-0079 source inventory");
-  }
+  const migrations = currentAuditedSchemaMigrations();
   mkdirSync(directory, { recursive: true, mode: 0o700 });
-  for (const { name } of MIGRATIONS) {
+  for (const { name } of migrations) {
     copyFileSync(resolve(import.meta.dir, "../../migrations", name), join(directory, name));
   }
   return directory;

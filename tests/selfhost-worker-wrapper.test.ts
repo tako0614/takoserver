@@ -5,6 +5,14 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  SELFHOST_WORKER_EVENT_CONTENT_TYPE,
+  SELFHOST_WORKER_EVENT_ENTRYPOINT,
+  SELFHOST_WORKER_EVENT_HEADER,
+  SELFHOST_WORKER_EVENT_PATH,
+  SELFHOST_WORKER_EVENT_PROTOCOL,
+  selfhostScheduleEvent,
+} from "../src/providers/selfhost-events.ts";
+import {
   SELFHOST_WORKER_PRELUDE_MODULE,
   selfhostWorkerPreludeModuleName,
   selfhostWorkerPreludeSource,
@@ -99,6 +107,9 @@ async function loadGenerated(
     fetch(request: Request, env: Record<string, unknown>, context: object): Promise<Response>;
     queue?: (event: unknown, env: Record<string, unknown>, context: object) => Promise<unknown>;
   };
+  readonly eventEntrypoint?: {
+    fetch(request: Request, env: Record<string, unknown>, context: object): Promise<Response>;
+  };
   dispose(): Promise<void>;
 }> {
   const root = await mkdtemp(join(tmpdir(), "takoserver-selfhost-wrapper-"));
@@ -113,9 +124,17 @@ async function loadGenerated(
   await Bun.write(wrapperPath, selfhostWorkerEntrypointSource(input));
   const loaded = (await import(
     `${pathToFileURL(wrapperPath).href}?test=${crypto.randomUUID()}`
-  )) as { readonly default: Awaited<ReturnType<typeof loadGenerated>>["worker"] };
+  )) as {
+    readonly default: Awaited<ReturnType<typeof loadGenerated>>["worker"];
+    readonly [SELFHOST_WORKER_EVENT_ENTRYPOINT]?: Awaited<
+      ReturnType<typeof loadGenerated>
+    >["eventEntrypoint"];
+  };
   return {
     worker: loaded.default,
+    ...(loaded[SELFHOST_WORKER_EVENT_ENTRYPOINT]
+      ? { eventEntrypoint: loaded[SELFHOST_WORKER_EVENT_ENTRYPOINT] }
+      : {}),
     async dispose() {
       await rm(root, { recursive: true, force: true });
     },
@@ -1306,6 +1325,115 @@ const OBJECTS_ONLY: SelfhostWorkerEntrypointSourceInput = {
   declaredHandlers: ["fetch"],
   bindings: [{ kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND, publicName: "MEDIA" }],
 };
+
+test("scheduled event reports exact handler settlement without leaking thrown details", async () => {
+  const generated = await loadGenerated(
+    `export default { async scheduled(event, env, ctx) {
+      if (event.cron === "0 * * * *") throw new Error("private tenant secret");
+      ctx.waitUntil(Promise.reject(new Error("background secret")));
+    } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["scheduled"],
+      bindings: [],
+      events: true,
+    },
+  );
+  try {
+    const eventEntrypoint = generated.eventEntrypoint;
+    expect(eventEntrypoint).toBeDefined();
+    const invoke = async (cron: string) =>
+      await eventEntrypoint?.fetch(
+        new Request(`http://takoserver-selfhost-events.invalid${SELFHOST_WORKER_EVENT_PATH}`, {
+          method: "POST",
+          headers: {
+            "content-type": SELFHOST_WORKER_EVENT_CONTENT_TYPE,
+            [SELFHOST_WORKER_EVENT_HEADER]: SELFHOST_WORKER_EVENT_PROTOCOL,
+          },
+          body: JSON.stringify(
+            selfhostScheduleEvent({
+              script: "worker-001",
+              publication: "v2-selected",
+              cron,
+              scheduledTime: 1_700_000_000_000,
+            }),
+          ),
+        }),
+        {},
+        {
+          waitUntil(promise: Promise<unknown>) {
+            void promise.catch(() => undefined);
+          },
+        },
+      );
+    const rejected = await invoke("0 * * * *");
+    expect(rejected?.status).toBe(500);
+    expect(await rejected?.json()).toEqual({
+      protocol: SELFHOST_WORKER_EVENT_PROTOCOL,
+      kind: "schedule",
+      outcome: "rejected",
+    });
+    const resolved = await invoke("1 * * * *");
+    expect(resolved?.status).toBe(200);
+    expect(await resolved?.json()).toEqual({
+      protocol: SELFHOST_WORKER_EVENT_PROTOCOL,
+      kind: "schedule",
+      outcome: "ack",
+    });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("scheduled waitUntil registration refusal is unknown even when the handler catches context_expired", async () => {
+  const generated = await loadGenerated(
+    `export default { async scheduled(event, env, ctx) {
+      try { ctx.waitUntil(Promise.resolve()); }
+      catch (error) {
+        if (error.name !== "context_expired") throw error;
+      }
+    } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["scheduled"],
+      bindings: [],
+      events: true,
+    },
+  );
+  try {
+    const response = await generated.eventEntrypoint?.fetch(
+      new Request(`http://takoserver-selfhost-events.invalid${SELFHOST_WORKER_EVENT_PATH}`, {
+        method: "POST",
+        headers: {
+          "content-type": SELFHOST_WORKER_EVENT_CONTENT_TYPE,
+          [SELFHOST_WORKER_EVENT_HEADER]: SELFHOST_WORKER_EVENT_PROTOCOL,
+        },
+        body: JSON.stringify(
+          selfhostScheduleEvent({
+            script: "worker-001",
+            publication: "v2-selected",
+            cron: "0 * * * *",
+            scheduledTime: 1_700_000_000_000,
+          }),
+        ),
+      }),
+      {},
+      {
+        waitUntil() {
+          throw new Error("private native context detail");
+        },
+      },
+    );
+    expect(response?.status).toBe(500);
+    expect(await response?.text()).toBe("");
+  } finally {
+    await generated.dispose();
+  }
+});
 
 test("the edge.objects facade offers exactly the nine methods the Binding fixes", async () => {
   const { service } = objectPlane([]);

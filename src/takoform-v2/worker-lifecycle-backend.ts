@@ -1,5 +1,6 @@
 import { canonicalJson } from "../json.ts";
 import type { Sql } from "../ports.ts";
+import type { WorkerdRuntime } from "../workerd-runtime.ts";
 import {
   referencesForWorkerDeployment,
   referencesForWorkerVersion,
@@ -19,11 +20,13 @@ import {
   type WorkerVersionSpec,
 } from "./forms/worker-specs.ts";
 import { TakoformV2Error, type V2BackendResult, type V2Execution, type V2Form } from "./types.ts";
+import { inspectV2WorkerCodeVersionEligibility } from "./worker-code-runtime.ts";
 import type { V2WorkerVersionResolution } from "./worker-publication-state.ts";
 import { projectV2StaticWorkerVersion } from "./worker-static-runtime.ts";
 
 export const MODULE_WORKER_LIFECYCLE_BACKEND_ID = "selfhost-v2-module-worker-identity-v1";
 export const WORKER_VERSION_LIFECYCLE_BACKEND_ID = "selfhost-v2-static-worker-version-v1";
+export const WORKER_CODE_VERSION_LIFECYCLE_BACKEND_ID = "selfhost-v2-code-worker-version-v1";
 
 type VersionState = {
   resolveVersion(input: { execution: V2Execution }): Promise<V2WorkerVersionResolution>;
@@ -636,11 +639,133 @@ export function createInternalV2ModuleWorkerForm(options: {
 }
 
 function staticOnly(spec: WorkerVersionSpec): WorkerVersionSpec {
-  // The code projection currently cannot produce a publishable Host entrypoint
-  // or the complete Binding/private-input/event ABI. Do not accept a pending
-  // Operation that can never become eligible on this internal backend.
+  // Keep the existing backend explicitly static-only. Code eligibility has a
+  // separate internal constructor and backend identity.
   if (spec.bundle !== undefined) throw new TakoformV2Error("capability_required", 422);
   return spec;
+}
+
+function codeOnly(spec: WorkerVersionSpec): WorkerVersionSpec {
+  if (
+    !spec.bundle ||
+    spec.handlers.some((handler) => handler !== "fetch" && handler !== "scheduled") ||
+    spec.requiredSensitiveVars.length > 0 ||
+    spec.kvBindings.length > 0 ||
+    spec.sqliteBindings.length > 0 ||
+    spec.bucketBindings.length > 0 ||
+    spec.queueProducerBindings.length > 0 ||
+    spec.serviceBindings.length > 0 ||
+    spec.actorBindings.length > 0 ||
+    spec.workflowBindings.length > 0
+  ) {
+    throw new TakoformV2Error("capability_required", 422);
+  }
+  return spec;
+}
+
+/**
+ * Internal held-code eligibility for WorkerVersion. This checks whether the
+ * exact accepted bundle can support the currently inspected handlers; it does
+ * not publish a Deployment or authorize scheduled event delivery.
+ */
+export function createInternalV2CodeWorkerVersionForm(options: {
+  readonly sql: Sql;
+  readonly targetKey: string;
+  readonly publicationState: VersionState;
+  readonly retirement: V2WorkerRetirementReader;
+  readonly inspectModule: WorkerdRuntime["inspectModule"];
+}): V2Form {
+  if (
+    !options.targetKey ||
+    !options.publicationState?.resolveVersion ||
+    !options.retirement?.observeRetired ||
+    typeof options.inspectModule !== "function"
+  ) {
+    throw new TypeError(
+      "Code WorkerVersion requires targetKey, publication state, exact retirement reader and module inspector",
+    );
+  }
+  const { sql, targetKey } = options;
+  const resolveVersion = options.publicationState.resolveVersion.bind(options.publicationState);
+  const observeRetired = options.retirement.observeRetired.bind(options.retirement);
+  const inspectModule = options.inspectModule;
+
+  async function manage(execution: V2Execution): Promise<V2BackendResult> {
+    if (
+      execution.form !== WORKER_VERSION_FORM_URL ||
+      execution.targetKey !== targetKey ||
+      execution.backendId !== WORKER_CODE_VERSION_LIFECYCLE_BACKEND_ID
+    ) {
+      return unresolved();
+    }
+    if (execution.action === "delete") {
+      try {
+        const spec = codeOnly(parseWorkerVersionSpec(execution.spec));
+        return (await retired(sql, observeRetired, execution, spec.worker.resourceUid, "version"))
+          ? { kind: "complete", observed: {}, output: {} }
+          : unresolved();
+      } catch {
+        return unresolved();
+      }
+    }
+    try {
+      const spec = codeOnly(parseWorkerVersionSpec(execution.spec));
+      if (!(await currentClaim(sql, execution))) return unresolved();
+      const resolution = await resolveVersion({ execution });
+      if (resolution.kind !== "ready") return unresolved();
+      const { snapshot } = resolution;
+      if (
+        snapshot.sourceOperationId !== execution.operationId ||
+        snapshot.worker.uid !== spec.worker.resourceUid ||
+        snapshot.worker.principal !== execution.principal ||
+        snapshot.worker.space !== execution.space ||
+        snapshot.version.uid !== execution.resourceUid ||
+        snapshot.version.generation !== execution.generation ||
+        canonicalJson(snapshot.version.spec) !== canonicalJson(spec)
+      ) {
+        return unresolved();
+      }
+      const materials = await resolution.readMaterials();
+      await inspectV2WorkerCodeVersionEligibility({
+        workerResourceUid: snapshot.worker.uid,
+        ...(spec.bundle ? { bundleResourceUid: spec.bundle.resourceUid } : {}),
+        ...(spec.assets ? { assetResourceUid: spec.assets.bundle.resourceUid } : {}),
+        spec: snapshot.version.spec,
+        bundle: materials.bundle,
+        assets: materials.assets,
+        inspectModule,
+      });
+      if (!(await resolution.stillCurrent()) || !(await currentClaim(sql, execution))) {
+        return unresolved();
+      }
+      return {
+        kind: "complete",
+        observed: { ready: true, resolvedBindings: true, bundleVerified: true },
+        output: {},
+      };
+    } catch {
+      return unresolved();
+    }
+  }
+
+  return {
+    validateCreate(spec) {
+      codeOnly(validated(() => parseWorkerVersionSpec(spec)));
+    },
+    validateUpdate(previous, spec) {
+      codeOnly(validated(() => validateWorkerVersionUpdate(previous, spec)));
+    },
+    references(spec) {
+      return referencesForWorkerVersion(codeOnly(validated(() => parseWorkerVersionSpec(spec))));
+    },
+    rejectDeleteWhileReferenced: true,
+    backend: {
+      id: WORKER_CODE_VERSION_LIFECYCLE_BACKEND_ID,
+      targetKey,
+      execute: manage,
+      reconcile: manage,
+    },
+  };
 }
 
 /**

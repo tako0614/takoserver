@@ -16,7 +16,10 @@ import {
   validateWorkerBundlePayload,
   type WorkerBundleManifest,
 } from "../src/takoform-v2/forms/worker-bundle.ts";
-import { projectV2WorkerCodeVersion } from "../src/takoform-v2/worker-code-runtime.ts";
+import {
+  inspectV2WorkerCodeVersionEligibility,
+  projectV2WorkerCodeVersion,
+} from "../src/takoform-v2/worker-code-runtime.ts";
 
 const encoder = new TextEncoder();
 const MANIFEST_URL = "https://artifacts.example.test/bundle/manifest.json";
@@ -29,6 +32,10 @@ const MODULE_PATH = "src/index.mjs";
 const MESSAGE_PATH = "message.txt";
 const MODULE_BYTES = encoder.encode(
   "export default { fetch(request, env) { return new Response(env.SETTINGS.label); } };\n",
+);
+const SCHEDULED_MODULE_BYTES = encoder.encode("export default { scheduled() {} };\n");
+const FETCH_AND_SCHEDULED_MODULE_BYTES = encoder.encode(
+  "export default { fetch(request) { return new Response('fetch'); }, scheduled() {} };\n",
 );
 const MESSAGE_BYTES = encoder.encode("verified bundle module dependency");
 const ASSET_UID = "asset-uid-001";
@@ -184,6 +191,34 @@ test("projects verified code and JSON vars without changing v2 Worker identities
   expect(projection.modules.get(MODULE_PATH)).toEqual(MODULE_BYTES);
 });
 
+test("checks scheduled code eligibility without inventing an event-delivery token", async () => {
+  const held = await heldBundle({ moduleBytes: SCHEDULED_MODULE_BYTES });
+  const observed: WorkerModuleInspectionInput[] = [];
+
+  await expect(
+    inspectV2WorkerCodeVersionEligibility({
+      workerResourceUid: WORKER_UID,
+      bundleResourceUid: BUNDLE_UID,
+      spec: versionSpec({ handlers: ["scheduled"] }),
+      bundle: held,
+      inspectModule: inspector({ outcome: "valid", exportedHandlers: ["scheduled"] }, (input) =>
+        observed.push(input),
+      ),
+    }),
+  ).resolves.toBeUndefined();
+  expect(observed).toHaveLength(1);
+  expect(observed[0]?.declaredHandlers).toEqual(["scheduled"]);
+
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec: versionSpec({ handlers: ["scheduled"] }),
+      bundle: held,
+      inspectModule: inspector({ outcome: "valid", exportedHandlers: ["scheduled"] }),
+    }),
+  ).rejects.toMatchObject({ code: "worker_event_delivery_unavailable" });
+});
+
 test("rejects bytes that no longer match the immutable bundle digest and observation", async () => {
   const held = await heldBundle();
   held.files[0]?.fill(0x20);
@@ -231,6 +266,16 @@ test("requires the bundle UID and inspection handler set to match the accepted V
       inspectModule: inspector({ outcome: "valid", exportedHandlers: [] }),
     }),
   ).rejects.toMatchObject({ code: "worker_handler_mismatch" });
+
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec: versionSpec({ handlers: ["scheduled"] }),
+      bundle: await heldBundle({ moduleBytes: FETCH_AND_SCHEDULED_MODULE_BYTES }),
+      inspectModule: inspector({ outcome: "valid", exportedHandlers: ["fetch", "scheduled"] }),
+      eventDelivery: { token: "c".repeat(64) },
+    }),
+  ).rejects.toMatchObject({ code: "worker_handler_mismatch" });
 });
 
 test("keeps valid fetch code separate from unsupported bindings, secrets, and events", async () => {
@@ -253,6 +298,52 @@ test("keeps valid fetch code separate from unsupported bindings, secrets, and ev
       }),
     ).rejects.toMatchObject({ code });
   }
+});
+
+test("scheduled code requires an explicit private delivery capability and exact handler export", async () => {
+  const spec = versionSpec({ handlers: ["fetch", "scheduled"] });
+  const bundle = await heldBundle({ moduleBytes: FETCH_AND_SCHEDULED_MODULE_BYTES });
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec,
+      bundle,
+      inspectModule: inspector({ outcome: "valid", exportedHandlers: ["fetch", "scheduled"] }),
+    }),
+  ).rejects.toMatchObject({ code: "worker_event_delivery_unavailable" });
+  const projected = await projectV2WorkerCodeVersion({
+    identity: identity(),
+    spec,
+    bundle,
+    inspectModule: inspector({ outcome: "valid", exportedHandlers: ["fetch", "scheduled"] }),
+    eventDelivery: { token: "a".repeat(64) },
+  });
+  expect(projected.site.fetchHandler).toBe(true);
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec,
+      bundle: await heldBundle(),
+      inspectModule: inspector({ outcome: "valid", exportedHandlers: ["fetch"] }),
+      eventDelivery: { token: "a".repeat(64) },
+    }),
+  ).rejects.toMatchObject({ code: "worker_handler_mismatch" });
+});
+
+test("handler-only scheduled code projects before a Cron attachment exists", async () => {
+  const projection = await projectV2WorkerCodeVersion({
+    identity: identity(),
+    spec: versionSpec({ handlers: ["scheduled"] }),
+    bundle: await heldBundle({
+      moduleBytes: encoder.encode("export default { scheduled() {} };\n"),
+    }),
+    inspectModule: inspector({ outcome: "valid", exportedHandlers: ["scheduled"] }),
+    eventDelivery: { token: "b".repeat(64) },
+  });
+  expect(projection.site.fetchHandler).toBe(false);
+  expect(projection.modules.get(MODULE_PATH)).toEqual(
+    encoder.encode("export default { scheduled() {} };\n"),
+  );
 });
 
 test("projects verified code+assets into one copied Version with exact routing policy", async () => {

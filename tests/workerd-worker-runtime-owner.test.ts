@@ -40,6 +40,7 @@ import {
 } from "../src/takoform-v2/worker-endpoint-backend.ts";
 import type { V2WorkerPublicationResolution } from "../src/takoform-v2/worker-publication-state.ts";
 import { spawnWorkerdWithParentDeath } from "../src/workerd-linux-process.ts";
+import type { WorkerdPublicationIdentity } from "../src/workerd-runtime.ts";
 import type { WorkerdProcess } from "../src/workerd-supervisor.ts";
 import {
   inspectWorkerdWorkerExecutionCopies,
@@ -52,7 +53,8 @@ import {
 
 const TARGET_KEY = "fixture-v2-worker-runtime-owner";
 const CHILD_SOURCE = `
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 const [verb, watch, configPath] = process.argv.slice(-3);
 if (verb !== "serve" || watch !== "--watch" || !configPath) throw new Error("unexpected command");
@@ -65,13 +67,27 @@ function identity() {
   return { port: Number(port), generation, token };
 }
 const initial = identity();
-const server = Bun.serve({ hostname: "127.0.0.1", port: initial.port, fetch(request) {
+const server = Bun.serve({ hostname: "127.0.0.1", port: initial.port, async fetch(request) {
   const current = identity();
   const url = new URL(request.url);
   if (request.method === "POST" && request.headers.get("host") === "runtime.selfhost-config.invalid" &&
       url.pathname === "/.well-known/takoserver/selfhost-runtime-config/v1" &&
       request.headers.get("x-takoserver-selfhost-runtime-config") === current.token) {
     return new Response(null, { status: 204, headers: { "x-takoserver-selfhost-config-identity": current.generation } });
+  }
+  if (request.method === "POST" && request.headers.get("host")?.endsWith(".selfhost-events.invalid") &&
+      url.pathname === "/.well-known/takoserver/managed-worker-events/v1") {
+    const config = readFileSync(configPath, "utf8");
+    const eventToken = /name = "__TAKOSERVER_SELFHOST_EVENT_TOKEN", text = "([0-9a-f]{64})"/u.exec(config)?.[1];
+    if (!eventToken || request.headers.get("x-takoserver-selfhost-event-token") !== eventToken)
+      return new Response(null, { status: 404 });
+    const event = await request.json();
+    writeFileSync(join(dirname(process.argv[1]), "last-schedule.json"), JSON.stringify({ pid: process.pid, event }));
+    if (event.cron === "2 * * * *") await Bun.sleep(50);
+    if (event.cron === "0 * * * *")
+      return Response.json({ protocol: "takoserver.managed-worker-event@v1", kind: "schedule", outcome: "rejected" }, { status: 500 });
+    if (event.cron === "3 * * * *") return Response.json({ ok: true });
+    return Response.json({ protocol: "takoserver.managed-worker-event@v1", kind: "schedule", outcome: "ack" });
   }
   if (url.pathname === "/hold") {
     let timer;
@@ -142,11 +158,15 @@ async function fixture() {
   };
 }
 
-async function heldCodeBundle(): Promise<SqlArtifactCustodyRead<WorkerBundleManifest>> {
+async function heldCodeBundle(
+  scheduled = false,
+): Promise<SqlArtifactCustodyRead<WorkerBundleManifest>> {
   const manifestUrl = "https://artifacts.example.test/runtime/manifest.json";
   const moduleUrl = "https://artifacts.example.test/runtime/index.mjs";
   const moduleBytes = new TextEncoder().encode(
-    "export default { fetch() { return new Response('ok'); } };\n",
+    scheduled
+      ? "export default { fetch() { return new Response('ok'); }, scheduled() {} };\n"
+      : "export default { fetch() { return new Response('ok'); } };\n",
   );
   const moduleSha256 = (await bytesDigest(moduleBytes)).slice("sha256:".length);
   const manifestBytes = new TextEncoder().encode(
@@ -177,10 +197,15 @@ async function heldCodeBundle(): Promise<SqlArtifactCustodyRead<WorkerBundleMani
   };
 }
 
-function staticPublicationState(workerResourceUid: string, withCode = false) {
+function staticPublicationState(
+  workerResourceUid: string,
+  withCode = false,
+  withScheduled = false,
+) {
   const assetBytes = new TextEncoder().encode("owner fixture asset");
   let lastOperationId: string | undefined;
   let fenceCurrent = true;
+  let lastExecution: V2Execution | null = null;
   const source = {
     async resolve({
       execution,
@@ -189,6 +214,7 @@ function staticPublicationState(workerResourceUid: string, withCode = false) {
       execution: V2Execution;
       incumbentSourceOperationId?: string;
     }): Promise<V2WorkerPublicationResolution> {
+      lastExecution = execution;
       if (
         (execution.action === "update" || execution.action === "delete") &&
         incumbentSourceOperationId !== undefined
@@ -207,7 +233,7 @@ function staticPublicationState(workerResourceUid: string, withCode = false) {
         ? {
             worker: { resourceUid: workerResourceUid },
             bundle: { resourceUid: `code-${execution.operationId}` },
-            handlers: ["fetch"],
+            handlers: withScheduled ? ["fetch", "scheduled"] : ["fetch"],
             vars: { SETTINGS: { label: "owner fixture" } },
           }
         : {
@@ -292,11 +318,32 @@ function staticPublicationState(workerResourceUid: string, withCode = false) {
         },
         async readVersionMaterials() {
           return {
-            bundle: withCode ? await heldCodeBundle() : null,
+            bundle: withCode ? await heldCodeBundle(withScheduled) : null,
             assets: withCode ? null : heldAssets,
           };
         },
       } as V2WorkerPublicationResolution;
+    },
+    async resolveCurrentServing(input: {
+      workerUid: string;
+      targetKey: string;
+      sourceOperationId: string;
+      expectedIdentity: WorkerdPublicationIdentity;
+    }) {
+      if (
+        !lastExecution ||
+        input.workerUid !== workerResourceUid ||
+        input.targetKey !== TARGET_KEY ||
+        lastExecution.operationId !== input.sourceOperationId ||
+        input.expectedIdentity.generation !== `takoserver-v2-operation:${input.sourceOperationId}`
+      ) {
+        return {
+          kind: "unresolved" as const,
+          code: "stale",
+          message: "fixture serving graph changed",
+        };
+      }
+      return await source.resolve({ execution: lastExecution });
     },
   };
   return {
@@ -1399,7 +1446,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
           configurationSha256: string | null;
         }>;
       };
-      expect(finalState.schema).toBe("takoserver.v2-worker-runtime-owner@7");
+      expect(finalState.schema).toBe("takoserver.v2-worker-runtime-owner@8");
       expect(
         finalState.incarnations.every(
           (record) =>
@@ -1435,11 +1482,42 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         delete record.processIdentity;
         delete record.configurationSha256;
         delete record.configurationRefreshPending;
+        delete record.eventToken;
       }
       await rm(join(groupRoot, ".retired-execution-copies"), { recursive: true, force: true });
       await writeFile(statePath, `${JSON.stringify(previousV2)}\n`, { mode: 0o600 });
       const migratedV2 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
       await migratedV2.close();
+      expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
+        "takoserver.v2-worker-runtime-owner@8",
+      );
+
+      const previousV7 = JSON.parse(await Bun.file(statePath).text()) as {
+        schema: string;
+        incarnations: Array<Record<string, unknown>>;
+      };
+      previousV7.schema = "takoserver.v2-worker-runtime-owner@7";
+      await writeFile(statePath, `${JSON.stringify(previousV7)}\n`, { mode: 0o600 });
+      await expect(openWorkerdWorkerRuntimeOwner(ownerOptions)).rejects.toMatchObject({
+        code: "ownership_uncertain",
+      });
+      for (const record of previousV7.incarnations) delete record.eventToken;
+      const incompleteV7 = structuredClone(previousV7);
+      const incompleteCopy = incompleteV7.incarnations[0];
+      if (!incompleteCopy) throw new Error("retired v7 incarnation missing");
+      (incompleteV7 as typeof incompleteV7 & Record<string, unknown>).activeOperationId = null;
+      (incompleteV7 as typeof incompleteV7 & Record<string, unknown>).admissionClosedBy = deleteId;
+      (incompleteV7 as typeof incompleteV7 & Record<string, unknown>).deletionPublicationConfirmed =
+        true;
+      (incompleteV7 as typeof incompleteV7 & Record<string, unknown>).endpointRouteAbsence = null;
+      incompleteCopy.executionCopiesReleased = false;
+      await writeFile(statePath, `${JSON.stringify(incompleteV7)}\n`, { mode: 0o600 });
+      await expect(openWorkerdWorkerRuntimeOwner(ownerOptions)).rejects.toMatchObject({
+        code: "ownership_uncertain",
+      });
+      await writeFile(statePath, `${JSON.stringify(previousV7)}\n`, { mode: 0o600 });
+      const migratedV7 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+      await migratedV7.close();
       expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
         "takoserver.v2-worker-runtime-owner@7",
       );
@@ -1451,6 +1529,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         delete record.processIdentity;
         delete record.configurationSha256;
         delete record.configurationRefreshPending;
+        delete record.eventToken;
       }
       await writeFile(statePath, `${JSON.stringify(previousV4)}\n`, { mode: 0o600 });
       const migratedV4 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
@@ -1471,6 +1550,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         delete record.processIdentity;
         delete record.configurationSha256;
         delete record.configurationRefreshPending;
+        delete record.eventToken;
       }
       await rm(join(groupRoot, ".retired-execution-copies"), { recursive: true, force: true });
       await writeFile(statePath, `${JSON.stringify(previousV3)}\n`, { mode: 0o600 });
@@ -1494,12 +1574,13 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         delete record.processIdentity;
         delete record.configurationSha256;
         delete record.configurationRefreshPending;
+        delete record.eventToken;
       }
       await writeFile(statePath, `${JSON.stringify(previousV1)}\n`, { mode: 0o600 });
       const migratedV1 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
       await migratedV1.close();
       expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
-        "takoserver.v2-worker-runtime-owner@7",
+        "takoserver.v2-worker-runtime-owner@8",
       );
       expect(owned.children).toHaveLength(1);
     } finally {
@@ -1546,6 +1627,14 @@ test("code incarnation retirement waits for its persisted grace deadline after r
       deferRetirementUntilDeadline: true,
     });
     publication.setCurrent(createId);
+    expect(
+      await owner.observeScheduledCapability({
+        workerUid,
+        principal: "org-runtime-owner",
+        space: "production",
+        targetKey: TARGET_KEY,
+      }),
+    ).toEqual({ kind: "unknown" });
     const oldChild = owned.children[0];
     if (!oldChild) throw new Error("initial code Worker child missing");
 
@@ -1572,6 +1661,110 @@ test("code incarnation retirement waits for its persisted grace deadline after r
       identity: null,
     });
     publication.setCurrent(deleteId);
+    await owner.close();
+  } finally {
+    await owner.close().catch(() => undefined);
+    await owned.cleanup();
+  }
+});
+
+test("scheduled port delivers the exact match through the current private Version gate", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-scheduled-gate";
+  const publication = staticPublicationState(workerUid, true, true);
+  const createId = "7502b0fd-177f-45e7-aee0-09579856016d";
+  const deleteId = "4fb3f262-7b20-4af7-a79d-c06d921544e9";
+  const options = {
+    rootDirectory: join(owned.root, "owners"),
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+    inspectModule: async (): Promise<WorkerModuleInspectionResult> => ({
+      outcome: "valid",
+      exportedHandlers: ["fetch", "scheduled"],
+    }),
+  };
+  const owner = await openWorkerdWorkerRuntimeOwner(options);
+  try {
+    const created = await owner.execute(execution(workerUid, createId, "create"));
+    expect(created.kind).toBe("confirmed");
+    if (created.kind !== "confirmed" || !created.identity)
+      throw new Error("scheduled publication identity missing");
+    publication.setCurrent(createId);
+    const capability = await owner.observeScheduledCapability({
+      workerUid,
+      principal: "org-runtime-owner",
+      space: "production",
+      targetKey: TARGET_KEY,
+    });
+    expect(capability).toMatchObject({
+      kind: "confirmed",
+      servingSourceOperationId: createId,
+      deploymentUid: `deployment-${workerUid}`,
+      deploymentGeneration: 1,
+      versions: [{ workerVersionUid: `version-${createId}`, generation: 1, weight: 10_000 }],
+    });
+    if (capability.kind !== "confirmed") throw new Error("scheduled capability missing");
+    expect(await capability.stillCurrent()).toBe(true);
+    expect(await pathExists(join(owned.root, "last-schedule.json"))).toBe(false);
+    const match = {
+      triggerUid: "cron-001",
+      workerUid,
+      cron: "17 */2 * * 1-5",
+      scheduledTime: 1_700_000_000_000,
+      matchId: "cron-001:1700000000000",
+    };
+    expect(await owner.invokeScheduled(match)).toEqual({
+      kind: "handler_resolved",
+      workerVersionUid: `version-${createId}`,
+    });
+    const observed = JSON.parse(await Bun.file(join(owned.root, "last-schedule.json")).text()) as {
+      pid: number;
+      event: Record<string, unknown>;
+    };
+    const child = owned.children[0];
+    if (!child) throw new Error("scheduled child missing");
+    expect(observed.pid).toBe(child.pid);
+    expect(observed.event).toMatchObject({
+      protocol: "takoserver.managed-worker-event@v1",
+      kind: "schedule",
+      deploymentId: created.identity.versions[0]?.versionId,
+      cron: match.cron,
+      scheduledTime: match.scheduledTime,
+    });
+    expect(await owner.invokeScheduled({ ...match, cron: "0 * * * *" })).toEqual({
+      kind: "handler_rejected",
+      workerVersionUid: `version-${createId}`,
+    });
+    expect(await owner.invokeScheduled({ ...match, cron: "3 * * * *" })).toEqual({
+      kind: "unknown",
+    });
+    const inflight = owner.invokeScheduled({ ...match, cron: "2 * * * *" });
+    await until(() => {
+      try {
+        const seen = JSON.parse(readFileSync(join(owned.root, "last-schedule.json"), "utf8")) as {
+          event?: { cron?: string };
+        };
+        return seen.event?.cron === "2 * * * *";
+      } catch {
+        return false;
+      }
+    });
+    publication.setFenceCurrent(false);
+    expect(await capability.stillCurrent()).toBe(false);
+    expect(await inflight).toEqual({ kind: "unknown" });
+    expect(await owner.invokeScheduled(match)).toEqual({ kind: "unknown" });
+    publication.setFenceCurrent(true);
+    await expect(openWorkerdWorkerRuntimeOwner(options)).rejects.toMatchObject({
+      code: "ownership_uncertain",
+    });
+    expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
+      kind: "confirmed",
+      identity: null,
+    });
     await owner.close();
   } finally {
     await owner.close().catch(() => undefined);

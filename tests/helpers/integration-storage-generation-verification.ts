@@ -8,25 +8,21 @@ import type {
 } from "../../scripts/deploy/integration-storage-generation.ts";
 import { canonicalSchemaShape, type D1SchemaState } from "../../scripts/deploy/migrations.ts";
 import type { DeployTarget } from "../../scripts/deploy/target.ts";
-import { MIGRATIONS } from "../../src/db-schema.ts";
+import { currentAuditedSchemaMigrations } from "./audited-schema-fixture.ts";
 
 const MIGRATION_DIRECTORY = resolve(import.meta.dir, "../../migrations");
 const FRESH_V2_ARTIFACT_END = "0075_v2_artifact_progress.sql";
-const CURRENT_SOURCE_END = "0079_v2_worker_native_deletions.sql";
 
-/** Qualified generated storage has the fixed 0075 payload, while source includes 0079. */
+/** Qualified generated storage has the fixed 0075 payload, regardless of source-only successors. */
 export function completeIntegrationStorageState(): D1SchemaState {
-  if (
-    MIGRATIONS.length !== 79 ||
-    MIGRATIONS.at(74)?.name !== FRESH_V2_ARTIFACT_END ||
-    MIGRATIONS.at(-1)?.name !== CURRENT_SOURCE_END
-  ) {
-    throw new Error("fixed v2 artifact fixture requires the audited 0001-0079 source inventory");
+  const migrations = currentAuditedSchemaMigrations();
+  if (migrations.at(74)?.name !== FRESH_V2_ARTIFACT_END) {
+    throw new Error("fixed v2 artifact fixture requires the audited 0001-0075 prefix");
   }
-  const migrations = MIGRATIONS.slice(0, 75);
+  const qualifiedMigrations = migrations.slice(0, 75);
   const database = new Database(":memory:");
   try {
-    for (const { name } of migrations) {
+    for (const { name } of qualifiedMigrations) {
       database.exec(readFileSync(resolve(MIGRATION_DIRECTORY, name), "utf8"));
     }
     const rows = database
@@ -45,7 +41,7 @@ export function completeIntegrationStorageState(): D1SchemaState {
       ),
     );
     return {
-      applied: migrations.map(({ name }) => name),
+      applied: qualifiedMigrations.map(({ name }) => name),
       shape,
       shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
     };

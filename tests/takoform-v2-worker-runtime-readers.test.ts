@@ -17,6 +17,7 @@ import {
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { createTakoformV2Routes } from "../src/takoform-v2/routes.ts";
 import type { V2Operation } from "../src/takoform-v2/types.ts";
+import { createWorkerCronTriggerAdmissionReader } from "../src/takoform-v2/worker-cron-trigger-backend.ts";
 import { createWorkerDeploymentForm } from "../src/takoform-v2/worker-deployment-backend.ts";
 import {
   createInternalV2ModuleWorkerForm,
@@ -257,6 +258,7 @@ test("Host HTTP lifecycle and UID-owned runtime require physical Version retirem
       [WORKER_DEPLOYMENT_FORM_URL]: createWorkerDeploymentForm({
         targetKey: TARGET_KEY,
         publicationState,
+        scheduledAttachments: createWorkerCronTriggerAdmissionReader({ sql }),
         ownerForWorker: async (uid) => {
           if (!owner || owner.workerResourceUid !== uid) throw new Error("wrong owner");
           return owner;

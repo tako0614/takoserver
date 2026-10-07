@@ -12,6 +12,12 @@ import { createWorkerBundleForm } from "./forms/worker-bundle-backend.ts";
 import { createTakoformV2Host } from "./host.ts";
 import type { V2Form } from "./types.ts";
 
+export type V2OperatorFormFactory = (context: {
+  readonly sql: Sql;
+  readonly objects: ObjectStoreAccess;
+  readonly clock: Clock;
+}) => Readonly<Record<string, V2Form>>;
+
 /** Compose only Forms whose complete v2 backend is available at this entry. */
 export function createTakoformV2Application(options: {
   readonly sql: Sql;
@@ -20,10 +26,15 @@ export function createTakoformV2Application(options: {
   readonly publicOrigin: string;
   readonly config: V2ApplicationConfig;
   readonly clock: Clock;
+  /** Selected by the embedding operator, never by public configuration or a request. */
+  readonly formFactory?: V2OperatorFormFactory;
 }) {
+  if (options.formFactory !== undefined && typeof options.formFactory !== "function") {
+    throw new TypeError("v2 Form factory must be a function");
+  }
   const { sql, objects, accounts, publicOrigin, config, clock } = options;
   const access = createTakoformV2AccountAccess(accounts);
-  const forms: Record<string, V2Form> = {};
+  const forms: Record<string, V2Form> = Object.create(null) as Record<string, V2Form>;
   if (config.sqliteMigrationSet) {
     const source = createV2HeldArtifactSource({
       objects,
@@ -57,11 +68,46 @@ export function createTakoformV2Application(options: {
       targetKey: config.staticAssetBundle.targetKey,
     });
   }
+  if (options.formFactory !== undefined) {
+    const selected = options.formFactory({ sql, objects, clock });
+    if (
+      !selected ||
+      typeof selected !== "object" ||
+      Array.isArray(selected) ||
+      (Object.getPrototypeOf(selected) !== Object.prototype &&
+        Object.getPrototypeOf(selected) !== null)
+    ) {
+      throw new TypeError("v2 Form factory must return a plain exact Form map");
+    }
+    for (const url of Reflect.ownKeys(selected)) {
+      const descriptor = Object.getOwnPropertyDescriptor(selected, url);
+      if (typeof url !== "string" || !descriptor?.enumerable || !("value" in descriptor)) {
+        throw new TypeError("v2 Form map must contain only enumerable exact Form entries");
+      }
+      if (Object.hasOwn(forms, url)) throw new TypeError("duplicate v2 Form URL");
+      const form = descriptor.value as V2Form | undefined;
+      if (
+        !form ||
+        typeof form.validateCreate !== "function" ||
+        typeof form.validateUpdate !== "function" ||
+        !form.backend ||
+        typeof form.backend.id !== "string" ||
+        form.backend.id.length === 0 ||
+        typeof form.backend.targetKey !== "string" ||
+        form.backend.targetKey.length === 0 ||
+        typeof form.backend.execute !== "function" ||
+        typeof form.backend.reconcile !== "function"
+      ) {
+        throw new TypeError("v2 Form factory returned an incomplete backend");
+      }
+      forms[url] = form;
+    }
+  }
   return createTakoformV2Host({
     sql,
     now: clock,
     authorize: access.authorize,
-    forms,
+    forms: Object.freeze(forms),
     baseUrl: `${publicOrigin}/apis/forms.takoform.com/v2`,
     documentation: config.documentation,
     authenticationDocumentation: config.authenticationDocumentation,
