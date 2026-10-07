@@ -135,6 +135,13 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "v2-contract", "v2-form"],
   },
   {
+    // Exact outer composition point for the existing physical Actor owner;
+    // never broadens pure Form or generic v2 runtime access to app modules.
+    name: "v2-actor-physical-backend",
+    match: /^src\/takoform-v2\/actor-namespace-backend\.ts$/u,
+    may: ["core", "app", "v2-contract", "v2-form", "v2-actor-admission"],
+  },
+  {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state"],

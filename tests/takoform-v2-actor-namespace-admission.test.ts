@@ -1,10 +1,16 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject } from "../src/ports.ts";
+import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { prepareV2ActorNamespaceAdmission } from "../src/takoform-v2/actor-namespace-admission.ts";
+import { createV2ActorNamespaceForm } from "../src/takoform-v2/actor-namespace-backend.ts";
+import { createV2ActorNamespaceGraphAuthority } from "../src/takoform-v2/actor-namespace-graph-authority.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import {
   ACTOR_NAMESPACE_FORM_URL,
@@ -31,7 +37,7 @@ const PRINCIPAL = "org:actor-admission";
 const SPACE = "production";
 const TARGET = "actor-admission-local-target";
 
-function fixture() {
+function fixture(physicalRoot?: string) {
   const db = new Database(":memory:");
   migrateSqlite(db);
   const sql = createSqliteSql(db);
@@ -104,7 +110,19 @@ function fixture() {
     backend,
     ...extras,
   });
-  const actor = form({
+  const physical = physicalRoot
+    ? createSelfhostActorExecutionHost({
+        runtimeRoot: join(physicalRoot, "runtime"),
+        storageRoot: join(physicalRoot, "actor"),
+        binary: "/unused/workerd",
+        authority: createV2ActorNamespaceGraphAuthority({
+          sql,
+          targetKey: TARGET,
+          owner: { ownerForWorker: async () => null },
+        }),
+      })
+    : null;
+  const fixtureActor = form({
     validateCreate: parseActorNamespaceSpec,
     validateUpdate: validateActorNamespaceUpdate,
     references: referencesForActorNamespace,
@@ -126,6 +144,15 @@ function fixture() {
       targetKey: TARGET,
     });
   }
+  const actor = physical
+    ? createV2ActorNamespaceForm({
+        sql,
+        targetKey: TARGET,
+        bundleCustody: bundleHost.custody,
+        inspector,
+        physical,
+      })
+    : fixtureActor;
   const engine = createTakoformV2Engine({
     sql,
     replayWindowSeconds: 3600,
@@ -201,6 +228,7 @@ function fixture() {
     worker,
     version,
     admission,
+    physical,
     setInspection(value: typeof inspection) {
       inspection = value;
     },
@@ -233,6 +261,120 @@ test("Actor Namespace admission allows pre-Deployment create, but not a duplicat
     ).toHaveLength(1);
   } finally {
     f.db.close();
+  }
+});
+
+test("pre-Deployment Actor backend settles only after durable physical namespaceEmpty proof", async () => {
+  const root = mkdtempSync(join(tmpdir(), "actor-v2-empty-"));
+  const f = fixture(root);
+  if (!f.physical) throw new Error("physical Actor host fixture missing");
+  try {
+    const worker = await f.worker();
+    const spec = { worker: { resourceUid: worker.resourceUid }, className: "CounterActor" };
+    const created = await f.create(ACTOR_NAMESPACE_FORM_URL, "empty-namespace", spec, false);
+    expect(await f.engine.runNext()).toMatchObject({ id: created.id, status: "succeeded" });
+    const scope = { tenantId: PRINCIPAL, namespaceResourceUid: created.resourceUid };
+    expect(await f.physical.namespaceEmpty(scope)).toBe(true);
+    expect(
+      await f.sql.query("SELECT observed_json FROM tf_v2_resources WHERE uid = ?", [
+        created.resourceUid,
+      ]),
+    ).toEqual([
+      {
+        observed_json: JSON.stringify({
+          activeActorCount: 0,
+          openSocketCount: 0,
+          pendingAlarmCount: 0,
+          ready: false,
+        }),
+      },
+    ]);
+    const updated = await f.engine.acceptUpdate({
+      principal: PRINCIPAL,
+      key: "empty-namespace-update-0001",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: updated.id, status: "succeeded" });
+    const sourceVersion = await f.version(worker.resourceUid, "unweighted-source-version");
+    const versionRow = (
+      await f.sql.query("SELECT spec_json FROM tf_v2_resources WHERE uid = ?", [
+        sourceVersion.resourceUid,
+      ])
+    )[0];
+    const bundleUid = parseWorkerVersionSpec(JSON.parse(String(versionRow?.spec_json))).bundle
+      ?.resourceUid;
+    if (!bundleUid) throw new Error("fixture Bundle missing");
+    const binding = await f.create(WORKER_VERSION_FORM_URL, "unweighted-actor-binding", {
+      worker: { resourceUid: worker.resourceUid },
+      bundle: { resourceUid: bundleUid },
+      handlers: ["fetch"],
+      actorBindings: [{ name: "ACTOR", resource: { resourceUid: created.resourceUid } }],
+    });
+    await expect(
+      f.engine.acceptDelete({
+        principal: PRINCIPAL,
+        key: "bound-empty-namespace-delete-0001",
+        uid: created.resourceUid,
+        expectedGeneration: 2,
+      }),
+    ).rejects.toMatchObject({ code: "dependency_conflict" });
+    const removedBinding = await f.engine.acceptDelete({
+      principal: PRINCIPAL,
+      key: "unweighted-actor-binding-delete-0001",
+      uid: binding.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: removedBinding.id, status: "succeeded" });
+    const deleted = await f.engine.acceptDelete({
+      principal: PRINCIPAL,
+      key: "empty-namespace-delete-0001",
+      uid: created.resourceUid,
+      expectedGeneration: 2,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: deleted.id, status: "succeeded" });
+    expect(await f.physical.namespaceAbsent(scope)).toBe(true);
+  } finally {
+    await f.physical.close();
+    f.db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Actor backend does not synthesize counts or settle an active Deployment", async () => {
+  const root = mkdtempSync(join(tmpdir(), "actor-v2-active-"));
+  const f = fixture(root);
+  if (!f.physical) throw new Error("physical Actor host fixture missing");
+  try {
+    const worker = await f.worker();
+    const version = await f.version(worker.resourceUid, "version-active");
+    await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment-active", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    const namespace = await f.create(
+      ACTOR_NAMESPACE_FORM_URL,
+      "namespace-active",
+      { worker: { resourceUid: worker.resourceUid }, className: "CounterActor" },
+      false,
+    );
+    expect(await f.engine.runNext()).toMatchObject({ id: namespace.id, status: "reconciling" });
+    expect(
+      await f.sql.query("SELECT observed_json FROM tf_v2_resources WHERE uid = ?", [
+        namespace.resourceUid,
+      ]),
+    ).toEqual([{ observed_json: "{}" }]);
+    expect(
+      await f.physical.hasNamespace({
+        tenantId: PRINCIPAL,
+        namespaceResourceUid: namespace.resourceUid,
+      }),
+    ).toBe(false);
+  } finally {
+    await f.physical.close();
+    f.db.close();
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
