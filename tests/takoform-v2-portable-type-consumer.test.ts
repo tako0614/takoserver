@@ -40,5 +40,18 @@ test("the public v2 eligibility export does not pull native Workerd modules into
         file.endsWith("/src/takoform-v2/worker-publication-state.ts"));
     return !knownExistingRowCast;
   });
-  expect(unexpectedDiagnostics).toEqual([]);
+  // TypeScript diagnostics retain SourceFile/program graphs. Compare compact
+  // evidence so a new error fails this gate without recursively printing that
+  // graph in the test runner.
+  expect(
+    unexpectedDiagnostics.map((diagnostic) => ({
+      code: diagnostic.code,
+      file: diagnostic.file?.fileName.replaceAll("\\", "/"),
+      line:
+        diagnostic.file && diagnostic.start !== undefined
+          ? diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start).line + 1
+          : undefined,
+      message: ts.flattenDiagnosticMessageText(diagnostic.messageText, " "),
+    })),
+  ).toEqual([]);
 });

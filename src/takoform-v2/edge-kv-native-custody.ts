@@ -1,5 +1,5 @@
 import { canonicalJson } from "../json.ts";
-import type { Clock, JsonObject, Sql, SqlParam } from "../ports.ts";
+import type { Clock, JsonObject, Row, Sql, SqlParam } from "../ports.ts";
 import { EDGE_KV_NAMESPACE_FORM_URL, EDGE_KV_NAMESPACE_LIMITS } from "./forms/edge-kv-namespace.ts";
 import type { V2Execution } from "./types.ts";
 
@@ -91,6 +91,48 @@ interface CustodyRow {
   readonly confirmed_receipt: string | null;
 }
 
+function custodyRow(value: Row | undefined): CustodyRow | null {
+  if (
+    !value ||
+    typeof value.operation_id !== "string" ||
+    typeof value.resource_uid !== "string" ||
+    (value.action !== "create" && value.action !== "delete") ||
+    typeof value.principal !== "string" ||
+    typeof value.space !== "string" ||
+    typeof value.backend_key !== "string" ||
+    typeof value.backend_id !== "string" ||
+    typeof value.target_key !== "string" ||
+    typeof value.generation !== "number" ||
+    !Number.isSafeInteger(value.generation) ||
+    typeof value.accepted_spec_json !== "string" ||
+    typeof value.planned_title !== "string" ||
+    typeof value.closure_digest !== "string" ||
+    (value.source_operation_id !== null && typeof value.source_operation_id !== "string") ||
+    (value.native_id !== null && typeof value.native_id !== "string") ||
+    (value.acknowledged_receipt !== null && typeof value.acknowledged_receipt !== "string") ||
+    (value.confirmed_receipt !== null && typeof value.confirmed_receipt !== "string")
+  )
+    return null;
+  return {
+    operation_id: value.operation_id,
+    resource_uid: value.resource_uid,
+    action: value.action,
+    principal: value.principal,
+    space: value.space,
+    backend_key: value.backend_key,
+    backend_id: value.backend_id,
+    target_key: value.target_key,
+    generation: value.generation,
+    accepted_spec_json: value.accepted_spec_json,
+    planned_title: value.planned_title,
+    closure_digest: value.closure_digest,
+    source_operation_id: value.source_operation_id,
+    native_id: value.native_id,
+    acknowledged_receipt: value.acknowledged_receipt,
+    confirmed_receipt: value.confirmed_receipt,
+  };
+}
+
 function capture(input: V2Execution): V2Execution | null {
   try {
     const spec = JSON.parse(canonicalJson(input.spec)) as JsonObject;
@@ -174,11 +216,14 @@ export function createV2EdgeKvNativeCustody(options: { readonly sql: Sql; readon
     return Number.isSafeInteger(value) && value >= 0 ? value : null;
   };
   const row = async (operationId: string): Promise<CustodyRow | null> =>
-    ((
-      await sql.query("SELECT * FROM tf_v2_edge_kv_native_custody WHERE operation_id = ? LIMIT 1", [
-        operationId,
-      ])
-    )[0] as CustodyRow | undefined) ?? null;
+    custodyRow(
+      (
+        await sql.query(
+          "SELECT * FROM tf_v2_edge_kv_native_custody WHERE operation_id = ? LIMIT 1",
+          [operationId],
+        )
+      )[0],
+    );
   const current = async (e: V2Execution): Promise<boolean> => {
     const at = time();
     if (at === null) return false;
@@ -477,16 +522,18 @@ export function createV2EdgeKvNativeCustody(options: { readonly sql: Sql; readon
     async confirmedForUpdate(input: V2Execution): Promise<V2EdgeKvConfirmedIdentity | null> {
       const e = capture(input);
       if (e?.action !== "update" || !(await current(e))) return null;
-      const prior = (
-        await sql.query(
-          `SELECT * FROM tf_v2_edge_kv_native_custody
+      const prior = custodyRow(
+        (
+          await sql.query(
+            `SELECT * FROM tf_v2_edge_kv_native_custody
          WHERE resource_uid = ? AND action = 'create' AND principal = ?
            AND space = ? AND backend_id = ? AND target_key = ?
            AND generation < ? AND native_id IS NOT NULL
            AND confirmed_receipt IS NOT NULL LIMIT 1`,
-          [e.resourceUid, e.principal, e.space, e.backendId, e.targetKey, e.generation],
-        )
-      )[0] as CustodyRow | undefined;
+            [e.resourceUid, e.principal, e.space, e.backendId, e.targetKey, e.generation],
+          )
+        )[0],
+      );
       if (!prior || !(await current(e))) return null;
       return confirmed(prior);
     },
@@ -494,9 +541,10 @@ export function createV2EdgeKvNativeCustody(options: { readonly sql: Sql; readon
     async prepareDelete(input: V2Execution): Promise<V2EdgeKvConfirmedIdentity | null> {
       const e = capture(input);
       if (e?.action !== "delete" || !(await current(e))) return null;
-      const prior = (
-        await sql.query(
-          `SELECT source.* FROM tf_v2_edge_kv_native_custody source
+      const prior = custodyRow(
+        (
+          await sql.query(
+            `SELECT source.* FROM tf_v2_edge_kv_native_custody source
          WHERE source.resource_uid = ? AND source.action = 'create'
            AND source.principal = ? AND source.space = ?
            AND source.backend_id = ? AND source.target_key = ?
@@ -506,9 +554,10 @@ export function createV2EdgeKvNativeCustody(options: { readonly sql: Sql; readon
              JOIN tf_v2_resources referrer ON referrer.uid = ref.referrer_uid
              WHERE ref.target_uid = source.resource_uid AND referrer.deleted_at IS NULL)
          LIMIT 1`,
-          [e.resourceUid, e.principal, e.space, e.backendId, e.targetKey, e.generation],
-        )
-      )[0] as CustodyRow | undefined;
+            [e.resourceUid, e.principal, e.space, e.backendId, e.targetKey, e.generation],
+          )
+        )[0],
+      );
       if (!prior || !(await current(e))) return null;
       return confirmed(prior);
     },
