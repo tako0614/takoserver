@@ -70,27 +70,12 @@ export class ParentWorkflow {
 }
 export default {
   async fetch(request, env) {
-    let stage = "select";
-    try {
-      if (new URL(request.url).pathname === "/create") {
-        stage = "create";
-        const created = await env.PARENT.create({ id: "parent-from-fetch", params: { value: 42 } });
-        stage = "status";
-        return Response.json({ id: created.id, status: (await created.status()).status });
-      }
-      stage = "get";
-      const fetched = await env.PARENT.get("parent-from-fetch");
-      stage = "status";
-      return Response.json({ id: fetched.id, status: (await fetched.status()).status });
-    } catch (error) {
-      // The outer Host wrapper intentionally returns a generic 500 for a
-      // tenant throw. Redact token-shaped text from this diagnostic response.
-      const message = String(error?.message ?? "").replace(/[a-f0-9]{64}/g, "[redacted]");
-      return Response.json(
-        { stage, name: error?.name, code: error?.code, message: message.slice(0, 240) },
-        { status: 500 },
-      );
+    if (new URL(request.url).pathname === "/create") {
+      const created = await env.PARENT.create({ id: "parent-from-fetch", params: { value: 42 } });
+      return Response.json({ id: created.id, status: (await created.status()).status });
     }
+    const fetched = await env.PARENT.get("parent-from-fetch");
+    return Response.json({ id: fetched.id, status: (await fetched.status()).status });
   }
 };
 `);
