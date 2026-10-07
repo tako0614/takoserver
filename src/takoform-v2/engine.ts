@@ -25,7 +25,11 @@ function validName(value: string): boolean {
 }
 
 function referenceUnavailable(error: unknown): boolean {
-  return error instanceof SqlError && error.message.includes("tf_v2_reference_target_unavailable");
+  return (
+    error instanceof SqlError &&
+    (error.message.includes("tf_v2_reference_target_unavailable") ||
+      error.message.includes("tf_v2_worker_invocation_live_reference"))
+  );
 }
 
 function resource(row: ResourceRow): V2Resource {
@@ -360,6 +364,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       } catch (error) {
         const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
         if (winner) return winner;
+        if (referenceUnavailable(error)) fail("dependency_conflict", 409);
         throw error;
       }
       const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
