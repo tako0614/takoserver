@@ -10,6 +10,7 @@ import {
 } from "../scripts/deploy/integration-storage-generation.ts";
 import { canonicalSchemaShape } from "../scripts/deploy/migrations.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
+import { MIGRATIONS } from "../src/db-schema.ts";
 import { bytesDigest } from "../src/json.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
@@ -47,7 +48,7 @@ const CASES = [
   },
 ] as const;
 
-test("fresh selected 0075 payload on real Miniflare D1 supports all three normal Worker artifact Form journeys", async () => {
+test("fresh selected 0075 payload on real Miniflare D1 serves artifact Forms after local 0081 closure", async () => {
   const artifacts = await Promise.all(
     CASES.map(async ({ slug, path, mediaType, contents }) => {
       const fileBytes = new TextEncoder().encode(contents);
@@ -232,6 +233,24 @@ test("fresh selected 0075 payload on real Miniflare D1 supports all three normal
     for (const artifact of artifacts) {
       await r2.put(artifact.manifestKey, artifact.manifestBytes);
       await r2.put(artifact.fileKey, artifact.fileBytes);
+    }
+    const unclosedSupport = await runtime.dispatchFetch(
+      `${BASE}/support?form=${encodeURIComponent(SQLITE_MIGRATION_SET_FORM_URL)}`,
+      { headers: { authorization: `Bearer ${TOKEN}` } },
+    );
+    expect(unclosedSupport.status).toBe(503);
+    expect(await sql.query("SELECT count(*) AS count FROM tf_v2_operations")).toEqual([
+      { count: 0 },
+    ]);
+    // The 0075 generation proof above is unchanged. The current Host needs the
+    // later source-only 0081 closure before this local D1 fixture may serve.
+    const closure = MIGRATIONS.findIndex(({ name }) => name === "0081_v2_private_inputs.sql");
+    if (closure < 75) throw new Error("missing 0081 fixture closure");
+    for (const migration of MIGRATIONS.slice(75, closure + 1)) {
+      for (const statement of splitMigration(migration.sql)) {
+        await d1.prepare(statement).run();
+      }
+      await d1.prepare('INSERT INTO "d1_migrations" (name) VALUES (?)').bind(migration.name).run();
     }
     for (const [index, fixture] of CASES.entries()) {
       const artifact = artifacts[index];

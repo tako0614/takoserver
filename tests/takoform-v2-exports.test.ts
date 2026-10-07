@@ -40,6 +40,7 @@ const RUNTIME_EXPORTS = [
   "parseWorkerDeploymentSpec",
   "parseWorkerEndpointSpec",
   "parseWorkerVersionSpec",
+  "readV2ConfiguredPrivateInputs",
   "referencesForModuleWorker",
   "referencesForWorkerDeployment",
   "referencesForWorkerEndpoint",

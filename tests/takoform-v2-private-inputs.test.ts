@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalJson } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
@@ -244,7 +245,7 @@ function createBody(privateInputs: unknown = ORIGINAL) {
 }
 
 test("v2 private map survives lost HTTP response and SQLite process restart without public leakage", async () => {
-  const directory = mkdtempSync("/dev/shm/t/v2-private-");
+  const directory = mkdtempSync(join(tmpdir(), "v2-private-"));
   const path = join(directory, "state.sqlite");
   const custody = await keys();
   let database = new Database(path);
