@@ -24,6 +24,9 @@ argument-shape `TypeError` behavior without changing the retained V1 SQL facade.
 Composition must choose two collision-free root-level `.js` module names for
 the adapter and its captured-intrinsics helper, then add both returned modules
 and their JavaScript media types to the execution copy before graph compilation.
+The adapter keeps the original main module's named exports, including any
+Actor or Workflow class export used by a separate native bootstrap; its own
+default export alone wraps the declared Worker handlers.
 
 Every SQL call rechecks the native selected Version and Core current graph, the
 settled Version/Operation and sealed exact reference set, the active edge, and

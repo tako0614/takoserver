@@ -46,6 +46,7 @@ export function v2SqliteWorkerProjection(input: {
   SafeTextDecoderDecode as decode,
 } from ${JSON.stringify(importSpecifier(input.intrinsicModule))};
 import original from ${JSON.stringify(importSpecifier(input.originalMainModule))};
+export * from ${JSON.stringify(importSpecifier(input.originalMainModule))};
 const sqliteNames = ${JSON.stringify(input.sqliteBindingNames)};
 const encoder = new Encoder();
 const decoder = new Decoder("utf-8", { fatal: true });

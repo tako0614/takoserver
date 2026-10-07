@@ -338,8 +338,11 @@ test.skipIf(WORKERD === undefined)(
         privateRoot: join(host.root, "artifact"),
       });
       if (!artifact.binary) throw new Error(artifact.diagnostic ?? "pinned workerd unavailable");
-      const original = `export default { async fetch(request, env) {
+      const original = `import { className } from "./class-probe.js";
+    export class Application {}
+    export default { async fetch(request, env) {
       const keys = Object.keys(env).sort();
+      if (new URL(request.url).pathname === "/class") return Response.json({ className: className() });
       if (new URL(request.url).pathname === "/write") {
         const result = await env.DB.execute("INSERT INTO records (id, body) VALUES (?, ?)", [7, "native"]);
         return Response.json({ keys, result, hasRaw: "close" in env.DB || "database" in env.DB });
@@ -392,6 +395,12 @@ test.skipIf(WORKERD === undefined)(
       });
       const modules = new Map<string, Uint8Array>([
         ["app.js", new TextEncoder().encode(original)],
+        [
+          "class-probe.js",
+          new TextEncoder().encode(
+            'import { Application } from "./v2-adapter.js"; export function className() { return Application.name; }',
+          ),
+        ],
         ...projection,
       ]);
       const graph = compileWorkerdVersionGraph({
@@ -400,6 +409,7 @@ test.skipIf(WORKERD === undefined)(
         modules,
         moduleMediaTypes: {
           "app.js": "application/javascript+module",
+          "class-probe.js": "application/javascript+module",
           "v2-adapter.js": "application/javascript+module",
           "v2-intrinsics.js": "application/javascript+module",
         },
@@ -464,6 +474,7 @@ test.skipIf(WORKERD === undefined)(
         status: 200,
         value: { rows: [{ body: "native" }], rowsWritten: 0 },
       });
+      expect(await call("/class")).toEqual({ status: 200, value: { className: "Application" } });
       expect(await call("/invalid")).toEqual({
         status: 200,
         value: {
