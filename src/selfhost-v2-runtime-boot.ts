@@ -173,6 +173,22 @@ export function createSelfhostV2RuntimeBoot(options: {
   });
 }
 
+/** One tracked Cron pass, independent of settlement and other delivery lanes. */
+export function startSelfhostV2ScheduledDuePass(
+  shutdown: Pick<SelfhostEntryShutdown, "startInterval">,
+  workers: Pick<ReturnType<typeof createSelfhostV2WorkerComposition>, "pollScheduledDue">,
+  onFailure: (name: string) => void,
+): void {
+  shutdown.startInterval(
+    "takoform-v2-scheduled-due",
+    1_000,
+    async () => {
+      await workers.pollScheduledDue();
+    },
+    onFailure,
+  );
+}
+
 /** One tracked named pass, independent of legacy settlement and Queue work. */
 export function startSelfhostV2WorkflowDuePass(
   shutdown: Pick<SelfhostEntryShutdown, "startInterval">,

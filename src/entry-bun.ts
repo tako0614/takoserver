@@ -91,6 +91,7 @@ import { createSelfhostV2QueueScheduler } from "./selfhost-v2-queue-scheduler.ts
 import {
   createSelfhostV2RuntimeBoot,
   parseSelfhostV2RuntimeBoot,
+  startSelfhostV2ScheduledDuePass,
   startSelfhostV2WorkflowDuePass,
 } from "./selfhost-v2-runtime-boot.ts";
 import { createSelfhostV2WorkerComposition } from "./selfhost-v2-worker-composition.ts";
@@ -830,6 +831,7 @@ try {
   ownersRestored = true;
 } catch (error) {
   clearV2BootKeys();
+  await workers?.closeScheduledHost();
   await workers?.closeWorkflowHost();
   await v2RuntimeBoot?.closeActor();
   await v2QueueComposition?.close();
@@ -1203,6 +1205,7 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
         workerdShutdown: () => workerd.shutdown(),
         mayCloseDependents: () => shutdownClean,
         v2WorkerSuspend: async () => {
+          await v2WorkerComposition.closeScheduledHost();
           await v2QueueScheduler?.close();
           await v2WorkerComposition.closeWorkflowHost();
           await v2RuntimeBoot?.closeActor();
@@ -1348,6 +1351,9 @@ entryShutdown.startInterval(
     await app.tickTakoformV2();
   },
   (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
+);
+startSelfhostV2ScheduledDuePass(entryShutdown, v2WorkerComposition, (name) =>
+  process.stderr.write(`self-host background pass failed: ${name}\n`),
 );
 if (v2RuntimeBoot?.v2Workflow) {
   startSelfhostV2WorkflowDuePass(entryShutdown, v2WorkerComposition, (name) =>

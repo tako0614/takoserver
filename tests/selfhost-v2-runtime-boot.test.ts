@@ -9,6 +9,7 @@ import { createSelfhostEntryShutdown } from "../src/selfhost-entry-shutdown.ts";
 import {
   createSelfhostV2RuntimeBoot,
   parseSelfhostV2RuntimeBoot,
+  startSelfhostV2ScheduledDuePass,
   startSelfhostV2WorkflowDuePass,
 } from "../src/selfhost-v2-runtime-boot.ts";
 import { createSelfhostV2WorkerComposition } from "../src/selfhost-v2-worker-composition.ts";
@@ -74,6 +75,81 @@ test("selected native ports fail before storage effects without executable or gu
   } finally {
     database.close();
   }
+});
+
+test("stalled Cron poll is tracked independently and drained before shutdown", async () => {
+  let pollRun: (() => void | Promise<void>) | undefined;
+  let release!: () => void;
+  const stalled = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const order: string[] = [];
+  const shutdown = createSelfhostEntryShutdown({
+    stopIngress: async () => {
+      order.push("ingress");
+    },
+    finishShutdown: async () => {
+      order.push("closed");
+    },
+    onFailure: () => {},
+    onSuccess: () => {},
+  });
+  startSelfhostV2ScheduledDuePass(
+    {
+      startInterval(name, milliseconds, run) {
+        expect(name).toBe("takoform-v2-scheduled-due");
+        expect(milliseconds).toBe(1_000);
+        pollRun = run;
+      },
+    },
+    {
+      pollScheduledDue: async () => {
+        order.push("cron-start");
+        await stalled;
+        order.push("cron-end");
+        return {
+          recorded: 0,
+          claimed: 0,
+          resolved: 0,
+          rejected: 0,
+          unknown: 0,
+          scanComplete: true,
+          hasMore: false,
+          continuation: null,
+        };
+      },
+    },
+    () => {},
+  );
+  if (!pollRun) throw new Error("Cron pass was not registered");
+  const running = shutdown.runPass("takoform-v2-scheduled-due", pollRun);
+  await Promise.resolve();
+  await shutdown.runPass("takoform-v2", async () => {
+    order.push("ordinary-pass");
+  });
+  const closing = shutdown.shutdown();
+  await Promise.resolve();
+  expect(order).toContain("ordinary-pass");
+  expect(order).not.toContain("closed");
+  release();
+  await running;
+  expect(await closing).toBe(true);
+  expect(order.indexOf("cron-end")).toBeLessThan(order.indexOf("closed"));
+
+  startSelfhostV2ScheduledDuePass(
+    {
+      startInterval(_name, _milliseconds, run) {
+        pollRun = run;
+      },
+    },
+    {
+      pollScheduledDue: async () => {
+        throw new Error("poll rejected");
+      },
+    },
+    () => {},
+  );
+  await expect(pollRun?.()).rejects.toThrow("poll rejected");
 });
 
 test("stalled or rejected Workflow poll is an independent tracked pass", async () => {

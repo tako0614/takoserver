@@ -20,6 +20,7 @@ import {
   SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH,
 } from "./providers/selfhost-worker-wrapper.ts";
 import { createSelfhostV2QueueWorkerCapability } from "./selfhost-v2-queue-worker-capability.ts";
+import { createSelfhostV2ScheduledComposition } from "./selfhost-v2-scheduled-composition.ts";
 import type { V2OperatorFormFactory } from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
 import { readV2ConfiguredPrivateInputs } from "./takoform-v2/configured-private-inputs.ts";
@@ -34,6 +35,7 @@ import { createQueueWorkerBindingAuthority } from "./takoform-v2/forms/queue-wor
 import { createSQLiteWorkerBindingAuthority } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { createStaticAssetBundleCustody } from "./takoform-v2/forms/static-asset-bundle-backend.ts";
 import { createWorkerBundleCustody } from "./takoform-v2/forms/worker-bundle-backend.ts";
+import { WORKER_CRON_TRIGGER_FORM_URL } from "./takoform-v2/forms/worker-cron-trigger.ts";
 import {
   MODULE_WORKER_FORM_URL,
   parseWorkerDeploymentSpec,
@@ -43,7 +45,11 @@ import {
 } from "./takoform-v2/forms/worker-specs.ts";
 import type { createSelfhostV2WorkflowComposition } from "./takoform-v2/selfhost-v2-workflow-composition.ts";
 import { createV2ServiceBindingAuthority } from "./takoform-v2/service-binding-authority.ts";
-import { createWorkerCronTriggerAdmissionReader } from "./takoform-v2/worker-cron-trigger-backend.ts";
+import {
+  createWorkerCronTriggerAdmissionReader,
+  createWorkerCronTriggerForm,
+} from "./takoform-v2/worker-cron-trigger-backend.ts";
+import type { WorkerCronTriggerTickResult } from "./takoform-v2/worker-cron-trigger-scheduler.ts";
 import { createWorkerDeploymentForm } from "./takoform-v2/worker-deployment-backend.ts";
 import { createWorkerEndpointForm } from "./takoform-v2/worker-endpoint-backend.ts";
 import {
@@ -280,6 +286,10 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   >;
   /** Real SQL publication plus restored native Queue export proof, absent without Queue boot. */
   readonly queueCapability?: V2QueueConsumerCapability;
+  /** One tracked durable Cron scan; unavailable before restoration or after close. */
+  pollScheduledDue(): Promise<WorkerCronTriggerTickResult>;
+  /** Freeze Cron delivery and join its current pass before stopping native owners. */
+  closeScheduledHost(): Promise<void>;
   /** Host-private one-shot due scan, unavailable before restore or after shutdown. */
   pollWorkflowDue(): Promise<WorkflowDuePoll>;
   /** Host-private one-shot execution, unavailable before restore or after shutdown. */
@@ -1104,6 +1114,19 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       return await openOwner(uid);
     },
   });
+  const scheduled = createSelfhostV2ScheduledComposition({
+    sql,
+    targetKey,
+    now: clock,
+    ownerForWorkerUid: async (uid) => {
+      if (!restorationComplete || ownerAdmissionFrozen)
+        throw new Error("v2 scheduled Worker owner is unavailable");
+      const owner = await openOwner(uid);
+      if (!restorationComplete || ownerAdmissionFrozen)
+        throw new Error("v2 scheduled Worker owner is unavailable");
+      return owner;
+    },
+  });
   const queueCapability = queueSettlement
     ? createSelfhostV2QueueWorkerCapability({
         sql,
@@ -1166,6 +1189,12 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           return await openOwner(uid);
         },
       }),
+      [WORKER_CRON_TRIGGER_FORM_URL]: createWorkerCronTriggerForm({
+        sql,
+        targetKey,
+        capability: scheduled.capability,
+        now: clock,
+      }),
       ...(actor
         ? {
             [ACTOR_NAMESPACE_FORM_URL]: actor.namespaceForm,
@@ -1225,6 +1254,15 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   return {
     ...(queueCapability ? { queueCapability } : {}),
     endpointPublicationState,
+    pollScheduledDue() {
+      if (!restorationComplete || ownerAdmissionFrozen)
+        return Promise.reject(new Error("v2 scheduled delivery is unavailable"));
+      return scheduled.tick();
+    },
+    async closeScheduledHost() {
+      scheduled.close();
+      await scheduled.drain();
+    },
     restoreOwners() {
       restoration ??= restore();
       return restoration;
@@ -1259,7 +1297,9 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       // while retaining its durable lock/state for a later Host process.
       ownerAdmissionFrozen = true;
       workflowHostClosing = true;
+      scheduled.close();
       const attempt = (async () => {
+        await scheduled.drain();
         // A guarded Workflow run can hold the selected native owner lease.
         // Reap it before owner suspension; failure retains all owner custody.
         await workflow?.close();
