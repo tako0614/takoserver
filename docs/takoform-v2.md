@@ -590,9 +590,11 @@ parameter bounds before one atomic transaction; the output budget is checked
 before commit. Native tests pass a
 42-statement transaction with 1,000,000-byte parameters and verify all 42 rows.
 Malformed or interrupted input is rejected before execution; a later SQL failure
-or excess output rolls back without retained named input files. The wrapper still serializes a whole call
-before sending it, so maximum legal aggregate input is not yet qualified. The
-KV and Queue transports retain their existing limits.
+or excess output rolls back without retained named input files. The SQL wrapper
+captures its input before sending and serializes it incrementally, with at most
+4096 UTF-16 units in a fragment; it does not build a whole-call JSON string.
+Input normalization and maximum legal aggregate input remain unqualified. KV and
+Queue transports retain their existing limits.
 
 The internal WorkerCronTrigger backend and scheduler use the published
 WorkerCronTrigger 0.3.0 contract. Admission seals the exact Worker, target and
@@ -646,6 +648,26 @@ nonextractable keys to the v2 owner sealer before restoration. An absent or
 unavailable key still refuses sensitive Versions without deleting ciphertext;
 no key is generated from local ciphertext or public configuration.
 
+The optional Bun setting `TAKOSERVER_V2_WORKER_PRIVATE_PLANES` selects private
+SQLite, KV, ObjectBucket, Queue settlement and Queue Producer services. It is an
+exact JSON object with optional `sqlite`, `kv`, `objectBucket`, `queue` and
+`queueProducer` records. Each selected record requires a distinct fixed
+`privatePort` and an absolute `signingKeyFile`; SQLite additionally requires a
+pre-existing private `stagingRoot`. The data root must be an existing absolute
+owner-private directory. Key files contain 32–4096 raw bytes, are owner-private
+and non-symlink, and are never generated or logged by this boot path.
+
+Producer and settlement services use the same SQL-backed Queue custody but
+different listeners and signing keys. Private listeners bind to loopback before
+UID-owner restoration, and native authorization is unavailable until restoration
+finishes. The same Producer boot authority is used by Version admission and
+execution. With both Queue services configured, the internal factory also
+composes AtLeastOnceQueue. A pinned-workerd organization-HTTP journey covers
+Queue creation, a declared Producer Binding, `send`/`sendBatch`, retention update
+and dependency-ordered deletion without per-Form overrides. The ordinary entry
+still does not advertise incomplete Worker Forms. Its empty-owner process test
+proves orderly stop/reopen of these listeners, not active Worker crash recovery.
+
 Orderly Bun shutdown freezes new v2 owner admission and awaits pending owner opens.
 An active serving owner is suspended with retained custody, rather than treated as
 a deleted Worker. An exact completed ModuleWorker deletion, or SQL proof that no
@@ -674,10 +696,16 @@ ownership under the owner lane, then fences accepted SQL currentness before
 returning the observation. The ActorNamespace parser uses the published singular
 `className` and exact Worker UID reference. An empty-namespace proof is scoped to
 the physical tenant and namespace identity; it is not a claim about future
-activity. These are internal foundations, not ActorNamespace Form registration
-or an executable Actor Binding. Admission against active and accepted pending
-Deployments, runtime counts, and service/data binding composition remain to be
-connected.
+activity. The internal Actor Namespace admission now checks every selected class
+in active and earlier accepted pending Deployments, using held verified Bundle
+bytes and an atomic SQL graph predicate. Proven ABI failures and existing
+Worker/class duplicates are dependency conflicts; unavailable inspection or a
+graph change before acceptance is retryable busy, without Resource/Operation
+creation. A separate physical backend can confirm an empty namespace before any
+Deployment and delete it with authoritative absence proof. Its tests use a
+semantic-inspector stand-in, not native active Actor ABI proof. Active runtime
+counts and the executable Actor Binding remain incomplete; these internal paths
+do not register or advertise ActorNamespace Form support.
 
 ## Existing installations
 
