@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { access, mkdtemp, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { canonicalJson } from "../src/json.ts";
 import {
   SELFHOST_WORKER_PRELUDE_MODULE,
   selfhostWorkerPreludeSource,
@@ -135,7 +136,7 @@ export class Counter extends Base {
             kind: "ready" as const,
             realization: {
               ...result.realization,
-              authorityKey: JSON.stringify({
+              authorityKey: canonicalJson({
                 sourceOperationId,
                 incarnationId,
                 generationKey: result.realization.graph.generationKey,
@@ -176,6 +177,133 @@ export class Counter extends Base {
       });
       await runtime.publish?.("worker", publication);
       await host.registerNamespace(scope);
+      const warmGraph = await legacyAuthority.readGraph(scope, AbortSignal.timeout(5_000));
+      if (!warmGraph) throw new Error("accepted Actor graph missing before warm");
+      const warmNative = await legacyAuthority.readRealization(
+        warmGraph,
+        AbortSignal.timeout(5_000),
+      );
+      if (warmNative.kind !== "ready") throw new Error("native Actor graph missing before warm");
+      const warmRealization = {
+        ...warmNative.realization,
+        authorityKey: canonicalJson({
+          sourceOperationId,
+          incarnationId,
+          generationKey: warmNative.realization.graph.generationKey,
+          versions: warmNative.realization.graph.versions.map(
+            ({ versionId, workerVersionUid, weight }) => ({ versionId, workerVersionUid, weight }),
+          ),
+        }),
+      };
+      const warmExpected = {
+        workerUid: warmGraph.workerUid,
+        className: warmGraph.className,
+        sourceOperationId,
+        incarnationId,
+        generationKey: warmRealization.graph.generationKey,
+        versions: warmRealization.graph.versions.map(({ versionId, workerVersionUid, weight }) => ({
+          versionId,
+          workerVersionUid,
+          weight,
+        })),
+      };
+      ownOperationBusy = true;
+      expect(await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000))).toEqual({
+        kind: "unknown",
+      });
+      expect(
+        await host.warmNamespaceForAcceptedOperation(
+          scope,
+          {
+            graph: warmGraph,
+            realization: warmRealization,
+            expected: warmExpected,
+            stillAuthorized: async () => false,
+          },
+          AbortSignal.timeout(5_000),
+        ),
+      ).toEqual({ kind: "unknown" });
+      expect(
+        await access(childPidFile).then(
+          () => true,
+          () => false,
+        ),
+      ).toBe(false);
+      expect(
+        await host.warmNamespaceForAcceptedOperation(
+          scope,
+          {
+            graph: warmGraph,
+            realization: warmRealization,
+            expected: { ...warmExpected, incarnationId: "foreign-incarnation" },
+            stillAuthorized: async () => true,
+          },
+          AbortSignal.timeout(5_000),
+        ),
+      ).toEqual({ kind: "unknown" });
+      expect(
+        await access(childPidFile).then(
+          () => true,
+          () => false,
+        ),
+      ).toBe(false);
+      expect(
+        await host.warmNamespaceForAcceptedOperation(
+          scope,
+          {
+            graph: warmGraph,
+            realization: warmRealization,
+            expected: warmExpected,
+            stillAuthorized: async () => {
+              // The held lease is revoked after native spawn but before readback.
+              return !(await access(childPidFile).then(
+                () => true,
+                () => false,
+              ));
+            },
+          },
+          AbortSignal.timeout(10_000),
+        ),
+      ).toEqual({ kind: "unknown" });
+      const failedWarmPid = Number((await readFile(childPidFile, "utf8")).trim());
+      expect(Number.isSafeInteger(failedWarmPid) && failedWarmPid > 0).toBe(true);
+      expect(() => process.kill(failedWarmPid, 0)).toThrow();
+      expect(await host.hasNamespace(scope)).toBe(true);
+      expect(
+        await host.observeNamespaceRuntimeForAcceptedOperation(
+          scope,
+          warmExpected,
+          AbortSignal.timeout(5_000),
+        ),
+      ).toEqual({ kind: "unknown" });
+      await unlink(childPidFile);
+      const warmed = await host.warmNamespaceForAcceptedOperation(
+        scope,
+        {
+          graph: warmGraph,
+          realization: warmRealization,
+          expected: warmExpected,
+          stillAuthorized: async () => ownOperationBusy,
+        },
+        AbortSignal.timeout(10_000),
+      );
+      expect(warmed).toMatchObject({
+        kind: "confirmed",
+        activeActorCount: 0,
+        pendingAlarmCount: 0,
+        openSocketCount: 0,
+      });
+      expect(await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000))).toEqual({
+        kind: "unknown",
+      });
+      const warmedPid = Number((await readFile(childPidFile, "utf8")).trim());
+      expect(warmedPid).not.toBe(failedWarmPid);
+      ownOperationBusy = false;
+      expect(() => process.kill(warmedPid, 0)).not.toThrow();
+      expect(await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000))).toMatchObject({
+        kind: "confirmed",
+        activeActorCount: 0,
+      });
       const identity = { ...scope, id: "actor-one" };
       expect(
         await (await host.fetch(identity, new Request("http://actor.invalid/value"))).json(),
@@ -184,6 +312,7 @@ export class Counter extends Base {
         value: 0,
         version: "one",
       });
+      expect(Number((await readFile(childPidFile, "utf8")).trim())).toBe(warmedPid);
       const initial = await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
       expect(initial).toMatchObject({
         kind: "confirmed",
@@ -204,6 +333,7 @@ export class Counter extends Base {
         { ...scope, id: "actor-two" },
         new Request("http://actor.invalid/stream"),
       );
+      expect(Number((await readFile(childPidFile, "utf8")).trim())).toBe(warmedPid);
       const reader = stream.body?.getReader();
       expect(await reader?.read()).toMatchObject({ done: false });
       const active = await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));

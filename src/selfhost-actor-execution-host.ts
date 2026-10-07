@@ -14,6 +14,7 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import type { ActorResourceGraph, ActorResourceGraphReader } from "./actor-resource-graph.ts";
+import { canonicalJson } from "./json.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
 import {
   type ActorExecutionGraph,
@@ -101,6 +102,14 @@ export interface ActorAcceptedOperationRuntimeTarget {
     readonly workerVersionUid: string;
     readonly weight: number;
   }[];
+}
+
+/** A backend-held, leased candidate for inspection only, never event admission. */
+export interface ActorAcceptedOperationWarmCandidate {
+  readonly graph: ActorExecutionGraph;
+  readonly realization: ActorExecutionRealization;
+  readonly expected: ActorAcceptedOperationRuntimeTarget;
+  readonly stillAuthorized: (signal: AbortSignal) => Promise<boolean>;
 }
 
 /**
@@ -472,7 +481,12 @@ export function createSelfhostActorExecutionHost(options: {
   const activate = async (
     identity: ActorScope,
     signal: AbortSignal,
-  ): Promise<{ readonly session: Session; readonly variantKey: string }> => {
+    warm?: ActorAcceptedOperationWarmCandidate,
+  ): Promise<{
+    readonly session: Session;
+    readonly variantKey: string;
+    readonly observation?: ActorNamespaceRuntimeObservation;
+  }> => {
     if (stopped || !identity.tenantId || !identity.namespaceResourceUid)
       throw new Error("Actor namespace unavailable");
     const key = keyOf(identity.tenantId, identity.namespaceResourceUid);
@@ -489,22 +503,26 @@ export function createSelfhostActorExecutionHost(options: {
       if (stopped || current.revoked || revoked.has(key)) throw new Error("Actor owner stopped");
       if (!(await registeredScope(key, identity)))
         throw new ActorAuthorityUnavailable("Actor namespace is not registered");
-      const graph = await authority.readGraph(identity, signal);
+      if (warm && (current.session || !(await warm.stillAuthorized(signal))))
+        throw new ActorAuthorityUnavailable("Actor warm candidate unavailable");
+      const graph = warm?.graph ?? (await authority.readGraph(identity, signal));
       if (
         !graph ||
         graph.scope.tenantId !== identity.tenantId ||
         graph.scope.namespaceResourceUid !== identity.namespaceResourceUid
       ) {
-        await retire(current);
+        if (!warm) await retire(current);
         throw new ActorAuthorityUnavailable("Actor Resource unavailable");
       }
-      if (!(await authority.hasRealization(graph))) {
+      if (!warm && !(await authority.hasRealization(graph))) {
         await retire(current);
         throw new ActorAuthorityUnavailable("Actor Worker realization unavailable");
       }
-      const realized = await currentRealization(graph, signal);
+      const realized: ActorRealizationRead = warm
+        ? { kind: "ready", realization: warm.realization }
+        : await currentRealization(graph, signal);
       if (realized.kind === "authority_changed") {
-        await retire(current);
+        if (!warm) await retire(current);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
       if (realized.kind !== "ready") {
@@ -514,8 +532,12 @@ export function createSelfhostActorExecutionHost(options: {
       const residentGraph = realization.graph;
       // A publication read cannot confer authority after Resource deletion
       // or deployment replacement during that read.
-      if (!(await authority.stillCurrent(graph, realization, signal))) {
-        await retire(current);
+      if (
+        !(await (warm
+          ? warm.stillAuthorized(signal)
+          : authority.stillCurrent(graph, realization, signal)))
+      ) {
+        if (!warm) await retire(current);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
       signal.throwIfAborted();
@@ -737,6 +759,46 @@ export function createSelfhostActorExecutionHost(options: {
             .catch(() => {});
         });
       }
+      if (warm) {
+        try {
+          signal.throwIfAborted();
+          const candidate = current.session;
+          if (
+            stopped ||
+            !candidate ||
+            candidate.dead ||
+            candidate.retiring ||
+            !(await warm.stillAuthorized(signal))
+          )
+            throw new ActorAuthorityUnavailable("Actor warm candidate changed");
+          // Native startup only; normal readGraph/stillCurrent remains the
+          // sole gate for every application, alarm, and socket invocation.
+          candidate.process.disableAlarmAdmission();
+          const observation = await observeSession(
+            identity,
+            signal,
+            async (session, checkSignal) =>
+              acceptedOperationMatches(
+                session.authorityGraph,
+                session.realization,
+                warm.expected,
+              ) && (await warm.stillAuthorized(checkSignal)),
+          );
+          if (
+            observation.kind !== "confirmed" ||
+            !(await warm.stillAuthorized(signal)) ||
+            current.session !== candidate
+          )
+            throw new ActorAuthorityUnavailable("Actor warm inspection unavailable");
+          return { session: candidate, variantKey: "", observation };
+        } catch (error) {
+          // A failed candidate is not a Resource DELETE. Stop only the child
+          // opened by this warm attempt; registration, ID index and Actor SQL
+          // remain held for a later exact retry.
+          await retire(current);
+          throw error;
+        }
+      }
       // Retirement can wait on an old response stream, and native startup
       // can also yield. A Resource or publication selected before either
       // wait must not be dispatched afterward without another readback.
@@ -853,22 +915,24 @@ export function createSelfhostActorExecutionHost(options: {
   void ready.catch(() => {});
 
   const acceptedOperationMatches = (
-    session: Session,
+    graph: ActorExecutionGraph,
+    realization: ActorExecutionRealization,
     expected: ActorAcceptedOperationRuntimeTarget,
   ): boolean => {
     if (
-      session.authorityGraph.workerUid !== expected.workerUid ||
-      session.authorityGraph.className !== expected.className ||
-      session.graph.workerResourceUid !== expected.workerUid ||
-      session.graph.generationKey !== expected.generationKey ||
+      graph.workerUid !== expected.workerUid ||
+      graph.className !== expected.className ||
+      realization.graph.workerResourceUid !== expected.workerUid ||
+      realization.graph.generationKey !== expected.generationKey ||
+      !realization.script ||
       !expected.sourceOperationId ||
       !expected.incarnationId ||
       !Array.isArray(expected.versions)
     )
       return false;
-    const realization: unknown = JSON.parse(session.realization.authorityKey);
-    if (!realization || typeof realization !== "object" || Array.isArray(realization)) return false;
-    const record = realization as Record<string, unknown>;
+    const parsed: unknown = JSON.parse(realization.authorityKey);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const record = parsed as Record<string, unknown>;
     if (
       Object.keys(record).sort().join(",") !==
         "generationKey,incarnationId,sourceOperationId,versions" ||
@@ -877,12 +941,12 @@ export function createSelfhostActorExecutionHost(options: {
       record.generationKey !== expected.generationKey
     )
       return false;
-    const residentVersions = session.graph.versions.map(
+    const residentVersions = realization.graph.versions.map(
       ({ versionId, workerVersionUid, weight }) => ({ versionId, workerVersionUid, weight }),
     );
     return (
-      JSON.stringify(record.versions) === JSON.stringify(residentVersions) &&
-      JSON.stringify(expected.versions) === JSON.stringify(residentVersions)
+      canonicalJson(record.versions) === canonicalJson(residentVersions) &&
+      canonicalJson(expected.versions) === canonicalJson(residentVersions)
     );
   };
 
@@ -1011,8 +1075,37 @@ export function createSelfhostActorExecutionHost(options: {
       try {
         const captured = structuredClone(expected);
         return observeSession(scope, signal, async (session) =>
-          acceptedOperationMatches(session, captured),
+          acceptedOperationMatches(session.authorityGraph, session.realization, captured),
         );
+      } catch {
+        return { kind: "unknown" };
+      }
+    },
+    /** Initial native readback under a held accepted Operation; never admits an application event. */
+    async warmNamespaceForAcceptedOperation(
+      scope: ActorScope,
+      candidate: ActorAcceptedOperationWarmCandidate,
+      signal: AbortSignal,
+    ): Promise<ActorNamespaceRuntimeObservation> {
+      try {
+        await ready;
+        signal.throwIfAborted();
+        if (stopped || !validScope(scope) || typeof candidate.stillAuthorized !== "function")
+          return { kind: "unknown" };
+        const captured: ActorAcceptedOperationWarmCandidate = {
+          graph: structuredClone(candidate.graph),
+          realization: structuredClone(candidate.realization),
+          expected: structuredClone(candidate.expected),
+          stillAuthorized: candidate.stillAuthorized,
+        };
+        if (
+          captured.graph.scope.tenantId !== scope.tenantId ||
+          captured.graph.scope.namespaceResourceUid !== scope.namespaceResourceUid ||
+          !acceptedOperationMatches(captured.graph, captured.realization, captured.expected)
+        )
+          return { kind: "unknown" };
+        const warmed = await activate({ ...scope }, signal, captured);
+        return warmed.observation ?? { kind: "unknown" };
       } catch {
         return { kind: "unknown" };
       }
@@ -1181,7 +1274,10 @@ export function createSelfhostActorExecutionHost(options: {
       // Capture caller-owned identity before any asynchronous resolution.
       const identity = { ...scope };
       await rememberActorId(identity);
-      const acquired = await activate(identity, request.signal);
+      const acquired = await activate(
+        { tenantId: identity.tenantId, namespaceResourceUid: identity.namespaceResourceUid },
+        request.signal,
+      );
       let released = false;
       const releaseOnce = (): void => {
         if (released) return;
@@ -1261,7 +1357,10 @@ export function createSelfhostActorExecutionHost(options: {
       await ready;
       const identity = { ...scope };
       await rememberActorId(identity);
-      const acquired = await activate(identity, request.signal);
+      const acquired = await activate(
+        { tenantId: identity.tenantId, namespaceResourceUid: identity.namespaceResourceUid },
+        request.signal,
+      );
       let settled = false;
       const finish = (): void => {
         if (settled) return;
