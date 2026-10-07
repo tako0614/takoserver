@@ -35,6 +35,7 @@ CREATE TABLE queue_v2_batch_executions (
   consumer_uid TEXT NOT NULL CHECK (length(consumer_uid) BETWEEN 1 AND 128),
   consumer_generation INTEGER NOT NULL CHECK (consumer_generation BETWEEN 1 AND 9007199254740991),
   worker_uid TEXT NOT NULL CHECK (length(worker_uid) BETWEEN 1 AND 128),
+  consumer_spec_json TEXT NOT NULL CHECK (json_valid(consumer_spec_json)),
   serving_source_operation_id TEXT NOT NULL CHECK (length(serving_source_operation_id) BETWEEN 1 AND 128),
   selected_versions_json TEXT NOT NULL CHECK (json_valid(selected_versions_json)),
   principal TEXT NOT NULL, space TEXT NOT NULL, target_key TEXT NOT NULL,
@@ -112,6 +113,7 @@ WHEN NEW.state <> 'reserved' OR NEW.reservation_until_ms <=
       AND consumer.target_key = NEW.target_key AND consumer.deleted_at IS NULL
       AND consumer.phase = 'idle' AND consumer.busy_operation IS NULL
       AND consumer.generation = consumer.observed_generation
+      AND consumer.spec_json = NEW.consumer_spec_json
       AND op.resource_uid = consumer.uid AND op.status = 'succeeded'
       AND op.effect = 'complete' AND op.accepted_spec_json = consumer.spec_json
       AND json_extract(consumer.observed_json, '$.consumerAttached') = 1
@@ -121,8 +123,11 @@ WHEN NEW.state <> 'reserved' OR NEW.reservation_until_ms <=
       AND custody.consumer_id = consumer.uid AND custody.generation = NEW.consumer_generation
       AND custody.state = 'active'
       AND source_op.status = 'succeeded' AND source_op.effect = 'complete'
-      AND source_op.action IN ('create','update')
-      AND source.deleted_at IS NULL AND source.phase = 'idle'
+      AND ((source_op.action IN ('create','update') AND source.deleted_at IS NULL) OR
+        (source_op.action = 'delete' AND source.form_url =
+          'https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/'
+          AND source.deleted_at IS NOT NULL))
+      AND source.phase = 'idle'
       AND source.busy_operation IS NULL AND source.last_operation = source_op.id
       AND source.generation = source.observed_generation
       AND source.observed_generation = source_op.generation
@@ -133,6 +138,17 @@ WHEN NEW.state <> 'reserved' OR NEW.reservation_until_ms <=
       ) AND source.principal = NEW.principal AND source.space = NEW.space
       AND source.target_key = NEW.target_key
       AND json_extract(source_op.accepted_spec_json, '$.worker.resourceUid') = NEW.worker_uid
+      AND NOT EXISTS (SELECT 1 FROM tf_v2_resources newer
+        JOIN tf_v2_operations newer_op ON newer_op.id = newer.last_operation
+        WHERE newer.form_url IN (
+          'https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/',
+          'https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/'
+        ) AND newer.principal = NEW.principal AND newer.space = NEW.space
+          AND newer.target_key = NEW.target_key AND newer.busy_operation IS NULL
+          AND newer.observed_generation = newer_op.generation
+          AND newer_op.status = 'succeeded' AND newer_op.effect = 'complete'
+          AND json_extract(newer_op.accepted_spec_json, '$.worker.resourceUid') = NEW.worker_uid
+          AND newer_op.acceptance_order > source_op.acceptance_order)
   ) OR EXISTS (SELECT 1 FROM tf_v2_resources competing
     WHERE competing.form_url IN (
       'https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/',
@@ -154,6 +170,7 @@ WHEN OLD.batch_id IS NOT NEW.batch_id OR OLD.reservation_token IS NOT NEW.reserv
   (OLD.lease_token IS NOT NULL AND OLD.lease_token IS NOT NEW.lease_token) OR
   OLD.queue_id IS NOT NEW.queue_id OR OLD.consumer_uid IS NOT NEW.consumer_uid OR
   OLD.consumer_generation IS NOT NEW.consumer_generation OR OLD.worker_uid IS NOT NEW.worker_uid OR
+  OLD.consumer_spec_json IS NOT NEW.consumer_spec_json OR
   OLD.serving_source_operation_id IS NOT NEW.serving_source_operation_id OR
   OLD.selected_versions_json IS NOT NEW.selected_versions_json OR
   OLD.principal IS NOT NEW.principal OR OLD.space IS NOT NEW.space OR
@@ -219,6 +236,7 @@ WHEN NEW.state = 'send_authorized' AND (
     WHERE consumer.uid = OLD.consumer_uid AND consumer.deleted_at IS NULL
       AND consumer.phase = 'idle' AND consumer.busy_operation IS NULL
       AND consumer.generation = consumer.observed_generation
+      AND consumer.spec_json = OLD.consumer_spec_json
       AND custody.consumer_id = consumer.uid AND custody.state = 'active'
       AND custody.generation = OLD.consumer_generation) OR
   NOT EXISTS (SELECT 1 FROM tf_v2_operations source_op
@@ -226,13 +244,28 @@ WHEN NEW.state = 'send_authorized' AND (
     WHERE source_op.id = OLD.serving_source_operation_id
       AND source_op.status = 'succeeded' AND source_op.effect = 'complete'
       AND source_op.principal = OLD.principal AND source_op.target_key = OLD.target_key
-      AND source.deleted_at IS NULL AND source.principal = OLD.principal
+      AND ((source_op.action IN ('create','update') AND source.deleted_at IS NULL) OR
+        (source_op.action = 'delete' AND source.form_url =
+          'https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/'
+          AND source.deleted_at IS NOT NULL))
+      AND source.principal = OLD.principal
       AND source.space = OLD.space AND source.target_key = OLD.target_key
       AND source.phase = 'idle' AND source.busy_operation IS NULL
       AND source.last_operation = source_op.id
       AND source.generation = source.observed_generation
       AND source.observed_generation = source_op.generation
-      AND source.spec_json = source_op.accepted_spec_json) OR
+      AND source.spec_json = source_op.accepted_spec_json
+      AND NOT EXISTS (SELECT 1 FROM tf_v2_resources newer
+        JOIN tf_v2_operations newer_op ON newer_op.id = newer.last_operation
+        WHERE newer.form_url IN (
+          'https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/',
+          'https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/'
+        ) AND newer.principal = OLD.principal AND newer.space = OLD.space
+          AND newer.target_key = OLD.target_key AND newer.busy_operation IS NULL
+          AND newer.observed_generation = newer_op.generation
+          AND newer_op.status = 'succeeded' AND newer_op.effect = 'complete'
+          AND json_extract(newer_op.accepted_spec_json, '$.worker.resourceUid') = OLD.worker_uid
+          AND newer_op.acceptance_order > source_op.acceptance_order)) OR
   EXISTS (SELECT 1 FROM tf_v2_resources competing
     WHERE competing.form_url IN (
       'https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/',

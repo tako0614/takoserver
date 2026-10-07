@@ -1,4 +1,5 @@
 import type { Sql } from "../ports.ts";
+import { createQueueCustody } from "../queue-custody.ts";
 import {
   AT_LEAST_ONCE_QUEUE_FORM_URL,
   type AtLeastOnceQueueSpec,
@@ -137,6 +138,7 @@ export function createQueueConsumerForm(options: {
   readonly capability: V2QueueConsumerCapability;
 }): V2Form {
   const { sql, targetKey, capability } = options;
+  const queueCustody = createQueueCustody({ sql });
   if (!sql || !capability || typeof targetKey !== "string" || !targetKey)
     throw new TypeError("QueueConsumer SQL, target, and capability are required");
 
@@ -295,6 +297,21 @@ export function createQueueConsumerForm(options: {
             [Date.now(), queueId, row.consumer_id, row.generation, ...v2QueueClaimParams(claim)],
           );
           if (begun.changes !== 1) return UNKNOWN;
+        }
+        // Retiring generations cannot enter the normal claim loop. Reap only
+        // their expired exact leases under this accepted Operation's SQL
+        // lease; a send-authorized handler remains untouched until its native
+        // terminal/physical-absence receipt retires the execution.
+        try {
+          await queueCustody.reapRetiredV2({
+            queueId,
+            consumerId: row.consumer_id,
+            generation: row.generation,
+            limit: 32,
+            operationClaim: claim,
+          });
+        } catch {
+          return UNKNOWN;
         }
         const replacementGeneration = row.generation + 1;
         if (!Number.isSafeInteger(replacementGeneration)) return UNKNOWN;

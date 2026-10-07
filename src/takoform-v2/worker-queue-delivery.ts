@@ -784,6 +784,7 @@ export function createV2QueueDelivery(options: {
              AND resource.deleted_at IS NULL AND resource.phase = 'idle'
              AND resource.busy_operation IS NULL
              AND resource.generation = resource.observed_generation
+             AND resource.spec_json = ?
              AND op.status = 'succeeded' AND op.effect = 'complete'
              AND op.accepted_spec_json = resource.spec_json
              AND consumer.consumer_id = resource.uid AND consumer.generation = ?
@@ -795,6 +796,7 @@ export function createV2QueueDelivery(options: {
             identity.space,
             identity.targetKey,
             QUEUE_CONSUMER_FORM_URL,
+            canonicalJson(spec),
             generation,
           ],
         );
@@ -837,9 +839,9 @@ export function createV2QueueDelivery(options: {
         reserved = await sql.run(
           `INSERT INTO queue_v2_batch_executions
            (batch_id,reservation_token,queue_id,consumer_uid,consumer_generation,
-            worker_uid,serving_source_operation_id,selected_versions_json,principal,space,target_key,
+            worker_uid,consumer_spec_json,serving_source_operation_id,selected_versions_json,principal,space,target_key,
             max_concurrency,reserved_at_ms,reservation_until_ms,state)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?, ?,${DB_NOW_MS},${DB_NOW_MS} + 120000,'reserved')`,
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?, ?,${DB_NOW_MS},${DB_NOW_MS} + 120000,'reserved')`,
           [
             batchId,
             reservationToken,
@@ -847,6 +849,7 @@ export function createV2QueueDelivery(options: {
             identity.consumerUid,
             generation,
             spec.worker.resourceUid,
+            canonicalJson(spec),
             sourceOperationId,
             canonicalJson(versions),
             identity.principal,

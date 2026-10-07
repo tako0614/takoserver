@@ -325,7 +325,7 @@ const AUDITED_MIGRATION_SHA256: Readonly<
   "0082_v2_queue_batch_settlements.sql":
     "sha256:9531bcf872272ddbdf370436a906223b15a13471aff7e4466f0b16f134ecdffc",
   "0083_v2_queue_consumer_acceptance.sql":
-    "sha256:b0009351f394a461394b41c37ac1d96a6e9fe9d8a2650591f4bdd1d6bd4734fb",
+    "sha256:14227aaa009b3ac31adb23880fd529518aad8f1e9a1d31480c8a0606e4661cfa",
 };
 // 0067-0083 are part of the exact source inventory only. None has an in-place apply wave.
 const INTEGRATION_APPLY_CEILING_COUNT = 66;

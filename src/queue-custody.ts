@@ -195,6 +195,28 @@ export interface QueueCustody {
     readonly generation: number;
     readonly limit?: number;
   }): Promise<QueueCustodyRetirementStatus>;
+  /** Internal v2 retiring maintenance; every write is batched with the live Operation fence. */
+  reapRetiredV2(input: {
+    readonly queueId: string;
+    readonly consumerId: string;
+    readonly generation: number;
+    readonly limit?: number;
+    readonly operationClaim: {
+      readonly operationId: string;
+      readonly leaseToken: string;
+      readonly resourceUid: string;
+      readonly principal: string;
+      readonly form: string;
+      readonly space: string;
+      readonly name: string;
+      readonly backendId: string;
+      readonly targetKey: string;
+      readonly backendKey: string;
+      readonly action: string;
+      readonly generation: number;
+      readonly specJson: string;
+    };
+  }): Promise<QueueCustodyRetirementStatus>;
   finishRetirement(input: {
     readonly queueId: string;
     readonly consumerId: string;
@@ -207,6 +229,53 @@ export interface QueueCustodyOptions {
   readonly sql: Sql;
   readonly clock?: () => Date;
   readonly randomId?: () => string;
+}
+
+type V2ReapClaim = Parameters<QueueCustody["reapRetiredV2"]>[0]["operationClaim"];
+const V2_REAP_DB_NOW = `(CAST(strftime('%s', 'now') AS INTEGER) * 1000
+  + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))`;
+// This SELECT runs as the first statement of the same atomic Sql.batch as
+// all message/notice writes. A false claim deliberately raises a SQLite
+// malformed-JSON error, rolling the batch back before any custody mutation.
+const V2_REAP_GUARD_SQL = `SELECT CASE WHEN EXISTS (
+  SELECT 1 FROM tf_v2_operations op
+  JOIN tf_v2_resources resource ON resource.uid = op.resource_uid
+  WHERE op.id = ? AND op.lease_token = ? AND op.resource_uid = ?
+    AND op.principal = ? AND op.backend_id = ? AND op.target_key = ?
+    AND op.backend_key = ? AND op.action = ? AND op.generation = ?
+    AND op.accepted_spec_json = ? AND op.status = 'reconciling'
+    AND op.dispatch_possible = 1 AND op.lease_until_ms > ${V2_REAP_DB_NOW}
+    AND resource.uid = ? AND resource.principal = ? AND resource.form_url = ?
+    AND resource.space = ? AND resource.name = ?
+    AND resource.backend_id = ? AND resource.target_key = ?
+    AND resource.generation = op.generation AND resource.spec_json = op.accepted_spec_json
+    AND resource.last_operation = op.id AND resource.busy_operation = op.id
+    AND resource.deleted_at IS NULL
+) THEN 1 ELSE json_extract('{', '$') END AS authorized`;
+
+function v2ReapGuard(claim: V2ReapClaim): SqlStatement {
+  return {
+    sql: V2_REAP_GUARD_SQL,
+    params: [
+      claim.operationId,
+      claim.leaseToken,
+      claim.resourceUid,
+      claim.principal,
+      claim.backendId,
+      claim.targetKey,
+      claim.backendKey,
+      claim.action,
+      claim.generation,
+      claim.specJson,
+      claim.resourceUid,
+      claim.principal,
+      claim.form,
+      claim.space,
+      claim.name,
+      claim.backendId,
+      claim.targetKey,
+    ],
+  };
 }
 
 /**
@@ -453,6 +522,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
     millis: number,
     limit: number,
     v2Execution = false,
+    v2OperationClaim?: V2ReapClaim,
   ): Promise<boolean> => {
     const rows = await sql.query(
       `SELECT message_id, enqueued_at_ms, visible_at_ms, expires_at_ms,
@@ -495,6 +565,9 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       const maxRetries = nonNegativeStoredInteger(row.lease_max_retries);
       const retryDelaySeconds = nonNegativeStoredInteger(row.lease_retry_delay_seconds);
       const target = leaseTargetFromRow(row);
+      // An unconfirmed native handler may still be using this exact message.
+      // Expired delivery time is not proof of handler+waitUntil retirement.
+      if (v2Execution && row.execution_state === "send_authorized") continue;
       const snapshotParams = [
         identity.queueId,
         id,
@@ -626,7 +699,10 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         ),
       );
     }
-    if (statements.length > 0) await sql.batch(statements);
+    if (statements.length > 0)
+      await sql.batch(
+        v2OperationClaim ? [v2ReapGuard(v2OperationClaim), ...statements] : statements,
+      );
     return true;
   };
 
@@ -1066,6 +1142,9 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                    AND execution.queue_id = ? AND execution.consumer_uid = ?
                    AND execution.consumer_generation = ?
                    AND execution.lease_token = ? AND execution.state = 'reserved'
+                   AND EXISTS (SELECT 1 FROM tf_v2_resources attachment
+                     WHERE attachment.uid = execution.consumer_uid
+                       AND attachment.spec_json = execution.consumer_spec_json)
                    AND execution.reservation_until_ms >
                      (CAST(strftime('%s', 'now') AS INTEGER) * 1000
                       + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER)))`
@@ -1698,6 +1777,25 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         "queue custody reap limit",
       );
       await reapExpiredLeases(current, millis, limit);
+      return await retirementStatus(current, millis);
+    },
+
+    async reapRetiredV2(input) {
+      const selected = generationIdentity(input);
+      const current = await readGeneration(selected);
+      if (
+        current?.state !== "retiring" ||
+        current.consumerId !== selected.consumerId ||
+        current.generation !== selected.generation
+      )
+        throw new QueueCustodyConflictError();
+      const millis = now();
+      const limit = positiveInteger(
+        input.limit ?? MAX_REAP_MESSAGES,
+        MAX_REAP_MESSAGES,
+        "queue custody reap limit",
+      );
+      await reapExpiredLeases(current, millis, limit, true, input.operationClaim);
       return await retirementStatus(current, millis);
     },
 

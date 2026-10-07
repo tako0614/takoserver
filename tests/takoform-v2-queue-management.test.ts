@@ -13,6 +13,7 @@ import { QUEUE_CONSUMER_FORM_URL } from "../src/takoform-v2/forms/queue-consumer
 import {
   MODULE_WORKER_FORM_URL,
   WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
@@ -154,6 +155,7 @@ function fixture(databasePath = ":memory:") {
       [MODULE_WORKER_FORM_URL]: worker,
       [WORKER_VERSION_FORM_URL]: version,
       [WORKER_DEPLOYMENT_FORM_URL]: deployment,
+      [WORKER_ENDPOINT_FORM_URL]: deployment,
       [QUEUE_CONSUMER_FORM_URL]: consumer,
     },
   });
@@ -849,6 +851,165 @@ test("a pending Deployment DELETE fences the old source before native Queue send
   }
 });
 
+test("latest settled Endpoint publisher replaces Deployment, including Endpoint DELETE", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "publisher-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "publisher-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "publisher-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "publisher-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "publisher-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId: "publisher-one", body: new Uint8Array([1]) },
+    );
+    const delivery = createV2QueueDelivery({ sql: f.sql, custody, capability: f.capability });
+    const old = await delivery.claimRegisteredBatch({
+      consumerUid: consumer.resourceUid,
+      principal,
+      space,
+      targetKey,
+    });
+    if (old.kind !== "ready") throw new Error("old publisher batch unavailable");
+    const endpoint = await f.create(WORKER_ENDPOINT_FORM_URL, "publisher-endpoint", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    expect(
+      await authorizeV2QueueBatchSend(f.sql, {
+        batchId: old.batchId,
+        reservationToken: old.reservationToken,
+        queueUid: queue.resourceUid,
+        consumerUid: consumer.resourceUid,
+        generation: old.generation,
+        workerUid: worker.resourceUid,
+        servingSourceOperationId: deployment.id,
+        workerVersionUid: version.resourceUid,
+        workerVersionGeneration: 1,
+        incarnationOperationId: "publisher-incarnation",
+      }),
+    ).toBe("unknown");
+    expect(
+      await cancelV2QueueBatchBeforeSend(f.sql, {
+        batchId: old.batchId,
+        reservationToken: old.reservationToken,
+      }),
+    ).toBe(true);
+    const endpointDelete = await f.engine.acceptDelete({
+      principal,
+      key: "publisher-endpoint-delete-key-01",
+      uid: endpoint.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect((await f.engine.runNext())?.status).toBe("succeeded");
+    f.setServingSource(endpointDelete.id);
+    const next = await delivery.claimRegisteredBatch({
+      consumerUid: consumer.resourceUid,
+      principal,
+      space,
+      targetKey,
+    });
+    expect(next.kind).toBe("ready");
+    if (next.kind !== "ready") throw new Error("Endpoint DELETE publisher not accepted");
+    expect(next.servingSourceOperationId).toBe(endpointDelete.id);
+  } finally {
+    f.database.close();
+  }
+});
+
+test("a Consumer batch-size PUT during readiness cannot claim under old settings", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "settings-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "settings-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "settings-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "settings-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const spec = consumerSpec(queue.resourceUid, worker.resourceUid, { maxBatchSize: 10 });
+    const consumer = await f.create(QUEUE_CONSUMER_FORM_URL, "settings-consumer", spec);
+    const custody = createQueueCustody({ sql: f.sql });
+    for (const id of ["settings-one", "settings-two"])
+      await custody.admit(
+        {
+          queueId: v2QueueId(queue.resourceUid),
+          messageRetentionSeconds: 3600,
+          deliveryDelaySeconds: 0,
+        },
+        { messageId: id, body: new Uint8Array([1]) },
+      );
+    let releaseReadiness!: () => void;
+    let signalReadiness!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      releaseReadiness = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      signalReadiness = resolve;
+    });
+    const delivery = createV2QueueDelivery({
+      sql: f.sql,
+      custody: {
+        ...custody,
+        async readiness(input) {
+          signalReadiness();
+          await waiting;
+          return custody.readiness(input);
+        },
+      },
+      capability: f.capability,
+    });
+    const inFlight = delivery.claimRegisteredBatch({
+      consumerUid: consumer.resourceUid,
+      principal,
+      space,
+      targetKey,
+    });
+    await entered;
+    const update = await f.engine.acceptUpdate({
+      principal,
+      key: "settings-consumer-update-key-01",
+      uid: consumer.resourceUid,
+      expectedGeneration: 1,
+      spec: { ...spec, maxBatchSize: 1 },
+    });
+    expect((await f.engine.runNext())?.status).toBe("succeeded");
+    expect((await f.engine.getOperation({ principal, id: update.id })).effect).toBe("complete");
+    releaseReadiness();
+    expect((await inFlight).kind).toBe("unknown");
+    expect(await f.sql.query("SELECT batch_id FROM queue_v2_batch_executions")).toEqual([]);
+    expect(await f.sql.query("SELECT deliveries FROM selfhost_queue_messages")).toEqual([
+      { deliveries: 0 },
+      { deliveries: 0 },
+    ]);
+  } finally {
+    f.database.close();
+  }
+});
+
 test("Consumer DELETE drains a crashed pre-send batch without charging delivery", async () => {
   const f = fixture();
   try {
@@ -911,6 +1072,199 @@ test("Consumer DELETE drains a crashed pre-send batch without charging delivery"
     f.advance(1_000);
     expect((await f.engine.runNext())?.status).toBe("succeeded");
     expect((await f.engine.getOperation({ principal, id: deleted.id })).effect).toBe("complete");
+  } finally {
+    f.database.close();
+  }
+});
+
+test("retiring Consumer reaps only a physically retired expired handler lease", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "retire-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "retire-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "retire-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "retire-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "retire-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId: "retire-message", body: new Uint8Array([9]) },
+    );
+    const delivery = createV2QueueDelivery({ sql: f.sql, custody, capability: f.capability });
+    const batch = await delivery.claimRegisteredBatch({
+      consumerUid: consumer.resourceUid,
+      principal,
+      space,
+      targetKey,
+    });
+    if (batch.kind !== "ready") throw new Error("retiring batch not registered");
+    const execution = {
+      batchId: batch.batchId,
+      reservationToken: batch.reservationToken,
+      queueUid: queue.resourceUid,
+      consumerUid: consumer.resourceUid,
+      generation: batch.generation,
+      workerUid: worker.resourceUid,
+      servingSourceOperationId: deployment.id,
+      workerVersionUid: version.resourceUid,
+      workerVersionGeneration: 1,
+      incarnationOperationId: "retire-incarnation",
+    };
+    expect(await authorizeV2QueueBatchSend(f.sql, execution)).toBe("authorized");
+    // Simulate the actual clock passing the persisted message lease deadline;
+    // no settlement or native handler receipt is manufactured by this write.
+    await f.sql.run("UPDATE selfhost_queue_messages SET lease_expires_at_ms = ?", [Date.now() - 1]);
+    const deleted = await f.engine.acceptDelete({
+      principal,
+      key: "retire-consumer-delete-key-01",
+      uid: consumer.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect((await f.engine.runNext())?.status).toBe("reconciling");
+    expect(await f.sql.query("SELECT lease_token FROM selfhost_queue_messages")).toMatchObject([
+      { lease_token: batch.claims[0]?.leaseToken },
+    ]);
+    expect(
+      await confirmV2QueueBatchRetirement(f.sql, {
+        execution,
+        kind: "incarnation_absent",
+        receiptDigest: "c".repeat(64),
+      }),
+    ).toBe("retired");
+    await expect(
+      custody.reapRetiredV2({
+        queueId: v2QueueId(queue.resourceUid),
+        consumerId: consumer.resourceUid,
+        generation: batch.generation,
+        operationClaim: {
+          operationId: deleted.id,
+          leaseToken: "stale-token",
+          resourceUid: consumer.resourceUid,
+          principal,
+          form: QUEUE_CONSUMER_FORM_URL,
+          space,
+          name: "retire-consumer",
+          backendId: "wrong-backend",
+          targetKey,
+          backendKey: "wrong-key",
+          action: "delete",
+          generation: 2,
+          specJson: JSON.stringify(consumerSpec(queue.resourceUid, worker.resourceUid)),
+        },
+      }),
+    ).rejects.toThrow();
+    expect(await f.sql.query("SELECT lease_token FROM selfhost_queue_messages")).toMatchObject([
+      { lease_token: batch.claims[0]?.leaseToken },
+    ]);
+    f.advance(1_000);
+    expect((await f.engine.runNext())?.status).toBe("succeeded");
+    expect((await f.engine.getOperation({ principal, id: deleted.id })).effect).toBe("complete");
+    expect(await f.sql.query("SELECT lease_token,deliveries FROM selfhost_queue_messages")).toEqual(
+      [{ lease_token: null, deliveries: 1 }],
+    );
+  } finally {
+    f.database.close();
+  }
+});
+
+test("retiring Consumer retains a DLQ wake notice after terminal copy", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "notice-source", {
+      messageRetentionSeconds: 3600,
+    });
+    const dlq = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "notice-target", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "notice-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "notice-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "notice-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "notice-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid, {
+        maxRetries: 0,
+        deadLetterQueue: { resourceUid: dlq.resourceUid },
+      }),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId: "notice-message", body: new Uint8Array([8]) },
+    );
+    const delivery = createV2QueueDelivery({ sql: f.sql, custody, capability: f.capability });
+    const batch = await delivery.claimRegisteredBatch({
+      consumerUid: consumer.resourceUid,
+      principal,
+      space,
+      targetKey,
+    });
+    if (batch.kind !== "ready") throw new Error("DLQ batch not registered");
+    const execution = {
+      batchId: batch.batchId,
+      reservationToken: batch.reservationToken,
+      queueUid: queue.resourceUid,
+      consumerUid: consumer.resourceUid,
+      generation: batch.generation,
+      workerUid: worker.resourceUid,
+      servingSourceOperationId: deployment.id,
+      workerVersionUid: version.resourceUid,
+      workerVersionGeneration: 1,
+      incarnationOperationId: "notice-incarnation",
+    };
+    expect(await authorizeV2QueueBatchSend(f.sql, execution)).toBe("authorized");
+    await f.sql.run("UPDATE selfhost_queue_messages SET lease_expires_at_ms = ?", [Date.now() - 1]);
+    const deleted = await f.engine.acceptDelete({
+      principal,
+      key: "notice-consumer-delete-key-01",
+      uid: consumer.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect((await f.engine.runNext())?.status).toBe("reconciling");
+    expect(
+      await confirmV2QueueBatchRetirement(f.sql, {
+        execution,
+        kind: "incarnation_absent",
+        receiptDigest: "d".repeat(64),
+      }),
+    ).toBe("retired");
+    f.advance(1_000);
+    expect((await f.engine.runNext())?.status).toBe("reconciling");
+    expect(
+      await f.sql.query("SELECT queue_id,message_id FROM selfhost_queue_messages"),
+    ).toMatchObject([{ queue_id: v2QueueId(dlq.resourceUid) }]);
+    expect(
+      await f.sql.query("SELECT target_queue_id,notice_token FROM queue_custody_transfer_notices"),
+    ).toMatchObject([{ target_queue_id: v2QueueId(dlq.resourceUid) }]);
+    expect((await f.engine.getOperation({ principal, id: deleted.id })).status).toBe("reconciling");
   } finally {
     f.database.close();
   }
