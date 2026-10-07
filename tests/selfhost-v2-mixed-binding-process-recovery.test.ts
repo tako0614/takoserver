@@ -569,6 +569,31 @@ export default {
       await remove(database.resourceUid, "database");
       await remove(bundle.resourceUid, "bundle");
       await remove(worker.resourceUid, "worker");
+
+      const routeAfterDelete = await request(
+        resumedHost.port,
+        key.secret,
+        `/__fixture/serve/${worker.resourceUid}/read`,
+      );
+      expect(routeAfterDelete.status).toBe(503);
+
+      const ownerAfterDelete = await ownerState(root, worker.resourceUid);
+      expect(ownerAfterDelete.activeOperationId).toBeNull();
+      expect(childAfter?.processIdentity).not.toBeNull();
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (
+          childAfter?.processIdentity &&
+          (await linuxProcessLiveness(childAfter.processIdentity)) === "stale"
+        ) {
+          break;
+        }
+        await Bun.sleep(10);
+      }
+      expect(
+        childAfter?.processIdentity
+          ? await linuxProcessLiveness(childAfter.processIdentity)
+          : "unknown",
+      ).toBe("stale");
     } finally {
       await second?.kill();
       await first?.kill();
