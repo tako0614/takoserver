@@ -63,7 +63,12 @@ export function createSQLiteWorkerBindingAuthority(options: {
     let spec: ReturnType<typeof parseWorkerVersionSpec>;
     try {
       spec = parseWorkerVersionSpec(JSON.parse(version.spec_json));
-      if (!isReadyWorkerVersionObservation(JSON.parse(version.observed_json), spec.bundle !== null))
+      if (
+        !isReadyWorkerVersionObservation(
+          JSON.parse(version.observed_json),
+          spec.bundle !== undefined,
+        )
+      )
         return null;
     } catch {
       return null;
