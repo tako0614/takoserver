@@ -105,6 +105,7 @@ import {
   readWorkerdActiveActorGraph,
   readWorkerdActiveDeployment,
   readWorkerdSelectedActiveVersion,
+  readWorkerdSelectedPinnedVersionForRecovery,
   V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER,
   V2_SERVICE_BINDING_ORIGINAL_URL_HEADER,
   workerdServiceBindingRouterName,
@@ -2932,10 +2933,14 @@ export async function openWorkerdWorkerRuntimeOwner(
       },
       isReady: () => group.isReady(),
       serviceBindingSocketDirectory: privateSocketDirectoryFor(record.operationId),
-      v2ServiceBindingDispatch: {
-        token: serviceBindingDispatchToken,
-        internalHostname: internalHostname(scriptName(options.workerResourceUid)),
-      },
+      ...(v2ServiceBinding
+        ? {
+            v2ServiceBindingDispatch: {
+              token: serviceBindingDispatchToken,
+              internalHostname: internalHostname(scriptName(options.workerResourceUid)),
+            },
+          }
+        : {}),
       ...(serviceBindingForward
         ? { v2ServiceBindingBrokerSocket: serviceBindingForward.socket }
         : {}),
@@ -3289,6 +3294,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     handle: IncarnationHandle,
     record: IncarnationRecord,
     snapshot: V2WorkerPublicationSnapshot,
+    phase: "pinned" | "active",
   ): Promise<void> => {
     const deployment = snapshot.deployment;
     if (!deployment || !record.identity) {
@@ -3296,11 +3302,26 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
     let basisPoint = 0;
     for (const version of deployment.versions) {
-      const selected = await readWorkerdSelectedActiveVersion(
-        handle.group.runtimeRoot,
-        scriptName(options.workerResourceUid),
-        { expectedWorkerResourceUid: options.workerResourceUid, basisPoint },
-      );
+      const selected =
+        phase === "pinned"
+          ? await readWorkerdSelectedPinnedVersionForRecovery(
+              handle.group.runtimeRoot,
+              scriptName(options.workerResourceUid),
+              {
+                expectedWorkerResourceUid: options.workerResourceUid,
+                expectedGeneration: record.identity.generation,
+                basisPoint,
+              },
+            )
+          : await readWorkerdSelectedActiveVersion(
+              handle.group.runtimeRoot,
+              scriptName(options.workerResourceUid),
+              {
+                expectedWorkerResourceUid: options.workerResourceUid,
+                basisPoint,
+                includeStatic: true,
+              },
+            );
       const expectedVersionId = `v2-${createHash("sha256")
         .update(`${version.uid}\u0000${version.generation}`, "utf8")
         .digest("hex")}`;
@@ -3314,7 +3335,8 @@ export async function openWorkerdWorkerRuntimeOwner(
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       }
       const declared = parseWorkerVersionSpec(version.spec).serviceBindings;
-      const persisted = selected.site.serviceBindings ?? [];
+      const persisted =
+        selected.site.kind === "static" ? [] : (selected.site.serviceBindings ?? []);
       const hasExactPrivateOrdinals = persisted.every(
         (binding, index) => binding.name === workerdVersionServiceBindingName(index, true),
       );
@@ -3435,12 +3457,13 @@ export async function openWorkerdWorkerRuntimeOwner(
     // Recovery removed only the previously proved-dead child's config-declared
     // sockets above. Pin the now-empty directory before recreating its brokers.
     await handle.runtime.preparePrivateServiceBindingSockets();
-    await restoreServiceBindingBrokers(handle, activeRecord, resolution.snapshot);
+    await restoreServiceBindingBrokers(handle, activeRecord, resolution.snapshot, "pinned");
     await updateRecord(activeRecord.operationId, (current) => ({
       ...current,
       configurationRefreshPending: true,
     }));
     const restoredNames = await handle.runtime.restore();
+    await restoreServiceBindingBrokers(handle, activeRecord, resolution.snapshot, "active");
     const nativeProof = await handle.runtime.observeExactPublication?.(
       scriptName(options.workerResourceUid),
       activeRecord.identity,

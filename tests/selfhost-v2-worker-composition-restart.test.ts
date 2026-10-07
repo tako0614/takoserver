@@ -352,9 +352,9 @@ for (const checkpoint of ["retired", "retiring"] as const) {
       expect(served.status).toBe(200);
       const restoredConfigIdentity = await served.text();
       expect(restoredConfigIdentity).toMatch(/^[0-9a-f]{64}$/u);
-      // The accepted graph identity stays exact across Host replacement;
-      // per-process private readiness credentials are not this public digest.
-      expect(restoredConfigIdentity).toBe(firstConfigIdentity);
+      // The accepted SQL graph below stays exact; the private Service dispatch
+      // credential is re-keyed per Host process and changes the rendered config.
+      expect(restoredConfigIdentity).not.toBe(firstConfigIdentity);
       const endpointRead = await request(
         second.port,
         key.secret,

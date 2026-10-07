@@ -5322,6 +5322,42 @@ export async function readWorkerdSelectedActiveVersion(
   script: string,
   options: SelectedActiveVersionOptions & { readonly includeStatic?: boolean },
 ): Promise<WorkerdSelectedActiveVersion<WorkerdSite | WorkerdStaticSite> | null> {
+  return await readWorkerdSelectedVersion(root, script, options, { kind: "active" });
+}
+
+/**
+ * Recovery-only immutable weighted-pointer read. A failed native activation
+ * can clear the active marker while leaving the accepted pointer intact. This
+ * read never claims the Version is serving: its caller must hold owner custody,
+ * compare the accepted SQL graph, then prove native activation separately.
+ */
+export async function readWorkerdSelectedPinnedVersionForRecovery(
+  root: string,
+  script: string,
+  options: SelectedActiveVersionOptions & { readonly expectedGeneration: string },
+): Promise<WorkerdSelectedActiveVersion<WorkerdSite | WorkerdStaticSite> | null> {
+  if (typeof options?.expectedGeneration !== "string" || options.expectedGeneration.length === 0) {
+    throw new Error("unusable worker recovery version options");
+  }
+  return await readWorkerdSelectedVersion(
+    root,
+    script,
+    { ...options, includeStatic: true },
+    {
+      kind: "pinned",
+      expectedGeneration: options.expectedGeneration,
+    },
+  );
+}
+
+async function readWorkerdSelectedVersion(
+  root: string,
+  script: string,
+  options: SelectedActiveVersionOptions & { readonly includeStatic?: boolean },
+  mode:
+    | { readonly kind: "active" }
+    | { readonly kind: "pinned"; readonly expectedGeneration: string },
+): Promise<WorkerdSelectedActiveVersion<WorkerdSite | WorkerdStaticSite> | null> {
   if (!SCRIPT_NAME.test(script)) throw new Error("unusable script name");
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     throw new Error("unusable worker active version options");
@@ -5336,8 +5372,12 @@ export async function readWorkerdSelectedActiveVersion(
   } catch {
     throw new Error("unusable worker active version snapshot");
   }
-  const activeGeneration = before[script];
-  if (typeof activeGeneration !== "string") return null;
+  const beforeMarker = before[script];
+  const expectedGeneration = mode.kind === "active" ? beforeMarker : mode.expectedGeneration;
+  if (typeof expectedGeneration !== "string") return null;
+  if (mode.kind === "pinned" && beforeMarker != null && beforeMarker !== expectedGeneration) {
+    return null;
+  }
 
   const pointerPath = join(scriptsRoot, script, MANIFEST);
   const pointerRaw = await readFile(pointerPath, "utf8").catch((error: unknown) => {
@@ -5359,7 +5399,7 @@ export async function readWorkerdSelectedActiveVersion(
     throw new Error("unusable worker active version snapshot");
   }
   if (
-    deployment.deployment.generation !== activeGeneration ||
+    deployment.deployment.generation !== expectedGeneration ||
     deployment.deployment.workerResourceUid !== expectedWorkerResourceUid
   ) {
     return null;
@@ -5558,7 +5598,9 @@ export async function readWorkerdSelectedActiveVersion(
   });
   if (
     finalPointerRaw === null ||
-    after[script] !== activeGeneration ||
+    (mode.kind === "active"
+      ? after[script] !== expectedGeneration
+      : after[script] !== beforeMarker) ||
     finalPointerRaw !== pointerRaw
   ) {
     return null;

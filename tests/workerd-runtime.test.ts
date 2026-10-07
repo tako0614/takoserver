@@ -27,6 +27,7 @@ import {
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_ORIGIN_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_TOKEN_BINDING,
   WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
+  workerdV2PrivateServiceBindingName,
   workerdV2PrivateWorkflowBindingName,
 } from "../src/providers/workerd-v2-private-binding-names.ts";
 import {
@@ -45,6 +46,7 @@ import {
   ROUTER_SOURCE,
   readWorkerdActiveDeployment,
   readWorkerdSelectedActiveVersion,
+  readWorkerdSelectedPinnedVersionForRecovery,
   V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER,
   V2_SERVICE_BINDING_ORIGINAL_URL_HEADER,
   type WorkerdBinding,
@@ -4227,6 +4229,84 @@ test("reads exactly one selected Version at weighted boundaries", async () => {
     workerResourceUid: "uid-ModuleWorker-site",
     fetchHandler: true,
   });
+});
+
+test("recovery reads only the pinned weighted Version when failed activation cleared its marker", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication is unavailable");
+  await runtime.publish("site", weightedPublication("site", "generation-1"));
+  const marker = join(root, "workers", ".takoserver-active.json");
+  await writeFile(marker, JSON.stringify({ site: null }));
+  const expected = {
+    expectedWorkerResourceUid: "uid-ModuleWorker-site",
+    expectedGeneration: "generation-1",
+    basisPoint: 0,
+  };
+  expect(await readWorkerdSelectedActiveVersion(root, "site", expected)).toBeNull();
+  const pinned = await readWorkerdSelectedPinnedVersionForRecovery(root, "site", expected);
+  expect(pinned).toMatchObject({
+    generation: "generation-1",
+    workerResourceUid: "uid-ModuleWorker-site",
+    workerVersionUid: "uid-WorkerVersion-site-a",
+    versionId: "site-v-a",
+  });
+  expect(
+    await readWorkerdSelectedPinnedVersionForRecovery(root, "site", {
+      ...expected,
+      expectedGeneration: "foreign-generation",
+    }),
+  ).toBeNull();
+  expect(
+    await readWorkerdSelectedPinnedVersionForRecovery(root, "site", {
+      ...expected,
+      expectedWorkerResourceUid: "foreign-worker",
+    }),
+  ).toBeNull();
+  await writeFile(marker, JSON.stringify({ site: "foreign-generation" }));
+  expect(await readWorkerdSelectedPinnedVersionForRecovery(root, "site", expected)).toBeNull();
+});
+
+test("recovery preserves an exact declared private Service binding in pinned Version bytes", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication is unavailable");
+  const binding = {
+    name: workerdV2PrivateServiceBindingName(0),
+    target: "target-worker",
+    targetResourceUid: "uid-ModuleWorker-target",
+    unavailableToken: "a".repeat(64),
+  };
+  const publication = weightedPublication("site", "generation-service");
+  await runtime.publish("site", {
+    ...publication,
+    versions: publication.versions.map((version) => ({
+      ...version,
+      site: {
+        ...version.site,
+        hostModules: [WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE],
+        serviceBindings: [binding],
+      },
+      hostModules: new Map([
+        ...(version.hostModules ?? []),
+        [
+          WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+          new TextEncoder().encode('export { default } from "./index.js";'),
+        ],
+      ]),
+    })),
+  });
+  await writeFile(join(root, "workers", ".takoserver-active.json"), JSON.stringify({ site: null }));
+  const selected = await readWorkerdSelectedPinnedVersionForRecovery(root, "site", {
+    expectedWorkerResourceUid: "uid-ModuleWorker-site",
+    expectedGeneration: "generation-service",
+    basisPoint: 0,
+  });
+  expect(selected?.site.serviceBindings).toEqual([binding]);
+  expect(
+    await readWorkerdSelectedActiveVersion(root, "site", {
+      expectedWorkerResourceUid: "uid-ModuleWorker-site",
+      basisPoint: 0,
+    }),
+  ).toBeNull();
 });
 
 test("reads the fresh active generation and never selects a legacy scalar", async () => {
