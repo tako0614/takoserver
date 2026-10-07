@@ -732,10 +732,10 @@ describe("0061 accepted-authority cutover", () => {
       {
         label: "extra source",
         mutate(directory: string, database: Database) {
-          writeFileSync(join(directory, "0084_rogue.sql"), "-- rogue\n");
+          writeFileSync(join(directory, "0085_rogue.sql"), "-- rogue\n");
           void database;
         },
-        message: "exact audited source inventory 0001-0083",
+        message: "exact audited source inventory 0001-0084",
       },
       {
         label: "rogue predecessor shape",
