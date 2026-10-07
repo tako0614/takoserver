@@ -138,6 +138,7 @@ function exactHost(request: Request, suffix: string): string | undefined {
   const authority = request.headers.get("host");
   if (
     url.protocol !== "https:" ||
+    url.port !== "" ||
     url.username !== "" ||
     url.password !== "" ||
     hostname !== hostname.toLowerCase() ||
@@ -180,14 +181,17 @@ const defaultFactories: SelfhostV2WorkerEndpointHttpsFactories = {
 /**
  * Owns the shared self-host Worker Endpoint TLS listener. Routing remains the
  * adapter's stateless SQL-backed `fetch`; this listener never keeps a parallel
- * route registry. Its witness proves local TLS listener state only, while the
- * adapter separately proves accepted SQL routes and native owner state.
+ * route registry. Its deletion witness requires the adapter's exact route
+ * denial plus drained matching-host response bodies and current local TLS/SNI.
+ * The adapter separately proves accepted SQL and native owner state.
  */
 export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
   readonly configuration: SelfhostV2WorkerEndpointHttpsConfiguration;
   readonly certificateChain: string;
   readonly privateKey: string;
   readonly fetch: (request: Request) => Promise<Response | null>;
+  /** Same stateless SQL decision used by the frontend request dispatcher. */
+  readonly routeDenies: (address: WorkerEndpointAddress) => Promise<boolean>;
   readonly factories?: SelfhostV2WorkerEndpointHttpsFactories;
 }): Promise<SelfhostV2WorkerEndpointHttpsListener> {
   const suffix = canonicalSuffix(input.configuration.workerEndpointSuffix);
@@ -199,7 +203,70 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
   let active = false;
   let closed = false;
   let server: ListenerServer;
+  const inFlightByHostname = new Map<string, number>();
   const listenerCurrent = () => active && !closed && server.port === HTTPS_PORT;
+  const inFlightCount = (hostname: string) => inFlightByHostname.get(hostname) ?? 0;
+  const beginRequest = (hostname: string) => {
+    inFlightByHostname.set(hostname, inFlightCount(hostname) + 1);
+  };
+  const finishRequest = (hostname: string) => {
+    const remaining = inFlightCount(hostname) - 1;
+    if (remaining <= 0) inFlightByHostname.delete(hostname);
+    else inFlightByHostname.set(hostname, remaining);
+  };
+
+  function trackResponseBody(response: Response, hostname: string): Response {
+    const body = response.body;
+    if (!body) {
+      finishRequest(hostname);
+      return response;
+    }
+    const reader = body.getReader();
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      finishRequest(hostname);
+    };
+    const trackedBody = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          try {
+            const chunk = await reader.read();
+            if (chunk.done) {
+              controller.close();
+              finish();
+              reader.releaseLock();
+            } else {
+              controller.enqueue(chunk.value);
+            }
+          } catch (error) {
+            // An errored read is not a proof that the native response source
+            // stopped. Keep the request counted unless cancellation confirms it.
+            controller.error(error);
+            try {
+              await reader.cancel(error);
+              finish();
+              reader.releaseLock();
+            } catch {
+              // Fail closed: route retirement remains blocked by this reader.
+            }
+          }
+        },
+        async cancel(reason) {
+          await reader.cancel(reason);
+          finish();
+          reader.releaseLock();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    return new Response(trackedBody, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  }
 
   server = factories.serve({
     port: HTTPS_PORT,
@@ -207,12 +274,18 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
     tls: { cert: input.certificateChain, key: input.privateKey },
     fetch: async (request) => {
       if (!listenerCurrent()) return new Response(null, { status: 503, headers: NO_STORE_HEADERS });
-      if (!exactHost(request, suffix))
-        return new Response(null, { status: 404, headers: NO_STORE_HEADERS });
+      const hostname = exactHost(request, suffix);
+      if (!hostname) return new Response(null, { status: 404, headers: NO_STORE_HEADERS });
+      beginRequest(hostname);
       try {
         const response = await input.fetch(request);
-        return response ?? new Response(null, { status: 404, headers: NO_STORE_HEADERS });
+        if (!response) {
+          finishRequest(hostname);
+          return new Response(null, { status: 404, headers: NO_STORE_HEADERS });
+        }
+        return trackResponseBody(response, hostname);
       } catch {
+        finishRequest(hostname);
         return new Response(null, { status: 503, headers: NO_STORE_HEADERS });
       }
     },
@@ -285,7 +358,24 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
       },
       async observeRouteAbsent(address: WorkerEndpointAddress) {
         const exact = validAddress(address, suffix);
-        const absent = exact ? await proveCurrent(exact) : false;
+        let absent = false;
+        if (exact && listenerCurrent() && inFlightCount(exact.hostname) === 0) {
+          try {
+            const deniedBeforeProof = await input.routeDenies(exact);
+            if (deniedBeforeProof === true && inFlightCount(exact.hostname) === 0) {
+              const tlsCurrent = await proveCurrent(exact);
+              if (tlsCurrent && inFlightCount(exact.hostname) === 0) {
+                const deniedAfterProof = await input.routeDenies(exact);
+                absent =
+                  deniedAfterProof === true &&
+                  inFlightCount(exact.hostname) === 0 &&
+                  listenerCurrent();
+              }
+            }
+          } catch {
+            absent = false;
+          }
+        }
         return { ...(exact ?? address), absent };
       },
     }),

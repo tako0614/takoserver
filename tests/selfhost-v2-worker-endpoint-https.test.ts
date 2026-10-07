@@ -60,14 +60,18 @@ async function createLoopbackListener(input: {
   readonly certificateChain: string;
   readonly privateKey: string;
   readonly fetch: (request: Request) => Promise<Response | null>;
+  readonly routeDenies: (address: V2WorkerEndpointAddress) => Promise<boolean>;
+  readonly onSni?: (hostname: string) => void;
 }) {
   let loopbackPort: number | undefined;
+  let listenerFetch: ((request: Request) => Response | Promise<Response>) | undefined;
   const sniNames: string[] = [];
   const listener = await createSelfhostV2WorkerEndpointHttpsListener({
     configuration: { workerEndpointSuffix: suffix, port: 443 },
     ...input,
     factories: {
       serve(options) {
+        listenerFetch = options.fetch;
         const server = Bun.serve({ ...options, port: 0, hostname: "127.0.0.1" });
         loopbackPort = server.port;
         // Tests remap the required logical 443 to an OS-selected loopback port.
@@ -76,6 +80,7 @@ async function createLoopbackListener(input: {
       async proveSni(probe) {
         if (loopbackPort === undefined) throw new Error("test listener was not created");
         sniNames.push(probe.hostname);
+        input.onSni?.(probe.hostname);
         await verifySelfhostV2WorkerEndpointHttpsSni({
           ...probe,
           host: "127.0.0.1",
@@ -85,7 +90,8 @@ async function createLoopbackListener(input: {
     },
   });
   if (loopbackPort === undefined) throw new Error("test listener was not created");
-  return { listener, port: loopbackPort, sniNames };
+  if (!listenerFetch) throw new Error("listener fetch was not installed");
+  return { listener, port: loopbackPort, sniNames, listenerFetch };
 }
 
 function get(port: number, host: string, path = "/"): Promise<{ status: number; body: string }> {
@@ -115,8 +121,10 @@ function get(port: number, host: string, path = "/"): Promise<{ status: number; 
 test("V2 Worker Endpoint HTTPS serves exact suffix hosts and witnesses current local SNI", async () => {
   const fixture = await certificateFixture();
   let dispatched = 0;
+  let routeDenied = false;
   const { listener, port, sniNames } = await createLoopbackListener({
     ...fixture,
+    routeDenies: async () => routeDenied,
     fetch: async (request) => {
       dispatched++;
       expect(new URL(request.url).hostname).toBe(address.hostname);
@@ -134,6 +142,7 @@ test("V2 Worker Endpoint HTTPS serves exact suffix hosts and witnesses current l
       body: "served:/hello",
     });
     expect(dispatched).toBe(1);
+    routeDenied = true;
     await expect(listener.witness.observeRouteAbsent(address)).resolves.toEqual({
       ...address,
       absent: true,
@@ -156,6 +165,7 @@ test("witness rejects a noncanonical or foreign Endpoint address", async () => {
   const fixture = await certificateFixture();
   const { listener, port, sniNames } = await createLoopbackListener({
     ...fixture,
+    routeDenies: async () => true,
     fetch: async () => new Response("unexpected"),
   });
   try {
@@ -180,6 +190,153 @@ test("witness rejects a noncanonical or foreign Endpoint address", async () => {
   }
 });
 
+test("route absence requires a denied route and fully drained matching-host response bodies", async () => {
+  const fixture = await certificateFixture();
+  let routeDenied = false;
+  let dispatched = 0;
+  let closeBody: (() => void) | undefined;
+  const { listener, listenerFetch } = await createLoopbackListener({
+    ...fixture,
+    routeDenies: async () => routeDenied,
+    fetch: async () => {
+      dispatched++;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("stream-open"));
+            closeBody = () => controller.close();
+          },
+        }),
+      );
+    },
+  });
+  try {
+    const response = await listenerFetch(
+      new Request(`https://${address.hostname}/stream`, { headers: { host: address.hostname } }),
+    );
+    expect(response.status).toBe(200);
+    expect(dispatched).toBe(1);
+    await expect(listener.witness.observeRouteAbsent(address)).resolves.toMatchObject({
+      absent: false,
+    });
+
+    routeDenied = true;
+    await expect(listener.witness.observeRouteAbsent(address)).resolves.toMatchObject({
+      absent: false,
+    });
+    const reading = response.text();
+    await Promise.resolve();
+    await expect(listener.witness.observeRouteAbsent(address)).resolves.toMatchObject({
+      absent: false,
+    });
+
+    closeBody?.();
+    await expect(reading).resolves.toBe("stream-open");
+    await expect(listener.witness.observeRouteAbsent(address)).resolves.toEqual({
+      ...address,
+      absent: true,
+    });
+  } finally {
+    await listener.close(true);
+    await fixture.cleanup();
+  }
+});
+
+test("route absence is rechecked after awaited SNI proof and rejects non-default request ports", async () => {
+  const fixture = await certificateFixture();
+  let routeChecks = 0;
+  let routeDenied = true;
+  let dispatched = 0;
+  const { listener, listenerFetch } = await createLoopbackListener({
+    ...fixture,
+    routeDenies: async () => {
+      routeChecks++;
+      return routeDenied;
+    },
+    onSni(hostname) {
+      if (hostname === address.hostname) routeDenied = false;
+    },
+    fetch: async () => {
+      dispatched++;
+      return new Response("unexpected");
+    },
+  });
+  try {
+    await expect(listener.witness.observeRouteAbsent(address)).resolves.toMatchObject({
+      absent: false,
+    });
+    expect(routeChecks).toBe(2);
+
+    const nonDefaultPort = await listenerFetch(
+      new Request(`https://${address.hostname}:444/`, { headers: { host: address.hostname } }),
+    );
+    expect(nonDefaultPort.status).toBe(404);
+    expect(dispatched).toBe(0);
+  } finally {
+    await listener.close(true);
+    await fixture.cleanup();
+  }
+});
+
+test("a matching-host body cancellation is awaited before route absence can be witnessed", async () => {
+  const fixture = await certificateFixture();
+  let beginSourceCancel: (() => void) | undefined;
+  let finishSourceCancel: (() => void) | undefined;
+  const sourceCancelStarted = new Promise<void>((resolve) => {
+    beginSourceCancel = resolve;
+  });
+  const sourceCancelGate = new Promise<void>((resolve) => {
+    finishSourceCancel = resolve;
+  });
+  let sourceCancelCompleted = false;
+  const { listener, listenerFetch } = await createLoopbackListener({
+    ...fixture,
+    routeDenies: async () => true,
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            controller.enqueue(new TextEncoder().encode("streaming"));
+          },
+          async cancel() {
+            beginSourceCancel?.();
+            await sourceCancelGate;
+            sourceCancelCompleted = true;
+          },
+        }),
+      ),
+  });
+  try {
+    const response = await listenerFetch(
+      new Request(`https://${address.hostname}/cancel`, { headers: { host: address.hostname } }),
+    );
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const first = await reader?.read();
+    expect(new TextDecoder().decode(first?.value)).toBe("streaming");
+    await expect(listener.witness.observeRouteAbsent(address)).resolves.toMatchObject({
+      absent: false,
+    });
+
+    const cancelling = reader?.cancel("client disconnected");
+    await sourceCancelStarted;
+    await expect(listener.witness.observeRouteAbsent(address)).resolves.toMatchObject({
+      absent: false,
+    });
+    expect(sourceCancelCompleted).toBe(false);
+    finishSourceCancel?.();
+    await cancelling;
+    expect(sourceCancelCompleted).toBe(true);
+    await expect(listener.witness.observeRouteAbsent(address)).resolves.toEqual({
+      ...address,
+      absent: true,
+    });
+  } finally {
+    await listener.close(true);
+    await fixture.cleanup();
+  }
+});
+
 test("listener rejects noncanonical suffix and validates matching wildcard cert before binding", async () => {
   const fixture = await certificateFixture();
   const wrongWildcard = await certificateFixture("DNS:*.unrelated.example.test");
@@ -196,6 +353,7 @@ test("listener rejects noncanonical suffix and validates matching wildcard cert 
       createSelfhostV2WorkerEndpointHttpsListener({
         configuration: { workerEndpointSuffix: "Workers.example.test", port: 443 },
         ...fixture,
+        routeDenies: async () => true,
         fetch: async () => null,
         factories,
       }),
@@ -205,6 +363,7 @@ test("listener rejects noncanonical suffix and validates matching wildcard cert 
         configuration: { workerEndpointSuffix: suffix, port: 443 },
         certificateChain: wrongWildcard.certificateChain,
         privateKey: wrongWildcard.privateKey,
+        routeDenies: async () => true,
         fetch: async () => null,
         factories,
       }),
@@ -214,6 +373,7 @@ test("listener rejects noncanonical suffix and validates matching wildcard cert 
         configuration: { workerEndpointSuffix: suffix, port: 443 },
         certificateChain: fixture.certificateChain,
         privateKey: "not a private key",
+        routeDenies: async () => true,
         fetch: async () => null,
         factories,
       }),
