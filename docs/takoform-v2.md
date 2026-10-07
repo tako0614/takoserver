@@ -663,6 +663,14 @@ same-match redelivery, a non-equivalent schedule update and delete/drain. That
 evidence is not native workerd ABI, normal application Form registration,
 Hosted scheduled delivery or production readiness.
 
+A separate pinned-workerd journey uses the same internal composition and
+organization-authenticated Host API to create a scheduled Worker graph and Cron
+Attachment, replay its create, deliver a match through `pollScheduledDue`, update
+to a different expression, and delete in reference order. It also confirms that
+closing an in-flight delivery keeps its late native result unknown in SQL.
+Those native ABI tests run within one Host process; they do not replace the
+stand-in process-restart test or qualify native delivery after an OS restart.
+
 The normal Bun entry now also constructs the v2 UID-owner composition against
 its canonical SQL, object store, clock and selected workerd binary. Before its
 public listener opens, it reopens only private owner directories explained by
