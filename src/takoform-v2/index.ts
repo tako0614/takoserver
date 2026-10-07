@@ -40,6 +40,10 @@ export type {
   V2ReferenceRequirement,
 } from "./types.ts";
 export {
+  inspectV2WorkerCodeVersionEligibility,
+  type V2WorkerModuleInspector,
+} from "./worker-code-runtime.ts";
+export {
   createV2WorkerInvocationLifecycle,
   type V2WorkerInvocationAdmission,
   type V2WorkerInvocationCustody,

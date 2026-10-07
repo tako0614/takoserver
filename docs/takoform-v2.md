@@ -474,6 +474,43 @@ against a hostile local binder. OS-child tests qualify the process lifecycle,
 not native workerd ABI readiness, Host-process restart recovery, or a complete
 public Worker deletion. The primitive is not registered in the normal runtime.
 
+## Code Version and scheduled delivery composition
+
+The internal code WorkerVersion backend requires a semantic module inspector.
+It validates held Bundle bytes and the exact declared/exported handler set,
+without publishing a Deployment or granting event delivery. The software
+extension exports the same `inspectV2WorkerCodeVersionEligibility` check and
+`V2WorkerModuleInspector` port for private execution adapters. It does not ship
+a native runtime or qualify an inspector supplied by the embedding Host.
+Unsupported resource Bindings, secrets and queue delivery remain explicit
+refusals in this code projection, not claims of complete WorkerVersion support.
+
+The internal WorkerCronTrigger backend and scheduler use the published
+WorkerCronTrigger 0.3.0 contract. Admission seals the exact Worker, target and
+selected Deployment/Versions. Deployment changes must keep every selected
+Version eligible for `scheduled` delivery while an attachment exists.
+Migration `0080` stores matches before invocation and fences attachment changes
+against concurrent Deployment acceptance; adding it to source does not permit
+a live D1 migration.
+
+Each scheduler call processes at most 128 attachment candidates for one target
+and current UTC minute, then attempts a bounded batch of pending deliveries.
+It persists the minute and keyset cursor, and returns `hasMore`/`scanComplete`.
+The embedding scheduler must continue `hasMore` calls within that same minute
+under its qualified capacity. A minute rollover skips unrecorded old-minute
+matches; it does not catch up. Recorded matches retain their stable identity
+across restart and unknown acknowledgements. Explicit handler rejection is
+terminal for that match, while an unknown result may be delivered again.
+
+The owner projects a private, incarnation-bound scheduled-event capability
+before publication. Delivery checks the current serving graph and does not use
+an HTTP response as proof that `waitUntil` work has retired. The integration
+journey uses actual Host HTTP, persistent SQLite, SIGKILL and a new Host PID,
+and executes the verified held JavaScript module in a Bun stand-in. It checks
+same-match redelivery, a non-equivalent schedule update and delete/drain. That
+evidence is not native workerd ABI, normal application Form registration,
+Hosted scheduled delivery or production readiness.
+
 ## Existing installations
 
 The additive v2 tables do not convert or delete existing v1 records. Preserving

@@ -35,6 +35,11 @@ export type V2WorkerCodeVersionIdentity = {
 
 export type V2WorkerCodeDeploymentVariant = WorkerdDeploymentVariant<WorkerdSite>;
 
+/** Evaluate exact module bytes in the owning runtime, never the control plane. */
+export type V2WorkerModuleInspector = (
+  input: WorkerModuleInspectionInput,
+) => Promise<WorkerModuleInspectionResult>;
+
 export type V2WorkerCodeRuntimeErrorCode =
   | "worker_version_unavailable"
   | "worker_bundle_unavailable"
@@ -72,7 +77,7 @@ export async function inspectV2WorkerCodeVersionEligibility(input: {
   readonly spec: unknown;
   readonly bundle: SqlArtifactCustodyRead<WorkerBundleManifest> | null;
   readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
-  readonly inspectModule: WorkerdRuntime["inspectModule"];
+  readonly inspectModule: V2WorkerModuleInspector;
   readonly privateInputs?: unknown;
 }): Promise<void> {
   await verifyV2WorkerCodeEligibility(input);
