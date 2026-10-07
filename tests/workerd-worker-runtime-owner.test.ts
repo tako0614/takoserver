@@ -1446,7 +1446,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
           configurationSha256: string | null;
         }>;
       };
-      expect(finalState.schema).toBe("takoserver.v2-worker-runtime-owner@8");
+      expect(finalState.schema).toBe("takoserver.v2-worker-runtime-owner@9");
       expect(
         finalState.incarnations.every(
           (record) =>
@@ -1459,6 +1459,14 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
       ).toBe(true);
       expect(owned.children).toHaveLength(1);
       await reopened.close();
+
+      const previousV8 = JSON.parse(await Bun.file(statePath).text()) as Record<string, unknown>;
+      previousV8.schema = "takoserver.v2-worker-runtime-owner@8";
+      delete previousV8.suspended;
+      delete previousV8.physicalAbsences;
+      await writeFile(statePath, `${JSON.stringify(previousV8)}\n`, { mode: 0o600 });
+      const migratedV8 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+      await migratedV8.close();
 
       await cp(backup, join(groupRoot, "workers"), { recursive: true, force: true });
       expect(await pathExists(scriptCopy)).toBe(true);
@@ -1475,6 +1483,8 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
       };
       previousV2.schema = "takoserver.v2-worker-runtime-owner@2";
       delete (previousV2 as Record<string, unknown>).endpointRouteAbsence;
+      delete (previousV2 as Record<string, unknown>).suspended;
+      delete (previousV2 as Record<string, unknown>).physicalAbsences;
       for (const record of previousV2.incarnations) {
         delete record.executionCopiesReleased;
         delete record.executionCopiesCleanupStarted;
@@ -1489,7 +1499,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
       const migratedV2 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
       await migratedV2.close();
       expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
-        "takoserver.v2-worker-runtime-owner@8",
+        "takoserver.v2-worker-runtime-owner@9",
       );
 
       const previousV7 = JSON.parse(await Bun.file(statePath).text()) as {
@@ -1497,6 +1507,8 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         incarnations: Array<Record<string, unknown>>;
       };
       previousV7.schema = "takoserver.v2-worker-runtime-owner@7";
+      delete (previousV7 as Record<string, unknown>).suspended;
+      delete (previousV7 as Record<string, unknown>).physicalAbsences;
       await writeFile(statePath, `${JSON.stringify(previousV7)}\n`, { mode: 0o600 });
       await expect(openWorkerdWorkerRuntimeOwner(ownerOptions)).rejects.toMatchObject({
         code: "ownership_uncertain",
@@ -1580,7 +1592,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
       const migratedV1 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
       await migratedV1.close();
       expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
-        "takoserver.v2-worker-runtime-owner@8",
+        "takoserver.v2-worker-runtime-owner@9",
       );
       expect(owned.children).toHaveLength(1);
     } finally {

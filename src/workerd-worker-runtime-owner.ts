@@ -93,7 +93,8 @@ const CLEANUP_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@4";
 const ROUTE_RECEIPT_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@5";
 const PROCESS_PIN_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@6";
 const EVENTLESS_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@7";
-const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@8";
+const EVENT_TOKEN_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@8";
+const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@9";
 const LOCK_SCHEMA = "takoserver.v2-worker-runtime-owner-lock@2";
 const OPERATION_MARKER = "takoserver-v2-operation:";
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -159,7 +160,20 @@ interface PersistedOwnerState {
   readonly deletionPublicationConfirmed: boolean;
   /** Latest exact no-active-Deployment Endpoint absence proof in this owner record. */
   readonly endpointRouteAbsence: V2WorkerEndpointRouteAbsentResult | null;
+  /** A normal Host stop keeps custody but has no serving child or admission. */
+  readonly suspended: boolean;
+  /** Exact physical executions proved absent before a replacement PID is recorded. */
+  readonly physicalAbsences: readonly PhysicalIncarnationAbsence[];
   readonly incarnations: readonly IncarnationRecord[];
+}
+
+interface PhysicalIncarnationAbsence {
+  readonly operationId: string;
+  readonly incarnationId: string;
+  readonly processIdentity: LinuxProcessIdentity;
+  readonly listenerPort: number;
+  readonly configurationSha256: string;
+  readonly receiptDigest: string;
 }
 
 interface ActiveInvocation {
@@ -245,6 +259,21 @@ export interface WorkerdWorkerRuntimeOwner {
     readonly incarnationId: string;
     readonly servingSourceOperationId: string;
   }): ReturnType<WorkerdWorkerRuntimeOwner["observeVersionTarget"]>;
+  /** Exact old physical Queue execution absence, never a logical Operation completion. */
+  observeQueuePhysicalAbsence(input: {
+    readonly workerUid: string;
+    readonly incarnationId: string;
+    readonly servingSourceOperationId: string;
+  }): Promise<
+    | {
+        readonly kind: "confirmed_absent";
+        readonly workerUid: string;
+        readonly incarnationId: string;
+        readonly servingSourceOperationId: string;
+        readonly receiptDigest: string;
+      }
+    | { readonly kind: "unknown" }
+  >;
   /** Prove absence only after the exact active inventory or all retired receipts. */
   observeRetirement(input: { readonly workerVersionUid?: string }): Promise<
     | {
@@ -352,6 +381,8 @@ export interface WorkerdWorkerRuntimeOwner {
   }): ReturnType<WorkerdWorkerRuntimeOwner["observeScheduledCapability"]>;
   /** Release the owner lock only after every known incarnation has a durable receipt. */
   close(): Promise<void>;
+  /** Host-private graceful stop: no DELETE, no retirement receipt, no lost custody. */
+  suspend(): Promise<void>;
 }
 
 export interface OpenWorkerdWorkerRuntimeOwnerOptions {
@@ -1018,7 +1049,7 @@ async function acquireOwnerLock(
     if (previous === null) {
       if (remainingClaims !== 0) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       const snapshot = await readOwnerStateSnapshot(statePath, workerResourceUid);
-      await requireSafeStateForNewOwner(snapshot, false);
+      await requireSafeStateForNewOwner(snapshot, false, snapshot.state.suspended);
       const created = await createOwnerLock(lockPath, directory);
       if (created) return created;
       continue;
@@ -1169,6 +1200,46 @@ function uidKey(uid: string): string {
   return createHash("sha256").update(uid, "utf8").digest("hex");
 }
 
+function physicalIncarnationId(operationId: string, identity: LinuxProcessIdentity): string {
+  const bytes = createHash("sha256")
+    .update("takoserver.v2-worker-physical-incarnation@1\0")
+    .update(
+      JSON.stringify([
+        operationId,
+        identity.pid,
+        identity.bootId,
+        identity.pidNamespace,
+        identity.startTimeTicks,
+      ]),
+    )
+    .digest();
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x50;
+  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+  const hex = bytes.subarray(0, 16).toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function physicalAbsenceDigest(input: Omit<PhysicalIncarnationAbsence, "receiptDigest">): string {
+  return createHash("sha256")
+    .update("takoserver.v2-worker-physical-absence@1\0")
+    .update(canonicalJson(input))
+    .digest("hex");
+}
+
+function physicalAbsenceFor(record: IncarnationRecord): PhysicalIncarnationAbsence {
+  if (!record.processIdentity || !record.configurationSha256) {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
+  const fields = {
+    operationId: record.operationId,
+    incarnationId: physicalIncarnationId(record.operationId, record.processIdentity),
+    processIdentity: record.processIdentity,
+    listenerPort: record.listenerPort,
+    configurationSha256: record.configurationSha256,
+  };
+  return { ...fields, receiptDigest: physicalAbsenceDigest(fields) };
+}
+
 function validateOperationId(value: string): void {
   if (!OPERATION_ID.test(value)) throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
 }
@@ -1197,6 +1268,8 @@ function emptyState(workerResourceUid: string): PersistedOwnerState {
     admissionClosedBy: null,
     deletionPublicationConfirmed: false,
     endpointRouteAbsence: null,
+    suspended: false,
+    physicalAbsences: [],
     incarnations: [],
   };
 }
@@ -1305,7 +1378,8 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
     const routeReceiptState = state.schema === ROUTE_RECEIPT_STATE_SCHEMA;
     const processPinState = state.schema === PROCESS_PIN_STATE_SCHEMA;
     const eventlessState = state.schema === EVENTLESS_STATE_SCHEMA;
-    const currentState = state.schema === STATE_SCHEMA;
+    const currentState = state.schema === STATE_SCHEMA || state.schema === EVENT_TOKEN_STATE_SCHEMA;
+    const suspendState = state.schema === STATE_SCHEMA;
     if (
       (!legacyStaticState &&
         !previousState &&
@@ -1325,7 +1399,10 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
             validEndpointRouteAbsence(state.endpointRouteAbsence)
           )
         : state.endpointRouteAbsence !== undefined) ||
-      !Array.isArray(state.incarnations)
+      !Array.isArray(state.incarnations) ||
+      (suspendState
+        ? typeof state.suspended !== "boolean" || !Array.isArray(state.physicalAbsences)
+        : state.suspended !== undefined || state.physicalAbsences !== undefined)
     ) {
       throw new Error();
     }
@@ -1442,6 +1519,41 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         eventToken: currentState ? (item.eventToken as string | null) : null,
       } as unknown as IncarnationRecord);
     }
+    const physicalAbsences: PhysicalIncarnationAbsence[] = [];
+    if (suspendState) {
+      const seen = new Set<string>();
+      for (const raw of state.physicalAbsences as unknown[]) {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error();
+        const item = raw as Record<string, unknown>;
+        if (
+          Object.keys(item).sort().join(",") !==
+            "configurationSha256,incarnationId,listenerPort,operationId,processIdentity,receiptDigest" ||
+          typeof item.operationId !== "string" ||
+          !OPERATION_ID.test(item.operationId) ||
+          typeof item.incarnationId !== "string" ||
+          !OPERATION_ID.test(item.incarnationId) ||
+          !validLinuxProcessIdentityRecord(item.processIdentity) ||
+          !Number.isSafeInteger(item.listenerPort) ||
+          typeof item.configurationSha256 !== "string" ||
+          !/^[0-9a-f]{64}$/u.test(item.configurationSha256) ||
+          typeof item.receiptDigest !== "string" ||
+          !/^[0-9a-f]{64}$/u.test(item.receiptDigest) ||
+          seen.has(item.incarnationId) ||
+          !incarnations.some((record) => record.operationId === item.operationId) ||
+          physicalIncarnationId(item.operationId, item.processIdentity) !== item.incarnationId ||
+          physicalAbsenceDigest({
+            operationId: item.operationId,
+            incarnationId: item.incarnationId,
+            processIdentity: item.processIdentity,
+            listenerPort: item.listenerPort as number,
+            configurationSha256: item.configurationSha256,
+          }) !== item.receiptDigest
+        )
+          throw new Error();
+        seen.add(item.incarnationId);
+        physicalAbsences.push(item as unknown as PhysicalIncarnationAbsence);
+      }
+    }
     const result: PersistedOwnerState = {
       schema: STATE_SCHEMA,
       workerResourceUid,
@@ -1452,11 +1564,14 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         routeReceiptState || processPinState || eventlessState || currentState
           ? (state.endpointRouteAbsence as V2EndpointRouteAbsentReceipt | null)
           : null,
+      suspended: suspendState ? (state.suspended as boolean) : false,
+      physicalAbsences,
       incarnations,
     };
     const activeRecords = incarnations.filter((item) => item.status === "active");
     if (
       (state.admissionClosedBy === null && state.deletionPublicationConfirmed) ||
+      (result.suspended && !recoverableIncarnationSet(result)) ||
       (state.deletionPublicationConfirmed &&
         (state.activeOperationId !== null ||
           incarnations.some(
@@ -1626,7 +1741,17 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                         ({ eventToken: _eventToken, ...item }) => item,
                       ),
                     }
-                  : result;
+                  : state.schema === EVENT_TOKEN_STATE_SCHEMA
+                    ? {
+                        schema: EVENT_TOKEN_STATE_SCHEMA,
+                        workerResourceUid: result.workerResourceUid,
+                        activeOperationId: result.activeOperationId,
+                        admissionClosedBy: result.admissionClosedBy,
+                        deletionPublicationConfirmed: result.deletionPublicationConfirmed,
+                        endpointRouteAbsence: result.endpointRouteAbsence,
+                        incarnations: result.incarnations,
+                      }
+                    : result;
     if (canonicalJson(canonicalState) !== text) throw new Error();
     return result;
   } catch {
@@ -1810,14 +1935,15 @@ export async function openWorkerdWorkerRuntimeOwner(
       (state.endpointRouteAbsence !== null &&
         state.endpointRouteAbsence.targetKey !== options.targetKey) ||
       (hasServingIncarnations &&
-        (!ownerLock.recoveredFromStaleOwner || !recoverableIncarnationSet(state))) ||
+        (!(ownerLock.recoveredFromStaleOwner || state.suspended) ||
+          !recoverableIncarnationSet(state))) ||
       state.incarnations.some(
         (item) =>
           item.status !== "retired" &&
           !(
             ((item.status === "retiring" || item.status === "uncertain") &&
               item.retirementOperationId !== null) ||
-            (ownerLock.recoveredFromStaleOwner &&
+            ((ownerLock.recoveredFromStaleOwner || state.suspended) &&
               (item.status === "active" || item.status === "draining"))
           ),
       )
@@ -1837,6 +1963,7 @@ export async function openWorkerdWorkerRuntimeOwner(
   let admissionClosedBy = state.admissionClosedBy;
   let serial: Promise<void> = Promise.resolve();
   let closed = false;
+  let suspending = false;
 
   const stateWriter = createSerializedWorkerdOwnerStateWriter(state, async (next) => {
     const sorted = [...next.incarnations].sort((left, right) =>
@@ -1852,13 +1979,58 @@ export async function openWorkerdWorkerRuntimeOwner(
   });
   const transitionState = stateWriter.transition;
 
+  const persistPhysicalAbsence = async (record: IncarnationRecord): Promise<void> => {
+    if (
+      !record.processIdentity ||
+      (await linuxProcessLiveness(record.processIdentity)) !== "stale" ||
+      (await workerPortOwnership(record.listenerPort, undefined)) !== "vacant"
+    )
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const receipt = physicalAbsenceFor(record);
+    await transitionState((current) => {
+      const existing = current.physicalAbsences.find(
+        (item) => item.incarnationId === receipt.incarnationId,
+      );
+      if (existing && canonicalJson(existing) !== canonicalJson(receipt))
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      return existing
+        ? current
+        : { ...current, physicalAbsences: [...current.physicalAbsences, receipt] };
+    });
+  };
+
+  const persistPhysicalAbsences = async (suspended: boolean): Promise<void> => {
+    if (!recoverableIncarnationSet(state))
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    await requireStaleIncarnationChildrenAndVacantListeners(state);
+    const nextAbsences = [...state.physicalAbsences];
+    for (const record of state.incarnations) {
+      if (
+        record.status !== "active" &&
+        record.status !== "draining" &&
+        record.status !== "retiring"
+      )
+        continue;
+      const receipt = physicalAbsenceFor(record);
+      const prior = nextAbsences.find((item) => item.incarnationId === receipt.incarnationId);
+      if (prior && canonicalJson(prior) !== canonicalJson(receipt))
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      if (!prior) nextAbsences.push(receipt);
+    }
+    await transitionState((current) => ({
+      ...current,
+      suspended,
+      physicalAbsences: nextAbsences,
+    }));
+  };
+
   // Retired receipts outlive their publisher process. Retry physical-copy
   // cleanup under this owner's lock before exposing any replay/observation API.
   // A still-active successor finishes its retiring predecessor only after the
   // exact current SQL graph is resolved below; do not mistake it for a
   // standalone completed retirement here.
   const recoveringActive =
-    ownerLock.recoveredFromStaleOwner &&
+    (ownerLock.recoveredFromStaleOwner || state.suspended) &&
     state.incarnations.some((item) => item.status === "active");
   try {
     for (const record of [...state.incarnations]) {
@@ -1895,6 +2067,9 @@ export async function openWorkerdWorkerRuntimeOwner(
               verified.copies.generationKeys.length !== 0))
         ) {
           throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        }
+        if (record.status === "retiring" && record.processIdentity) {
+          await persistPhysicalAbsence(record);
         }
         const snapshot = await transitionState((current) => ({
           ...current,
@@ -2047,6 +2222,7 @@ export async function openWorkerdWorkerRuntimeOwner(
           workerResourceUid: options.workerResourceUid,
           operationId,
         });
+        await persistPhysicalAbsence(incarnation.record);
         const verified = await verifyRetiredWorkerdWorkerExecutionCopies({
           groupDirectory: incarnation.group.runtimeRoot,
           workerResourceUid: options.workerResourceUid,
@@ -2359,6 +2535,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     ) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
+    await persistPhysicalAbsence(record);
     const groupDirectory = groupDirectoryFor(record);
     const operationId = record.retirementOperationId;
     if (record.executionCopiesCleanupStarted) {
@@ -2452,6 +2629,9 @@ export async function openWorkerdWorkerRuntimeOwner(
   };
 
   const recoverActiveIncarnation = async (): Promise<void> => {
+    // An old Queue grant may remain send-authorized. Record exact physical
+    // absence before restore can replace the active record's process identity.
+    await persistPhysicalAbsences(state.suspended);
     const currentServing = options.publicationState.resolveCurrentServing;
     const activeRecord = state.incarnations.find(
       (record) => record.operationId === state.activeOperationId && record.status === "active",
@@ -2554,6 +2734,9 @@ export async function openWorkerdWorkerRuntimeOwner(
     if (!(await resolution.stillCurrent())) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
+    if (state.suspended) {
+      await transitionState((current) => ({ ...current, suspended: false }));
+    }
     recoveringGroup = null;
   };
 
@@ -2607,6 +2790,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     // metadata pointer inside that non-listening group is not a live route.
     if (
       closed ||
+      suspending ||
       active !== null ||
       state.activeOperationId !== null ||
       state.incarnations.some(
@@ -2726,7 +2910,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
     return runSerial(async () => {
       const execution = captured;
-      if (closed) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      if (closed || suspending) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       validateOperationId(execution.operationId);
       if (
         (execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
@@ -2855,6 +3039,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       const unknown = { kind: "unknown" } as const;
       if (
         closed ||
+        suspending ||
         input.workerResourceUid !== options.workerResourceUid ||
         input.targetKey !== options.targetKey ||
         admissionClosedBy !== null
@@ -2899,6 +3084,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       const current = recordFor(operationId);
       if (
         closed ||
+        suspending ||
         admissionClosedBy !== null ||
         active !== incarnation ||
         state.activeOperationId !== operationId ||
@@ -2934,19 +3120,22 @@ export async function openWorkerdWorkerRuntimeOwner(
       incarnationId: input.incarnationId,
       servingSourceOperationId: input.servingSourceOperationId,
     };
+    const operationId = requireEventToken ? target.servingSourceOperationId : target.incarnationId;
     return runSerial(async () => {
       const unknown = { kind: "unknown" } as const;
       if (
         closed ||
+        suspending ||
         admissionClosedBy !== null ||
         target.workerUid !== options.workerResourceUid ||
         !OPERATION_ID.test(target.incarnationId) ||
-        target.servingSourceOperationId !== target.incarnationId
+        !OPERATION_ID.test(operationId) ||
+        target.servingSourceOperationId !== operationId
       ) {
         return unknown;
       }
-      const incarnation = handles.get(target.incarnationId);
-      const record = recordFor(target.incarnationId);
+      const incarnation = handles.get(operationId);
+      const record = recordFor(operationId);
       const identity = record?.identity;
       if (
         !incarnation ||
@@ -2957,19 +3146,21 @@ export async function openWorkerdWorkerRuntimeOwner(
         record.executionCopiesReleased ||
         (requireEventToken && !record.eventToken) ||
         !record.processIdentity ||
+        (requireEventToken &&
+          physicalIncarnationId(operationId, record.processIdentity) !== target.incarnationId) ||
         !record.configurationSha256 ||
         record.configurationRefreshPending ||
         record.configurationSha256 !== incarnation.group.configurationSha256 ||
         canonicalJson(incarnation.record) !== canonicalJson(record) ||
         !identity ||
         identity.workerResourceUid !== options.workerResourceUid ||
-        identity.generation !== expectedOperationMarker(target.incarnationId) ||
+        identity.generation !== expectedOperationMarker(operationId) ||
         !identity.versions.some((version) => version.versionId === target.versionId) ||
         !incarnation.group.isReady() ||
         (record.status === "active"
-          ? active !== incarnation || state.activeOperationId !== target.incarnationId
+          ? active !== incarnation || state.activeOperationId !== operationId
           : active === incarnation ||
-            state.activeOperationId === target.incarnationId ||
+            state.activeOperationId === operationId ||
             record.retireAtMs === null ||
             record.retireAtMs <= Date.now())
       ) {
@@ -2991,19 +3182,20 @@ export async function openWorkerdWorkerRuntimeOwner(
       ) {
         return unknown;
       }
-      const latest = recordFor(target.incarnationId);
+      const latest = recordFor(operationId);
       if (
         closed ||
+        suspending ||
         admissionClosedBy !== null ||
-        handles.get(target.incarnationId) !== incarnation ||
+        handles.get(operationId) !== incarnation ||
         !latest ||
         canonicalJson(latest) !== canonicalJson(record) ||
         canonicalJson(incarnation.record) !== canonicalJson(record) ||
         !incarnation.group.isReady() ||
         (record.status === "active"
-          ? active !== incarnation || state.activeOperationId !== target.incarnationId
+          ? active !== incarnation || state.activeOperationId !== operationId
           : active === incarnation ||
-            state.activeOperationId === target.incarnationId ||
+            state.activeOperationId === operationId ||
             record.retireAtMs === null ||
             record.retireAtMs <= Date.now())
       ) {
@@ -3023,11 +3215,38 @@ export async function openWorkerdWorkerRuntimeOwner(
     observeVersionTargetCore(input, false);
   const observeQueueTarget: WorkerdWorkerRuntimeOwner["observeQueueTarget"] = (input) =>
     observeVersionTargetCore(input, true);
+  const observeQueuePhysicalAbsence: WorkerdWorkerRuntimeOwner["observeQueuePhysicalAbsence"] = (
+    input,
+  ) =>
+    runSerial(async () => {
+      const unknown = { kind: "unknown" } as const;
+      if (
+        closed ||
+        input.workerUid !== options.workerResourceUid ||
+        !OPERATION_ID.test(input.incarnationId) ||
+        !OPERATION_ID.test(input.servingSourceOperationId)
+      )
+        return unknown;
+      const receipt = state.physicalAbsences.find(
+        (item) =>
+          item.incarnationId === input.incarnationId &&
+          item.operationId === input.servingSourceOperationId,
+      );
+      if (!receipt || (await linuxProcessLiveness(receipt.processIdentity)) !== "stale")
+        return unknown;
+      return {
+        kind: "confirmed_absent",
+        workerUid: input.workerUid,
+        incarnationId: input.incarnationId,
+        servingSourceOperationId: input.servingSourceOperationId,
+        receiptDigest: receipt.receiptDigest,
+      };
+    });
 
   const observeRetirement: WorkerdWorkerRuntimeOwner["observeRetirement"] = (input) =>
     runSerial(async () => {
       const unknown = { kind: "unknown" } as const;
-      if (closed || (input.workerVersionUid !== undefined && !input.workerVersionUid))
+      if (closed || suspending || (input.workerVersionUid !== undefined && !input.workerVersionUid))
         return unknown;
       const servingIncarnation = active;
       const operationIds: string[] = [];
@@ -3294,7 +3513,7 @@ export async function openWorkerdWorkerRuntimeOwner(
   }
 
   const fetchRequest = async (request: Request): Promise<Response> => {
-    if (closed) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    if (closed || suspending) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     if (admissionClosedBy !== null || !active)
       throw new WorkerdWorkerRuntimeOwnerError("admission_closed");
     const incarnation = active;
@@ -3333,6 +3552,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       const operationId = state.activeOperationId;
       if (
         closed ||
+        suspending ||
         admissionClosedBy !== null ||
         !source ||
         !incarnation ||
@@ -3394,6 +3614,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         await runSerial(async () => {
           if (
             closed ||
+            suspending ||
             admissionClosedBy !== null ||
             active !== incarnation ||
             state.activeOperationId !== operationId ||
@@ -3474,6 +3695,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         const operationId = state.activeOperationId;
         if (
           closed ||
+          suspending ||
           admissionClosedBy !== null ||
           !source ||
           !queueBinding ||
@@ -3561,6 +3783,12 @@ export async function openWorkerdWorkerRuntimeOwner(
           return unknown;
         let basisPoint = 0;
         for (const version of identity.versions) {
+          const bindingIdentity = {
+            workerUid: requested.workerUid,
+            versionId: version.versionId,
+            incarnationId: operationId,
+            servingSourceOperationId: operationId,
+          };
           const selected = await readWorkerdSelectedActiveVersion(
             incarnation.group.runtimeRoot,
             scriptName(requested.workerUid),
@@ -3578,11 +3806,7 @@ export async function openWorkerdWorkerRuntimeOwner(
             selected.site.queueSettlement.vars.length !== 1 ||
             selected.site.queueSettlement.vars[0]?.name !== V2_QUEUE_SETTLEMENT_TOKEN_BINDING ||
             selected.site.queueSettlement.vars[0]?.value !==
-              queueBinding.bindingToken({
-                workerUid: requested.workerUid,
-                versionId: version.versionId,
-                incarnationId: operationId,
-              })
+              queueBinding.bindingToken(bindingIdentity)
           )
             return unknown;
           basisPoint += version.weight;
@@ -3615,6 +3839,7 @@ export async function openWorkerdWorkerRuntimeOwner(
           await runSerial(async () => {
             if (
               closed ||
+              suspending ||
               admissionClosedBy !== null ||
               active !== incarnation ||
               state.activeOperationId !== operationId ||
@@ -3746,7 +3971,12 @@ export async function openWorkerdWorkerRuntimeOwner(
       return unknown;
     const source = options.publicationState.resolveCurrentServing;
     const admitted = await runSerial(async () => {
-      if (closed || admissionClosedBy !== null || !(await stillCurrent().catch(() => false)))
+      if (
+        closed ||
+        suspending ||
+        admissionClosedBy !== null ||
+        !(await stillCurrent().catch(() => false))
+      )
         return null;
       const incarnation = active;
       const operationId = state.activeOperationId;
@@ -3845,6 +4075,12 @@ export async function openWorkerdWorkerRuntimeOwner(
         scriptName(batch.workerUid),
         { expectedWorkerResourceUid: batch.workerUid, basisPoint },
       ).catch(() => null);
+      const bindingIdentity = {
+        workerUid: batch.workerUid,
+        versionId: selected.versionId,
+        incarnationId: operationId,
+        servingSourceOperationId: operationId,
+      };
       if (
         !selectedGraph ||
         selectedGraph.versionId !== selected.versionId ||
@@ -3857,17 +4093,14 @@ export async function openWorkerdWorkerRuntimeOwner(
         selectedGraph.site.queueSettlement.vars.length !== 1 ||
         selectedGraph.site.queueSettlement.vars[0]?.name !== V2_QUEUE_SETTLEMENT_TOKEN_BINDING ||
         selectedGraph.site.queueSettlement.vars[0]?.value !==
-          queueBinding.bindingToken({
-            workerUid: batch.workerUid,
-            versionId: selected.versionId,
-            incarnationId: operationId,
-          })
+          queueBinding.bindingToken(bindingIdentity)
       )
         return null;
+      const physicalId = physicalIncarnationId(operationId, record.processIdentity);
       const target = {
         workerVersionUid: version.workerVersionUid,
         workerVersionGeneration: version.generation,
-        incarnationOperationId: operationId,
+        incarnationOperationId: physicalId,
       };
       let event: ReturnType<typeof selfhostV2QueueEvent>;
       try {
@@ -3890,7 +4123,7 @@ export async function openWorkerdWorkerRuntimeOwner(
               messageId: claim.messageId,
               workerUid: batch.workerUid,
               versionId: selected.versionId,
-              incarnationId: operationId,
+              incarnationId: physicalId,
               servingSourceOperationId: operationId,
               consumerUid: batch.consumerUid,
               queueUid: batch.queueUid,
@@ -3983,7 +4216,7 @@ export async function openWorkerdWorkerRuntimeOwner(
           incarnationId: admitted.target.incarnationOperationId,
           servingSourceOperationId: batch.servingSourceOperationId,
         },
-        false,
+        true,
       );
       if (native.kind !== "confirmed") return unknown;
       const receiptDigest = createHash("sha256")
@@ -4025,7 +4258,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     const source = options.publicationState.resolveCurrentServing;
     if (!source) return unknown;
     const admitted = await runSerial(async () => {
-      if (closed || admissionClosedBy !== null) return null;
+      if (closed || suspending || admissionClosedBy !== null) return null;
       const incarnation = active;
       const operationId = state.activeOperationId;
       if (
@@ -4101,6 +4334,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       }
       if (
         closed ||
+        suspending ||
         admissionClosedBy !== null ||
         active !== incarnation ||
         state.activeOperationId !== operationId ||
@@ -4162,6 +4396,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       return await runSerial(async () => {
         if (
           closed ||
+          suspending ||
           admitted.invocation.abort.signal.aborted ||
           admissionClosedBy !== null ||
           active !== admitted.incarnation ||
@@ -4185,6 +4420,7 @@ export async function openWorkerdWorkerRuntimeOwner(
   const close = async (): Promise<void> => {
     await runSerial(async () => {
       if (closed) return;
+      if (suspending) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       if (
         state.incarnations.some(
           (item) =>
@@ -4200,10 +4436,39 @@ export async function openWorkerdWorkerRuntimeOwner(
     });
   };
 
+  const suspend = async (): Promise<void> => {
+    if (closed || suspending) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    // This is a terminal operation on this owner object. Freeze new admission
+    // synchronously, even while an earlier serialized publication is settling.
+    suspending = true;
+    await runSerial(async () => {
+      try {
+        if (!recoverableIncarnationSet(state))
+          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        for (const handle of handles.values()) {
+          handle.retirementTimer?.();
+          await cancelInvocations(handle);
+        }
+        for (const handle of handles.values()) {
+          if (handle.record.status === "active" || handle.record.status === "draining") {
+            await handle.group.suspendRetainingCustody();
+          }
+        }
+        await persistPhysicalAbsences(true);
+        await releaseOwnerLock(lockPath, directory, ownerLock);
+        closed = true;
+      } catch {
+        // A failed stop, vacancy probe, or durable write never releases the
+        // successor lock. The object stays admission-closed for this Host.
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+    });
+  };
+
   const initial: PersistedOwnerState = state;
   if (!initial.incarnations.length) await transitionState((current) => current);
   if (
-    ownerLock.recoveredFromStaleOwner &&
+    (ownerLock.recoveredFromStaleOwner || state.suspended) &&
     state.incarnations.some((item) => item.status === "active")
   ) {
     try {
@@ -4224,9 +4489,9 @@ export async function openWorkerdWorkerRuntimeOwner(
         handles.delete(operationId);
         active = null;
       }
-      // An active record can never be reopened through the no-lock path. Keep
-      // this successor lock (and its PID fingerprint) even when failure was
-      // transient; a later Host may retry only after this PID is proven stale.
+      // A failed recovery is not a completed graceful suspend. Keep this
+      // successor lock even when failure was transient; another Host may
+      // retry only after this PID is proven stale.
       await retainOwnerLockAfterFailure(ownerLock);
       if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
@@ -4240,6 +4505,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     observeServing,
     observeVersionTarget,
     observeQueueTarget,
+    observeQueuePhysicalAbsence,
     observeRetirement,
     fetch: fetchRequest,
     observeScheduledCapability,
@@ -4247,5 +4513,6 @@ export async function openWorkerdWorkerRuntimeOwner(
     invokeQueue,
     invokeScheduled,
     close,
+    suspend,
   });
 }

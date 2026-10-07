@@ -30,6 +30,38 @@ async function nativeVersionId(operationId: string, generation: number): Promise
   return `v2-${(await bytesDigest(seed)).slice("sha256:".length)}`;
 }
 
+async function physicalIncarnationId(root: string, operationId: string): Promise<string> {
+  const workerKey = createHash("sha256").update(WORKER_UID).digest("hex");
+  const state = JSON.parse(
+    await Bun.file(join(root, "owners", workerKey, "runtime-owner.json")).text(),
+  ) as {
+    incarnations: Array<{
+      operationId: string;
+      processIdentity: Parameters<typeof linuxProcessLiveness>[0] | null;
+    }>;
+  };
+  const processIdentity = state.incarnations.find(
+    (item) => item.operationId === operationId,
+  )?.processIdentity;
+  if (!processIdentity) throw new Error("persisted exact process identity missing");
+  const bytes = createHash("sha256")
+    .update("takoserver.v2-worker-physical-incarnation@1\0")
+    .update(
+      JSON.stringify([
+        operationId,
+        processIdentity.pid,
+        processIdentity.bootId,
+        processIdentity.pidNamespace,
+        processIdentity.startTimeTicks,
+      ]),
+    )
+    .digest();
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x50;
+  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+  const hex = bytes.subarray(0, 16).toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 afterAll(async () => {
   // Flush FileHandle finalizers here, rather than letting a later unrelated
   // test discover that a fixture swallowed an owner.close() refusal.
@@ -293,17 +325,24 @@ test("Queue target observation confirms only the exact live active or draining n
     const oldTarget = {
       workerUid: WORKER_UID,
       versionId: await nativeVersionId(CREATE_ID, 1),
-      incarnationId: CREATE_ID,
+      incarnationId: await physicalIncarnationId(root, CREATE_ID),
       servingSourceOperationId: CREATE_ID,
     };
+    expect(
+      await owner.observeVersionTarget({ ...oldTarget, incarnationId: CREATE_ID }),
+    ).toMatchObject({ kind: "confirmed" });
     expect(await owner.observeQueueTarget(oldTarget)).toEqual({
       kind: "confirmed",
       ...oldTarget,
       status: "active",
     });
-    expect(await owner.observeVersionTarget(oldTarget)).toEqual({
+    expect(await owner.observeQueueTarget({ ...oldTarget, incarnationId: CREATE_ID })).toEqual({
+      kind: "unknown",
+    });
+    expect(await owner.observeVersionTarget({ ...oldTarget, incarnationId: CREATE_ID })).toEqual({
       kind: "confirmed",
       ...oldTarget,
+      incarnationId: CREATE_ID,
       status: "active",
     });
     const mutableTarget = { ...oldTarget };
@@ -365,7 +404,7 @@ test("Queue target observation confirms only the exact live active or draining n
     const newTarget = {
       workerUid: WORKER_UID,
       versionId: await nativeVersionId(UPDATE_ID, 2),
-      incarnationId: UPDATE_ID,
+      incarnationId: await physicalIncarnationId(root, UPDATE_ID),
       servingSourceOperationId: UPDATE_ID,
     };
     expect(await owner.observeQueueTarget(newTarget)).toEqual({
@@ -426,7 +465,7 @@ test("Queue target observation refuses a live child that lost its listener and a
     const target = {
       workerUid: WORKER_UID,
       versionId: await nativeVersionId(CREATE_ID, 1),
-      incarnationId: CREATE_ID,
+      incarnationId: await physicalIncarnationId(root, CREATE_ID),
       servingSourceOperationId: CREATE_ID,
     };
     expect(await owner.observeQueueTarget(target)).toMatchObject({
