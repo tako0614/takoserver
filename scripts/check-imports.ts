@@ -180,6 +180,8 @@ const LAYERS: readonly Layer[] = [
       "v2-runtime",
       "v2-private",
       "v2-code-validation",
+      "v2-selfhost-queue-worker-capability",
+      "v2-queue-manager",
     ],
   },
   {
