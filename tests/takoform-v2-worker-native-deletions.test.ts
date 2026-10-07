@@ -16,6 +16,7 @@ import {
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { createV2Store } from "../src/takoform-v2/store.ts";
 import type { V2Execution } from "../src/takoform-v2/types.ts";
+import { createV2WorkerInvocationLifecycle } from "../src/takoform-v2/worker-invocation-custody.ts";
 import { createV2NativeDeletionCustody } from "../src/takoform-v2/worker-native-deletions.ts";
 import { createV2NativeEffectCustody } from "../src/takoform-v2/worker-native-effects.ts";
 
@@ -296,6 +297,64 @@ test("confirmed source stages, one DELETE grant persists across reopen, and lost
   }
 });
 
+test("native DELETE remains blocked by a sent invocation until exact no-dispatch proof", async () => {
+  const f = await fixture();
+  try {
+    expect(await f.custody.stageNext(f.execution)).toBe("more");
+    expect(await f.custody.stageNext(f.execution)).toBe("ready");
+    const item = await f.custody.next(f.execution);
+    if (!item) throw new Error("missing native deletion item");
+    for (const [uid, form] of [
+      ["inv-worker", "ModuleWorker/0.3.0"],
+      ["inv-deployment", "WorkerDeployment/0.4.0"],
+      ["inv-endpoint", "WorkerEndpoint/0.3.0"],
+    ] as const) {
+      await f.sql.run(
+        `INSERT INTO tf_v2_resources
+         (uid, principal, form_url, space, name, backend_id, target_key,
+          active_name, generation, observed_generation, phase, spec_json, last_operation)
+         VALUES (?, 'org-a', ?, 'production', ?, 'fixture-version-backend',
+          'target-a', ?, 1, 1, 'idle', '{}', ?)`,
+        [uid, `https://edge.forms.takoform.com/forms/${form}/`, uid, uid, f.source.operationId],
+      );
+    }
+    const invocation = {
+      invocationId: "native-delete-guard-invocation",
+      custodyToken: "native-delete-guard-token",
+    };
+    await f.sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+       (invocation_id, custody_token, backend_id, target_key, principal, space,
+        worker_uid, deployment_uid, deployment_generation, source_operation_id,
+        endpoint_uid, endpoint_generation, version_uid, version_generation,
+        version_operation_id, native_identity, closure_digest, confirmed_receipt,
+        admitted_at_ms)
+       VALUES (?, ?, 'fixture-version-backend', 'target-a', 'org-a', 'production',
+        'inv-worker', 'inv-deployment', 1, ?, 'inv-endpoint', 1, ?, 1, ?, ?, ?,
+        'etag-upload', 1000)`,
+      [
+        invocation.invocationId,
+        invocation.custodyToken,
+        f.source.operationId,
+        f.source.resourceUid,
+        f.source.operationId,
+        nativeIdentity,
+        digest,
+      ],
+    );
+    const lifecycle = createV2WorkerInvocationLifecycle({
+      sql: f.sql,
+      now: () => new Date(2000),
+    });
+    expect(await lifecycle.beginSend(invocation)).toBe(true);
+    expect(await f.custody.grant(item, "etag-upload")).toBe("unknown");
+    expect(await lifecycle.confirmNoNativeDispatch(invocation)).toBe(true);
+    expect(await f.custody.grant(item, "etag-upload")).toBe("granted");
+  } finally {
+    f.close();
+  }
+});
+
 test("historical reused script identity deletes the latest source once and accounts for every old grant", async () => {
   const f = await fixture(true, true, false, true);
   try {
@@ -480,7 +539,7 @@ test("stale DELETE claim cannot stage or send a script", async () => {
   }
 });
 
-test("local D1 applies 0079 and rejects an unclaimed native DELETE item", async () => {
+test("local D1 applies 0084 and rejects an unclaimed native DELETE item", async () => {
   const runtime = new Miniflare({
     workers: [
       {
@@ -514,6 +573,7 @@ test("local D1 applies 0079 and rejects an unclaimed native DELETE item", async 
         "0077_v2_operation_acceptance_order.sql",
         "0078_v2_worker_invocation_retirement.sql",
         "0079_v2_worker_native_deletions.sql",
+        "0084_v2_worker_invocation_no_native_dispatch.sql",
       ].includes(name),
     )) {
       for (const statement of splitMigration(migration.sql))

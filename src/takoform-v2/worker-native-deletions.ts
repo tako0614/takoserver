@@ -145,6 +145,7 @@ const UNSAFE = `EXISTS (SELECT 1 FROM tf_v2_resource_references ref
   OR EXISTS (SELECT 1 FROM tf_v2_worker_invocations invocation
     WHERE invocation.version_uid = op.resource_uid
       AND invocation.phase <> 'pre_effect_refused'
+      AND invocation.no_native_dispatch_at_ms IS NULL
       AND (invocation.retired_at_ms IS NULL OR invocation.retirement_receipt_digest IS NULL))
   OR EXISTS (SELECT 1 FROM tf_v2_operations source
     WHERE source.resource_uid = op.resource_uid AND source.action IN ('create','update')
