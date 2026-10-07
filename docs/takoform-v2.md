@@ -778,6 +778,28 @@ WebSocket upgrade, active same-spec update counts, and first active creation.
 These internal paths do not register or advertise ActorNamespace Form support,
 or establish Hosted or ordinary-entry qualification.
 
+An Actor Binding may target a Namespace whose class is provided by a different
+Worker. Admission checks the caller's accepted Version and sealed reference
+separately from the Namespace's provider Worker, within the same authorized
+organization, Space and execution target. Host restoration first rebuilds every
+retained owner and private broker without admitting Actor delivery. It then
+rechecks the complete caller/provider graph and opens one shared delivery gate;
+self references and static A-to-B/B-to-A graphs do not wait on that same gate.
+Standalone owners complete their own post-restore proof before admission.
+
+Physical Actor leases persist exact Linux Host and child process identities.
+The child stops before executing workerd, resumes only after its ownership
+record is durable, and is killed when its Host dies. Recovery reclaims only an
+exact owned lease whose Host and recorded child are proved dead; a fixed
+exclusive claim serializes competing recoveries. Legacy, foreign, incomplete
+or uncertain ownership stays unavailable and retains its data. An interrupted
+recovery claim still requires operator repair rather than guessed cleanup.
+A pinned-workerd Host-process test covers cross-Worker and self Binding calls,
+distinct Host/Worker/Actor PIDs after SIGKILL, the same Actor ID and persisted
+value, updates and dependency-ordered deletion. Nested calls from an Actor
+class to another Actor remain an unimplemented native composition path, not a
+restriction of the published Binding contract.
+
 The normal Bun entry can now opt in to its existing private v2 Actor and
 Workflow boot ports with `TAKOSERVER_V2_WORKER_RUNTIME_BOOT`, for example
 `{"actor":true,"workflow":{"maximumRegistrations":4}}`. The exact JSON
