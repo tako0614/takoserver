@@ -9,7 +9,11 @@ import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
-import { WORKER_VERSION_FORM_URL } from "../src/takoform-v2/forms/worker-specs.ts";
+import {
+  parseWorkerVersionSpec,
+  validateWorkerVersionUpdate,
+  WORKER_VERSION_FORM_URL,
+} from "../src/takoform-v2/forms/worker-specs.ts";
 import { createV2Store } from "../src/takoform-v2/store.ts";
 import type { V2Execution } from "../src/takoform-v2/types.ts";
 import { createV2NativeDeletionCustody } from "../src/takoform-v2/worker-native-deletions.ts";
@@ -18,7 +22,12 @@ import { createV2NativeEffectCustody } from "../src/takoform-v2/worker-native-ef
 const digest = `sha256:${"a".repeat(64)}` as const;
 const nativeIdentity = `v2w-${"b".repeat(48)}`;
 
-async function fixture(confirmUpload = true, secondSource = false, deadReferrer = false) {
+async function fixture(
+  confirmUpload = true,
+  secondSource = false,
+  deadReferrer = false,
+  equivalentShape = false,
+) {
   const directory = mkdtempSync(join(tmpdir(), "v2-native-delete-"));
   const path = join(directory, "db.sqlite");
   const db = new Database(path);
@@ -43,8 +52,8 @@ async function fixture(confirmUpload = true, secondSource = false, deadReferrer 
     authorize: async () => true,
     forms: {
       [WORKER_VERSION_FORM_URL]: {
-        validateCreate() {},
-        validateUpdate() {},
+        validateCreate: parseWorkerVersionSpec,
+        validateUpdate: validateWorkerVersionUpdate,
         backend,
       },
     },
@@ -56,7 +65,11 @@ async function fixture(confirmUpload = true, secondSource = false, deadReferrer 
       form: WORKER_VERSION_FORM_URL,
       space: "production",
       name: "version-a",
-      spec: { worker: { resourceUid: "worker-a" }, handlers: [] },
+      spec: {
+        worker: { resourceUid: "worker-a" },
+        bundle: { resourceUid: "bundle-a" },
+        handlers: ["fetch"],
+      },
     },
   });
   const store = createV2Store(sql);
@@ -121,7 +134,7 @@ async function fixture(confirmUpload = true, secondSource = false, deadReferrer 
       key: "update-version-key",
       uid: resource.uid,
       expectedGeneration: 1,
-      spec: source.spec,
+      spec: equivalentShape ? { ...source.spec, vars: {} } : source.spec,
     });
     const updateRow = await store.operation(update.id);
     if (!updateRow) throw new Error("missing version update");
@@ -135,6 +148,7 @@ async function fixture(confirmUpload = true, secondSource = false, deadReferrer 
       action: "update",
       generation: 2,
       backendKey: updateRow.backend_key,
+      spec: JSON.parse(updateRow.accepted_spec_json),
       leaseToken: token,
     };
     expect(
@@ -209,6 +223,7 @@ async function fixture(confirmUpload = true, secondSource = false, deadReferrer 
     operationId: deletionRow.id,
     action: "delete",
     generation: deletionRow.generation,
+    spec: JSON.parse(deletionRow.accepted_spec_json),
     backendKey: deletionRow.backend_key,
     backendId: deletionRow.backend_id,
     targetKey: deletionRow.target_key,
@@ -282,8 +297,16 @@ test("confirmed source stages, one DELETE grant persists across reopen, and lost
 });
 
 test("historical reused script identity deletes the latest source once and accounts for every old grant", async () => {
-  const f = await fixture(true, true);
+  const f = await fixture(true, true, false, true);
   try {
+    const acceptedSpecs = await f.sql.query(
+      `SELECT accepted_spec_json
+      FROM tf_v2_operations WHERE resource_uid = ? AND action IN ('create','update')
+      ORDER BY generation`,
+      [f.execution.resourceUid],
+    );
+    expect(acceptedSpecs).toHaveLength(2);
+    expect(acceptedSpecs[0]?.accepted_spec_json).not.toBe(acceptedSpecs[1]?.accepted_spec_json);
     expect(await f.custody.stageNext(f.execution)).toBe("more");
     expect(await f.custody.stageNext(f.execution)).toBe("ready");
     const rows = await f.sql.query(

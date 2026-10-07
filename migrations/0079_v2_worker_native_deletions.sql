@@ -86,7 +86,6 @@ WHEN NEW.grant_lease_token IS NOT NULL OR NEW.granted_at_ms IS NOT NULL OR
       AND source.action IN ('create', 'update')
       AND source.generation = NEW.source_generation
       AND source.generation < NEW.delete_generation
-      AND source.accepted_spec_json = deletion.accepted_spec_json
       AND effect.resource_uid = version.uid AND effect.principal = NEW.principal
       AND effect.space = NEW.space AND effect.backend_id = NEW.backend_id
       AND effect.target_key = NEW.target_key AND effect.generation = NEW.source_generation
