@@ -207,6 +207,37 @@ test("confirmed exact ID survives same-spec UPDATE and DELETE one-send/absence p
     expect(
       await f.custody.readSettledTarget({ ...settledCreate, principal: "foreign-org" }),
     ).toBeNull();
+    const observedRow = (
+      await f.sql.query("SELECT observed_json FROM tf_v2_resources WHERE uid = ?", [
+        f.create.resourceUid,
+      ])
+    )[0];
+    const originalObserved = observedRow?.observed_json;
+    if (typeof originalObserved !== "string") throw new Error("missing observed projection");
+    const extraObserved = JSON.stringify({ ...JSON.parse(originalObserved), foreign: true });
+    await f.sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+      extraObserved,
+      f.create.resourceUid,
+    ]);
+    expect(await f.custody.readSettledTarget(settledCreate)).toBeNull();
+    await f.sql.run("UPDATE tf_v2_operations SET result_observed_json = ? WHERE id = ?", [
+      extraObserved,
+      f.create.operationId,
+    ]);
+    expect(await f.custody.readSettledTarget(settledCreate)).toBeNull();
+    await f.sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+      originalObserved,
+      f.create.resourceUid,
+    ]);
+    await f.sql.run(
+      "UPDATE tf_v2_operations SET result_observed_json = ?, result_output_json = ? WHERE id = ?",
+      [originalObserved, '{"foreign":true}', f.create.operationId],
+    );
+    expect(await f.custody.readSettledTarget(settledCreate)).toBeNull();
+    await f.sql.run("UPDATE tf_v2_operations SET result_output_json = '{}' WHERE id = ?", [
+      f.create.operationId,
+    ]);
+    expect(await f.custody.readSettledTarget(settledCreate)).toEqual(expectedTarget);
     const update = await f.engine.acceptUpdate({
       principal: "org-a",
       key: "update-edge-kv-native-0001",

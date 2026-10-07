@@ -256,6 +256,8 @@ export function createV2EdgeKvNativeCustody(options: { readonly sql: Sql; readon
            AND resource.deleted_at IS NULL AND resource.spec_json = '{}'
            AND resource.output_json = '{}'
            AND json_valid(resource.observed_json) = 1
+           AND json_type(resource.observed_json) = 'object'
+           AND (SELECT COUNT(*) FROM json_each(resource.observed_json)) = 5
            AND json_extract(resource.observed_json, '$.namespaceExists') = 1
            AND json_extract(resource.observed_json, '$.maxKeyBytes') = ?
            AND json_extract(resource.observed_json, '$.maxValueBytes') = ?
@@ -269,6 +271,8 @@ export function createV2EdgeKvNativeCustody(options: { readonly sql: Sql; readon
            AND current_op.action IN ('create','update')
            AND current_op.status = 'succeeded' AND current_op.effect = 'complete'
            AND current_op.accepted_spec_json = '{}'
+           AND current_op.result_observed_json = resource.observed_json
+           AND current_op.result_output_json = resource.output_json
            AND source.principal = resource.principal AND source.space = resource.space
            AND source.backend_id = resource.backend_id
            AND source.target_key = resource.target_key
