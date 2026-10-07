@@ -151,8 +151,8 @@ test("Endpoint publication reader is fail-closed before restore and after owner 
     await expect(composition.ownerForWorkerUid(currentServing.workerUid)).rejects.toThrow(
       "v2 Worker owner admission is frozen",
     );
-    expect(composition.internalFormFactory({ sql, objects, clock })[WORKER_ENDPOINT_FORM_URL]).toBe(
-      undefined,
+    expect(() => composition.internalFormFactory({ sql, objects, clock })).toThrow(
+      "v2 Worker owners must restore before Form composition",
     );
   } finally {
     database.close();

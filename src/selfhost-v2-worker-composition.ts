@@ -292,11 +292,18 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   closePrivateBindingServices(): Promise<void>;
   /** Internal acceptance seam only. The normal entry must not register it yet. */
   readonly internalFormFactory: V2OperatorFormFactory;
+  /**
+   * Bind the existing Form map to the Endpoint ports returned by this
+   * composition's restored self-host Endpoint boot.
+   */
+  internalFormFactoryForEndpoint(endpoint: EndpointPorts): V2OperatorFormFactory;
 } {
   if (!options.targetKey || !options.rootDirectory || !options.sql || !options.objects) {
     throw new TypeError("v2 Worker composition requires SQL, objects, target and private root");
   }
   const { sql, objects, clock, config, targetKey } = options;
+  const configuredEndpoint =
+    options.endpoint === undefined ? undefined : Object.freeze({ ...options.endpoint });
   const queueSettlement = options.queueSettlement;
   if (
     queueSettlement &&
@@ -1108,15 +1115,17 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         },
       })
     : undefined;
-  const internalFormFactory: V2OperatorFormFactory = (context) => {
+  const createInternalForms = (
+    context: Parameters<V2OperatorFormFactory>[0],
+    endpoint: EndpointPorts | undefined,
+  ) => {
     if (context.sql !== sql || context.objects !== objects || context.clock !== clock) {
       throw new TypeError(
         "v2 Worker Forms must use this application's exact SQL, objects and clock",
       );
     }
-    if (!restorationComplete)
+    if (!restorationComplete || ownerAdmissionFrozen)
       throw new TypeError("v2 Worker owners must restore before Form composition");
-    const endpoint = options.endpoint;
     if (
       endpoint !== undefined &&
       (typeof endpoint?.assignHostname !== "function" ||
@@ -1192,6 +1201,26 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         : {}),
     };
   };
+  const internalFormFactory: V2OperatorFormFactory = (context) =>
+    createInternalForms(context, configuredEndpoint);
+  function internalFormFactoryForEndpoint(endpoint: EndpointPorts): V2OperatorFormFactory {
+    if (!restorationComplete || ownerAdmissionFrozen)
+      throw new TypeError("v2 Worker owners must restore before Form composition");
+    if (
+      !endpoint ||
+      typeof endpoint.assignHostname !== "function" ||
+      typeof endpoint.observeTls !== "function" ||
+      typeof endpoint.observeRouteAbsent !== "function"
+    ) {
+      throw new TypeError("v2 Worker Endpoint frontend proof is not composed");
+    }
+    const capturedEndpoint = Object.freeze({
+      assignHostname: endpoint.assignHostname,
+      observeTls: endpoint.observeTls,
+      observeRouteAbsent: endpoint.observeRouteAbsent,
+    });
+    return (context) => createInternalForms(context, capturedEndpoint);
+  }
 
   return {
     ...(queueCapability ? { queueCapability } : {}),
@@ -1317,5 +1346,6 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       queueProducerServer = undefined;
     },
     internalFormFactory,
+    internalFormFactoryForEndpoint,
   };
 }
