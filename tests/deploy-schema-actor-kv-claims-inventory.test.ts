@@ -9,7 +9,7 @@ import {
 } from "../scripts/deploy/schema.ts";
 
 const MIGRATION = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
-const CURRENT_SOURCE_TAIL = "0076_v2_worker_invocation_custody.sql";
+const CURRENT_SOURCE_TAIL = "0077_v2_operation_acceptance_order.sql";
 const ROOT = mkdtempSync(
   join(process.env.TMPDIR ?? "/tmp", "takoserver-actor-kv-schema-inventory-"),
 );
@@ -18,11 +18,11 @@ afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 test("the current source closure projects to an explicit 0066 apply artifact", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
   const artifact = projectApplyQualifiedMigrationArtifact(source);
-  expect(source.names).toHaveLength(76);
+  expect(source.names).toHaveLength(77);
   expect(source.names.at(-1)).toBe(CURRENT_SOURCE_TAIL);
   expect(source.files.at(-1)).toMatchObject({
     name: CURRENT_SOURCE_TAIL,
-    digest: "sha256:9b598b4bb465b0a7df7f49f2a8e8a0de690ab1a6740879266c433ed09138cfc6",
+    digest: "sha256:236764a188e80e80bab88ac73e37fff85ee8814f3b9b77423904e8022dadc02c",
   });
   expect(artifact.names).toHaveLength(66);
   expect(artifact.names.at(-1)).toBe(MIGRATION);
@@ -65,12 +65,12 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
     cpSync(resolve(import.meta.dir, "../migrations"), directory, { recursive: true });
     if (drift === "missing") rmSync(join(directory, CURRENT_SOURCE_TAIL));
     else
-      writeFileSync(join(directory, "0077_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+      writeFileSync(join(directory, "0078_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     expect(() => readCurrentAuditedMigrationSourceArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0076",
+      "audited migration lineage must contain exactly 0001-0077",
     );
     expect(() => readAuditedMigrationArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0076",
+      "audited migration lineage must contain exactly 0001-0077",
     );
   }
 });

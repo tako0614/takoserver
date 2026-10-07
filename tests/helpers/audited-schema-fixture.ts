@@ -6,13 +6,13 @@ import { canonicalSchemaShape, type D1SchemaState } from "../../scripts/deploy/m
 import { MIGRATIONS } from "../../src/db-schema.ts";
 
 const APPLY_QUALIFIED_MIGRATION_END = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
-const CURRENT_SOURCE_MIGRATION_END = "0076_v2_worker_invocation_custody.sql";
+const CURRENT_SOURCE_MIGRATION_END = "0077_v2_operation_acceptance_order.sql";
 
 function applyQualifiedMigrations() {
   const endIndex = MIGRATIONS.findIndex(({ name }) => name === APPLY_QUALIFIED_MIGRATION_END);
   if (
     endIndex !== 65 ||
-    MIGRATIONS.length !== 76 ||
+    MIGRATIONS.length !== 77 ||
     MIGRATIONS.at(-1)?.name !== CURRENT_SOURCE_MIGRATION_END
   ) {
     throw new Error("apply-qualified schema fixture requires the exact audited 0001-0066 prefix");
@@ -86,11 +86,12 @@ export function copyAuditedSchemaFixture(directory: string): string {
  * WorkerVersion delete acknowledgement proof, source-only 0070 v2 Host core,
  * source-only 0071 Migration Set custody, source-only 0072 shared artifact custody,
  * source-only 0073 accepted reference protection, source-only 0074
- * Worker native-effect custody, source-only 0075 artifact progress, and
- * source-only 0076 Worker invocation custody. */
+ * Worker native-effect custody, source-only 0075 artifact progress,
+ * source-only 0076 Worker invocation custody, and source-only 0077
+ * Operation acceptance order. */
 export function copyCurrentSchemaFixture(directory: string): string {
-  if (MIGRATIONS.length !== 76 || MIGRATIONS.at(-1)?.name !== CURRENT_SOURCE_MIGRATION_END) {
-    throw new Error("current schema fixture requires the audited 0001-0076 source inventory");
+  if (MIGRATIONS.length !== 77 || MIGRATIONS.at(-1)?.name !== CURRENT_SOURCE_MIGRATION_END) {
+    throw new Error("current schema fixture requires the audited 0001-0077 source inventory");
   }
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   for (const { name } of MIGRATIONS) {

@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { MIGRATIONS } from "../src/db-schema.ts";
 import { bytesDigest } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject } from "../src/ports.ts";
@@ -26,11 +27,25 @@ const BUNDLE_FORM_URL = "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.
 
 // The Version backend below is a graph-only substitute, not ABI qualification;
 // its Bundle dependency uses real verified SQL byte custody.
-function fixture(distinctFormBackends = false) {
+function fixture(distinctFormBackends = false, legacySchema = false) {
   const root = mkdtempSync(join(tmpdir(), "v2-publication-"));
   const path = join(root, "state.sqlite");
   const db = new Database(path);
-  migrateSqlite(db);
+  if (legacySchema) {
+    db.exec(`CREATE TABLE applied_migrations (
+      name TEXT PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL
+    )`);
+    for (const migration of MIGRATIONS.filter(
+      (item) => item.name !== "0077_v2_operation_acceptance_order.sql",
+    )) {
+      db.exec(migration.sql);
+      db.query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, datetime('now'))").run(
+        migration.name,
+      );
+    }
+  } else {
+    migrateSqlite(db);
+  }
   const sql = createSqliteSql(db);
   // Custody write guards use SQLite's real clock; advance from that same epoch.
   let clockMs = Date.now();
@@ -660,6 +675,111 @@ test("a fresh SQL handle reconstructs a terminal current serving graph without a
   }
 });
 
+test("a historical source without acceptance order is unresolved after additive migration", async () => {
+  const f = fixture(false, true);
+  try {
+    const { worker, version } = await f.basics();
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    expect(migrateSqlite(f.db).applied).toEqual(["0077_v2_operation_acceptance_order.sql"]);
+    expect(
+      await f.sql.query("SELECT acceptance_order FROM tf_v2_operations WHERE id = ?", [
+        deployment.id,
+      ]),
+    ).toEqual([{ acceptance_order: null }]);
+    const oldInput = {
+      workerUid: worker.resourceUid,
+      targetKey: "fixture-workerd-root",
+      sourceOperationId: deployment.id,
+      expectedIdentity: {
+        generation: `takoserver-v2-operation:${deployment.id}`,
+        workerResourceUid: worker.resourceUid,
+        hostnames: [],
+        versions: [{ workerVersionUid: version.resourceUid, weight: 10_000 }],
+      },
+    };
+    expect(await f.reader.resolveCurrentServing(oldInput)).toMatchObject({ kind: "unresolved" });
+    const endpoint = await f.create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    expect(
+      await f.reader.resolveCurrentServing({
+        ...oldInput,
+        sourceOperationId: endpoint.id,
+        expectedIdentity: {
+          ...oldInput.expectedIdentity,
+          generation: `takoserver-v2-operation:${endpoint.id}`,
+          hostnames: ["assigned.example.test"],
+        },
+      }),
+    ).toMatchObject({ kind: "ready" });
+  } finally {
+    f.close();
+  }
+});
+
+test("current serving limits pending and attachment reads before refusing crowded graphs", async () => {
+  const f = fixture();
+  try {
+    const { worker, version } = await f.basics();
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    const rowsRead = { pending: [] as number[], attachments: [] as number[] };
+    const reader = createV2WorkerPublicationState({
+      sql: {
+        ...f.sql,
+        async query(...args: Parameters<typeof f.sql.query>) {
+          const rows = await f.sql.query(...args);
+          if (args[0].includes("SELECT 1 FROM tf_v2_operations op"))
+            rowsRead.pending.push(rows.length);
+          if (args[0].includes("SELECT * FROM tf_v2_resources") && args[0].includes("LIMIT 2"))
+            rowsRead.attachments.push(rows.length);
+          return rows;
+        },
+      },
+    });
+    const input = {
+      workerUid: worker.resourceUid,
+      targetKey: "fixture-workerd-root",
+      sourceOperationId: deployment.id,
+      expectedIdentity: {
+        generation: `takoserver-v2-operation:${deployment.id}`,
+        workerResourceUid: worker.resourceUid,
+        hostnames: [],
+        versions: [{ workerVersionUid: version.resourceUid, weight: 10_000 }],
+      },
+    };
+    for (let index = 0; index < 12; index++) {
+      await f.create(
+        WORKER_ENDPOINT_FORM_URL,
+        `queued-endpoint-${index}`,
+        { worker: { resourceUid: worker.resourceUid } },
+        false,
+      );
+    }
+    expect(await reader.resolveCurrentServing(input)).toMatchObject({
+      kind: "unresolved",
+      code: "source_unsettled",
+    });
+    expect(rowsRead.pending).toEqual([1]);
+    for (let index = 0; index < 12; index++) {
+      expect(await f.engine.runNext()).toMatchObject({ status: "succeeded" });
+    }
+    expect(await reader.resolveCurrentServing(input)).toMatchObject({
+      kind: "unresolved",
+      code: "publication_conflict",
+    });
+    expect(rowsRead.attachments.length).toBeGreaterThan(0);
+    expect(Math.max(...rowsRead.attachments)).toBe(2);
+  } finally {
+    f.close();
+  }
+});
+
 test("current serving follows the latest Endpoint marker across distinct Form backends and its DELETE tombstone", async () => {
   const f = fixture(true);
   try {
@@ -811,6 +931,97 @@ test("current serving compares the complete weighted Version set independent of 
     );
     expect(await ready.stillCurrent()).toBe(false);
     expect(await f.reader.resolveCurrentServing(base)).toMatchObject({ kind: "unresolved" });
+  } finally {
+    f.close();
+  }
+});
+
+test("current serving does not revive an older Deployment marker after a clock-rollback Endpoint DELETE", async () => {
+  const f = fixture();
+  try {
+    const { worker, version } = await f.basics();
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    const deploymentOp = await f.store.operation(deployment.id);
+    if (!deploymentOp) throw new Error("missing Deployment operation fixture");
+    const endpoint = await f.create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setClock(Date.parse(deploymentOp.created_at) - 1_000);
+    const deleted = await f.engine.acceptDelete({
+      principal: "org-1",
+      key: "clock-rollback-delete-endpoint-key",
+      uid: endpoint.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: deleted.id, status: "succeeded" });
+    const deletedOp = await f.store.operation(deleted.id);
+    if (!deletedOp) throw new Error("missing Endpoint delete operation fixture");
+    expect(deletedOp.created_at < deploymentOp.created_at).toBe(true);
+    const identity = {
+      workerResourceUid: worker.resourceUid,
+      hostnames: [],
+      versions: [{ workerVersionUid: version.resourceUid, weight: 10_000 }],
+    };
+    expect(
+      await f.reader.resolveCurrentServing({
+        workerUid: worker.resourceUid,
+        targetKey: "fixture-workerd-root",
+        sourceOperationId: deployment.id,
+        expectedIdentity: {
+          ...identity,
+          generation: `takoserver-v2-operation:${deployment.id}`,
+        },
+      }),
+    ).toMatchObject({ kind: "unresolved" });
+    expect(
+      await f.reader.resolveCurrentServing({
+        workerUid: worker.resourceUid,
+        targetKey: "fixture-workerd-root",
+        sourceOperationId: deleted.id,
+        expectedIdentity: { ...identity, generation: `takoserver-v2-operation:${deleted.id}` },
+      }),
+    ).toMatchObject({ kind: "ready" });
+    f.db.exec("VACUUM");
+    const reopened = new Database(f.path);
+    try {
+      const reopenedSql = createSqliteSql(reopened);
+      const reader = createV2WorkerPublicationState({
+        sql: reopenedSql,
+        bundleCustody: createWorkerBundleHost({
+          sql: reopenedSql,
+          targetKey: "fixture-workerd-root",
+          source: {
+            async read() {
+              throw new Error("source is offline after restart");
+            },
+          },
+        }).custody,
+      });
+      expect(
+        await reader.resolveCurrentServing({
+          workerUid: worker.resourceUid,
+          targetKey: "fixture-workerd-root",
+          sourceOperationId: deployment.id,
+          expectedIdentity: {
+            ...identity,
+            generation: `takoserver-v2-operation:${deployment.id}`,
+          },
+        }),
+      ).toMatchObject({ kind: "unresolved" });
+      expect(
+        await reader.resolveCurrentServing({
+          workerUid: worker.resourceUid,
+          targetKey: "fixture-workerd-root",
+          sourceOperationId: deleted.id,
+          expectedIdentity: { ...identity, generation: `takoserver-v2-operation:${deleted.id}` },
+        }),
+      ).toMatchObject({ kind: "ready" });
+    } finally {
+      reopened.close();
+    }
   } finally {
     f.close();
   }

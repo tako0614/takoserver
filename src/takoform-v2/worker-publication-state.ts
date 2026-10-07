@@ -483,13 +483,29 @@ export function createV2WorkerPublicationState(options: {
     workerUid: string,
     principal: string,
     space: string,
+    bounded = false,
   ): Promise<ResourceRow[]> {
     return (await sql.query(
       `SELECT * FROM tf_v2_resources
        WHERE form_url = ? AND principal = ? AND space = ? AND deleted_at IS NULL
-         AND json_extract(spec_json, '$.worker.resourceUid') = ? ORDER BY uid`,
+         AND json_extract(spec_json, '$.worker.resourceUid') = ? ORDER BY uid
+         ${bounded ? "LIMIT 2" : ""}`,
       [form, principal, space, workerUid],
     )) as unknown as ResourceRow[];
+  }
+  async function hasPendingPublication(workerUid: string): Promise<boolean> {
+    return (
+      (
+        await sql.query(
+          `SELECT 1 FROM tf_v2_operations op
+         JOIN tf_v2_resources r ON r.uid = op.resource_uid
+         WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
+           AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
+           AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ? LIMIT 1`,
+          [WORKER_DEPLOYMENT_FORM_URL, WORKER_ENDPOINT_FORM_URL, workerUid],
+        )
+      ).length !== 0
+    );
   }
   async function pendingPublication(workerUid: string): Promise<OperationRow[]> {
     return (await sql.query(
@@ -567,9 +583,9 @@ export function createV2WorkerPublicationState(options: {
     workerUid: string;
     principal: string;
     space: string;
-  }): Promise<readonly { readonly id: unknown; readonly created_at: unknown }[]> {
+  }): Promise<readonly { readonly id: unknown; readonly acceptance_order: unknown }[]> {
     return (await sql.query(
-      `SELECT op.id, op.created_at FROM tf_v2_resources r
+      `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
        JOIN tf_v2_operations op ON op.id = r.last_operation
        WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
          AND op.principal = r.principal
@@ -577,7 +593,7 @@ export function createV2WorkerPublicationState(options: {
          AND op.status = 'succeeded' AND op.effect = 'complete'
          AND r.observed_generation = op.generation AND r.busy_operation IS NULL
          AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
-       ORDER BY op.created_at DESC, op.id DESC LIMIT 2`,
+       ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2`,
       [
         WORKER_DEPLOYMENT_FORM_URL,
         WORKER_ENDPOINT_FORM_URL,
@@ -585,7 +601,7 @@ export function createV2WorkerPublicationState(options: {
         input.space,
         input.workerUid,
       ],
-    )) as readonly { readonly id: unknown; readonly created_at: unknown }[];
+    )) as readonly { readonly id: unknown; readonly acceptance_order: unknown }[];
   }
 
   async function artifactTarget(input: {
@@ -887,9 +903,9 @@ export function createV2WorkerPublicationState(options: {
       }
     }
 
-    const pending = await pendingPublication(workerUid);
+    const pending = current ? [] : await pendingPublication(workerUid);
     if (current) {
-      if (pending.length !== 0) {
+      if (await hasPendingPublication(workerUid)) {
         return unresolved("source_unsettled", "A later Worker publication is unresolved");
       }
     } else {
@@ -902,9 +918,12 @@ export function createV2WorkerPublicationState(options: {
     }
 
     const [deploymentRows, endpointRows] = await Promise.all([
-      matchingResources(WORKER_DEPLOYMENT_FORM_URL, workerUid, op.principal, own.space),
-      matchingResources(WORKER_ENDPOINT_FORM_URL, workerUid, op.principal, own.space),
+      matchingResources(WORKER_DEPLOYMENT_FORM_URL, workerUid, op.principal, own.space, !!current),
+      matchingResources(WORKER_ENDPOINT_FORM_URL, workerUid, op.principal, own.space, !!current),
     ]);
+    if (current && (deploymentRows.length > 1 || endpointRows.length > 1)) {
+      return unresolved("publication_conflict", "More than one Worker attachment is present");
+    }
     for (const row of [...deploymentRows, ...endpointRows]) {
       if (await hasUnresolvedPriorEffect(row)) {
         return unresolved(
@@ -1219,7 +1238,11 @@ export function createV2WorkerPublicationState(options: {
     if (
       current &&
       (publisherRows?.[0]?.id !== op.id ||
-        (publisherRows.length > 1 && publisherRows[0]?.created_at === publisherRows[1]?.created_at))
+        typeof publisherRows[0]?.acceptance_order !== "number" ||
+        !Number.isSafeInteger(publisherRows[0].acceptance_order) ||
+        publisherRows[0].acceptance_order <= 0 ||
+        (publisherRows.length > 1 &&
+          publisherRows[0].acceptance_order === publisherRows[1]?.acceptance_order))
     ) {
       return unresolved("graph_unresolved", "Serving source is not the unique latest publisher");
     }
