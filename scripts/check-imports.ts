@@ -107,8 +107,8 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "v2-workflow-manager",
-    match: /^src\/takoform-v2\/workflow-backend\.ts$/u,
-    may: ["core", "domain", "v2-contract", "v2-form"],
+    match: /^src\/takoform-v2\/workflow-(?:backend|class-admission)\.ts$/u,
+    may: ["core", "domain", "v2-contract", "v2-form", "v2-workflow-manager"],
   },
   {
     name: "v2-runtime",

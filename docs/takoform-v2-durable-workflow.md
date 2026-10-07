@@ -20,13 +20,15 @@ An unswept instance past caller-visible retention is still retired by its
 physical row: the v2-only engine path stops any retained owner before the
 claimed purge, without reopening the expired instance to public callers.
 
-`createDurableWorkflowForm` requires a boot-selected class-admission port that
-proves every active and pending weighted Version from accepted SQL, verifies
-the sealed reference graph and held module bytes, inspects the named Workflow
-class in isolation, and returns a same-statement graph predicate. The current
-repository has no concrete Workflow-specific v2 inspector/selector behind
-that port. It also lacks a v2 native Workflow Binding/runner composition that
-binds the private broker scope to the same principal, Space, UID, current
+`createDurableWorkflowForm` requires a boot-selected class-admission port.
+`createV2WorkflowClassAdmission` now captures every active and pending weighted
+Version from accepted SQL, verifies sealed reference sets and held module bytes,
+inspects the named Workflow class in a disposable, pinned workerd, and returns
+a same-statement graph predicate. A clean native class refusal is distinct
+from unavailable inspection; an allocation changed after inspection is
+retryable, not a definitive class error. This component is not yet wired to
+the normal Host. A v2 native Workflow Binding/runner composition is still
+missing; it must bind the private broker scope to the same principal, Space, UID, current
 Deployment and selected Version. Consequently the Form is not registered in
 the normal factory and `workflowBindings` remains rejected in WorkerVersion
 eligibility. Do not advertise v2 Workflow FormSupport from the synthetic
@@ -36,6 +38,10 @@ The focused synthetic test exercises accepted v2 HTTP Resource/Operation CRUD,
 step history replay after SQLite close/reopen, active-instance DELETE, and an
 instance-create versus DELETE race. Two Workflow Resources may share one
 Worker/class while retaining separate instance ID spaces. The test also covers
-unswept expired rows and synthetic owner-stop acknowledgement. It supplies a fake class-admission result
-and an in-process execution host. It does not qualify held-byte inspection,
+unswept expired rows and synthetic owner-stop acknowledgement. The class
+admission tests exercise accepted active and pending weighted graph capture,
+held Bundle bytes, same-statement drift, and accepted Ready observation. Native
+tests use the pinned workerd artifact for class ABI inspection and held-byte
+graph qualification. The CRUD/step test still supplies a fake class-admission
+result and an in-process execution host. That test alone does not qualify
 physical workerd stop, broker delivery, OS process recovery, or public Support.
