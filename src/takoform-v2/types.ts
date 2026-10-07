@@ -113,6 +113,8 @@ export interface V2AdmissionPredicate {
   /** A boolean SQL expression embedded in the Resource acceptance statement. */
   readonly sql: string;
   readonly params: readonly SqlParam[];
+  /** Failure classification for this predicate only; omitted preserves conflict. */
+  readonly conflictCode?: "dependency_conflict" | "resource_busy";
 }
 
 export interface V2Form {

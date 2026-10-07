@@ -39,18 +39,21 @@ function fixture() {
   };
   let allowed = true;
   let admissionCalls = 0;
-  let admissionSql = "EXISTS (SELECT 1 FROM admission_target WHERE ready = 1)";
-  let admissionParams: SqlParam[] = [];
+  let admissionPredicate: {
+    sql: string;
+    params: SqlParam[];
+    conflictCode?: "dependency_conflict" | "resource_busy";
+  } = {
+    sql: "EXISTS (SELECT 1 FROM admission_target WHERE ready = 1)",
+    params: [],
+  };
   const form: V2Form = {
     validateCreate() {},
     validateUpdate() {},
     async prepareAdmission() {
       admissionCalls += 1;
       if (hold) await gate;
-      return {
-        sql: admissionSql,
-        params: admissionParams,
-      };
+      return admissionPredicate;
     },
     backend: {
       id: "admission-test-backend",
@@ -81,9 +84,8 @@ function fixture() {
       allowed = value;
     },
     admissionCalls: () => admissionCalls,
-    setPredicate(value: { sql: string; params: SqlParam[] }) {
-      admissionSql = value.sql;
-      admissionParams = value.params;
+    setPredicate(value: typeof admissionPredicate) {
+      admissionPredicate = value;
     },
     holdBatch() {
       let resume: (() => void) | null = null;
@@ -142,6 +144,40 @@ test("admission predicate is evaluated in the accepting write after asynchronous
   expect(db.query("SELECT count(*) AS n FROM tf_v2_operations").get()).toEqual({ n: 0 });
 });
 
+test("transient CREATE admission races report busy without consuming the request", async () => {
+  const f = fixture();
+  f.db.exec("INSERT INTO admission_target VALUES (1)");
+  const predicate = {
+    sql: "EXISTS (SELECT 1 FROM admission_target WHERE ready = 1)",
+    params: [] as SqlParam[],
+    conflictCode: "resource_busy" as "resource_busy" | "dependency_conflict",
+  };
+  f.setPredicate(predicate);
+  const request = {
+    principal: "alice",
+    key: "admission-transient-create-0001",
+    input: { form: FORM, space: "default", name: "consumer", spec: {} },
+  };
+  const held = f.holdBatch();
+  const pending = f.engine.acceptCreate(request);
+  try {
+    await held.entered;
+    f.db.exec("UPDATE admission_target SET ready = 0");
+    // The trusted hook's caller cannot change the captured failure classification.
+    predicate.conflictCode = "dependency_conflict";
+  } finally {
+    held.release();
+  }
+  await expect(pending).rejects.toMatchObject({ code: "resource_busy", status: 409 });
+  expect(
+    await f.engine.listResources({ principal: "alice", space: "default", limit: 100 }),
+  ).toEqual([]);
+  f.db.exec("UPDATE admission_target SET ready = 1");
+  const accepted = await f.engine.acceptCreate(request);
+  expect(accepted.status).toBe("queued");
+  expect((await f.engine.acceptCreate(request)).id).toBe(accepted.id);
+});
+
 test("UPDATE admission refusal leaves prior Resource generation and replay key intact", async () => {
   const { db, engine } = fixture();
   db.exec("INSERT INTO admission_target VALUES (1)");
@@ -172,6 +208,69 @@ test("UPDATE admission refusal leaves prior Resource generation and replay key i
   const accepted = await engine.acceptUpdate(request);
   expect(accepted.generation).toBe(2);
   expect((await engine.acceptUpdate(request)).id).toBe(accepted.id);
+});
+
+test("transient UPDATE admission races keep the prior generation and allow exact retry", async () => {
+  const f = fixture();
+  f.db.exec("INSERT INTO admission_target VALUES (1)");
+  const created = await f.engine.acceptCreate({
+    principal: "alice",
+    key: "admission-transient-base-0001",
+    input: { form: FORM, space: "default", name: "consumer", spec: { value: 1 } },
+  });
+  expect((await f.engine.runNext())?.status).toBe("succeeded");
+  f.setPredicate({
+    sql: "EXISTS (SELECT 1 FROM admission_target WHERE ready = 1)",
+    params: [],
+    conflictCode: "resource_busy",
+  });
+  const request = {
+    principal: "alice",
+    key: "admission-transient-update-0001",
+    uid: created.resourceUid,
+    expectedGeneration: 1,
+    spec: { value: 2 },
+  };
+  const held = f.holdBatch();
+  const pending = f.engine.acceptUpdate(request);
+  try {
+    await held.entered;
+    f.db.exec("UPDATE admission_target SET ready = 0");
+  } finally {
+    held.release();
+  }
+  await expect(pending).rejects.toMatchObject({ code: "resource_busy", status: 409 });
+  expect(
+    await f.engine.getResource({ principal: "alice", uid: created.resourceUid }),
+  ).toMatchObject({
+    generation: 1,
+    spec: { value: 1 },
+    phase: "idle",
+  });
+  f.db.exec("UPDATE admission_target SET ready = 1");
+  const accepted = await f.engine.acceptUpdate(request);
+  expect(accepted.generation).toBe(2);
+  expect((await f.engine.acceptUpdate(request)).id).toBe(accepted.id);
+});
+
+test("invalid trusted admission classifications cannot write a Resource", async () => {
+  const f = fixture();
+  f.db.exec("INSERT INTO admission_target VALUES (1)");
+  f.setPredicate({
+    sql: "EXISTS (SELECT 1 FROM admission_target WHERE ready = 1)",
+    params: [],
+    conflictCode: "other" as "resource_busy",
+  });
+  await expect(
+    f.engine.acceptCreate({
+      principal: "alice",
+      key: "admission-invalid-code-0001",
+      input: { form: FORM, space: "default", name: "consumer", spec: {} },
+    }),
+  ).rejects.toBeInstanceOf(TypeError);
+  expect(
+    await f.engine.listResources({ principal: "alice", space: "default", limit: 100 }),
+  ).toEqual([]);
 });
 
 test("authorization, exact replay and unknown Form lookup precede trusted admission preparation", async () => {

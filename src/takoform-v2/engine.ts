@@ -105,8 +105,16 @@ function snapshotRequest<T>(request: T): T {
 function snapshotAdmission(value: V2AdmissionPredicate | null): V2AdmissionPredicate | null {
   if (value === null) return null;
   const sql = value.sql;
+  const conflictCode = value.conflictCode;
   if (typeof sql !== "string" || !sql.trim() || sql.includes(";") || !Array.isArray(value.params)) {
     throw new TypeError("invalid trusted Form admission predicate");
+  }
+  if (
+    conflictCode !== undefined &&
+    conflictCode !== "dependency_conflict" &&
+    conflictCode !== "resource_busy"
+  ) {
+    throw new TypeError("invalid trusted Form admission failure code");
   }
   const params: SqlParam[] = value.params.map((param) => {
     if (param instanceof ArrayBuffer) return param.slice(0);
@@ -118,7 +126,11 @@ function snapshotAdmission(value: V2AdmissionPredicate | null): V2AdmissionPredi
       return param;
     throw new TypeError("invalid trusted Form admission parameter");
   });
-  return Object.freeze({ sql, params: Object.freeze(params) });
+  return Object.freeze({
+    sql,
+    params: Object.freeze(params),
+    ...(conflictCode === undefined ? {} : { conflictCode }),
+  });
 }
 
 function snapshotPrivateInputs(
@@ -523,6 +535,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           admission,
         );
         if (result === "dependency_conflict") fail("dependency_conflict", 409);
+        if (result === "resource_busy") fail("resource_busy", 409);
       } catch (error) {
         const winner = await winnerAfterRace(principal, key, fingerprint, privateInputs);
         if (winner) return winner;
@@ -647,6 +660,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       const winner = await winnerAfterRace(input.principal, input.key, fingerprint, privateInputs);
       if (winner) return winner;
       if (result === "dependency_conflict") fail("dependency_conflict", 409);
+      if (result === "resource_busy") fail("resource_busy", 409);
       const latest = await ownedResource(input.principal, input.uid, "write");
       if (latest.busy_operation) fail("resource_busy", 409);
       fail("generation_conflict", 409);
