@@ -85,6 +85,21 @@ export class ReportWorkflow extends Base {
 );
 
 test.skipIf(workerd === null)(
+  "pinned workerd accepts a callable run beyond 32 inherited prototypes",
+  async () => {
+    const intermediateBases = Array.from(
+      { length: 40 },
+      (_, index) => `class Base${index + 1} extends Base${index} {}`,
+    ).join("\n");
+    expect(
+      await inspect(`class Base0 { run() {} }
+${intermediateBases}
+export class ReportWorkflow extends Base40 {}`),
+    ).toEqual({ outcome: "valid" });
+  },
+);
+
+test.skipIf(workerd === null)(
   "pinned workerd rejects missing, accessor and non-callable prototype run",
   async () => {
     for (const source of [

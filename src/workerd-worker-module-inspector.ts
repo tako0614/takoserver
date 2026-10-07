@@ -300,6 +300,9 @@ const getProto = Object.getPrototypeOf;
 const hasOwn = Object.prototype.hasOwnProperty;
 const objectPrototype = Object.prototype;
 const arrayIsArray = Array.isArray;
+const visited = new WeakSet();
+const visitedHas = WeakSet.prototype.has;
+const visitedAdd = WeakSet.prototype.add;
 function inert() {}
 export function reportWorkflowClassVerdict(value) { apply(log, logReceiver, [value]); }
 function ownValue(record, name) {
@@ -317,8 +320,9 @@ export function inspectWorkflowClass(namespace, className) {
         prototype === null) return false;
     construct(inert, [], exported);
     let current = prototype;
-    for (let depth = 0; current !== null && depth < 32; depth += 1) {
-      if (current === objectPrototype) return false;
+    while (current !== null) {
+      if (current === objectPrototype || apply(visitedHas, visited, [current])) return false;
+      apply(visitedAdd, visited, [current]);
       const descriptor = getOwn(current, "run");
       if (descriptor) return apply(hasOwn, descriptor, ["value"]) &&
         typeof descriptor.value === "function";
