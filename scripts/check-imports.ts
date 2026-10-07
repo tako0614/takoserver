@@ -188,6 +188,11 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "adapter", "v2-queue-manager", "v2-runtime"],
   },
   {
+    name: "v2-selfhost-queue-scheduler",
+    match: /^src\/selfhost-v2-queue-scheduler\.ts$/u,
+    may: ["core", "domain", "v2-form", "v2-queue-manager", "v2-selfhost-queue-composition"],
+  },
+  {
     name: "release-data",
     match:
       /^(?:vendor\/takoform\/.*\.json|src\/generated\/takoform-(?:stable-v1-catalog|stable-error-taxonomy|integration-form-packages|publisher-set-receipt|publisher-set-authority-closure)\.ts)$/u,
