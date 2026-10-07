@@ -22,6 +22,7 @@ import {
   MODULE_WORKER_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import { isReadyWorkerVersionObservation } from "../src/takoform-v2/forms/worker-version-observed.ts";
 
 const TARGET = "kv-binding-target";
 const BUNDLE_FORM = "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/";
@@ -150,11 +151,46 @@ test("private KV binding broker exposes only the current sealed namespace bindin
       value: { found: true, value: "AQ==", metadata: { content: "sample" } },
     });
 
+    for (const observed of [
+      { ready: true, bundleVerified: true },
+      { ready: true, resolvedBindings: false, bundleVerified: true },
+      { ready: true, resolvedBindings: true },
+      { ready: true, resolvedBindings: true, bundleVerified: "true" },
+    ]) {
+      control
+        .prepare("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = 'version-one'")
+        .run(JSON.stringify(observed));
+      expect(await call("get", { key: "binary" })).toEqual({
+        ok: false,
+        error: { code: "backend_unavailable" },
+      });
+    }
+    control
+      .prepare("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = 'version-one'")
+      .run(
+        JSON.stringify({ ready: true, resolvedBindings: true, bundleVerified: true, extra: true }),
+      );
+    expect(await call("get", { key: "binary" })).toEqual({
+      ok: true,
+      value: { found: true, value: "AP8=" },
+    });
+    control
+      .prepare("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = 'version-one'")
+      .run(JSON.stringify({ ready: true, resolvedBindings: true, bundleVerified: true }));
+
     expect(await call("get", { key: "binary" }, "OTHER")).toEqual({
       ok: false,
       error: { code: "backend_unavailable" },
     });
     expect(await call("get", { key: "binary", extra: true })).toEqual({
+      ok: false,
+      error: { code: "backend_unavailable" },
+    });
+    expect(await call("constructor")).toEqual({
+      ok: false,
+      error: { code: "backend_unavailable" },
+    });
+    expect(await call("__proto__")).toEqual({
       ok: false,
       error: { code: "backend_unavailable" },
     });
@@ -178,6 +214,26 @@ test("private KV binding broker exposes only the current sealed namespace bindin
     control.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("WorkerVersion observation eligibility follows the bundle-dependent public shape", () => {
+  expect(
+    isReadyWorkerVersionObservation(
+      { ready: true, resolvedBindings: true, bundleVerified: true },
+      true,
+    ),
+  ).toBe(true);
+  expect(isReadyWorkerVersionObservation({ ready: true, resolvedBindings: true }, false)).toBe(
+    true,
+  );
+  expect(
+    isReadyWorkerVersionObservation(
+      { ready: true, resolvedBindings: true, bundleVerified: true },
+      false,
+    ),
+  ).toBe(false);
+  expect(isReadyWorkerVersionObservation({ ready: true, bundleVerified: true }, true)).toBe(false);
+  expect(isReadyWorkerVersionObservation([], true)).toBe(false);
 });
 
 function settleTarget(
@@ -249,5 +305,6 @@ function seedVersion(db: Database, spec: string): void {
   db.exec(`UPDATE tf_v2_operations SET status='succeeded',effect='complete',result_observed_json='{"ready":true}'
     WHERE id='op-version-one'`);
   db.exec(`UPDATE tf_v2_resources SET phase='idle',observed_generation=1,
-    observed_json='{"ready":true}',busy_operation=NULL WHERE uid='version-one'`);
+    observed_json='{"ready":true,"resolvedBindings":true,"bundleVerified":true}',
+    busy_operation=NULL WHERE uid='version-one'`);
 }

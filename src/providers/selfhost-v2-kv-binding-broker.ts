@@ -295,14 +295,14 @@ function checkedGrant(input: unknown, targetKey: string): V2KvBindingGrant {
 }
 
 function kvInput(payload: Record<string, unknown>): Record<string, unknown> | null {
-  const operationFields: Readonly<Record<string, readonly string[]>> = {
-    get: ["key"],
-    getWithMetadata: ["key"],
-    put: ["key", "value", "metadata", "expirationTtlSeconds"],
-    delete: ["key"],
-    list: ["prefix", "cursor", "limit"],
-  };
-  const allowed = operationFields[payload.op as string];
+  const operationFields = new Map<string, readonly string[]>([
+    ["get", ["key"]],
+    ["getWithMetadata", ["key"]],
+    ["put", ["key", "value", "metadata", "expirationTtlSeconds"]],
+    ["delete", ["key"]],
+    ["list", ["prefix", "cursor", "limit"]],
+  ]);
+  const allowed = operationFields.get(payload.op as string);
   if (
     !allowed ||
     Object.keys(payload).some((field) => !["protocol", "binding", "op", ...allowed].includes(field))

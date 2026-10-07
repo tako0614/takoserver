@@ -4,6 +4,7 @@ import { EDGE_KV_NAMESPACE_FORM_URL, EDGE_KV_NAMESPACE_LIMITS } from "./edge-kv-
 import { EDGE_KV_NAMESPACE_BACKEND_ID } from "./edge-kv-namespace-backend.ts";
 import { referencesForWorkerVersion } from "./worker-references.ts";
 import { parseWorkerVersionSpec, WORKER_VERSION_FORM_URL } from "./worker-specs.ts";
+import { isReadyWorkerVersionObservation } from "./worker-version-observed.ts";
 
 /** Core-only proof for one sealed WorkerVersion KV binding. */
 export interface KvWorkerBindingClaim {
@@ -85,7 +86,10 @@ export function createKvWorkerBindingAuthority(options: {
     let spec: ReturnType<typeof parseWorkerVersionSpec>;
     try {
       spec = parseWorkerVersionSpec(JSON.parse(version.spec_json));
-      if (JSON.parse(version.observed_json)?.ready !== true) return null;
+      const observed: unknown = JSON.parse(version.observed_json);
+      if (!isReadyWorkerVersionObservation(observed, spec.bundle !== undefined)) {
+        return null;
+      }
     } catch {
       return null;
     }
