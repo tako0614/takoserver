@@ -169,6 +169,66 @@ test("v2 Workflow-only class rejects mismatched broker token and releases the le
   }
 });
 
+test("v2 Workflow-only class cannot change tenant while broker lease is pending", async () => {
+  const root = await mkdtemp(join(tmpdir(), "twf-v2-binding-tenant-race-"));
+  const foreignTenant = "org:other-tenant";
+  const foreignSite: WorkerdSite = {
+    ...selectedSite(),
+    workflowForward: {
+      schema: "takoserver.v2-workflow-binding-forward@1",
+      snapshotDigest,
+      bindings: [
+        {
+          publicName: "CHILD",
+          serviceName,
+          tenantId: foreignTenant,
+          workflowResourceUid: childUid,
+          token,
+        },
+      ],
+    },
+  };
+  let resolveAcquire!: (lease: WorkerdPrivateServiceLease) => void;
+  const acquisition = new Promise<WorkerdPrivateServiceLease>((resolve) => {
+    resolveAcquire = resolve;
+  });
+  let entered!: () => void;
+  const acquired = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let releases = 0;
+  try {
+    const input = preparation(root, foreignSite, async () => {
+      entered();
+      return acquisition;
+    });
+    const pending = prepareWorkerdWorkflowExecution(input);
+    await acquired;
+    input.selection.tenantId = foreignTenant;
+    resolveAcquire({
+      services: [],
+      workflowServices: [
+        {
+          name: serviceName,
+          publicName: "CHILD",
+          workflowResourceUid: childUid,
+          token,
+          snapshotDigest,
+          upstreamSocket: join(root, `${"a".repeat(22)}.sock`),
+        },
+      ],
+      async release() {
+        releases += 1;
+      },
+    });
+    await expect(pending).rejects.toThrow("private Workflow lease does not match selected Version");
+    expect(releases).toBe(1);
+    expect(await readdir(root)).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("guarded v2 class preparation refuses a legacy Workflow descriptor before lease acquisition", async () => {
   const root = await mkdtemp(join(tmpdir(), "twf-v2-binding-legacy-"));
   let acquisitions = 0;

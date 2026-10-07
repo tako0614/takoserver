@@ -185,13 +185,14 @@ export async function prepareWorkerdWorkflowExecution(
   signal.throwIfAborted();
   const temporaryRoot = options.temporaryRoot ?? tmpdir();
   const selected = options.selection;
+  const selectedTenantId = selected.tenantId;
   const runtimeClassRef = selected.runtimeClassRef;
   if (runtimeClassRef !== undefined && !isExactWorkflowV3InterfaceRef(runtimeClassRef)) {
     throw new WorkflowRuntimeError("invalid_runtime_input");
   }
   if (
     !isAbsolute(temporaryRoot) ||
-    selected.tenantId !== options.identity.scope.tenantId ||
+    selectedTenantId !== options.identity.scope.tenantId ||
     selected.workflowResourceUid !== options.identity.scope.workflowResourceUid ||
     [
       selected.workerResourceUid,
@@ -298,7 +299,7 @@ export async function prepareWorkerdWorkflowExecution(
           configureSignal.throwIfAborted();
           const mapped = privateServiceMappings(root, selectedBindings, serviceLease);
           workflowBindings = privateWorkflowMappings(
-            selected.tenantId,
+            selectedTenantId,
             site.workflowForward,
             serviceLease,
           );
