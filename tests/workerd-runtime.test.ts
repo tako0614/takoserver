@@ -734,6 +734,36 @@ test("persists private asset routing order through reload and restart", async ()
   expect(await restarted.has("site", "gen-assets")).toBe(true);
 });
 
+test("persists opt-in strict code+asset paths without changing legacy code manifests", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  await runtime.write(
+    "v2-code-assets",
+    {
+      directory: "v2-code-assets",
+      mainModule: "index.js",
+      hostnames: ["v2.localhost"],
+      generation: "v2-generation",
+      assets: {
+        notFoundHandling: "none",
+        runWorkerFirst: false,
+        strictPaths: true,
+        mediaTypes: { "index.html": "text/html" },
+      },
+    },
+    MODULES,
+    new Map([["index.html", new TextEncoder().encode("v2 index")]]),
+  );
+  const manifest = JSON.parse(
+    await readFile(join(root, "workers", "v2-code-assets", "takoserver-site.json"), "utf8"),
+  ) as { assets: { strictPaths?: boolean } };
+  expect(manifest.assets.strictPaths).toBe(true);
+  const restarted = createWorkerdRuntime({ root, isReady: () => true });
+  expect(await restarted.restore()).toEqual(["v2-code-assets"]);
+  const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  expect(config).toContain('(name = "STRICT_PATHS", text = "true")');
+  expect(config).toContain('(name = "WORKER", service = "v2-code-assets")');
+});
+
 test("keeps assets above 10 MiB across restart and rejects assets above 20 MiB", async () => {
   const runtime = createWorkerdRuntime({ root, isReady: () => true });
   const site = {
@@ -955,6 +985,79 @@ test("generated asset routing treats valid URL misses separately from malformed 
   expect(workerWins.status).toBe(200);
   expect(await workerWins.text()).toBe("app-ok");
   expect(routerAssetRequests).toHaveLength(3);
+});
+
+test("strict code+assets routes index paths and treats malformed lookup as worker fallback", async () => {
+  const assets = await generatedFetchWorker(ASSETS_SOURCE, "generated-v2-code-assets.mjs");
+  const router = await generatedFetchWorker(
+    ASSET_ROUTER_SOURCE,
+    "generated-v2-code-asset-router.mjs",
+  );
+  const fileReads: string[] = [];
+  const workerRequests: string[] = [];
+  let workerStatus = 404;
+  const assetEnv = {
+    STRICT_PATHS: "true",
+    NOT_FOUND: "none",
+    ASSET_MANIFEST: {
+      "index.html": { key: "asset-00000", mediaType: "text/html" },
+      "dir/index.html": { key: "asset-00001", mediaType: "text/html" },
+    },
+    FILES: {
+      async fetch(request: Request | string) {
+        const key = new URL(typeof request === "string" ? request : request.url).pathname.slice(1);
+        fileReads.push(key);
+        return new Response(key === "asset-00000" ? "root" : "directory", { status: 200 });
+      },
+    },
+  };
+  const env = {
+    RUN_WORKER_FIRST: "false",
+    ASSETS: {
+      async fetch(request: Request) {
+        return await assets.fetch(request, assetEnv);
+      },
+    },
+    WORKER: {
+      async fetch(request: Request) {
+        workerRequests.push(new URL(request.url).pathname);
+        return new Response(workerStatus === 404 ? "worker miss" : "worker response", {
+          status: workerStatus,
+          headers: { "x-worker": "preserved" },
+        });
+      },
+    },
+  };
+  expect(await (await router.fetch(new Request("https://v2.test/"), env)).text()).toBe("root");
+  expect(await (await router.fetch(new Request("https://v2.test/dir/"), env)).text()).toBe(
+    "directory",
+  );
+  expect(fileReads).toEqual(["asset-00000", "asset-00001"]);
+  const validMiss = await router.fetch(new Request("https://v2.test/missing"), env);
+  expect(validMiss.headers.get("x-worker")).toBe("preserved");
+  const head = await router.fetch(new Request("https://v2.test/", { method: "HEAD" }), env);
+  expect(head.headers.get("content-type")).toBe("text/html");
+  expect(await head.text()).toBe("");
+  const malformed = await router.fetch(rawRequest("https://v2.test/a//b"), env);
+  expect(malformed.headers.get("x-worker")).toBe("preserved");
+  expect(workerRequests).toEqual(["/missing", "/a//b"]);
+  assetEnv.NOT_FOUND = "single-page-application";
+  const spa = await router.fetch(new Request("https://v2.test/missing"), env);
+  expect(await spa.text()).toBe("root");
+  const malformedSpa = await router.fetch(rawRequest("https://v2.test/a//b"), env);
+  expect(malformedSpa.headers.get("x-worker")).toBe("preserved");
+  expect(workerRequests).toEqual(["/missing", "/a//b", "/a//b"]);
+  env.RUN_WORKER_FIRST = "true";
+  const workerFirst = await router.fetch(new Request("https://v2.test/"), env);
+  expect(await workerFirst.text()).toBe("root");
+  const workerFirstMiss = await router.fetch(rawRequest("https://v2.test/a//b"), env);
+  expect(workerFirstMiss.headers.get("x-worker")).toBe("preserved");
+  expect(workerRequests).toEqual(["/missing", "/a//b", "/a//b", "/", "/a//b"]);
+  workerStatus = 200;
+  const fileReadsBefore = fileReads.length;
+  const workerFirstWins = await router.fetch(new Request("https://v2.test/"), env);
+  expect(await workerFirstWins.text()).toBe("worker response");
+  expect(fileReads).toHaveLength(fileReadsBefore);
 });
 
 test("rejects unusable asset routing before damaging the active publication", async () => {

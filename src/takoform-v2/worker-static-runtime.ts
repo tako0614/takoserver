@@ -74,7 +74,7 @@ export async function projectV2StaticWorkerVersion(input: {
   if (!input.materials || input.materials.bundle !== null || !input.materials.assets) {
     throw new V2WorkerStaticRuntimeError("asset_bundle_unavailable");
   }
-  const assets = await verifyAssetMaterials(input.materials.assets);
+  const assets = await verifyV2AssetMaterials(input.materials.assets);
   if (
     spec.assets.notFoundHandling === "single_page_application" &&
     !assets.bytes.has("index.html")
@@ -108,7 +108,8 @@ export async function projectV2StaticWorkerVersion(input: {
   };
 }
 
-async function verifyAssetMaterials(
+/** Verify and copy the exact held StaticAssetBundle for either static or code Versions. */
+export async function verifyV2AssetMaterials(
   held: SqlArtifactCustodyRead<StaticAssetBundleManifest>,
 ): Promise<{
   readonly bytes: ReadonlyMap<string, Uint8Array>;

@@ -87,6 +87,8 @@ type WorkerdAssetInput = {
   readonly files: ReadonlyMap<string, Uint8Array>;
   readonly notFoundHandling: "none" | "single-page-application";
   readonly runWorkerFirst: boolean;
+  /** Host-owned v2 path grammar; omitted for retained v1 code assets. */
+  readonly strictPaths?: true;
   readonly mediaTypes: Readonly<Record<string, string>>;
 };
 
@@ -693,6 +695,7 @@ function snapshotAssets(assets: WorkerdVersionGraphInput["assets"]):
     !isRecord(assets.mediaTypes) ||
     (assets.notFoundHandling !== "none" && assets.notFoundHandling !== "single-page-application") ||
     typeof assets.runWorkerFirst !== "boolean" ||
+    (assets.strictPaths !== undefined && assets.strictPaths !== true) ||
     !assets.files ||
     typeof assets.files[Symbol.iterator] !== "function"
   ) {
@@ -729,6 +732,7 @@ function snapshotAssets(assets: WorkerdVersionGraphInput["assets"]):
     configuration: {
       notFoundHandling: assets.notFoundHandling,
       runWorkerFirst: assets.runWorkerFirst,
+      ...(assets.strictPaths === true ? { strictPaths: true as const } : {}),
       mediaTypes,
     },
   };

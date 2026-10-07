@@ -86,6 +86,8 @@ export type WorkerdModuleMediaType =
 interface WorkerdAssetDeclaration {
   readonly notFoundHandling: "none" | "single-page-application";
   readonly runWorkerFirst: boolean;
+  /** Explicit v2 code+asset path grammar; omitted for legacy code sites. */
+  readonly strictPaths?: true;
   /** Exact normalized media type for every logical asset path. */
   readonly mediaTypes: Readonly<Record<string, string>>;
 }
@@ -190,6 +192,7 @@ interface WorkerdAssetManifest {
   readonly storageLayout: typeof WORKERD_ASSET_STORAGE_LAYOUT;
   readonly notFoundHandling: "none" | "single-page-application";
   readonly runWorkerFirst: boolean;
+  readonly strictPaths?: true;
   /** Exact logical path to private physical key and declared media. */
   readonly files: Readonly<Record<string, WorkerdAssetManifestEntry>>;
 }
@@ -3203,6 +3206,7 @@ async function validAssets(
 > {
   if (configuration === undefined && assets === undefined) return undefined;
   const normalized = validAssetDeclaration(configuration, staticOnly);
+  const strictPaths = staticOnly || normalized?.strictPaths === true;
   if (normalized === undefined || assets === undefined || assets.size < 1) {
     throw new Error("unusable worker asset declaration");
   }
@@ -3210,7 +3214,7 @@ async function validAssets(
   for (const [name, source] of assets) {
     if (
       typeof name !== "string" ||
-      !validAssetPath(name, staticOnly) ||
+      !validAssetPath(name, strictPaths) ||
       !(source instanceof Uint8Array)
     ) {
       throw new Error("unusable worker asset declaration");
@@ -3237,7 +3241,7 @@ async function validAssets(
     const key = assetStorageName(index);
     total += bytes.byteLength;
     if (
-      (staticOnly && bytes.byteLength > MAX_STATIC_ASSET_FILE_BYTES) ||
+      (strictPaths && bytes.byteLength > MAX_STATIC_ASSET_FILE_BYTES) ||
       !Number.isSafeInteger(total) ||
       total > MAX_ASSET_BYTES
     ) {
@@ -3256,6 +3260,7 @@ async function validAssets(
       storageLayout: WORKERD_ASSET_STORAGE_LAYOUT,
       notFoundHandling: normalized.notFoundHandling,
       runWorkerFirst: normalized.runWorkerFirst,
+      ...(normalized.strictPaths === true ? { strictPaths: true as const } : {}),
       files,
     },
     entries,
@@ -3271,7 +3276,10 @@ function validAssetDeclaration(
     typeof value !== "object" ||
     value === null ||
     Array.isArray(value) ||
-    Object.keys(value).sort().join(",") !== "mediaTypes,notFoundHandling,runWorkerFirst"
+    ![
+      "mediaTypes,notFoundHandling,runWorkerFirst",
+      "mediaTypes,notFoundHandling,runWorkerFirst,strictPaths",
+    ].includes(Object.keys(value).sort().join(","))
   ) {
     throw new Error("unusable worker asset declaration");
   }
@@ -3279,16 +3287,19 @@ function validAssetDeclaration(
   const notFoundHandling = candidate.notFoundHandling;
   const runWorkerFirst = candidate.runWorkerFirst;
   const mediaTypes = candidate.mediaTypes;
+  const strictPaths = candidate.strictPaths;
   if (
     (notFoundHandling !== "none" && notFoundHandling !== "single-page-application") ||
-    typeof runWorkerFirst !== "boolean"
+    typeof runWorkerFirst !== "boolean" ||
+    (strictPaths !== undefined && strictPaths !== true)
   ) {
     throw new Error("unusable worker asset declaration");
   }
   return {
     notFoundHandling,
     runWorkerFirst,
-    mediaTypes: validAssetMediaTypes(mediaTypes, staticOnly),
+    ...(strictPaths === true ? { strictPaths: true as const } : {}),
+    mediaTypes: validAssetMediaTypes(mediaTypes, staticOnly || strictPaths === true),
   };
 }
 
@@ -3298,7 +3309,10 @@ function validAssetManifest(value: unknown, staticOnly = false): WorkerdAssetMan
     typeof value !== "object" ||
     value === null ||
     Array.isArray(value) ||
-    Object.keys(value).sort().join(",") !== "files,notFoundHandling,runWorkerFirst,storageLayout"
+    ![
+      "files,notFoundHandling,runWorkerFirst,storageLayout",
+      "files,notFoundHandling,runWorkerFirst,storageLayout,strictPaths",
+    ].includes(Object.keys(value).sort().join(","))
   ) {
     throw new Error("unusable worker asset manifest");
   }
@@ -3306,11 +3320,13 @@ function validAssetManifest(value: unknown, staticOnly = false): WorkerdAssetMan
   const storageLayout = candidate.storageLayout;
   const notFoundHandling = candidate.notFoundHandling;
   const runWorkerFirst = candidate.runWorkerFirst;
+  const strictPaths = candidate.strictPaths;
   const sourceFiles = candidate.files;
   if (
     storageLayout !== WORKERD_ASSET_STORAGE_LAYOUT ||
     (notFoundHandling !== "none" && notFoundHandling !== "single-page-application") ||
     typeof runWorkerFirst !== "boolean" ||
+    (strictPaths !== undefined && strictPaths !== true) ||
     typeof sourceFiles !== "object" ||
     sourceFiles === null ||
     Array.isArray(sourceFiles)
@@ -3321,7 +3337,8 @@ function validAssetManifest(value: unknown, staticOnly = false): WorkerdAssetMan
   const logicalPaths = Object.keys(filesRecord).sort((left, right) =>
     left < right ? -1 : left > right ? 1 : 0,
   );
-  if (logicalPaths.length < 1 || logicalPaths.length > (staticOnly ? 512 : MAX_ASSET_ENTRIES)) {
+  const strictGrammar = staticOnly || strictPaths === true;
+  if (logicalPaths.length < 1 || logicalPaths.length > (strictGrammar ? 512 : MAX_ASSET_ENTRIES)) {
     throw new Error("unusable worker asset manifest");
   }
   const files: Record<string, WorkerdAssetManifestEntry> = Object.create(null);
@@ -3329,7 +3346,7 @@ function validAssetManifest(value: unknown, staticOnly = false): WorkerdAssetMan
   for (const [index, path] of logicalPaths.entries()) {
     const entry = filesRecord[path];
     if (
-      !validAssetPath(path, staticOnly) ||
+      !validAssetPath(path, strictGrammar) ||
       typeof entry !== "object" ||
       entry === null ||
       Array.isArray(entry) ||
@@ -3340,10 +3357,10 @@ function validAssetManifest(value: unknown, staticOnly = false): WorkerdAssetMan
     const record = entry as Record<string, unknown>;
     if (
       record.key !== assetStorageName(index) ||
-      !validAssetMediaType(record.mediaType, staticOnly) ||
+      !validAssetMediaType(record.mediaType, strictGrammar) ||
       !Number.isSafeInteger(record.size) ||
       (record.size as number) < 0 ||
-      (record.size as number) > (staticOnly ? MAX_STATIC_ASSET_FILE_BYTES : MAX_ASSET_BYTES) ||
+      (record.size as number) > (strictGrammar ? MAX_STATIC_ASSET_FILE_BYTES : MAX_ASSET_BYTES) ||
       typeof record.digest !== "string" ||
       !SHA256_DIGEST.test(record.digest)
     ) {
@@ -3367,6 +3384,7 @@ function validAssetManifest(value: unknown, staticOnly = false): WorkerdAssetMan
     storageLayout,
     notFoundHandling,
     runWorkerFirst,
+    ...(strictPaths === true ? { strictPaths: true as const } : {}),
     files,
   };
 }
@@ -4765,6 +4783,7 @@ export async function readWorkerdSelectedActiveVersion(
                 assets: {
                   notFoundHandling: manifest.assets.notFoundHandling,
                   runWorkerFirst: manifest.assets.runWorkerFirst,
+                  ...(manifest.assets.strictPaths === true ? { strictPaths: true as const } : {}),
                   mediaTypes: Object.fromEntries(
                     Object.entries(manifest.assets.files).map(([path, entry]) => [
                       path,
@@ -4987,6 +5006,7 @@ export async function readWorkerdActiveActorGraph(
               assets: {
                 notFoundHandling: manifest.assets.notFoundHandling,
                 runWorkerFirst: manifest.assets.runWorkerFirst,
+                ...(manifest.assets.strictPaths === true ? { strictPaths: true as const } : {}),
                 mediaTypes: Object.fromEntries(
                   Object.entries(manifest.assets.files).map(([path, entry]) => [
                     path,
@@ -5532,7 +5552,7 @@ function renderConfig(
       bindings = [
         (name = "FILES", service = "${entry.name}-assets-files"),
         (name = "NOT_FOUND", text = "${assets.notFoundHandling}"),
-        ${isStaticManifest(entry.manifest) ? '(name = "STRICT_PATHS", text = "true"),' : ""}
+        ${isStaticManifest(entry.manifest) || assets.strictPaths === true ? '(name = "STRICT_PATHS", text = "true"),' : ""}
         (name = "ASSET_MANIFEST", json = ${capnpText(JSON.stringify(assets.files))}),
       ],
       compatibilityDate = "2026-01-01",
@@ -6144,10 +6164,9 @@ function miss() {
 }
 
 function invalidPath() {
-  // Deliberately indistinguishable from an ordinary public 404, but without
-  // the private miss marker: once the declared ordering reaches asset lookup,
-  // the composition service treats this as final instead of entering a later
-  // Worker stage or SPA fallback.
+  // Retained v1 code+asset behavior: without the private miss marker, the
+  // composition service treats this as final rather than entering a later
+  // Worker stage or SPA fallback. V2 strict paths use miss() instead.
   return new Response("not found\\n", {
     status: 404,
     headers: { "content-type": "text/plain; charset=utf-8" },
@@ -6227,7 +6246,11 @@ function manifestEntry(env, path) {
 export default {
   async fetch(request, env) {
     const assetPath = pathOf(request, env.STRICT_PATHS === "true");
-    if (assetPath === null) return invalidPath();
+    // V2 code+assets treats an unsearchable path as an asset miss, so an
+    // asset-first Version can still dispatch its declared fetch handler.
+    // Retained v1 code keeps the historical terminal invalid-path response.
+    // A static-only Version turns the marked miss into its ordinary final 404.
+    if (assetPath === null) return env.STRICT_PATHS === "true" ? miss() : invalidPath();
 
     const directEntry = assetPath === "" ? null : manifestEntry(env, assetPath);
     const direct = directEntry ? await file(env, directEntry) : null;
