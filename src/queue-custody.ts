@@ -126,6 +126,14 @@ export interface QueueCustody {
     readonly generation: number;
     readonly limit: number;
     readonly leaseMillis?: number;
+    /** Internal v2 attachment gate; fences DELETE/UPDATE acceptance in the lease write. */
+    readonly v2Attachment?: {
+      readonly principal: string;
+      readonly space: string;
+      readonly targetKey: string;
+    };
+    /** Exact pre-send execution reservation; never an authority to deliver by itself. */
+    readonly v2Reservation?: { readonly batchId: string; readonly reservationToken: string };
   }): Promise<readonly QueueCustodyClaimedMessage[]>;
   release(message: QueueCustodyClaimedMessage, visibleAtMillis?: number): Promise<boolean>;
   settle(
@@ -135,6 +143,7 @@ export interface QueueCustody {
   registerSettlementBatch(
     batchId: string,
     messages: readonly QueueCustodyClaimedMessage[],
+    v2Reservation?: { readonly reservationToken: string },
   ): Promise<void>;
   readSettlementBatch(input: {
     readonly batchId: string;
@@ -145,6 +154,19 @@ export interface QueueCustody {
   settleBatchMessage(input: {
     readonly batchId: string;
     readonly message: QueueCustodyClaimedMessage;
+    readonly decision: { readonly outcome: "ack" | "retry"; readonly delaySeconds?: number };
+    readonly settlementToken: string;
+  }): Promise<"settled" | "already_settled" | "unknown_batch" | "unknown_message" | "unavailable">;
+  /** Trusted transport-only settlement by an already registered, exact SQL claim. */
+  settleRegisteredBatchMessage(input: {
+    readonly batchId: string;
+    readonly messageId: string;
+    readonly expected: {
+      readonly queueId: string;
+      readonly consumerId: string;
+      readonly generation: number;
+      readonly leaseToken: string;
+    };
     readonly decision: { readonly outcome: "ack" | "retry"; readonly delaySeconds?: number };
     readonly settlementToken: string;
   }): Promise<"settled" | "already_settled" | "unknown_batch" | "unknown_message" | "unavailable">;
@@ -173,6 +195,28 @@ export interface QueueCustody {
     readonly generation: number;
     readonly limit?: number;
   }): Promise<QueueCustodyRetirementStatus>;
+  /** Internal v2 retiring maintenance; every write is batched with the live Operation fence. */
+  reapRetiredV2(input: {
+    readonly queueId: string;
+    readonly consumerId: string;
+    readonly generation: number;
+    readonly limit?: number;
+    readonly operationClaim: {
+      readonly operationId: string;
+      readonly leaseToken: string;
+      readonly resourceUid: string;
+      readonly principal: string;
+      readonly form: string;
+      readonly space: string;
+      readonly name: string;
+      readonly backendId: string;
+      readonly targetKey: string;
+      readonly backendKey: string;
+      readonly action: string;
+      readonly generation: number;
+      readonly specJson: string;
+    };
+  }): Promise<QueueCustodyRetirementStatus>;
   finishRetirement(input: {
     readonly queueId: string;
     readonly consumerId: string;
@@ -185,6 +229,53 @@ export interface QueueCustodyOptions {
   readonly sql: Sql;
   readonly clock?: () => Date;
   readonly randomId?: () => string;
+}
+
+type V2ReapClaim = Parameters<QueueCustody["reapRetiredV2"]>[0]["operationClaim"];
+const V2_REAP_DB_NOW = `(CAST(strftime('%s', 'now') AS INTEGER) * 1000
+  + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))`;
+// This SELECT runs as the first statement of the same atomic Sql.batch as
+// all message/notice writes. A false claim deliberately raises a SQLite
+// malformed-JSON error, rolling the batch back before any custody mutation.
+const V2_REAP_GUARD_SQL = `SELECT CASE WHEN EXISTS (
+  SELECT 1 FROM tf_v2_operations op
+  JOIN tf_v2_resources resource ON resource.uid = op.resource_uid
+  WHERE op.id = ? AND op.lease_token = ? AND op.resource_uid = ?
+    AND op.principal = ? AND op.backend_id = ? AND op.target_key = ?
+    AND op.backend_key = ? AND op.action = ? AND op.generation = ?
+    AND op.accepted_spec_json = ? AND op.status = 'reconciling'
+    AND op.dispatch_possible = 1 AND op.lease_until_ms > ${V2_REAP_DB_NOW}
+    AND resource.uid = ? AND resource.principal = ? AND resource.form_url = ?
+    AND resource.space = ? AND resource.name = ?
+    AND resource.backend_id = ? AND resource.target_key = ?
+    AND resource.generation = op.generation AND resource.spec_json = op.accepted_spec_json
+    AND resource.last_operation = op.id AND resource.busy_operation = op.id
+    AND resource.deleted_at IS NULL
+) THEN 1 ELSE json_extract('{', '$') END AS authorized`;
+
+function v2ReapGuard(claim: V2ReapClaim): SqlStatement {
+  return {
+    sql: V2_REAP_GUARD_SQL,
+    params: [
+      claim.operationId,
+      claim.leaseToken,
+      claim.resourceUid,
+      claim.principal,
+      claim.backendId,
+      claim.targetKey,
+      claim.backendKey,
+      claim.action,
+      claim.generation,
+      claim.specJson,
+      claim.resourceUid,
+      claim.principal,
+      claim.form,
+      claim.space,
+      claim.name,
+      claim.backendId,
+      claim.targetKey,
+    ],
+  };
 }
 
 /**
@@ -430,6 +521,8 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
     identity: Pick<QueueCustodyConsumerGeneration, "queueId" | "consumerId" | "generation">,
     millis: number,
     limit: number,
+    v2Execution = false,
+    v2OperationClaim?: V2ReapClaim,
   ): Promise<boolean> => {
     const rows = await sql.query(
       `SELECT message_id, enqueued_at_ms, visible_at_ms, expires_at_ms,
@@ -437,8 +530,23 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
               lease_retry_delay_seconds,
               lease_dead_letter_queue_id,
               lease_dead_letter_delivery_delay_seconds,
-              lease_dead_letter_retention_seconds
-       FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_custody_lease
+              lease_dead_letter_retention_seconds,
+              ${
+                v2Execution
+                  ? `
+              (SELECT execution.state FROM queue_v2_batch_executions execution
+               WHERE execution.queue_id = message.queue_id
+                 AND execution.consumer_uid = message.lease_consumer_id
+                 AND execution.consumer_generation = message.lease_generation
+                 AND execution.lease_token = message.lease_token) AS execution_state,
+              (SELECT execution.reservation_until_ms FROM queue_v2_batch_executions execution
+               WHERE execution.queue_id = message.queue_id
+                 AND execution.consumer_uid = message.lease_consumer_id
+                 AND execution.consumer_generation = message.lease_generation
+                 AND execution.lease_token = message.lease_token) AS execution_until_ms`
+                  : `NULL AS execution_state, NULL AS execution_until_ms`
+              }
+       FROM selfhost_queue_messages AS message INDEXED BY selfhost_queue_messages_custody_lease
        WHERE queue_id = ? AND lease_consumer_id = ? AND lease_generation = ?
          AND lease_expires_at_ms <= ?
        ORDER BY lease_expires_at_ms LIMIT ?`,
@@ -457,6 +565,9 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       const maxRetries = nonNegativeStoredInteger(row.lease_max_retries);
       const retryDelaySeconds = nonNegativeStoredInteger(row.lease_retry_delay_seconds);
       const target = leaseTargetFromRow(row);
+      // An unconfirmed native handler may still be using this exact message.
+      // Expired delivery time is not proof of handler+waitUntil retirement.
+      if (v2Execution && row.execution_state === "send_authorized") continue;
       const snapshotParams = [
         identity.queueId,
         id,
@@ -495,6 +606,47 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                    AND state IN ('active', 'retiring')
                )`,
           params: [...snapshotParams.slice(0, 15), millis, ...snapshotParams.slice(15)],
+        });
+        continue;
+      }
+      if (
+        row.execution_state === "reserved" ||
+        row.execution_state === "registered" ||
+        row.execution_state === "pre_effect_refused"
+      ) {
+        const until = positiveStoredInteger(row.execution_until_ms);
+        // Before this DB-time deadline, a registered sender could still win
+        // authorization. Never refund an attempt that might have been sent.
+        if (row.execution_state !== "pre_effect_refused" && until > millis) continue;
+        statements.push({
+          sql: `UPDATE selfhost_queue_messages
+             SET visible_at_ms = ?,
+                 deliveries = CASE WHEN deliveries > 0 THEN deliveries - 1 ELSE 0 END,
+                 lease_token = NULL, lease_expires_at_ms = NULL,
+                 lease_consumer_id = NULL, lease_generation = NULL,
+                 lease_max_retries = NULL, lease_retry_delay_seconds = NULL,
+                 lease_dead_letter_queue_id = NULL,
+                 lease_dead_letter_delivery_delay_seconds = NULL,
+                 lease_dead_letter_retention_seconds = NULL
+             WHERE queue_id = ? AND message_id = ? AND enqueued_at_ms = ?
+               AND visible_at_ms = ? AND expires_at_ms = ? AND deliveries = ?
+               AND lease_token = ? AND lease_expires_at_ms = ?
+               AND lease_consumer_id = ? AND lease_generation = ?
+               AND lease_max_retries = ? AND lease_retry_delay_seconds = ?
+               AND lease_dead_letter_queue_id IS ?
+               AND lease_dead_letter_delivery_delay_seconds IS ?
+               AND lease_dead_letter_retention_seconds IS ?
+               AND EXISTS (SELECT 1 FROM queue_v2_batch_executions execution
+                 WHERE execution.queue_id = selfhost_queue_messages.queue_id
+                   AND execution.consumer_uid = selfhost_queue_messages.lease_consumer_id
+                   AND execution.consumer_generation = selfhost_queue_messages.lease_generation
+                   AND execution.lease_token = selfhost_queue_messages.lease_token
+                   AND (execution.state = 'pre_effect_refused' OR
+                     (execution.state IN ('reserved','registered') AND
+                      execution.reservation_until_ms <=
+                        (CAST(strftime('%s', 'now') AS INTEGER) * 1000
+                         + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))))`,
+          params: [millis, ...snapshotParams.slice(0, 15)],
         });
         continue;
       }
@@ -547,7 +699,10 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         ),
       );
     }
-    if (statements.length > 0) await sql.batch(statements);
+    if (statements.length > 0)
+      await sql.batch(
+        v2OperationClaim ? [v2ReapGuard(v2OperationClaim), ...statements] : statements,
+      );
     return true;
   };
 
@@ -874,6 +1029,25 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
 
     async claim(input) {
       const selected = generationIdentity(input);
+      const v2Attachment =
+        input.v2Attachment === undefined
+          ? undefined
+          : {
+              principal: token(input.v2Attachment.principal, 128, "v2 attachment principal"),
+              space: token(input.v2Attachment.space, 128, "v2 attachment space"),
+              targetKey: token(input.v2Attachment.targetKey, 512, "v2 attachment target"),
+            };
+      const v2Reservation =
+        input.v2Reservation === undefined
+          ? undefined
+          : {
+              batchId: token(input.v2Reservation.batchId, 256, "v2 batch id"),
+              reservationToken: token(
+                input.v2Reservation.reservationToken,
+                128,
+                "v2 reservation token",
+              ),
+            };
       const limit = positiveInteger(input.limit, MAX_BATCH_MESSAGES, "queue custody claim limit");
       const leaseMillis = positiveInteger(
         input.leaseMillis ?? MAX_LEASE_MILLIS,
@@ -889,7 +1063,8 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         return [];
       }
       const millis = now();
-      if (await reapExpiredLeases(current, millis, MAX_REAP_MESSAGES)) return [];
+      if (await reapExpiredLeases(current, millis, MAX_REAP_MESSAGES, v2Reservation !== undefined))
+        return [];
       const rows = await readUnleasedWindow(current.queueId);
       if (await progressActiveWindow(current, millis, rows)) return [];
       const candidateMetadata = rows
@@ -926,9 +1101,8 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       const leaseToken = randomId();
       token(leaseToken, 128, "queue custody lease token");
       const target = current.policy.deadLetterQueue;
-      const written = await sql.batch(
-        candidates.map((message) => ({
-          sql: `UPDATE selfhost_queue_messages
+      const claimStatements: SqlStatement[] = candidates.map((message) => ({
+        sql: `UPDATE selfhost_queue_messages
              SET lease_token = ?, lease_expires_at_ms = ?, deliveries = deliveries + 1,
                  lease_consumer_id = ?, lease_generation = ?, lease_max_retries = ?,
                  lease_retry_delay_seconds = ?, lease_dead_letter_queue_id = ?,
@@ -942,33 +1116,99 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                  SELECT 1 FROM queue_consumer_custody
                  WHERE queue_id = ? AND consumer_id = ? AND generation = ?
                    AND state = 'active'
-               )`,
+               )${
+                 v2Attachment
+                   ? `
+               AND EXISTS (
+                 SELECT 1 FROM tf_v2_resources attachment
+                 JOIN tf_v2_operations op ON op.id = attachment.last_operation
+                 WHERE attachment.uid = ? AND attachment.principal = ?
+                   AND attachment.space = ? AND attachment.target_key = ?
+                   AND attachment.form_url = 'https://edge.forms.takoform.com/forms/QueueConsumer/0.3.0/'
+                   AND attachment.deleted_at IS NULL AND attachment.phase = 'idle'
+                   AND attachment.busy_operation IS NULL
+                   AND attachment.generation = attachment.observed_generation
+                   AND op.resource_uid = attachment.uid AND op.status = 'succeeded'
+                   AND op.effect = 'complete' AND op.action IN ('create','update')
+                   AND op.generation = attachment.generation
+                   AND op.accepted_spec_json = attachment.spec_json
+               )`
+                   : ""
+}${
+                 v2Reservation
+                   ? `
+               AND EXISTS (SELECT 1 FROM queue_v2_batch_executions execution
+                 WHERE execution.batch_id = ? AND execution.reservation_token = ?
+                   AND execution.queue_id = ? AND execution.consumer_uid = ?
+                   AND execution.consumer_generation = ?
+                   AND execution.lease_token = ? AND execution.state = 'reserved'
+                   AND EXISTS (SELECT 1 FROM tf_v2_resources attachment
+                     WHERE attachment.uid = execution.consumer_uid
+                       AND attachment.spec_json = execution.consumer_spec_json)
+                   AND execution.reservation_until_ms >
+                     (CAST(strftime('%s', 'now') AS INTEGER) * 1000
+                      + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER)))`
+                   : ""
+}`,
+        params: [
+          leaseToken,
+          millis + leaseMillis,
+          current.consumerId,
+          current.generation,
+          current.policy.maxRetries,
+          current.policy.retryDelaySeconds,
+          target?.queueId ?? null,
+          target?.deliveryDelaySeconds ?? null,
+          target?.messageRetentionSeconds ?? null,
+          current.queueId,
+          message.messageId,
+          message.attempts - 1,
+          message.enqueuedAtMillis,
+          message.visibleAtMillis,
+          message.expiresAtMillis,
+          millis,
+          millis,
+          current.queueId,
+          current.consumerId,
+          current.generation,
+          ...(v2Attachment
+            ? [
+                current.consumerId,
+                v2Attachment.principal,
+                v2Attachment.space,
+                v2Attachment.targetKey,
+              ]
+            : []),
+          ...(v2Reservation
+            ? [
+                v2Reservation.batchId,
+                v2Reservation.reservationToken,
+                current.queueId,
+                current.consumerId,
+                current.generation,
+                leaseToken,
+              ]
+            : []),
+        ],
+      }));
+      if (v2Reservation)
+        claimStatements.unshift({
+          sql: `UPDATE queue_v2_batch_executions SET lease_token = ?
+          WHERE batch_id = ? AND reservation_token = ? AND queue_id = ?
+            AND consumer_uid = ? AND consumer_generation = ? AND state = 'reserved'
+            AND lease_token IS NULL`,
           params: [
             leaseToken,
-            millis + leaseMillis,
-            current.consumerId,
-            current.generation,
-            current.policy.maxRetries,
-            current.policy.retryDelaySeconds,
-            target?.queueId ?? null,
-            target?.deliveryDelaySeconds ?? null,
-            target?.messageRetentionSeconds ?? null,
-            current.queueId,
-            message.messageId,
-            message.attempts - 1,
-            message.enqueuedAtMillis,
-            message.visibleAtMillis,
-            message.expiresAtMillis,
-            millis,
-            millis,
+            v2Reservation.batchId,
+            v2Reservation.reservationToken,
             current.queueId,
             current.consumerId,
             current.generation,
           ],
-        })),
-      );
+        });
+      const written = await sql.batch(claimStatements);
       return candidates.flatMap((message, index) =>
-        written[index]?.changes === 1
+        written[index + (v2Reservation ? 1 : 0)]?.changes === 1
           ? [
               {
                 ...message,
@@ -1086,8 +1326,18 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       return written.at(-1)?.changes === 1;
     },
 
-    async registerSettlementBatch(batchIdValue, messageValues) {
+    async registerSettlementBatch(batchIdValue, messageValues, v2ReservationValue) {
       const batchId = token(batchIdValue, 256, "queue batch id");
+      const v2Reservation =
+        v2ReservationValue === undefined
+          ? undefined
+          : {
+              reservationToken: token(
+                v2ReservationValue.reservationToken,
+                128,
+                "v2 reservation token",
+              ),
+            };
       if (
         !Array.isArray(messageValues) ||
         messageValues.length < 1 ||
@@ -1113,40 +1363,77 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         throw new TypeError("queue batch claim is invalid");
       }
       try {
-        await sql.batch(
-          messages.map((message) => ({
-            sql: `INSERT INTO queue_v2_batch_settlements
+        const statements: SqlStatement[] = messages.map((message) => ({
+          sql: `INSERT INTO queue_v2_batch_settlements
             (batch_id, queue_id, consumer_id, generation, lease_token, message_id,
              attempts, max_retries, retry_delay_seconds, dead_letter_queue_id,
-             dead_letter_delivery_delay_seconds, dead_letter_retention_seconds)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             dead_letter_delivery_delay_seconds, dead_letter_retention_seconds,
+             execution_reservation_token)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
+            batchId,
+            message.queueId,
+            message.consumerId,
+            message.generation,
+            message.leaseToken,
+            message.messageId,
+            message.attempts,
+            message.policy.maxRetries,
+            message.policy.retryDelaySeconds,
+            message.policy.deadLetterQueue?.queueId ?? null,
+            message.policy.deadLetterQueue?.deliveryDelaySeconds ?? null,
+            message.policy.deadLetterQueue?.messageRetentionSeconds ?? null,
+            v2Reservation?.reservationToken ?? null,
+          ],
+        }));
+        if (v2Reservation)
+          statements.push({
+            sql: `UPDATE queue_v2_batch_executions SET state = 'registered', message_count = ?
+            WHERE batch_id = ? AND reservation_token = ? AND queue_id = ?
+              AND consumer_uid = ? AND consumer_generation = ?`,
             params: [
+              messages.length,
               batchId,
-              message.queueId,
-              message.consumerId,
-              message.generation,
-              message.leaseToken,
-              message.messageId,
-              message.attempts,
-              message.policy.maxRetries,
-              message.policy.retryDelaySeconds,
-              message.policy.deadLetterQueue?.queueId ?? null,
-              message.policy.deadLetterQueue?.deliveryDelaySeconds ?? null,
-              message.policy.deadLetterQueue?.messageRetentionSeconds ?? null,
+              v2Reservation.reservationToken,
+              first.queueId,
+              first.consumerId,
+              first.generation,
             ],
-          })),
-        );
+          });
+        const results = await sql.batch(statements);
+        if (v2Reservation && results.at(-1)?.changes !== 1)
+          throw new QueueCustodyConflictError("queue batch reservation is unavailable");
       } catch {
         // Includes a lost acknowledgement after the atomic batch committed.
         // An identical complete registration is safe to reopen; a partial or
         // differently scoped row set is never adopted.
         const rows = await settlementRows(batchId);
+        const executionRows = v2Reservation
+          ? await sql.query(
+              `SELECT state, message_count FROM queue_v2_batch_executions
+           WHERE batch_id = ? AND reservation_token = ? AND queue_id = ?
+             AND consumer_uid = ? AND consumer_generation = ? LIMIT 2`,
+              [
+                batchId,
+                v2Reservation.reservationToken,
+                first.queueId,
+                first.consumerId,
+                first.generation,
+              ],
+            )
+          : [];
         if (
           rows.length === messages.length &&
           rows.every((row) => row.state === "pending" || row.state === "settled") &&
           rows.every((row) =>
             messages.some((message) => sameSettlementClaim(row, batchId, message)),
-          )
+          ) &&
+          (!v2Reservation ||
+            (executionRows.length === 1 &&
+              executionRows[0]?.message_count === messages.length &&
+              ["registered", "send_authorized", "retired"].includes(
+                String(executionRows[0]?.state),
+              )))
         ) {
           return;
         }
@@ -1314,6 +1601,68 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       }
     },
 
+    async settleRegisteredBatchMessage(input) {
+      // The transport authenticates the grant. Capture it before SQL awaits;
+      // the receipt is the only source for immutable policy/attempt fields.
+      const batchId = token(input.batchId, 256, "queue batch id");
+      const id = messageId(input.messageId);
+      const expected = {
+        ...generationIdentity(input.expected),
+        leaseToken: token(input.expected.leaseToken, 128, "queue custody lease token"),
+      };
+      const decision = settlementDecision(input.decision);
+      const settlementToken = token(input.settlementToken, 128, "queue settlement token");
+      const rows = await settlementRows(batchId);
+      if (rows.length === 0) return "unknown_batch";
+      const row = rows.find((candidate) => candidate.message_id === id);
+      if (!row) return "unknown_message";
+      if (
+        row.queue_id !== expected.queueId ||
+        row.consumer_id !== expected.consumerId ||
+        row.generation !== expected.generation ||
+        row.lease_token !== expected.leaseToken
+      )
+        return "unknown_message";
+      const effectiveDelay =
+        decision.outcome === "retry"
+          ? (decision.delaySeconds ?? nonNegativeStoredInteger(row.retry_delay_seconds))
+          : null;
+      if (row.state === "settled") {
+        return row.settlement_token === settlementToken &&
+          row.outcome === decision.outcome &&
+          row.delay_seconds === effectiveDelay
+          ? "settled"
+          : "already_settled";
+      }
+      if (row.state !== "pending") return "unavailable";
+      // The original body has no settlement authority. The immutable receipt
+      // reconstructs exactly the claim fields; SQL verifies its live lease.
+      const message: QueueCustodyClaimedMessage = {
+        ...expected,
+        messageId: id,
+        body: new Uint8Array(0),
+        enqueuedAtMillis: 1,
+        visibleAtMillis: 1,
+        attempts: positiveStoredInteger(row.attempts),
+        policy: {
+          maxRetries: nonNegativeStoredInteger(row.max_retries),
+          retryDelaySeconds: nonNegativeStoredInteger(row.retry_delay_seconds),
+          ...(row.dead_letter_queue_id === null
+            ? {}
+            : {
+                deadLetterQueue: {
+                  queueId: token(row.dead_letter_queue_id, 512, "queue custody target queue id"),
+                  deliveryDelaySeconds: nonNegativeStoredInteger(
+                    row.dead_letter_delivery_delay_seconds,
+                  ),
+                  messageRetentionSeconds: positiveStoredInteger(row.dead_letter_retention_seconds),
+                },
+              }),
+        },
+      };
+      return await this.settleBatchMessage({ batchId, message, decision, settlementToken });
+    },
+
     async listTransferNotices(input) {
       const selected = generationIdentity(input);
       const limit = positiveInteger(
@@ -1428,6 +1777,25 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         "queue custody reap limit",
       );
       await reapExpiredLeases(current, millis, limit);
+      return await retirementStatus(current, millis);
+    },
+
+    async reapRetiredV2(input) {
+      const selected = generationIdentity(input);
+      const current = await readGeneration(selected);
+      if (
+        current?.state !== "retiring" ||
+        current.consumerId !== selected.consumerId ||
+        current.generation !== selected.generation
+      )
+        throw new QueueCustodyConflictError();
+      const millis = now();
+      const limit = positiveInteger(
+        input.limit ?? MAX_REAP_MESSAGES,
+        MAX_REAP_MESSAGES,
+        "queue custody reap limit",
+      );
+      await reapExpiredLeases(current, millis, limit, true, input.operationClaim);
       return await retirementStatus(current, millis);
     },
 
@@ -1786,6 +2154,15 @@ function retentionSeconds(value: unknown): number {
 function bytes(value: unknown): Uint8Array {
   if (value instanceof Uint8Array) return value.slice();
   if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+  // D1 projects SQLite BLOBs as integer arrays. Reject coercion/truncation so
+  // the retained message body is exactly the byte sequence that was admitted.
+  if (
+    Array.isArray(value) &&
+    value.every(
+      (byte) => typeof byte === "number" && Number.isInteger(byte) && byte >= 0 && byte <= 255,
+    )
+  )
+    return Uint8Array.from(value);
   throw new TypeError("queue custody message body is invalid");
 }
 

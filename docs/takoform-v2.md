@@ -572,6 +572,25 @@ same-match redelivery, a non-equivalent schedule update and delete/drain. That
 evidence is not native workerd ABI, normal application Form registration,
 Hosted scheduled delivery or production readiness.
 
+The normal Bun entry now also constructs the v2 UID-owner composition against
+its canonical SQL, object store, clock and selected workerd binary. Before its
+public listener opens, it reopens only private owner directories explained by
+the same SQL Worker inventory and refuses missing serving owners or unexplained
+directories. This is a boot/recovery path, not a new public Form registration:
+the reusable internal Form factory is exercised only by local integration tests
+through normal organization-authenticated `buildApp` HTTP. A complete Worker
+Form claim still needs the remaining typed Binding and queue-handler contracts,
+operator-configured sensitive-input keys in the ordinary entry, and an
+independently qualified public HTTPS Endpoint route/TLS/absence observer. The
+internal factory now accepts an already-created operator sealer and gives both
+Version admission and the native owner the same SQL-backed Resource-owned
+configured-input custody. A local test uses synthetic nonextractable keys and
+the selected native workerd artifact to prove HTTP create, same-value/omitted
+PUT, mismatch refusal, configured fetch, and Host-PID restart without putting
+the secret in public Resource output. It does not register the Worker Forms on
+the normal public entry or qualify live HTTPS delivery. The existing Bun-child
+scheduled/asset tests remain stand-ins, not native workerd evidence.
+
 ## Existing installations
 
 The additive v2 tables do not convert or delete existing v1 records. Preserving

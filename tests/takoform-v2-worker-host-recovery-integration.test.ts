@@ -1,22 +1,30 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bytesDigest } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
+import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
 import {
   MODULE_WORKER_FORM_URL,
   WORKER_DEPLOYMENT_FORM_URL,
   WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 const API = "/apis/forms.takoform.com/v2";
 const MANIFEST_URL = "https://artifacts.example.test/host-recovery/manifest.json";
 const FILE_URL = "https://artifacts.example.test/host-recovery/index.html";
 const MANIFEST_KEY = "host-recovery/manifest";
 const FILE_KEY = "host-recovery/index.html";
+const CODE_MANIFEST_URL = "https://artifacts.example.test/host-recovery/code.json";
+const CODE_FILE_URL = "https://artifacts.example.test/host-recovery/index.mjs";
+const CODE_MANIFEST_KEY = "host-recovery/code-manifest";
+const CODE_FILE_KEY = "host-recovery/code-file";
 type Json = Record<string, unknown>;
 type FixtureEvent = { stage: string; port?: number; error?: string };
 
@@ -26,6 +34,7 @@ async function startHost(
   binary: string,
   manifestSha256: string,
   fileSha256: string,
+  nativeCode?: { manifestSha256: string; fileSha256: string },
 ) {
   const child = Bun.spawn(
     [
@@ -37,6 +46,7 @@ async function startHost(
       workerUid ?? "-",
       manifestSha256,
       fileSha256,
+      ...(nativeCode ? ["native-code", nativeCode.manifestSha256, nativeCode.fileSha256] : []),
     ],
     { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
   );
@@ -96,6 +106,306 @@ async function startHost(
     throw error;
   }
 }
+
+const nativeWorkerd = nativeEvidenceBinary("workerd-artifact") ?? null;
+
+test.skipIf(nativeWorkerd === null)(
+  "OS-restarted Host restores accepted native code+assets and secret without replay upload",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "v2-worker-native-host-recovery-"));
+    const assetBytes = new TextEncoder().encode("native restart held asset");
+    const codeBytes = new TextEncoder().encode(
+      "export default { fetch(request, env) { const path = new URL(request.url).pathname; return new Response(path === '/api' ? env.TOKEN + ':' + env.LABEL : 'worker fallback'); } };\n",
+    );
+    const digest = async (bytes: Uint8Array) => (await bytesDigest(bytes)).slice("sha256:".length);
+    const assetManifest = new TextEncoder().encode(
+      JSON.stringify({
+        files: [
+          {
+            path: "index.html",
+            url: FILE_URL,
+            sha256: await digest(assetBytes),
+            mediaType: "text/html",
+          },
+        ],
+      }),
+    );
+    const codeManifest = new TextEncoder().encode(
+      JSON.stringify({
+        entrypoint: "index.mjs",
+        files: [
+          {
+            path: "index.mjs",
+            url: CODE_FILE_URL,
+            sha256: await digest(codeBytes),
+            mediaType: "application/javascript+module",
+          },
+        ],
+      }),
+    );
+    const nativeCode = {
+      manifestSha256: await digest(codeManifest),
+      fileSha256: await digest(codeBytes),
+    };
+    const manifestSha256 = await digest(assetManifest);
+    const fileSha256 = await digest(assetBytes);
+    const secret = "fixture-os-restart-secret";
+    const createKey = "native-restart-deployment-create-key";
+    let first: Awaited<ReturnType<typeof startHost>> | undefined;
+    let second: Awaited<ReturnType<typeof startHost>> | undefined;
+    try {
+      const selected = await selectClosedGraphWorkerd({
+        binary: nativeWorkerd as string,
+        privateRoot: join(root, "selected-binary"),
+      });
+      if (!selected.binary) throw new Error(selected.diagnostic ?? "pinned Workerd unavailable");
+      const objects = createFileObjectStore({ root: join(root, "objects") });
+      await objects.put(MANIFEST_KEY, assetManifest);
+      await objects.put(FILE_KEY, assetBytes);
+      await objects.put(CODE_MANIFEST_KEY, codeManifest);
+      await objects.put(CODE_FILE_KEY, codeBytes);
+      first = await startHost(root, null, selected.binary, manifestSha256, fileSha256, nativeCode);
+      const worker = await createResource(
+        first.origin,
+        MODULE_WORKER_FORM_URL,
+        "native-worker",
+        {},
+      );
+      const assets = await createResource(
+        first.origin,
+        STATIC_ASSET_BUNDLE_FORM_URL,
+        "native-assets",
+        {
+          artifact: { url: MANIFEST_URL, sha256: manifestSha256 },
+        },
+      );
+      const bundle = await createResource(first.origin, WORKER_BUNDLE_FORM_URL, "native-bundle", {
+        artifact: { url: CODE_MANIFEST_URL, sha256: nativeCode.manifestSha256 },
+      });
+      const versionSpec = {
+        worker: { resourceUid: worker.resourceUid },
+        bundle: { resourceUid: bundle.resourceUid },
+        handlers: ["fetch"],
+        vars: { LABEL: "public-label" },
+        requiredSensitiveVars: ["TOKEN"],
+        assets: {
+          bundle: { resourceUid: assets.resourceUid },
+          runWorkerFirst: false,
+          notFoundHandling: "none",
+        },
+      };
+      const versionResponse = await request(
+        first.origin,
+        "/resources",
+        "POST",
+        {
+          form: WORKER_VERSION_FORM_URL,
+          space: "production",
+          name: "native-version",
+          spec: versionSpec,
+          privateInputs: { TOKEN: secret },
+        },
+        "native-version-create-key",
+      );
+      expect(versionResponse.status).toBe(202);
+      const version = (await versionResponse.json()) as { id: string; resourceUid: string };
+      expect(await waitForOperation(first.origin, version.id)).toMatchObject({
+        status: "succeeded",
+      });
+      const publicVersion = await request(first.origin, `/resources/${version.resourceUid}`);
+      expect(publicVersion.status).toBe(200);
+      expect(await publicVersion.text()).not.toContain(secret);
+      const deploymentSpec = {
+        worker: { resourceUid: worker.resourceUid },
+        versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+      };
+      const dropped = await request(
+        first.origin,
+        "/resources",
+        "POST",
+        {
+          form: WORKER_DEPLOYMENT_FORM_URL,
+          space: "production",
+          name: "native-deployment",
+          spec: deploymentSpec,
+        },
+        createKey,
+      );
+      expect(dropped.status).toBe(202);
+      await dropped.body?.cancel();
+      const deployed = await waitForResourceOperation(first.origin, "native-deployment");
+      const endpointSpec = { worker: { resourceUid: worker.resourceUid } };
+      const endpointKey = "native-endpoint-create-key";
+      const droppedEndpoint = await request(
+        first.origin,
+        "/resources",
+        "POST",
+        {
+          form: WORKER_ENDPOINT_FORM_URL,
+          space: "production",
+          name: "native-endpoint",
+          spec: endpointSpec,
+        },
+        endpointKey,
+      );
+      expect(droppedEndpoint.status).toBe(202);
+      await droppedEndpoint.body?.cancel();
+      const endpoint = await waitForResourceOperation(first.origin, "native-endpoint");
+      const serve = async (host: Awaited<ReturnType<typeof startHost>>, path: string) => {
+        const response = await fetch(
+          `${host.origin}/__fixture/serve/${worker.resourceUid}?path=${encodeURIComponent(path)}`,
+        );
+        expect(response.status).toBe(200);
+        return (await response.json()) as { body: string; sourceOperationId: string };
+      };
+      expect((await serve(first, "/")).body).toBe("native restart held asset");
+      expect((await serve(first, "/api")).body).toBe(`${secret}:public-label`);
+      const firstStatus = (await (
+        await fetch(`${first.origin}/__fixture/status/${worker.resourceUid}`)
+      ).json()) as {
+        pid: number;
+        childPids: number[];
+        serving: { sourceOperationId: string };
+      };
+      expect(firstStatus.childPids.length).toBeGreaterThanOrEqual(1);
+      expect(firstStatus.serving.sourceOperationId).toBe(endpoint.resource.lastOperation);
+      const uidKey = createHash("sha256").update(worker.resourceUid).digest("hex");
+      const publicationRoot = join(
+        root,
+        "worker-owners",
+        uidKey,
+        "incarnations",
+        endpoint.resource.lastOperation,
+        "groups",
+        uidKey,
+        "workers",
+        ".publications",
+        `v2-worker-${uidKey}`,
+      );
+      const generations = await readdir(publicationRoot);
+      expect(generations).toHaveLength(1);
+      const manifestPath = join(publicationRoot, generations[0] as string, "deployment.json");
+      const beforeRestart = await stat(manifestPath, { bigint: true });
+      const firstHostPid = first.child.pid;
+      await first.close();
+      first = undefined;
+      for (const key of [MANIFEST_KEY, FILE_KEY, CODE_MANIFEST_KEY, CODE_FILE_KEY]) {
+        expect(await objects.delete(key)).toBe(true);
+      }
+      second = await startHost(
+        root,
+        worker.resourceUid,
+        selected.binary,
+        manifestSha256,
+        fileSha256,
+        nativeCode,
+      );
+      expect(second.child.pid).not.toBe(firstHostPid);
+      const recovered = await waitForResourceOperation(second.origin, "native-deployment");
+      expect(recovered.resource).toMatchObject({
+        uid: deployed.resource.uid,
+        lastOperation: deployed.resource.lastOperation,
+      });
+      expect((await serve(second, "/")).body).toBe("native restart held asset");
+      expect((await serve(second, "/api")).body).toBe(`${secret}:public-label`);
+      const secondStatus = (await (
+        await fetch(`${second.origin}/__fixture/status/${worker.resourceUid}`)
+      ).json()) as {
+        pid: number;
+        childPids: number[];
+        serving: { sourceOperationId: string };
+      };
+      expect(secondStatus.childPids).toHaveLength(1);
+      expect(firstStatus.childPids).not.toContain(secondStatus.childPids[0]);
+      expect(secondStatus.serving.sourceOperationId).toBe(endpoint.resource.lastOperation);
+      const replay = await request(
+        second.origin,
+        "/resources",
+        "POST",
+        {
+          form: WORKER_ENDPOINT_FORM_URL,
+          space: "production",
+          name: "native-endpoint",
+          spec: endpointSpec,
+        },
+        endpointKey,
+      );
+      expect(replay.status).toBe(200);
+      expect(await replay.json()).toMatchObject({ id: endpoint.resource.lastOperation });
+      expect(await readdir(publicationRoot)).toEqual(generations);
+      const afterReplay = await stat(manifestPath, { bigint: true });
+      expect([afterReplay.ino, afterReplay.mtimeNs]).toEqual([
+        beforeRestart.ino,
+        beforeRestart.mtimeNs,
+      ]);
+      const update = await request(
+        second.origin,
+        `/resources/${deployed.resource.uid}`,
+        "PUT",
+        {
+          spec: deploymentSpec,
+        },
+        "native-deployment-update-key",
+        1,
+      );
+      expect(update.status).toBe(202);
+      const updateOperation = (await update.json()) as { id: string };
+      expect(await waitForOperation(second.origin, updateOperation.id)).toMatchObject({
+        status: "succeeded",
+      });
+      expect((await serve(second, "/api")).body).toBe(`${secret}:public-label`);
+      const endpointDelete = await request(
+        second.origin,
+        `/resources/${endpoint.resource.uid}`,
+        "DELETE",
+        undefined,
+        "native-endpoint-delete-key",
+        1,
+      );
+      expect(endpointDelete.status).toBe(202);
+      const endpointDeleteOperation = (await endpointDelete.json()) as { id: string };
+      expect(await waitForOperation(second.origin, endpointDeleteOperation.id)).toMatchObject({
+        status: "succeeded",
+      });
+      const routeStatus = (await (
+        await fetch(`${second.origin}/__fixture/status/${worker.resourceUid}`)
+      ).json()) as {
+        serving: { kind: string; hostnames?: string[]; sourceOperationId?: string };
+      };
+      expect(routeStatus.serving).toMatchObject({
+        kind: "serving",
+        hostnames: [],
+        sourceOperationId: endpointDeleteOperation.id,
+      });
+      const deletion = await request(
+        second.origin,
+        `/resources/${deployed.resource.uid}`,
+        "DELETE",
+        undefined,
+        "native-deployment-delete-key",
+        2,
+      );
+      expect(deletion.status).toBe(202);
+      const deleteOperation = (await deletion.json()) as { id: string };
+      expect(await waitForOperation(second.origin, deleteOperation.id)).toMatchObject({
+        status: "succeeded",
+      });
+      expect((await request(second.origin, `/resources/${deployed.resource.uid}`)).status).toBe(
+        410,
+      );
+      const deletedStatus = (await (
+        await fetch(`${second.origin}/__fixture/status/${worker.resourceUid}`)
+      ).json()) as { childPids: number[]; serving: { kind: string } };
+      expect(deletedStatus.serving).toEqual({ kind: "unknown" });
+      expect(deletedStatus.childPids).toEqual([]);
+    } finally {
+      await first?.close();
+      await second?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+  120_000,
+);
 
 async function request(
   origin: string,

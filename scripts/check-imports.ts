@@ -101,6 +101,11 @@ const LAYERS: readonly Layer[] = [
     may: ["domain"],
   },
   {
+    name: "v2-queue-manager",
+    match: /^src\/takoform-v2\/worker-queue-(?:backend|consumer-backend|delivery)\.ts$/u,
+    may: ["core", "domain", "v2-contract", "v2-form", "v2-runtime", "v2-queue-manager"],
+  },
+  {
     name: "v2-runtime",
     match:
       /^src\/takoform-v2\/(?:worker-bundle-runtime|worker-code-runtime|worker-cron-trigger-backend|worker-cron-trigger-scheduler|worker-deployment-backend|worker-endpoint-backend|worker-lifecycle-backend|worker-runtime-readers|worker-publication-state|worker-publication-sql-guard|worker-static-runtime|worker-static-publication|worker-native-effects|worker-native-deletions)\.ts$|^src\/workerd-worker-runtime-owner\.ts$/u,
@@ -164,6 +169,25 @@ const LAYERS: readonly Layer[] = [
     may: ["v2-contract"],
   },
   {
+    name: "v2-selfhost-composition",
+    match: /^src\/selfhost-v2-worker-composition\.ts$/u,
+    may: [
+      "core",
+      "adapter",
+      "v2-application",
+      "v2-config",
+      "v2-form",
+      "v2-runtime",
+      "v2-private",
+      "v2-code-validation",
+    ],
+  },
+  {
+    name: "v2-selfhost-queue-composition",
+    match: /^src\/selfhost-v2-queue-composition\.ts$/u,
+    may: ["core", "domain", "adapter", "v2-queue-manager", "v2-runtime"],
+  },
+  {
     name: "release-data",
     match:
       /^(?:vendor\/takoform\/.*\.json|src\/generated\/takoform-(?:stable-v1-catalog|stable-error-taxonomy|integration-form-packages|publisher-set-receipt|publisher-set-authority-closure)\.ts)$/u,
@@ -224,7 +248,16 @@ const LAYERS: readonly Layer[] = [
     // A runtime-specific wrapper may re-export the host-independent entry it
     // adapts (for example Cloudflare's WorkerEntrypoint intrinsic). Both remain
     // composition roots and the host-only graph checks below still apply.
-    may: ["core", "adapter", "domain", "routes", "app", "entry", "v2-config"],
+    may: [
+      "core",
+      "adapter",
+      "domain",
+      "routes",
+      "app",
+      "entry",
+      "v2-config",
+      "v2-selfhost-composition",
+    ],
   },
   // The published package surface re-exports the product for an embedder. It
   // states no policy of its own, so it may name anything a consumer is allowed

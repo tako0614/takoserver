@@ -11,6 +11,11 @@ import {
   selfhostEventServiceSource,
 } from "./providers/selfhost-events.ts";
 import {
+  V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+  V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+  v2QueueSettlementServiceSource,
+} from "./providers/selfhost-v2-queue-transport.ts";
+import {
   normalizeWorkflowBindings,
   type SelfhostVersionWorkflowBinding,
 } from "./providers/selfhost-version-bindings.ts";
@@ -131,6 +136,8 @@ export interface WorkerdVersionGraphInput {
     readonly probeHostname: string;
   };
   readonly eventToken?: string;
+  /** Required at boot for the opt-in v2 queue handler, not resolved per call. */
+  readonly v2QueueSettlement?: { readonly address: string; readonly token: string };
 }
 
 /** The runtime projection and copied bytes for one selected Version. */
@@ -195,6 +202,18 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
   });
   if (serviceBindings.length > 0 && input.workerResourceUid === undefined) invalid();
   const eventToken = projectOpaqueToken(input.eventToken);
+  const v2QueueSettlement = input.v2QueueSettlement;
+  if (
+    v2QueueSettlement !== undefined &&
+    (!isRecord(v2QueueSettlement) ||
+      typeof v2QueueSettlement.address !== "string" ||
+      v2QueueSettlement.address.length === 0 ||
+      typeof v2QueueSettlement.token !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/u.test(v2QueueSettlement.token) ||
+      eventToken === undefined ||
+      !input.declaredHandlers.includes("queue"))
+  )
+    invalid();
 
   const services = serviceBindings.map((binding, index) => ({
     name: serviceBindingName(index),
@@ -229,6 +248,7 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
     publication: input.readiness.publication,
     probeHostname: input.readiness.probeHostname,
     ...(eventToken === undefined ? {} : { events: true }),
+    ...(v2QueueSettlement === undefined ? {} : { v2Queue: true }),
   });
 
   const preludeModule = selfhostWorkerPreludeModuleName(input.mainModule);
@@ -302,6 +322,12 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
       encoder.encode(selfhostEventServiceSource()),
     );
   }
+  if (v2QueueSettlement !== undefined) {
+    hostModules.set(
+      V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+      encoder.encode(v2QueueSettlementServiceSource()),
+    );
+  }
 
   const site: WorkerdSite = {
     directory: input.directory,
@@ -359,6 +385,21 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
               {
                 name: SELFHOST_WORKER_EVENT_TOKEN_BINDING,
                 value: eventToken,
+                kind: "text" as const,
+              },
+            ],
+          },
+        }),
+    ...(v2QueueSettlement === undefined
+      ? {}
+      : {
+          queueSettlement: {
+            address: v2QueueSettlement.address,
+            module: V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+            vars: [
+              {
+                name: V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+                value: v2QueueSettlement.token,
                 kind: "text" as const,
               },
             ],

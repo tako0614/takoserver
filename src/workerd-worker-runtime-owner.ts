@@ -204,6 +204,23 @@ export interface WorkerdWorkerRuntimeOwner {
       }
     | { readonly kind: "unknown" }
   >;
+  /** Observe a previously qualified live native Queue target; Core owns SQL serving and receipt scope. */
+  observeQueueTarget(input: {
+    readonly workerUid: string;
+    readonly versionId: string;
+    readonly incarnationId: string;
+    readonly servingSourceOperationId: string;
+  }): Promise<
+    | {
+        readonly kind: "confirmed";
+        readonly workerUid: string;
+        readonly versionId: string;
+        readonly incarnationId: string;
+        readonly servingSourceOperationId: string;
+        readonly status: "active" | "draining";
+      }
+    | { readonly kind: "unknown" }
+  >;
   /** Prove absence only after the exact active inventory or all retired receipts. */
   observeRetirement(input: { readonly workerVersionUid?: string }): Promise<
     | {
@@ -605,9 +622,9 @@ async function verifyKnownGroupContents(
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   });
   const retired = record.status === "retired";
-  const draining = record.status === "draining";
+  const retirementPending = record.status === "draining" || record.status === "retiring";
   const allowed =
-    retired || draining
+    retired || retirementPending
       ? new Set([
           "group.json",
           "retirement.json",
@@ -832,7 +849,9 @@ function recoverableIncarnationSet(state: PersistedOwnerState): boolean {
       return record.receipt !== null && record.retirementOperationId !== null;
     }
     return (
-      (record.status === "active" || record.status === "draining") &&
+      (record.status === "active" ||
+        record.status === "draining" ||
+        record.status === "retiring") &&
       record.identity !== null &&
       record.processIdentity !== null &&
       record.configurationSha256 !== null &&
@@ -851,7 +870,8 @@ async function requireStaleIncarnationChildrenAndVacantListeners(
 ): Promise<void> {
   const ports = new Set<number>();
   for (const record of state.incarnations) {
-    if (record.status !== "active" && record.status !== "draining") continue;
+    if (record.status !== "active" && record.status !== "draining" && record.status !== "retiring")
+      continue;
     if (
       !record.processIdentity ||
       (await linuxProcessLiveness(record.processIdentity)) !== "stale" ||
@@ -1707,9 +1727,20 @@ export async function openWorkerdWorkerRuntimeOwner(
 
   // Retired receipts outlive their publisher process. Retry physical-copy
   // cleanup under this owner's lock before exposing any replay/observation API.
+  // A still-active successor finishes its retiring predecessor only after the
+  // exact current SQL graph is resolved below; do not mistake it for a
+  // standalone completed retirement here.
+  const recoveringActive =
+    ownerLock.recoveredFromStaleOwner &&
+    state.incarnations.some((item) => item.status === "active");
   try {
     for (const record of [...state.incarnations]) {
-      if (record.status === "active" || record.status === "draining") continue;
+      if (
+        record.status === "active" ||
+        record.status === "draining" ||
+        (recoveringActive && record.status === "retiring")
+      )
+        continue;
       if (!record.retirementOperationId) {
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       }
@@ -2189,9 +2220,9 @@ export async function openWorkerdWorkerRuntimeOwner(
     });
   };
 
-  const retireRecoveredDrainingIncarnation = async (record: IncarnationRecord): Promise<void> => {
+  const finishRecoveredPredecessorRetirement = async (record: IncarnationRecord): Promise<void> => {
     if (
-      record.status !== "draining" ||
+      (record.status !== "draining" && record.status !== "retiring") ||
       !record.retirementOperationId ||
       !record.processIdentity ||
       (await linuxProcessLiveness(record.processIdentity)) !== "stale" ||
@@ -2258,7 +2289,10 @@ export async function openWorkerdWorkerRuntimeOwner(
       listenerPort: record.listenerPort,
       scriptName: scriptName(options.workerResourceUid),
     });
-    if (!executionCopiesMatchRecord(record, verified.copies, true)) {
+    if (
+      (record.receipt && canonicalJson(record.receipt) !== canonicalJson(verified.receipt)) ||
+      !executionCopiesMatchRecord(record, verified.copies, true)
+    ) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
     const prepared = await updateRecord(record.operationId, (current) => ({
@@ -2328,7 +2362,9 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
 
     for (const record of [...state.incarnations]) {
-      if (record.status === "draining") await retireRecoveredDrainingIncarnation(record);
+      if (record.status === "draining" || record.status === "retiring") {
+        await finishRecoveredPredecessorRetirement(record);
+      }
     }
     await verifyOwnerNamespace(directory, state, options.workerResourceUid);
     if (
@@ -2662,7 +2698,6 @@ export async function openWorkerdWorkerRuntimeOwner(
           }
           return result;
         }
-        candidate.group.sealConfiguration();
         return await activateIncarnation(
           candidate,
           result.identity,
@@ -2758,6 +2793,100 @@ export async function openWorkerdWorkerRuntimeOwner(
         })),
       };
     });
+
+  const observeQueueTarget: WorkerdWorkerRuntimeOwner["observeQueueTarget"] = (input) => {
+    // Capture caller-owned input before waiting for the serial lane or I/O.
+    const target = {
+      workerUid: input.workerUid,
+      versionId: input.versionId,
+      incarnationId: input.incarnationId,
+      servingSourceOperationId: input.servingSourceOperationId,
+    };
+    return runSerial(async () => {
+      const unknown = { kind: "unknown" } as const;
+      if (
+        closed ||
+        admissionClosedBy !== null ||
+        target.workerUid !== options.workerResourceUid ||
+        !OPERATION_ID.test(target.incarnationId) ||
+        target.servingSourceOperationId !== target.incarnationId
+      ) {
+        return unknown;
+      }
+      const incarnation = handles.get(target.incarnationId);
+      const record = recordFor(target.incarnationId);
+      const identity = record?.identity;
+      if (
+        !incarnation ||
+        !record ||
+        (record.status !== "active" && record.status !== "draining") ||
+        record.receipt !== null ||
+        record.executionCopiesCleanupStarted ||
+        record.executionCopiesReleased ||
+        !record.eventToken ||
+        !record.processIdentity ||
+        !record.configurationSha256 ||
+        record.configurationRefreshPending ||
+        record.configurationSha256 !== incarnation.group.configurationSha256 ||
+        canonicalJson(incarnation.record) !== canonicalJson(record) ||
+        !identity ||
+        identity.workerResourceUid !== options.workerResourceUid ||
+        identity.generation !== expectedOperationMarker(target.incarnationId) ||
+        !identity.versions.some((version) => version.workerVersionUid === target.versionId) ||
+        !incarnation.group.isReady() ||
+        (record.status === "active"
+          ? active !== incarnation || state.activeOperationId !== target.incarnationId
+          : active === incarnation ||
+            state.activeOperationId === target.incarnationId ||
+            record.retireAtMs === null ||
+            record.retireAtMs <= Date.now())
+      ) {
+        return unknown;
+      }
+
+      // Only an installed handle that passed publication/recovery can reach this
+      // status. This is live owner/child possession, not a fresh artifact
+      // integrity attestation. New dispatch still uses full publication proof;
+      // Core independently verifies the SQL serving source and claimed lease.
+      const config = await readPinnedGroupConfiguration(record).catch(() => null);
+      if (!config) return unknown;
+      if (
+        (await linuxProcessLiveness(record.processIdentity)) !== "live" ||
+        (await workerPortOwnership(record.listenerPort, record.processIdentity.pid).catch(
+          () => "foreign",
+        )) !== "owned" ||
+        (await linuxProcessLiveness(record.processIdentity)) !== "live"
+      ) {
+        return unknown;
+      }
+      const latest = recordFor(target.incarnationId);
+      if (
+        closed ||
+        admissionClosedBy !== null ||
+        handles.get(target.incarnationId) !== incarnation ||
+        !latest ||
+        canonicalJson(latest) !== canonicalJson(record) ||
+        canonicalJson(incarnation.record) !== canonicalJson(record) ||
+        !incarnation.group.isReady() ||
+        (record.status === "active"
+          ? active !== incarnation || state.activeOperationId !== target.incarnationId
+          : active === incarnation ||
+            state.activeOperationId === target.incarnationId ||
+            record.retireAtMs === null ||
+            record.retireAtMs <= Date.now())
+      ) {
+        return unknown;
+      }
+      return {
+        kind: "confirmed",
+        workerUid: target.workerUid,
+        versionId: target.versionId,
+        incarnationId: target.incarnationId,
+        servingSourceOperationId: target.servingSourceOperationId,
+        status: record.status,
+      };
+    });
+  };
 
   const observeRetirement: WorkerdWorkerRuntimeOwner["observeRetirement"] = (input) =>
     runSerial(async () => {
@@ -2892,6 +3021,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     )
       return { kind: "unknown" };
     if (identity.generation !== expectedOperationMarker(operationId)) return { kind: "unknown" };
+    candidate.group.sealConfiguration();
     const previous = active;
     const now = Date.now();
     let oldRecord: IncarnationRecord | null = null;
@@ -3421,6 +3551,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     workerResourceUid: options.workerResourceUid,
     execute,
     observeServing,
+    observeQueueTarget,
     observeRetirement,
     fetch: fetchRequest,
     observeScheduledCapability,

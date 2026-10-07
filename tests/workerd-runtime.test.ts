@@ -6,6 +6,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { bytesDigest } from "../src/json.ts";
+import {
+  SELFHOST_WORKER_EVENT_SERVICE_MODULE,
+  SELFHOST_WORKER_EVENT_TOKEN_BINDING,
+  selfhostEventServiceSource,
+} from "../src/providers/selfhost-events.ts";
+import {
+  V2_QUEUE_SETTLEMENT_SERVICE_BINDING,
+  V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+  V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+  v2QueueSettlementServiceSource,
+} from "../src/providers/selfhost-v2-queue-transport.ts";
 import { forwardTakoformCandidates } from "../src/takoform/forward-candidates.ts";
 import {
   ASSET_ROUTER_SOURCE,
@@ -1747,6 +1758,83 @@ test("publishes one canonical immutable weighted graph and retains old generatio
   // Deactivation removes only the stable pointer. The immutable payload may
   // still back an in-flight request and has no safe eager-GC process boundary.
   expect(await readFile(join(firstRoot, "deployment.json"), "utf8")).toBe(firstManifest);
+});
+
+test("weighted v2 Queue settlement has a private service and survives manifest reopen", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication is unavailable");
+  const base = weightedPublication("queue-site", "queue-generation");
+  const withV2 = {
+    ...base,
+    versions: base.versions.map((version) => ({
+      ...version,
+      site: {
+        ...version.site,
+        events: {
+          module: SELFHOST_WORKER_EVENT_SERVICE_MODULE,
+          vars: [
+            {
+              name: SELFHOST_WORKER_EVENT_TOKEN_BINDING,
+              value: "f".repeat(64),
+              kind: "text" as const,
+            },
+          ],
+        },
+        queueSettlement: {
+          address: "127.0.0.1:4999",
+          module: V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+          vars: [
+            {
+              name: V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+              value: "A".repeat(43),
+              kind: "text" as const,
+            },
+          ],
+        },
+      },
+      hostModules: new Map([
+        ...(version.hostModules ?? []),
+        [
+          SELFHOST_WORKER_EVENT_SERVICE_MODULE,
+          new TextEncoder().encode(selfhostEventServiceSource()),
+        ],
+        [
+          V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+          new TextEncoder().encode(v2QueueSettlementServiceSource()),
+        ],
+      ]),
+    })),
+  };
+  await runtime.publish("queue-site", withV2);
+  const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  expect(config).toContain("-v2-queue-settlement-origin");
+  expect(config).toContain(`name = "${V2_QUEUE_SETTLEMENT_SERVICE_BINDING}"`);
+  expect(config).toContain(`name = "${V2_QUEUE_SETTLEMENT_TOKEN_BINDING}"`);
+  expect(config).toContain('globalOutbound = "queue-settlement-deny"');
+  expect(config).toContain('(name = "queue-settlement-deny", network = (allow = []))');
+  const first = withV2.versions[0];
+  const second = withV2.versions[1];
+  if (!first || !second) throw new Error("weighted fixture lost a Version");
+  const { queueSettlement: _unused, ...withoutV2Site } = second.site;
+  const withoutV2Modules = new Map(
+    [...second.hostModules].filter(([name]) => name !== V2_QUEUE_SETTLEMENT_SERVICE_MODULE),
+  );
+  await expect(
+    runtime.publish("queue-site", {
+      ...withV2,
+      versions: [first, { ...second, site: withoutV2Site, hostModules: withoutV2Modules }],
+    }),
+  ).rejects.toThrow("weighted worker Versions require one v2 Queue capability shape");
+  const restarted = createWorkerdRuntime({ root, isReady: () => true });
+  expect(await restarted.restore()).toEqual(["queue-site"]);
+  const normalize = (value: string) =>
+    withoutPrivateRuntimeTokens(value).replace(
+      /(name = "__TAKOSERVER_SELFHOST_RUNTIME_READINESS", text = ")[0-9a-f]{64}"/gu,
+      '$1<private-runtime-token>"',
+    );
+  expect(normalize(await readFile(join(root, "workers", "workerd.capnp"), "utf8"))).toBe(
+    normalize(config),
+  );
 });
 
 test("persists an opt-in Actor forward graph and rejects unmapped Host sockets", async () => {

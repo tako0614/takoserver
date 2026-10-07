@@ -9,7 +9,7 @@ import {
 } from "../scripts/deploy/schema.ts";
 
 const MIGRATION = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
-const CURRENT_SOURCE_TAIL = "0082_v2_queue_batch_settlements.sql";
+const CURRENT_SOURCE_TAIL = "0083_v2_queue_consumer_acceptance.sql";
 const ROOT = mkdtempSync(
   join(process.env.TMPDIR ?? "/tmp", "takoserver-actor-kv-schema-inventory-"),
 );
@@ -18,20 +18,20 @@ afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 test("the current source closure projects to an explicit 0066 apply artifact", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
   const artifact = projectApplyQualifiedMigrationArtifact(source);
-  expect(source.names.at(-3)).toBe("0080_v2_worker_cron_trigger_matches.sql");
-  expect(source.names.at(-2)).toBe("0081_v2_private_inputs.sql");
+  expect(source.names.at(-3)).toBe("0081_v2_private_inputs.sql");
+  expect(source.names.at(-2)).toBe("0082_v2_queue_batch_settlements.sql");
   expect(source.names.at(-1)).toBe(CURRENT_SOURCE_TAIL);
   expect(source.files.at(-3)).toMatchObject({
-    name: "0080_v2_worker_cron_trigger_matches.sql",
-    digest: "sha256:e073edc5605f20ff8c39450777f39bd85547f59cd7148d4051fdab3c90f27e68",
-  });
-  expect(source.files.at(-2)).toMatchObject({
     name: "0081_v2_private_inputs.sql",
     digest: "sha256:c371ee2d52bdde69fae5b70888913a5179beb3df6797067bd2ff0dc4aeaabe85",
   });
+  expect(source.files.at(-2)).toMatchObject({
+    name: "0082_v2_queue_batch_settlements.sql",
+    digest: "sha256:9531bcf872272ddbdf370436a906223b15a13471aff7e4466f0b16f134ecdffc",
+  });
   expect(source.files.at(-1)).toMatchObject({
     name: CURRENT_SOURCE_TAIL,
-    digest: "sha256:9531bcf872272ddbdf370436a906223b15a13471aff7e4466f0b16f134ecdffc",
+    digest: "sha256:14227aaa009b3ac31adb23880fd529518aad8f1e9a1d31480c8a0606e4661cfa",
   });
   expect(artifact.names).toHaveLength(66);
   expect(artifact.names.at(-1)).toBe(MIGRATION);
@@ -74,12 +74,12 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
     cpSync(resolve(import.meta.dir, "../migrations"), directory, { recursive: true });
     if (drift === "missing") rmSync(join(directory, CURRENT_SOURCE_TAIL));
     else
-      writeFileSync(join(directory, "0083_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+      writeFileSync(join(directory, "0084_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     expect(() => readCurrentAuditedMigrationSourceArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0082",
+      "audited migration lineage must contain exactly 0001-0083",
     );
     expect(() => readAuditedMigrationArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0082",
+      "audited migration lineage must contain exactly 0001-0083",
     );
   }
 });

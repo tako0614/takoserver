@@ -1,6 +1,6 @@
-import type { Sql } from "../../ports.ts";
+import type { Clock, Sql } from "../../ports.ts";
 import { TakoformV2Error, type V2Form } from "../types.ts";
-import { createSqlArtifactCustody } from "./artifact-custody.ts";
+import { createSqlArtifactCustody, type SqlArtifactCustody } from "./artifact-custody.ts";
 import type { V2ArtifactSource } from "./artifact-source.ts";
 import {
   parseSQLiteMigrationManifest,
@@ -8,6 +8,7 @@ import {
   projectSQLiteMigrationVerified,
   SQLITE_MIGRATION_SET_FORM_URL,
   SQLITE_MIGRATION_SET_LIMITS,
+  type SQLiteMigrationManifest,
   SQLiteMigrationSetValidationError,
   validateSQLiteMigrationPayload,
   validateSQLiteMigrationSetUpdate,
@@ -15,17 +16,15 @@ import {
 
 export const SQLITE_MIGRATION_SET_BACKEND_ID = "selfhost-v2-sqlite-migration-set-sql-v1";
 
-/** Historical 0071 rows remain authoritative; only the mechanism is shared. */
-export function createSQLiteMigrationSetForm(options: {
+export function createSQLiteMigrationSetCustody(options: {
   sql: Sql;
   source: V2ArtifactSource;
-  /** Stable opaque identity of this durable local SQL target, never a path or secret. */
-  targetKey: string;
-}): V2Form {
-  if (!options.targetKey) throw new TypeError("targetKey is required");
-  const apply = createSqlArtifactCustody({
+  now?: Clock;
+}): SqlArtifactCustody<SQLiteMigrationManifest> {
+  return createSqlArtifactCustody({
     sql: options.sql,
     source: options.source,
+    ...(options.now ? { now: options.now } : {}),
     layout: "migration-set-0071",
     formUrl: SQLITE_MIGRATION_SET_FORM_URL,
     limits: SQLITE_MIGRATION_SET_LIMITS,
@@ -38,6 +37,18 @@ export function createSQLiteMigrationSetForm(options: {
     invalidManifest: () => new SQLiteMigrationSetValidationError("invalid_manifest"),
     failureNoun: "Migration",
   });
+}
+
+/** Historical 0071 rows remain authoritative; only the mechanism is shared. */
+export function createSQLiteMigrationSetForm(options: {
+  sql: Sql;
+  source: V2ArtifactSource;
+  /** Stable opaque identity of this durable local SQL target, never a path or secret. */
+  targetKey: string;
+  now?: Clock;
+}): V2Form {
+  if (!options.targetKey) throw new TypeError("targetKey is required");
+  const apply = createSQLiteMigrationSetCustody(options);
   return {
     validateCreate(spec) {
       try {

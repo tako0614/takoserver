@@ -506,6 +506,76 @@ test("successor completes a draining receipt checkpoint left before owner-state 
   }
 });
 
+for (const receiptWritten of [false, true])
+  test(`successor finishes an accepted retiring predecessor ${receiptWritten ? "with" : "before"} its receipt`, async () => {
+    const owned = await fixture();
+    const port = await unusedPort();
+    let first: HostProcess | undefined;
+    let successor: HostProcess | undefined;
+    try {
+      first = await startHost("active-update-draining", owned.root, owned.binary, port, UPDATE_ID);
+      expect(await readJsonLine(first)).toMatchObject({ kind: "active-updated-draining", port });
+      await terminateHost(first);
+      first = undefined;
+      await waitForVacant(port);
+
+      if (receiptWritten) {
+        const uidHash = createHash("sha256").update(WORKER_UID).digest("hex");
+        const groupRoot = join(ownerDirectory(owned.root), "incarnations", CREATE_ID, "groups");
+        const configuration = new Uint8Array(
+          await readFile(join(groupRoot, uidHash, "workers", "workerd.capnp")),
+        );
+        const group = await openWorkerdWorkerExecutionGroup({
+          rootDirectory: groupRoot,
+          workerResourceUid: WORKER_UID,
+          listenerPort: port,
+          configuration,
+          configurationPath: "workers/workerd.capnp",
+          workerdBinary: owned.binary,
+          recoverExisting: true,
+        });
+        await group.retire({ workerResourceUid: WORKER_UID, operationId: UPDATE_ID });
+      }
+
+      // The real update path persists `retiring` before group.retire writes its
+      // receipt. A host crash here leaves a newer active graph and this exact
+      // unfinished predecessor, not an arbitrary orphan or a completed delete.
+      const statePath = join(ownerDirectory(owned.root), "runtime-owner.json");
+      const checkpoint = await ownerState(owned.root);
+      checkpoint.incarnations = (checkpoint.incarnations as Record<string, unknown>[]).map(
+        (item) => (item.operationId === CREATE_ID ? { ...item, status: "retiring" } : item),
+      );
+      const predecessor = (checkpoint.incarnations as Record<string, unknown>[]).find(
+        (item) => item.operationId === CREATE_ID,
+      );
+      expect(predecessor).toMatchObject({
+        status: "retiring",
+        retirementOperationId: UPDATE_ID,
+        receipt: null,
+        executionCopiesCleanupStarted: false,
+      });
+      await writeFile(statePath, `${JSON.stringify(checkpoint)}\n`, { mode: 0o600 });
+
+      successor = await startHost("active-recover-only", owned.root, owned.binary, port, UPDATE_ID);
+      expect(await readJsonLine(successor)).toMatchObject({ kind: "recovered-active", port });
+      const after = await ownerState(owned.root);
+      expect(
+        (after.incarnations as Record<string, unknown>[]).find(
+          (item) => item.operationId === CREATE_ID,
+        ),
+      ).toMatchObject({
+        status: "retired",
+        retirementOperationId: UPDATE_ID,
+        executionCopiesReleased: true,
+        receipt: { operationId: UPDATE_ID, listenerPort: port },
+      });
+    } finally {
+      if (first) await terminateHost(first);
+      if (successor) await terminateHost(successor);
+      await owned.cleanup();
+    }
+  });
+
 test("successor resumes a draining cleanup-intent checkpoint before copy release", async () => {
   const owned = await fixture();
   const port = await unusedPort();
