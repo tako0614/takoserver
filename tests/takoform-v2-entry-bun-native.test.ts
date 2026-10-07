@@ -107,6 +107,51 @@ function expectWorkerBundleCustody(
   }
 }
 
+async function workerBundleCustodyBytes(
+  root: string,
+  resourceUid: string,
+): Promise<{
+  readonly manifestDigest: string;
+  readonly chunkDigests: readonly { fileIndex: number; chunkIndex: number; digest: string }[];
+}> {
+  const database = new Database(join(root, "control.sqlite"), { readonly: true });
+  try {
+    const owner = database
+      .query("SELECT manifest_bytes FROM tf_v2_artifact_owners WHERE resource_uid = ?")
+      .get(resourceUid) as { manifest_bytes: Uint8Array } | null;
+    if (!owner || !(owner.manifest_bytes instanceof Uint8Array)) {
+      throw new Error("foreign custody manifest is unavailable");
+    }
+    const chunks = database
+      .query(
+        `SELECT file_index, chunk_index, bytes FROM tf_v2_artifact_chunks
+         WHERE resource_uid = ? ORDER BY file_index, chunk_index`,
+      )
+      .all(resourceUid) as {
+      file_index: number;
+      chunk_index: number;
+      bytes: Uint8Array;
+    }[];
+    return {
+      manifestDigest: await bytesDigest(owner.manifest_bytes),
+      chunkDigests: await Promise.all(
+        chunks.map(async (chunk) => {
+          if (!(chunk.bytes instanceof Uint8Array)) {
+            throw new Error("foreign custody chunk is unavailable");
+          }
+          return {
+            fileIndex: chunk.file_index,
+            chunkIndex: chunk.chunk_index,
+            digest: await bytesDigest(chunk.bytes),
+          };
+        }),
+      ),
+    };
+  } finally {
+    database.close();
+  }
+}
+
 function expectStaticAssetBundleCustody(
   root: string,
   resourceUid: string,
@@ -1110,6 +1155,11 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
         sentinelBytes.byteLength,
         true,
       );
+      const foreignCustodyBefore = await workerBundleCustodyBytes(root, sentinelUid);
+      expect(foreignCustodyBefore).toEqual({
+        manifestDigest: `sha256:${sentinelManifestSha256}`,
+        chunkDigests: [{ fileIndex: 0, chunkIndex: 0, digest: `sha256:${sentinelSha256}` }],
+      });
 
       const spec = { artifact: { url: MANIFEST_URL, sha256: manifestSha256 } };
       const body = {
@@ -1205,6 +1255,7 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
         sentinelBytes.byteLength,
         true,
       );
+      expect(await workerBundleCustodyBytes(root, sentinelUid)).toEqual(foreignCustodyBefore);
 
       // Once the interrupted create has finished, later same-spec work needs
       // only the held custody; the original source objects may disappear.
@@ -1273,6 +1324,7 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
         sentinelBytes.byteLength,
         true,
       );
+      expect(await workerBundleCustodyBytes(root, sentinelUid)).toEqual(foreignCustodyBefore);
     } finally {
       const stops = await Promise.allSettled([stopHost(serving), stopHost(bootstrap)]);
       cleanupFailed = stops.some((result) => result.status === "rejected");
