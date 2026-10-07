@@ -11,11 +11,22 @@ import type { DeployTarget } from "../../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../../src/db-schema.ts";
 
 const MIGRATION_DIRECTORY = resolve(import.meta.dir, "../../migrations");
+const FRESH_V2_ARTIFACT_END = "0075_v2_artifact_progress.sql";
+const CURRENT_SOURCE_END = "0076_v2_worker_invocation_custody.sql";
 
+/** Qualified generated storage has the fixed 0075 payload, while source includes 0076. */
 export function completeIntegrationStorageState(): D1SchemaState {
+  if (
+    MIGRATIONS.length !== 76 ||
+    MIGRATIONS.at(74)?.name !== FRESH_V2_ARTIFACT_END ||
+    MIGRATIONS.at(-1)?.name !== CURRENT_SOURCE_END
+  ) {
+    throw new Error("fixed v2 artifact fixture requires the audited 0001-0076 source inventory");
+  }
+  const migrations = MIGRATIONS.slice(0, 75);
   const database = new Database(":memory:");
   try {
-    for (const { name } of MIGRATIONS) {
+    for (const { name } of migrations) {
       database.exec(readFileSync(resolve(MIGRATION_DIRECTORY, name), "utf8"));
     }
     const rows = database
@@ -34,7 +45,7 @@ export function completeIntegrationStorageState(): D1SchemaState {
       ),
     );
     return {
-      applied: MIGRATIONS.map(({ name }) => name),
+      applied: migrations.map(({ name }) => name),
       shape,
       shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
     };

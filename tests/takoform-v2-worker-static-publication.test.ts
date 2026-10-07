@@ -358,7 +358,14 @@ function fencedRuntime(initial: WorkerdPublicationIdentity | null = null) {
   return runtime;
 }
 
-async function deploymentFixture(f: ReturnType<typeof setup>, includeCode = false) {
+async function deploymentFixture(
+  f: ReturnType<typeof setup>,
+  includeCode = false,
+  codeAssets?: {
+    readonly runWorkerFirst: boolean;
+    readonly notFoundHandling: "none" | "single_page_application";
+  },
+) {
   const worker = await f.create(MODULE_WORKER_FORM_URL, "worker", {});
   const assetDigest = await bytesDigest(
     new TextEncoder().encode(
@@ -419,6 +426,14 @@ async function deploymentFixture(f: ReturnType<typeof setup>, includeCode = fals
       bundle: { resourceUid: bundle.resourceUid },
       handlers: ["fetch"],
       vars: { LABEL: "code-v2" },
+      ...(codeAssets
+        ? {
+            assets: {
+              bundle: { resourceUid: asset.resourceUid },
+              ...codeAssets,
+            },
+          }
+        : {}),
     });
     versions.push({ workerVersion: { resourceUid: codeVersion.resourceUid }, weight: 5_000 });
   }
@@ -470,6 +485,41 @@ test("publishes accepted static Worker material through the fenced runtime and r
     expect(runtime.publishCalls).toBe(1);
   } finally {
     f.close();
+  }
+});
+
+test("publishes one accepted code+asset graph with exact held bytes and both routing orders", async () => {
+  for (const runWorkerFirst of [false, true]) {
+    const f = setup();
+    try {
+      const { codeVersion, deployment } = await deploymentFixture(f, true, {
+        runWorkerFirst,
+        notFoundHandling: "single_page_application",
+      });
+      const readsBefore = f.sourceReads();
+      const execution = await f.execution(deployment.id);
+      expect(await f.publication.publish(execution)).toMatchObject({ kind: "confirmed" });
+      const version = f.runtime.publication?.versions.find(
+        (candidate) => candidate.workerVersionUid === codeVersion?.resourceUid,
+      );
+      expect(version).toMatchObject({
+        site: {
+          assets: {
+            strictPaths: true,
+            runWorkerFirst,
+            notFoundHandling: "single-page-application",
+            mediaTypes: { "index.html": "text/html" },
+          },
+        },
+      });
+      expect(version?.assets?.get("index.html")).toEqual(ASSET_BYTES);
+      expect(version?.modules.get("src/index.mjs")).toEqual(CODE_MODULE_BYTES);
+      expect(f.sourceReads()).toBe(readsBefore);
+      expect(await f.publication.observe(execution)).toMatchObject({ kind: "confirmed" });
+      expect(f.runtime.publishCalls).toBe(1);
+    } finally {
+      f.close();
+    }
   }
 });
 

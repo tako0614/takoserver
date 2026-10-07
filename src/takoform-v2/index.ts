@@ -40,6 +40,14 @@ export type {
   V2ReferenceRequirement,
 } from "./types.ts";
 export {
+  createV2WorkerInvocationLifecycle,
+  type V2WorkerInvocationAdmission,
+  type V2WorkerInvocationCustody,
+  type V2WorkerInvocationHandle,
+  type V2WorkerInvocationRecord,
+  type V2WorkerInvocationSelection,
+} from "./worker-invocation-custody.ts";
+export {
   createV2NativeEffectCustody,
   type V2NativeEffectCustody,
   type V2NativeEffectIdentity,

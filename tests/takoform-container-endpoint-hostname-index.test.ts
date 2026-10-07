@@ -16,6 +16,7 @@ const V2_ARTIFACT_CUSTODY = "0072_v2_artifact_custody.sql";
 const V2_REFERENCE_ACCEPTANCE = "0073_v2_reference_acceptance.sql";
 const V2_WORKER_NATIVE_EFFECTS = "0074_v2_worker_native_effects.sql";
 const V2_ARTIFACT_PROGRESS = "0075_v2_artifact_progress.sql";
+const V2_WORKER_INVOCATION_CUSTODY = "0076_v2_worker_invocation_custody.sql";
 
 function insertResource(
   database: Database,
@@ -165,6 +166,7 @@ test("0067 upgrades nonempty 0066 Resource data without changing rows", async ()
       V2_REFERENCE_ACCEPTANCE,
       V2_WORKER_NATIVE_EFFECTS,
       V2_ARTIFACT_PROGRESS,
+      V2_WORKER_INVOCATION_CUSTODY,
     ]);
     expect(database.query("SELECT * FROM tf_resources ORDER BY kind").all()).toEqual(before);
     expect(migrateSqlite(database).applied).toEqual([]);

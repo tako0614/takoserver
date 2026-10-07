@@ -21,6 +21,7 @@ const V2_ARTIFACT_CUSTODY = "0072_v2_artifact_custody.sql";
 const V2_REFERENCE_ACCEPTANCE = "0073_v2_reference_acceptance.sql";
 const V2_WORKER_NATIVE_EFFECTS = "0074_v2_worker_native_effects.sql";
 const V2_ARTIFACT_PROGRESS = "0075_v2_artifact_progress.sql";
+const V2_WORKER_INVOCATION_CUSTODY = "0076_v2_worker_invocation_custody.sql";
 
 const MUTATION_AUTHORITY_SUMMARY = JSON.stringify({
   formRef: {
@@ -247,6 +248,7 @@ describe("Takoform accepted-authority continuity migration", () => {
       V2_REFERENCE_ACCEPTANCE,
       V2_WORKER_NATIVE_EFFECTS,
       V2_ARTIFACT_PROGRESS,
+      V2_WORKER_INVOCATION_CUSTODY,
     ]);
     expect(database.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
     expect(

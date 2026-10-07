@@ -182,9 +182,13 @@ export function createV2WorkerPublication(options: {
           identity: {
             ...identity,
             bundleResourceUid: versionSpec.bundle.resourceUid,
+            ...(versionSpec.assets
+              ? { assetResourceUid: versionSpec.assets.bundle.resourceUid }
+              : {}),
           },
           spec: versionSpec,
           bundle: materials.bundle,
+          assets: materials.assets,
           inspectModule,
         });
         const graph = compileWorkerdVersionGraph({
@@ -192,6 +196,14 @@ export function createV2WorkerPublication(options: {
           mainModule: codeProjection.site.mainModule,
           modules: codeProjection.modules,
           moduleMediaTypes: codeProjection.site.moduleMediaTypes ?? {},
+          ...(codeProjection.site.assets && codeProjection.assets
+            ? {
+                assets: {
+                  files: codeProjection.assets,
+                  ...codeProjection.site.assets,
+                },
+              }
+            : {}),
           environment: (codeProjection.site.vars ?? []).map((binding) => ({
             name: binding.name,
             value: binding.value,

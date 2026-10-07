@@ -7,6 +7,11 @@ import type {
 } from "../src/providers/worker-module-semantic-inspection.ts";
 import type { SqlArtifactCustodyRead } from "../src/takoform-v2/forms/artifact-custody.ts";
 import {
+  parseStaticAssetBundleManifest,
+  type StaticAssetBundleManifest,
+  validateStaticAssetBundlePayload,
+} from "../src/takoform-v2/forms/static-asset-bundle.ts";
+import {
   parseWorkerBundleManifest,
   validateWorkerBundlePayload,
   type WorkerBundleManifest,
@@ -26,6 +31,8 @@ const MODULE_BYTES = encoder.encode(
   "export default { fetch(request, env) { return new Response(env.SETTINGS.label); } };\n",
 );
 const MESSAGE_BYTES = encoder.encode("verified bundle module dependency");
+const ASSET_UID = "asset-uid-001";
+const ASSET_BYTES = encoder.encode("<main>verified asset</main>");
 
 async function digest(bytes: Uint8Array): Promise<string> {
   return (await bytesDigest(bytes)).slice("sha256:".length);
@@ -76,6 +83,38 @@ async function heldBundle(input?: { moduleBytes?: Uint8Array }) {
     observed: verified.observed as unknown as JsonObject,
   };
   return read;
+}
+
+async function heldAssets(): Promise<SqlArtifactCustodyRead<StaticAssetBundleManifest>> {
+  const manifestBytes = encoder.encode(
+    JSON.stringify({
+      files: [
+        {
+          path: "index.html",
+          url: "https://artifacts.example.test/assets/index.html",
+          sha256: await digest(ASSET_BYTES),
+          mediaType: "text/html",
+        },
+      ],
+    }),
+  );
+  const manifest = parseStaticAssetBundleManifest(manifestBytes);
+  const verified = await validateStaticAssetBundlePayload({
+    spec: {
+      artifact: {
+        url: "https://artifacts.example.test/assets/manifest.json",
+        sha256: await digest(manifestBytes),
+      },
+    },
+    manifestBytes,
+    fileBytes: [ASSET_BYTES],
+  });
+  return {
+    manifest,
+    manifestBytes,
+    files: [new Uint8Array(ASSET_BYTES)],
+    observed: verified.observed as unknown as JsonObject,
+  };
 }
 
 function identity() {
@@ -194,7 +233,7 @@ test("requires the bundle UID and inspection handler set to match the accepted V
   ).rejects.toMatchObject({ code: "worker_handler_mismatch" });
 });
 
-test("keeps valid fetch code separate from unsupported bindings, secrets, assets, and events", async () => {
+test("keeps valid fetch code separate from unsupported bindings, secrets, and events", async () => {
   const held = await heldBundle();
   for (const [spec, code] of [
     [
@@ -204,16 +243,6 @@ test("keeps valid fetch code separate from unsupported bindings, secrets, assets
     [versionSpec({ requiredSensitiveVars: ["TOKEN"] }), "worker_private_inputs_unavailable"],
     [versionSpec({ handlers: ["fetch", "queue"] }), "worker_event_delivery_unavailable"],
     [versionSpec({ handlers: ["fetch", "scheduled"] }), "worker_event_delivery_unavailable"],
-    [
-      versionSpec({
-        assets: {
-          bundle: { resourceUid: "assets-1" },
-          runWorkerFirst: false,
-          notFoundHandling: "none",
-        },
-      }),
-      "worker_assets_unavailable",
-    ],
   ] as const) {
     await expect(
       projectV2WorkerCodeVersion({
@@ -224,6 +253,83 @@ test("keeps valid fetch code separate from unsupported bindings, secrets, assets
       }),
     ).rejects.toMatchObject({ code });
   }
+});
+
+test("projects verified code+assets into one copied Version with exact routing policy", async () => {
+  const held = await heldAssets();
+  const projection = await projectV2WorkerCodeVersion({
+    identity: { ...identity(), assetResourceUid: ASSET_UID },
+    spec: versionSpec({
+      assets: {
+        bundle: { resourceUid: ASSET_UID },
+        runWorkerFirst: true,
+        notFoundHandling: "single_page_application",
+      },
+    }),
+    bundle: await heldBundle(),
+    assets: held,
+    inspectModule: inspector(),
+  });
+  expect(projection.site.assets).toEqual({
+    notFoundHandling: "single-page-application",
+    runWorkerFirst: true,
+    strictPaths: true,
+    mediaTypes: { "index.html": "text/html" },
+  });
+  expect(projection.assets?.get("index.html")).toEqual(ASSET_BYTES);
+  held.files[0]?.fill(0);
+  expect(projection.assets?.get("index.html")).toEqual(ASSET_BYTES);
+});
+
+test("bundle-backed assets permit no declared fetch without inventing a handler", async () => {
+  const projection = await projectV2WorkerCodeVersion({
+    identity: { ...identity(), assetResourceUid: ASSET_UID },
+    spec: versionSpec({
+      handlers: [],
+      assets: {
+        bundle: { resourceUid: ASSET_UID },
+        runWorkerFirst: false,
+        notFoundHandling: "none",
+      },
+    }),
+    bundle: await heldBundle({ moduleBytes: encoder.encode("export default {};\n") }),
+    assets: await heldAssets(),
+    inspectModule: inspector({ outcome: "valid", exportedHandlers: [] }),
+  });
+  expect(projection.site.fetchHandler).toBe(false);
+  expect(projection.site.assets?.runWorkerFirst).toBe(false);
+  expect(projection.assets?.get("index.html")).toEqual(ASSET_BYTES);
+});
+
+test("refuses missing, wrong-UID, or modified held assets before code inspection", async () => {
+  const held = await heldAssets();
+  const spec = versionSpec({
+    assets: { bundle: { resourceUid: ASSET_UID }, runWorkerFirst: false, notFoundHandling: "none" },
+  });
+  let inspections = 0;
+  const request = {
+    identity: { ...identity(), assetResourceUid: ASSET_UID },
+    spec,
+    bundle: await heldBundle(),
+    assets: held,
+    inspectModule: inspector(validInspection, () => {
+      inspections += 1;
+    }),
+  };
+  await expect(projectV2WorkerCodeVersion({ ...request, assets: null })).rejects.toMatchObject({
+    code: "worker_assets_unavailable",
+  });
+  await expect(
+    projectV2WorkerCodeVersion({
+      ...request,
+      identity: { ...request.identity, assetResourceUid: "other" },
+    }),
+  ).rejects.toMatchObject({ code: "worker_assets_unavailable" });
+  held.files[0]?.fill(0);
+  await expect(projectV2WorkerCodeVersion(request)).rejects.toMatchObject({
+    code: "worker_assets_unavailable",
+  });
+  expect(inspections).toBe(0);
 });
 
 test("rejects unavailable or invalid semantic inspection without publishing a graph", async () => {

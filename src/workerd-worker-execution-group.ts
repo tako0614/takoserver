@@ -1,5 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
-import { type FileHandle, lstat, mkdir, open, readFile, realpath, rename } from "node:fs/promises";
+import {
+  type FileHandle,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rmdir,
+  unlink,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { spawnWorkerdWithParentDeath, workerPortOwnership } from "./workerd-linux-process.ts";
 import { createWorkerdSupervisor, type WorkerdProcess } from "./workerd-supervisor.ts";
@@ -8,6 +19,9 @@ const MANIFEST_NAME = "group.json";
 const CONFIG_NAME = "workerd.conf";
 const RECEIPT_NAME = "retirement.json";
 const RECEIPT_TEMP_PREFIX = ".retirement-";
+const DEPLOYMENT_MANIFEST_NAME = "deployment.json";
+const DEPLOYMENT_PUBLICATIONS_NAME = ".publications";
+const WORKER_POINTER_NAME = "takoserver-site.json";
 
 export class WorkerdWorkerExecutionGroupError extends Error {
   readonly code:
@@ -55,6 +69,58 @@ export interface WorkerdWorkerExecutionGroup {
     readonly workerResourceUid: string;
     readonly operationId: string;
   }): Promise<WorkerdWorkerRetirementReceipt>;
+}
+
+export interface WorkerdWorkerExecutionCopies {
+  readonly versionUids: readonly string[];
+  readonly generationKeys: readonly string[];
+  readonly publications: readonly {
+    readonly generationKey: string;
+    readonly generation: string;
+    readonly versions: readonly { readonly workerVersionUid: string; readonly weight: number }[];
+  }[];
+}
+
+export interface RetiredWorkerdWorkerExecutionCopiesInput {
+  readonly groupDirectory: string;
+  readonly workerResourceUid: string;
+  readonly operationId: string;
+  readonly listenerPort: number;
+  readonly scriptName: string;
+  /** The owner persisted the exact retirement receipt and cleanup intent first. */
+  readonly cleanupIntentPersisted: true;
+  /** SHA-256 of the exact pre-cleanup inventory persisted in the owner state. */
+  readonly cleanupManifestSha256: string | null;
+  /** Verify, but never resume mutation for, a previously committed completion marker. */
+  readonly alreadyReleased?: true;
+  /** Deterministic interruption seam for recovery tests; production callers omit it. */
+  readonly afterEntryRemoved?: () => void;
+}
+
+export interface VerifyRetiredWorkerdWorkerExecutionCopiesInput {
+  readonly groupDirectory: string;
+  readonly workerResourceUid: string;
+  readonly operationId: string;
+  readonly listenerPort: number;
+  readonly scriptName: string;
+}
+
+interface WorkerdExecutionCopyInventoryEntry {
+  readonly path: string;
+  readonly kind: "directory" | "file";
+  readonly mode: number;
+  readonly size?: number;
+  readonly sha256?: string;
+}
+
+interface WorkerdExecutionCopyInventory {
+  readonly schema: "takoserver.workerd-execution-copy-inventory@1";
+  readonly workerResourceUid: string;
+  readonly operationId: string;
+  readonly listenerPort: number;
+  readonly scriptName: string;
+  readonly configurationSha256: string;
+  readonly entries: readonly WorkerdExecutionCopyInventoryEntry[];
 }
 
 export interface OpenWorkerdWorkerExecutionGroupOptions {
@@ -557,4 +623,1002 @@ export async function openWorkerdWorkerExecutionGroup(
     initialState: "retired",
     receipt: expectedReceipt,
   });
+}
+
+/**
+ * Verifies the private, immutable publication copies owned by one Worker
+ * incarnation. This deliberately inventories stored deployment manifests,
+ * including generations no longer selected by the pointer.
+ */
+export async function inspectWorkerdWorkerExecutionCopies(input: {
+  readonly groupDirectory: string;
+  readonly workerResourceUid: string;
+  readonly listenerPort: number;
+  readonly scriptName: string;
+}): Promise<WorkerdWorkerExecutionCopies> {
+  validateIdentity(input.workerResourceUid);
+  if (!/^[a-z0-9][a-z0-9_-]{0,127}$/u.test(input.scriptName)) {
+    throw new WorkerdWorkerExecutionGroupError("invalid_identity");
+  }
+  const directory = await requireOwnedDirectory(input.groupDirectory);
+  const manifestPath = join(directory, MANIFEST_NAME);
+  const configurationPath = join(directory, "workers/workerd.capnp");
+  const manifestText = await readRequiredRegularFile(manifestPath);
+  let manifestValue: unknown;
+  try {
+    manifestValue = JSON.parse(manifestText);
+  } catch {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  if (
+    !manifestValue ||
+    typeof manifestValue !== "object" ||
+    Array.isArray(manifestValue) ||
+    Object.keys(manifestValue).sort().join(",") !==
+      "configurationSha256,listenerPort,schema,workerResourceUid"
+  ) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  const manifest = manifestValue as Record<string, unknown>;
+  if (
+    manifest.schema !== "takoserver.workerd-worker-group@1" ||
+    manifest.workerResourceUid !== input.workerResourceUid ||
+    manifest.listenerPort !== input.listenerPort ||
+    typeof manifest.configurationSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(manifest.configurationSha256) ||
+    manifestText !== canonicalJson(manifestValue)
+  ) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  const configuration = await readRequiredRegularFile(configurationPath);
+  if (sha256(new TextEncoder().encode(configuration)) !== manifest.configurationSha256) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+
+  const workersRoot = join(directory, "workers");
+  const workersInfo = await lstat(workersRoot).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  if (!workersInfo) return { versionUids: [], generationKeys: [], publications: [] };
+  if (
+    !workersInfo.isDirectory() ||
+    workersInfo.isSymbolicLink() ||
+    (workersInfo.mode & 0o077) !== 0
+  )
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  const workersEntries = await readdir(workersRoot).catch(() => {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  const allowedWorkersEntries = new Set([
+    "workerd.capnp",
+    ".takoserver-active.json",
+    "static-readiness.js",
+    "event-dispatcher.js",
+    "deployment-router.js",
+    "service-router.js",
+    "asset-router.js",
+    "assets.js",
+    "router.js",
+    input.scriptName,
+    DEPLOYMENT_PUBLICATIONS_NAME,
+  ]);
+  if (workersEntries.some((entry) => !allowedWorkersEntries.has(entry))) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  const activationPath = join(workersRoot, ".takoserver-active.json");
+  const activationInfo = await lstat(activationPath).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  if (activationInfo && (!activationInfo.isFile() || activationInfo.isSymbolicLink())) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  const legacyAssetsPath = join(directory, "assets", input.scriptName);
+  const legacyAssetsInfo = await lstat(legacyAssetsPath).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  if (legacyAssetsInfo) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+
+  const directPath = join(workersRoot, input.scriptName);
+  const directInfo = await lstat(directPath).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  if (directInfo) {
+    if (!directInfo.isDirectory() || directInfo.isSymbolicLink())
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    await requireNoSymlinksOrSpecialFiles(directPath);
+    const directEntries = await readdir(directPath).catch(() => {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    });
+    if (directEntries.length !== 1 || directEntries[0] !== WORKER_POINTER_NAME) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+    const pointerPath = join(directPath, WORKER_POINTER_NAME);
+    const pointerText = await readRequiredRegularFile(pointerPath);
+    let pointer: unknown;
+    try {
+      pointer = JSON.parse(pointerText);
+    } catch {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+    if (
+      !pointer ||
+      typeof pointer !== "object" ||
+      Array.isArray(pointer) ||
+      Object.keys(pointer).sort().join(",") !==
+        "generation,generationKey,publicationStorageLayout" ||
+      (pointer as Record<string, unknown>).publicationStorageLayout !== "weighted-deployment-v1" ||
+      typeof (pointer as Record<string, unknown>).generation !== "string" ||
+      typeof (pointer as Record<string, unknown>).generationKey !== "string" ||
+      !/^[0-9a-f]{64}$/u.test((pointer as Record<string, unknown>).generationKey as string) ||
+      pointerText !== JSON.stringify(pointer)
+    ) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+  }
+
+  const publicationRoot = join(workersRoot, DEPLOYMENT_PUBLICATIONS_NAME);
+  const publicationsInfo = await lstat(publicationRoot).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  if (!publicationsInfo) {
+    if (directInfo) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    return { versionUids: [], generationKeys: [], publications: [] };
+  }
+  if (
+    !publicationsInfo.isDirectory() ||
+    publicationsInfo.isSymbolicLink() ||
+    (publicationsInfo.mode & 0o077) !== 0
+  ) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  const publicationEntries = await readdir(publicationRoot).catch(() => {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  if (publicationEntries.some((entry) => entry !== input.scriptName)) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  const scriptRoot = join(publicationRoot, input.scriptName);
+  const scriptInfo = await lstat(scriptRoot).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  if (!scriptInfo) {
+    if (directInfo) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    return { versionUids: [], generationKeys: [], publications: [] };
+  }
+  if (!scriptInfo.isDirectory() || scriptInfo.isSymbolicLink() || (scriptInfo.mode & 0o077) !== 0)
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+
+  const generationKeys = await readdir(scriptRoot).catch(() => {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  if (generationKeys.length > 256 || generationKeys.some((key) => !/^[0-9a-f]{64}$/u.test(key))) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  const versionUids = new Set<string>();
+  const publicationInventory: WorkerdWorkerExecutionCopies["publications"][number][] = [];
+  let activePointerGenerationKey: string | undefined;
+  if (directInfo) {
+    const pointerText = await readRequiredRegularFile(join(directPath, WORKER_POINTER_NAME));
+    const pointer = JSON.parse(pointerText) as { generationKey?: unknown };
+    if (typeof pointer.generationKey !== "string")
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    activePointerGenerationKey = pointer.generationKey;
+  }
+  for (const generationKey of generationKeys) {
+    const generationRoot = join(scriptRoot, generationKey);
+    const generationInfo = await lstat(generationRoot).catch(() => null);
+    if (!generationInfo?.isDirectory() || generationInfo.isSymbolicLink())
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    await requireNoSymlinksOrSpecialFiles(generationRoot);
+    const raw = await readRequiredRegularFile(join(generationRoot, DEPLOYMENT_MANIFEST_NAME));
+    if (sha256(new TextEncoder().encode(raw)) !== generationKey) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+    let deployment: unknown;
+    try {
+      deployment = JSON.parse(raw);
+    } catch {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+    if (
+      !deployment ||
+      typeof deployment !== "object" ||
+      Array.isArray(deployment) ||
+      Object.keys(deployment).sort().join(",") !==
+        "generation,hostnames,publicationStorageLayout,versions,workerResourceUid"
+    ) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+    const graph = deployment as Record<string, unknown>;
+    if (
+      graph.publicationStorageLayout !== "weighted-deployment-v1" ||
+      graph.workerResourceUid !== input.workerResourceUid ||
+      typeof graph.generation !== "string" ||
+      !Array.isArray(graph.versions) ||
+      graph.versions.length < 1 ||
+      graph.versions.length > 8
+    ) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+    const expectedEntries = [DEPLOYMENT_MANIFEST_NAME];
+    const seenVersions = new Set<string>();
+    const seenVersionIds = new Set<string>();
+    const publicationVersions: Array<{ workerVersionUid: string; weight: number }> = [];
+    let totalWeight = 0;
+    let priorVersionUid = "";
+    for (const [index, versionValue] of graph.versions.entries()) {
+      if (!versionValue || typeof versionValue !== "object" || Array.isArray(versionValue))
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      const version = versionValue as Record<string, unknown>;
+      if (
+        Object.keys(version).sort().join(",") !==
+          "manifest,storageKey,versionId,weight,workerVersionUid" ||
+        version.storageKey !== `version-${index.toString(10).padStart(5, "0")}` ||
+        typeof version.versionId !== "string" ||
+        !/^[a-z0-9][a-z0-9_-]{0,127}$/u.test(version.versionId) ||
+        typeof version.workerVersionUid !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u.test(version.workerVersionUid) ||
+        !Number.isSafeInteger(version.weight) ||
+        (version.weight as number) < 1 ||
+        (version.weight as number) > 10_000 ||
+        seenVersions.has(version.workerVersionUid) ||
+        seenVersionIds.has(version.versionId) ||
+        (priorVersionUid !== "" && version.workerVersionUid < priorVersionUid)
+      ) {
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      }
+      seenVersions.add(version.workerVersionUid);
+      seenVersionIds.add(version.versionId);
+      totalWeight += version.weight as number;
+      priorVersionUid = version.workerVersionUid;
+      versionUids.add(version.workerVersionUid);
+      publicationVersions.push({
+        workerVersionUid: version.workerVersionUid,
+        weight: version.weight as number,
+      });
+      expectedEntries.push(version.storageKey as string);
+      await verifyStoredVersionTree(
+        join(generationRoot, version.storageKey as string),
+        version.manifest,
+      );
+    }
+    if (totalWeight !== 10_000) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    publicationInventory.push({
+      generationKey,
+      generation: graph.generation,
+      versions: publicationVersions,
+    });
+    const actualEntries = await readdir(generationRoot).catch(() => {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    });
+    if (
+      actualEntries.length !== expectedEntries.length ||
+      expectedEntries.some((entry) => !actualEntries.includes(entry))
+    ) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+    if (
+      activePointerGenerationKey === generationKey &&
+      graph.generation !== (await readPointerGeneration(directPath))
+    ) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+  }
+  if (
+    generationKeys.length === 0 ||
+    (activePointerGenerationKey !== undefined &&
+      !generationKeys.includes(activePointerGenerationKey))
+  ) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  return {
+    versionUids: [...versionUids].sort(),
+    generationKeys: [...generationKeys].sort(),
+    publications: publicationInventory.sort((left, right) =>
+      left.generationKey.localeCompare(right.generationKey),
+    ),
+  };
+}
+
+async function readRetiredGroupAuthority(
+  input: VerifyRetiredWorkerdWorkerExecutionCopiesInput,
+): Promise<{
+  readonly directory: string;
+  readonly expectedReceipt: WorkerdWorkerRetirementReceipt;
+}> {
+  validateIdentity(input.workerResourceUid, input.operationId);
+  const directory = await requireOwnedDirectory(input.groupDirectory);
+  const groupManifestText = await readRequiredRegularFile(join(directory, MANIFEST_NAME));
+  const configurationPath = join(directory, "workers/workerd.capnp");
+  const configuration = await readRequiredRegularFile(configurationPath);
+  const receiptText = await readRequiredRegularFile(join(directory, RECEIPT_NAME));
+  let manifestValue: unknown;
+  try {
+    manifestValue = JSON.parse(groupManifestText);
+  } catch {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  const expectedReceipt: WorkerdWorkerRetirementReceipt = {
+    workerResourceUid: input.workerResourceUid,
+    operationId: input.operationId,
+    listenerPort: input.listenerPort,
+    configurationSha256: sha256(new TextEncoder().encode(configuration)),
+  };
+  if (
+    !parseExactJson(receiptText, expectedReceipt) ||
+    !manifestValue ||
+    typeof manifestValue !== "object" ||
+    Array.isArray(manifestValue) ||
+    !parseExactJson(groupManifestText, {
+      schema: "takoserver.workerd-worker-group@1",
+      workerResourceUid: input.workerResourceUid,
+      listenerPort: input.listenerPort,
+      configurationSha256: expectedReceipt.configurationSha256,
+    })
+  ) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  return { directory, expectedReceipt };
+}
+
+/** Prove the exact receipt and complete immutable copies before cleanup intent is persisted. */
+export async function verifyRetiredWorkerdWorkerExecutionCopies(
+  input: VerifyRetiredWorkerdWorkerExecutionCopiesInput,
+): Promise<{
+  readonly copies: WorkerdWorkerExecutionCopies;
+  readonly receipt: WorkerdWorkerRetirementReceipt;
+  readonly cleanupManifestSha256: string;
+}> {
+  const { directory, expectedReceipt } = await readRetiredGroupAuthority(input);
+  const copies = await inspectWorkerdWorkerExecutionCopies({
+    groupDirectory: directory,
+    workerResourceUid: input.workerResourceUid,
+    listenerPort: input.listenerPort,
+    scriptName: input.scriptName,
+  });
+  const inventory = await buildExecutionCopyInventory(directory, input, expectedReceipt);
+  return {
+    copies,
+    receipt: expectedReceipt,
+    cleanupManifestSha256: digestInventory(inventory),
+  };
+}
+
+function digestInventory(inventory: WorkerdExecutionCopyInventory): string {
+  return `sha256:${sha256(new TextEncoder().encode(JSON.stringify(inventory)))}`;
+}
+
+async function buildExecutionCopyInventory(
+  directory: string,
+  input: VerifyRetiredWorkerdWorkerExecutionCopiesInput,
+  receipt: WorkerdWorkerRetirementReceipt,
+): Promise<WorkerdExecutionCopyInventory> {
+  const entries: WorkerdExecutionCopyInventoryEntry[] = [];
+  const roots = [
+    { path: join(directory, "workers", input.scriptName), label: "direct" },
+    {
+      path: join(directory, "workers", DEPLOYMENT_PUBLICATIONS_NAME, input.scriptName),
+      label: "publications",
+    },
+  ] as const;
+  const visit = async (path: string, label: string, relative: string): Promise<void> => {
+    const info = await lstat(path).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    });
+    if (!info) return;
+    if (info.isSymbolicLink()) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    const inventoryPath = relative ? `${label}/${relative}` : label;
+    if (info.isDirectory()) {
+      entries.push({ path: inventoryPath, kind: "directory", mode: info.mode & 0o777 });
+      const children = (await readdir(path)).sort();
+      for (const child of children) {
+        if (!child || child === "." || child === ".." || child.includes("/"))
+          throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+        await visit(join(path, child), label, relative ? `${relative}/${child}` : child);
+      }
+      return;
+    }
+    if (!info.isFile()) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    const bytes = await readFile(path);
+    entries.push({
+      path: inventoryPath,
+      kind: "file",
+      mode: info.mode & 0o777,
+      size: bytes.byteLength,
+      sha256: sha256(bytes),
+    });
+  };
+  for (const root of roots) await visit(root.path, root.label, "");
+  entries.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+  return {
+    schema: "takoserver.workerd-execution-copy-inventory@1",
+    workerResourceUid: input.workerResourceUid,
+    operationId: input.operationId,
+    listenerPort: input.listenerPort,
+    scriptName: input.scriptName,
+    configurationSha256: receipt.configurationSha256,
+    entries,
+  };
+}
+
+async function validateInventoryAtTree(
+  path: string,
+  label: "direct" | "publications",
+  inventory: WorkerdExecutionCopyInventory,
+  requireComplete: boolean,
+): Promise<void> {
+  const expected = new Map(
+    inventory.entries
+      .filter((entry) => entry.path === label || entry.path.startsWith(`${label}/`))
+      .map((entry) => [entry.path, entry]),
+  );
+  const actual = new Set<string>();
+  const visit = async (currentPath: string, relative: string): Promise<void> => {
+    const info = await lstat(currentPath).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    });
+    if (!info) return;
+    if (info.isSymbolicLink()) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    const key = relative ? `${label}/${relative}` : label;
+    const proof = expected.get(key);
+    if (
+      !proof ||
+      (info.isDirectory() ? proof.kind !== "directory" : proof.kind !== "file") ||
+      proof.mode !== (info.mode & 0o777)
+    )
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    actual.add(key);
+    if (info.isDirectory()) {
+      if ((info.mode & 0o077) !== 0)
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      const children = (await readdir(currentPath)).sort();
+      for (const child of children) {
+        if (!child || child === "." || child === ".." || child.includes("/"))
+          throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+        await visit(join(currentPath, child), relative ? `${relative}/${child}` : child);
+      }
+      return;
+    }
+    if (!info.isFile()) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    const bytes = await readFile(currentPath);
+    if (proof.size !== bytes.byteLength || proof.sha256 !== sha256(bytes))
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  };
+  await visit(path, "");
+  if (requireComplete && actual.size !== expected.size)
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+}
+
+async function readCleanupInventory(
+  path: string,
+  input: VerifyRetiredWorkerdWorkerExecutionCopiesInput,
+  receipt: WorkerdWorkerRetirementReceipt,
+): Promise<WorkerdExecutionCopyInventory> {
+  try {
+    const info = await lstat(path);
+    if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) throw new Error();
+    const text = await readFile(path, "utf8");
+    const value: unknown = JSON.parse(text);
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
+    const record = value as Record<string, unknown>;
+    if (
+      Object.keys(record).sort().join(",") !==
+        "configurationSha256,entries,listenerPort,operationId,schema,scriptName,workerResourceUid" ||
+      record.schema !== "takoserver.workerd-execution-copy-inventory@1" ||
+      record.workerResourceUid !== input.workerResourceUid ||
+      record.operationId !== input.operationId ||
+      record.listenerPort !== input.listenerPort ||
+      record.scriptName !== input.scriptName ||
+      record.configurationSha256 !== receipt.configurationSha256 ||
+      !Array.isArray(record.entries) ||
+      record.entries.length > 100_000
+    ) {
+      throw new Error();
+    }
+    let previousPath = "";
+    for (const raw of record.entries) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error();
+      const entry = raw as Record<string, unknown>;
+      if (
+        typeof entry.path !== "string" ||
+        (previousPath !== "" && entry.path <= previousPath) ||
+        !/^(?:direct|publications)(?:\/[A-Za-z0-9._-]+)*$/u.test(entry.path) ||
+        entry.path.split("/").some((part) => part === "." || part === "..")
+      ) {
+        throw new Error();
+      }
+      if (entry.kind === "directory") {
+        if (
+          Object.keys(entry).sort().join(",") !== "kind,mode,path" ||
+          !Number.isSafeInteger(entry.mode) ||
+          (entry.mode as number) < 0 ||
+          (entry.mode as number) > 0o777
+        )
+          throw new Error();
+      } else if (entry.kind === "file") {
+        if (
+          Object.keys(entry).sort().join(",") !== "kind,mode,path,sha256,size" ||
+          !Number.isSafeInteger(entry.mode) ||
+          (entry.mode as number) < 0 ||
+          (entry.mode as number) > 0o777 ||
+          !Number.isSafeInteger(entry.size) ||
+          (entry.size as number) < 0 ||
+          typeof entry.sha256 !== "string" ||
+          !/^[0-9a-f]{64}$/u.test(entry.sha256)
+        ) {
+          throw new Error();
+        }
+      } else {
+        throw new Error();
+      }
+      previousPath = entry.path;
+    }
+    if (JSON.stringify(value) !== text) throw new Error();
+    return value as unknown as WorkerdExecutionCopyInventory;
+  } catch {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+}
+
+async function writeCleanupInventory(
+  path: string,
+  temporaryPath: string,
+  inventory: WorkerdExecutionCopyInventory,
+): Promise<void> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(temporaryPath, "wx", 0o600);
+    await handle.writeFile(JSON.stringify(inventory));
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporaryPath, path);
+    await syncDirectory(dirname(path));
+  } catch {
+    await handle?.close().catch(() => undefined);
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+}
+
+/**
+ * Remove exact retired publication copies after a durable owner cleanup intent.
+ * Strictly verified trees are first atomically moved to an incarnation- and
+ * retirement-operation-specific quarantine. A partial recursive removal can
+ * therefore be resumed without treating a partial ordinary publication tree
+ * as valid or weakening validation of any remaining source tree.
+ */
+export async function releaseRetiredWorkerdWorkerExecutionCopies(
+  input: RetiredWorkerdWorkerExecutionCopiesInput,
+): Promise<{ readonly receipt: WorkerdWorkerRetirementReceipt }> {
+  if (input.cleanupIntentPersisted !== true)
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  const { directory, expectedReceipt } = await readRetiredGroupAuthority(input);
+  const workersRoot = join(directory, "workers");
+  const directPath = join(workersRoot, input.scriptName);
+  const publicationRoot = join(workersRoot, DEPLOYMENT_PUBLICATIONS_NAME);
+  const publicationPath = join(publicationRoot, input.scriptName);
+  const quarantineRoot = join(directory, ".retired-execution-copies");
+  const quarantinePath = join(quarantineRoot, input.operationId);
+  const quarantinedDirect = join(quarantinePath, "direct");
+  const quarantinedPublications = join(quarantinePath, "publications");
+  const inventoryPath = join(quarantinePath, "inventory.json");
+  const inventoryTemporaryPath = join(quarantinePath, "inventory.tmp");
+
+  const quarantineExists = await requireDirectoryOrMissing(quarantineRoot);
+  if (quarantineExists) {
+    const quarantineEntries = await readdir(quarantineRoot).catch(() => {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    });
+    if (quarantineEntries.some((entry) => entry !== input.operationId))
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  const operationQuarantineExists = await requireDirectoryOrMissing(quarantinePath);
+  if (operationQuarantineExists) {
+    const entries = await readdir(quarantinePath).catch(() => {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    });
+    if (
+      entries.some(
+        (entry) =>
+          entry !== "direct" &&
+          entry !== "publications" &&
+          entry !== "inventory.json" &&
+          entry !== "inventory.tmp",
+      )
+    )
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    for (const target of [quarantinedDirect, quarantinedPublications]) {
+      if (await requireDirectoryOrMissing(target)) await requireNoSymlinksOrSpecialFiles(target);
+    }
+  }
+
+  const hasQuarantinedDirect = await requireDirectoryOrMissing(quarantinedDirect);
+  const hasQuarantinedPublications = await requireDirectoryOrMissing(quarantinedPublications);
+  const hasSourceDirect = await requireDirectoryOrMissing(directPath);
+  const hasSourcePublications = await requireDirectoryOrMissing(publicationPath);
+  if (hasSourceDirect && hasQuarantinedDirect)
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  if (hasSourcePublications && hasQuarantinedPublications)
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  if (hasQuarantinedPublications && hasSourceDirect)
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+
+  const hasAnyQuarantine = hasQuarantinedDirect || hasQuarantinedPublications;
+  const inventoryInfo = await lstat(inventoryPath).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  const temporaryInfo = await lstat(inventoryTemporaryPath).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  let inventory: WorkerdExecutionCopyInventory;
+  if (input.alreadyReleased === true) {
+    if (hasSourceDirect || hasSourcePublications || hasAnyQuarantine || temporaryInfo !== null)
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    if (input.cleanupManifestSha256 === null) {
+      if (quarantineExists || inventoryInfo !== null)
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    } else {
+      if (inventoryInfo === null || inventoryInfo.isSymbolicLink())
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      inventory = await readCleanupInventory(inventoryPath, input, expectedReceipt);
+      if (digestInventory(inventory) !== input.cleanupManifestSha256)
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      await requireEmptyDirectoryOrMissing(quarantinedDirect);
+      await requireEmptyDirectoryOrMissing(quarantinedPublications);
+    }
+    const copies = await inspectWorkerdWorkerExecutionCopies({
+      groupDirectory: directory,
+      workerResourceUid: input.workerResourceUid,
+      listenerPort: input.listenerPort,
+      scriptName: input.scriptName,
+    });
+    if (copies.versionUids.length !== 0 || copies.generationKeys.length !== 0)
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    return { receipt: expectedReceipt };
+  }
+  if (inventoryInfo) {
+    if (inventoryInfo.isSymbolicLink() || !inventoryInfo.isFile() || !input.cleanupManifestSha256)
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    inventory = await readCleanupInventory(inventoryPath, input, expectedReceipt);
+    if (digestInventory(inventory) !== input.cleanupManifestSha256)
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  } else {
+    if (hasAnyQuarantine) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+    await inspectWorkerdWorkerExecutionCopies({
+      groupDirectory: directory,
+      workerResourceUid: input.workerResourceUid,
+      listenerPort: input.listenerPort,
+      scriptName: input.scriptName,
+    });
+    inventory = await buildExecutionCopyInventory(directory, input, expectedReceipt);
+    if (
+      !input.cleanupManifestSha256 ||
+      digestInventory(inventory) !== input.cleanupManifestSha256
+    ) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+  }
+
+  if (!operationQuarantineExists) {
+    if (!quarantineExists) {
+      await mkdir(quarantineRoot, { mode: 0o700 });
+      await syncDirectory(directory);
+    }
+    await mkdir(quarantinePath, { mode: 0o700 });
+    await syncDirectory(quarantineRoot);
+  }
+
+  if (!inventoryInfo) {
+    if (hasAnyQuarantine) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    if (temporaryInfo) {
+      if (!temporaryInfo.isFile() || temporaryInfo.isSymbolicLink())
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      await unlink(inventoryTemporaryPath);
+      await syncDirectory(quarantinePath);
+    }
+    await writeCleanupInventory(inventoryPath, inventoryTemporaryPath, inventory);
+  } else if (temporaryInfo) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+
+  if (hasSourceDirect) {
+    await validateInventoryAtTree(directPath, "direct", inventory, true);
+  }
+  if (hasSourcePublications) {
+    await validateInventoryAtTree(publicationPath, "publications", inventory, true);
+  }
+  if (hasQuarantinedDirect) {
+    await validateInventoryAtTree(quarantinedDirect, "direct", inventory, false);
+  }
+  if (hasQuarantinedPublications) {
+    await validateInventoryAtTree(quarantinedPublications, "publications", inventory, false);
+  }
+
+  if (hasSourceDirect && !hasQuarantinedDirect) {
+    await rename(directPath, quarantinedDirect).catch(() => {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    });
+    await syncDirectory(workersRoot);
+    await syncDirectory(quarantinePath);
+  }
+  if (hasSourcePublications && !hasQuarantinedPublications) {
+    const directMoved = await requireDirectoryOrMissing(quarantinedDirect);
+    const directStillInSource = await requireDirectoryOrMissing(directPath);
+    if (!directMoved && directStillInSource)
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    await rename(publicationPath, quarantinedPublications).catch(() => {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    });
+    await syncDirectory(publicationRoot);
+    await syncDirectory(quarantinePath);
+  }
+
+  for (const [target, label] of [
+    [quarantinedDirect, "direct"],
+    [quarantinedPublications, "publications"],
+  ] as const) {
+    if (await requireDirectoryOrMissing(target)) {
+      await validateInventoryAtTree(target, label, inventory, false);
+      await removeOwnedTreeDurably(target, input.afterEntryRemoved);
+    }
+  }
+  const after = await inspectWorkerdWorkerExecutionCopies({
+    groupDirectory: directory,
+    workerResourceUid: input.workerResourceUid,
+    listenerPort: input.listenerPort,
+    scriptName: input.scriptName,
+  });
+  if (after.generationKeys.length !== 0 || after.versionUids.length !== 0) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  if (await requireDirectoryOrMissing(quarantinedDirect))
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  if (await requireDirectoryOrMissing(quarantinedPublications))
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  const persistedInventory = await readCleanupInventory(inventoryPath, input, expectedReceipt);
+  if (digestInventory(persistedInventory) !== input.cleanupManifestSha256)
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  return { receipt: expectedReceipt };
+}
+
+async function readPointerGeneration(directPath: string): Promise<string> {
+  const text = await readRequiredRegularFile(join(directPath, WORKER_POINTER_NAME));
+  try {
+    const pointer = JSON.parse(text) as Record<string, unknown>;
+    if (typeof pointer.generation !== "string") throw new Error();
+    return pointer.generation;
+  } catch {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+}
+
+async function requireOwnedDirectory(path: string): Promise<string> {
+  try {
+    const absolute = await realpath(path);
+    if (absolute !== path) throw new Error();
+    const info = await lstat(absolute);
+    if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0)
+      throw new Error();
+    return absolute;
+  } catch {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+}
+
+async function readRequiredRegularFile(path: string): Promise<string> {
+  try {
+    const info = await lstat(path);
+    if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) throw new Error();
+    return await readFile(path, "utf8");
+  } catch {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+}
+
+async function requireNoSymlinksOrSpecialFiles(path: string): Promise<void> {
+  const info = await lstat(path).catch(() => null);
+  if (!info || info.isSymbolicLink())
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  if (info.isDirectory()) {
+    if ((info.mode & 0o077) !== 0)
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    const entries = await readdir(path).catch(() => {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    });
+    if (entries.length > 100_000) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    for (const entry of entries) await requireNoSymlinksOrSpecialFiles(join(path, entry));
+    return;
+  }
+  if (!info.isFile()) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+}
+
+async function requireDirectoryOrMissing(path: string): Promise<boolean> {
+  const info = await lstat(path).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  if (!info) return false;
+  if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0)
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  return true;
+}
+
+async function requireEmptyDirectoryOrMissing(path: string): Promise<void> {
+  if (!(await requireDirectoryOrMissing(path))) return;
+  const entries = await readdir(path).catch(() => {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  if (entries.length !== 0) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+}
+
+async function removeOwnedTreeDurably(path: string, afterEntryRemoved?: () => void): Promise<void> {
+  const info = await lstat(path).catch(() => null);
+  if (!info || info.isSymbolicLink())
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  if (info.isDirectory()) {
+    const entries = await readdir(path).catch(() => {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    });
+    for (const entry of entries) await removeOwnedTreeDurably(join(path, entry), afterEntryRemoved);
+    await syncDirectory(path);
+    await rmdir(path).catch(() => {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    });
+    await syncDirectory(dirname(path));
+    afterEntryRemoved?.();
+    return;
+  }
+  if (!info.isFile()) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  await unlink(path).catch(() => {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  });
+  await syncDirectory(dirname(path));
+  afterEntryRemoved?.();
+}
+
+async function verifyStoredVersionTree(root: string, manifestValue: unknown): Promise<void> {
+  if (!manifestValue || typeof manifestValue !== "object" || Array.isArray(manifestValue)) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  const manifest = manifestValue as Record<string, unknown>;
+  const expected = new Map<string, { readonly size: number; readonly sha256: string }>();
+  if (manifest.kind === "static") {
+    if (
+      Object.keys(manifest).sort().join(",") !==
+        "assets,fetchHandler,generation,hostnames,kind,workerResourceUid" ||
+      manifest.fetchHandler !== false
+    ) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+  } else {
+    if (
+      typeof manifest.moduleFiles !== "object" ||
+      manifest.moduleFiles === null ||
+      Array.isArray(manifest.moduleFiles)
+    ) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+    const moduleFiles = manifest.moduleFiles as Record<string, unknown>;
+    if (Object.keys(moduleFiles).sort().join(",") !== "application,hostPrivate") {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+    for (const [directory, inventory] of [
+      ["application", moduleFiles.application],
+      ["host-private", moduleFiles.hostPrivate],
+    ] as const) {
+      if (!Array.isArray(inventory))
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      for (const [index, entryValue] of inventory.entries()) {
+        if (!entryValue || typeof entryValue !== "object" || Array.isArray(entryValue))
+          throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+        const entry = entryValue as Record<string, unknown>;
+        if (
+          Object.keys(entry).sort().join(",") !== "digest,key,name,size" ||
+          entry.key !== `module-${index.toString(10).padStart(5, "0")}` ||
+          typeof entry.digest !== "string" ||
+          !/^sha256:[0-9a-f]{64}$/u.test(entry.digest) ||
+          !Number.isSafeInteger(entry.size) ||
+          (entry.size as number) < 0
+        ) {
+          throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+        }
+        expected.set(`${directory}/${entry.key}`, {
+          size: entry.size as number,
+          sha256: entry.digest.slice("sha256:".length),
+        });
+      }
+    }
+  }
+  const assetManifest = manifest.assets;
+  if (assetManifest !== undefined) {
+    if (!assetManifest || typeof assetManifest !== "object" || Array.isArray(assetManifest)) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+    const assets = assetManifest as Record<string, unknown>;
+    if (typeof assets.files !== "object" || assets.files === null || Array.isArray(assets.files)) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+    const assetEntries = Object.entries(assets.files as Record<string, unknown>).sort(
+      ([left], [right]) => left.localeCompare(right),
+    );
+    for (const [index, [, entryValue]] of assetEntries.entries()) {
+      if (!entryValue || typeof entryValue !== "object" || Array.isArray(entryValue))
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      const entry = entryValue as Record<string, unknown>;
+      if (
+        Object.keys(entry).sort().join(",") !== "digest,key,mediaType,size" ||
+        entry.key !== `asset-${index.toString(10).padStart(5, "0")}` ||
+        typeof entry.digest !== "string" ||
+        !/^sha256:[0-9a-f]{64}$/u.test(entry.digest) ||
+        !Number.isSafeInteger(entry.size) ||
+        (entry.size as number) < 0
+      ) {
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      }
+      expected.set(`assets/${entry.key}`, {
+        size: entry.size as number,
+        sha256: entry.digest.slice("sha256:".length),
+      });
+    }
+  }
+  if (expected.size === 0) throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+
+  const actual = new Map<string, Uint8Array>();
+  const actualDirectories = new Set<string>();
+  const visit = async (directory: string, prefix: string): Promise<void> => {
+    const entries = await readdir(directory);
+    for (const name of entries) {
+      if (name === "" || name === "." || name === ".." || name.includes("/"))
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      const child = join(directory, name);
+      const childInfo = await lstat(child).catch(() => null);
+      if (!childInfo || childInfo.isSymbolicLink())
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      const relative = prefix ? `${prefix}/${name}` : name;
+      if (childInfo.isDirectory()) {
+        actualDirectories.add(relative);
+        await visit(child, relative);
+      } else if (childInfo.isFile()) {
+        actual.set(relative, await readFile(child));
+      } else {
+        throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+      }
+    }
+  };
+  await visit(root, "");
+  if (actual.size !== expected.size)
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  const expectedDirectories = new Set<string>();
+  for (const name of expected.keys()) {
+    const segments = name.split("/");
+    for (let index = 1; index < segments.length; index += 1) {
+      expectedDirectories.add(segments.slice(0, index).join("/"));
+    }
+  }
+  if (
+    actualDirectories.size !== expectedDirectories.size ||
+    [...actualDirectories].some((directory) => !expectedDirectories.has(directory))
+  ) {
+    throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+  }
+  for (const [name, proof] of expected) {
+    const bytes = actual.get(name);
+    if (!bytes || bytes.byteLength !== proof.size || sha256(bytes) !== proof.sha256) {
+      throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+    }
+  }
 }

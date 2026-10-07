@@ -25,7 +25,11 @@ function validName(value: string): boolean {
 }
 
 function referenceUnavailable(error: unknown): boolean {
-  return error instanceof SqlError && error.message.includes("tf_v2_reference_target_unavailable");
+  return (
+    error instanceof SqlError &&
+    (error.message.includes("tf_v2_reference_target_unavailable") ||
+      error.message.includes("tf_v2_worker_invocation_live_reference"))
+  );
 }
 
 function resource(row: ResourceRow): V2Resource {
@@ -286,6 +290,8 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       if (target.generation !== input.expectedGeneration) fail("generation_conflict", 409);
       if (target.generation >= Number.MAX_SAFE_INTEGER) fail("invalid_request", 400);
       const selectedForm = boundForm(target);
+      const serializeUpdatesWithPendingReferrers =
+        selectedForm.serializeUpdatesWithPendingReferrers === true;
       selectedForm.validateUpdate(JSON.parse(target.spec_json) as JsonObject, input.spec);
       const referencesJson = prepareV2References(selectedForm, input.spec);
       if (referencesJson !== null) await permitted(input.principal, target.space, "read");
@@ -298,9 +304,14 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         spec: input.spec,
         formUrl: target.form_url,
       });
+      let result: Awaited<ReturnType<typeof store.insertChange>>;
       try {
-        if (await store.insertChange(record, referencesJson))
-          return operation(await storedOperation(record.id));
+        result = await store.insertChange(
+          record,
+          referencesJson,
+          serializeUpdatesWithPendingReferrers,
+        );
+        if (result === "accepted") return operation(await storedOperation(record.id));
       } catch (error) {
         const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
         if (winner) return winner;
@@ -309,6 +320,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       }
       const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
       if (winner) return winner;
+      if (result === "dependency_conflict") fail("dependency_conflict", 409);
       const latest = await ownedResource(input.principal, input.uid, "write");
       if (latest.busy_operation) fail("resource_busy", 409);
       fail("generation_conflict", 409);
@@ -347,10 +359,12 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         formUrl: target.form_url,
       });
       try {
-        if (await store.insertChange(record)) return operation(await storedOperation(record.id));
+        if ((await store.insertChange(record)) === "accepted")
+          return operation(await storedOperation(record.id));
       } catch (error) {
         const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
         if (winner) return winner;
+        if (referenceUnavailable(error)) fail("dependency_conflict", 409);
         throw error;
       }
       const winner = await winnerAfterRace(input.principal, input.key, fingerprint);

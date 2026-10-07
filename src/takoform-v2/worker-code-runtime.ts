@@ -12,12 +12,14 @@ import type {
   WorkerdSite,
 } from "../workerd-runtime.ts";
 import type { SqlArtifactCustodyRead } from "./forms/artifact-custody.ts";
+import type { StaticAssetBundleManifest } from "./forms/static-asset-bundle.ts";
 import {
   parseWorkerBundleManifest,
   WORKER_BUNDLE_LIMITS,
   type WorkerBundleManifest,
 } from "./forms/worker-bundle.ts";
 import { parseWorkerVersionSpec } from "./forms/worker-specs.ts";
+import { verifyV2AssetMaterials } from "./worker-static-runtime.ts";
 
 export type V2WorkerCodeVersionIdentity = {
   readonly directory: string;
@@ -28,6 +30,7 @@ export type V2WorkerCodeVersionIdentity = {
   readonly versionId: string;
   readonly weight: number;
   readonly bundleResourceUid: string;
+  readonly assetResourceUid?: string;
 };
 
 export type V2WorkerCodeDeploymentVariant = WorkerdDeploymentVariant<WorkerdSite>;
@@ -60,6 +63,7 @@ export async function projectV2WorkerCodeVersion(input: {
   readonly identity: V2WorkerCodeVersionIdentity;
   readonly spec: unknown;
   readonly bundle: SqlArtifactCustodyRead<WorkerBundleManifest> | null;
+  readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
   readonly inspectModule: WorkerdRuntime["inspectModule"];
   readonly privateInputs?: unknown;
 }): Promise<V2WorkerCodeDeploymentVariant> {
@@ -101,11 +105,31 @@ export async function projectV2WorkerCodeVersion(input: {
   if (spec.handlers.some((handler) => handler !== "fetch")) {
     throw new V2WorkerCodeRuntimeError("worker_event_delivery_unavailable");
   }
-  if (spec.assets) throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
+  if (spec.assets?.bundle.resourceUid !== identity.assetResourceUid) {
+    throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
+  }
+  if (!spec.assets && input.assets) {
+    throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
+  }
   if (!input.bundle) throw bundleUnavailable();
 
   const held = snapshotBundle(input.bundle);
   const observed = await verifyBundle(held);
+  let assets: Awaited<ReturnType<typeof verifyV2AssetMaterials>> | undefined;
+  if (spec.assets) {
+    if (!input.assets) throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
+    try {
+      assets = await verifyV2AssetMaterials(input.assets);
+    } catch {
+      throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
+    }
+    if (
+      spec.assets.notFoundHandling === "single_page_application" &&
+      !assets.bytes.has("index.html")
+    ) {
+      throw new V2WorkerCodeRuntimeError("worker_assets_unavailable");
+    }
+  }
   const inspectionInput = inspectionInputForBundle(held, observed.manifest, spec.handlers);
   const inspection = await inspectModule(inspectionInput);
   if (!isValidInspection(inspection)) {
@@ -140,6 +164,19 @@ export async function projectV2WorkerCodeVersion(input: {
     generation: identity.generation,
     workerResourceUid: identity.workerResourceUid,
     fetchHandler: spec.handlers.includes("fetch"),
+    ...(assets && spec.assets
+      ? {
+          assets: {
+            notFoundHandling:
+              spec.assets.notFoundHandling === "single_page_application"
+                ? ("single-page-application" as const)
+                : ("none" as const),
+            runWorkerFirst: spec.assets.runWorkerFirst,
+            strictPaths: true as const,
+            mediaTypes: assets.mediaTypes,
+          },
+        }
+      : {}),
     ...(vars.length === 0 ? {} : { vars }),
   };
   return {
@@ -148,6 +185,7 @@ export async function projectV2WorkerCodeVersion(input: {
     weight: identity.weight,
     site,
     modules,
+    ...(assets ? { assets: assets.bytes } : {}),
   };
 }
 
@@ -162,6 +200,7 @@ function snapshotIdentity(input: V2WorkerCodeVersionIdentity): V2WorkerCodeVersi
       versionId: input.versionId,
       weight: input.weight,
       bundleResourceUid: input.bundleResourceUid,
+      ...(input.assetResourceUid === undefined ? {} : { assetResourceUid: input.assetResourceUid }),
     };
   } catch {
     throw new V2WorkerCodeRuntimeError("worker_version_unavailable");

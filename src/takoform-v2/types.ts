@@ -106,6 +106,8 @@ export interface V2ReferenceRequirement {
 export interface V2Form {
   validateCreate(spec: JsonObject): void;
   validateUpdate(previousSpec: JsonObject, spec: JsonObject): void;
+  /** Internal acceptance ordering for a target whose observation reads live referrers. */
+  readonly serializeUpdatesWithPendingReferrers?: true;
   /**
    * Pure initial public output, persisted with Resource/Operation acceptance.
    * Must not perform external allocation: a losing acceptance can roll back.
