@@ -108,7 +108,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "v2-runtime",
     match:
-      /^src\/takoform-v2\/(?:worker-bundle-runtime|worker-code-runtime|worker-cron-trigger-backend|worker-cron-trigger-scheduler|worker-deployment-backend|worker-endpoint-backend|worker-lifecycle-backend|worker-runtime-readers|worker-publication-state|worker-publication-sql-guard|worker-static-runtime|worker-static-publication|worker-native-effects|worker-native-deletions)\.ts$|^src\/workerd-worker-runtime-owner\.ts$/u,
+      /^src\/takoform-v2\/(?:module-worker-lifecycle-backend|worker-bundle-runtime|worker-code-runtime|worker-cron-trigger-backend|worker-cron-trigger-scheduler|worker-deployment-backend|worker-endpoint-backend|worker-lifecycle-backend|worker-runtime-readers|worker-publication-state|worker-publication-sql-guard|worker-static-runtime|worker-static-publication|worker-native-effects|worker-native-deletions)\.ts$|^src\/workerd-worker-runtime-owner\.ts$/u,
     may: [
       "core",
       "v2-contract",
@@ -118,6 +118,28 @@ const LAYERS: readonly Layer[] = [
       "v2-runtime",
       "adapter",
     ],
+  },
+  {
+    // Outer adapter: accepted v2 SQL/native authority meets the existing
+    // physical Actor port, whose explicit legacy adapter lives in one module.
+    // This is not a pure Form parser or a new native-import permission for it.
+    name: "v2-actor-graph-authority",
+    match: /^src\/takoform-v2\/actor-namespace-graph-authority\.ts$/u,
+    may: ["core", "adapter", "app", "v2-form", "v2-runtime"],
+  },
+  {
+    // Actor acceptance reads v2 SQL and held Form bytes through typed ports;
+    // it does not import the native owner or the legacy Actor adapter.
+    name: "v2-actor-admission",
+    match: /^src\/takoform-v2\/actor-namespace-admission\.ts$/u,
+    may: ["core", "v2-contract", "v2-form"],
+  },
+  {
+    // Exact outer composition point for the existing physical Actor owner;
+    // never broadens pure Form or generic v2 runtime access to app modules.
+    name: "v2-actor-physical-backend",
+    match: /^src\/takoform-v2\/actor-namespace-backend\.ts$/u,
+    may: ["core", "app", "v2-contract", "v2-form", "v2-actor-admission"],
   },
   {
     name: "v2-engine",
@@ -274,6 +296,7 @@ const LAYERS: readonly Layer[] = [
       "entry",
       "v2-config",
       "v2-selfhost-composition",
+      "v2-selfhost-queue-composition",
       "v2-selfhost-configured-input-sealer",
     ],
   },

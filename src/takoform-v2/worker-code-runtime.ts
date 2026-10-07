@@ -18,6 +18,7 @@ import {
   type V2KvNativeBoot,
   type V2ResolvedKvBinding,
   type V2ResolvedObjectBucketBinding,
+  type V2ResolvedQueueProducerBinding,
   type V2ResolvedSqliteBinding,
   type V2SqliteNativeBoot,
   V2WorkerCodeRuntimeError,
@@ -29,6 +30,7 @@ export {
   type V2KvNativeBoot,
   type V2ResolvedKvBinding,
   type V2ResolvedObjectBucketBinding,
+  type V2ResolvedQueueProducerBinding,
   type V2ResolvedSqliteBinding,
   type V2SqliteNativeBoot,
   V2WorkerCodeRuntimeError,
@@ -72,12 +74,14 @@ export async function projectV2WorkerCodeVersion(input: {
   readonly resolvedSqliteBindings?: readonly V2ResolvedSqliteBinding[];
   readonly resolvedObjectBucketBindings?: readonly V2ResolvedObjectBucketBinding[];
   readonly resolvedKvBindings?: readonly V2ResolvedKvBinding[];
+  readonly resolvedQueueProducerBindings?: readonly V2ResolvedQueueProducerBinding[];
   /** Signed by the fixed Host-private broker after selected native ID is known. */
   readonly sqliteBoot?: V2SqliteNativeBoot;
   /** Exact selected-Version grant for the private ObjectBucket dispatcher. */
   readonly objectBucketBoot?: import("./worker-code-eligibility.ts").V2ObjectBucketNativeBoot;
   /** Exact selected-Version grant for the private KV data-service facade. */
   readonly kvBoot?: V2KvNativeBoot;
+  readonly queueProducerBoot?: import("./worker-code-eligibility.ts").V2QueueProducerNativeBoot;
   /** Non-optional private event gate capability composed by the owning Host. */
   readonly eventDelivery?: { readonly token: string };
   /** Exact private settlement binding selected before tenant materialization. */
@@ -124,6 +128,15 @@ export async function projectV2WorkerCodeVersion(input: {
   } catch {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
+  let resolvedQueueProducerBindings: readonly V2ResolvedQueueProducerBinding[] | undefined;
+  try {
+    resolvedQueueProducerBindings = input.resolvedQueueProducerBindings?.map((binding) => ({
+      name: binding.name,
+      resourceUid: binding.resourceUid,
+    }));
+  } catch {
+    throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
+  }
   const verified = await prepareV2WorkerCodeProjection({
     workerResourceUid: identity.workerResourceUid,
     bundleResourceUid: identity.bundleResourceUid,
@@ -140,9 +153,13 @@ export async function projectV2WorkerCodeVersion(input: {
     ...(resolvedSqliteBindings === undefined ? {} : { resolvedSqliteBindings }),
     ...(resolvedObjectBucketBindings === undefined ? {} : { resolvedObjectBucketBindings }),
     ...(resolvedKvBindings === undefined ? {} : { resolvedKvBindings }),
+    ...(resolvedQueueProducerBindings === undefined ? {} : { resolvedQueueProducerBindings }),
     ...(input.sqliteBoot === undefined ? {} : { sqliteBoot: input.sqliteBoot }),
     ...(input.objectBucketBoot === undefined ? {} : { objectBucketBoot: input.objectBucketBoot }),
     ...(input.kvBoot === undefined ? {} : { kvBoot: input.kvBoot }),
+    ...(input.queueProducerBoot === undefined
+      ? {}
+      : { queueProducerBoot: input.queueProducerBoot }),
     requireEventDelivery: true,
     ...(input.eventDelivery === undefined ? {} : { eventDelivery: input.eventDelivery }),
     ...(input.queueSettlement === undefined ? {} : { queueSettlement: input.queueSettlement }),
@@ -238,6 +255,15 @@ export async function projectV2WorkerCodeVersion(input: {
             address: verified.kvBoot.address,
             token: verified.kvBoot.token,
             bindings: verified.kvBoot.bindings,
+          },
+        }
+      : {}),
+    ...(verified.queueProducerBoot
+      ? {
+          v2QueueProducerBinding: {
+            address: verified.queueProducerBoot.address,
+            token: verified.queueProducerBoot.token,
+            bindings: verified.queueProducerBoot.bindings,
           },
         }
       : {}),

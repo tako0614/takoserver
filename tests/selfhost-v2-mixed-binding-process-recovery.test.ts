@@ -8,6 +8,7 @@ import { createAccounts } from "../src/auth.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
 import { EDGE_KV_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/edge-kv-namespace.ts";
 import { OBJECT_BUCKET_FORM_URL } from "../src/takoform-v2/forms/object-bucket.ts";
 import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-database.ts";
@@ -18,6 +19,7 @@ import {
   WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import { v2QueueId } from "../src/takoform-v2/worker-queue-delivery.ts";
 import { type LinuxProcessIdentity, linuxProcessLiveness } from "../src/workerd-linux-process.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
@@ -167,10 +169,27 @@ async function ownerState(root: string, workerUid: string): Promise<OwnerState> 
   ) as OwnerState;
 }
 
+function readQueueMessages(root: string, queueUid: string) {
+  const database = new Database(join(root, "control.sqlite"), { readonly: true });
+  try {
+    const rows = database
+      .query(
+        "SELECT message_id, body FROM selfhost_queue_messages WHERE queue_id = ? ORDER BY rowid",
+      )
+      .all(v2QueueId(queueUid)) as { message_id: string; body: Uint8Array }[];
+    return rows.map(({ message_id, body }) => ({
+      id: message_id,
+      body: new TextDecoder().decode(body),
+    }));
+  } finally {
+    database.close();
+  }
+}
+
 // This test covers abrupt Host SIGKILL recovery only; graceful suspend has a
 // separate lifecycle test and is not used to prepare or close this owner.
 test.skipIf(binary === null)(
-  "normal Host recovers the same accepted mixed KV, SQLite, and Object Worker after Host SIGKILL",
+  "normal Host recovers the same accepted mixed KV, SQLite, Object, and Queue Worker after Host SIGKILL",
   async () => {
     const root = await mkdtemp(join(tmpdir(), "selfhost-v2-mixed-binding-recovery-"));
     let first: Awaited<ReturnType<typeof startHost>> | undefined;
@@ -219,7 +238,13 @@ export default {
       await env.DB.execute("INSERT INTO records(value) VALUES (?)", ["sql-before-restart"]);
       const bytes = encoder.encode("object-before-restart");
       await env.MEDIA.put("persisted.txt", bytes.buffer, { contentLength: bytes.byteLength, contentType: "text/plain" });
-      return new Response("written");
+      const queueMessageId = await env.TASKS.send("queue-before-restart");
+      return Response.json({ written: true, queueMessageId });
+    }
+    if (path === "/queue-send") {
+      const message = new URL(request.url).searchParams.get("message") ?? "queue-after-restart";
+      const queueMessageId = await env.TASKS.send(message);
+      return Response.json({ queueMessageId });
     }
     if (path === "/read") {
       const kv = await env.CACHE.get("persisted");
@@ -263,7 +288,13 @@ export default {
         if (!port) throw new Error("private binding port unavailable");
         return port;
       };
-      const ports = [await reservePort(), await reservePort(), await reservePort()];
+      const ports = [
+        await reservePort(),
+        await reservePort(),
+        await reservePort(),
+        await reservePort(),
+        await reservePort(),
+      ];
       const firstHost = await startHost(
         root,
         binary as string,
@@ -326,6 +357,57 @@ export default {
         {},
         "create-kv-namespace-mixed-process",
       );
+      const queueSpec = { messageRetentionSeconds: 3_600 };
+      const queueReplayKey = "create-queue-mixed-process";
+      const queueAbort = new AbortController();
+      const lostQueueAck = request(
+        first.port,
+        key.secret,
+        `${API}/resources`,
+        "POST",
+        {
+          form: AT_LEAST_ONCE_QUEUE_FORM_URL,
+          space: organization.id,
+          name: "queue",
+          spec: queueSpec,
+        },
+        queueReplayKey,
+        undefined,
+        true,
+        queueAbort.signal,
+      );
+      let queueAcknowledgementHeld = false;
+      for (let attempt = 0; attempt < 250; attempt += 1) {
+        const held = await request(first.port, key.secret, "/__fixture/accepted-response-held");
+        queueAcknowledgementHeld = ((await held.json()) as { held: boolean }).held;
+        if (queueAcknowledgementHeld) break;
+        await Bun.sleep(10);
+      }
+      expect(queueAcknowledgementHeld).toBe(true);
+      queueAbort.abort();
+      let queueResponseWasLost = false;
+      try {
+        await lostQueueAck;
+      } catch {
+        queueResponseWasLost = true;
+      }
+      expect(queueResponseWasLost).toBe(true);
+      const queueResponse = await request(
+        first.port,
+        key.secret,
+        `${API}/resources`,
+        "POST",
+        {
+          form: AT_LEAST_ONCE_QUEUE_FORM_URL,
+          space: organization.id,
+          name: "queue",
+          spec: queueSpec,
+        },
+        queueReplayKey,
+      );
+      expect([200, 202]).toContain(queueResponse.status);
+      const queue = (await queueResponse.json()) as { id: string; resourceUid: string };
+      await operation(first.port, key.secret, queue.id);
       const bundle = await create(
         first.port,
         WORKER_BUNDLE_FORM_URL,
@@ -333,7 +415,7 @@ export default {
         { artifact: { url: MANIFEST_URL, sha256: manifestSha } },
         "create-bundle-mixed",
       );
-      if (!worker || !bucket || !database || !namespace || !bundle) {
+      if (!worker || !bucket || !database || !namespace || !queue || !bundle) {
         throw new Error("fixture resource creation did not return an identity");
       }
 
@@ -352,56 +434,15 @@ export default {
         kvBindings: [{ name: "CACHE", resource: { resourceUid: namespace.resourceUid } }],
         sqliteBindings: [{ name: "DB", resource: { resourceUid: database.resourceUid } }],
         bucketBindings: [{ name: "MEDIA", resource: { resourceUid: bucket.resourceUid } }],
+        queueProducerBindings: [{ name: "TASKS", resource: { resourceUid: queue.resourceUid } }],
       };
-      const abortAck = new AbortController();
-      const lostAck = request(
+      const version = await create(
         first.port,
-        key.secret,
-        `${API}/resources`,
-        "POST",
-        {
-          form: WORKER_VERSION_FORM_URL,
-          space: organization.id,
-          name: "version",
-          spec: versionSpec,
-        },
-        CREATE_VERSION_KEY,
-        undefined,
-        true,
-        abortAck.signal,
-      );
-      let acknowledgementHeld = false;
-      for (let attempt = 0; attempt < 250; attempt += 1) {
-        const held = await request(first.port, key.secret, "/__fixture/accepted-response-held");
-        acknowledgementHeld = ((await held.json()) as { held: boolean }).held;
-        if (acknowledgementHeld) break;
-        await Bun.sleep(10);
-      }
-      expect(acknowledgementHeld).toBe(true);
-      abortAck.abort();
-      let responseWasLost = false;
-      try {
-        await lostAck;
-      } catch {
-        responseWasLost = true;
-      }
-      expect(responseWasLost).toBe(true);
-      const versionResponse = await request(
-        first.port,
-        key.secret,
-        `${API}/resources`,
-        "POST",
-        {
-          form: WORKER_VERSION_FORM_URL,
-          space: organization.id,
-          name: "version",
-          spec: versionSpec,
-        },
+        WORKER_VERSION_FORM_URL,
+        "version",
+        versionSpec,
         CREATE_VERSION_KEY,
       );
-      expect(versionResponse.status).toBe(202);
-      const version = (await versionResponse.json()) as { id: string; resourceUid: string };
-      await operation(first.port, key.secret, version.id);
       const deploymentSpec = {
         worker: { resourceUid: worker.resourceUid },
         versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
@@ -428,7 +469,15 @@ export default {
         `/__fixture/serve/${worker.resourceUid}/write`,
       );
       expect(write.status).toBe(200);
-      expect(await write.text()).toBe("written");
+      const queuedBeforeRestart = (await write.json()) as {
+        readonly written: boolean;
+        readonly queueMessageId: string;
+      };
+      expect(queuedBeforeRestart.written).toBe(true);
+      expect(typeof queuedBeforeRestart.queueMessageId).toBe("string");
+      expect(readQueueMessages(root, queue.resourceUid)).toEqual([
+        { id: queuedBeforeRestart.queueMessageId, body: "queue-before-restart" },
+      ]);
       const before = await request(
         first.port,
         key.secret,
@@ -482,6 +531,9 @@ export default {
       );
       expect(childAfter?.identity).toEqual(childBefore?.identity);
       expect(childAfter?.processIdentity?.pid).not.toBe(childBefore?.processIdentity?.pid);
+      expect(readQueueMessages(root, queue.resourceUid)).toEqual([
+        { id: queuedBeforeRestart.queueMessageId, body: "queue-before-restart" },
+      ]);
 
       const replay = await request(
         resumedHost.port,
@@ -520,6 +572,37 @@ export default {
           (item) => item.uid,
         ),
       ).toEqual([version.resourceUid]);
+      const queueReplay = await request(
+        resumedHost.port,
+        key.secret,
+        `${API}/resources`,
+        "POST",
+        {
+          form: AT_LEAST_ONCE_QUEUE_FORM_URL,
+          space: organization.id,
+          name: "queue",
+          spec: queueSpec,
+        },
+        queueReplayKey,
+      );
+      expect(queueReplay.status).toBe(200);
+      expect(await queueReplay.json()).toMatchObject({
+        id: queue.id,
+        resourceUid: queue.resourceUid,
+        status: "succeeded",
+        effect: "complete",
+      });
+      const queues = await request(
+        resumedHost.port,
+        key.secret,
+        `${API}/resources?space=${organization.id}&form=${encodeURIComponent(AT_LEAST_ONCE_QUEUE_FORM_URL)}&limit=100`,
+      );
+      expect(queues.status).toBe(200);
+      expect(
+        ((await queues.json()) as { items: readonly { uid: string }[] }).items.map(
+          (item) => item.uid,
+        ),
+      ).toEqual([queue.resourceUid]);
       const after = await request(
         resumedHost.port,
         key.secret,
@@ -527,6 +610,17 @@ export default {
       );
       expect(after.status).toBe(200);
       expect(await after.json()).toEqual(values);
+      const queueSend = await request(
+        resumedHost.port,
+        key.secret,
+        `/__fixture/serve/${worker.resourceUid}/queue-send?message=queue-after-restart`,
+      );
+      expect(queueSend.status).toBe(200);
+      const queuedAfterRestart = (await queueSend.json()) as { readonly queueMessageId: string };
+      expect(readQueueMessages(root, queue.resourceUid)).toEqual([
+        { id: queuedBeforeRestart.queueMessageId, body: "queue-before-restart" },
+        { id: queuedAfterRestart.queueMessageId, body: "queue-after-restart" },
+      ]);
 
       const update = await request(
         resumedHost.port,
@@ -546,6 +640,7 @@ export default {
         `/__fixture/serve/${worker.resourceUid}/read`,
       );
       expect(await afterUpdate.json()).toEqual(values);
+      expect(readQueueMessages(root, queue.resourceUid)).toHaveLength(2);
 
       const remove = async (uid: string, name: string, generation = 1) => {
         const response = await request(
@@ -564,11 +659,13 @@ export default {
       await remove(endpoint.resourceUid, "endpoint");
       await remove(deployment.resourceUid, "deployment");
       await remove(version.resourceUid, "version", 2);
+      await remove(queue.resourceUid, "queue");
       await remove(bucket.resourceUid, "bucket");
       await remove(namespace.resourceUid, "namespace");
       await remove(database.resourceUid, "database");
       await remove(bundle.resourceUid, "bundle");
       await remove(worker.resourceUid, "worker");
+      expect(readQueueMessages(root, queue.resourceUid)).toEqual([]);
 
       const routeAfterDelete = await request(
         resumedHost.port,

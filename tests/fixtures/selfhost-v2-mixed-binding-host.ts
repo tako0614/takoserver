@@ -2,6 +2,7 @@
 // All keys and ports are fixed test inputs; this does not mount Worker Forms
 // into the normal application registry or claim public Support.
 import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { buildApp } from "../../src/app.ts";
 import { migrateSqlite } from "../../src/migrate-sqlite.ts";
@@ -9,11 +10,13 @@ import { createFileObjectStore } from "../../src/objects-fs.ts";
 import { createSelfhostV2KvStore } from "../../src/providers/selfhost-v2-kv-store.ts";
 import { createSelfhostV2ObjectBucketStore } from "../../src/providers/selfhost-v2-object-bucket-store.ts";
 import { createSelfhostV2SQLiteStore } from "../../src/providers/selfhost-v2-sqlite-store.ts";
+import { createQueueCustody } from "../../src/queue-custody.ts";
 import {
   runSelfhostKvOperation,
   selfhostKvOperationErrorCode,
 } from "../../src/selfhost-data-planes.ts";
 import { createSelfhostTakoformV2Ingress } from "../../src/selfhost-takoform-v2-ingress.ts";
+import { createSelfhostV2QueueComposition } from "../../src/selfhost-v2-queue-composition.ts";
 import { createSelfhostV2WorkerComposition } from "../../src/selfhost-v2-worker-composition.ts";
 import { createSqliteSql } from "../../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../../src/takoform/memory-driver.ts";
@@ -23,6 +26,7 @@ import { OBJECT_BUCKET_FORM_URL } from "../../src/takoform-v2/forms/object-bucke
 import { createObjectBucketForm } from "../../src/takoform-v2/forms/object-bucket-backend.ts";
 import { SQLITE_DATABASE_FORM_URL } from "../../src/takoform-v2/forms/sqlite-database.ts";
 import { createSQLiteDatabaseForm } from "../../src/takoform-v2/forms/sqlite-database-backend.ts";
+import type { V2QueueConsumerCapability } from "../../src/takoform-v2/worker-queue-consumer-backend.ts";
 import { WorkerdWorkerRuntimeOwnerError } from "../../src/workerd-worker-runtime-owner.ts";
 
 const [
@@ -34,10 +38,14 @@ const [
   sqlitePortText,
   kvPortText,
   objectPortText,
+  queueSettlementPortText,
+  queueProducerPortText,
 ] = process.argv.slice(2);
 const sqlitePort = Number(sqlitePortText);
 const kvPort = Number(kvPortText);
 const objectPort = Number(objectPortText);
+const queueSettlementPort = Number(queueSettlementPortText);
+const queueProducerPort = Number(queueProducerPortText);
 if (
   !root ||
   !binary ||
@@ -50,7 +58,11 @@ if (
   kvPort < 1 ||
   !Number.isSafeInteger(objectPort) ||
   objectPort < 1 ||
-  new Set([sqlitePort, kvPort, objectPort]).size !== 3
+  !Number.isSafeInteger(queueSettlementPort) ||
+  queueSettlementPort < 1 ||
+  !Number.isSafeInteger(queueProducerPort) ||
+  queueProducerPort < 1 ||
+  new Set([sqlitePort, kvPort, objectPort, queueSettlementPort, queueProducerPort]).size !== 5
 ) {
   throw new Error("mixed-binding Host fixture arguments are invalid");
 }
@@ -104,9 +116,36 @@ const objectBucketStore = createSelfhostV2ObjectBucketStore({
   clock,
 });
 
-let composition: ReturnType<typeof createSelfhostV2WorkerComposition>;
+let composition: ReturnType<typeof createSelfhostV2WorkerComposition> | undefined;
+let queueComposition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
 try {
-  composition = createSelfhostV2WorkerComposition({
+  const stagingRoot = join(root, "sql-input-staging");
+  mkdirSync(stagingRoot, { recursive: true, mode: 0o700 });
+  const queueCustody = createQueueCustody({ sql });
+  const queueCapability: V2QueueConsumerCapability = {
+    async observeQueueServingCapability(input) {
+      if (!composition?.queueCapability)
+        throw new Error("v2 Queue native capability is not composed");
+      return await composition.queueCapability.observeQueueServingCapability(input);
+    },
+    async observeCurrentServing(input) {
+      if (!composition?.queueCapability)
+        throw new Error("v2 Queue native capability is not composed");
+      return await composition.queueCapability.observeCurrentServing(input);
+    },
+  };
+  queueComposition = createSelfhostV2QueueComposition({
+    sql,
+    custody: queueCustody,
+    capability: queueCapability,
+    settlementKey: new Uint8Array(32).fill(0x75),
+    ownerForWorkerUid: async (uid) => {
+      if (!composition) throw new Error("Worker composition is not ready");
+      return await composition.ownerForWorkerUid(uid);
+    },
+    privatePort: queueSettlementPort,
+  });
+  const workers = createSelfhostV2WorkerComposition({
     sql,
     objects,
     clock,
@@ -116,6 +155,7 @@ try {
     workerdBinary: binary,
     sqliteBinding: {
       store: sqliteStore,
+      stagingRoot,
       signingKey: new Uint8Array(32).fill(0x72),
       privatePort: sqlitePort,
     },
@@ -129,12 +169,18 @@ try {
       signingKey: new Uint8Array(32).fill(0x74),
       privatePort: objectPort,
     },
+    queueSettlement: queueComposition.settlementBinding,
+    v2QueueProducerBinding: {
+      custody: queueCustody,
+      signingKey: new Uint8Array(32).fill(0x76),
+      privatePort: queueProducerPort,
+    },
     endpoint: {
       assignHostname({ resourceUid }) {
         return `worker-${resourceUid.slice(0, 8)}.example.test`;
       },
       async observeTls(input) {
-        const owner = await composition.ownerForWorkerUid(input.workerUid);
+        const owner = await workers.ownerForWorkerUid(input.workerUid);
         const serving = await owner.observeServing({
           workerResourceUid: input.workerUid,
           targetKey: TARGET,
@@ -145,7 +191,7 @@ try {
         };
       },
       async observeRouteAbsent(input) {
-        const owner = await composition.ownerForWorkerUid(input.workerUid);
+        const owner = await workers.ownerForWorkerUid(input.workerUid);
         const serving = await owner.observeServing({
           workerResourceUid: input.workerUid,
           targetKey: TARGET,
@@ -157,7 +203,8 @@ try {
       },
     },
   });
-  const restored = await composition.restoreOwners();
+  composition = workers;
+  const restored = await workers.restoreOwners();
   const app = buildApp({
     sql,
     objects,
@@ -180,7 +227,9 @@ try {
     v2: config,
     v2FormFactory(context) {
       return {
-        ...composition.internalFormFactory(context),
+        // The Queue Form is supplied by this exact internal factory; it is
+        // intentionally not replaced in the fixture's per-Resource overrides.
+        ...workers.internalFormFactory(context),
         [SQLITE_DATABASE_FORM_URL]: createSQLiteDatabaseForm({ store: sqliteStore }),
         [EDGE_KV_NAMESPACE_FORM_URL]: createEdgeKVNamespaceForm({
           store: kvStore,
@@ -227,7 +276,7 @@ try {
       const serve = /^\/__fixture\/serve\/([A-Za-z0-9._-]{1,128})(\/.*)?$/u.exec(url.pathname);
       if (serve) {
         const workerUid = serve[1] as string;
-        const owner = await composition.ownerForWorkerUid(workerUid);
+        const owner = await workers.ownerForWorkerUid(workerUid);
         const serving = await owner.observeServing({
           workerResourceUid: workerUid,
           targetKey: TARGET,

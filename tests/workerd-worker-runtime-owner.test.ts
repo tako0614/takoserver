@@ -39,7 +39,7 @@ import {
   WORKER_ENDPOINT_BACKEND_ID,
 } from "../src/takoform-v2/worker-endpoint-backend.ts";
 import type { V2WorkerPublicationResolution } from "../src/takoform-v2/worker-publication-state.ts";
-import { spawnWorkerdWithParentDeath } from "../src/workerd-linux-process.ts";
+import { spawnWorkerdWithParentDeath, workerPortOwnership } from "../src/workerd-linux-process.ts";
 import type { WorkerdPublicationIdentity } from "../src/workerd-runtime.ts";
 import type { WorkerdProcess } from "../src/workerd-supervisor.ts";
 import {
@@ -67,7 +67,7 @@ function identity() {
   return { port: Number(port), generation, token };
 }
 const initial = identity();
-const server = Bun.serve({ hostname: "127.0.0.1", port: initial.port, async fetch(request) {
+const startServer = () => Bun.serve({ hostname: "127.0.0.1", port: initial.port, async fetch(request) {
   const current = identity();
   const url = new URL(request.url);
   if (request.method === "POST" && request.headers.get("host") === "runtime.selfhost-config.invalid" &&
@@ -98,7 +98,11 @@ const server = Bun.serve({ hostname: "127.0.0.1", port: initial.port, async fetc
   }
   return new Response(current.generation);
 } });
-process.on("SIGTERM", () => server.stop(true));
+let server = startServer();
+let heldOpen;
+process.on("SIGTERM", () => { server.stop(true); if (heldOpen) clearInterval(heldOpen); });
+process.on("SIGUSR1", () => { server.stop(true); heldOpen = setInterval(() => {}, 1000); });
+process.on("SIGUSR2", () => { server = startServer(); if (heldOpen) clearInterval(heldOpen); heldOpen = undefined; });
 `;
 
 type TestChild = ReturnType<typeof spawnWorkerdWithParentDeath>;
@@ -205,6 +209,8 @@ function staticPublicationState(
   const assetBytes = new TextEncoder().encode("owner fixture asset");
   let lastOperationId: string | undefined;
   let fenceCurrent = true;
+  let fenceChecks = 0;
+  let fenceFailureAfter: number | null = null;
   let lastExecution: V2Execution | null = null;
   const source = {
     async resolve({
@@ -314,7 +320,8 @@ function staticPublicationState(
         },
         sqlGuard: { sql: "SELECT 1", params: [] },
         async stillCurrent() {
-          return fenceCurrent;
+          fenceChecks += 1;
+          return fenceCurrent && (fenceFailureAfter === null || fenceChecks <= fenceFailureAfter);
         },
         async readVersionMaterials() {
           return {
@@ -353,6 +360,10 @@ function staticPublicationState(
     },
     setFenceCurrent(value: boolean) {
       fenceCurrent = value;
+    },
+    failAfterFenceChecks(limit: number | null) {
+      fenceChecks = 0;
+      fenceFailureAfter = limit;
     },
   };
 }
@@ -1601,6 +1612,159 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
   } finally {
     await owner.close().catch(() => undefined);
     await owned.cleanup();
+  }
+});
+
+test("Actor graph readback is pinned to current SQL and the live native incarnation", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-actor-readback";
+  const createId = "0cfebc3b-3b9a-4a5b-a897-6713df09120e";
+  const deleteId = "f1840189-4a30-41c2-bae2-9c086a5327c3";
+  const publication = staticPublicationState(workerUid, true);
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: join(owned.root, "owners"),
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+    inspectModule: async (): Promise<WorkerModuleInspectionResult> => ({
+      outcome: "valid",
+      exportedHandlers: ["fetch"],
+    }),
+  });
+  const read = () =>
+    owner.observeActorGraph({
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      sourceOperationId: createId,
+    });
+  try {
+    expect(await read()).toEqual({ kind: "unknown" });
+    expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
+      kind: "confirmed",
+    });
+    publication.setCurrent(createId);
+    const exact = await read();
+    expect(exact).toMatchObject({
+      kind: "ready",
+      sourceOperationId: createId,
+      graph: {
+        workerResourceUid: workerUid,
+        generation: `takoserver-v2-operation:${createId}`,
+        versions: [{ workerVersionUid: `version-${createId}`, weight: 10_000 }],
+      },
+    });
+    if (exact.kind !== "ready") throw new Error("native Actor graph not observed");
+    expect(exact.graph.versions[0]?.modules.get("index.mjs")).toBeInstanceOf(Uint8Array);
+    expect(
+      await owner.observeActorGraph({
+        workerResourceUid: workerUid,
+        targetKey: TARGET_KEY,
+        sourceOperationId: deleteId,
+      }),
+    ).toEqual({ kind: "unknown" });
+    const mutable = {
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      sourceOperationId: deleteId,
+    };
+    const staleRequest = owner.observeActorGraph(mutable);
+    mutable.sourceOperationId = createId;
+    expect(await staleRequest).toEqual({ kind: "unknown" });
+    publication.setFenceCurrent(false);
+    expect(await read()).toEqual({ kind: "unknown" });
+    publication.setFenceCurrent(true);
+    publication.failAfterFenceChecks(2);
+    expect(await read()).toEqual({ kind: "unknown" });
+    publication.failAfterFenceChecks(null);
+    expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
+      kind: "confirmed",
+      identity: null,
+    });
+    expect(await read()).toEqual({ kind: "unknown" });
+  } finally {
+    await owner.close().catch(() => undefined);
+    await owned.cleanup();
+  }
+});
+
+test("Actor graph readback refuses a foreign listener while native bytes remain", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-actor-lost-listener";
+  const createId = "03448a40-4525-4d4b-8da0-8cebfcedaf88";
+  const deleteId = "e43fb7dd-b1f3-41b5-8a9e-ecbb38c64069";
+  const publication = staticPublicationState(workerUid, true);
+  const ownerRoot = join(owned.root, "owners");
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: ownerRoot,
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+    inspectModule: async (): Promise<WorkerModuleInspectionResult> => ({
+      outcome: "valid",
+      exportedHandlers: ["fetch"],
+    }),
+  });
+  let foreign: ReturnType<typeof Bun.serve> | undefined;
+  let child: TestChild | undefined;
+  let listenerPort: number | undefined;
+  try {
+    expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
+      kind: "confirmed",
+    });
+    publication.setCurrent(createId);
+    const request = {
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      sourceOperationId: createId,
+    };
+    expect((await owner.observeActorGraph(request)).kind).toBe("ready");
+    const workerKey = createHash("sha256").update(workerUid).digest("hex");
+    const groupRoot = join(ownerRoot, workerKey, "incarnations", createId, "groups", workerKey);
+    const group = JSON.parse(await Bun.file(join(groupRoot, "group.json")).text()) as {
+      listenerPort: number;
+    };
+    child = owned.children[0];
+    if (!child?.pid) throw new Error("native child PID missing");
+    listenerPort = group.listenerPort;
+    child.kill("SIGUSR1");
+    let listener = await workerPortOwnership(group.listenerPort, child.pid);
+    for (let attempt = 0; listener === "owned" && attempt < 150; attempt += 1) {
+      await Bun.sleep(20);
+      listener = await workerPortOwnership(group.listenerPort, child.pid);
+    }
+    expect(listener).not.toBe("owned");
+    foreign = Bun.serve({
+      hostname: "127.0.0.1",
+      port: group.listenerPort,
+      fetch: () => new Response("foreign"),
+    });
+    expect(await owner.observeActorGraph(request)).toEqual({ kind: "unknown" });
+  } finally {
+    await foreign?.stop(true);
+    try {
+      if (child?.pid && listenerPort !== undefined) {
+        child.kill("SIGUSR2");
+        let listener = await workerPortOwnership(listenerPort, child.pid);
+        for (let attempt = 0; listener !== "owned" && attempt < 150; attempt += 1) {
+          await Bun.sleep(20);
+          listener = await workerPortOwnership(listenerPort, child.pid);
+        }
+        expect(listener).toBe("owned");
+        expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
+          kind: "confirmed",
+          identity: null,
+        });
+      }
+      await owner.close();
+    } finally {
+      await owned.cleanup();
+    }
   }
 });
 

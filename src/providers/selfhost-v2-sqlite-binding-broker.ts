@@ -6,21 +6,23 @@ import {
   type SelfhostV2SqliteStatement,
 } from "./selfhost-v2-sqlite-plane.ts";
 import {
+  checkedSqlStagingRoot,
+  readSqlRequestBody,
+  type SqlRequestBody,
+} from "./selfhost-v2-sqlite-staged-input.ts";
+import {
   type SelfhostV2SQLiteStore,
   SelfhostV2SQLiteStoreError,
   SQLITE_MIGRATION_LEDGER,
 } from "./selfhost-v2-sqlite-store.ts";
 import {
   SELFHOST_DATA_PLANE_CONTENT_TYPE,
-  SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES,
   SELFHOST_DATA_PLANE_PROTOCOL,
   SELFHOST_DATA_PLANE_SQL_PATH,
 } from "./selfhost-worker-wrapper.ts";
 
 const UID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const BINDING = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
-// The Host-private workerd companion already applies this exact wire ceiling.
-const MAX_BODY = SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES;
 type ErrorCode = "sql_error" | "numeric_out_of_range" | "busy" | "backend_unavailable";
 
 /** Host-issued, immutable selected-Version identity. DB generation is deliberately absent. */
@@ -47,6 +49,8 @@ export interface V2SqliteSelectedVersionObservation {
 
 export interface V2SqliteBindingBrokerOptions {
   readonly store: SelfhostV2SQLiteStore;
+  /** Existing operator-private real directory; never chosen by a Worker. */
+  readonly stagingRoot: string;
   /** A Host-private persistent key; never project it into a Worker service. */
   readonly signingKey: Uint8Array;
   /** Native owner readback, not a caller-supplied process-map assertion. */
@@ -81,6 +85,7 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
   )
     throw new TypeError("private SQLite binding broker authority is required");
   const key = Buffer.from(options.signingKey);
+  const stagingRoot = checkedSqlStagingRoot(options.stagingRoot);
 
   function issueGrant(input: V2SqliteBindingGrant): string {
     const grant = checkedGrant(input, options.store.targetKey);
@@ -151,19 +156,24 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
     if (request.method !== "POST") return refusal("backend_unavailable", 405);
     const grant = authenticate(request);
     if (!grant) return refusal("backend_unavailable", 401);
+    let body: SqlRequestBody | undefined;
     let payload: Record<string, unknown>;
     try {
-      const bytes = await boundedBody(request);
-      payload = JSON.parse(new TextDecoder().decode(bytes));
+      body = await readSqlRequestBody(request, stagingRoot);
+      payload =
+        body.kind === "inline"
+          ? JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body.bytes))
+          : { protocol: body.protocol, binding: body.binding, op: body.op };
       if (!record(payload) || payload.protocol !== SELFHOST_DATA_PLANE_PROTOCOL) throw new Error();
     } catch {
+      body?.dispose();
       return refusal("backend_unavailable", 400);
     }
     const binding = payload.binding;
     const op = payload.op;
-    if (typeof binding !== "string" || typeof op !== "string")
-      return refusal("backend_unavailable", 400);
     try {
+      if (typeof binding !== "string" || typeof op !== "string")
+        return refusal("backend_unavailable", 400);
       const captured = await authorizedVector(grant, binding);
       if (!captured) return refusal("backend_unavailable", 200);
       const stillAuthorized = async () => {
@@ -181,7 +191,7 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
           });
           let result: unknown;
           if (op === "execute" || op === "query") {
-            const statement = payload.statement;
+            const statement = body.kind === "staged" ? body.statementAt(0) : payload.statement;
             if (!record(statement)) throw new SelfhostV2SqliteError("sql_error");
             result =
               op === "execute"
@@ -194,9 +204,15 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
                     statement.params as readonly EdgeSqlValue[] | undefined,
                   );
           } else if (op === "transaction") {
-            result = await plane.transaction(
-              payload.statements as readonly SelfhostV2SqliteStatement[],
-            );
+            if (body.kind === "staged") {
+              result = await plane.transactionStaged(function* () {
+                for (let index = 0; index < body.count; index += 1) yield body.statementAt(index);
+              });
+            } else {
+              result = await plane.transaction(
+                payload.statements as readonly SelfhostV2SqliteStatement[],
+              );
+            }
           } else throw new SelfhostV2SqliteError("sql_error");
           if (!(await stillAuthorized())) throw new SelfhostV2SqliteError("backend_unavailable");
           return result;
@@ -214,6 +230,8 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
             ? "busy"
             : "backend_unavailable";
       return refusal(code, 200);
+    } finally {
+      body.dispose();
     }
   }
 
@@ -283,30 +301,6 @@ function checkedGrant(input: unknown, targetKey: string): V2SqliteBindingGrant {
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-async function boundedBody(request: Request): Promise<Uint8Array> {
-  if (!request.body) throw new TypeError("missing body");
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  for (;;) {
-    const next = await reader.read();
-    if (next.done) break;
-    length += next.value.byteLength;
-    if (length > MAX_BODY) {
-      await reader.cancel();
-      throw new TypeError("body too large");
-    }
-    chunks.push(next.value);
-  }
-  const output = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return output;
 }
 
 function refusal(code: ErrorCode, status: number): Response {

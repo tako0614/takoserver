@@ -281,7 +281,7 @@ export function createV2Store(sql: Sql) {
       referencesJson: string | null = null,
       initialOutputJson = "{}",
       admission?: V2AdmissionPredicate,
-    ): Promise<"accepted" | "dependency_conflict"> {
+    ): Promise<"accepted" | "dependency_conflict" | "resource_busy"> {
       const writes = await sql.batch([
         ...(admission
           ? [{ sql: `SELECT 1 AS permitted WHERE (${admission.sql})`, params: admission.params }]
@@ -319,7 +319,8 @@ export function createV2Store(sql: Sql) {
         ...configuredPrivateWrites(record),
         ...referenceWrites(record, referencesJson),
       ]);
-      if (admission && writes[0]?.rows.length !== 1) return "dependency_conflict";
+      if (admission && writes[0]?.rows.length !== 1)
+        return admission.conflictCode ?? "dependency_conflict";
       if (writes[admission ? 1 : 0]?.changes !== 1 || writes[admission ? 2 : 1]?.changes !== 1) {
         throw new Error("v2 CREATE acceptance did not persist its Resource and Operation");
       }
@@ -330,7 +331,7 @@ export function createV2Store(sql: Sql) {
       referencesJson: string | null = null,
       serializeUpdatesWithPendingReferrers = false,
       admission?: V2AdmissionPredicate,
-    ): Promise<"accepted" | "dependency_conflict" | "conflict"> {
+    ): Promise<"accepted" | "dependency_conflict" | "resource_busy" | "conflict"> {
       const serialize = record.action === "update" && serializeUpdatesWithPendingReferrers;
       const writes = await sql.batch([
         ...(admission
@@ -413,7 +414,8 @@ export function createV2Store(sql: Sql) {
       const resourceIndex = admission ? 1 : 0;
       if (writes[resourceIndex]?.changes === 1 && writes[resourceIndex + 1]?.changes === 1)
         return "accepted";
-      if (admission && writes[0]?.rows.length !== 1) return "dependency_conflict";
+      if (admission && writes[0]?.rows.length !== 1)
+        return admission.conflictCode ?? "dependency_conflict";
       if (serialize && writes.at(-1)?.rows.length) return "dependency_conflict";
       return "conflict";
     },

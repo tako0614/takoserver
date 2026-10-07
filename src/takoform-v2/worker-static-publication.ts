@@ -1,5 +1,9 @@
 import { bytesDigest, canonicalJson } from "../json.ts";
 import type { V2KvBindingGrant } from "../providers/selfhost-v2-kv-binding-broker.ts";
+import type {
+  V2QueueProducerBindingGrant,
+  V2QueueProducerBindingResolution,
+} from "../providers/selfhost-v2-queue-producer-broker.ts";
 import type { V2SqliteBindingGrant } from "../providers/selfhost-v2-sqlite-binding-broker.ts";
 import { SELFHOST_WORKER_EDGE_SQL_BINDING_KIND } from "../providers/selfhost-worker-wrapper.ts";
 import { canonicalSelfhostWeightedVersions } from "../selfhost-weighted-deployment.ts";
@@ -217,6 +221,15 @@ export function createV2WorkerPublication(options: {
       readonly vector: string;
     } | null>;
   };
+  /** Fixed private Queue producer broker, separate from the consumer settlement plane. */
+  readonly v2QueueProducerBinding?: {
+    readonly address: string;
+    issueGrant(grant: V2QueueProducerBindingGrant): string;
+    resolveCurrentBinding(
+      claim: V2QueueProducerBindingGrant,
+      binding: string,
+    ): Promise<V2QueueProducerBindingResolution | null>;
+  };
 }): V2WorkerPublication {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   const inspectModule = options.runtime.inspectModule;
@@ -400,6 +413,58 @@ export function createV2WorkerPublication(options: {
         if (kvBindings.length > 0 && !codeKvBoot) {
           throw new Error("native KV binding is unavailable");
         }
+        const queueProducerBindings = versionSpec.queueProducerBindings.map((binding) => ({
+          name: binding.name,
+          resourceUid: binding.resource.resourceUid,
+        }));
+        let queueProducerBoot:
+          | {
+              readonly address: string;
+              readonly token: string;
+              readonly bindings: readonly { readonly publicName: string }[];
+            }
+          | undefined;
+        if (queueProducerBindings.length > 0) {
+          const binder = options.v2QueueProducerBinding;
+          if (!binder || !OPERATION_ID.test(version.sourceOperationId)) {
+            throw new Error("native Queue producer binding is unavailable");
+          }
+          const claim: V2QueueProducerBindingGrant = {
+            principal: snapshot.worker.principal,
+            space: snapshot.worker.space,
+            targetKey: options.targetKey,
+            workerUid: snapshot.worker.uid,
+            workerVersionUid: version.uid,
+            workerVersionOperationId: version.sourceOperationId,
+            nativeVersionId: identity.versionId,
+            incarnationId: execution.operationId,
+            servingSourceOperationId: execution.operationId,
+            bindings: queueProducerBindings,
+          };
+          for (const binding of queueProducerBindings) {
+            const current = await binder.resolveCurrentBinding(claim, binding.name);
+            if (
+              !current ||
+              current.identity.targetKey !== claim.targetKey ||
+              current.identity.principal !== claim.principal ||
+              current.identity.space !== claim.space ||
+              current.identity.resourceUid !== binding.resourceUid ||
+              current.target.queueId !== `takoform-v2-queue:${binding.resourceUid}` ||
+              typeof current.vector !== "string" ||
+              current.vector.length === 0
+            ) {
+              throw new Error("current Queue producer binding is unavailable");
+            }
+          }
+          if (!(await resolution.stillCurrent())) {
+            throw new Error("Queue producer reference graph changed");
+          }
+          queueProducerBoot = {
+            address: binder.address,
+            token: binder.issueGrant(claim),
+            bindings: queueProducerBindings.map(({ name }) => ({ publicName: name })),
+          };
+        }
         const queueSettlement =
           versionSpec.handlers.includes("queue") && options.v2QueueSettlement !== undefined
             ? {
@@ -448,6 +513,12 @@ export function createV2WorkerPublication(options: {
               }
             : {}),
           ...(codeKvBoot ? { resolvedKvBindings: kvBindings, kvBoot: codeKvBoot } : {}),
+          ...(queueProducerBoot
+            ? {
+                resolvedQueueProducerBindings: queueProducerBindings,
+                queueProducerBoot,
+              }
+            : {}),
           ...(sqliteBoot === undefined ? {} : { sqliteBoot }),
           ...(options.scheduledEventToken === undefined
             ? {}
@@ -494,6 +565,7 @@ export function createV2WorkerPublication(options: {
               }),
           ...(objectBucketBoot === undefined ? {} : { v2ObjectBucketBinding: objectBucketBoot }),
           ...(kvBoot === undefined ? {} : { v2KvBinding: kvBoot }),
+          ...(queueProducerBoot === undefined ? {} : { v2QueueProducerBinding: queueProducerBoot }),
           hostnames: [],
           generation,
           workerResourceUid: snapshot.worker.uid,

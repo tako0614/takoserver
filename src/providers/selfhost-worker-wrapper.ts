@@ -33,6 +33,7 @@ import {
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
   WORKERD_V2_PRIVATE_KV_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+  WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING,
   WORKERD_V2_PRIVATE_QUEUE_SETTLEMENT_BINDING,
   WORKERD_V2_PRIVATE_READINESS_BINDING,
 } from "./workerd-v2-private-binding-names.ts";
@@ -1012,7 +1013,7 @@ function projectEnv(rawEnv) {
         descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_KV_BINDING_KIND)}
           ? createKvAdapter(call, descriptor.publicName, descriptor.internalName !== undefined)
           : descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND)}
-            ? createQueueAdapter(call, descriptor.publicName)
+            ? createQueueAdapter(call, descriptor.publicName, descriptor.internalName !== undefined)
             : descriptor.kind === VECTOR_KIND
               ? createEdgeVectorAdapter((operation, input, project) => {
                   const payload = planeRequest(descriptor.publicName, operation);
@@ -1499,17 +1500,17 @@ function projectEncodedBody(value) {
  * acceptance id this returns is the Host's own, not a provider dedupe id, which
  * is exactly what the managed adapter promises.
  */
-function createQueueAdapter(call, binding) {
+function createQueueAdapter(call, binding, strictTypes) {
   const portable = SafeObjectCreate(null);
   portable.send = async (body, options) => {
     const bytes = runtimeBytes(body, "invalid_body");
     if (viewByteLength(bytes) > MAX_QUEUE_MESSAGE_BYTES) throw portableError("message_too_large");
-    const normalized = validateQueueSendOptions(options);
+    const normalized = validateQueueSendOptions(options, strictTypes);
     const payload = planeRequest(binding, "send");
     payload.body = encodeBase64(bytes);
     if (normalized.delaySeconds !== undefined) payload.delaySeconds = normalized.delaySeconds;
     const value = await call(QUEUE_URL, payload, QUEUE_ERROR_CODES);
-    if (!isRecord(value) || !exactKeys(value, ["messageId"]) || !boundedText(value.messageId, 512)) {
+    if (!isRecord(value) || !exactKeys(value, ["messageId"]) || !boundedText(value.messageId, strictTypes ? 256 : 512)) {
       throw portableError("backend_unavailable");
     }
     return value.messageId;
@@ -1530,6 +1531,7 @@ function createQueueAdapter(call, binding) {
       if (message.delaySeconds !== undefined) optionInput.delaySeconds = message.delaySeconds;
       const normalized = validateQueueSendOptions(
         message.delaySeconds === undefined ? undefined : optionInput,
+        strictTypes,
       );
       const entry = SafeObjectCreate(null);
       entry.body = encodeBase64(bytes);
@@ -1548,23 +1550,23 @@ function createQueueAdapter(call, binding) {
       throw portableError("backend_unavailable");
     }
     return mapArray(value.messageIds, (id) => {
-      if (!boundedText(id, 512)) throw portableError("backend_unavailable");
+      if (!boundedText(id, strictTypes ? 256 : 512)) throw portableError("backend_unavailable");
       return id;
     });
   };
   return portable;
 }
 
-function validateQueueSendOptions(options) {
+function validateQueueSendOptions(options, strictTypes) {
   if (options === undefined) return SafeObjectCreate(null);
-  if (!isRecord(options) || !onlyKeys(options, ["delaySeconds"])) throw portableError("invalid_argument");
+  if (!isRecord(options) || !onlyKeys(options, ["delaySeconds"])) throw portableError(strictTypes ? "invalid_body" : "invalid_argument");
   if (options.delaySeconds === undefined) return SafeObjectCreate(null);
   if (
     !SafeNumberIsSafeInteger(options.delaySeconds) ||
     options.delaySeconds < 0 ||
     options.delaySeconds > MAX_QUEUE_DELAY_SECONDS
   ) {
-    throw portableError("invalid_argument");
+    throw portableError(strictTypes ? "invalid_body" : "invalid_argument");
   }
   const result = SafeObjectCreate(null);
   result.delaySeconds = options.delaySeconds;
@@ -2422,13 +2424,14 @@ function freezeObject(value) {
 function createPlaneCaller(rawEnv, internalName) {
   const service = rawEnv[internalName || DATA_SERVICE];
   const send = captureMethod(service, "fetch");
-  return async (url, payload, codes, project) => {
+  return async (url, payload, codes, project, requestBody) => {
     const headers = SafeObjectCreate(null);
     headers["content-type"] = CONTENT_TYPE;
     const init = SafeObjectCreate(null);
     init.method = "POST";
     init.headers = headers;
-    init.body = SafeJSONStringify(payload);
+    init.body = requestBody === undefined ? SafeJSONStringify(payload) : requestBody;
+    if (requestBody !== undefined) init.duplex = "half";
     let response;
     try {
       response = await SafeApply(send, service, [url, init]);
@@ -2584,23 +2587,25 @@ function createSqlAdapter(call, binding) {
   portable.execute = async (sql, params) => {
     const payload = planeRequest(binding, "execute");
     payload.statement = sqlInput(sql, params);
-    return projectSqlResult(await call(SQL_URL, payload, SQL_ERROR_CODES));
+    return projectSqlResult(await callSql(payload));
   };
   portable.query = async (sql, params) => {
     const payload = planeRequest(binding, "query");
     payload.statement = sqlInput(sql, params);
-    const result = projectSqlResult(await call(SQL_URL, payload, SQL_ERROR_CODES));
+    const result = projectSqlResult(await callSql(payload));
     if (result.rowsWritten !== 0) throw portableError("backend_unavailable");
     return result;
   };
   portable.transaction = async (statements) => {
-    if (!SafeArrayIsArray(statements) || statements.length < 1 || statements.length > MAX_SQL_STATEMENTS) {
+    if (!SafeArrayIsArray(statements)) throw portableError("sql_error");
+    const statementCount = statements.length;
+    if (statementCount < 1 || statementCount > MAX_SQL_STATEMENTS) {
       throw portableError("sql_error");
     }
-    const normalized = mapArray(statements, normalizeSqlStatement);
+    const normalized = snapshotSqlArray(statements, statementCount, normalizeSqlStatement);
     const payload = planeRequest(binding, "transaction");
     payload.statements = normalized;
-    const value = await call(SQL_URL, payload, SQL_ERROR_CODES);
+    const value = await callSql(payload);
     if (
       !isRecord(value) ||
       !exactKeys(value, ["results"]) ||
@@ -2617,7 +2622,137 @@ function createSqlAdapter(call, binding) {
     }
     return envelope;
   };
+  function callSql(payload) {
+    return call(SQL_URL, payload, SQL_ERROR_CODES, undefined, createSqlRequestBody(payload));
+  }
   return portable;
+}
+
+/**
+ * SQL's published per-field bounds allow a transaction body much larger than
+ * the ordinary data-plane buffer. The inputs here are already validated and
+ * copied by sqlInput, so later tenant mutations cannot change an async pull.
+ * Only this SQL route uses a streaming request body; other facades retain their
+ * existing buffered transport.
+ */
+function createSqlRequestBody(payload) {
+  const tasks = SafeObjectCreate(null);
+  let taskCount = 0;
+  function push(kind, value, index) {
+    const task = SafeObjectCreate(null);
+    task.kind = kind;
+    task.value = value;
+    task.index = index;
+    tasks[taskCount] = task;
+    taskCount += 1;
+  }
+  function bytes(value) {
+    return SafeApply(SafeTextEncoderEncode, encoder, [value]);
+  }
+  function quotedFragment(value, start) {
+    let end = start + 4096;
+    if (end > value.length) end = value.length;
+    // JSON.stringify must see both halves of a pair together. A lone
+    // surrogate remains lone and is escaped by the captured intrinsic.
+    if (end < value.length) {
+      const last = SafeApply(SafeStringCharCodeAt, value, [end - 1]);
+      const next = SafeApply(SafeStringCharCodeAt, value, [end]);
+      if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+        end -= 1;
+      }
+    }
+    const units = SafeObjectCreate(null);
+    units.length = end - start;
+    for (let at = start; at < end; at += 1) {
+      units[at - start] = SafeApply(SafeStringCharCodeAt, value, [at]);
+    }
+    const fragment = SafeApply(SafeStringFromCharCode, undefined, units);
+    const encoded = bytes(SafeJSONStringify(fragment));
+    const buffer = SafeApply(SafeTypedArrayBufferGet, encoded, []);
+    const offset = SafeApply(SafeTypedArrayByteOffsetGet, encoded, []);
+    const length = SafeApply(SafeTypedArrayByteLengthGet, encoded, []);
+    return {
+      next: end,
+      bytes: new SafeUint8Array(buffer, offset + 1, length - 2),
+    };
+  }
+  push("literal", payload.op === "transaction" ? "]}" : "}");
+  if (payload.op === "transaction") {
+    push("statements", payload.statements, 0);
+    push("literal", ',"statements":[');
+  } else {
+    push("statement", payload.statement);
+    push("literal", ',"statement":');
+  }
+  push("literal", '{"protocol":' + SafeJSONStringify(payload.protocol) +
+    ',"binding":' + SafeJSONStringify(payload.binding) +
+    ',"op":' + SafeJSONStringify(payload.op));
+  return new SafeReadableStream({
+    pull(controller) {
+      while (taskCount > 0) {
+        taskCount -= 1;
+        const task = tasks[taskCount];
+        delete tasks[taskCount];
+        let chunk;
+        if (task.kind === "literal") {
+          chunk = bytes(task.value);
+        } else if (task.kind === "quoted") {
+          push("literal", '"');
+          push("string", task.value, 0);
+          push("literal", '"');
+        } else if (task.kind === "string") {
+          if (task.index < task.value.length) {
+            const fragment = quotedFragment(task.value, task.index);
+            if (fragment.next < task.value.length) {
+              push("string", task.value, fragment.next);
+            }
+            chunk = fragment.bytes;
+          }
+        } else if (task.kind === "statement") {
+          push("literal", SafeObjectHasOwn(task.value, "params") ? "]}" : "}");
+          if (SafeObjectHasOwn(task.value, "params")) {
+            push("params", task.value.params, 0);
+            push("literal", ',"params":[');
+          }
+          push("quoted", task.value.sql);
+          push("literal", '{"sql":');
+        } else if (task.kind === "statements") {
+          if (task.index < task.value.length) {
+            push("statements", task.value, task.index + 1);
+            push("statement", task.value[task.index]);
+            if (task.index > 0) push("literal", ",");
+          }
+        } else if (task.kind === "params") {
+          if (task.index < task.value.length) {
+            push("params", task.value, task.index + 1);
+            push("value", task.value[task.index]);
+            if (task.index > 0) push("literal", ",");
+          }
+        } else if (task.kind === "value") {
+          if (typeof task.value === "string") {
+            push("quoted", task.value);
+          } else if (task.value !== null && typeof task.value === "object") {
+            push("literal", "}");
+            push("quoted", task.value.data);
+            push("literal", '{"encoding":"base64","data":');
+          } else {
+            chunk = bytes(SafeJSONStringify(task.value));
+          }
+        }
+        if (chunk !== undefined) {
+          SafeApply(SafeReadableStreamControllerEnqueue, controller, [chunk]);
+          return;
+        }
+      }
+      SafeApply(SafeReadableStreamControllerClose, controller, []);
+    },
+    cancel() {
+      while (taskCount > 0) {
+        taskCount -= 1;
+        delete tasks[taskCount];
+      }
+    },
+  });
 }
 
 ${renderEdgeVectorWorkerFacadeSource()}
@@ -2627,12 +2762,24 @@ function sqlInput(sql, params) {
   const input = SafeObjectCreate(null);
   input.sql = sql;
   if (params !== undefined) {
-    if (!SafeArrayIsArray(params) || params.length > MAX_SQL_PARAMETERS) {
+    if (!SafeArrayIsArray(params)) throw portableError("sql_error");
+    const parameterCount = params.length;
+    if (parameterCount > MAX_SQL_PARAMETERS) {
       throw portableError("sql_error");
     }
-    input.params = mapArray(params, projectSqlValue);
+    input.params = snapshotSqlArray(params, parameterCount, projectSqlValue);
   }
   return input;
+}
+
+function snapshotSqlArray(values, length, project) {
+  const output = [];
+  for (let index = 0; index < length; index += 1) {
+    SafeApply(SafeObjectDefineProperty, SafeObject, [output, index, {
+      value: project(values[index]), enumerable: true, configurable: true, writable: true,
+    }]);
+  }
+  return output;
 }
 
 function normalizeSqlStatement(statement) {
@@ -3093,9 +3240,12 @@ function normalizeSourceInput(
       const privateKvService =
         binding.kind === SELFHOST_WORKER_EDGE_KV_BINDING_KIND &&
         Object.hasOwn(binding, "internalName");
+      const privateQueueProducerService =
+        binding.kind === SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND &&
+        Object.hasOwn(binding, "internalName");
       exactNormalizedKeys(
         binding,
-        privateObjectService || privateKvService
+        privateObjectService || privateKvService || privateQueueProducerService
           ? ["kind", "publicName", "internalName"]
           : ["kind", "publicName"],
         "bindings",
@@ -3115,11 +3265,17 @@ function normalizeSourceInput(
       ) {
         invalid("bindings");
       }
+      if (
+        privateQueueProducerService &&
+        (!v2PrivateNames || binding.internalName !== WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING)
+      ) {
+        invalid("bindings");
+      }
       validatePublicName(binding.publicName, publicNames, false, v2PrivateNames);
       bindings.push({
         kind: binding.kind as SelfhostWorkerDataBindingDescriptor["kind"],
         publicName: binding.publicName as string,
-        ...(privateObjectService || privateKvService
+        ...(privateObjectService || privateKvService || privateQueueProducerService
           ? { internalName: binding.internalName as string }
           : {}),
       });

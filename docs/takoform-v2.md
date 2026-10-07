@@ -567,10 +567,12 @@ public HTTPS delivery or Hosted qualification.
 
 The internal factory also composes a separately keyed KV broker and private service.
 Linear Base64 validation passes the full 25 MiB value limit through pinned workerd.
-An organization-authenticated Host journey creates accepted KV, SQLite and Object
-references and uses all three from one Worker. A separate process test discards an
-accepted Version response, retries the same operation, SIGKILLs the Host, and
-restores the same Worker and stored values under new Host and native child PIDs.
+An organization-authenticated Host journey creates accepted KV, SQLite, Object and
+Queue references and uses all four from one Worker. A separate process test
+discards an accepted Queue create response, retries the same operation, SIGKILLs
+the Host, and restores the same Worker, stored values and queued message under
+new Host and native child PIDs. It replays the Queue create key without a second
+Resource and sends another message through the restored native Producer Binding.
 It checks update and deletion, then proves the child is gone while the recovered
 Host is still alive. These tests manually register the Forms in an isolated Host;
 they do not qualify normal-entry registration, public TLS, Hosted execution or
@@ -582,11 +584,19 @@ Host journey covers durable ACK, retry, Consumer update and deletion refusal.
 External currentness preflight occurs outside the owner's serial lane; native
 identity, SQL source and one-send authorization remain checked inside it.
 
-The same integrated native candidate checks these Object and KV data paths,
-SQLite Binding and owner shutdown together. A valid SQLite transaction above the
-private transport's 40 MiB aggregate limit is rejected before any database write.
-That test records an implementation capacity gap, not support for the rejected
-request.
+SQLite calls now use a separate private streaming transport rather than the
+shared 40 MiB buffered companion path. The operator supplies a pre-existing
+private staging directory. Calls above the 1 MiB inline threshold write through
+an already-unlinked file descriptor. The transport validates statement and
+parameter bounds before one atomic transaction; the output budget is checked
+before commit. Native tests pass a
+42-statement transaction with 1,000,000-byte parameters and verify all 42 rows.
+Malformed or interrupted input is rejected before execution; a later SQL failure
+or excess output rolls back without retained named input files. The SQL wrapper
+captures its input before sending and serializes it incrementally, with at most
+4096 UTF-16 units in a fragment; it does not build a whole-call JSON string.
+Input normalization and maximum legal aggregate input remain unqualified. KV and
+Queue transports retain their existing limits.
 
 The internal WorkerCronTrigger backend and scheduler use the published
 WorkerCronTrigger 0.3.0 contract. Admission seals the exact Worker, target and
@@ -621,8 +631,11 @@ the same SQL Worker inventory and refuses missing serving owners or unexplained
 directories. This is a boot/recovery path, not a new public Form registration:
 the reusable internal Form factory is exercised only by local integration tests
 through normal organization-authenticated `buildApp` HTTP. A complete Worker
-Form claim still needs the remaining typed Binding and queue-handler contracts and an
-independently qualified public HTTPS Endpoint route/TLS/absence observer. The
+Form claim still needs the remaining typed Binding and queue-handler contracts.
+The internal factory can compose ModuleWorker, WorkerVersion and WorkerDeployment
+without a WorkerEndpoint frontend; it registers no Endpoint Form in that case.
+Endpoint support separately requires all hostname, TLS and route-absence ports,
+and an incomplete frontend configuration refuses composition. The
 internal factory now accepts an already-created operator sealer and gives both
 Version admission and the native owner the same SQL-backed Resource-owned
 configured-input custody. A local test uses synthetic nonextractable keys and
@@ -636,6 +649,28 @@ once under the same HTTPS/non-drain gate and passes its current and retained
 nonextractable keys to the v2 owner sealer before restoration. An absent or
 unavailable key still refuses sensitive Versions without deleting ciphertext;
 no key is generated from local ciphertext or public configuration.
+
+The optional Bun setting `TAKOSERVER_V2_WORKER_PRIVATE_PLANES` selects private
+SQLite, KV, ObjectBucket, Queue settlement and Queue Producer services. It is an
+exact JSON object with optional `sqlite`, `kv`, `objectBucket`, `queue` and
+`queueProducer` records. Each selected record requires a distinct fixed
+`privatePort` and an absolute `signingKeyFile`; SQLite additionally requires a
+pre-existing private `stagingRoot`. The data root must be an existing absolute
+owner-private directory. Key files contain 32–4096 raw bytes, are owner-private
+and non-symlink, and are never generated or logged by this boot path.
+
+Producer and settlement services use the same SQL-backed Queue custody but
+different listeners and signing keys. Private listeners bind to loopback before
+UID-owner restoration, and native authorization is unavailable until restoration
+finishes. The same Producer boot authority is used by Version admission and
+execution. With both Queue services configured, the internal factory also
+composes AtLeastOnceQueue. A pinned-workerd organization-HTTP journey covers
+Queue creation, a declared Producer Binding, `send`/`sendBatch`, retention update
+and dependency-ordered deletion without per-Form overrides. The ordinary entry
+still does not advertise incomplete Worker Forms. Its empty-owner process test
+proves orderly stop/reopen of these listeners; the separate mixed-binding Host
+process journey proves active Worker and Producer recovery through the internal
+factory, not the ordinary entry or delivery settlement after a crash.
 
 Orderly Bun shutdown freezes new v2 owner admission and awaits pending owner opens.
 An active serving owner is suspended with retained custody, rather than treated as
@@ -656,8 +691,25 @@ An admitted old invocation also keeps its signed exact-incarnation SQLite
 Binding while a replacement Deployment is pending and while that incarnation
 drains; each call still checks the live native owner and current settled
 Version/Database references, and retirement ends that authority.
-That evidence does not qualify the 40 MiB companion transport boundary,
+That restart evidence does not qualify maximum legal SQLite input,
 public HTTPS/TLS, or complete WorkerVersion/SQLiteDatabase Form support.
+
+The native owner also exposes a private Actor graph observation port. It checks
+every weighted Version's verified graph, exact process incarnation and listener
+ownership under the owner lane, then fences accepted SQL currentness before
+returning the observation. The ActorNamespace parser uses the published singular
+`className` and exact Worker UID reference. An empty-namespace proof is scoped to
+the physical tenant and namespace identity; it is not a claim about future
+activity. The internal Actor Namespace admission now checks every selected class
+in active and earlier accepted pending Deployments, using held verified Bundle
+bytes and an atomic SQL graph predicate. Proven ABI failures and existing
+Worker/class duplicates are dependency conflicts; unavailable inspection or a
+graph change before acceptance is retryable busy, without Resource/Operation
+creation. A separate physical backend can confirm an empty namespace before any
+Deployment and delete it with authoritative absence proof. Its tests use a
+semantic-inspector stand-in, not native active Actor ABI proof. Active runtime
+counts and the executable Actor Binding remain incomplete; these internal paths
+do not register or advertise ActorNamespace Form support.
 
 ## Existing installations
 

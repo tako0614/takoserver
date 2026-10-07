@@ -1,6 +1,15 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSelfhostV2SqliteBindingBroker } from "../src/providers/selfhost-v2-sqlite-binding-broker.ts";
@@ -35,6 +44,8 @@ const WORKERD = nativeEvidenceBinary("workerd-artifact");
 
 async function fixture(bindingName = "DB") {
   const root = mkdtempSync(join(tmpdir(), "v2-sqlite-binding-"));
+  const stagingRoot = join(root, "sql-input-staging");
+  mkdirSync(stagingRoot, { mode: 0o700 });
   const control = new Database(join(root, "control.sqlite"));
   control.exec("PRAGMA foreign_keys = ON");
   for (const name of [
@@ -150,6 +161,7 @@ async function fixture(bindingName = "DB") {
   const authority = createSQLiteWorkerBindingAuthority({ sql, targetKey: TARGET });
   const broker = createSelfhostV2SqliteBindingBroker({
     store,
+    stagingRoot,
     signingKey: new Uint8Array(32).fill(7),
     resolveCurrentBinding: authority.resolveCurrentBinding,
     async observeVersionTarget(input) {
@@ -197,6 +209,30 @@ async function fixture(bindingName = "DB") {
 
 test("a SQLite binding broker requires private signing authority", () => {
   expect(() => createSelfhostV2SqliteBindingBroker({} as never)).toThrow(TypeError);
+});
+
+test("SQL staging requires an operator-private real directory", async () => {
+  const host = await fixture();
+  try {
+    const root = join(host.root, "sql-input-staging");
+    const alias = join(host.root, "sql-input-alias");
+    symlinkSync(root, alias);
+    const options = {
+      store: host.store,
+      signingKey: new Uint8Array(32).fill(7),
+      stagingRoot: alias,
+      observeVersionTarget: async () => ({ kind: "unknown" as const }),
+      graphStillCurrent: async () => false,
+      resolveCurrentBinding: async () => null,
+    };
+    expect(() => createSelfhostV2SqliteBindingBroker(options)).toThrow(TypeError);
+    chmodSync(root, 0o755);
+    expect(() => createSelfhostV2SqliteBindingBroker({ ...options, stagingRoot: root })).toThrow(
+      TypeError,
+    );
+  } finally {
+    host.close();
+  }
 });
 
 test("SQLite bindings refuse incomplete or unresolved WorkerVersion observations", async () => {
@@ -273,6 +309,195 @@ test("a signed Version binding reaches only its current UID database and survive
     expect(await host.call("query", { sql: "SELECT body FROM records" })).toEqual({
       ok: false,
       error: { code: "backend_unavailable" },
+    });
+  } finally {
+    host.close();
+  }
+});
+
+test("staged SQL rolls back a later invalid statement and removes its private input", async () => {
+  const host = await fixture();
+  try {
+    const body = JSON.stringify({
+      protocol: SELFHOST_DATA_PLANE_PROTOCOL,
+      binding: "DB",
+      op: "transaction",
+      statements: [
+        {
+          sql: "INSERT INTO records (id, body) VALUES (?, ?)",
+          params: [100, "x".repeat(1_000_000)],
+        },
+        {
+          sql: "INSERT INTO records (id, body) VALUES (?, ?)",
+          params: [101, "x".repeat(1_000_000)],
+        },
+        { sql: "BEGIN" },
+      ],
+    });
+    const response = await host.broker.handle(
+      new Request(`http://localhost${SELFHOST_DATA_PLANE_SQL_PATH}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${host.token}` },
+        body,
+      }),
+    );
+    expect(await response?.json()).toEqual({ ok: false, error: { code: "sql_error" } });
+    expect(
+      await host.call("query", { sql: "SELECT count(*) AS count FROM records WHERE id >= 100" }),
+    ).toEqual({
+      ok: true,
+      value: { rows: [{ count: 0 }], rowsWritten: 0 },
+    });
+    expect(readdirSync(join(host.root, "sql-input-staging"))).toEqual([]);
+  } finally {
+    host.close();
+  }
+});
+
+test("staged SQL output over the published 8 MiB limit rolls back before commit", async () => {
+  const host = await fixture();
+  try {
+    const body = JSON.stringify({
+      protocol: SELFHOST_DATA_PLANE_PROTOCOL,
+      binding: "DB",
+      op: "transaction",
+      statements: [
+        ...Array.from({ length: 9 }, (_, index) => ({
+          sql: "INSERT INTO records (id, body) VALUES (?, ?)",
+          params: [100 + index, "x".repeat(1_000_000)],
+        })),
+        { sql: "SELECT body FROM records WHERE id >= 100 ORDER BY id" },
+      ],
+    });
+    const response = await host.broker.handle(
+      new Request(`http://localhost${SELFHOST_DATA_PLANE_SQL_PATH}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${host.token}` },
+        body,
+      }),
+    );
+    expect(await response?.json()).toEqual({ ok: false, error: { code: "sql_error" } });
+    expect(
+      await host.call("query", { sql: "SELECT count(*) AS count FROM records WHERE id >= 100" }),
+    ).toEqual({
+      ok: true,
+      value: { rows: [{ count: 0 }], rowsWritten: 0 },
+    });
+    expect(readdirSync(join(host.root, "sql-input-staging"))).toEqual([]);
+  } finally {
+    host.close();
+  }
+});
+
+test("a pending staged SQL call has no named SQL bytes and cleans its own directory", async () => {
+  const host = await fixture();
+  try {
+    const body = JSON.stringify({
+      protocol: SELFHOST_DATA_PLANE_PROTOCOL,
+      binding: "DB",
+      op: "transaction",
+      statements: [
+        {
+          sql: "INSERT INTO records (id, body) VALUES (?, ?)",
+          params: [100, "x".repeat(1_000_000)],
+        },
+        {
+          sql: "INSERT INTO records (id, body) VALUES (?, ?)",
+          params: [101, "x".repeat(1_000_000)],
+        },
+      ],
+    });
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const stream = new ReadableStream<Uint8Array>({
+      start(value) {
+        controller = value;
+        value.enqueue(new TextEncoder().encode(body.slice(0, 1_200_000)));
+      },
+    });
+    const pending = host.broker.handle(
+      new Request(`http://localhost${SELFHOST_DATA_PLANE_SQL_PATH}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${host.token}` },
+        body: stream,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" }),
+    );
+    const stagingRoot = join(host.root, "sql-input-staging");
+    let calls: string[] = [];
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      calls = readdirSync(stagingRoot);
+      if (calls.length > 0) break;
+      await Bun.sleep(10);
+    }
+    expect(calls).toHaveLength(1);
+    expect(readdirSync(join(stagingRoot, calls[0] as string))).toEqual([]);
+    controller?.enqueue(new TextEncoder().encode(body.slice(1_200_000)));
+    controller?.close();
+    expect(await (await pending)?.json()).toEqual({
+      ok: true,
+      value: {
+        results: [
+          { rows: [], rowsWritten: 1 },
+          { rows: [], rowsWritten: 1 },
+        ],
+      },
+    });
+    expect(readdirSync(stagingRoot)).toEqual([]);
+  } finally {
+    host.close();
+  }
+});
+
+test("malformed or interrupted staged SQL never applies and leaves no private input", async () => {
+  const host = await fixture();
+  try {
+    const prefix = JSON.stringify({
+      protocol: SELFHOST_DATA_PLANE_PROTOCOL,
+      binding: "DB",
+      op: "transaction",
+      statements: [
+        {
+          sql: "INSERT INTO records (id, body) VALUES (?, ?)",
+          params: [100, "x".repeat(1_000_000)],
+        },
+        {
+          sql: "INSERT INTO records (id, body) VALUES (?, ?)",
+          params: [101, "x".repeat(1_000_000)],
+        },
+      ],
+    });
+    const malformed = prefix.replace(/\]\}$/, ",]}");
+    const route = `http://localhost${SELFHOST_DATA_PLANE_SQL_PATH}`;
+    const headers = { authorization: `Bearer ${host.token}` };
+    const response = await host.broker.handle(
+      new Request(route, { method: "POST", headers, body: malformed }),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+    expect(readdirSync(join(host.root, "sql-input-staging"))).toEqual([]);
+
+    const interrupted = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(malformed.slice(0, 1_200_000)));
+        controller.error(new Error("simulated upload interruption"));
+      },
+    });
+    const aborted = await host.broker.handle(
+      new Request(route, {
+        method: "POST",
+        headers,
+        body: interrupted,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" }),
+    );
+    expect(aborted?.status).toBe(400);
+    expect(await aborted?.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+    expect(readdirSync(join(host.root, "sql-input-staging"))).toEqual([]);
+    expect(
+      await host.call("query", { sql: "SELECT count(*) AS count FROM records WHERE id >= 100" }),
+    ).toEqual({
+      ok: true,
+      value: { rows: [{ count: 0 }], rowsWritten: 0 },
     });
   } finally {
     host.close();
@@ -412,16 +637,17 @@ for (const { bindingName, publicVar } of [
         return Response.json({ keys, publicValue, privateVisible, result, hasRaw: "close" in database || "database" in database });
       }
       if (new URL(request.url).pathname === "/oversize") {
-        // Each value and statement is legal; only the aggregate body exceeds 40 MiB.
+        // Every input is legal; this transaction's aggregate wire body exceeds 40 MiB.
         const body = "x".repeat(1000000);
-        let name = "unexpected_success";
+        let outcome;
         try {
-          await database.transaction(Array.from({ length: 42 }, (_, index) => ({
+          const result = await database.transaction(Array.from({ length: 42 }, (_, index) => ({
             sql: "INSERT INTO records (id, body) VALUES (?, ?)", params: [100 + index, body]
           })));
-        } catch (error) { name = error.name; }
+          outcome = { ok: true, results: result.results.length, rowsWritten: result.results.reduce((total, item) => total + item.rowsWritten, 0) };
+        } catch (error) { outcome = { ok: false, name: error.name }; }
         const state = await database.query("SELECT count(*) AS count FROM records WHERE id >= 100");
-        return Response.json({ name, state });
+        return Response.json({ outcome, state });
       }
       if (new URL(request.url).pathname === "/invalid") {
         const names = [];
@@ -596,8 +822,8 @@ for (const { bindingName, publicVar } of [
           expect(await call("/oversize")).toEqual({
             status: 200,
             value: {
-              name: "backend_unavailable",
-              state: { rows: [{ count: 0 }], rowsWritten: 0 },
+              outcome: { ok: true, results: 42, rowsWritten: 42 },
+              state: { rows: [{ count: 42 }], rowsWritten: 0 },
             },
           });
         }

@@ -44,6 +44,10 @@ import type {
   ObjectBucketWorkerBindingClaim,
   ObjectBucketWorkerBindingResolution,
 } from "./takoform-v2/forms/object-bucket-worker-binding-authority.ts";
+import type {
+  QueueWorkerBindingClaim,
+  QueueWorkerBindingResolution,
+} from "./takoform-v2/forms/queue-worker-binding-authority.ts";
 import type { SQLiteWorkerBindingClaim } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import {
   parseWorkerEndpointSpec,
@@ -70,6 +74,7 @@ import {
 } from "./workerd-linux-process.ts";
 import type {
   HostedWorkerdRuntime,
+  WorkerdActiveActorGraph,
   WorkerdPublicationIdentity,
   WorkerdRuntime,
   WorkerdSite,
@@ -77,6 +82,7 @@ import type {
 } from "./workerd-runtime.ts";
 import {
   createWorkerdRuntime,
+  readWorkerdActiveActorGraph,
   readWorkerdActiveDeployment,
   readWorkerdSelectedActiveVersion,
 } from "./workerd-runtime.ts";
@@ -238,6 +244,22 @@ export interface WorkerdWorkerRuntimeOwner {
           readonly workerVersionUid: string;
           readonly weight: number;
         }[];
+      }
+    | { readonly kind: "unknown" }
+  >;
+  /** Operator-private, exact current Actor bytes; never a public Resource observation. */
+  observeActorGraph(input: {
+    readonly workerResourceUid: string;
+    readonly targetKey: string;
+    readonly sourceOperationId: string;
+  }): Promise<
+    | {
+        readonly kind: "ready";
+        readonly sourceOperationId: string;
+        readonly incarnationId: string;
+        readonly script: string;
+        readonly identity: WorkerdPublicationIdentity;
+        readonly graph: WorkerdActiveActorGraph;
       }
     | { readonly kind: "unknown" }
   >;
@@ -444,6 +466,15 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
       };
       readonly vector: string;
     } | null>;
+  };
+  /** Fixed private Queue producer broker and Core authority, not handler settlement. */
+  readonly v2QueueProducerBinding?: {
+    readonly address: string;
+    issueGrant(grant: QueueWorkerBindingClaim): string;
+    resolveCurrentBinding(
+      claim: QueueWorkerBindingClaim,
+      binding: string,
+    ): Promise<QueueWorkerBindingResolution | null>;
   };
   readonly workerdBinary: string | null;
   /** Trusted code-module inspector; absent uses the WorkerdRuntime's pinned inspector. */
@@ -780,6 +811,31 @@ async function requireExactEntries(path: string, expected: readonly string[]): P
   }
 }
 
+async function requireExactEntriesAfterRecoveryRace(
+  path: string,
+  expected: readonly string[],
+): Promise<void> {
+  const expectedSet = new Set(expected);
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const actual = await readdir(path).catch(() => {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    });
+    if (canonicalJson([...actual].sort()) === canonicalJson([...expected].sort())) return;
+    // A competing process may have linked the old lock just as this process
+    // replaced it. It must remove its own claim after noticing the new inode.
+    // Never accept an incomplete namespace; wait only for named claims and
+    // perform the same exact inventory check again before opening the owner.
+    if (
+      expected.some((name) => !actual.includes(name)) ||
+      actual.some((name) => !expectedSet.has(name) && parseRecoveryClaimName(name) === null) ||
+      attempt === 31
+    ) {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    await Bun.sleep(10);
+  }
+}
+
 async function verifyKnownGroupContents(
   groupDirectory: string,
   record: IncarnationRecord,
@@ -830,6 +886,7 @@ async function verifyOwnerNamespace(
   directory: string,
   state: PersistedOwnerState,
   workerResourceUid: string,
+  recoveredFromStaleOwner = false,
 ): Promise<void> {
   const stateInfo = await lstat(join(directory, STATE_NAME)).catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -845,7 +902,8 @@ async function verifyOwnerNamespace(
     ...(stateInfo ? [STATE_NAME] : []),
     ...(incarnationInfo ? ["incarnations"] : []),
   ];
-  await requireExactEntries(directory, topLevel);
+  if (recoveredFromStaleOwner) await requireExactEntriesAfterRecoveryRace(directory, topLevel);
+  else await requireExactEntries(directory, topLevel);
   if (stateInfo && (!stateInfo.isFile() || stateInfo.isSymbolicLink())) {
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
@@ -1964,6 +2022,27 @@ export async function openWorkerdWorkerRuntimeOwner(
         resolveCurrentBinding: options.v2KvBinding.resolveCurrentBinding.bind(options.v2KvBinding),
       })
     : undefined;
+  if (
+    options.v2QueueProducerBinding !== undefined &&
+    (typeof options.v2QueueProducerBinding.issueGrant !== "function" ||
+      typeof options.v2QueueProducerBinding.resolveCurrentBinding !== "function" ||
+      !/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(options.v2QueueProducerBinding.address) ||
+      Number(
+        options.v2QueueProducerBinding.address.slice(
+          options.v2QueueProducerBinding.address.lastIndexOf(":") + 1,
+        ),
+      ) > 65_535)
+  )
+    throw new WorkerdWorkerRuntimeOwnerError("invalid_identity");
+  const v2QueueProducerBinding = options.v2QueueProducerBinding
+    ? Object.freeze({
+        address: options.v2QueueProducerBinding.address,
+        issueGrant: options.v2QueueProducerBinding.issueGrant.bind(options.v2QueueProducerBinding),
+        resolveCurrentBinding: options.v2QueueProducerBinding.resolveCurrentBinding.bind(
+          options.v2QueueProducerBinding,
+        ),
+      })
+    : undefined;
 
   let canonicalRoot: string;
   try {
@@ -1998,7 +2077,12 @@ export async function openWorkerdWorkerRuntimeOwner(
       throw error;
     });
     state = parseState(text, options.workerResourceUid);
-    await verifyOwnerNamespace(directory, state, options.workerResourceUid);
+    await verifyOwnerNamespace(
+      directory,
+      state,
+      options.workerResourceUid,
+      ownerLock.recoveredFromStaleOwner,
+    );
     const hasServingIncarnations = state.incarnations.some(
       (item) => item.status === "active" || item.status === "draining",
     );
@@ -2447,6 +2531,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       ...(options.v2SqliteBinding ? { v2SqliteBinding: options.v2SqliteBinding } : {}),
       ...(v2ObjectBucketBinding ? { v2ObjectBucketBinding } : {}),
       ...(v2KvBinding ? { v2KvBinding } : {}),
+      ...(v2QueueProducerBinding ? { v2QueueProducerBinding } : {}),
       ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
     });
     const handle: IncarnationHandle = {
@@ -3205,6 +3290,162 @@ export async function openWorkerdWorkerRuntimeOwner(
         })),
       };
     });
+
+  const observeActorGraph: WorkerdWorkerRuntimeOwner["observeActorGraph"] = async (input) => {
+    const unknown = { kind: "unknown" } as const;
+    // Capture caller-owned fields before any serial-lane wait or SQL/native await.
+    const target = {
+      workerResourceUid: input.workerResourceUid,
+      targetKey: input.targetKey,
+      sourceOperationId: input.sourceOperationId,
+    };
+    const source = options.publicationState.resolveCurrentServing;
+    if (
+      !source ||
+      target.workerResourceUid !== options.workerResourceUid ||
+      target.targetKey !== options.targetKey ||
+      !OPERATION_ID.test(target.sourceOperationId)
+    )
+      return unknown;
+
+    // The SQL/held-byte resolver must run outside the owner serial lane. Its
+    // currentness callback may itself consult the owner in a binding path.
+    const captured = await runSerial(async () => {
+      const incarnation = active;
+      const record = recordFor(target.sourceOperationId);
+      if (
+        closed ||
+        suspending ||
+        admissionClosedBy !== null ||
+        !incarnation ||
+        state.activeOperationId !== target.sourceOperationId ||
+        incarnation.record.operationId !== target.sourceOperationId ||
+        record?.status !== "active" ||
+        !record.processIdentity ||
+        !record.configurationSha256 ||
+        record.configurationRefreshPending ||
+        record.configurationSha256 !== incarnation.group.configurationSha256 ||
+        !record.identity ||
+        record.identity.workerResourceUid !== options.workerResourceUid ||
+        sourceOperationIdFromIdentity(record.identity) !== target.sourceOperationId ||
+        !incarnation.group.isReady()
+      )
+        return null;
+      return {
+        recordKey: canonicalJson(record),
+        identity: structuredClone(record.identity),
+        incarnationId: physicalIncarnationId(target.sourceOperationId, record.processIdentity),
+      };
+    });
+    if (!captured) return unknown;
+
+    const resolution = await source({
+      workerUid: target.workerResourceUid,
+      targetKey: target.targetKey,
+      sourceOperationId: target.sourceOperationId,
+      expectedIdentity: captured.identity,
+    }).catch(() => null);
+    if (
+      resolution?.kind !== "ready" ||
+      resolution.snapshot.sourceOperationId !== target.sourceOperationId ||
+      resolution.snapshot.worker.uid !== target.workerResourceUid ||
+      !resolution.snapshot.deployment ||
+      !(await resolution.stillCurrent().catch(() => false))
+    )
+      return unknown;
+
+    const currentOwner = () => {
+      const incarnation = active;
+      const record = recordFor(target.sourceOperationId);
+      return !closed &&
+        !suspending &&
+        admissionClosedBy === null &&
+        incarnation?.record.operationId === target.sourceOperationId &&
+        state.activeOperationId === target.sourceOperationId &&
+        record?.status === "active" &&
+        canonicalJson(record) === captured.recordKey &&
+        incarnation.group.isReady()
+        ? { incarnation, record }
+        : null;
+    };
+    const graph = await runSerial(async () => {
+      const current = currentOwner();
+      if (!current) return null;
+      const { incarnation, record } = current;
+      const processIdentity = record.processIdentity;
+      if (!processIdentity) return null;
+      const copies = await inspectWorkerdWorkerExecutionCopies({
+        groupDirectory: incarnation.group.runtimeRoot,
+        workerResourceUid: target.workerResourceUid,
+        listenerPort: record.listenerPort,
+        scriptName: scriptName(target.workerResourceUid),
+      }).catch(() => null);
+      if (
+        !copies ||
+        !executionCopiesMatchRecord(record, copies, true) ||
+        captured.identity.versions.some(
+          (version) => !copies.versionUids.includes(version.workerVersionUid),
+        ) ||
+        (await incarnation.runtime.observeExactPublication?.(
+          scriptName(target.workerResourceUid),
+          captured.identity,
+        )) !== "matches" ||
+        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) !== "live" ||
+        (await workerPortOwnership(record.listenerPort, processIdentity.pid).catch(
+          () => "foreign",
+        )) !== "owned" ||
+        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) !== "live"
+      )
+        return null;
+      const native = await readWorkerdActiveActorGraph(
+        incarnation.group.runtimeRoot,
+        scriptName(target.workerResourceUid),
+        target.workerResourceUid,
+      ).catch(() => null);
+      if (
+        !native ||
+        native.generation !== captured.identity.generation ||
+        canonicalJson(
+          native.versions.map(({ versionId, workerVersionUid, weight }) => ({
+            versionId,
+            workerVersionUid,
+            weight,
+          })),
+        ) !== canonicalJson(captured.identity.versions) ||
+        !currentOwner()
+      )
+        return null;
+      return native;
+    });
+    if (!graph || !(await resolution.stillCurrent().catch(() => false))) return unknown;
+    const finalOwner = await runSerial(async () => {
+      const current = currentOwner();
+      const processIdentity = current?.record.processIdentity;
+      return (
+        current &&
+        processIdentity &&
+        (await current.incarnation.runtime.observeExactPublication?.(
+          scriptName(target.workerResourceUid),
+          captured.identity,
+        )) === "matches" &&
+        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) === "live" &&
+        (await workerPortOwnership(current.record.listenerPort, processIdentity.pid).catch(
+          () => "foreign",
+        )) === "owned" &&
+        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) === "live" &&
+        currentOwner() !== null
+      );
+    });
+    if (!finalOwner || !(await resolution.stillCurrent().catch(() => false))) return unknown;
+    return {
+      kind: "ready",
+      sourceOperationId: target.sourceOperationId,
+      incarnationId: captured.incarnationId,
+      script: scriptName(target.workerResourceUid),
+      identity: captured.identity,
+      graph,
+    };
+  };
 
   const observeVersionTargetCore = (
     input: Parameters<WorkerdWorkerRuntimeOwner["observeVersionTarget"]>[0],
@@ -4606,6 +4847,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     workerResourceUid: options.workerResourceUid,
     execute,
     observeServing,
+    observeActorGraph,
     observeVersionTarget,
     observeQueueTarget,
     observeQueuePhysicalAbsence,

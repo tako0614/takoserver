@@ -35,6 +35,18 @@ export interface QueueCustodyAdmission {
   readonly delaySeconds?: number;
 }
 
+/** Host-private selector; the SQL write must re-prove it, not trust this DTO. */
+export interface QueueCustodyV2ProducerClaim {
+  readonly principal: string;
+  readonly space: string;
+  readonly targetKey: string;
+  readonly queueUid: string;
+  readonly workerUid: string;
+  readonly workerVersionUid: string;
+  readonly workerVersionOperationId: string;
+  readonly bindingName: string;
+}
+
 export type QueueCustodyDeadLetterTarget = QueueCustodyTarget;
 
 export interface QueueCustodyRetryPolicy {
@@ -134,6 +146,12 @@ export class QueueCustodyConflictError extends Error {
 export interface QueueCustody {
   admit(target: QueueCustodyTarget, message: QueueCustodyAdmission): Promise<void>;
   admitBatch(target: QueueCustodyTarget, messages: readonly QueueCustodyAdmission[]): Promise<void>;
+  /** Atomic v2 Queue/Version/reference check and all-or-none producer admission. */
+  admitV2Batch(input: {
+    readonly claim: QueueCustodyV2ProducerClaim;
+    readonly target: QueueCustodyTarget;
+    readonly messages: readonly QueueCustodyAdmission[];
+  }): Promise<boolean>;
   activateConsumer(generation: QueueCustodyConsumerGeneration): Promise<void>;
   readiness(input: {
     readonly queueId: string;
@@ -260,6 +278,61 @@ export interface QueueCustodyOptions {
 type V2ReapClaim = Parameters<QueueCustody["reapRetiredV2"]>[0]["operationClaim"];
 const V2_REAP_DB_NOW = `(CAST(strftime('%s', 'now') AS INTEGER) * 1000
   + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))`;
+const V2_QUEUE_FORM = "https://edge.forms.takoform.com/forms/AtLeastOnceQueue/0.2.0/";
+const V2_VERSION_FORM = "https://edge.forms.takoform.com/forms/WorkerVersion/0.5.0/";
+const V2_QUEUE_BACKEND = "selfhost-v2-at-least-once-queue-sql-v1";
+// Evaluated for every INSERT inside the same BEGIN IMMEDIATE/implicit D1 batch.
+// No pre-read can turn a concurrently accepted Queue DELETE into an admission.
+const V2_PRODUCER_GUARD = `EXISTS (
+  SELECT 1 FROM tf_v2_resources queue
+  JOIN tf_v2_operations queue_op ON queue_op.id = queue.last_operation
+  JOIN tf_v2_resources version ON version.uid = ?
+  JOIN tf_v2_operations version_op ON version_op.id = version.last_operation
+  JOIN tf_v2_operations source_op ON source_op.id = ?
+  JOIN tf_v2_operation_reference_sets refs ON refs.operation_id = version_op.id
+  JOIN tf_v2_operation_references ref ON ref.operation_id = refs.operation_id
+  JOIN tf_v2_resource_references edge ON edge.referrer_uid = version.uid
+  WHERE queue.uid = ? AND queue.form_url = '${V2_QUEUE_FORM}'
+    AND queue.backend_id = '${V2_QUEUE_BACKEND}'
+    AND queue.principal = ? AND queue.space = ? AND queue.target_key = ?
+    AND queue.deleted_at IS NULL AND queue.phase = 'idle'
+    AND queue.busy_operation IS NULL AND queue.observed_generation = queue.generation
+    AND json_type(queue.observed_json, '$.queueExists') = 'true'
+    AND queue_op.resource_uid = queue.uid AND queue_op.principal = queue.principal
+    AND queue_op.backend_id = queue.backend_id AND queue_op.target_key = queue.target_key
+    AND queue_op.generation = queue.generation AND queue_op.status = 'succeeded'
+    AND queue_op.effect = 'complete' AND queue_op.action IN ('create','update')
+    AND queue_op.accepted_spec_json = queue.spec_json
+    AND json_extract(queue.spec_json, '$.messageRetentionSeconds') = ?
+    AND COALESCE(json_extract(queue.spec_json, '$.deliveryDelaySeconds'), 0) = ?
+    AND version.form_url = '${V2_VERSION_FORM}'
+    AND version.principal = queue.principal AND version.space = queue.space
+    AND version.target_key = queue.target_key AND version.deleted_at IS NULL
+    AND version.phase = 'idle' AND version.busy_operation IS NULL
+    AND version.observed_generation = version.generation
+    AND json_type(version.observed_json, '$.ready') = 'true'
+    AND version_op.resource_uid = version.uid AND version_op.principal = version.principal
+    AND version_op.backend_id = version.backend_id
+    AND version_op.target_key = version.target_key
+    AND version_op.generation = version.generation
+    AND version_op.status = 'succeeded' AND version_op.effect = 'complete'
+    AND version_op.action IN ('create','update')
+    AND version_op.accepted_spec_json = version.spec_json
+    AND source_op.resource_uid = version.uid AND source_op.principal = version.principal
+    AND source_op.backend_id = version.backend_id
+    AND source_op.target_key = version.target_key
+    AND source_op.generation <= version.generation
+    AND source_op.status = 'succeeded' AND source_op.effect = 'complete'
+    AND source_op.action IN ('create','update')
+    AND source_op.accepted_spec_json = version.spec_json
+    AND json_extract(version.spec_json, '$.worker.resourceUid') = ?
+    AND EXISTS (SELECT 1 FROM json_each(version.spec_json, '$.queueProducerBindings') binding
+      WHERE json_extract(binding.value, '$.name') = ?
+        AND json_extract(binding.value, '$.resource.resourceUid') = queue.uid)
+    AND refs.sealed = 1 AND ref.target_uid = queue.uid
+    AND ref.form_url = queue.form_url AND ref.readiness = 'observed'
+    AND edge.target_uid = queue.uid
+)`;
 // This SELECT runs as the first statement of the same atomic Sql.batch as
 // all message/notice writes. A false claim deliberately raises a SQLite
 // malformed-JSON error, rolling the batch back before any custody mutation.
@@ -903,6 +976,48 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
 
     async admitBatch(target, messages) {
       await sql.batch(admissionStatements(target, messages));
+    },
+
+    async admitV2Batch({ claim, target, messages }) {
+      if (
+        !claim?.principal ||
+        !claim.space ||
+        !claim.targetKey ||
+        !claim.queueUid ||
+        !claim.workerUid ||
+        !claim.workerVersionUid ||
+        !claim.workerVersionOperationId ||
+        !claim.bindingName ||
+        target.queueId !== `takoform-v2-queue:${claim.queueUid}`
+      ) {
+        throw new TypeError("v2 Queue producer admission identity is invalid");
+      }
+      const statements = admissionStatements(target, messages).map((statement): SqlStatement => {
+        const suffix = "VALUES (?, ?, ?, ?, ?, ?, 0)";
+        if (!statement.sql.endsWith(suffix)) {
+          throw new Error("Queue admission statement changed unexpectedly");
+        }
+        return {
+          sql: `${statement.sql.slice(0, -suffix.length)}SELECT ?, ?, ?, ?, ?, ?, 0 WHERE ${V2_PRODUCER_GUARD}`,
+          params: [
+            ...(statement.params ?? []),
+            claim.workerVersionUid,
+            claim.workerVersionOperationId,
+            claim.queueUid,
+            claim.principal,
+            claim.space,
+            claim.targetKey,
+            target.messageRetentionSeconds,
+            target.deliveryDelaySeconds,
+            claim.workerUid,
+            claim.bindingName,
+          ],
+        };
+      });
+      const writes = await sql.batch(statements);
+      if (writes.every((write) => write.changes === 1)) return true;
+      if (writes.every((write) => write.changes === 0)) return false;
+      throw new Error("v2 Queue producer admission was not atomic");
     },
 
     async activateConsumer(value) {

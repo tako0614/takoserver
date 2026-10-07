@@ -720,6 +720,32 @@ export function createSelfhostActorExecutionHost(options: {
       const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
       return registeredScope(key, scope);
     },
+    /** Proves a registered namespace has never allocated native Actor data. */
+    async namespaceEmpty(scope: ActorScope): Promise<boolean> {
+      await ready;
+      if (stopped || !validScope(scope)) return false;
+      const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
+      const owner = owners.get(key);
+      if (owner?.session || owner?.locked || !(await registeredScope(key, scope))) return false;
+      const namespaces = join(options.storageRoot, "namespaces");
+      const leases = join(options.storageRoot, "leases");
+      if ((await pathExists(join(namespaces, key))) || (await pathExists(join(leases, key))))
+        return false;
+      // A page-cache miss is not an absence receipt across Host processes.
+      for (const directory of [registrations, namespaces, leases]) {
+        try {
+          await syncDirectory(directory);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+      return (
+        !(owner?.session || owner?.locked) &&
+        (await registeredScope(key, scope)) &&
+        !(await pathExists(join(namespaces, key))) &&
+        !(await pathExists(join(leases, key)))
+      );
+    },
     async namespaceAbsent(scope: ActorScope): Promise<boolean> {
       await ready;
       if (!validScope(scope)) return false;

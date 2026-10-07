@@ -102,7 +102,7 @@ function plane(answers: Record<string, unknown>[]): {
         calls.push({
           url,
           authorization: headers.authorization ?? null,
-          body: JSON.parse(String(init.body)) as Record<string, unknown>,
+          body: JSON.parse(await new Response(init.body).text()) as Record<string, unknown>,
         });
         const answer = answers[index] ?? { ok: false, error: { code: "backend_unavailable" } };
         index += 1;
@@ -1162,6 +1162,88 @@ test("a SQL transaction returns the closed results envelope through the generate
       op: "transaction",
       statements: [{ sql: "SELECT 1" }],
     });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("SQL request serialization streams bounded chunks with exact JSON and captured inputs", async () => {
+  const input = `${"a".repeat(4095)}😀\ud800\u0000\n${"b".repeat(900_000)}`;
+  const second = "c".repeat(400_000);
+  let body = "";
+  let chunkCount = 0;
+  let maximumChunk = 0;
+  const service = {
+    async fetch(url: string, init: RequestInit): Promise<Response> {
+      expect(url).toEndWith(SELFHOST_DATA_PLANE_SQL_PATH);
+      expect(init.method).toBe("POST");
+      expect((init as RequestInit & { duplex?: string }).duplex).toBe("half");
+      expect(init.body).toBeInstanceOf(ReadableStream);
+      const reader = (init.body as ReadableStream<Uint8Array>).getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) break;
+        chunkCount += 1;
+        maximumChunk = Math.max(maximumChunk, next.value.byteLength);
+        body += decoder.decode(next.value, { stream: true });
+      }
+      body += decoder.decode();
+      return Response.json({
+        ok: true,
+        value: {
+          results: [
+            { rows: [], rowsWritten: 0 },
+            { rows: [], rowsWritten: 0 },
+          ],
+        },
+      });
+    },
+  };
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const first = ${JSON.stringify(input)};
+       const second = ${JSON.stringify(second)};
+       const statements = [
+         { sql: "SELECT ?1 AS value", params: [first] },
+         { sql: "SELECT ?1 AS value", params: [second, null, -0, { encoding: "base64", data: "AAE=" }] },
+       ];
+       const pending = env.DB.transaction(statements);
+       statements[0].params[0] = "mutated after call";
+       statements[1].params[0] = "mutated after call";
+       return Response.json(await pending);
+     } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["fetch"],
+      bindings: [{ kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" }],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(response.status).toBe(200);
+    expect(chunkCount).toBeGreaterThan(10);
+    expect(maximumChunk).toBeLessThan(32_768);
+    expect(body).toBe(
+      JSON.stringify({
+        protocol: SELFHOST_DATA_PLANE_PROTOCOL,
+        binding: "DB",
+        op: "transaction",
+        statements: [
+          { sql: "SELECT ?1 AS value", params: [input] },
+          {
+            sql: "SELECT ?1 AS value",
+            params: [second, null, -0, { encoding: "base64", data: "AAE=" }],
+          },
+        ],
+      }),
+    );
   } finally {
     await generated.dispose();
   }

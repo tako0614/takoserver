@@ -44,6 +44,12 @@ export interface V2ResolvedKvBinding {
   readonly resourceUid: string;
 }
 
+/** Exact accepted Core Queue references; not a declaration-only capability. */
+export interface V2ResolvedQueueProducerBinding {
+  readonly name: string;
+  readonly resourceUid: string;
+}
+
 /** Host-private native companion destination and selected-Version signed grant. */
 export interface V2SqliteNativeBoot {
   readonly address: string;
@@ -59,6 +65,12 @@ export interface V2ObjectBucketNativeBoot {
 
 /** Private native KV dispatcher and exact public binding names. */
 export interface V2KvNativeBoot {
+  readonly address: string;
+  readonly token: string;
+  readonly bindings: readonly { readonly publicName: string }[];
+}
+
+export interface V2QueueProducerNativeBoot {
   readonly address: string;
   readonly token: string;
   readonly bindings: readonly { readonly publicName: string }[];
@@ -96,6 +108,7 @@ export interface V2WorkerCodeEligibilityInput {
   readonly resolvedSqliteBindings?: readonly V2ResolvedSqliteBinding[];
   readonly resolvedObjectBucketBindings?: readonly V2ResolvedObjectBucketBinding[];
   readonly resolvedKvBindings?: readonly V2ResolvedKvBinding[];
+  readonly resolvedQueueProducerBindings?: readonly V2ResolvedQueueProducerBinding[];
 }
 
 interface VerifiedV2WorkerCodeEligibility {
@@ -109,6 +122,7 @@ interface VerifiedV2WorkerCodeEligibility {
   readonly assets?: V2VerifiedAssetMaterials;
   readonly sqliteBoot?: V2SqliteNativeBoot;
   readonly kvBoot?: V2KvNativeBoot;
+  readonly queueProducerBoot?: V2QueueProducerNativeBoot;
 }
 
 /**
@@ -133,6 +147,7 @@ export async function prepareV2WorkerCodeProjection(
     readonly sqliteBoot?: V2SqliteNativeBoot;
     readonly objectBucketBoot?: V2ObjectBucketNativeBoot;
     readonly kvBoot?: V2KvNativeBoot;
+    readonly queueProducerBoot?: V2QueueProducerNativeBoot;
   },
 ): Promise<VerifiedV2WorkerCodeEligibility> {
   return await verifyV2WorkerCodeProjection(input, false);
@@ -147,6 +162,7 @@ async function verifyV2WorkerCodeProjection(
     readonly sqliteBoot?: V2SqliteNativeBoot;
     readonly objectBucketBoot?: V2ObjectBucketNativeBoot;
     readonly kvBoot?: V2KvNativeBoot;
+    readonly queueProducerBoot?: V2QueueProducerNativeBoot;
   },
   inspectionOnly: boolean,
 ): Promise<VerifiedV2WorkerCodeEligibility> {
@@ -181,11 +197,7 @@ async function verifyV2WorkerCodeProjection(
   ) {
     throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
   }
-  if (
-    spec.queueProducerBindings.length > 0 ||
-    spec.actorBindings.length > 0 ||
-    spec.workflowBindings.length > 0
-  ) {
+  if (spec.actorBindings.length > 0 || spec.workflowBindings.length > 0) {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
   // Snapshot the accepted graph and the private grant before any material or
@@ -198,6 +210,8 @@ async function verifyV2WorkerCodeProjection(
   const objectBucketBoot = snapshotObjectBucketBoot(input.objectBucketBoot);
   const kvBindings = snapshotResolvedKvBindings(input.resolvedKvBindings);
   const kvBoot = snapshotKvBoot(input.kvBoot);
+  const queueProducerBindings = snapshotResolvedKvBindings(input.resolvedQueueProducerBindings);
+  const queueProducerBoot = snapshotKvBoot(input.queueProducerBoot);
   if (
     sqliteBindings === null ||
     sqliteBoot === null ||
@@ -238,6 +252,21 @@ async function verifyV2WorkerCodeProjection(
       (kvBoot.bindings.length !== spec.kvBindings.length ||
         spec.kvBindings.some(
           (binding, index) => kvBoot.bindings[index]?.publicName !== binding.name,
+        ))) ||
+    queueProducerBindings === null ||
+    queueProducerBoot === null ||
+    spec.queueProducerBindings.length !== (queueProducerBindings?.length ?? 0) ||
+    spec.queueProducerBindings.some(
+      (binding, index) =>
+        binding.name !== queueProducerBindings?.[index]?.name ||
+        binding.resource.resourceUid !== queueProducerBindings[index]?.resourceUid,
+    ) ||
+    (spec.queueProducerBindings.length > 0 && !inspectionOnly && queueProducerBoot === undefined) ||
+    (spec.queueProducerBindings.length === 0 && queueProducerBoot !== undefined) ||
+    (queueProducerBoot !== undefined &&
+      (queueProducerBoot.bindings.length !== spec.queueProducerBindings.length ||
+        spec.queueProducerBindings.some(
+          (binding, index) => queueProducerBoot.bindings[index]?.publicName !== binding.name,
         )))
   ) {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
@@ -312,6 +341,7 @@ async function verifyV2WorkerCodeProjection(
     ...(assets ? { assets } : {}),
     ...(sqliteBoot ? { sqliteBoot } : {}),
     ...(kvBoot ? { kvBoot } : {}),
+    ...(queueProducerBoot ? { queueProducerBoot } : {}),
   };
 }
 
