@@ -196,14 +196,27 @@ export function createV2WorkerVersionConfiguredInputSealer(
       sealed: V2WorkerVersionSealedInputs,
       proposed: Readonly<Record<string, string>> | undefined,
     ): Promise<"matched" | "mismatched" | "unavailable"> {
-      const currentInputs = await this.open(identity, sealed);
+      const normalizedSpec = parseWorkerVersionSpec(identity.spec);
+      const identitySnapshot: V2WorkerVersionPrivateIdentity = Object.freeze({
+        principal: identity.principal,
+        space: identity.space,
+        name: identity.name,
+        form: identity.form,
+        resourceUid: identity.resourceUid,
+        spec: JSON.parse(canonicalJson(normalizedSpec)) as unknown,
+      });
+      const names = [...normalizedSpec.requiredSensitiveVars];
+      const proposedIsValid = exactValues(proposed, names);
+      const proposedSnapshot = proposedIsValid
+        ? Object.freeze(Object.fromEntries(names.map((name) => [name, proposed?.[name] as string])))
+        : undefined;
+      // Keep unavailable-key/tampering precedence over a malformed proposal.
+      const currentInputs = await this.open(identitySnapshot, sealed);
       if (!currentInputs) return "unavailable";
-      const { names, aad } = identityParts(identity);
-      aad.fill(0);
-      if (!exactValues(proposed, names)) return "mismatched";
+      if (!proposedIsValid || !proposedSnapshot) return "mismatched";
       let matched = true;
       for (const name of names) {
-        matched = sameValue(currentInputs[name] ?? "", proposed?.[name] ?? "") && matched;
+        matched = sameValue(currentInputs[name] ?? "", proposedSnapshot[name] ?? "") && matched;
       }
       return matched ? "matched" : "mismatched";
     },

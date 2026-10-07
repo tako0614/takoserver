@@ -107,6 +107,38 @@ test("configured input sealing requires an exact complete map and allows no-secr
   await expect(sealer.seal(noSecrets, { TOKEN: "extra" })).rejects.toThrow();
 });
 
+test("compare snapshots proposed values and immutable identity before awaiting decryption", async () => {
+  const key = await nonextractableKey();
+  const sealer = createV2WorkerVersionConfiguredInputSealer({
+    current: { keyId: "fixture-key-1", key },
+    keyForDecryption: () => key,
+  });
+  const sealed = await sealer.seal(identity, { TOKEN: "expected" });
+  if (!sealed) throw new Error("expected sealed synthetic inputs");
+  const tampered = {
+    ...sealed,
+    ciphertext: `${sealed.ciphertext[0] === "A" ? "B" : "A"}${sealed.ciphertext.slice(1)}`,
+  };
+
+  const proposed = { TOKEN: "different" };
+  const proposedComparison = sealer.compare(identity, sealed, proposed);
+  proposed.TOKEN = "expected";
+  expect(await proposedComparison).toBe("mismatched");
+
+  const mutableIdentity = structuredClone(identity) as {
+    principal: string;
+    space: string;
+    name: string;
+    form: string;
+    resourceUid: string;
+    spec: Record<string, unknown>;
+  };
+  const identityComparison = sealer.compare(mutableIdentity, sealed, {});
+  mutableIdentity.spec.requiredSensitiveVars = [];
+  expect(await identityComparison).toBe("mismatched");
+  expect(await sealer.compare(identity, tampered, undefined)).toBe("unavailable");
+});
+
 test("configured input rotation retains old decryption keys without accepting an absent key", async () => {
   const oldKey = await nonextractableKey();
   const oldSealer = createV2WorkerVersionConfiguredInputSealer({
