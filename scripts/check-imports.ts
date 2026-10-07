@@ -302,6 +302,7 @@ const LAYERS: readonly Layer[] = [
       "v2-config",
       "v2-selfhost-composition",
       "v2-selfhost-queue-composition",
+      "v2-selfhost-queue-scheduler",
       "v2-selfhost-configured-input-sealer",
     ],
   },

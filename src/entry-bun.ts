@@ -86,6 +86,7 @@ import {
 } from "./selfhost-tenant-run-credentials.ts";
 import { createSelfhostV2ConfiguredInputSealer } from "./selfhost-v2-configured-input-sealer.ts";
 import { createSelfhostV2QueueComposition } from "./selfhost-v2-queue-composition.ts";
+import { createSelfhostV2QueueScheduler } from "./selfhost-v2-queue-scheduler.ts";
 import { createSelfhostV2WorkerComposition } from "./selfhost-v2-worker-composition.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
@@ -784,6 +785,15 @@ try {
   throw error;
 }
 const v2WorkerComposition = workers;
+const v2QueueScheduler =
+  v2QueueComposition && v2QueueCustody
+    ? createSelfhostV2QueueScheduler({
+        sql,
+        custody: v2QueueCustody,
+        composition: v2QueueComposition,
+        workerComposition: v2WorkerComposition,
+      })
+    : undefined;
 if (restoredV2WorkerUids.length > 0) {
   process.stdout.write(`restored ${restoredV2WorkerUids.length} v2 Worker owner(s)\n`);
 }
@@ -1141,6 +1151,7 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
         workerdShutdown: () => workerd.shutdown(),
         mayCloseDependents: () => shutdownClean,
         v2WorkerSuspend: async () => {
+          await v2QueueScheduler?.close();
           await v2WorkerComposition.suspendOwnersRetainingCustody();
           await v2QueueComposition?.close();
         },
@@ -1242,10 +1253,23 @@ entryShutdown.startInterval(
   (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
 );
 entryShutdown.startInterval(
-  "queue-pump",
+  "queue-wake",
   1_000,
-  async () => {
-    await queuePump?.tick();
+  () => {
+    // Share only the wake timer. A blocked recovery scan must not hold the
+    // other delivery lane; both named passes remain owned by shutdown.
+    void entryShutdown
+      .runPass("takoform-v2-queue-delivery", async () => {
+        await v2QueueScheduler?.tick();
+      })
+      .catch(() => {
+        process.stderr.write("self-host background pass failed: takoform-v2-queue-delivery\n");
+      });
+    void entryShutdown
+      .runPass("queue-pump", async () => {
+        await queuePump?.tick();
+      })
+      .catch(() => process.stderr.write("self-host background pass failed: queue-pump\n"));
   },
   (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
 );
