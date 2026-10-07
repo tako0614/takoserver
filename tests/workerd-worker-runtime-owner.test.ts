@@ -1642,8 +1642,15 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
       targetKey: TARGET_KEY,
       sourceOperationId: createId,
     });
+  const readPhysical = () =>
+    owner.observeActorGraphForAcceptedOperation({
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      sourceOperationId: createId,
+    });
   try {
     expect(await read()).toEqual({ kind: "unknown" });
+    expect(await readPhysical()).toEqual({ kind: "unknown" });
     expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
       kind: "confirmed",
     });
@@ -1659,9 +1666,17 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
       },
     });
     if (exact.kind !== "ready") throw new Error("native Actor graph not observed");
+    expect(await readPhysical()).toEqual(exact);
     expect(exact.graph.versions[0]?.modules.get("index.mjs")).toBeInstanceOf(Uint8Array);
     expect(
       await owner.observeActorGraph({
+        workerResourceUid: workerUid,
+        targetKey: TARGET_KEY,
+        sourceOperationId: deleteId,
+      }),
+    ).toEqual({ kind: "unknown" });
+    expect(
+      await owner.observeActorGraphForAcceptedOperation({
         workerResourceUid: workerUid,
         targetKey: TARGET_KEY,
         sourceOperationId: deleteId,
@@ -1677,15 +1692,25 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
     expect(await staleRequest).toEqual({ kind: "unknown" });
     publication.setFenceCurrent(false);
     expect(await read()).toEqual({ kind: "unknown" });
+    expect(await readPhysical()).toEqual(exact);
+    expect(
+      await owner.observeActorGraphForAcceptedOperation({
+        workerResourceUid: workerUid,
+        targetKey: "foreign-target",
+        sourceOperationId: createId,
+      }),
+    ).toEqual({ kind: "unknown" });
     publication.setFenceCurrent(true);
     publication.failAfterFenceChecks(2);
     expect(await read()).toEqual({ kind: "unknown" });
+    expect(await readPhysical()).toEqual(exact);
     publication.failAfterFenceChecks(null);
     expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
       kind: "confirmed",
       identity: null,
     });
     expect(await read()).toEqual({ kind: "unknown" });
+    expect(await readPhysical()).toEqual({ kind: "unknown" });
   } finally {
     await owner.close().catch(() => undefined);
     await owned.cleanup();
@@ -1877,6 +1902,7 @@ test("Actor graph readback refuses a foreign listener while native bytes remain"
       fetch: () => new Response("foreign"),
     });
     expect(await owner.observeActorGraph(request)).toEqual({ kind: "unknown" });
+    expect(await owner.observeActorGraphForAcceptedOperation(request)).toEqual({ kind: "unknown" });
   } finally {
     await foreign?.stop(true);
     try {

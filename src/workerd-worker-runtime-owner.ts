@@ -244,6 +244,18 @@ export type V2WorkerRuntimeOwnerExecutionResult =
   | V2WorkerPublicationResult
   | V2WorkerEndpointRouteAbsentResult;
 
+/** Host-local physical readback; SQL acceptance remains the caller's authority. */
+export type WorkerdActorNativeGraphObservation =
+  | {
+      readonly kind: "ready";
+      readonly sourceOperationId: string;
+      readonly incarnationId: string;
+      readonly script: string;
+      readonly identity: WorkerdPublicationIdentity;
+      readonly graph: WorkerdActiveActorGraph;
+    }
+  | { readonly kind: "unknown" };
+
 export interface WorkerdWorkerRuntimeOwner {
   readonly workerResourceUid: string;
   /** Run one accepted WorkerDeployment or WorkerEndpoint Operation for this UID. */
@@ -272,17 +284,13 @@ export interface WorkerdWorkerRuntimeOwner {
     readonly workerResourceUid: string;
     readonly targetKey: string;
     readonly sourceOperationId: string;
-  }): Promise<
-    | {
-        readonly kind: "ready";
-        readonly sourceOperationId: string;
-        readonly incarnationId: string;
-        readonly script: string;
-        readonly identity: WorkerdPublicationIdentity;
-        readonly graph: WorkerdActiveActorGraph;
-      }
-    | { readonly kind: "unknown" }
-  >;
+  }): Promise<WorkerdActorNativeGraphObservation>;
+  /** Physical native graph only; accepted Operation/lease/refs must be checked by its caller. */
+  observeActorGraphForAcceptedOperation(input: {
+    readonly workerResourceUid: string;
+    readonly targetKey: string;
+    readonly sourceOperationId: string;
+  }): Promise<WorkerdActorNativeGraphObservation>;
   /** Exact active code Version and private Service bridge for one Workflow run. */
   selectWorkflowExecution(input: {
     readonly workerUid: string;
@@ -3520,7 +3528,14 @@ export async function openWorkerdWorkerRuntimeOwner(
       };
     });
 
-  const observeActorGraph: WorkerdWorkerRuntimeOwner["observeActorGraph"] = async (input) => {
+  const observeActorGraphPhysical = async (
+    input: {
+      readonly workerResourceUid: string;
+      readonly targetKey: string;
+      readonly sourceOperationId: string;
+    },
+    requireSqlCurrentness: boolean,
+  ): Promise<WorkerdActorNativeGraphObservation> => {
     const unknown = { kind: "unknown" } as const;
     // Capture caller-owned fields before any serial-lane wait or SQL/native await.
     const target = {
@@ -3528,9 +3543,11 @@ export async function openWorkerdWorkerRuntimeOwner(
       targetKey: input.targetKey,
       sourceOperationId: input.sourceOperationId,
     };
-    const source = options.publicationState.resolveCurrentServing;
+    const source = requireSqlCurrentness
+      ? options.publicationState.resolveCurrentServing
+      : undefined;
     if (
-      !source ||
+      (requireSqlCurrentness && !source) ||
       target.workerResourceUid !== options.workerResourceUid ||
       target.targetKey !== options.targetKey ||
       !OPERATION_ID.test(target.sourceOperationId)
@@ -3568,18 +3585,24 @@ export async function openWorkerdWorkerRuntimeOwner(
     });
     if (!captured) return unknown;
 
-    const resolution = await source({
-      workerUid: target.workerResourceUid,
-      targetKey: target.targetKey,
-      sourceOperationId: target.sourceOperationId,
-      expectedIdentity: captured.identity,
-    }).catch(() => null);
+    const resolution = source
+      ? await source({
+          workerUid: target.workerResourceUid,
+          targetKey: target.targetKey,
+          sourceOperationId: target.sourceOperationId,
+          expectedIdentity: captured.identity,
+        }).catch(() => null)
+      : null;
+    const sqlCurrent = async (): Promise<boolean> =>
+      !requireSqlCurrentness ||
+      (resolution?.kind === "ready" && (await resolution.stillCurrent().catch(() => false)));
     if (
-      resolution?.kind !== "ready" ||
-      resolution.snapshot.sourceOperationId !== target.sourceOperationId ||
-      resolution.snapshot.worker.uid !== target.workerResourceUid ||
-      !resolution.snapshot.deployment ||
-      !(await resolution.stillCurrent().catch(() => false))
+      (requireSqlCurrentness &&
+        (resolution?.kind !== "ready" ||
+          resolution.snapshot.sourceOperationId !== target.sourceOperationId ||
+          resolution.snapshot.worker.uid !== target.workerResourceUid ||
+          !resolution.snapshot.deployment)) ||
+      !(await sqlCurrent())
     )
       return unknown;
 
@@ -3646,7 +3669,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         return null;
       return native;
     });
-    if (!graph || !(await resolution.stillCurrent().catch(() => false))) return unknown;
+    if (!graph || !(await sqlCurrent())) return unknown;
     const finalOwner = await runSerial(async () => {
       const current = currentOwner();
       const processIdentity = current?.record.processIdentity;
@@ -3665,7 +3688,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         currentOwner() !== null
       );
     });
-    if (!finalOwner || !(await resolution.stillCurrent().catch(() => false))) return unknown;
+    if (!finalOwner || !(await sqlCurrent())) return unknown;
     return {
       kind: "ready",
       sourceOperationId: target.sourceOperationId,
@@ -3675,6 +3698,11 @@ export async function openWorkerdWorkerRuntimeOwner(
       graph,
     };
   };
+
+  const observeActorGraph: WorkerdWorkerRuntimeOwner["observeActorGraph"] = (input) =>
+    observeActorGraphPhysical(input, true);
+  const observeActorGraphForAcceptedOperation: WorkerdWorkerRuntimeOwner["observeActorGraphForAcceptedOperation"] =
+    (input) => observeActorGraphPhysical(input, false);
 
   const selectWorkflowExecution: WorkerdWorkerRuntimeOwner["selectWorkflowExecution"] = async (
     input,
@@ -5343,6 +5371,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     execute,
     observeServing,
     observeActorGraph,
+    observeActorGraphForAcceptedOperation,
     selectWorkflowExecution,
     observeVersionTarget,
     observeQueueTarget,
