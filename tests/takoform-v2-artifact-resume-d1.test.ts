@@ -44,6 +44,7 @@ test("native D1 resumes one accepted artifact Operation within each invocation q
         "0071_v2_sqlite_migration_set_custody.sql",
         "0072_v2_artifact_custody.sql",
         "0075_v2_artifact_progress.sql",
+        "0081_v2_private_inputs.sql",
       ].includes(name),
     )) {
       for (const statement of splitMigration(migration.sql)) {

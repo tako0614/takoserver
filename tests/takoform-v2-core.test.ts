@@ -10,7 +10,11 @@ const KEY = "created-operation-key-00000001";
 
 function fixture(backend?: Partial<V2Backend>) {
   const db = new Database(":memory:");
-  for (const name of ["0070_takoform_v2.sql", "0071_v2_sqlite_migration_set_custody.sql"]) {
+  for (const name of [
+    "0070_takoform_v2.sql",
+    "0071_v2_sqlite_migration_set_custody.sql",
+    "0081_v2_private_inputs.sql",
+  ]) {
     db.exec(readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8"));
   }
   let time = Date.parse("2026-10-06T00:00:00Z");

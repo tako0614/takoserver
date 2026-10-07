@@ -16,7 +16,11 @@ const requested = { form: FORM, space: "default", name: "address", spec: {} };
 function fixture(path = ":memory:", initialize?: (uid: string) => JsonObject) {
   const db = new Database(path);
   if (!db.query("SELECT 1 FROM sqlite_master WHERE name = 'tf_v2_resources'").get()) {
-    for (const migration of ["0070_takoform_v2.sql", "0071_v2_sqlite_migration_set_custody.sql"]) {
+    for (const migration of [
+      "0070_takoform_v2.sql",
+      "0071_v2_sqlite_migration_set_custody.sql",
+      "0081_v2_private_inputs.sql",
+    ]) {
       db.exec(readFileSync(new URL(`../migrations/${migration}`, import.meta.url), "utf8"));
     }
   }
