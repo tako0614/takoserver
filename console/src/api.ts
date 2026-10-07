@@ -369,7 +369,10 @@ export function createApi(options: ApiOptions) {
         ...organizationHeader(organizationId),
         "idempotency-key": key,
       });
-      return operation(payload, status, path);
+      const accepted = operation(payload, status, path);
+      if (accepted.action !== "create" || accepted.generation !== 1)
+        throw new ApiError("invalid_response", status, path);
+      return accepted;
     },
 
     /** Updates one UID at the exact generation last read. */
@@ -391,7 +394,14 @@ export function createApi(options: ApiOptions) {
           "takoform-expected-generation": String(generation),
         },
       );
-      return operation(payload, status, path);
+      const accepted = operation(payload, status, path);
+      if (
+        accepted.action !== "update" ||
+        accepted.resourceUid !== uid ||
+        accepted.generation !== generation + 1
+      )
+        throw new ApiError("invalid_response", status, path);
+      return accepted;
     },
 
     /** Deletes one UID at the exact generation last read. */
@@ -407,7 +417,14 @@ export function createApi(options: ApiOptions) {
         "idempotency-key": key,
         "takoform-expected-generation": String(generation),
       });
-      return operation(payload, status, path);
+      const accepted = operation(payload, status, path);
+      if (
+        accepted.action !== "delete" ||
+        accepted.resourceUid !== uid ||
+        accepted.generation !== generation + 1
+      )
+        throw new ApiError("invalid_response", status, path);
+      return accepted;
     },
 
     /** Reads one accepted operation; never reissues the original mutation. */

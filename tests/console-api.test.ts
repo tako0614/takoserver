@@ -65,6 +65,7 @@ test("v2 create, read, update and delete keep exact UID, generation and caller k
         ...operation,
         action:
           request.method === "DELETE" ? "delete" : request.method === "PUT" ? "update" : "create",
+        generation: request.method === "POST" ? 1 : 2,
       },
       { status: 202 },
     );
@@ -181,4 +182,30 @@ test("v2 problem codes and session loss are distinct from malformed success", as
       "console-create-0001",
     ),
   ).rejects.toMatchObject({ code: "invalid_response", status: 200 });
+});
+
+test("a shaped but wrong Operation is unknown ACK, never accepted as this mutation", async () => {
+  transport(() => Response.json({ ...operation, action: "delete" }, { status: 202 }));
+  await expect(
+    client().createResource(
+      org,
+      { form, space: org, name: "one", spec: {} },
+      "console-create-0001",
+    ),
+  ).rejects.toMatchObject({ code: "invalid_response", status: 202 });
+  transport(() =>
+    Response.json(
+      { ...operation, action: "update", generation: 2, resourceUid: "other-uid" },
+      { status: 202 },
+    ),
+  );
+  await expect(
+    client().updateResource(org, resource.uid, 1, {}, "console-update-0001"),
+  ).rejects.toMatchObject({ code: "invalid_response", status: 202 });
+  transport(() =>
+    Response.json({ ...operation, action: "delete", generation: 3 }, { status: 202 }),
+  );
+  await expect(
+    client().deleteResource(org, resource.uid, 1, "console-delete-0001"),
+  ).rejects.toMatchObject({ code: "invalid_response", status: 202 });
 });

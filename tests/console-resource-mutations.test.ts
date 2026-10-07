@@ -278,7 +278,7 @@ test("delete requires explicit confirmation and retains the UID/generation fence
       const request = new Request(input, init);
       if (request.method === "GET") return Response.json(discovery);
       seen.push(request);
-      return Response.json({ ...op, action: "delete" }, { status: 202 });
+      return Response.json({ ...op, action: "delete", generation: 2 }, { status: 202 });
     },
     { preconnect: globalThis.fetch.preconnect },
   );
