@@ -52,8 +52,8 @@ export function validatePrivateInputCustody(custody: V2PrivateInputCustody): voi
 function validateRing(
   ring: { readonly current: V2PrivateInputKey; readonly previous?: readonly V2PrivateInputKey[] },
   algorithm: string,
-  firstUsage: KeyUsage,
-  secondUsage: KeyUsage,
+  firstUsage: "encrypt" | "sign",
+  secondUsage: "decrypt" | "verify",
 ): void {
   const keys = [ring.current, ...(ring.previous ?? [])];
   if (keys.length === 0 || keys.some((entry) => !entry || !ID.test(entry.id))) {
@@ -63,16 +63,21 @@ function validateRing(
     throw new TypeError("duplicate v2 private input key id");
   }
   for (const { key } of keys) {
+    if (!(key instanceof CryptoKey)) throw new TypeError("invalid v2 private input key");
+    const keyAlgorithm = key.algorithm as {
+      readonly name: string;
+      readonly hash?: { readonly name: string };
+      readonly length?: number;
+    };
     if (
-      !(key instanceof CryptoKey) ||
       key.type !== "secret" ||
       key.extractable ||
-      key.algorithm.name !== algorithm ||
+      keyAlgorithm.name !== algorithm ||
       !key.usages.includes(firstUsage) ||
       !key.usages.includes(secondUsage) ||
-      (algorithm === "HMAC" && (key.algorithm as HmacKeyAlgorithm).hash.name !== "SHA-256") ||
-      (algorithm === "HMAC" && (key.algorithm as HmacKeyAlgorithm).length < 256) ||
-      (algorithm === "AES-GCM" && (key.algorithm as AesKeyAlgorithm).length !== 256)
+      (algorithm === "HMAC" && keyAlgorithm.hash?.name !== "SHA-256") ||
+      (algorithm === "HMAC" && (keyAlgorithm.length ?? 0) < 256) ||
+      (algorithm === "AES-GCM" && keyAlgorithm.length !== 256)
     ) {
       throw new TypeError("invalid v2 private input key");
     }
@@ -195,7 +200,7 @@ export async function unsealPrivateInputs(
       decode(ciphertext),
     );
     return parsePrivateInputMap(
-      JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plain)),
+      JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(plain)),
     );
   } catch {
     return null;
@@ -210,15 +215,19 @@ function lookup(
 }
 
 function bindingBytes(binding: V2PrivateInputBinding): Uint8Array<ArrayBuffer> {
-  return encoder.encode(canonicalJson(["forms.takoform.com/v2/private-inputs", binding]));
+  return new Uint8Array(
+    encoder.encode(canonicalJson(["forms.takoform.com/v2/private-inputs", binding])),
+  );
 }
 
 function comparisonBytes(aad: Uint8Array, value: string): Uint8Array<ArrayBuffer> {
-  return encoder.encode(canonicalJson([new TextDecoder().decode(aad), value]));
+  return new Uint8Array(encoder.encode(canonicalJson([new TextDecoder().decode(aad), value])));
 }
 
 function comparisonMaterialBytes(tag: string): Uint8Array<ArrayBuffer> {
-  return encoder.encode(canonicalJson(["forms.takoform.com/v2/comparison-material@v1", tag]));
+  return new Uint8Array(
+    encoder.encode(canonicalJson(["forms.takoform.com/v2/comparison-material@v1", tag])),
+  );
 }
 
 function encode(value: ArrayBuffer | Uint8Array): string {
