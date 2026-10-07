@@ -205,6 +205,8 @@ function staticPublicationState(
   const assetBytes = new TextEncoder().encode("owner fixture asset");
   let lastOperationId: string | undefined;
   let fenceCurrent = true;
+  let fenceChecks = 0;
+  let fenceFailureAfter: number | null = null;
   let lastExecution: V2Execution | null = null;
   const source = {
     async resolve({
@@ -314,7 +316,8 @@ function staticPublicationState(
         },
         sqlGuard: { sql: "SELECT 1", params: [] },
         async stillCurrent() {
-          return fenceCurrent;
+          fenceChecks += 1;
+          return fenceCurrent && (fenceFailureAfter === null || fenceChecks <= fenceFailureAfter);
         },
         async readVersionMaterials() {
           return {
@@ -353,6 +356,10 @@ function staticPublicationState(
     },
     setFenceCurrent(value: boolean) {
       fenceCurrent = value;
+    },
+    failAfterFenceChecks(limit: number | null) {
+      fenceChecks = 0;
+      fenceFailureAfter = limit;
     },
   };
 }
@@ -1654,9 +1661,20 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
         sourceOperationId: deleteId,
       }),
     ).toEqual({ kind: "unknown" });
+    const mutable = {
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      sourceOperationId: deleteId,
+    };
+    const staleRequest = owner.observeActorGraph(mutable);
+    mutable.sourceOperationId = createId;
+    expect(await staleRequest).toEqual({ kind: "unknown" });
     publication.setFenceCurrent(false);
     expect(await read()).toEqual({ kind: "unknown" });
     publication.setFenceCurrent(true);
+    publication.failAfterFenceChecks(2);
+    expect(await read()).toEqual({ kind: "unknown" });
+    publication.failAfterFenceChecks(null);
     expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
       kind: "confirmed",
       identity: null,

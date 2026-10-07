@@ -3225,12 +3225,18 @@ export async function openWorkerdWorkerRuntimeOwner(
 
   const observeActorGraph: WorkerdWorkerRuntimeOwner["observeActorGraph"] = async (input) => {
     const unknown = { kind: "unknown" } as const;
+    // Capture caller-owned fields before any serial-lane wait or SQL/native await.
+    const target = {
+      workerResourceUid: input.workerResourceUid,
+      targetKey: input.targetKey,
+      sourceOperationId: input.sourceOperationId,
+    };
     const source = options.publicationState.resolveCurrentServing;
     if (
       !source ||
-      input.workerResourceUid !== options.workerResourceUid ||
-      input.targetKey !== options.targetKey ||
-      !OPERATION_ID.test(input.sourceOperationId)
+      target.workerResourceUid !== options.workerResourceUid ||
+      target.targetKey !== options.targetKey ||
+      !OPERATION_ID.test(target.sourceOperationId)
     )
       return unknown;
 
@@ -3238,14 +3244,14 @@ export async function openWorkerdWorkerRuntimeOwner(
     // currentness callback may itself consult the owner in a binding path.
     const captured = await runSerial(async () => {
       const incarnation = active;
-      const record = recordFor(input.sourceOperationId);
+      const record = recordFor(target.sourceOperationId);
       if (
         closed ||
         suspending ||
         admissionClosedBy !== null ||
         !incarnation ||
-        state.activeOperationId !== input.sourceOperationId ||
-        incarnation.record.operationId !== input.sourceOperationId ||
+        state.activeOperationId !== target.sourceOperationId ||
+        incarnation.record.operationId !== target.sourceOperationId ||
         record?.status !== "active" ||
         !record.processIdentity ||
         !record.configurationSha256 ||
@@ -3253,28 +3259,28 @@ export async function openWorkerdWorkerRuntimeOwner(
         record.configurationSha256 !== incarnation.group.configurationSha256 ||
         !record.identity ||
         record.identity.workerResourceUid !== options.workerResourceUid ||
-        sourceOperationIdFromIdentity(record.identity) !== input.sourceOperationId ||
+        sourceOperationIdFromIdentity(record.identity) !== target.sourceOperationId ||
         !incarnation.group.isReady()
       )
         return null;
       return {
         recordKey: canonicalJson(record),
         identity: structuredClone(record.identity),
-        incarnationId: physicalIncarnationId(input.sourceOperationId, record.processIdentity),
+        incarnationId: physicalIncarnationId(target.sourceOperationId, record.processIdentity),
       };
     });
     if (!captured) return unknown;
 
     const resolution = await source({
-      workerUid: input.workerResourceUid,
-      targetKey: input.targetKey,
-      sourceOperationId: input.sourceOperationId,
+      workerUid: target.workerResourceUid,
+      targetKey: target.targetKey,
+      sourceOperationId: target.sourceOperationId,
       expectedIdentity: captured.identity,
     }).catch(() => null);
     if (
       resolution?.kind !== "ready" ||
-      resolution.snapshot.sourceOperationId !== input.sourceOperationId ||
-      resolution.snapshot.worker.uid !== input.workerResourceUid ||
+      resolution.snapshot.sourceOperationId !== target.sourceOperationId ||
+      resolution.snapshot.worker.uid !== target.workerResourceUid ||
       !resolution.snapshot.deployment ||
       !(await resolution.stillCurrent().catch(() => false))
     )
@@ -3282,12 +3288,12 @@ export async function openWorkerdWorkerRuntimeOwner(
 
     const currentOwner = () => {
       const incarnation = active;
-      const record = recordFor(input.sourceOperationId);
+      const record = recordFor(target.sourceOperationId);
       return !closed &&
         !suspending &&
         admissionClosedBy === null &&
-        incarnation?.record.operationId === input.sourceOperationId &&
-        state.activeOperationId === input.sourceOperationId &&
+        incarnation?.record.operationId === target.sourceOperationId &&
+        state.activeOperationId === target.sourceOperationId &&
         record?.status === "active" &&
         canonicalJson(record) === captured.recordKey &&
         incarnation.group.isReady()
@@ -3298,11 +3304,13 @@ export async function openWorkerdWorkerRuntimeOwner(
       const current = currentOwner();
       if (!current) return null;
       const { incarnation, record } = current;
+      const processIdentity = record.processIdentity;
+      if (!processIdentity) return null;
       const copies = await inspectWorkerdWorkerExecutionCopies({
         groupDirectory: incarnation.group.runtimeRoot,
-        workerResourceUid: input.workerResourceUid,
+        workerResourceUid: target.workerResourceUid,
         listenerPort: record.listenerPort,
-        scriptName: scriptName(input.workerResourceUid),
+        scriptName: scriptName(target.workerResourceUid),
       }).catch(() => null);
       if (
         !copies ||
@@ -3311,15 +3319,20 @@ export async function openWorkerdWorkerRuntimeOwner(
           (version) => !copies.versionUids.includes(version.workerVersionUid),
         ) ||
         (await incarnation.runtime.observeExactPublication?.(
-          scriptName(input.workerResourceUid),
+          scriptName(target.workerResourceUid),
           captured.identity,
-        )) !== "matches"
+        )) !== "matches" ||
+        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) !== "live" ||
+        (await workerPortOwnership(record.listenerPort, processIdentity.pid).catch(
+          () => "foreign",
+        )) !== "owned" ||
+        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) !== "live"
       )
         return null;
       const native = await readWorkerdActiveActorGraph(
         incarnation.group.runtimeRoot,
-        scriptName(input.workerResourceUid),
-        input.workerResourceUid,
+        scriptName(target.workerResourceUid),
+        target.workerResourceUid,
       ).catch(() => null);
       if (
         !native ||
@@ -3339,19 +3352,26 @@ export async function openWorkerdWorkerRuntimeOwner(
     if (!graph || !(await resolution.stillCurrent().catch(() => false))) return unknown;
     const finalOwner = await runSerial(async () => {
       const current = currentOwner();
+      const processIdentity = current?.record.processIdentity;
       return (
         current &&
+        processIdentity &&
         (await current.incarnation.runtime.observeExactPublication?.(
-          scriptName(input.workerResourceUid),
+          scriptName(target.workerResourceUid),
           captured.identity,
         )) === "matches" &&
+        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) === "live" &&
+        (await workerPortOwnership(current.record.listenerPort, processIdentity.pid).catch(
+          () => "foreign",
+        )) === "owned" &&
+        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) === "live" &&
         currentOwner() !== null
       );
     });
-    if (!finalOwner) return unknown;
+    if (!finalOwner || !(await resolution.stillCurrent().catch(() => false))) return unknown;
     return {
       kind: "ready",
-      sourceOperationId: input.sourceOperationId,
+      sourceOperationId: target.sourceOperationId,
       incarnationId: captured.incarnationId,
       identity: captured.identity,
       graph,
