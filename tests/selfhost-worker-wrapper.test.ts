@@ -2290,6 +2290,73 @@ test("generic and private KV bindings use their own services in one Worker", asy
   }
 });
 
+test("private v2 KV preserves EdgeKV argument TypeErrors without changing legacy KV behavior", async () => {
+  const genericService = {
+    async fetch(_url: string, init: RequestInit) {
+      const request = JSON.parse(String(init.body)) as { op: string };
+      return Response.json({
+        ok: true,
+        value: request.op === "get" ? { found: false } : request.op === "list" ? { keys: [], listComplete: true } : {},
+      });
+    },
+  };
+  const privateService = {
+    async fetch(_url: string, init: RequestInit) {
+      const request = JSON.parse(String(init.body)) as { op: string };
+      return Response.json({
+        ok: true,
+        value: request.op === "get" ? { found: false } : request.op === "list" ? { keys: [], listComplete: true } : {},
+      });
+    },
+  };
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const errors = {};
+       const record = async (name, run) => {
+         try { await run(); errors[name] = "resolved"; }
+         catch (error) { errors[name] = error.name; }
+       };
+       await record("privateMetadataType", () => env.CACHE.put("k", "v", { metadata: "no" }));
+       await record("privateListLimitType", () => env.CACHE.list({ limit: "10" }));
+       await record("privateExtraGetArgument", () => env.CACHE.get("k", "ignored"));
+       await record("legacyMetadataType", () => env.LEGACY.put("k", "v", { metadata: "no" }));
+       await record("legacyExtraGetArgument", () => env.LEGACY.get("k", "ignored"));
+       return Response.json(errors);
+     } };`,
+    {
+      ...KV_ONLY,
+      publication: "private-kv-types",
+      bindings: [
+        { kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND, publicName: "LEGACY" },
+        {
+          kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
+          publicName: "CACHE",
+          internalName: WORKERD_V2_PRIVATE_KV_BINDING,
+        },
+      ],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(genericService, {
+        [WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING]: genericService,
+        [WORKERD_V2_PRIVATE_KV_BINDING]: privateService,
+      }),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      privateMetadataType: "TypeError",
+      privateListLimitType: "TypeError",
+      privateExtraGetArgument: "TypeError",
+      legacyMetadataType: "invalid_value",
+      legacyExtraGetArgument: "resolved",
+    });
+  } finally {
+    await generated.dispose();
+  }
+});
+
 test("a partial answer the plane could not have written is a backend failure", async () => {
   // The managed adapter refuses these three, and so does this one: a
   // zero-length window is not a range anything asked for, a suffix is a field

@@ -1010,7 +1010,7 @@ function projectEnv(rawEnv) {
       }
       projected[descriptor.publicName] =
         descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_KV_BINDING_KIND)}
-          ? createKvAdapter(call, descriptor.publicName)
+          ? createKvAdapter(call, descriptor.publicName, descriptor.internalName !== undefined)
           : descriptor.kind === ${JSON.stringify(SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND)}
             ? createQueueAdapter(call, descriptor.publicName)
             : descriptor.kind === VECTOR_KIND
@@ -2475,25 +2475,31 @@ function planeRequest(binding, op) {
   return payload;
 }
 
-function createKvAdapter(call, binding) {
+function createKvAdapter(call, binding, strictTypes) {
   const portable = SafeObjectCreate(null);
-  portable.get = async (key) => {
-    const found = await kvRead(call, binding, key, "get");
+  portable.get = async (...args) => {
+    if (strictTypes && args.length !== 1) throw new SafeTypeError("Invalid EdgeKV arguments");
+    const found = await kvRead(call, binding, args[0], "get", strictTypes);
     return found === null ? null : found.value;
   };
-  portable.getWithMetadata = async (key) => {
-    const found = await kvRead(call, binding, key, "getWithMetadata");
+  portable.getWithMetadata = async (...args) => {
+    if (strictTypes && args.length !== 1) throw new SafeTypeError("Invalid EdgeKV arguments");
+    const found = await kvRead(call, binding, args[0], "getWithMetadata", strictTypes);
     if (found === null) return null;
     const result = SafeObjectCreate(null);
     result.value = found.value;
     if (found.metadata !== undefined) result.metadata = found.metadata;
     return result;
   };
-  portable.put = async (key, value, options) => {
-    validateKey(key, MAX_KV_KEY_BYTES);
-    const bytes = runtimeBytes(value, "invalid_value");
+  portable.put = async (...args) => {
+    if (strictTypes && (args.length < 2 || args.length > 3)) {
+      throw new SafeTypeError("Invalid EdgeKV arguments");
+    }
+    const [key, value, options] = args;
+    validateKey(key, MAX_KV_KEY_BYTES, strictTypes);
+    const bytes = runtimeBytes(value, "invalid_value", strictTypes);
     if (viewByteLength(bytes) > MAX_KV_VALUE_BYTES) throw portableError("value_too_large");
-    const normalized = validateKvPutOptions(options);
+    const normalized = validateKvPutOptions(options, strictTypes);
     const payload = planeRequest(binding, "put");
     payload.key = key;
     payload.value = encodeBase64(bytes);
@@ -2504,15 +2510,19 @@ function createKvAdapter(call, binding) {
     const value_ = await call(KV_URL, payload, KV_ERROR_CODES);
     if (!isRecord(value_) || !exactKeys(value_, [])) throw portableError("backend_unavailable");
   };
-  portable.delete = async (key) => {
-    validateKey(key, MAX_KV_KEY_BYTES);
+  portable.delete = async (...args) => {
+    if (strictTypes && args.length !== 1) throw new SafeTypeError("Invalid EdgeKV arguments");
+    const [key] = args;
+    validateKey(key, MAX_KV_KEY_BYTES, strictTypes);
     const payload = planeRequest(binding, "delete");
     payload.key = key;
     const value = await call(KV_URL, payload, KV_ERROR_CODES);
     if (!isRecord(value) || !exactKeys(value, [])) throw portableError("backend_unavailable");
   };
-  portable.list = async (options) => {
-    const normalized = validateKvListOptions(options);
+  portable.list = async (...args) => {
+    if (strictTypes && args.length > 1) throw new SafeTypeError("Invalid EdgeKV arguments");
+    const [options] = args;
+    const normalized = validateKvListOptions(options, strictTypes);
     const payload = planeRequest(binding, "list");
     if (normalized.prefix !== undefined) payload.prefix = normalized.prefix;
     if (normalized.cursor !== undefined) payload.cursor = normalized.cursor;
@@ -2548,8 +2558,8 @@ function createKvAdapter(call, binding) {
   return portable;
 }
 
-async function kvRead(call, binding, key, op) {
-  validateKey(key, MAX_KV_KEY_BYTES);
+async function kvRead(call, binding, key, op, strictTypes) {
+  validateKey(key, MAX_KV_KEY_BYTES, strictTypes);
   const payload = planeRequest(binding, op);
   payload.key = key;
   const value = await call(KV_URL, payload, KV_ERROR_CODES);
@@ -2695,13 +2705,20 @@ function projectSqlValue(value, output) {
   throw portableError(output ? "backend_unavailable" : "sql_error");
 }
 
-function validateKvPutOptions(options) {
+function validateKvPutOptions(options, strictTypes) {
   if (options === undefined) return SafeObjectCreate(null);
-  if (!isRecord(options) || !onlyKeys(options, ["expirationTtlSeconds", "metadata"])) {
+  if (
+    !(strictTypes ? isPlainRecord(options) : isRecord(options)) ||
+    !onlyKeys(options, ["expirationTtlSeconds", "metadata"])
+  ) {
+    if (strictTypes) throw new SafeTypeError("Invalid EdgeKV options");
     throw portableError("invalid_value");
   }
   const result = SafeObjectCreate(null);
   if (options.expirationTtlSeconds !== undefined) {
+    if (strictTypes && typeof options.expirationTtlSeconds !== "number") {
+      throw new SafeTypeError("Invalid EdgeKV expirationTtlSeconds");
+    }
     if (
       !SafeNumberIsSafeInteger(options.expirationTtlSeconds) ||
       options.expirationTtlSeconds < 60 ||
@@ -2712,8 +2729,11 @@ function validateKvPutOptions(options) {
     result.expirationTtlSeconds = options.expirationTtlSeconds;
   }
   if (options.metadata !== undefined) {
-    if (!isRecord(options.metadata)) throw portableError("invalid_value");
-    const metadata = projectStringRecord(options.metadata);
+    if (!(strictTypes ? isPlainRecord(options.metadata) : isRecord(options.metadata))) {
+      if (strictTypes) throw new SafeTypeError("Invalid EdgeKV metadata");
+      throw portableError("invalid_value");
+    }
+    const metadata = projectStringRecord(options.metadata, strictTypes);
     if (utf8Length(SafeJSONStringify(metadata)) > MAX_KV_METADATA_BYTES) {
       throw portableError("metadata_too_large");
     }
@@ -2722,23 +2742,37 @@ function validateKvPutOptions(options) {
   return result;
 }
 
-function validateKvListOptions(options) {
+function validateKvListOptions(options, strictTypes) {
   if (options === undefined) return SafeObjectCreate(null);
-  if (!isRecord(options) || !onlyKeys(options, ["prefix", "cursor", "limit"])) {
+  if (
+    !(strictTypes ? isPlainRecord(options) : isRecord(options)) ||
+    !onlyKeys(options, ["prefix", "cursor", "limit"])
+  ) {
+    if (strictTypes) throw new SafeTypeError("Invalid EdgeKV list options");
     throw portableError("invalid_argument");
   }
   const result = SafeObjectCreate(null);
   if (options.prefix !== undefined) {
-    if (typeof options.prefix !== "string" || utf8Length(options.prefix) > MAX_KV_KEY_BYTES) {
+    if (typeof options.prefix !== "string") {
+      if (strictTypes) throw new SafeTypeError("Invalid EdgeKV prefix");
+      throw portableError("invalid_key");
+    }
+    if (utf8Length(options.prefix) > MAX_KV_KEY_BYTES) {
       throw portableError("invalid_key");
     }
     result.prefix = options.prefix;
   }
   if (options.cursor !== undefined) {
+    if (strictTypes && typeof options.cursor !== "string") {
+      throw new SafeTypeError("Invalid EdgeKV cursor");
+    }
     if (!boundedText(options.cursor, 4096)) throw portableError("invalid_cursor");
     result.cursor = options.cursor;
   }
   if (options.limit !== undefined) {
+    if (strictTypes && typeof options.limit !== "number") {
+      throw new SafeTypeError("Invalid EdgeKV limit");
+    }
     if (!SafeNumberIsSafeInteger(options.limit) || options.limit < 1 || options.limit > 1000) {
       throw portableError("invalid_argument");
     }
@@ -2747,7 +2781,7 @@ function validateKvListOptions(options) {
   return result;
 }
 
-function runtimeBytes(value, code) {
+function runtimeBytes(value, code, strictTypes) {
   if (typeof value === "string") return SafeApply(SafeTextEncoderEncode, encoder, [value]);
   try { return new SafeUint8Array(SafeApply(SafeArrayBufferSlice, value, [0])); } catch {}
   if (SafeArrayBufferIsView(value)) {
@@ -2761,10 +2795,14 @@ function runtimeBytes(value, code) {
         buffer = SafeApply(SafeDataViewBufferGet, value, []);
         byteOffset = SafeApply(SafeDataViewByteOffsetGet, value, []);
         byteLength = SafeApply(SafeDataViewByteLengthGet, value, []);
-      } catch { throw portableError(code); }
+      } catch {
+        if (strictTypes) throw new SafeTypeError("Invalid EdgeKV value");
+        throw portableError(code);
+      }
     }
     return new SafeUint8Array(SafeApply(SafeArrayBufferSlice, buffer, [byteOffset, byteOffset + byteLength]));
   }
+  if (strictTypes) throw new SafeTypeError("Invalid EdgeKV value");
   throw portableError(code);
 }
 
@@ -2846,8 +2884,11 @@ function base64Sextet(code) {
 // Metadata that is the wrong kind of thing is invalid_value; only too much of
 // it is metadata_too_large. Answering a size refusal to a one-member record
 // whose value is a number sends the caller to shrink what is already small.
-function projectStringRecord(value) {
-  if (!isRecord(value)) throw portableError("invalid_value");
+function projectStringRecord(value, strictTypes) {
+  if (!(strictTypes ? isPlainRecord(value) : isRecord(value))) {
+    if (strictTypes) throw new SafeTypeError("Invalid EdgeKV metadata");
+    throw portableError("invalid_value");
+  }
   const keys = SafeObjectKeys(value);
   sortStrings(keys);
   if (SafeOwnKeys(value).length !== keys.length) throw portableError("invalid_value");
@@ -2856,7 +2897,10 @@ function projectStringRecord(value) {
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index];
     const item = value[key];
-    if (typeof item !== "string") throw portableError("invalid_value");
+    if (typeof item !== "string") {
+      if (strictTypes) throw new SafeTypeError("Invalid EdgeKV metadata value");
+      throw portableError("invalid_value");
+    }
     if (key.length > 256 || item.length > 8192) {
       throw portableError("metadata_too_large");
     }
@@ -2877,7 +2921,10 @@ function sortStrings(values) {
   }
 }
 
-function validateKey(value, maximum) {
+function validateKey(value, maximum, strictTypes) {
+  if (strictTypes && typeof value !== "string") {
+    throw new SafeTypeError("Invalid EdgeKV key");
+  }
   if (!boundedUtf8(value, maximum)) throw portableError("invalid_key");
 }
 
