@@ -60,7 +60,8 @@ const PREVIOUS_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@2";
 const RETIRED_COPIES_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@3";
 const CLEANUP_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@4";
 const ROUTE_RECEIPT_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@5";
-const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@6";
+const PROCESS_PIN_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@6";
+const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@7";
 const LOCK_SCHEMA = "takoserver.v2-worker-runtime-owner-lock@2";
 const OPERATION_MARKER = "takoserver-v2-operation:";
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -110,6 +111,8 @@ interface IncarnationRecord {
   readonly processIdentity: LinuxProcessIdentity | null;
   /** Exact config bytes pinned when this incarnation became active. */
   readonly configurationSha256: string | null;
+  /** Recovery is re-rendering the same accepted graph with a new private readiness token. */
+  readonly configurationRefreshPending: boolean;
   readonly identity: WorkerdPublicationIdentity | null;
   readonly receipt: WorkerdWorkerRetirementReceipt | null;
 }
@@ -521,15 +524,23 @@ async function requireExactEntries(path: string, expected: readonly string[]): P
 
 async function verifyKnownGroupContents(
   groupDirectory: string,
-  status: IncarnationStatus,
+  record: IncarnationRecord,
 ): Promise<void> {
   const entries = await readdir(groupDirectory).catch(() => {
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   });
-  const retired = status === "retired";
-  const allowed = retired
-    ? new Set(["group.json", "retirement.json", "workers", "assets", ".retired-execution-copies"])
-    : new Set(["group.json", "workers", "assets"]);
+  const retired = record.status === "retired";
+  const draining = record.status === "draining";
+  const allowed =
+    retired || draining
+      ? new Set([
+          "group.json",
+          "retirement.json",
+          "workers",
+          "assets",
+          ...(retired || record.executionCopiesCleanupStarted ? [".retired-execution-copies"] : []),
+        ])
+      : new Set(["group.json", "workers", "assets"]);
   if (
     !entries.includes("group.json") ||
     !entries.includes("workers") ||
@@ -606,7 +617,7 @@ async function verifyOwnerNamespace(
     await requireExactEntries(groupsRoot, [workerKey]);
     const groupDirectory = join(groupsRoot, workerKey);
     await requirePrivateDirectory(groupDirectory);
-    await verifyKnownGroupContents(groupDirectory, record.status);
+    await verifyKnownGroupContents(groupDirectory, record);
   }
 }
 
@@ -750,8 +761,12 @@ function recoverableIncarnationSet(state: PersistedOwnerState): boolean {
       record.identity !== null &&
       record.processIdentity !== null &&
       record.configurationSha256 !== null &&
-      record.receipt === null &&
-      (record.status !== "draining" || record.retirementOperationId !== null)
+      (record.status === "active"
+        ? record.receipt === null && !record.executionCopiesCleanupStarted
+        : record.retirementOperationId !== null &&
+          (record.executionCopiesCleanupStarted
+            ? record.receipt !== null && record.executionCopiesCleanupManifestSha256 !== null
+            : record.receipt === null))
     );
   });
 }
@@ -1077,6 +1092,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
     const retiredCopiesState = state.schema === RETIRED_COPIES_STATE_SCHEMA;
     const cleanupState = state.schema === CLEANUP_STATE_SCHEMA;
     const routeReceiptState = state.schema === ROUTE_RECEIPT_STATE_SCHEMA;
+    const processPinState = state.schema === PROCESS_PIN_STATE_SCHEMA;
     const currentState = state.schema === STATE_SCHEMA;
     if (
       (!legacyStaticState &&
@@ -1084,12 +1100,13 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         !retiredCopiesState &&
         !cleanupState &&
         !routeReceiptState &&
+        !processPinState &&
         !currentState) ||
       state.workerResourceUid !== workerResourceUid ||
       !(state.activeOperationId === null || typeof state.activeOperationId === "string") ||
       !(state.admissionClosedBy === null || typeof state.admissionClosedBy === "string") ||
       typeof state.deletionPublicationConfirmed !== "boolean" ||
-      (routeReceiptState || currentState
+      (routeReceiptState || processPinState || currentState
         ? !(
             state.endpointRouteAbsence === null ||
             validEndpointRouteAbsence(state.endpointRouteAbsence)
@@ -1118,20 +1135,20 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         (legacyStaticState
           ? item.deferRetirementUntilDeadline !== undefined
           : typeof item.deferRetirementUntilDeadline !== "boolean") ||
-        (retiredCopiesState || cleanupState || routeReceiptState || currentState
+        (retiredCopiesState || cleanupState || routeReceiptState || processPinState || currentState
           ? typeof item.executionCopiesReleased !== "boolean"
           : item.executionCopiesReleased !== undefined) ||
-        (cleanupState || routeReceiptState || currentState
+        (cleanupState || routeReceiptState || processPinState || currentState
           ? typeof item.executionCopiesCleanupStarted !== "boolean"
           : item.executionCopiesCleanupStarted !== undefined) ||
-        (cleanupState || routeReceiptState || currentState
+        (cleanupState || routeReceiptState || processPinState || currentState
           ? !(
               item.executionCopiesCleanupManifestSha256 === null ||
               (typeof item.executionCopiesCleanupManifestSha256 === "string" &&
                 /^sha256:[0-9a-f]{64}$/u.test(item.executionCopiesCleanupManifestSha256))
             )
           : item.executionCopiesCleanupManifestSha256 !== undefined) ||
-        (currentState
+        (processPinState || currentState
           ? !(
               item.processIdentity === null || validLinuxProcessIdentityRecord(item.processIdentity)
             ) ||
@@ -1141,6 +1158,14 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                 /^[0-9a-f]{64}$/u.test(item.configurationSha256))
             )
           : item.processIdentity !== undefined || item.configurationSha256 !== undefined) ||
+        (currentState
+          ? typeof item.configurationRefreshPending !== "boolean"
+          : item.configurationRefreshPending !== undefined) ||
+        (currentState &&
+          item.configurationRefreshPending === true &&
+          (item.status !== "active" ||
+            item.processIdentity === null ||
+            item.configurationSha256 === null)) ||
         !(item.identity === null || validIdentity(item.identity)) ||
         !(item.receipt === null || validReceipt(item.receipt))
       ) {
@@ -1162,23 +1187,28 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
           ? false
           : (item.deferRetirementUntilDeadline as boolean),
         executionCopiesReleased:
-          retiredCopiesState || cleanupState || routeReceiptState || currentState
+          retiredCopiesState || cleanupState || routeReceiptState || processPinState || currentState
             ? (item.executionCopiesReleased as boolean)
             : false,
         executionCopiesCleanupStarted:
-          cleanupState || routeReceiptState || currentState
+          cleanupState || routeReceiptState || processPinState || currentState
             ? (item.executionCopiesCleanupStarted as boolean)
             : retiredCopiesState
               ? (item.executionCopiesReleased as boolean)
               : false,
         executionCopiesCleanupManifestSha256:
-          cleanupState || routeReceiptState || currentState
+          cleanupState || routeReceiptState || processPinState || currentState
             ? (item.executionCopiesCleanupManifestSha256 as string | null)
             : null,
-        processIdentity: currentState
-          ? (item.processIdentity as LinuxProcessIdentity | null)
-          : null,
-        configurationSha256: currentState ? (item.configurationSha256 as string | null) : null,
+        processIdentity:
+          processPinState || currentState
+            ? (item.processIdentity as LinuxProcessIdentity | null)
+            : null,
+        configurationSha256:
+          processPinState || currentState ? (item.configurationSha256 as string | null) : null,
+        configurationRefreshPending: currentState
+          ? (item.configurationRefreshPending as boolean)
+          : false,
       } as unknown as IncarnationRecord);
     }
     const result: PersistedOwnerState = {
@@ -1188,7 +1218,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
       admissionClosedBy: state.admissionClosedBy as string | null,
       deletionPublicationConfirmed: state.deletionPublicationConfirmed,
       endpointRouteAbsence:
-        routeReceiptState || currentState
+        routeReceiptState || processPinState || currentState
           ? (state.endpointRouteAbsence as V2EndpointRouteAbsentReceipt | null)
           : null,
       incarnations,
@@ -1202,7 +1232,11 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
             (item) =>
               item.status !== "retired" ||
               item.receipt === null ||
-              ((retiredCopiesState || cleanupState || routeReceiptState || currentState) &&
+              ((retiredCopiesState ||
+                cleanupState ||
+                routeReceiptState ||
+                processPinState ||
+                currentState) &&
                 !item.executionCopiesReleased),
           ))) ||
       (result.endpointRouteAbsence !== null &&
@@ -1252,6 +1286,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
               executionCopiesCleanupManifestSha256: _cleanupManifestSha256,
               processIdentity: _processIdentity,
               configurationSha256: _configurationSha256,
+              configurationRefreshPending: _refreshPending,
               ...item
             }) => item,
           ),
@@ -1270,6 +1305,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                 executionCopiesCleanupManifestSha256: _cleanupManifestSha256,
                 processIdentity: _processIdentity,
                 configurationSha256: _configurationSha256,
+                configurationRefreshPending: _refreshPending,
                 ...item
               }) => item,
             ),
@@ -1287,6 +1323,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                   executionCopiesCleanupManifestSha256: _cleanupManifestSha256,
                   processIdentity: _processIdentity,
                   configurationSha256: _configurationSha256,
+                  configurationRefreshPending: _refreshPending,
                   ...item
                 }) => item,
               ),
@@ -1303,26 +1340,40 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                   ({
                     processIdentity: _processIdentity,
                     configurationSha256: _configurationSha256,
+                    configurationRefreshPending: _refreshPending,
                     ...item
                   }) => item,
                 ),
               }
-            : cleanupState
+            : processPinState
               ? {
-                  schema: CLEANUP_STATE_SCHEMA,
+                  schema: PROCESS_PIN_STATE_SCHEMA,
                   workerResourceUid: state.workerResourceUid,
                   activeOperationId: state.activeOperationId,
                   admissionClosedBy: state.admissionClosedBy,
                   deletionPublicationConfirmed: state.deletionPublicationConfirmed,
+                  endpointRouteAbsence: result.endpointRouteAbsence,
                   incarnations: incarnations.map(
-                    ({
-                      processIdentity: _processIdentity,
-                      configurationSha256: _configurationSha256,
-                      ...item
-                    }) => item,
+                    ({ configurationRefreshPending: _refreshPending, ...item }) => item,
                   ),
                 }
-              : result;
+              : cleanupState
+                ? {
+                    schema: CLEANUP_STATE_SCHEMA,
+                    workerResourceUid: state.workerResourceUid,
+                    activeOperationId: state.activeOperationId,
+                    admissionClosedBy: state.admissionClosedBy,
+                    deletionPublicationConfirmed: state.deletionPublicationConfirmed,
+                    incarnations: incarnations.map(
+                      ({
+                        processIdentity: _processIdentity,
+                        configurationSha256: _configurationSha256,
+                        configurationRefreshPending: _refreshPending,
+                        ...item
+                      }) => item,
+                    ),
+                  }
+                : result;
     if (canonicalJson(canonicalState) !== text) throw new Error();
     return result;
   } catch {
@@ -1498,7 +1549,8 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
     if (hasServingIncarnations) await requireStaleIncarnationChildrenAndVacantListeners(state);
   } catch (error) {
-    await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
+    if (!ownerLock.recoveredFromStaleOwner)
+      await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
     if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
@@ -1641,7 +1693,8 @@ export async function openWorkerdWorkerRuntimeOwner(
       }
     }
   } catch (error) {
-    await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
+    if (!ownerLock.recoveredFromStaleOwner)
+      await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
     if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
@@ -1860,6 +1913,29 @@ export async function openWorkerdWorkerRuntimeOwner(
     if (processIdentity.pid !== child.pid) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
+    const spawningRecord = recordFor(operationId);
+    let refreshedDigest: string | null = null;
+    if (spawningRecord?.configurationRefreshPending) {
+      const groupDirectory = join(
+        incarnationDirectory(operationId),
+        "groups",
+        uidKey(options.workerResourceUid),
+      );
+      const config = await readFile(join(groupDirectory, "workers", "workerd.capnp"));
+      const manifest = JSON.parse(
+        await readFile(join(groupDirectory, "group.json"), "utf8"),
+      ) as Record<string, unknown>;
+      const digest = createHash("sha256").update(config).digest("hex");
+      if (
+        manifest.schema !== "takoserver.workerd-worker-group@1" ||
+        manifest.workerResourceUid !== options.workerResourceUid ||
+        manifest.listenerPort !== spawningRecord.listenerPort ||
+        manifest.configurationSha256 !== digest
+      ) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      refreshedDigest = digest;
+    }
     await updateRecord(operationId, (current) => {
       if (
         current.status !== "candidate" &&
@@ -1868,7 +1944,13 @@ export async function openWorkerdWorkerRuntimeOwner(
       ) {
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       }
-      return { ...current, processIdentity };
+      return {
+        ...current,
+        processIdentity,
+        ...(refreshedDigest === null
+          ? {}
+          : { configurationSha256: refreshedDigest, configurationRefreshPending: false }),
+      };
     });
   };
 
@@ -1892,6 +1974,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       executionCopiesCleanupManifestSha256: null,
       processIdentity: null,
       configurationSha256: null,
+      configurationRefreshPending: false,
       identity: null,
       receipt: null,
     };
@@ -1933,8 +2016,22 @@ export async function openWorkerdWorkerRuntimeOwner(
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
     const bytes = await readFile(configPath);
-    if (createHash("sha256").update(bytes).digest("hex") !== expectedDigest) {
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    if (digest !== expectedDigest && !record.configurationRefreshPending) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    if (record.configurationRefreshPending) {
+      const manifest = JSON.parse(
+        await readFile(join(groupDirectory, "group.json"), "utf8"),
+      ) as Record<string, unknown>;
+      if (
+        manifest.schema !== "takoserver.workerd-worker-group@1" ||
+        manifest.workerResourceUid !== options.workerResourceUid ||
+        manifest.listenerPort !== record.listenerPort ||
+        manifest.configurationSha256 !== digest
+      ) {
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
     }
     return Uint8Array.from(bytes);
   };
@@ -2123,7 +2220,10 @@ export async function openWorkerdWorkerRuntimeOwner(
     const group = await openExistingRecoveryGroup(activeRecord, configuration);
     recoveringGroup = group;
     const handle = makeIncarnationHandle(activeRecord, group, activeRecord.identity);
-    await group.start();
+    await updateRecord(activeRecord.operationId, (current) => ({
+      ...current,
+      configurationRefreshPending: true,
+    }));
     const restoredNames = await handle.runtime.restore();
     const nativeProof = await handle.runtime.observeExactPublication?.(
       scriptName(options.workerResourceUid),
@@ -2141,7 +2241,12 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
     group.sealConfiguration();
     const recoveredRecord = recordFor(activeRecord.operationId);
-    if (!recoveredRecord?.processIdentity) {
+    if (
+      !recoveredRecord?.processIdentity ||
+      !recoveredRecord.configurationSha256 ||
+      recoveredRecord.configurationRefreshPending ||
+      recoveredRecord.configurationSha256 !== group.configurationSha256
+    ) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
     handle.record = recoveredRecord;
@@ -2849,21 +2954,21 @@ export async function openWorkerdWorkerRuntimeOwner(
       // A failed recovery must never leave a newly started child serving. The
       // recovery group stops only the exact child it spawned and retains all
       // immutable owner custody for a later safe attempt.
-      let safeToReleaseLock = true;
       const operationId = state.activeOperationId;
       const failedRecoveryGroup = recoveringGroup as WorkerdWorkerExecutionGroup | null;
       if (failedRecoveryGroup && operationId) {
         try {
           await failedRecoveryGroup.stopAfterFailedRecovery();
         } catch {
-          safeToReleaseLock = false;
+          // The child or listener is still unknown. The live successor lock
+          // remains the only proof that this process owns the attempted recovery.
         }
         handles.delete(operationId);
         active = null;
       }
-      if (safeToReleaseLock) {
-        await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
-      }
+      // An active record can never be reopened through the no-lock path. Keep
+      // this successor lock (and its PID fingerprint) even when failure was
+      // transient; a later Host may retry only after this PID is proven stale.
       if (error instanceof WorkerdWorkerRuntimeOwnerError) throw error;
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }

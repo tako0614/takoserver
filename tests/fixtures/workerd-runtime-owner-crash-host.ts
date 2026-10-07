@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { bytesDigest, canonicalJson } from "../../src/json.ts";
@@ -164,6 +165,13 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
     } as V2WorkerPublicationResolution;
   },
   async resolveCurrentServing(input) {
+    if (mode === "active-recover-sql-unavailable") {
+      return {
+        kind: "unresolved",
+        code: "fixture_sql_unavailable",
+        message: "injected current-serving lookup failure",
+      };
+    }
     const current = await readCurrentServing();
     if (
       !current ||
@@ -177,6 +185,8 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
       };
     }
     const parsedSpec = parseWorkerDeploymentSpec(current.spec);
+    const originalChildPid =
+      mode === "active-recover-reject-after-spawn" ? await readActiveChildPid() : null;
     const snapshot = {
       sourceOperationId: current.sourceOperationId,
       worker: {
@@ -216,7 +226,10 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
     };
     const stillCurrent = async () => {
       const reread = await readCurrentServing();
-      return canonicalJson(reread) === canonicalJson(current);
+      return (
+        canonicalJson(reread) === canonicalJson(current) &&
+        (originalChildPid === null || (await readActiveChildPid()) === originalChildPid)
+      );
     };
     return {
       kind: "ready" as const,
@@ -225,6 +238,22 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
     };
   },
 };
+
+async function readActiveChildPid(): Promise<number | null> {
+  const uidHash = createHash("sha256")
+    .update(workerResourceUid as string)
+    .digest("hex");
+  const state = JSON.parse(
+    await readFile(join(rootDirectory as string, uidHash, "runtime-owner.json"), "utf8"),
+  ) as {
+    activeOperationId: string | null;
+    incarnations: { operationId: string; processIdentity: { pid: number } | null }[];
+  };
+  return (
+    state.incarnations.find((item) => item.operationId === state.activeOperationId)?.processIdentity
+      ?.pid ?? null
+  );
+}
 
 function execution(operationId: string, action: V2Execution["action"]): V2Execution {
   return {
@@ -250,6 +279,7 @@ function execution(operationId: string, action: V2Execution["action"]): V2Execut
 }
 
 let owner: Awaited<ReturnType<typeof openWorkerdWorkerRuntimeOwner>> | undefined;
+let _heldResponse: Response | undefined;
 let phase = "open-owner";
 try {
   owner = await openWorkerdWorkerRuntimeOwner({
@@ -260,8 +290,10 @@ try {
     workerdBinary,
     listenerPortForOperation: async (operationId) =>
       operationId === createId ? port : await sparePort(),
-    spawn: (command) =>
-      spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" }),
+    spawn: (command) => {
+      if (mode === "active-recover-fail-before-spawn") throw new Error("injected spawn failure");
+      return spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" });
+    },
   });
   phase = "owner-opened";
 } catch (error) {
@@ -271,12 +303,18 @@ try {
   process.stdout.write(
     `${JSON.stringify({ kind: "error", code, detail, phase, pid: process.pid, port })}\n`,
   );
-  process.exitCode = 2;
+  if (mode === "active-recover-reject-after-spawn") setInterval(() => undefined, 60_000);
+  else process.exitCode = 2;
 }
 
 if (owner)
   try {
-    if (mode === "retire" || mode === "empty-delete" || mode === "active-create") {
+    if (
+      mode === "retire" ||
+      mode === "empty-delete" ||
+      mode === "active-create" ||
+      mode === "active-update-draining"
+    ) {
       if (mode === "retire") {
         if (!createId) throw new Error("create operation ID missing");
         const created = await owner.execute(execution(createId, "create"));
@@ -284,7 +322,7 @@ if (owner)
           throw new Error(`fixture create was not confirmed: ${JSON.stringify(created)}`);
         lastOperationId = createId;
       }
-      if (mode === "active-create") {
+      if (mode === "active-create" || mode === "active-update-draining") {
         if (!createId) throw new Error("create operation ID missing");
         const created = await owner.execute(execution(createId, "create"));
         if (created.kind !== "confirmed" || created.identity === null)
@@ -301,45 +339,71 @@ if (owner)
           }),
           { mode: 0o600 },
         );
+        if (mode === "active-update-draining") {
+          if (!updateId) throw new Error("update operation ID missing");
+          _heldResponse = await owner.fetch(new Request("http://worker.fixture.test/"));
+          const updated = await owner.execute(execution(updateId, "update"));
+          if (updated.kind !== "confirmed" || updated.identity === null)
+            throw new Error(`fixture update was not confirmed: ${JSON.stringify(updated)}`);
+          const updatedResponse = await owner.fetch(new Request("http://worker.fixture.test/"));
+          const updatedConfigIdentity = await updatedResponse.text();
+          await writeFile(
+            servingPath,
+            canonicalJson({
+              sourceOperationId: updateId,
+              identity: updated.identity,
+              configIdentity: updatedConfigIdentity,
+              spec: execution(updateId, "update").spec,
+            }),
+            { mode: 0o600 },
+          );
+        }
       }
-      if (mode !== "active-create") {
+      if (mode !== "active-create" && mode !== "active-update-draining") {
         const deleted = await owner.execute(execution(deleteId, "delete"));
         if (deleted.kind !== "confirmed" || deleted.identity !== null)
           throw new Error("fixture delete was not confirmed");
       }
       process.stdout.write(
-        `${JSON.stringify({ kind: mode === "retire" ? "retired" : mode === "active-create" ? "active-created" : "empty-retired", pid: process.pid, port })}\n`,
+        `${JSON.stringify({ kind: mode === "retire" ? "retired" : mode === "active-create" ? "active-created" : mode === "active-update-draining" ? "active-updated-draining" : "empty-retired", pid: process.pid, port })}\n`,
       );
-    } else if (mode === "active-recover") {
+    } else if (mode === "active-recover" || mode === "active-recover-only") {
       phase = "recover-fetch";
       const current = await readCurrentServing();
       if (!current) throw new Error("current serving fixture missing");
       const response = await owner.fetch(new Request("http://worker.fixture.test/"));
       const body = await response.text();
       if (body !== current.configIdentity) throw new Error(`recovered fetch mismatch: ${body}`);
-      if (!updateId) throw new Error("update operation ID missing");
-      phase = "recover-update";
-      const updated = await owner.execute(execution(updateId, "update"));
-      if (updated.kind !== "confirmed" || updated.identity === null)
-        throw new Error(`fixture update was not confirmed: ${JSON.stringify(updated)}`);
-      await writeFile(
-        servingPath,
-        canonicalJson({
-          sourceOperationId: updateId,
-          identity: updated.identity,
-          configIdentity: body,
-          spec: execution(updateId, "update").spec,
-        }),
-        { mode: 0o600 },
-      );
-      if (!deleteId) throw new Error("delete operation ID missing");
-      phase = "recover-delete";
-      const deleted = await owner.execute(execution(deleteId, "delete"));
-      if (deleted.kind !== "confirmed" || deleted.identity !== null)
-        throw new Error("fixture delete was not confirmed");
-      process.stdout.write(
-        `${JSON.stringify({ kind: "recovered-updated-deleted", body, pid: process.pid, port })}\n`,
-      );
+      if (mode === "active-recover-only") {
+        process.stdout.write(
+          `${JSON.stringify({ kind: "recovered-active", body, pid: process.pid, port })}\n`,
+        );
+        setInterval(() => undefined, 60_000);
+      } else {
+        if (!updateId) throw new Error("update operation ID missing");
+        phase = "recover-update";
+        const updated = await owner.execute(execution(updateId, "update"));
+        if (updated.kind !== "confirmed" || updated.identity === null)
+          throw new Error(`fixture update was not confirmed: ${JSON.stringify(updated)}`);
+        await writeFile(
+          servingPath,
+          canonicalJson({
+            sourceOperationId: updateId,
+            identity: updated.identity,
+            configIdentity: body,
+            spec: execution(updateId, "update").spec,
+          }),
+          { mode: 0o600 },
+        );
+        if (!deleteId) throw new Error("delete operation ID missing");
+        phase = "recover-delete";
+        const deleted = await owner.execute(execution(deleteId, "delete"));
+        if (deleted.kind !== "confirmed" || deleted.identity !== null)
+          throw new Error("fixture delete was not confirmed");
+        process.stdout.write(
+          `${JSON.stringify({ kind: "recovered-updated-deleted", body, pid: process.pid, port })}\n`,
+        );
+      }
     } else if (mode === "replay") {
       const replayed = await owner.execute(execution(deleteId, "delete"));
       if (replayed.kind !== "confirmed" || replayed.identity !== null)

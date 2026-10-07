@@ -1399,7 +1399,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
           configurationSha256: string | null;
         }>;
       };
-      expect(finalState.schema).toBe("takoserver.v2-worker-runtime-owner@6");
+      expect(finalState.schema).toBe("takoserver.v2-worker-runtime-owner@7");
       expect(
         finalState.incarnations.every(
           (record) =>
@@ -1434,13 +1434,14 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         delete record.executionCopiesCleanupManifestSha256;
         delete record.processIdentity;
         delete record.configurationSha256;
+        delete record.configurationRefreshPending;
       }
       await rm(join(groupRoot, ".retired-execution-copies"), { recursive: true, force: true });
       await writeFile(statePath, `${JSON.stringify(previousV2)}\n`, { mode: 0o600 });
       const migratedV2 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
       await migratedV2.close();
       expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
-        "takoserver.v2-worker-runtime-owner@6",
+        "takoserver.v2-worker-runtime-owner@7",
       );
 
       const previousV4 = JSON.parse(await Bun.file(statePath).text()) as Record<string, unknown>;
@@ -1449,6 +1450,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
       for (const record of previousV4.incarnations as Array<Record<string, unknown>>) {
         delete record.processIdentity;
         delete record.configurationSha256;
+        delete record.configurationRefreshPending;
       }
       await writeFile(statePath, `${JSON.stringify(previousV4)}\n`, { mode: 0o600 });
       const migratedV4 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
@@ -1468,6 +1470,7 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         delete record.executionCopiesCleanupManifestSha256;
         delete record.processIdentity;
         delete record.configurationSha256;
+        delete record.configurationRefreshPending;
       }
       await rm(join(groupRoot, ".retired-execution-copies"), { recursive: true, force: true });
       await writeFile(statePath, `${JSON.stringify(previousV3)}\n`, { mode: 0o600 });
@@ -1490,12 +1493,13 @@ test("owner serving observation is exact and restart resumes interrupted copy cl
         delete record.deferRetirementUntilDeadline;
         delete record.processIdentity;
         delete record.configurationSha256;
+        delete record.configurationRefreshPending;
       }
       await writeFile(statePath, `${JSON.stringify(previousV1)}\n`, { mode: 0o600 });
       const migratedV1 = await openWorkerdWorkerRuntimeOwner(ownerOptions);
       await migratedV1.close();
       expect(JSON.parse(await Bun.file(statePath).text()).schema).toBe(
-        "takoserver.v2-worker-runtime-owner@6",
+        "takoserver.v2-worker-runtime-owner@7",
       );
       expect(owned.children).toHaveLength(1);
     } finally {

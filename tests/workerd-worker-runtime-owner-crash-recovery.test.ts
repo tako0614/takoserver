@@ -6,6 +6,10 @@ import { join } from "node:path";
 import { canonicalJson } from "../src/json.ts";
 import { spawnWorkerdWithParentDeath, workerPortOwnership } from "../src/workerd-linux-process.ts";
 import type { WorkerdProcess } from "../src/workerd-supervisor.ts";
+import {
+  openWorkerdWorkerExecutionGroup,
+  verifyRetiredWorkerdWorkerExecutionCopies,
+} from "../src/workerd-worker-execution-group.ts";
 
 const WORKER_UID = "worker-crash-reopen";
 const CREATE_ID = "8f068b66-a849-4d9c-aa5a-ed4823101fc9";
@@ -68,7 +72,17 @@ async function readJsonLine(child: HostProcess): Promise<Record<string, unknown>
 }
 
 async function startHost(
-  mode: "retire" | "empty-delete" | "replay" | "active-create" | "active-recover",
+  mode:
+    | "retire"
+    | "empty-delete"
+    | "replay"
+    | "active-create"
+    | "active-recover"
+    | "active-recover-only"
+    | "active-recover-reject-after-spawn"
+    | "active-recover-fail-before-spawn"
+    | "active-recover-sql-unavailable"
+    | "active-update-draining",
   root: string,
   binary: string,
   port: number,
@@ -213,6 +227,324 @@ test("a successor host reopens and serves the exact active incarnation before up
     );
   } finally {
     if (oldHost) await terminateHost(oldHost);
+    if (successor) await terminateHost(successor);
+    await owned.cleanup();
+  }
+});
+
+test("a second successor reopens the same active graph after a rotated config was pinned", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let first: HostProcess | undefined;
+  let second: HostProcess | undefined;
+  let third: HostProcess | undefined;
+  try {
+    first = await startHost("active-create", owned.root, owned.binary, port);
+    expect(await readJsonLine(first)).toMatchObject({ kind: "active-created", port });
+    const original = await ownerState(owned.root);
+    await terminateHost(first);
+    first = undefined;
+    await waitForVacant(port);
+
+    second = await startHost("active-recover-only", owned.root, owned.binary, port);
+    expect(await readJsonLine(second)).toMatchObject({ kind: "recovered-active", port });
+    const rotated = await ownerState(owned.root);
+    const originalActive = (original.incarnations as Record<string, unknown>[]).find(
+      (item) => item.operationId === CREATE_ID,
+    );
+    const rotatedActive = (rotated.incarnations as Record<string, unknown>[]).find(
+      (item) => item.operationId === CREATE_ID,
+    );
+    expect(rotatedActive?.configurationSha256).not.toBe(originalActive?.configurationSha256);
+    expect(rotatedActive?.configurationRefreshPending).toBe(false);
+    await terminateHost(second);
+    second = undefined;
+    await waitForVacant(port);
+
+    third = await startHost("active-recover", owned.root, owned.binary, port, UPDATE_ID);
+    expect(await readJsonLine(third)).toMatchObject({ kind: "recovered-updated-deleted", port });
+  } finally {
+    if (first) await terminateHost(first);
+    if (second) await terminateHost(second);
+    if (third) await terminateHost(third);
+    await owned.cleanup();
+  }
+});
+
+test("failed successor keeps its fenced lock until dead, then a third host retries", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let first: HostProcess | undefined;
+  let failed: HostProcess | undefined;
+  let third: HostProcess | undefined;
+  try {
+    first = await startHost("active-create", owned.root, owned.binary, port);
+    expect(await readJsonLine(first)).toMatchObject({ kind: "active-created", port });
+    await terminateHost(first);
+    first = undefined;
+    await waitForVacant(port);
+
+    failed = await startHost("active-recover-reject-after-spawn", owned.root, owned.binary, port);
+    expect(await readJsonLine(failed)).toMatchObject({
+      kind: "error",
+      code: "ownership_uncertain",
+      phase: "open-owner",
+    });
+    const lock = JSON.parse(
+      await readFile(join(ownerDirectory(owned.root), "runtime-owner.lock"), "utf8"),
+    ) as { pid: number };
+    expect(lock.pid).toBe(failed.pid);
+    await waitForVacant(port);
+    await failed.exited;
+    failed = undefined;
+
+    third = await startHost("active-recover", owned.root, owned.binary, port, UPDATE_ID);
+    expect(await readJsonLine(third)).toMatchObject({ kind: "recovered-updated-deleted", port });
+  } finally {
+    if (first) await terminateHost(first);
+    if (failed) await terminateHost(failed);
+    if (third) await terminateHost(third);
+    await owned.cleanup();
+  }
+});
+
+test("transient current-serving lookup failure preserves a retryable active owner", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let first: HostProcess | undefined;
+  let failed: HostProcess | undefined;
+  let third: HostProcess | undefined;
+  try {
+    first = await startHost("active-create", owned.root, owned.binary, port);
+    expect(await readJsonLine(first)).toMatchObject({ kind: "active-created", port });
+    await terminateHost(first);
+    first = undefined;
+    await waitForVacant(port);
+
+    failed = await startHost("active-recover-sql-unavailable", owned.root, owned.binary, port);
+    expect(await readJsonLine(failed)).toMatchObject({
+      kind: "error",
+      code: "ownership_uncertain",
+      phase: "open-owner",
+    });
+    const lock = JSON.parse(
+      await readFile(join(ownerDirectory(owned.root), "runtime-owner.lock"), "utf8"),
+    ) as { pid: number };
+    expect(lock.pid).toBe(failed.pid);
+    await failed.exited;
+    failed = undefined;
+
+    third = await startHost("active-recover", owned.root, owned.binary, port, UPDATE_ID);
+    expect(await readJsonLine(third)).toMatchObject({ kind: "recovered-updated-deleted", port });
+  } finally {
+    if (first) await terminateHost(first);
+    if (failed) await terminateHost(failed);
+    if (third) await terminateHost(third);
+    await owned.cleanup();
+  }
+});
+
+test("a third host retries a refresh checkpoint left before child spawn", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let first: HostProcess | undefined;
+  let failed: HostProcess | undefined;
+  let third: HostProcess | undefined;
+  try {
+    first = await startHost("active-create", owned.root, owned.binary, port);
+    expect(await readJsonLine(first)).toMatchObject({ kind: "active-created", port });
+    await terminateHost(first);
+    first = undefined;
+    await waitForVacant(port);
+
+    failed = await startHost("active-recover-fail-before-spawn", owned.root, owned.binary, port);
+    expect(await readJsonLine(failed)).toMatchObject({
+      kind: "error",
+      code: "ownership_uncertain",
+      phase: "open-owner",
+    });
+    const checkpoint = await ownerState(owned.root);
+    const active = (checkpoint.incarnations as Record<string, unknown>[]).find(
+      (item) => item.operationId === CREATE_ID,
+    );
+    expect(active?.configurationRefreshPending).toBe(true);
+    await failed.exited;
+    failed = undefined;
+
+    third = await startHost("active-recover", owned.root, owned.binary, port, UPDATE_ID);
+    expect(await readJsonLine(third)).toMatchObject({ kind: "recovered-updated-deleted", port });
+  } finally {
+    if (first) await terminateHost(first);
+    if (failed) await terminateHost(failed);
+    if (third) await terminateHost(third);
+    await owned.cleanup();
+  }
+});
+
+test("refresh checkpoint refuses a group manifest that no longer pins the config bytes", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let first: HostProcess | undefined;
+  let failed: HostProcess | undefined;
+  let successor: HostProcess | undefined;
+  try {
+    first = await startHost("active-create", owned.root, owned.binary, port);
+    expect(await readJsonLine(first)).toMatchObject({ kind: "active-created", port });
+    await terminateHost(first);
+    first = undefined;
+    await waitForVacant(port);
+
+    failed = await startHost("active-recover-fail-before-spawn", owned.root, owned.binary, port);
+    expect(await readJsonLine(failed)).toMatchObject({
+      kind: "error",
+      code: "ownership_uncertain",
+    });
+    await failed.exited;
+    failed = undefined;
+    const checkpoint = await ownerState(owned.root);
+    const groupDirectory = join(
+      ownerDirectory(owned.root),
+      "incarnations",
+      CREATE_ID,
+      "groups",
+      createHash("sha256").update(WORKER_UID).digest("hex"),
+    );
+    const manifestPath = join(groupDirectory, "group.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+    await writeFile(
+      manifestPath,
+      `${JSON.stringify({ ...manifest, configurationSha256: "0".repeat(64) })}\n`,
+    );
+
+    successor = await startHost("active-recover-only", owned.root, owned.binary, port);
+    expect(await readJsonLine(successor)).toMatchObject({
+      kind: "error",
+      code: "ownership_uncertain",
+      phase: "open-owner",
+    });
+    expect(await ownerState(owned.root)).toEqual(checkpoint);
+    expect(await workerPortOwnership(port, undefined)).toBe("vacant");
+  } finally {
+    if (first) await terminateHost(first);
+    if (failed) await terminateHost(failed);
+    if (successor) await terminateHost(successor);
+    await owned.cleanup();
+  }
+});
+
+test("successor completes a draining receipt checkpoint left before owner-state retirement", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let first: HostProcess | undefined;
+  let successor: HostProcess | undefined;
+  try {
+    first = await startHost("active-update-draining", owned.root, owned.binary, port, UPDATE_ID);
+    expect(await readJsonLine(first)).toMatchObject({ kind: "active-updated-draining", port });
+    const before = await ownerState(owned.root);
+    const draining = (before.incarnations as Record<string, unknown>[]).find(
+      (item) => item.operationId === CREATE_ID,
+    );
+    expect(draining?.status).toBe("draining");
+    expect(draining?.retirementOperationId).toBe(UPDATE_ID);
+    await terminateHost(first);
+    first = undefined;
+    await waitForVacant(port);
+
+    const uidHash = createHash("sha256").update(WORKER_UID).digest("hex");
+    const groupRoot = join(ownerDirectory(owned.root), "incarnations", CREATE_ID, "groups");
+    const configuration = new Uint8Array(
+      await readFile(join(groupRoot, uidHash, "workers", "workerd.capnp")),
+    );
+    const group = await openWorkerdWorkerExecutionGroup({
+      rootDirectory: groupRoot,
+      workerResourceUid: WORKER_UID,
+      listenerPort: port,
+      configuration,
+      configurationPath: "workers/workerd.capnp",
+      workerdBinary: owned.binary,
+      recoverExisting: true,
+    });
+    const receipt = await group.retire({ workerResourceUid: WORKER_UID, operationId: UPDATE_ID });
+    expect(receipt.configurationSha256).toBe(draining?.configurationSha256 as string);
+    expect((await ownerState(owned.root)).incarnations).toEqual(before.incarnations);
+
+    successor = await startHost("active-recover-only", owned.root, owned.binary, port, UPDATE_ID);
+    expect(await readJsonLine(successor)).toMatchObject({ kind: "recovered-active", port });
+    const after = await ownerState(owned.root);
+    const retired = (after.incarnations as Record<string, unknown>[]).find(
+      (item) => item.operationId === CREATE_ID,
+    );
+    expect(retired).toMatchObject({ status: "retired", executionCopiesReleased: true, receipt });
+  } finally {
+    if (first) await terminateHost(first);
+    if (successor) await terminateHost(successor);
+    await owned.cleanup();
+  }
+});
+
+test("successor resumes a draining cleanup-intent checkpoint before copy release", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let first: HostProcess | undefined;
+  let successor: HostProcess | undefined;
+  try {
+    first = await startHost("active-update-draining", owned.root, owned.binary, port, UPDATE_ID);
+    expect(await readJsonLine(first)).toMatchObject({ kind: "active-updated-draining", port });
+    await terminateHost(first);
+    first = undefined;
+    await waitForVacant(port);
+
+    const uidHash = createHash("sha256").update(WORKER_UID).digest("hex");
+    const groupRoot = join(ownerDirectory(owned.root), "incarnations", CREATE_ID, "groups");
+    const groupDirectory = join(groupRoot, uidHash);
+    const configuration = new Uint8Array(
+      await readFile(join(groupDirectory, "workers", "workerd.capnp")),
+    );
+    const group = await openWorkerdWorkerExecutionGroup({
+      rootDirectory: groupRoot,
+      workerResourceUid: WORKER_UID,
+      listenerPort: port,
+      configuration,
+      configurationPath: "workers/workerd.capnp",
+      workerdBinary: owned.binary,
+      recoverExisting: true,
+    });
+    await group.retire({ workerResourceUid: WORKER_UID, operationId: UPDATE_ID });
+    const verified = await verifyRetiredWorkerdWorkerExecutionCopies({
+      groupDirectory,
+      workerResourceUid: WORKER_UID,
+      operationId: UPDATE_ID,
+      listenerPort: port,
+      scriptName: `v2-worker-${uidHash}`,
+    });
+    const statePath = join(ownerDirectory(owned.root), "runtime-owner.json");
+    const checkpoint = await ownerState(owned.root);
+    checkpoint.incarnations = (checkpoint.incarnations as Record<string, unknown>[]).map((item) =>
+      item.operationId === CREATE_ID
+        ? {
+            ...item,
+            receipt: verified.receipt,
+            executionCopiesCleanupStarted: true,
+            executionCopiesCleanupManifestSha256: verified.cleanupManifestSha256,
+          }
+        : item,
+    );
+    await writeFile(statePath, `${JSON.stringify(checkpoint)}\n`, { mode: 0o600 });
+
+    successor = await startHost("active-recover-only", owned.root, owned.binary, port, UPDATE_ID);
+    expect(await readJsonLine(successor)).toMatchObject({ kind: "recovered-active", port });
+    const after = await ownerState(owned.root);
+    expect(
+      (after.incarnations as Record<string, unknown>[]).find(
+        (item) => item.operationId === CREATE_ID,
+      ),
+    ).toMatchObject({
+      status: "retired",
+      executionCopiesReleased: true,
+      receipt: verified.receipt,
+    });
+  } finally {
+    if (first) await terminateHost(first);
     if (successor) await terminateHost(successor);
     await owned.cleanup();
   }
