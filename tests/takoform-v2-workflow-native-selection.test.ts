@@ -165,6 +165,7 @@ function fixture() {
   let publicationCurrent = true;
   let ownerSelects = 0;
   let inspected = 0;
+  const servingVersions = [{ workerVersionUid: VERSION_UID, weight: 10_000 }];
   const owner = {
     async observeServing() {
       return {
@@ -174,7 +175,7 @@ function fixture() {
         sourceOperationId: SOURCE_OPERATION,
         generation: GENERATION,
         hostnames: [],
-        versions: [{ workerVersionUid: VERSION_UID, weight: 10_000 }],
+        versions: servingVersions,
       };
     },
     async selectWorkflowExecution(input: { readonly basisPoint: number }) {
@@ -273,6 +274,7 @@ function fixture() {
     select,
     selected,
     snapshot,
+    servingVersions,
     get ownerSelects() {
       return ownerSelects;
     },
@@ -356,6 +358,27 @@ test("synthetic selection requires the sealed Workflow to Worker reference and l
     await expect(f.select(identity, new AbortController().signal)).rejects.toMatchObject({
       code: "host_unavailable",
     });
+  } finally {
+    f.db.close();
+  }
+});
+
+test("synthetic weighted selection uses native codepoint UID order", async () => {
+  const f = fixture();
+  try {
+    f.servingVersions.splice(
+      0,
+      1,
+      { workerVersionUid: "Z-Version", weight: 5_000 },
+      { workerVersionUid: "a-version", weight: 5_000 },
+    );
+    const version = f.snapshot.deployment.versions[0];
+    if (!version) throw new Error("missing synthetic Version");
+    version.uid = "Z-Version";
+    f.selected.workerVersionUid = "Z-Version";
+    f.selected.versionId = `v2-${createHash("sha256").update("Z-Version\u00001").digest("hex")}`;
+    const captured = await f.select(identity, new AbortController().signal);
+    expect(captured.selection.workerVersionUid).toBe("Z-Version");
   } finally {
     f.db.close();
   }

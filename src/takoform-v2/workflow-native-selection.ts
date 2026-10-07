@@ -1,6 +1,7 @@
 import { createHash, randomInt } from "node:crypto";
 import { canonicalJson } from "../json.ts";
 import type { JsonObject, Sql } from "../ports.ts";
+import { compareSelfhostWeightedVersions } from "../selfhost-weighted-deployment.ts";
 import type { WorkerModuleSemanticInspector } from "../worker-module-inspection-contract.ts";
 import type {
   WorkerdPrivateServiceLease,
@@ -295,7 +296,7 @@ export function createV2WorkflowNativeSelection(options: {
       throw new WorkflowRuntimeError("invalid_runtime_input");
     let accumulatedWeight = 0;
     const expectedWeighted = [...serving.versions]
-      .sort((left, right) => left.workerVersionUid.localeCompare(right.workerVersionUid))
+      .sort(compareSelfhostWeightedVersions)
       .find((item) => {
         accumulatedWeight += item.weight;
         return selectedBasisPoint < accumulatedWeight;
