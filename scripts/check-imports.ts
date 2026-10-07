@@ -183,6 +183,11 @@ const LAYERS: readonly Layer[] = [
     ],
   },
   {
+    name: "v2-selfhost-queue-worker-capability",
+    match: /^src\/selfhost-v2-queue-worker-capability\.ts$/u,
+    may: ["core", "v2-form", "v2-queue-manager", "v2-runtime"],
+  },
+  {
     name: "v2-selfhost-configured-input-sealer",
     match: /^src\/selfhost-v2-configured-input-sealer\.ts$/u,
     may: ["app", "v2-code-validation"],
