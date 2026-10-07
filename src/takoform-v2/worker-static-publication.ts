@@ -17,7 +17,10 @@ import type {
   WorkerdStaticSite,
 } from "../workerd-runtime.ts";
 import { internalHostname } from "../workerd-runtime.ts";
-import { compileWorkerdVersionGraph } from "../workerd-version-graph.ts";
+import {
+  compileWorkerdVersionGraph,
+  workerdVersionServiceBindingName,
+} from "../workerd-version-graph.ts";
 import type { ObjectBucketWorkerBindingClaim } from "./forms/object-bucket-worker-binding-authority.ts";
 import type { SQLiteWorkerBindingClaim } from "./forms/sqlite-worker-binding-authority.ts";
 import {
@@ -648,7 +651,12 @@ export function createV2WorkerPublication(options: {
               ),
             ),
           });
-          for (const binding of serviceBindings) await forward.issueBinding(claim, binding);
+          for (const [index, binding] of serviceBindings.entries()) {
+            await forward.issueBinding(claim, {
+              ...binding,
+              name: workerdVersionServiceBindingName(index, true),
+            });
+          }
           if (!(await resolution.stillCurrent()))
             throw new Error("ServiceBinding reference graph changed");
         }

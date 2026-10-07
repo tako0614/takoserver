@@ -108,6 +108,7 @@ import {
   workerdV2ServiceBindingBrokerSocketPath,
 } from "./workerd-runtime.ts";
 import type { WorkerdProcess } from "./workerd-supervisor.ts";
+import { workerdVersionServiceBindingName } from "./workerd-version-graph.ts";
 import {
   inspectWorkerdWorkerExecutionCopies,
   openWorkerdWorkerExecutionGroup,
@@ -2792,19 +2793,58 @@ export async function openWorkerdWorkerRuntimeOwner(
     const serviceBindingForward: V2ServiceBindingForwardIncarnation | undefined = v2ServiceBinding
       ? {
           async issueBinding(claim, binding) {
-            const selected = claim.bindings.find((item) => item.name === binding.name);
-            const version = record.identity?.versions.find(
-              (item) =>
-                item.workerVersionUid === claim.workerVersionUid &&
-                item.versionId === claim.nativeVersionId,
+            // The publication callback issues the broker before activateIncarnation
+            // stores the candidate's serving identity. Validate the immutable
+            // accepted Version through Core instead of requiring that future
+            // identity to exist already. Runtime names are ordinal private aliases;
+            // the claim continues to carry the accepted public binding name.
+            const bindingIndex = claim.bindings.findIndex(
+              (_item, index) => workerdVersionServiceBindingName(index, true) === binding.name,
             );
+            const selected = claim.bindings[bindingIndex];
+            const currentRecord = () => recordFor(record.operationId);
+            const recordOwnsVersion = (): boolean => {
+              const latest = currentRecord();
+              if (
+                !latest ||
+                latest.operationId !== claim.incarnationId ||
+                latest.operationId !== claim.servingSourceOperationId ||
+                latest.status === "uncertain" ||
+                latest.status === "retiring" ||
+                latest.status === "retired"
+              ) {
+                return false;
+              }
+              if (latest.identity === null) return latest.status === "candidate";
+              return latest.identity.versions.some(
+                (item) =>
+                  item.workerVersionUid === claim.workerVersionUid &&
+                  item.versionId === claim.nativeVersionId,
+              );
+            };
             if (
               claim.workerUid !== options.workerResourceUid ||
               claim.incarnationId !== record.operationId ||
               claim.servingSourceOperationId !== record.operationId ||
-              !version ||
+              bindingIndex < 0 ||
               selected?.resourceUid !== binding.targetResourceUid ||
-              binding.target !== (await v2ServiceTargetName(binding.targetResourceUid))
+              binding.target !== (await v2ServiceTargetName(binding.targetResourceUid)) ||
+              !recordOwnsVersion()
+            ) {
+              throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+            }
+            const accepted = await v2ServiceBinding.authority.resolveCurrentBinding(
+              claim,
+              selected.name,
+            );
+            if (
+              !accepted ||
+              accepted.identity.targetKey !== options.targetKey ||
+              accepted.identity.principal !== claim.principal ||
+              accepted.identity.space !== claim.space ||
+              accepted.identity.resourceUid !== selected.resourceUid ||
+              !(await accepted.stillCurrent()) ||
+              !recordOwnsVersion()
             ) {
               throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
             }
@@ -2841,6 +2881,10 @@ export async function openWorkerdWorkerRuntimeOwner(
               },
               ownerForResourceUid: v2ServiceBinding.ownerForResourceUid,
             });
+            if (!(await accepted.stillCurrent()) || !recordOwnsVersion()) {
+              await broker.close();
+              throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+            }
             serviceBindingBrokers.set(router, {
               binding: { ...binding },
               socket: { socketPath: broker.socketPath, identity: { ...broker.identity } },
@@ -3252,7 +3296,17 @@ export async function openWorkerdWorkerRuntimeOwner(
       }
       const declared = parseWorkerVersionSpec(version.spec).serviceBindings;
       const persisted = selected.site.serviceBindings ?? [];
-      if (!(await exactV2ResolvedServiceBindings(declared, persisted))) {
+      const hasExactPrivateOrdinals = persisted.every(
+        (binding, index) => binding.name === workerdVersionServiceBindingName(index, true),
+      );
+      const persistedWithAcceptedNames = persisted.map((binding, index) => ({
+        ...binding,
+        name: declared[index]?.name ?? "",
+      }));
+      if (
+        !hasExactPrivateOrdinals ||
+        !(await exactV2ResolvedServiceBindings(declared, persistedWithAcceptedNames))
+      ) {
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       }
       if (persisted.length > 0) {
@@ -4350,29 +4404,30 @@ export async function openWorkerdWorkerRuntimeOwner(
       if (!captured) return null;
 
       const stillCurrent = async (): Promise<boolean> => {
-        const current = await observeVersionTargetCore(target, false).catch(() => ({
-          kind: "unknown" as const,
-        }));
-        if (
-          current.kind !== "confirmed" ||
-          (current.status !== captured.status && captured.status === "draining")
-        ) {
-          return false;
-        }
-        return await runSerial(async () => {
-          const incarnation = handles.get(target.incarnationId);
-          const record = recordFor(target.incarnationId);
-          return (
-            !closed &&
-            !suspending &&
-            admissionClosedBy === null &&
-            incarnation === captured.incarnation &&
-            record !== undefined &&
-            (record.status === "active" || record.status === "draining") &&
-            (captured.status !== "draining" || record.status === "draining") &&
-            incarnation.serviceBindingLeases.has(done)
-          );
-        });
+        // Retirement enters the serial lane and then waits for this lease to
+        // drain. Do not re-enter that lane here: a post-SQL authority check
+        // from the broker must be able to observe the retirement fence and
+        // release the lease while DELETE is waiting. JavaScript state reads
+        // are synchronous, and the exact handle remains pinned by `done`.
+        const incarnation = handles.get(target.incarnationId);
+        const record = recordFor(target.incarnationId);
+        return (
+          !closed &&
+          !suspending &&
+          admissionClosedBy === null &&
+          incarnation === captured.incarnation &&
+          record !== undefined &&
+          (record.status === "active" || record.status === "draining") &&
+          (captured.status !== "draining" || record.status === "draining") &&
+          record.receipt === null &&
+          !record.executionCopiesCleanupStarted &&
+          !record.executionCopiesReleased &&
+          record.identity?.versions.some((version) => version.versionId === target.versionId) ===
+            true &&
+          canonicalJson(incarnation.record) === canonicalJson(record) &&
+          incarnation.group.isReady() &&
+          incarnation.serviceBindingLeases.has(done)
+        );
       };
       let released = false;
       return {
