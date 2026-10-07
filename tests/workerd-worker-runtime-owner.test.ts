@@ -67,7 +67,7 @@ function identity() {
   return { port: Number(port), generation, token };
 }
 const initial = identity();
-const server = Bun.serve({ hostname: "127.0.0.1", port: initial.port, async fetch(request) {
+const startServer = () => Bun.serve({ hostname: "127.0.0.1", port: initial.port, async fetch(request) {
   const current = identity();
   const url = new URL(request.url);
   if (request.method === "POST" && request.headers.get("host") === "runtime.selfhost-config.invalid" &&
@@ -98,8 +98,11 @@ const server = Bun.serve({ hostname: "127.0.0.1", port: initial.port, async fetc
   }
   return new Response(current.generation);
 } });
-process.on("SIGTERM", () => server.stop(true));
-process.on("SIGUSR1", () => { server.stop(true); setInterval(() => {}, 1000); });
+let server = startServer();
+let heldOpen;
+process.on("SIGTERM", () => { server.stop(true); if (heldOpen) clearInterval(heldOpen); });
+process.on("SIGUSR1", () => { server.stop(true); heldOpen = setInterval(() => {}, 1000); });
+process.on("SIGUSR2", () => { server = startServer(); if (heldOpen) clearInterval(heldOpen); heldOpen = undefined; });
 `;
 
 type TestChild = ReturnType<typeof spawnWorkerdWithParentDeath>;
@@ -1691,6 +1694,7 @@ test("Actor graph readback refuses a foreign listener while native bytes remain"
   const owned = await fixture();
   const workerUid = "worker-actor-lost-listener";
   const createId = "03448a40-4525-4d4b-8da0-8cebfcedaf88";
+  const deleteId = "e43fb7dd-b1f3-41b5-8a9e-ecbb38c64069";
   const publication = staticPublicationState(workerUid, true);
   const ownerRoot = join(owned.root, "owners");
   const owner = await openWorkerdWorkerRuntimeOwner({
@@ -1707,6 +1711,8 @@ test("Actor graph readback refuses a foreign listener while native bytes remain"
     }),
   });
   let foreign: ReturnType<typeof Bun.serve> | undefined;
+  let child: TestChild | undefined;
+  let listenerPort: number | undefined;
   try {
     expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
       kind: "confirmed",
@@ -1723,8 +1729,9 @@ test("Actor graph readback refuses a foreign listener while native bytes remain"
     const group = JSON.parse(await Bun.file(join(groupRoot, "group.json")).text()) as {
       listenerPort: number;
     };
-    const child = owned.children[0];
+    child = owned.children[0];
     if (!child?.pid) throw new Error("native child PID missing");
+    listenerPort = group.listenerPort;
     child.kill("SIGUSR1");
     let listener = await workerPortOwnership(group.listenerPort, child.pid);
     for (let attempt = 0; listener === "owned" && attempt < 150; attempt += 1) {
@@ -1740,8 +1747,24 @@ test("Actor graph readback refuses a foreign listener while native bytes remain"
     expect(await owner.observeActorGraph(request)).toEqual({ kind: "unknown" });
   } finally {
     await foreign?.stop(true);
-    await owner.close().catch(() => undefined);
-    await owned.cleanup();
+    try {
+      if (child?.pid && listenerPort !== undefined) {
+        child.kill("SIGUSR2");
+        let listener = await workerPortOwnership(listenerPort, child.pid);
+        for (let attempt = 0; listener !== "owned" && attempt < 150; attempt += 1) {
+          await Bun.sleep(20);
+          listener = await workerPortOwnership(listenerPort, child.pid);
+        }
+        expect(listener).toBe("owned");
+        expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
+          kind: "confirmed",
+          identity: null,
+        });
+      }
+      await owner.close();
+    } finally {
+      await owned.cleanup();
+    }
   }
 });
 
