@@ -597,6 +597,9 @@ test("Endpoint create/update/delete publish only its route through the same weig
     ownerForWorker: () => owner,
     assignHostname: ({ resourceUid }) => `${resourceUid}.assigned.example.test`,
     observeTls: async (input) => ({ ...input, ready: true }),
+    // Frontend readback is an explicit fixture; native route retirement alone
+    // must not settle Endpoint deletion or imply shared TLS teardown.
+    observeRouteAbsent: async (input) => ({ ...input, absent: true }),
   });
 
   try {
