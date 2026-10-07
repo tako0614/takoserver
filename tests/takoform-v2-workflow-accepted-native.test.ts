@@ -335,6 +335,43 @@ export default { fetch() { return new Response("worker-serving"); } };
       );
       expect(servingResponse.status).toBe(200);
       expect(await servingResponse.text()).toBe("worker-serving");
+      await activeWorkflowComposition.runtime.instances.create(scope, {
+        id: "purge-probe",
+        params: { value: 9 },
+      });
+      expect(await activeWorkflowComposition.runtime.runOne(scope, "purge-probe")).toEqual({
+        kind: "parked",
+      });
+      await activeWorkflowComposition.runtime.instances.sendEvent(scope, "purge-probe", {
+        type: "purge-test",
+      });
+      expect(
+        database
+          .query(
+            "SELECT instance_id, status FROM tf_workflow_instances WHERE tenant_id = ? AND workflow_resource_uid = ? ORDER BY instance_id",
+          )
+          .all(scope.tenantId, scope.workflowResourceUid),
+      ).toEqual([
+        { instance_id: "native-instance", status: "complete" },
+        { instance_id: "purge-probe", status: "sleeping" },
+      ]);
+      expect(
+        database
+          .query(
+            "SELECT name, state FROM tf_workflow_steps WHERE tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ? ORDER BY name",
+          )
+          .all(scope.tenantId, scope.workflowResourceUid, "purge-probe"),
+      ).toEqual([
+        { name: "memo", state: "complete" },
+        { name: "pause", state: "waiting" },
+      ]);
+      expect(
+        database
+          .query(
+            "SELECT instance_id, type FROM tf_workflow_events WHERE tenant_id = ? AND workflow_resource_uid = ?",
+          )
+          .all(scope.tenantId, scope.workflowResourceUid),
+      ).toEqual([{ instance_id: "purge-probe", type: "purge-test" }]);
       const deleted = await request(
         `/resources/${workflow.resourceUid}`,
         "DELETE",
@@ -347,6 +384,13 @@ export default { fetch() { return new Response("worker-serving"); } };
       await Bun.sleep(1_100);
       expect(await app.tickTakoformV2()).toMatchObject({ status: "succeeded", effect: "complete" });
       expect((await request(`/resources/${workflow.resourceUid}`)).status).toBe(410);
+      for (const table of ["tf_workflow_instances", "tf_workflow_steps", "tf_workflow_events"]) {
+        expect(
+          database
+            .query(`SELECT 1 FROM ${table} WHERE tenant_id = ? AND workflow_resource_uid = ?`)
+            .all(scope.tenantId, scope.workflowResourceUid),
+        ).toEqual([]);
+      }
     } catch (error) {
       primaryError = error;
     }
