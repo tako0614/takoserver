@@ -1187,15 +1187,26 @@ async function invokeScheduled(event, rawEnv, rawContext) {
   const scheduled = SafeObjectCreate(null);
   scheduled.cron = event.cron;
   scheduled.scheduledTime = event.scheduledTime;
-  // The throw is the answer. A scheduled invocation has no per-message
-  // settlement, so a handler that failed is a failed invocation and this Host
-  // reports it by refusing the delivery rather than acknowledging one.
-  await SafeApply(original.handlers.scheduled, original.target, [scheduled, env, context]);
+  // Only a throw from the already-loaded tenant handler is a terminal handler
+  // rejection. Envelope, module, context and transport failures still reach
+  // the outer refusal as unknown to the Host's scheduler.
+  try {
+    await SafeApply(original.handlers.scheduled, original.target, [scheduled, env, context]);
+  } catch {
+    return scheduleResult("rejected", 500);
+  }
+  return scheduleResult("ack", 200);
+}
+
+function scheduleResult(outcome, status) {
   const result = SafeObjectCreate(null);
   result.protocol = EVENT_PROTOCOL;
   result.kind = "schedule";
-  result.outcome = "ack";
-  return jsonResponse(result);
+  result.outcome = outcome;
+  return new SafeResponse(SafeJSONStringify(result), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 function jsonResponse(value) {

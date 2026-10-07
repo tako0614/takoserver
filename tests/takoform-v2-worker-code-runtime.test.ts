@@ -255,6 +255,35 @@ test("keeps valid fetch code separate from unsupported bindings, secrets, and ev
   }
 });
 
+test("scheduled code requires an explicit private delivery capability and exact handler export", async () => {
+  const spec = versionSpec({ handlers: ["fetch", "scheduled"] });
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec,
+      bundle: await heldBundle(),
+      inspectModule: inspector({ outcome: "valid", exportedHandlers: ["fetch", "scheduled"] }),
+    }),
+  ).rejects.toMatchObject({ code: "worker_event_delivery_unavailable" });
+  const projected = await projectV2WorkerCodeVersion({
+    identity: identity(),
+    spec,
+    bundle: await heldBundle(),
+    inspectModule: inspector({ outcome: "valid", exportedHandlers: ["fetch", "scheduled"] }),
+    eventDelivery: { token: "a".repeat(64) },
+  });
+  expect(projected.site.fetchHandler).toBe(true);
+  await expect(
+    projectV2WorkerCodeVersion({
+      identity: identity(),
+      spec,
+      bundle: await heldBundle(),
+      inspectModule: inspector({ outcome: "valid", exportedHandlers: ["fetch"] }),
+      eventDelivery: { token: "a".repeat(64) },
+    }),
+  ).rejects.toMatchObject({ code: "worker_handler_mismatch" });
+});
+
 test("projects verified code+assets into one copied Version with exact routing policy", async () => {
   const held = await heldAssets();
   const projection = await projectV2WorkerCodeVersion({

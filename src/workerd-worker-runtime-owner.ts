@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
   link,
@@ -15,7 +15,20 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  SELFHOST_WORKER_EVENT_CONTENT_TYPE,
+  SELFHOST_WORKER_EVENT_HEADER,
+  SELFHOST_WORKER_EVENT_PATH,
+  SELFHOST_WORKER_EVENT_PROTOCOL,
+  SELFHOST_WORKER_EVENT_TOKEN_HEADER,
+  selfhostScheduleEvent,
+} from "./providers/selfhost-events.ts";
+import {
+  randomSelfhostDeploymentBasisPoint,
+  selectSelfhostWeightedVersion,
+} from "./selfhost-weighted-deployment.ts";
+import {
   parseWorkerEndpointSpec,
+  parseWorkerVersionSpec,
   WORKER_DEPLOYMENT_FORM_URL,
   WORKER_ENDPOINT_FORM_URL,
 } from "./takoform-v2/forms/worker-specs.ts";
@@ -61,7 +74,8 @@ const RETIRED_COPIES_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@3";
 const CLEANUP_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@4";
 const ROUTE_RECEIPT_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@5";
 const PROCESS_PIN_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@6";
-const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@7";
+const EVENTLESS_STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@7";
+const STATE_SCHEMA = "takoserver.v2-worker-runtime-owner@8";
 const LOCK_SCHEMA = "takoserver.v2-worker-runtime-owner-lock@2";
 const OPERATION_MARKER = "takoserver-v2-operation:";
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -113,6 +127,8 @@ interface IncarnationRecord {
   readonly configurationSha256: string | null;
   /** Recovery is re-rendering the same accepted graph with a new private readiness token. */
   readonly configurationRefreshPending: boolean;
+  /** Private per-incarnation event gate credential; null for pre-event incarnations. */
+  readonly eventToken: string | null;
   readonly identity: WorkerdPublicationIdentity | null;
   readonly receipt: WorkerdWorkerRetirementReceipt | null;
 }
@@ -200,6 +216,39 @@ export interface WorkerdWorkerRuntimeOwner {
   >;
   /** Route a Host-accepted request to the exact active incarnation. */
   fetch(request: Request): Promise<Response>;
+  /** Deliver one persisted cron match through the selected current private Version gate. */
+  invokeScheduled(input: {
+    readonly triggerUid: string;
+    readonly workerUid: string;
+    readonly cron: string;
+    readonly scheduledTime: number;
+    readonly matchId: string;
+  }): Promise<
+    | { readonly kind: "handler_resolved"; readonly workerVersionUid: string }
+    | { readonly kind: "handler_rejected"; readonly workerVersionUid: string }
+    | { readonly kind: "unknown" }
+  >;
+  /** Non-effecting proof that every current weighted Version can receive scheduled events. */
+  observeScheduledCapability(input: {
+    readonly workerUid: string;
+    readonly principal: string;
+    readonly space: string;
+    readonly targetKey: string;
+  }): Promise<
+    | {
+        readonly kind: "confirmed";
+        readonly servingSourceOperationId: string;
+        readonly deploymentUid: string;
+        readonly deploymentGeneration: number;
+        readonly versions: readonly {
+          readonly workerVersionUid: string;
+          readonly generation: number;
+          readonly weight: number;
+        }[];
+        stillCurrent(): Promise<boolean>;
+      }
+    | { readonly kind: "unknown" }
+  >;
   /** Release the owner lock only after every known incarnation has a durable receipt. */
   close(): Promise<void>;
 }
@@ -222,6 +271,29 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
 
 function canonicalJson(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
+}
+
+function scheduledAnswer(
+  answer: { readonly status: number; readonly body: string } | null | undefined,
+): "handler_resolved" | "handler_rejected" | null {
+  if (!answer || answer.body.length > 65_536) return null;
+  try {
+    const parsed: unknown = JSON.parse(answer.body);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const value = parsed as Record<string, unknown>;
+    if (
+      Object.keys(value).sort().join(",") !== "kind,outcome,protocol" ||
+      value.kind !== "schedule" ||
+      value.protocol !== SELFHOST_WORKER_EVENT_PROTOCOL
+    ) {
+      return null;
+    }
+    if (answer.status === 200 && value.outcome === "ack") return "handler_resolved";
+    if (answer.status === 500 && value.outcome === "rejected") return "handler_rejected";
+  } catch {
+    // A transport body that is not this Host's exact response decides nothing.
+  }
+  return null;
 }
 
 interface OwnerProcessFingerprint {
@@ -1106,6 +1178,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
     const cleanupState = state.schema === CLEANUP_STATE_SCHEMA;
     const routeReceiptState = state.schema === ROUTE_RECEIPT_STATE_SCHEMA;
     const processPinState = state.schema === PROCESS_PIN_STATE_SCHEMA;
+    const eventlessState = state.schema === EVENTLESS_STATE_SCHEMA;
     const currentState = state.schema === STATE_SCHEMA;
     if (
       (!legacyStaticState &&
@@ -1114,12 +1187,13 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         !cleanupState &&
         !routeReceiptState &&
         !processPinState &&
+        !eventlessState &&
         !currentState) ||
       state.workerResourceUid !== workerResourceUid ||
       !(state.activeOperationId === null || typeof state.activeOperationId === "string") ||
       !(state.admissionClosedBy === null || typeof state.admissionClosedBy === "string") ||
       typeof state.deletionPublicationConfirmed !== "boolean" ||
-      (routeReceiptState || processPinState || currentState
+      (routeReceiptState || processPinState || eventlessState || currentState
         ? !(
             state.endpointRouteAbsence === null ||
             validEndpointRouteAbsence(state.endpointRouteAbsence)
@@ -1148,20 +1222,25 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
         (legacyStaticState
           ? item.deferRetirementUntilDeadline !== undefined
           : typeof item.deferRetirementUntilDeadline !== "boolean") ||
-        (retiredCopiesState || cleanupState || routeReceiptState || processPinState || currentState
+        (retiredCopiesState ||
+        cleanupState ||
+        routeReceiptState ||
+        processPinState ||
+        eventlessState ||
+        currentState
           ? typeof item.executionCopiesReleased !== "boolean"
           : item.executionCopiesReleased !== undefined) ||
-        (cleanupState || routeReceiptState || processPinState || currentState
+        (cleanupState || routeReceiptState || processPinState || eventlessState || currentState
           ? typeof item.executionCopiesCleanupStarted !== "boolean"
           : item.executionCopiesCleanupStarted !== undefined) ||
-        (cleanupState || routeReceiptState || processPinState || currentState
+        (cleanupState || routeReceiptState || processPinState || eventlessState || currentState
           ? !(
               item.executionCopiesCleanupManifestSha256 === null ||
               (typeof item.executionCopiesCleanupManifestSha256 === "string" &&
                 /^sha256:[0-9a-f]{64}$/u.test(item.executionCopiesCleanupManifestSha256))
             )
           : item.executionCopiesCleanupManifestSha256 !== undefined) ||
-        (processPinState || currentState
+        (processPinState || eventlessState || currentState
           ? !(
               item.processIdentity === null || validLinuxProcessIdentityRecord(item.processIdentity)
             ) ||
@@ -1171,10 +1250,16 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                 /^[0-9a-f]{64}$/u.test(item.configurationSha256))
             )
           : item.processIdentity !== undefined || item.configurationSha256 !== undefined) ||
-        (currentState
+        (eventlessState || currentState
           ? typeof item.configurationRefreshPending !== "boolean"
           : item.configurationRefreshPending !== undefined) ||
-        (currentState &&
+        (currentState
+          ? !(
+              item.eventToken === null ||
+              (typeof item.eventToken === "string" && /^[0-9a-f]{64}$/u.test(item.eventToken))
+            )
+          : item.eventToken !== undefined) ||
+        ((eventlessState || currentState) &&
           item.configurationRefreshPending === true &&
           (item.status !== "active" ||
             item.processIdentity === null ||
@@ -1200,28 +1285,35 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
           ? false
           : (item.deferRetirementUntilDeadline as boolean),
         executionCopiesReleased:
-          retiredCopiesState || cleanupState || routeReceiptState || processPinState || currentState
+          retiredCopiesState ||
+          cleanupState ||
+          routeReceiptState ||
+          processPinState ||
+          eventlessState ||
+          currentState
             ? (item.executionCopiesReleased as boolean)
             : false,
         executionCopiesCleanupStarted:
-          cleanupState || routeReceiptState || processPinState || currentState
+          cleanupState || routeReceiptState || processPinState || eventlessState || currentState
             ? (item.executionCopiesCleanupStarted as boolean)
             : retiredCopiesState
               ? (item.executionCopiesReleased as boolean)
               : false,
         executionCopiesCleanupManifestSha256:
-          cleanupState || routeReceiptState || processPinState || currentState
+          cleanupState || routeReceiptState || processPinState || eventlessState || currentState
             ? (item.executionCopiesCleanupManifestSha256 as string | null)
             : null,
         processIdentity:
-          processPinState || currentState
+          processPinState || eventlessState || currentState
             ? (item.processIdentity as LinuxProcessIdentity | null)
             : null,
         configurationSha256:
-          processPinState || currentState ? (item.configurationSha256 as string | null) : null,
-        configurationRefreshPending: currentState
-          ? (item.configurationRefreshPending as boolean)
-          : false,
+          processPinState || eventlessState || currentState
+            ? (item.configurationSha256 as string | null)
+            : null,
+        configurationRefreshPending:
+          eventlessState || currentState ? (item.configurationRefreshPending as boolean) : false,
+        eventToken: currentState ? (item.eventToken as string | null) : null,
       } as unknown as IncarnationRecord);
     }
     const result: PersistedOwnerState = {
@@ -1231,7 +1323,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
       admissionClosedBy: state.admissionClosedBy as string | null,
       deletionPublicationConfirmed: state.deletionPublicationConfirmed,
       endpointRouteAbsence:
-        routeReceiptState || processPinState || currentState
+        routeReceiptState || processPinState || eventlessState || currentState
           ? (state.endpointRouteAbsence as V2EndpointRouteAbsentReceipt | null)
           : null,
       incarnations,
@@ -1300,6 +1392,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
               processIdentity: _processIdentity,
               configurationSha256: _configurationSha256,
               configurationRefreshPending: _refreshPending,
+              eventToken: _eventToken,
               ...item
             }) => item,
           ),
@@ -1319,6 +1412,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                 processIdentity: _processIdentity,
                 configurationSha256: _configurationSha256,
                 configurationRefreshPending: _refreshPending,
+                eventToken: _eventToken,
                 ...item
               }) => item,
             ),
@@ -1337,6 +1431,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                   processIdentity: _processIdentity,
                   configurationSha256: _configurationSha256,
                   configurationRefreshPending: _refreshPending,
+                  eventToken: _eventToken,
                   ...item
                 }) => item,
               ),
@@ -1354,6 +1449,7 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                     processIdentity: _processIdentity,
                     configurationSha256: _configurationSha256,
                     configurationRefreshPending: _refreshPending,
+                    eventToken: _eventToken,
                     ...item
                   }) => item,
                 ),
@@ -1367,7 +1463,11 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                   deletionPublicationConfirmed: state.deletionPublicationConfirmed,
                   endpointRouteAbsence: result.endpointRouteAbsence,
                   incarnations: incarnations.map(
-                    ({ configurationRefreshPending: _refreshPending, ...item }) => item,
+                    ({
+                      configurationRefreshPending: _refreshPending,
+                      eventToken: _eventToken,
+                      ...item
+                    }) => item,
                   ),
                 }
               : cleanupState
@@ -1382,11 +1482,24 @@ function parseState(text: string | null, workerResourceUid: string): PersistedOw
                         processIdentity: _processIdentity,
                         configurationSha256: _configurationSha256,
                         configurationRefreshPending: _refreshPending,
+                        eventToken: _eventToken,
                         ...item
                       }) => item,
                     ),
                   }
-                : result;
+                : eventlessState
+                  ? {
+                      schema: EVENTLESS_STATE_SCHEMA,
+                      workerResourceUid: state.workerResourceUid,
+                      activeOperationId: state.activeOperationId,
+                      admissionClosedBy: state.admissionClosedBy,
+                      deletionPublicationConfirmed: state.deletionPublicationConfirmed,
+                      endpointRouteAbsence: result.endpointRouteAbsence,
+                      incarnations: incarnations.map(
+                        ({ eventToken: _eventToken, ...item }) => item,
+                      ),
+                    }
+                  : result;
     if (canonicalJson(canonicalState) !== text) throw new Error();
     return result;
   } catch {
@@ -1906,6 +2019,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       targetKey: options.targetKey,
       publicationState: options.publicationState,
       runtime: candidateRuntime,
+      ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
     });
     const handle: IncarnationHandle = {
       record,
@@ -1988,6 +2102,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       processIdentity: null,
       configurationSha256: null,
       configurationRefreshPending: false,
+      eventToken: randomBytes(32).toString("hex"),
       identity: null,
       receipt: null,
     };
@@ -2937,6 +3052,314 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
   };
 
+  const observeScheduledCapability: WorkerdWorkerRuntimeOwner["observeScheduledCapability"] = (
+    input,
+  ) =>
+    runSerial(async () => {
+      const unknown = { kind: "unknown" } as const;
+      const source = options.publicationState.resolveCurrentServing;
+      const incarnation = active;
+      const operationId = state.activeOperationId;
+      if (
+        closed ||
+        admissionClosedBy !== null ||
+        !source ||
+        !incarnation ||
+        !operationId ||
+        input.workerUid !== options.workerResourceUid ||
+        input.targetKey !== options.targetKey ||
+        incarnation.record.operationId !== operationId ||
+        incarnation.record.status !== "active" ||
+        !incarnation.record.eventToken ||
+        !incarnation.record.identity ||
+        !incarnation.group.isReady()
+      ) {
+        return unknown;
+      }
+      const identity = cloneRecord(incarnation.record).identity;
+      if (!identity || identity.generation !== expectedOperationMarker(operationId)) return unknown;
+      const resolution = await source({
+        workerUid: options.workerResourceUid,
+        targetKey: options.targetKey,
+        sourceOperationId: operationId,
+        expectedIdentity: identity,
+      }).catch(() => null);
+      if (resolution?.kind !== "ready") return unknown;
+      const snapshot = resolution.snapshot;
+      if (
+        snapshot.sourceOperationId !== operationId ||
+        snapshot.worker.uid !== options.workerResourceUid ||
+        snapshot.worker.principal !== input.principal ||
+        snapshot.worker.space !== input.space ||
+        !snapshot.deployment ||
+        snapshot.deployment.versions.length !== identity.versions.length ||
+        canonicalJson(snapshot.endpoint ? [snapshot.endpoint.output.hostname] : []) !==
+          canonicalJson(identity.hostnames) ||
+        canonicalJson(
+          snapshot.deployment.versions
+            .map(({ uid, weight }) => ({ workerVersionUid: uid, weight }))
+            .sort((left, right) => left.workerVersionUid.localeCompare(right.workerVersionUid)),
+        ) !==
+          canonicalJson(
+            identity.versions
+              .map(({ workerVersionUid, weight }) => ({ workerVersionUid, weight }))
+              .sort((left, right) => left.workerVersionUid.localeCompare(right.workerVersionUid)),
+          )
+      ) {
+        return unknown;
+      }
+      try {
+        if (
+          snapshot.deployment.versions.some(
+            (version) => !parseWorkerVersionSpec(version.spec).handlers.includes("scheduled"),
+          )
+        ) {
+          return unknown;
+        }
+      } catch {
+        return unknown;
+      }
+      const stillCurrent = async (): Promise<boolean> =>
+        await runSerial(async () => {
+          if (
+            closed ||
+            admissionClosedBy !== null ||
+            active !== incarnation ||
+            state.activeOperationId !== operationId ||
+            canonicalJson(recordFor(operationId)?.identity) !== canonicalJson(identity) ||
+            !incarnation.group.isReady() ||
+            !(await resolution.stillCurrent().catch(() => false))
+          ) {
+            return false;
+          }
+          const copies = await inspectWorkerdWorkerExecutionCopies({
+            groupDirectory: incarnation.group.runtimeRoot,
+            workerResourceUid: options.workerResourceUid,
+            listenerPort: incarnation.record.listenerPort,
+            scriptName: scriptName(options.workerResourceUid),
+          }).catch(() => null);
+          return (
+            !!copies &&
+            executionCopiesMatchRecord(incarnation.record, copies, true) &&
+            identity.versions.every((version) =>
+              copies.versionUids.includes(version.workerVersionUid),
+            ) &&
+            (await incarnation.runtime.observeExactPublication?.(
+              scriptName(options.workerResourceUid),
+              identity,
+            )) === "matches" &&
+            (await resolution.stillCurrent().catch(() => false))
+          );
+        }).catch(() => false);
+      // This call already owns the serial lane. Recheck directly here to avoid
+      // waiting on ourselves; returned callers use the closure above.
+      const copies = await inspectWorkerdWorkerExecutionCopies({
+        groupDirectory: incarnation.group.runtimeRoot,
+        workerResourceUid: options.workerResourceUid,
+        listenerPort: incarnation.record.listenerPort,
+        scriptName: scriptName(options.workerResourceUid),
+      }).catch(() => null);
+      if (
+        !copies ||
+        !executionCopiesMatchRecord(incarnation.record, copies, true) ||
+        identity.versions.some(
+          (version) => !copies.versionUids.includes(version.workerVersionUid),
+        ) ||
+        (await incarnation.runtime.observeExactPublication?.(
+          scriptName(options.workerResourceUid),
+          identity,
+        )) !== "matches" ||
+        !(await resolution.stillCurrent().catch(() => false))
+      ) {
+        return unknown;
+      }
+      return {
+        kind: "confirmed" as const,
+        servingSourceOperationId: operationId,
+        deploymentUid: snapshot.deployment.uid,
+        deploymentGeneration: snapshot.deployment.generation,
+        versions: snapshot.deployment.versions.map(({ uid, generation, weight }) => ({
+          workerVersionUid: uid,
+          generation,
+          weight,
+        })),
+        stillCurrent,
+      };
+    }).catch(() => ({ kind: "unknown" as const }));
+
+  const invokeScheduled: WorkerdWorkerRuntimeOwner["invokeScheduled"] = async (input) => {
+    const unknown = { kind: "unknown" } as const;
+    if (
+      typeof input.triggerUid !== "string" ||
+      input.triggerUid.length === 0 ||
+      input.triggerUid.length > 256 ||
+      typeof input.matchId !== "string" ||
+      input.matchId.length === 0 ||
+      input.matchId.length > 512 ||
+      input.workerUid !== options.workerResourceUid
+    ) {
+      return unknown;
+    }
+    const source = options.publicationState.resolveCurrentServing;
+    if (!source) return unknown;
+    const admitted = await runSerial(async () => {
+      if (closed || admissionClosedBy !== null) return null;
+      const incarnation = active;
+      const operationId = state.activeOperationId;
+      if (
+        !incarnation ||
+        !operationId ||
+        incarnation.record.operationId !== operationId ||
+        incarnation.record.status !== "active" ||
+        !incarnation.record.eventToken ||
+        !incarnation.record.identity ||
+        !incarnation.group.isReady()
+      ) {
+        return null;
+      }
+      const identity = cloneRecord(incarnation.record).identity;
+      if (!identity || identity.generation !== expectedOperationMarker(operationId)) return null;
+      const sourceOperationId = sourceOperationIdFromIdentity(identity);
+      if (sourceOperationId !== operationId) return null;
+      const resolution = await source({
+        workerUid: options.workerResourceUid,
+        targetKey: options.targetKey,
+        sourceOperationId,
+        expectedIdentity: identity,
+      }).catch(() => null);
+      if (
+        resolution?.kind !== "ready" ||
+        resolution.snapshot.sourceOperationId !== operationId ||
+        resolution.snapshot.worker.uid !== options.workerResourceUid ||
+        !resolution.snapshot.deployment ||
+        canonicalJson(
+          resolution.snapshot.endpoint ? [resolution.snapshot.endpoint.output.hostname] : [],
+        ) !== canonicalJson(identity.hostnames) ||
+        canonicalJson(
+          resolution.snapshot.deployment.versions
+            .map(({ uid, weight }) => ({ workerVersionUid: uid, weight }))
+            .sort((left, right) => left.workerVersionUid.localeCompare(right.workerVersionUid)),
+        ) !==
+          canonicalJson(
+            identity.versions
+              .map(({ workerVersionUid, weight }) => ({ workerVersionUid, weight }))
+              .sort((left, right) => left.workerVersionUid.localeCompare(right.workerVersionUid)),
+          ) ||
+        !(await resolution.stillCurrent().catch(() => false)) ||
+        (await incarnation.runtime.observeExactPublication?.(
+          scriptName(options.workerResourceUid),
+          identity,
+        )) !== "matches"
+      ) {
+        return null;
+      }
+      const copies = await inspectWorkerdWorkerExecutionCopies({
+        groupDirectory: incarnation.group.runtimeRoot,
+        workerResourceUid: options.workerResourceUid,
+        listenerPort: incarnation.record.listenerPort,
+        scriptName: scriptName(options.workerResourceUid),
+      }).catch(() => null);
+      if (!copies || !executionCopiesMatchRecord(incarnation.record, copies, true)) return null;
+      let selected: ReturnType<typeof selectSelfhostWeightedVersion>;
+      let event: ReturnType<typeof selfhostScheduleEvent>;
+      try {
+        selected = selectSelfhostWeightedVersion(
+          identity.versions,
+          randomSelfhostDeploymentBasisPoint(),
+        );
+        if (!copies.versionUids.includes(selected.workerVersionUid)) return null;
+        event = selfhostScheduleEvent({
+          script: scriptName(options.workerResourceUid),
+          publication: selected.versionId,
+          cron: input.cron,
+          scheduledTime: input.scheduledTime,
+        });
+      } catch {
+        return null;
+      }
+      if (
+        closed ||
+        admissionClosedBy !== null ||
+        active !== incarnation ||
+        state.activeOperationId !== operationId ||
+        canonicalJson(recordFor(operationId)?.identity) !== canonicalJson(identity) ||
+        !(await resolution.stillCurrent().catch(() => false))
+      ) {
+        return null;
+      }
+      let doneResolve!: () => void;
+      const done = new Promise<void>((resolve) => {
+        doneResolve = resolve;
+      });
+      const invocation: ActiveInvocation = {
+        abort: new AbortController(),
+        done,
+        finish() {
+          finishInvocation(incarnation, invocation);
+          doneResolve();
+        },
+        finished: false,
+      };
+      incarnation.invocations.add(invocation);
+      return {
+        incarnation,
+        operationId,
+        identity,
+        selected,
+        event,
+        token: incarnation.record.eventToken,
+        resolution,
+        invocation,
+      };
+    }).catch(() => null);
+    if (!admitted) return unknown;
+    try {
+      if (
+        admitted.invocation.abort.signal.aborted ||
+        !(await admitted.resolution.stillCurrent().catch(() => false))
+      ) {
+        return unknown;
+      }
+      const answer = await admitted.incarnation.runtime.probe?.(
+        scriptName(options.workerResourceUid),
+        SELFHOST_WORKER_EVENT_PATH,
+        {
+          route: "events",
+          method: "POST",
+          headers: {
+            "content-type": SELFHOST_WORKER_EVENT_CONTENT_TYPE,
+            [SELFHOST_WORKER_EVENT_HEADER]: SELFHOST_WORKER_EVENT_PROTOCOL,
+            [SELFHOST_WORKER_EVENT_TOKEN_HEADER]: admitted.token,
+          },
+          body: JSON.stringify(admitted.event),
+          timeoutMillis: 30_000,
+        },
+      );
+      const outcome = scheduledAnswer(answer);
+      if (!outcome) return unknown;
+      return await runSerial(async () => {
+        if (
+          closed ||
+          admitted.invocation.abort.signal.aborted ||
+          admissionClosedBy !== null ||
+          active !== admitted.incarnation ||
+          state.activeOperationId !== admitted.operationId ||
+          canonicalJson(recordFor(admitted.operationId)?.identity) !==
+            canonicalJson(admitted.identity) ||
+          !admitted.incarnation.group.isReady() ||
+          !(await admitted.resolution.stillCurrent().catch(() => false))
+        ) {
+          return unknown;
+        }
+        return { kind: outcome, workerVersionUid: admitted.selected.workerVersionUid };
+      });
+    } catch {
+      return unknown;
+    } finally {
+      admitted.invocation.finish();
+    }
+  };
+
   const close = async (): Promise<void> => {
     await runSerial(async () => {
       if (closed) return;
@@ -2995,6 +3418,8 @@ export async function openWorkerdWorkerRuntimeOwner(
     observeServing,
     observeRetirement,
     fetch: fetchRequest,
+    observeScheduledCapability,
+    invokeScheduled,
     close,
   });
 }

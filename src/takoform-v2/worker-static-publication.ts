@@ -153,6 +153,8 @@ export function createV2WorkerPublication(options: {
   readonly targetKey: string;
   readonly publicationState: PublicationState;
   readonly runtime: WorkerRuntime;
+  /** Incarnation-pinned private gate credential, absent for read-only projections. */
+  readonly scheduledEventToken?: string;
 }): V2WorkerPublication {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   const inspectModule = options.runtime.inspectModule;
@@ -205,6 +207,9 @@ export function createV2WorkerPublication(options: {
           bundle: materials.bundle,
           assets: materials.assets,
           inspectModule,
+          ...(options.scheduledEventToken === undefined
+            ? {}
+            : { eventDelivery: { token: options.scheduledEventToken } }),
         });
         const graph = compileWorkerdVersionGraph({
           directory: name,
@@ -229,6 +234,9 @@ export function createV2WorkerPublication(options: {
           generation,
           workerResourceUid: snapshot.worker.uid,
           declaredHandlers: versionSpec.handlers,
+          ...(versionSpec.handlers.includes("scheduled")
+            ? { eventToken: options.scheduledEventToken }
+            : {}),
           readiness: {
             publication: codeProjection.versionId,
             probeHostname: internalHostname(name),

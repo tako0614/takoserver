@@ -66,6 +66,8 @@ export async function projectV2WorkerCodeVersion(input: {
   readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
   readonly inspectModule: WorkerdRuntime["inspectModule"];
   readonly privateInputs?: unknown;
+  /** Non-optional private event gate capability composed by the owning Host. */
+  readonly eventDelivery?: { readonly token: string };
 }): Promise<V2WorkerCodeDeploymentVariant> {
   const versionUnavailable = () => new V2WorkerCodeRuntimeError("worker_version_unavailable");
   const bundleUnavailable = () => new V2WorkerCodeRuntimeError("worker_bundle_unavailable");
@@ -102,7 +104,11 @@ export async function projectV2WorkerCodeVersion(input: {
   ) {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
   }
-  if (spec.handlers.some((handler) => handler !== "fetch")) {
+  if (
+    spec.handlers.some((handler) => handler !== "fetch" && handler !== "scheduled") ||
+    (spec.handlers.includes("scheduled") &&
+      (!input.eventDelivery || !/^[0-9a-f]{64}$/u.test(input.eventDelivery.token)))
+  ) {
     throw new V2WorkerCodeRuntimeError("worker_event_delivery_unavailable");
   }
   if (spec.assets?.bundle.resourceUid !== identity.assetResourceUid) {
