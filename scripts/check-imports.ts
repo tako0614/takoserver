@@ -148,6 +148,7 @@ const LAYERS: readonly Layer[] = [
       "v2-runtime",
       "v2-workflow-binding-authority",
       "v2-workflow-binding-projection",
+      "v2-service-binding-broker",
       "adapter",
     ],
   },
@@ -325,6 +326,7 @@ const LAYERS: readonly Layer[] = [
       "v2-selfhost-queue-worker-capability",
       "v2-queue-manager",
       "v2-selfhost-workflow-composition",
+      "v2-service-binding-authority",
     ],
   },
   {
