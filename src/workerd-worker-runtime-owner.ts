@@ -4067,14 +4067,13 @@ export async function openWorkerdWorkerRuntimeOwner(
     )
       return unknown;
     const source = options.publicationState.resolveCurrentServing;
+    // A real Queue capability's currentness check reads this same native
+    // owner under runSerial. Evaluate it before entering the owner lane; the
+    // SQL send-authorization CAS below repeats the accepted Consumer/source/
+    // Version fences immediately before the one native effect.
+    if (!(await stillCurrent().catch(() => false))) return unknown;
     const admitted = await runSerial(async () => {
-      if (
-        closed ||
-        suspending ||
-        admissionClosedBy !== null ||
-        !(await stillCurrent().catch(() => false))
-      )
-        return null;
+      if (closed || suspending || admissionClosedBy !== null) return null;
       const incarnation = active;
       const operationId = state.activeOperationId;
       const record = operationId ? recordFor(operationId) : undefined;
@@ -4233,7 +4232,6 @@ export async function openWorkerdWorkerRuntimeOwner(
         return null;
       }
       if (
-        !(await stillCurrent().catch(() => false)) ||
         !(await resolution.stillCurrent().catch(() => false)) ||
         active !== incarnation ||
         state.activeOperationId !== operationId ||

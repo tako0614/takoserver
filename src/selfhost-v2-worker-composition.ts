@@ -15,6 +15,7 @@ import {
   SELFHOST_DATA_PLANE_OBJECTS_PATH,
   SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH,
 } from "./providers/selfhost-worker-wrapper.ts";
+import { createSelfhostV2QueueWorkerCapability } from "./selfhost-v2-queue-worker-capability.ts";
 import type { V2OperatorFormFactory } from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
 import { readV2ConfiguredPrivateInputs } from "./takoform-v2/configured-private-inputs.ts";
@@ -41,12 +42,14 @@ import {
   MODULE_WORKER_LIFECYCLE_BACKEND_ID,
 } from "./takoform-v2/worker-lifecycle-backend.ts";
 import { createV2WorkerPublicationState } from "./takoform-v2/worker-publication-state.ts";
+import type { V2QueueConsumerCapability } from "./takoform-v2/worker-queue-consumer-backend.ts";
 import { createV2WorkerdWorkerRuntimeReaders } from "./takoform-v2/worker-runtime-readers.ts";
 import type { createV2WorkerVersionConfiguredInputSealer } from "./takoform-v2/worker-version-configured-inputs.ts";
 import { spawnWorkerdWithParentDeath } from "./workerd-linux-process.ts";
 import type { WorkerdProcess } from "./workerd-supervisor.ts";
 import { createWorkerdWorkerModuleInspector } from "./workerd-worker-module-inspector.ts";
 import {
+  type OpenWorkerdWorkerRuntimeOwnerOptions,
   openWorkerdWorkerRuntimeOwner,
   type WorkerdWorkerRuntimeOwner,
 } from "./workerd-worker-runtime-owner.ts";
@@ -66,6 +69,8 @@ export interface SelfhostV2WorkerCompositionOptions {
   readonly targetKey: string;
   /** Already selected and pinned by the normal Bun entry. */
   readonly workerdBinary: string | null;
+  /** Explicitly boot-composed Host-private Queue settlement service. */
+  readonly queueSettlement?: NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2QueueSettlement"]>;
   /** Already-created operator key authority; absent refuses sensitive Worker Versions. */
   readonly configuredInputSealer?: ReturnType<typeof createV2WorkerVersionConfiguredInputSealer>;
   /** Already-created Resource custody and pre-existing private signing authority. */
@@ -183,6 +188,8 @@ async function unusedPrivatePort(excluded: Set<number>): Promise<number> {
 export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompositionOptions): {
   restoreOwners(): Promise<readonly string[]>;
   ownerForWorkerUid(uid: string): Promise<WorkerdWorkerRuntimeOwner>;
+  /** Real SQL publication plus restored native Queue export proof, absent without Queue boot. */
+  readonly queueCapability?: V2QueueConsumerCapability;
   /** Stop exact known children but retain UID owner locks and durable accepted state. */
   suspendOwnersRetainingCustody(): Promise<void>;
   /** Close retired owners, then stop the private broker; active owners refuse. */
@@ -194,6 +201,17 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     throw new TypeError("v2 Worker composition requires SQL, objects, target and private root");
   }
   const { sql, objects, clock, config, targetKey } = options;
+  const queueSettlement = options.queueSettlement;
+  if (
+    queueSettlement &&
+    (!/^(?:127\.0\.0\.1|\[::1\]):[1-9][0-9]{0,4}$/u.test(queueSettlement.address) ||
+      Number(queueSettlement.address.slice(queueSettlement.address.lastIndexOf(":") + 1)) >
+        65_535 ||
+      typeof queueSettlement.queueIdForUid !== "function" ||
+      typeof queueSettlement.bindingToken !== "function")
+  ) {
+    throw new TypeError("v2 Queue settlement requires an exact private boot binding");
+  }
   if (
     options.sqliteBinding &&
     (options.sqliteBinding.store?.targetKey !== targetKey ||
@@ -557,6 +575,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         targetKey,
         publicationState,
         ...(configuredInputs ? { configuredInputs } : {}),
+        ...(queueSettlement ? { v2QueueSettlement: queueSettlement } : {}),
         ...(sqliteBoot ? { v2SqliteBinding: sqliteBoot } : {}),
         ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
         ...(kvBoot ? { v2KvBinding: kvBoot } : {}),
@@ -731,6 +750,17 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       return await openOwner(uid);
     },
   });
+  const queueCapability = queueSettlement
+    ? createSelfhostV2QueueWorkerCapability({
+        sql,
+        targetKey,
+        publicationState,
+        ownerForWorkerUid: async (uid) => {
+          if (!restorationComplete) throw new Error("v2 Worker owners have not restored");
+          return await openOwner(uid);
+        },
+      })
+    : undefined;
   const internalFormFactory: V2OperatorFormFactory = (context) => {
     if (context.sql !== sql || context.objects !== objects || context.clock !== clock) {
       throw new TypeError(
@@ -758,6 +788,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         publicationState,
         retirement: readers.retirement,
         inspectModule,
+        ...(queueSettlement ? { queueSettlement } : {}),
         ...(sqliteBoot ? { v2SqliteBinding: sqliteBoot } : {}),
         ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
         ...(kvBoot ? { v2KvBinding: kvBoot } : {}),
@@ -787,6 +818,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   };
 
   return {
+    ...(queueCapability ? { queueCapability } : {}),
     restoreOwners() {
       restoration ??= restore();
       return restoration;

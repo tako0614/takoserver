@@ -41,7 +41,7 @@ function form(
       bindingToken(input: {
         readonly workerUid: string;
         readonly versionId: string;
-        readonly incarnationId: string;
+        readonly servingSourceOperationId: string;
       }): string;
     };
     v2SqliteBinding?: {
