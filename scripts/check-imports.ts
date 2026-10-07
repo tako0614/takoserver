@@ -265,6 +265,8 @@ const LAYERS: readonly Layer[] = [
       "v2-selfhost-actor-boot",
       "v2-selfhost-workflow-boot",
       "v2-actor-graph-authority",
+      "v2-selfhost-composition",
+      "v2-runtime",
     ],
   },
   {
