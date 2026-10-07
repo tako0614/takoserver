@@ -5,13 +5,23 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
-import type { JsonObject } from "../src/ports.ts";
+import type { JsonObject, Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { createStaticAssetBundleHost } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
 import {
+  referencesForWorkerDeployment,
+  referencesForWorkerEndpoint,
+} from "../src/takoform-v2/forms/worker-references.ts";
+import {
   MODULE_WORKER_FORM_URL,
+  parseWorkerDeploymentSpec,
+  parseWorkerEndpointSpec,
+  validateWorkerDeploymentUpdate,
+  validateWorkerEndpointUpdate,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import {
@@ -28,16 +38,37 @@ const FILE_URL = "https://artifacts.example.test/static/index.html";
 const FILE_BYTES = new TextEncoder().encode("<main>held asset</main>");
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
-function fixture() {
+function fixture(options?: { backendQueryHook?: (statement: string, sql: Sql) => Promise<void> }) {
   const root = mkdtempSync(join(tmpdir(), "v2-worker-lifecycle-"));
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);
   const sql = createSqliteSql(db);
+  const backendSql: Sql = options?.backendQueryHook
+    ? {
+        ...sql,
+        async query(statement, params) {
+          const result = await sql.query(statement, params);
+          await options.backendQueryHook?.(statement, sql);
+          return result;
+        },
+      }
+    : sql;
   let nowMs = Date.now();
   let sourceAvailable = true;
   let sourceReads = 0;
   let retirementMode: "unknown" | "confirmed" | "wrong_identity" = "unknown";
   let retirementCalls = 0;
+  let servingMode: "confirmed" | "unknown" | "wrong_identity" = "confirmed";
+  let servingCalls = 0;
+  let served: {
+    kind: "serving";
+    workerResourceUid: string;
+    targetKey: string;
+    sourceOperationId: string;
+    generation: string;
+    hostnames: string[];
+    versions: { workerVersionUid: string; weight: number }[];
+  } | null = null;
   const manifest = new TextEncoder().encode(
     JSON.stringify({
       files: [
@@ -81,13 +112,86 @@ function fixture() {
       return proof;
     },
   };
-  const workerForm = createInternalV2ModuleWorkerForm({ sql, targetKey: TARGET_KEY, retirement });
+  const serving = {
+    async observeServing(input: { workerResourceUid: string; targetKey: string }) {
+      servingCalls += 1;
+      if (
+        servingMode === "unknown" ||
+        !served ||
+        served.workerResourceUid !== input.workerResourceUid ||
+        served.targetKey !== input.targetKey
+      ) {
+        return { kind: "unknown" as const };
+      }
+      return {
+        ...served,
+        sourceOperationId:
+          servingMode === "wrong_identity" ? "wrong-operation" : served.sourceOperationId,
+      };
+    },
+  };
+  const workerForm = createInternalV2ModuleWorkerForm({
+    sql: backendSql,
+    targetKey: TARGET_KEY,
+    retirement,
+    serving,
+  });
   const versionForm = createInternalV2StaticWorkerVersionForm({
-    sql,
+    sql: backendSql,
     targetKey: TARGET_KEY,
     publicationState,
     retirement,
   });
+  const confirmedDeployment = async (execution: { spec: JsonObject; operationId: string }) => {
+    const spec = parseWorkerDeploymentSpec(execution.spec);
+    served = {
+      kind: "serving",
+      workerResourceUid: spec.worker.resourceUid,
+      targetKey: TARGET_KEY,
+      sourceOperationId: execution.operationId,
+      generation: `takoserver-v2-operation:${execution.operationId}`,
+      hostnames: [],
+      versions: spec.versions.map((version) => ({
+        workerVersionUid: version.workerVersion.resourceUid,
+        weight: version.weight,
+      })),
+    };
+    return {
+      kind: "complete" as const,
+      observed: {
+        ready: true,
+        active: true,
+        selectedVersions: spec.versions.map((version) => ({
+          resourceUid: version.workerVersion.resourceUid,
+          weight: version.weight,
+        })),
+      },
+      output: {},
+    };
+  };
+  const confirmedEndpoint = async (execution: {
+    action: string;
+    spec: JsonObject;
+    operationId: string;
+  }) => {
+    parseWorkerEndpointSpec(execution.spec);
+    if (!served) return { kind: "unknown" as const };
+    served = {
+      ...served,
+      sourceOperationId: execution.operationId,
+      generation: `takoserver-v2-operation:${execution.operationId}`,
+      hostnames: execution.action === "delete" ? [] : ["worker.example.test"],
+    };
+    return {
+      kind: "complete" as const,
+      observed:
+        execution.action === "delete" ? {} : { tlsReady: true, activeDeploymentRouteReady: true },
+      output:
+        execution.action === "delete"
+          ? {}
+          : { hostname: "worker.example.test", url: "https://worker.example.test/" },
+    };
+  };
   const engine = createTakoformV2Engine({
     sql,
     now: () => new Date(nowMs),
@@ -98,6 +202,44 @@ function fixture() {
       [MODULE_WORKER_FORM_URL]: workerForm,
       [WORKER_VERSION_FORM_URL]: versionForm,
       [STATIC_ASSET_BUNDLE_FORM_URL]: assetHost.form,
+      // A test-only confirmed Deployment observation, not native publication proof.
+      [WORKER_DEPLOYMENT_FORM_URL]: {
+        validateCreate(spec) {
+          parseWorkerDeploymentSpec(spec);
+        },
+        validateUpdate(previous, spec) {
+          validateWorkerDeploymentUpdate(previous, spec);
+        },
+        references(spec) {
+          return referencesForWorkerDeployment(parseWorkerDeploymentSpec(spec));
+        },
+        rejectDeleteWhileReferenced: true,
+        backend: {
+          id: "fixture-confirmed-deployment",
+          targetKey: TARGET_KEY,
+          execute: confirmedDeployment,
+          reconcile: confirmedDeployment,
+        },
+      },
+      // Endpoint fixture only supplies a synthetic confirmed attachment.
+      [WORKER_ENDPOINT_FORM_URL]: {
+        validateCreate(spec) {
+          parseWorkerEndpointSpec(spec);
+        },
+        validateUpdate(previous, spec) {
+          validateWorkerEndpointUpdate(previous, spec);
+        },
+        references(spec) {
+          return referencesForWorkerEndpoint(parseWorkerEndpointSpec(spec));
+        },
+        rejectDeleteWhileReferenced: true,
+        backend: {
+          id: "fixture-confirmed-endpoint",
+          targetKey: TARGET_KEY,
+          execute: confirmedEndpoint,
+          reconcile: confirmedEndpoint,
+        },
+      },
     },
   });
   async function create(form: string, name: string, spec: JsonObject) {
@@ -133,6 +275,7 @@ function fixture() {
     workerForm,
     versionForm,
     retirement,
+    serving,
     create,
     createWorkerAndAssets,
     get nowMs() {
@@ -149,6 +292,12 @@ function fixture() {
     },
     get retirementCalls() {
       return retirementCalls;
+    },
+    get servingCalls() {
+      return servingCalls;
+    },
+    set servingMode(value: typeof servingMode) {
+      servingMode = value;
     },
     set retirementMode(value: typeof retirementMode) {
       retirementMode = value;
@@ -196,6 +345,188 @@ test("ModuleWorker allocation and isolated same-spec update never claim runtime 
     });
     expect(replay.id).toBe(update.id);
     expect(f.retirementCalls).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("ModuleWorker same-spec PUT keeps the confirmed active Deployment observation", async () => {
+  const f = fixture();
+  try {
+    const { worker, spec } = await f.createWorkerAndAssets();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec);
+    const versionOnly = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "worker-version-only-update",
+      uid: worker.resourceUid,
+      expectedGeneration: 1,
+      spec: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: versionOnly.id, status: "succeeded" });
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({ observed: { activeDeploymentUid: null, ready: false } });
+
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    const active = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "worker-active-deployment-update",
+      uid: worker.resourceUid,
+      expectedGeneration: 2,
+      spec: {},
+    });
+    f.servingMode = "unknown";
+    expect(await f.engine.runNext()).toMatchObject({ id: active.id, status: "reconciling" });
+    f.servingMode = "wrong_identity";
+    let pending = await f.sql.query(
+      "SELECT next_attempt_at_ms FROM tf_v2_operations WHERE id = ?",
+      [active.id],
+    );
+    f.nowMs = Number(pending[0]?.next_attempt_at_ms) + 1;
+    expect(await f.engine.runNext()).toMatchObject({ id: active.id, status: "reconciling" });
+    f.servingMode = "confirmed";
+    pending = await f.sql.query("SELECT next_attempt_at_ms FROM tf_v2_operations WHERE id = ?", [
+      active.id,
+    ]);
+    f.nowMs = Number(pending[0]?.next_attempt_at_ms) + 1;
+    expect(await f.engine.runNext()).toMatchObject({ id: active.id, status: "succeeded" });
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({
+      observedGeneration: 3,
+      observed: { activeDeploymentUid: deployment.resourceUid, ready: true },
+    });
+    expect(f.servingCalls).toBe(3);
+  } finally {
+    f.close();
+  }
+});
+
+test("ModuleWorker observation follows settled Endpoint publication and removal markers", async () => {
+  const f = fixture();
+  try {
+    const { worker, spec } = await f.createWorkerAndAssets();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    const endpoint = await f.create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    const afterAttach = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "worker-after-endpoint-attach",
+      uid: worker.resourceUid,
+      expectedGeneration: 1,
+      spec: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: afterAttach.id, status: "succeeded" });
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({
+      observed: { activeDeploymentUid: deployment.resourceUid, ready: true },
+    });
+
+    const removeEndpoint = await f.engine.acceptDelete({
+      principal: "org-1",
+      key: "delete-endpoint-fixture",
+      uid: endpoint.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: removeEndpoint.id, status: "succeeded" });
+    const afterRemoval = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "worker-after-endpoint-removal",
+      uid: worker.resourceUid,
+      expectedGeneration: 2,
+      spec: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: afterRemoval.id, status: "succeeded" });
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({
+      observedGeneration: 3,
+      observed: { activeDeploymentUid: deployment.resourceUid, ready: true },
+    });
+  } finally {
+    f.close();
+  }
+});
+
+test("ModuleWorker PUT stays unknown while an Endpoint publication is pending", async () => {
+  const f = fixture();
+  try {
+    const { worker, spec } = await f.createWorkerAndAssets();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec);
+    await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    const endpoint = await f.engine.acceptCreate({
+      principal: "org-1",
+      key: "pending-endpoint-fixture",
+      input: {
+        form: WORKER_ENDPOINT_FORM_URL,
+        space: "prod",
+        name: "endpoint",
+        spec: { worker: { resourceUid: worker.resourceUid } },
+      },
+    });
+    await f.sql.run("UPDATE tf_v2_operations SET next_attempt_at_ms = ? WHERE id = ?", [
+      f.nowMs + 60_000,
+      endpoint.id,
+    ]);
+    const workerUpdate = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "worker-with-pending-endpoint",
+      uid: worker.resourceUid,
+      expectedGeneration: 1,
+      spec: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: workerUpdate.id, status: "reconciling" });
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({
+      observedGeneration: 1,
+      observed: { activeDeploymentUid: null, ready: false },
+    });
+  } finally {
+    f.close();
+  }
+});
+
+test("ModuleWorker PUT will not mint readiness from a damaged selected Version edge", async () => {
+  const f = fixture();
+  try {
+    const { worker, spec } = await f.createWorkerAndAssets();
+    const version = await f.create(WORKER_VERSION_FORM_URL, "version", spec);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    await f.sql.run(
+      "DELETE FROM tf_v2_resource_references WHERE target_uid = ? AND referrer_uid = ?",
+      [version.resourceUid, deployment.resourceUid],
+    );
+    const update = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "worker-with-damaged-deployment-edge",
+      uid: worker.resourceUid,
+      expectedGeneration: 1,
+      spec: {},
+    });
+    expect(await f.engine.runNext()).toMatchObject({ id: update.id, status: "reconciling" });
+    expect(f.servingCalls).toBe(0);
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({
+      observedGeneration: 1,
+      observed: { activeDeploymentUid: null, ready: false },
+    });
   } finally {
     f.close();
   }
@@ -389,6 +720,7 @@ test("retirement is a required constructor capability, not a default absence cla
         sql: f.sql,
         targetKey: TARGET_KEY,
         retirement: null as never,
+        serving: f.serving,
       }),
     ).toThrow(TypeError);
     expect(() =>
@@ -427,6 +759,42 @@ test("retirement callback identity is captured at construction, before SQL await
     expect(await f.engine.runNext()).toMatchObject({ id: deletion.id, status: "reconciling" });
     expect(replacementCalls).toBe(0);
     expect(f.retirementCalls).toBe(1);
+  } finally {
+    f.close();
+  }
+});
+
+test("DELETE refuses a claim whose lease expires during its final reference read", async () => {
+  let referenceReads = 0;
+  let deletionId: string | null = null;
+  const f = fixture({
+    backendQueryHook: async (statement, sql) => {
+      if (!statement.includes("SELECT target_uid FROM tf_v2_resource_references")) return;
+      referenceReads += 1;
+      if (referenceReads === 2 && deletionId) {
+        await sql.run("UPDATE tf_v2_operations SET lease_until_ms = 1 WHERE id = ?", [deletionId]);
+      }
+    },
+  });
+  try {
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "worker", {});
+    referenceReads = 0;
+    const deletion = await f.engine.acceptDelete({
+      principal: "org-1",
+      key: "delete-worker-expired-lease",
+      uid: worker.resourceUid,
+      expectedGeneration: 1,
+    });
+    deletionId = deletion.id;
+    f.retirementMode = "confirmed";
+    expect(await f.engine.runNext()).toMatchObject({ id: deletion.id, status: "reconciling" });
+    expect(f.retirementCalls).toBe(1);
+    expect(
+      await f.engine.getResource({ principal: "org-1", uid: worker.resourceUid }),
+    ).toMatchObject({
+      phase: "deleting",
+      observedGeneration: 1,
+    });
   } finally {
     f.close();
   }
