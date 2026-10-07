@@ -403,6 +403,162 @@ test("one indefinitely running Consumer cannot block a later SQL page or schedul
   }
 });
 
+for (const copiedOutcome of ["ack", "retry"] as const)
+  test(`a copied DLQ message already ${copiedOutcome === "ack" ? "ACKed" : "retried"} by its exact native batch releases the source notice`, async () => {
+    const database = new Database(":memory:");
+    try {
+      for (const migration of MIGRATIONS) database.exec(migration.sql);
+      const accepted = await acceptedConsumer(database);
+      const sourceQueueUid = await accepted.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "receipt-source", {
+        messageRetentionSeconds: 3_600,
+      });
+      const sourceConsumerUid = await accepted.create(
+        QUEUE_CONSUMER_FORM_URL,
+        "receipt-source-consumer",
+        consumerSpec(sourceQueueUid, accepted.workerUid, {
+          maxRetries: 0,
+          retryDelaySeconds: 0,
+          deadLetterQueue: { resourceUid: accepted.queueUid },
+        }),
+      );
+      const source = {
+        queueId: v2QueueId(sourceQueueUid),
+        consumerId: sourceConsumerUid,
+        generation: 1,
+        policy: {
+          maxRetries: 0,
+          retryDelaySeconds: 0,
+          deadLetterQueue: {
+            queueId: v2QueueId(accepted.queueUid),
+            messageRetentionSeconds: 3_600,
+            deliveryDelaySeconds: 0,
+          },
+        },
+      };
+      const custody = createQueueCustody({
+        sql: accepted.sql,
+        randomId: () => "copied-dlq-message",
+      });
+      await custody.admit(
+        { queueId: source.queueId, messageRetentionSeconds: 3_600, deliveryDelaySeconds: 0 },
+        { messageId: "source-message", body: new Uint8Array([7]) },
+      );
+      const [sourceClaim] = await custody.claim({ ...source, limit: 1 });
+      if (!sourceClaim) throw new Error("source claim is missing");
+      expect(await custody.settle(sourceClaim, { outcome: "retry" })).toBe(true);
+      expect((await custody.listTransferNotices(source))[0]?.noticeToken).toBe(
+        "copied-dlq-message",
+      );
+      await custody.admit(
+        {
+          queueId: v2QueueId(accepted.queueUid),
+          messageRetentionSeconds: 3_600,
+          deliveryDelaySeconds: 0,
+        },
+        { messageId: "unrelated-target-message", body: new Uint8Array([8]) },
+      );
+      const selected = await createV2QueueDelivery({
+        sql: accepted.sql,
+        custody,
+        capability: accepted.capability,
+      }).claimRegisteredBatch({ consumerUid: accepted.consumerUid, principal, space, targetKey });
+      if (selected.kind !== "ready") throw new Error("target batch not registered");
+      expect(selected.claims.map((claim) => claim.messageId).sort()).toEqual([
+        "copied-dlq-message",
+        "unrelated-target-message",
+      ]);
+      expect(
+        await authorizeV2QueueBatchSend(accepted.sql, {
+          batchId: selected.batchId,
+          reservationToken: selected.reservationToken,
+          queueUid: accepted.queueUid,
+          consumerUid: accepted.consumerUid,
+          generation: selected.generation,
+          workerUid: accepted.workerUid,
+          servingSourceOperationId: accepted.servingSourceOperationId,
+          workerVersionUid: accepted.versionUid,
+          workerVersionGeneration: 1,
+          incarnationOperationId: "receipt-test-incarnation",
+        }),
+      ).toBe("authorized");
+      const settle = async (messageId: string, outcome: "ack" | "retry" = "ack") => {
+        const claim = selected.claims.find((candidate) => candidate.messageId === messageId);
+        if (!claim) throw new Error("target claim is missing");
+        expect(
+          await custody.settleRegisteredBatchMessage({
+            batchId: selected.batchId,
+            messageId,
+            expected: {
+              queueId: claim.queueId,
+              consumerId: claim.consumerId,
+              generation: claim.generation,
+              leaseToken: claim.leaseToken,
+            },
+            decision: { outcome },
+            settlementToken: `receipt-${messageId}`,
+          }),
+        ).toBe("settled");
+      };
+      await settle("unrelated-target-message");
+      const scheduler = createSelfhostV2QueueScheduler({
+        sql: accepted.sql,
+        custody,
+        composition: {
+          async deliverOnce() {
+            return { kind: "unknown" as const };
+          },
+        },
+        pollMillis: 60_000,
+      });
+      try {
+        scheduler.start();
+        await scheduler.tick();
+        expect((await custody.listTransferNotices(source)).length).toBe(1);
+        await settle("copied-dlq-message", copiedOutcome);
+        // Even a valid receipt for this token cannot release a notice that claims
+        // another destination than the source generation actually declared.
+        const wrongTargetQueueUid = await accepted.create(
+          AT_LEAST_ONCE_QUEUE_FORM_URL,
+          "wrong-receipt-target",
+          { messageRetentionSeconds: 3_600 },
+        );
+        await accepted.sql.run(
+          "UPDATE queue_custody_transfer_notices SET target_queue_id = ? WHERE source_queue_id = ? AND source_consumer_id = ? AND source_generation = ?",
+          [v2QueueId(wrongTargetQueueUid), source.queueId, source.consumerId, source.generation],
+        );
+        for (let attempt = 0; attempt < 4; attempt += 1) await scheduler.tick();
+        expect((await custody.listTransferNotices(source)).length).toBe(1);
+        await accepted.sql.run(
+          "UPDATE queue_custody_transfer_notices SET target_queue_id = ? WHERE source_queue_id = ? AND source_consumer_id = ? AND source_generation = ?",
+          [v2QueueId(accepted.queueUid), source.queueId, source.consumerId, source.generation],
+        );
+        for (let attempt = 0; attempt < 4; attempt += 1) await scheduler.tick();
+        expect(await custody.listTransferNotices(source)).toEqual([]);
+        if (copiedOutcome === "ack") {
+          // An injected ID reuse demonstrates the limit that *can* be proven
+          // from existing rows: an old ACK receipt cannot stand in for a newly
+          // copied, still-unattempted message with the same Queue/message ID.
+          await custody.admit(
+            { queueId: source.queueId, messageRetentionSeconds: 3_600, deliveryDelaySeconds: 0 },
+            { messageId: "second-source-message", body: new Uint8Array([9]) },
+          );
+          const [secondSourceClaim] = await custody.claim({ ...source, limit: 1 });
+          if (!secondSourceClaim) throw new Error("second source claim is missing");
+          expect(await custody.settle(secondSourceClaim, { outcome: "retry" })).toBe(true);
+          expect((await custody.listTransferNotices(source))[0]?.noticeToken).toBe(
+            "copied-dlq-message",
+          );
+          for (let attempt = 0; attempt < 4; attempt += 1) await scheduler.tick();
+          expect((await custody.listTransferNotices(source)).length).toBe(1);
+        }
+      } finally {
+        await scheduler.close();
+      }
+    } finally {
+      database.close();
+    }
+  });
+
 test("dead-letter notice stays pending without a verified active target wake, then ACKs exact token", async () => {
   const root = mkdtempSync(join(tmpdir(), "v2-queue-notice-"));
   const path = join(root, "state.sqlite");

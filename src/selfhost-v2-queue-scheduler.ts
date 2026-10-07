@@ -159,13 +159,29 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
       ]);
       if (noticeWakes.has(noticeKey)) continue;
       // Source may be retiring or soft-deleted. Its persisted v2 identity and
-      // immutable Queue reference still distinguish this from legacy custody.
+      // accepted generation's exact Queue and dead-letter references still
+      // distinguish this from legacy custody or another target Queue.
       const sourceRows = await options.sql.query(
-        `SELECT principal,space,target_key FROM tf_v2_resources
-         WHERE uid = ? AND form_url = ?
+        `SELECT source.principal,source.space,source.target_key
+         FROM tf_v2_resources source
+         JOIN tf_v2_operations source_op ON source_op.resource_uid = source.uid
+         WHERE source.uid = ? AND source.form_url = ?
+           AND source_op.generation = ? AND source_op.action IN ('create','update')
+           AND source_op.status = 'succeeded' AND source_op.effect = 'complete'
+           AND source_op.principal = source.principal
+           AND source_op.target_key = source.target_key
            AND ? = 'takoform-v2-queue:' ||
-             json_extract(spec_json, '$.queue.resourceUid') LIMIT 2`,
-        [sourceConsumerId, QUEUE_CONSUMER_FORM_URL, sourceQueueId],
+             json_extract(source_op.accepted_spec_json, '$.queue.resourceUid')
+           AND ? = 'takoform-v2-queue:' ||
+             json_extract(source_op.accepted_spec_json, '$.deadLetterQueue.resourceUid')
+         LIMIT 2`,
+        [
+          sourceConsumerId,
+          QUEUE_CONSUMER_FORM_URL,
+          sourceGeneration as number,
+          sourceQueueId,
+          targetQueueId,
+        ],
       );
       const source = sourceRows.length === 1 ? sourceRows[0] : null;
       if (
@@ -178,6 +194,51 @@ export function createSelfhostV2QueueScheduler(options: SelfhostV2QueueScheduler
       const sourcePrincipal = source.principal;
       const sourceSpace = source.space;
       const sourceTargetKey = source.target_key;
+      // A previous ordinary poll can have already settled the copied message
+      // before this notice is seen. Its immutable 0082 receipt and exact 0083
+      // authorized execution prove that this *same* copied ID was delivered.
+      // A retry leaves the target's independent delivery duty in place; only
+      // an ACK additionally proves removal. No payload digest survives ACK,
+      // so never adopt another message's or a pre-send execution's receipt.
+      const terminalCopy = await options.sql.query(
+        `SELECT 1 FROM queue_v2_batch_settlements receipt
+         JOIN queue_v2_batch_executions execution
+           ON execution.batch_id = receipt.batch_id
+          AND execution.queue_id = receipt.queue_id
+          AND execution.consumer_uid = receipt.consumer_id
+          AND execution.consumer_generation = receipt.generation
+          AND execution.lease_token = receipt.lease_token
+          AND execution.reservation_token = receipt.execution_reservation_token
+         WHERE receipt.queue_id = ? AND receipt.message_id = ?
+           AND receipt.state = 'settled' AND receipt.outcome IN ('ack','retry')
+           AND receipt.settlement_token IS NOT NULL AND receipt.settled_at_ms > 0
+           AND execution.state IN ('send_authorized','retired')
+           AND execution.principal = ? AND execution.space = ?
+           AND execution.target_key = ?
+           AND NOT EXISTS (SELECT 1 FROM selfhost_queue_messages fresh
+             WHERE fresh.queue_id = receipt.queue_id
+               AND fresh.message_id = receipt.message_id
+               AND fresh.deliveries = 0)
+           AND (receipt.outcome = 'retry' OR NOT EXISTS (
+             SELECT 1 FROM selfhost_queue_messages message
+             WHERE message.queue_id = receipt.queue_id
+               AND message.message_id = receipt.message_id))
+         LIMIT 1`,
+        [targetQueueId, noticeToken, sourcePrincipal, sourceSpace, sourceTargetKey],
+      );
+      if (terminalCopy.length === 1) {
+        if (!closed && timer)
+          await options.custody
+            .acknowledgeTransferNotice({
+              queueId: sourceQueueId,
+              consumerId: sourceConsumerId,
+              generation: sourceGeneration as number,
+              targetQueueId,
+              noticeToken,
+            })
+            .catch(() => false);
+        continue;
+      }
       const readTarget = () =>
         options.sql.query(
           `SELECT consumer.uid,consumer.spec_json,custody.generation
