@@ -88,6 +88,23 @@ describe("realized Worker configuration", () => {
     }
   });
 
+  test("v2 0088 maintenance adds one variable and retains the exact v2 config", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-v2-schema-maintenance-"));
+    try {
+      const config =
+        '{"documentation":"https://docs.example.test/v2","authenticationDocumentation":"https://docs.example.test/v2/authentication"}';
+      const path = writeWorkerConfig(
+        { ...target, takoformV2: { config }, schemaMaintenanceMode: "pre-v2-0088-quiesced" },
+        { path: join(root, "wrangler.jsonc"), main: "worker.js", commit: "a".repeat(40) },
+      );
+      const actual = JSON.parse(readFileSync(path, "utf8")) as { vars: Record<string, string> };
+      expect(actual.vars.TAKOSERVER_SCHEMA_MAINTENANCE_MODE).toBe("pre-v2-0088-quiesced");
+      expect(actual.vars.TAKOSERVER_TAKOFORM_V2_CONFIG).toBe(config);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("omits only the executor service while retaining the maintenance target inputs", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-config-artifact-quiescence-executor-"));
     const cloudflareProviderExecutor = cloudflareProviderExecutorTarget();

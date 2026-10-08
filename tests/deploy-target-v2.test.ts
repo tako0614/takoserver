@@ -186,6 +186,42 @@ describe("environment-exact deploy target", () => {
     ).toThrow("conflict");
   });
 
+  test("selects v2 0088 maintenance only for integration and preserves its v2 config", () => {
+    const config = JSON.stringify({
+      documentation: "https://docs.example.test/v2",
+      authenticationDocumentation: "https://docs.example.test/v2/authentication",
+    });
+    const selected = parseDeployTarget(
+      descriptor({
+        environment: "integration",
+        schemaMaintenanceMode: "pre-v2-0088-quiesced",
+        takoformV2: { config },
+      }),
+      "v2 maintenance target",
+      "integration",
+    );
+    expect(selected.schemaMaintenanceMode).toBe("pre-v2-0088-quiesced");
+    expect(selected.takoformV2?.config).toBe(config);
+    expect(() =>
+      parseDeployTarget(
+        descriptor({ schemaMaintenanceMode: "pre-v2-0088-quiesced" }),
+        "protected target",
+        "rehearsal",
+      ),
+    ).toThrow("integration-only");
+    expect(() =>
+      parseDeployTarget(
+        descriptor({
+          environment: "integration",
+          schemaMaintenanceMode: "pre-0058-quiesced",
+          takoformV2: { config },
+        }),
+        "old maintenance target",
+        "integration",
+      ),
+    ).toThrow("maintenance profile");
+  });
+
   test("refuses the retired cross-product runtime topology", () => {
     withTarget(
       descriptor({

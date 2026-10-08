@@ -40,8 +40,8 @@ export interface DeployTarget {
   readonly takoformV2?: { readonly config: string };
   /** Temporary pre-0043 runtime used only by the 0043 cutover protocol. */
   readonly artifactBlobIoMode?: "pre-0043-quiesced";
-  /** Optional whole-Host source-only maintenance profile for the pending 0058 transition. */
-  readonly schemaMaintenanceMode?: "pre-0058-quiesced";
+  /** Optional whole-Host source-only maintenance profile for an exact pending schema wave. */
+  readonly schemaMaintenanceMode?: "pre-0058-quiesced" | "pre-v2-0088-quiesced";
   /** Operator-selected, preprovisioned single-host custody for protected 0058 attempts. */
   readonly protected0058Custody?: {
     readonly root: string;
@@ -513,11 +513,20 @@ export function parseDeployTarget(
         }),
     signing: signing(value.signing),
   };
+  if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && environment !== "integration") {
+    throw preflightError("v2 0088 schema maintenance is integration-only");
+  }
+  if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && target.takoformV2 === undefined) {
+    throw preflightError("v2 0088 schema maintenance must retain the exact v2 Worker config");
+  }
   if (target.takoformV2 !== undefined) {
     if (environment !== "integration") {
       throw preflightError("v2 Worker target composition is integration-only");
     }
-    if (target.artifactBlobIoMode !== undefined || target.schemaMaintenanceMode !== undefined) {
+    if (
+      target.artifactBlobIoMode !== undefined ||
+      target.schemaMaintenanceMode === "pre-0058-quiesced"
+    ) {
       throw preflightError("v2 Worker target cannot select a maintenance profile");
     }
   }
@@ -1330,12 +1339,12 @@ function artifactBlobIoMode(value: unknown): { readonly artifactBlobIoMode?: "pr
 }
 
 function schemaMaintenanceMode(value: unknown): {
-  readonly schemaMaintenanceMode?: "pre-0058-quiesced";
+  readonly schemaMaintenanceMode?: "pre-0058-quiesced" | "pre-v2-0088-quiesced";
 } {
   if (value === undefined) return {};
-  if (value !== "pre-0058-quiesced") {
+  if (value !== "pre-0058-quiesced" && value !== "pre-v2-0088-quiesced") {
     throw preflightError(
-      "deploy target `schemaMaintenanceMode` must be pre-0058-quiesced when set",
+      "deploy target `schemaMaintenanceMode` is not a supported maintenance profile",
     );
   }
   return { schemaMaintenanceMode: value };

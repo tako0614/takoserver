@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
@@ -288,6 +289,7 @@ function fixture(
     readonly storeSecrets?: readonly string[];
     readonly selected?: DeployTarget;
     readonly local?: readonly string[];
+    readonly auditedShape?: string;
   } = {},
 ): Fixture {
   const selected = input.selected ?? target;
@@ -385,6 +387,12 @@ function fixture(
         return {
           local: input.local ?? ["0001_first.sql", "0002_second.sql"],
           applied: input.applied ?? ["0001_first.sql", "0002_second.sql"],
+          ...(input.auditedShape === undefined
+            ? {}
+            : {
+                shape: input.auditedShape,
+                shapeDigest: `sha256:${createHash("sha256").update(input.auditedShape).digest("hex")}`,
+              }),
         };
       },
     },
@@ -815,6 +823,130 @@ describe("reviewed Worker closure transition", () => {
         probe: { status: 503, traffic: "maintenance" },
       });
       expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    });
+  });
+
+  test("publishes the exact v2 0088 maintenance successor from an audited 0066 predecessor", async () => {
+    await withRoot("takoserver-closure-v2-0088-maintenance-", async (root) => {
+      const selected = {
+        ...v2Target,
+        schemaMaintenanceMode: "pre-v2-0088-quiesced" as const,
+      } satisfies DeployTarget;
+      const shape = deriveExpectedApplicationShape(readMigrationArtifact().files.slice(0, 66));
+      const parts = fixture(root, {
+        selected,
+        local: schemaMigrations,
+        applied: schemaMigrations.slice(0, 66),
+        auditedShape: shape,
+        predecessor: { dropVar: SCHEMA_MODE_VAR, v2Startup: true },
+      });
+      const executor = providerExecutorInspection({ ready: false, schemaReady: false });
+      const maintenanceExecutor = {
+        ...executor,
+        maintenance: {
+          mode: "pre-v2-0088-quiesced" as const,
+          accountId: selected.accountId,
+          databaseId: selected.d1.databaseId,
+          databaseName: selected.d1.databaseName,
+          workerName: selected.cloudflareProviderExecutor.workerName,
+          activeVersionId: executor.versionId ?? "",
+          activeDeploymentId: executor.deploymentId ?? "",
+          previousVersionId: executor.previousVersionId ?? "",
+          selectedSourceCommit: executor.commit ?? "",
+          selectedModuleDigestHex: executor.moduleDigestHex ?? "",
+          predecessorSourceCommit: LIVE_COMMIT,
+          predecessorVersionId: executor.previousVersionId ?? "",
+          observedNonCodeDigestHex: "9".repeat(64),
+        },
+      };
+      const result = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: {
+            retiredVars: [],
+            addedVars: [SCHEMA_MODE_VAR],
+            refreshedVars: [],
+            addedBindings: [],
+            addedSecrets: [],
+            rotatedSecrets: [],
+          },
+        },
+        selected,
+        {
+          run: parts.run,
+          state: parts.state,
+          migrations: parts.migrations,
+          providerExecutorQualification: qualification(maintenanceExecutor),
+          review: "reviewer@example.test",
+          secretDirectory: parts.secretDirectory,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          outputDirectory: join(root, "work"),
+          fetcher: async () =>
+            Response.json(
+              {
+                error: {
+                  code: "backend_unavailable",
+                  message: "Host is quiesced for the v2 0088 schema maintenance transition",
+                  details: { reason: "runtime-configuration" },
+                },
+              },
+              { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
+            ),
+        },
+      );
+      expect(result).toMatchObject({
+        maintenance: "pre-v2-0088-quiesced",
+        previousVersionId: PREDECESSOR,
+        versionId: SUCCESSOR,
+        pendingMigrations: schemaMigrations.slice(66),
+        probe: { status: 503, traffic: "maintenance" },
+      });
+      expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+      const lost = fixture(join(root, "lost-ack"), {
+        selected,
+        local: schemaMigrations,
+        applied: schemaMigrations.slice(0, 66),
+        auditedShape: shape,
+        predecessor: { dropVar: SCHEMA_MODE_VAR, v2Startup: true },
+      });
+      const failure = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: {
+            retiredVars: [],
+            addedVars: [SCHEMA_MODE_VAR],
+            refreshedVars: [],
+            addedBindings: [],
+            addedSecrets: [],
+            rotatedSecrets: [],
+          },
+        },
+        selected,
+        {
+          run: async (command, options) => {
+            const result = await lost.run(command, options);
+            return command.includes("--no-bundle") ? { ...result, exitCode: 1 } : result;
+          },
+          state: lost.state,
+          migrations: lost.migrations,
+          providerExecutorQualification: qualification(maintenanceExecutor),
+          review: "reviewer@example.test",
+          secretDirectory: lost.secretDirectory,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          outputDirectory: join(root, "lost-work"),
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).message).toContain("indeterminate");
+      expect(lost.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
     });
   });
 

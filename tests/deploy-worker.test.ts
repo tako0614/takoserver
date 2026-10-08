@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
@@ -11,6 +13,8 @@ import type { ProviderExecutorInspection } from "../scripts/deploy/worker.ts";
 import {
   authoritySensitiveWorkerPaths,
   probeProduct,
+  probeSchemaMaintenance,
+  providerExecutorAllowsPublication,
   runWorker,
   type WorkerMigrationReader,
   type WorkerProcess,
@@ -901,6 +905,104 @@ describe("split Takoserver Worker surfaces", () => {
       ready: false,
       pendingMigrations: canonicalMigrations.slice(57),
     });
+  });
+
+  test("v2 0088 maintenance admits only canonical audited 0066 through 0088 prefixes", () => {
+    const selected = { ...v2Target, schemaMaintenanceMode: "pre-v2-0088-quiesced" as const };
+    const files = readMigrationArtifact().files;
+    const at = (count: number) => {
+      const shape = deriveExpectedApplicationShape(files.slice(0, count));
+      return {
+        local: canonicalMigrations,
+        applied: canonicalMigrations.slice(0, count),
+        shape,
+        shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
+      };
+    };
+    for (const count of [66, 67, 69, 75, 86, 87, 88]) {
+      expect(workerSchemaAllowsPending(selected, at(count))).toBe(true);
+    }
+    expect(workerSchemaAllowsPending(selected, at(65))).toBe(false);
+    expect(workerSchemaAllowsPending(selected, { ...at(75), shape: "[]" })).toBe(false);
+    expect(
+      workerSchemaAllowsPending(selected, {
+        ...at(75),
+        applied: [...canonicalMigrations.slice(0, 74), "0075_foreign.sql"],
+      }),
+    ).toBe(false);
+    expect(
+      workerSchemaAllowsPending(selected, {
+        ...at(75),
+        local: [...canonicalMigrations.slice(0, 87), "0088_foreign.sql"],
+      }),
+    ).toBe(false);
+  });
+
+  test("v2 0088 maintenance probe requires the distinct current-mode response", async () => {
+    const response = Response.json(
+      {
+        error: {
+          code: "backend_unavailable",
+          message: "Host is quiesced for the v2 0088 schema maintenance transition",
+          details: { reason: "runtime-configuration" },
+        },
+      },
+      { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
+    );
+    expect(
+      await probeSchemaMaintenance(
+        target.publicOrigin,
+        async () => response.clone(),
+        "pre-v2-0088-quiesced",
+      ),
+    ).toMatchObject({ status: 503, traffic: "maintenance" });
+    await expect(
+      probeSchemaMaintenance(target.publicOrigin, async () => response.clone()),
+    ).rejects.toThrow("maintenance refusal");
+  });
+
+  test("v2 maintenance executor proof binds the exact target and cannot qualify ordinary publication", () => {
+    const selected = {
+      ...v2Target,
+      cloudflareProviderExecutor: executorTarget.cloudflareProviderExecutor,
+      schemaMaintenanceMode: "pre-v2-0088-quiesced" as const,
+    };
+    const ordinary = providerExecutorInspection(true);
+    const inactive = {
+      ...ordinary,
+      ready: false,
+      schemaReady: false,
+      maintenance: {
+        mode: "pre-v2-0088-quiesced" as const,
+        accountId: selected.accountId,
+        databaseId: selected.d1.databaseId,
+        databaseName: selected.d1.databaseName,
+        workerName: selected.cloudflareProviderExecutor.workerName,
+        activeVersionId: ordinary.versionId ?? "",
+        activeDeploymentId: ordinary.deploymentId ?? "",
+        previousVersionId: ordinary.previousVersionId ?? "",
+        selectedSourceCommit: ordinary.commit ?? "",
+        selectedModuleDigestHex: ordinary.moduleDigestHex ?? "",
+        predecessorSourceCommit: OTHER_COMMIT,
+        predecessorVersionId: ordinary.previousVersionId ?? "",
+        observedNonCodeDigestHex: "7".repeat(64),
+      },
+    };
+    expect(providerExecutorAllowsPublication(selected, inactive)).toBe(true);
+    expect(providerExecutorAllowsPublication(selected, ordinary)).toBe(false);
+    expect(providerExecutorAllowsPublication(v2Target, inactive)).toBe(false);
+    expect(
+      providerExecutorAllowsPublication(selected, {
+        ...inactive,
+        maintenance: { ...inactive.maintenance, databaseId: target.d1.databaseId },
+      }),
+    ).toBe(false);
+    expect(
+      providerExecutorAllowsPublication(selected, {
+        ...inactive,
+        maintenance: { ...inactive.maintenance, selectedModuleDigestHex: "f".repeat(64) },
+      }),
+    ).toBe(false);
   });
 
   test("0058 maintenance does not bypass a declared private executor qualifier", async () => {

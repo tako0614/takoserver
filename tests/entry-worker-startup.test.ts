@@ -382,6 +382,23 @@ describe("Worker startup diagnostics", () => {
     await expect(worker.scheduled({}, env)).resolves.toBeUndefined();
   });
 
+  test("the pre-v2-0088 maintenance mode blocks HTTP and scheduled work before v2 composition", async () => {
+    const env = {
+      TAKOSERVER_SCHEMA_MAINTENANCE_MODE: "pre-v2-0088-quiesced",
+      get STATE_DB(): never {
+        throw new Error("maintenance read storage");
+      },
+      get TAKOSERVER_TAKOFORM_V2_CONFIG(): never {
+        throw new Error("maintenance read v2 config");
+      },
+    } as unknown as Parameters<typeof worker.fetch>[1];
+    const response = await worker.fetch(new Request(`${ORIGIN}/healthz`), env);
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect((await envelope(response)).error.message).toContain("0088");
+    await expect(worker.scheduled({}, env)).resolves.toBeUndefined();
+  });
+
   test("invalid or conflicting maintenance selectors refuse before composition", async () => {
     for (const selected of ["", "pre-0058", "PRE-0058-QUIESCED", null, 7]) {
       const response = await worker.fetch(

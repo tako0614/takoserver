@@ -3,6 +3,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { canonicalJson } from "../../src/json.ts";
 import {
+  applicationSchemaMatches,
+  deriveExpectedApplicationShape,
+} from "./application-schema-shape.ts";
+import {
   artifactBlobIoSchemaAllowsPending,
   probeArtifactBlobIoQuiescence,
 } from "./artifact-blob-io-compatibility.ts";
@@ -32,6 +36,7 @@ import {
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import { writeWorkerConfig } from "./realized-config.ts";
 import { runAuthorityTransition } from "./retirement.ts";
+import { readCurrentAuditedMigrationSourceArtifact } from "./schema.ts";
 import {
   activePublicJwk,
   createRemoteSigningDatabase,
@@ -71,7 +76,12 @@ import {
 } from "./worker-live.ts";
 
 export interface WorkerMigrationReader {
-  read(): Promise<{ readonly local: readonly string[]; readonly applied: readonly string[] }>;
+  read(): Promise<{
+    readonly local: readonly string[];
+    readonly applied: readonly string[];
+    readonly shape?: string;
+    readonly shapeDigest?: string;
+  }>;
 }
 
 export interface WorkerInvocation {
@@ -135,6 +145,50 @@ export interface ProviderExecutorInspection {
   readonly commit: string | null;
   readonly bundleDigestHex: string | null;
   readonly moduleDigestHex: string | null;
+  /** Owner-proved, non-serving predecessor publication for the integration 0088 wave. */
+  readonly maintenance?: {
+    readonly mode: "pre-v2-0088-quiesced";
+    readonly accountId: string;
+    readonly databaseId: string;
+    readonly databaseName: string;
+    readonly workerName: string;
+    readonly activeVersionId: string;
+    readonly activeDeploymentId: string;
+    readonly previousVersionId: string;
+    readonly selectedSourceCommit: string;
+    readonly selectedModuleDigestHex: string;
+    readonly predecessorSourceCommit: string;
+    readonly predecessorVersionId: string;
+    readonly observedNonCodeDigestHex: string;
+  };
+}
+
+export function providerExecutorAllowsPublication(
+  target: DeployTarget,
+  inspection: ProviderExecutorInspection | null,
+): boolean {
+  if (inspection === null) return true;
+  if (target.schemaMaintenanceMode !== "pre-v2-0088-quiesced") return inspection.ready;
+  const proof = inspection.maintenance;
+  return (
+    proof?.mode === target.schemaMaintenanceMode &&
+    !inspection.ready &&
+    !inspection.schemaReady &&
+    inspection.managedExact &&
+    inspection.routeLess &&
+    proof.accountId === target.accountId &&
+    proof.databaseId === target.d1.databaseId &&
+    proof.databaseName === target.d1.databaseName &&
+    proof.workerName === target.cloudflareProviderExecutor?.workerName &&
+    proof.activeVersionId === inspection.versionId &&
+    proof.activeDeploymentId === inspection.deploymentId &&
+    proof.previousVersionId === inspection.previousVersionId &&
+    proof.selectedSourceCommit === inspection.commit &&
+    proof.selectedModuleDigestHex === inspection.moduleDigestHex &&
+    proof.predecessorVersionId === inspection.previousVersionId &&
+    /^[0-9a-f]{40}$/u.test(proof.predecessorSourceCommit) &&
+    /^[0-9a-f]{64}$/u.test(proof.observedNonCodeDigestHex)
+  );
 }
 
 export interface WorkerProviderExecutorQualification {
@@ -154,12 +208,40 @@ interface WorkerInspection {
 
 const SCHEMA_0058_NAME = "0058_cloudflare_managed_worker_domain_receipts.sql";
 
-/** One non-serving source profile, not authority to apply 0058 or its later catalog tail. */
+/** Non-serving source profiles only; neither is authority to apply a pending migration. */
 export function workerSchemaAllowsPending(
   target: DeployTarget,
-  migrations: { readonly local: readonly string[]; readonly applied: readonly string[] },
+  migrations: {
+    readonly local: readonly string[];
+    readonly applied: readonly string[];
+    readonly shape?: string;
+    readonly shapeDigest?: string;
+  },
   sourceRepositoryRoot = REPOSITORY,
 ): boolean {
+  if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced") {
+    if (target.environment !== "integration" || target.artifactBlobIoMode !== undefined) {
+      return false;
+    }
+    const source = readCurrentAuditedMigrationSourceArtifact(
+      resolve(sourceRepositoryRoot, "migrations"),
+    );
+    const count = migrations.applied.length;
+    if (
+      count < 66 ||
+      count > 88 ||
+      JSON.stringify(migrations.local) !== JSON.stringify(source.names) ||
+      migrations.applied.some((name, index) => name !== source.names[index]) ||
+      migrations.shape === undefined ||
+      migrations.shapeDigest === undefined
+    ) {
+      return false;
+    }
+    return applicationSchemaMatches(
+      { applied: migrations.applied, shape: migrations.shape, shapeDigest: migrations.shapeDigest },
+      deriveExpectedApplicationShape(source.files.slice(0, count)),
+    );
+  }
   if (target.schemaMaintenanceMode !== "pre-0058-quiesced") {
     return artifactBlobIoSchemaAllowsPending(
       target,
@@ -176,6 +258,7 @@ export function workerSchemaAllowsPending(
 export async function probeSchemaMaintenance(
   origin: string,
   fetcher: (input: string, init?: RequestInit) => Promise<Response>,
+  mode: NonNullable<DeployTarget["schemaMaintenanceMode"]> = "pre-0058-quiesced",
 ): Promise<{ readonly url: string; readonly status: 503; readonly traffic: "maintenance" }> {
   const url = `${origin}/healthz`;
   let response: Response;
@@ -187,7 +270,7 @@ export async function probeSchemaMaintenance(
     });
   } catch (error) {
     throw verificationError(
-      "0058 schema maintenance Worker probe failed",
+      "schema maintenance Worker probe failed",
       error instanceof Error ? `${error.name}: ${error.message}` : String(error),
     );
   }
@@ -204,7 +287,10 @@ export async function probeSchemaMaintenance(
     !("code" in body.error) ||
     body.error.code !== "backend_unavailable" ||
     !("message" in body.error) ||
-    body.error.message !== "Host is quiesced for the 0058 schema maintenance transition" ||
+    body.error.message !==
+      (mode === "pre-0058-quiesced"
+        ? "Host is quiesced for the 0058 schema maintenance transition"
+        : "Host is quiesced for the v2 0088 schema maintenance transition") ||
     !("details" in body.error) ||
     typeof body.error.details !== "object" ||
     body.error.details === null ||
@@ -212,7 +298,7 @@ export async function probeSchemaMaintenance(
     body.error.details.reason !== "runtime-configuration"
   ) {
     throw verificationError(
-      "0058 schema maintenance Worker did not prove maintenance refusal",
+      "schema maintenance Worker did not prove maintenance refusal",
       `status=${response.status}`,
     );
   }
@@ -263,7 +349,7 @@ export async function runWorker(
   // Worker the same way the Worker composes itself on its first request.
   await assertTargetComposes("preflight", target);
   const v2StorageBefore =
-    target.takoformV2 === undefined
+    target.takoformV2 === undefined || target.schemaMaintenanceMode === "pre-v2-0088-quiesced"
       ? null
       : await readFreshV2StorageProof(
           "preflight",
@@ -296,8 +382,7 @@ export async function runWorker(
       : await providerExecutorQualification.read("preflight");
   if (
     invocation.action === "apply" &&
-    providerExecutorBefore !== null &&
-    !providerExecutorBefore.ready
+    !providerExecutorAllowsPublication(target, providerExecutorBefore)
   ) {
     throw preflightError(
       "public Worker publication requires the exact selected-commit Cloudflare provider executor",
@@ -560,7 +645,12 @@ export async function runWorker(
     }
     if (providerExecutorQualification !== null && providerExecutorBefore !== null) {
       const currentProviderExecutor = await providerExecutorQualification.read("preflight");
-      assertProviderExecutorUnchanged(providerExecutorBefore, currentProviderExecutor);
+      assertProviderExecutorUnchanged(
+        providerExecutorBefore,
+        currentProviderExecutor,
+        "preflight",
+        target,
+      );
     }
     if (legacyBootstrap) {
       const selector = invocation.legacyPredecessorVersionId;
@@ -636,7 +726,12 @@ export async function runWorker(
           );
           if (providerExecutorQualification !== null && providerExecutorBefore !== null) {
             const currentProviderExecutor = await providerExecutorQualification.read("preflight");
-            assertProviderExecutorUnchanged(providerExecutorBefore, currentProviderExecutor);
+            assertProviderExecutorUnchanged(
+              providerExecutorBefore,
+              currentProviderExecutor,
+              "preflight",
+              target,
+            );
           }
         },
       });
@@ -719,13 +814,15 @@ export async function runWorker(
         providerExecutorBefore,
         providerExecutorAfter,
         "verification",
+        target,
       );
     }
     const probe =
-      target.schemaMaintenanceMode === "pre-0058-quiesced"
+      target.schemaMaintenanceMode !== undefined
         ? await probeSchemaMaintenance(
             target.publicOrigin,
             options.fetcher ?? ((input, init) => fetch(input, init)),
+            target.schemaMaintenanceMode,
           )
         : target.artifactBlobIoMode === "pre-0043-quiesced"
           ? await probeArtifactBlobIoQuiescence(
@@ -882,9 +979,10 @@ export function assertProviderExecutorUnchanged(
   expected: ProviderExecutorInspection,
   actual: ProviderExecutorInspection,
   phase: "preflight" | "verification" = "preflight",
+  target?: DeployTarget,
 ): void {
   if (
-    !actual.ready ||
+    (target === undefined ? !actual.ready : !providerExecutorAllowsPublication(target, actual)) ||
     actual.versionId !== expected.versionId ||
     actual.deploymentId !== expected.deploymentId ||
     actual.previousVersionId !== expected.previousVersionId ||
@@ -894,7 +992,8 @@ export function assertProviderExecutorUnchanged(
     actual.managedExact !== expected.managedExact ||
     actual.routeLess !== expected.routeLess ||
     actual.schemaReady !== expected.schemaReady ||
-    JSON.stringify(actual.dependencies) !== JSON.stringify(expected.dependencies)
+    JSON.stringify(actual.dependencies) !== JSON.stringify(expected.dependencies) ||
+    JSON.stringify(actual.maintenance) !== JSON.stringify(expected.maintenance)
   ) {
     const message =
       "Cloudflare provider executor qualification changed during public Worker publication";
@@ -1076,7 +1175,12 @@ function remoteMigrationReader(
           wranglerCommand: (args) => deployWranglerCommand(wranglerPath, args),
         }),
       );
-      return { local: local.names, applied: remote.applied };
+      return {
+        local: local.names,
+        applied: remote.applied,
+        shape: remote.shape,
+        shapeDigest: remote.shapeDigest,
+      };
     },
   };
 }
