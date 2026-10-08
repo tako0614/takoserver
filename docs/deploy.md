@@ -26,8 +26,8 @@ production require exactly one approved next-wave selector, while integration
 may use the same selector for one bounded audited wave:
 
 ```sh
-bun run deploy -- takoserver-d1-schema --status --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058>
-bun run deploy -- takoserver-d1-schema --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057>
+bun run deploy -- takoserver-d1-schema --status --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088>
+bun run deploy -- takoserver-d1-schema --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0088>
 ```
 
 The fixed order is the one-time legacy production catch-up 0017–0022, then
@@ -1348,6 +1348,21 @@ publishes once, and checks the mode-specific 503 response. An uncertain upload
 acknowledgement is not retried automatically. This is a source-publication
 foundation, not permission to apply migrations, evidence that older in-flight
 invocations drained, or a claim of normal v2 serving readiness.
+
+The separate `--through-migration=0088` D1 apply path remains integration-only
+and requires the operator-composed public Host plus private CPE live proof.
+The public predecessor must be a clean, locally rebuilt source no later than
+`af6dd0e6` (the direct parent of the first v2 entry) with native module bytes
+equal to that build; the selected maintenance Version's native bytes must
+equal its selected build. The private owner separately proves its historical
+pre-v2 source and native predecessor bytes. Source annotations alone, 503, or
+absence of new tables are not drain evidence. An existing v2-capable predecessor
+without real invocation drain is refused. Both Worker publication leases and
+the D1 lease remain held through the final readback. The original migration
+lineage must be the audited canonical 0066–0088 prefix, the 0068 epoch closed,
+and affected v2 Resource data absent. Interrupted canonical prefixes may be
+resumed only with fresh proof; a provider transport exception causes readback,
+never automatic resend. No protected production or default 0066 ceiling changes.
 
 The public Host has a source-only, optional deploy-target profile
 `"schemaMaintenanceMode": "pre-0058-quiesced"`. It projects the non-secret

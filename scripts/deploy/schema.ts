@@ -63,7 +63,15 @@ import {
   reconcileDispatchedProtected0058Transition,
   runProtected0058Transition,
 } from "./schema-0058-transition.ts";
+import {
+  assertSameV2ExistingMaintenanceProof,
+  inspectV2ExistingMaintenancePublication,
+  type V2ExistingMaintenanceProof,
+  type V2ExistingMaintenanceWorkerState,
+} from "./schema-v2-existing-transition.ts";
 import type { DeployTarget } from "./target.ts";
+import type { WorkerProviderExecutorQualification } from "./worker.ts";
+import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 
 const RECEIPT_KIND = "takoserver.d1-schema-rehearsal-receipt@v3";
@@ -385,6 +393,7 @@ export const SCHEMA_WAVE_BOUNDARIES = [
   "0056",
   "0057",
   "0058",
+  "0088",
 ] as const;
 export type SchemaWaveBoundary = (typeof SCHEMA_WAVE_BOUNDARIES)[number];
 const SCHEMA_WAVES: Readonly<
@@ -518,6 +527,12 @@ const SCHEMA_WAVES: Readonly<
     throughCount: 58,
     throughMigration: "0058_cloudflare_managed_worker_domain_receipts.sql",
   },
+  "0088": {
+    fromCount: 66,
+    fromMigration: "0066_cloudflare_managed_actor_kv_capability_claims.sql",
+    throughCount: 88,
+    throughMigration: "0088_v2_worker_sqlite_external_drain.sql",
+  },
 };
 const RECEIPT_CHAIN_BOUNDARIES = SCHEMA_WAVE_BOUNDARIES.filter(
   (boundary): boundary is Exclude<SchemaWaveBoundary, "0022"> =>
@@ -557,6 +572,15 @@ export type SchemaProcess = (
 
 export interface SchemaReader {
   read(phase: DeployPhase): Promise<D1SchemaState>;
+  /** Test-only projection of the fixed 0068 closed epoch and unserved v2 data. */
+  v2ExistingSnapshot?(
+    phase: DeployPhase,
+    appliedCount: number,
+  ): Promise<{
+    readonly epochState: "absent" | "closed" | "open";
+    readonly providerInvocationCount: number;
+    readonly v2ResourceCount: number;
+  }>;
   /** Value-free test boundary for the fixed 0058 four-table/BLOB scan. */
   protected0058Snapshot?(phase: DeployPhase): Promise<Protected0058Snapshot>;
   /** Open effects need their retained resource identity; unresolved work itself is allowed. */
@@ -623,6 +647,14 @@ export interface SchemaOptions {
     phase: DeployPhase,
     context: { readonly bearerToken: string | undefined },
   ) => Promise<ArtifactBlobIoDeploymentCompatibility>;
+  /** Trusted owner composition for the separate integration-only 0066→0088 wave. */
+  readonly v2ExistingMaintenance?: {
+    readonly providerExecutorQualification: WorkerProviderExecutorQualification;
+    /** Clean historical checkout of the actually deployed pre-v2 predecessor. */
+    readonly historicalSourceRoot: string;
+    /** Live provider state; omitted only when the ordinary Cloudflare credential can supply it. */
+    readonly publicWorkerState?: V2ExistingMaintenanceWorkerState;
+  };
 }
 
 export type SchemaBaselineOptions = Omit<SchemaOptions, "receiptPath" | "predecessorReceiptPath">;
@@ -867,6 +899,17 @@ export async function runD1Schema(
   ) {
     throw preflightError("D1 schema through migration is not an approved fixed wave boundary");
   }
+  if (
+    invocation.throughMigration === "0088" &&
+    (invocation.environment !== "integration" ||
+      target.schemaMaintenanceMode !== "pre-v2-0088-quiesced" ||
+      target.takoformV2 === undefined ||
+      target.cloudflareProviderExecutor === undefined)
+  ) {
+    throw preflightError(
+      "0088 requires the exact integration public Host and CPE maintenance target",
+    );
+  }
   if (invocation.environment !== "integration" && invocation.throughMigration === undefined) {
     throw preflightError(
       "rehearsal and production D1 schema invocations require one fixed --through-migration boundary",
@@ -876,7 +919,8 @@ export async function runD1Schema(
   const credential =
     invocation.environment === "integration" &&
     options.reader !== undefined &&
-    invocation.action === "status"
+    invocation.action === "status" &&
+    options.v2ExistingMaintenance?.publicWorkerState !== undefined
       ? undefined
       : await resolveCloudflareCredential(invocation.environment, {
           cloudflareEnvironment: options.cloudflareEnvironment,
@@ -896,6 +940,8 @@ export async function runD1Schema(
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-schema-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
   let lease: Awaited<ReturnType<typeof acquireWranglerVersionPublicationLease>> | null = null;
+  const v2PublicationLeases: Awaited<ReturnType<typeof acquireWranglerVersionPublicationLease>>[] =
+    [];
   try {
     try {
       lease =
@@ -919,6 +965,35 @@ export async function runD1Schema(
       throw error;
     }
     protected0058Custody?.assertContinuity();
+    if (invocation.throughMigration === "0088") {
+      if (
+        invocation.environment !== "integration" ||
+        target.schemaMaintenanceMode !== "pre-v2-0088-quiesced" ||
+        target.takoformV2 === undefined ||
+        target.cloudflareProviderExecutor === undefined
+      ) {
+        throw preflightError(
+          "0088 requires the exact integration public Host and CPE maintenance target",
+        );
+      }
+      if (target.workerName === target.cloudflareProviderExecutor.workerName) {
+        throw preflightError("0088 public Host and CPE must retain separate publication owners");
+      }
+      if (invocation.action === "apply") {
+        for (const workerName of [
+          target.workerName,
+          target.cloudflareProviderExecutor.workerName,
+        ].sort()) {
+          v2PublicationLeases.push(
+            await acquireWranglerVersionPublicationLease({
+              accountId: target.accountId,
+              workerName,
+              ...(options.leaseRoot === undefined ? {} : { root: options.leaseRoot }),
+            }),
+          );
+        }
+      }
+    }
     const inspectionConfig = writeD1Config(
       join(root, "inspect-wrangler.jsonc"),
       target,
@@ -980,6 +1055,17 @@ export async function runD1Schema(
         );
       }
       throw error;
+    }
+    if (wave.selector === "0088") {
+      assertV2ExistingCanonicalState(initial, sourceMigrations.files);
+      await assertV2ExistingDataSnapshot({
+        phase: "preflight",
+        state: initial,
+        configPath: inspectionConfig,
+        environment,
+        run,
+        injected: options.reader,
+      });
     }
     // Reopening a durable dispatched 0058 attempt is read-only, including when
     // an interrupted import left the lineage unchanged or the schema partial.
@@ -1135,6 +1221,29 @@ export async function runD1Schema(
       compatibilityReader: options.artifactBlobIoCompatibilityReader,
       receiptPath: options.artifactBlobIoQuiescenceReceiptPath,
     });
+    const v2ExistingSources =
+      wave.selector === "0088" && options.v2ExistingMaintenance !== undefined
+        ? await prepareV2ExistingProofSources({
+            invocation,
+            target,
+            options,
+            root,
+            environment,
+            run,
+          })
+        : null;
+    const v2ExistingProof =
+      wave.selector === "0088" && options.v2ExistingMaintenance !== undefined
+        ? await inspectV2ExistingProof({
+            invocation,
+            target,
+            options,
+            environment,
+            run,
+            credentialToken: credential?.token,
+            sources: v2ExistingSources as V2ExistingProofSources,
+          })
+        : null;
     if (invocation.action === "status") {
       return {
         kind: "takoserver.d1-schema-status@v3",
@@ -1172,6 +1281,14 @@ export async function runD1Schema(
         managedActorOwnerCutover,
         runtimeInputLeaseGenerationCutover,
         actorKvCapabilityCutover,
+        v2ExistingMaintenance:
+          wave.selector === "0088"
+            ? {
+                qualified: v2ExistingProof !== null,
+                publicVersionId: v2ExistingProof?.publicVersionId ?? null,
+                predecessorVersionId: v2ExistingProof?.publicPredecessorVersionId ?? null,
+              }
+            : null,
         protected0058:
           wave.selector === "0058"
             ? {
@@ -1184,6 +1301,7 @@ export async function runD1Schema(
         readyForApply:
           wave.pending.length > 0 &&
           wave.selector !== "0058" &&
+          (wave.selector !== "0088" || v2ExistingProof !== null) &&
           dataPreflights.status === "ready" &&
           (wave.selector !== LEGACY_PRODUCTION_CATCHUP_BOUNDARY ||
             (legacyCatchupIntegrity.status === "ready" &&
@@ -1206,6 +1324,9 @@ export async function runD1Schema(
     }
     if (wave.selector === "0058") {
       requireProtected0058OwnerQualification();
+    }
+    if (wave.selector === "0088" && v2ExistingProof === null) {
+      throw preflightError("0088 requires exact public Host and CPE maintenance publication proof");
     }
     assertDataPreflightsReady(dataPreflights, "before qualification");
     assertLegacyProductionCatchupReady(
@@ -1311,6 +1432,7 @@ export async function runD1Schema(
     }
     const additiveCutoverPostShape =
       wave.selector === "0058" ||
+      wave.selector === "0088" ||
       applyProviderSelectionCutover.status === "ready" ||
       managedQueueRetirementCutover.status === "ready" ||
       managedActorOwnerCutover.status === "ready" ||
@@ -1342,6 +1464,29 @@ export async function runD1Schema(
 
     const requalified = await readState("preflight", configPath, environment, run, options.reader);
     assertSamePreState(initial, requalified);
+    if (wave.selector === "0088") {
+      assertV2ExistingCanonicalState(requalified, sealedMigrationArtifact.files);
+      await assertV2ExistingDataSnapshot({
+        phase: "preflight",
+        state: requalified,
+        configPath,
+        environment,
+        run,
+        injected: options.reader,
+      });
+      assertSameV2ExistingMaintenanceProof(
+        v2ExistingProof as V2ExistingMaintenanceProof,
+        await inspectV2ExistingProof({
+          invocation,
+          target,
+          options,
+          run,
+          credentialToken: credential?.token,
+          sources: v2ExistingSources as V2ExistingProofSources,
+        }),
+        "preflight",
+      );
+    }
     if (protected0058 !== null) {
       assertProtected0058Preserved(
         protected0058,
@@ -1462,6 +1607,29 @@ export async function runD1Schema(
     artifact.assertUnchanged();
     const fenced = await readState("preflight", configPath, environment, run, options.reader);
     assertSamePreState(requalified, fenced);
+    if (wave.selector === "0088") {
+      assertV2ExistingCanonicalState(fenced, sealedMigrationArtifact.files);
+      await assertV2ExistingDataSnapshot({
+        phase: "preflight",
+        state: fenced,
+        configPath,
+        environment,
+        run,
+        injected: options.reader,
+      });
+      assertSameV2ExistingMaintenanceProof(
+        v2ExistingProof as V2ExistingMaintenanceProof,
+        await inspectV2ExistingProof({
+          invocation,
+          target,
+          options,
+          run,
+          credentialToken: credential?.token,
+          sources: v2ExistingSources as V2ExistingProofSources,
+        }),
+        "preflight",
+      );
+    }
     if (protected0058 !== null) {
       assertProtected0058Preserved(
         protected0058,
@@ -1634,6 +1802,37 @@ export async function runD1Schema(
     let providerAcknowledgement = "reconciled-complete-without-second-apply";
     let post = fenced;
     if (fencedWave.pending.length > 0) {
+      if (wave.selector === "0088") {
+        const immediateState = await readState(
+          "mutation",
+          configPath,
+          environment,
+          run,
+          options.reader,
+        );
+        assertSamePreState(fenced, immediateState, "at the immediate 0088 migration fence");
+        assertV2ExistingCanonicalState(immediateState, sealedMigrationArtifact.files);
+        await assertV2ExistingDataSnapshot({
+          phase: "mutation",
+          state: fenced,
+          configPath,
+          environment,
+          run,
+          injected: options.reader,
+        });
+        assertSameV2ExistingMaintenanceProof(
+          v2ExistingProof as V2ExistingMaintenanceProof,
+          await inspectV2ExistingProof({
+            invocation,
+            target,
+            options,
+            run,
+            credentialToken: credential?.token,
+            sources: v2ExistingSources as V2ExistingProofSources,
+          }),
+          "preflight",
+        );
+      }
       runtimeInputQuiescence = await enforceRuntimeInputPreparationV2Quiescence({
         pending: fencedWave.pending,
         applied: fenced.applied,
@@ -1887,32 +2086,77 @@ export async function runD1Schema(
         post = transition.post;
         providerAcknowledgement = transition.providerAcknowledgement;
       } else {
-        const apply = await run(
-          wranglerCommand(
-            migrationImportPath === null
-              ? [
-                  "d1",
-                  "migrations",
-                  "apply",
-                  target.d1.databaseName,
-                  "--remote",
-                  "--config",
-                  configPath,
-                ]
-              : [
-                  "d1",
-                  "execute",
-                  target.d1.databaseName,
-                  "--remote",
-                  "--yes",
-                  "--config",
-                  configPath,
-                  "--file",
-                  migrationImportPath,
-                ],
-          ),
-          { env: environment },
-        );
+        if (wave.selector === "0088") {
+          // Earlier compatibility checks can await external reads. Recheck the
+          // exact target and both maintenance publications at the dispatch edge.
+          const dispatchState = await readState(
+            "mutation",
+            configPath,
+            environment,
+            run,
+            options.reader,
+          );
+          assertSamePreState(
+            fenced,
+            dispatchState,
+            "immediately before the 0088 migration dispatch",
+          );
+          assertV2ExistingCanonicalState(dispatchState, sealedMigrationArtifact.files);
+          await assertV2ExistingDataSnapshot({
+            phase: "mutation",
+            state: dispatchState,
+            configPath,
+            environment,
+            run,
+            injected: options.reader,
+          });
+          assertSameV2ExistingMaintenanceProof(
+            v2ExistingProof as V2ExistingMaintenanceProof,
+            await inspectV2ExistingProof({
+              invocation,
+              target,
+              options,
+              run,
+              credentialToken: credential?.token,
+              sources: v2ExistingSources as V2ExistingProofSources,
+            }),
+            "mutation",
+          );
+        }
+        let apply: CommandResult;
+        try {
+          apply = await run(
+            wranglerCommand(
+              migrationImportPath === null
+                ? [
+                    "d1",
+                    "migrations",
+                    "apply",
+                    target.d1.databaseName,
+                    "--remote",
+                    "--config",
+                    configPath,
+                  ]
+                : [
+                    "d1",
+                    "execute",
+                    target.d1.databaseName,
+                    "--remote",
+                    "--yes",
+                    "--config",
+                    configPath,
+                    "--file",
+                    migrationImportPath,
+                  ],
+            ),
+            { env: environment },
+          );
+        } catch (error) {
+          if (wave.selector !== "0088") throw error;
+          // A transport exception is an uncertain ACK, not permission to resend.
+          // The unchanged authoritative readback path below alone can settle it.
+          apply = { exitCode: 1, stdout: "", stderr: "provider transport outcome unknown" };
+        }
         providerAcknowledgement = "acknowledged";
         if (apply.exitCode !== 0) {
           let readback: D1SchemaState;
@@ -1977,6 +2221,30 @@ export async function runD1Schema(
       run,
       injected: options.reader,
     });
+    if (wave.selector === "0088") {
+      assertV2ExistingCanonicalState(post, sealedMigrationArtifact.files);
+      await assertV2ExistingDataSnapshot({
+        phase: "verification",
+        state: post,
+        configPath,
+        environment,
+        run,
+        injected: options.reader,
+      });
+      assertSameV2ExistingMaintenanceProof(
+        v2ExistingProof as V2ExistingMaintenanceProof,
+        await inspectV2ExistingProof({
+          invocation,
+          target,
+          options,
+          run,
+          credentialToken: credential?.token,
+          sources: v2ExistingSources as V2ExistingProofSources,
+          phase: "verification",
+        }),
+        "verification",
+      );
+    }
     assertSameLegacyProductionCatchupIntegrity(
       fencedLegacyCatchupIntegrity,
       postLegacyCatchupIntegrity,
@@ -2178,6 +2446,9 @@ export async function runD1Schema(
       unsealDirectory(root);
       if (temporary) rmSync(root, { recursive: true, force: true });
     } finally {
+      for (const publicationLease of v2PublicationLeases.reverse()) {
+        await publicationLease.release();
+      }
       await lease?.release();
     }
   }
@@ -3915,6 +4186,195 @@ async function readState(
   return withoutRuntimeInputQuiescenceTrigger(
     await readD1SchemaState(new RemoteD1(configPath, { environment, run }), phase),
   );
+}
+
+function assertV2ExistingCanonicalState(
+  state: D1SchemaState,
+  files: readonly MigrationArtifactFile[],
+): void {
+  const count = state.applied.length;
+  if (
+    count < 66 ||
+    count > 88 ||
+    !applicationSchemaMatches(state, deriveExpectedApplicationShape(files.slice(0, count)))
+  ) {
+    throw preflightError("0088 requires one exact canonical 0066–0088 D1 prefix and schema shape");
+  }
+}
+
+async function assertV2ExistingDataSnapshot(input: {
+  readonly phase: DeployPhase;
+  readonly state: D1SchemaState;
+  readonly configPath: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+  readonly injected: SchemaReader | undefined;
+}): Promise<void> {
+  const count = input.state.applied.length;
+  const snapshot = input.injected?.v2ExistingSnapshot
+    ? await input.injected.v2ExistingSnapshot(input.phase, count)
+    : await readV2ExistingDataSnapshot(input);
+  if (
+    snapshot.epochState !== (count < 68 ? "absent" : "closed") ||
+    snapshot.providerInvocationCount !== 0 ||
+    snapshot.v2ResourceCount !== 0
+  ) {
+    throw preflightError(
+      "0088 requires the closed 0068 invocation epoch and no affected v2 data; retain current schema for forward repair",
+    );
+  }
+}
+
+async function readV2ExistingDataSnapshot(input: {
+  readonly phase: DeployPhase;
+  readonly state: D1SchemaState;
+  readonly configPath: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+}): Promise<{
+  readonly epochState: "absent" | "closed" | "open";
+  readonly providerInvocationCount: number;
+  readonly v2ResourceCount: number;
+}> {
+  const count = input.state.applied.length;
+  if (count < 68) {
+    return { epochState: "absent", providerInvocationCount: 0, v2ResourceCount: 0 };
+  }
+  const database = new RemoteD1(input.configPath, {
+    environment: input.environment,
+    run: input.run,
+  });
+  const rows = await database.query(
+    input.phase,
+    "0088 closed invocation epoch and unserved data proof",
+    `SELECT (SELECT state FROM tf_cloudflare_provider_invocation_epoch WHERE singleton = 1) AS epoch_state, ` +
+      `(SELECT COUNT(*) FROM tf_cloudflare_provider_invocations) AS provider_invocation_count, ` +
+      `${count < 70 ? "0" : "(SELECT COUNT(*) FROM tf_v2_resources)"} AS v2_resource_count`,
+  );
+  const row = rows[0];
+  if (
+    rows.length !== 1 ||
+    row?.epoch_state !== "closed" ||
+    !Number.isSafeInteger(row.provider_invocation_count) ||
+    !Number.isSafeInteger(row.v2_resource_count)
+  ) {
+    throw preflightError("0088 invocation epoch or affected-data readback is malformed");
+  }
+  return {
+    epochState: "closed",
+    providerInvocationCount: Number(row.provider_invocation_count),
+    v2ResourceCount: Number(row.v2_resource_count),
+  };
+}
+
+interface V2ExistingProofSources {
+  readonly selectedModuleDigestHex: string;
+  readonly buildHistorical: (commit: string) => Promise<string>;
+}
+
+async function prepareV2ExistingProofSources(input: {
+  readonly invocation: SchemaInvocation;
+  readonly target: DeployTarget;
+  readonly options: SchemaOptions;
+  readonly root: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+}): Promise<V2ExistingProofSources> {
+  const configured = input.options.v2ExistingMaintenance;
+  if (configured === undefined) {
+    throw preflightError("0088 has no owner-composed maintenance proof");
+  }
+  await qualifySource({
+    environment: "integration",
+    commit: input.invocation.commit,
+    run: input.run,
+  });
+  const selected = await prepareWorkerArtifact({
+    root: join(input.root, "v2-selected-worker-build"),
+    target: input.target,
+    commit: input.invocation.commit,
+    run: input.run,
+    environment: input.environment,
+  });
+  let builtHistoricalCommit: string | null = null;
+  let historicalModuleDigestHex: string | null = null;
+  return {
+    selectedModuleDigestHex: selected.bundleDigestHex,
+    async buildHistorical(commit) {
+      if (commit === builtHistoricalCommit && historicalModuleDigestHex !== null) {
+        return historicalModuleDigestHex;
+      }
+      if (!/^[0-9a-f]{40}$/u.test(commit)) {
+        throw preflightError("0088 historical Worker source commit is malformed");
+      }
+      const checkout = realpathSync(configured.historicalSourceRoot);
+      const head = await input.run(["git", "-C", checkout, "rev-parse", "HEAD"]);
+      const status = await input.run([
+        "git",
+        "-C",
+        checkout,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+      ]);
+      if (
+        head.exitCode !== 0 ||
+        head.stdout.trim() !== commit ||
+        status.exitCode !== 0 ||
+        status.stdout !== ""
+      ) {
+        throw preflightError(
+          "0088 historical Worker checkout is not the exact clean predecessor source",
+        );
+      }
+      const built = await prepareWorkerArtifact({
+        root: join(input.root, "v2-predecessor-worker-build"),
+        target: input.target,
+        commit,
+        sourceRepositoryRoot: checkout,
+        run: input.run,
+        environment: input.environment,
+      });
+      builtHistoricalCommit = commit;
+      historicalModuleDigestHex = built.bundleDigestHex;
+      return built.bundleDigestHex;
+    },
+  };
+}
+
+async function inspectV2ExistingProof(input: {
+  readonly invocation: SchemaInvocation;
+  readonly target: DeployTarget;
+  readonly options: SchemaOptions;
+  readonly environment?: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+  readonly credentialToken: string | undefined;
+  readonly sources: V2ExistingProofSources;
+  readonly phase?: "preflight" | "verification";
+}): Promise<V2ExistingMaintenanceProof> {
+  const configured = input.options.v2ExistingMaintenance;
+  if (configured === undefined) {
+    throw preflightError("0088 has no owner-composed maintenance proof");
+  }
+  const state =
+    configured.publicWorkerState ??
+    (input.credentialToken === undefined
+      ? null
+      : new CloudflareState({ accountId: input.target.accountId, token: input.credentialToken }));
+  if (state === null) {
+    throw preflightError("0088 cannot read authoritative public Worker state");
+  }
+  return await inspectV2ExistingMaintenancePublication({
+    phase: input.phase ?? "preflight",
+    target: input.target,
+    selectedCommit: input.invocation.commit,
+    selectedBuiltModuleDigestHex: input.sources.selectedModuleDigestHex,
+    buildHistorical: input.sources.buildHistorical,
+    state,
+    providerExecutorQualification: configured.providerExecutorQualification,
+    run: input.run,
+  });
 }
 
 async function inspectProtected0058Predecessor(input: {
