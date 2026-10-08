@@ -26,7 +26,7 @@ const V2_ENTRY_ENV = "TAKOSERVER_V2_ENTRY_NATIVE";
 test("classifies the normal Bun v2 entry journey as readiness, not execution", () => {
   const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));
   const own = gates.filter((gate) => gate.file === "tests/takoform-v2-entry-bun-native.test.ts");
-  expect(own).toHaveLength(2);
+  expect(own).toHaveLength(3);
   for (const gate of own) {
     expect(gate.environments).toEqual([V2_ENTRY_ENV]);
     expect(gate.capability).toBe("takoform-v2-bun-entry-lifecycle");
