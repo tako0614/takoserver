@@ -4,6 +4,7 @@ import * as selfhost from "@takoserver/core/provider-extension/selfhost";
 import {
   createSelfhostV2SQLiteStore,
   createSelfhostV2SqliteBindingBroker,
+  createWorkerdWorkerModuleInspector,
   SELFHOST_DATA_PLANE_CONTENT_TYPE,
   SELFHOST_DATA_PLANE_PROTOCOL,
   SELFHOST_DATA_PLANE_SQL_PATH,
@@ -15,8 +16,10 @@ import {
   type V2SqliteBindingGrant,
   type V2SqliteInvocationAuthority,
   type V2SqliteSelectedVersionObservation,
+  type WorkerdWorkerModuleInspectorOptions,
 } from "@takoserver/core/provider-extension/selfhost";
 import * as portableV2 from "@takoserver/core/takoform-v2";
+import { createWorkerdWorkerModuleInspector as existingWorkerdInspector } from "../src/workerd-worker-module-inspector.ts";
 
 test("Node selfhost extension exposes the existing SQLite store and guarded broker through one subpath", () => {
   expect(Object.keys(selfhost).sort()).toEqual(
@@ -31,8 +34,10 @@ test("Node selfhost extension exposes the existing SQLite store and guarded brok
       "createSelfhostContainerRuntime",
       "createSelfhostV2SQLiteStore",
       "createSelfhostV2SqliteBindingBroker",
+      "createWorkerdWorkerModuleInspector",
     ].sort(),
   );
+  expect(createWorkerdWorkerModuleInspector).toBe(existingWorkerdInspector);
   expect(selfhost.createSelfhostV2SQLiteStore).toBe(createSelfhostV2SQLiteStore);
   expect(selfhost.createSelfhostV2SqliteBindingBroker).toBe(createSelfhostV2SqliteBindingBroker);
   expect(new SelfhostV2SQLiteStoreError("busy")).toMatchObject({ code: "busy" });
@@ -74,6 +79,8 @@ test("Node selfhost extension exposes the existing SQLite store and guarded brok
     },
   } satisfies V2SqliteBindingBrokerOptions;
   expect(options.observeVersionTarget).toBeFunction();
+  const inspectorOptions: WorkerdWorkerModuleInspectorOptions = { binary: null };
+  expect(inspectorOptions.binary).toBeNull();
   expect(grant.bindings).toHaveLength(1);
   const proofs: SQLiteStoreProofPort = {
     async currentClaim(_input: SQLiteNativeExecution) {
@@ -101,6 +108,7 @@ test("Node selfhost extension exposes the existing SQLite store and guarded brok
     "createSelfhostV2SQLiteStore",
     "SelfhostV2SQLiteStoreError",
     "createSelfhostV2SqliteBindingBroker",
+    "createWorkerdWorkerModuleInspector",
     "SELFHOST_DATA_PLANE_SQL_PATH",
   ]) {
     expect(name in portableV2).toBe(false);

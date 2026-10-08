@@ -21,6 +21,10 @@ export {
   type V2EdgeKvSettledTarget,
   type V2EdgeKvSettledTargetInput,
 } from "./edge-kv-native-custody.ts";
+export {
+  createV2HeldArtifactSource,
+  type V2HeldArtifactSourceOptions,
+} from "./forms/artifact-source.ts";
 export { AT_LEAST_ONCE_QUEUE_FORM_URL } from "./forms/at-least-once-queue.ts";
 export {
   EDGE_KV_NAMESPACE_FORM_URL,
@@ -84,6 +88,7 @@ export {
 } from "./forms/sqlite-worker-binding-authority.ts";
 export {
   createWorkerBundleCustody,
+  createWorkerBundleHost,
   type WorkerBundleCustody,
 } from "./forms/worker-bundle-backend.ts";
 export {

@@ -3,8 +3,15 @@ import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SELFHOST_WORKER_DATA_SERVICE_MODULE } from "../src/providers/selfhost-data-service.ts";
+import { SELFHOST_WORKER_EVENT_SERVICE_MODULE } from "../src/providers/selfhost-events.ts";
+import {
+  V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+  V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+} from "../src/providers/selfhost-v2-queue-transport.ts";
 import {
   WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+  WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING,
   WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
   workerdV2PrivateWorkflowBindingName,
 } from "../src/providers/workerd-v2-private-binding-names.ts";
@@ -96,6 +103,62 @@ test("guarded v2 Workflow class uses exact selected broker UDS without public in
   expect(config).toContain(`name = "${input.site.hostEntrypoint}"`);
   expect(config).toContain('globalOutbound = "deny"');
   expect(config).not.toContain('name = "router"');
+});
+
+test("guarded v2 Workflow class retains its selected Queue producer facade", async () => {
+  const input = fixture();
+  const site: WorkerdSite = {
+    ...input.site,
+    v2QueueProducerPlane: { address: "127.0.0.1:17779", token: `private.${"a".repeat(43)}` },
+  };
+  const config = await readFile(
+    await writeWorkerdPrivateExecution({
+      ...input,
+      site,
+      hostModules: new Map([
+        ...input.hostModules,
+        [SELFHOST_WORKER_DATA_SERVICE_MODULE, encoder.encode("export default {};")] as const,
+      ]),
+    }),
+    "utf8",
+  );
+  expect(config).toContain(
+    `(name = "${WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING}", service = "v2-queue-producer")`,
+  );
+  expect(config).toContain('name = "v2-queue-producer-origin"');
+  expect(config).toContain('globalOutbound = "v2-queue-producer-deny"');
+});
+
+test("guarded Workflow class excludes event-only modules also listed by its generated entry", async () => {
+  const input = fixture();
+  const site: WorkerdSite = {
+    ...input.site,
+    hostModules: [
+      ...(input.site.hostModules ?? []),
+      SELFHOST_WORKER_EVENT_SERVICE_MODULE,
+      V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+    ],
+    events: { module: SELFHOST_WORKER_EVENT_SERVICE_MODULE, vars: [] },
+    queueSettlement: {
+      module: V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+      address: "127.0.0.1:17778",
+      vars: [{ name: V2_QUEUE_SETTLEMENT_TOKEN_BINDING, kind: "text", value: "a".repeat(43) }],
+    },
+  };
+  const config = await readFile(
+    await writeWorkerdPrivateExecution({
+      ...input,
+      site,
+      hostModules: new Map([
+        ...input.hostModules,
+        [SELFHOST_WORKER_EVENT_SERVICE_MODULE, encoder.encode("export default {};")] as const,
+        [V2_QUEUE_SETTLEMENT_SERVICE_MODULE, encoder.encode("export default {};")] as const,
+      ]),
+    }),
+    "utf8",
+  );
+  expect(config).not.toContain("queue-settlement-deny");
+  expect(config).not.toContain("event-gate");
 });
 
 test("guarded v2 Workflow class rejects a legacy active wrapper or wrong broker", async () => {
