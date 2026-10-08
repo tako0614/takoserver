@@ -45,6 +45,13 @@ export interface QueueCustodyV2ProducerClaim {
   readonly workerVersionUid: string;
   readonly workerVersionOperationId: string;
   readonly bindingName: string;
+  /** Optional physical source custody; checked by each INSERT in the atomic batch. */
+  readonly sourceInvocation?: {
+    readonly invocationId: string;
+    readonly custodyToken: string;
+    readonly incarnationId: string;
+    readonly servingSourceOperationId: string;
+  };
 }
 
 export type QueueCustodyDeadLetterTarget = QueueCustodyTarget;
@@ -332,6 +339,20 @@ const V2_PRODUCER_GUARD = `EXISTS (
     AND refs.sealed = 1 AND ref.target_uid = queue.uid
     AND ref.form_url = queue.form_url AND ref.readiness = 'observed'
     AND edge.target_uid = queue.uid
+)`;
+// The physical WfP source may retire while a request is awaiting SQL. This
+// exact 0086 row must still be send-authorized at each INSERT's linearization
+// point; a current logical Version alone does not prove a live incarnation.
+const V2_SOURCE_INVOCATION_GUARD = `EXISTS (
+  SELECT 1 FROM tf_v2_worker_invocations invocation
+  WHERE invocation.invocation_id = ? AND invocation.custody_token = ?
+    AND invocation.principal = ? AND invocation.space = ?
+    AND invocation.target_key = ? AND invocation.worker_uid = ?
+    AND invocation.version_uid = ? AND invocation.version_operation_id = ?
+    AND invocation.native_identity = ? AND invocation.source_operation_id = ?
+    AND invocation.phase = 'send_authorized'
+    AND invocation.retired_at_ms IS NULL
+    AND invocation.no_native_dispatch_at_ms IS NULL
 )`;
 // This SELECT runs as the first statement of the same atomic Sql.batch as
 // all message/notice writes. A false claim deliberately raises a SQLite
@@ -992,13 +1013,41 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       ) {
         throw new TypeError("v2 Queue producer admission identity is invalid");
       }
+      const source =
+        "sourceInvocation" in claim
+          ? {
+              invocationId: token(
+                claim.sourceInvocation?.invocationId,
+                255,
+                "v2 Queue source invocation id",
+              ),
+              custodyToken: token(
+                claim.sourceInvocation?.custodyToken,
+                255,
+                "v2 Queue source custody token",
+              ),
+              incarnationId: token(
+                claim.sourceInvocation?.incarnationId,
+                255,
+                "v2 Queue source incarnation id",
+              ),
+              servingSourceOperationId: token(
+                claim.sourceInvocation?.servingSourceOperationId,
+                255,
+                "v2 Queue serving source operation id",
+              ),
+            }
+          : null;
+      if (source && source.custodyToken.length < 16) {
+        throw new TypeError("v2 Queue source custody token is invalid");
+      }
       const statements = admissionStatements(target, messages).map((statement): SqlStatement => {
         const suffix = "VALUES (?, ?, ?, ?, ?, ?, 0)";
         if (!statement.sql.endsWith(suffix)) {
           throw new Error("Queue admission statement changed unexpectedly");
         }
         return {
-          sql: `${statement.sql.slice(0, -suffix.length)}SELECT ?, ?, ?, ?, ?, ?, 0 WHERE ${V2_PRODUCER_GUARD}`,
+          sql: `${statement.sql.slice(0, -suffix.length)}SELECT ?, ?, ?, ?, ?, ?, 0 WHERE ${V2_PRODUCER_GUARD}${source ? ` AND ${V2_SOURCE_INVOCATION_GUARD}` : ""}`,
           params: [
             ...(statement.params ?? []),
             claim.workerVersionUid,
@@ -1011,6 +1060,20 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
             target.deliveryDelaySeconds,
             claim.workerUid,
             claim.bindingName,
+            ...(source
+              ? [
+                  source.invocationId,
+                  source.custodyToken,
+                  claim.principal,
+                  claim.space,
+                  claim.targetKey,
+                  claim.workerUid,
+                  claim.workerVersionUid,
+                  claim.workerVersionOperationId,
+                  source.incarnationId,
+                  source.servingSourceOperationId,
+                ]
+              : []),
           ],
         };
       });
