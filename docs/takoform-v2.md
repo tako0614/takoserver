@@ -329,12 +329,11 @@ TLS or production qualification.
 Source and custody authorization are distinct: a caller
 may have write access to a Space but no grant to a particular source artifact.
 
-## Worker runtime integration in progress
+## Worker runtime integration and normal-entry support
 
-Worker Form input parsing and runtime integration are separate from support
-registration. The current source parses ModuleWorker 0.3.0, WorkerVersion 0.5.0,
-WorkerDeployment 0.4.0 and WorkerEndpoint 0.3.0, but does not register those Forms
-in the normal application yet.
+Worker Form input parsing, runtime integration and support registration are
+separate steps. Normal-entry registration is conditional on the complete boot
+requirements below; parsing a Form alone never makes it supported.
 
 A Form can declare its complete outbound Resource reference set. Acceptance
 checks the exact owner, Space, Form URL, current observation and required target
@@ -354,10 +353,10 @@ inputs to the workerd compiler. Inspection is not publication or traffic readine
 Separately, the self-host `WorkerdRuntime` now has a lazy, same-process fenced
 publication seam with exact serving-identity readback. Focused source tests cover
 successful readback, stale-fence refusal, and restoring the prior pointer when
-readback cannot be proved. This generic seam is not connected to public v2 Worker
-Forms: those Forms are not registered in the normal application and do not call
-it. It does not provide multi-process fencing or invocation retirement, and it
-does not establish v2 Worker publication or traffic readiness.
+readback cannot be proved. This generic seam alone does not provide
+multi-process fencing or invocation retirement, and does not establish v2
+Worker publication or traffic readiness. The UID owner and normal-entry
+composition provide those separate proofs.
 
 The internal material reader reuses the existing immutable Bundle and StaticAssetBundle
 custody rather than create another Version byte ledger. A live Version's sealed
@@ -447,8 +446,9 @@ rebasing on stale memory. Retirement receipts bind actual configuration bytes,
 child exit and listener vacancy. This result does not remove shared hostname
 routes, settle the Form, or qualify non-HTTP execution contexts.
 
-The owner is not registered by the normal application. Its portable tests do
-not qualify the pinned native workerd binary. Orderly closure can release its
+The owner is composed by the normal application under the complete boot
+selection below. Its portable tests alone do not qualify the pinned native
+workerd binary. Orderly closure can release its
 local lock after retirement. After a Host-process crash, a successor may replay
 the same DELETE only when the durable owner state proves deletion and every
 recorded incarnation has an exact retirement receipt, every recorded listener
@@ -512,10 +512,10 @@ an assigned address while its route is pending or failed. The Endpoint backend
 must preserve that address in subsequent results; the callback must not create
 external routes or perform other effects.
 
-Remaining work includes actual Worker Form backends and their normal-entry
-composition, invocation retirement, and Endpoint routing. Neither the existing
-generic publication seam nor these focused tests establish complete Worker Form
-support, public HTTPS delivery, or Hosted qualification.
+The later Form backends, owner-side invocation retirement, Endpoint routing and
+conditional normal-entry composition supply additional proofs beyond this
+generic seam. These focused seam tests alone do not establish complete Worker
+Form support, public HTTPS delivery, or Hosted qualification.
 
 An internal execution-group primitive now owns one immutable Worker UID,
 configuration and child listener within a private incarnation directory. It
@@ -534,7 +534,7 @@ routing and settlement, and supply a private or authenticated ingress boundary.
 The current local TCP ownership check is not atomic with connection establishment
 against a hostile local binder. OS-child tests qualify the process lifecycle,
 not native workerd ABI readiness, Host-process restart recovery, or a complete
-public Worker deletion. The primitive is not registered in the normal runtime.
+public Worker deletion. This primitive alone is not normal-entry Form support.
 
 ## Code Version and scheduled delivery composition
 
@@ -569,8 +569,8 @@ descriptor calls those entries `secret_text` without adding a WfP binding or
 disclosing their values in Resource, Operation, observation or output. Confirmed
 deletion releases the UID's configured ciphertext through the same Core ledger.
 Tests cover real SQLite acceptance and publication with a synthetic runtime,
-including a lost runtime acknowledgement. They do not prove OS-process restart,
-native workerd ABI, normal Form registration or live provider behavior.
+including a lost runtime acknowledgement. They do not alone prove OS-process
+restart, native workerd ABI, normal Form registration or live provider behavior.
 
 The internal code path admits a SQLite Binding only when one boot-selected
 SQLite store, a persistent Host-private signing key of at least 32 bytes, and
@@ -580,8 +580,8 @@ owner before it restores any Worker. Each call rechecks the current accepted
 serving graph and native selected Version; neither a Form URL nor an in-memory
 name grants SQL access. Without that complete boot capability the Version is
 refused. The ordinary Bun entry supplies it when its private SQLite plane is
-configured, but still does not register Worker Forms.
-Other uncomposed typed Bindings remain explicit refusals in this factory.
+configured; registration additionally requires the other complete boot
+prerequisites below. Uncomposed typed Bindings remain explicit refusals.
 
 The same internal factory can compose a separately keyed ObjectBucket broker at
 an operator-selected stable loopback port. Its grants bind the exact organization,
@@ -591,8 +591,8 @@ Native descriptors use a distinct internal service name; multiple Object service
 descriptors retain separate callers rather than sharing whichever endpoint was
 initialized first. A local organization-authenticated Host journey uses the pinned
 workerd artifact for Bucket create, Worker put/get, Worker update, deletion and
-orderly termination. This is an internal composition, not normal-entry registration,
-public HTTPS delivery or Hosted qualification.
+orderly termination. That internal journey alone does not prove normal-entry
+registration, public HTTPS delivery or Hosted qualification.
 
 The internal factory also composes a separately keyed KV broker and private service.
 Linear Base64 validation passes the full 25 MiB value limit through pinned workerd.
@@ -604,7 +604,7 @@ new Host and native child PIDs. It replays the Queue create key without a second
 Resource and sends another message through the restored native Producer Binding.
 It checks update and deletion, then proves the child is gone while the recovered
 Host is still alive. These tests manually register the Forms in an isolated Host;
-they do not qualify normal-entry registration, public TLS, Hosted execution or
+they do not alone qualify normal-entry registration, public TLS, Hosted execution or
 the KV Form's worldwide replicated eventual-consistency semantics.
 
 Queue boot precedes Worker restoration. Its capability joins the current accepted
@@ -657,8 +657,8 @@ tracked one-second pass. A stalled delivery does not block management settlement
 Queue work, or Workflow polling. The pass is unavailable before restoration or
 after closure. Shutdown freezes scheduled admission and joins the active scan
 before suspending native owners or closing SQL; a native result arriving after
-that freeze remains unknown and retryable. This connection does not register
-incomplete Worker Forms in the public entry or claim exactly-once execution.
+that freeze remains unknown and retryable. This connection alone does not
+register Worker Forms in the public entry or claim exactly-once execution.
 
 The owner projects a private, incarnation-bound scheduled-event capability
 before publication. Delivery checks the current serving graph and does not use
@@ -666,7 +666,7 @@ an HTTP response as proof that `waitUntil` work has retired. The integration
 journey uses actual Host HTTP, persistent SQLite, SIGKILL and a new Host PID,
 and executes the verified held JavaScript module in a Bun stand-in. It checks
 same-match redelivery, a non-equivalent schedule update and delete/drain. That
-evidence is not native workerd ABI, normal application Form registration,
+evidence alone is not native workerd ABI, normal application Form registration,
 Hosted scheduled delivery or production readiness.
 
 A separate pinned-workerd journey uses the same internal composition and
@@ -686,7 +686,7 @@ teardown requires the child fixture's post-owner-stop witness and zero exit;
 unproven shutdown retains its workspace. Effects are observed inside the native
 module, not in an external durable destination. This proves that local native
 restart path, not exactly-once external effects, an independent response-loss
-case, ordinary-entry Form registration, or Hosted qualification.
+case, ordinary-entry composition by itself, or Hosted qualification.
 
 The normal Bun entry now also constructs the v2 UID-owner composition against
 its canonical SQL, object store, clock and selected workerd binary. Before its
@@ -698,7 +698,11 @@ StaticAssetBundle backends target its exact Worker target, the selected native
 binary and Actor/Workflow boot are available, all five private
 SQLite/KV/ObjectBucket/Queue planes are configured, and Worker owners have
 restored. It also registers the SQLiteDatabase, EdgeKVNamespace and
-ObjectBucket target lifecycle Forms from those same stores. A missing
+ObjectBucket target lifecycle Forms from those same stores. This intentional
+complete map also registers WorkerCronTrigger, ActorNamespace, DurableWorkflow,
+AtLeastOnceQueue and QueueConsumer. Their scheduler, native owner, broker,
+settlement and producer capabilities are required to create referenced event
+and Binding targets on a clean Host. A missing
 prerequisite leaves the whole Worker Form unsupported, not a narrower Binding
 profile. Endpoint Form support separately requires the actual selected HTTPS
 listener's hostname, TLS and route-absence ports; without it the other Worker
@@ -747,8 +751,8 @@ a deleted Worker. An exact completed ModuleWorker deletion, or SQL proof that no
 current publication exists, permits retirement-only closure; closure still requires
 each recorded incarnation to be retired. An uncertain proof stops shutdown before
 the dependent data planes and SQL are closed. A failed suspend never falls back to
-destructive closure. Native owner/entry tests cover this dependency order, but do
-not make the ordinary entry advertise the internal Worker Forms.
+destructive closure. Native owner/entry tests cover this dependency order;
+normal-entry advertisement separately requires the complete boot selection.
 
 A separate normal-`buildApp` local journey composes the
 existing SQLiteDatabase, held SQLiteMigrationSet/Application, and this private
@@ -760,7 +764,7 @@ An admitted old invocation also keeps its signed exact-incarnation SQLite
 Binding while a replacement Deployment is pending and while that incarnation
 drains; each call still checks the live native owner and current settled
 Version/Database references, and retirement ends that authority.
-That restart evidence does not qualify maximum legal SQLite input,
+That restart evidence alone does not qualify maximum legal SQLite input,
 public HTTPS/TLS, or complete WorkerVersion/SQLiteDatabase Form support.
 
 The native owner also exposes a private Actor graph observation port. It checks
@@ -780,8 +784,8 @@ tests use a semantic-inspector stand-in. The internal boot also composes the
 executable Actor Binding and accepted-operation warm/runtime-count paths with
 the same physical owner. Separate pinned-workerd tests exercise fetch and
 WebSocket upgrade, active same-spec update counts, and first active creation.
-These internal paths do not register or advertise ActorNamespace Form support,
-or establish Hosted or ordinary-entry qualification.
+These internal paths alone do not register ActorNamespace Form support or
+establish Hosted or ordinary-entry qualification.
 
 An Actor Binding may target a Namespace whose class is provided by a different
 Worker. Admission checks the caller's accepted Version and sealed reference
@@ -891,8 +895,8 @@ frontend now checks the selected Endpoint identity and optional accepted output
 without dropping its SQL or native currentness fences. Removing an accepted
 execution asset copy makes native observation unknown and HTTPS return 503;
 restoring its exact bytes restores serving. These are local self-signed TLS and
-native execution checks, not public CA/DNS, normal-entry registration or an
-OS-process restart test.
+native execution checks, not public CA/DNS, normal-entry registration by
+themselves or an OS-process restart test.
 
 The pinned-workerd Service Binding journey accepts caller and target resources
 through the authenticated Host fixture, then kills that Host process and proves
@@ -901,7 +905,7 @@ same SQLite, file object store and owner roots. Service calls retain the origina
 URL/Host and exclude private transport headers; a target-only Deployment change
 is visible without republishing the caller, followed by dependency-ordered
 deletion. This is loopback fixture evidence, not public TLS, normal Form
-registration or a long-stream interruption proof.
+registration by itself or a long-stream interruption proof.
 
 Within one accepted publication, candidate revalidation reuses the exact
 Operation/Version/ordered-Binding token projection instead of opening an orphan

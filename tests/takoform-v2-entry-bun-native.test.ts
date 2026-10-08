@@ -7,13 +7,17 @@ import { join } from "node:path";
 import { base64UrlEncode, bytesDigest } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
+import { ACTOR_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/actor-namespace.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
+import { DURABLE_WORKFLOW_FORM_URL } from "../src/takoform-v2/forms/durable-workflow.ts";
 import { EDGE_KV_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/edge-kv-namespace.ts";
 import { OBJECT_BUCKET_FORM_URL } from "../src/takoform-v2/forms/object-bucket.ts";
+import { QUEUE_CONSUMER_FORM_URL } from "../src/takoform-v2/forms/queue-consumer.ts";
 import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-database.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
+import { WORKER_CRON_TRIGGER_FORM_URL } from "../src/takoform-v2/forms/worker-cron-trigger.ts";
 import {
   MODULE_WORKER_FORM_URL,
   WORKER_DEPLOYMENT_FORM_URL,
@@ -40,6 +44,20 @@ const ASSET_FILE_KEY = "operator-held/v2/assets/site.css";
 const CURSOR_KEY = base64UrlEncode(new Uint8Array(32).fill(0x74));
 const WORKER_TARGET = "selfhost-v2-worker-primary";
 const WORKER_SUFFIX = "workers.native.test";
+const COMPLETE_WORKER_FORM_URLS = [
+  MODULE_WORKER_FORM_URL,
+  WORKER_VERSION_FORM_URL,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_CRON_TRIGGER_FORM_URL,
+  ACTOR_NAMESPACE_FORM_URL,
+  DURABLE_WORKFLOW_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+  SQLITE_DATABASE_FORM_URL,
+  EDGE_KV_NAMESPACE_FORM_URL,
+  OBJECT_BUCKET_FORM_URL,
+  AT_LEAST_ONCE_QUEUE_FORM_URL,
+  QUEUE_CONSUMER_FORM_URL,
+] as const;
 
 type Child = ReturnType<typeof Bun.spawn>;
 type Json = Record<string, unknown>;
@@ -1226,26 +1244,18 @@ test.skipIf(OPT_IN !== "1")(
         ...fullBoot,
         TAKOSERVER_V2_WORKER_RUNTIME_BOOT: JSON.stringify({ actor: true }),
       });
-      expect(
-        await jsonAt(
-          port,
-          "GET",
-          `${V2}/support?form=${encodeURIComponent(WORKER_VERSION_FORM_URL)}`,
-          200,
-          undefined,
-          auth,
-        ),
-      ).toMatchObject({ supported: false });
-      expect(
-        await jsonAt(
-          port,
-          "GET",
-          `${V2}/support?form=${encodeURIComponent(MODULE_WORKER_FORM_URL)}`,
-          200,
-          undefined,
-          auth,
-        ),
-      ).toMatchObject({ supported: false });
+      for (const form of COMPLETE_WORKER_FORM_URLS) {
+        expect(
+          await jsonAt(
+            port,
+            "GET",
+            `${V2}/support?form=${encodeURIComponent(form)}`,
+            200,
+            undefined,
+            auth,
+          ),
+        ).toMatchObject({ supported: false });
+      }
       await stopHost(serving);
       serving = null;
       const noAssets = JSON.parse(config) as Json;
@@ -1273,16 +1283,7 @@ test.skipIf(OPT_IN !== "1")(
           undefined,
           auth,
         );
-      for (const form of [
-        MODULE_WORKER_FORM_URL,
-        WORKER_VERSION_FORM_URL,
-        WORKER_DEPLOYMENT_FORM_URL,
-        WORKER_ENDPOINT_FORM_URL,
-        SQLITE_DATABASE_FORM_URL,
-        EDGE_KV_NAMESPACE_FORM_URL,
-        OBJECT_BUCKET_FORM_URL,
-        AT_LEAST_ONCE_QUEUE_FORM_URL,
-      ]) {
+      for (const form of COMPLETE_WORKER_FORM_URLS) {
         expect(await support(form)).toMatchObject({ supported: true, privateInputs: false });
       }
       const create = async (form: string, name: string, spec: Json) => {
