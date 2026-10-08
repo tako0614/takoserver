@@ -415,14 +415,20 @@ test.skipIf(binary === undefined)(
       const oldCallerChild = await activeChild(root, caller.resourceUid);
       const oldTargetChild = await activeChild(root, target.resourceUid);
       const oldActorChild = await activeActorChild(root, principal, namespace.resourceUid);
-      actorChildren.push(oldActorChild);
+      const oldCallerActorChild = await activeActorChild(
+        root,
+        principal,
+        callerNamespace.resourceUid,
+      );
+      actorChildren.push(oldActorChild, oldCallerActorChild);
       await initial.close();
       first = undefined;
       for (let attempt = 0; attempt < 200; attempt += 1) {
         if (
           (await linuxProcessLiveness(oldCallerChild)) === "stale" &&
           (await linuxProcessLiveness(oldTargetChild)) === "stale" &&
-          (await linuxProcessLiveness(oldActorChild)) === "stale"
+          (await linuxProcessLiveness(oldActorChild)) === "stale" &&
+          (await linuxProcessLiveness(oldCallerActorChild)) === "stale"
         )
           break;
         await Bun.sleep(10);
@@ -430,6 +436,7 @@ test.skipIf(binary === undefined)(
       expect(await linuxProcessLiveness(oldCallerChild)).toBe("stale");
       expect(await linuxProcessLiveness(oldTargetChild)).toBe("stale");
       expect(await linuxProcessLiveness(oldActorChild)).toBe("stale");
+      expect(await linuxProcessLiveness(oldCallerActorChild)).toBe("stale");
       second = await startHost(root, selected.binary);
       expect(second.pid).not.toBe(firstHostPid);
       expect(second.restored?.sort()).toEqual([caller.resourceUid, target.resourceUid].sort());
@@ -452,6 +459,14 @@ test.skipIf(binary === undefined)(
       );
       expect(other.status).toBe(200);
       expect(await other.json()).toEqual(written);
+      const newCallerActorChild = await activeActorChild(
+        root,
+        principal,
+        callerNamespace.resourceUid,
+      );
+      actorChildren.push(newCallerActorChild);
+      expect(newCallerActorChild.pid).not.toBe(oldCallerActorChild.pid);
+      expect(await linuxProcessLiveness(newCallerActorChild)).toBe("live");
       const selfNestedAfter = await invoke(second.port, "/self-nested");
       expect(selfNestedAfter).toEqual(selfNestedBefore);
       const newActorChild = await activeActorChild(root, principal, namespace.resourceUid);
