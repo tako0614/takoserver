@@ -4534,17 +4534,14 @@ export async function writeWorkerdPrivateExecution(options: {
         : undefined;
       const actorWorkflowMappings = variant.workflowBindings ?? [];
       const versionBindings: string[] = [];
-      if (
-        actorWorkflowMappings.length !== actorWorkflow?.bindings.length &&
-        (actorWorkflowMappings.length !== 0 || actorWorkflow !== undefined)
-      )
+      if (actorWorkflowMappings.length !== (actorWorkflow?.bindings.length ?? 0))
         throw new Error("Actor class Workflow broker unavailable");
       const mappedWorkflow = new Map(
         actorWorkflowMappings.map((mapping) => [mapping.name, mapping]),
       );
       if (mappedWorkflow.size !== actorWorkflowMappings.length)
         throw new Error("unusable Actor class Workflow broker");
-      for (const binding of actorWorkflow?.bindings ?? []) {
+      for (const [bindingIndex, binding] of (actorWorkflow?.bindings ?? []).entries()) {
         const mapping = mappedWorkflow.get(binding.serviceName);
         if (
           !mapping ||
@@ -4566,7 +4563,7 @@ export async function writeWorkerdPrivateExecution(options: {
         if (!identity) throw new Error("Actor class Workflow broker unavailable");
         workflowSocketProofs.push({ path: mapping.socketPath, identity });
         servicePaths.add(mapping.socketPath);
-        const brokerName = `actor-version-${index}-workflow-${mappedWorkflow.size}`;
+        const brokerName = `actor-version-${index}-workflow-${bindingIndex}`;
         versionBindings.push(
           `(name = ${capnpText(binding.serviceName)}, service = ${capnpText(brokerName)})`,
         );

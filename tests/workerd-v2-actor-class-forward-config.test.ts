@@ -315,6 +315,34 @@ test("v2 Actor class retains the selected Version's Workflow broker inside its n
   const config = await readFile(await writeWorkerdPrivateExecution(selected), "utf8");
   expect(config).toContain(`name = "${workflow.bindings[0]?.serviceName}"`);
   expect(config).toContain(`unix:${socketPath}`);
+  expect(config).toContain('name = "actor-version-0-workflow-0"');
+  const selectedVariant = selected.actor.variants[0];
+  if (!selectedVariant) throw new Error("Actor Workflow variant unavailable");
+  const withoutMapping = {
+    ...selected,
+    actor: {
+      ...selected.actor,
+      variants: [{ ...selectedVariant, workflowBindings: [] }],
+    },
+  };
+  await expect(writeWorkerdPrivateExecution(withoutMapping)).rejects.toThrow(
+    "Actor class Workflow broker unavailable",
+  );
+  const mixedWrapper = {
+    ...selected,
+    actor: {
+      ...selected.actor,
+      variants: [
+        {
+          ...selectedVariant,
+          workflowSourceEntrypoint: first.site.hostEntrypoint as string,
+        },
+      ],
+    },
+  };
+  await expect(writeWorkerdPrivateExecution(mixedWrapper)).rejects.toThrow(
+    "unusable Actor class Workflow source",
+  );
 });
 
 test("v2 Actor class refuses a missing or different-token broker", async () => {
