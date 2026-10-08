@@ -78,6 +78,7 @@ retry; the ordinary Worker startup 503 envelope applies. The callback's raw
 exception text is never returned to the caller; canonical Form-map validation
 may report its own bounded `TypeError` refusal.
 
-No provider credentials, private inputs, or new registry are supplied by this
-hook. In particular, composing a Form here does not itself qualify a managed
-Worker runtime, offer supply, or authorize deployment.
+The hook creates no additional credential, private-input channel, or registry;
+`env` remains the existing operator-owned Worker binding object and must not be
+logged or returned to tenants. Composing a Form here does not itself qualify a
+managed Worker runtime, offer supply, or authorize deployment.
