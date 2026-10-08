@@ -166,13 +166,25 @@ test("accepted upgrade holds route absence until the original client socket clos
   const fixture = await certificateFixture();
   let options: Parameters<SelfhostV2WorkerEndpointHttpsFactories["serve"]>[0] | undefined;
   let bridge: { clientClosed(): void } | undefined;
+  const upstreamSent: (string | Uint8Array)[] = [];
+  let upstreamClose: { code: number | undefined; reason: string | undefined } | undefined;
   const upstream = new EventTarget();
   Object.assign(upstream, {
     readyState: 1,
     protocol: "",
     bufferedAmount: 0,
-    close() {
-      upstream.dispatchEvent(new Event("close"));
+    forwardMessages(send: (value: string | Uint8Array) => void) {
+      upstream.addEventListener("message", (event) => {
+        send((event as MessageEvent).data);
+      });
+      send("welcome");
+    },
+    send(value: string | Uint8Array) {
+      upstreamSent.push(value);
+    },
+    close(code?: number, reason?: string) {
+      upstreamClose = { code, reason };
+      upstream.dispatchEvent(new CloseEvent("close", { code: code ?? 1000, reason: reason ?? "" }));
     },
     terminate() {
       upstream.dispatchEvent(new Event("close"));
@@ -208,6 +220,9 @@ test("accepted upgrade holds route absence until the original client socket clos
   });
   try {
     if (!options) throw new Error("listener options unavailable");
+    expect(options.websocket.maxPayloadLength).toBe(33_554_432);
+    expect(options.websocket.backpressureLimit).toBe(33_554_432);
+    expect(options.websocket.closeOnBackpressureLimit).toBe(false);
     const request = new Request(`https://${address.hostname}/actor-socket`, {
       headers: {
         host: address.hostname,
@@ -226,19 +241,39 @@ test("accepted upgrade holds route absence until the original client socket clos
     expect(upgradeCalls).toBe(1);
     expect(bridge).toBeDefined();
     expect((await listener.witness.observeRouteAbsent(address)).absent).toBe(false);
+    const clientSent: (string | ArrayBuffer | Uint8Array)[] = [];
+    let clientClose: { code: number | undefined; reason: string | undefined } | undefined;
     const client = {
       data: bridge,
       readyState: 1,
-      close() {},
+      close(code?: number, reason?: string) {
+        clientClose = { code, reason };
+      },
       terminate() {},
-      send() {
-        return 1;
+      send(value: string | ArrayBuffer | Uint8Array) {
+        clientSent.push(value);
+        return -1; // Bun accepted the frame into its bounded backpressure queue.
       },
     };
     options.websocket.open?.(client as never);
-    upstream.dispatchEvent(new Event("close"));
+    expect(clientSent).toEqual(["welcome"]);
+    const legalFrame = new Uint8Array(9 * 1024 * 1024);
+    options.websocket.message(client as never, legalFrame as never);
+    expect(upstreamSent).toEqual([legalFrame]);
+    upstream.dispatchEvent(new MessageEvent("message", { data: legalFrame.buffer }));
+    expect(clientSent).toHaveLength(2);
+    expect(clientSent[1]).toBe(legalFrame.buffer);
+    options.websocket.drain?.(client as never);
+    const maximumFrame = new Uint8Array(33_554_432);
+    options.websocket.message(client as never, maximumFrame as never);
+    expect(upstreamSent[1]).toBe(maximumFrame);
+    upstream.dispatchEvent(new MessageEvent("message", { data: maximumFrame.buffer }));
+    expect(clientSent[2]).toBe(maximumFrame.buffer);
+    upstream.dispatchEvent(new CloseEvent("close", { code: 4000, reason: "done" }));
+    expect(clientClose).toEqual({ code: 4000, reason: "done" });
     expect((await listener.witness.observeRouteAbsent(address)).absent).toBe(false);
-    options.websocket.close?.(client as never, 1000, "closed");
+    options.websocket.close?.(client as never, 4001, "client done");
+    expect(upstreamClose).toEqual({ code: 4001, reason: "client done" });
     expect((await listener.witness.observeRouteAbsent(address)).absent).toBe(true);
   } finally {
     await listener.close(true);

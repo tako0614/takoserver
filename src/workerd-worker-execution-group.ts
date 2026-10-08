@@ -24,7 +24,13 @@ const DEPLOYMENT_PUBLICATIONS_NAME = ".publications";
 const WORKER_POINTER_NAME = "takoserver-site.json";
 
 /** Bun's native client socket has immediate termination in addition to DOM close. */
-export type WorkerdNativeWebSocket = WebSocket & { terminate(): void };
+export type WorkerdBridgeMessage = string | ArrayBuffer | Uint8Array;
+export type WorkerdNativeWebSocket = WebSocket & {
+  terminate(): void;
+  /** Stage native messages before the public upgrade, then drain in order. */
+  forwardMessages(send: (value: WorkerdBridgeMessage) => void): void;
+};
+export const WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT = 33_554_432;
 
 export class WorkerdWorkerExecutionGroupError extends Error {
   readonly code:
@@ -444,6 +450,50 @@ function makeGroup(input: {
       ...(protocol ? { protocols: protocol.split(",").map((part) => part.trim()) } : {}),
     });
     socket.binaryType = "arraybuffer";
+    const early: WorkerdBridgeMessage[] = [];
+    let earlyBytes = 0;
+    let forward: ((value: WorkerdBridgeMessage) => void) | undefined;
+    socket.addEventListener("message", (event) => {
+      const value: unknown = event.data;
+      if (
+        typeof value !== "string" &&
+        !(value instanceof ArrayBuffer) &&
+        !(value instanceof Uint8Array)
+      ) {
+        socket.terminate();
+        return;
+      }
+      const size = typeof value === "string" ? Buffer.byteLength(value) : value.byteLength;
+      if (
+        size > WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT ||
+        (!forward && earlyBytes + size > WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT)
+      ) {
+        socket.terminate();
+        return;
+      }
+      if (forward) forward(value);
+      else {
+        early.push(value);
+        earlyBytes += size;
+      }
+    });
+    socket.addEventListener(
+      "close",
+      () => {
+        early.length = 0;
+        earlyBytes = 0;
+      },
+      { once: true },
+    );
+    Object.defineProperty(socket, "forwardMessages", {
+      value(send: (value: WorkerdBridgeMessage) => void) {
+        if (forward) throw new WorkerdWorkerExecutionGroupError("admission_closed");
+        forward = send;
+        for (const value of early) send(value);
+        early.length = 0;
+        earlyBytes = 0;
+      },
+    });
     return await new Promise<WorkerdNativeWebSocket>((resolve, reject) => {
       let settled = false;
       const done = (error?: Error) => {

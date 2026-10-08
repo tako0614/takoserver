@@ -6,7 +6,11 @@ import type {
   V2EndpointRouteAbsenceObservation,
   V2EndpointTlsObservation,
 } from "./takoform-v2/worker-endpoint-backend.ts";
-import type { WorkerdNativeWebSocket } from "./workerd-worker-execution-group.ts";
+import {
+  WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT,
+  type WorkerdBridgeMessage,
+  type WorkerdNativeWebSocket,
+} from "./workerd-worker-execution-group.ts";
 
 const NO_STORE_HEADERS = { "cache-control": "no-store" };
 const HTTPS_PORT = 443;
@@ -26,13 +30,34 @@ interface ListenerServer {
 
 interface SocketBridgeData {
   readonly upstream: WorkerdNativeWebSocket;
+  backpressuredBytes: number;
   readonly clientClosed: () => void;
   readonly upstreamClosed: () => void;
   readonly force: () => void;
 }
 
-const MAX_BRIDGE_BUFFER = 1024 * 1024;
-const MAX_BRIDGE_MESSAGE = 8 * 1024 * 1024;
+function forwardableClose(event: {
+  code?: number;
+  reason?: string;
+}): { code: number; reason: string } | null {
+  const code = event.code;
+  const reason = event.reason ?? "";
+  if (
+    typeof code !== "number" ||
+    !(
+      code === 1000 ||
+      code === 1001 ||
+      code === 1009 ||
+      code === 1011 ||
+      code === 1012 ||
+      code === 1013 ||
+      (code >= 3000 && code <= 4999)
+    ) ||
+    Buffer.byteLength(reason) > 123
+  )
+    return null;
+  return { code, reason };
+}
 
 function isUpgradeAttempt(request: Request): boolean {
   return request.headers.has("upgrade") || request.headers.has("sec-websocket-key");
@@ -331,28 +356,40 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
     hostname: "0.0.0.0",
     tls: { cert: input.certificateChain, key: input.privateKey },
     websocket: {
+      maxPayloadLength: WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT,
+      backpressureLimit: WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT,
+      closeOnBackpressureLimit: false,
       open(ws) {
         liveSockets.add(ws);
         const upstream = ws.data.upstream;
-        upstream.addEventListener("message", (event) => {
+        const forward = (value: WorkerdBridgeMessage) => {
           if (ws.readyState !== 1) return;
-          const value = event.data;
-          if (typeof value !== "string" && !(value instanceof ArrayBuffer)) {
-            ws.terminate();
+          const size = typeof value === "string" ? Buffer.byteLength(value) : value.byteLength;
+          if (
+            size > WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT ||
+            ws.data.backpressuredBytes + size > WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT
+          ) {
+            ws.close(1013, "bridge overloaded");
             ws.data.force();
             return;
           }
-          const size = typeof value === "string" ? Buffer.byteLength(value) : value.byteLength;
-          if (size > MAX_BRIDGE_MESSAGE || ws.send(value) <= 0) {
+          const accepted = ws.send(value);
+          if (accepted === 0) {
             ws.terminate();
             ws.data.force();
+          } else if (accepted === -1) {
+            ws.data.backpressuredBytes += size;
           }
-        });
+        };
         upstream.addEventListener(
           "close",
-          () => {
+          (event) => {
             ws.data.upstreamClosed();
-            if (ws.readyState === 1) ws.close(1001, "upstream closed");
+            const close = forwardableClose(event as CloseEvent) ?? {
+              code: 1001,
+              reason: "upstream closed",
+            };
+            if (ws.readyState === 1) ws.close(close.code, close.reason);
             else ws.terminate();
             // Upstream EOF starts the public close handshake; it does not by
             // itself prove the original client's socket has closed.
@@ -373,6 +410,12 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
           },
           { once: true },
         );
+        try {
+          upstream.forwardMessages(forward);
+        } catch {
+          ws.terminate();
+          ws.data.force();
+        }
         if (upstream.readyState !== WebSocket.OPEN) {
           ws.terminate();
           ws.data.force();
@@ -382,22 +425,27 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
         const upstream = ws.data.upstream;
         const size = typeof value === "string" ? Buffer.byteLength(value) : value.byteLength;
         if (
-          size > MAX_BRIDGE_MESSAGE ||
+          size > WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT ||
           upstream.readyState !== WebSocket.OPEN ||
-          upstream.bufferedAmount + size > MAX_BRIDGE_BUFFER
+          upstream.bufferedAmount + size > WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT
         ) {
-          ws.terminate();
+          ws.close(size > WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT ? 1009 : 1013);
           ws.data.force();
           return;
         }
         upstream.send(value);
       },
-      close(ws) {
+      drain(ws) {
+        ws.data.backpressuredBytes = 0;
+      },
+      close(ws, code, reason) {
         liveSockets.delete(ws);
         ws.data.clientClosed();
         const upstream = ws.data.upstream;
         if (upstream.readyState === WebSocket.OPEN) {
-          upstream.close();
+          const close = forwardableClose({ code, reason });
+          if (close) upstream.close(close.code, close.reason);
+          else upstream.terminate();
           setTimeout(() => {
             if (upstream.readyState !== WebSocket.CLOSED) upstream.terminate();
           }, 1_000);
@@ -435,6 +483,7 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
           };
           const data: SocketBridgeData = {
             upstream,
+            backpressuredBytes: 0,
             clientClosed() {
               clientClosed = true;
               if (upstreamClosed) finish();
