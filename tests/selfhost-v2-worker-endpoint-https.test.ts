@@ -166,13 +166,22 @@ test("accepted upgrade holds route absence until the original client socket clos
   const fixture = await certificateFixture();
   let options: Parameters<SelfhostV2WorkerEndpointHttpsFactories["serve"]>[0] | undefined;
   let bridge: { clientClosed(): void } | undefined;
+  let upgradeHeaders: HeadersInit | undefined;
   const upstreamSent: (string | Uint8Array)[] = [];
   let upstreamClose: { code: number | undefined; reason: string | undefined } | undefined;
   const upstream = new EventTarget();
   Object.assign(upstream, {
     readyState: 1,
     protocol: "",
+    handshakeHeaders: [
+      ["x-actor-upgrade-marker", "native-header"],
+      ["set-cookie", "first=1; Path=/"],
+      ["set-cookie", "second=2; Path=/"],
+    ],
     bufferedAmount: 0,
+    getTerminalClose() {
+      return null;
+    },
     forwardMessages(send: (value: string | Uint8Array) => void) {
       upstream.addEventListener("message", (event) => {
         send((event as MessageEvent).data);
@@ -193,8 +202,9 @@ test("accepted upgrade holds route absence until the original client socket clos
   const server = {
     port: 443,
     stop() {},
-    upgrade(_request: Request, upgrade: { data: { clientClosed(): void } }) {
+    upgrade(_request: Request, upgrade: { data: { clientClosed(): void }; headers?: HeadersInit }) {
       bridge = upgrade.data;
+      upgradeHeaders = upgrade.headers;
       return true;
     },
   };
@@ -238,6 +248,11 @@ test("accepted upgrade holds route absence until the original client socket clos
     expect((await options.fetch(invalid, server as never)).status).toBe(400);
     expect(upgradeCalls).toBe(0);
     expect(await options.fetch(request, server as never)).toBeUndefined();
+    expect(upgradeHeaders).toEqual([
+      ["x-actor-upgrade-marker", "native-header"],
+      ["set-cookie", "first=1; Path=/"],
+      ["set-cookie", "second=2; Path=/"],
+    ]);
     expect(upgradeCalls).toBe(1);
     expect(bridge).toBeDefined();
     expect((await listener.witness.observeRouteAbsent(address)).absent).toBe(false);

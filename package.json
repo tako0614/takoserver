@@ -88,7 +88,8 @@
   "dependencies": {
     "@cloudflare/containers": "0.3.7",
     "@noble/hashes": "2.4.0",
-    "drizzle-orm": "^0.45.2"
+    "drizzle-orm": "^0.45.2",
+    "ws": "8.21.0"
   },
   "overrides": {
     "sharp": "0.35.5",

@@ -381,27 +381,29 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
             ws.data.backpressuredBytes += size;
           }
         };
-        upstream.addEventListener(
-          "close",
-          (event) => {
-            ws.data.upstreamClosed();
-            const close = forwardableClose(event as CloseEvent) ?? {
-              code: 1001,
-              reason: "upstream closed",
-            };
-            if (ws.readyState === 1) ws.close(close.code, close.reason);
-            else ws.terminate();
-            // Upstream EOF starts the public close handshake; it does not by
-            // itself prove the original client's socket has closed.
-            setTimeout(() => {
-              if (ws.readyState !== 3) {
-                ws.terminate();
-                ws.data.force();
-              }
-            }, 1_000);
-          },
-          { once: true },
-        );
+        let upstreamTerminalDelivered = false;
+        const upstreamDidClose = (event: CloseEvent) => {
+          if (upstreamTerminalDelivered) return;
+          upstreamTerminalDelivered = true;
+          ws.data.upstreamClosed();
+          const close = forwardableClose(event) ?? {
+            code: 1001,
+            reason: "upstream closed",
+          };
+          if (ws.readyState === 1) ws.close(close.code, close.reason);
+          else ws.terminate();
+          // Upstream EOF starts the public close handshake; it does not by
+          // itself prove the original client's socket has closed.
+          setTimeout(() => {
+            if (ws.readyState !== 3) {
+              ws.terminate();
+              ws.data.force();
+            }
+          }, 1_000);
+        };
+        upstream.addEventListener("close", (event) => upstreamDidClose(event as CloseEvent), {
+          once: true,
+        });
         upstream.addEventListener(
           "error",
           () => {
@@ -416,7 +418,9 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
           ws.terminate();
           ws.data.force();
         }
-        if (upstream.readyState !== WebSocket.OPEN) {
+        const terminal = upstream.getTerminalClose();
+        if (terminal) upstreamDidClose(terminal);
+        else if (upstream.readyState === WebSocket.CLOSED) {
           ws.terminate();
           ws.data.force();
         }
@@ -497,14 +501,16 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
               finish();
             },
           };
-          const headers = upstream.protocol
-            ? { "sec-websocket-protocol": upstream.protocol }
-            : undefined;
+          const headers: [string, string][] = upstream.handshakeHeaders.map(([name, value]) => [
+            name,
+            value,
+          ]);
+          if (upstream.protocol) headers.push(["sec-websocket-protocol", upstream.protocol]);
           if (
             !listenerCurrent() ||
             !upgradeServer.upgrade(request, {
               data,
-              ...(headers ? { headers } : {}),
+              ...(headers.length > 0 ? { headers } : {}),
             })
           ) {
             upstream.terminate();
