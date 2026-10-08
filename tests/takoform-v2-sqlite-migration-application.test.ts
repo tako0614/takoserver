@@ -20,11 +20,18 @@ import {
   createSQLiteMigrationSetCustody,
   createSQLiteMigrationSetForm,
 } from "../src/takoform-v2/forms/sqlite-migration-set-backend.ts";
-import type { SQLiteDatabaseNativePort } from "../src/takoform-v2/forms/sqlite-native-store-port.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
 
 const MANIFEST_URL = "https://artifacts.example.test/migrations.json";
 const FILE_URL = "https://artifacts.example.test/0001.sql";
+
+interface NativeAuthorizedSQLiteStore {
+  withAuthorizedDatabase<T>(input: {
+    readonly resourceUid: string;
+    readonly stillAuthorized: () => Promise<boolean>;
+    readonly use: (database: DatabaseSync) => Promise<T> | T;
+  }): Promise<T>;
+}
 
 async function fixture(
   sqlText: string | readonly string[],
@@ -609,7 +616,7 @@ test("native session never treats an in-doubt transaction's visible ledger row a
     },
     setAuthorizer() {},
   } as unknown as DatabaseSync;
-  const store: Pick<SQLiteDatabaseNativePort, "withAuthorizedDatabase"> = {
+  const store: NativeAuthorizedSQLiteStore = {
     async withAuthorizedDatabase(input) {
       return await input.use(database);
     },

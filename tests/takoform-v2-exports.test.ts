@@ -27,6 +27,10 @@ import {
   validateSQLiteDatabaseUpdate,
 } from "../src/takoform-v2/forms/sqlite-database.ts";
 import { createSQLiteDatabaseForm } from "../src/takoform-v2/forms/sqlite-database-backend.ts";
+import {
+  createSQLiteMigrationApplicationForm,
+  SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
+} from "../src/takoform-v2/forms/sqlite-migration-application-backend.ts";
 import { createSQLiteWorkerBindingAuthority } from "../src/takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { referencesForWorkerForm } from "../src/takoform-v2/forms/worker-references.ts";
 import {
@@ -63,6 +67,7 @@ const RUNTIME_EXPORTS = [
   "createAtLeastOnceQueueForm",
   "createQueueWorkerBindingAuthority",
   "createSQLiteDatabaseForm",
+  "createSQLiteMigrationApplicationForm",
   "createSQLiteWorkerBindingAuthority",
   "createV2NativeEffectCustody",
   "createV2NativeDeletionCustody",
@@ -88,6 +93,7 @@ const RUNTIME_EXPORTS = [
   "referencesForWorkerVersion",
   "runWorkerCronTriggerTick",
   "SQLITE_DATABASE_FORM_URL",
+  "SQLITE_MIGRATION_APPLICATION_BACKEND_ID",
   "v2WorkerInvocationSchemaReady",
   "V2_QUEUE_BACKEND_ID",
   "validateEdgeKVNamespaceUpdate",
@@ -102,6 +108,10 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
   expect(extension.createSQLiteDatabaseForm).toBe(createSQLiteDatabaseForm);
+  expect(extension.createSQLiteMigrationApplicationForm).toBe(createSQLiteMigrationApplicationForm);
+  expect(extension.SQLITE_MIGRATION_APPLICATION_BACKEND_ID).toBe(
+    SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
+  );
   expect(extension.createSQLiteWorkerBindingAuthority).toBe(createSQLiteWorkerBindingAuthority);
   expect(extension.SQLITE_DATABASE_FORM_URL).toBe(SQLITE_DATABASE_FORM_URL);
   expect(extension.parseSQLiteDatabaseSpec).toBe(parseSQLiteDatabaseSpec);
@@ -153,7 +163,12 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   const materialsType = (_materials: V2WorkerVersionMaterials): void => {};
   const sqlType = (_sql: Sql): void => {};
   const inspectorType = (_inspector: V2WorkerModuleInspector): void => {};
-  const sqlitePortType = (_port: SQLiteDatabaseNativePort): void => {};
+  const sqlitePort: SQLiteDatabaseNativePort = {
+    targetKey: "sqlite-target",
+    ensureCreated: async () => "present",
+    inspect: async () => "present",
+    ensureDeleted: async () => "absent",
+  };
   const sqliteClaimType = (_claim: SQLiteWorkerBindingClaim): void => {};
   expect(unresolved.kind).toBe("unresolved");
   expect([
@@ -161,7 +176,7 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
     materialsType,
     sqlType,
     inspectorType,
-    sqlitePortType,
+    sqlitePort,
     sqliteClaimType,
   ]).toHaveLength(6);
 

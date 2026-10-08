@@ -5,13 +5,21 @@ import type {
   SQLiteMigrationFileResult,
   SQLiteMigrationRecord,
 } from "./sqlite-migration-application-port.ts";
-import type { SQLiteDatabaseNativePort } from "./sqlite-native-store-port.ts";
 
 const LEDGER = "_takoform_sqlite_migrations";
 
+/** Host-only SQLite capability used by this adapter; never part of the Worker SDK port. */
+interface AuthorizedSQLiteDatabaseStore {
+  withAuthorizedDatabase<T>(input: {
+    readonly resourceUid: string;
+    readonly stillAuthorized: () => Promise<boolean>;
+    readonly use: (database: DatabaseSync) => Promise<T> | T;
+  }): Promise<T>;
+}
+
 /** Self-host realization of the portable migration session. Never expose this to a Worker. */
 export function createSQLiteMigrationApplicationNativePort(
-  store: Pick<SQLiteDatabaseNativePort, "withAuthorizedDatabase">,
+  store: AuthorizedSQLiteDatabaseStore,
 ): SQLiteMigrationApplicationPort {
   return {
     withAuthorizedMigrationSession(input) {
