@@ -612,6 +612,12 @@ SQL graph and held bytes to the exact native owner and selected Version. A nativ
 Host journey covers durable ACK, retry, Consumer update and deletion refusal.
 External currentness preflight occurs outside the owner's serial lane; native
 identity, SQL source and one-send authorization remain checked inside it.
+The same internal composition also keeps an execution outstanding after durable
+ACK while native `waitUntil` work remains. Closing the scheduler refuses new
+ticks but does not release that execution; the native handler's later completion
+permits retirement and reference-ordered deletion. This same-process test does
+not prove owner suspension with pending work, retention beyond expiry, response
+loss, or delivery settlement after an OS restart.
 
 SQLite calls now use a separate private streaming transport rather than the
 shared 40 MiB buffered companion path. The operator supplies a pre-existing
@@ -670,6 +676,17 @@ to a different expression, and delete in reference order. It also confirms that
 closing an in-flight delivery keeps its late native result unknown in SQL.
 Those native ABI tests run within one Host process; they do not replace the
 stand-in process-restart test or qualify native delivery after an OS restart.
+
+A separate pinned-workerd process journey persists the real organization,
+API-key identity, accepted Worker graph, Cron Attachment and match in the same
+SQLite database. It SIGKILLs an identity-checked Host, restores with different
+Host and native child PIDs, resolves the same match through a second attempt,
+then checks Cron update, retrieval and reference-ordered deletion. Normal
+teardown requires the child fixture's post-owner-stop witness and zero exit;
+unproven shutdown retains its workspace. Effects are observed inside the native
+module, not in an external durable destination. This proves that local native
+restart path, not exactly-once external effects, an independent response-loss
+case, ordinary-entry Form registration, or Hosted qualification.
 
 The normal Bun entry now also constructs the v2 UID-owner composition against
 its canonical SQL, object store, clock and selected workerd binary. Before its
@@ -753,10 +770,51 @@ bytes and an atomic SQL graph predicate. Proven ABI failures and existing
 Worker/class duplicates are dependency conflicts; unavailable inspection or a
 graph change before acceptance is retryable busy, without Resource/Operation
 creation. A separate physical backend can confirm an empty namespace before any
-Deployment and delete it with authoritative absence proof. Its tests use a
-semantic-inspector stand-in, not native active Actor ABI proof. Active runtime
-counts and the executable Actor Binding remain incomplete; these internal paths
-do not register or advertise ActorNamespace Form support.
+Deployment and delete it with authoritative absence proof. Its empty-namespace
+tests use a semantic-inspector stand-in. The internal boot also composes the
+executable Actor Binding and accepted-operation warm/runtime-count paths with
+the same physical owner. Separate pinned-workerd tests exercise fetch and
+WebSocket upgrade, active same-spec update counts, and first active creation.
+These internal paths do not register or advertise ActorNamespace Form support,
+or establish Hosted or ordinary-entry qualification.
+
+An Actor Binding may target a Namespace whose class is provided by a different
+Worker. Admission checks the caller's accepted Version and sealed reference
+separately from the Namespace's provider Worker, within the same authorized
+organization, Space and execution target. Host restoration first rebuilds every
+retained owner and private broker without admitting Actor delivery. It then
+rechecks the complete caller/provider graph and opens one shared delivery gate;
+self references and static A-to-B/B-to-A graphs do not wait on that same gate.
+Standalone owners complete their own post-restore proof before admission.
+
+Physical Actor leases persist exact Linux Host and child process identities.
+The child stops before executing workerd, resumes only after its ownership
+record is durable, and is killed when its Host dies. Recovery reclaims only an
+exact owned lease whose Host and recorded child are proved dead; a fixed
+exclusive claim serializes competing recoveries. Legacy, foreign, incomplete
+or uncertain ownership stays unavailable and retains its data. An interrupted
+recovery claim still requires operator repair rather than guessed cleanup.
+A pinned-workerd Host-process test covers cross-Worker and self Binding calls,
+distinct Host/Worker/Actor PIDs after SIGKILL, the same Actor ID and persisted
+value, updates and dependency-ordered deletion. Actor class environments now
+compose their own Version's declared Actor Bindings through the same retained
+private broker sockets. The class configuration checks exact token, channel,
+scope and socket ownership; weighted Versions may share only the same exact
+broker identity. A separate native Host-process journey covers Actor A calling
+another Worker's Actor B, B calling a different ID in its own Namespace, and
+both Actor children restarting with the same persisted values.
+
+The published ActorNamespace contract permits socket acceptance only when the
+original client's upgrade reaches that Actor directly; a reservation cannot be
+forwarded into another invocation. Nested A-to-B upgrade is therefore a refused
+operation, not a missing positive runtime capability. The native journey checks
+that refusal without changing B's accepted-socket count, live socket count, or
+owned lease. A direct original-client upgrade to B echoes and closes normally.
+After Host SIGKILL, a distinct Host and native children restore the same Actor
+data, and a new socket ID echoes and closes; ordered deletion removes both
+Namespaces' owned leases. This does not prove public-CA WSS or delivery of a
+terminal callback for a connection lost with its Host. Recursive calls to the
+same Actor ID remain unqualified.
 
 The normal Bun entry can now opt in to its existing private v2 Actor and
 Workflow boot ports with `TAKOSERVER_V2_WORKER_RUNTIME_BOOT`, for example

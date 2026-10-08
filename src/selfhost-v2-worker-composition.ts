@@ -99,6 +99,8 @@ export interface SelfhostV2ActorBootPort {
     readonly bundleCustody: NonNullable<ReturnType<typeof createWorkerBundleCustody>>;
     readonly inspector: ReturnType<typeof createWorkerdWorkerModuleInspector>;
     readonly ownerForWorker: (uid: string) => Promise<WorkerdWorkerRuntimeOwner | null>;
+    /** One global gate for all restored Actor brokers; false until every proof completes. */
+    readonly actorInvocationReady: () => boolean;
   }): {
     readonly namespaceForm: ReturnType<V2OperatorFormFactory>[string];
     readonly bindingAuthority: NonNullable<
@@ -278,6 +280,8 @@ async function unusedPrivatePort(excluded: Set<number>): Promise<number> {
  */
 export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompositionOptions): {
   restoreOwners(): Promise<readonly string[]>;
+  /** Trusted graph-reader port; never opens an unlisted owner during restoration. */
+  actorOwnerForRecovery(uid: string): Promise<WorkerdWorkerRuntimeOwner | null>;
   ownerForWorkerUid(uid: string): Promise<WorkerdWorkerRuntimeOwner>;
   /** Read-only Endpoint routing view; does not register WorkerEndpoint in the normal Host. */
   readonly endpointPublicationState: Pick<
@@ -484,6 +488,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   });
   const inspectModule = moduleInspector.inspect;
   const owners = new Map<string, Promise<WorkerdWorkerRuntimeOwner>>();
+  let actorRestoreProof = false;
   let workflowHostClosing = false;
   const actor = options.v2Actor
     ? (() => {
@@ -500,9 +505,11 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           bundleCustody,
           inspector: moduleInspector,
           ownerForWorker: async (uid) => {
+            if (actorRestoreProof) return (await owners.get(uid)) ?? null;
             if (!restorationComplete) return null;
             return await openOwner(uid);
           },
+          actorInvocationReady: () => restorationComplete && !ownerAdmissionFrozen,
         });
         if (
           typeof prepared?.namespaceForm?.backend?.execute !== "function" ||
@@ -919,6 +926,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         },
         ...(actor && row.deleted_at === null
           ? {
+              deferActorRestoreAdmission: !restorationComplete,
               v2ActorForward: {
                 openIncarnation(source) {
                   return actor.forwardBoot.openIncarnation({ ...source, ...actorIdentity });
@@ -1092,7 +1100,10 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         await openOwner(uid, true);
         restored.push(uid);
       }
+      actorRestoreProof = true;
+      for (const opening of owners.values()) await (await opening).completeActorRestore();
     } catch (error) {
+      actorRestoreProof = false;
       await sqliteServer?.stop(true);
       sqliteServer = undefined;
       await objectBucketServer?.stop(true);
@@ -1104,6 +1115,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       throw error;
     }
     restorationComplete = true;
+    actorRestoreProof = false;
     return restored;
   }
 
@@ -1266,6 +1278,12 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     restoreOwners() {
       restoration ??= restore();
       return restoration;
+    },
+    async actorOwnerForRecovery(uid) {
+      if (ownerAdmissionFrozen) return null;
+      if (actorRestoreProof) return (await owners.get(uid)) ?? null;
+      if (!restorationComplete) return null;
+      return await openOwner(uid);
     },
     async ownerForWorkerUid(uid) {
       if (!restoration) throw new Error("v2 Worker owners have not restored");

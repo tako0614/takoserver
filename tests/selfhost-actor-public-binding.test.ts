@@ -949,6 +949,45 @@ test("deletion retains the exclusive lease until native data is removed", async 
   }
 });
 
+test("failed ownerless Actor DELETE retries under the same held Host lease", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-delete-owned-retry-"));
+  const scope = { tenantId: "tenant-one", namespaceResourceUid: "uid-actor-delete-retry" };
+  const storageRoot = join(root, "actor");
+  const key = createHash("sha256")
+    .update(JSON.stringify([scope.tenantId, scope.namespaceResourceUid]))
+    .digest("hex");
+  let injected = false;
+  const host = createSelfhostActorExecutionHost({
+    runtimeRoot: join(root, "runtime"),
+    storageRoot,
+    binary: "/unused/workerd",
+    graph: async () => null,
+    deployments: { active: async () => null },
+    providerPackRef: "local.pack",
+    providerInstallationRef: "local.primary",
+    async beforeNamespaceStorageDelete() {
+      if (injected) return;
+      injected = true;
+      throw new Error("owned deletion interrupted");
+    },
+  });
+  let stopped = false;
+  try {
+    await host.ready;
+    await host.registerNamespace(scope);
+    await expect(host.forgetNamespace(scope)).rejects.toThrow("owned deletion interrupted");
+    expect((await lstat(join(storageRoot, "leases", key))).isDirectory()).toBe(true);
+    expect((await lstat(join(storageRoot, "leases", `${key}.owner.json`))).isFile()).toBe(true);
+    await host.forgetNamespace(scope);
+    expect(await host.namespaceAbsent(scope)).toBe(true);
+    await host.close();
+    stopped = true;
+  } finally {
+    if (!stopped) await host.close();
+    if (stopped) await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("owner refuses to delete a namespace while canonical graph authority remains", async () => {
   const root = await mkdtemp(join(tmpdir(), "actor-live-delete-"));
   const scope = { tenantId: "tenant-one", namespaceResourceUid: "uid-actor-live-one" };
@@ -1007,5 +1046,39 @@ test("delete recovery proves a failed lease-unlink ACK durably absent", async ()
   } finally {
     await first.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("same Host retries an unknown final Actor lease ACK from retained custody", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-lease-ack-retry-"));
+  const scope = { tenantId: "tenant-one", namespaceResourceUid: "uid-actor-ack-retry" };
+  let interrupted = false;
+  const host = createSelfhostActorExecutionHost({
+    runtimeRoot: join(root, "runtime"),
+    storageRoot: join(root, "actor"),
+    binary: "/unused/workerd",
+    graph: async () => null,
+    deployments: { active: async () => null },
+    providerPackRef: "local.pack",
+    providerInstallationRef: "local.primary",
+    async afterLeaseUnlinkBeforeSync() {
+      if (interrupted) return;
+      interrupted = true;
+      throw new Error("lease ACK unknown");
+    },
+  });
+  let closed = false;
+  try {
+    await host.ready;
+    await host.registerNamespace(scope);
+    await expect(host.forgetNamespace(scope)).rejects.toThrow("lease ACK unknown");
+    expect(await host.namespaceAbsent(scope)).toBe(false);
+    await host.forgetNamespace(scope);
+    expect(await host.namespaceAbsent(scope)).toBe(true);
+    await host.close();
+    closed = true;
+  } finally {
+    if (!closed) await host.close();
+    if (closed) await rm(root, { recursive: true, force: true });
   }
 });

@@ -4218,6 +4218,7 @@ export async function writeWorkerdPrivateExecution(options: {
       readonly modules: ReadonlyMap<string, Uint8Array>;
       readonly hostModules: ReadonlyMap<string, Uint8Array>;
       readonly className: string;
+      readonly actorForwardSockets?: readonly WorkerdActorForwardSocket[];
     }[];
   };
   readonly runSocketPath: string;
@@ -4453,6 +4454,9 @@ export async function writeWorkerdPrivateExecution(options: {
   }
   let actorServices = "";
   let actorVersionServices = "";
+  let actorVersionExternals = "";
+  const actorSocketProofs: { path: string; identity: PrivateSocketIdentity }[] = [];
+  const actorSocketOwners = new Map<string, string>();
   const actorPrepared: {
     readonly root: string;
     readonly version: Awaited<ReturnType<typeof prepareWorkerdSite>>;
@@ -4501,6 +4505,48 @@ export async function writeWorkerdPrivateExecution(options: {
         (binding) =>
           `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
       );
+      // The class sees only its own immutable Version's declared bindings.
+      // Reuse the provider Worker's exact incumbent brokers; never mint a new
+      // token or infer a target from a request URL in the Actor child.
+      if (version.manifest.actorForward && hasWorkerdV2PrivateBindingProfile(version.manifest)) {
+        const declared = validActorForward(version.manifest.actorForward, true);
+        const sockets = validActorForwardSockets(variant.actorForwardSockets);
+        for (const [bindingIndex, binding] of declared.bindings.entries()) {
+          const socket = sockets.get(
+            actorForwardIdentity(binding.tenantId, binding.namespaceResourceUid, binding.token),
+          );
+          if (!socket || socket.token !== binding.token)
+            throw new Error("Actor class forward broker unavailable");
+          for (const [kind, path] of [
+            ["http", socket.httpSocketPath],
+            ["upgrade", socket.upgradeSocketPath],
+          ] as const) {
+            const socketOwner = `${actorForwardIdentity(binding.tenantId, binding.namespaceResourceUid, binding.token)}:${kind}`;
+            const previousOwner = actorSocketOwners.get(path);
+            if (
+              path === runSocketPath ||
+              path === actorProxySocketPath ||
+              (servicePaths.has(path) && previousOwner !== socketOwner)
+            )
+              throw new Error("unusable Actor class forward broker");
+            await requirePrivateSocketDirectory(dirname(path));
+            const identity = await privateSocketMetadata(path);
+            if (!identity) throw new Error("Actor class forward broker unavailable");
+            actorSocketProofs.push({ path, identity });
+            actorSocketOwners.set(path, socketOwner);
+            servicePaths.add(path);
+          }
+          const httpService = `actor-version-${index}-forward-http-${bindingIndex}`;
+          const upgradeService = `actor-version-${index}-forward-upgrade-${bindingIndex}`;
+          versionBindings.push(
+            `(name = ${capnpText(binding.httpService)}, service = ${capnpText(httpService)})`,
+            `(name = ${capnpText(binding.upgradeService)}, service = ${capnpText(upgradeService)})`,
+          );
+          actorVersionExternals += `
+  (name = ${capnpText(httpService)}, external = (address = ${capnpText(`unix:${socket.httpSocketPath}`)}, http = ())),
+  (name = ${capnpText(upgradeService)}, external = (address = ${capnpText(`unix:${socket.upgradeSocketPath}`)}, http = (style = proxy))),`;
+        }
+      }
       if (
         version.manifest.vars?.some((binding) => binding.name === "__TAKOSERVER_ACTOR_ALARM_OWNER")
       ) {
@@ -4538,7 +4584,7 @@ const config :Workerd.Config = (
     compatibilityFlags = [${(actor ? [...APPLICATION_COMPATIBILITY_FLAGS, "experimental"] : APPLICATION_COMPATIBILITY_FLAGS).map(capnpText).join(", ")}],
     globalOutbound = "deny"
   )),
-  ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${serviceExternals}${workflowExternals}${actorVersionServices}${actorServices}
+  ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${serviceExternals}${workflowExternals}${actorVersionServices}${actorVersionExternals}${actorServices}
   (name = "deny", network = (allow = []))
  ],
  sockets = [(name = ${capnpText(actor ? "actor" : "workflow")}, address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = ${capnpText(actor ? "actor-owner" : "application")})${actor ? `, (name = "actor-duplex", address = ${capnpText(`unix:${actorProxySocketPath}`)}, http = (style = proxy), service = "actor-owner")` : ""}]
@@ -4546,6 +4592,12 @@ const config :Workerd.Config = (
   await writePreparedWorkerdSite(root, classPrepared);
   for (const { root: versionRoot, version } of actorPrepared) {
     await writePreparedWorkerdSite(versionRoot, version);
+  }
+  for (const proof of actorSocketProofs) {
+    await requirePrivateSocketDirectory(dirname(proof.path));
+    const current = await privateSocketMetadata(proof.path);
+    if (!current || !samePrivateSocketIdentity(proof.identity, current))
+      throw new Error("Actor class forward broker changed");
   }
   const configPath = join(root, "workerd.capnp");
   await writeFile(configPath, config, { mode: 0o600, flag: "wx" });

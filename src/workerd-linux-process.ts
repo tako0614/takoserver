@@ -5,10 +5,12 @@ import { readdir, readFile, readlink, stat } from "node:fs/promises";
 // arguments are positional; neither a tenant value nor a config path is code.
 const PARENT_GUARD = `
 expected=$1
-shift
+pause=$2
+shift 2
 while read -r key value rest; do
   if [ "$key" = "PPid:" ]; then
     [ "$value" = "$expected" ] || exit 125
+    if [ "$pause" = "1" ]; then kill -STOP $$; fi
     exec "$@"
   fi
 done < /proc/self/status
@@ -139,6 +141,7 @@ export async function linuxProcessLiveness(
 export function spawnWorkerdWithParentDeath(
   command: readonly string[],
   stdio: { readonly stdout: "inherit" | "ignore"; readonly stderr: "inherit" | "ignore" },
+  options?: { readonly pauseBeforeExec?: true; readonly env?: Readonly<Record<string, string>> },
 ): ReturnType<typeof Bun.spawn> {
   if (process.platform !== "linux") {
     throw new Error("workerd parent-bound launch requires Linux");
@@ -154,10 +157,44 @@ export function spawnWorkerdWithParentDeath(
       PARENT_GUARD,
       "workerd-parent-guard",
       String(process.pid),
+      options?.pauseBeforeExec ? "1" : "0",
       ...command,
     ],
-    stdio,
+    { ...stdio, ...(options?.env === undefined ? {} : { env: options.env }) },
   );
+}
+
+/** A stopped, unreaped child cannot execute workerd until its owner ACKs custody. */
+export async function waitForStoppedWorkerdChild(
+  child: ReturnType<typeof Bun.spawn>,
+  signal: AbortSignal,
+): Promise<LinuxProcessIdentity> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    signal.throwIfAborted();
+    if (child.exitCode !== null || child.signalCode !== null)
+      throw new Error("workerd exited before custody ACK");
+    const identity = await readLinuxProcessIdentity(child.pid).catch(() => null);
+    if (identity) {
+      const statText = await readFile(`/proc/${child.pid}/stat`, "utf8").catch(() => "");
+      const commandEnd = statText.lastIndexOf(")");
+      const state =
+        commandEnd < 0
+          ? null
+          : statText
+              .slice(commandEnd + 1)
+              .trim()
+              .split(/\s+/u)[0];
+      if (
+        (state === "T" || state === "t") &&
+        JSON.stringify(await readLinuxProcessIdentity(child.pid).catch(() => null)) ===
+          JSON.stringify(identity)
+      )
+        return identity;
+    }
+    await Bun.sleep(5);
+  }
+  throw new Error("workerd did not stop before custody ACK");
 }
 
 /** The kernel's LISTEN socket inode(s) for one TCP port, not an HTTP claim. */

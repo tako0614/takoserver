@@ -350,6 +350,7 @@ export function createV2ActorNamespaceGraphAuthority(options: {
         script: native.script,
         graph: native.graph,
         authorityKey: realizationKey(native),
+        actorForwardSockets: native.actorForwardSockets,
       };
     },
     hasRealization: activeDeployment,
@@ -370,6 +371,7 @@ export function createV2ActorNamespaceGraphAuthority(options: {
           script: native.script,
           graph: native.graph,
           authorityKey: realizationKey(native),
+          actorForwardSockets: native.actorForwardSockets,
         },
       };
     },
@@ -383,6 +385,8 @@ export function createV2ActorNamespaceGraphAuthority(options: {
         !!native &&
         native.script === realization.script &&
         realizationKey(native) === realization.authorityKey &&
+        canonicalJson(native.actorForwardSockets) ===
+          canonicalJson(realization.actorForwardSockets ?? []) &&
         (await activeDeployment(graph)) &&
         (await acceptedGraph(graph.scope))?.authorityKey === graph.authorityKey
       );

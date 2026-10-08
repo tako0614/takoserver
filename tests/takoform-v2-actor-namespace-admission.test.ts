@@ -459,7 +459,8 @@ test("accepted sealed WorkerVersion Actor binding resolves its exact physical na
       worker: { resourceUid: worker.resourceUid },
       className: "CounterActor",
     });
-    const sourceVersion = await f.version(worker.resourceUid, "bound-source");
+    const caller = await f.create(MODULE_WORKER_FORM_URL, "caller", {});
+    const sourceVersion = await f.version(caller.resourceUid, "bound-source");
     const row = (
       await f.sql.query("SELECT spec_json FROM tf_v2_resources WHERE uid = ?", [
         sourceVersion.resourceUid,
@@ -470,7 +471,7 @@ test("accepted sealed WorkerVersion Actor binding resolves its exact physical na
     if (!bundleUid) throw new Error("fixture Bundle missing");
     const binding = { name: "ACTOR", resource: { resourceUid: namespace.resourceUid } };
     const version = await f.create(WORKER_VERSION_FORM_URL, "bound-version", {
-      worker: { resourceUid: worker.resourceUid },
+      worker: { resourceUid: caller.resourceUid },
       bundle: { resourceUid: bundleUid },
       handlers: ["fetch"],
       actorBindings: [binding],
@@ -491,7 +492,7 @@ test("accepted sealed WorkerVersion Actor binding resolves its exact physical na
         principal: PRINCIPAL,
         space: SPACE,
         targetKey: TARGET,
-        workerUid: worker.resourceUid,
+        workerUid: caller.resourceUid,
         namespaceResourceUid: namespace.resourceUid,
       }),
     ).toMatchObject({
@@ -506,7 +507,7 @@ test("accepted sealed WorkerVersion Actor binding resolves its exact physical na
       principal: PRINCIPAL,
       space: SPACE,
       targetKey: TARGET,
-      workerUid: worker.resourceUid,
+      workerUid: caller.resourceUid,
       workerVersionUid: version.resourceUid,
       workerVersionOperationId: version.id,
       nativeVersionId,
@@ -517,6 +518,14 @@ test("accepted sealed WorkerVersion Actor binding resolves its exact physical na
       namespaceResourceUid: namespace.resourceUid,
       className: "CounterActor",
     });
+    for (const foreign of [
+      { principal: `${PRINCIPAL}-other` },
+      { space: `${SPACE}-other` },
+      { targetKey: `${TARGET}-other` },
+      { workerUid: worker.resourceUid },
+    ]) {
+      expect(await authority.resolveCurrentBinding({ ...claim, ...foreign }, "ACTOR")).toBeNull();
+    }
     const forward = createV2ActorForwardBoot({
       sql: f.sql,
       targetKey: TARGET,
@@ -526,7 +535,7 @@ test("accepted sealed WorkerVersion Actor binding resolves its exact physical na
     }).openIncarnation({
       principal: PRINCIPAL,
       space: SPACE,
-      workerUid: worker.resourceUid,
+      workerUid: caller.resourceUid,
       sourceOperationId: "8c44e450-1765-4366-919a-4c022f48d97c",
       eventToken: "a".repeat(64),
       scriptName: "actor-binding-test-script",
@@ -541,7 +550,7 @@ test("accepted sealed WorkerVersion Actor binding resolves its exact physical na
     if (!issued) throw new Error("Actor private grant unavailable");
     const publication = {
       script: "actor-binding-test-script",
-      workerResourceUid: worker.resourceUid,
+      workerResourceUid: caller.resourceUid,
       versionId: nativeVersionId,
       workerVersionResourceUid: version.resourceUid,
       bindings: [

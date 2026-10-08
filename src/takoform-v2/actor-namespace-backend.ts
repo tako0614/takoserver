@@ -94,6 +94,7 @@ interface ActorOwner {
           }[];
         };
         readonly graph: ActorExecutionRealization["graph"];
+        readonly actorForwardSockets: NonNullable<ActorExecutionRealization["actorForwardSockets"]>;
       }
   >;
 }
@@ -426,6 +427,8 @@ export function createV2ActorNamespaceForm(options: {
         currentNative.incarnationId !== native.incarnationId ||
         currentNative.script !== native.script ||
         currentNative.graph.generationKey !== native.graph.generationKey ||
+        canonicalJson(currentNative.actorForwardSockets) !==
+          canonicalJson(native.actorForwardSockets) ||
         canonicalJson(currentNative.identity) !== canonicalJson(native.identity) ||
         canonicalJson(
           currentNative.graph.versions.map(({ versionId, workerVersionUid, weight }) => ({

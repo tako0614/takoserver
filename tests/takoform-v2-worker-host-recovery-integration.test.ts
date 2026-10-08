@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bytesDigest } from "../src/json.ts";
@@ -487,6 +487,75 @@ async function waitForResourceOperation(origin: string, name: string) {
   throw new Error("Host Resource operation did not settle");
 }
 
+async function waitForExactServingChild(
+  origin: string,
+  root: string,
+  workerUid: string,
+  sourceOperationId: string,
+) {
+  const uidKey = createHash("sha256").update(workerUid).digest("hex");
+  const statePath = join(root, "worker-owners", uidKey, "runtime-owner.json");
+  let lastObservation = "none";
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
+    const response = await fetch(`${origin}/__fixture/status/${workerUid}`);
+    expect(response.status).toBe(200);
+    const status = (await response.json()) as {
+      pid: number;
+      childPids: number[];
+      serving: { kind: string; hostnames: string[]; sourceOperationId: string };
+      routeAbsenceReads: {
+        endpointUid: string;
+        workerUid: string;
+        hostname: string;
+        url: string;
+      }[];
+    };
+    const state = JSON.parse(await readFile(statePath, "utf8")) as {
+      workerResourceUid: string;
+      activeOperationId: string | null;
+      incarnations: {
+        operationId: string;
+        status: string;
+        processIdentity: { pid: number } | null;
+        receipt: unknown | null;
+        executionCopiesReleased: boolean;
+      }[];
+    };
+    const active = state.incarnations.find((item) => item.operationId === sourceOperationId);
+    const predecessorsRetired = state.incarnations.every(
+      (item) =>
+        item.operationId === sourceOperationId ||
+        (item.status === "retired" && item.receipt !== null && item.executionCopiesReleased),
+    );
+    if (
+      state.workerResourceUid === workerUid &&
+      state.activeOperationId === sourceOperationId &&
+      active?.status === "active" &&
+      active.processIdentity &&
+      status.serving.kind === "serving" &&
+      status.serving.sourceOperationId === sourceOperationId &&
+      predecessorsRetired &&
+      status.childPids.length === 1 &&
+      status.childPids[0] === active.processIdentity.pid
+    ) {
+      return status;
+    }
+    lastObservation = JSON.stringify({
+      childPids: status.childPids,
+      activeOperationId: state.activeOperationId,
+      incarnations: state.incarnations.map((item) => ({
+        operationId: item.operationId,
+        status: item.status,
+        pid: item.processIdentity?.pid,
+        receipt: item.receipt !== null,
+        executionCopiesReleased: item.executionCopiesReleased,
+      })),
+    });
+    await Bun.sleep(10);
+  }
+  throw new Error(`Worker child retirement did not settle: ${lastObservation}`);
+}
+
 test("real Host restart restores SQL-proven Worker serving from custody and preserves exact replay", async () => {
   // The Bun child is a test-only workerd stand-in. This covers real Host HTTP,
   // SQL 0077 publication recovery, held-byte custody, and OS-process restart;
@@ -513,6 +582,7 @@ test("real Host restart restores SQL-proven Worker serving from custody and pres
   let deploymentSpec: Json = {};
   let first: Awaited<ReturnType<typeof startHost>> | undefined;
   let second: Awaited<ReturnType<typeof startHost>> | undefined;
+  let exitCensusHeld = false;
 
   try {
     const childSource = `
@@ -739,6 +809,18 @@ process.on("SIGTERM", () => server.stop(true));
     };
     expect(JSON.parse(afterUpdate.body)).toMatchObject({ path: "/index.html" });
     expect(afterUpdate.sourceOperationId).not.toBe(beforeUpdate.sourceOperationId);
+    const beforeEndpointDelete = await waitForExactServingChild(
+      second.origin,
+      root,
+      worker.resourceUid,
+      updateOperation.id,
+    );
+    const previousChildPid = beforeEndpointDelete.childPids[0];
+    if (previousChildPid === undefined) throw new Error("Worker child PID is unavailable");
+    expect(
+      (await fetch(`${second.origin}/__fixture/hold-child-exit-census`, { method: "POST" })).status,
+    ).toBe(204);
+    exitCensusHeld = true;
 
     const endpointDelete = await request(
       second.origin,
@@ -766,19 +848,39 @@ process.on("SIGTERM", () => server.stop(true));
     expect(await endpointReplay.json()).toMatchObject({ id: endpointDeleteOperation.id });
     expect((await request(second.origin, `/resources/${endpoint.resourceUid}`)).status).toBe(410);
 
-    const status = await fetch(`${second.origin}/__fixture/status/${worker.resourceUid}`);
-    expect(status.status).toBe(200);
-    const recoveredServing = (await status.json()) as {
-      pid: number;
+    // Deterministically observe the prior PID in the fixture census after
+    // its real exit. A successful public Operation does not itself prove the
+    // predecessor's asynchronous retirement has been reflected there.
+    type HeldChildExitStatus = {
       childPids: number[];
-      serving: { kind: string; hostnames: string[]; sourceOperationId: string };
-      routeAbsenceReads: {
-        endpointUid: string;
-        workerUid: string;
-        hostname: string;
-        url: string;
-      }[];
+      heldChildExitPids: number[];
     };
+    let heldExitStatus: HeldChildExitStatus | null = null;
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      heldExitStatus = (await (
+        await fetch(`${second.origin}/__fixture/status/${worker.resourceUid}`)
+      ).json()) as HeldChildExitStatus;
+      if (heldExitStatus.heldChildExitPids.includes(previousChildPid)) break;
+      await Bun.sleep(10);
+    }
+    expect(heldExitStatus?.heldChildExitPids).toEqual([previousChildPid]);
+    expect(heldExitStatus?.childPids).toHaveLength(2);
+    expect(heldExitStatus?.childPids).toContain(previousChildPid);
+    expect(
+      (await fetch(`${second.origin}/__fixture/release-child-exit-census`, { method: "POST" }))
+        .status,
+    ).toBe(204);
+    exitCensusHeld = false;
+
+    // The public Operation may settle before asynchronous predecessor retirement.
+    // Wait for the durable physical receipts, then require the fixture census to
+    // contain exactly the PID of the current accepted incarnation.
+    const recoveredServing = await waitForExactServingChild(
+      second.origin,
+      root,
+      worker.resourceUid,
+      endpointDeleteOperation.id,
+    );
     expect(recoveredServing.pid).toBe(second.child.pid);
     expect(recoveredServing.childPids.length).toBe(1);
     expect(recoveredServing.childPids[0]).not.toBe(firstChildPid);
@@ -871,6 +973,11 @@ process.on("SIGTERM", () => server.stop(true));
     });
     expect((await request(second.origin, `/resources/${worker.resourceUid}`)).status).toBe(410);
   } finally {
+    if (exitCensusHeld && second) {
+      await fetch(`${second.origin}/__fixture/release-child-exit-census`, {
+        method: "POST",
+      }).catch(() => undefined);
+    }
     await first?.close();
     await second?.close();
     await rm(root, { recursive: true, force: true });
