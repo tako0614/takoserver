@@ -32,7 +32,10 @@ import { EDGE_KV_NAMESPACE_FORM_URL } from "./takoform-v2/forms/edge-kv-namespac
 import { createEdgeKVNamespaceForm } from "./takoform-v2/forms/edge-kv-namespace-backend.ts";
 import { createKvWorkerBindingAuthority } from "./takoform-v2/forms/kv-worker-binding-authority.ts";
 import { OBJECT_BUCKET_FORM_URL } from "./takoform-v2/forms/object-bucket.ts";
-import { createObjectBucketForm } from "./takoform-v2/forms/object-bucket-backend.ts";
+import {
+  createObjectBucketForm,
+  resolveObjectBucketBackendId,
+} from "./takoform-v2/forms/object-bucket-backend.ts";
 import { createObjectBucketWorkerBindingAuthority } from "./takoform-v2/forms/object-bucket-worker-binding-authority.ts";
 import { QUEUE_CONSUMER_FORM_URL } from "./takoform-v2/forms/queue-consumer.ts";
 import { createQueueWorkerBindingAuthority } from "./takoform-v2/forms/queue-worker-binding-authority.ts";
@@ -180,6 +183,8 @@ export interface SelfhostV2WorkerCompositionOptions {
   /** Separately keyed Host-private Worker Binding broker; not public Form registration. */
   readonly v2ObjectBucketBinding?: {
     readonly store: SelfhostV2ObjectBucketStore;
+    /** One trusted backend identity for Form, Core reader and Version eligibility. */
+    readonly backendId?: string;
     readonly signingKey: Uint8Array;
     /** Stable loopback port embedded in each exact Version graph. */
     readonly privatePort: number;
@@ -417,6 +422,10 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   const v2ObjectBucketBinding = options.v2ObjectBucketBinding
     ? Object.freeze({
         store: Object.freeze({ ...options.v2ObjectBucketBinding.store }),
+        backendId: resolveObjectBucketBackendId(
+          options.v2ObjectBucketBinding.backendId,
+          Object.hasOwn(options.v2ObjectBucketBinding, "backendId"),
+        ),
         signingKey: new Uint8Array(options.v2ObjectBucketBinding.signingKey),
         privatePort: options.v2ObjectBucketBinding.privatePort,
       })
@@ -570,7 +579,11 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     ? createSQLiteWorkerBindingAuthority({ sql, targetKey })
     : undefined;
   const objectBucketAuthority = v2ObjectBucketBinding
-    ? createObjectBucketWorkerBindingAuthority({ sql, targetKey })
+    ? createObjectBucketWorkerBindingAuthority({
+        sql,
+        targetKey,
+        backendId: v2ObjectBucketBinding.backendId,
+      })
     : undefined;
   const kvAuthority = v2KvBinding ? createKvWorkerBindingAuthority({ sql, targetKey }) : undefined;
   const queueProducerAuthority = v2QueueProducerBinding
@@ -672,6 +685,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     v2ObjectBucketBinding && objectBucketBroker && objectBucketAuthority
       ? Object.freeze({
           address: `127.0.0.1:${v2ObjectBucketBinding.privatePort}`,
+          expectedBackendId: v2ObjectBucketBinding.backendId,
           issueGrant: objectBucketBroker.issueGrant,
           resolveCurrentBucketBinding: objectBucketAuthority.resolveCurrentBucketBinding,
         })
@@ -1309,13 +1323,13 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       !queueCapability ||
       !sqliteBinding ||
       !options.v2KvBinding ||
-      !options.v2ObjectBucketBinding
+      !v2ObjectBucketBinding
     ) {
       throw new TypeError("complete secret-free v2 Worker Form dependencies are unavailable");
     }
     const sqliteStore = sqliteBinding.store;
     const kvStore = options.v2KvBinding.store;
-    const objectBucketStore = options.v2ObjectBucketBinding.store;
+    const objectBucketStore = v2ObjectBucketBinding.store;
     const migrationCustody = config.sqliteMigrationSet
       ? createSQLiteMigrationSetCustody({
           sql,
@@ -1359,6 +1373,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       [OBJECT_BUCKET_FORM_URL]: createObjectBucketForm({
         store: objectBucketStore,
         targetKey,
+        backendId: v2ObjectBucketBinding.backendId,
       }),
     });
   }

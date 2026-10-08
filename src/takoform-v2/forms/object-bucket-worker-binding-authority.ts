@@ -1,7 +1,7 @@
 import { bytesDigest, canonicalJson } from "../../json.ts";
 import type { Sql } from "../../ports.ts";
 import { OBJECT_BUCKET_LIMITS, parseObjectBucketSpec } from "./object-bucket.ts";
-import { OBJECT_BUCKET_BACKEND_ID } from "./object-bucket-backend.ts";
+import { resolveObjectBucketBackendId } from "./object-bucket-backend.ts";
 import { referencesForWorkerVersion } from "./worker-references.ts";
 import { parseWorkerVersionSpec, WORKER_VERSION_FORM_URL } from "./worker-specs.ts";
 import { isReadyWorkerVersionObservation } from "./worker-version-observed.ts";
@@ -38,10 +38,16 @@ export interface ObjectBucketWorkerBindingResolution {
 export function createObjectBucketWorkerBindingAuthority(options: {
   readonly sql: Sql;
   readonly targetKey: string;
+  /** Trusted operator-selected identity for this one Bucket supply. */
+  readonly backendId?: string;
 }) {
   if (!options?.sql || !options.targetKey) {
     throw new TypeError("ObjectBucket Worker binding authority is required");
   }
+  const backendId = resolveObjectBucketBackendId(
+    options.backendId,
+    Object.hasOwn(options, "backendId"),
+  );
 
   async function resolveCurrentBucketBinding(
     grant: ObjectBucketWorkerBindingClaim,
@@ -227,7 +233,7 @@ export function createObjectBucketWorkerBindingAuthority(options: {
           const observed = JSON.parse(target.observed_json as string);
           const output = JSON.parse(target.output_json as string);
           if (
-            target.backend_id !== OBJECT_BUCKET_BACKEND_ID ||
+            target.backend_id !== backendId ||
             canonicalJson(observed) !==
               canonicalJson({ bucketExists: true, ...OBJECT_BUCKET_LIMITS }) ||
             canonicalJson(output) !== "{}"
