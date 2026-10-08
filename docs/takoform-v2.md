@@ -802,8 +802,19 @@ private broker sockets. The class configuration checks exact token, channel,
 scope and socket ownership; weighted Versions may share only the same exact
 broker identity. A separate native Host-process journey covers Actor A calling
 another Worker's Actor B, B calling a different ID in its own Namespace, and
-both Actor children restarting with the same persisted values. Nested
-WebSocket upgrade and recursive calls to the same Actor ID are not yet qualified.
+both Actor children restarting with the same persisted values.
+
+The published ActorNamespace contract permits socket acceptance only when the
+original client's upgrade reaches that Actor directly; a reservation cannot be
+forwarded into another invocation. Nested A-to-B upgrade is therefore a refused
+operation, not a missing positive runtime capability. The native journey checks
+that refusal without changing B's accepted-socket count, live socket count, or
+owned lease. A direct original-client upgrade to B echoes and closes normally.
+After Host SIGKILL, a distinct Host and native children restore the same Actor
+data, and a new socket ID echoes and closes; ordered deletion removes both
+Namespaces' owned leases. This does not prove public-CA WSS or delivery of a
+terminal callback for a connection lost with its Host. Recursive calls to the
+same Actor ID remain unqualified.
 
 The normal Bun entry can now opt in to its existing private v2 Actor and
 Workflow boot ports with `TAKOSERVER_V2_WORKER_RUNTIME_BOOT`, for example
