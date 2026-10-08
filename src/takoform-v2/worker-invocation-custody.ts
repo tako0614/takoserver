@@ -1,4 +1,8 @@
 import type { Clock, Sql } from "../ports.ts";
+import {
+  inspectV2WorkerInvocationSchema,
+  v2WorkerInvocationSchemaReady,
+} from "./worker-invocation-schema.ts";
 
 /** Host-only handle. The gateway never sends this to a customer Worker. */
 export interface V2WorkerInvocationHandle {
@@ -251,6 +255,7 @@ export function createV2WorkerInvocationLifecycle(options: {
 }): V2WorkerInvocationCustody {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
+  const anyReady = `(${v2WorkerInvocationSchemaReady("endpoint")}) OR (${v2WorkerInvocationSchemaReady("service")})`;
   function instant(): number {
     const value = now().getTime();
     if (!Number.isSafeInteger(value) || value < 0) throw new TypeError("invalid invocation clock");
@@ -259,7 +264,8 @@ export function createV2WorkerInvocationLifecycle(options: {
   async function read(handle: V2WorkerInvocationHandle): Promise<V2WorkerInvocationRecord | null> {
     const ownedHandle = ownHandle(handle);
     const rows = await sql.query(
-      "SELECT * FROM tf_v2_worker_invocations WHERE invocation_id = ? AND custody_token = ? LIMIT 2",
+      `SELECT * FROM tf_v2_worker_invocations WHERE invocation_id = ? AND custody_token = ?
+        AND (${anyReady}) LIMIT 2`,
       [ownedHandle.invocationId, ownedHandle.custodyToken],
     );
     return rows.length === 1 ? record(rows[0], ownedHandle) : null;
@@ -270,7 +276,8 @@ export function createV2WorkerInvocationLifecycle(options: {
       const ownedHandle = ownHandle(handle);
       const result = await sql.run(
         `UPDATE tf_v2_worker_invocations SET phase = 'send_authorized', send_authorized_at_ms = ?
-         WHERE invocation_id = ? AND custody_token = ? AND phase = 'admitted'`,
+         WHERE invocation_id = ? AND custody_token = ? AND phase = 'admitted'
+           AND (${anyReady})`,
         [instant(), ownedHandle.invocationId, ownedHandle.custodyToken],
       );
       return result.changes === 1;
@@ -279,7 +286,8 @@ export function createV2WorkerInvocationLifecycle(options: {
       const ownedHandle = ownHandle(handle);
       const result = await sql.run(
         `UPDATE tf_v2_worker_invocations SET phase = 'pre_effect_refused', refused_at_ms = ?
-         WHERE invocation_id = ? AND custody_token = ? AND phase = 'admitted'`,
+         WHERE invocation_id = ? AND custody_token = ? AND phase = 'admitted'
+           AND (${anyReady})`,
         [instant(), ownedHandle.invocationId, ownedHandle.custodyToken],
       );
       return result.changes === 1;
@@ -294,7 +302,7 @@ export function createV2WorkerInvocationLifecycle(options: {
              AND phase = 'send_authorized' AND send_authorized_at_ms IS NOT NULL
              AND no_native_dispatch_at_ms IS NULL AND body_state IS NULL
              AND body_observed_at_ms IS NULL AND retired_at_ms IS NULL
-             AND retirement_receipt_digest IS NULL`,
+             AND retirement_receipt_digest IS NULL AND (${anyReady})`,
           [instant(), ownedHandle.invocationId, ownedHandle.custodyToken],
         );
         if (result.changes === 1) return true;
@@ -311,7 +319,8 @@ export function createV2WorkerInvocationLifecycle(options: {
       const result = await sql.run(
         `UPDATE tf_v2_worker_invocations SET body_state = ?, body_observed_at_ms = ?
          WHERE invocation_id = ? AND custody_token = ? AND phase = 'send_authorized'
-           AND body_state IS NULL AND no_native_dispatch_at_ms IS NULL`,
+           AND body_state IS NULL AND no_native_dispatch_at_ms IS NULL
+           AND (${anyReady})`,
         [state, instant(), ownedHandle.invocationId, ownedHandle.custodyToken],
       );
       if (result.changes === 1) return true;
@@ -384,36 +393,10 @@ export function createV2WorkerInvocationLifecycle(options: {
       // 0086 is source-only for protected D1 until an owning apply wave is
       // authorized. Continue exact Endpoint retirement on an 0084/0085 DB;
       // never offer this legacy path to a Service or a partial schema.
-      let columns: Set<string>;
-      try {
-        columns = new Set(
-          (await sql.query("PRAGMA table_info(tf_v2_worker_invocations)"))
-            .map((row) => row.name)
-            .filter((name): name is string => typeof name === "string"),
-        );
-      } catch {
+      const schema = await inspectV2WorkerInvocationSchema(sql);
+      if (schema === null || (schema === "endpoint" && expected.ingress.kind !== "endpoint"))
         return false;
-      }
-      const serviceSchema = [
-        "ingress_kind",
-        "service_caller_worker_uid",
-        "service_caller_version_uid",
-        "service_caller_version_generation",
-        "service_caller_version_operation_id",
-        "service_binding_name",
-        "service_caller_execution_ref",
-      ].every((name) => columns.has(name));
-      const legacyEndpointSchema =
-        ![...columns].some((name) => name.startsWith("service_") || name === "ingress_kind") &&
-        [
-          "endpoint_uid",
-          "endpoint_generation",
-          "no_native_dispatch_at_ms",
-          "retired_at_ms",
-          "retirement_receipt_digest",
-        ].every((name) => columns.has(name));
-      if (!serviceSchema && !(legacyEndpointSchema && expected.ingress.kind === "endpoint"))
-        return false;
+      const serviceSchema = schema === "service";
       try {
         const result = await sql.run(
           serviceSchema
@@ -431,7 +414,8 @@ export function createV2WorkerInvocationLifecycle(options: {
              AND version_uid = ? AND version_generation = ? AND version_operation_id = ?
              AND native_identity = ? AND closure_digest = ? AND confirmed_receipt = ?
              AND phase = 'send_authorized' AND retired_at_ms IS NULL
-             AND retirement_receipt_digest IS NULL AND no_native_dispatch_at_ms IS NULL`
+             AND retirement_receipt_digest IS NULL AND no_native_dispatch_at_ms IS NULL
+             AND (${v2WorkerInvocationSchemaReady("service")})`
             : `UPDATE tf_v2_worker_invocations
            SET retired_at_ms = max(?, send_authorized_at_ms),
                retirement_receipt_digest = ?
@@ -442,7 +426,8 @@ export function createV2WorkerInvocationLifecycle(options: {
              AND version_uid = ? AND version_generation = ? AND version_operation_id = ?
              AND native_identity = ? AND closure_digest = ? AND confirmed_receipt = ?
              AND phase = 'send_authorized' AND retired_at_ms IS NULL
-             AND retirement_receipt_digest IS NULL AND no_native_dispatch_at_ms IS NULL`,
+             AND retirement_receipt_digest IS NULL AND no_native_dispatch_at_ms IS NULL
+             AND (${v2WorkerInvocationSchemaReady("endpoint")})`,
           serviceSchema
             ? [
                 instant(),
@@ -519,11 +504,12 @@ export function createV2WorkerInvocationLifecycle(options: {
       deploymentUid: string,
     ): Promise<{ readonly outstanding: number; readonly bodyFinished: number }> {
       const rows = await sql.query(
-        `SELECT count(*) AS outstanding,
+        `SELECT * FROM (SELECT count(*) AS outstanding,
            coalesce(sum(CASE WHEN body_state = 'finished' THEN 1 ELSE 0 END), 0) AS body_finished
          FROM tf_v2_worker_invocations
          WHERE deployment_uid = ? AND phase <> 'pre_effect_refused'
-           AND retired_at_ms IS NULL AND no_native_dispatch_at_ms IS NULL`,
+           AND retired_at_ms IS NULL AND no_native_dispatch_at_ms IS NULL)
+         WHERE (${anyReady})`,
         [deploymentUid],
       );
       const row = rows[0];

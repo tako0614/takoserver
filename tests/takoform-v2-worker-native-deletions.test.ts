@@ -29,11 +29,15 @@ async function fixture(
   secondSource = false,
   deadReferrer = false,
   equivalentShape = false,
+  legacyInvocationSchema = false,
 ) {
   const directory = mkdtempSync(join(tmpdir(), "v2-native-delete-"));
   const path = join(directory, "db.sqlite");
   const db = new Database(path);
-  migrateSqlite(db);
+  if (legacyInvocationSchema) {
+    for (const migration of MIGRATIONS.filter(({ name }) => !name.startsWith("0086_")))
+      db.exec(migration.sql);
+  } else migrateSqlite(db);
   const sql = createSqliteSql(db);
   const now = () => new Date();
   const backend = {
@@ -378,6 +382,108 @@ test("a late Service child fences caller native DELETE grant and pre-send absenc
     expect(await inventory.custody.allAbsent(inventory.execution)).toBe(true);
   } finally {
     inventory.close();
+  }
+});
+
+test("0086 interrupted after final table creation never reports absence, then reopens after closure", async () => {
+  const f = await fixture(true, false, false, false, true);
+  try {
+    expect(await f.custody.stageNext(f.execution)).toBe("more");
+    expect(await f.custody.stageNext(f.execution)).toBe("ready");
+    const item = await f.custody.next(f.execution);
+    if (!item) throw new Error("missing native deletion item");
+    expect(await f.custody.grant(item, "etag-upload")).toBe("granted");
+    expect(await f.custody.confirmAbsent(item, "owned-absence")).toBe(true);
+    expect(await f.custody.allAbsent(f.execution)).toBe(true);
+    for (const [uid, form] of [
+      ["partial-inv-worker", "ModuleWorker/0.3.0"],
+      ["partial-inv-deployment", "WorkerDeployment/0.4.0"],
+      ["partial-inv-endpoint", "WorkerEndpoint/0.3.0"],
+    ] as const) {
+      await f.sql.run(
+        `INSERT INTO tf_v2_resources
+         (uid, principal, form_url, space, name, backend_id, target_key,
+          active_name, generation, observed_generation, phase, spec_json, last_operation)
+         VALUES (?, 'org-a', ?, 'production', ?, 'fixture-version-backend',
+          'target-a', ?, 1, 1, 'idle', '{}', ?)`,
+        [uid, `https://edge.forms.takoform.com/forms/${form}/`, uid, uid, f.source.operationId],
+      );
+    }
+    const handle = { invocationId: "partial-invocation", custodyToken: "partial-invocation-token" };
+    await f.sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+       (invocation_id, custody_token, backend_id, target_key, principal, space,
+        worker_uid, deployment_uid, deployment_generation, source_operation_id,
+        endpoint_uid, endpoint_generation, version_uid, version_generation,
+        version_operation_id, native_identity, closure_digest, confirmed_receipt, admitted_at_ms)
+       VALUES (?, ?, 'fixture-version-backend', 'target-a', 'org-a', 'production',
+        'partial-inv-worker', 'partial-inv-deployment', 1, ?, 'partial-inv-endpoint', 1,
+        ?, 1, ?, ?, ?, 'etag-upload', 1000)`,
+      [
+        handle.invocationId,
+        handle.custodyToken,
+        f.source.operationId,
+        f.source.resourceUid,
+        f.source.operationId,
+        nativeIdentity,
+        digest,
+      ],
+    );
+    expect(await f.custody.allAbsent(f.execution)).toBe(false);
+    const forward = MIGRATIONS.find(({ name }) => name.startsWith("0086_"));
+    if (!forward) throw new Error("missing 0086 migration");
+    const statements = splitMigration(forward.sql);
+    expect(statements[6]?.startsWith("CREATE TABLE tf_v2_worker_invocations (")).toBe(true);
+    for (const statement of statements.slice(0, 7)) f.db.exec(statement);
+    expect((await f.sql.query("SELECT count(*) AS n FROM tf_v2_worker_invocations"))[0]?.n).toBe(0);
+    expect(
+      (await f.sql.query("SELECT count(*) AS n FROM tf_v2_worker_invocations_next"))[0]?.n,
+    ).toBe(1);
+    expect(await f.custody.allAbsent(f.execution)).toBe(false);
+    expect(await f.custody.grant(item, "etag-upload")).toBe("unknown");
+    const partialLifecycle = createV2WorkerInvocationLifecycle({ sql: f.sql });
+    await expect(partialLifecycle.inspectDeployment("partial-inv-deployment")).rejects.toThrow(
+      "invocation inventory unavailable",
+    );
+    const firstTrigger = statements.findIndex((statement) =>
+      statement.startsWith("CREATE TRIGGER"),
+    );
+    expect(firstTrigger).toBeGreaterThan(7);
+    for (const statement of statements.slice(7, firstTrigger)) f.db.exec(statement);
+    expect((await f.sql.query("SELECT count(*) AS n FROM tf_v2_worker_invocations"))[0]?.n).toBe(1);
+    expect(
+      (
+        await f.sql.query(
+          "SELECT count(*) AS n FROM sqlite_schema WHERE name = 'tf_v2_worker_invocations_next'",
+        )
+      )[0]?.n,
+    ).toBe(0);
+    expect(await f.custody.allAbsent(f.execution)).toBe(false);
+    await expect(partialLifecycle.inspectDeployment("partial-inv-deployment")).rejects.toThrow(
+      "invocation inventory unavailable",
+    );
+    for (const statement of statements.slice(firstTrigger)) f.db.exec(statement);
+    const reopenedDb = new Database(f.path);
+    try {
+      const reopenedSql = createSqliteSql(reopenedDb);
+      const reopened = createV2NativeDeletionCustody({ sql: reopenedSql });
+      const lifecycle = createV2WorkerInvocationLifecycle({
+        sql: reopenedSql,
+        now: () => new Date(2000),
+      });
+      expect(await reopened.allAbsent(f.execution)).toBe(false);
+      expect(await lifecycle.inspectDeployment("partial-inv-deployment")).toEqual({
+        outstanding: 1,
+        bodyFinished: 0,
+      });
+      expect(await lifecycle.beginSend(handle)).toBe(true);
+      expect(await lifecycle.confirmNoNativeDispatch(handle)).toBe(true);
+      expect(await reopened.allAbsent(f.execution)).toBe(true);
+    } finally {
+      reopenedDb.close();
+    }
+  } finally {
+    f.close();
   }
 });
 

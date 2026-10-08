@@ -9,11 +9,11 @@ import {
   WORKER_DEPLOYMENT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import { createV2ServiceBindingAuthority as exportedAuthority } from "../src/takoform-v2/index.ts";
 import {
   createV2ServiceBindingAuthority,
   type V2ServiceBindingClaim,
 } from "../src/takoform-v2/service-binding-authority.ts";
-import { createV2ServiceBindingAuthority as exportedAuthority } from "../src/takoform-v2/index.ts";
 
 test("public v2 extension entrypoint exposes the logical service binding authority", () => {
   expect(exportedAuthority).toBe(createV2ServiceBindingAuthority);
