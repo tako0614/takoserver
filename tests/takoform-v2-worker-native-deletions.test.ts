@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import type { Sql } from "../src/ports.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
@@ -344,6 +345,39 @@ test("a late Service child fences caller native DELETE grant and pre-send absenc
     expect(await absence.custody.confirmAbsent(resumed, "exact-preexisting-absence")).toBe(true);
   } finally {
     absence.close();
+  }
+
+  const inventory = await fixture();
+  try {
+    expect(await inventory.custody.stageNext(inventory.execution)).toBe("more");
+    expect(await inventory.custody.stageNext(inventory.execution)).toBe("ready");
+    const item = await inventory.custody.next(inventory.execution);
+    if (!item) throw new Error("missing native deletion item");
+    expect(await inventory.custody.grant(item, "etag-upload")).toBe("granted");
+    expect(await inventory.custody.confirmAbsent(item, "owned-absence")).toBe(true);
+    expect(await inventory.custody.allAbsent(inventory.execution)).toBe(true);
+    const partialSchemaSql: Sql = {
+      run: (statement, params) => inventory.sql.run(statement, params),
+      batch: (statements) => inventory.sql.batch(statements),
+      async query(statement, params) {
+        const rows = await inventory.sql.query(statement, params);
+        return statement.startsWith("PRAGMA table_info(tf_v2_worker_invocations)")
+          ? rows.filter((row) => row.name !== "service_binding_name")
+          : rows;
+      },
+    };
+    const partial = createV2NativeDeletionCustody({ sql: partialSchemaSql });
+    expect(await partial.grant(item, "etag-upload")).toBe("unknown");
+    expect(await partial.confirmAbsent(item, "owned-absence")).toBe(false);
+    expect(await partial.allAbsent(inventory.execution)).toBe(false);
+    // A late raw row must not let inventory announce completion while caller
+    // execution is still outstanding, even though the earlier DELETE settled.
+    const child = await seedLateServiceCallerInvocation(inventory);
+    expect(await inventory.custody.allAbsent(inventory.execution)).toBe(false);
+    expect(await child.lifecycle.confirmNoNativeDispatch(child.handle)).toBe(true);
+    expect(await inventory.custody.allAbsent(inventory.execution)).toBe(true);
+  } finally {
+    inventory.close();
   }
 });
 
