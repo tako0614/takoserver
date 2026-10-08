@@ -87,11 +87,15 @@ test("Node selfhost extension exposes the existing SQLite store and guarded brok
     async read() {
       return null;
     },
+    async readSelectedBindings() {
+      return null;
+    },
     async confirmSQLiteDrained() {
       return false;
     },
   };
   expect(proofs.currentClaim).toBeFunction();
+  expect(invocationAuthority.readSelectedBindings).toBeFunction();
   expect(invocationAuthority.confirmSQLiteDrained).toBeFunction();
   for (const name of [
     "createSelfhostV2SQLiteStore",

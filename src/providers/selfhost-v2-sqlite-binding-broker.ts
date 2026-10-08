@@ -53,6 +53,11 @@ export interface V2SqliteBindingGrant {
 export interface V2SqliteInvocationAuthority {
   /** Fixed D1 read of the exact existing custody row, not an arbitrary query. */
   read(handle: V2WorkerInvocationHandle): Promise<V2WorkerInvocationRecord | null>;
+  /** Fixed read of the selected Version's sealed SQLite name/UID set. */
+  readSelectedBindings(input: {
+    readonly handle: V2WorkerInvocationHandle;
+    readonly expected: V2WorkerInvocationRetirementIdentity;
+  }): Promise<readonly { readonly name: string; readonly resourceUid: string }[] | null>;
   /** Core statement-time CAS, called only after terminal proof and Node recovery. */
   confirmSQLiteDrained(input: V2WorkerSQLiteDrainInput): Promise<boolean>;
 }
@@ -102,7 +107,11 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
     options.signingKey.byteLength < 32 ||
     typeof options.observeVersionTarget !== "function" ||
     typeof options.graphStillCurrent !== "function" ||
-    typeof options.resolveCurrentBinding !== "function"
+    typeof options.resolveCurrentBinding !== "function" ||
+    (options.invocationAuthority &&
+      (typeof options.invocationAuthority.read !== "function" ||
+        typeof options.invocationAuthority.readSelectedBindings !== "function" ||
+        typeof options.invocationAuthority.confirmSQLiteDrained !== "function"))
   )
     throw new TypeError("private SQLite binding broker authority is required");
   const key = Buffer.from(options.signingKey);
@@ -320,6 +329,35 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
       const terminal = await invocationProof(grant, true);
       if (!terminal?.retirement) return false;
       const expected = selected.expected;
+      let selectedBindings: V2SqliteBindingGrant["bindings"];
+      try {
+        const readback = await authority.readSelectedBindings({
+          handle: selected.handle,
+          expected,
+        });
+        if (!readback) return false;
+        selectedBindings = checkedGrant(
+          { ...grant, bindings: readback },
+          options.store.targetKey,
+          true,
+        ).bindings;
+      } catch {
+        return false;
+      }
+      const byName = (bindings: V2SqliteBindingGrant["bindings"]) =>
+        [...bindings].sort((left, right) => left.name.localeCompare(right.name));
+      const offered = byName(grant.bindings);
+      const authoritative = byName(selectedBindings);
+      if (
+        offered.length !== authoritative.length ||
+        authoritative.some(
+          (entry, index) =>
+            entry.name !== offered[index]?.name ||
+            entry.resourceUid !== offered[index]?.resourceUid,
+        )
+      )
+        return false;
+      const resourceUids = [...new Set(authoritative.map((entry) => entry.resourceUid))].sort();
       const receiptDigest = `sha256:${createHash("sha256")
         .update(
           JSON.stringify([
@@ -342,14 +380,14 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
             expected.closureDigest,
             expected.confirmedReceipt,
             terminal.retirement.receiptDigest,
-            [...new Set(grant.bindings.map((entry) => entry.resourceUid))].sort(),
+            resourceUids,
           ]),
         )
         .digest("hex")}` as const;
       if (terminal.sqliteDrainState === "drained") {
         return terminal.sqliteDrainReceiptDigest === receiptDigest;
       }
-      for (const uid of [...new Set(grant.bindings.map((entry) => entry.resourceUid))].sort()) {
+      for (const uid of resourceUids) {
         if (!(await options.store.recoverOwnedDatabase(uid))) return false;
       }
       return await authority.confirmSQLiteDrained({

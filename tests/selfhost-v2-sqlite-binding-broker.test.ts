@@ -45,7 +45,7 @@ const TARGET = "sqlite-binding-target";
 const BUNDLE_FORM = "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/";
 const WORKERD = nativeEvidenceBinary("workerd-artifact");
 
-async function fixture(bindingName = "DB", invocationScoped = false) {
+async function fixture(bindingName = "DB", invocationScoped = false, includeAux = false) {
   const root = mkdtempSync(join(tmpdir(), "v2-sqlite-binding-"));
   const stagingRoot = join(root, "sql-input-staging");
   mkdirSync(stagingRoot, { mode: 0o700 });
@@ -77,6 +77,16 @@ async function fixture(bindingName = "DB", invocationScoped = false) {
   });
   expect((await engine.runNext())?.status).toBe("succeeded");
   const databaseUid = created.resourceUid;
+  const auxDatabaseUid = includeAux
+    ? (
+        await engine.acceptCreate({
+          principal: "alice",
+          key: "sqlite-binding-create-aux-0001",
+          input: { form: SQLITE_DATABASE_FORM_URL, space: "default", name: "aux", spec: {} },
+        })
+      ).resourceUid
+    : null;
+  if (auxDatabaseUid) expect((await engine.runNext())?.status).toBe("succeeded");
   await store.withAuthorizedDatabase({
     resourceUid: databaseUid,
     stillAuthorized: async () => true,
@@ -107,7 +117,10 @@ async function fixture(bindingName = "DB", invocationScoped = false) {
     worker: { resourceUid: "worker-one" },
     bundle: { resourceUid: "bundle-one" },
     handlers: ["fetch"],
-    sqliteBindings: [{ name: bindingName, resource: { resourceUid: databaseUid } }],
+    sqliteBindings: [
+      { name: bindingName, resource: { resourceUid: databaseUid } },
+      ...(auxDatabaseUid ? [{ name: "AUX", resource: { resourceUid: auxDatabaseUid } }] : []),
+    ],
   });
   control
     .prepare(`INSERT INTO tf_v2_resources
@@ -131,6 +144,7 @@ async function fixture(bindingName = "DB", invocationScoped = false) {
     ["worker-one", MODULE_WORKER_FORM_URL],
     ["bundle-one", BUNDLE_FORM],
     [databaseUid, SQLITE_DATABASE_FORM_URL],
+    ...(auxDatabaseUid ? ([[auxDatabaseUid, SQLITE_DATABASE_FORM_URL]] as [string, string][]) : []),
   ];
   for (const [uid, form] of referenceTargets) {
     control
@@ -183,9 +197,14 @@ async function fixture(bindingName = "DB", invocationScoped = false) {
     nativeVersionId: "v2-native-one",
     incarnationId: "incarnation-one",
     servingSourceOperationId: "source-operation-one",
-    bindings: [{ name: bindingName, resourceUid: databaseUid }],
+    bindings: [
+      { name: bindingName, resourceUid: databaseUid },
+      ...(auxDatabaseUid ? [{ name: "AUX", resourceUid: auxDatabaseUid }] : []),
+    ],
     ...(invocation ? { invocation } : {}),
   };
+  let selectedBindings: readonly { name: string; resourceUid: string }[] | null = grant.bindings;
+  let selectedBindingsReadFails = false;
   let nativeCurrent = true;
   let graphCurrent = true;
   let retirement: { retiredAtMs: number; receiptDigest: `sha256:${string}` } | null = null;
@@ -233,6 +252,10 @@ async function fixture(bindingName = "DB", invocationScoped = false) {
           }
           return true;
         },
+        async readSelectedBindings() {
+          if (selectedBindingsReadFails) throw new Error("D1 selected-binding read unavailable");
+          return selectedBindings;
+        },
       }
     : undefined;
   const authority = createSQLiteWorkerBindingAuthority({ sql, targetKey: TARGET });
@@ -268,9 +291,16 @@ async function fixture(bindingName = "DB", invocationScoped = false) {
     store,
     engine,
     databaseUid,
+    auxDatabaseUid,
     broker,
     grant,
     token,
+    setSelectedBindings(bindings: readonly { name: string; resourceUid: string }[] | null) {
+      selectedBindings = bindings;
+    },
+    failSelectedBindingsRead(value: boolean) {
+      selectedBindingsReadFails = value;
+    },
     setReadHook(hook: ((count: number) => Promise<void>) | undefined) {
       readHook = hook;
     },
@@ -605,6 +635,76 @@ test("a lost drain acknowledgement replays only the identical terminal digest", 
     expect(await host.broker.drainInvocation(host.grant)).toBe(true);
     host.changeRetirementDigest();
     expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+  } finally {
+    host.close();
+  }
+});
+
+test("terminal drain cannot clear pending from a subset of selected SQLite bindings", async () => {
+  const host = await fixture("DB", true, true);
+  try {
+    host.retire();
+    const databaseBinding = host.grant.bindings[0];
+    const auxDatabaseUid = host.auxDatabaseUid;
+    if (!databaseBinding || !auxDatabaseUid) throw new Error("two SQLite bindings expected");
+    const recovered: string[] = [];
+    let failRecoveryUid: string | null = [auxDatabaseUid, host.databaseUid].sort()[1] ?? null;
+    const originalRecover = host.store.recoverOwnedDatabase;
+    host.store.recoverOwnedDatabase = async (uid) => {
+      recovered.push(uid);
+      if (uid === failRecoveryUid) return false;
+      return originalRecover(uid);
+    };
+    const subset = { ...host.grant, bindings: [databaseBinding] };
+    expect(await host.broker.drainInvocation(subset)).toBe(false);
+    expect(host.drained()).toBe(false);
+    expect(recovered).toEqual([]);
+    expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+    expect(host.drained()).toBe(false);
+    expect(recovered).toEqual([auxDatabaseUid, host.databaseUid].sort());
+    recovered.length = 0;
+    failRecoveryUid = null;
+    expect(await host.broker.drainInvocation(host.grant)).toBe(true);
+    expect(host.drained()).toBe(true);
+    expect(recovered).toEqual([auxDatabaseUid, host.databaseUid].sort());
+    expect(await host.broker.drainInvocation(subset)).toBe(false);
+  } finally {
+    host.close();
+  }
+});
+
+test("terminal drain refuses unproven, malformed, or mismatched selected bindings", async () => {
+  const host = await fixture("DB", true, true);
+  try {
+    host.retire();
+    const full = host.grant.bindings;
+    const databaseBinding = full[0];
+    const auxBinding = full[1];
+    if (!databaseBinding || !auxBinding) throw new Error("two SQLite bindings expected");
+    for (const bindings of [
+      [databaseBinding, { name: "OTHER", resourceUid: auxBinding.resourceUid }],
+      [databaseBinding, { name: "AUX", resourceUid: "fabricated-uid" }],
+      [...full, { name: "EXTRA", resourceUid: "fabricated-uid" }],
+    ]) {
+      expect(await host.broker.drainInvocation({ ...host.grant, bindings })).toBe(false);
+      expect(host.drained()).toBe(false);
+    }
+    await expect(
+      host.broker.drainInvocation({ ...host.grant, bindings: [...full, databaseBinding] }),
+    ).rejects.toThrow(TypeError);
+    host.setSelectedBindings([...full, databaseBinding]);
+    expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+    host.setSelectedBindings(null);
+    expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+    host.failSelectedBindingsRead(true);
+    expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+    host.failSelectedBindingsRead(false);
+    host.setSelectedBindings(full);
+    host.setProofPatch({ versionGeneration: 2 });
+    expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+    host.setProofPatch({});
+    expect(host.drained()).toBe(false);
+    expect(await host.broker.drainInvocation(host.grant)).toBe(true);
   } finally {
     host.close();
   }
