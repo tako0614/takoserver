@@ -21,7 +21,9 @@ import type { WorkerBundleCustody } from "./forms/worker-bundle-backend.ts";
 import {
   MODULE_WORKER_FORM_URL,
   parseWorkerDeploymentSpec,
+  parseWorkerEndpointSpec,
   WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
 } from "./forms/worker-specs.ts";
 import {
   TakoformV2Error,
@@ -34,6 +36,8 @@ import {
 export const V2_ACTOR_NAMESPACE_BACKEND_ID = "selfhost-v2-actor-namespace-sql-v1";
 const DB_NOW_MS =
   "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
+const hostnamePattern =
+  /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/u;
 const UNKNOWN: V2BackendResult = {
   kind: "unknown",
   code: "outcome_unconfirmed",
@@ -67,6 +71,8 @@ interface ActorOwner {
     | {
         readonly kind: "serving";
         readonly sourceOperationId: string;
+        readonly generation: string;
+        readonly hostnames: readonly string[];
         readonly versions: readonly {
           readonly workerVersionUid: string;
           readonly weight: number;
@@ -87,6 +93,7 @@ interface ActorOwner {
         readonly identity: {
           readonly workerResourceUid: string;
           readonly generation: string;
+          readonly hostnames: readonly string[];
           readonly versions: readonly {
             readonly versionId: string;
             readonly workerVersionUid: string;
@@ -100,8 +107,8 @@ interface ActorOwner {
 }
 
 /**
- * Internal Form only, not a public FormSupport registration. Active completion
- * requires physically observed native counts under an exact accepted graph.
+ * Active completion requires physically observed native counts under an exact
+ * accepted graph.
  * A missing Session may only be warmed under this backend's held Operation;
  * ordinary event delivery retains the strict settled graph reader.
  */
@@ -212,6 +219,7 @@ export function createV2ActorNamespaceForm(options: {
     workerUid: string,
   ): Promise<{
     readonly sourceOperationId: string;
+    readonly hostnames: readonly string[];
     readonly versions: readonly { readonly workerVersionUid: string; readonly weight: number }[];
   } | null> => {
     const rows = await options.sql.query(
@@ -285,8 +293,188 @@ export function createV2ActorNamespaceForm(options: {
         )
       )
         return null;
+      // A confirmed Endpoint can republish this exact Deployment without
+      // changing its weighted Versions. The durable latest accepted publisher,
+      // not the Deployment's own Operation or a wall-clock timestamp, owns the
+      // current native marker. Do not consult the generic current-serving
+      // resolver here: this accepted Namespace PUT is itself a busy Version
+      // dependency until the backend confirms its physical observation.
+      const publisherRows = await options.sql.query(
+        `SELECT r.uid, r.form_url, r.principal, r.space, r.backend_id,
+           r.target_key, r.generation, r.observed_generation, r.phase,
+           r.busy_operation, r.deleted_at, r.last_operation, r.spec_json,
+           r.observed_json, r.output_json,
+           source.id, source.resource_uid, source.principal AS op_principal,
+           source.backend_id AS op_backend_id, source.target_key AS op_target_key,
+           source.generation AS op_generation, source.accepted_spec_json,
+           source.action, source.status, source.effect, source.acceptance_order
+         FROM tf_v2_resources r
+         JOIN tf_v2_operations source ON source.id = r.last_operation
+         WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
+           AND r.target_key = ?
+           AND json_extract(source.accepted_spec_json, '$.worker.resourceUid') = ?
+         ORDER BY source.acceptance_order DESC LIMIT 2`,
+        [
+          WORKER_DEPLOYMENT_FORM_URL,
+          WORKER_ENDPOINT_FORM_URL,
+          execution.principal,
+          execution.space,
+          options.targetKey,
+          workerUid,
+        ],
+      );
+      const publisher = publisherRows[0];
+      if (
+        !publisher ||
+        typeof publisher.id !== "string" ||
+        typeof publisher.acceptance_order !== "number" ||
+        !Number.isSafeInteger(publisher.acceptance_order) ||
+        publisher.acceptance_order <= 0 ||
+        publisher.acceptance_order === publisherRows[1]?.acceptance_order ||
+        publisher.last_operation !== publisher.id ||
+        publisher.resource_uid !== publisher.uid ||
+        publisher.principal !== execution.principal ||
+        publisher.space !== execution.space ||
+        publisher.target_key !== options.targetKey ||
+        publisher.op_principal !== publisher.principal ||
+        publisher.op_backend_id !== publisher.backend_id ||
+        publisher.op_target_key !== publisher.target_key ||
+        publisher.op_generation !== publisher.generation ||
+        publisher.observed_generation !== publisher.generation ||
+        publisher.phase !== "idle" ||
+        publisher.accepted_spec_json !== publisher.spec_json ||
+        publisher.status !== "succeeded" ||
+        publisher.effect !== "complete" ||
+        publisher.busy_operation !== null
+      )
+        return null;
+      const endpointRows = await options.sql.query(
+        `SELECT endpoint.uid, endpoint.principal, endpoint.space,
+           endpoint.target_key, endpoint.generation, endpoint.observed_generation,
+           endpoint.phase, endpoint.busy_operation, endpoint.last_operation,
+           endpoint.spec_json, endpoint.observed_json, endpoint.output_json,
+           active.id, active.resource_uid, active.principal AS op_principal,
+           active.backend_id AS op_backend_id, active.target_key AS op_target_key,
+           active.generation AS op_generation, active.accepted_spec_json,
+           active.action, active.status, active.effect,
+           endpoint.backend_id
+         FROM tf_v2_resources endpoint
+         JOIN tf_v2_operations active ON active.id = endpoint.last_operation
+         WHERE endpoint.form_url = ? AND endpoint.principal = ?
+           AND endpoint.space = ? AND endpoint.target_key = ?
+           AND endpoint.deleted_at IS NULL
+           AND json_extract(endpoint.spec_json, '$.worker.resourceUid') = ?
+         LIMIT 2`,
+        [
+          WORKER_ENDPOINT_FORM_URL,
+          execution.principal,
+          execution.space,
+          options.targetKey,
+          workerUid,
+        ],
+      );
+      if (endpointRows.length > 1) return null;
+      let hostnames: readonly string[] = [];
+      const endpoint = endpointRows[0];
+      if (endpoint) {
+        if (
+          typeof endpoint.uid !== "string" ||
+          typeof endpoint.id !== "string" ||
+          endpoint.principal !== execution.principal ||
+          endpoint.space !== execution.space ||
+          endpoint.target_key !== options.targetKey ||
+          endpoint.generation !== endpoint.observed_generation ||
+          endpoint.phase !== "idle" ||
+          endpoint.busy_operation !== null ||
+          endpoint.last_operation !== endpoint.id ||
+          endpoint.resource_uid !== endpoint.uid ||
+          endpoint.op_principal !== endpoint.principal ||
+          endpoint.op_backend_id !== endpoint.backend_id ||
+          endpoint.op_target_key !== endpoint.target_key ||
+          endpoint.op_generation !== endpoint.generation ||
+          endpoint.accepted_spec_json !== endpoint.spec_json ||
+          (endpoint.action !== "create" && endpoint.action !== "update") ||
+          endpoint.status !== "succeeded" ||
+          endpoint.effect !== "complete"
+        )
+          return null;
+        const endpointSpec = parseWorkerEndpointSpec(JSON.parse(String(endpoint.spec_json)));
+        const endpointObserved = JSON.parse(String(endpoint.observed_json)) as Record<
+          string,
+          unknown
+        >;
+        const endpointOutput = JSON.parse(String(endpoint.output_json)) as Record<string, unknown>;
+        if (
+          endpointSpec.worker.resourceUid !== workerUid ||
+          endpointObserved?.tlsReady !== true ||
+          endpointObserved.activeDeploymentRouteReady !== true ||
+          typeof endpointOutput?.hostname !== "string" ||
+          !hostnamePattern.test(endpointOutput.hostname) ||
+          Object.keys(endpointOutput).sort().join(",") !== "hostname,url" ||
+          endpointOutput.url !== `https://${endpointOutput.hostname}/`
+        )
+          return null;
+        const [edge, sealed] = await Promise.all([
+          options.sql.query(
+            `SELECT 1 FROM tf_v2_resource_references
+             WHERE referrer_uid = ? AND target_uid = ?
+               AND NOT EXISTS (SELECT 1 FROM tf_v2_resource_references extra
+                 WHERE extra.referrer_uid = ? AND extra.target_uid <> ?)
+             LIMIT 2`,
+            [endpoint.uid, workerUid, endpoint.uid, workerUid],
+          ),
+          options.sql.query(
+            `SELECT reference.target_uid, reference.form_url,
+               reference.readiness, reference.target_spec_path,
+               reference.target_spec_equals
+             FROM tf_v2_operation_reference_sets sealed
+             JOIN tf_v2_operation_references reference
+               ON reference.operation_id = sealed.operation_id
+             WHERE sealed.operation_id = ? AND sealed.sealed = 1 LIMIT 2`,
+            [endpoint.id],
+          ),
+        ]);
+        if (
+          edge.length !== 1 ||
+          sealed.length !== 1 ||
+          sealed[0]?.target_uid !== workerUid ||
+          sealed[0]?.form_url !== MODULE_WORKER_FORM_URL ||
+          sealed[0]?.readiness !== "observed" ||
+          sealed[0]?.target_spec_path !== null ||
+          sealed[0]?.target_spec_equals !== null
+        )
+          return null;
+        hostnames = [endpointOutput.hostname];
+      }
+      if (publisher.form_url === WORKER_DEPLOYMENT_FORM_URL) {
+        if (
+          publisher.id !== row.id ||
+          publisher.uid !== row.uid ||
+          publisher.deleted_at !== null ||
+          publisher.phase !== "idle" ||
+          publisher.generation !== publisher.observed_generation ||
+          (publisher.action !== "create" && publisher.action !== "update")
+        )
+          return null;
+      } else if (publisher.form_url === WORKER_ENDPOINT_FORM_URL) {
+        if (publisher.action === "delete") {
+          if (publisher.deleted_at === null || endpoint !== undefined || hostnames.length !== 0)
+            return null;
+        } else if (
+          (publisher.action !== "create" && publisher.action !== "update") ||
+          publisher.deleted_at !== null ||
+          publisher.phase !== "idle" ||
+          publisher.generation !== publisher.observed_generation ||
+          publisher.uid !== endpoint?.uid
+        ) {
+          return null;
+        }
+      } else {
+        return null;
+      }
       return {
-        sourceOperationId: row.id,
+        sourceOperationId: publisher.id,
+        hostnames,
         versions: spec.versions
           .map((weighted) => ({
             workerVersionUid: weighted.workerVersion.resourceUid,
@@ -340,6 +528,8 @@ export function createV2ActorNamespaceForm(options: {
     if (
       serving.kind !== "serving" ||
       serving.sourceOperationId !== sourceOperationId ||
+      serving.generation !== `takoserver-v2-operation:${sourceOperationId}` ||
+      canonicalJson(serving.hostnames) !== canonicalJson(source.hostnames) ||
       canonicalJson(
         serving.versions
           .map(({ workerVersionUid, weight }) => ({ workerVersionUid, weight }))
@@ -358,6 +548,8 @@ export function createV2ActorNamespaceForm(options: {
       native.kind !== "ready" ||
       native.sourceOperationId !== sourceOperationId ||
       native.identity.workerResourceUid !== spec.worker.resourceUid ||
+      native.identity.generation !== serving.generation ||
+      canonicalJson(native.identity.hostnames) !== canonicalJson(source.hostnames) ||
       native.graph.workerResourceUid !== spec.worker.resourceUid ||
       native.identity.generation !== native.graph.generation ||
       native.identity.versions.length !== native.graph.versions.length ||
@@ -412,6 +604,8 @@ export function createV2ActorNamespaceForm(options: {
       if (
         currentServing.kind !== "serving" ||
         currentServing.sourceOperationId !== sourceOperationId ||
+        currentServing.generation !== serving.generation ||
+        canonicalJson(currentServing.hostnames) !== canonicalJson(source.hostnames) ||
         canonicalJson(currentServing.versions) !== canonicalJson(serving.versions)
       )
         return false;

@@ -1174,7 +1174,36 @@ test.skipIf(OPT_IN !== "1")(
       bootstrap = null;
 
       const moduleBytes = new TextEncoder().encode(
-        "export default { fetch(request) { return new Response('normal-v2:' + new URL(request.url).pathname); } };\n",
+        `export default {
+  fetch(request, env) {
+    const path = new URL(request.url).pathname;
+    if (path === "/actor-write" || path === "/actor-read") {
+      const actor = env.ACTOR.get(env.ACTOR.idFromName("room"));
+      return actor.fetch(new Request("http://actor.invalid/" + (path === "/actor-write" ? "write" : "read")));
+    }
+    return new Response("normal-v2:" + path);
+  }
+};
+export class CounterActor {
+  constructor(context) { this.context = context; }
+  async start() {
+    await this.context.storage.execute("CREATE TABLE IF NOT EXISTS counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)");
+  }
+  async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === "/write") {
+      const result = await this.context.storage.execute("INSERT INTO counter VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET value = value + 1 RETURNING value");
+      return Response.json({value: Number(result.rows[0].value)});
+    }
+    const result = await this.context.storage.query("SELECT value FROM counter WHERE id = 1");
+    return Response.json({value: Number(result.rows[0]?.value ?? 0)});
+  }
+  async alarm() {}
+  async socketMessage() {}
+  async socketClose() {}
+  async socketError() {}
+}
+`,
       );
       const moduleDigest = (await bytesDigest(moduleBytes)).slice(7);
       const manifestBytes = new TextEncoder().encode(
@@ -1305,6 +1334,11 @@ test.skipIf(OPT_IN !== "1")(
       const bundle = await create(WORKER_BUNDLE_FORM_URL, "bundle", {
         artifact: { url: BUNDLE_MANIFEST_URL, sha256: manifestDigest },
       });
+      const namespaceSpec = {
+        worker: { resourceUid: worker.uid },
+        className: "CounterActor",
+      };
+      const namespace = await create(ACTOR_NAMESPACE_FORM_URL, "namespace", namespaceSpec);
       const sensitive = await jsonAt(
         port,
         "POST",
@@ -1350,6 +1384,7 @@ test.skipIf(OPT_IN !== "1")(
         handlers: ["fetch"],
         vars: {},
         requiredSensitiveVars: [],
+        actorBindings: [{ name: "ACTOR", resource: { resourceUid: namespace.uid } }],
       });
       const deployment = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
         worker: { resourceUid: worker.uid },
@@ -1371,6 +1406,10 @@ test.skipIf(OPT_IN !== "1")(
         status: 200,
         body: "normal-v2:/before-crash",
       });
+      expect(await nativeHttps(hostname, "/actor-write")).toEqual({
+        status: 200,
+        body: '{"value":1}',
+      });
 
       const firstPid = serving.pid;
       await killHost(serving);
@@ -1383,6 +1422,52 @@ test.skipIf(OPT_IN !== "1")(
       expect(await nativeHttps(hostname, "/after-crash")).toEqual({
         status: 200,
         body: "normal-v2:/after-crash",
+      });
+      expect(await nativeHttps(hostname, "/actor-read")).toEqual({
+        status: 200,
+        body: '{"value":1}',
+      });
+      expect(await nativeHttps(hostname, "/actor-write")).toEqual({
+        status: 200,
+        body: '{"value":2}',
+      });
+      const endpointUpdate = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${endpoint.uid}`,
+        202,
+        { spec: { worker: { resourceUid: worker.uid } } },
+        {
+          ...auth,
+          "idempotency-key": "normal-v2-endpoint-update",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(await settled(port, token, String(endpointUpdate.id))).toMatchObject({
+        effect: "complete",
+      });
+      expect(await nativeHttps(hostname, "/actor-read")).toEqual({
+        status: 200,
+        body: '{"value":2}',
+      });
+      const namespaceUpdate = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${namespace.uid}`,
+        202,
+        { spec: namespaceSpec },
+        {
+          ...auth,
+          "idempotency-key": "normal-v2-namespace-update",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(await settled(port, token, String(namespaceUpdate.id))).toMatchObject({
+        effect: "complete",
+      });
+      expect(await nativeHttps(hostname, "/actor-read")).toEqual({
+        status: 200,
+        body: '{"value":2}',
       });
       const update = await jsonAt(
         port,
@@ -1407,9 +1492,25 @@ test.skipIf(OPT_IN !== "1")(
           effect: "complete",
         });
       };
-      await remove(endpoint.uid, 1, "endpoint");
+      await remove(endpoint.uid, 2, "endpoint");
+      const afterEndpointDelete = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${namespace.uid}`,
+        202,
+        { spec: namespaceSpec },
+        {
+          ...auth,
+          "idempotency-key": "normal-v2-namespace-after-endpoint-delete",
+          "takoform-expected-generation": "2",
+        },
+      );
+      expect(await settled(port, token, String(afterEndpointDelete.id))).toMatchObject({
+        effect: "complete",
+      });
       await remove(deployment.uid, 1, "deployment");
       await remove(version.uid, 1, "version");
+      await remove(namespace.uid, 3, "namespace");
       await remove(bundle.uid, 1, "bundle");
       await remove(queueTarget.uid, 1, "queue-target");
       await remove(bucketTarget.uid, 1, "bucket-target");

@@ -1,4 +1,3 @@
-import { type DatabaseSync, constants as SQLITE } from "node:sqlite";
 import type { Clock, JsonObject, Sql } from "../../ports.ts";
 import { TakoformV2Error, type V2BackendResult, type V2Execution, type V2Form } from "../types.ts";
 import type { SqlArtifactCustody } from "./artifact-custody.ts";
@@ -10,22 +9,16 @@ import {
   sqliteMigrationApplicationReferences,
   validateSQLiteMigrationApplicationUpdate,
 } from "./sqlite-migration-application.ts";
+import type {
+  SQLiteMigrationApplicationPort,
+  SQLiteMigrationEntry,
+  SQLiteMigrationRecord,
+  SQLiteMigrationSession,
+} from "./sqlite-migration-application-port.ts";
 import type { SQLiteMigrationManifest } from "./sqlite-migration-set.ts";
-import type { SQLiteDatabaseNativePort } from "./sqlite-native-store-port.ts";
 
 export const SQLITE_MIGRATION_APPLICATION_BACKEND_ID =
   "selfhost-v2-sqlite-migration-application-native-v1";
-const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
-
-interface MigrationEntry {
-  readonly path: string;
-  readonly sha256: string;
-}
-
-interface MigrationRecord extends MigrationEntry {
-  readonly operationId: string;
-}
-
 type MigrationErrorCode =
   | "artifact_invalid"
   | "migration_history_conflict"
@@ -33,27 +26,27 @@ type MigrationErrorCode =
   | "database_busy"
   | "backend_unavailable";
 
-class MigrationFailure extends Error {
-  constructor(
-    readonly code: MigrationErrorCode,
-    readonly newlyApplied: number,
-    readonly appliedEntries: readonly MigrationEntry[],
-  ) {
-    super(code);
-    this.name = "MigrationFailure";
-  }
-}
-
-class MigrationHistoryUncertain extends Error {}
+type MigrationRunResult =
+  | { readonly kind: "complete"; readonly appliedEntries: readonly SQLiteMigrationEntry[] }
+  | {
+      readonly kind: "failure";
+      readonly code: MigrationErrorCode;
+      readonly newlyApplied: number;
+      readonly appliedEntries: readonly SQLiteMigrationEntry[];
+    }
+  | {
+      readonly kind: "unknown";
+      readonly code: "migration_history_conflict" | "backend_unavailable";
+    };
 
 export function createSQLiteMigrationApplicationForm(options: {
   readonly sql: Sql;
-  readonly store: Pick<SQLiteDatabaseNativePort, "withAuthorizedDatabase">;
+  readonly migrationPort: SQLiteMigrationApplicationPort;
   readonly custody: Pick<SqlArtifactCustody<SQLiteMigrationManifest>, "readVerified">;
   readonly targetKey: string;
   readonly now?: Clock;
 }): V2Form {
-  if (!options.targetKey || !options.store || !options.custody) {
+  if (!options.targetKey || !options.migrationPort || !options.custody) {
     throw new TypeError("SQLiteMigrationApplication backend is incomplete");
   }
   const now = options.now ?? (() => new Date());
@@ -159,37 +152,55 @@ export function createSQLiteMigrationApplicationForm(options: {
       };
     }
     try {
-      const appliedEntries = await options.store.withAuthorizedDatabase({
+      const result = await options.migrationPort.withAuthorizedMigrationSession({
         resourceUid: databaseUid,
+        execution: {
+          operationId: input.operationId,
+          leaseToken: input.leaseToken,
+          backendKey: input.backendKey,
+          backendId: input.backendId,
+          targetKey: input.targetKey,
+          resourceUid: input.resourceUid,
+          principal: input.principal,
+          action: input.action,
+          generation: input.generation,
+          form: input.form,
+          space: input.space,
+          name: input.name,
+          spec: input.spec,
+        },
         stillAuthorized: () => stillAuthorized(input, databaseUid),
-        use(database) {
-          return applyHeldMigrations(database, targetEntries, held.files, input.operationId);
+        use(session) {
+          return applyHeldMigrations(session, targetEntries, held.files, input.operationId);
         },
       });
-      return {
-        kind: "complete",
-        observed: observation(databaseUid, setUid, appliedEntries, targetEntries),
-        output: {},
-      };
-    } catch (error) {
-      if (error instanceof MigrationFailure) {
-        return error.newlyApplied === 0
-          ? { kind: "no_effect", code: error.code, message: error.code }
+      if (result.kind === "unknown") {
+        return {
+          kind: "unknown",
+          code: result.code,
+          message:
+            result.code === "migration_history_conflict"
+              ? "Migration history cannot establish the outcome"
+              : "Migration outcome is unconfirmed",
+        };
+      }
+      if (result.kind === "failure") {
+        return result.newlyApplied === 0
+          ? { kind: "no_effect", code: result.code, message: result.code }
           : {
               kind: "partial",
-              code: error.code,
-              message: error.code,
-              observed: observation(databaseUid, setUid, error.appliedEntries, targetEntries),
+              code: result.code,
+              message: result.code,
+              observed: observation(databaseUid, setUid, result.appliedEntries, targetEntries),
               output: {},
             };
       }
-      if (error instanceof MigrationHistoryUncertain) {
-        return {
-          kind: "unknown",
-          code: "migration_history_conflict",
-          message: "Migration history cannot establish the outcome",
-        };
-      }
+      return {
+        kind: "complete",
+        observed: observation(databaseUid, setUid, result.appliedEntries, targetEntries),
+        output: {},
+      };
+    } catch (error) {
       if (isNativeBusy(error)) {
         return {
           kind: "unknown",
@@ -245,8 +256,8 @@ function isNativeBusy(error: unknown): boolean {
 function observation(
   databaseUid: string,
   migrationSetUid: string,
-  appliedEntries: readonly MigrationEntry[],
-  targetEntries: readonly MigrationEntry[],
+  appliedEntries: readonly SQLiteMigrationEntry[],
+  targetEntries: readonly SQLiteMigrationEntry[],
 ): JsonObject {
   return {
     databaseUid,
@@ -263,75 +274,83 @@ function observation(
   };
 }
 
-function applyHeldMigrations(
-  database: DatabaseSync,
-  target: readonly MigrationEntry[],
+async function applyHeldMigrations(
+  session: SQLiteMigrationSession,
+  target: readonly SQLiteMigrationEntry[],
   files: readonly Uint8Array[],
   operationId: string,
-): readonly MigrationEntry[] {
-  let applied = readLedger(database);
+): Promise<MigrationRunResult> {
+  const initial = await session.readLedger();
+  if (initial.kind === "unknown") {
+    return { kind: "unknown", code: "migration_history_conflict" };
+  }
+  if (!validLedger(initial.entries)) {
+    return { kind: "unknown", code: "migration_history_conflict" };
+  }
+  let applied = initial.entries;
   let newlyApplied = applied.filter((entry) => entry.operationId === operationId).length;
   if (!isPrefix(applied, target)) {
-    throw new MigrationFailure("migration_history_conflict", newlyApplied, applied);
+    return {
+      kind: "failure",
+      code: "migration_history_conflict",
+      newlyApplied,
+      appliedEntries: applied,
+    };
   }
   for (let index = applied.length; index < target.length; index += 1) {
     const entry = target[index];
     const bytes = files[index];
-    if (!entry || !bytes) throw new MigrationFailure("artifact_invalid", newlyApplied, applied);
-    let sqlText: string;
-    try {
-      sqlText = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
-    } catch {
-      throw new MigrationFailure("artifact_invalid", newlyApplied, applied);
+    if (!entry || !bytes) {
+      return { kind: "failure", code: "artifact_invalid", newlyApplied, appliedEntries: applied };
     }
-    if (sqlText.includes("\0")) {
-      throw new MigrationFailure("migration_sql_error", newlyApplied, applied);
+    const result = await session.applyOneHeldFile({
+      sequence: index + 1,
+      expectedPrefix: applied,
+      entry,
+      bytes,
+      operationId,
+    });
+    if (result.kind === "rejected") {
+      return { kind: "failure", code: result.code, newlyApplied, appliedEntries: applied };
     }
-    try {
-      runFileAndLedger(database, sqlText, entry, index + 1, operationId);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "";
-      if (message === "rollback_unconfirmed") throw error;
-      throw new MigrationFailure(
-        /locked|busy/iu.test(message) ? "database_busy" : "migration_sql_error",
-        newlyApplied,
-        applied,
-      );
+    if (
+      result.kind === "applied" &&
+      (result.sequence !== index + 1 ||
+        result.record.sequence !== index + 1 ||
+        result.record.path !== entry.path ||
+        result.record.sha256 !== entry.sha256 ||
+        result.record.operationId !== operationId)
+    ) {
+      return { kind: "unknown", code: "backend_unavailable" };
+    }
+    if (result.kind === "unknown") {
+      // The ACK alone cannot tell whether the SQL and ledger committed. A
+      // session read is ordered after the attempt and under the same UID lock.
+      const reread = await session.readLedger();
+      if (
+        reread.kind !== "read" ||
+        !validLedger(reread.entries) ||
+        !isPrefix(reread.entries, target) ||
+        reread.entries.length !== index + 1 ||
+        !applied.every(
+          (previous, previousIndex) =>
+            reread.entries[previousIndex]?.operationId === previous.operationId,
+        ) ||
+        reread.entries[index]?.operationId !== operationId
+      ) {
+        return { kind: "unknown", code: "backend_unavailable" };
+      }
     }
     newlyApplied += 1;
-    applied = [...applied, { ...entry, operationId }];
+    applied = [...applied, { ...entry, sequence: index + 1, operationId }];
   }
-  return applied;
+  return { kind: "complete", appliedEntries: applied };
 }
 
-function readLedger(database: DatabaseSync): readonly MigrationRecord[] {
-  let rows: readonly Record<string, unknown>[];
-  try {
-    rows = database
-      .prepare(
-        `SELECT sequence, path, sha256, operation_id FROM ${SQLITE_MIGRATION_LEDGER} ORDER BY sequence`,
-      )
-      .all() as readonly Record<string, unknown>[];
-  } catch {
-    throw new MigrationHistoryUncertain();
-  }
-  if (rows.length > 512) throw new MigrationHistoryUncertain();
-  return rows.map((row, index) => {
-    if (
-      row.sequence !== index + 1 ||
-      typeof row.path !== "string" ||
-      typeof row.sha256 !== "string" ||
-      typeof row.operation_id !== "string" ||
-      row.operation_id.length === 0 ||
-      !/^[0-9a-f]{64}$/u.test(row.sha256)
-    ) {
-      throw new MigrationHistoryUncertain();
-    }
-    return { path: row.path, sha256: row.sha256, operationId: row.operation_id };
-  });
-}
-
-function isPrefix(applied: readonly MigrationEntry[], target: readonly MigrationEntry[]): boolean {
+function isPrefix(
+  applied: readonly SQLiteMigrationRecord[],
+  target: readonly SQLiteMigrationEntry[],
+): boolean {
   return (
     applied.length <= target.length &&
     applied.every(
@@ -341,72 +360,18 @@ function isPrefix(applied: readonly MigrationEntry[], target: readonly Migration
   );
 }
 
-function runFileAndLedger(
-  database: DatabaseSync,
-  sqlText: string,
-  entry: MigrationEntry,
-  sequence: number,
-  operationId: string,
-): void {
-  let internalTransaction = false;
-  let internalLedger = false;
-  const ledger = SQLITE_MIGRATION_LEDGER;
-  database.setAuthorizer((action, first, second, schema) => {
-    if (action === SQLITE.SQLITE_TRANSACTION || action === SQLITE.SQLITE_SAVEPOINT) {
-      return internalTransaction ? SQLITE.SQLITE_OK : SQLITE.SQLITE_DENY;
-    }
-    if (
-      action === SQLITE.SQLITE_ATTACH ||
-      action === SQLITE.SQLITE_DETACH ||
-      action === SQLITE.SQLITE_PRAGMA ||
-      action === SQLITE.SQLITE_REINDEX ||
-      action === SQLITE.SQLITE_ANALYZE ||
-      action === SQLITE.SQLITE_COPY ||
-      action === SQLITE.SQLITE_CREATE_VTABLE ||
-      action === SQLITE.SQLITE_DROP_VTABLE
-    ) {
-      return SQLITE.SQLITE_DENY;
-    }
-    if (action === SQLITE.SQLITE_FUNCTION && second?.toLowerCase() === "load_extension") {
-      return SQLITE.SQLITE_DENY;
-    }
-    if (schema !== null && schema !== "main") return SQLITE.SQLITE_DENY;
-    if (first?.toLowerCase() === ledger || second?.toLowerCase() === ledger) {
-      return internalLedger ? SQLITE.SQLITE_OK : SQLITE.SQLITE_DENY;
-    }
-    return SQLITE.SQLITE_OK;
-  });
-  let started = false;
-  try {
-    internalTransaction = true;
-    database.exec("BEGIN IMMEDIATE");
-    internalTransaction = false;
-    started = true;
-    database.exec(sqlText);
-    internalLedger = true;
-    database
-      .prepare(
-        `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, sha256, operation_id) VALUES (?, ?, ?, ?)`,
-      )
-      .run(sequence, entry.path, entry.sha256, operationId);
-    internalLedger = false;
-    internalTransaction = true;
-    database.exec("COMMIT");
-    started = false;
-  } catch (error) {
-    if (started) {
-      try {
-        internalTransaction = true;
-        database.exec("ROLLBACK");
-      } catch {
-        // A failed rollback is an unknown native outcome, not a safe retry.
-        throw new Error("rollback_unconfirmed");
-      }
-    }
-    throw error;
-  } finally {
-    internalTransaction = false;
-    internalLedger = false;
-    database.setAuthorizer(null);
-  }
+function validLedger(entries: readonly SQLiteMigrationRecord[]): boolean {
+  return (
+    Array.isArray(entries) &&
+    entries.length <= 512 &&
+    entries.every(
+      (entry, index) =>
+        entry?.sequence === index + 1 &&
+        typeof entry.path === "string" &&
+        typeof entry.sha256 === "string" &&
+        /^[0-9a-f]{64}$/u.test(entry.sha256) &&
+        typeof entry.operationId === "string" &&
+        entry.operationId.length > 0,
+    )
+  );
 }

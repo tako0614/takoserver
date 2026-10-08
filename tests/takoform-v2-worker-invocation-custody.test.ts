@@ -7,7 +7,10 @@ import type { Sql } from "../src/ports.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createV2WorkerInvocationLifecycle } from "../src/takoform-v2/worker-invocation-custody.ts";
-import { inspectV2WorkerInvocationSchema } from "../src/takoform-v2/worker-invocation-schema.ts";
+import {
+  inspectV2WorkerInvocationSchema,
+  v2WorkerInvocationSchemaReady,
+} from "../src/takoform-v2/worker-invocation-schema.ts";
 
 const handle = { invocationId: "invocation-001", custodyToken: "private-custody-token-001" };
 const digest = `sha256:${"a".repeat(64)}` as const;
@@ -330,9 +333,11 @@ test("0084 forward migration preserves old sent rows and exact lost-ACK terminal
       "UPDATE tf_v2_worker_invocations SET phase = 'send_authorized', send_authorized_at_ms = 1500 WHERE invocation_id = ?",
       [handle.invocationId],
     );
+    expect(await inspectV2WorkerInvocationSchema(sql)).toBeNull();
     const forward = MIGRATIONS.find(({ name }) => name.startsWith("0084_"));
     if (!forward) throw new Error("missing 0084 source");
     db.exec(forward.sql);
+    expect(await inspectV2WorkerInvocationSchema(sql)).toBe("endpoint");
     const owner = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(2000) });
     const legacyTail = { invocationId: "legacy-tail", custodyToken: "legacy-tail-token" };
     await sql.run(
@@ -548,6 +553,10 @@ test("0086 preserves populated endpoint phases and opens exact endpoint-free Ser
     const migration = MIGRATIONS.find(({ name }) => name.startsWith("0086_"));
     if (!migration) throw new Error("missing 0086 source");
     db.exec(migration.sql);
+    expect(await inspectV2WorkerInvocationSchema(sql)).toBe("service");
+    expect(
+      await sql.query(`SELECT 1 WHERE ${v2WorkerInvocationSchemaReady("service")}`),
+    ).toHaveLength(1);
     // A new SQL text avoids bun:sqlite's cached pre-DDL SELECT * shape.
     const after = await sql.query(
       "SELECT * FROM tf_v2_worker_invocations ORDER BY invocation_id /* 0086 */",
@@ -744,10 +753,46 @@ test("0087 preserves populated Endpoint and Service custody and fences incomplet
       expect(after[index]?.cron_match_id).toBeNull();
     }
     expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
-    expect(await inspectV2WorkerInvocationSchema(sql)).toBe("cron");
+    const selectedShape = await inspectV2WorkerInvocationSchema(sql);
+    expect(selectedShape).toBe("cron");
+    expect(
+      await sql.query(`SELECT 1 WHERE ${v2WorkerInvocationSchemaReady("service")}`),
+    ).toHaveLength(0);
+    expect(
+      await sql.query(`SELECT 1 WHERE ${v2WorkerInvocationSchemaReady("endpoint")}`),
+    ).toHaveLength(0);
+    expect(await sql.query(`SELECT 1 WHERE ${v2WorkerInvocationSchemaReady("cron")}`)).toHaveLength(
+      1,
+    );
     const owner = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(2000) });
     expect((await owner.read(service))?.ingress.kind).toBe("service");
     expect(await owner.beginSend(handle)).toBe(true);
+    if (selectedShape !== "cron") throw new Error("0087 shape not ready");
+    const freshService = {
+      invocationId: "post-0087-service",
+      custodyToken: "post-0087-service-token",
+    };
+    const admitService = (shape: "service" | "cron") =>
+      sql.run(
+        `INSERT INTO tf_v2_worker_invocations
+       (invocation_id,custody_token,backend_id,target_key,principal,space,
+        worker_uid,deployment_uid,deployment_generation,source_operation_id,
+        ingress_kind,service_caller_worker_uid,service_caller_version_uid,
+        service_caller_version_generation,service_caller_version_operation_id,
+        service_binding_name,service_caller_execution_ref,version_uid,version_generation,
+        version_operation_id,native_identity,closure_digest,confirmed_receipt,admitted_at_ms)
+       SELECT ?,?,backend_id,target_key,principal,space,worker_uid,deployment_uid,
+        deployment_generation,source_operation_id,'service',worker_uid,version_uid,
+        version_generation,version_operation_id,'CALLER','fresh-slot',version_uid,
+        version_generation,version_operation_id,native_identity,closure_digest,
+        confirmed_receipt,admitted_at_ms
+       FROM tf_v2_worker_invocations WHERE invocation_id=? AND (${v2WorkerInvocationSchemaReady(shape)})`,
+        [freshService.invocationId, freshService.custodyToken, handle.invocationId],
+      );
+    expect((await admitService("service")).changes).toBe(0);
+    expect((await admitService(selectedShape)).changes).toBe(1);
+    expect((await owner.read(freshService))?.ingress.kind).toBe("service");
+    expect(await owner.beginSend(freshService)).toBe(true);
     expect(
       await owner.confirmNativeRetirement({
         handle: service,

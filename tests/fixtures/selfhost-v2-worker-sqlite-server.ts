@@ -17,6 +17,7 @@ import { SQLITE_DATABASE_FORM_URL } from "../../src/takoform-v2/forms/sqlite-dat
 import { createSQLiteDatabaseForm } from "../../src/takoform-v2/forms/sqlite-database-backend.ts";
 import { SQLITE_MIGRATION_APPLICATION_FORM_URL } from "../../src/takoform-v2/forms/sqlite-migration-application.ts";
 import { createSQLiteMigrationApplicationForm } from "../../src/takoform-v2/forms/sqlite-migration-application-backend.ts";
+import { createSQLiteMigrationApplicationNativePort } from "../../src/takoform-v2/forms/sqlite-migration-application-native.ts";
 import { createSQLiteMigrationSetCustody } from "../../src/takoform-v2/forms/sqlite-migration-set-backend.ts";
 import { WorkerdWorkerRuntimeOwnerError } from "../../src/workerd-worker-runtime-owner.ts";
 
@@ -181,7 +182,7 @@ try {
         [SQLITE_DATABASE_FORM_URL]: createSQLiteDatabaseForm({ store }),
         [SQLITE_MIGRATION_APPLICATION_FORM_URL]: createSQLiteMigrationApplicationForm({
           sql,
-          store,
+          migrationPort: createSQLiteMigrationApplicationNativePort(store),
           custody: migrationCustody,
           targetKey: TARGET,
           now: clock,
