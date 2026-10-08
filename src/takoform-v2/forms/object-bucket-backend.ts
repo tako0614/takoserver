@@ -18,7 +18,7 @@ export function resolveObjectBucketBackendId(backendId: unknown, supplied: boole
   return backendId;
 }
 
-interface ObjectBucketIdentity {
+export interface ObjectBucketIdentity {
   readonly targetKey: string;
   readonly principal: string;
   readonly space: string;
