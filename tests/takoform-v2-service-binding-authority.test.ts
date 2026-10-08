@@ -13,6 +13,11 @@ import {
   createV2ServiceBindingAuthority,
   type V2ServiceBindingClaim,
 } from "../src/takoform-v2/service-binding-authority.ts";
+import { createV2ServiceBindingAuthority as exportedAuthority } from "../src/takoform-v2/index.ts";
+
+test("public v2 extension entrypoint exposes the logical service binding authority", () => {
+  expect(exportedAuthority).toBe(createV2ServiceBindingAuthority);
+});
 
 const TARGET_KEY = "service-authority-target";
 const CALLER_UID = "caller-worker";

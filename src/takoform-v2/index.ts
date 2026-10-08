@@ -71,6 +71,11 @@ export type {
   V2PrivateInputKey,
   V2PrivateInputMap,
 } from "./private-inputs.ts";
+export {
+  createV2ServiceBindingAuthority,
+  type V2ServiceBindingClaim,
+  type V2ServiceBindingResolution,
+} from "./service-binding-authority.ts";
 export type {
   V2Backend,
   V2BackendResult,

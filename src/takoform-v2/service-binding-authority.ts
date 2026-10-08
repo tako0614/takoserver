@@ -9,7 +9,12 @@ import {
 } from "./forms/worker-specs.ts";
 import { isReadyWorkerVersionObservation } from "./forms/worker-version-observed.ts";
 
-/** Core-only proof input; physical incarnation/current serving context is owner-owned. */
+/**
+ * Core-only logical proof input. `nativeVersionId` is the portable
+ * v2-hash(VersionUID, source generation) token, NOT a WfP v2w script ID.
+ * A provider must independently seal and recheck physical caller liveness;
+ * `incarnationId` and `servingSourceOperationId` do not make D1 such a witness.
+ */
 export interface V2ServiceBindingClaim {
   readonly principal: string;
   readonly space: string;
