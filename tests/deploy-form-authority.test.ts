@@ -18,6 +18,7 @@ import { canonicalSchemaShape } from "../scripts/deploy/migrations.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
+import { acquireWranglerVersionPublicationLease } from "../scripts/deploy/wrangler-state.ts";
 import { canonicalJson } from "../src/json.ts";
 import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
 import {
@@ -31,6 +32,7 @@ import {
   objectBucketSuppliesFixture,
 } from "./helpers/hosted-supply-fixtures.ts";
 import { integrationStorageVerificationOptions as baseIntegrationStorageVerificationOptions } from "./helpers/integration-storage-generation-verification.ts";
+import { expectPublicationLeaseHeld } from "./helpers/publication-lease.ts";
 
 const COMMIT = "a".repeat(40);
 const PREVIOUS_COMMIT = "b".repeat(40);
@@ -1914,6 +1916,10 @@ describe("route-less Form authority deploy surfaces", () => {
   test("migrates the exact historical public pin to one dynamic successor", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-historical-"));
     const currentTarget = evolvedIntegrationTarget();
+    const integrationWorkerName = currentTarget.formAuthority?.integrationWorkerName;
+    if (integrationWorkerName === undefined)
+      throw new Error("fixture has no integration authority Worker");
+    const publicationLeaseRoot = join(root, "publication-leases");
     let uploaded = false;
     try {
       const process = fakeProcess({
@@ -1921,6 +1927,20 @@ describe("route-less Form authority deploy surfaces", () => {
           uploaded = true;
         },
       });
+      const baseState = historicalPinnedPublicState(currentTarget, { isUploaded: () => uploaded });
+      const state: FormAuthorityDeployState = {
+        ...baseState,
+        async workerDeployments(workerName) {
+          if (workerName === integrationWorkerName) {
+            await expectPublicationLeaseHeld({
+              accountId: currentTarget.accountId,
+              workerName,
+              root: publicationLeaseRoot,
+            });
+          }
+          return await baseState.workerDeployments(workerName);
+        },
+      };
       const result = await runFormAuthority(
         {
           surface: "takoserver-integration-form-authority-worker",
@@ -1931,10 +1951,11 @@ describe("route-less Form authority deploy surfaces", () => {
         currentTarget,
         {
           run: process.run,
-          state: historicalPinnedPublicState(currentTarget, { isUploaded: () => uploaded }),
+          state,
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           review: "independent-reviewer",
+          publicationLeaseRoot,
         },
       );
 
@@ -1944,6 +1965,12 @@ describe("route-less Form authority deploy surfaces", () => {
         publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
       });
       expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+      const released = await acquireWranglerVersionPublicationLease({
+        accountId: currentTarget.accountId,
+        workerName: integrationWorkerName,
+        root: publicationLeaseRoot,
+      });
+      await released.release();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

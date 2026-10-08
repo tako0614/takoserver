@@ -12,7 +12,9 @@ import type { DeployEnvironment } from "../scripts/deploy/qualification.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { WorkerState } from "../scripts/deploy/worker-live.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
+import { acquireWranglerVersionPublicationLease } from "../scripts/deploy/wrangler-state.ts";
 import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
+import { expectPublicationLeaseHeld } from "./helpers/publication-lease.ts";
 
 const COMMIT = "a".repeat(40);
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
@@ -168,7 +170,19 @@ describe("operator identity authority", () => {
     const selected = await authorityFixture("integration");
     try {
       const process = processFixture("integration");
-      const state = transitionState(selected.target, null, process);
+      const publicationLeaseRoot = join(selected.root, "publication-leases");
+      const baseState = transitionState(selected.target, null, process);
+      const state: TransitionState = {
+        ...baseState,
+        async workerVersion(workerName, versionId) {
+          await expectPublicationLeaseHeld({
+            accountId: selected.target.accountId,
+            workerName,
+            root: publicationLeaseRoot,
+          });
+          return await baseState.workerVersion(workerName, versionId);
+        },
+      };
       const requests: Request[] = [];
       const result = await runOperatorIdentity(
         invocation("integration", "apply"),
@@ -184,6 +198,7 @@ describe("operator identity authority", () => {
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
           fetcher: ownerSessionFetcher(selected.publicKey, requests),
           now: () => new Date("2026-09-03T12:00:00.000Z"),
+          publicationLeaseRoot,
         },
       );
       expect(result).toMatchObject({
@@ -218,6 +233,12 @@ describe("operator identity authority", () => {
       expect(JSON.stringify(result.rollback)).not.toContain("wrangler");
       expect(process.uploads).toBe(1);
       expect(process.rollbacks).toBe(0);
+      const released = await acquireWranglerVersionPublicationLease({
+        accountId: selected.target.accountId,
+        workerName: selected.target.workerName,
+        root: publicationLeaseRoot,
+      });
+      await released.release();
       expect(
         requests.map((request) => `${request.method} ${new URL(request.url).pathname}`),
       ).toEqual([

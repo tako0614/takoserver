@@ -84,6 +84,7 @@ import {
   type WorkerBindingDrift,
   type WorkerSurfaceTransition,
 } from "./worker-surface-transition.ts";
+import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 
 /**
  * Which descriptor field owns each Form-authority binding value.
@@ -183,6 +184,8 @@ export interface FormAuthorityDeployOptions {
     IntegrationStorageGenerationTargetVerificationOptions,
     "run" | "cloudflareEnvironment"
   >;
+  /** Portable test seam; production uses the shared default publication-lease root. */
+  readonly publicationLeaseRoot?: string;
 }
 
 export interface FormAuthorityCoreVerifierReadbackExpectation {
@@ -340,6 +343,35 @@ export async function runFormAuthority(
   invocation: FormAuthorityDeployInvocation,
   target: DeployTarget,
   options: FormAuthorityDeployOptions = {},
+): Promise<Record<string, unknown>> {
+  if (isIntegrationOnlySurface(invocation.surface) && invocation.environment !== "integration") {
+    throw preflightError("integration Form authority deploy surface is integration-only");
+  }
+  if (target.environment !== invocation.environment) {
+    throw preflightError("Form authority invocation and target environments differ");
+  }
+  const selectedForLease = selectTarget(invocation, target);
+  const publicationLease =
+    invocation.action === "apply"
+      ? await acquireWranglerVersionPublicationLease({
+          accountId: target.accountId,
+          workerName: selectedForLease.workerName,
+          ...(options.publicationLeaseRoot === undefined
+            ? {}
+            : { root: options.publicationLeaseRoot }),
+        })
+      : null;
+  try {
+    return await runFormAuthorityWithLease(invocation, target, options);
+  } finally {
+    await publicationLease?.release();
+  }
+}
+
+async function runFormAuthorityWithLease(
+  invocation: FormAuthorityDeployInvocation,
+  target: DeployTarget,
+  options: FormAuthorityDeployOptions,
 ): Promise<Record<string, unknown>> {
   if (isIntegrationOnlySurface(invocation.surface) && invocation.environment !== "integration") {
     throw preflightError("integration Form authority deploy surface is integration-only");

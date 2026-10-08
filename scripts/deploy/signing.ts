@@ -36,6 +36,7 @@ import {
   parseWorkerDeploymentHistory,
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
+import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 
 const PUBLIC_KEYS = ["crv", "kty", "x"] as const;
 const LEGACY_PUBLIC_KEYS = ["crv", "key_ops", "kty", "x"] as const;
@@ -79,6 +80,8 @@ export interface SigningOptions {
   readonly review?: string;
   readonly outputDirectory?: string;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
+  /** Portable test seam; production uses the shared default publication-lease root. */
+  readonly publicationLeaseRoot?: string;
 }
 
 interface PrivateKeyInput {
@@ -118,6 +121,31 @@ export async function runSigning(
   invocation: SigningInvocation,
   target: DeployTarget,
   options: SigningOptions = {},
+): Promise<Record<string, unknown>> {
+  if (target.environment !== invocation.environment) {
+    throw preflightError("signing invocation and target environments differ");
+  }
+  const publicationLease =
+    invocation.action === "apply"
+      ? await acquireWranglerVersionPublicationLease({
+          accountId: target.accountId,
+          workerName: target.workerName,
+          ...(options.publicationLeaseRoot === undefined
+            ? {}
+            : { root: options.publicationLeaseRoot }),
+        })
+      : null;
+  try {
+    return await runSigningWithLease(invocation, target, options);
+  } finally {
+    await publicationLease?.release();
+  }
+}
+
+async function runSigningWithLease(
+  invocation: SigningInvocation,
+  target: DeployTarget,
+  options: SigningOptions,
 ): Promise<Record<string, unknown>> {
   if (target.environment !== invocation.environment) {
     throw preflightError("signing invocation and target environments differ");

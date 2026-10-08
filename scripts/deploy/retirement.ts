@@ -59,6 +59,7 @@ import {
   workerLegacySecretCustodyProfile,
   workerSecretsForLegacyCustody,
 } from "./worker-state.ts";
+import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 
 export const HOSTED_SPONSORSHIP_SECRET = LEGACY_HOSTED_SPONSORSHIP_SECRET;
 const QUIESCED_ARTIFACT_MODE = "pre-0043-quiesced" as const;
@@ -109,6 +110,8 @@ export interface RetirementOptions {
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
   readonly proofGate?: SponsorshipCutoverProofGate;
   readonly cutoverConsumptionDatabase?: SponsorshipCutoverConsumptionDatabase;
+  /** Portable test seam; production uses the shared default publication-lease root. */
+  readonly publicationLeaseRoot?: string;
 }
 
 /**
@@ -120,6 +123,29 @@ export async function runRetirement(
   invocation: RetirementInvocation,
   target: DeployTarget,
   options: RetirementOptions = {},
+): Promise<Record<string, unknown>> {
+  validateInvocation(invocation, target);
+  const publicationLease =
+    invocation.action === "apply"
+      ? await acquireWranglerVersionPublicationLease({
+          accountId: target.accountId,
+          workerName: target.workerName,
+          ...(options.publicationLeaseRoot === undefined
+            ? {}
+            : { root: options.publicationLeaseRoot }),
+        })
+      : null;
+  try {
+    return await runRetirementWithLease(invocation, target, options);
+  } finally {
+    await publicationLease?.release();
+  }
+}
+
+async function runRetirementWithLease(
+  invocation: RetirementInvocation,
+  target: DeployTarget,
+  options: RetirementOptions,
 ): Promise<Record<string, unknown>> {
   validateInvocation(invocation, target);
   const run = options.run ?? runCommand;
@@ -147,7 +173,7 @@ export async function runRetirement(
     invocation.surface === "takoserver-worker-authority-cutover" ||
     invocation.surface === "takoserver-sponsorship-public-route-retirement"
   ) {
-    return await runAuthorityTransition(invocation, target, state, run, runtimeOptions);
+    return await runAuthorityTransitionWithLease(invocation, target, state, run, runtimeOptions);
   }
   if (invocation.surface === "takoserver-host-runtime-topology-retirement") {
     return await runTopologyRetirement(invocation, target, state, run, runtimeOptions);
@@ -164,6 +190,39 @@ export async function runAuthorityTransition(
   state: RetirementState,
   run: RetirementProcess,
   options: RetirementOptions = {},
+): Promise<Record<string, unknown>> {
+  const selector = invocation.legacyHostRuntimePredecessorVersionId;
+  if (selector === undefined) {
+    throw preflightError(
+      "authority transition requires --legacy-host-runtime-predecessor-version=<uuid>",
+    );
+  }
+  if (!isWorkerVersionId(selector)) {
+    throw preflightError("legacy Host-runtime predecessor Version ID must be one exact UUID");
+  }
+  const publicationLease =
+    invocation.action === "apply"
+      ? await acquireWranglerVersionPublicationLease({
+          accountId: target.accountId,
+          workerName: target.workerName,
+          ...(options.publicationLeaseRoot === undefined
+            ? {}
+            : { root: options.publicationLeaseRoot }),
+        })
+      : null;
+  try {
+    return await runAuthorityTransitionWithLease(invocation, target, state, run, options);
+  } finally {
+    await publicationLease?.release();
+  }
+}
+
+async function runAuthorityTransitionWithLease(
+  invocation: RetirementInvocation,
+  target: DeployTarget,
+  state: RetirementState,
+  run: RetirementProcess,
+  options: RetirementOptions,
 ): Promise<Record<string, unknown>> {
   const selector = invocation.legacyHostRuntimePredecessorVersionId;
   if (selector === undefined) {
