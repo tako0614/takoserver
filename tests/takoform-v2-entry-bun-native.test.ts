@@ -1,9 +1,11 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type TLSSocket, connect as tlsConnect } from "node:tls";
 import { base64UrlEncode, bytesDigest } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
@@ -310,6 +312,163 @@ function nativeHttps(hostname: string, path: string): Promise<{ status: number; 
     request.once("error", reject);
     request.end();
   });
+}
+
+class NativeSocketReader {
+  private buffered = Buffer.alloc(0);
+  private readonly waiters: Array<() => void> = [];
+  constructor(socket: TLSSocket) {
+    socket.on("data", (chunk: Buffer) => {
+      this.buffered = Buffer.concat([this.buffered, chunk]);
+      for (const wake of this.waiters.splice(0)) wake();
+    });
+  }
+  async bytes(count: number): Promise<Buffer> {
+    const deadline = Date.now() + 10_000;
+    while (this.buffered.byteLength < count && Date.now() < deadline) await this.wait();
+    if (this.buffered.byteLength < count) throw new Error("native Actor WSS read timed out");
+    const result = this.buffered.subarray(0, count);
+    this.buffered = this.buffered.subarray(count);
+    return result;
+  }
+  async until(delimiter: Buffer): Promise<Buffer> {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const index = this.buffered.indexOf(delimiter);
+      if (index >= 0) return await this.bytes(index + delimiter.byteLength);
+      await this.wait();
+    }
+    throw new Error("native Actor WSS handshake timed out");
+  }
+  private wait(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const index = this.waiters.indexOf(wake);
+        if (index >= 0) this.waiters.splice(index, 1);
+        reject(new Error("native Actor WSS read timed out"));
+      }, 500);
+      const wake = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      this.waiters.push(wake);
+    });
+  }
+}
+
+async function nativeActorWssExchange(
+  hostname: string,
+  certificateFile: string,
+  message: string,
+  mode: "echo" | "welcome-close" = "echo",
+): Promise<string | { welcome: string; closeCode: number; closeReason: string }> {
+  const socket = tlsConnect({
+    host: "127.0.0.1",
+    port: 443,
+    servername: hostname,
+    ca: await readFile(certificateFile),
+    rejectUnauthorized: true,
+  });
+  const reader = new NativeSocketReader(socket);
+  const sendFrame = (opcode: number, payload: Buffer) => {
+    if (payload.byteLength > 2 * 1024 * 1024)
+      throw new Error("native Actor WSS payload is too large");
+    const mask = randomBytes(4);
+    const headerBytes = payload.byteLength <= 125 ? 2 : payload.byteLength <= 65_535 ? 4 : 10;
+    const frame = Buffer.alloc(headerBytes + 4 + payload.byteLength);
+    frame[0] = 0x80 | opcode;
+    frame[1] = 0x80 | (headerBytes === 2 ? payload.byteLength : headerBytes === 4 ? 126 : 127);
+    if (headerBytes === 4) frame.writeUInt16BE(payload.byteLength, 2);
+    if (headerBytes === 10) frame.writeBigUInt64BE(BigInt(payload.byteLength), 2);
+    mask.copy(frame, headerBytes);
+    for (let index = 0; index < payload.byteLength; index += 1)
+      frame[headerBytes + 4 + index] = (payload[index] ?? 0) ^ (mask[index % 4] ?? 0);
+    socket.write(frame);
+  };
+  const readFrame = async () => {
+    const header = await reader.bytes(2);
+    const opcode = (header[0] ?? 0) & 0x0f;
+    let size = (header[1] ?? 0) & 0x7f;
+    if (size === 126) size = (await reader.bytes(2)).readUInt16BE(0);
+    else if (size === 127) {
+      const extended = (await reader.bytes(8)).readBigUInt64BE(0);
+      if (extended > BigInt(2 * 1024 * 1024 + 64))
+        throw new Error("native Actor WSS frame is too large");
+      size = Number(extended);
+    }
+    if (size > 2 * 1024 * 1024 + 64 || ((header[1] ?? 0) & 0x80) !== 0)
+      throw new Error("native Actor WSS reply is invalid");
+    return { opcode, payload: await reader.bytes(size) };
+  };
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("secureConnect", resolve);
+      socket.once("error", reject);
+    });
+    const key = randomBytes(16).toString("base64");
+    socket.write(
+      `GET ${mode === "welcome-close" ? "/actor-socket-welcome" : "/actor-socket"} HTTP/1.1\r\nHost: ${hostname}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
+        `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+    );
+    const handshake = (
+      await reader.until(Buffer.from("\r\n\r\n")).catch((error: unknown) => {
+        throw new Error("native Actor WSS handshake read failed", { cause: error });
+      })
+    ).toString("latin1");
+    const accept = createHash("sha1")
+      .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest("base64");
+    const lines = handshake.split("\r\n");
+    const headerValues = (name: string) =>
+      lines.slice(1).flatMap((line) => {
+        const colon = line.indexOf(":");
+        return colon >= 0 && line.slice(0, colon).toLowerCase() === name
+          ? [line.slice(colon + 1).trim()]
+          : [];
+      });
+    if (
+      !/^HTTP\/1\.1 101\b/u.test(lines[0] ?? "") ||
+      headerValues("sec-websocket-accept").length !== 1 ||
+      headerValues("sec-websocket-accept")[0] !== accept
+    )
+      throw new Error(`native Actor WSS handshake rejected: ${lines[0]}`);
+    expect(headerValues("x-actor-upgrade-marker")).toEqual(["native-header"]);
+    expect(headerValues("set-cookie")).toEqual(["actor-first=1; Path=/", "actor-second=2; Path=/"]);
+    expect(lines.some((line) => line.toLowerCase().startsWith("x-takoserver-private"))).toBe(false);
+    expect(handshake.includes("unix:") || handshake.includes("127.0.0.1")).toBe(false);
+    if (mode === "welcome-close") {
+      // No client frame is sent until the Actor's post-accept welcome arrives.
+      const first = await readFrame().catch((error: unknown) => {
+        throw new Error("native Actor WSS immediate welcome read failed", { cause: error });
+      });
+      if (first.opcode !== 1) throw new Error("native Actor WSS welcome is not text");
+      sendFrame(1, Buffer.from(message));
+      const closed = await readFrame().catch((error: unknown) => {
+        throw new Error("native Actor WSS application close read failed", { cause: error });
+      });
+      if (closed.opcode !== 8 || closed.payload.byteLength < 2)
+        throw new Error("native Actor WSS application close is invalid");
+      sendFrame(8, closed.payload);
+      return {
+        welcome: first.payload.toString("utf8"),
+        closeCode: closed.payload.readUInt16BE(0),
+        closeReason: closed.payload.subarray(2).toString("utf8"),
+      };
+    }
+    sendFrame(1, Buffer.from(message));
+    const echoed = await readFrame().catch((error: unknown) => {
+      throw new Error("native Actor WSS echo read failed", { cause: error });
+    });
+    if (echoed.opcode !== 1) throw new Error("native Actor WSS text reply is missing");
+    sendFrame(8, Buffer.from([0x03, 0xe8]));
+    const closed = await readFrame().catch((error: unknown) => {
+      throw new Error("native Actor WSS close read failed", { cause: error });
+    });
+    if (closed.opcode !== 8) throw new Error("native Actor WSS close reply is missing");
+    return echoed.payload.toString("utf8");
+  } finally {
+    socket.destroy();
+  }
 }
 
 async function nativeWorkflowComplete(hostname: string, id: string): Promise<Json> {
@@ -1065,7 +1224,7 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
 );
 
 test.skipIf(OPT_IN !== "1")(
-  "normal Bun entry admits a complete secret-free v2 Worker graph, serves HTTPS, and recovers after SIGKILL",
+  "normal Bun entry serves HTTPS and direct Actor WSS across SIGKILL recovery",
   async () => {
     const binary = process.env.TAKOSERVER_WORKERD_BINARY;
     const guard = process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY;
@@ -1215,6 +1374,8 @@ test.skipIf(OPT_IN !== "1")(
       const result = await env.DB.query("SELECT value FROM item ORDER BY rowid");
       return Response.json(result.rows);
     }
+    if (path === "/actor-socket" || path === "/actor-socket-welcome")
+      return env.ACTOR.get(env.ACTOR.idFromName("room")).fetch(request);
     if (path === "/actor-write" || path === "/actor-read" || path === "/actor-sql" || path === "/actor-workflow-create" || path === "/actor-workflow-status") {
       const actor = env.ACTOR.get(env.ACTOR.idFromName("room"));
       const actorPath = path === "/actor-write" ? "write" : path === "/actor-sql" ? "sql" : path === "/actor-workflow-create" ? "workflow-create" : path === "/actor-workflow-status" ? "workflow-status" : "read";
@@ -1239,6 +1400,14 @@ export class CounterActor {
   }
   async fetch(request) {
     const path = new URL(request.url).pathname;
+    if (path === "/actor-socket" || path === "/actor-socket-welcome") {
+      const accepted = await this.context.sockets.accept(request);
+      accepted.response.headers.set("x-actor-upgrade-marker", "native-header");
+      accepted.response.headers.append("set-cookie", "actor-first=1; Path=/");
+      accepted.response.headers.append("set-cookie", "actor-second=2; Path=/");
+      if (path === "/actor-socket-welcome") await accepted.socket.send("actor:welcome");
+      return accepted.response;
+    }
     if (path === "/sql") {
       const result = await this.env.DB.query("SELECT value FROM item ORDER BY rowid");
       return Response.json(result.rows);
@@ -1261,7 +1430,10 @@ export class CounterActor {
     return Response.json({value: Number(result.rows[0]?.value ?? 0)});
   }
   async alarm() {}
-  async socketMessage() {}
+  async socketMessage(socket, data) {
+    if (String(data) === "finish") await socket.close(4000, "done");
+    else await socket.send("actor:" + String(data));
+  }
   async socketClose() {}
   async socketError() {}
 }
@@ -1555,6 +1727,18 @@ export class SqlWorkflow {
         status: 200,
         body: '{"value":1}',
       });
+      expect(await nativeActorWssExchange(hostname, certificateFile, "before-restart")).toBe(
+        "actor:before-restart",
+      );
+      expect(
+        await nativeActorWssExchange(hostname, certificateFile, "finish", "welcome-close"),
+      ).toEqual({ welcome: "actor:welcome", closeCode: 4000, closeReason: "done" });
+      const legalMessage = "x".repeat(2 * 1024 * 1024);
+      const legalEcho = await nativeActorWssExchange(hostname, certificateFile, legalMessage);
+      expect({
+        bytes: typeof legalEcho === "string" ? Buffer.byteLength(legalEcho) : 0,
+        matches: legalEcho === `actor:${legalMessage}`,
+      }).toEqual({ bytes: 2 * 1024 * 1024 + 6, matches: true });
       expect(await nativeHttps(hostname, "/actor-sql")).toEqual({
         status: 200,
         body: '[{"value":"once"}]',
@@ -1593,6 +1777,13 @@ export class SqlWorkflow {
         status: 200,
         body: "normal-v2:/after-crash",
       });
+      expect(await nativeHttps(hostname, "/actor-read")).toEqual({
+        status: 200,
+        body: '{"value":1}',
+      });
+      expect(await nativeActorWssExchange(hostname, certificateFile, "after-restart")).toBe(
+        "actor:after-restart",
+      );
       expect(await nativeHttps(hostname, "/actor-read")).toEqual({
         status: 200,
         body: '{"value":1}',

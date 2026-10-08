@@ -12,6 +12,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { openSelfhostV2WorkerEndpointUpstreamWebSocket } from "./selfhost-v2-worker-endpoint-upstream-websocket.ts";
 import { spawnWorkerdWithParentDeath, workerPortOwnership } from "./workerd-linux-process.ts";
 import { createWorkerdSupervisor, type WorkerdProcess } from "./workerd-supervisor.ts";
 
@@ -22,6 +23,18 @@ const RECEIPT_TEMP_PREFIX = ".retirement-";
 const DEPLOYMENT_MANIFEST_NAME = "deployment.json";
 const DEPLOYMENT_PUBLICATIONS_NAME = ".publications";
 const WORKER_POINTER_NAME = "takoserver-site.json";
+
+/** The private upstream socket has immediate termination in addition to DOM close. */
+export type WorkerdBridgeMessage = string | ArrayBuffer | Uint8Array;
+export type WorkerdNativeWebSocket = WebSocket & {
+  terminate(): void;
+  readonly handshakeHeaders: readonly (readonly [string, string])[];
+  /** Stage native messages before the public upgrade, then drain in order. */
+  forwardMessages(send: (value: WorkerdBridgeMessage) => void): void;
+  /** A close can overtake the public upgrade after the native 101 opens. */
+  getTerminalClose(): CloseEvent | null;
+};
+export const WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT = 33_554_432;
 
 export class WorkerdWorkerExecutionGroupError extends Error {
   readonly code:
@@ -62,6 +75,8 @@ export interface WorkerdWorkerExecutionGroup {
   sealConfiguration(): void;
   isReady(): boolean;
   fetch(request: Request): Promise<Response>;
+  /** One original-client upgrade against this exact native incarnation. */
+  connectWebSocket(request: Request, signal: AbortSignal): Promise<WorkerdNativeWebSocket>;
   /** Stop a failed recovery child without writing retirement or deleting custody. */
   stopAfterFailedRecovery(): Promise<void>;
   /** Stop the owned child and listener, retaining the exact execution copies for reopen. */
@@ -399,6 +414,46 @@ function makeGroup(input: {
     });
   };
 
+  const connectWebSocket = async (
+    request: Request,
+    signal: AbortSignal,
+  ): Promise<WorkerdNativeWebSocket> => {
+    if (state !== "serving" || retirementStarted || supervisor?.isReady() !== true)
+      fail("not_serving");
+    const owner = supervisor;
+    if (owner === null) throw new WorkerdWorkerExecutionGroupError("not_serving");
+    try {
+      await owner.ensure(configurationPath);
+    } catch {
+      if (admissionClosed()) fail("admission_closed");
+      state = "uncertain";
+      fail("not_serving");
+    }
+    if (admissionClosed() || state !== "serving" || supervisor !== owner || !owner.isReady())
+      fail("admission_closed");
+    const incoming = new URL(request.url);
+    if (incoming.protocol !== "https:" || request.method !== "GET" || signal.aborted)
+      fail("admission_closed");
+    const target = `ws://127.0.0.1:${options.listenerPort}${incoming.pathname}${incoming.search}`;
+    const headers = new Headers(request.headers);
+    // Bun mints its own handshake. A public client cannot choose a private
+    // transport key, connection framing, or service-binding dispatch metadata.
+    for (const name of [...headers.keys()]) {
+      if (/^sec-websocket-/iu.test(name)) headers.delete(name);
+    }
+    headers.delete("connection");
+    headers.delete("upgrade");
+    headers.delete("content-length");
+    headers.set("host", incoming.host);
+    const protocol = request.headers.get("sec-websocket-protocol");
+    return await openSelfhostV2WorkerEndpointUpstreamWebSocket({
+      url: target,
+      headers,
+      protocols: protocol ? protocol.split(",").map((part) => part.trim()) : [],
+      signal,
+    });
+  };
+
   const reloadConfiguration = (): Promise<void> => {
     if (configurationSealed || retirementStarted || state === "retired")
       return Promise.reject(new WorkerdWorkerExecutionGroupError("admission_closed"));
@@ -528,6 +583,7 @@ function makeGroup(input: {
     isReady() {
       return state === "serving" && supervisor?.isReady() === true;
     },
+    connectWebSocket,
     async stopAfterFailedRecovery() {
       if (options.recoverExisting !== true || retirementStarted) {
         throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");

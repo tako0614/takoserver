@@ -15,6 +15,7 @@ import type {
   V2WorkerCurrentServingResolution,
   V2WorkerPublicationResolution,
 } from "./takoform-v2/worker-publication-state.ts";
+import type { WorkerdNativeWebSocket } from "./workerd-worker-execution-group.ts";
 import type { WorkerdWorkerRuntimeOwner } from "./workerd-worker-runtime-owner.ts";
 
 const ROUTE_COLUMNS = `r.uid, r.principal, r.form_url, r.space, r.name, r.backend_id,
@@ -61,7 +62,7 @@ type PublicationState = {
 
 type RuntimeOwner = Pick<
   WorkerdWorkerRuntimeOwner,
-  "workerResourceUid" | "observeServing" | "observeRetirement" | "fetch"
+  "workerResourceUid" | "observeServing" | "observeRetirement" | "fetch" | "connectWebSocket"
 >;
 
 type ReadyPublication = Extract<V2WorkerPublicationResolution, { kind: "ready" }>;
@@ -357,6 +358,14 @@ export function createSelfhostV2WorkerEndpointFrontend(options: {
 }): {
   /** `null` is reserved for unrelated authority; reserved misses are terminal. */
   fetch(request: Request): Promise<Response | null>;
+  /** Original-client upgrade uses precisely the same route/Serving proof as fetch. */
+  upgrade(
+    request: Request,
+  ): Promise<
+    | { readonly kind: "unrelated" }
+    | { readonly kind: "denied"; readonly response: Response }
+    | { readonly kind: "accepted"; readonly socket: WorkerdNativeWebSocket }
+  >;
   /** True only when the same settled predicate used by fetch denies this address. */
   routeDenies(input: V2WorkerEndpointAddress): Promise<boolean>;
   observeTls(
@@ -731,88 +740,121 @@ export function createSelfhostV2WorkerEndpointFrontend(options: {
     return false;
   }
 
+  async function qualifiedRequest<T>(
+    request: Request,
+    dispatch: (owner: RuntimeOwner) => Promise<T>,
+    discard: (value: T) => Promise<void>,
+  ): Promise<
+    | { readonly kind: "unrelated" }
+    | { readonly kind: "denied"; readonly response: Response }
+    | { readonly kind: "accepted"; readonly value: T }
+  > {
+    const hostname = requestHostname(request);
+    if (hostname === null) {
+      let urlHostname: string | null = null;
+      try {
+        urlHostname = new URL(request.url).hostname.toLowerCase();
+      } catch {
+        // A malformed non-reserved request is left to the ordinary router.
+      }
+      const headerHostname = authorityHostname(request.headers.get("host"));
+      return (urlHostname && isReserved(urlHostname)) ||
+        (headerHostname && isReserved(headerHostname))
+        ? { kind: "denied", response: noStore(421) }
+        : { kind: "unrelated" };
+    }
+    if (!isReserved(hostname)) return { kind: "unrelated" };
+    const candidates = await rowsForHostname(hostname);
+    if (!candidates) return { kind: "denied", response: noStore(503) };
+    if (candidates.length === 0) return { kind: "denied", response: noStore(404) };
+    const [candidate] = candidates;
+    if (!candidate || !activeRoute(candidate)) return { kind: "denied", response: noStore(503) };
+    const current = await activePublication(candidate);
+    if (!current) return { kind: "denied", response: noStore(503) };
+    let serving: Awaited<ReturnType<RuntimeOwner["observeServing"]>>;
+    try {
+      serving = await current.owner.observeServing({
+        workerResourceUid: candidate.workerUid,
+        targetKey: options.targetKey,
+      });
+    } catch {
+      return { kind: "denied", response: noStore(503) };
+    }
+    if (
+      !matchesServing(
+        serving,
+        exactIdentity(current.serving),
+        candidate.workerUid,
+        options.targetKey,
+        current.serving.sourceOperationId,
+      ) ||
+      !(await current.resolution.stillCurrent())
+    ) {
+      return { kind: "denied", response: noStore(503) };
+    }
+    let value: T;
+    try {
+      value = await dispatch(current.owner);
+    } catch {
+      return { kind: "denied", response: noStore(503) };
+    }
+    let afterServing: Awaited<ReturnType<RuntimeOwner["observeServing"]>>;
+    const afterRoute = await rowsForHostname(hostname);
+    try {
+      afterServing = await current.owner.observeServing({
+        workerResourceUid: candidate.workerUid,
+        targetKey: options.targetKey,
+      });
+    } catch {
+      await discard(value);
+      return { kind: "denied", response: noStore(503) };
+    }
+    const afterCandidate = afterRoute?.[0];
+    if (
+      afterRoute?.length !== 1 ||
+      !afterCandidate ||
+      afterCandidate.row.uid !== candidate.row.uid ||
+      !activeRoute(afterCandidate) ||
+      !matchesServing(
+        afterServing,
+        exactIdentity(current.serving),
+        candidate.workerUid,
+        options.targetKey,
+        current.serving.sourceOperationId,
+      ) ||
+      !(await current.resolution.stillCurrent())
+    ) {
+      await discard(value);
+      return { kind: "denied", response: noStore(503) };
+    }
+    return { kind: "accepted", value };
+  }
+
   return {
     routeDenies,
     async fetch(request) {
-      const hostname = requestHostname(request);
-      if (hostname === null) {
-        let urlHostname: string | null = null;
-        try {
-          urlHostname = new URL(request.url).hostname.toLowerCase();
-        } catch {
-          // A malformed non-reserved request is left to the ordinary router.
-        }
-        const headerHostname = authorityHostname(request.headers.get("host"));
-        return (urlHostname && isReserved(urlHostname)) ||
-          (headerHostname && isReserved(headerHostname))
-          ? noStore(421)
+      const result = await qualifiedRequest(
+        request,
+        (owner) => owner.fetch(request),
+        async (response) => {
+          await response.body?.cancel().catch(() => undefined);
+        },
+      );
+      return result.kind === "accepted"
+        ? result.value
+        : result.kind === "denied"
+          ? result.response
           : null;
-      }
-      if (!isReserved(hostname)) return null;
-      const candidates = await rowsForHostname(hostname);
-      if (!candidates) return noStore(503);
-      if (candidates.length === 0) return noStore(404);
-      const [candidate] = candidates;
-      if (!candidate || !activeRoute(candidate)) return noStore(503);
-      const current = await activePublication(candidate);
-      if (!current) return noStore(503);
-      let serving: Awaited<ReturnType<RuntimeOwner["observeServing"]>>;
-      try {
-        serving = await current.owner.observeServing({
-          workerResourceUid: candidate.workerUid,
-          targetKey: options.targetKey,
-        });
-      } catch {
-        return noStore(503);
-      }
-      if (
-        !matchesServing(
-          serving,
-          exactIdentity(current.serving),
-          candidate.workerUid,
-          options.targetKey,
-          current.serving.sourceOperationId,
-        ) ||
-        !(await current.resolution.stillCurrent())
-      ) {
-        return noStore(503);
-      }
-      let response: Response;
-      try {
-        response = await current.owner.fetch(request);
-      } catch {
-        return noStore(503);
-      }
-      let afterServing: Awaited<ReturnType<RuntimeOwner["observeServing"]>>;
-      const afterRoute = await rowsForHostname(hostname);
-      try {
-        afterServing = await current.owner.observeServing({
-          workerResourceUid: candidate.workerUid,
-          targetKey: options.targetKey,
-        });
-      } catch {
-        await response.body?.cancel().catch(() => undefined);
-        return noStore(503);
-      }
-      const afterCandidate = afterRoute?.[0];
-      if (
-        afterRoute?.length !== 1 ||
-        !afterCandidate ||
-        afterCandidate.row.uid !== candidate.row.uid ||
-        !activeRoute(afterCandidate) ||
-        !matchesServing(
-          afterServing,
-          exactIdentity(current.serving),
-          candidate.workerUid,
-          options.targetKey,
-          current.serving.sourceOperationId,
-        ) ||
-        !(await current.resolution.stillCurrent())
-      ) {
-        await response.body?.cancel().catch(() => undefined);
-        return noStore(503);
-      }
-      return response;
+    },
+    async upgrade(request) {
+      const result = await qualifiedRequest(
+        request,
+        (owner) => owner.connectWebSocket(request),
+        async (socket) => {
+          socket.terminate();
+        },
+      );
+      return result.kind === "accepted" ? { kind: "accepted", socket: result.value } : result;
     },
     observeTls,
     observeRouteAbsent,

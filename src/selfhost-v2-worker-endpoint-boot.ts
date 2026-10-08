@@ -112,6 +112,12 @@ export async function createSelfhostV2WorkerEndpointBoot(
       if (closed || !frontend) return new Response(null, { status: 503 });
       return await frontend.fetch(request);
     },
+    upgrade: async (request) => {
+      if (closed || !frontend) {
+        return { kind: "denied", response: new Response(null, { status: 503 }) };
+      }
+      return await frontend.upgrade(request);
+    },
     routeDenies: async (address) => {
       if (closed || !frontend) return false;
       return await frontend.routeDenies(address);

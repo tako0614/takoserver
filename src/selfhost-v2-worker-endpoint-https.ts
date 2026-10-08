@@ -6,6 +6,11 @@ import type {
   V2EndpointRouteAbsenceObservation,
   V2EndpointTlsObservation,
 } from "./takoform-v2/worker-endpoint-backend.ts";
+import {
+  WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT,
+  type WorkerdBridgeMessage,
+  type WorkerdNativeWebSocket,
+} from "./workerd-worker-execution-group.ts";
 
 const NO_STORE_HEADERS = { "cache-control": "no-store" };
 const HTTPS_PORT = 443;
@@ -19,7 +24,61 @@ export interface SelfhostV2WorkerEndpointHttpsConfiguration {
 
 interface ListenerServer {
   readonly port: number | undefined;
+  upgrade?(request: Request, options: { data: SocketBridgeData; headers?: HeadersInit }): boolean;
   stop(closeActiveConnections?: boolean): void | Promise<void>;
+}
+
+interface SocketBridgeData {
+  readonly upstream: WorkerdNativeWebSocket;
+  backpressuredBytes: number;
+  readonly clientClosed: () => void;
+  readonly upstreamClosed: () => void;
+  readonly force: () => void;
+}
+
+function forwardableClose(event: {
+  code?: number;
+  reason?: string;
+}): { code: number; reason: string } | null {
+  const code = event.code;
+  const reason = event.reason ?? "";
+  if (
+    typeof code !== "number" ||
+    !(
+      code === 1000 ||
+      code === 1001 ||
+      code === 1009 ||
+      code === 1011 ||
+      code === 1012 ||
+      code === 1013 ||
+      (code >= 3000 && code <= 4999)
+    ) ||
+    Buffer.byteLength(reason) > 123
+  )
+    return null;
+  return { code, reason };
+}
+
+function isUpgradeAttempt(request: Request): boolean {
+  return request.headers.has("upgrade") || request.headers.has("sec-websocket-key");
+}
+
+function validUpgrade(request: Request): boolean {
+  const headers = request.headers;
+  const key = headers.get("sec-websocket-key");
+  return (
+    request.method === "GET" &&
+    headers.get("upgrade")?.toLowerCase() === "websocket" &&
+    headers
+      .get("connection")
+      ?.toLowerCase()
+      .split(",")
+      .some((token) => token.trim() === "upgrade") === true &&
+    headers.get("sec-websocket-version") === "13" &&
+    key !== null &&
+    /^[A-Za-z0-9+/]{22}==$/u.test(key) &&
+    Buffer.from(key, "base64").length === 16
+  );
 }
 
 export interface SelfhostV2WorkerEndpointHttpsFactories {
@@ -27,7 +86,8 @@ export interface SelfhostV2WorkerEndpointHttpsFactories {
     readonly port: 443;
     readonly hostname: "0.0.0.0";
     readonly tls: { readonly cert: string; readonly key: string };
-    readonly fetch: (request: Request) => Response | Promise<Response>;
+    readonly fetch: (request: Request, server?: ListenerServer) => Response | Promise<Response>;
+    readonly websocket: Bun.WebSocketHandler<SocketBridgeData>;
   }) => ListenerServer;
   readonly proveSni: (input: {
     readonly host: string;
@@ -190,6 +250,13 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
   readonly certificateChain: string;
   readonly privateKey: string;
   readonly fetch: (request: Request) => Promise<Response | null>;
+  readonly upgrade?: (
+    request: Request,
+  ) => Promise<
+    | { readonly kind: "unrelated" }
+    | { readonly kind: "denied"; readonly response: Response }
+    | { readonly kind: "accepted"; readonly socket: WorkerdNativeWebSocket }
+  >;
   /** Same stateless SQL decision used by the frontend request dispatcher. */
   readonly routeDenies: (address: WorkerEndpointAddress) => Promise<boolean>;
   readonly factories?: SelfhostV2WorkerEndpointHttpsFactories;
@@ -204,6 +271,7 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
   let closed = false;
   let server: ListenerServer;
   const inFlightByHostname = new Map<string, number>();
+  const liveSockets = new Set<Bun.ServerWebSocket<SocketBridgeData>>();
   let inFlightTotal = 0;
   let drainedWaiters: (() => void)[] = [];
   const listenerCurrent = () => active && !closed && server.port === HTTPS_PORT;
@@ -287,12 +355,171 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
     port: HTTPS_PORT,
     hostname: "0.0.0.0",
     tls: { cert: input.certificateChain, key: input.privateKey },
-    fetch: async (request) => {
+    websocket: {
+      maxPayloadLength: WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT,
+      backpressureLimit: WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT,
+      closeOnBackpressureLimit: false,
+      open(ws) {
+        liveSockets.add(ws);
+        const upstream = ws.data.upstream;
+        const forward = (value: WorkerdBridgeMessage) => {
+          if (ws.readyState !== 1) return;
+          const size = typeof value === "string" ? Buffer.byteLength(value) : value.byteLength;
+          if (
+            size > WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT ||
+            ws.data.backpressuredBytes + size > WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT
+          ) {
+            ws.close(1013, "bridge overloaded");
+            ws.data.force();
+            return;
+          }
+          const accepted = ws.send(value);
+          if (accepted === 0) {
+            ws.terminate();
+            ws.data.force();
+          } else if (accepted === -1) {
+            ws.data.backpressuredBytes += size;
+          }
+        };
+        let upstreamTerminalDelivered = false;
+        const upstreamDidClose = (event: CloseEvent) => {
+          if (upstreamTerminalDelivered) return;
+          upstreamTerminalDelivered = true;
+          ws.data.upstreamClosed();
+          const close = forwardableClose(event) ?? {
+            code: 1001,
+            reason: "upstream closed",
+          };
+          if (ws.readyState === 1) ws.close(close.code, close.reason);
+          else ws.terminate();
+          // Upstream EOF starts the public close handshake; it does not by
+          // itself prove the original client's socket has closed.
+          setTimeout(() => {
+            if (ws.readyState !== 3) {
+              ws.terminate();
+              ws.data.force();
+            }
+          }, 1_000);
+        };
+        upstream.addEventListener("close", (event) => upstreamDidClose(event as CloseEvent), {
+          once: true,
+        });
+        upstream.addEventListener(
+          "error",
+          () => {
+            ws.terminate();
+            ws.data.force();
+          },
+          { once: true },
+        );
+        try {
+          upstream.forwardMessages(forward);
+        } catch {
+          ws.terminate();
+          ws.data.force();
+        }
+        const terminal = upstream.getTerminalClose();
+        if (terminal) upstreamDidClose(terminal);
+        else if (upstream.readyState === WebSocket.CLOSED) {
+          ws.terminate();
+          ws.data.force();
+        }
+      },
+      message(ws, value) {
+        const upstream = ws.data.upstream;
+        const size = typeof value === "string" ? Buffer.byteLength(value) : value.byteLength;
+        if (
+          size > WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT ||
+          upstream.readyState !== WebSocket.OPEN ||
+          upstream.bufferedAmount + size > WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT
+        ) {
+          ws.close(size > WORKER_ENDPOINT_ACTOR_SOCKET_LIMIT ? 1009 : 1013);
+          ws.data.force();
+          return;
+        }
+        upstream.send(value);
+      },
+      drain(ws) {
+        ws.data.backpressuredBytes = 0;
+      },
+      close(ws, code, reason) {
+        liveSockets.delete(ws);
+        ws.data.clientClosed();
+        const upstream = ws.data.upstream;
+        if (upstream.readyState === WebSocket.OPEN) {
+          const close = forwardableClose({ code, reason });
+          if (close) upstream.close(close.code, close.reason);
+          else upstream.terminate();
+          setTimeout(() => {
+            if (upstream.readyState !== WebSocket.CLOSED) upstream.terminate();
+          }, 1_000);
+        } else if (upstream.readyState !== WebSocket.CLOSED) {
+          upstream.terminate();
+        }
+      },
+    },
+    fetch: async (request, upgradeServer) => {
       if (!listenerCurrent()) return new Response(null, { status: 503, headers: NO_STORE_HEADERS });
       const hostname = exactHost(request, suffix);
       if (!hostname) return new Response(null, { status: 404, headers: NO_STORE_HEADERS });
       beginRequest(hostname);
       try {
+        if (isUpgradeAttempt(request)) {
+          if (!validUpgrade(request) || !input.upgrade || !upgradeServer?.upgrade) {
+            finishRequest(hostname);
+            return new Response(null, { status: 400, headers: NO_STORE_HEADERS });
+          }
+          const result = await input.upgrade(request);
+          if (result.kind !== "accepted") {
+            finishRequest(hostname);
+            return result.kind === "denied"
+              ? result.response
+              : new Response(null, { status: 404, headers: NO_STORE_HEADERS });
+          }
+          const upstream = result.socket;
+          let finished = false;
+          let clientClosed = false;
+          let upstreamClosed = false;
+          const finish = () => {
+            if (finished) return;
+            finished = true;
+            finishRequest(hostname);
+          };
+          const data: SocketBridgeData = {
+            upstream,
+            backpressuredBytes: 0,
+            clientClosed() {
+              clientClosed = true;
+              if (upstreamClosed) finish();
+            },
+            upstreamClosed() {
+              upstreamClosed = true;
+              if (clientClosed) finish();
+            },
+            force() {
+              upstream.terminate();
+              finish();
+            },
+          };
+          const headers: [string, string][] = upstream.handshakeHeaders.map(([name, value]) => [
+            name,
+            value,
+          ]);
+          if (upstream.protocol) headers.push(["sec-websocket-protocol", upstream.protocol]);
+          if (
+            !listenerCurrent() ||
+            !upgradeServer.upgrade(request, {
+              data,
+              ...(headers.length > 0 ? { headers } : {}),
+            })
+          ) {
+            upstream.terminate();
+            finish();
+            return new Response(null, { status: 503, headers: NO_STORE_HEADERS });
+          }
+          // Bun's upgrade contract consumes the HTTP response itself.
+          return undefined as never;
+        }
         const response = await input.fetch(request);
         if (!response) {
           finishRequest(hostname);
@@ -359,6 +586,12 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
   let closeReject: ((error: unknown) => void) | undefined;
   let closeSettled = false;
   const stop = (force: boolean) => {
+    if (force) {
+      for (const socket of liveSockets) {
+        socket.terminate();
+        socket.data.force();
+      }
+    }
     try {
       return Promise.resolve(server.stop(force));
     } catch (error) {

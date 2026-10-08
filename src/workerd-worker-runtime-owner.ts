@@ -119,6 +119,7 @@ import {
   openWorkerdWorkerExecutionGroup,
   releaseRetiredWorkerdWorkerExecutionCopies,
   verifyRetiredWorkerdWorkerExecutionCopies,
+  type WorkerdNativeWebSocket,
   type WorkerdWorkerExecutionGroup,
   type WorkerdWorkerRetirementReceipt,
 } from "./workerd-worker-execution-group.ts";
@@ -223,6 +224,7 @@ interface ActiveInvocation {
   readonly finish: () => void;
   bodyController?: ReadableStreamDefaultController<Uint8Array>;
   reader?: ReadableStreamDefaultReader<Uint8Array>;
+  cancelSocket?: () => void;
   finished: boolean;
 }
 
@@ -423,6 +425,8 @@ export interface WorkerdWorkerRuntimeOwner {
   >;
   /** Route a Host-accepted request to the exact active incarnation. */
   fetch(request: Request): Promise<Response>;
+  /** Original-client-only upgrade; retains the incarnation until socket EOF. */
+  connectWebSocket(request: Request): Promise<WorkerdNativeWebSocket>;
   /** Begin one logical ServiceBinding dispatch without waiting for its body. */
   dispatchServiceBinding(
     request: Request,
@@ -2800,6 +2804,7 @@ export async function openWorkerdWorkerRuntimeOwner(
   const cancelInvocations = async (incarnation: IncarnationHandle): Promise<void> => {
     for (const invocation of [...incarnation.invocations]) {
       invocation.abort.abort(new WorkerdWorkerRuntimeOwnerError("admission_closed"));
+      invocation.cancelSocket?.();
       try {
         invocation.bodyController?.error(new WorkerdWorkerRuntimeOwnerError("admission_closed"));
       } catch {
@@ -5165,6 +5170,58 @@ export async function openWorkerdWorkerRuntimeOwner(
     return await dispatched.response;
   };
 
+  const connectWebSocket: WorkerdWorkerRuntimeOwner["connectWebSocket"] = async (request) => {
+    if (closed || suspending || admissionClosedBy !== null || !active)
+      throw new WorkerdWorkerRuntimeOwnerError("admission_closed");
+    const incarnation = active;
+    let doneResolve!: () => void;
+    const done = new Promise<void>((resolve) => {
+      doneResolve = resolve;
+    });
+    const invocation: ActiveInvocation = {
+      abort: new AbortController(),
+      done,
+      finish() {
+        finishInvocation(incarnation, invocation);
+        doneResolve();
+      },
+      finished: false,
+    };
+    incarnation.invocations.add(invocation);
+    try {
+      const headers = new Headers(request.headers);
+      headers.delete(V2_SERVICE_BINDING_ORIGINAL_URL_HEADER);
+      headers.delete(V2_SERVICE_BINDING_DISPATCH_TOKEN_HEADER);
+      const forwarded = new Request(request.url, {
+        method: "GET",
+        headers,
+        signal: request.signal,
+      });
+      const socket = await incarnation.group.connectWebSocket(
+        forwarded,
+        AbortSignal.any([request.signal, invocation.abort.signal]),
+      );
+      invocation.cancelSocket = () => socket.terminate();
+      if (invocation.abort.signal.aborted || invocation.finished || closed || suspending) {
+        socket.terminate();
+        throw new WorkerdWorkerRuntimeOwnerError("admission_closed");
+      }
+      socket.addEventListener("close", () => invocation.finish(), { once: true });
+      socket.addEventListener(
+        "error",
+        () => {
+          socket.terminate();
+          invocation.finish();
+        },
+        { once: true },
+      );
+      return socket;
+    } catch (error) {
+      invocation.finish();
+      throw error;
+    }
+  };
+
   const observeScheduledCapability: WorkerdWorkerRuntimeOwner["observeScheduledCapability"] = (
     input,
   ) =>
@@ -6155,6 +6212,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     observeRetirement,
     fetch: fetchRequest,
     dispatchServiceBinding,
+    connectWebSocket,
     acquireServiceBindingRequest,
     observeScheduledCapability,
     observeQueueServingCapability,

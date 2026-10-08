@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createSelfhostV2WorkerEndpointHttpsListener,
+  type SelfhostV2WorkerEndpointHttpsFactories,
   verifySelfhostV2WorkerEndpointHttpsSni,
 } from "../src/selfhost-v2-worker-endpoint-https.ts";
 import type { V2EndpointTlsObservation } from "../src/takoform-v2/worker-endpoint-backend.ts";
@@ -155,6 +156,140 @@ test("V2 Worker Endpoint HTTPS serves exact suffix hosts and witnesses current l
       ...address,
       ready: false,
     });
+  } finally {
+    await listener.close(true);
+    await fixture.cleanup();
+  }
+});
+
+test("accepted upgrade holds route absence until the original client socket closes", async () => {
+  const fixture = await certificateFixture();
+  let options: Parameters<SelfhostV2WorkerEndpointHttpsFactories["serve"]>[0] | undefined;
+  let bridge: { clientClosed(): void } | undefined;
+  let upgradeHeaders: HeadersInit | undefined;
+  const upstreamSent: (string | Uint8Array)[] = [];
+  let upstreamClose: { code: number | undefined; reason: string | undefined } | undefined;
+  const upstream = new EventTarget();
+  Object.assign(upstream, {
+    readyState: 1,
+    protocol: "",
+    handshakeHeaders: [
+      ["x-actor-upgrade-marker", "native-header"],
+      ["set-cookie", "first=1; Path=/"],
+      ["set-cookie", "second=2; Path=/"],
+    ],
+    bufferedAmount: 0,
+    getTerminalClose() {
+      return null;
+    },
+    forwardMessages(send: (value: string | Uint8Array) => void) {
+      upstream.addEventListener("message", (event) => {
+        send((event as MessageEvent).data);
+      });
+      send("welcome");
+    },
+    send(value: string | Uint8Array) {
+      upstreamSent.push(value);
+    },
+    close(code?: number, reason?: string) {
+      upstreamClose = { code, reason };
+      upstream.dispatchEvent(new CloseEvent("close", { code: code ?? 1000, reason: reason ?? "" }));
+    },
+    terminate() {
+      upstream.dispatchEvent(new Event("close"));
+    },
+  });
+  const server = {
+    port: 443,
+    stop() {},
+    upgrade(_request: Request, upgrade: { data: { clientClosed(): void }; headers?: HeadersInit }) {
+      bridge = upgrade.data;
+      upgradeHeaders = upgrade.headers;
+      return true;
+    },
+  };
+  let upgradeCalls = 0;
+  const listener = await createSelfhostV2WorkerEndpointHttpsListener({
+    configuration: { workerEndpointSuffix: suffix, port: 443 },
+    ...fixture,
+    fetch: async () => {
+      throw new Error("ordinary fetch must not handle an upgrade");
+    },
+    upgrade: async () => {
+      upgradeCalls++;
+      return { kind: "accepted", socket: upstream as never };
+    },
+    routeDenies: async () => true,
+    factories: {
+      serve(value) {
+        options = value;
+        return server;
+      },
+      async proveSni() {},
+    },
+  });
+  try {
+    if (!options) throw new Error("listener options unavailable");
+    expect(options.websocket.maxPayloadLength).toBe(33_554_432);
+    expect(options.websocket.backpressureLimit).toBe(33_554_432);
+    expect(options.websocket.closeOnBackpressureLimit).toBe(false);
+    const request = new Request(`https://${address.hostname}/actor-socket`, {
+      headers: {
+        host: address.hostname,
+        connection: "Upgrade",
+        upgrade: "websocket",
+        "sec-websocket-version": "13",
+        "sec-websocket-key": "MDEyMzQ1Njc4OWFiY2RlZg==",
+      },
+    });
+    const invalid = new Request(request.url, {
+      headers: { host: address.hostname, upgrade: "websocket" },
+    });
+    expect((await options.fetch(invalid, server as never)).status).toBe(400);
+    expect(upgradeCalls).toBe(0);
+    expect(await options.fetch(request, server as never)).toBeUndefined();
+    expect(upgradeHeaders).toEqual([
+      ["x-actor-upgrade-marker", "native-header"],
+      ["set-cookie", "first=1; Path=/"],
+      ["set-cookie", "second=2; Path=/"],
+    ]);
+    expect(upgradeCalls).toBe(1);
+    expect(bridge).toBeDefined();
+    expect((await listener.witness.observeRouteAbsent(address)).absent).toBe(false);
+    const clientSent: (string | ArrayBuffer | Uint8Array)[] = [];
+    let clientClose: { code: number | undefined; reason: string | undefined } | undefined;
+    const client = {
+      data: bridge,
+      readyState: 1,
+      close(code?: number, reason?: string) {
+        clientClose = { code, reason };
+      },
+      terminate() {},
+      send(value: string | ArrayBuffer | Uint8Array) {
+        clientSent.push(value);
+        return -1; // Bun accepted the frame into its bounded backpressure queue.
+      },
+    };
+    options.websocket.open?.(client as never);
+    expect(clientSent).toEqual(["welcome"]);
+    const legalFrame = new Uint8Array(9 * 1024 * 1024);
+    options.websocket.message(client as never, legalFrame as never);
+    expect(upstreamSent).toEqual([legalFrame]);
+    upstream.dispatchEvent(new MessageEvent("message", { data: legalFrame.buffer }));
+    expect(clientSent).toHaveLength(2);
+    expect(clientSent[1]).toBe(legalFrame.buffer);
+    options.websocket.drain?.(client as never);
+    const maximumFrame = new Uint8Array(33_554_432);
+    options.websocket.message(client as never, maximumFrame as never);
+    expect(upstreamSent[1]).toBe(maximumFrame);
+    upstream.dispatchEvent(new MessageEvent("message", { data: maximumFrame.buffer }));
+    expect(clientSent[2]).toBe(maximumFrame.buffer);
+    upstream.dispatchEvent(new CloseEvent("close", { code: 4000, reason: "done" }));
+    expect(clientClose).toEqual({ code: 4000, reason: "done" });
+    expect((await listener.witness.observeRouteAbsent(address)).absent).toBe(false);
+    options.websocket.close?.(client as never, 4001, "client done");
+    expect(upstreamClose).toEqual({ code: 4001, reason: "client done" });
+    expect((await listener.witness.observeRouteAbsent(address)).absent).toBe(true);
   } finally {
     await listener.close(true);
     await fixture.cleanup();
