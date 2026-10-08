@@ -42,6 +42,17 @@ export {
   type QueueWorkerBindingResolution,
 } from "./forms/queue-worker-binding-authority.ts";
 export {
+  parseSQLiteDatabaseSpec,
+  SQLITE_DATABASE_FORM_URL,
+  validateSQLiteDatabaseUpdate,
+} from "./forms/sqlite-database.ts";
+export { createSQLiteDatabaseForm } from "./forms/sqlite-database-backend.ts";
+export type { SQLiteDatabaseNativePort } from "./forms/sqlite-native-store-port.ts";
+export {
+  createSQLiteWorkerBindingAuthority,
+  type SQLiteWorkerBindingClaim,
+} from "./forms/sqlite-worker-binding-authority.ts";
+export {
   referencesForModuleWorker,
   referencesForWorkerDeployment,
   referencesForWorkerEndpoint,
@@ -94,7 +105,16 @@ export {
   type V2WorkerModuleInspector,
 } from "./worker-code-eligibility.ts";
 export {
+  runWorkerCronTriggerTick,
+  type WorkerCronTriggerDelivery,
+  type WorkerCronTriggerDeliveryResult,
+  type WorkerCronTriggerScanContinuation,
+  type WorkerCronTriggerTickResult,
+} from "./worker-cron-trigger-scheduler.ts";
+export {
   createV2WorkerInvocationLifecycle,
+  type V2WorkerCronInvocationClaim,
+  type V2WorkerCronRouteRelease,
   type V2WorkerInvocationAdmission,
   type V2WorkerInvocationCustody,
   type V2WorkerInvocationHandle,

@@ -35,8 +35,9 @@ async function fixture(
   const path = join(directory, "db.sqlite");
   const db = new Database(path);
   if (legacyInvocationSchema) {
-    for (const migration of MIGRATIONS.filter(({ name }) => !name.startsWith("0086_")))
-      db.exec(migration.sql);
+    const forwardIndex = MIGRATIONS.findIndex(({ name }) => name.startsWith("0086_"));
+    if (forwardIndex < 0) throw new Error("missing 0086 migration");
+    for (const migration of MIGRATIONS.slice(0, forwardIndex)) db.exec(migration.sql);
   } else migrateSqlite(db);
   const sql = createSqliteSql(db);
   const now = () => new Date();

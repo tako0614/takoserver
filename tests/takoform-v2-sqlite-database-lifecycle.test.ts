@@ -23,7 +23,10 @@ import {
   parseSQLiteDatabaseSpec,
   SQLITE_DATABASE_FORM_URL,
 } from "../src/takoform-v2/forms/sqlite-database.ts";
-import { createSQLiteDatabaseForm } from "../src/takoform-v2/forms/sqlite-database-backend.ts";
+import {
+  createSQLiteDatabaseForm,
+  SQLITE_DATABASE_BACKEND_ID,
+} from "../src/takoform-v2/forms/sqlite-database-backend.ts";
 
 const TARGET = "selfhost-sqlite-target-1";
 const CREATE_KEY = "sqlite-create-key-0000000001";
@@ -78,6 +81,37 @@ test("published SQLiteDatabase spec accepts only an empty object", () => {
   expect(parseSQLiteDatabaseSpec({})).toEqual({});
   for (const input of [null, [], { engine: "sqlite" }, { schema: null }]) {
     expect(() => parseSQLiteDatabaseSpec(input)).toThrow();
+  }
+});
+
+test("SQLiteDatabase Form keeps Selfhost backend identity unless an explicit valid operator ID is supplied", () => {
+  const store = {
+    targetKey: TARGET,
+    async ensureCreated() {
+      return "present" as const;
+    },
+    async inspect() {
+      return "present" as const;
+    },
+    async ensureDeleted() {
+      return "absent" as const;
+    },
+  };
+  expect(createSQLiteDatabaseForm({ store }).backend.id).toBe(SQLITE_DATABASE_BACKEND_ID);
+  expect(
+    createSQLiteDatabaseForm({ store, backendId: "wfp-v2-sqlite-database-native-v1" }).backend.id,
+  ).toBe("wfp-v2-sqlite-database-native-v1");
+  for (const backendId of [
+    "",
+    " ",
+    " leading",
+    "trailing ",
+    "bad\nline",
+    "bad\0nul",
+    "x".repeat(256),
+    7,
+  ]) {
+    expect(() => createSQLiteDatabaseForm({ store, backendId: backendId as string })).toThrow();
   }
 });
 

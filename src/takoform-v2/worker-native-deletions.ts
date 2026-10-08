@@ -180,7 +180,7 @@ export function createV2NativeDeletionCustody(options: {
     return kind === null
       ? null
       : {
-          unsafe: unsafePredicate(kind === "service"),
+          unsafe: unsafePredicate(kind !== "endpoint"),
           ready: v2WorkerInvocationSchemaReady(kind),
         };
   }

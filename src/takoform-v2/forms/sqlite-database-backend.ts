@@ -14,12 +14,19 @@ export const SQLITE_DATABASE_BACKEND_ID = "selfhost-v2-sqlite-database-native-v1
  * authorized native plane; schema changes are SQLiteMigrationApplication's.
  */
 export function createSQLiteDatabaseForm(options: {
+  /** Operator-selected immutable backend identity; never request-controlled. */
+  readonly backendId?: string;
   readonly store: Pick<
     SQLiteDatabaseNativePort,
     "targetKey" | "ensureCreated" | "inspect" | "ensureDeleted"
   >;
 }): V2Form {
   if (!options.store?.targetKey) throw new TypeError("SQLiteDatabase store is required");
+  const backendId =
+    options.backendId === undefined ? SQLITE_DATABASE_BACKEND_ID : options.backendId;
+  if (typeof backendId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/u.test(backendId)) {
+    throw new TypeError("SQLiteDatabase backendId is invalid");
+  }
 
   async function apply(input: V2Execution): Promise<V2BackendResult> {
     if (input.form !== SQLITE_DATABASE_FORM_URL || input.targetKey !== options.store.targetKey) {
@@ -88,7 +95,7 @@ export function createSQLiteDatabaseForm(options: {
     },
     rejectDeleteWhileReferenced: true,
     backend: {
-      id: SQLITE_DATABASE_BACKEND_ID,
+      id: backendId,
       targetKey: options.store.targetKey,
       execute: apply,
       reconcile: apply,
