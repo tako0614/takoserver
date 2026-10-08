@@ -381,9 +381,43 @@ export function createV2WorkerInvocationLifecycle(options: {
         )
       )
         return false;
+      // 0086 is source-only for protected D1 until an owning apply wave is
+      // authorized. Continue exact Endpoint retirement on an 0084/0085 DB;
+      // never offer this legacy path to a Service or a partial schema.
+      let columns: Set<string>;
+      try {
+        columns = new Set(
+          (await sql.query("PRAGMA table_info(tf_v2_worker_invocations)"))
+            .map((row) => row.name)
+            .filter((name): name is string => typeof name === "string"),
+        );
+      } catch {
+        return false;
+      }
+      const serviceSchema = [
+        "ingress_kind",
+        "service_caller_worker_uid",
+        "service_caller_version_uid",
+        "service_caller_version_generation",
+        "service_caller_version_operation_id",
+        "service_binding_name",
+        "service_caller_execution_ref",
+      ].every((name) => columns.has(name));
+      const legacyEndpointSchema =
+        ![...columns].some((name) => name.startsWith("service_") || name === "ingress_kind") &&
+        [
+          "endpoint_uid",
+          "endpoint_generation",
+          "no_native_dispatch_at_ms",
+          "retired_at_ms",
+          "retirement_receipt_digest",
+        ].every((name) => columns.has(name));
+      if (!serviceSchema && !(legacyEndpointSchema && expected.ingress.kind === "endpoint"))
+        return false;
       try {
         const result = await sql.run(
-          `UPDATE tf_v2_worker_invocations
+          serviceSchema
+            ? `UPDATE tf_v2_worker_invocations
            SET retired_at_ms = max(?, send_authorized_at_ms),
                retirement_receipt_digest = ?
            WHERE invocation_id = ? AND custody_token = ?
@@ -397,36 +431,74 @@ export function createV2WorkerInvocationLifecycle(options: {
              AND version_uid = ? AND version_generation = ? AND version_operation_id = ?
              AND native_identity = ? AND closure_digest = ? AND confirmed_receipt = ?
              AND phase = 'send_authorized' AND retired_at_ms IS NULL
+             AND retirement_receipt_digest IS NULL AND no_native_dispatch_at_ms IS NULL`
+            : `UPDATE tf_v2_worker_invocations
+           SET retired_at_ms = max(?, send_authorized_at_ms),
+               retirement_receipt_digest = ?
+           WHERE invocation_id = ? AND custody_token = ?
+             AND backend_id = ? AND target_key = ? AND principal = ? AND space = ?
+             AND worker_uid = ? AND deployment_uid = ? AND deployment_generation = ?
+             AND source_operation_id = ? AND endpoint_uid = ? AND endpoint_generation = ?
+             AND version_uid = ? AND version_generation = ? AND version_operation_id = ?
+             AND native_identity = ? AND closure_digest = ? AND confirmed_receipt = ?
+             AND phase = 'send_authorized' AND retired_at_ms IS NULL
              AND retirement_receipt_digest IS NULL AND no_native_dispatch_at_ms IS NULL`,
-          [
-            instant(),
-            receiptDigest,
-            handle.invocationId,
-            handle.custodyToken,
-            expected.backendId,
-            expected.targetKey,
-            expected.principal,
-            expected.space,
-            expected.workerUid,
-            expected.deploymentUid,
-            expected.deploymentGeneration,
-            expected.sourceOperationId,
-            expected.ingress.kind,
-            expected.ingress.kind === "endpoint" ? expected.ingress.endpointUid : null,
-            expected.ingress.kind === "endpoint" ? expected.ingress.endpointGeneration : null,
-            expected.ingress.kind === "service" ? expected.ingress.callerWorkerUid : null,
-            expected.ingress.kind === "service" ? expected.ingress.callerVersionUid : null,
-            expected.ingress.kind === "service" ? expected.ingress.callerVersionGeneration : null,
-            expected.ingress.kind === "service" ? expected.ingress.callerVersionOperationId : null,
-            expected.ingress.kind === "service" ? expected.ingress.bindingName : null,
-            expected.ingress.kind === "service" ? expected.ingress.callerExecutionRef : null,
-            expected.versionUid,
-            expected.versionGeneration,
-            expected.versionOperationId,
-            expected.nativeIdentity,
-            expected.closureDigest,
-            expected.confirmedReceipt,
-          ],
+          serviceSchema
+            ? [
+                instant(),
+                receiptDigest,
+                handle.invocationId,
+                handle.custodyToken,
+                expected.backendId,
+                expected.targetKey,
+                expected.principal,
+                expected.space,
+                expected.workerUid,
+                expected.deploymentUid,
+                expected.deploymentGeneration,
+                expected.sourceOperationId,
+                expected.ingress.kind,
+                expected.ingress.kind === "endpoint" ? expected.ingress.endpointUid : null,
+                expected.ingress.kind === "endpoint" ? expected.ingress.endpointGeneration : null,
+                expected.ingress.kind === "service" ? expected.ingress.callerWorkerUid : null,
+                expected.ingress.kind === "service" ? expected.ingress.callerVersionUid : null,
+                expected.ingress.kind === "service"
+                  ? expected.ingress.callerVersionGeneration
+                  : null,
+                expected.ingress.kind === "service"
+                  ? expected.ingress.callerVersionOperationId
+                  : null,
+                expected.ingress.kind === "service" ? expected.ingress.bindingName : null,
+                expected.ingress.kind === "service" ? expected.ingress.callerExecutionRef : null,
+                expected.versionUid,
+                expected.versionGeneration,
+                expected.versionOperationId,
+                expected.nativeIdentity,
+                expected.closureDigest,
+                expected.confirmedReceipt,
+              ]
+            : [
+                instant(),
+                receiptDigest,
+                handle.invocationId,
+                handle.custodyToken,
+                expected.backendId,
+                expected.targetKey,
+                expected.principal,
+                expected.space,
+                expected.workerUid,
+                expected.deploymentUid,
+                expected.deploymentGeneration,
+                expected.sourceOperationId,
+                expected.ingress.kind === "endpoint" ? expected.ingress.endpointUid : null,
+                expected.ingress.kind === "endpoint" ? expected.ingress.endpointGeneration : null,
+                expected.versionUid,
+                expected.versionGeneration,
+                expected.versionOperationId,
+                expected.nativeIdentity,
+                expected.closureDigest,
+                expected.confirmedReceipt,
+              ],
         );
         if (result.changes === 1) return true;
       } catch {

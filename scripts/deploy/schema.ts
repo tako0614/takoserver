@@ -334,7 +334,7 @@ const AUDITED_MIGRATION_SHA256: Readonly<
   "0085_v2_edge_kv_native_custody.sql":
     "sha256:1a123aa756178762b45dd67949f36bea12a8be2f62b32e451480d0ce7f40fa11",
   "0086_v2_worker_service_invocation_custody.sql":
-    "sha256:673eda3b4489af3b0968bcc6ca5a24217d142bb0c6fea9154ec0204895b89545",
+    "sha256:4bacc1b2d8d3d78a7736ccc66257d2e8c8a077ec82a0fc1a208038266b28a0d5",
 };
 // 0067-0086 are part of the exact source inventory only. None has an in-place apply wave.
 const INTEGRATION_APPLY_CEILING_COUNT = 66;

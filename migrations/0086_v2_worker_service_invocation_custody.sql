@@ -320,7 +320,9 @@ BEGIN
       WHERE reference.target_uid = OLD.resource_uid AND referrer.deleted_at IS NULL) OR
     EXISTS (
       SELECT 1 FROM tf_v2_worker_invocations invocation
-      WHERE invocation.version_uid = OLD.resource_uid
+      WHERE (invocation.version_uid = OLD.resource_uid OR
+        (invocation.ingress_kind = 'service' AND
+          invocation.service_caller_version_uid = OLD.resource_uid))
         AND invocation.phase <> 'pre_effect_refused'
         AND invocation.no_native_dispatch_at_ms IS NULL
         AND (invocation.retired_at_ms IS NULL OR invocation.retirement_receipt_digest IS NULL)
@@ -383,7 +385,9 @@ BEGIN
       JOIN tf_v2_resources referrer ON referrer.uid = reference.referrer_uid
       WHERE reference.target_uid = OLD.resource_uid AND referrer.deleted_at IS NULL) OR
     EXISTS (SELECT 1 FROM tf_v2_worker_invocations invocation
-      WHERE invocation.version_uid = OLD.resource_uid
+      WHERE (invocation.version_uid = OLD.resource_uid OR
+        (invocation.ingress_kind = 'service' AND
+          invocation.service_caller_version_uid = OLD.resource_uid))
         AND invocation.phase <> 'pre_effect_refused'
         AND invocation.no_native_dispatch_at_ms IS NULL
         AND (invocation.retired_at_ms IS NULL OR invocation.retirement_receipt_digest IS NULL)) OR

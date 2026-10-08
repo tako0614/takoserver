@@ -248,6 +248,105 @@ async function fixture(
   };
 }
 
+/** A child Service call admitted after its caller's DELETE was accepted. */
+async function seedLateServiceCallerInvocation(f: Awaited<ReturnType<typeof fixture>>) {
+  for (const [uid, form] of [
+    ["service-callee-worker", "ModuleWorker/0.3.0"],
+    ["service-callee-deployment", "WorkerDeployment/0.4.0"],
+    ["service-callee-version", "WorkerVersion/0.5.0"],
+    ["service-caller-worker", "ModuleWorker/0.3.0"],
+  ] as const) {
+    await f.sql.run(
+      `INSERT INTO tf_v2_resources
+       (uid, principal, form_url, space, name, backend_id, target_key,
+        active_name, generation, observed_generation, phase, spec_json, last_operation)
+       VALUES (?, 'org-a', ?, 'production', ?, 'fixture-version-backend',
+        'target-a', ?, 1, 1, 'idle', '{}', ?)`,
+      [uid, `https://edge.forms.takoform.com/forms/${form}/`, uid, uid, f.source.operationId],
+    );
+  }
+  for (const uid of ["service-callee-deployment", "service-callee-version"]) {
+    await f.sql.run(
+      `INSERT INTO tf_v2_operations
+       (id, resource_uid, principal, replay_key, request_fingerprint, action,
+        generation, status, effect, created_at, updated_at, retain_until,
+        backend_id, target_key, backend_key, accepted_spec_json)
+       SELECT ?, ?, principal, ?, request_fingerprint, action, generation,
+        status, effect, created_at, updated_at, retain_until, backend_id,
+        target_key, ?, accepted_spec_json FROM tf_v2_operations WHERE id = ?`,
+      [`op-${uid}`, uid, `replay-${uid}`, `key-${uid}`, f.source.operationId],
+    );
+  }
+  const handle = { invocationId: "late-service-child", custodyToken: "late-service-child-token" };
+  await f.sql.run(
+    `INSERT INTO tf_v2_worker_invocations
+     (invocation_id, custody_token, backend_id, target_key, principal, space,
+      worker_uid, deployment_uid, deployment_generation, source_operation_id,
+      ingress_kind, endpoint_uid, endpoint_generation,
+      service_caller_worker_uid, service_caller_version_uid,
+      service_caller_version_generation, service_caller_version_operation_id,
+      service_binding_name, service_caller_execution_ref,
+      version_uid, version_generation, version_operation_id,
+      native_identity, closure_digest, confirmed_receipt, admitted_at_ms)
+     VALUES (?, ?, 'fixture-version-backend', 'target-a', 'org-a', 'production',
+       'service-callee-worker', 'service-callee-deployment', 1,
+       'op-service-callee-deployment', 'service', NULL, NULL,
+       'service-caller-worker', ?, 1, ?, 'UPSTREAM', 'nonsecret-caller-context',
+       'service-callee-version', 1, 'op-service-callee-version',
+       'callee-native-script', ?, 'callee-receipt', 1000)`,
+    [handle.invocationId, handle.custodyToken, f.source.resourceUid, f.source.operationId, digest],
+  );
+  const lifecycle = createV2WorkerInvocationLifecycle({ sql: f.sql, now: () => new Date(2000) });
+  expect(await lifecycle.beginSend(handle)).toBe(true);
+  return { handle, lifecycle };
+}
+
+test("a late Service child fences caller native DELETE grant and pre-send absence until no-dispatch", async () => {
+  const grant = await fixture();
+  try {
+    expect(await grant.custody.stageNext(grant.execution)).toBe("more");
+    expect(await grant.custody.stageNext(grant.execution)).toBe("ready");
+    const item = await grant.custody.next(grant.execution);
+    if (!item) throw new Error("missing native deletion item");
+    const child = await seedLateServiceCallerInvocation(grant);
+    expect(await grant.custody.grant(item, "etag-upload")).toBe("unknown");
+    expect(await child.lifecycle.confirmNoNativeDispatch(child.handle)).toBe(true);
+    expect(await grant.custody.grant(item, "etag-upload")).toBe("granted");
+  } finally {
+    grant.close();
+  }
+
+  const absence = await fixture();
+  try {
+    expect(await absence.custody.stageNext(absence.execution)).toBe("more");
+    const item = await absence.custody.next(absence.execution);
+    if (!item) throw new Error("missing native deletion item");
+    const child = await seedLateServiceCallerInvocation(absence);
+    await absence.sql.run("UPDATE tf_v2_operations SET lease_until_ms = ? WHERE id = ?", [
+      Date.now() - 1000,
+      absence.execution.operationId,
+    ]);
+    const reclaimedAt = Date.now();
+    expect(
+      await absence.store.claim(
+        absence.execution.operationId,
+        "service-absence-reclaimed",
+        reclaimedAt,
+        reclaimedAt + 60_000,
+      ),
+    ).toBe(true);
+    const resumed = {
+      ...item,
+      execution: { ...item.execution, leaseToken: "service-absence-reclaimed" },
+    };
+    expect(await absence.custody.confirmAbsent(resumed, "exact-preexisting-absence")).toBe(false);
+    expect(await child.lifecycle.confirmNoNativeDispatch(child.handle)).toBe(true);
+    expect(await absence.custody.confirmAbsent(resumed, "exact-preexisting-absence")).toBe(true);
+  } finally {
+    absence.close();
+  }
+});
+
 test("confirmed source stages, one DELETE grant persists across reopen, and lost ACK reconciles by absence", async () => {
   const f = await fixture();
   try {

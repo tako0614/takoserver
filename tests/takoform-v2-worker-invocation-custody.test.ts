@@ -332,6 +332,32 @@ test("0084 forward migration preserves old sent rows and exact lost-ACK terminal
     if (!forward) throw new Error("missing 0084 source");
     db.exec(forward.sql);
     const owner = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(2000) });
+    const legacyTail = { invocationId: "legacy-tail", custodyToken: "legacy-tail-token" };
+    await sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+       (invocation_id, custody_token, backend_id, target_key, principal, space,
+        worker_uid, deployment_uid, deployment_generation, source_operation_id,
+        endpoint_uid, endpoint_generation, version_uid, version_generation,
+        version_operation_id, native_identity, closure_digest, confirmed_receipt, admitted_at_ms)
+       SELECT ?, ?, backend_id, target_key, principal, space, worker_uid, deployment_uid,
+         deployment_generation, source_operation_id, endpoint_uid, endpoint_generation,
+         version_uid, version_generation, version_operation_id, native_identity,
+         closure_digest, confirmed_receipt, admitted_at_ms
+       FROM tf_v2_worker_invocations WHERE invocation_id = ?`,
+      [legacyTail.invocationId, legacyTail.custodyToken, handle.invocationId],
+    );
+    expect(await owner.beginSend(legacyTail)).toBe(true);
+    expect(await owner.observeBody(legacyTail, "finished")).toBe(true);
+    expect(
+      await owner.confirmNativeRetirement({
+        handle: legacyTail,
+        expected: retirementIdentity,
+        receiptDigest: `sha256:${"c".repeat(64)}`,
+      }),
+    ).toBe(true);
+    expect((await owner.read(legacyTail))?.retirement?.receiptDigest).toBe(
+      `sha256:${"c".repeat(64)}`,
+    );
     expect(await owner.inspectDeployment("deployment-one")).toEqual({
       outstanding: 1,
       bodyFinished: 0,
