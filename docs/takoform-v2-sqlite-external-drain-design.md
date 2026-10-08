@@ -72,8 +72,11 @@ identity; it then rechecks the sealed/current binding vector and original
 CREATE ownership. The invocation lock remains held through SQL
 commit/rollback and database close, not merely until HTTP headers or body
 EOF. Every Node SQL entry and trusted drain path uses the same lock root and
-order. An old grant or a delayed request must reread D1 *inside* that lock;
-pre-lock validation and a post-commit vector check alone do not fence SQL.
+order. An old grant or a delayed request must use a fresh authoritative D1
+read *inside* that lock; a cached or lagging replica read cannot establish
+that Tail has not already retired the invocation. If that read consistency
+cannot be supplied, the SQLite profile remains unmounted. Pre-lock
+validation and a post-commit vector check alone do not fence SQL.
 
 The trusted Tail receiver may record the existing positive provider terminal
 receipt. While `sqlite_drain_state=pending`, **every** Deployment/Version
