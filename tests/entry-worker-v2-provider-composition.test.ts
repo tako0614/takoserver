@@ -327,12 +327,28 @@ test("malformed and duplicate selected Form maps refuse startup", async () => {
     });
     const invalid = await request(malformed, env, `/support?form=${encodeURIComponent(FORM)}`);
     expect(invalid.status).toBe(503);
-    expect(await invalid.text()).toContain("plain exact Form map");
+    const invalidRefusal = await invalid.text();
+    expect(invalidRefusal).toContain("runtime-configuration");
+    expect(invalidRefusal).not.toContain("plain exact Form map");
     const missing = createWorkerEntry({
       composeV2Forms: () => undefined as unknown as Record<string, V2Form>,
     });
     const absent = await request(missing, env, `/support?form=${encodeURIComponent(FORM)}`);
     expect(absent.status).toBe(503);
+    const getter = createWorkerEntry({
+      composeV2Forms: () => ({
+        [FORM]: {
+          get validateCreate(): V2Form["validateCreate"] {
+            throw new TypeError("private-secret-must-not-leak");
+          },
+          validateUpdate() {},
+          backend: completeForm().backend,
+        },
+      }),
+    });
+    const getterFailure = await request(getter, env, `/support?form=${encodeURIComponent(FORM)}`);
+    expect(getterFailure.status).toBe(503);
+    expect(await getterFailure.text()).not.toContain("private-secret-must-not-leak");
     const withBuiltin = {
       ...env,
       TAKOSERVER_TAKOFORM_V2_CONFIG: JSON.stringify({
@@ -350,7 +366,9 @@ test("malformed and duplicate selected Form maps refuse startup", async () => {
       `/support?form=${encodeURIComponent(WORKER_BUNDLE_FORM_URL)}`,
     );
     expect(rejected.status).toBe(503);
-    expect(await rejected.text()).toContain("duplicate v2 Form URL");
+    const duplicateRefusal = await rejected.text();
+    expect(duplicateRefusal).toContain("runtime-configuration");
+    expect(duplicateRefusal).not.toContain("duplicate v2 Form URL");
   } finally {
     await runtime.dispose();
   }

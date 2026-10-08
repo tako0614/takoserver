@@ -792,40 +792,52 @@ async function composeApp(
     deployments: createResourceDeploymentStore(sql, clock),
   });
   originReservationBinding.connect(originReservations);
-  const app = buildApp({
-    sql,
-    objects,
-    publicWorkerVersionId: env.WORKER_VERSION.id,
-    ...(implementationIdentity
-      ? {
-          formImplementationDigest: implementationIdentity.implementationDigest,
-        }
-      : {}),
-    ...(integrationE2eCredentialAuthority ? { integrationE2eCredentialAuthority } : {}),
-    ...(integrationOrganizationBootstrap ? { integrationOrganizationBootstrap } : {}),
-    ...(runtimeInputs ? { runtimeInputs } : {}),
-    originReservations,
-    artifacts,
-    ...(signingKey ? { signingKey } : {}),
-    identity,
-    identityProviders,
-    settlement,
-    ...(checkout ? { checkout } : {}),
-    ...dataServices,
-    publicOrigin: origin,
-    v2: v2Config,
-    ...(composeV2Forms === undefined
-      ? {}
-      : { v2FormFactory: () => selectedV2Forms as WorkerEntryV2FormMap }),
-    ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
-    forms: formSource.forms,
-    bindings: formSource.bindings,
-    hostForms: [...formSource.forms, ...formSource.retainedForms],
-    hostBindings: [...formSource.bindings, ...formSource.retainedBindings],
-    providers: deployment.providers,
-    providerPacks: deployment.providerPacks,
-    offerings: deployment.offerings,
-  });
+  let app: App;
+  try {
+    app = buildApp({
+      sql,
+      objects,
+      publicWorkerVersionId: env.WORKER_VERSION.id,
+      ...(implementationIdentity
+        ? {
+            formImplementationDigest: implementationIdentity.implementationDigest,
+          }
+        : {}),
+      ...(integrationE2eCredentialAuthority ? { integrationE2eCredentialAuthority } : {}),
+      ...(integrationOrganizationBootstrap ? { integrationOrganizationBootstrap } : {}),
+      ...(runtimeInputs ? { runtimeInputs } : {}),
+      originReservations,
+      artifacts,
+      ...(signingKey ? { signingKey } : {}),
+      identity,
+      identityProviders,
+      settlement,
+      ...(checkout ? { checkout } : {}),
+      ...dataServices,
+      publicOrigin: origin,
+      v2: v2Config,
+      ...(composeV2Forms === undefined
+        ? {}
+        : { v2FormFactory: () => selectedV2Forms as WorkerEntryV2FormMap }),
+      ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
+      forms: formSource.forms,
+      bindings: formSource.bindings,
+      hostForms: [...formSource.forms, ...formSource.retainedForms],
+      hostBindings: [...formSource.bindings, ...formSource.retainedBindings],
+      providers: deployment.providers,
+      providerPacks: deployment.providerPacks,
+      offerings: deployment.offerings,
+    });
+  } catch (error) {
+    if (composeV2Forms === undefined) throw error;
+    // The selected map is inspected by the canonical application only here.
+    // Getters and backend constructors can throw private text after the async
+    // callback has returned, so this boundary must classify them too.
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new Error("operator v2 Form application construction failed", { cause: error }),
+    );
+  }
   return app;
 }
 

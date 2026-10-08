@@ -74,9 +74,10 @@ snapshot for support and Operation execution. A missing callback retains the
 existing three-artifact-form behavior. Each `createWorkerEntry` instance has its
 own per-Env startup cache; simultaneous fetch and scheduled calls share one
 composition. Failed composition is not cached, so a repaired environment may
-retry; the ordinary Worker startup 503 envelope applies. The callback's raw
-exception text is never returned to the caller; canonical Form-map validation
-may report its own bounded `TypeError` refusal.
+retry; the ordinary Worker startup 503 envelope applies. A selected composer's
+callback, Form-map validation, or backend-constructor exception text is not
+returned to the caller. Existing no-composer configuration diagnostics remain
+unchanged.
 
 The hook creates no additional credential, private-input channel, or registry;
 `env` remains the existing operator-owned Worker binding object and must not be
