@@ -397,7 +397,7 @@ test("staged SQL rolls back a later invalid statement and removes its private in
   }
 });
 
-test("staged SQL retains a valid 42 MiB transaction outside the inline bound", async () => {
+test("staged SQL retains a valid 42 MB transaction outside the inline bound", async () => {
   const host = await fixture();
   try {
     const body = JSON.stringify({
