@@ -312,6 +312,21 @@ function nativeHttps(hostname: string, path: string): Promise<{ status: number; 
   });
 }
 
+async function nativeWorkflowComplete(hostname: string, id: string): Promise<Json> {
+  let last: Json = {};
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const response = await nativeHttps(hostname, `/workflow-status?id=${encodeURIComponent(id)}`);
+    expect(response.status).toBe(200);
+    last = JSON.parse(response.body) as Json;
+    if (last.status === "complete") return last;
+    if (last.status === "errored" || last.status === "terminated") break;
+    await Bun.sleep(200);
+  }
+  throw new Error(
+    `native Workflow did not complete (${String(last.status)}/${String((last.error as Json | undefined)?.reason ?? "no-reason")})`,
+  );
+}
+
 async function startHost(
   root: string,
   port: number,
@@ -1194,7 +1209,8 @@ test.skipIf(OPT_IN !== "1")(
       const moduleBytes = new TextEncoder().encode(
         `export default {
   async fetch(request, env) {
-    const path = new URL(request.url).pathname;
+    const url = new URL(request.url);
+    const path = url.pathname;
     if (path === "/sqlite-read") {
       const result = await env.DB.query("SELECT value FROM item ORDER BY rowid");
       return Response.json(result.rows);
@@ -1202,6 +1218,15 @@ test.skipIf(OPT_IN !== "1")(
     if (path === "/actor-write" || path === "/actor-read" || path === "/actor-sql") {
       const actor = env.ACTOR.get(env.ACTOR.idFromName("room"));
       return actor.fetch(new Request("http://actor.invalid/" + (path === "/actor-write" ? "write" : path === "/actor-sql" ? "sql" : "read")));
+    }
+    if (path === "/workflow-create") {
+      const id = url.searchParams.get("id") || "workflow-before";
+      const created = await env.WORKFLOW.create({ id, params: { value: id } });
+      return Response.json({ id: created.id, status: (await created.status()).status });
+    }
+    if (path === "/workflow-status") {
+      const instance = await env.WORKFLOW.get(url.searchParams.get("id") || "workflow-before");
+      return Response.json(await instance.status());
     }
     return new Response("normal-v2:" + path);
   }
@@ -1228,6 +1253,17 @@ export class CounterActor {
   async socketMessage() {}
   async socketClose() {}
   async socketError() {}
+}
+export class SqlWorkflow {
+  constructor(env) { this.env = env; }
+  async run(event, step) {
+    await step.do("write", async () => {
+      await this.env.DB.execute("INSERT INTO item(value) VALUES (?)", [event.params.value]);
+      return { written: true };
+    });
+    const result = await this.env.DB.query("SELECT value FROM item ORDER BY rowid");
+    return { values: result.rows.map((row) => row.value) };
+  }
 }
 `,
       );
@@ -1602,6 +1638,74 @@ export class CounterActor {
         },
       );
       expect(await settled(port, token, String(update.id))).toMatchObject({ effect: "complete" });
+      const workflow = await create(DURABLE_WORKFLOW_FORM_URL, "workflow", {
+        worker: { resourceUid: worker.uid },
+        className: "SqlWorkflow",
+      });
+      const workflowVersion = await create(WORKER_VERSION_FORM_URL, "workflow-version", {
+        worker: { resourceUid: worker.uid },
+        bundle: { resourceUid: bundle.uid },
+        handlers: ["fetch"],
+        sqliteBindings: [{ name: "DB", resource: { resourceUid: sqliteTarget.uid } }],
+        workflowBindings: [{ name: "WORKFLOW", resource: { resourceUid: workflow.uid } }],
+      });
+      const workflowDeployment = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${deployment.uid}`,
+        202,
+        {
+          spec: {
+            worker: { resourceUid: worker.uid },
+            versions: [{ workerVersion: { resourceUid: workflowVersion.uid }, weight: 10_000 }],
+          },
+        },
+        {
+          ...auth,
+          "idempotency-key": "normal-v2-workflow-deployment",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(await settled(port, token, String(workflowDeployment.id))).toMatchObject({
+        effect: "complete",
+      });
+      expect(await nativeHttps(hostname, "/workflow-create?id=workflow-before")).toEqual({
+        status: 200,
+        body: '{"id":"workflow-before","status":"queued"}',
+      });
+      expect(await nativeWorkflowComplete(hostname, "workflow-before")).toEqual({
+        status: "complete",
+        output: { values: ["once", "workflow-before"] },
+      });
+      expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
+        status: 200,
+        body: '[{"value":"once"},{"value":"workflow-before"}]',
+      });
+      const workflowHostPid = serving.pid;
+      await killHost(serving);
+      serving = null;
+      serving = await startHost(root, port, config, fullBoot);
+      expect(serving.pid).not.toBe(workflowHostPid);
+      expect(await nativeWorkflowComplete(hostname, "workflow-before")).toEqual({
+        status: "complete",
+        output: { values: ["once", "workflow-before"] },
+      });
+      expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
+        status: 200,
+        body: '[{"value":"once"},{"value":"workflow-before"}]',
+      });
+      expect(await nativeHttps(hostname, "/workflow-create?id=workflow-after")).toEqual({
+        status: 200,
+        body: '{"id":"workflow-after","status":"queued"}',
+      });
+      expect(await nativeWorkflowComplete(hostname, "workflow-after")).toEqual({
+        status: "complete",
+        output: { values: ["once", "workflow-before", "workflow-after"] },
+      });
+      expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
+        status: 200,
+        body: '[{"value":"once"},{"value":"workflow-before"},{"value":"workflow-after"}]',
+      });
       const remove = async (uid: string, generation: number, name: string) => {
         const accepted = await jsonAt(port, "DELETE", `${V2}/resources/${uid}`, 202, undefined, {
           ...auth,
@@ -1628,7 +1732,9 @@ export class CounterActor {
       expect(await settled(port, token, String(afterEndpointDelete.id))).toMatchObject({
         effect: "complete",
       });
-      await remove(deployment.uid, 1, "deployment");
+      await remove(deployment.uid, 2, "deployment");
+      await remove(workflowVersion.uid, 1, "workflow-version");
+      await remove(workflow.uid, 1, "workflow");
       await remove(version.uid, 1, "version");
       await remove(namespace.uid, 3, "namespace");
       await remove(bundle.uid, 1, "bundle");

@@ -145,7 +145,9 @@ export function createSelfhostV2RuntimeBoot(options: {
         };
       })()
     : undefined;
-  const address = options.dataPlaneAddress;
+  // The v2 Workflow class must use the same current private SQLite listener
+  // selected for its accepted WorkerVersion, not the legacy data-plane port.
+  const address = options.v2SqliteBindingAddress ?? options.dataPlaneAddress;
   const workflow =
     options.selection.workflow && guard
       ? createSelfhostV2WorkflowBoot({
