@@ -19,7 +19,7 @@ import {
   OBJECT_BUCKET_LIMITS,
   parseObjectBucketSpec,
 } from "./forms/object-bucket.ts";
-import { OBJECT_BUCKET_BACKEND_ID } from "./forms/object-bucket-backend.ts";
+import { resolveObjectBucketBackendId } from "./forms/object-bucket-backend.ts";
 import type { ObjectBucketWorkerBindingClaim } from "./forms/object-bucket-worker-binding-authority.ts";
 import type { QueueWorkerBindingClaim } from "./forms/queue-worker-binding-authority.ts";
 import { parseSQLiteDatabaseSpec, SQLITE_DATABASE_FORM_URL } from "./forms/sqlite-database.ts";
@@ -175,6 +175,8 @@ export interface V2CodeSqliteBindingBoot {
  */
 export interface V2CodeObjectBucketBindingBoot {
   readonly address: string;
+  /** Exact trusted Form backend identity selected before Version execution. */
+  readonly expectedBackendId?: string;
   issueGrant(grant: ObjectBucketWorkerBindingClaim): string;
   resolveCurrentBucketBinding(
     claim: ObjectBucketWorkerBindingClaim,
@@ -360,6 +362,7 @@ async function resolvedObjectBucketBindings(
   sql: Sql,
   spec: WorkerVersionSpec,
   identity: { readonly principal: string; readonly space: string; readonly targetKey: string },
+  expectedBackendId: string,
 ): Promise<readonly V2ResolvedObjectBucketBinding[] | null> {
   const resolved: V2ResolvedObjectBucketBinding[] = [];
   for (const binding of spec.bucketBindings) {
@@ -380,7 +383,7 @@ async function resolvedObjectBucketBindings(
         identity.principal,
         identity.space,
         identity.targetKey,
-        OBJECT_BUCKET_BACKEND_ID,
+        expectedBackendId,
       ],
     );
     const row = rows.length === 1 ? rows[0] : null;
@@ -388,7 +391,7 @@ async function resolvedObjectBucketBindings(
       typeof row?.spec_json !== "string" ||
       typeof row.observed_json !== "string" ||
       typeof row.output_json !== "string" ||
-      row.backend_id !== OBJECT_BUCKET_BACKEND_ID
+      row.backend_id !== expectedBackendId
     ) {
       return null;
     }
@@ -628,6 +631,10 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
   const queueSettlement = options.queueSettlement;
   const sqliteBinding = options.v2SqliteBinding;
   const objectBucketBinding = options.v2ObjectBucketBinding;
+  const expectedObjectBucketBackendId = resolveObjectBucketBackendId(
+    objectBucketBinding?.expectedBackendId,
+    objectBucketBinding !== undefined && Object.hasOwn(objectBucketBinding, "expectedBackendId"),
+  );
   const kvBinding = options.v2KvBinding;
   const queueProducerBinding = options.v2QueueProducerBinding;
   const actorBinding = options.v2ActorBinding;
@@ -732,11 +739,16 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
       if (resolvedSQLite === null) return unresolved();
       const resolvedBuckets =
         spec.bucketBindings.length > 0
-          ? await resolvedObjectBucketBindings(sql, snapshot.version.spec, {
-              principal: execution.principal,
-              space: execution.space,
-              targetKey: execution.targetKey,
-            })
+          ? await resolvedObjectBucketBindings(
+              sql,
+              snapshot.version.spec,
+              {
+                principal: execution.principal,
+                space: execution.space,
+                targetKey: execution.targetKey,
+              },
+              expectedObjectBucketBackendId,
+            )
           : [];
       if (resolvedBuckets === null) return unresolved();
       const resolvedKv =

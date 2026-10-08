@@ -7,8 +7,18 @@ import {
 } from "./object-bucket.ts";
 
 export const OBJECT_BUCKET_BACKEND_ID = "selfhost-v2-object-bucket-filesystem-v1";
+const BACKEND_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u;
 
-interface ObjectBucketIdentity {
+/** Select one trusted implementation identity before any Resource effect. */
+export function resolveObjectBucketBackendId(backendId: unknown, supplied: boolean): string {
+  if (!supplied) return OBJECT_BUCKET_BACKEND_ID;
+  if (typeof backendId !== "string" || !BACKEND_ID.test(backendId)) {
+    throw new TypeError("ObjectBucket backendId must be an exact nonempty identifier");
+  }
+  return backendId;
+}
+
+export interface ObjectBucketIdentity {
   readonly targetKey: string;
   readonly principal: string;
   readonly space: string;
@@ -75,9 +85,15 @@ function invalidSpec(error: unknown): never {
 export function createObjectBucketForm(options: {
   readonly store: ObjectBucketStore;
   readonly targetKey: string;
+  /** Trusted operator-selected implementation; absent keeps existing filesystem identity. */
+  readonly backendId?: string;
 }): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   const { store, targetKey } = options;
+  const backendId = resolveObjectBucketBackendId(
+    options.backendId,
+    Object.hasOwn(options, "backendId"),
+  );
 
   const execute = async (input: V2Execution): Promise<V2BackendResult> => {
     try {
@@ -157,7 +173,7 @@ export function createObjectBucketForm(options: {
     },
     rejectDeleteWhileReferenced: true,
     backend: {
-      id: OBJECT_BUCKET_BACKEND_ID,
+      id: backendId,
       targetKey,
       execute,
       reconcile,
