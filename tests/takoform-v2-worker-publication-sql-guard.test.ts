@@ -1,7 +1,10 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { Miniflare } from "miniflare";
+import { MIGRATIONS } from "../src/db-schema.ts";
 import { canonicalJson } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
   MODULE_WORKER_FORM_URL,
@@ -173,3 +176,105 @@ test("an atomic SQL batch rolls back the guarded route mutation on a later failu
     f.db.close();
   }
 });
+
+test("the captured full Operation guard executes within real D1 expression depth", async () => {
+  const f = fixture();
+  const runtime = new Miniflare({
+    workers: [
+      {
+        config: {
+          name: "v2-worker-publication-guard-d1-test",
+          type: "worker",
+          compatibilityDate: "2026-08-18",
+          manifest: {
+            mainModule: "worker.js",
+            modules: {
+              "worker.js": {
+                type: "esm",
+                contents: "export default { fetch() { return new Response('ok'); } };",
+              },
+            },
+          },
+          env: { STATE_DB: { type: "d1", id: "v2-worker-publication-guard-d1-test" } },
+          triggers: [],
+        },
+      },
+    ],
+  });
+  try {
+    const database = await runtime.getD1Database("STATE_DB");
+    for (const migration of MIGRATIONS.filter(({ name }) => /^00(?:7\d|8[0-8])_/.test(name))) {
+      for (const statement of splitMigration(migration.sql))
+        await database.prepare(statement).run();
+    }
+    const sql = createD1Sql(database);
+    await sql.run("CREATE TABLE test_routes (route_id TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    await sql.run("INSERT INTO test_routes VALUES ('route-1', 'old')");
+    const copyRow = async (table: string, key: string, value: string) => {
+      const source = f.db.query(`SELECT * FROM ${table} WHERE ${key} = ?`).get(value) as Record<
+        string,
+        string | number | null
+      > | null;
+      if (!source) throw new Error(`missing ${table} test evidence`);
+      // D1's acceptance-order trigger assigns this immutable value on insert.
+      const entries = Object.entries(source).filter(([name]) => name !== "acceptance_order");
+      await sql.run(
+        `INSERT INTO ${table} (${entries.map(([name]) => `"${name}"`).join(", ")}) VALUES (${entries.map(() => "?").join(", ")})`,
+        entries.map(([, cell]) => cell),
+      );
+    };
+    await copyRow("tf_v2_resources", "uid", f.workerUid);
+    await copyRow("tf_v2_resources", "uid", f.resourceUid);
+    await copyRow("tf_v2_operations", "id", f.operationId);
+    expect(
+      (
+        await sql.run(
+          `UPDATE test_routes SET value = 'new' WHERE route_id = 'route-1' AND (${f.guard.sql})`,
+          f.guard.params,
+        )
+      ).changes,
+    ).toBe(1);
+    await sql.run("UPDATE tf_v2_operations SET lease_token = ? WHERE id = ?", [
+      "reclaimed-lease",
+      f.operationId,
+    ]);
+    expect(
+      (
+        await sql.run(
+          `UPDATE test_routes SET value = 'wrong' WHERE route_id = 'route-1' AND (${f.guard.sql})`,
+          f.guard.params,
+        )
+      ).changes,
+    ).toBe(0);
+    expect(await sql.query("SELECT value FROM test_routes WHERE route_id = 'route-1'")).toEqual([
+      { value: "new" },
+    ]);
+  } finally {
+    f.db.close();
+    await runtime.dispose();
+  }
+});
+
+function splitMigration(source: string): readonly string[] {
+  const statements: string[] = [];
+  let rest = source.replace(/^\s*--.*$/gmu, "").trim();
+  while (rest.length > 0) {
+    if (/^CREATE\s+(?:TEMP\s+)?TRIGGER\b/iu.test(rest)) {
+      const end = /^END\s*;/imu.exec(rest);
+      if (!end || end.index === undefined) throw new Error("incomplete migration trigger");
+      const boundary = end.index + end[0].length;
+      statements.push(rest.slice(0, boundary).trim());
+      rest = rest.slice(boundary).trim();
+      continue;
+    }
+    const boundary = rest.indexOf(";");
+    if (boundary < 0) {
+      statements.push(rest);
+      break;
+    }
+    const statement = rest.slice(0, boundary).trim();
+    if (statement) statements.push(statement);
+    rest = rest.slice(boundary + 1).trim();
+  }
+  return statements;
+}

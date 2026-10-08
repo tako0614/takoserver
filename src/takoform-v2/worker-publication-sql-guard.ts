@@ -25,6 +25,14 @@ function addRow(rows: Rows, key: string, row: SqlRow): void {
   rows.set(key, row);
 }
 
+function balancedAnd(clauses: readonly string[]): string {
+  const first = clauses[0];
+  if (first === undefined) throw new Error("Empty Worker publication SQL conjunction");
+  if (clauses.length === 1) return first;
+  const middle = Math.floor(clauses.length / 2);
+  return `(${balancedAnd(clauses.slice(0, middle))} AND ${balancedAnd(clauses.slice(middle))})`;
+}
+
 function scanEvidence(
   value: unknown,
   resources: Rows,
@@ -68,15 +76,15 @@ function exactRows(
   if (columns.length === 0 || columns.some((name) => !/^[a-z_][a-z_0-9]*$/u.test(name))) {
     throw new Error("Invalid Worker publication SQL evidence columns");
   }
-  const comparisons = columns
-    .map((name) => `actual."${name}" IS json_extract(expected.value, '$."${name}"')`)
-    .join(" AND ");
-  const keys = keyColumns
-    .map((name) => `actual."${name}" = json_extract(expected.value, '$."${name}"')`)
-    .join(" AND ");
+  const comparisons = columns.map(
+    (name) => `actual."${name}" IS json_extract(expected.value, '$."${name}"')`,
+  );
+  const keys = keyColumns.map(
+    (name) => `actual."${name}" = json_extract(expected.value, '$."${name}"')`,
+  );
   return {
     sql: `NOT EXISTS (SELECT 1 FROM json_each(?) expected WHERE NOT EXISTS (
-      SELECT 1 FROM ${table} actual WHERE ${keys} AND ${comparisons}))`,
+      SELECT 1 FROM ${table} actual WHERE ${balancedAnd([...keys, ...comparisons])}))`,
     params: [JSON.stringify(values)],
   };
 }
@@ -212,5 +220,5 @@ export function createWorkerPublicationSqlGuard(input: {
     });
   }
   if (params.length > 100) throw new Error("Worker publication SQL guard exceeds D1 bind limit");
-  return Object.freeze({ sql: clauses.join(" AND "), params: Object.freeze(params) });
+  return Object.freeze({ sql: balancedAnd(clauses), params: Object.freeze(params) });
 }
