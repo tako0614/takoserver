@@ -796,9 +796,14 @@ or uncertain ownership stays unavailable and retains its data. An interrupted
 recovery claim still requires operator repair rather than guessed cleanup.
 A pinned-workerd Host-process test covers cross-Worker and self Binding calls,
 distinct Host/Worker/Actor PIDs after SIGKILL, the same Actor ID and persisted
-value, updates and dependency-ordered deletion. Nested calls from an Actor
-class to another Actor remain an unimplemented native composition path, not a
-restriction of the published Binding contract.
+value, updates and dependency-ordered deletion. Actor class environments now
+compose their own Version's declared Actor Bindings through the same retained
+private broker sockets. The class configuration checks exact token, channel,
+scope and socket ownership; weighted Versions may share only the same exact
+broker identity. A separate native Host-process journey covers Actor A calling
+another Worker's Actor B, B calling a different ID in its own Namespace, and
+both Actor children restarting with the same persisted values. Nested
+WebSocket upgrade and recursive calls to the same Actor ID are not yet qualified.
 
 The normal Bun entry can now opt in to its existing private v2 Actor and
 Workflow boot ports with `TAKOSERVER_V2_WORKER_RUNTIME_BOOT`, for example
