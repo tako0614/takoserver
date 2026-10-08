@@ -4355,7 +4355,23 @@ export async function writeWorkerdPrivateExecution(options: {
     options.dataPlaneAddress === undefined
       ? undefined
       : validDataPlaneAddress(options.dataPlaneAddress);
-  if (site.dataPlane && !planeAddress) throw new Error("private data plane listener unavailable");
+  // Legacy publications retain an old process address and follow the current
+  // callback. A v2 private profile (including an Actor's selected Version)
+  // must keep its accepted listener exact instead of silently rebinding it.
+  const exactV2DataPlane = (declaration: {
+    readonly hostEntrypoint?: string;
+    readonly hostModules?: readonly string[];
+    readonly workflowForward?: WorkerdWorkflowForward;
+  }): boolean =>
+    hasWorkerdV2PrivateBindingProfile(declaration) ||
+    declaration.workflowForward?.schema === V2_WORKFLOW_FORWARD_SCHEMA;
+  if (site.dataPlane && !planeAddress) {
+    throw new Error(
+      exactV2DataPlane(site)
+        ? "private data plane listener unavailable"
+        : "unusable data plane address",
+    );
+  }
   // Deliberately select declarations: never carry hostname, assets or event
   // ingress into a guarded class process. Their Host-private module bytes can
   // remain in the exact closed graph without installing their routing services.
@@ -4440,9 +4456,15 @@ export async function writeWorkerdPrivateExecution(options: {
     modulePrefix: string,
   ): { readonly binding: string; readonly services: string } | null => {
     if (!manifest.dataPlane) return null;
-    if (!planeAddress) throw new Error("private data plane listener unavailable");
+    if (!planeAddress) {
+      throw new Error(
+        exactV2DataPlane(manifest)
+          ? "private data plane listener unavailable"
+          : "unusable data plane address",
+      );
+    }
     const plane = validDataPlane(manifest.dataPlane);
-    if (plane.address !== planeAddress) {
+    if (exactV2DataPlane(manifest) && plane.address !== planeAddress) {
       throw new Error("private data plane listener changed");
     }
     const module = requiredStoredModule(manifest.moduleFiles.hostPrivate, plane.module);
