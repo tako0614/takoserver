@@ -25,6 +25,7 @@ const cronColumns = [
   "cron_lease_token",
   "cron_attempt",
 ];
+const drainColumns = ["sqlite_drain_state", "sqlite_drain_receipt_digest"];
 
 /**
  * This predicate is repeated inside every absence or retirement statement:
@@ -71,6 +72,42 @@ export function v2WorkerInvocationSchemaReady(kind: V2WorkerInvocationSchema): s
       'cron_match_id TEXT REFERENCES tf_v2_worker_cron_matches(match_id)') ${kind === "cron" ? ">" : "="} 0`;
 }
 
+/** 0088 must be complete before any external SQLite authorization or drain. */
+export function v2WorkerInvocationDrainSchemaReady(): string {
+  return `(${v2WorkerInvocationSchemaReady("cron")})
+    AND (SELECT count(*) FROM pragma_table_info('tf_v2_worker_invocations')
+      WHERE name IN ('sqlite_drain_state', 'sqlite_drain_receipt_digest')) = 2
+    AND (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger'
+      AND tbl_name = 'tf_v2_worker_invocations' AND name IN (
+      'tf_v2_worker_invocations_no_sqlite_drain_insert',
+      'tf_v2_worker_invocations_sqlite_drain_monotonic',
+      'tf_v2_worker_invocations_sqlite_drain_no_dispatch_guard')) = 3
+    AND (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger'
+      AND tbl_name = 'tf_v2_operations' AND name IN (
+      'tf_v2_worker_invocation_sqlite_drain_version_delete_guard',
+      'tf_v2_worker_invocation_sqlite_drain_deployment_delete_guard')) = 2
+    AND (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger'
+      AND tbl_name = 'tf_v2_worker_native_deletions' AND name IN (
+      'tf_v2_worker_native_deletion_sqlite_drain_send_guard',
+      'tf_v2_worker_native_deletion_sqlite_drain_absence_guard')) = 2`;
+}
+
+/** A probe may select this old statement only while no 0088 column exists. */
+export function v2WorkerInvocationLegacySchemaReady(kind: V2WorkerInvocationSchema): string {
+  return `(${v2WorkerInvocationSchemaReady(kind)})
+    AND NOT EXISTS (SELECT 1 FROM pragma_table_info('tf_v2_worker_invocations')
+      WHERE name IN ('sqlite_drain_state', 'sqlite_drain_receipt_digest'))`;
+}
+
+/** Profile startup probe only; each authority-changing statement repeats the seal. */
+export async function inspectV2WorkerInvocationDrainSchema(sql: Sql): Promise<boolean> {
+  try {
+    return (await sql.query(`SELECT 1 WHERE ${v2WorkerInvocationDrainSchemaReady()}`)).length === 1;
+  } catch {
+    return false;
+  }
+}
+
 /** Only selects SQL shape; the selected statement must repeat its own seal. */
 export async function inspectV2WorkerInvocationSchema(
   sql: Sql,
@@ -84,6 +121,8 @@ export async function inspectV2WorkerInvocationSchema(
     if (!commonColumns.every((name) => columns.has(name))) return null;
     const hasService = serviceColumns.every((name) => columns.has(name));
     const hasCron = cronColumns.every((name) => columns.has(name));
+    const hasDrain = drainColumns.every((name) => columns.has(name));
+    if (drainColumns.some((name) => columns.has(name)) && !hasDrain) return null;
     const kind =
       hasService && hasCron
         ? "cron"
@@ -94,7 +133,10 @@ export async function inspectV2WorkerInvocationSchema(
             ? "endpoint"
             : null;
     if (!kind) return null;
-    const rows = await sql.query(`SELECT 1 WHERE ${v2WorkerInvocationSchemaReady(kind)}`);
+    const ready = hasDrain
+      ? v2WorkerInvocationDrainSchemaReady()
+      : v2WorkerInvocationLegacySchemaReady(kind);
+    const rows = await sql.query(`SELECT 1 WHERE ${ready}`);
     return rows.length === 1 ? kind : null;
   } catch {
     return null;

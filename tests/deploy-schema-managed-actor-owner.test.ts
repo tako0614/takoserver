@@ -273,12 +273,12 @@ describe("0063 to 0064 durable Actor owner claim transition", () => {
     const unreviewed = join(root, "unreviewed-migrations");
     cpSync(migrations, unreviewed, { recursive: true });
     writeFileSync(
-      join(unreviewed, "0088_unreviewed_extension.sql"),
+      join(unreviewed, "0089_unreviewed_extension.sql"),
       "CREATE TABLE unreviewed_extension(value TEXT);\n",
     );
     const f = fixture({ migrationDirectory: unreviewed });
     try {
-      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0087");
+      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0088");
       expect(f.applies()).toBe(0);
     } finally {
       f.db.close();

@@ -12,7 +12,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createSelfhostV2SqliteBindingBroker } from "../src/providers/selfhost-v2-sqlite-binding-broker.ts";
+import {
+  createSelfhostV2SqliteBindingBroker,
+  type V2SqliteInvocationAuthority,
+} from "../src/providers/selfhost-v2-sqlite-binding-broker.ts";
 import { createSelfhostV2SQLiteStore } from "../src/providers/selfhost-v2-sqlite-store.ts";
 import { v2SqliteWorkerProjection } from "../src/providers/selfhost-v2-sqlite-worker-projection.ts";
 import {
@@ -42,7 +45,7 @@ const TARGET = "sqlite-binding-target";
 const BUNDLE_FORM = "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/";
 const WORKERD = nativeEvidenceBinary("workerd-artifact");
 
-async function fixture(bindingName = "DB") {
+async function fixture(bindingName = "DB", invocationScoped = false, includeAux = false) {
   const root = mkdtempSync(join(tmpdir(), "v2-sqlite-binding-"));
   const stagingRoot = join(root, "sql-input-staging");
   mkdirSync(stagingRoot, { mode: 0o700 });
@@ -74,6 +77,16 @@ async function fixture(bindingName = "DB") {
   });
   expect((await engine.runNext())?.status).toBe("succeeded");
   const databaseUid = created.resourceUid;
+  const auxDatabaseUid = includeAux
+    ? (
+        await engine.acceptCreate({
+          principal: "alice",
+          key: "sqlite-binding-create-aux-0001",
+          input: { form: SQLITE_DATABASE_FORM_URL, space: "default", name: "aux", spec: {} },
+        })
+      ).resourceUid
+    : null;
+  if (auxDatabaseUid) expect((await engine.runNext())?.status).toBe("succeeded");
   await store.withAuthorizedDatabase({
     resourceUid: databaseUid,
     stillAuthorized: async () => true,
@@ -104,7 +117,10 @@ async function fixture(bindingName = "DB") {
     worker: { resourceUid: "worker-one" },
     bundle: { resourceUid: "bundle-one" },
     handlers: ["fetch"],
-    sqliteBindings: [{ name: bindingName, resource: { resourceUid: databaseUid } }],
+    sqliteBindings: [
+      { name: bindingName, resource: { resourceUid: databaseUid } },
+      ...(auxDatabaseUid ? [{ name: "AUX", resource: { resourceUid: auxDatabaseUid } }] : []),
+    ],
   });
   control
     .prepare(`INSERT INTO tf_v2_resources
@@ -128,6 +144,7 @@ async function fixture(bindingName = "DB") {
     ["worker-one", MODULE_WORKER_FORM_URL],
     ["bundle-one", BUNDLE_FORM],
     [databaseUid, SQLITE_DATABASE_FORM_URL],
+    ...(auxDatabaseUid ? ([[auxDatabaseUid, SQLITE_DATABASE_FORM_URL]] as [string, string][]) : []),
   ];
   for (const [uid, form] of referenceTargets) {
     control
@@ -145,6 +162,32 @@ async function fixture(bindingName = "DB") {
   control.exec(`UPDATE tf_v2_operations SET status='succeeded', effect='complete',
     result_observed_json='{"ready":true,"resolvedBindings":true,"bundleVerified":true}'
     WHERE id='op-version-one'`);
+  const invocation = invocationScoped
+    ? {
+        handle: { invocationId: "invocation-one", custodyToken: "custody-token-one-0001" },
+        expected: {
+          backendId: "worker-backend",
+          targetKey: TARGET,
+          principal: "alice",
+          space: "default",
+          workerUid: "worker-one",
+          deploymentUid: "deployment-one",
+          deploymentGeneration: 1,
+          sourceOperationId: "source-operation-one",
+          ingress: {
+            kind: "endpoint" as const,
+            endpointUid: "endpoint-one",
+            endpointGeneration: 1,
+          },
+          versionUid: "version-one",
+          versionGeneration: 1,
+          versionOperationId: "op-version-one",
+          nativeIdentity: "native-identity-one",
+          closureDigest: `sha256:${"a".repeat(64)}` as const,
+          confirmedReceipt: "confirmed-receipt-one",
+        },
+      }
+    : undefined;
   const grant = {
     principal: "alice",
     space: "default",
@@ -154,15 +197,73 @@ async function fixture(bindingName = "DB") {
     nativeVersionId: "v2-native-one",
     incarnationId: "incarnation-one",
     servingSourceOperationId: "source-operation-one",
-    bindings: [{ name: bindingName, resourceUid: databaseUid }],
+    bindings: [
+      { name: bindingName, resourceUid: databaseUid },
+      ...(auxDatabaseUid ? [{ name: "AUX", resourceUid: auxDatabaseUid }] : []),
+    ],
+    ...(invocation ? { invocation } : {}),
   };
+  let selectedBindings: readonly { name: string; resourceUid: string }[] | null = grant.bindings;
+  let selectedBindingsReadFails = false;
   let nativeCurrent = true;
   let graphCurrent = true;
+  let retirement: { retiredAtMs: number; receiptDigest: `sha256:${string}` } | null = null;
+  let drainState: "pending" | "drained" = "pending";
+  let drainReceiptDigest: `sha256:${string}` | null = null;
+  let loseDrainAck = false;
+  let readCount = 0;
+  let readHook: ((count: number) => Promise<void>) | undefined;
+  let proofPatch: {
+    space?: string;
+    targetKey?: string;
+    versionGeneration?: number;
+    noNativeDispatchAtMs?: number;
+  } = {};
+  const invocationAuthority: V2SqliteInvocationAuthority | undefined = invocation
+    ? {
+        async read() {
+          readCount += 1;
+          await readHook?.(readCount);
+          return {
+            ...invocation.expected,
+            handle: invocation.handle,
+            phase: "send_authorized",
+            bodyState: null,
+            noNativeDispatchAtMs: null,
+            retirement,
+            sqliteDrainState: drainState,
+            sqliteDrainReceiptDigest: drainReceiptDigest,
+            ...proofPatch,
+          };
+        },
+        async confirmSQLiteDrained(input) {
+          if (
+            !retirement ||
+            drainState !== "pending" ||
+            input.handle.invocationId !== invocation.handle.invocationId ||
+            input.handle.custodyToken !== invocation.handle.custodyToken
+          )
+            return false;
+          drainState = "drained";
+          drainReceiptDigest = input.receiptDigest;
+          if (loseDrainAck) {
+            loseDrainAck = false;
+            return false;
+          }
+          return true;
+        },
+        async readSelectedBindings() {
+          if (selectedBindingsReadFails) throw new Error("D1 selected-binding read unavailable");
+          return selectedBindings;
+        },
+      }
+    : undefined;
   const authority = createSQLiteWorkerBindingAuthority({ sql, targetKey: TARGET });
   const broker = createSelfhostV2SqliteBindingBroker({
     store,
     stagingRoot,
     signingKey: new Uint8Array(32).fill(7),
+    ...(invocationAuthority ? { invocationAuthority } : {}),
     resolveCurrentBinding: authority.resolveCurrentBinding,
     async observeVersionTarget(input) {
       return nativeCurrent
@@ -190,9 +291,37 @@ async function fixture(bindingName = "DB") {
     store,
     engine,
     databaseUid,
+    auxDatabaseUid,
     broker,
     grant,
     token,
+    setSelectedBindings(bindings: readonly { name: string; resourceUid: string }[] | null) {
+      selectedBindings = bindings;
+    },
+    failSelectedBindingsRead(value: boolean) {
+      selectedBindingsReadFails = value;
+    },
+    setReadHook(hook: ((count: number) => Promise<void>) | undefined) {
+      readHook = hook;
+    },
+    setProofPatch(patch: typeof proofPatch) {
+      proofPatch = patch;
+    },
+    readCount() {
+      return readCount;
+    },
+    retire() {
+      retirement = { retiredAtMs: 1, receiptDigest: `sha256:${"b".repeat(64)}` };
+    },
+    changeRetirementDigest() {
+      retirement = { retiredAtMs: 1, receiptDigest: `sha256:${"c".repeat(64)}` };
+    },
+    drained() {
+      return drainState === "drained";
+    },
+    loseNextDrainAck() {
+      loseDrainAck = true;
+    },
     call,
     stopNative() {
       nativeCurrent = false;
@@ -353,6 +482,229 @@ test("inline SQL refuses extra and duplicate envelope fields before executing", 
       ok: true,
       value: { rows: [{ body: '{"op":"execute","binding":"OTHER"}' }], rowsWritten: 0 },
     });
+  } finally {
+    host.close();
+  }
+});
+
+test("terminal drain waits for a lost SQL acknowledgement and refuses a late call", async () => {
+  const host = await fixture("DB", true);
+  try {
+    let release!: () => void;
+    let blocked!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const reached = new Promise<void>((resolve) => {
+      blocked = resolve;
+    });
+    host.setReadHook(async (count) => {
+      if (count === 4) {
+        blocked();
+        await held;
+      }
+    });
+    const pendingSQL = host.call("execute", {
+      sql: "INSERT INTO records (id, body) VALUES (1, 'committed before lost ACK')",
+    });
+    await reached;
+    host.retire();
+    const pendingDrain = host.broker.drainInvocation(host.grant);
+    await Bun.sleep(30);
+    expect(host.drained()).toBe(false);
+    release();
+    expect(await pendingSQL).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+    expect(await pendingDrain).toBe(true);
+    expect(host.drained()).toBe(true);
+    expect(await host.broker.drainInvocation(host.grant)).toBe(true);
+    expect(
+      await host.call("execute", {
+        sql: "INSERT INTO records (id, body) VALUES (2, 'late SQL')",
+      }),
+    ).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+    expect(
+      await host.store.withAuthorizedDatabase({
+        resourceUid: host.databaseUid,
+        stillAuthorized: async () => true,
+        use(database) {
+          return database.prepare("SELECT id FROM records ORDER BY id").all();
+        },
+      }),
+    ).toEqual([{ id: 1 }]);
+  } finally {
+    host.close();
+  }
+});
+
+test("invocation-scoped SQL refuses wrong Core scope and no-native-dispatch before effect", async () => {
+  const host = await fixture("DB", true);
+  try {
+    for (const patch of [
+      { space: "foreign" },
+      { targetKey: "foreign-target" },
+      { versionGeneration: 2 },
+      { noNativeDispatchAtMs: 1 },
+    ]) {
+      host.setProofPatch(patch);
+      expect(
+        await host.call("execute", {
+          sql: "INSERT INTO records (id, body) VALUES (1, 'forbidden')",
+        }),
+      ).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+    }
+    expect(
+      await host.store.withAuthorizedDatabase({
+        resourceUid: host.databaseUid,
+        stillAuthorized: async () => true,
+        use(database) {
+          return database.prepare("SELECT count(*) AS count FROM records").get();
+        },
+      }),
+    ).toEqual({ count: 0 });
+  } finally {
+    host.close();
+  }
+});
+
+test("a killed Node SQL process releases invocation custody only after journal recovery", async () => {
+  const host = await fixture("DB", true);
+  const storeSource = new URL("../src/providers/selfhost-v2-sqlite-store.ts", import.meta.url).href;
+  const sqlSource = new URL("../src/sql-sqlite.ts", import.meta.url).href;
+  const childCode = `
+    const { Database } = await import("bun:sqlite");
+    const { createSqliteSql } = await import(${JSON.stringify(sqlSource)});
+    const { createSelfhostV2SQLiteStore } = await import(${JSON.stringify(storeSource)});
+    const control = new Database(${JSON.stringify(join(host.root, "control.sqlite"))});
+    const store = createSelfhostV2SQLiteStore({
+      root: ${JSON.stringify(join(host.root, "native"))},
+      sql: createSqliteSql(control), targetKey: ${JSON.stringify(TARGET)}
+    });
+    await store.withInvocationLock("invocation-one", async () => {
+      await store.withAuthorizedDatabase({
+        resourceUid: ${JSON.stringify(host.databaseUid)},
+        stillAuthorized: async () => true,
+        async use(database) {
+          database.exec("BEGIN IMMEDIATE");
+          database.exec("INSERT INTO records (id, body) VALUES (7, 'uncommitted')");
+          console.log("sql-open");
+          await new Promise(() => {});
+        }
+      });
+    });
+  `;
+  const child = Bun.spawn([process.execPath, "--no-env-file", "-e", childCode], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  try {
+    const first = await child.stdout.getReader().read();
+    expect(new TextDecoder().decode(first.value)).toContain("sql-open");
+    host.retire();
+    const pendingDrain = host.broker.drainInvocation(host.grant);
+    await Bun.sleep(30);
+    expect(host.drained()).toBe(false);
+    child.kill("SIGKILL");
+    await child.exited;
+    expect(await pendingDrain).toBe(true);
+    expect(
+      await host.call("execute", { sql: "INSERT INTO records (id, body) VALUES (8, 'late')" }),
+    ).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+    expect(
+      await host.store.withAuthorizedDatabase({
+        resourceUid: host.databaseUid,
+        stillAuthorized: async () => true,
+        use(database) {
+          return database.prepare("SELECT count(*) AS count FROM records").get();
+        },
+      }),
+    ).toEqual({ count: 0 });
+  } finally {
+    child.kill("SIGKILL");
+    await child.exited;
+    host.close();
+  }
+});
+
+test("a lost drain acknowledgement replays only the identical terminal digest", async () => {
+  const host = await fixture("DB", true);
+  try {
+    host.retire();
+    host.loseNextDrainAck();
+    expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+    expect(host.drained()).toBe(true);
+    expect(await host.broker.drainInvocation(host.grant)).toBe(true);
+    host.changeRetirementDigest();
+    expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+  } finally {
+    host.close();
+  }
+});
+
+test("terminal drain cannot clear pending from a subset of selected SQLite bindings", async () => {
+  const host = await fixture("DB", true, true);
+  try {
+    host.retire();
+    const databaseBinding = host.grant.bindings[0];
+    const auxDatabaseUid = host.auxDatabaseUid;
+    if (!databaseBinding || !auxDatabaseUid) throw new Error("two SQLite bindings expected");
+    const recovered: string[] = [];
+    let failRecoveryUid: string | null = [auxDatabaseUid, host.databaseUid].sort()[1] ?? null;
+    const originalRecover = host.store.recoverOwnedDatabase;
+    host.store.recoverOwnedDatabase = async (uid) => {
+      recovered.push(uid);
+      if (uid === failRecoveryUid) return false;
+      return originalRecover(uid);
+    };
+    const subset = { ...host.grant, bindings: [databaseBinding] };
+    expect(await host.broker.drainInvocation(subset)).toBe(false);
+    expect(host.drained()).toBe(false);
+    expect(recovered).toEqual([]);
+    expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+    expect(host.drained()).toBe(false);
+    expect(recovered).toEqual([auxDatabaseUid, host.databaseUid].sort());
+    recovered.length = 0;
+    failRecoveryUid = null;
+    expect(await host.broker.drainInvocation(host.grant)).toBe(true);
+    expect(host.drained()).toBe(true);
+    expect(recovered).toEqual([auxDatabaseUid, host.databaseUid].sort());
+    expect(await host.broker.drainInvocation(subset)).toBe(false);
+  } finally {
+    host.close();
+  }
+});
+
+test("terminal drain refuses unproven, malformed, or mismatched selected bindings", async () => {
+  const host = await fixture("DB", true, true);
+  try {
+    host.retire();
+    const full = host.grant.bindings;
+    const databaseBinding = full[0];
+    const auxBinding = full[1];
+    if (!databaseBinding || !auxBinding) throw new Error("two SQLite bindings expected");
+    for (const bindings of [
+      [databaseBinding, { name: "OTHER", resourceUid: auxBinding.resourceUid }],
+      [databaseBinding, { name: "AUX", resourceUid: "fabricated-uid" }],
+      [...full, { name: "EXTRA", resourceUid: "fabricated-uid" }],
+    ]) {
+      expect(await host.broker.drainInvocation({ ...host.grant, bindings })).toBe(false);
+      expect(host.drained()).toBe(false);
+    }
+    await expect(
+      host.broker.drainInvocation({ ...host.grant, bindings: [...full, databaseBinding] }),
+    ).rejects.toThrow(TypeError);
+    host.setSelectedBindings([...full, databaseBinding]);
+    expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+    host.setSelectedBindings(null);
+    expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+    host.failSelectedBindingsRead(true);
+    expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+    host.failSelectedBindingsRead(false);
+    host.setSelectedBindings(full);
+    host.setProofPatch({ versionGeneration: 2 });
+    expect(await host.broker.drainInvocation(host.grant)).toBe(false);
+    host.setProofPatch({});
+    expect(host.drained()).toBe(false);
+    expect(await host.broker.drainInvocation(host.grant)).toBe(true);
   } finally {
     host.close();
   }

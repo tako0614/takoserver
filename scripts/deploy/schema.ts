@@ -162,6 +162,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0085_v2_edge_kv_native_custody.sql",
   "0086_v2_worker_service_invocation_custody.sql",
   "0087_v2_worker_cron_invocation_custody.sql",
+  "0088_v2_worker_sqlite_external_drain.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -338,8 +339,10 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:4bacc1b2d8d3d78a7736ccc66257d2e8c8a077ec82a0fc1a208038266b28a0d5",
   "0087_v2_worker_cron_invocation_custody.sql":
     "sha256:0375e932701b6596363468a784cdef91d56846f9e4a49cc65ff5890c0f2d0b7e",
+  "0088_v2_worker_sqlite_external_drain.sql":
+    "sha256:88bf294753e8bd43809634410c4a8648cb3e0500e7400d53ec4c8f17fae46c84",
 };
-// 0067-0087 are part of the exact source inventory only. None has an in-place apply wave.
+// 0067-0088 are part of the exact source inventory only. None has an in-place apply wave.
 const INTEGRATION_APPLY_CEILING_COUNT = 66;
 // Fresh production bootstrap is a distinct, still-frozen authority. Auditing
 // a new local source migration never silently adds it to this payload.
@@ -2233,7 +2236,7 @@ function selectSchemaWave(
     if (hasAvailabilityCutover) {
       if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
         throw preflightError(
-          "integration D1 cutover requires the exact audited source inventory 0001-0087",
+          "integration D1 cutover requires the exact audited source inventory 0001-0088",
         );
       }
       assertAuditedMigrationHashes(artifact.files);
@@ -2280,7 +2283,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0087",
+      "selected D1 wave requires the exact audited source inventory 0001-0088",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -2355,14 +2358,14 @@ function assertOperationGenerationMigrationHashes(
   );
 }
 
-/** Reads and validates the exact current 0001-0087 source corpus. */
+/** Reads and validates the exact current 0001-0088 source corpus. */
 export function readCurrentAuditedMigrationSourceArtifact(
   directory: string = resolve(REPOSITORY, "migrations"),
 ): ReturnType<typeof readMigrationArtifact> {
   const artifact = readMigrationArtifact(directory);
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0087",
+      "audited migration lineage must contain exactly 0001-0088",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }
@@ -2372,14 +2375,14 @@ export function readCurrentAuditedMigrationSourceArtifact(
 
 /**
  * Explicitly projects the exact current source corpus to the existing 0001-0066
- * apply-qualified lineage. This does not grant 0067-0087 an apply wave or authority.
+ * apply-qualified lineage. This does not grant 0067-0088 an apply wave or authority.
  */
 export function projectApplyQualifiedMigrationArtifact(
   source: ReturnType<typeof readMigrationArtifact>,
 ): ReturnType<typeof readMigrationArtifact> {
   if (JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "apply-qualified migration projection requires the exact audited source inventory 0001-0087",
+      "apply-qualified migration projection requires the exact audited source inventory 0001-0088",
       `actual=${JSON.stringify(source.names)}`,
     );
   }
@@ -2398,7 +2401,7 @@ export function projectFreshV2ArtifactMigrationArtifact(
 ): ReturnType<typeof readMigrationArtifact> {
   if (JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "fresh v2 artifact projection requires the exact audited source inventory 0001-0087",
+      "fresh v2 artifact projection requires the exact audited source inventory 0001-0088",
       `actual=${JSON.stringify(source.names)}`,
     );
   }
@@ -2434,7 +2437,7 @@ export function projectFreshProductionMigrationArtifact(
 ): ReturnType<typeof readMigrationArtifact> {
   if (JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "fresh production projection requires the exact audited source inventory 0001-0087",
+      "fresh production projection requires the exact audited source inventory 0001-0088",
       `actual=${JSON.stringify(source.names)}`,
     );
   }
@@ -2494,7 +2497,7 @@ export function readAuditedMigrationArtifact(
 
 /**
  * Reads the frozen 0001-0060 operation-generation corpus. This boundary is
- * intentionally separate from the current 0001-0087 source inventory: the
+ * intentionally separate from the current 0001-0088 source inventory: the
  * operation-generation cutover is historical evidence, not a claim about the
  * current migration tail.
  */
@@ -2910,7 +2913,7 @@ function inspectManagedQueueRetirementCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "managed Queue retirement cutover requires the exact audited source inventory 0001-0087",
+      "managed Queue retirement cutover requires the exact audited source inventory 0001-0088",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -2950,7 +2953,7 @@ function inspectManagedActorOwnerCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "Actor owner claim cutover requires the exact audited source inventory 0001-0087",
+      "Actor owner claim cutover requires the exact audited source inventory 0001-0088",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -2991,7 +2994,7 @@ function inspectRuntimeInputLeaseGenerationCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "runtime-input lease generation cutover requires the exact audited source inventory 0001-0087",
+      "runtime-input lease generation cutover requires the exact audited source inventory 0001-0088",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -3033,7 +3036,7 @@ function inspectActorKvCapabilityCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "Actor KV capability claim cutover requires the exact audited source inventory 0001-0087",
+      "Actor KV capability claim cutover requires the exact audited source inventory 0001-0088",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -3110,7 +3113,7 @@ async function inspectApplyProviderSelectionCutover(input: {
     }
     if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
       throw preflightError(
-        "accepted-authority cutover requires the exact audited source inventory 0001-0087",
+        "accepted-authority cutover requires the exact audited source inventory 0001-0088",
       );
     }
     assertAuditedMigrationHashes(input.artifact.files);
@@ -3152,7 +3155,7 @@ async function inspectApplyProviderSelectionCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "operation-generation cutover requires the exact audited source inventory 0001-0087",
+      "operation-generation cutover requires the exact audited source inventory 0001-0088",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);

@@ -626,6 +626,15 @@ an already-unlinked file descriptor. The transport validates statement and
 parameter bounds before one atomic transaction; the output budget is checked
 before commit. Native tests pass a
 42-statement transaction with 1,000,000-byte parameters and verify all 42 rows.
+The Node-only SQLite extension also has an opt-in custody mode for an external
+Core proof source. It keeps the same UID file and original CREATE receipt for
+Form lifecycle and Worker SQL, while a file-backed invocation lock encloses the
+UID lock, SQL close, and terminal drain. The proof source has fixed claim,
+original-CREATE, and invocation readback methods, not an arbitrary SQL bridge.
+The legacy self-host composition still uses its local fixed SQL checks. This
+internal seam alone does not activate or qualify a WfP SQLite Form or Binding;
+the operator must select one durable lock/root realm and connect the Core arm,
+terminal proof, and drain CAS before admitting SQL.
 Malformed or interrupted input is rejected before execution; a later SQL failure
 or excess output rolls back without retained named input files. The SQL wrapper
 captures its input before sending and serializes it incrementally, with at most

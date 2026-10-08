@@ -17,12 +17,15 @@ export {
   createSelfhostV2SqliteBindingBroker,
   type V2SqliteBindingBrokerOptions,
   type V2SqliteBindingGrant,
+  type V2SqliteInvocationAuthority,
   type V2SqliteSelectedVersionObservation,
 } from "./selfhost-v2-sqlite-binding-broker.ts";
 export {
   createSelfhostV2SQLiteStore,
   type SelfhostV2SQLiteStore,
   SelfhostV2SQLiteStoreError,
+  type SQLiteNativeExecution,
+  type SQLiteStoreProofPort,
 } from "./selfhost-v2-sqlite-store.ts";
 export {
   SELFHOST_DATA_PLANE_CONTENT_TYPE,

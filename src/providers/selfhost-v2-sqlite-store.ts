@@ -40,7 +40,7 @@ const LEDGER_SQL = LEDGER_SCHEMA.replace("CREATE TABLE ", "CREATE TABLE IF NOT E
 type Presence = "present" | "absent" | "unknown";
 
 /** Neutral structural input: this adapter never imports the v2 Form layer. */
-interface SQLiteNativeExecution {
+export interface SQLiteNativeExecution {
   readonly operationId: string;
   readonly leaseToken: string;
   readonly backendKey: string;
@@ -53,6 +53,24 @@ interface SQLiteNativeExecution {
   readonly form: string;
   readonly space: string;
   readonly name: string;
+}
+
+/** Operator-selected Core readback, never a tenant-supplied query capability. */
+export interface SQLiteStoreProofPort {
+  currentClaim(input: SQLiteNativeExecution): Promise<
+    | (SQLiteNativeExecution & {
+        readonly leaseUntilMs: number;
+      })
+    | null
+  >;
+  acceptedCreate(input: { readonly resourceUid: string; readonly targetKey: string }): Promise<{
+    readonly createOperationId: string;
+    readonly resourceUid: string;
+    readonly principal: string;
+    readonly space: string;
+    readonly backendId: string;
+    readonly targetKey: string;
+  } | null>;
 }
 
 interface OwnerReceipt {
@@ -75,24 +93,32 @@ export class SelfhostV2SQLiteStoreError extends Error {
  * `withAuthorizedDatabase` is Host-internal and must never be exposed to a
  * Worker: the Worker receives only the SQL plane's three safe methods.
  */
-export function createSelfhostV2SQLiteStore(options: {
-  readonly root: string;
-  readonly sql: Sql;
-  readonly targetKey: string;
-  readonly now?: Clock;
-}) {
+export function createSelfhostV2SQLiteStore(
+  options: {
+    readonly root: string;
+    readonly targetKey: string;
+    readonly now?: Clock;
+  } & (
+    | { readonly sql: Sql; readonly proofs?: never }
+    | { readonly proofs: SQLiteStoreProofPort; readonly sql?: never }
+  ),
+) {
   if (!options.root || !isAbsolute(options.root)) {
     throw new TypeError("an absolute SQLite custody root is required");
   }
   if (!options.targetKey || Buffer.byteLength(options.targetKey, "utf8") > 256) {
     throw new TypeError("targetKey must be 1 to 256 UTF-8 bytes");
   }
+  if (("sql" in options && !!options.sql) === ("proofs" in options && !!options.proofs)) {
+    throw new TypeError("exactly one SQLite Core proof source is required");
+  }
   const root = resolve(options.root);
   const resources = join(root, "resources");
   const staging = join(root, "staging");
   const deleted = join(root, "deleted");
   const locks = join(root, "locks");
-  for (const directory of [root, resources, staging, deleted, locks]) {
+  const invocationLocks = join(locks, "invocations");
+  for (const directory of [root, resources, staging, deleted, locks, invocationLocks]) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const metadata = lstatSync(directory);
     if (!metadata.isDirectory() || (metadata.mode & 0o077) !== 0) {
@@ -105,6 +131,52 @@ export function createSelfhostV2SQLiteStore(options: {
   const stageDir = (operationId: string) => join(staging, checkedId(operationId));
   const deletedDir = (uid: string, operationId: string) =>
     join(deleted, checkedId(uid), checkedId(operationId));
+
+  /** Must be acquired before a UID lock. The SQLite file lock dies with its process. */
+  async function withInvocationLock<T>(
+    invocationId: string,
+    work: () => Promise<T> | T,
+    input: { readonly signal?: AbortSignal; readonly timeoutMs?: number } = {},
+  ): Promise<T> {
+    if (typeof invocationId !== "string" || invocationId.length < 1 || invocationId.length > 255)
+      throw new SelfhostV2SQLiteStoreError("backend_unavailable");
+    const timeoutMs = input.timeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000)
+      throw new TypeError("invalid SQLite invocation lock timeout");
+    const path = join(
+      invocationLocks,
+      `${createHash("sha256").update(invocationId).digest("hex")}.sqlite`,
+    );
+    const deadline = performance.now() + timeoutMs;
+    for (;;) {
+      if (input.signal?.aborted || performance.now() >= deadline)
+        throw new SelfhostV2SQLiteStoreError("busy");
+      if (!privateDirectory(invocationLocks) || (entryExists(path) && !regular(path)))
+        throw new SelfhostV2SQLiteStoreError("ownership_uncertain");
+      const mutex = new DatabaseSync(path);
+      let locked = false;
+      try {
+        mutex.exec("PRAGMA busy_timeout = 0");
+        mutex.exec("BEGIN EXCLUSIVE");
+        locked = true;
+        chmodSync(path, 0o600);
+        return await work();
+      } catch (error) {
+        if (locked || !/locked|busy/iu.test(error instanceof Error ? error.message : ""))
+          throw error;
+      } finally {
+        if (locked) {
+          try {
+            mutex.exec("ROLLBACK");
+          } catch {
+            // Process death also releases this lock; the caller treats uncertain work as unknown.
+          }
+        }
+        mutex.close();
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+  }
 
   async function withLock<T>(uid: string, work: () => Promise<T>): Promise<T> {
     const shard = createHash("sha256").update(uid).digest("hex").slice(0, 2);
@@ -135,6 +207,31 @@ export function createSelfhostV2SQLiteStore(options: {
   async function ownsClaim(input: SQLiteNativeExecution): Promise<boolean> {
     const nowMs = now().getTime();
     if (!Number.isSafeInteger(nowMs)) return false;
+    if (options.proofs) {
+      const claim = await options.proofs.currentClaim(input);
+      return (
+        claim !== null &&
+        Number.isSafeInteger(claim.leaseUntilMs) &&
+        claim.leaseUntilMs > nowMs &&
+        (
+          [
+            "operationId",
+            "leaseToken",
+            "backendKey",
+            "backendId",
+            "targetKey",
+            "resourceUid",
+            "principal",
+            "action",
+            "generation",
+            "form",
+            "space",
+            "name",
+          ] as const
+        ).every((key) => claim[key] === input[key])
+      );
+    }
+    if (!options.sql) return false;
     const row = (
       await options.sql.query(
         `SELECT op.id FROM tf_v2_operations op
@@ -217,6 +314,25 @@ export function createSelfhostV2SQLiteStore(options: {
 
   async function matchesAcceptedCreate(uid: string, owner: OwnerReceipt | null): Promise<boolean> {
     if (!matchesOwner(owner, uid)) return false;
+    if (options.proofs) {
+      const created = await options.proofs.acceptedCreate({
+        resourceUid: uid,
+        targetKey: options.targetKey,
+      });
+      return (
+        created !== null &&
+        created.resourceUid === uid &&
+        created.targetKey === options.targetKey &&
+        created.createOperationId === owner.createOperationId &&
+        typeof created.principal === "string" &&
+        created.principal.length > 0 &&
+        typeof created.space === "string" &&
+        created.space.length > 0 &&
+        typeof created.backendId === "string" &&
+        created.backendId.length > 0
+      );
+    }
+    if (!options.sql) return false;
     const rows = await options.sql.query(
       `SELECT created.id FROM tf_v2_resources r
        JOIN tf_v2_operations created ON created.resource_uid = r.uid
@@ -586,12 +702,40 @@ export function createSelfhostV2SQLiteStore(options: {
     });
   }
 
+  /** Physical UID ownership/readiness witness; never returns a database handle. */
+  async function inspectOwnedDatabase(input: {
+    readonly resourceUid: string;
+    readonly stillAuthorized: () => Promise<boolean>;
+  }): Promise<"confirmed" | "unknown"> {
+    try {
+      return await withAuthorizedDatabase({
+        ...input,
+        use: async () => ((await input.stillAuthorized()) ? "confirmed" : "unknown"),
+      });
+    } catch {
+      return "unknown";
+    }
+  }
+
+  /** Trusted terminal drain only: forces journal recovery under the UID lock. */
+  async function recoverOwnedDatabase(resourceUid: string): Promise<boolean> {
+    const uid = checkedId(resourceUid);
+    return withLock(uid, async () => {
+      return (
+        presence(uid) === "present" && (await matchesAcceptedCreate(uid, ownerAt(resourceDir(uid))))
+      );
+    });
+  }
+
   return {
     targetKey: options.targetKey,
     ensureCreated,
     inspect,
     ensureDeleted,
     withAuthorizedDatabase,
+    inspectOwnedDatabase,
+    withInvocationLock,
+    recoverOwnedDatabase,
   };
 }
 

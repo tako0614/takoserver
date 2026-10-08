@@ -9,8 +9,11 @@ import {
   SELFHOST_DATA_PLANE_SQL_PATH,
   type SelfhostV2SQLiteStore,
   SelfhostV2SQLiteStoreError,
+  type SQLiteNativeExecution,
+  type SQLiteStoreProofPort,
   type V2SqliteBindingBrokerOptions,
   type V2SqliteBindingGrant,
+  type V2SqliteInvocationAuthority,
   type V2SqliteSelectedVersionObservation,
 } from "@takoserver/core/provider-extension/selfhost";
 import * as portableV2 from "@takoserver/core/takoform-v2";
@@ -72,6 +75,28 @@ test("Node selfhost extension exposes the existing SQLite store and guarded brok
   } satisfies V2SqliteBindingBrokerOptions;
   expect(options.observeVersionTarget).toBeFunction();
   expect(grant.bindings).toHaveLength(1);
+  const proofs: SQLiteStoreProofPort = {
+    async currentClaim(_input: SQLiteNativeExecution) {
+      return null;
+    },
+    async acceptedCreate() {
+      return null;
+    },
+  };
+  const invocationAuthority: V2SqliteInvocationAuthority = {
+    async read() {
+      return null;
+    },
+    async readSelectedBindings() {
+      return null;
+    },
+    async confirmSQLiteDrained() {
+      return false;
+    },
+  };
+  expect(proofs.currentClaim).toBeFunction();
+  expect(invocationAuthority.readSelectedBindings).toBeFunction();
+  expect(invocationAuthority.confirmSQLiteDrained).toBeFunction();
   for (const name of [
     "createSelfhostV2SQLiteStore",
     "SelfhostV2SQLiteStoreError",
