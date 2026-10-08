@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1595,6 +1595,8 @@ export class SqlWorkflow {
       };
       const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
       const sqliteTarget = await create(SQLITE_DATABASE_FORM_URL, "sqlite-target", {});
+      const sqliteUidDirectory = join(root, "v2-sqlite-databases", "resources", sqliteTarget.uid);
+      expect((await stat(join(sqliteUidDirectory, "database.sqlite"))).isFile()).toBe(true);
       const migrationSet = await create(SQLITE_MIGRATION_SET_FORM_URL, "migration-set", {
         artifact: { url: MANIFEST_URL, sha256: migrationManifestDigest },
       });
@@ -1991,6 +1993,10 @@ export class SqlWorkflow {
       await remove(bucketTarget.uid, 1, "bucket-target");
       await remove(kvTarget.uid, 1, "kv-target");
       await remove(sqliteTarget.uid, 1, "sqlite-target");
+      await expect(stat(join(sqliteUidDirectory, "database.sqlite"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(stat(sqliteUidDirectory)).rejects.toMatchObject({ code: "ENOENT" });
       await remove(worker.uid, 2, "worker");
       await stopHost(serving);
       serving = null;

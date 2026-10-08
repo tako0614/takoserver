@@ -41,3 +41,45 @@ install packages, verify signatures, authorize resale, or qualify a native
 workerd implementation. Existing `v2` configuration still selects only its
 three artifact-custody Forms unless an operator programmatically composes
 additional complete backends.
+
+## Normal Cloudflare Worker entry
+
+The public Cloudflare Worker entry keeps one normal Takoform Host API v2, account
+authority, SQL ledger, and scheduled executor. Operator code may select additional
+complete Forms with `createWorkerEntry` from `@takoserver/core/worker-entry`:
+
+```ts
+import { createWorkerEntry } from "@takoserver/core/worker-entry";
+
+export default createWorkerEntry({
+  async composeV2Forms({ env, sql, objects, clock }) {
+    // Inspect required schema and compose a complete private backend here.
+    // Return only additional exact Form URL entries.
+    return privateFormsFor(env, sql, objects, clock);
+  },
+});
+```
+
+This is an in-process, code-selected hook, not a request field, environment
+selector, uploaded plug-in, or new public Form. The callback receives the exact
+`env`, `Sql`, object store, and clock used by `buildApp`. It may await bounded,
+read-only startup qualification; it must not mutate provider state during
+composition. A concrete backend still owns its Form-specific admission,
+execution, reconciliation, and native authority.
+
+The callback returns a plain map keyed by exact HTTPS Form URL. The canonical
+v2 application validates and snapshots it, rejects incomplete entries and
+collisions with the configured built-in artifact Forms, then uses that same
+snapshot for support and Operation execution. A missing callback retains the
+existing three-artifact-form behavior. Each `createWorkerEntry` instance has its
+own per-Env startup cache; simultaneous fetch and scheduled calls share one
+composition. Failed composition is not cached, so a repaired environment may
+retry; the ordinary Worker startup 503 envelope applies. A selected composer's
+callback, Form-map validation, or backend-constructor exception text is not
+returned to the caller. Existing no-composer configuration diagnostics remain
+unchanged.
+
+The hook creates no additional credential, private-input channel, or registry;
+`env` remains the existing operator-owned Worker binding object and must not be
+logged or returned to tenants. Composing a Form here does not itself qualify a
+managed Worker runtime, offer supply, or authorize deployment.
