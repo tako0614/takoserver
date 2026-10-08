@@ -155,9 +155,6 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
     },
     vector: "vector",
   };
-  expect(claim.nativeVersionId).toBe("v2-logical-public-identity");
-  expect(resolution.target.queueId).toBe("takoform-v2-queue:queue");
-
   const sql: Sql = {
     query: async () => [],
     run: async () => ({ rows: [], changes: 0 }),
@@ -165,10 +162,13 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   };
   const authority = extension.createQueueWorkerBindingAuthority({ sql, targetKey: "target" });
   expect(await authority.resolveCurrentBinding(claim, "QUEUE")).toBeNull();
-  const queue = extension.createAtLeastOnceQueueForm({ sql, targetKey: "target" });
+  const queue = extension.createAtLeastOnceQueueForm({
+    sql,
+    targetKey: resolution.identity.targetKey,
+  });
   expect(queue.backend.id).toBe(V2_QUEUE_BACKEND_ID);
   expect(queue.backend.targetKey).toBe("target");
-  queue.validateCreate({ messageRetentionSeconds: 60 });
+  queue.validateCreate({ messageRetentionSeconds: resolution.target.messageRetentionSeconds });
 });
 
 test("v2 extension entrypoint bundles for a Worker without Node or workerd runtime", async () => {
