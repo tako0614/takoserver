@@ -356,11 +356,12 @@ class NativeSocketReader {
   }
 }
 
-async function nativeActorWssEcho(
+async function nativeActorWssExchange(
   hostname: string,
   certificateFile: string,
   message: string,
-): Promise<string> {
+  mode: "echo" | "welcome-close" = "echo",
+): Promise<string | { welcome: string; closeCode: number; closeReason: string }> {
   const socket = tlsConnect({
     host: "127.0.0.1",
     port: 443,
@@ -397,7 +398,7 @@ async function nativeActorWssEcho(
     });
     const key = randomBytes(16).toString("base64");
     socket.write(
-      `GET /actor-socket HTTP/1.1\r\nHost: ${hostname}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
+      `GET ${mode === "welcome-close" ? "/actor-socket-welcome" : "/actor-socket"} HTTP/1.1\r\nHost: ${hostname}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
         `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
     );
     const handshake = (
@@ -413,6 +414,25 @@ async function nativeActorWssEcho(
       !handshake.toLowerCase().includes(`sec-websocket-accept: ${accept.toLowerCase()}`)
     )
       throw new Error(`native Actor WSS handshake rejected: ${handshake.split("\r\n")[0]}`);
+    if (mode === "welcome-close") {
+      // No client frame is sent until the Actor's post-accept welcome arrives.
+      const first = await readFrame().catch((error: unknown) => {
+        throw new Error("native Actor WSS immediate welcome read failed", { cause: error });
+      });
+      if (first.opcode !== 1) throw new Error("native Actor WSS welcome is not text");
+      sendFrame(1, Buffer.from(message));
+      const closed = await readFrame().catch((error: unknown) => {
+        throw new Error("native Actor WSS application close read failed", { cause: error });
+      });
+      if (closed.opcode !== 8 || closed.payload.byteLength < 2)
+        throw new Error("native Actor WSS application close is invalid");
+      sendFrame(8, closed.payload);
+      return {
+        welcome: first.payload.toString("utf8"),
+        closeCode: closed.payload.readUInt16BE(0),
+        closeReason: closed.payload.subarray(2).toString("utf8"),
+      };
+    }
     sendFrame(1, Buffer.from(message));
     const echoed = await readFrame().catch((error: unknown) => {
       throw new Error("native Actor WSS echo read failed", { cause: error });
@@ -1332,7 +1352,7 @@ test.skipIf(OPT_IN !== "1")(
       const result = await env.DB.query("SELECT value FROM item ORDER BY rowid");
       return Response.json(result.rows);
     }
-    if (path === "/actor-socket")
+    if (path === "/actor-socket" || path === "/actor-socket-welcome")
       return env.ACTOR.get(env.ACTOR.idFromName("room")).fetch(request);
     if (path === "/actor-write" || path === "/actor-read" || path === "/actor-sql" || path === "/actor-workflow-create" || path === "/actor-workflow-status") {
       const actor = env.ACTOR.get(env.ACTOR.idFromName("room"));
@@ -1358,8 +1378,11 @@ export class CounterActor {
   }
   async fetch(request) {
     const path = new URL(request.url).pathname;
-    if (path === "/actor-socket")
-      return (await this.context.sockets.accept(request)).response;
+    if (path === "/actor-socket" || path === "/actor-socket-welcome") {
+      const accepted = await this.context.sockets.accept(request);
+      if (path === "/actor-socket-welcome") await accepted.socket.send("actor:welcome");
+      return accepted.response;
+    }
     if (path === "/sql") {
       const result = await this.env.DB.query("SELECT value FROM item ORDER BY rowid");
       return Response.json(result.rows);
@@ -1382,7 +1405,10 @@ export class CounterActor {
     return Response.json({value: Number(result.rows[0]?.value ?? 0)});
   }
   async alarm() {}
-  async socketMessage(socket, data) { await socket.send("actor:" + String(data)); }
+  async socketMessage(socket, data) {
+    if (String(data) === "finish") await socket.close(4000, "done");
+    else await socket.send("actor:" + String(data));
+  }
   async socketClose() {}
   async socketError() {}
 }
@@ -1676,9 +1702,12 @@ export class SqlWorkflow {
         status: 200,
         body: '{"value":1}',
       });
-      expect(await nativeActorWssEcho(hostname, certificateFile, "before-restart")).toBe(
+      expect(await nativeActorWssExchange(hostname, certificateFile, "before-restart")).toBe(
         "actor:before-restart",
       );
+      expect(
+        await nativeActorWssExchange(hostname, certificateFile, "finish", "welcome-close"),
+      ).toEqual({ welcome: "actor:welcome", closeCode: 4000, closeReason: "done" });
       expect(await nativeHttps(hostname, "/actor-sql")).toEqual({
         status: 200,
         body: '[{"value":"once"}]',
@@ -1721,7 +1750,7 @@ export class SqlWorkflow {
         status: 200,
         body: '{"value":1}',
       });
-      expect(await nativeActorWssEcho(hostname, certificateFile, "after-restart")).toBe(
+      expect(await nativeActorWssExchange(hostname, certificateFile, "after-restart")).toBe(
         "actor:after-restart",
       );
       expect(await nativeHttps(hostname, "/actor-read")).toEqual({
