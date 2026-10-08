@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { parseStrictJson } from "../strict-json.ts";
 import {
   createSelfhostV2SqlitePlane,
   type EdgeSqlValue,
@@ -160,11 +161,22 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
     let payload: Record<string, unknown>;
     try {
       body = await readSqlRequestBody(request, stagingRoot);
-      payload =
+      const parsed: unknown =
         body.kind === "inline"
-          ? JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body.bytes))
+          ? parseStrictJson(body.bytes, 1_048_576)
           : { protocol: body.protocol, binding: body.binding, op: body.op };
-      if (!record(payload) || payload.protocol !== SELFHOST_DATA_PLANE_PROTOCOL) throw new Error();
+      if (!record(parsed) || parsed.protocol !== SELFHOST_DATA_PLANE_PROTOCOL) throw new Error();
+      if (body.kind === "inline") {
+        const keys = Object.keys(parsed).sort().join(",");
+        if (
+          ((parsed.op === "execute" || parsed.op === "query") &&
+            keys !== "binding,op,protocol,statement") ||
+          (parsed.op === "transaction" && keys !== "binding,op,protocol,statements") ||
+          (parsed.op !== "execute" && parsed.op !== "query" && parsed.op !== "transaction")
+        )
+          throw new Error();
+      }
+      payload = parsed;
     } catch {
       body?.dispose();
       return refusal("backend_unavailable", 400);
