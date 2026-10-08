@@ -52,8 +52,10 @@ interface Layer {
 }
 
 const LAYERS: readonly Layer[] = [
-  // v2 shares neutral primitives, not the v1 package/admission domain. Keep
-  // these edges explicit so a protocol translator cannot enter unnoticed.
+  // v2 shares neutral primitives, not the v1 package/admission domain. The
+  // Queue Resource/Operation manager is exposed as a source-extension factory,
+  // but this does not register it in the normal Host. Keep other edges explicit
+  // so a protocol translator cannot enter unnoticed.
   {
     name: "v2-extension",
     match: /^src\/takoform-v2\/index\.ts$/u,
@@ -66,6 +68,7 @@ const LAYERS: readonly Layer[] = [
       "v2-code-validation",
       "v2-runtime",
       "v2-service-binding-authority",
+      "v2-queue-manager",
     ],
   },
   {
