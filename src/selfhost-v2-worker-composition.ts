@@ -38,6 +38,10 @@ import { QUEUE_CONSUMER_FORM_URL } from "./takoform-v2/forms/queue-consumer.ts";
 import { createQueueWorkerBindingAuthority } from "./takoform-v2/forms/queue-worker-binding-authority.ts";
 import { SQLITE_DATABASE_FORM_URL } from "./takoform-v2/forms/sqlite-database.ts";
 import { createSQLiteDatabaseForm } from "./takoform-v2/forms/sqlite-database-backend.ts";
+import { SQLITE_MIGRATION_APPLICATION_FORM_URL } from "./takoform-v2/forms/sqlite-migration-application.ts";
+import { createSQLiteMigrationApplicationForm } from "./takoform-v2/forms/sqlite-migration-application-backend.ts";
+import { createSQLiteMigrationApplicationNativePort } from "./takoform-v2/forms/sqlite-migration-application-native.ts";
+import { createSQLiteMigrationSetCustody } from "./takoform-v2/forms/sqlite-migration-set-backend.ts";
 import { createSQLiteWorkerBindingAuthority } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { createStaticAssetBundleCustody } from "./takoform-v2/forms/static-asset-bundle-backend.ts";
 import { createWorkerBundleCustody } from "./takoform-v2/forms/worker-bundle-backend.ts";
@@ -1303,15 +1307,25 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       !queueSettlement ||
       !queueProducerBoot ||
       !queueCapability ||
-      !options.sqliteBinding ||
+      !sqliteBinding ||
       !options.v2KvBinding ||
       !options.v2ObjectBucketBinding
     ) {
       throw new TypeError("complete secret-free v2 Worker Form dependencies are unavailable");
     }
-    const sqliteStore = options.sqliteBinding.store;
+    const sqliteStore = sqliteBinding.store;
     const kvStore = options.v2KvBinding.store;
     const objectBucketStore = options.v2ObjectBucketBinding.store;
+    const migrationCustody = config.sqliteMigrationSet
+      ? createSQLiteMigrationSetCustody({
+          sql,
+          source: createV2HeldArtifactSource({
+            objects,
+            entries: config.sqliteMigrationSet.heldArtifacts,
+          }),
+          now: clock,
+        })
+      : undefined;
     let capturedEndpoint: EndpointPorts | undefined;
     if (endpoint !== undefined) {
       const { assignHostname, observeTls, observeRouteAbsent } = endpoint;
@@ -1327,6 +1341,17 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     return (context) => ({
       ...createInternalForms(context, capturedEndpoint, false),
       [SQLITE_DATABASE_FORM_URL]: createSQLiteDatabaseForm({ store: sqliteStore }),
+      ...(migrationCustody
+        ? {
+            [SQLITE_MIGRATION_APPLICATION_FORM_URL]: createSQLiteMigrationApplicationForm({
+              sql,
+              migrationPort: createSQLiteMigrationApplicationNativePort(sqliteStore),
+              custody: migrationCustody,
+              targetKey,
+              now: clock,
+            }),
+          }
+        : {}),
       [EDGE_KV_NAMESPACE_FORM_URL]: createEdgeKVNamespaceForm({
         store: kvStore,
         targetKey,

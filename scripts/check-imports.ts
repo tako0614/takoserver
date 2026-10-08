@@ -359,6 +359,7 @@ const LAYERS: readonly Layer[] = [
       "v2-application",
       "v2-config",
       "v2-form",
+      "v2-sqlite-migration-native",
       "v2-runtime",
       "v2-private",
       "v2-code-validation",
