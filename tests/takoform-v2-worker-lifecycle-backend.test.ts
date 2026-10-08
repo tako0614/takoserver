@@ -6,9 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql } from "../src/ports.ts";
+import { createSelfhostV2ObjectBucketStore } from "../src/providers/selfhost-v2-object-bucket-store.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { readV2ConfiguredPrivateInputs } from "../src/takoform-v2/configured-private-inputs.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
+import { OBJECT_BUCKET_FORM_URL } from "../src/takoform-v2/forms/object-bucket.ts";
+import { createObjectBucketForm } from "../src/takoform-v2/forms/object-bucket-backend.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { createStaticAssetBundleHost } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
@@ -61,6 +64,7 @@ const FILE_BYTES = new TextEncoder().encode("<main>held asset</main>");
 const BUNDLE_MANIFEST_URL = "https://artifacts.example.test/code/manifest.json";
 const BUNDLE_FILE_URL = "https://artifacts.example.test/code/index.mjs";
 const BUNDLE_FILE_BYTES = new TextEncoder().encode("export default { scheduled() {} };\n");
+const ALTERNATE_BUCKET_BACKEND_ID = "operator-selected-object-bucket-v1";
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
 function fixture(options?: {
@@ -71,6 +75,8 @@ function fixture(options?: {
   configuredInputCustody?: V2CodeConfiguredInputCustody;
   privateInputCustody?: V2PrivateInputCustody;
   inspectModule?: WorkerdRuntime["inspectModule"];
+  objectBucketBackendId?: string;
+  objectBucketExpectedBackendId?: string;
   backendQueryHook?: (
     statement: string,
     sql: Sql,
@@ -194,6 +200,32 @@ function fixture(options?: {
   const configuredInputCustody: V2CodeConfiguredInputCustody = options?.configuredInputCustody ?? {
     read: async (identity) => await readV2ConfiguredPrivateInputs(sql, identity),
   };
+  const bucketStore =
+    options?.objectBucketBackendId === undefined
+      ? undefined
+      : createSelfhostV2ObjectBucketStore({ sql, root: join(root, "buckets") });
+  const bucketForm = bucketStore
+    ? createObjectBucketForm({
+        store: bucketStore,
+        targetKey: TARGET_KEY,
+        ...(options?.objectBucketBackendId === undefined
+          ? {}
+          : { backendId: options.objectBucketBackendId }),
+      })
+    : undefined;
+  const objectBucketBoot =
+    options?.objectBucketBackendId === undefined
+      ? undefined
+      : {
+          address: "127.0.0.1:31999",
+          expectedBackendId: options.objectBucketExpectedBackendId ?? options.objectBucketBackendId,
+          issueGrant() {
+            throw new Error("fixture has no native owner");
+          },
+          async resolveCurrentBucketBinding() {
+            throw new Error("fixture has no native owner");
+          },
+        };
   const versionForm = options?.unifiedWorkerVersion
     ? createInternalV2WorkerVersionForm({
         sql: backendSql,
@@ -203,6 +235,7 @@ function fixture(options?: {
         inspectModule:
           options.inspectModule ??
           (async () => ({ outcome: "valid", exportedHandlers: ["scheduled"] })),
+        ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
         ...(options.configuredInputSealer
           ? { configuredInputSealer: options.configuredInputSealer, configuredInputCustody }
           : {}),
@@ -216,6 +249,7 @@ function fixture(options?: {
           inspectModule:
             options.inspectModule ??
             (async () => ({ outcome: "valid", exportedHandlers: ["scheduled"] })),
+          ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
           ...(options.configuredInputSealer
             ? { configuredInputSealer: options.configuredInputSealer }
             : {}),
@@ -291,6 +325,7 @@ function fixture(options?: {
       [WORKER_VERSION_FORM_URL]: versionForm,
       [STATIC_ASSET_BUNDLE_FORM_URL]: assetHost.form,
       [WORKER_BUNDLE_FORM_URL]: bundleHost.form,
+      ...(bucketForm ? { [OBJECT_BUCKET_FORM_URL]: bucketForm } : {}),
       // A test-only confirmed Deployment observation, not native publication proof.
       [WORKER_DEPLOYMENT_FORM_URL]: {
         validateCreate(spec) {
@@ -398,6 +433,7 @@ function fixture(options?: {
     workerForm,
     versionForm,
     publicationState,
+    objectBucketBoot,
     configuredInputCustody,
     retirement,
     serving,
@@ -1445,6 +1481,73 @@ test("scheduled code WorkerVersion settles from held bundle eligibility without 
     });
   } finally {
     f.close();
+  }
+});
+
+test("code Version uses the boot-selected exact ObjectBucket backend ID, captured before SQL awaits", async () => {
+  const matching = fixture({
+    codeWorkerVersion: true,
+    objectBucketBackendId: ALTERNATE_BUCKET_BACKEND_ID,
+  });
+  try {
+    const selectedBoot = matching.objectBucketBoot;
+    if (!selectedBoot) throw new Error("selected Bucket boot missing");
+    expect(() =>
+      createInternalV2CodeWorkerVersionForm({
+        sql: matching.sql,
+        targetKey: TARGET_KEY,
+        publicationState: matching.publicationState,
+        retirement: matching.retirement,
+        inspectModule: async () => ({ outcome: "valid", exportedHandlers: ["scheduled"] }),
+        v2ObjectBucketBinding: { ...selectedBoot, expectedBackendId: "" },
+      }),
+    ).toThrow(TypeError);
+    const bucket = await matching.create(OBJECT_BUCKET_FORM_URL, "selected-bucket", {});
+    const { spec } = await matching.createWorkerAndBundle();
+    const versionSpec: JsonObject = {
+      ...spec,
+      bucketBindings: [{ name: "MEDIA", resource: { resourceUid: bucket.resourceUid } }],
+    };
+    // A later mutation of the caller's boot object cannot change Version eligibility.
+    selectedBoot.expectedBackendId = "wrong-after-construction";
+    const version = await matching.create(WORKER_VERSION_FORM_URL, "selected-version", versionSpec);
+    expect(
+      await matching.engine.getResource({ principal: "org-1", uid: version.resourceUid }),
+    ).toMatchObject({ observed: { ready: true, resolvedBindings: true, bundleVerified: true } });
+  } finally {
+    matching.close();
+  }
+
+  const mismatched = fixture({
+    codeWorkerVersion: true,
+    objectBucketBackendId: ALTERNATE_BUCKET_BACKEND_ID,
+    objectBucketExpectedBackendId: "different-object-bucket-v1",
+  });
+  try {
+    const bucket = await mismatched.create(OBJECT_BUCKET_FORM_URL, "mismatch-bucket", {});
+    const { spec } = await mismatched.createWorkerAndBundle();
+    const accepted = await mismatched.engine.acceptCreate({
+      principal: "org-1",
+      key: "create-mismatched-bucket-version",
+      input: {
+        form: WORKER_VERSION_FORM_URL,
+        space: "prod",
+        name: "mismatched-bucket-version",
+        spec: {
+          ...spec,
+          bucketBindings: [{ name: "MEDIA", resource: { resourceUid: bucket.resourceUid } }],
+        },
+      },
+    });
+    expect(await mismatched.engine.runNext()).toMatchObject({
+      id: accepted.id,
+      status: "reconciling",
+    });
+    expect(
+      await mismatched.engine.getResource({ principal: "org-1", uid: accepted.resourceUid }),
+    ).not.toMatchObject({ observed: { ready: true } });
+  } finally {
+    mismatched.close();
   }
 });
 

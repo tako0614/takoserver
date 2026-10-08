@@ -18,7 +18,11 @@ import {
   parseObjectBucketSpec,
   validateObjectBucketUpdate,
 } from "../src/takoform-v2/forms/object-bucket.ts";
-import { createObjectBucketForm } from "../src/takoform-v2/forms/object-bucket-backend.ts";
+import {
+  createObjectBucketForm,
+  OBJECT_BUCKET_BACKEND_ID,
+  type ObjectBucketStore,
+} from "../src/takoform-v2/forms/object-bucket-backend.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
 
 const OBJECT_BUCKET_REFERENCE_FORM_URL = "https://fixture.example/ObjectBucketReference/1.0.0/";
@@ -30,6 +34,37 @@ test("ObjectBucket accepts only the immutable empty spec", () => {
     expect(() => parseObjectBucketSpec(value)).toThrow(ObjectBucketValidationError);
   }
   expect(() => validateObjectBucketUpdate({}, { cors: [] })).toThrow(ObjectBucketValidationError);
+});
+
+test("trusted ObjectBucket backend selection rejects invalid IDs before any store effect", () => {
+  let effects = 0;
+  const store: ObjectBucketStore = {
+    async create() {
+      effects += 1;
+      return "ready";
+    },
+    async reconcileCreate() {
+      effects += 1;
+      return "ready";
+    },
+    async observe() {
+      effects += 1;
+      return "ready";
+    },
+    async delete() {
+      effects += 1;
+      return "deleted";
+    },
+  };
+  expect(createObjectBucketForm({ store, targetKey: "exact-target" }).backend.id).toBe(
+    OBJECT_BUCKET_BACKEND_ID,
+  );
+  for (const backendId of [undefined, "", " backend", "backend ", "bad/id", "x".repeat(257)]) {
+    expect(() =>
+      createObjectBucketForm({ store, targetKey: "exact-target", backendId: backendId as string }),
+    ).toThrow(TypeError);
+  }
+  expect(effects).toBe(0);
 });
 
 test("ObjectBucket lifecycle uses owned filesystem storage and survives SQLite reopen", async () => {

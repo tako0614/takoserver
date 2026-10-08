@@ -44,6 +44,7 @@ import {
 import type { V2Form } from "../src/takoform-v2/types.ts";
 
 const TARGET = "v2-object-binding-target";
+const ALTERNATE_BACKEND_ID = "operator-selected-object-bucket-v1";
 const ORIGIN = "http://127.0.0.1";
 const IDENTITY: SelfhostV2ObjectBucketIdentity = {
   targetKey: TARGET,
@@ -496,7 +497,7 @@ test("multipart completion body carries the full sorted 10,000-part manifest", a
   ).toMatchObject({ ok: false, error: { code: "invalid_part" } });
 });
 
-test("Core reader proves the exact sealed same-owner binding and survives immutable Version PUT", async () => {
+async function proveCoreBucketBinding(backendId: string | undefined) {
   const root = mkdtempSync(join(tmpdir(), "v2-object-authority-"));
   const database = new Database(join(root, "control.sqlite"));
   try {
@@ -561,7 +562,12 @@ test("Core reader proves the exact sealed same-owner binding and survives immuta
         },
       },
     };
-    const bucketForm = createObjectBucketForm({ store, targetKey: TARGET });
+    const bucketForm = createObjectBucketForm({
+      store,
+      targetKey: TARGET,
+      ...(backendId === undefined ? {} : { backendId }),
+    });
+    expect(bucketForm.backend.id).toBe(backendId ?? OBJECT_BUCKET_BACKEND_ID);
     const engine = createTakoformV2Engine({
       sql,
       replayWindowSeconds: 3600,
@@ -614,7 +620,11 @@ test("Core reader proves the exact sealed same-owner binding and survives immuta
       servingSourceOperationId: "source-op-v1",
       bindings: [{ name: "MEDIA", resourceUid: bucket.resourceUid }],
     };
-    const authority = createObjectBucketWorkerBindingAuthority({ sql, targetKey: TARGET });
+    const authority = createObjectBucketWorkerBindingAuthority({
+      sql,
+      targetKey: TARGET,
+      ...(backendId === undefined ? {} : { backendId }),
+    });
     const first = await authority.resolveCurrentBucketBinding(grant, "MEDIA");
     expect(first).toMatchObject({
       identity: {
@@ -624,6 +634,24 @@ test("Core reader proves the exact sealed same-owner binding and survives immuta
         resourceUid: bucket.resourceUid,
       },
     });
+    const wrongAuthority = createObjectBucketWorkerBindingAuthority({
+      sql,
+      targetKey: TARGET,
+      ...(backendId === ALTERNATE_BACKEND_ID ? {} : { backendId: ALTERNATE_BACKEND_ID }),
+    });
+    expect(await wrongAuthority.resolveCurrentBucketBinding(grant, "MEDIA")).toBeNull();
+    expect(() =>
+      createObjectBucketWorkerBindingAuthority({ sql, targetKey: TARGET, backendId: "" }),
+    ).toThrow(TypeError);
+    expect(
+      await authority.resolveCurrentBucketBinding(
+        { ...grant, principal: "foreign-owner" },
+        "MEDIA",
+      ),
+    ).toBeNull();
+    expect(
+      await authority.resolveCurrentBucketBinding({ ...grant, space: "foreign-space" }, "MEDIA"),
+    ).toBeNull();
     // Readiness is a complete observation, not a boolean supplied by this fixture.
     // Missing Binding or Bundle proof must not authorize a native call.
     for (const observed of [
@@ -724,4 +752,12 @@ test("Core reader proves the exact sealed same-owner binding and survives immuta
     database.close();
     rmSync(root, { recursive: true, force: true });
   }
+}
+
+test("Core reader keeps the filesystem default and survives immutable Version PUT", async () => {
+  await proveCoreBucketBinding(undefined);
+});
+
+test("Core reader accepts one selected alternate backend and refuses the default", async () => {
+  await proveCoreBucketBinding(ALTERNATE_BACKEND_ID);
 });
