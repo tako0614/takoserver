@@ -99,6 +99,11 @@ export {
   type V2WorkerInvocationSelection,
 } from "./worker-invocation-custody.ts";
 export {
+  inspectV2WorkerInvocationSchema,
+  type V2WorkerInvocationSchema,
+  v2WorkerInvocationSchemaReady,
+} from "./worker-invocation-schema.ts";
+export {
   createV2NativeDeletionCustody,
   type V2NativeDeletionCustody,
   type V2NativeDeletionInspection,
