@@ -31,6 +31,7 @@ const V2_QUEUE_BATCH_SETTLEMENTS = "0082_v2_queue_batch_settlements.sql";
 const V2_QUEUE_CONSUMER_ACCEPTANCE = "0083_v2_queue_consumer_acceptance.sql";
 const V2_INVOCATION_NO_NATIVE_DISPATCH = "0084_v2_worker_invocation_no_native_dispatch.sql";
 const V2_EDGE_KV_NATIVE_CUSTODY = "0085_v2_edge_kv_native_custody.sql";
+const V2_WORKER_SERVICE_INVOCATION_CUSTODY = "0086_v2_worker_service_invocation_custody.sql";
 
 const MUTATION_AUTHORITY_SUMMARY = JSON.stringify({
   formRef: {
@@ -267,6 +268,7 @@ describe("Takoform accepted-authority continuity migration", () => {
       V2_QUEUE_CONSUMER_ACCEPTANCE,
       V2_INVOCATION_NO_NATIVE_DISPATCH,
       V2_EDGE_KV_NATIVE_CUSTODY,
+      V2_WORKER_SERVICE_INVOCATION_CUSTODY,
     ]);
     expect(database.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
     expect(

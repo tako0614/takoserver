@@ -47,16 +47,16 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0086_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0086_container_runtime_input_custody (id TEXT);\n",
+    "0087_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0087_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0087_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0087_container_runtime_input_rewrap (id TEXT);\n",
+    "0088_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0088_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0088_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0088_container_runtime_input_acceptance (id TEXT);\n",
+    "0089_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0089_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
