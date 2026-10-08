@@ -741,6 +741,11 @@ try {
         : {}),
       ownerForWorkerUid: async (uid) => (workers ? await workers.actorOwnerForRecovery(uid) : null),
       ...(dataPlanes ? { dataPlaneAddress: dataPlanes.address } : {}),
+      ...(v2PrivatePlaneBoot?.sqlite
+        ? {
+            v2SqliteBindingAddress: `127.0.0.1:${v2PrivatePlaneBoot.sqlite.privatePort}`,
+          }
+        : {}),
     });
   }
   if (v2PrivatePlaneBoot?.queue && v2QueueCustody) {

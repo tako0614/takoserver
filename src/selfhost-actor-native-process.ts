@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { resolveActorAbiProfile } from "./actor-class-execution.ts";
 import { ACTOR_NATIVE_BOOTSTRAP_SOURCE } from "./generated/actor-native-bootstrap.ts";
-import { SELFHOST_WORKER_PROJECT_ENV_EXPORT } from "./providers/selfhost-worker-wrapper.ts";
+import { SELFHOST_WORKER_DATA_SERVICE_MODULE } from "./providers/selfhost-data-service.ts";
+import {
+  SELFHOST_WORKER_DATA_TOKEN_BINDING,
+  SELFHOST_WORKER_PROJECT_ENV_EXPORT,
+} from "./providers/selfhost-worker-wrapper.ts";
+import { hasWorkerdV2PrivateBindingProfile } from "./providers/workerd-v2-private-binding-names.ts";
 import {
   type LinuxProcessIdentity,
   spawnWorkerdWithParentDeath,
@@ -26,6 +31,8 @@ export interface WorkerdActorNamespaceOptions {
   readonly graph: WorkerdActiveActorGraph;
   /** Current provider incarnation's exact private broker sockets, not tenant input. */
   readonly actorForwardSockets?: readonly WorkerdActorForwardSocket[];
+  /** Current Host-owned v2 SQLite broker listener, never a saved Version address. */
+  readonly dataPlaneAddress?: string;
   readonly signal: AbortSignal;
   /** Host authority callbacks; neither is exposed to application modules. */
   readonly admitAlarm: (
@@ -264,8 +271,24 @@ export async function openWorkerdActorNamespace(
     const hostModules = new Map(
       [...version.hostModules].map(([name, bytes]) => [name, new Uint8Array(bytes)]),
     );
-    if ((site.serviceBindings?.length ?? 0) > 0 || site.dataPlane) {
-      throw new Error("Actor retained service/data binding composition unavailable");
+    if ((site.serviceBindings?.length ?? 0) > 0) {
+      throw new Error("Actor retained service binding composition unavailable");
+    }
+    if (site.dataPlane) {
+      const plane = site.dataPlane;
+      if (
+        !options.dataPlaneAddress ||
+        !hasWorkerdV2PrivateBindingProfile(site) ||
+        plane.module !== SELFHOST_WORKER_DATA_SERVICE_MODULE ||
+        !Array.isArray(plane.vars) ||
+        plane.vars.length !== 1 ||
+        plane.vars[0]?.name !== SELFHOST_WORKER_DATA_TOKEN_BINDING ||
+        plane.vars[0].kind !== "text" ||
+        typeof plane.vars[0].value !== "string" ||
+        !plane.vars[0].value
+      ) {
+        throw new Error("Actor retained v2 data plane composition unavailable");
+      }
     }
     const wrapper = site.hostEntrypoint;
     if (!wrapper || wrapper === site.mainModule || !hostModules.has(wrapper)) {
@@ -402,7 +425,15 @@ export default { fetch(request) { return inspectVersion(request); } };`),
       site: {
         ...site,
         hostEntrypoint: entry,
-        hostModules: [...hostModules.keys()].filter((name) => name !== entry),
+        // Keep implicit private plane modules implicit. Re-declaring a module
+        // already supplied by dataPlane (or another private plane) is invalid.
+        hostModules: [
+          ...(site.hostModules ?? []),
+          // The former entrypoint becomes an additional module. Legacy Actor
+          // graphs can already list it; do not declare that same module twice.
+          ...(site.hostModules?.includes(wrapper) ? [] : [wrapper]),
+          helper,
+        ],
       },
       modules,
       hostModules,
@@ -718,11 +749,14 @@ export default {
       root,
       site: {
         ...first.site,
-        hostModules: [...ownerModules.keys()].filter((name) => name !== first.site.hostEntrypoint),
+        hostModules: [...(first.site.hostModules ?? []), owner],
       },
       modules: first.modules,
       hostModules: ownerModules,
       runSocketPath: socket,
+      ...(options.dataPlaneAddress === undefined
+        ? {}
+        : { dataPlaneAddress: options.dataPlaneAddress }),
       actorProxySocketPath,
       actor: {
         namespaceKey: options.namespaceKey,
@@ -739,9 +773,7 @@ export default {
           }) => ({
             site: {
               ...variantSite,
-              hostModules: [...variantHostModules.keys()].filter(
-                (name) => name !== variantSite.hostEntrypoint,
-              ),
+              hostModules: [...(variantSite.hostModules ?? [])],
             },
             modules: variantModules,
             hostModules: variantHostModules,

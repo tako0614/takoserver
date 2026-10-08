@@ -102,6 +102,8 @@ export function createSelfhostV2RuntimeBoot(options: {
   readonly guardBinary?: string;
   readonly ownerForWorkerUid: (uid: string) => Promise<WorkerdWorkerRuntimeOwner | null>;
   readonly dataPlaneAddress?: string;
+  /** Current v2 SQLite broker port selected by the private-plane boot. */
+  readonly v2SqliteBindingAddress?: string;
 }) {
   if (!options.selection.actor && !options.selection.workflow)
     throw new TypeError("v2 runtime boot requires an explicit capability");
@@ -127,6 +129,9 @@ export function createSelfhostV2RuntimeBoot(options: {
           storageRoot: privateDirectory(join(root, "actor-storage")),
           binary,
           authority: graph,
+          ...(options.v2SqliteBindingAddress
+            ? { v2SqliteBindingAddress: options.v2SqliteBindingAddress }
+            : {}),
         });
         return {
           physical,
@@ -140,7 +145,9 @@ export function createSelfhostV2RuntimeBoot(options: {
         };
       })()
     : undefined;
-  const address = options.dataPlaneAddress;
+  // The v2 Workflow class must use the same current private SQLite listener
+  // selected for its accepted WorkerVersion, not the legacy data-plane port.
+  const address = options.v2SqliteBindingAddress ?? options.dataPlaneAddress;
   const workflow =
     options.selection.workflow && guard
       ? createSelfhostV2WorkflowBoot({

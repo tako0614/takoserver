@@ -14,6 +14,7 @@ import { EDGE_KV_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/edge-kv-nam
 import { OBJECT_BUCKET_FORM_URL } from "../src/takoform-v2/forms/object-bucket.ts";
 import { QUEUE_CONSUMER_FORM_URL } from "../src/takoform-v2/forms/queue-consumer.ts";
 import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-database.ts";
+import { SQLITE_MIGRATION_APPLICATION_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-application.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
@@ -309,6 +310,21 @@ function nativeHttps(hostname: string, path: string): Promise<{ status: number; 
     request.once("error", reject);
     request.end();
   });
+}
+
+async function nativeWorkflowComplete(hostname: string, id: string): Promise<Json> {
+  let last: Json = {};
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const response = await nativeHttps(hostname, `/workflow-status?id=${encodeURIComponent(id)}`);
+    expect(response.status).toBe(200);
+    last = JSON.parse(response.body) as Json;
+    if (last.status === "complete") return last;
+    if (last.status === "errored" || last.status === "terminated") break;
+    await Bun.sleep(200);
+  }
+  throw new Error(
+    `native Workflow did not complete (${String(last.status)}/${String((last.error as Json | undefined)?.reason ?? "no-reason")})`,
+  );
 }
 
 async function startHost(
@@ -1173,24 +1189,59 @@ test.skipIf(OPT_IN !== "1")(
       await stopHost(bootstrap);
       bootstrap = null;
 
+      const migrationBytes = new TextEncoder().encode(
+        "CREATE TABLE item (value TEXT NOT NULL); INSERT INTO item VALUES ('once');",
+      );
+      const migrationDigest = (await bytesDigest(migrationBytes)).slice(7);
+      const migrationManifestBytes = new TextEncoder().encode(
+        JSON.stringify({
+          files: [
+            {
+              path: "migrations/0001.sql",
+              url: FILE_URL,
+              sha256: migrationDigest,
+              mediaType: "application/sql",
+            },
+          ],
+        }),
+      );
+      const migrationManifestDigest = (await bytesDigest(migrationManifestBytes)).slice(7);
       const moduleBytes = new TextEncoder().encode(
         `export default {
-  fetch(request, env) {
-    const path = new URL(request.url).pathname;
-    if (path === "/actor-write" || path === "/actor-read") {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    if (path === "/sqlite-read") {
+      const result = await env.DB.query("SELECT value FROM item ORDER BY rowid");
+      return Response.json(result.rows);
+    }
+    if (path === "/actor-write" || path === "/actor-read" || path === "/actor-sql") {
       const actor = env.ACTOR.get(env.ACTOR.idFromName("room"));
-      return actor.fetch(new Request("http://actor.invalid/" + (path === "/actor-write" ? "write" : "read")));
+      return actor.fetch(new Request("http://actor.invalid/" + (path === "/actor-write" ? "write" : path === "/actor-sql" ? "sql" : "read")));
+    }
+    if (path === "/workflow-create") {
+      const id = url.searchParams.get("id") || "workflow-before";
+      const created = await env.WORKFLOW.create({ id, params: { value: id } });
+      return Response.json({ id: created.id, status: (await created.status()).status });
+    }
+    if (path === "/workflow-status") {
+      const instance = await env.WORKFLOW.get(url.searchParams.get("id") || "workflow-before");
+      return Response.json(await instance.status());
     }
     return new Response("normal-v2:" + path);
   }
 };
 export class CounterActor {
-  constructor(context) { this.context = context; }
+  constructor(context, env) { this.context = context; this.env = env; }
   async start() {
     await this.context.storage.execute("CREATE TABLE IF NOT EXISTS counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)");
   }
   async fetch(request) {
     const path = new URL(request.url).pathname;
+    if (path === "/sql") {
+      const result = await this.env.DB.query("SELECT value FROM item ORDER BY rowid");
+      return Response.json(result.rows);
+    }
     if (path === "/write") {
       const result = await this.context.storage.execute("INSERT INTO counter VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET value = value + 1 RETURNING value");
       return Response.json({value: Number(result.rows[0].value)});
@@ -1202,6 +1253,17 @@ export class CounterActor {
   async socketMessage() {}
   async socketClose() {}
   async socketError() {}
+}
+export class SqlWorkflow {
+  constructor(env) { this.env = env; }
+  async run(event, step) {
+    await step.do("write", async () => {
+      await this.env.DB.execute("INSERT INTO item(value) VALUES (?)", [event.params.value]);
+      return { written: true };
+    });
+    const result = await this.env.DB.query("SELECT value FROM item ORDER BY rowid");
+    return { values: result.rows.map((row) => row.value) };
+  }
 }
 `,
       );
@@ -1237,6 +1299,8 @@ export class CounterActor {
       const assetManifestDigest = (await bytesDigest(assetManifestBytes)).slice(7);
       const objects = createFileObjectStore({ root });
       for (const [objectKey, bytes, contentType] of [
+        [MANIFEST_KEY, migrationManifestBytes, "application/json"],
+        [FILE_KEY, migrationBytes, "application/sql"],
         [BUNDLE_MANIFEST_KEY, manifestBytes, "application/json"],
         [BUNDLE_FILE_KEY, moduleBytes, "application/javascript+module"],
         [ASSET_MANIFEST_KEY, assetManifestBytes, "application/json"],
@@ -1246,7 +1310,15 @@ export class CounterActor {
       }
       const grants = [{ principal: `org:${space}`, space }];
       const config = fixtureConfig(
-        undefined,
+        [
+          {
+            url: MANIFEST_URL,
+            sha256: migrationManifestDigest,
+            objectKey: MANIFEST_KEY,
+            grants,
+          },
+          { url: FILE_URL, sha256: migrationDigest, objectKey: FILE_KEY, grants },
+        ],
         [
           {
             url: BUNDLE_MANIFEST_URL,
@@ -1285,6 +1357,16 @@ export class CounterActor {
           ),
         ).toMatchObject({ supported: false });
       }
+      expect(
+        await jsonAt(
+          port,
+          "GET",
+          `${V2}/support?form=${encodeURIComponent(SQLITE_MIGRATION_APPLICATION_FORM_URL)}`,
+          200,
+          undefined,
+          auth,
+        ),
+      ).toMatchObject({ supported: false });
       await stopHost(serving);
       serving = null;
       const noAssets = JSON.parse(config) as Json;
@@ -1315,6 +1397,10 @@ export class CounterActor {
       for (const form of COMPLETE_WORKER_FORM_URLS) {
         expect(await support(form)).toMatchObject({ supported: true, privateInputs: false });
       }
+      expect(await support(SQLITE_MIGRATION_APPLICATION_FORM_URL)).toMatchObject({
+        supported: true,
+        privateInputs: false,
+      });
       const create = async (form: string, name: string, spec: Json) => {
         const body = { form, space, name, spec };
         const headers = { ...auth, "idempotency-key": `normal-v2-${name}-create` };
@@ -1326,6 +1412,30 @@ export class CounterActor {
       };
       const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
       const sqliteTarget = await create(SQLITE_DATABASE_FORM_URL, "sqlite-target", {});
+      const migrationSet = await create(SQLITE_MIGRATION_SET_FORM_URL, "migration-set", {
+        artifact: { url: MANIFEST_URL, sha256: migrationManifestDigest },
+      });
+      const applicationSpec = {
+        database: { resourceUid: sqliteTarget.uid },
+        migrationSet: { resourceUid: migrationSet.uid },
+      };
+      const application = await create(
+        SQLITE_MIGRATION_APPLICATION_FORM_URL,
+        "migration-application",
+        applicationSpec,
+      );
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${application.uid}`, 200, undefined, auth),
+      ).toMatchObject({
+        generation: 1,
+        observedGeneration: 1,
+        observed: {
+          ready: true,
+          databaseUid: sqliteTarget.uid,
+          migrationSetUid: migrationSet.uid,
+          appliedEntries: [{ path: "migrations/0001.sql", sha256: migrationDigest }],
+        },
+      });
       const kvTarget = await create(EDGE_KV_NAMESPACE_FORM_URL, "kv-target", {});
       const bucketTarget = await create(OBJECT_BUCKET_FORM_URL, "bucket-target", {});
       const queueTarget = await create(AT_LEAST_ONCE_QUEUE_FORM_URL, "queue-target", {
@@ -1385,6 +1495,7 @@ export class CounterActor {
         vars: {},
         requiredSensitiveVars: [],
         actorBindings: [{ name: "ACTOR", resource: { resourceUid: namespace.uid } }],
+        sqliteBindings: [{ name: "DB", resource: { resourceUid: sqliteTarget.uid } }],
       });
       const deployment = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
         worker: { resourceUid: worker.uid },
@@ -1410,6 +1521,14 @@ export class CounterActor {
         status: 200,
         body: '{"value":1}',
       });
+      expect(await nativeHttps(hostname, "/actor-sql")).toEqual({
+        status: 200,
+        body: '[{"value":"once"}]',
+      });
+      expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
+        status: 200,
+        body: '[{"value":"once"}]',
+      });
 
       const firstPid = serving.pid;
       await killHost(serving);
@@ -1427,9 +1546,46 @@ export class CounterActor {
         status: 200,
         body: '{"value":1}',
       });
+      expect(await nativeHttps(hostname, "/actor-sql")).toEqual({
+        status: 200,
+        body: '[{"value":"once"}]',
+      });
       expect(await nativeHttps(hostname, "/actor-write")).toEqual({
         status: 200,
         body: '{"value":2}',
+      });
+      expect(
+        await jsonAt(port, "POST", `${V2}/resources`, 200, application.body, application.headers),
+      ).toMatchObject({ id: application.id, status: "succeeded" });
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${application.uid}`, 200, undefined, auth),
+      ).toMatchObject({
+        generation: 1,
+        observedGeneration: 1,
+        observed: { ready: true, appliedEntries: [{ path: "migrations/0001.sql" }] },
+      });
+      expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
+        status: 200,
+        body: '[{"value":"once"}]',
+      });
+      const applicationUpdate = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${application.uid}`,
+        202,
+        { spec: applicationSpec },
+        {
+          ...auth,
+          "idempotency-key": "normal-v2-migration-application-update",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(await settled(port, token, String(applicationUpdate.id))).toMatchObject({
+        effect: "complete",
+      });
+      expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
+        status: 200,
+        body: '[{"value":"once"}]',
       });
       const endpointUpdate = await jsonAt(
         port,
@@ -1482,6 +1638,74 @@ export class CounterActor {
         },
       );
       expect(await settled(port, token, String(update.id))).toMatchObject({ effect: "complete" });
+      const workflow = await create(DURABLE_WORKFLOW_FORM_URL, "workflow", {
+        worker: { resourceUid: worker.uid },
+        className: "SqlWorkflow",
+      });
+      const workflowVersion = await create(WORKER_VERSION_FORM_URL, "workflow-version", {
+        worker: { resourceUid: worker.uid },
+        bundle: { resourceUid: bundle.uid },
+        handlers: ["fetch"],
+        sqliteBindings: [{ name: "DB", resource: { resourceUid: sqliteTarget.uid } }],
+        workflowBindings: [{ name: "WORKFLOW", resource: { resourceUid: workflow.uid } }],
+      });
+      const workflowDeployment = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${deployment.uid}`,
+        202,
+        {
+          spec: {
+            worker: { resourceUid: worker.uid },
+            versions: [{ workerVersion: { resourceUid: workflowVersion.uid }, weight: 10_000 }],
+          },
+        },
+        {
+          ...auth,
+          "idempotency-key": "normal-v2-workflow-deployment",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(await settled(port, token, String(workflowDeployment.id))).toMatchObject({
+        effect: "complete",
+      });
+      expect(await nativeHttps(hostname, "/workflow-create?id=workflow-before")).toEqual({
+        status: 200,
+        body: '{"id":"workflow-before","status":"queued"}',
+      });
+      expect(await nativeWorkflowComplete(hostname, "workflow-before")).toEqual({
+        status: "complete",
+        output: { values: ["once", "workflow-before"] },
+      });
+      expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
+        status: 200,
+        body: '[{"value":"once"},{"value":"workflow-before"}]',
+      });
+      const workflowHostPid = serving.pid;
+      await killHost(serving);
+      serving = null;
+      serving = await startHost(root, port, config, fullBoot);
+      expect(serving.pid).not.toBe(workflowHostPid);
+      expect(await nativeWorkflowComplete(hostname, "workflow-before")).toEqual({
+        status: "complete",
+        output: { values: ["once", "workflow-before"] },
+      });
+      expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
+        status: 200,
+        body: '[{"value":"once"},{"value":"workflow-before"}]',
+      });
+      expect(await nativeHttps(hostname, "/workflow-create?id=workflow-after")).toEqual({
+        status: 200,
+        body: '{"id":"workflow-after","status":"queued"}',
+      });
+      expect(await nativeWorkflowComplete(hostname, "workflow-after")).toEqual({
+        status: "complete",
+        output: { values: ["once", "workflow-before", "workflow-after"] },
+      });
+      expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
+        status: 200,
+        body: '[{"value":"once"},{"value":"workflow-before"},{"value":"workflow-after"}]',
+      });
       const remove = async (uid: string, generation: number, name: string) => {
         const accepted = await jsonAt(port, "DELETE", `${V2}/resources/${uid}`, 202, undefined, {
           ...auth,
@@ -1508,10 +1732,14 @@ export class CounterActor {
       expect(await settled(port, token, String(afterEndpointDelete.id))).toMatchObject({
         effect: "complete",
       });
-      await remove(deployment.uid, 1, "deployment");
+      await remove(deployment.uid, 2, "deployment");
+      await remove(workflowVersion.uid, 1, "workflow-version");
+      await remove(workflow.uid, 1, "workflow");
       await remove(version.uid, 1, "version");
       await remove(namespace.uid, 3, "namespace");
       await remove(bundle.uid, 1, "bundle");
+      await remove(application.uid, 2, "migration-application");
+      await remove(migrationSet.uid, 1, "migration-set");
       await remove(queueTarget.uid, 1, "queue-target");
       await remove(bucketTarget.uid, 1, "bucket-target");
       await remove(kvTarget.uid, 1, "kv-target");

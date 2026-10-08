@@ -19,6 +19,7 @@ import type {
   WorkerdWorkflowSelection,
 } from "@takoserver/core/workflow-runtime/workerd";
 import * as workerdRuntime from "@takoserver/core/workflow-runtime/workerd";
+import { WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE } from "../src/providers/workerd-v2-private-binding-names.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -211,6 +212,43 @@ test("package preparation does not reject a configured address that extends a pe
   } finally {
     await disposePrepared(prepared);
   }
+});
+
+test("legacy private Workflow execution refuses a missing or invalid current listener", async () => {
+  const { dataPlaneAddress: _currentAddress, ...missingAddress } = preparationOptions();
+  await expect(workerdRuntime.prepareWorkerdWorkflowExecution(missingAddress)).rejects.toThrow(
+    "unusable data plane address",
+  );
+  await expect(
+    workerdRuntime.prepareWorkerdWorkflowExecution(
+      preparationOptions({ dataPlaneAddress: () => "127.0.0.2:4666" }),
+    ),
+  ).rejects.toThrow("unusable data plane address");
+  expect(await readdir(temporaryRoot)).toEqual([]);
+});
+
+test("v2 private Workflow execution keeps its selected listener address fence", async () => {
+  const original = selection();
+  const selected = selection({
+    site: {
+      ...original.site,
+      hostModules: [...(original.site.hostModules ?? []), WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE],
+    },
+    hostModules: new Map([
+      ...original.hostModules,
+      [WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE, encoder.encode("export default {};")],
+    ]),
+  });
+  await expect(
+    workerdRuntime.prepareWorkerdWorkflowExecution(preparationOptions({ selection: selected })),
+  ).rejects.toThrow("private data plane listener changed");
+  const { dataPlaneAddress: _currentAddress, ...missingAddress } = preparationOptions({
+    selection: selected,
+  });
+  await expect(workerdRuntime.prepareWorkerdWorkflowExecution(missingAddress)).rejects.toThrow(
+    "private data plane listener unavailable",
+  );
+  expect(await readdir(temporaryRoot)).toEqual([]);
 });
 
 test("package preparation materializes a selected graph privately without app evaluation", async () => {
