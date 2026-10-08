@@ -26,6 +26,9 @@ export interface WorkerCronTriggerDelivery {
     readonly cron: string;
     readonly scheduledTime: number;
     readonly matchId: string;
+    /** Exact durable physical attempt, never the logical match identity. */
+    readonly leaseToken: string;
+    readonly attempt: number;
   }): Promise<WorkerCronTriggerDeliveryResult>;
 }
 
@@ -69,6 +72,7 @@ interface MatchRow {
   readonly cron: string;
   readonly scheduled_time_ms: number;
   readonly lease_token: string;
+  readonly attempts: number;
 }
 
 /**
@@ -274,7 +278,7 @@ export async function runWorkerCronTriggerTick(options: {
     );
     if (claim.changes !== 1) continue;
     const [row] = (await options.sql.query(
-      `SELECT match_id, target_key, trigger_uid, worker_uid, cron, scheduled_time_ms, lease_token
+      `SELECT match_id, target_key, trigger_uid, worker_uid, cron, scheduled_time_ms, lease_token, attempts
        FROM tf_v2_worker_cron_matches
        WHERE match_id = ? AND target_key = ? AND state = 'dispatching' AND lease_token = ?`,
       [candidate.match_id, options.targetKey, leaseToken],
@@ -290,6 +294,8 @@ export async function runWorkerCronTriggerTick(options: {
         cron: row.cron,
         scheduledTime: row.scheduled_time_ms,
         matchId: row.match_id,
+        leaseToken: row.lease_token,
+        attempt: row.attempts,
       });
     } catch {
       result = { kind: "unknown" };

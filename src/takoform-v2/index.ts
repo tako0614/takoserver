@@ -95,6 +95,8 @@ export {
 } from "./worker-code-eligibility.ts";
 export {
   createV2WorkerInvocationLifecycle,
+  type V2WorkerCronInvocationClaim,
+  type V2WorkerCronRouteRelease,
   type V2WorkerInvocationAdmission,
   type V2WorkerInvocationCustody,
   type V2WorkerInvocationHandle,

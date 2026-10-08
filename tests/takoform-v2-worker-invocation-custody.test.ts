@@ -7,6 +7,7 @@ import type { Sql } from "../src/ports.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createV2WorkerInvocationLifecycle } from "../src/takoform-v2/worker-invocation-custody.ts";
+import { inspectV2WorkerInvocationSchema } from "../src/takoform-v2/worker-invocation-schema.ts";
 
 const handle = { invocationId: "invocation-001", custodyToken: "private-custody-token-001" };
 const digest = `sha256:${"a".repeat(64)}` as const;
@@ -319,7 +320,8 @@ test("0084 forward migration preserves old sent rows and exact lost-ACK terminal
   const db = new Database(":memory:");
   try {
     for (const migration of MIGRATIONS.filter(
-      ({ name }) => !name.startsWith("0084_") && !name.startsWith("0086_"),
+      ({ name }) =>
+        !name.startsWith("0084_") && !name.startsWith("0086_") && !name.startsWith("0087_"),
     ))
       db.exec(migration.sql);
     const sql = createSqliteSql(db);
@@ -493,7 +495,9 @@ test("0086 preserves populated endpoint phases and opens exact endpoint-free Ser
   const db = new Database(":memory:");
   try {
     db.exec("PRAGMA foreign_keys = ON");
-    for (const migration of MIGRATIONS.filter(({ name }) => !name.startsWith("0086_")))
+    for (const migration of MIGRATIONS.filter(
+      ({ name }) => !name.startsWith("0086_") && !name.startsWith("0087_"),
+    ))
       db.exec(migration.sql);
     const sql = createSqliteSql(db);
     await seed(sql);
@@ -692,6 +696,100 @@ test("0086 preserves populated endpoint phases and opens exact endpoint-free Ser
         service.invocationId,
       ]),
     ).rejects.toThrow();
+  } finally {
+    db.close();
+  }
+});
+
+test("0087 preserves populated Endpoint and Service custody and fences incomplete schema closure", async () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    for (const migration of MIGRATIONS.filter(({ name }) => !name.startsWith("0087_")))
+      db.exec(migration.sql);
+    const sql = createSqliteSql(db);
+    await seed(sql);
+    const service = { invocationId: "pre-0087-service", custodyToken: "service-custody-token" };
+    await sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+      (invocation_id,custody_token,backend_id,target_key,principal,space,
+       worker_uid,deployment_uid,deployment_generation,source_operation_id,
+       ingress_kind,service_caller_worker_uid,service_caller_version_uid,
+       service_caller_version_generation,service_caller_version_operation_id,
+       service_binding_name,service_caller_execution_ref,version_uid,version_generation,
+       version_operation_id,native_identity,closure_digest,confirmed_receipt,admitted_at_ms)
+      SELECT ?,?,backend_id,target_key,principal,space,worker_uid,deployment_uid,
+        deployment_generation,source_operation_id,'service',worker_uid,version_uid,
+        version_generation,version_operation_id,'CALLER','private-slot',version_uid,
+        version_generation,version_operation_id,native_identity,closure_digest,
+        confirmed_receipt,admitted_at_ms
+      FROM tf_v2_worker_invocations WHERE invocation_id=?`,
+      [service.invocationId, service.custodyToken, handle.invocationId],
+    );
+    await sql.run(
+      `UPDATE tf_v2_worker_invocations SET phase='send_authorized',
+      send_authorized_at_ms=1500 WHERE invocation_id=?`,
+      [service.invocationId],
+    );
+    const before = await sql.query("SELECT * FROM tf_v2_worker_invocations ORDER BY invocation_id");
+    const migration = MIGRATIONS.find(({ name }) => name.startsWith("0087_"));
+    if (!migration) throw new Error("missing 0087 source");
+    db.exec(migration.sql);
+    const after = await sql.query(
+      "SELECT * FROM tf_v2_worker_invocations ORDER BY invocation_id /* 0087 */",
+    );
+    expect(after).toHaveLength(2);
+    for (let index = 0; index < before.length; index += 1) {
+      expect(after[index]).toMatchObject(before[index] ?? {});
+      expect(after[index]?.cron_match_id).toBeNull();
+    }
+    expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    expect(await inspectV2WorkerInvocationSchema(sql)).toBe("cron");
+    const owner = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(2000) });
+    expect((await owner.read(service))?.ingress.kind).toBe("service");
+    expect(await owner.beginSend(handle)).toBe(true);
+    expect(
+      await owner.confirmNativeRetirement({
+        handle: service,
+        expected: {
+          ...retirementIdentity,
+          ingress: {
+            kind: "service",
+            callerWorkerUid: "worker-one",
+            callerVersionUid: "version-one",
+            callerVersionGeneration: 1,
+            callerVersionOperationId: "op-version-one",
+            bindingName: "CALLER",
+            callerExecutionRef: "private-slot",
+          },
+        },
+        receiptDigest: terminalReceipt,
+      }),
+    ).toBe(true);
+    expect((await owner.read(service))?.retirement?.receiptDigest).toBe(terminalReceipt);
+    const pending = { invocationId: "post-0087-pending", custodyToken: "pending-custody-token" };
+    await sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+      (invocation_id,custody_token,backend_id,target_key,principal,space,
+       worker_uid,deployment_uid,deployment_generation,source_operation_id,
+       ingress_kind,endpoint_uid,endpoint_generation,version_uid,version_generation,
+       version_operation_id,native_identity,closure_digest,confirmed_receipt,admitted_at_ms)
+      SELECT ?,?,backend_id,target_key,principal,space,worker_uid,deployment_uid,
+        deployment_generation,source_operation_id,ingress_kind,endpoint_uid,
+        endpoint_generation,version_uid,version_generation,version_operation_id,
+        native_identity,closure_digest,confirmed_receipt,admitted_at_ms
+      FROM tf_v2_worker_invocations WHERE invocation_id=?`,
+      [pending.invocationId, pending.custodyToken, handle.invocationId],
+    );
+    db.exec("CREATE TABLE tf_v2_worker_invocations_next (marker INTEGER)");
+    expect(await inspectV2WorkerInvocationSchema(sql)).toBeNull();
+    expect(await owner.read(handle)).toBeNull();
+    expect(await owner.beginSend(pending)).toBe(false);
+    db.exec("DROP TABLE tf_v2_worker_invocations_next");
+    expect(await owner.beginSend(pending)).toBe(true);
+    db.exec("DROP INDEX tf_v2_worker_invocations_cron_attempt");
+    expect(await inspectV2WorkerInvocationSchema(sql)).toBeNull();
+    expect(await owner.read(handle)).toBeNull();
   } finally {
     db.close();
   }
