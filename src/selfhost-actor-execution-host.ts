@@ -503,10 +503,11 @@ export function createSelfhostActorExecutionHost(options: {
     // Only lifecycle selection is queued here. Individual IDs run under
     // native input gates, not a second generic application scheduler.
     const session = await exclusive(current, async () => {
+      let openedByWarm: Session | undefined;
       if (stopped || current.revoked || revoked.has(key)) throw new Error("Actor owner stopped");
       if (!(await registeredScope(key, identity)))
         throw new ActorAuthorityUnavailable("Actor namespace is not registered");
-      if (warm && (current.session || !(await warm.stillAuthorized(signal))))
+      if (warm && !(await warm.stillAuthorized(signal)))
         throw new ActorAuthorityUnavailable("Actor warm candidate unavailable");
       const graph = warm?.graph ?? (await authority.readGraph(identity, signal));
       if (
@@ -558,7 +559,15 @@ export function createSelfhostActorExecutionHost(options: {
         ]),
       ]);
       if (current.session?.selection !== selection || current.session.dead) {
+        // An accepted Namespace update may outlive a hostname-only Worker
+        // publication. Its old Actor carrier is no longer an exact readback,
+        // and with no Endpoint there may be no public request to refresh it.
+        // Do not interrupt an in-flight event: the held Operation can retry
+        // once that event releases the old carrier.
+        if (warm && current.session && current.session.active > 0 && !current.session.dead)
+          throw new ActorAuthorityUnavailable("Actor warm carrier is in use");
         await retire(current);
+        signal.throwIfAborted();
         if (revoked.has(key)) throw new ActorAuthorityUnavailable("Actor namespace revoked");
         if (!current.locked) {
           current.lease = await acquireActorNativeLease({
@@ -572,6 +581,8 @@ export function createSelfhostActorExecutionHost(options: {
         // acquisition yield; a current graph alone cannot open retained SQL.
         if (!(await registeredScope(key, identity)))
           throw new ActorAuthorityUnavailable("Actor namespace is not registered");
+        if (warm && !(await warm.stillAuthorized(signal)))
+          throw new ActorAuthorityUnavailable("Actor warm candidate changed before native start");
         let process: WorkerdActorNamespace;
         let admittedSession: Session | undefined;
         const admitEvent = async (
@@ -706,6 +717,7 @@ export function createSelfhostActorExecutionHost(options: {
         };
         admittedSession = session;
         current.session = session;
+        if (warm) openedByWarm = session;
         void process.exited.then(() => {
           process.disableAlarmAdmission();
           const unexpected = !session.retiring;
@@ -802,9 +814,9 @@ export function createSelfhostActorExecutionHost(options: {
           return { session: candidate, variantKey: "", observation };
         } catch (error) {
           // A failed candidate is not a Resource DELETE. Stop only the child
-          // opened by this warm attempt; registration, ID index and Actor SQL
-          // remain held for a later exact retry.
-          await retire(current);
+          // opened by this warm attempt. A pre-existing carrier must remain
+          // untouched when its candidate fails validation or readback.
+          if (openedByWarm && current.session === openedByWarm) await retire(current);
           throw error;
         }
       }

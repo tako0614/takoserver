@@ -450,6 +450,77 @@ export class Counter extends Base {
           AbortSignal.timeout(5_000),
         ),
       ).toEqual({ kind: "unknown" });
+      // An Endpoint-only publication can replace the native source marker
+      // without changing the selected Actor class or its retained SQL. The
+      // accepted Namespace PUT must retire the old carrier and verify a new
+      // one even when no public HTTP event can trigger a normal refresh.
+      const nextSourceOperationId = "physical-count-next-source-operation";
+      const nextRealization = {
+        ...currentNative.realization,
+        authorityKey: canonicalJson({
+          sourceOperationId: nextSourceOperationId,
+          incarnationId,
+          generationKey: currentNative.realization.graph.generationKey,
+          versions: currentNative.realization.graph.versions.map(
+            ({ versionId, workerVersionUid, weight }) => ({ versionId, workerVersionUid, weight }),
+          ),
+        }),
+      };
+      const nextExpected = { ...expected, sourceOperationId: nextSourceOperationId };
+      const retiredPid = Number((await readFile(childPidFile, "utf8")).trim());
+      expect(
+        await host.warmNamespaceForAcceptedOperation(
+          scope,
+          {
+            graph: accepted,
+            realization: nextRealization,
+            expected: nextExpected,
+            stillAuthorized: async () => false,
+          },
+          AbortSignal.timeout(5_000),
+        ),
+      ).toEqual({ kind: "unknown" });
+      expect(() => process.kill(retiredPid, 0)).not.toThrow();
+      await writeFile(denySpawnFile, "blocked");
+      try {
+        expect(
+          await host.warmNamespaceForAcceptedOperation(
+            scope,
+            {
+              graph: accepted,
+              realization: nextRealization,
+              expected: nextExpected,
+              stillAuthorized: async () => ownOperationBusy,
+            },
+            AbortSignal.timeout(5_000),
+          ),
+        ).toEqual({ kind: "unknown" });
+        expect(() => process.kill(retiredPid, 0)).toThrow();
+      } finally {
+        await unlink(denySpawnFile);
+      }
+      expect(
+        await host.warmNamespaceForAcceptedOperation(
+          scope,
+          {
+            graph: accepted,
+            realization: nextRealization,
+            expected: nextExpected,
+            stillAuthorized: async () => ownOperationBusy,
+          },
+          AbortSignal.timeout(10_000),
+        ),
+      ).toMatchObject({ kind: "confirmed", pendingAlarmCount: 1 });
+      expect(() => process.kill(retiredPid, 0)).toThrow();
+      const replacementPid = Number((await readFile(childPidFile, "utf8")).trim());
+      expect(replacementPid).not.toBe(retiredPid);
+      expect(
+        await host.observeNamespaceRuntimeForAcceptedOperation(
+          scope,
+          nextExpected,
+          AbortSignal.timeout(5_000),
+        ),
+      ).toMatchObject({ kind: "confirmed", pendingAlarmCount: 1 });
       ownOperationBusy = false;
       // The original child is still alive; only its Unix pathname is replaced.
       // A foreign listener may relay valid native replies, but it is not the
