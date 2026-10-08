@@ -1336,6 +1336,19 @@ managed customer runtime.
 
 ### 0058 domain receipt schema: protected status only
 
+For the separate integration v2 0066→0088 source wave, an operator may select
+`"schemaMaintenanceMode": "pre-v2-0088-quiesced"` on a target that retains its
+exact v2 config. The closure transition adds only
+`TAKOSERVER_SCHEMA_MAINTENANCE_MODE`; HTTP returns 503 before Host composition
+and scheduled work does not run. The public Worker publisher requires the
+current audited D1 source and an exact canonical applied prefix from 0066
+through 0088, including schema shape readback, plus the owner-qualified
+non-serving provider-executor predecessor. It pins the previous Worker Version,
+publishes once, and checks the mode-specific 503 response. An uncertain upload
+acknowledgement is not retried automatically. This is a source-publication
+foundation, not permission to apply migrations, evidence that older in-flight
+invocations drained, or a claim of normal v2 serving readiness.
+
 The public Host has a source-only, optional deploy-target profile
 `"schemaMaintenanceMode": "pre-0058-quiesced"`. It projects the non-secret
 `TAKOSERVER_SCHEMA_MAINTENANCE_MODE=pre-0058-quiesced` into the selected Worker

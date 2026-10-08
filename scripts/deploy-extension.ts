@@ -77,7 +77,10 @@ export {
   sealDirectory,
   unsealDirectory,
 } from "./deploy/qualification.ts";
-export { readAuditedMigrationArtifact } from "./deploy/schema.ts";
+export {
+  readAuditedMigrationArtifact,
+  readCurrentAuditedMigrationSourceArtifact,
+} from "./deploy/schema.ts";
 export type {
   DeployTarget,
   ManagedWorkerDispatchNamespaceTarget,

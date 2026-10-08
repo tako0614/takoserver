@@ -1410,9 +1410,9 @@ test.skipIf(OPT_IN !== "1")(
     }
     if (path === "/actor-socket" || path === "/actor-socket-welcome")
       return env.ACTOR.get(env.ACTOR.idFromName("room")).fetch(request);
-    if (path === "/actor-write" || path === "/actor-read" || path === "/actor-sql" || path === "/actor-workflow-create" || path === "/actor-workflow-status") {
+    if (path === "/actor-write" || path === "/actor-read" || path === "/actor-sql" || path === "/actor-queue-send" || path === "/actor-workflow-create" || path === "/actor-workflow-status") {
       const actor = env.ACTOR.get(env.ACTOR.idFromName("room"));
-      const actorPath = path === "/actor-write" ? "write" : path === "/actor-sql" ? "sql" : path === "/actor-workflow-create" ? "workflow-create" : path === "/actor-workflow-status" ? "workflow-status" : "read";
+      const actorPath = path === "/actor-write" ? "write" : path === "/actor-sql" ? "sql" : path === "/actor-queue-send" ? "queue-send" : path === "/actor-workflow-create" ? "workflow-create" : path === "/actor-workflow-status" ? "workflow-status" : "read";
       return actor.fetch(new Request("http://actor.invalid/" + actorPath + url.search));
     }
     if (path === "/workflow-create") {
@@ -1456,6 +1456,10 @@ export class CounterActor {
       const result = await this.env.DB.query("SELECT value FROM item ORDER BY rowid");
       return Response.json(result.rows);
     }
+    if (path === "/queue-send") {
+      const id = await this.env.TASKS.send(new URL(request.url).searchParams.get("value") || "actor-origin");
+      return Response.json({ id });
+    }
     if (path === "/workflow-create") {
       const id = new URL(request.url).searchParams.get("id") || "actor-before";
       const created = await this.env.WORKFLOW.create({ id, params: { value: id } });
@@ -1489,6 +1493,10 @@ export class SqlWorkflow {
       return { written: true };
     });
     const result = await this.env.DB.query("SELECT value FROM item ORDER BY rowid");
+    if (event.params.value === "workflow-after") {
+      const queued = await step.do("enqueue", async () => ({ id: await this.env.TASKS.send("workflow-origin") }));
+      return { values: result.rows.map((row) => row.value), queueMessageId: queued.id };
+    }
     return { values: result.rows.map((row) => row.value) };
   }
 }
@@ -1853,6 +1861,15 @@ export class SqlWorkflow {
         body: '[{"value":"before-restart"},{"value":"after-restart"}]',
       });
       await waitForNativeQueueReceipt(root, afterMessageId, "retired");
+      const queuedFromActor = await nativeHttps(hostname, "/actor-queue-send?value=actor-origin");
+      expect(queuedFromActor.status).toBe(200);
+      const actorMessageId = String((JSON.parse(queuedFromActor.body) as Json).id);
+      expect(actorMessageId.length).toBeGreaterThan(0);
+      await waitForNativeQueueReceipt(root, actorMessageId, "retired");
+      expect(await nativeHttps(hostname, "/queue-read")).toEqual({
+        status: 200,
+        body: '[{"value":"before-restart"},{"value":"after-restart"},{"value":"actor-origin"}]',
+      });
       expect(await nativeHttps(hostname, "/actor-read")).toEqual({
         status: 200,
         body: '{"value":1}',
@@ -2022,9 +2039,17 @@ export class SqlWorkflow {
         status: 200,
         body: '{"id":"workflow-after","status":"queued"}',
       });
-      expect(await nativeWorkflowComplete(hostname, "workflow-after")).toEqual({
+      const workflowAfter = await nativeWorkflowComplete(hostname, "workflow-after");
+      expect(workflowAfter).toMatchObject({
         status: "complete",
         output: { values: ["once", "actor-before", "workflow-before", "workflow-after"] },
+      });
+      const workflowMessageId = String((workflowAfter.output as Json).queueMessageId);
+      expect(workflowMessageId.length).toBeGreaterThan(0);
+      await waitForNativeQueueReceipt(root, workflowMessageId, "retired");
+      expect(await nativeHttps(hostname, "/queue-read")).toEqual({
+        status: 200,
+        body: '[{"value":"before-restart"},{"value":"after-restart"},{"value":"actor-origin"},{"value":"workflow-origin"}]',
       });
       expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
         status: 200,

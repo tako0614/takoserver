@@ -17,7 +17,7 @@ describe("curated deploy extension schema readback", () => {
       [
         process.execPath,
         "-e",
-        `const api = await import("@takoserver/core/deploy-extension"); console.log(JSON.stringify({ read: typeof api.readD1SchemaState, match: typeof api.applicationSchemaMatches, derive: typeof api.deriveExpectedApplicationShape, audit: typeof api.readAuditedMigrationArtifact }));`,
+        `const api = await import("@takoserver/core/deploy-extension"); console.log(JSON.stringify({ read: typeof api.readD1SchemaState, match: typeof api.applicationSchemaMatches, derive: typeof api.deriveExpectedApplicationShape, audit: typeof api.readAuditedMigrationArtifact, currentSource: typeof api.readCurrentAuditedMigrationSourceArtifact }));`,
       ],
       {
         cwd: REPOSITORY,
@@ -40,6 +40,7 @@ describe("curated deploy extension schema readback", () => {
       match: "function",
       derive: "function",
       audit: "function",
+      currentSource: "function",
     });
     for (const forbidden of [
       "readMigrationArtifact",
@@ -49,6 +50,15 @@ describe("curated deploy extension schema readback", () => {
     ]) {
       expect(forbidden in deployExtension).toBe(false);
     }
+  });
+
+  test("exposes the audited current source without widening the legacy artifact", () => {
+    const legacy = deployExtension.readAuditedMigrationArtifact();
+    const current = deployExtension.readCurrentAuditedMigrationSourceArtifact();
+    expect(legacy.names).toHaveLength(66);
+    expect(current.names).toHaveLength(88);
+    expect(current.names.slice(0, legacy.names.length)).toEqual([...legacy.names]);
+    expect(current.files.at(-1)?.name).toBe("0088_v2_worker_sqlite_external_drain.sql");
   });
 
   test("reads a 0057 schema through the curated read-only database port", async () => {

@@ -70,7 +70,7 @@ export interface WorkerEnv {
   readonly TAKOSERVER_WORKER_ARTIFACT_DIGEST?: string;
   /** Temporary fail-closed 0042/0043 deployment bridge; never a steady mode. */
   readonly TAKOSERVER_ARTIFACT_BLOB_IO_MODE?: string;
-  /** Whole-Host pre-0058 maintenance; never a serving runtime mode. */
+  /** Whole-Host schema maintenance; never a serving runtime mode. */
   readonly TAKOSERVER_SCHEMA_MAINTENANCE_MODE?: string;
   /** Where this deployment's console is served, if it has one. */
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
@@ -298,10 +298,10 @@ function artifactBlobIoMode(
 
 function schemaMaintenanceMode(
   env: Pick<WorkerEnv, "TAKOSERVER_SCHEMA_MAINTENANCE_MODE" | "TAKOSERVER_ARTIFACT_BLOB_IO_MODE">,
-): "normal" | "pre-0058-quiesced" {
+): "normal" | "pre-0058-quiesced" | "pre-v2-0088-quiesced" {
   const value = env.TAKOSERVER_SCHEMA_MAINTENANCE_MODE;
   if (value === undefined) return "normal";
-  if (value !== "pre-0058-quiesced") {
+  if (value !== "pre-0058-quiesced" && value !== "pre-v2-0088-quiesced") {
     throw new TypeError("TAKOSERVER_SCHEMA_MAINTENANCE_MODE is invalid");
   }
   if (env.TAKOSERVER_ARTIFACT_BLOB_IO_MODE !== undefined) {
@@ -310,13 +310,15 @@ function schemaMaintenanceMode(
   return value;
 }
 
-function schemaMaintenanceResponse(): Response {
+function schemaMaintenanceResponse(mode: "pre-0058-quiesced" | "pre-v2-0088-quiesced"): Response {
   return errorEnvelopeResponse(
     "backend_unavailable",
     503,
     { reason: "runtime-configuration" },
     { headers: { "cache-control": "no-store", "retry-after": "60" } },
-    "Host is quiesced for the 0058 schema maintenance transition",
+    mode === "pre-0058-quiesced"
+      ? "Host is quiesced for the 0058 schema maintenance transition"
+      : "Host is quiesced for the v2 0088 schema maintenance transition",
   );
 }
 
@@ -871,7 +873,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       try {
         const schemaMode = startupStage("runtime-configuration", () => schemaMaintenanceMode(env));
         const mode = startupStage("runtime-configuration", () => artifactBlobIoMode(env));
-        if (schemaMode === "pre-0058-quiesced") return schemaMaintenanceResponse();
+        if (schemaMode !== "normal") return schemaMaintenanceResponse(schemaMode);
         if (mode === "pre-0043-quiesced") {
           return artifactBlobIoQuiescenceResponse();
         }
@@ -890,7 +892,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
 
     /** Background settlement: expiring reservations return their holds. */
     async scheduled(_event: unknown, env: WorkerEnv): Promise<void> {
-      if (schemaMaintenanceMode(env) === "pre-0058-quiesced") return;
+      if (schemaMaintenanceMode(env) !== "normal") return;
       if (artifactBlobIoMode(env) === "pre-0043-quiesced") return;
       const app = await appFor(env, requirePublicOrigin(env));
       const results = await Promise.allSettled([

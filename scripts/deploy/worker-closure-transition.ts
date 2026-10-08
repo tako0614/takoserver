@@ -29,6 +29,7 @@ import {
   assertProviderExecutorUnchanged,
   probeProduct,
   probeSchemaMaintenance,
+  providerExecutorAllowsPublication,
   providerExecutorQualificationReader,
   type WorkerMigrationReader,
   type WorkerProviderExecutorQualification,
@@ -155,6 +156,20 @@ export async function runWorkerClosureTransition(
     throw preflightError("closure predecessor Version ID must be one exact UUID");
   }
   const delta = normalizedWorkerClosureDelta(invocation.delta);
+  if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced") {
+    if (
+      JSON.stringify(delta.addedVars) !== JSON.stringify(["TAKOSERVER_SCHEMA_MAINTENANCE_MODE"]) ||
+      delta.retiredVars.length !== 0 ||
+      delta.refreshedVars.length !== 0 ||
+      (delta.refreshedServiceBindings?.length ?? 0) !== 0 ||
+      delta.addedBindings.length !== 0 ||
+      delta.addedSecrets.length !== 0 ||
+      delta.rotatedSecrets.length !== 0 ||
+      delta.storageRebind !== undefined
+    ) {
+      throw preflightError("v2 0088 maintenance transition may add only its maintenance variable");
+    }
+  }
   if (target.takoformV2 !== undefined) {
     if (invocation.environment !== "integration") {
       throw preflightError("v2 Worker closure transition is integration-only");
@@ -191,7 +206,8 @@ export async function runWorkerClosureTransition(
   // correction composes before it can be uploaded.
   await assertTargetComposes("preflight", target);
   const initialStorageProof =
-    delta.storageRebind === undefined && target.takoformV2 === undefined
+    target.schemaMaintenanceMode === "pre-v2-0088-quiesced" ||
+    (delta.storageRebind === undefined && target.takoformV2 === undefined)
       ? null
       : await selectedStorageVerifier(target)(target, invocation.environment, {
           ...options.integrationStorageVerification,
@@ -232,8 +248,7 @@ export async function runWorkerClosureTransition(
         : await providerExecutorQualification.read("preflight");
     if (
       invocation.action === "apply" &&
-      providerExecutorBefore !== null &&
-      !providerExecutorBefore.ready
+      !providerExecutorAllowsPublication(target, providerExecutorBefore)
     ) {
       throw preflightError(
         "public Worker publication requires the exact selected-commit Cloudflare provider executor",
@@ -470,7 +485,12 @@ export async function runWorkerClosureTransition(
     }
     if (providerExecutorQualification !== null && providerExecutorBefore !== null) {
       const currentProviderExecutor = await providerExecutorQualification.read("preflight");
-      assertProviderExecutorUnchanged(providerExecutorBefore, currentProviderExecutor);
+      assertProviderExecutorUnchanged(
+        providerExecutorBefore,
+        currentProviderExecutor,
+        "preflight",
+        target,
+      );
     }
     const finalMigrationState = await migrations.read();
     const finalPending = pendingMigrations(finalMigrationState.local, finalMigrationState.applied);
@@ -564,6 +584,7 @@ export async function runWorkerClosureTransition(
         providerExecutorBefore,
         providerExecutorAfter,
         "verification",
+        target,
       );
     }
     if (initialStorageProof !== null) {
@@ -593,10 +614,11 @@ export async function runWorkerClosureTransition(
       }
     }
     const probe =
-      target.schemaMaintenanceMode === "pre-0058-quiesced"
+      target.schemaMaintenanceMode !== undefined
         ? await probeSchemaMaintenance(
             target.publicOrigin,
             options.fetcher ?? ((input, init) => fetch(input, init)),
+            target.schemaMaintenanceMode,
           )
         : target.artifactBlobIoMode === "pre-0043-quiesced"
           ? await probeArtifactBlobIoQuiescence(
@@ -1005,7 +1027,12 @@ function remoteMigrationReader(
           wranglerCommand: (args) => deployWranglerCommand(wranglerPath, args),
         }),
       );
-      return { local: local.names, applied: remote.applied };
+      return {
+        local: local.names,
+        applied: remote.applied,
+        shape: remote.shape,
+        shapeDigest: remote.shapeDigest,
+      };
     },
   };
 }
