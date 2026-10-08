@@ -65,6 +65,7 @@ const LAYERS: readonly Layer[] = [
       "v2-form",
       "v2-code-validation",
       "v2-runtime",
+      "v2-service-binding-authority",
     ],
   },
   {
@@ -79,8 +80,8 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "v2-state",
-    match: /^src\/takoform-v2\/(?:store|worker-invocation-custody)\.ts$/u,
-    may: ["core", "v2-contract", "v2-private"],
+    match: /^src\/takoform-v2\/(?:store|worker-invocation-custody|worker-invocation-schema)\.ts$/u,
+    may: ["core", "v2-contract", "v2-private", "v2-state"],
   },
   {
     name: "v2-form",

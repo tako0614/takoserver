@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import type { Sql } from "../src/ports.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
@@ -28,11 +29,15 @@ async function fixture(
   secondSource = false,
   deadReferrer = false,
   equivalentShape = false,
+  legacyInvocationSchema = false,
 ) {
   const directory = mkdtempSync(join(tmpdir(), "v2-native-delete-"));
   const path = join(directory, "db.sqlite");
   const db = new Database(path);
-  migrateSqlite(db);
+  if (legacyInvocationSchema) {
+    for (const migration of MIGRATIONS.filter(({ name }) => !name.startsWith("0086_")))
+      db.exec(migration.sql);
+  } else migrateSqlite(db);
   const sql = createSqliteSql(db);
   const now = () => new Date();
   const backend = {
@@ -247,6 +252,298 @@ async function fixture(
     },
   };
 }
+
+/** A child Service call admitted after its caller's DELETE was accepted. */
+async function seedLateServiceCallerInvocation(f: Awaited<ReturnType<typeof fixture>>) {
+  for (const [uid, form] of [
+    ["service-callee-worker", "ModuleWorker/0.3.0"],
+    ["service-callee-deployment", "WorkerDeployment/0.4.0"],
+    ["service-callee-version", "WorkerVersion/0.5.0"],
+    ["service-caller-worker", "ModuleWorker/0.3.0"],
+  ] as const) {
+    await f.sql.run(
+      `INSERT INTO tf_v2_resources
+       (uid, principal, form_url, space, name, backend_id, target_key,
+        active_name, generation, observed_generation, phase, spec_json, last_operation)
+       VALUES (?, 'org-a', ?, 'production', ?, 'fixture-version-backend',
+        'target-a', ?, 1, 1, 'idle', '{}', ?)`,
+      [uid, `https://edge.forms.takoform.com/forms/${form}/`, uid, uid, f.source.operationId],
+    );
+  }
+  for (const uid of ["service-callee-deployment", "service-callee-version"]) {
+    await f.sql.run(
+      `INSERT INTO tf_v2_operations
+       (id, resource_uid, principal, replay_key, request_fingerprint, action,
+        generation, status, effect, created_at, updated_at, retain_until,
+        backend_id, target_key, backend_key, accepted_spec_json)
+       SELECT ?, ?, principal, ?, request_fingerprint, action, generation,
+        status, effect, created_at, updated_at, retain_until, backend_id,
+        target_key, ?, accepted_spec_json FROM tf_v2_operations WHERE id = ?`,
+      [`op-${uid}`, uid, `replay-${uid}`, `key-${uid}`, f.source.operationId],
+    );
+  }
+  const handle = { invocationId: "late-service-child", custodyToken: "late-service-child-token" };
+  await f.sql.run(
+    `INSERT INTO tf_v2_worker_invocations
+     (invocation_id, custody_token, backend_id, target_key, principal, space,
+      worker_uid, deployment_uid, deployment_generation, source_operation_id,
+      ingress_kind, endpoint_uid, endpoint_generation,
+      service_caller_worker_uid, service_caller_version_uid,
+      service_caller_version_generation, service_caller_version_operation_id,
+      service_binding_name, service_caller_execution_ref,
+      version_uid, version_generation, version_operation_id,
+      native_identity, closure_digest, confirmed_receipt, admitted_at_ms)
+     VALUES (?, ?, 'fixture-version-backend', 'target-a', 'org-a', 'production',
+       'service-callee-worker', 'service-callee-deployment', 1,
+       'op-service-callee-deployment', 'service', NULL, NULL,
+       'service-caller-worker', ?, 1, ?, 'UPSTREAM', 'nonsecret-caller-context',
+       'service-callee-version', 1, 'op-service-callee-version',
+       'callee-native-script', ?, 'callee-receipt', 1000)`,
+    [handle.invocationId, handle.custodyToken, f.source.resourceUid, f.source.operationId, digest],
+  );
+  const lifecycle = createV2WorkerInvocationLifecycle({ sql: f.sql, now: () => new Date(2000) });
+  expect(await lifecycle.beginSend(handle)).toBe(true);
+  return { handle, lifecycle };
+}
+
+test("a late Service child fences caller native DELETE grant and pre-send absence until no-dispatch", async () => {
+  const grant = await fixture();
+  try {
+    expect(await grant.custody.stageNext(grant.execution)).toBe("more");
+    expect(await grant.custody.stageNext(grant.execution)).toBe("ready");
+    const item = await grant.custody.next(grant.execution);
+    if (!item) throw new Error("missing native deletion item");
+    const child = await seedLateServiceCallerInvocation(grant);
+    expect(await grant.custody.grant(item, "etag-upload")).toBe("unknown");
+    expect(await child.lifecycle.confirmNoNativeDispatch(child.handle)).toBe(true);
+    expect(await grant.custody.grant(item, "etag-upload")).toBe("granted");
+  } finally {
+    grant.close();
+  }
+
+  const absence = await fixture();
+  try {
+    expect(await absence.custody.stageNext(absence.execution)).toBe("more");
+    const item = await absence.custody.next(absence.execution);
+    if (!item) throw new Error("missing native deletion item");
+    const child = await seedLateServiceCallerInvocation(absence);
+    await absence.sql.run("UPDATE tf_v2_operations SET lease_until_ms = ? WHERE id = ?", [
+      Date.now() - 1000,
+      absence.execution.operationId,
+    ]);
+    const reclaimedAt = Date.now();
+    expect(
+      await absence.store.claim(
+        absence.execution.operationId,
+        "service-absence-reclaimed",
+        reclaimedAt,
+        reclaimedAt + 60_000,
+      ),
+    ).toBe(true);
+    const resumed = {
+      ...item,
+      execution: { ...item.execution, leaseToken: "service-absence-reclaimed" },
+    };
+    expect(await absence.custody.confirmAbsent(resumed, "exact-preexisting-absence")).toBe(false);
+    expect(await child.lifecycle.confirmNoNativeDispatch(child.handle)).toBe(true);
+    expect(await absence.custody.confirmAbsent(resumed, "exact-preexisting-absence")).toBe(true);
+  } finally {
+    absence.close();
+  }
+
+  const inventory = await fixture();
+  try {
+    expect(await inventory.custody.stageNext(inventory.execution)).toBe("more");
+    expect(await inventory.custody.stageNext(inventory.execution)).toBe("ready");
+    const item = await inventory.custody.next(inventory.execution);
+    if (!item) throw new Error("missing native deletion item");
+    expect(await inventory.custody.grant(item, "etag-upload")).toBe("granted");
+    expect(await inventory.custody.confirmAbsent(item, "owned-absence")).toBe(true);
+    expect(await inventory.custody.allAbsent(inventory.execution)).toBe(true);
+    const partialSchemaSql: Sql = {
+      run: (statement, params) => inventory.sql.run(statement, params),
+      batch: (statements) => inventory.sql.batch(statements),
+      async query(statement, params) {
+        const rows = await inventory.sql.query(statement, params);
+        return statement.startsWith("PRAGMA table_info(tf_v2_worker_invocations)")
+          ? rows.filter((row) => row.name !== "service_binding_name")
+          : rows;
+      },
+    };
+    const partial = createV2NativeDeletionCustody({ sql: partialSchemaSql });
+    expect(await partial.grant(item, "etag-upload")).toBe("unknown");
+    expect(await partial.confirmAbsent(item, "owned-absence")).toBe(false);
+    expect(await partial.allAbsent(inventory.execution)).toBe(false);
+    // A late raw row must not let inventory announce completion while caller
+    // execution is still outstanding, even though the earlier DELETE settled.
+    const child = await seedLateServiceCallerInvocation(inventory);
+    expect(await inventory.custody.allAbsent(inventory.execution)).toBe(false);
+    expect(await child.lifecycle.confirmNoNativeDispatch(child.handle)).toBe(true);
+    expect(await inventory.custody.allAbsent(inventory.execution)).toBe(true);
+  } finally {
+    inventory.close();
+  }
+});
+
+test("0086 interrupted after final table creation never reports absence, then reopens after closure", async () => {
+  const f = await fixture(true, false, false, false, true);
+  try {
+    expect(await f.custody.stageNext(f.execution)).toBe("more");
+    expect(await f.custody.stageNext(f.execution)).toBe("ready");
+    const item = await f.custody.next(f.execution);
+    if (!item) throw new Error("missing native deletion item");
+    expect(await f.custody.grant(item, "etag-upload")).toBe("granted");
+    expect(await f.custody.confirmAbsent(item, "owned-absence")).toBe(true);
+    expect(await f.custody.allAbsent(f.execution)).toBe(true);
+    for (const [uid, form] of [
+      ["partial-inv-worker", "ModuleWorker/0.3.0"],
+      ["partial-inv-deployment", "WorkerDeployment/0.4.0"],
+      ["partial-inv-endpoint", "WorkerEndpoint/0.3.0"],
+    ] as const) {
+      await f.sql.run(
+        `INSERT INTO tf_v2_resources
+         (uid, principal, form_url, space, name, backend_id, target_key,
+          active_name, generation, observed_generation, phase, spec_json, last_operation)
+         VALUES (?, 'org-a', ?, 'production', ?, 'fixture-version-backend',
+          'target-a', ?, 1, 1, 'idle', '{}', ?)`,
+        [uid, `https://edge.forms.takoform.com/forms/${form}/`, uid, uid, f.source.operationId],
+      );
+    }
+    const handle = { invocationId: "partial-invocation", custodyToken: "partial-invocation-token" };
+    await f.sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+       (invocation_id, custody_token, backend_id, target_key, principal, space,
+        worker_uid, deployment_uid, deployment_generation, source_operation_id,
+        endpoint_uid, endpoint_generation, version_uid, version_generation,
+        version_operation_id, native_identity, closure_digest, confirmed_receipt, admitted_at_ms)
+       VALUES (?, ?, 'fixture-version-backend', 'target-a', 'org-a', 'production',
+        'partial-inv-worker', 'partial-inv-deployment', 1, ?, 'partial-inv-endpoint', 1,
+        ?, 1, ?, ?, ?, 'etag-upload', 1000)`,
+      [
+        handle.invocationId,
+        handle.custodyToken,
+        f.source.operationId,
+        f.source.resourceUid,
+        f.source.operationId,
+        nativeIdentity,
+        digest,
+      ],
+    );
+    expect(await f.custody.allAbsent(f.execution)).toBe(false);
+    const forward = MIGRATIONS.find(({ name }) => name.startsWith("0086_"));
+    if (!forward) throw new Error("missing 0086 migration");
+    const statements = splitMigration(forward.sql);
+    expect(statements[6]?.startsWith("CREATE TABLE tf_v2_worker_invocations (")).toBe(true);
+    for (const statement of statements.slice(0, 7)) f.db.exec(statement);
+    expect((await f.sql.query("SELECT count(*) AS n FROM tf_v2_worker_invocations"))[0]?.n).toBe(0);
+    expect(
+      (await f.sql.query("SELECT count(*) AS n FROM tf_v2_worker_invocations_next"))[0]?.n,
+    ).toBe(1);
+    expect(await f.custody.allAbsent(f.execution)).toBe(false);
+    expect(await f.custody.grant(item, "etag-upload")).toBe("unknown");
+    const partialLifecycle = createV2WorkerInvocationLifecycle({ sql: f.sql });
+    await expect(partialLifecycle.inspectDeployment("partial-inv-deployment")).rejects.toThrow(
+      "invocation inventory unavailable",
+    );
+    const firstTrigger = statements.findIndex((statement) =>
+      statement.startsWith("CREATE TRIGGER"),
+    );
+    expect(firstTrigger).toBeGreaterThan(7);
+    for (const statement of statements.slice(7, firstTrigger)) f.db.exec(statement);
+    expect((await f.sql.query("SELECT count(*) AS n FROM tf_v2_worker_invocations"))[0]?.n).toBe(1);
+    expect(
+      (
+        await f.sql.query(
+          "SELECT count(*) AS n FROM sqlite_schema WHERE name = 'tf_v2_worker_invocations_next'",
+        )
+      )[0]?.n,
+    ).toBe(0);
+    expect(await f.custody.allAbsent(f.execution)).toBe(false);
+    await expect(partialLifecycle.inspectDeployment("partial-inv-deployment")).rejects.toThrow(
+      "invocation inventory unavailable",
+    );
+    for (const statement of statements.slice(firstTrigger)) f.db.exec(statement);
+    const reopenedDb = new Database(f.path);
+    try {
+      const reopenedSql = createSqliteSql(reopenedDb);
+      const reopened = createV2NativeDeletionCustody({ sql: reopenedSql });
+      const lifecycle = createV2WorkerInvocationLifecycle({
+        sql: reopenedSql,
+        now: () => new Date(2000),
+      });
+      expect(await reopened.allAbsent(f.execution)).toBe(false);
+      expect(await lifecycle.inspectDeployment("partial-inv-deployment")).toEqual({
+        outstanding: 1,
+        bodyFinished: 0,
+      });
+      expect(await lifecycle.beginSend(handle)).toBe(true);
+      expect(await lifecycle.confirmNoNativeDispatch(handle)).toBe(true);
+      expect(await reopened.allAbsent(f.execution)).toBe(true);
+    } finally {
+      reopenedDb.close();
+    }
+  } finally {
+    f.close();
+  }
+});
+
+test("native DELETE refuses a guard disappearing after schema precheck", async () => {
+  const grant = await fixture();
+  try {
+    expect(await grant.custody.stageNext(grant.execution)).toBe("more");
+    expect(await grant.custody.stageNext(grant.execution)).toBe("ready");
+    const item = await grant.custody.next(grant.execution);
+    if (!item) throw new Error("missing native deletion item");
+    let dropped = false;
+    const racingSql: Sql = {
+      query: (statement, params) => grant.sql.query(statement, params),
+      batch: (statements) => grant.sql.batch(statements),
+      run(statement, params) {
+        if (!dropped && statement.includes("SET grant_lease_token = ?")) {
+          grant.db.exec("DROP TRIGGER tf_v2_worker_native_deletion_send_guard");
+          dropped = true;
+        }
+        return grant.sql.run(statement, params);
+      },
+    };
+    const racing = createV2NativeDeletionCustody({ sql: racingSql });
+    expect(await racing.grant(item, "etag-upload")).toBe("unknown");
+    expect(dropped).toBe(true);
+  } finally {
+    grant.close();
+  }
+
+  const absence = await fixture();
+  try {
+    expect(await absence.custody.stageNext(absence.execution)).toBe("more");
+    expect(await absence.custody.stageNext(absence.execution)).toBe("ready");
+    const item = await absence.custody.next(absence.execution);
+    if (!item) throw new Error("missing native deletion item");
+    expect(await absence.custody.grant(item, "etag-upload")).toBe("granted");
+    expect(await absence.custody.confirmAbsent(item, "owned-absence")).toBe(true);
+    expect(await absence.custody.allAbsent(absence.execution)).toBe(true);
+    let dropped = false;
+    const racingSql: Sql = {
+      run: (statement, params) => absence.sql.run(statement, params),
+      batch: (statements) => absence.sql.batch(statements),
+      query(statement, params) {
+        if (
+          !dropped &&
+          statement.includes("AND NOT EXISTS (SELECT 1 FROM tf_v2_worker_native_deletions item")
+        ) {
+          absence.db.exec("DROP TRIGGER tf_v2_worker_native_deletion_send_guard");
+          dropped = true;
+        }
+        return absence.sql.query(statement, params);
+      },
+    };
+    const racing = createV2NativeDeletionCustody({ sql: racingSql });
+    expect(await racing.allAbsent(absence.execution)).toBe(false);
+    expect(dropped).toBe(true);
+  } finally {
+    absence.close();
+  }
+});
 
 test("confirmed source stages, one DELETE grant persists across reopen, and lost ACK reconciles by absence", async () => {
   const f = await fixture();

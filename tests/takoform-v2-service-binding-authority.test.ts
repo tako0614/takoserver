@@ -10,9 +10,27 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import {
+  createV2ServiceBindingAuthority as exportedAuthority,
+  inspectV2WorkerInvocationSchema as exportedSchemaInspector,
+  v2WorkerInvocationSchemaReady as exportedSchemaReady,
+} from "../src/takoform-v2/index.ts";
+import {
   createV2ServiceBindingAuthority,
   type V2ServiceBindingClaim,
 } from "../src/takoform-v2/service-binding-authority.ts";
+import {
+  inspectV2WorkerInvocationSchema,
+  v2WorkerInvocationSchemaReady,
+} from "../src/takoform-v2/worker-invocation-schema.ts";
+
+test("public v2 extension entrypoint exposes the logical service binding authority", () => {
+  expect(exportedAuthority).toBe(createV2ServiceBindingAuthority);
+});
+
+test("public v2 extension entrypoint exposes the same invocation schema seal", () => {
+  expect(exportedSchemaInspector).toBe(inspectV2WorkerInvocationSchema);
+  expect(exportedSchemaReady).toBe(v2WorkerInvocationSchemaReady);
+});
 
 const TARGET_KEY = "service-authority-target";
 const CALLER_UID = "caller-worker";

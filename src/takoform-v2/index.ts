@@ -71,6 +71,11 @@ export type {
   V2PrivateInputKey,
   V2PrivateInputMap,
 } from "./private-inputs.ts";
+export {
+  createV2ServiceBindingAuthority,
+  type V2ServiceBindingClaim,
+  type V2ServiceBindingResolution,
+} from "./service-binding-authority.ts";
 export type {
   V2Backend,
   V2BackendResult,
@@ -87,11 +92,17 @@ export {
   type V2WorkerInvocationAdmission,
   type V2WorkerInvocationCustody,
   type V2WorkerInvocationHandle,
+  type V2WorkerInvocationIngress,
   type V2WorkerInvocationRecord,
   type V2WorkerInvocationRetirementIdentity,
   type V2WorkerInvocationRetirementInput,
   type V2WorkerInvocationSelection,
 } from "./worker-invocation-custody.ts";
+export {
+  inspectV2WorkerInvocationSchema,
+  type V2WorkerInvocationSchema,
+  v2WorkerInvocationSchemaReady,
+} from "./worker-invocation-schema.ts";
 export {
   createV2NativeDeletionCustody,
   type V2NativeDeletionCustody,
@@ -115,6 +126,11 @@ export {
   type V2WorkerVersionResolution,
   type V2WorkerVersionSnapshot,
 } from "./worker-publication-state.ts";
+export {
+  exactV2ResolvedServiceBindings,
+  projectV2ResolvedServiceBindings,
+  type V2ResolvedServiceBinding,
+} from "./worker-service-resolution.ts";
 export {
   createV2WorkerVersionConfiguredInputSealer,
   type V2WorkerVersionConfiguredKeyring,

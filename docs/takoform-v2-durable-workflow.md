@@ -24,18 +24,28 @@ database's current time inside that statement; a lease expiring while a batch
 is held cannot authorize a late purge.
 
 `createDurableWorkflowForm` requires a boot-selected class-admission port.
-`createV2WorkflowClassAdmission` now captures every active and pending weighted
+`createV2WorkflowClassAdmission` captures every active and pending weighted
 Version from accepted SQL, verifies sealed reference sets and held module bytes,
 inspects the named Workflow class in a disposable, pinned workerd, and returns
 a same-statement graph predicate. A clean native class refusal is distinct
 from unavailable inspection; an allocation changed after inspection is
-retryable, not a definitive class error. This component is not yet wired to
-the normal Host. A v2 native Workflow Binding/runner composition is still
-missing; it must bind the private broker scope to the same principal, Space, UID, current
-Deployment and selected Version. Consequently the Form is not registered in
-the normal factory and `workflowBindings` remains rejected in WorkerVersion
-eligibility. Do not advertise v2 Workflow FormSupport from the synthetic
-backend tests.
+retryable, not a definitive class error.
+
+The normal self-host entry can now opt into a v2 Workflow boot with an explicit
+`TAKOSERVER_V2_WORKER_RUNTIME_BOOT` selection, durable private storage, and
+selected executable workerd and Workflow guard binaries. It passes that boot
+to `createSelfhostV2WorkerComposition` before owner restoration. Only with
+this boot does the internal Form factory mount `DurableWorkflow/0.3.0` and give
+WorkerVersion its v2 Workflow Binding authority. The authority resolves the
+accepted same-principal, same-Space Resource UID and current relation; native
+publication projects only declared `env` names through an owner-incarnation-
+pinned private broker. `createSelfhostV2WorkflowComposition` reuses the same
+SQL-backed instance/step engine and guarded native runner. The normal entry
+also starts a bounded due poll for queued and waking v2 instances when this
+boot is selected; runtime execution retains the final SQL/native fences.
+Without this explicit boot, Workflow Binding admission still refuses the
+unavailable capability. This is an internal, opt-in Form map, not a public
+FormSupport registry advertisement or a claim of full Form support.
 
 The focused synthetic test exercises accepted v2 HTTP Resource/Operation CRUD,
 step history replay after SQLite close/reopen, active-instance DELETE, and an
@@ -43,8 +53,28 @@ instance-create versus DELETE race. Two Workflow Resources may share one
 Worker/class while retaining separate instance ID spaces. The test also covers
 unswept expired rows and synthetic owner-stop acknowledgement. The class
 admission tests exercise accepted active and pending weighted graph capture,
-held Bundle bytes, same-statement drift, and accepted Ready observation. Native
-tests use the pinned workerd artifact for class ABI inspection and held-byte
-graph qualification. The CRUD/step test still supplies a fake class-admission
-result and an in-process execution host. That test alone does not qualify
-physical workerd stop, broker delivery, OS process recovery, or public Support.
+held Bundle bytes, same-statement drift, and accepted Ready observation. The
+CRUD/step test still supplies a fake class-admission result and an in-process
+execution host; SQLite close/reopen is not Host OS-process restart evidence.
+
+Separately, `tests/takoform-v2-workflow-binding-native.test.ts` passed on the
+pinned workerd (`sha256:c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52`)
+and Workflow execution guard
+(`sha256:5588505e384cd54105cb4e1a46bb4c33ce6d33f222270f49ed7b3f3e88da84dc`):
+normal organization HTTP accepted a bound WorkerVersion and Deployment, the
+selected Worker called `env.PARENT.create`, and its guarded parent class called
+`env.CHILD.create/get/status` before native child completion.
+
+`tests/selfhost-v2-workflow-os-restart-native.test.ts` additionally uses the same
+SQLite, object store and private owner roots across Host SIGKILL and replacement.
+It verifies distinct Host and native Worker PIDs, retained accepted Operations,
+Binding get/status/create, parent step replay, child completion, and event-driven
+parent continuation. A same-spec Workflow PUT and dependency-ordered DELETE
+complete after restart. Event acceptance is durable; it does not promise
+immediate consumption or a particular intermediate status. Failed or uncertain
+cleanup retains the fixture roots instead of treating missing process identities
+as absence.
+
+This is local loopback/native recovery evidence. It does not cover a kill during
+an in-flight external effect, public TLS/Ingress, public FormSupport, Hosted/live
+operation, or full Form support.

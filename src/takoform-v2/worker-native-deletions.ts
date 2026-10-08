@@ -2,6 +2,10 @@ import { canonicalJson } from "../json.ts";
 import type { Clock, JsonObject, Sql, SqlParam } from "../ports.ts";
 import { WORKER_VERSION_FORM_URL } from "./forms/worker-specs.ts";
 import type { V2Execution } from "./types.ts";
+import {
+  inspectV2WorkerInvocationSchema,
+  v2WorkerInvocationSchemaReady,
+} from "./worker-invocation-schema.ts";
 
 /** An immutable prior upload, copied under an accepted Version DELETE claim. */
 export interface V2NativeDeletionItem {
@@ -139,11 +143,17 @@ const MISSING = `EXISTS (
         AND (item.upload_receipt IS effect.confirmed_receipt OR
           item.qualified_source_receipt = effect.confirmed_receipt))
 )`;
-const UNSAFE = `EXISTS (SELECT 1 FROM tf_v2_resource_references ref
+function unsafePredicate(serviceAware: boolean): string {
+  const invocationVersion = serviceAware
+    ? `(invocation.version_uid = op.resource_uid OR
+      (invocation.ingress_kind = 'service' AND
+        invocation.service_caller_version_uid = op.resource_uid))`
+    : "invocation.version_uid = op.resource_uid";
+  return `EXISTS (SELECT 1 FROM tf_v2_resource_references ref
     JOIN tf_v2_resources referrer ON referrer.uid = ref.referrer_uid
     WHERE ref.target_uid = op.resource_uid AND referrer.deleted_at IS NULL)
   OR EXISTS (SELECT 1 FROM tf_v2_worker_invocations invocation
-    WHERE invocation.version_uid = op.resource_uid
+    WHERE ${invocationVersion}
       AND invocation.phase <> 'pre_effect_refused'
       AND invocation.no_native_dispatch_at_ms IS NULL
       AND (invocation.retired_at_ms IS NULL OR invocation.retirement_receipt_digest IS NULL))
@@ -152,6 +162,7 @@ const UNSAFE = `EXISTS (SELECT 1 FROM tf_v2_resource_references ref
       AND source.status = 'succeeded' AND source.effect = 'complete'
       AND NOT EXISTS (SELECT 1 FROM tf_v2_worker_native_effects effect
         WHERE effect.operation_id = source.id))`;
+}
 
 /** Custody is not a provider CAS and never converts an absent old upload into no effect. */
 export function createV2NativeDeletionCustody(options: {
@@ -160,6 +171,19 @@ export function createV2NativeDeletionCustody(options: {
 }): V2NativeDeletionCustody {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
+
+  async function currentUnsafePredicate(): Promise<{
+    readonly unsafe: string;
+    readonly ready: string;
+  } | null> {
+    const kind = await inspectV2WorkerInvocationSchema(sql);
+    return kind === null
+      ? null
+      : {
+          unsafe: unsafePredicate(kind === "service"),
+          ready: v2WorkerInvocationSchemaReady(kind),
+        };
+  }
 
   function time(): number | null {
     const value = now().getTime();
@@ -189,7 +213,7 @@ export function createV2NativeDeletionCustody(options: {
     return (found[0] ?? null) as ItemRow | null;
   }
 
-  async function accepted(item: V2NativeDeletionItem): Promise<boolean> {
+  async function accepted(item: V2NativeDeletionItem, ready?: string): Promise<boolean> {
     const e = item.execution;
     return (
       (
@@ -200,7 +224,8 @@ export function createV2NativeDeletionCustody(options: {
         AND op.backend_key = ? AND op.backend_id = ? AND op.target_key = ?
         AND op.accepted_spec_json = ? AND r.principal = ? AND r.space = ?
         AND r.name = ? AND r.form_url = ? AND r.backend_id = op.backend_id
-        AND r.target_key = op.target_key LIMIT 1`,
+        AND r.target_key = op.target_key
+        ${ready ? `AND (${ready})` : ""} LIMIT 1`,
           [
             e.operationId,
             e.resourceUid,
@@ -314,8 +339,10 @@ export function createV2NativeDeletionCustody(options: {
         return "unknown";
       const existing = await row(item);
       if (!existing || !sameRow(existing, item)) return "unknown";
+      const predicate = await currentUnsafePredicate();
+      if (predicate === null) return "unknown";
       if (existing.grant_lease_token !== null)
-        return (await accepted(item)) ? "already_granted" : "unknown";
+        return (await accepted(item, predicate.ready)) ? "already_granted" : "unknown";
       try {
         const changed = await sql.run(
           `UPDATE tf_v2_worker_native_deletions
@@ -328,9 +355,10 @@ export function createV2NativeDeletionCustody(options: {
               WHERE later.delete_operation_id = tf_v2_worker_native_deletions.delete_operation_id
                 AND later.native_identity = tf_v2_worker_native_deletions.native_identity
                 AND later.source_generation > tf_v2_worker_native_deletions.source_generation)
+            AND (${predicate.ready})
             AND EXISTS (SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r
               ON r.uid = op.resource_uid WHERE ${CLAIM}
-                AND NOT (${UNSAFE}) AND NOT (${MISSING}))`,
+                AND NOT (${predicate.unsafe}) AND NOT (${MISSING}))`,
           [
             e.leaseToken,
             currentSourceReceipt,
@@ -351,7 +379,13 @@ export function createV2NativeDeletionCustody(options: {
       const item = captureItem(input);
       if (!validExecution(item.execution)) return { kind: "unknown" };
       const existing = await row(item);
-      if (!existing || !sameRow(existing, item) || !(await accepted(item)))
+      const predicate = await currentUnsafePredicate();
+      if (
+        !existing ||
+        !sameRow(existing, item) ||
+        predicate === null ||
+        !(await accepted(item, predicate.ready))
+      )
         return { kind: "unknown" };
       if (existing.confirmed_absence_receipt !== null)
         return {
@@ -392,7 +426,9 @@ export function createV2NativeDeletionCustody(options: {
       if (!validReceipt(receipt)) return false;
       const existing = await row(item);
       if (!existing || !sameRow(existing, item) || !(await accepted(item))) return false;
-      if (existing.confirmed_absence_receipt === receipt) return true;
+      const predicate = await currentUnsafePredicate();
+      if (predicate === null) return false;
+      if (existing.confirmed_absence_receipt === receipt) return accepted(item, predicate.ready);
       if (existing.confirmed_absence_receipt !== null) return false;
       const nowMs = time();
       if (nowMs === null) return false;
@@ -405,12 +441,13 @@ export function createV2NativeDeletionCustody(options: {
           absence_lease_token = CASE WHEN grant_lease_token IS NULL THEN ? ELSE absence_lease_token END
         WHERE delete_operation_id = ? AND source_operation_id = ?
           AND confirmed_absence_receipt IS NULL
+          AND (${predicate.ready})
           AND (upload_receipt IS NOT NULL OR qualified_source_receipt IS NOT NULL)
           AND (grant_lease_token IS NOT NULL OR
             (upload_receipt IS NOT NULL AND EXISTS (
               SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r
               ON r.uid = op.resource_uid WHERE ${CLAIM}
-                AND NOT (${UNSAFE}) AND NOT (${MISSING}))))`,
+                AND NOT (${predicate.unsafe}) AND NOT (${MISSING}))))`,
               [
                 receipt,
                 item.execution.leaseToken,
@@ -429,10 +466,13 @@ export function createV2NativeDeletionCustody(options: {
       const e = captureExecution(input);
       const nowMs = time();
       if (!validExecution(e) || nowMs === null) return false;
+      const predicate = await currentUnsafePredicate();
+      if (predicate === null) return false;
       const rows = await sql.query(
         `SELECT 1 FROM tf_v2_operations op
         JOIN tf_v2_resources r ON r.uid = op.resource_uid WHERE ${CLAIM}
-          AND NOT (${UNSAFE}) AND NOT (${MISSING})
+          AND (${predicate.ready})
+          AND NOT (${predicate.unsafe}) AND NOT (${MISSING})
           AND NOT EXISTS (SELECT 1 FROM tf_v2_worker_native_deletions item
             WHERE item.delete_operation_id = op.id
               AND item.confirmed_absence_receipt IS NULL) LIMIT 1`,
