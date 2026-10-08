@@ -58,14 +58,23 @@ export class Counter extends Base {
   async fetch(request) {
     const path = new URL(request.url).pathname;
     if (path === '/alarm-set') {
-      await this.context.alarm.set(Date.now() + 60000);
+      const delay = Number(new URL(request.url).searchParams.get('delay') ?? 60000);
+      await this.context.alarm.set(Date.now() + delay);
       return Response.json({ pending: await this.context.alarm.get() });
+    }
+    if (path === '/alarm-count') {
+      const rows = await this.context.storage.query('SELECT count FROM alarm_runs WHERE id = 1');
+      return Response.json({ count: Number(rows.rows[0]?.count ?? 0) });
     }
     if (path === '/stream') return new Response(new ReadableStream({ start(controller) {
       controller.enqueue(new TextEncoder().encode('head'));
       setTimeout(() => controller.close(), 2000);
     } }));
     return super.fetch(request);
+  }
+  async alarm() {
+    await this.context.storage.execute('CREATE TABLE IF NOT EXISTS alarm_runs (id INTEGER PRIMARY KEY, count INTEGER NOT NULL)');
+    await this.context.storage.execute('INSERT INTO alarm_runs VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET count = count + 1');
   }
 }`;
     const publication: WorkerdDeploymentPublication = {
@@ -119,7 +128,7 @@ export class Counter extends Base {
       providerInstallationRef: "local.primary",
     });
     let ownOperationBusy = false;
-    const sourceOperationId = "physical-count-source-operation";
+    let sourceOperationId = "physical-count-source-operation";
     const incarnationId = "physical-count-incarnation";
     const host = createSelfhostActorExecutionHost({
       runtimeRoot,
@@ -415,6 +424,11 @@ export class Counter extends Base {
           ({ versionId, workerVersionUid, weight }) => ({ versionId, workerVersionUid, weight }),
         ),
       };
+      const dueSoon = await host.fetch(
+        identity,
+        new Request("http://actor.invalid/alarm-set?delay=5000"),
+      );
+      expect(((await dueSoon.json()) as { pending: number }).pending).toBeGreaterThan(Date.now());
       ownOperationBusy = true;
       expect(await host.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000))).toEqual({
         kind: "unknown",
@@ -521,7 +535,63 @@ export class Counter extends Base {
           AbortSignal.timeout(5_000),
         ),
       ).toMatchObject({ kind: "confirmed", pendingAlarmCount: 1 });
+      sourceOperationId = nextSourceOperationId;
       ownOperationBusy = false;
+      let deliveredWithoutFetch = false;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const observed = await host.observeNamespaceRuntimeForAcceptedOperation(
+          scope,
+          nextExpected,
+          AbortSignal.timeout(5_000),
+        );
+        if (observed.kind === "confirmed" && observed.pendingAlarmCount === 0) {
+          deliveredWithoutFetch = true;
+          break;
+        }
+        await Bun.sleep(100);
+      }
+      expect(deliveredWithoutFetch).toBe(true);
+      expect(
+        await (await host.fetch(identity, new Request("http://actor.invalid/alarm-count"))).json(),
+      ).toEqual({ count: 1 });
+      const secondDue = await host.fetch(
+        identity,
+        new Request("http://actor.invalid/alarm-set?delay=3000"),
+      );
+      expect(((await secondDue.json()) as { pending: number }).pending).toBeGreaterThan(Date.now());
+      ownOperationBusy = true;
+      let matchingChecks = 0;
+      expect(
+        await host.warmNamespaceForAcceptedOperation(
+          scope,
+          {
+            graph: accepted,
+            realization: nextRealization,
+            expected: nextExpected,
+            stillAuthorized: async () => ++matchingChecks < 4,
+          },
+          AbortSignal.timeout(5_000),
+        ),
+      ).toEqual({ kind: "unknown" });
+      expect(() => process.kill(replacementPid, 0)).not.toThrow();
+      ownOperationBusy = false;
+      deliveredWithoutFetch = false;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const observed = await host.observeNamespaceRuntimeForAcceptedOperation(
+          scope,
+          nextExpected,
+          AbortSignal.timeout(5_000),
+        );
+        if (observed.kind === "confirmed" && observed.pendingAlarmCount === 0) {
+          deliveredWithoutFetch = true;
+          break;
+        }
+        await Bun.sleep(100);
+      }
+      expect(deliveredWithoutFetch).toBe(true);
+      expect(
+        await (await host.fetch(identity, new Request("http://actor.invalid/alarm-count"))).json(),
+      ).toEqual({ count: 2 });
       // The original child is still alive; only its Unix pathname is replaced.
       // A foreign listener may relay valid native replies, but it is not the
       // listener whose readiness the Host accepted for this child.
@@ -569,6 +639,7 @@ export class Counter extends Base {
       await rm(root, { recursive: true, force: true });
     }
   },
+  20_000,
 );
 
 test.skipIf(binary === undefined)(

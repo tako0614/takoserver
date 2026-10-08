@@ -45,6 +45,7 @@ interface Session {
   dead: boolean;
   retiring: boolean;
   reap?: Promise<void>;
+  admissionRecovery?: Promise<void>;
 }
 interface Owner {
   tail: Promise<void>;
@@ -416,12 +417,61 @@ export function createSelfhostActorExecutionHost(options: {
   const retire = async (owner: Owner): Promise<void> => {
     const session = owner.session;
     if (!session) return;
+    session.retiring = true;
     session.process.disableAlarmAdmission();
     if (session.active > 0 && !session.dead)
       await new Promise<void>((resolve) => session.idle.add(resolve));
-    session.retiring = true;
     await (session.reap ?? session.process.close());
     if (owner.session === session) delete owner.session;
+  };
+  const resumeAdmissionAfterSettlement = (owner: Owner, session: Session, identity: ActorScope) => {
+    if (session.admissionRecovery) return;
+    const captured = { ...identity };
+    session.admissionRecovery = (async () => {
+      while (
+        !stopped &&
+        !owner.revoked &&
+        owner.session === session &&
+        !session.dead &&
+        !session.retiring
+      ) {
+        try {
+          const signal = AbortSignal.timeout(5_000);
+          const graph = await authority.readGraph(captured, signal);
+          if (graph?.authorityKey === session.authorityGraph.authorityKey) {
+            const realized = await authority.readRealization(graph, signal);
+            if (
+              realized.kind === "ready" &&
+              realized.realization.authorityKey === session.realization.authorityKey &&
+              realized.realization.script === session.realization.script &&
+              realized.realization.graph.generationKey === session.graph.generationKey &&
+              canonicalJson(realized.realization.actorForwardSockets ?? []) ===
+                canonicalJson(session.realization.actorForwardSockets ?? []) &&
+              (await authority.stillCurrent(graph, session.realization, signal)) &&
+              (await authority.readGraph(captured, signal))?.authorityKey ===
+                session.authorityGraph.authorityKey &&
+              !stopped &&
+              !owner.revoked &&
+              owner.session === session &&
+              !session.dead &&
+              !session.retiring
+            ) {
+              // The settled graph, not the accepted busy Operation, now
+              // authorizes callbacks. The native callback still rechecks
+              // current SQL and the selected Version before any event effect.
+              session.process.enableAlarmAdmission();
+              return;
+            }
+          }
+        } catch {
+          // An unavailable graph or native readback cannot enable admission.
+        }
+        await Bun.sleep(250);
+      }
+    })().finally(() => {
+      delete session.admissionRecovery;
+    });
+    void session.admissionRecovery.catch(() => {});
   };
   const selectedVersion = async (
     graph: ActorExecutionGraph,
@@ -504,6 +554,7 @@ export function createSelfhostActorExecutionHost(options: {
     // native input gates, not a second generic application scheduler.
     const session = await exclusive(current, async () => {
       let openedByWarm: Session | undefined;
+      let disabledCarrier: Session | undefined;
       if (stopped || current.revoked || revoked.has(key)) throw new Error("Actor owner stopped");
       if (!(await registeredScope(key, identity)))
         throw new ActorAuthorityUnavailable("Actor namespace is not registered");
@@ -795,6 +846,7 @@ export function createSelfhostActorExecutionHost(options: {
           // Native startup only; normal readGraph/stillCurrent remains the
           // sole gate for every application, alarm, and socket invocation.
           candidate.process.disableAlarmAdmission();
+          disabledCarrier = candidate;
           const observation = await observeSession(
             identity,
             signal,
@@ -811,12 +863,15 @@ export function createSelfhostActorExecutionHost(options: {
             current.session !== candidate
           )
             throw new ActorAuthorityUnavailable("Actor warm inspection unavailable");
+          resumeAdmissionAfterSettlement(current, candidate, identity);
           return { session: candidate, variantKey: "", observation };
         } catch (error) {
           // A failed candidate is not a Resource DELETE. Stop only the child
           // opened by this warm attempt. A pre-existing carrier must remain
           // untouched when its candidate fails validation or readback.
           if (openedByWarm && current.session === openedByWarm) await retire(current);
+          else if (disabledCarrier && current.session === disabledCarrier)
+            resumeAdmissionAfterSettlement(current, disabledCarrier, identity);
           throw error;
         }
       }
