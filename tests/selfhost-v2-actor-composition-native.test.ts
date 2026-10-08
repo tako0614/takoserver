@@ -53,22 +53,16 @@ export class CounterActor {
     }
     if (new URL(request.url).pathname === "/held-nested") {
       const actor = this.env.ACTOR;
-      return new Response(new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode("head"));
-          setTimeout(async () => {
-            try {
-              const nested = await actor.get(actor.idFromName("nested")).fetch(
-                new Request("http://actor.example.test/plain"),
-              );
-              controller.enqueue(new TextEncoder().encode("nested-admitted:" + nested.status));
-            } catch {
-              controller.enqueue(new TextEncoder().encode("nested-refused"));
-            }
-            controller.close();
-          }, 750);
-        },
-      }));
+      if (!actor) return new Response("nested-binding-missing", {status: 500});
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      try {
+        const nested = await actor.get(actor.idFromName("nested")).fetch(
+          new Request("http://actor.example.test/plain"),
+        );
+        return new Response("nested-status:" + nested.status);
+      } catch {
+        return new Response("nested-refused");
+      }
     }
     return new Response("actor:" + this.env.LABEL);
   }
@@ -94,6 +88,7 @@ async function exercise(
   activeUpdate: boolean,
   namespaceAfterDeployment = false,
   failedRetirement = false,
+  graphChangeDuringNested = false,
 ): Promise<void> {
   if (!binary) throw new Error("pinned Workerd unavailable");
   const root = await mkdtemp(join(tmpdir(), "v2-actor-composition-"));
@@ -156,12 +151,43 @@ async function exercise(
         },
       },
     });
-    physical = createSelfhostActorExecutionHost({
+    let graphWithdrawn = false;
+    let holdNextGraphRead = false;
+    let markGraphReadStarted!: () => void;
+    const graphReadStarted = new Promise<void>((resolve) => {
+      markGraphReadStarted = resolve;
+    });
+    let releaseGraphRead!: () => void;
+    const graphReadGate = new Promise<void>((resolve) => {
+      releaseGraphRead = resolve;
+    });
+    const physicalAuthority: typeof graph = {
+      ...graph,
+      async readGraph(identity, signal) {
+        if (graphWithdrawn) {
+          if (holdNextGraphRead) {
+            holdNextGraphRead = false;
+            markGraphReadStarted();
+            await graphReadGate;
+          }
+          signal.throwIfAborted();
+          return null;
+        }
+        return graph.readGraph(identity, signal);
+      },
+    };
+    let observeNestedArrival = false;
+    let markNestedArrival!: () => void;
+    const nestedArrival = new Promise<void>((resolve) => {
+      markNestedArrival = resolve;
+    });
+    const actorHost = createSelfhostActorExecutionHost({
       runtimeRoot: join(root, "actor-runtime"),
       storageRoot: join(root, "actor-storage"),
       binary: selected.binary,
-      authority: graph,
+      authority: physicalAuthority,
     });
+    physical = actorHost;
     let listenerPort = 0;
     workers = createSelfhostV2WorkerComposition({
       sql,
@@ -180,7 +206,14 @@ async function exercise(
         sql,
         targetKey,
         namespaceGraph: graph,
-        physical,
+        physical: {
+          ...actorHost,
+          fetch: (identity, request) => {
+            if (observeNestedArrival && new URL(request.url).pathname === "/plain")
+              markNestedArrival();
+            return actorHost.fetch(identity, request);
+          },
+        },
         privateSocketDirectory: join(root, "actor-brokers"),
       }),
       listenerPortForOperation: async () => (listenerPort = await unusedPort()),
@@ -321,26 +354,44 @@ async function exercise(
         !readback.realization.incarnationId
       )
         throw new Error("Actor retirement fixture lacks an exact incarnation");
+      const baselineNested = await physical.fetch(
+        { ...scope, id: "retirement-baseline" },
+        new Request("http://actor.example.test/held-nested"),
+      );
+      expect(baselineNested.status).toBe(200);
+      expect(await baselineNested.text()).toBe("nested-status:200");
       const armed = await physical.fetch(
-        { ...scope, id: "retirement-outer" },
+        { ...scope, id: "retirement-alarm" },
         new Request("http://actor.example.test/alarm-set"),
       );
       expect(await armed.text()).toBe("armed");
-      expect(
-        await physical.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000)),
-      ).toMatchObject({
+      const beforeTurn = await physical.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      expect(beforeTurn).toMatchObject({
         kind: "confirmed",
         pendingAlarmCount: 1,
       });
-      const outer = await physical.fetch(
+      if (beforeTurn.kind !== "confirmed") throw new Error("Actor observation unavailable");
+      const outer = physical.fetch(
         { ...scope, id: "retirement-outer" },
         new Request("http://actor.example.test/held-nested", {
           signal: AbortSignal.timeout(10_000),
         }),
       );
-      const reader = outer.body?.getReader();
-      expect(reader).toBeDefined();
-      expect(new TextDecoder().decode((await reader?.read())?.value)).toBe("head");
+      void outer.catch(() => {});
+      let activeTurn = await physical.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      for (
+        let attempt = 0;
+        attempt < 80 &&
+        (activeTurn.kind !== "confirmed" ||
+          activeTurn.activeActorCount <= beforeTurn.activeActorCount);
+        attempt += 1
+      ) {
+        await Bun.sleep(25);
+        activeTurn = await physical.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      }
+      expect(activeTurn.kind).toBe("confirmed");
+      if (activeTurn.kind !== "confirmed") throw new Error("Actor turn never started");
+      expect(activeTurn.activeActorCount).toBeGreaterThan(beforeTurn.activeActorCount);
       const retirementInput = {
         workerResourceUid: worker.resourceUid,
         targetKey,
@@ -359,12 +410,17 @@ async function exercise(
         authorityReads += 1;
         return authorityReads === 1;
       });
+      const retirementOutcome = retirement.then(
+        () => null,
+        (error: unknown) => error,
+      );
       await expect(physical.quiesceIncarnation(retirementInput, async () => true)).rejects.toThrow(
         "retirement already in progress",
       );
-      expect(new TextDecoder().decode((await reader?.read())?.value)).toBe("nested-refused");
-      expect((await reader?.read())?.done).toBe(true);
-      await expect(retirement).rejects.toThrow("retirement authority changed");
+      const outerResponse = await outer;
+      expect(outerResponse.status).toBe(200);
+      expect(await outerResponse.text()).toBe("nested-status:503");
+      expect(String(await retirementOutcome)).toContain("retirement authority changed");
       expect(authorityReads).toBe(2);
       // No application fetch may wake the carrier after the lost withdrawal
       // proof; the retained alarm must resume from its current graph alone.
@@ -396,10 +452,73 @@ async function exercise(
       ).rejects.toThrow("retirement authority changed");
       expect(errorReads).toBe(2);
       const counted = await physical.fetch(
-        { ...scope, id: "retirement-outer" },
+        { ...scope, id: "retirement-alarm" },
         new Request("http://actor.example.test/alarm-count"),
       );
       expect(await counted.text()).toBe("1");
+    }
+    if (graphChangeDuringNested) {
+      const baseline = await physical.fetch(
+        { ...scope, id: "graph-change-baseline" },
+        new Request("http://actor.example.test/held-nested"),
+      );
+      expect(baseline.status).toBe(200);
+      expect(await baseline.text()).toBe("nested-status:200");
+      const beforeTurn = await physical.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      expect(beforeTurn.kind).toBe("confirmed");
+      if (beforeTurn.kind !== "confirmed") throw new Error("Actor observation unavailable");
+      const outer = physical.fetch(
+        { ...scope, id: "graph-change-outer" },
+        new Request("http://actor.example.test/held-nested", {
+          signal: AbortSignal.timeout(10_000),
+        }),
+      );
+      void outer.catch(() => {});
+      let activeTurn = await physical.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      for (
+        let attempt = 0;
+        attempt < 80 &&
+        (activeTurn.kind !== "confirmed" ||
+          activeTurn.activeActorCount <= beforeTurn.activeActorCount);
+        attempt += 1
+      ) {
+        await Bun.sleep(25);
+        activeTurn = await physical.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      }
+      expect(activeTurn.kind).toBe("confirmed");
+      if (activeTurn.kind !== "confirmed") throw new Error("Actor turn never started");
+      expect(activeTurn.activeActorCount).toBeGreaterThan(beforeTurn.activeActorCount);
+      graphWithdrawn = true;
+      holdNextGraphRead = true;
+      observeNestedArrival = true;
+      const refresh = physical.fetch(
+        { ...scope, id: "graph-change-refresh" },
+        new Request("http://actor.example.test/plain", {
+          signal: AbortSignal.timeout(10_000),
+        }),
+      );
+      const refreshOutcome = refresh.then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await graphReadStarted;
+      await nestedArrival;
+      // The inner same-Namespace call has arrived while the outer selector's
+      // graph read holds the lane. Releasing the read must not start a drain
+      // behind which that inner call waits for its own outer turn.
+      releaseGraphRead();
+      expect(String(await refreshOutcome)).toContain("Actor carrier is in use");
+      const outerResponse = await outer;
+      expect(outerResponse.status).toBe(200);
+      graphWithdrawn = false;
+      observeNestedArrival = false;
+      expect(await outerResponse.text()).toBe("nested-status:503");
+      const recovered = await physical.fetch(
+        { ...scope, id: "graph-change-outer" },
+        new Request("http://actor.example.test/plain"),
+      );
+      expect(recovered.status).toBe(200);
+      expect(await recovered.text()).toBe("actor:composition");
     }
   } catch (error) {
     failure = error;
@@ -449,6 +568,12 @@ test.skipIf(binary === undefined)(
 
 test.skipIf(binary === undefined)(
   "Actor retirement releases its Namespace lane during a nested turn and restores the current child after a lost withdrawal claim",
-  () => exercise(false, true, true),
+  () => exercise(false, false, true),
+  60_000,
+);
+
+test.skipIf(binary === undefined)(
+  "graph-change selection refuses an active Actor carrier without blocking a queued nested call",
+  () => exercise(false, false, false, true),
   60_000,
 );

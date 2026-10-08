@@ -49,6 +49,7 @@ interface Session {
   retiring: boolean;
   reap?: Promise<void>;
   admissionRecovery?: Promise<void>;
+  refreshAfterIdle?: boolean;
 }
 interface Owner {
   tail: Promise<void>;
@@ -555,6 +556,35 @@ export function createSelfhostActorExecutionHost(options: {
       });
   };
 
+  const retireIdleCarrier = async (owner: Owner, identity: ActorScope): Promise<void> => {
+    const session = owner.session;
+    if (session && !session.dead && session.active > 0) {
+      // This selector may itself be a nested call from the active Actor turn.
+      // It cannot wait for that turn while holding the Namespace lane. Keep
+      // the old carrier, refuse this admission, and retry once the turn ends.
+      if (!session.refreshAfterIdle) {
+        session.refreshAfterIdle = true;
+        session.idle.add(() => {
+          session.refreshAfterIdle = false;
+          if (owner.session !== session || session.retiring) return;
+          const refreshing = owner.refreshing;
+          if (refreshing) {
+            void refreshing
+              .finally(() => {
+                if (owner.session === session && !session.retiring)
+                  scheduleRefresh(owner, identity);
+              })
+              .catch(() => {});
+          } else scheduleRefresh(owner, identity);
+        });
+      }
+      throw new ActorAuthorityUnavailable("Actor carrier is in use");
+    }
+    // No await occurs between the active count check and retire's synchronous
+    // retiring flag, which also closes the native alarm/socket admission gate.
+    await retire(owner);
+  };
+
   const activate = async (
     identity: ActorScope,
     signal: AbortSignal,
@@ -596,18 +626,18 @@ export function createSelfhostActorExecutionHost(options: {
         graph.scope.tenantId !== identity.tenantId ||
         graph.scope.namespaceResourceUid !== identity.namespaceResourceUid
       ) {
-        if (!warm) await retire(current);
+        if (!warm) await retireIdleCarrier(current, identity);
         throw new ActorAuthorityUnavailable("Actor Resource unavailable");
       }
       if (!warm && !(await authority.hasRealization(graph))) {
-        await retire(current);
+        await retireIdleCarrier(current, identity);
         throw new ActorAuthorityUnavailable("Actor Worker realization unavailable");
       }
       const realized: ActorRealizationRead = warm
         ? { kind: "ready", realization: warm.realization }
         : await currentRealization(graph, signal);
       if (realized.kind === "authority_changed") {
-        if (!warm) await retire(current);
+        if (!warm) await retireIdleCarrier(current, identity);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
       if (realized.kind !== "ready") {
@@ -622,7 +652,7 @@ export function createSelfhostActorExecutionHost(options: {
           ? warm.stillAuthorized(signal)
           : authority.stillCurrent(graph, realization, signal)))
       ) {
-        if (!warm) await retire(current);
+        if (!warm) await retireIdleCarrier(current, identity);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
       signal.throwIfAborted();
@@ -643,11 +673,9 @@ export function createSelfhostActorExecutionHost(options: {
         // An accepted Namespace update may outlive a hostname-only Worker
         // publication. Its old Actor carrier is no longer an exact readback,
         // and with no Endpoint there may be no public request to refresh it.
-        // Do not interrupt an in-flight event: the held Operation can retry
-        // once that event releases the old carrier.
-        if (warm && current.session && current.session.active > 0 && !current.session.dead)
-          throw new ActorAuthorityUnavailable("Actor warm carrier is in use");
-        await retire(current);
+        // Do not interrupt an in-flight event: its release schedules a fresh
+        // selection against the latest accepted graph.
+        await retireIdleCarrier(current, identity);
         signal.throwIfAborted();
         if (revoked.has(key)) throw new ActorAuthorityUnavailable("Actor namespace revoked");
         if (!current.locked) {
@@ -947,7 +975,8 @@ export function createSelfhostActorExecutionHost(options: {
           // A failed candidate is not a Resource DELETE. Stop only the child
           // opened by this warm attempt. A pre-existing carrier must remain
           // untouched when its candidate fails validation or readback.
-          if (openedByWarm && current.session === openedByWarm) await retire(current);
+          if (openedByWarm && current.session === openedByWarm)
+            await retireIdleCarrier(current, identity);
           else if (disabledCarrier && current.session === disabledCarrier)
             resumeAdmissionAfterSettlement(current, disabledCarrier, identity);
           throw error;
@@ -959,7 +988,7 @@ export function createSelfhostActorExecutionHost(options: {
       const basisPoint = (options.basisPoint ?? (() => randomInt(10_000)))();
       const finalVersion = await selectedVersion(graph, realization, basisPoint);
       if (stopped || !(await authority.stillCurrent(graph, realization, signal))) {
-        await retire(current);
+        await retireIdleCarrier(current, identity);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
       if (!finalVersion || finalVersion.generationKey !== residentGraph.generationKey)
