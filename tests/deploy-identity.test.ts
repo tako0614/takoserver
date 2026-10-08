@@ -171,36 +171,39 @@ describe("operator identity authority", () => {
     try {
       const process = processFixture("integration");
       const publicationLeaseRoot = join(selected.root, "publication-leases");
-      const baseState = transitionState(selected.target, null, process);
+      const callerTarget = structuredClone(selected.target);
+      const stateTarget = structuredClone(callerTarget);
+      const expectedWorkerName = callerTarget.workerName;
+      const baseState = transitionState(stateTarget, null, process);
       const state: TransitionState = {
         ...baseState,
         async workerVersion(workerName, versionId) {
+          expect(workerName).toBe(expectedWorkerName);
           await expectPublicationLeaseHeld({
-            accountId: selected.target.accountId,
-            workerName,
+            accountId: stateTarget.accountId,
+            workerName: expectedWorkerName,
             root: publicationLeaseRoot,
           });
           return await baseState.workerVersion(workerName, versionId);
         },
       };
       const requests: Request[] = [];
-      const result = await runOperatorIdentity(
-        invocation("integration", "apply"),
-        selected.target,
-        {
-          state,
-          migrations: migrations(),
-          run: process.run,
-          privateJwkPath: selected.privateJwkPath,
-          operatorIdentityPath: selected.identityPath,
-          review: "independent-reviewer",
-          outputDirectory: join(selected.root, "work"),
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
-          fetcher: ownerSessionFetcher(selected.publicKey, requests),
-          now: () => new Date("2026-09-03T12:00:00.000Z"),
-          publicationLeaseRoot,
-        },
-      );
+      const resultPromise = runOperatorIdentity(invocation("integration", "apply"), callerTarget, {
+        state,
+        migrations: migrations(),
+        run: process.run,
+        privateJwkPath: selected.privateJwkPath,
+        operatorIdentityPath: selected.identityPath,
+        review: "independent-reviewer",
+        outputDirectory: join(selected.root, "work"),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
+        fetcher: ownerSessionFetcher(selected.publicKey, requests),
+        now: () => new Date("2026-09-03T12:00:00.000Z"),
+        publicationLeaseRoot,
+      });
+      Reflect.set(callerTarget, "accountId", `${stateTarget.accountId}-mutated`);
+      Reflect.set(callerTarget, "workerName", `${expectedWorkerName}-mutated`);
+      const result = await resultPromise;
       expect(result).toMatchObject({
         kind: "takoserver.operator-identity-apply@v1",
         environment: "integration",

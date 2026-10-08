@@ -112,26 +112,37 @@ export async function runOperatorIdentity(
   target: DeployTarget,
   options: OperatorIdentityOptions = {},
 ): Promise<Record<string, unknown>> {
-  assertInvocation(invocation, target);
-  const organizationId = invocation.organizationId;
+  // Keep the lease key and every later effect bound to the same caller-owned
+  // values. The public API accepts plain realized data, so snapshot it before
+  // the first await (lease acquisition may yield to arbitrary caller code).
+  const ownedInvocation = structuredClone(invocation);
+  const ownedTarget = structuredClone(target);
+  const ownedOptions: OperatorIdentityOptions = {
+    ...options,
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: { ...options.cloudflareEnvironment } }),
+  };
+  assertInvocation(ownedInvocation, ownedTarget);
+  const organizationId = ownedInvocation.organizationId;
   if (organizationId === undefined || !ORGANIZATION_ID.test(organizationId)) {
     throw preflightError("operator identity requires one exact --organization id");
   }
-  if (!target.operatorIdentity?.publicJwk) {
+  if (!ownedTarget.operatorIdentity?.publicJwk) {
     throw preflightError("operator identity surface requires target `operatorIdentity.publicJwk`");
   }
   const publicationLease =
-    invocation.action === "apply"
+    ownedInvocation.action === "apply"
       ? await acquireWranglerVersionPublicationLease({
-          accountId: target.accountId,
-          workerName: target.workerName,
-          ...(options.publicationLeaseRoot === undefined
+          accountId: ownedTarget.accountId,
+          workerName: ownedTarget.workerName,
+          ...(ownedOptions.publicationLeaseRoot === undefined
             ? {}
-            : { root: options.publicationLeaseRoot }),
+            : { root: ownedOptions.publicationLeaseRoot }),
         })
       : null;
   try {
-    return await runOperatorIdentityWithLease(invocation, target, options);
+    return await runOperatorIdentityWithLease(ownedInvocation, ownedTarget, ownedOptions);
   } finally {
     await publicationLease?.release();
   }

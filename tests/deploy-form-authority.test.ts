@@ -1922,33 +1922,36 @@ describe("route-less Form authority deploy surfaces", () => {
     const publicationLeaseRoot = join(root, "publication-leases");
     let uploaded = false;
     try {
+      const callerTarget = structuredClone(currentTarget);
+      const stateTarget = structuredClone(callerTarget);
       const process = fakeProcess({
         onUpload() {
           uploaded = true;
         },
       });
-      const baseState = historicalPinnedPublicState(currentTarget, { isUploaded: () => uploaded });
+      const baseState = historicalPinnedPublicState(stateTarget, { isUploaded: () => uploaded });
       const state: FormAuthorityDeployState = {
         ...baseState,
         async workerDeployments(workerName) {
+          expect(workerName).not.toBe(`${integrationWorkerName}-mutated`);
           if (workerName === integrationWorkerName) {
             await expectPublicationLeaseHeld({
-              accountId: currentTarget.accountId,
-              workerName,
+              accountId: stateTarget.accountId,
+              workerName: integrationWorkerName,
               root: publicationLeaseRoot,
             });
           }
           return await baseState.workerDeployments(workerName);
         },
       };
-      const result = await runFormAuthority(
+      const resultPromise = runFormAuthority(
         {
           surface: "takoserver-integration-form-authority-worker",
           action: "apply",
           environment: "integration",
           commit: COMMIT,
         },
-        currentTarget,
+        callerTarget,
         {
           run: process.run,
           state,
@@ -1958,6 +1961,15 @@ describe("route-less Form authority deploy surfaces", () => {
           publicationLeaseRoot,
         },
       );
+      Reflect.set(callerTarget, "accountId", `${stateTarget.accountId}-mutated`);
+      if (callerTarget.formAuthority === undefined)
+        throw new Error("fixture has no caller-owned authority selection");
+      Reflect.set(
+        callerTarget.formAuthority,
+        "integrationWorkerName",
+        `${integrationWorkerName}-mutated`,
+      );
+      const result = await resultPromise;
 
       expect(result).toMatchObject({
         previousVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
@@ -1966,7 +1978,7 @@ describe("route-less Form authority deploy surfaces", () => {
       });
       expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
       const released = await acquireWranglerVersionPublicationLease({
-        accountId: currentTarget.accountId,
+        accountId: stateTarget.accountId,
         workerName: integrationWorkerName,
         root: publicationLeaseRoot,
       });

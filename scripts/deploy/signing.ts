@@ -122,21 +122,31 @@ export async function runSigning(
   target: DeployTarget,
   options: SigningOptions = {},
 ): Promise<Record<string, unknown>> {
-  if (target.environment !== invocation.environment) {
+  // Capture the realized identity before awaiting the publication lease. A
+  // caller mutating its input during that wait must not redirect this writer.
+  const ownedInvocation = structuredClone(invocation);
+  const ownedTarget = structuredClone(target);
+  const ownedOptions: SigningOptions = {
+    ...options,
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: { ...options.cloudflareEnvironment } }),
+  };
+  if (ownedTarget.environment !== ownedInvocation.environment) {
     throw preflightError("signing invocation and target environments differ");
   }
   const publicationLease =
-    invocation.action === "apply"
+    ownedInvocation.action === "apply"
       ? await acquireWranglerVersionPublicationLease({
-          accountId: target.accountId,
-          workerName: target.workerName,
-          ...(options.publicationLeaseRoot === undefined
+          accountId: ownedTarget.accountId,
+          workerName: ownedTarget.workerName,
+          ...(ownedOptions.publicationLeaseRoot === undefined
             ? {}
-            : { root: options.publicationLeaseRoot }),
+            : { root: ownedOptions.publicationLeaseRoot }),
         })
       : null;
   try {
-    return await runSigningWithLease(invocation, target, options);
+    return await runSigningWithLease(ownedInvocation, ownedTarget, ownedOptions);
   } finally {
     await publicationLease?.release();
   }

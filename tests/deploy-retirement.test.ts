@@ -188,19 +188,23 @@ describe("reviewed Hosted legacy-edge retirement", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-authority-"));
     const publicationLeaseRoot = join(root, "publication-leases");
     try {
-      const fixture = stateFixture("legacy");
+      const callerTarget = structuredClone(target);
+      const expectedWorkerName = callerTarget.workerName;
+      const stateTarget = structuredClone(callerTarget);
+      const fixture = stateFixture("legacy", undefined, COMMIT, stateTarget);
       const state: RetirementState = {
         ...fixture.state,
         async workerDeployments(workerName) {
+          expect(workerName).toBe(expectedWorkerName);
           await expectPublicationLeaseHeld({
-            accountId: target.accountId,
-            workerName,
+            accountId: stateTarget.accountId,
+            workerName: expectedWorkerName,
             root: publicationLeaseRoot,
           });
           return await fixture.state.workerDeployments(workerName);
         },
       };
-      const result = await runAuthorityTransition(
+      const resultPromise = runAuthorityTransition(
         {
           surface: "takoserver-sponsorship-public-route-retirement",
           action: "apply",
@@ -208,7 +212,7 @@ describe("reviewed Hosted legacy-edge retirement", () => {
           commit: COMMIT,
           legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
         },
-        target,
+        callerTarget,
         state,
         fixture.run,
         {
@@ -219,6 +223,9 @@ describe("reviewed Hosted legacy-edge retirement", () => {
           publicationLeaseRoot,
         },
       );
+      Reflect.set(callerTarget, "accountId", `${stateTarget.accountId}-mutated`);
+      Reflect.set(callerTarget, "workerName", `${expectedWorkerName}-mutated`);
+      const result = await resultPromise;
       expect(result).toMatchObject({
         state: "candidate",
         previousVersionId: VERSION_LEGACY,
@@ -231,8 +238,8 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       expect(mutations[0]?.command).toContain("--no-bundle");
       expect(mutations[0]?.command.join(" ")).not.toContain("secret delete");
       const released = await acquireWranglerVersionPublicationLease({
-        accountId: target.accountId,
-        workerName: target.workerName,
+        accountId: stateTarget.accountId,
+        workerName: expectedWorkerName,
         root: publicationLeaseRoot,
       });
       await released.release();

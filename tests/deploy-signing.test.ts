@@ -507,32 +507,53 @@ describe("split signing authority surfaces", () => {
       const db = new FakeDatabase();
       db.rows.set("key-current", row("key-current", key.publicJwk));
       const process = processFixture();
-      const result = await runSigning(
+      const callerTarget = structuredClone(baseTarget);
+      const stateTarget = structuredClone(callerTarget);
+      const expectedWorkerName = callerTarget.workerName;
+      const publicationLeaseRoot = join(root, "publication-leases");
+      const baseState = workerState({
+        target: stateTarget,
+        beforeSigning: "key-current",
+        afterAnnotations: { "workers/triggered_by": "secret" },
+        afterWhen: () =>
+          process.calls.some(
+            ({ command }) => command.includes("secret") && command.includes("put"),
+          ),
+      });
+      const state: WorkerState = {
+        ...baseState,
+        async workerDeployments(workerName) {
+          expect(workerName).toBe(expectedWorkerName);
+          await expectPublicationLeaseHeld({
+            accountId: stateTarget.accountId,
+            workerName: expectedWorkerName,
+            root: publicationLeaseRoot,
+          });
+          return await baseState.workerDeployments(workerName);
+        },
+      };
+      const resultPromise = runSigning(
         {
           surface: "takoserver-signing-repair",
           action: "apply",
           environment: "integration",
           commit: COMMIT,
         },
-        baseTarget,
+        callerTarget,
         {
           database: db,
-          state: workerState({
-            target: baseTarget,
-            beforeSigning: "key-current",
-            afterAnnotations: { "workers/triggered_by": "secret" },
-            afterWhen: () =>
-              process.calls.some(
-                ({ command }) => command.includes("secret") && command.includes("put"),
-              ),
-          }),
+          state,
           run: process.run,
           privateJwkPath: privatePath,
           review: "reviewer@example.test",
           outputDirectory: join(root, "work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          publicationLeaseRoot,
         },
       );
+      Reflect.set(callerTarget, "accountId", `${stateTarget.accountId}-mutated`);
+      Reflect.set(callerTarget, "workerName", `${expectedWorkerName}-mutated`);
+      const result = await resultPromise;
       expect(result).toMatchObject({
         kind: "takoserver.signing-repair-apply@v2",
         keyId: "key-current",
@@ -545,6 +566,12 @@ describe("split signing authority surfaces", () => {
       expect(mutations[0]?.input).toBe(privateRaw);
       expect(mutations[0]?.command.join(" ")).not.toContain(privateRaw.trim());
       expect(process.calls.some(({ command }) => command.includes("--secrets-file"))).toBe(false);
+      const released = await acquireWranglerVersionPublicationLease({
+        accountId: stateTarget.accountId,
+        workerName: expectedWorkerName,
+        root: publicationLeaseRoot,
+      });
+      await released.release();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

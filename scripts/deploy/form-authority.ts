@@ -344,25 +344,46 @@ export async function runFormAuthority(
   target: DeployTarget,
   options: FormAuthorityDeployOptions = {},
 ): Promise<Record<string, unknown>> {
-  if (isIntegrationOnlySurface(invocation.surface) && invocation.environment !== "integration") {
+  // Target selection is mutable plain JSON at this exported API boundary.
+  // Snapshot before waiting for the lease so selected worker and all subsequent
+  // publication/readback decisions use the exact values protected by it.
+  const ownedInvocation = structuredClone(invocation);
+  const ownedTarget = structuredClone(target);
+  const ownedOptions: FormAuthorityDeployOptions = {
+    ...options,
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: { ...options.cloudflareEnvironment } }),
+    ...(options.integrationStorageVerification === undefined
+      ? {}
+      : {
+          integrationStorageVerification: {
+            ...options.integrationStorageVerification,
+          },
+        }),
+  };
+  if (
+    isIntegrationOnlySurface(ownedInvocation.surface) &&
+    ownedInvocation.environment !== "integration"
+  ) {
     throw preflightError("integration Form authority deploy surface is integration-only");
   }
-  if (target.environment !== invocation.environment) {
+  if (ownedTarget.environment !== ownedInvocation.environment) {
     throw preflightError("Form authority invocation and target environments differ");
   }
-  const selectedForLease = selectTarget(invocation, target);
+  const selectedForLease = selectTarget(ownedInvocation, ownedTarget);
   const publicationLease =
-    invocation.action === "apply"
+    ownedInvocation.action === "apply"
       ? await acquireWranglerVersionPublicationLease({
-          accountId: target.accountId,
+          accountId: ownedTarget.accountId,
           workerName: selectedForLease.workerName,
-          ...(options.publicationLeaseRoot === undefined
+          ...(ownedOptions.publicationLeaseRoot === undefined
             ? {}
-            : { root: options.publicationLeaseRoot }),
+            : { root: ownedOptions.publicationLeaseRoot }),
         })
       : null;
   try {
-    return await runFormAuthorityWithLease(invocation, target, options);
+    return await runFormAuthorityWithLease(ownedInvocation, ownedTarget, ownedOptions);
   } finally {
     await publicationLease?.release();
   }

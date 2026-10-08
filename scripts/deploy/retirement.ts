@@ -124,19 +124,27 @@ export async function runRetirement(
   target: DeployTarget,
   options: RetirementOptions = {},
 ): Promise<Record<string, unknown>> {
-  validateInvocation(invocation, target);
+  const ownedInvocation = structuredClone(invocation);
+  const ownedTarget = structuredClone(target);
+  const ownedOptions: RetirementOptions = {
+    ...options,
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: { ...options.cloudflareEnvironment } }),
+  };
+  validateInvocation(ownedInvocation, ownedTarget);
   const publicationLease =
-    invocation.action === "apply"
+    ownedInvocation.action === "apply"
       ? await acquireWranglerVersionPublicationLease({
-          accountId: target.accountId,
-          workerName: target.workerName,
-          ...(options.publicationLeaseRoot === undefined
+          accountId: ownedTarget.accountId,
+          workerName: ownedTarget.workerName,
+          ...(ownedOptions.publicationLeaseRoot === undefined
             ? {}
-            : { root: options.publicationLeaseRoot }),
+            : { root: ownedOptions.publicationLeaseRoot }),
         })
       : null;
   try {
-    return await runRetirementWithLease(invocation, target, options);
+    return await runRetirementWithLease(ownedInvocation, ownedTarget, ownedOptions);
   } finally {
     await publicationLease?.release();
   }
@@ -191,7 +199,15 @@ export async function runAuthorityTransition(
   run: RetirementProcess,
   options: RetirementOptions = {},
 ): Promise<Record<string, unknown>> {
-  const selector = invocation.legacyHostRuntimePredecessorVersionId;
+  const ownedInvocation = structuredClone(invocation);
+  const ownedTarget = structuredClone(target);
+  const ownedOptions: RetirementOptions = {
+    ...options,
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: { ...options.cloudflareEnvironment } }),
+  };
+  const selector = ownedInvocation.legacyHostRuntimePredecessorVersionId;
   if (selector === undefined) {
     throw preflightError(
       "authority transition requires --legacy-host-runtime-predecessor-version=<uuid>",
@@ -201,17 +217,23 @@ export async function runAuthorityTransition(
     throw preflightError("legacy Host-runtime predecessor Version ID must be one exact UUID");
   }
   const publicationLease =
-    invocation.action === "apply"
+    ownedInvocation.action === "apply"
       ? await acquireWranglerVersionPublicationLease({
-          accountId: target.accountId,
-          workerName: target.workerName,
-          ...(options.publicationLeaseRoot === undefined
+          accountId: ownedTarget.accountId,
+          workerName: ownedTarget.workerName,
+          ...(ownedOptions.publicationLeaseRoot === undefined
             ? {}
-            : { root: options.publicationLeaseRoot }),
+            : { root: ownedOptions.publicationLeaseRoot }),
         })
       : null;
   try {
-    return await runAuthorityTransitionWithLease(invocation, target, state, run, options);
+    return await runAuthorityTransitionWithLease(
+      ownedInvocation,
+      ownedTarget,
+      state,
+      run,
+      ownedOptions,
+    );
   } finally {
     await publicationLease?.release();
   }
