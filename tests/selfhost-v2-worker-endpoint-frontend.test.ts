@@ -151,6 +151,16 @@ function fixture(
   const fixtureOptions = input;
   const rows = input.rows ?? endpointRows();
   const fetchCalls: Request[] = [];
+  const upgradeCalls: Request[] = [];
+  const socketState = { terminated: false };
+  const socket = Object.assign(new EventTarget(), {
+    terminate() {
+      socketState.terminated = true;
+    },
+    readyState: 1,
+    protocol: "",
+    bufferedAmount: 0,
+  });
   const observationCalls: V2WorkerEndpointAddress[] = [];
   const publicationCalls: unknown[] = [];
   const responseBodyState = { cancelled: false };
@@ -196,6 +206,10 @@ function fixture(
         }),
         { headers: { "content-type": "text/plain" } },
       );
+    },
+    async connectWebSocket(request: Request) {
+      upgradeCalls.push(request);
+      return socket as never;
     },
     async observeRetirement() {
       return {
@@ -279,10 +293,44 @@ function fixture(
       },
     },
   });
-  return { frontend, fetchCalls, observationCalls, publicationCalls, responseBodyState };
+  return {
+    frontend,
+    fetchCalls,
+    upgradeCalls,
+    socketState,
+    socket,
+    observationCalls,
+    publicationCalls,
+    responseBodyState,
+  };
 }
 
 describe("self-host v2 Worker Endpoint frontend adapter", () => {
+  test("upgrades only the exact settled route and closes a socket on post-dispatch drift", async () => {
+    const request = new Request(`https://${HOSTNAME}/actor-socket`, {
+      headers: { host: HOSTNAME, upgrade: "websocket" },
+    });
+    const accepted = fixture();
+    const acceptedResult = await accepted.frontend.upgrade(request);
+    expect(acceptedResult.kind).toBe("accepted");
+    if (acceptedResult.kind === "accepted") {
+      expect(Object.is(acceptedResult.socket, accepted.socket)).toBe(true);
+    }
+    expect(accepted.upgradeCalls).toEqual([request]);
+    expect(accepted.fetchCalls).toHaveLength(0);
+    expect(accepted.socketState.terminated).toBe(false);
+
+    const drifted = fixture({ staleAfterFetch: true });
+    const denied = await drifted.frontend.upgrade(request);
+    expect(denied.kind).toBe("denied");
+    if (denied.kind === "denied") expect(denied.response.status).toBe(503);
+    expect(drifted.upgradeCalls).toEqual([request]);
+    expect(drifted.socketState.terminated).toBe(true);
+
+    const unresolved = fixture({ resolution: "unresolved" });
+    expect((await unresolved.frontend.upgrade(request)).kind).toBe("denied");
+    expect(unresolved.upgradeCalls).toHaveLength(0);
+  });
   test("dispatches a settled reserved hostname to its exact UID owner without rewriting the request", async () => {
     const { frontend, fetchCalls, publicationCalls } = fixture();
     const request = new Request(`https://${HOSTNAME}/hello?x=1`, {

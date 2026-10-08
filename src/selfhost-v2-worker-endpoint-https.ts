@@ -6,6 +6,7 @@ import type {
   V2EndpointRouteAbsenceObservation,
   V2EndpointTlsObservation,
 } from "./takoform-v2/worker-endpoint-backend.ts";
+import type { WorkerdNativeWebSocket } from "./workerd-worker-execution-group.ts";
 
 const NO_STORE_HEADERS = { "cache-control": "no-store" };
 const HTTPS_PORT = 443;
@@ -19,7 +20,40 @@ export interface SelfhostV2WorkerEndpointHttpsConfiguration {
 
 interface ListenerServer {
   readonly port: number | undefined;
+  upgrade?(request: Request, options: { data: SocketBridgeData; headers?: HeadersInit }): boolean;
   stop(closeActiveConnections?: boolean): void | Promise<void>;
+}
+
+interface SocketBridgeData {
+  readonly upstream: WorkerdNativeWebSocket;
+  readonly clientClosed: () => void;
+  readonly upstreamClosed: () => void;
+  readonly force: () => void;
+}
+
+const MAX_BRIDGE_BUFFER = 1024 * 1024;
+const MAX_BRIDGE_MESSAGE = 8 * 1024 * 1024;
+
+function isUpgradeAttempt(request: Request): boolean {
+  return request.headers.has("upgrade") || request.headers.has("sec-websocket-key");
+}
+
+function validUpgrade(request: Request): boolean {
+  const headers = request.headers;
+  const key = headers.get("sec-websocket-key");
+  return (
+    request.method === "GET" &&
+    headers.get("upgrade")?.toLowerCase() === "websocket" &&
+    headers
+      .get("connection")
+      ?.toLowerCase()
+      .split(",")
+      .some((token) => token.trim() === "upgrade") === true &&
+    headers.get("sec-websocket-version") === "13" &&
+    key !== null &&
+    /^[A-Za-z0-9+/]{22}==$/u.test(key) &&
+    Buffer.from(key, "base64").length === 16
+  );
 }
 
 export interface SelfhostV2WorkerEndpointHttpsFactories {
@@ -27,7 +61,8 @@ export interface SelfhostV2WorkerEndpointHttpsFactories {
     readonly port: 443;
     readonly hostname: "0.0.0.0";
     readonly tls: { readonly cert: string; readonly key: string };
-    readonly fetch: (request: Request) => Response | Promise<Response>;
+    readonly fetch: (request: Request, server?: ListenerServer) => Response | Promise<Response>;
+    readonly websocket: Bun.WebSocketHandler<SocketBridgeData>;
   }) => ListenerServer;
   readonly proveSni: (input: {
     readonly host: string;
@@ -190,6 +225,13 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
   readonly certificateChain: string;
   readonly privateKey: string;
   readonly fetch: (request: Request) => Promise<Response | null>;
+  readonly upgrade?: (
+    request: Request,
+  ) => Promise<
+    | { readonly kind: "unrelated" }
+    | { readonly kind: "denied"; readonly response: Response }
+    | { readonly kind: "accepted"; readonly socket: WorkerdNativeWebSocket }
+  >;
   /** Same stateless SQL decision used by the frontend request dispatcher. */
   readonly routeDenies: (address: WorkerEndpointAddress) => Promise<boolean>;
   readonly factories?: SelfhostV2WorkerEndpointHttpsFactories;
@@ -204,6 +246,7 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
   let closed = false;
   let server: ListenerServer;
   const inFlightByHostname = new Map<string, number>();
+  const liveSockets = new Set<Bun.ServerWebSocket<SocketBridgeData>>();
   let inFlightTotal = 0;
   let drainedWaiters: (() => void)[] = [];
   const listenerCurrent = () => active && !closed && server.port === HTTPS_PORT;
@@ -287,12 +330,141 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
     port: HTTPS_PORT,
     hostname: "0.0.0.0",
     tls: { cert: input.certificateChain, key: input.privateKey },
-    fetch: async (request) => {
+    websocket: {
+      open(ws) {
+        liveSockets.add(ws);
+        const upstream = ws.data.upstream;
+        upstream.addEventListener("message", (event) => {
+          if (ws.readyState !== 1) return;
+          const value = event.data;
+          if (typeof value !== "string" && !(value instanceof ArrayBuffer)) {
+            ws.terminate();
+            ws.data.force();
+            return;
+          }
+          const size = typeof value === "string" ? Buffer.byteLength(value) : value.byteLength;
+          if (size > MAX_BRIDGE_MESSAGE || ws.send(value) <= 0) {
+            ws.terminate();
+            ws.data.force();
+          }
+        });
+        upstream.addEventListener(
+          "close",
+          () => {
+            ws.data.upstreamClosed();
+            if (ws.readyState === 1) ws.close(1001, "upstream closed");
+            else ws.terminate();
+            // Upstream EOF starts the public close handshake; it does not by
+            // itself prove the original client's socket has closed.
+            setTimeout(() => {
+              if (ws.readyState !== 3) {
+                ws.terminate();
+                ws.data.force();
+              }
+            }, 1_000);
+          },
+          { once: true },
+        );
+        upstream.addEventListener(
+          "error",
+          () => {
+            ws.terminate();
+            ws.data.force();
+          },
+          { once: true },
+        );
+        if (upstream.readyState !== WebSocket.OPEN) {
+          ws.terminate();
+          ws.data.force();
+        }
+      },
+      message(ws, value) {
+        const upstream = ws.data.upstream;
+        const size = typeof value === "string" ? Buffer.byteLength(value) : value.byteLength;
+        if (
+          size > MAX_BRIDGE_MESSAGE ||
+          upstream.readyState !== WebSocket.OPEN ||
+          upstream.bufferedAmount + size > MAX_BRIDGE_BUFFER
+        ) {
+          ws.terminate();
+          ws.data.force();
+          return;
+        }
+        upstream.send(value);
+      },
+      close(ws) {
+        liveSockets.delete(ws);
+        ws.data.clientClosed();
+        const upstream = ws.data.upstream;
+        if (upstream.readyState === WebSocket.OPEN) {
+          upstream.close();
+          setTimeout(() => {
+            if (upstream.readyState !== WebSocket.CLOSED) upstream.terminate();
+          }, 1_000);
+        } else if (upstream.readyState !== WebSocket.CLOSED) {
+          upstream.terminate();
+        }
+      },
+    },
+    fetch: async (request, upgradeServer) => {
       if (!listenerCurrent()) return new Response(null, { status: 503, headers: NO_STORE_HEADERS });
       const hostname = exactHost(request, suffix);
       if (!hostname) return new Response(null, { status: 404, headers: NO_STORE_HEADERS });
       beginRequest(hostname);
       try {
+        if (isUpgradeAttempt(request)) {
+          if (!validUpgrade(request) || !input.upgrade || !upgradeServer?.upgrade) {
+            finishRequest(hostname);
+            return new Response(null, { status: 400, headers: NO_STORE_HEADERS });
+          }
+          const result = await input.upgrade(request);
+          if (result.kind !== "accepted") {
+            finishRequest(hostname);
+            return result.kind === "denied"
+              ? result.response
+              : new Response(null, { status: 404, headers: NO_STORE_HEADERS });
+          }
+          const upstream = result.socket;
+          let finished = false;
+          let clientClosed = false;
+          let upstreamClosed = false;
+          const finish = () => {
+            if (finished) return;
+            finished = true;
+            finishRequest(hostname);
+          };
+          const data: SocketBridgeData = {
+            upstream,
+            clientClosed() {
+              clientClosed = true;
+              if (upstreamClosed) finish();
+            },
+            upstreamClosed() {
+              upstreamClosed = true;
+              if (clientClosed) finish();
+            },
+            force() {
+              upstream.terminate();
+              finish();
+            },
+          };
+          const headers = upstream.protocol
+            ? { "sec-websocket-protocol": upstream.protocol }
+            : undefined;
+          if (
+            !listenerCurrent() ||
+            !upgradeServer.upgrade(request, {
+              data,
+              ...(headers ? { headers } : {}),
+            })
+          ) {
+            upstream.terminate();
+            finish();
+            return new Response(null, { status: 503, headers: NO_STORE_HEADERS });
+          }
+          // Bun's upgrade contract consumes the HTTP response itself.
+          return undefined as never;
+        }
         const response = await input.fetch(request);
         if (!response) {
           finishRequest(hostname);
@@ -359,6 +531,12 @@ export async function createSelfhostV2WorkerEndpointHttpsListener(input: {
   let closeReject: ((error: unknown) => void) | undefined;
   let closeSettled = false;
   const stop = (force: boolean) => {
+    if (force) {
+      for (const socket of liveSockets) {
+        socket.terminate();
+        socket.data.force();
+      }
+    }
     try {
       return Promise.resolve(server.stop(force));
     } catch (error) {

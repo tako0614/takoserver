@@ -23,6 +23,9 @@ const DEPLOYMENT_MANIFEST_NAME = "deployment.json";
 const DEPLOYMENT_PUBLICATIONS_NAME = ".publications";
 const WORKER_POINTER_NAME = "takoserver-site.json";
 
+/** Bun's native client socket has immediate termination in addition to DOM close. */
+export type WorkerdNativeWebSocket = WebSocket & { terminate(): void };
+
 export class WorkerdWorkerExecutionGroupError extends Error {
   readonly code:
     | "invalid_identity"
@@ -62,6 +65,8 @@ export interface WorkerdWorkerExecutionGroup {
   sealConfiguration(): void;
   isReady(): boolean;
   fetch(request: Request): Promise<Response>;
+  /** One original-client upgrade against this exact native incarnation. */
+  connectWebSocket(request: Request, signal: AbortSignal): Promise<WorkerdNativeWebSocket>;
   /** Stop a failed recovery child without writing retirement or deleting custody. */
   stopAfterFailedRecovery(): Promise<void>;
   /** Stop the owned child and listener, retaining the exact execution copies for reopen. */
@@ -399,6 +404,77 @@ function makeGroup(input: {
     });
   };
 
+  const connectWebSocket = async (
+    request: Request,
+    signal: AbortSignal,
+  ): Promise<WorkerdNativeWebSocket> => {
+    if (state !== "serving" || retirementStarted || supervisor?.isReady() !== true)
+      fail("not_serving");
+    const owner = supervisor;
+    if (owner === null) throw new WorkerdWorkerExecutionGroupError("not_serving");
+    try {
+      await owner.ensure(configurationPath);
+    } catch {
+      if (admissionClosed()) fail("admission_closed");
+      state = "uncertain";
+      fail("not_serving");
+    }
+    if (admissionClosed() || state !== "serving" || supervisor !== owner || !owner.isReady())
+      fail("admission_closed");
+    const incoming = new URL(request.url);
+    if (incoming.protocol !== "https:" || request.method !== "GET" || signal.aborted)
+      fail("admission_closed");
+    const target = `ws://127.0.0.1:${options.listenerPort}${incoming.pathname}${incoming.search}`;
+    const headers = new Headers(request.headers);
+    // Bun mints its own handshake. A public client cannot choose a private
+    // transport key, connection framing, or service-binding dispatch metadata.
+    for (const name of [...headers.keys()]) {
+      if (/^sec-websocket-/iu.test(name)) headers.delete(name);
+    }
+    headers.delete("connection");
+    headers.delete("upgrade");
+    headers.delete("content-length");
+    headers.set("host", incoming.host);
+    const protocol = request.headers.get("sec-websocket-protocol");
+    const NativeWebSocket = WebSocket as unknown as {
+      new (url: string, options: Bun.WebSocketOptions): WorkerdNativeWebSocket;
+    };
+    const socket = new NativeWebSocket(target, {
+      headers: Object.fromEntries(headers.entries()),
+      ...(protocol ? { protocols: protocol.split(",").map((part) => part.trim()) } : {}),
+    });
+    socket.binaryType = "arraybuffer";
+    return await new Promise<WorkerdNativeWebSocket>((resolve, reject) => {
+      let settled = false;
+      const done = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", aborted);
+        socket.removeEventListener("open", opened);
+        socket.removeEventListener("error", failed);
+        socket.removeEventListener("close", closed);
+        if (error) {
+          socket.terminate();
+          reject(error);
+        } else resolve(socket);
+      };
+      const aborted = () => done(new WorkerdWorkerExecutionGroupError("admission_closed"));
+      const opened = () => done();
+      const failed = () => done(new WorkerdWorkerExecutionGroupError("not_serving"));
+      const closed = () => done(new WorkerdWorkerExecutionGroupError("not_serving"));
+      const timer = setTimeout(
+        () => done(new WorkerdWorkerExecutionGroupError("not_serving")),
+        10_000,
+      );
+      signal.addEventListener("abort", aborted, { once: true });
+      socket.addEventListener("open", opened, { once: true });
+      socket.addEventListener("error", failed, { once: true });
+      socket.addEventListener("close", closed, { once: true });
+      if (signal.aborted) aborted();
+    });
+  };
+
   const reloadConfiguration = (): Promise<void> => {
     if (configurationSealed || retirementStarted || state === "retired")
       return Promise.reject(new WorkerdWorkerExecutionGroupError("admission_closed"));
@@ -528,6 +604,7 @@ function makeGroup(input: {
     isReady() {
       return state === "serving" && supervisor?.isReady() === true;
     },
+    connectWebSocket,
     async stopAfterFailedRecovery() {
       if (options.recoverExisting !== true || retirementStarted) {
         throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");

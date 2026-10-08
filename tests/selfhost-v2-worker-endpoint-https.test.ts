@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createSelfhostV2WorkerEndpointHttpsListener,
+  type SelfhostV2WorkerEndpointHttpsFactories,
   verifySelfhostV2WorkerEndpointHttpsSni,
 } from "../src/selfhost-v2-worker-endpoint-https.ts";
 import type { V2EndpointTlsObservation } from "../src/takoform-v2/worker-endpoint-backend.ts";
@@ -155,6 +156,90 @@ test("V2 Worker Endpoint HTTPS serves exact suffix hosts and witnesses current l
       ...address,
       ready: false,
     });
+  } finally {
+    await listener.close(true);
+    await fixture.cleanup();
+  }
+});
+
+test("accepted upgrade holds route absence until the original client socket closes", async () => {
+  const fixture = await certificateFixture();
+  let options: Parameters<SelfhostV2WorkerEndpointHttpsFactories["serve"]>[0] | undefined;
+  let bridge: { clientClosed(): void } | undefined;
+  const upstream = new EventTarget();
+  Object.assign(upstream, {
+    readyState: 1,
+    protocol: "",
+    bufferedAmount: 0,
+    close() {
+      upstream.dispatchEvent(new Event("close"));
+    },
+    terminate() {
+      upstream.dispatchEvent(new Event("close"));
+    },
+  });
+  const server = {
+    port: 443,
+    stop() {},
+    upgrade(_request: Request, upgrade: { data: { clientClosed(): void } }) {
+      bridge = upgrade.data;
+      return true;
+    },
+  };
+  let upgradeCalls = 0;
+  const listener = await createSelfhostV2WorkerEndpointHttpsListener({
+    configuration: { workerEndpointSuffix: suffix, port: 443 },
+    ...fixture,
+    fetch: async () => {
+      throw new Error("ordinary fetch must not handle an upgrade");
+    },
+    upgrade: async () => {
+      upgradeCalls++;
+      return { kind: "accepted", socket: upstream as never };
+    },
+    routeDenies: async () => true,
+    factories: {
+      serve(value) {
+        options = value;
+        return server;
+      },
+      async proveSni() {},
+    },
+  });
+  try {
+    if (!options) throw new Error("listener options unavailable");
+    const request = new Request(`https://${address.hostname}/actor-socket`, {
+      headers: {
+        host: address.hostname,
+        connection: "Upgrade",
+        upgrade: "websocket",
+        "sec-websocket-version": "13",
+        "sec-websocket-key": "MDEyMzQ1Njc4OWFiY2RlZg==",
+      },
+    });
+    const invalid = new Request(request.url, {
+      headers: { host: address.hostname, upgrade: "websocket" },
+    });
+    expect((await options.fetch(invalid, server as never)).status).toBe(400);
+    expect(upgradeCalls).toBe(0);
+    expect(await options.fetch(request, server as never)).toBeUndefined();
+    expect(upgradeCalls).toBe(1);
+    expect(bridge).toBeDefined();
+    expect((await listener.witness.observeRouteAbsent(address)).absent).toBe(false);
+    const client = {
+      data: bridge,
+      readyState: 1,
+      close() {},
+      terminate() {},
+      send() {
+        return 1;
+      },
+    };
+    options.websocket.open?.(client as never);
+    upstream.dispatchEvent(new Event("close"));
+    expect((await listener.witness.observeRouteAbsent(address)).absent).toBe(false);
+    options.websocket.close?.(client as never, 1000, "closed");
+    expect((await listener.witness.observeRouteAbsent(address)).absent).toBe(true);
   } finally {
     await listener.close(true);
     await fixture.cleanup();
