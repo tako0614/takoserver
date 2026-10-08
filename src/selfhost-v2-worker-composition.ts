@@ -28,10 +28,16 @@ import { ACTOR_NAMESPACE_FORM_URL } from "./takoform-v2/forms/actor-namespace.ts
 import { createV2HeldArtifactSource } from "./takoform-v2/forms/artifact-source.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "./takoform-v2/forms/at-least-once-queue.ts";
 import { DURABLE_WORKFLOW_FORM_URL } from "./takoform-v2/forms/durable-workflow.ts";
+import { EDGE_KV_NAMESPACE_FORM_URL } from "./takoform-v2/forms/edge-kv-namespace.ts";
+import { createEdgeKVNamespaceForm } from "./takoform-v2/forms/edge-kv-namespace-backend.ts";
 import { createKvWorkerBindingAuthority } from "./takoform-v2/forms/kv-worker-binding-authority.ts";
+import { OBJECT_BUCKET_FORM_URL } from "./takoform-v2/forms/object-bucket.ts";
+import { createObjectBucketForm } from "./takoform-v2/forms/object-bucket-backend.ts";
 import { createObjectBucketWorkerBindingAuthority } from "./takoform-v2/forms/object-bucket-worker-binding-authority.ts";
 import { QUEUE_CONSUMER_FORM_URL } from "./takoform-v2/forms/queue-consumer.ts";
 import { createQueueWorkerBindingAuthority } from "./takoform-v2/forms/queue-worker-binding-authority.ts";
+import { SQLITE_DATABASE_FORM_URL } from "./takoform-v2/forms/sqlite-database.ts";
+import { createSQLiteDatabaseForm } from "./takoform-v2/forms/sqlite-database-backend.ts";
 import { createSQLiteWorkerBindingAuthority } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { createStaticAssetBundleCustody } from "./takoform-v2/forms/static-asset-bundle-backend.ts";
 import { createWorkerBundleCustody } from "./takoform-v2/forms/worker-bundle-backend.ts";
@@ -311,6 +317,8 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
    * composition's restored self-host Endpoint boot.
    */
   internalFormFactoryForEndpoint(endpoint: EndpointPorts): V2OperatorFormFactory;
+  /** Complete secret-free public admission; runtime ciphertext recovery remains configured. */
+  secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory;
 } {
   if (!options.targetKey || !options.rootDirectory || !options.sql || !options.objects) {
     throw new TypeError("v2 Worker composition requires SQL, objects, target and private root");
@@ -1153,6 +1161,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   const createInternalForms = (
     context: Parameters<V2OperatorFormFactory>[0],
     endpoint: EndpointPorts | undefined,
+    allowPrivateInputs = true,
   ) => {
     if (context.sql !== sql || context.objects !== objects || context.clock !== clock) {
       throw new TypeError(
@@ -1169,29 +1178,49 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     ) {
       throw new TypeError("v2 Worker Endpoint frontend proof is not composed");
     }
+    const versionOptions = {
+      sql,
+      targetKey,
+      publicationState,
+      retirement: readers.retirement,
+      inspectModule,
+      ...(queueSettlement ? { queueSettlement } : {}),
+      ...(sqliteBoot ? { v2SqliteBinding: sqliteBoot } : {}),
+      ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
+      ...(kvBoot ? { v2KvBinding: kvBoot } : {}),
+      ...(queueProducerBoot ? { v2QueueProducerBinding: queueProducerBoot } : {}),
+      ...(actor ? { v2ActorBinding: actor.bindingAuthority } : {}),
+      ...(workflow ? { v2WorkflowBinding: workflow.bindingAuthority } : {}),
+    };
+    const runtimeVersionForm = createInternalV2WorkerVersionForm({
+      ...versionOptions,
+      ...(configuredInputSealer && configuredInputCustody
+        ? { configuredInputSealer, configuredInputCustody }
+        : {}),
+    });
+    const admissionVersionForm = allowPrivateInputs
+      ? runtimeVersionForm
+      : createInternalV2WorkerVersionForm(versionOptions);
+    const versionForm = allowPrivateInputs
+      ? runtimeVersionForm
+      : {
+          validateCreate: admissionVersionForm.validateCreate,
+          validateUpdate: admissionVersionForm.validateUpdate,
+          ...(admissionVersionForm.references
+            ? { references: admissionVersionForm.references }
+            : {}),
+          ...(runtimeVersionForm.rejectDeleteWhileReferenced
+            ? { rejectDeleteWhileReferenced: true as const }
+            : {}),
+          backend: runtimeVersionForm.backend,
+        };
     return {
       [MODULE_WORKER_FORM_URL]: createInternalV2ModuleWorkerForm({
         sql,
         targetKey,
         ...readers,
       }),
-      [WORKER_VERSION_FORM_URL]: createInternalV2WorkerVersionForm({
-        sql,
-        targetKey,
-        publicationState,
-        retirement: readers.retirement,
-        inspectModule,
-        ...(queueSettlement ? { queueSettlement } : {}),
-        ...(sqliteBoot ? { v2SqliteBinding: sqliteBoot } : {}),
-        ...(objectBucketBoot ? { v2ObjectBucketBinding: objectBucketBoot } : {}),
-        ...(kvBoot ? { v2KvBinding: kvBoot } : {}),
-        ...(queueProducerBoot ? { v2QueueProducerBinding: queueProducerBoot } : {}),
-        ...(actor ? { v2ActorBinding: actor.bindingAuthority } : {}),
-        ...(workflow ? { v2WorkflowBinding: workflow.bindingAuthority } : {}),
-        ...(configuredInputSealer && configuredInputCustody
-          ? { configuredInputSealer, configuredInputCustody }
-          : {}),
-      }),
+      [WORKER_VERSION_FORM_URL]: versionForm,
       [WORKER_DEPLOYMENT_FORM_URL]: createWorkerDeploymentForm({
         targetKey,
         publicationState,
@@ -1261,6 +1290,52 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       observeRouteAbsent: endpoint.observeRouteAbsent,
     });
     return (context) => createInternalForms(context, capturedEndpoint);
+  }
+  function secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory {
+    if (!restorationComplete || ownerAdmissionFrozen)
+      throw new TypeError("v2 Worker owners must restore before Form composition");
+    if (
+      !options.workerdBinary ||
+      config.workerBundle?.targetKey !== targetKey ||
+      config.staticAssetBundle?.targetKey !== targetKey ||
+      !actor ||
+      !workflow ||
+      !queueSettlement ||
+      !queueProducerBoot ||
+      !queueCapability ||
+      !options.sqliteBinding ||
+      !options.v2KvBinding ||
+      !options.v2ObjectBucketBinding
+    ) {
+      throw new TypeError("complete secret-free v2 Worker Form dependencies are unavailable");
+    }
+    const sqliteStore = options.sqliteBinding.store;
+    const kvStore = options.v2KvBinding.store;
+    const objectBucketStore = options.v2ObjectBucketBinding.store;
+    let capturedEndpoint: EndpointPorts | undefined;
+    if (endpoint !== undefined) {
+      const { assignHostname, observeTls, observeRouteAbsent } = endpoint;
+      if (
+        typeof assignHostname !== "function" ||
+        typeof observeTls !== "function" ||
+        typeof observeRouteAbsent !== "function"
+      ) {
+        throw new TypeError("v2 Worker Endpoint frontend proof is not composed");
+      }
+      capturedEndpoint = Object.freeze({ assignHostname, observeTls, observeRouteAbsent });
+    }
+    return (context) => ({
+      ...createInternalForms(context, capturedEndpoint, false),
+      [SQLITE_DATABASE_FORM_URL]: createSQLiteDatabaseForm({ store: sqliteStore }),
+      [EDGE_KV_NAMESPACE_FORM_URL]: createEdgeKVNamespaceForm({
+        store: kvStore,
+        targetKey,
+      }),
+      [OBJECT_BUCKET_FORM_URL]: createObjectBucketForm({
+        store: objectBucketStore,
+        targetKey,
+      }),
+    });
   }
 
   return {
@@ -1405,5 +1480,6 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     },
     internalFormFactory,
     internalFormFactoryForEndpoint,
+    secretFreeFormFactory,
   };
 }

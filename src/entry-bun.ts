@@ -1080,62 +1080,148 @@ if (selfhostTenantRunCredentialSigningKey) {
 
 const configuredAi = aiGateway();
 let selfhostEndpointIngressFetch: ((request: Request) => Promise<Response | null>) | undefined;
-const app = buildApp({
-  sql,
-  resourceStores,
-  objects,
-  ...(signingKey ? { signingKey } : {}),
-  identity: identity.verifier,
-  identityProviders: identity.providers,
-  ...(configuredAi ? { ai: configuredAi } : {}),
-  settlement:
-    payment.settlement ??
-    (legacyPublicKeyJwk
-      ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
-      : unconfigured),
-  v2: takoformV2Config,
-  ...(payment.checkout ? { checkout: payment.checkout } : {}),
-  publicOrigin,
-  ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
-    ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
-    : {}),
-  forms: currentCandidates.forms,
-  bindings: currentCandidates.bindings,
-  hostForms: currentCandidates.forms,
-  hostBindings: currentCandidates.bindings,
-  providers,
-  providerPacks,
-  offerings,
-  artifacts: artifactStore,
-  ...(selfhostTenantRunCredentialSigningKey
-    ? {
-        selfhostTenantRunCredentialAuthority: (originReservations) =>
-          createSelfhostTenantRunCredentials({
-            issuer: publicOrigin,
-            signingKey: selfhostTenantRunCredentialSigningKey,
-            ordinarySigningKeyId: signingKey.keyId,
-            runtimeGrantKeys: sql,
-            originReservations,
-            clock,
-            randomId: () => crypto.randomUUID().replaceAll("-", ""),
-          }),
-      }
-    : {}),
-  ...(selfhostContainerEndpointHttps && selfhostContainer && containerEndpointIngress
-    ? {
-        selfhostEndpointIngressFactory: ({ store, deployments }) => {
-          selfhostEndpointIngressFetch = createSelfhostContainerEndpointIngress({
-            qualification: containerEndpointIngress,
-            store,
-            deployments,
-          });
-          return selfhostEndpointIngressFetch;
-        },
-      }
-    : {}),
-  ...(runtimeInputs ? { runtimeInputs } : {}),
-  clock,
-});
+let selfhostV2WorkerEndpointBoot: SelfhostV2WorkerEndpointBoot | undefined;
+if (v2WorkerEndpointHttpsSelection) {
+  if (!workerdTls) throw new Error("selected v2 Worker Endpoint HTTPS lost its TLS inputs");
+  try {
+    selfhostV2WorkerEndpointBoot = await createSelfhostV2WorkerEndpointBoot({
+      sql,
+      targetKey: v2WorkerTargetKey,
+      publicOrigin,
+      configuration: v2WorkerEndpointHttpsSelection,
+      certificateChain: workerdTls.certificateChain,
+      privateKey: workerdTls.privateKey,
+      publicationState: v2WorkerComposition.endpointPublicationState,
+      ownerForWorkerUid: async (uid) => {
+        if (!ownersRestored) throw new Error("v2 Worker owners are not restored");
+        return await v2WorkerComposition.ownerForWorkerUid(uid);
+      },
+    });
+    process.once("exit", () => {
+      void selfhostV2WorkerEndpointBoot?.close();
+    });
+  } catch (error) {
+    throw new Error("selected v2 Worker Endpoint HTTPS could not start", { cause: error });
+  }
+}
+
+// Exact Form support is all-or-nothing. A missing optional operator plane is
+// not a narrower public WorkerVersion profile. Keep the private input sealer
+// in the owner for ciphertext recovery, but admit only secret-free new specs.
+const completeV2WorkerForms =
+  workerdBinary !== null &&
+  takoformV2Config.workerBundle?.targetKey === v2WorkerTargetKey &&
+  takoformV2Config.staticAssetBundle?.targetKey === v2WorkerTargetKey &&
+  v2RuntimeBoot?.v2Actor !== undefined &&
+  v2RuntimeBoot.v2Workflow !== undefined &&
+  v2SqliteStore !== undefined &&
+  v2KvStore !== undefined &&
+  v2ObjectBucketStore !== undefined &&
+  v2QueueCustody !== undefined &&
+  v2QueueComposition !== undefined &&
+  v2PrivatePlaneBoot?.sqlite !== undefined &&
+  v2PrivatePlaneBoot.kv !== undefined &&
+  v2PrivatePlaneBoot.objectBucket !== undefined &&
+  v2PrivatePlaneBoot.queue !== undefined &&
+  v2PrivatePlaneBoot.queueProducer !== undefined &&
+  v2WorkerComposition.queueCapability !== undefined &&
+  ownersRestored;
+async function closeBeforePublicIngress(): Promise<void> {
+  await selfhostV2WorkerEndpointBoot?.close(true);
+  const closed = await closeSelfhostEntryOwnedResources({
+    workerdShutdown: () => workerd.shutdown(),
+    mayCloseDependents: () => true,
+    v2WorkerSuspend: async () => {
+      await v2WorkerComposition.closeScheduledHost();
+      await v2QueueScheduler?.close();
+      await v2WorkerComposition.closeWorkflowHost();
+      await v2RuntimeBoot?.closeActor();
+      await v2WorkerComposition.suspendOwnersRetainingCustody();
+      await v2QueueComposition?.close();
+    },
+    actorClose: async () => {
+      await actorRuntime?.close();
+    },
+    dataPlanesStop: async () => {
+      await dataPlanes?.stop(false);
+    },
+    controlDatabaseClose: () => controlDatabase.close(),
+    onFailure: (stage) => {
+      process.stderr.write(`self-host startup cleanup failed at ${stage}\n`);
+    },
+  });
+  if (!closed) throw new Error("self-host startup owner cleanup is unconfirmed");
+}
+let app: ReturnType<typeof buildApp>;
+try {
+  const v2FormFactory = completeV2WorkerForms
+    ? v2WorkerComposition.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
+    : undefined;
+  app = buildApp({
+    sql,
+    resourceStores,
+    objects,
+    ...(signingKey ? { signingKey } : {}),
+    identity: identity.verifier,
+    identityProviders: identity.providers,
+    ...(configuredAi ? { ai: configuredAi } : {}),
+    settlement:
+      payment.settlement ??
+      (legacyPublicKeyJwk
+        ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
+        : unconfigured),
+    v2: takoformV2Config,
+    ...(v2FormFactory ? { v2FormFactory } : {}),
+    ...(payment.checkout ? { checkout: payment.checkout } : {}),
+    publicOrigin,
+    ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
+      ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
+      : {}),
+    forms: currentCandidates.forms,
+    bindings: currentCandidates.bindings,
+    hostForms: currentCandidates.forms,
+    hostBindings: currentCandidates.bindings,
+    providers,
+    providerPacks,
+    offerings,
+    artifacts: artifactStore,
+    ...(selfhostTenantRunCredentialSigningKey
+      ? {
+          selfhostTenantRunCredentialAuthority: (originReservations) =>
+            createSelfhostTenantRunCredentials({
+              issuer: publicOrigin,
+              signingKey: selfhostTenantRunCredentialSigningKey,
+              ordinarySigningKeyId: signingKey.keyId,
+              runtimeGrantKeys: sql,
+              originReservations,
+              clock,
+              randomId: () => crypto.randomUUID().replaceAll("-", ""),
+            }),
+        }
+      : {}),
+    ...(selfhostContainerEndpointHttps && selfhostContainer && containerEndpointIngress
+      ? {
+          selfhostEndpointIngressFactory: ({ store, deployments }) => {
+            selfhostEndpointIngressFetch = createSelfhostContainerEndpointIngress({
+              qualification: containerEndpointIngress,
+              store,
+              deployments,
+            });
+            return selfhostEndpointIngressFetch;
+          },
+        }
+      : {}),
+    ...(runtimeInputs ? { runtimeInputs } : {}),
+    clock,
+  });
+} catch (error) {
+  try {
+    await closeBeforePublicIngress();
+  } catch (cleanupError) {
+    throw new AggregateError([error, cleanupError], "self-host Form startup cleanup failed");
+  }
+  throw error;
+}
 // Install only the callback composed against this Host's canonical stores. A
 // suffix miss becomes a private 404 on this dedicated listener and can never
 // fall through to Host health, provisioning, or API routes.
@@ -1188,7 +1274,6 @@ const bunFetch = createSelfhostBunFetchHandler({
   appFetch: takoformV2Ingress,
 });
 let bunServer: ReturnType<typeof Bun.serve> | undefined;
-let selfhostV2WorkerEndpointBoot: SelfhostV2WorkerEndpointBoot | undefined;
 let shutdownClean = true;
 let closeSequenceFinished = false;
 const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
@@ -1284,30 +1369,6 @@ process.on("exit", () => {
   workerd.stop();
 });
 
-if (v2WorkerEndpointHttpsSelection) {
-  if (!workerdTls) throw new Error("selected v2 Worker Endpoint HTTPS lost its TLS inputs");
-  try {
-    selfhostV2WorkerEndpointBoot = await createSelfhostV2WorkerEndpointBoot({
-      sql,
-      targetKey: v2WorkerTargetKey,
-      publicOrigin,
-      configuration: v2WorkerEndpointHttpsSelection,
-      certificateChain: workerdTls.certificateChain,
-      privateKey: workerdTls.privateKey,
-      publicationState: v2WorkerComposition.endpointPublicationState,
-      ownerForWorkerUid: async (uid) => {
-        if (!ownersRestored) throw new Error("v2 Worker owners are not restored");
-        return await v2WorkerComposition.ownerForWorkerUid(uid);
-      },
-    });
-    process.once("exit", () => {
-      void selfhostV2WorkerEndpointBoot?.close();
-    });
-  } catch (error) {
-    throw new Error("selected v2 Worker Endpoint HTTPS could not start", { cause: error });
-  }
-}
-
 try {
   bunServer = Bun.serve({
     port,
@@ -1318,11 +1379,11 @@ try {
   });
 } catch (error) {
   try {
-    await selfhostV2WorkerEndpointBoot?.close(true);
+    await closeBeforePublicIngress();
   } catch (closeError) {
     throw new AggregateError(
       [error, closeError],
-      "self-host Bun listener failed and v2 Worker Endpoint cleanup was not confirmed",
+      "self-host Bun listener failed and owned startup cleanup was not confirmed",
     );
   }
   throw error;

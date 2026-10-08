@@ -1,14 +1,29 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { base64UrlEncode, bytesDigest } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
+import { ACTOR_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/actor-namespace.ts";
+import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
+import { DURABLE_WORKFLOW_FORM_URL } from "../src/takoform-v2/forms/durable-workflow.ts";
+import { EDGE_KV_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/edge-kv-namespace.ts";
+import { OBJECT_BUCKET_FORM_URL } from "../src/takoform-v2/forms/object-bucket.ts";
+import { QUEUE_CONSUMER_FORM_URL } from "../src/takoform-v2/forms/queue-consumer.ts";
+import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-database.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
+import { WORKER_CRON_TRIGGER_FORM_URL } from "../src/takoform-v2/forms/worker-cron-trigger.ts";
+import {
+  MODULE_WORKER_FORM_URL,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+  WORKER_VERSION_FORM_URL,
+} from "../src/takoform-v2/forms/worker-specs.ts";
 
 const OPT_IN = process.env.TAKOSERVER_V2_ENTRY_NATIVE;
 const PUBLIC_ORIGIN = "https://v2-entry.takoserver.test";
@@ -27,6 +42,22 @@ const ASSET_FILE_URL = "https://artifacts.example.test/assets/site.css";
 const ASSET_MANIFEST_KEY = "operator-held/v2/static-asset-manifest";
 const ASSET_FILE_KEY = "operator-held/v2/assets/site.css";
 const CURSOR_KEY = base64UrlEncode(new Uint8Array(32).fill(0x74));
+const WORKER_TARGET = "selfhost-v2-worker-primary";
+const WORKER_SUFFIX = "workers.native.test";
+const COMPLETE_WORKER_FORM_URLS = [
+  MODULE_WORKER_FORM_URL,
+  WORKER_VERSION_FORM_URL,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_CRON_TRIGGER_FORM_URL,
+  ACTOR_NAMESPACE_FORM_URL,
+  DURABLE_WORKFLOW_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+  SQLITE_DATABASE_FORM_URL,
+  EDGE_KV_NAMESPACE_FORM_URL,
+  OBJECT_BUCKET_FORM_URL,
+  AT_LEAST_ONCE_QUEUE_FORM_URL,
+  QUEUE_CONSUMER_FORM_URL,
+] as const;
 
 type Child = ReturnType<typeof Bun.spawn>;
 type Json = Record<string, unknown>;
@@ -35,6 +66,7 @@ function fixtureConfig(
   heldArtifacts?: readonly Json[],
   workerBundleHeldArtifacts?: readonly Json[],
   staticAssetBundleHeldArtifacts?: readonly Json[],
+  workerTargetKey = "native-entry-worker-bundle-v1",
 ) {
   return JSON.stringify({
     documentation: "https://docs.example.test/takoform-v2",
@@ -51,7 +83,7 @@ function fixtureConfig(
       ? {}
       : {
           workerBundle: {
-            targetKey: "native-entry-worker-bundle-v1",
+            targetKey: workerTargetKey,
             heldArtifacts: workerBundleHeldArtifacts,
           },
         }),
@@ -59,7 +91,10 @@ function fixtureConfig(
       ? {}
       : {
           staticAssetBundle: {
-            targetKey: "native-entry-static-assets-v1",
+            targetKey:
+              workerTargetKey === "native-entry-worker-bundle-v1"
+                ? "native-entry-static-assets-v1"
+                : workerTargetKey,
             heldArtifacts: staticAssetBundleHeldArtifacts,
           },
         }),
@@ -241,7 +276,47 @@ async function choosePort(): Promise<number> {
   return port;
 }
 
-async function startHost(root: string, port: number, config: string): Promise<Child> {
+async function chooseUnusedPort(excluded: Set<number>): Promise<number> {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const port = await choosePort();
+    if (!excluded.has(port)) {
+      excluded.add(port);
+      return port;
+    }
+  }
+  throw new Error("native entry port allocation unavailable");
+}
+
+function nativeHttps(hostname: string, path: string): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const request = httpsRequest(
+      {
+        hostname: "127.0.0.1",
+        port: 443,
+        servername: hostname,
+        path,
+        headers: { host: hostname },
+        rejectUnauthorized: false,
+      },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk: string) => (body += chunk));
+        response.once("end", () => resolve({ status: response.statusCode ?? 0, body }));
+      },
+    );
+    request.setTimeout(10_000, () => request.destroy(new Error("native Endpoint timed out")));
+    request.once("error", reject);
+    request.end();
+  });
+}
+
+async function startHost(
+  root: string,
+  port: number,
+  config: string,
+  extraEnv: Record<string, string> = {},
+): Promise<Child> {
   const child = Bun.spawn([process.execPath, "--no-env-file", "src/entry-bun.ts"], {
     cwd: join(import.meta.dir, ".."),
     stdin: "ignore",
@@ -259,6 +334,7 @@ async function startHost(root: string, port: number, config: string): Promise<Ch
       TAKOSERVER_PUBLIC_ORIGIN: PUBLIC_ORIGIN,
       TAKOSERVER_TAKOFORM_V2_CONFIG: config,
       TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: CURSOR_KEY,
+      ...extraEnv,
     },
   });
   try {
@@ -970,6 +1046,405 @@ test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
     if (cleanupFailed) throw new Error("native v2 child cleanup failed");
   },
   180_000,
+);
+
+test.skipIf(OPT_IN !== "1")(
+  "normal Bun entry admits a complete secret-free v2 Worker graph, serves HTTPS, and recovers after SIGKILL",
+  async () => {
+    const binary = process.env.TAKOSERVER_WORKERD_BINARY;
+    const guard = process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY;
+    if (!binary || !guard) throw new Error("exact native workerd and Workflow guard are required");
+    const root = await mkdtemp(join(tmpdir(), "v2n-"));
+    const chosen = new Set<number>([443]);
+    const port = await chooseUnusedPort(chosen);
+    const workerdPort = await chooseUnusedPort(chosen);
+    const dataPlanePort = await chooseUnusedPort(chosen);
+    const privatePorts = await Promise.all(
+      Array.from({ length: 5 }, () => chooseUnusedPort(chosen)),
+    );
+    const privateRoot = join(root, "keys");
+    await mkdir(privateRoot, { recursive: true, mode: 0o700 });
+    await mkdir(join(root, "staging"), { recursive: true, mode: 0o700 });
+    const names = ["sqlite", "kv", "objectBucket", "queue", "queueProducer"] as const;
+    const keyPaths = Object.fromEntries(
+      names.map((name) => [name, join(privateRoot, `${name}.key`)]),
+    );
+    for (const [index, name] of names.entries()) {
+      const keyPath = keyPaths[name];
+      if (!keyPath) throw new Error("native private-plane key path unavailable");
+      await writeFile(keyPath, new Uint8Array(32).fill(0x31 + index), { mode: 0o600 });
+    }
+    const certificateFile = join(root, "cert.pem");
+    const privateKeyFile = join(root, "tls.key");
+    const openssl = Bun.spawn(
+      [
+        "openssl",
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        privateKeyFile,
+        "-out",
+        certificateFile,
+        "-days",
+        "2",
+        "-subj",
+        `/CN=*.${WORKER_SUFFIX}`,
+        "-addext",
+        `subjectAltName=DNS:*.${WORKER_SUFFIX}`,
+      ],
+      { stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+    );
+    if ((await openssl.exited) !== 0) throw new Error("native Endpoint certificate unavailable");
+    const privateBoot = JSON.stringify({
+      sqlite: {
+        privatePort: privatePorts[0],
+        signingKeyFile: keyPaths.sqlite,
+        stagingRoot: join(root, "staging"),
+      },
+      kv: { privatePort: privatePorts[1], signingKeyFile: keyPaths.kv },
+      objectBucket: { privatePort: privatePorts[2], signingKeyFile: keyPaths.objectBucket },
+      queue: { privatePort: privatePorts[3], signingKeyFile: keyPaths.queue },
+      queueProducer: { privatePort: privatePorts[4], signingKeyFile: keyPaths.queueProducer },
+    });
+    const fullBoot = {
+      TAKOSERVER_WORKERD_BINARY: binary,
+      TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY: guard,
+      TAKOSERVER_WORKERD_PORT: String(workerdPort),
+      TAKOSERVER_DATA_PLANE_PORT: String(dataPlanePort),
+      TAKOSERVER_V2_WORKER_RUNTIME_BOOT: JSON.stringify({
+        actor: true,
+        workflow: { maximumRegistrations: 64 },
+      }),
+      TAKOSERVER_V2_WORKER_PRIVATE_PLANES: privateBoot,
+      TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS: "1",
+      TAKOSERVER_WORKER_ENDPOINT_SUFFIX: WORKER_SUFFIX,
+      TAKOSERVER_WORKERD_TLS_CERT_FILE: certificateFile,
+      TAKOSERVER_WORKERD_TLS_KEY_FILE: privateKeyFile,
+      TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING: JSON.stringify({
+        current: { id: "v2-entry-fixture", key: base64UrlEncode(new Uint8Array(32).fill(0x6f)) },
+      }),
+    };
+    let bootstrap: Child | null = null;
+    let serving: Child | null = null;
+    let completed = false;
+    try {
+      bootstrap = await startHost(root, port, fixtureConfig());
+      const assertion = await signOperatorAssertion({
+        privateJwk: await readFile(join(root, "operator-key.jwk"), "utf8"),
+        claims: {
+          purpose: "sign-in",
+          aud: PUBLIC_ORIGIN,
+          provider: "google",
+          subject: "v2-worker-entry-owner",
+          email: "worker-entry-owner@localhost",
+          displayName: "Worker Entry Owner",
+        },
+        nowSeconds: Math.floor(Date.now() / 1_000),
+        lifetimeSeconds: 60,
+      });
+      const session = await jsonAt(port, "POST", "/v1/sessions", 200, {
+        provider: "google",
+        method: "operator-assertion",
+        assertion,
+        sessionTtlSeconds: 60,
+      });
+      const organization = await jsonAt(
+        port,
+        "POST",
+        "/v1/organizations",
+        201,
+        { name: "Native v2 Worker entry" },
+        { authorization: `Bearer ${String(session.sessionToken)}` },
+      );
+      const space = String((organization.organization as Json).id);
+      const key = await jsonAt(
+        port,
+        "POST",
+        `/v1/organizations/${space}/api-keys`,
+        201,
+        { name: "worker entry writer", scopes: ["resources:write"], expiresInSeconds: 3600 },
+        { authorization: `Bearer ${String(session.sessionToken)}` },
+      );
+      const token = String(key.secret);
+      const auth = { authorization: `Bearer ${token}` };
+      await stopHost(bootstrap);
+      bootstrap = null;
+
+      const moduleBytes = new TextEncoder().encode(
+        "export default { fetch(request) { return new Response('normal-v2:' + new URL(request.url).pathname); } };\n",
+      );
+      const moduleDigest = (await bytesDigest(moduleBytes)).slice(7);
+      const manifestBytes = new TextEncoder().encode(
+        JSON.stringify({
+          entrypoint: "worker.js",
+          files: [
+            {
+              path: "worker.js",
+              url: BUNDLE_FILE_URL,
+              sha256: moduleDigest,
+              mediaType: "application/javascript+module",
+            },
+          ],
+        }),
+      );
+      const manifestDigest = (await bytesDigest(manifestBytes)).slice(7);
+      const assetBytes = new TextEncoder().encode("body { color: #124; }\n");
+      const assetDigest = (await bytesDigest(assetBytes)).slice(7);
+      const assetManifestBytes = new TextEncoder().encode(
+        JSON.stringify({
+          files: [
+            {
+              path: "public/site.css",
+              url: ASSET_FILE_URL,
+              sha256: assetDigest,
+              mediaType: "text/css",
+            },
+          ],
+        }),
+      );
+      const assetManifestDigest = (await bytesDigest(assetManifestBytes)).slice(7);
+      const objects = createFileObjectStore({ root });
+      for (const [objectKey, bytes, contentType] of [
+        [BUNDLE_MANIFEST_KEY, manifestBytes, "application/json"],
+        [BUNDLE_FILE_KEY, moduleBytes, "application/javascript+module"],
+        [ASSET_MANIFEST_KEY, assetManifestBytes, "application/json"],
+        [ASSET_FILE_KEY, assetBytes, "text/css"],
+      ] as const) {
+        expect(await objects.create(objectKey, bytes, { contentType })).not.toBeNull();
+      }
+      const grants = [{ principal: `org:${space}`, space }];
+      const config = fixtureConfig(
+        undefined,
+        [
+          {
+            url: BUNDLE_MANIFEST_URL,
+            sha256: manifestDigest,
+            objectKey: BUNDLE_MANIFEST_KEY,
+            grants,
+          },
+          { url: BUNDLE_FILE_URL, sha256: moduleDigest, objectKey: BUNDLE_FILE_KEY, grants },
+        ],
+        [
+          {
+            url: ASSET_MANIFEST_URL,
+            sha256: assetManifestDigest,
+            objectKey: ASSET_MANIFEST_KEY,
+            grants,
+          },
+          { url: ASSET_FILE_URL, sha256: assetDigest, objectKey: ASSET_FILE_KEY, grants },
+        ],
+        WORKER_TARGET,
+      );
+      // One missing runtime capability cannot become a narrower public Form
+      // profile. The same held bytes and private planes alone are insufficient.
+      serving = await startHost(root, port, config, {
+        ...fullBoot,
+        TAKOSERVER_V2_WORKER_RUNTIME_BOOT: JSON.stringify({ actor: true }),
+      });
+      for (const form of COMPLETE_WORKER_FORM_URLS) {
+        expect(
+          await jsonAt(
+            port,
+            "GET",
+            `${V2}/support?form=${encodeURIComponent(form)}`,
+            200,
+            undefined,
+            auth,
+          ),
+        ).toMatchObject({ supported: false });
+      }
+      await stopHost(serving);
+      serving = null;
+      const noAssets = JSON.parse(config) as Json;
+      delete noAssets.staticAssetBundle;
+      serving = await startHost(root, port, JSON.stringify(noAssets), fullBoot);
+      expect(
+        await jsonAt(
+          port,
+          "GET",
+          `${V2}/support?form=${encodeURIComponent(WORKER_VERSION_FORM_URL)}`,
+          200,
+          undefined,
+          auth,
+        ),
+      ).toMatchObject({ supported: false });
+      await stopHost(serving);
+      serving = null;
+      serving = await startHost(root, port, config, fullBoot);
+      const support = async (form: string) =>
+        await jsonAt(
+          port,
+          "GET",
+          `${V2}/support?form=${encodeURIComponent(form)}`,
+          200,
+          undefined,
+          auth,
+        );
+      for (const form of COMPLETE_WORKER_FORM_URLS) {
+        expect(await support(form)).toMatchObject({ supported: true, privateInputs: false });
+      }
+      const create = async (form: string, name: string, spec: Json) => {
+        const body = { form, space, name, spec };
+        const headers = { ...auth, "idempotency-key": `normal-v2-${name}-create` };
+        const accepted = await jsonAt(port, "POST", `${V2}/resources`, 202, body, headers);
+        expect(await settled(port, token, String(accepted.id))).toMatchObject({
+          effect: "complete",
+        });
+        return { body, headers, uid: String(accepted.resourceUid), id: String(accepted.id) };
+      };
+      const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
+      const sqliteTarget = await create(SQLITE_DATABASE_FORM_URL, "sqlite-target", {});
+      const kvTarget = await create(EDGE_KV_NAMESPACE_FORM_URL, "kv-target", {});
+      const bucketTarget = await create(OBJECT_BUCKET_FORM_URL, "bucket-target", {});
+      const queueTarget = await create(AT_LEAST_ONCE_QUEUE_FORM_URL, "queue-target", {
+        messageRetentionSeconds: 3600,
+      });
+      const bundle = await create(WORKER_BUNDLE_FORM_URL, "bundle", {
+        artifact: { url: BUNDLE_MANIFEST_URL, sha256: manifestDigest },
+      });
+      const sensitive = await jsonAt(
+        port,
+        "POST",
+        `${V2}/resources`,
+        422,
+        {
+          form: WORKER_VERSION_FORM_URL,
+          space,
+          name: "sensitive-version",
+          spec: {
+            worker: { resourceUid: worker.uid },
+            bundle: { resourceUid: bundle.uid },
+            handlers: ["fetch"],
+            requiredSensitiveVars: ["SECRET"],
+          },
+        },
+        { ...auth, "idempotency-key": "normal-v2-sensitive-refused" },
+      );
+      expect(sensitive).toMatchObject({ code: "capability_required" });
+      const emptyPrivateInput = await jsonAt(
+        port,
+        "POST",
+        `${V2}/resources`,
+        422,
+        {
+          form: WORKER_VERSION_FORM_URL,
+          space,
+          name: "empty-private-input-version",
+          spec: {
+            worker: { resourceUid: worker.uid },
+            bundle: { resourceUid: bundle.uid },
+            handlers: ["fetch"],
+            requiredSensitiveVars: [],
+          },
+          privateInputs: {},
+        },
+        { ...auth, "idempotency-key": "normal-v2-private-input-refused" },
+      );
+      expect(emptyPrivateInput).toMatchObject({ code: "capability_required" });
+      const version = await create(WORKER_VERSION_FORM_URL, "version", {
+        worker: { resourceUid: worker.uid },
+        bundle: { resourceUid: bundle.uid },
+        handlers: ["fetch"],
+        vars: {},
+        requiredSensitiveVars: [],
+      });
+      const deployment = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+        worker: { resourceUid: worker.uid },
+        versions: [{ workerVersion: { resourceUid: version.uid }, weight: 10_000 }],
+      });
+      const endpoint = await create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
+        worker: { resourceUid: worker.uid },
+      });
+      const endpointRead = await jsonAt(
+        port,
+        "GET",
+        `${V2}/resources/${endpoint.uid}`,
+        200,
+        undefined,
+        auth,
+      );
+      const hostname = String((endpointRead.output as Json).hostname);
+      expect(await nativeHttps(hostname, "/before-crash")).toEqual({
+        status: 200,
+        body: "normal-v2:/before-crash",
+      });
+
+      const firstPid = serving.pid;
+      await killHost(serving);
+      serving = null;
+      serving = await startHost(root, port, config, fullBoot);
+      expect(serving.pid).not.toBe(firstPid);
+      expect(
+        await jsonAt(port, "POST", `${V2}/resources`, 200, worker.body, worker.headers),
+      ).toMatchObject({ id: worker.id, status: "succeeded" });
+      expect(await nativeHttps(hostname, "/after-crash")).toEqual({
+        status: 200,
+        body: "normal-v2:/after-crash",
+      });
+      const update = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${worker.uid}`,
+        202,
+        { spec: {} },
+        {
+          ...auth,
+          "idempotency-key": "normal-v2-worker-update",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(await settled(port, token, String(update.id))).toMatchObject({ effect: "complete" });
+      const remove = async (uid: string, generation: number, name: string) => {
+        const accepted = await jsonAt(port, "DELETE", `${V2}/resources/${uid}`, 202, undefined, {
+          ...auth,
+          "idempotency-key": `normal-v2-${name}-delete`,
+          "takoform-expected-generation": String(generation),
+        });
+        expect(await settled(port, token, String(accepted.id))).toMatchObject({
+          effect: "complete",
+        });
+      };
+      await remove(endpoint.uid, 1, "endpoint");
+      await remove(deployment.uid, 1, "deployment");
+      await remove(version.uid, 1, "version");
+      await remove(bundle.uid, 1, "bundle");
+      await remove(queueTarget.uid, 1, "queue-target");
+      await remove(bucketTarget.uid, 1, "bucket-target");
+      await remove(kvTarget.uid, 1, "kv-target");
+      await remove(sqliteTarget.uid, 1, "sqlite-target");
+      await remove(worker.uid, 2, "worker");
+      await stopHost(serving);
+      serving = null;
+      const occupiedControl = Bun.serve({
+        hostname: "127.0.0.1",
+        port,
+        fetch: () => new Response(null, { status: 503 }),
+      });
+      try {
+        await expect(startHost(root, port, config, fullBoot)).rejects.toThrow(
+          "normal Bun entry exited during startup",
+        );
+        // The existing Endpoint boot bound 443 before the ordinary Bun listener
+        // failed. No listener may survive its failed startup cleanup.
+        const availableEndpoint = Bun.serve({
+          hostname: "127.0.0.1",
+          port: 443,
+          fetch: () => new Response(null, { status: 503 }),
+        });
+        await availableEndpoint.stop(true);
+      } finally {
+        await occupiedControl.stop(true);
+      }
+      completed = true;
+    } finally {
+      await Promise.allSettled([stopHost(serving), stopHost(bootstrap)]);
+      if (completed) await rm(root, { recursive: true, force: true });
+    }
+  },
+  240_000,
 );
 
 test.skipIf(OPT_IN === undefined || OPT_IN.trim() === "")(
