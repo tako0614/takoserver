@@ -72,6 +72,7 @@ export async function inspectV2ExistingMaintenancePublication(input: {
   readonly phase: "preflight" | "verification";
   readonly target: DeployTarget;
   readonly selectedCommit: string;
+  readonly providerExecutorSourceCommit: string;
   readonly selectedBuiltModuleDigestHex: string;
   readonly buildHistorical: (commit: string) => Promise<string>;
   readonly state: V2ExistingMaintenanceWorkerState;
@@ -79,6 +80,9 @@ export async function inspectV2ExistingMaintenancePublication(input: {
   readonly run: (command: readonly string[]) => Promise<CommandResult>;
 }): Promise<V2ExistingMaintenanceProof> {
   const { phase, target, state } = input;
+  if (!/^[0-9a-f]{40}$/u.test(input.providerExecutorSourceCommit)) {
+    throw phaseError(phase, "0088 private CPE selected source is malformed");
+  }
   if (
     target.environment !== "integration" ||
     target.schemaMaintenanceMode !== "pre-v2-0088-quiesced" ||
@@ -137,7 +141,7 @@ export async function inspectV2ExistingMaintenancePublication(input: {
   const provider = await input.providerExecutorQualification.read(phase);
   if (
     !providerExecutorAllowsPublication(target, provider) ||
-    provider.maintenance?.selectedSourceCommit !== input.selectedCommit ||
+    provider.maintenance?.selectedSourceCommit !== input.providerExecutorSourceCommit ||
     provider.maintenance.predecessorSourceCommit === provider.maintenance.selectedSourceCommit
   ) {
     throw phaseError(phase, "0088 private CPE maintenance publication is not exact");

@@ -64,6 +64,7 @@ describe("curated deploy extension schema readback", () => {
     const options: SchemaOptions = {
       v2ExistingMaintenance: {
         historicalSourceRoot: "/fixture/historical",
+        providerExecutorSourceCommit: "b".repeat(40),
         providerExecutorQualification: {
           read: async () => {
             throw new Error("unused fixture");

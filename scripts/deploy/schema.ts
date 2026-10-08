@@ -650,6 +650,8 @@ export interface SchemaOptions {
   /** Trusted owner composition for the separate integration-only 0066→0088 wave. */
   readonly v2ExistingMaintenance?: {
     readonly providerExecutorQualification: WorkerProviderExecutorQualification;
+    /** Owner-selected and source-qualified private CPE SHA; never the public repo SHA. */
+    readonly providerExecutorSourceCommit: string;
     /** Clean historical checkout of the actually deployed pre-v2 predecessor. */
     readonly historicalSourceRoot: string;
     /** Live provider state; omitted only when the ordinary Cloudflare credential can supply it. */
@@ -4369,6 +4371,7 @@ async function inspectV2ExistingProof(input: {
     phase: input.phase ?? "preflight",
     target: input.target,
     selectedCommit: input.invocation.commit,
+    providerExecutorSourceCommit: configured.providerExecutorSourceCommit,
     selectedBuiltModuleDigestHex: input.sources.selectedModuleDigestHex,
     buildHistorical: input.sources.buildHistorical,
     state,

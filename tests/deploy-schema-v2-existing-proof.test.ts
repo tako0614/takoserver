@@ -19,6 +19,8 @@ import type { ProviderExecutorInspection } from "../scripts/deploy/worker.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 
 const selectedCommit = "a".repeat(40);
+const privateSelectedCommit = "b".repeat(40);
+const privatePredecessorCommit = "c".repeat(40);
 const predecessorCommit = "af6dd0e6b38a23a075ee47f5d60d4d04173676ff";
 const code = "export default { fetch() { return new Response('maintenance'); } };\n";
 const digest = createHash("sha256").update(code).digest("hex");
@@ -126,7 +128,7 @@ const provider: ProviderExecutorInspection = {
   versionId: "00000000-0000-4000-8000-000000000091",
   deploymentId: "00000000-0000-4000-8000-000000000092",
   previousVersionId: "00000000-0000-4000-8000-000000000093",
-  commit: selectedCommit,
+  commit: privateSelectedCommit,
   bundleDigestHex: digest,
   moduleDigestHex: digest,
   maintenance: {
@@ -138,9 +140,9 @@ const provider: ProviderExecutorInspection = {
     activeVersionId: "00000000-0000-4000-8000-000000000091",
     activeDeploymentId: "00000000-0000-4000-8000-000000000092",
     previousVersionId: "00000000-0000-4000-8000-000000000093",
-    selectedSourceCommit: selectedCommit,
+    selectedSourceCommit: privateSelectedCommit,
     selectedModuleDigestHex: digest,
-    predecessorSourceCommit: predecessorCommit,
+    predecessorSourceCommit: privatePredecessorCommit,
     predecessorVersionId: "00000000-0000-4000-8000-000000000093",
     observedNonCodeDigestHex: "f".repeat(64),
   },
@@ -151,6 +153,7 @@ function input(nativeCurrent = code) {
     phase: "preflight" as const,
     target,
     selectedCommit,
+    providerExecutorSourceCommit: privateSelectedCommit,
     selectedBuiltModuleDigestHex: digest,
     buildHistorical: async () => digest,
     state: state(nativeCurrent),
@@ -171,6 +174,38 @@ describe("0088 exact non-serving publication proof", () => {
       publicPredecessorVersionId: predecessorId,
       publicModuleDigestHex: digest,
     });
+    expect(proof.provider.maintenance?.selectedSourceCommit).toBe(privateSelectedCommit);
+    expect(proof.provider.maintenance?.selectedSourceCommit).not.toBe(selectedCommit);
+  });
+
+  test("rejects a private CPE source vector inconsistent within its own repo", async () => {
+    const maintenance = provider.maintenance;
+    if (maintenance === undefined) throw new Error("fixture maintenance is missing");
+    await expect(
+      inspectV2ExistingMaintenancePublication({
+        ...input(),
+        providerExecutorQualification: {
+          async read() {
+            return {
+              ...provider,
+              maintenance: {
+                ...maintenance,
+                selectedSourceCommit: selectedCommit,
+              },
+            };
+          },
+        },
+      }),
+    ).rejects.toThrow("private CPE maintenance publication is not exact");
+  });
+
+  test("rejects a different owner-selected private source despite exact public bytes", async () => {
+    await expect(
+      inspectV2ExistingMaintenancePublication({
+        ...input(),
+        providerExecutorSourceCommit: "d".repeat(40),
+      }),
+    ).rejects.toThrow("private CPE maintenance publication is not exact");
   });
 
   test("refuses selected native bytes drift despite matching annotation", async () => {
@@ -195,6 +230,7 @@ async function runApplyFixture(
     readonly afterCount?: number;
     readonly driftAtProofRead?: number;
     readonly onDispatch?: () => void;
+    readonly providerExecutorSourceCommit?: string;
   } = {},
 ) {
   const maintenance = provider.maintenance;
@@ -277,6 +313,8 @@ async function runApplyFixture(
         review: "reviewer@example.test",
         v2ExistingMaintenance: {
           historicalSourceRoot: root,
+          providerExecutorSourceCommit:
+            options.providerExecutorSourceCommit ?? privateSelectedCommit,
           publicWorkerState: state(),
           providerExecutorQualification: {
             async read() {
@@ -327,5 +365,16 @@ test("a last-edge CPE publication change refuses before the migration dispatch",
   await expect(
     runApplyFixture({ driftAtProofRead: 5, onDispatch: () => dispatches++ }),
   ).rejects.toThrow("maintenance proof changed");
+  expect(dispatches).toBe(0);
+});
+
+test("the composed writer refuses a wrong private CPE source without dispatch", async () => {
+  let dispatches = 0;
+  await expect(
+    runApplyFixture({
+      providerExecutorSourceCommit: "d".repeat(40),
+      onDispatch: () => dispatches++,
+    }),
+  ).rejects.toThrow("private CPE maintenance publication is not exact");
   expect(dispatches).toBe(0);
 });
