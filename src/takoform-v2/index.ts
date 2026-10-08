@@ -83,6 +83,10 @@ export {
   type SQLiteWorkerBindingClaim,
 } from "./forms/sqlite-worker-binding-authority.ts";
 export {
+  createWorkerBundleCustody,
+  type WorkerBundleCustody,
+} from "./forms/worker-bundle-backend.ts";
+export {
   referencesForModuleWorker,
   referencesForWorkerDeployment,
   referencesForWorkerEndpoint,

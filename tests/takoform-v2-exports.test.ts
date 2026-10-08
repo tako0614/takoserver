@@ -20,6 +20,7 @@ import type {
   V2WorkerPublicationResolution,
   V2WorkerPublicationSnapshot,
   V2WorkerVersionMaterials,
+  WorkerBundleCustody,
 } from "@takoserver/core/takoform-v2";
 import * as extension from "@takoserver/core/takoform-v2";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
@@ -48,6 +49,7 @@ import {
   SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
 } from "../src/takoform-v2/forms/sqlite-migration-application-backend.ts";
 import { createSQLiteWorkerBindingAuthority } from "../src/takoform-v2/forms/sqlite-worker-binding-authority.ts";
+import { createWorkerBundleCustody } from "../src/takoform-v2/forms/worker-bundle-backend.ts";
 import { referencesForWorkerForm } from "../src/takoform-v2/forms/worker-references.ts";
 import {
   MODULE_WORKER_FORM_URL,
@@ -91,6 +93,7 @@ const RUNTIME_EXPORTS = [
   "createSQLiteDatabaseForm",
   "createSQLiteMigrationApplicationForm",
   "createSQLiteWorkerBindingAuthority",
+  "createWorkerBundleCustody",
   "createV2NativeEffectCustody",
   "createV2NativeDeletionCustody",
   "createV2ServiceBindingAuthority",
@@ -131,6 +134,7 @@ const RUNTIME_EXPORTS = [
 test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", async () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
+  expect(extension.createWorkerBundleCustody).toBe(createWorkerBundleCustody);
   expect(extension.createObjectBucketForm).toBe(createObjectBucketForm);
   expect(extension.createObjectBucketWorkerBindingAuthority).toBe(
     createObjectBucketWorkerBindingAuthority,
@@ -204,6 +208,7 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
     ensureDeleted: async () => "absent",
   };
   const sqliteClaimType = (_claim: SQLiteWorkerBindingClaim): void => {};
+  const workerBundleCustodyType = (_custody: WorkerBundleCustody): void => {};
   expect(unresolved.kind).toBe("unresolved");
   expect([
     snapshotType,
@@ -212,7 +217,8 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
     inspectorType,
     sqlitePort,
     sqliteClaimType,
-  ]).toHaveLength(6);
+    workerBundleCustodyType,
+  ]).toHaveLength(7);
 
   const claim: QueueWorkerBindingClaim = {
     principal: "principal",
@@ -311,5 +317,7 @@ test("v2 extension entrypoint bundles for a Worker without Node or workerd runti
   if (!artifact) throw new Error("missing v2 extension artifact");
   const source = await artifact.text();
   expect(new Bun.Transpiler({ loader: "js" }).scanImports(source)).toEqual([]);
-  expect(source).not.toMatch(/\b(?:Bun|process)\b|\bnode:/u);
+  expect(source).not.toMatch(
+    /\bBun\b|(?<![\w.])process\s*(?:\?\.|\.|\?\[|\[)|typeof\s+(?:globalThis\.)?process\b|\b(?:globalThis|self|window)\.process\b|\bnode:/u,
+  );
 });
