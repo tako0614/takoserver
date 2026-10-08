@@ -478,6 +478,8 @@ export default { fetch(request) { return inspectVersion(request); } };`),
         // already supplied by dataPlane (or another private plane) is invalid.
         hostModules: [
           ...(site.hostModules ?? []),
+          // The former entrypoint becomes an additional module. Legacy Actor
+          // graphs can already list it; do not declare that same module twice.
           ...(site.hostModules?.includes(wrapper) ? [] : [wrapper]),
           helper,
         ],
