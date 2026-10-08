@@ -478,14 +478,16 @@ test.skipIf(binary === undefined || guard === undefined)(
           cleanupErrors.push(error);
         }
       }
-      const workerStopped = (
-        await Promise.all(
-          [oldWorkerChild, recoveredWorkerChild]
-            .filter((identity): identity is LinuxProcessIdentity => identity !== undefined)
-            .map(linuxProcessLiveness),
-        )
-      ).every((state) => state === "stale");
+      // A failed journey may have started a native child before its identity
+      // was captured. Never remove owner roots on that unknown inventory.
+      const workerStopped =
+        oldWorkerChild !== undefined &&
+        recoveredWorkerChild !== undefined &&
+        (await Promise.all([oldWorkerChild, recoveredWorkerChild].map(linuxProcessLiveness))).every(
+          (state) => state === "stale",
+        );
       const safeToRemove =
+        primaryFailure === undefined &&
         cleanupErrors.length === 0 &&
         [second, first].every((host) => !host || host.stopped()) &&
         workerStopped;
