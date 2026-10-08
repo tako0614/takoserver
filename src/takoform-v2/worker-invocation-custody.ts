@@ -700,6 +700,18 @@ export function createV2WorkerInvocationLifecycle(options: {
                AND deployment.last_operation=tf_v2_worker_invocations.source_operation_id
                AND json_type(deployment.observed_json,'$.ready')='true'
                AND json_extract(deployment.observed_json,'$.active')=1
+               AND json_array_length(json_extract(deployment.spec_json,'$.versions'))=
+                 json_array_length(json_extract(deployment.observed_json,'$.selectedVersions'))
+               AND NOT EXISTS (SELECT 1 FROM json_each(deployment.spec_json,'$.versions') desired
+                 WHERE NOT EXISTS (SELECT 1 FROM json_each(deployment.observed_json,'$.selectedVersions') observed
+                   WHERE json_extract(observed.value,'$.resourceUid')=
+                     json_extract(desired.value,'$.workerVersion.resourceUid')
+                     AND json_extract(observed.value,'$.weight')=json_extract(desired.value,'$.weight')))
+               AND NOT EXISTS (SELECT 1 FROM json_each(deployment.observed_json,'$.selectedVersions') observed
+                 WHERE NOT EXISTS (SELECT 1 FROM json_each(deployment.spec_json,'$.versions') desired
+                   WHERE json_extract(desired.value,'$.workerVersion.resourceUid')=
+                     json_extract(observed.value,'$.resourceUid')
+                     AND json_extract(desired.value,'$.weight')=json_extract(observed.value,'$.weight')))
                AND EXISTS (SELECT 1 FROM json_each(deployment.spec_json,'$.versions') desired
                  JOIN json_each(deployment.observed_json,'$.selectedVersions') observed
                    ON json_extract(observed.value,'$.resourceUid')=

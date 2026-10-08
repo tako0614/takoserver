@@ -618,6 +618,163 @@ test("an accepted Trigger update retains the already recorded match identity", a
   }
 });
 
+test("beginSend refuses a weighted Deployment whose non-selected observed release disappeared", async () => {
+  for (const removeOther of [false, true]) {
+    const db = openDb();
+    try {
+      const { graph, release } = seedPublishedGraph(db);
+      const secondUid = "version-cron-second";
+      const secondOp = "version-operation-second";
+      const pairOperation = "deployment-operation-pair";
+      const secondRelease = {
+        ...release,
+        versionUid: secondUid,
+        scriptName: `v2w-${"c".repeat(48)}`,
+        descriptorDigest: `sha256:${"e".repeat(64)}` as const,
+        providerEtag: "provider-cron-receipt-002",
+        weight: 5_000,
+      };
+      const firstRelease = { ...release, weight: 5_000 };
+      db.prepare(`INSERT INTO tf_v2_resources
+      (uid,principal,form_url,space,name,backend_id,target_key,active_name,
+       generation,observed_generation,observed_at,phase,spec_json,observed_json,
+       output_json,last_operation,busy_operation,deleted_at)
+      SELECT ?,principal,form_url,space,'cron-second-version',backend_id,target_key,
+        'cron-second-version',generation,observed_generation,observed_at,phase,
+        spec_json,observed_json,output_json,?,busy_operation,deleted_at
+      FROM tf_v2_resources WHERE uid=?`).run(secondUid, secondOp, graph.versionUid);
+      db.prepare(`INSERT INTO tf_v2_operations
+      (id,resource_uid,principal,replay_key,request_fingerprint,action,generation,
+       status,effect,created_at,updated_at,retain_until,backend_id,target_key,
+       backend_key,accepted_spec_json,dispatch_possible,next_attempt_at_ms,
+       result_observed_json,result_output_json)
+      SELECT ?,?,principal,'replay-second-version','fingerprint-second-version',
+        action,generation,status,effect,created_at,updated_at,retain_until,
+        backend_id,target_key,'backend-version-operation-second',accepted_spec_json,
+        dispatch_possible,next_attempt_at_ms,result_observed_json,result_output_json
+      FROM tf_v2_operations WHERE id=?`).run(secondOp, secondUid, graph.versionOperation);
+      db.prepare(
+        "INSERT INTO tf_v2_operation_reference_sets (operation_id,sealed) VALUES (?,1)",
+      ).run(secondOp);
+      db.prepare(`INSERT INTO tf_v2_operation_references
+      (operation_id,target_uid,form_url,readiness,target_spec_path,target_spec_equals)
+      VALUES (?,?,?,'observed',NULL,NULL)`).run(secondOp, graph.workerUid, MODULE_WORKER_FORM_URL);
+      db.prepare(`INSERT INTO tf_v2_operation_references
+      (operation_id,target_uid,form_url,readiness,target_spec_path,target_spec_equals)
+      VALUES (?,?,?,'ready',NULL,NULL)`).run(
+        graph.deploymentOperation,
+        secondUid,
+        WORKER_VERSION_FORM_URL,
+      );
+      db.prepare(`INSERT INTO tf_v2_worker_native_effects
+      (operation_id,resource_uid,principal,space,backend_key,backend_id,target_key,
+       generation,native_identity,closure_digest,grant_lease_token,granted_at_ms,
+       acknowledged_receipt,confirmed_receipt)
+      VALUES (?,?,?,?,'backend-version-operation-second','fixture-backend',?,
+       1,?,?,?,1000,?,?)`).run(
+        secondOp,
+        secondUid,
+        PRINCIPAL,
+        SPACE,
+        TARGET_KEY,
+        secondRelease.scriptName,
+        secondRelease.descriptorDigest,
+        "version-grant-token-002",
+        secondRelease.providerEtag,
+        secondRelease.providerEtag,
+      );
+      const desired = JSON.stringify({
+        worker: { resourceUid: graph.workerUid },
+        versions: [firstRelease, secondRelease].map((item) => ({
+          workerVersion: { resourceUid: item.versionUid },
+          weight: item.weight,
+        })),
+      });
+      const observed = JSON.stringify({
+        active: true,
+        ready: true,
+        selectedVersions: [firstRelease, secondRelease].map((item) => ({
+          resourceUid: item.versionUid,
+          weight: item.weight,
+        })),
+      });
+      db.prepare(`INSERT INTO tf_v2_operations
+      (id,resource_uid,principal,replay_key,request_fingerprint,action,generation,
+       status,effect,created_at,updated_at,retain_until,backend_id,target_key,
+       backend_key,accepted_spec_json,dispatch_possible,next_attempt_at_ms,
+       result_observed_json,result_output_json)
+      SELECT ?,resource_uid,principal,'replay-pair','fingerprint-pair','update',2,
+        status,effect,created_at,updated_at,retain_until,backend_id,target_key,
+        'backend-deployment-operation-pair',?,dispatch_possible,next_attempt_at_ms,
+        ?,result_output_json
+      FROM tf_v2_operations WHERE id=?`).run(
+        pairOperation,
+        desired,
+        observed,
+        graph.deploymentOperation,
+      );
+      db.prepare(
+        "INSERT INTO tf_v2_operation_reference_sets (operation_id,sealed) VALUES (?,1)",
+      ).run(pairOperation);
+      for (const [uid, form, readiness] of [
+        [graph.workerUid, MODULE_WORKER_FORM_URL, "observed"],
+        [graph.versionUid, WORKER_VERSION_FORM_URL, "ready"],
+        [secondUid, WORKER_VERSION_FORM_URL, "ready"],
+      ] as const) {
+        db.prepare(`INSERT INTO tf_v2_operation_references
+        (operation_id,target_uid,form_url,readiness,target_spec_path,target_spec_equals)
+        VALUES (?,?,?,?,NULL,NULL)`).run(pairOperation, uid, form, readiness);
+      }
+      db.prepare(`UPDATE tf_v2_resources SET generation=2,observed_generation=2,
+      last_operation=?,spec_json=?,observed_json=? WHERE uid=?`).run(
+        pairOperation,
+        desired,
+        observed,
+        graph.deploymentUid,
+      );
+      const sql = createSqliteSql(db);
+      const custody = createV2WorkerInvocationLifecycle({ sql });
+      let admission: unknown;
+      let began: boolean | undefined;
+      await runWorkerCronTriggerTick({
+        sql,
+        now: () => new Date(),
+        targetKey: TARGET_KEY,
+        delivery: {
+          async invokeScheduled(input) {
+            const claim = cronClaim(graph, firstRelease, input);
+            admission = await custody.admitCron({
+              ...claim,
+              route: {
+                ...claim.route,
+                deploymentGeneration: 2,
+                sourceOperationId: pairOperation,
+                releases: [firstRelease, secondRelease],
+              },
+            });
+            if (removeOther) {
+              db.prepare("UPDATE tf_v2_resources SET observed_json=? WHERE uid=?").run(
+                JSON.stringify({
+                  active: true,
+                  ready: true,
+                  selectedVersions: [{ resourceUid: graph.versionUid, weight: 5_000 }],
+                }),
+                graph.deploymentUid,
+              );
+            }
+            began = await custody.beginSend(claim.handle);
+            return { kind: "unknown" };
+          },
+        },
+      });
+      expect(admission).toMatchObject({ kind: "granted" });
+      expect(began).toBe(!removeOther);
+    } finally {
+      db.close();
+    }
+  }
+});
+
 test("ambiguous Cron admission and beginSend ACKs never authorize a second native send", async () => {
   for (const lost of ["admit", "beginSend"] as const) {
     const directory = mkdtempSync(join(tmpdir(), "v2-cron-custody-ack-"));
