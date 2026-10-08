@@ -87,6 +87,13 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "v2-contract", "v2-private", "v2-state"],
   },
   {
+    // Node's DatabaseSync and authorizer are the self-host-only realization.
+    // Portable Form orchestration and the SDK index must not import it.
+    name: "v2-sqlite-migration-native",
+    match: /^src\/takoform-v2\/forms\/sqlite-migration-application-native\.ts$/u,
+    may: ["v2-form"],
+  },
+  {
     name: "v2-form",
     match: /^src\/takoform-v2\/forms\/[^/]+\.ts$/u,
     may: ["core", "v2-contract", "v2-form"],
@@ -545,6 +552,7 @@ const WORKER_ENTRIES = walk("src").filter((path) =>
   /^src\/entry-(?:[^/]+-)?worker\.ts$/u.test(path),
 );
 const HOST_ONLY = [
+  "src/takoform-v2/forms/sqlite-migration-application-native.ts",
   "src/sql-sqlite.ts",
   "src/objects-mem.ts",
   // A Worker has no filesystem. Reaching this would fail at runtime rather

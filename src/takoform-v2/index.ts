@@ -47,6 +47,18 @@ export {
   validateSQLiteDatabaseUpdate,
 } from "./forms/sqlite-database.ts";
 export { createSQLiteDatabaseForm } from "./forms/sqlite-database-backend.ts";
+export {
+  createSQLiteMigrationApplicationForm,
+  SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
+} from "./forms/sqlite-migration-application-backend.ts";
+export type {
+  SQLiteMigrationApplicationPort,
+  SQLiteMigrationEntry,
+  SQLiteMigrationFileResult,
+  SQLiteMigrationLedgerResult,
+  SQLiteMigrationRecord,
+  SQLiteMigrationSession,
+} from "./forms/sqlite-migration-application-port.ts";
 export type { SQLiteDatabaseNativePort } from "./forms/sqlite-native-store-port.ts";
 export {
   createSQLiteWorkerBindingAuthority,

@@ -3,6 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { bytesDigest } from "../src/json.ts";
 import { createSelfhostV2SQLiteStore } from "../src/providers/selfhost-v2-sqlite-store.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -12,17 +13,23 @@ import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-databa
 import { createSQLiteDatabaseForm } from "../src/takoform-v2/forms/sqlite-database-backend.ts";
 import { SQLITE_MIGRATION_APPLICATION_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-application.ts";
 import { createSQLiteMigrationApplicationForm } from "../src/takoform-v2/forms/sqlite-migration-application-backend.ts";
+import { createSQLiteMigrationApplicationNativePort } from "../src/takoform-v2/forms/sqlite-migration-application-native.ts";
+import type { SQLiteMigrationApplicationPort } from "../src/takoform-v2/forms/sqlite-migration-application-port.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 import {
   createSQLiteMigrationSetCustody,
   createSQLiteMigrationSetForm,
 } from "../src/takoform-v2/forms/sqlite-migration-set-backend.ts";
+import type { SQLiteDatabaseNativePort } from "../src/takoform-v2/forms/sqlite-native-store-port.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
 
 const MANIFEST_URL = "https://artifacts.example.test/migrations.json";
 const FILE_URL = "https://artifacts.example.test/0001.sql";
 
-async function fixture(sqlText: string | readonly string[]) {
+async function fixture(
+  sqlText: string | readonly string[],
+  portFactory?: (native: SQLiteMigrationApplicationPort) => SQLiteMigrationApplicationPort,
+) {
   const root = mkdtempSync(join(tmpdir(), "v2-sqlite-app-"));
   const database = new Database(join(root, "control.sqlite"));
   database.exec("PRAGMA foreign_keys = ON");
@@ -89,7 +96,9 @@ async function fixture(sqlText: string | readonly string[]) {
   });
   const appForm = createSQLiteMigrationApplicationForm({
     sql,
-    store,
+    migrationPort: portFactory
+      ? portFactory(createSQLiteMigrationApplicationNativePort(store))
+      : createSQLiteMigrationApplicationNativePort(store),
     custody,
     targetKey: "selfhost-application-target-1",
     now: clock,
@@ -387,6 +396,258 @@ test("lost Application acknowledgement resumes from committed ledger without rer
   } finally {
     f.close();
   }
+});
+
+test("portable session reconciles an unknown file ACK from the exact committed ledger row", async () => {
+  let attempts = 0;
+  const f = await fixture(
+    "CREATE TABLE item (value TEXT); INSERT INTO item VALUES ('once');",
+    (native) => ({
+      withAuthorizedMigrationSession(input) {
+        return native.withAuthorizedMigrationSession({
+          ...input,
+          use(session) {
+            return input.use({
+              ...session,
+              async applyOneHeldFile(file) {
+                attempts += 1;
+                const result = await session.applyOneHeldFile(file);
+                return result.kind === "applied" ? { kind: "unknown" } : result;
+              },
+            });
+          },
+        });
+      },
+    }),
+  );
+  try {
+    const { databaseUid, setUid } = await f.prepare();
+    const application = await f.createApplication(databaseUid, setUid);
+    expect((await f.drive(application.id)).status).toBe("succeeded");
+    expect(attempts).toBe(1);
+    expect(
+      await f.store.withAuthorizedDatabase({
+        resourceUid: databaseUid,
+        stillAuthorized: async () => true,
+        use(database) {
+          return {
+            rows: database.prepare("SELECT value FROM item").all(),
+            ledger: database
+              .prepare(
+                "SELECT sequence, path, sha256, operation_id FROM _takoform_sqlite_migrations",
+              )
+              .all(),
+          };
+        },
+      }),
+    ).toMatchObject({
+      rows: [{ value: "once" }],
+      ledger: [{ sequence: 1, path: "migrations/0001.sql", sha256: f.fileSha256 }],
+    });
+  } finally {
+    f.close();
+  }
+});
+
+test("portable session leaves an uncommitted unknown file outcome unknown until a new lease", async () => {
+  let attempts = 0;
+  const f = await fixture(
+    "CREATE TABLE item (value TEXT); INSERT INTO item VALUES ('once');",
+    (native) => ({
+      withAuthorizedMigrationSession(input) {
+        return native.withAuthorizedMigrationSession({
+          ...input,
+          use(session) {
+            return input.use({
+              ...session,
+              async applyOneHeldFile(file) {
+                attempts += 1;
+                return attempts === 1 ? { kind: "unknown" } : session.applyOneHeldFile(file);
+              },
+            });
+          },
+        });
+      },
+    }),
+  );
+  try {
+    const { databaseUid, setUid } = await f.prepare();
+    const application = await f.createApplication(databaseUid, setUid);
+    expect((await f.engine.runNext())?.status).toBe("reconciling");
+    expect(
+      await f.store.withAuthorizedDatabase({
+        resourceUid: databaseUid,
+        stillAuthorized: async () => true,
+        use(database) {
+          return database
+            .prepare("SELECT count(*) AS count FROM _takoform_sqlite_migrations")
+            .get();
+        },
+      }),
+    ).toEqual({ count: 0 });
+    f.advance(1_001);
+    expect((await f.drive(application.id)).status).toBe("succeeded");
+    expect(attempts).toBe(2);
+  } finally {
+    f.close();
+  }
+});
+
+test("a valid but different durable ledger prefix refuses the held migration without SQL effect", async () => {
+  const f = await fixture("CREATE TABLE item (value TEXT)");
+  try {
+    const { databaseUid, setUid } = await f.prepare();
+    await f.store.withAuthorizedDatabase({
+      resourceUid: databaseUid,
+      stillAuthorized: async () => true,
+      use(database) {
+        database
+          .prepare(
+            "INSERT INTO _takoform_sqlite_migrations (sequence, path, sha256, operation_id) VALUES (?, ?, ?, ?)",
+          )
+          .run(1, "migrations/other.sql", "a".repeat(64), "earlier-operation");
+      },
+    });
+    const application = await f.createApplication(databaseUid, setUid);
+    expect(await f.drive(application.id)).toMatchObject({
+      status: "failed",
+      effect: "none",
+      error: { code: "migration_history_conflict" },
+    });
+    expect(
+      await f.store.withAuthorizedDatabase({
+        resourceUid: databaseUid,
+        stillAuthorized: async () => true,
+        use(database) {
+          return {
+            table: database.prepare("SELECT name FROM sqlite_schema WHERE name = 'item'").get(),
+            ledger: database
+              .prepare("SELECT sequence, path FROM _takoform_sqlite_migrations")
+              .all(),
+          };
+        },
+      }),
+    ).toEqual({ table: undefined, ledger: [{ sequence: 1, path: "migrations/other.sql" }] });
+  } finally {
+    f.close();
+  }
+});
+
+test("typed second-file busy keeps the first committed file as partial evidence", async () => {
+  const f = await fixture(
+    [
+      "CREATE TABLE item (value TEXT); INSERT INTO item VALUES ('first');",
+      "INSERT INTO item VALUES ('second');",
+    ],
+    (native) => ({
+      withAuthorizedMigrationSession(input) {
+        return native.withAuthorizedMigrationSession({
+          ...input,
+          use(session) {
+            return input.use({
+              ...session,
+              applyOneHeldFile(file) {
+                return file.sequence === 2
+                  ? Promise.resolve({ kind: "rejected", code: "database_busy" })
+                  : session.applyOneHeldFile(file);
+              },
+            });
+          },
+        });
+      },
+    }),
+  );
+  try {
+    const { databaseUid, setUid } = await f.prepare();
+    const application = await f.createApplication(databaseUid, setUid);
+    expect(await f.drive(application.id)).toMatchObject({
+      status: "failed",
+      effect: "partial",
+      error: { code: "database_busy" },
+    });
+    expect(
+      await f.store.withAuthorizedDatabase({
+        resourceUid: databaseUid,
+        stillAuthorized: async () => true,
+        use(database) {
+          return {
+            rows: database.prepare("SELECT value FROM item").all(),
+            ledger: database
+              .prepare("SELECT sequence, path FROM _takoform_sqlite_migrations")
+              .all(),
+          };
+        },
+      }),
+    ).toEqual({
+      rows: [{ value: "first" }],
+      ledger: [{ sequence: 1, path: "migrations/0001.sql" }],
+    });
+  } finally {
+    f.close();
+  }
+});
+
+test("native session never treats an in-doubt transaction's visible ledger row as committed", async () => {
+  const entry = { path: "migrations/0001.sql", sha256: "a".repeat(64) };
+  let uncommitted = false;
+  const database = {
+    prepare(sql: string) {
+      if (sql.startsWith("SELECT")) {
+        return {
+          all: () =>
+            uncommitted ? [{ sequence: 1, ...entry, operation_id: "operation-one" }] : [],
+        };
+      }
+      return {
+        run: () => {
+          uncommitted = true;
+        },
+      };
+    },
+    exec(sql: string) {
+      if (sql === "COMMIT" || sql === "ROLLBACK") throw new Error("forced transaction uncertainty");
+    },
+    setAuthorizer() {},
+  } as unknown as DatabaseSync;
+  const store: Pick<SQLiteDatabaseNativePort, "withAuthorizedDatabase"> = {
+    async withAuthorizedDatabase(input) {
+      return await input.use(database);
+    },
+  };
+  const port = createSQLiteMigrationApplicationNativePort(store);
+  await port.withAuthorizedMigrationSession({
+    resourceUid: "database-one",
+    execution: {
+      operationId: "operation-one",
+      leaseToken: "lease-one",
+      backendKey: "backend-one",
+      backendId: "backend-id-one",
+      targetKey: "target-one",
+      resourceUid: "application-one",
+      principal: "alice",
+      action: "create",
+      generation: 1,
+      form: SQLITE_MIGRATION_APPLICATION_FORM_URL,
+      space: "default",
+      name: "application",
+      spec: {},
+    },
+    stillAuthorized: async () => true,
+    async use(session) {
+      expect(await session.readLedger()).toEqual({ kind: "read", entries: [] });
+      expect(
+        await session.applyOneHeldFile({
+          sequence: 1,
+          expectedPrefix: [],
+          entry,
+          bytes: new TextEncoder().encode("CREATE TABLE item (value TEXT)"),
+          operationId: "operation-one",
+        }),
+      ).toEqual({ kind: "unknown" });
+      expect(uncommitted).toBe(true);
+      expect(await session.readLedger()).toEqual({ kind: "unknown" });
+    },
+  });
 });
 
 test("known first-file commit is partial; a new immutable Set advances from its exact prefix", async () => {
