@@ -4,6 +4,8 @@ import type {
   JsonObject,
   QueueWorkerBindingClaim,
   QueueWorkerBindingResolution,
+  SQLiteDatabaseNativePort,
+  SQLiteWorkerBindingClaim,
   Sql,
   V2Backend,
   V2BackendResult,
@@ -19,6 +21,13 @@ import * as extension from "@takoserver/core/takoform-v2";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
 import { createQueueWorkerBindingAuthority } from "../src/takoform-v2/forms/queue-worker-binding-authority.ts";
+import {
+  parseSQLiteDatabaseSpec,
+  SQLITE_DATABASE_FORM_URL,
+  validateSQLiteDatabaseUpdate,
+} from "../src/takoform-v2/forms/sqlite-database.ts";
+import { createSQLiteDatabaseForm } from "../src/takoform-v2/forms/sqlite-database-backend.ts";
+import { createSQLiteWorkerBindingAuthority } from "../src/takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { referencesForWorkerForm } from "../src/takoform-v2/forms/worker-references.ts";
 import {
   MODULE_WORKER_FORM_URL,
@@ -53,6 +62,8 @@ const RUNTIME_EXPORTS = [
   "createV2EdgeKvNativeCustody",
   "createAtLeastOnceQueueForm",
   "createQueueWorkerBindingAuthority",
+  "createSQLiteDatabaseForm",
+  "createSQLiteWorkerBindingAuthority",
   "createV2NativeEffectCustody",
   "createV2NativeDeletionCustody",
   "createV2ServiceBindingAuthority",
@@ -64,6 +75,7 @@ const RUNTIME_EXPORTS = [
   "inspectV2WorkerInvocationSchema",
   "parseEdgeKVNamespaceSpec",
   "parseModuleWorkerSpec",
+  "parseSQLiteDatabaseSpec",
   "parseWorkerDeploymentSpec",
   "parseWorkerEndpointSpec",
   "parseWorkerVersionSpec",
@@ -75,10 +87,12 @@ const RUNTIME_EXPORTS = [
   "referencesForWorkerForm",
   "referencesForWorkerVersion",
   "runWorkerCronTriggerTick",
+  "SQLITE_DATABASE_FORM_URL",
   "v2WorkerInvocationSchemaReady",
   "V2_QUEUE_BACKEND_ID",
   "validateEdgeKVNamespaceUpdate",
   "validateModuleWorkerUpdate",
+  "validateSQLiteDatabaseUpdate",
   "validateWorkerDeploymentUpdate",
   "validateWorkerEndpointUpdate",
   "validateWorkerVersionUpdate",
@@ -87,6 +101,11 @@ const RUNTIME_EXPORTS = [
 test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", async () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
+  expect(extension.createSQLiteDatabaseForm).toBe(createSQLiteDatabaseForm);
+  expect(extension.createSQLiteWorkerBindingAuthority).toBe(createSQLiteWorkerBindingAuthority);
+  expect(extension.SQLITE_DATABASE_FORM_URL).toBe(SQLITE_DATABASE_FORM_URL);
+  expect(extension.parseSQLiteDatabaseSpec).toBe(parseSQLiteDatabaseSpec);
+  expect(extension.validateSQLiteDatabaseUpdate).toBe(validateSQLiteDatabaseUpdate);
   expect(extension.runWorkerCronTriggerTick).toBe(runWorkerCronTriggerTick);
   expect(extension.createQueueWorkerBindingAuthority).toBe(createQueueWorkerBindingAuthority);
   expect(extension.createAtLeastOnceQueueForm).toBe(createAtLeastOnceQueueForm);
@@ -134,8 +153,17 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   const materialsType = (_materials: V2WorkerVersionMaterials): void => {};
   const sqlType = (_sql: Sql): void => {};
   const inspectorType = (_inspector: V2WorkerModuleInspector): void => {};
+  const sqlitePortType = (_port: SQLiteDatabaseNativePort): void => {};
+  const sqliteClaimType = (_claim: SQLiteWorkerBindingClaim): void => {};
   expect(unresolved.kind).toBe("unresolved");
-  expect([snapshotType, materialsType, sqlType, inspectorType]).toHaveLength(4);
+  expect([
+    snapshotType,
+    materialsType,
+    sqlType,
+    inspectorType,
+    sqlitePortType,
+    sqliteClaimType,
+  ]).toHaveLength(6);
 
   const claim: QueueWorkerBindingClaim = {
     principal: "principal",

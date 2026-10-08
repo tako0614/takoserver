@@ -42,6 +42,17 @@ export {
   type QueueWorkerBindingResolution,
 } from "./forms/queue-worker-binding-authority.ts";
 export {
+  parseSQLiteDatabaseSpec,
+  SQLITE_DATABASE_FORM_URL,
+  validateSQLiteDatabaseUpdate,
+} from "./forms/sqlite-database.ts";
+export { createSQLiteDatabaseForm } from "./forms/sqlite-database-backend.ts";
+export type { SQLiteDatabaseNativePort } from "./forms/sqlite-native-store-port.ts";
+export {
+  createSQLiteWorkerBindingAuthority,
+  type SQLiteWorkerBindingClaim,
+} from "./forms/sqlite-worker-binding-authority.ts";
+export {
   referencesForModuleWorker,
   referencesForWorkerDeployment,
   referencesForWorkerEndpoint,
