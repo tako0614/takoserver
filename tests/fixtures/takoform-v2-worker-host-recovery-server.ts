@@ -170,6 +170,10 @@ async function main(): Promise<void> {
   type RuntimeOwner = Awaited<ReturnType<typeof openWorkerdWorkerRuntimeOwner>>;
   const owners = new Map<string, RuntimeOwner>();
   const children: { readonly pid: number; active: boolean }[] = [];
+  // Test-only gate: the child may have exited while the fixture census has not
+  // yet observed it. This makes the post-Operation retirement window repeatable.
+  let holdChildExitCensus = false;
+  const heldChildExits = new Map<number, () => void>();
   const routeAbsenceReads: {
     endpointUid: string;
     workerUid: string;
@@ -197,14 +201,16 @@ async function main(): Promise<void> {
         }
         const tracked = { pid: child.pid, active: true };
         children.push(tracked);
-        void child.exited?.then(
-          () => {
+        const observeExit = () => {
+          if (holdChildExitCensus) {
+            heldChildExits.set(tracked.pid, () => {
+              tracked.active = false;
+            });
+          } else {
             tracked.active = false;
-          },
-          () => {
-            tracked.active = false;
-          },
-        );
+          }
+        };
+        void child.exited?.then(observeExit, observeExit);
         return child;
       },
     });
@@ -323,6 +329,16 @@ async function main(): Promise<void> {
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      if (request.method === "POST" && url.pathname === "/__fixture/hold-child-exit-census") {
+        holdChildExitCensus = true;
+        return new Response(null, { status: 204 });
+      }
+      if (request.method === "POST" && url.pathname === "/__fixture/release-child-exit-census") {
+        holdChildExitCensus = false;
+        for (const release of heldChildExits.values()) release();
+        heldChildExits.clear();
+        return new Response(null, { status: 204 });
+      }
       const fixture = /^\/__fixture\/(status|serve)\/([0-9a-f-]{36})$/u.exec(url.pathname);
       if (fixture) {
         const mode = fixture[1];
@@ -334,6 +350,7 @@ async function main(): Promise<void> {
           return Response.json({
             pid: process.pid,
             childPids: children.filter((child) => child.active).map((child) => child.pid),
+            heldChildExitPids: [...heldChildExits.keys()],
             serving: await owner.observeServing({ workerResourceUid: uid, targetKey: TARGET_KEY }),
             routeAbsenceReads,
           });
