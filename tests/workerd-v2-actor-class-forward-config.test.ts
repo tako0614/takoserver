@@ -5,10 +5,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
 import { SELFHOST_WORKER_DATA_SERVICE_MODULE } from "../src/providers/selfhost-data-service.ts";
+import { SELFHOST_WORKER_EVENT_SERVICE_MODULE } from "../src/providers/selfhost-events.ts";
+import {
+  V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+  V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+} from "../src/providers/selfhost-v2-queue-transport.ts";
 import { SELFHOST_WORKER_DATA_TOKEN_BINDING } from "../src/providers/selfhost-worker-wrapper.ts";
 import {
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
   WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+  WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING,
   WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
   workerdV2PrivateActorBindingName,
   workerdV2PrivateWorkflowBindingName,
@@ -115,6 +121,50 @@ test("v2 Actor class gets only its Version's exact private forward broker", asyn
   expect(config).toContain(`unix:${input.actorForwardSockets[0]?.httpSocketPath}`);
   expect(config).toContain(`unix:${input.actorForwardSockets[0]?.upgradeSocketPath}`);
   expect(config).not.toContain('name = "router"');
+});
+
+test("Actor class excludes declared Queue event-only modules from its private snapshot", async () => {
+  const input = fixture();
+  const variant = input.actor.variants[0];
+  if (!variant) throw new Error("Actor fixture unavailable");
+  const events = { module: SELFHOST_WORKER_EVENT_SERVICE_MODULE, vars: [] };
+  const queueSettlement = {
+    address: "127.0.0.1:17778",
+    module: V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+    vars: [
+      { name: V2_QUEUE_SETTLEMENT_TOKEN_BINDING, kind: "text" as const, value: "a".repeat(43) },
+    ],
+  };
+  const v2QueueProducerPlane = {
+    address: "127.0.0.1:17779",
+    token: `private.${"a".repeat(43)}`,
+  };
+  const eventModules = new Map([
+    [events.module, encoder.encode("export default {};")],
+    [queueSettlement.module, encoder.encode("export default {};")],
+    [SELFHOST_WORKER_DATA_SERVICE_MODULE, encoder.encode("export default {};")],
+  ]);
+  const selected = {
+    ...input,
+    site: { ...input.site, events, queueSettlement, v2QueueProducerPlane },
+    hostModules: new Map([...input.hostModules, ...eventModules]),
+    actor: {
+      ...input.actor,
+      variants: [
+        {
+          ...variant,
+          site: { ...variant.site, events, queueSettlement, v2QueueProducerPlane },
+          hostModules: new Map([...variant.hostModules, ...eventModules]),
+        },
+      ],
+    },
+  };
+  const config = await readFile(await writeWorkerdPrivateExecution(selected), "utf8");
+  expect(config).toContain('name = "actor-version-0"');
+  expect(config).not.toContain(V2_QUEUE_SETTLEMENT_TOKEN_BINDING);
+  expect(config).toContain(
+    `(name = "${WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING}", service = "actor-version-0-v2-queue-producer")`,
+  );
 });
 
 test("two weighted class Versions may reuse the same exact broker, not an aliased grant", async () => {

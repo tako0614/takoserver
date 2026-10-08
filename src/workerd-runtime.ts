@@ -4213,6 +4213,45 @@ async function writePreparedWorkerdSite(
  * bindings. Service bindings require an exact private per-binding gateway
  * mapping acquired from the shared runtime; no target URL is derived here.
  */
+function privateClassEventModules(site: WorkerdSite): readonly string[] {
+  const eventModules = [
+    site.events === undefined ? undefined : validEventGate(site.events).module,
+    site.queueSettlement === undefined
+      ? undefined
+      : validQueueSettlement(site.queueSettlement).module,
+  ].filter((name): name is string => name !== undefined);
+  if (new Set(eventModules).size !== eventModules.length)
+    throw new Error("private event module collision");
+  return eventModules;
+}
+
+function privateClassHostModuleNames(
+  site: WorkerdSite,
+  hostModules: readonly string[],
+): readonly string[] {
+  const removed = new Set(privateClassEventModules(site));
+  return hostModules.filter((name) => !removed.has(name));
+}
+
+function privateClassHostModules(
+  site: WorkerdSite,
+  hostModules: ReadonlyMap<string, Uint8Array>,
+): ReadonlyMap<string, Uint8Array> {
+  const eventModules = privateClassEventModules(site);
+  if (eventModules.length === 0) return hostModules;
+  const selected = new Map(hostModules);
+  const removed = new Set(eventModules);
+  for (const name of eventModules) {
+    // Retained class-only callers may omit bytes for an unused event ingress.
+    // If present in a full Version snapshot, they must not enter this class.
+    selected.delete(name);
+  }
+  // The private snapshot must still read each retained byte from the captured
+  // source at snapshot time, not an earlier Map copy of those byte references.
+  selected.get = (name) => (removed.has(name) ? undefined : hostModules.get(name));
+  return selected;
+}
+
 export async function writeWorkerdPrivateExecution(options: {
   readonly root: string;
   readonly site: WorkerdSite;
@@ -4396,8 +4435,14 @@ export async function writeWorkerdPrivateExecution(options: {
     assets: _assets,
     events: _events,
     queueSettlement: _queueSettlement,
-    ...classSite
+    ...classDeclaration
   } = site;
+  const classSite: WorkerdSite = {
+    ...classDeclaration,
+    ...(site.hostModules === undefined
+      ? {}
+      : { hostModules: privateClassHostModuleNames(site, site.hostModules) }),
+  };
   // Validate the selected v2 outer wrapper as active before replacing only
   // the guarded class entrypoint. Ordinary publication has no such exception.
   const validationSite: WorkerdSite = hasV2Workflow
@@ -4417,7 +4462,7 @@ export async function writeWorkerdPrivateExecution(options: {
     validationSite,
     options.modules,
     undefined,
-    options.hostModules,
+    privateClassHostModules(site, options.hostModules),
   );
   const classPrepared: PreparedWorkerdSite<Manifest> = hasV2Workflow
     ? {
@@ -4511,6 +4556,27 @@ export async function writeWorkerdPrivateExecution(options: {
   const topLevelDataPlane = privateDataPlane(prepared.manifest, "data", "data-origin", "");
   if (topLevelDataPlane) bindings.push(topLevelDataPlane.binding);
   const dataServices = topLevelDataPlane?.services ?? "";
+  let privateQueueProducerServices = "";
+  if (!actor && prepared.manifest.v2QueueProducerPlane) {
+    const plane = validV2KvPlane(prepared.manifest.v2QueueProducerPlane);
+    const module = requiredStoredModule(
+      prepared.manifest.moduleFiles.hostPrivate,
+      SELFHOST_WORKER_DATA_SERVICE_MODULE,
+    );
+    bindings.push(
+      `(name = ${capnpText(WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING)}, service = "v2-queue-producer")`,
+    );
+    privateQueueProducerServices = `
+  (name = "v2-queue-producer", worker = (
+    modules = [(name = ${capnpText(SELFHOST_WORKER_DATA_SERVICE_MODULE)}, esModule = embed ${capnpText(`./${HOST_PRIVATE_MODULE_DIRECTORY}/${module.key}`)})],
+    bindings = [
+      (name = ${capnpText(SELFHOST_WORKER_DATA_PLANE_BINDING)}, service = "v2-queue-producer-origin"),
+      (name = ${capnpText(SELFHOST_WORKER_DATA_TOKEN_BINDING)}, text = ${capnpText(plane.token)})
+    ], compatibilityDate = "2026-01-01", globalOutbound = "v2-queue-producer-deny"
+  )),
+  (name = "v2-queue-producer-origin", external = (address = ${capnpText(plane.address)}, http = ())),
+  (name = "v2-queue-producer-deny", network = (allow = [])),`;
+  }
   let actorServices = "";
   let actorVersionServices = "";
   let actorVersionExternals = "";
@@ -4521,6 +4587,7 @@ export async function writeWorkerdPrivateExecution(options: {
     readonly version: Awaited<ReturnType<typeof prepareWorkerdSite>>;
   }[] = [];
   let actorVersionDataServices = "";
+  let actorVersionQueueProducerServices = "";
   if (actor) {
     requiredStoredModule(prepared.manifest.moduleFiles.hostPrivate, actor.ownerModule);
     const actorInternalBindings = new Set([
@@ -4551,7 +4618,20 @@ export async function writeWorkerdPrivateExecution(options: {
       // Actor classes have no public asset/event ingress. Those declarations
       // were verified from durable state, but are intentionally not composed
       // into the private class service.
-      const { assets: _assets, events: _events, ...versionSite } = variant.site;
+      const {
+        assets: _assets,
+        events: _events,
+        queueSettlement: _queueSettlement,
+        ...versionDeclaration
+      } = variant.site;
+      const versionSite: WorkerdSite = {
+        ...versionDeclaration,
+        ...(variant.site.hostModules === undefined
+          ? {}
+          : {
+              hostModules: privateClassHostModuleNames(variant.site, variant.site.hostModules),
+            }),
+      };
       const hasV2ActorWorkflow = versionSite.workflowForward?.schema === V2_WORKFLOW_FORWARD_SCHEMA;
       if (
         (hasV2ActorWorkflow &&
@@ -4622,7 +4702,7 @@ export async function writeWorkerdPrivateExecution(options: {
         validationVersionSite,
         variant.modules,
         undefined,
-        variant.hostModules,
+        privateClassHostModules(variant.site, variant.hostModules),
       );
       const version: PreparedWorkerdSite<Manifest> = hasV2ActorWorkflow
         ? {
@@ -4667,6 +4747,29 @@ export async function writeWorkerdPrivateExecution(options: {
         if (!retained) throw new Error("Actor retained v2 data plane is unavailable");
         versionBindings.push(retained.binding);
         actorVersionDataServices += retained.services;
+      }
+      if (version.manifest.v2QueueProducerPlane) {
+        if (!hasWorkerdV2PrivateBindingProfile(version.manifest))
+          throw new Error("Actor retained Queue producer requires v2 private binding profile");
+        const plane = validV2KvPlane(version.manifest.v2QueueProducerPlane);
+        const module = requiredStoredModule(
+          version.manifest.moduleFiles.hostPrivate,
+          SELFHOST_WORKER_DATA_SERVICE_MODULE,
+        );
+        const producer = `actor-version-${index}-v2-queue-producer`;
+        const origin = `${producer}-origin`;
+        versionBindings.push(
+          `(name = ${capnpText(WORKERD_V2_PRIVATE_QUEUE_PRODUCER_BINDING)}, service = ${capnpText(producer)})`,
+        );
+        actorVersionQueueProducerServices += `
+  (name = ${capnpText(producer)}, worker = (
+    modules = [(name = ${capnpText(SELFHOST_WORKER_DATA_SERVICE_MODULE)}, esModule = embed ${capnpText(`${versionPrefix}/${HOST_PRIVATE_MODULE_DIRECTORY}/${module.key}`)})],
+    bindings = [
+      (name = ${capnpText(SELFHOST_WORKER_DATA_PLANE_BINDING)}, service = ${capnpText(origin)}),
+      (name = ${capnpText(SELFHOST_WORKER_DATA_TOKEN_BINDING)}, text = ${capnpText(plane.token)})
+    ], compatibilityDate = "2026-01-01", globalOutbound = "v2-queue-producer-deny"
+  )),
+  (name = ${capnpText(origin)}, external = (address = ${capnpText(plane.address)}, http = ())),`;
       }
       // The class sees only its own immutable Version's declared bindings.
       // Reuse the provider Worker's exact incumbent brokers; never mint a new
@@ -4747,7 +4850,7 @@ const config :Workerd.Config = (
     compatibilityFlags = [${(actor ? [...APPLICATION_COMPATIBILITY_FLAGS, "experimental"] : APPLICATION_COMPATIBILITY_FLAGS).map(capnpText).join(", ")}],
     globalOutbound = "deny"
   )),
-  ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${serviceExternals}${workflowExternals}${actorVersionServices}${actorVersionDataServices}${actorVersionExternals}${actorServices}
+  ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${privateQueueProducerServices}${serviceExternals}${workflowExternals}${actorVersionServices}${actorVersionDataServices}${actorVersionQueueProducerServices}${actorVersionQueueProducerServices ? '\n  (name = "v2-queue-producer-deny", network = (allow = [])),' : ""}${actorVersionExternals}${actorServices}
   (name = "deny", network = (allow = []))
  ],
  sockets = [(name = ${capnpText(actor ? "actor" : "workflow")}, address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = ${capnpText(actor ? "actor-owner" : "application")})${actor ? `, (name = "actor-duplex", address = ${capnpText(`unix:${actorProxySocketPath}`)}, http = (style = proxy), service = "actor-owner")` : ""}]

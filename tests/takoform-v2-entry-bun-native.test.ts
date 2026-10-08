@@ -314,6 +314,32 @@ function nativeHttps(hostname: string, path: string): Promise<{ status: number; 
   });
 }
 
+async function waitForNativeQueueReceipt(
+  root: string,
+  messageId: string,
+  executionState: "send_authorized" | "retired",
+): Promise<void> {
+  const database = new Database(join(root, "control.sqlite"), { readonly: true });
+  try {
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      const row = database
+        .query(
+          `SELECT receipt.state AS receipt_state, execution.state AS execution_state
+           FROM queue_v2_batch_settlements receipt
+           JOIN queue_v2_batch_executions execution ON execution.batch_id = receipt.batch_id
+           WHERE receipt.message_id = ?`,
+        )
+        .get(messageId) as Json | null;
+      if (row?.receipt_state === "settled" && row.execution_state === executionState) return;
+      await Bun.sleep(20);
+    }
+    throw new Error(`native Queue message ${messageId} did not settle with ${executionState}`);
+  } finally {
+    database.close();
+  }
+}
+
 class NativeSocketReader {
   private buffered = Buffer.alloc(0);
   private readonly waiters: Array<() => void> = [];
@@ -1349,7 +1375,7 @@ test.skipIf(OPT_IN !== "1")(
       bootstrap = null;
 
       const migrationBytes = new TextEncoder().encode(
-        "CREATE TABLE item (value TEXT NOT NULL); INSERT INTO item VALUES ('once');",
+        "CREATE TABLE item (value TEXT NOT NULL); INSERT INTO item VALUES ('once'); CREATE TABLE queue_receipt (value TEXT NOT NULL UNIQUE);",
       );
       const migrationDigest = (await bytesDigest(migrationBytes)).slice(7);
       const migrationManifestBytes = new TextEncoder().encode(
@@ -1374,6 +1400,14 @@ test.skipIf(OPT_IN !== "1")(
       const result = await env.DB.query("SELECT value FROM item ORDER BY rowid");
       return Response.json(result.rows);
     }
+    if (path === "/queue-read") {
+      const result = await env.DB.query("SELECT value FROM queue_receipt ORDER BY rowid");
+      return Response.json(result.rows);
+    }
+    if (path === "/queue-send") {
+      const id = await env.TASKS.send(url.searchParams.get("value") || "before-restart");
+      return Response.json({ id });
+    }
     if (path === "/actor-socket" || path === "/actor-socket-welcome")
       return env.ACTOR.get(env.ACTOR.idFromName("room")).fetch(request);
     if (path === "/actor-write" || path === "/actor-read" || path === "/actor-sql" || path === "/actor-workflow-create" || path === "/actor-workflow-status") {
@@ -1391,6 +1425,16 @@ test.skipIf(OPT_IN !== "1")(
       return Response.json(await instance.status());
     }
     return new Response("normal-v2:" + path);
+  },
+  async queue(batch, env, ctx) {
+    for (const message of batch.messages) {
+      const value = new TextDecoder().decode(message.body);
+      await env.DB.execute("INSERT OR IGNORE INTO queue_receipt(value) VALUES (?)", [value]);
+      if (value === "after-restart") {
+        ctx.waitUntil(new Promise((resolve) => setTimeout(resolve, 8000)));
+      }
+    }
+    await batch.acknowledgeAll();
   }
 };
 export class CounterActor {
@@ -1680,12 +1724,13 @@ export class SqlWorkflow {
       const version = await create(WORKER_VERSION_FORM_URL, "version", {
         worker: { resourceUid: worker.uid },
         bundle: { resourceUid: bundle.uid },
-        handlers: ["fetch"],
+        handlers: ["fetch", "queue"],
         vars: {},
         requiredSensitiveVars: [],
         actorBindings: [{ name: "ACTOR", resource: { resourceUid: namespace.uid } }],
         sqliteBindings: [{ name: "DB", resource: { resourceUid: sqliteTarget.uid } }],
         workflowBindings: [{ name: "WORKFLOW", resource: { resourceUid: workflow.uid } }],
+        queueProducerBindings: [{ name: "TASKS", resource: { resourceUid: queueTarget.uid } }],
       });
       const deployment = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
         worker: { resourceUid: worker.uid },
@@ -1749,6 +1794,25 @@ export class SqlWorkflow {
         status: 200,
         body: '[{"value":"once"}]',
       });
+      const consumerSpec = {
+        queue: { resourceUid: queueTarget.uid },
+        worker: { resourceUid: worker.uid },
+        maxBatchSize: 1,
+        maxBatchTimeoutSeconds: 0,
+        maxConcurrency: 1,
+        maxRetries: 1,
+        retryDelaySeconds: 0,
+      };
+      const consumer = await create(QUEUE_CONSUMER_FORM_URL, "consumer", consumerSpec);
+      const queuedBefore = await nativeHttps(hostname, "/queue-send?value=before-restart");
+      expect(queuedBefore.status).toBe(200);
+      const beforeMessageId = String((JSON.parse(queuedBefore.body) as Json).id);
+      expect(beforeMessageId.length).toBeGreaterThan(0);
+      await waitForNativeQueueReceipt(root, beforeMessageId, "retired");
+      expect(await nativeHttps(hostname, "/queue-read")).toEqual({
+        status: 200,
+        body: '[{"value":"before-restart"}]',
+      });
       expect(await nativeHttps(hostname, "/actor-workflow-create?id=actor-before")).toEqual({
         status: 200,
         body: '{"id":"actor-before","status":"queued"}',
@@ -1779,6 +1843,16 @@ export class SqlWorkflow {
         status: 200,
         body: "normal-v2:/after-crash",
       });
+      const queuedAfter = await nativeHttps(hostname, "/queue-send?value=after-restart");
+      expect(queuedAfter.status).toBe(200);
+      const afterMessageId = String((JSON.parse(queuedAfter.body) as Json).id);
+      expect(afterMessageId.length).toBeGreaterThan(0);
+      await waitForNativeQueueReceipt(root, afterMessageId, "send_authorized");
+      expect(await nativeHttps(hostname, "/queue-read")).toEqual({
+        status: 200,
+        body: '[{"value":"before-restart"},{"value":"after-restart"}]',
+      });
+      await waitForNativeQueueReceipt(root, afterMessageId, "retired");
       expect(await nativeHttps(hostname, "/actor-read")).toEqual({
         status: 200,
         body: '{"value":1}',
@@ -1894,9 +1968,10 @@ export class SqlWorkflow {
       const workflowVersion = await create(WORKER_VERSION_FORM_URL, "workflow-version", {
         worker: { resourceUid: worker.uid },
         bundle: { resourceUid: bundle.uid },
-        handlers: ["fetch"],
+        handlers: ["fetch", "queue"],
         sqliteBindings: [{ name: "DB", resource: { resourceUid: sqliteTarget.uid } }],
         workflowBindings: [{ name: "WORKFLOW", resource: { resourceUid: workflow.uid } }],
+        queueProducerBindings: [{ name: "TASKS", resource: { resourceUid: queueTarget.uid } }],
       });
       const workflowDeployment = await jsonAt(
         port,
@@ -1966,6 +2041,7 @@ export class SqlWorkflow {
         });
       };
       await remove(endpoint.uid, 2, "endpoint");
+      await remove(consumer.uid, 1, "consumer");
       const afterEndpointDelete = await jsonAt(
         port,
         "PUT",
