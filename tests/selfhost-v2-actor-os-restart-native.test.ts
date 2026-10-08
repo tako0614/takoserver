@@ -15,8 +15,10 @@ import {
   WORKER_DEPLOYMENT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import { v2ServiceTargetName } from "../src/takoform-v2/worker-service-resolution.ts";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { type LinuxProcessIdentity, linuxProcessLiveness } from "../src/workerd-linux-process.ts";
+import { internalHostname } from "../src/workerd-runtime.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 const binary = nativeEvidenceBinary("workerd-artifact");
@@ -42,19 +44,28 @@ export class CounterActor {
     if (path === "/self-nested") {
       return this.env.SELF.get(this.env.SELF.idFromName("other-room")).fetch(new Request("http://actor.invalid/read"));
     }
+    if (path === "/socket-count") {
+      const result = await this.context.storage.query("SELECT value FROM counter WHERE id = 2");
+      return Response.json({ live: (await this.context.sockets.list()).length, accepted: Number(result.rows[0]?.value ?? 0) });
+    }
+    if (path === "/socket" || path === "/other-upgrade") {
+      const accepted = await this.context.sockets.accept(request, { protocol: "chat" });
+      await this.context.storage.execute("INSERT INTO counter VALUES (2, 1) ON CONFLICT(id) DO UPDATE SET value = value + 1");
+      return accepted.response;
+    }
     return new Response(null, { status: 404 });
   }
   async alarm() {}
-  async socketMessage() {}
+  async socketMessage(socket, data) { await socket.send(JSON.stringify({version:this.env.VERSION, data:String(data), socketId:socket.id})); }
   async socketClose() {}
   async socketError() {}
 }
 export default {
   fetch(request, env) {
     const path = new URL(request.url).pathname;
-    const binding = path === "/self" ? env.SELF : path === "/other" ? env.OTHER : null;
+    const binding = path === "/self" || path === "/socket" || path === "/socket-count" ? env.SELF : path === "/other" || path === "/other-upgrade" || path === "/other-synthetic" || path === "/other-socket-count" ? env.OTHER : null;
     if (!binding) return new Response("target");
-    return binding.get(binding.idFromName("same-room")).fetch(new Request("http://actor.invalid/" + (path === "/other" ? "nested" : "read")));
+    return binding.get(binding.idFromName("same-room")).fetch(path === "/socket" || path === "/other-upgrade" ? request : new Request("http://actor.invalid/" + (path === "/other" ? "nested" : path === "/other-synthetic" ? "other-synthetic" : path === "/other-socket-count" || path === "/socket-count" ? "socket-count" : "read")));
   }
 };
 `);
@@ -62,9 +73,29 @@ const callerCode = encoder.encode(`
 export class CallerActor {
   constructor(context, env) { this.context = context; this.env = env; }
   async fetch(request) {
-    if (new URL(request.url).pathname === "/nested") {
+    const path = new URL(request.url).pathname;
+    if (path === "/nested") {
       return this.env.ACTOR.get(this.env.ACTOR.idFromName("same-room")).fetch(new Request("http://actor.invalid/read"));
     }
+    if (path === "/other-upgrade") {
+      try {
+        await this.env.ACTOR.get(this.env.ACTOR.idFromName("same-room")).fetch(request);
+        return new Response("nested upgrade unexpectedly forwarded", { status: 500 });
+      } catch (error) {
+        return Response.json({ code: error?.message ?? "unknown" }, { status: 409 });
+      }
+    }
+    if (path === "/other-synthetic") {
+      try {
+        await this.env.ACTOR.get(this.env.ACTOR.idFromName("same-room")).fetch(new Request("http://actor.invalid/socket", {
+          headers: { upgrade: "websocket", connection: "Upgrade", "sec-websocket-version": "13", "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==" },
+        }));
+        return Response.json({ code: "unexpected-forward" });
+      } catch (error) {
+        return Response.json({ code: error?.message ?? "unknown" });
+      }
+    }
+    if (path === "/socket-count") return Response.json({ live: (await this.context.sockets.list()).length });
     return Response.json({ from: "caller-actor", id: this.context.id });
   }
   async alarm() {}
@@ -204,6 +235,102 @@ async function activeChild(root: string, uid: string): Promise<LinuxProcessIdent
   return identity;
 }
 
+async function activeListener(root: string, uid: string): Promise<number> {
+  const ownerKey = digest(encoder.encode(uid));
+  const record = JSON.parse(
+    await readFile(join(root, "owners", ownerKey, "runtime-owner.json"), "utf8"),
+  ) as { incarnations: { status: string; listenerPort: number }[] };
+  const port = record.incarnations.find((item) => item.status === "active")?.listenerPort;
+  if (!port || !Number.isSafeInteger(port)) throw new Error("native Worker listener not persisted");
+  return port;
+}
+
+const WebSocketWithHeaders = WebSocket as unknown as new (
+  url: string,
+  options: { protocols: readonly string[]; headers: Record<string, string> },
+) => WebSocket;
+
+async function echoAndClose(
+  port: number,
+  hostname: string,
+  message: string,
+): Promise<{ version: string; data: string; socketId: string }> {
+  const socket = new WebSocketWithHeaders(`ws://127.0.0.1:${port}/socket`, {
+    protocols: ["chat"],
+    headers: { host: hostname },
+  });
+  const echoed = await new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("direct native Actor socket timed out")),
+      10_000,
+    );
+    let reply: string | undefined;
+    socket.onopen = () => socket.send(message);
+    socket.onmessage = (event) => {
+      reply = String(event.data);
+      socket.close(1000, "done");
+    };
+    socket.onclose = () => {
+      clearTimeout(timer);
+      if (reply === undefined) reject(new Error("direct native Actor socket closed without echo"));
+      else resolve(reply);
+    };
+    socket.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("direct native Actor socket failed"));
+    };
+  });
+  return JSON.parse(echoed) as { version: string; data: string; socketId: string };
+}
+
+async function rejectedNestedUpgrade(port: number, hostname: string): Promise<void> {
+  const socket = new WebSocketWithHeaders(`ws://127.0.0.1:${port}/other-upgrade`, {
+    protocols: ["chat"],
+    headers: { host: hostname },
+  });
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("nested Actor upgrade did not reject")),
+      10_000,
+    );
+    socket.onopen = () => {
+      clearTimeout(timer);
+      socket.close();
+      reject(new Error("nested Actor upgrade was incorrectly accepted"));
+    };
+    // A failed handshake may emit error before close. Observe transport closure
+    // before asserting that neither Actor retained a socket.
+    socket.onerror = () => {};
+    socket.onclose = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+  });
+}
+
+async function socketCount(
+  port: number,
+  hostname: string,
+): Promise<{ live: number; accepted: number }> {
+  const response = await fetch(`http://127.0.0.1:${port}/socket-count`, {
+    headers: { host: hostname },
+    signal: AbortSignal.timeout(10_000),
+  });
+  expect(response.status).toBe(200);
+  return (await response.json()) as { live: number; accepted: number };
+}
+
+function actorLeasePath(root: string, principal: string, namespaceUid: string, suffix: string) {
+  const key = digest(encoder.encode(JSON.stringify([principal, namespaceUid])));
+  return join(root, "v2-runtime", "actor-storage", "leases", `${key}.${suffix}.json`);
+}
+
+async function assertNestedUpgradeGuard(port: number, key: string, workerUid: string) {
+  const response = await request(port, key, `/__fixture/serve/${workerUid}/other-synthetic`);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ code: "invalid_upgrade" });
+}
+
 async function activeActorChild(
   root: string,
   principal: string,
@@ -226,7 +353,7 @@ async function activeActorChild(
 }
 
 test.skipIf(binary === undefined)(
-  "accepted v2 Actor Binding retains one Actor ID across Host SIGKILL, recovers and drains references",
+  "accepted v2 Actor Binding rejects nested upgrade, restores direct Actor sockets and drains references after Host SIGKILL",
   async () => {
     if (!binary) throw new Error("pinned Workerd unavailable");
     // Unix-domain Actor broker addresses are bounded by the kernel path limit.
@@ -411,6 +538,35 @@ test.skipIf(binary === undefined)(
       expect(await nestedBefore.json()).toEqual(written);
       const selfNestedBefore = await invoke(initial.port, "/self-nested");
       expect(selfNestedBefore).toMatchObject({ value: 0, version: "one" });
+      const targetHostname = internalHostname(await v2ServiceTargetName(target.resourceUid));
+      const initialTargetPort = await activeListener(root, target.resourceUid);
+      const targetLease = actorLeasePath(root, principal, namespace.resourceUid, "owner");
+      const targetLeaseBefore = await readFile(targetLease, "utf8");
+      expect(await socketCount(initialTargetPort, targetHostname)).toEqual({
+        live: 0,
+        accepted: 0,
+      });
+      await assertNestedUpgradeGuard(initial.port, key.secret, target.resourceUid);
+      await rejectedNestedUpgrade(initialTargetPort, targetHostname);
+      expect(await socketCount(initialTargetPort, targetHostname)).toEqual({
+        live: 0,
+        accepted: 0,
+      });
+      const otherCountBefore = await request(
+        initial.port,
+        key.secret,
+        `/__fixture/serve/${target.resourceUid}/other-socket-count`,
+      );
+      expect(otherCountBefore.status).toBe(200);
+      expect(await otherCountBefore.json()).toEqual({ live: 0 });
+      expect(await readFile(targetLease, "utf8")).toBe(targetLeaseBefore);
+      const socketBefore = await echoAndClose(initialTargetPort, targetHostname, "before");
+      expect(socketBefore).toMatchObject({ version: "one", data: "before" });
+      expect(socketBefore.socketId.length).toBeGreaterThan(0);
+      expect(await socketCount(initialTargetPort, targetHostname)).toEqual({
+        live: 0,
+        accepted: 1,
+      });
       const firstHostPid = initial.pid;
       const oldCallerChild = await activeChild(root, caller.resourceUid);
       const oldTargetChild = await activeChild(root, target.resourceUid);
@@ -473,6 +629,34 @@ test.skipIf(binary === undefined)(
       actorChildren.push(newActorChild);
       expect(newActorChild.pid).not.toBe(oldActorChild.pid);
       expect(await linuxProcessLiveness(newActorChild)).toBe("live");
+      const restoredTargetPort = await activeListener(root, target.resourceUid);
+      const targetLeaseAfter = await readFile(targetLease, "utf8");
+      expect(targetLeaseAfter).not.toBe(targetLeaseBefore);
+      expect(await socketCount(restoredTargetPort, targetHostname)).toEqual({
+        live: 0,
+        accepted: 1,
+      });
+      await assertNestedUpgradeGuard(second.port, key.secret, target.resourceUid);
+      await rejectedNestedUpgrade(restoredTargetPort, targetHostname);
+      expect(await socketCount(restoredTargetPort, targetHostname)).toEqual({
+        live: 0,
+        accepted: 1,
+      });
+      const otherCountAfter = await request(
+        second.port,
+        key.secret,
+        `/__fixture/serve/${target.resourceUid}/other-socket-count`,
+      );
+      expect(otherCountAfter.status).toBe(200);
+      expect(await otherCountAfter.json()).toEqual({ live: 0 });
+      expect(await readFile(targetLease, "utf8")).toBe(targetLeaseAfter);
+      const socketAfter = await echoAndClose(restoredTargetPort, targetHostname, "after");
+      expect(socketAfter).toMatchObject({ version: "one", data: "after" });
+      expect(socketAfter.socketId).not.toBe(socketBefore.socketId);
+      expect(await socketCount(restoredTargetPort, targetHostname)).toEqual({
+        live: 0,
+        accepted: 2,
+      });
       const targetVersionTwo = await (async () => {
         const response = await request(
           second.port,
@@ -552,6 +736,10 @@ test.skipIf(binary === undefined)(
         ["target", target.resourceUid],
       ] as const)
         await remove(uid, name);
+      for (const uid of [namespace.resourceUid, callerNamespace.resourceUid]) {
+        expect(await Bun.file(actorLeasePath(root, principal, uid, "owner")).exists()).toBe(false);
+        expect(await Bun.file(actorLeasePath(root, principal, uid, "child")).exists()).toBe(false);
+      }
     } catch (error) {
       primaryFailure = error;
     } finally {
