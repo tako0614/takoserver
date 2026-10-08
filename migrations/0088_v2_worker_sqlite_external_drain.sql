@@ -47,8 +47,8 @@ BEGIN
   SELECT RAISE(ABORT, 'tf_v2_worker_invocation_sqlite_drain_dispatched');
 END;
 
--- Pending external SQL survives Tail retirement. Neither a new Version DELETE
--- nor native deletion grant/absence may use the retired receipt as absence.
+-- Pending external SQL survives Tail retirement. Neither a new Version nor
+-- Deployment DELETE, nor native deletion grant/absence, may infer absence.
 CREATE TRIGGER tf_v2_worker_invocation_sqlite_drain_version_delete_guard
 BEFORE INSERT ON tf_v2_operations
 WHEN NEW.action = 'delete' AND EXISTS (
@@ -58,7 +58,18 @@ WHEN NEW.action = 'delete' AND EXISTS (
     AND i.sqlite_drain_state = 'pending'
 )
 BEGIN
-  SELECT RAISE(ABORT, 'tf_v2_worker_invocation_sqlite_drain_live_reference');
+  SELECT RAISE(ABORT, 'tf_v2_worker_invocation_live_reference');
+END;
+
+CREATE TRIGGER tf_v2_worker_invocation_sqlite_drain_deployment_delete_guard
+BEFORE INSERT ON tf_v2_operations
+WHEN NEW.action = 'delete' AND EXISTS (
+  SELECT 1 FROM tf_v2_worker_invocations i
+  WHERE i.deployment_uid = NEW.resource_uid
+    AND i.sqlite_drain_state = 'pending'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'tf_v2_worker_invocation_live_reference');
 END;
 
 CREATE TRIGGER tf_v2_worker_native_deletion_sqlite_drain_send_guard

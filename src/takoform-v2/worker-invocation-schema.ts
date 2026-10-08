@@ -83,8 +83,9 @@ export function v2WorkerInvocationDrainSchemaReady(): string {
       'tf_v2_worker_invocations_sqlite_drain_monotonic',
       'tf_v2_worker_invocations_sqlite_drain_no_dispatch_guard')) = 3
     AND (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger'
-      AND tbl_name = 'tf_v2_operations' AND name =
-      'tf_v2_worker_invocation_sqlite_drain_version_delete_guard') = 1
+      AND tbl_name = 'tf_v2_operations' AND name IN (
+      'tf_v2_worker_invocation_sqlite_drain_version_delete_guard',
+      'tf_v2_worker_invocation_sqlite_drain_deployment_delete_guard')) = 2
     AND (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger'
       AND tbl_name = 'tf_v2_worker_native_deletions' AND name IN (
       'tf_v2_worker_native_deletion_sqlite_drain_send_guard',

@@ -6,6 +6,7 @@ import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { createV2WorkerInvocationLifecycle } from "../src/takoform-v2/worker-invocation-custody.ts";
 import {
   inspectV2WorkerInvocationDrainSchema,
@@ -899,6 +900,7 @@ test("native D1 fences external SQLite through Tail and exact trusted drain", as
         name === "0078_v2_worker_invocation_retirement.sql" ||
         name === "0079_v2_worker_native_deletions.sql" ||
         name === "0080_v2_worker_cron_trigger_matches.sql" ||
+        name === "0081_v2_private_inputs.sql" ||
         name === "0084_v2_worker_invocation_no_native_dispatch.sql",
     )) {
       for (const statement of splitMigration(migration.sql))
@@ -1001,6 +1003,116 @@ test("native D1 fences external SQLite through Tail and exact trusted drain", as
     await expect(
       sql.run(deletion, ["pending-delete", "pending-replay", "pending-key"]),
     ).rejects.toThrow();
+    const deploymentDelete = `INSERT INTO tf_v2_operations
+      (id,resource_uid,principal,replay_key,request_fingerprint,action,
+       generation,status,effect,created_at,updated_at,retain_until,
+       backend_id,target_key,backend_key,accepted_spec_json)
+      VALUES (? ,?,'org-1',?,'fp','delete',2,'queued','none',
+        '2026-10-07T00:00:00Z','2026-10-07T00:00:00Z','2026-10-08T00:00:00Z',
+        'backend-one','target-one',?,'{}')`;
+    await expect(
+      sql.run(deploymentDelete, [
+        "pending-deployment-delete",
+        "deployment-one",
+        "pending-deployment-replay",
+        "pending-deployment-key",
+      ]),
+    ).rejects.toThrow();
+    await sql.run(
+      `INSERT INTO tf_v2_resources
+       (uid,principal,form_url,space,name,backend_id,target_key,active_name,
+        generation,observed_generation,phase,spec_json,last_operation)
+       SELECT 'deployment-foreign',principal,form_url,space,'foreign',backend_id,
+         target_key,'foreign',generation,observed_generation,phase,spec_json,
+         'op-deployment-foreign' FROM tf_v2_resources WHERE uid='deployment-one'`,
+    );
+    await sql.run(
+      `INSERT INTO tf_v2_operations
+       (id,resource_uid,principal,replay_key,request_fingerprint,action,
+        generation,status,effect,created_at,updated_at,retain_until,
+        backend_id,target_key,backend_key,accepted_spec_json)
+       SELECT 'op-deployment-foreign','deployment-foreign',principal,
+         'replay-deployment-foreign',request_fingerprint,action,generation,
+         status,effect,created_at,updated_at,retain_until,backend_id,target_key,
+         'key-deployment-foreign',accepted_spec_json
+       FROM tf_v2_operations WHERE id='op-deployment-one'`,
+    );
+    await sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+       (invocation_id,custody_token,backend_id,target_key,principal,space,
+        worker_uid,deployment_uid,deployment_generation,source_operation_id,
+        ingress_kind,endpoint_uid,endpoint_generation,version_uid,version_generation,
+        version_operation_id,native_identity,closure_digest,confirmed_receipt,admitted_at_ms)
+       SELECT 'foreign-invocation','foreign-custody-token',backend_id,target_key,
+         principal,space,worker_uid,'deployment-foreign',deployment_generation,
+         'op-deployment-foreign',ingress_kind,endpoint_uid,endpoint_generation,
+         version_uid,version_generation,version_operation_id,native_identity,
+         closure_digest,confirmed_receipt,admitted_at_ms
+       FROM tf_v2_worker_invocations WHERE invocation_id=?`,
+      [handle.invocationId],
+    );
+    await sql.run(
+      `UPDATE tf_v2_worker_invocations SET phase='send_authorized',
+       send_authorized_at_ms=1500 WHERE invocation_id='foreign-invocation'`,
+    );
+    await sql.run(
+      `UPDATE tf_v2_worker_invocations SET retired_at_ms=2000,
+       retirement_receipt_digest=? WHERE invocation_id='foreign-invocation'`,
+      [`sha256:${"f".repeat(64)}`],
+    );
+    expect(
+      await sql.query(
+        "SELECT sqlite_drain_state FROM tf_v2_worker_invocations WHERE invocation_id='foreign-invocation'",
+      ),
+    ).toEqual([{ sqlite_drain_state: null }]);
+    await sql.run(deploymentDelete, [
+      "foreign-deployment-delete",
+      "deployment-foreign",
+      "foreign-deployment-replay",
+      "foreign-deployment-key",
+    ]);
+    const engine = createTakoformV2Engine({
+      sql,
+      now: () => new Date("2026-10-07T01:00:00Z"),
+      replayWindowSeconds: 3600,
+      authorize: async () => true,
+      forms: {
+        "https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/": {
+          validateCreate() {},
+          validateUpdate() {},
+          backend: {
+            id: "backend-one",
+            targetKey: "target-one",
+            async execute() {
+              return { kind: "unknown" as const };
+            },
+            async reconcile() {
+              return { kind: "unknown" as const };
+            },
+          },
+        },
+      },
+    });
+    const deploymentRequest = {
+      principal: "org-1",
+      key: "deployment-pending-delete-001",
+      uid: "deployment-one",
+      expectedGeneration: 1,
+    };
+    await expect(engine.acceptDelete(deploymentRequest)).rejects.toMatchObject({
+      code: "dependency_conflict",
+      status: 409,
+    });
+    expect(
+      await sql.query(
+        "SELECT generation,busy_operation,last_operation FROM tf_v2_resources WHERE uid='deployment-one'",
+      ),
+    ).toEqual([{ generation: 1, busy_operation: null, last_operation: "op-deployment-one" }]);
+    expect(
+      await sql.query("SELECT id FROM tf_v2_operations WHERE replay_key=?", [
+        deploymentRequest.key,
+      ]),
+    ).toEqual([]);
     const freshOwner = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(3000) });
     const drainReceipt = `sha256:${"d".repeat(64)}` as const;
     const lostDrainAck: Sql = {
@@ -1031,8 +1143,10 @@ test("native D1 fences external SQLite through Tail and exact trusted drain", as
       bodyFinished: 0,
     });
     await sql.run(deletion, ["drained-delete", "drained-replay", "drained-key"]);
+    const acceptedDeployment = await engine.acceptDelete(deploymentRequest);
+    expect(acceptedDeployment).toMatchObject({ action: "delete", generation: 2 });
     await database
-      .prepare("DROP TRIGGER tf_v2_worker_native_deletion_sqlite_drain_send_guard")
+      .prepare("DROP TRIGGER tf_v2_worker_invocation_sqlite_drain_deployment_delete_guard")
       .run();
     expect(await inspectV2WorkerInvocationDrainSchema(sql)).toBe(false);
     expect(await freshOwner.read(handle)).toBeNull();
