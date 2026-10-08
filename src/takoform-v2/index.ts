@@ -94,6 +94,13 @@ export {
   type V2WorkerModuleInspector,
 } from "./worker-code-eligibility.ts";
 export {
+  runWorkerCronTriggerTick,
+  type WorkerCronTriggerDelivery,
+  type WorkerCronTriggerDeliveryResult,
+  type WorkerCronTriggerScanContinuation,
+  type WorkerCronTriggerTickResult,
+} from "./worker-cron-trigger-scheduler.ts";
+export {
   createV2WorkerInvocationLifecycle,
   type V2WorkerCronInvocationClaim,
   type V2WorkerCronRouteRelease,

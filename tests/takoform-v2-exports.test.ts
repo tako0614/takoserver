@@ -27,6 +27,7 @@ import {
 import { createInternalV2ModuleWorkerForm } from "../src/takoform-v2/module-worker-lifecycle-backend.ts";
 import { inspectV2WorkerCodeVersionEligibility as portableEligibility } from "../src/takoform-v2/worker-code-eligibility.ts";
 import { inspectV2WorkerCodeVersionEligibility } from "../src/takoform-v2/worker-code-runtime.ts";
+import { runWorkerCronTriggerTick } from "../src/takoform-v2/worker-cron-trigger-scheduler.ts";
 import { createV2NativeDeletionCustody } from "../src/takoform-v2/worker-native-deletions.ts";
 import { createV2NativeEffectCustody } from "../src/takoform-v2/worker-native-effects.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
@@ -73,6 +74,7 @@ const RUNTIME_EXPORTS = [
   "referencesForWorkerEndpoint",
   "referencesForWorkerForm",
   "referencesForWorkerVersion",
+  "runWorkerCronTriggerTick",
   "v2WorkerInvocationSchemaReady",
   "V2_QUEUE_BACKEND_ID",
   "validateEdgeKVNamespaceUpdate",
@@ -85,6 +87,7 @@ const RUNTIME_EXPORTS = [
 test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", async () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
+  expect(extension.runWorkerCronTriggerTick).toBe(runWorkerCronTriggerTick);
   expect(extension.createQueueWorkerBindingAuthority).toBe(createQueueWorkerBindingAuthority);
   expect(extension.createAtLeastOnceQueueForm).toBe(createAtLeastOnceQueueForm);
   expect(extension.V2_QUEUE_BACKEND_ID).toBe(V2_QUEUE_BACKEND_ID);
