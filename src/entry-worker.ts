@@ -15,6 +15,7 @@ import {
 import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { resolvePayment } from "./payment-setup.ts";
+import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
 import type { CloudflareProviderExecutorRpc } from "./providers/cloudflare-provider-executor-port.ts";
 import type { CloudflareWorkersAiBinding } from "./providers/cloudflare-workers-ai.ts";
 import { embeddedPublicFormImplementationIdentity } from "./public-form-implementation-build.ts";
@@ -196,7 +197,22 @@ export function workerCredentials(
   };
 }
 
-let cached: { readonly env: WorkerEnv; readonly app: App } | null = null;
+/** Code-selected Forms added to the canonical Host map at Worker startup. */
+type WorkerEntryV2FormMap = ReturnType<
+  NonNullable<Parameters<typeof buildApp>[0]["v2FormFactory"]>
+>;
+
+export type WorkerEntryV2FormComposer = (context: {
+  readonly env: WorkerEnv;
+  readonly sql: Sql;
+  readonly objects: ObjectStoreAccess;
+  readonly clock: Clock;
+}) => WorkerEntryV2FormMap | Promise<WorkerEntryV2FormMap>;
+
+export interface WorkerEntryOptions {
+  /** Operator code only; no request or environment field selects the composer. */
+  readonly composeV2Forms?: WorkerEntryV2FormComposer;
+}
 
 /**
  * Bounded classification of a startup refusal.
@@ -669,8 +685,17 @@ async function requireV2PrivateInputSchema(sql: ReturnType<typeof createD1Sql>):
   }
 }
 
-async function appFor(env: WorkerEnv, origin: string): Promise<App> {
-  if (cached?.env === env) return cached.app;
+async function composeApp(
+  env: WorkerEnv,
+  origin: string,
+  composeV2Forms: WorkerEntryV2FormComposer | undefined,
+): Promise<App> {
+  if (composeV2Forms !== undefined && typeof composeV2Forms !== "function") {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("v2 Worker entry Form composer must be a function"),
+    );
+  }
   const v2Config = startupStage("runtime-configuration", () =>
     parseTakoformV2ApplicationConfig(env),
   );
@@ -716,6 +741,19 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   }
   const objects = createR2ObjectStore(env.OBJECTS);
   const clock = () => new Date();
+  let selectedV2Forms: WorkerEntryV2FormMap | undefined;
+  if (composeV2Forms !== undefined) {
+    try {
+      selectedV2Forms = await composeV2Forms({ env, sql, objects, clock });
+    } catch (error) {
+      // A private composer can throw provider/credential text. Keep its cause
+      // for operator diagnostics, but never make that text a public refusal.
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new Error("operator v2 Form composition failed", { cause: error }),
+      );
+    }
+  }
   const randomId = () => crypto.randomUUID();
   const originReservationBinding = createWorkerEndpointOriginReservationBindingHandle();
   const runtimeInputs = env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING
@@ -776,6 +814,9 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     ...dataServices,
     publicOrigin: origin,
     v2: v2Config,
+    ...(composeV2Forms === undefined
+      ? {}
+      : { v2FormFactory: () => selectedV2Forms as WorkerEntryV2FormMap }),
     ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
     forms: formSource.forms,
     bindings: formSource.bindings,
@@ -785,57 +826,73 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     providerPacks: deployment.providerPacks,
     offerings: deployment.offerings,
   });
-  cached = { env, app };
   return app;
 }
 
-export default {
-  /**
-   * Startup is lazy and per request, and only its success is cached, so a
-   * startup refusal is answered rather than thrown: `/healthz`,
-   * `/.well-known/takoserver` and every other route report the readable 503
-   * reason class instead of a bare provider exception page.
-   */
-  async fetch(
-    request: Request,
-    env: WorkerEnv,
-    context?: { waitUntil(work: Promise<unknown>): void },
-  ): Promise<Response> {
-    let app: App;
-    try {
-      const schemaMode = startupStage("runtime-configuration", () => schemaMaintenanceMode(env));
-      const mode = startupStage("runtime-configuration", () => artifactBlobIoMode(env));
-      if (schemaMode === "pre-0058-quiesced") return schemaMaintenanceResponse();
-      if (mode === "pre-0043-quiesced") {
-        return artifactBlobIoQuiescenceResponse();
+/** A separate startup cache for each code-selected Worker entry. */
+export function createWorkerEntry(options: WorkerEntryOptions = {}) {
+  const composeV2Forms = options.composeV2Forms;
+  const starts = new WeakMap<WorkerEnv, Promise<App>>();
+  const appFor = (env: WorkerEnv, origin: string): Promise<App> => {
+    const existing = starts.get(env);
+    if (existing) return existing;
+    const started = composeApp(env, origin, composeV2Forms).catch((error: unknown) => {
+      if (starts.get(env) === started) starts.delete(env);
+      throw error;
+    });
+    starts.set(env, started);
+    return started;
+  };
+  return {
+    /**
+     * Startup is lazy and per request, and only its success is cached, so a
+     * startup refusal is answered rather than thrown: `/healthz`,
+     * `/.well-known/takoserver` and every other route report the readable 503
+     * reason class instead of a bare provider exception page.
+     */
+    async fetch(
+      request: Request,
+      env: WorkerEnv,
+      context?: { waitUntil(work: Promise<unknown>): void },
+    ): Promise<Response> {
+      let app: App;
+      try {
+        const schemaMode = startupStage("runtime-configuration", () => schemaMaintenanceMode(env));
+        const mode = startupStage("runtime-configuration", () => artifactBlobIoMode(env));
+        if (schemaMode === "pre-0058-quiesced") return schemaMaintenanceResponse();
+        if (mode === "pre-0043-quiesced") {
+          return artifactBlobIoQuiescenceResponse();
+        }
+        app = await appFor(
+          env,
+          startupStage("public-origin", () => requirePublicOrigin(env)),
+        );
+      } catch (error) {
+        return workerStartupFailureResponse(error);
       }
-      app = await appFor(
-        env,
-        startupStage("public-origin", () => requirePublicOrigin(env)),
+      return await app.fetch(
+        request,
+        context ? { waitUntil: (work) => context.waitUntil(work) } : undefined,
       );
-    } catch (error) {
-      return workerStartupFailureResponse(error);
-    }
-    return await app.fetch(
-      request,
-      context ? { waitUntil: (work) => context.waitUntil(work) } : undefined,
-    );
-  },
+    },
 
-  /** Background settlement: expiring reservations return their holds. */
-  async scheduled(_event: unknown, env: WorkerEnv): Promise<void> {
-    if (schemaMaintenanceMode(env) === "pre-0058-quiesced") return;
-    if (artifactBlobIoMode(env) === "pre-0043-quiesced") return;
-    const app = await appFor(env, requirePublicOrigin(env));
-    const results = await Promise.allSettled([
-      Promise.resolve().then(() => app.tick()),
-      Promise.resolve().then(() => app.tickTakoformV2()),
-    ]);
-    const failures = results.flatMap((result) =>
-      result.status === "rejected" ? [result.reason] : [],
-    );
-    if (failures.length > 0) {
-      throw new AggregateError(failures, "one or more scheduled Host passes failed");
-    }
-  },
-};
+    /** Background settlement: expiring reservations return their holds. */
+    async scheduled(_event: unknown, env: WorkerEnv): Promise<void> {
+      if (schemaMaintenanceMode(env) === "pre-0058-quiesced") return;
+      if (artifactBlobIoMode(env) === "pre-0043-quiesced") return;
+      const app = await appFor(env, requirePublicOrigin(env));
+      const results = await Promise.allSettled([
+        Promise.resolve().then(() => app.tick()),
+        Promise.resolve().then(() => app.tickTakoformV2()),
+      ]);
+      const failures = results.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "one or more scheduled Host passes failed");
+      }
+    },
+  };
+}
+
+export default createWorkerEntry();

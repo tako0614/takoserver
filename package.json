@@ -6,6 +6,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./worker-entry": "./src/entry-worker.ts",
     "./provider-extension": "./src/provider-extension.ts",
     "./provider-extension/selfhost": "./src/providers/selfhost-extension.ts",
     "./takoform-integration-actor-host": "./src/takoform/integration-actor-host.ts",
