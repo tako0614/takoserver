@@ -2,6 +2,8 @@ import { expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import type {
   JsonObject,
+  QueueWorkerBindingClaim,
+  QueueWorkerBindingResolution,
   Sql,
   V2Backend,
   V2BackendResult,
@@ -15,6 +17,8 @@ import type {
 } from "@takoserver/core/takoform-v2";
 import * as extension from "@takoserver/core/takoform-v2";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
+import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
+import { createQueueWorkerBindingAuthority } from "../src/takoform-v2/forms/queue-worker-binding-authority.ts";
 import { referencesForWorkerForm } from "../src/takoform-v2/forms/worker-references.ts";
 import {
   MODULE_WORKER_FORM_URL,
@@ -26,6 +30,10 @@ import { inspectV2WorkerCodeVersionEligibility } from "../src/takoform-v2/worker
 import { createV2NativeDeletionCustody } from "../src/takoform-v2/worker-native-deletions.ts";
 import { createV2NativeEffectCustody } from "../src/takoform-v2/worker-native-effects.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
+import {
+  createAtLeastOnceQueueForm,
+  V2_QUEUE_BACKEND_ID,
+} from "../src/takoform-v2/worker-queue-backend.ts";
 import { createV2WorkerVersionConfiguredInputSealer } from "../src/takoform-v2/worker-version-configured-inputs.ts";
 
 const RUNTIME_EXPORTS = [
@@ -37,10 +45,13 @@ const RUNTIME_EXPORTS = [
   "WORKER_DEPLOYMENT_FORM_URL",
   "WORKER_ENDPOINT_FORM_URL",
   "WORKER_VERSION_FORM_URL",
+  "AT_LEAST_ONCE_QUEUE_FORM_URL",
   "WorkerFormValidationError",
   "createEdgeKVNamespaceForm",
   "createInternalV2ModuleWorkerForm",
   "createV2EdgeKvNativeCustody",
+  "createAtLeastOnceQueueForm",
+  "createQueueWorkerBindingAuthority",
   "createV2NativeEffectCustody",
   "createV2NativeDeletionCustody",
   "createV2ServiceBindingAuthority",
@@ -63,6 +74,7 @@ const RUNTIME_EXPORTS = [
   "referencesForWorkerForm",
   "referencesForWorkerVersion",
   "v2WorkerInvocationSchemaReady",
+  "V2_QUEUE_BACKEND_ID",
   "validateEdgeKVNamespaceUpdate",
   "validateModuleWorkerUpdate",
   "validateWorkerDeploymentUpdate",
@@ -70,9 +82,13 @@ const RUNTIME_EXPORTS = [
   "validateWorkerVersionUpdate",
 ] as const;
 
-test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", () => {
+test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", async () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
+  expect(extension.createQueueWorkerBindingAuthority).toBe(createQueueWorkerBindingAuthority);
+  expect(extension.createAtLeastOnceQueueForm).toBe(createAtLeastOnceQueueForm);
+  expect(extension.V2_QUEUE_BACKEND_ID).toBe(V2_QUEUE_BACKEND_ID);
+  expect(extension.AT_LEAST_ONCE_QUEUE_FORM_URL).toBe(AT_LEAST_ONCE_QUEUE_FORM_URL);
   expect(extension.createV2EdgeKvNativeCustody).toBe(createV2EdgeKvNativeCustody);
   expect(extension.createInternalV2ModuleWorkerForm).toBe(createInternalV2ModuleWorkerForm);
   expect(extension.createV2WorkerVersionConfiguredInputSealer).toBe(
@@ -117,6 +133,42 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   const inspectorType = (_inspector: V2WorkerModuleInspector): void => {};
   expect(unresolved.kind).toBe("unresolved");
   expect([snapshotType, materialsType, sqlType, inspectorType]).toHaveLength(4);
+
+  const claim: QueueWorkerBindingClaim = {
+    principal: "principal",
+    space: "space",
+    targetKey: "target",
+    workerUid: "worker",
+    workerVersionUid: "version",
+    workerVersionOperationId: "operation",
+    nativeVersionId: "v2-logical-public-identity",
+    incarnationId: "incarnation",
+    servingSourceOperationId: "serving-operation",
+    bindings: [],
+  };
+  const resolution: QueueWorkerBindingResolution = {
+    identity: { principal: "principal", space: "space", targetKey: "target", resourceUid: "queue" },
+    target: {
+      queueId: "takoform-v2-queue:queue",
+      messageRetentionSeconds: 60,
+      deliveryDelaySeconds: 0,
+    },
+    vector: "vector",
+  };
+  expect(claim.nativeVersionId).toBe("v2-logical-public-identity");
+  expect(resolution.target.queueId).toBe("takoform-v2-queue:queue");
+
+  const sql: Sql = {
+    query: async () => [],
+    run: async () => ({ rows: [], changes: 0 }),
+    batch: async () => [],
+  };
+  const authority = extension.createQueueWorkerBindingAuthority({ sql, targetKey: "target" });
+  expect(await authority.resolveCurrentBinding(claim, "QUEUE")).toBeNull();
+  const queue = extension.createAtLeastOnceQueueForm({ sql, targetKey: "target" });
+  expect(queue.backend.id).toBe(V2_QUEUE_BACKEND_ID);
+  expect(queue.backend.targetKey).toBe("target");
+  queue.validateCreate({ messageRetentionSeconds: 60 });
 });
 
 test("v2 extension entrypoint bundles for a Worker without Node or workerd runtime", async () => {

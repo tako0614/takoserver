@@ -21,6 +21,7 @@ export {
   type V2EdgeKvSettledTarget,
   type V2EdgeKvSettledTargetInput,
 } from "./edge-kv-native-custody.ts";
+export { AT_LEAST_ONCE_QUEUE_FORM_URL } from "./forms/at-least-once-queue.ts";
 export {
   EDGE_KV_NAMESPACE_FORM_URL,
   EDGE_KV_NAMESPACE_LIMITS,
@@ -35,6 +36,11 @@ export {
   type EdgeKVNamespaceIdentity,
   type EdgeKVNamespaceStore,
 } from "./forms/edge-kv-namespace-backend.ts";
+export {
+  createQueueWorkerBindingAuthority,
+  type QueueWorkerBindingClaim,
+  type QueueWorkerBindingResolution,
+} from "./forms/queue-worker-binding-authority.ts";
 export {
   referencesForModuleWorker,
   referencesForWorkerDeployment,
@@ -126,6 +132,10 @@ export {
   type V2WorkerVersionResolution,
   type V2WorkerVersionSnapshot,
 } from "./worker-publication-state.ts";
+export {
+  createAtLeastOnceQueueForm,
+  V2_QUEUE_BACKEND_ID,
+} from "./worker-queue-backend.ts";
 export {
   exactV2ResolvedServiceBindings,
   projectV2ResolvedServiceBindings,
