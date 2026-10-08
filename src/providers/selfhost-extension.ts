@@ -1,5 +1,9 @@
 /** Node/filesystem-native adapters; not part of the portable Worker extension. */
 export {
+  createWorkerdWorkerModuleInspector,
+  type WorkerdWorkerModuleInspectorOptions,
+} from "../workerd-worker-module-inspector.ts";
+export {
   createDockerHttpRevisionRuntime,
   type DockerHttpRevision,
   DockerHttpRevisionError,
