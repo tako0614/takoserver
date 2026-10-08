@@ -2663,6 +2663,7 @@ export async function openWorkerdWorkerRuntimeOwner(
   const actorRetirementInput = (
     incarnation: IncarnationHandle,
     retirementOperationId: string,
+    retirementLeaseToken?: string,
   ): ActorIncarnationRetirement | null => {
     const identity = incarnation.record.identity;
     const processIdentity = incarnation.record.processIdentity;
@@ -2683,6 +2684,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         weight,
       })),
       retirementOperationId,
+      ...(retirementLeaseToken === undefined ? {} : { retirementLeaseToken }),
     };
   };
 
@@ -3775,7 +3777,9 @@ export async function openWorkerdWorkerRuntimeOwner(
         const targets = await runSerial(async () =>
           [...handles.values()]
             .filter((handle) => handle.record.status !== "retired")
-            .map((handle) => actorRetirementInput(handle, captured.operationId))
+            .map((handle) =>
+              actorRetirementInput(handle, captured.operationId, captured.leaseToken),
+            )
             .filter((item): item is ActorIncarnationRetirement => item !== null),
         );
         for (const target of targets) {

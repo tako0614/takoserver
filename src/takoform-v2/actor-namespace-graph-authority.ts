@@ -54,7 +54,10 @@ export async function hasAcceptedV2ActorIncarnationWithdrawal(options: {
          (retirement_op.status = 'succeeded' AND retirement_op.effect = 'complete')
          OR (retirement_op.status IN ('running', 'reconciling')
              AND retirement_op.lease_token IS NOT NULL
-             AND retirement_op.lease_until_ms > ${DB_NOW_MS})
+             AND retirement_op.lease_until_ms > ${DB_NOW_MS}
+             AND retirement_resource.busy_operation = retirement_op.id
+             AND retirement_resource.last_operation = retirement_op.id
+             AND (? IS NULL OR retirement_op.lease_token = ?))
        )
        AND retirement_resource.form_url IN (?, ?)
        AND retirement_resource.principal = retirement_op.principal
@@ -77,6 +80,8 @@ export async function hasAcceptedV2ActorIncarnationWithdrawal(options: {
       WORKER_DEPLOYMENT_FORM_URL,
       WORKER_ENDPOINT_FORM_URL,
       input.workerResourceUid,
+      input.retirementLeaseToken ?? null,
+      input.retirementLeaseToken ?? null,
       WORKER_DEPLOYMENT_FORM_URL,
       WORKER_ENDPOINT_FORM_URL,
       input.workerResourceUid,

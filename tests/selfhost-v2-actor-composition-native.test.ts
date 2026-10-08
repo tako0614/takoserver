@@ -43,9 +43,39 @@ export class CounterActor {
   async fetch(request) {
     if (new URL(request.url).pathname === "/socket")
       return (await this.context.sockets.accept(request, {protocol: "chat"})).response;
+    if (new URL(request.url).pathname === "/alarm-set") {
+      await this.context.alarm.set(Date.now() + 2500);
+      return new Response("armed");
+    }
+    if (new URL(request.url).pathname === "/alarm-count") {
+      const rows = await this.context.storage.query("SELECT count(*) AS n FROM retirement_alarm_runs").catch(() => ({rows:[{n:0}]}));
+      return new Response(String(rows.rows[0].n));
+    }
+    if (new URL(request.url).pathname === "/held-nested") {
+      const actor = this.env.ACTOR;
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("head"));
+          setTimeout(async () => {
+            try {
+              const nested = await actor.get(actor.idFromName("nested")).fetch(
+                new Request("http://actor.example.test/plain"),
+              );
+              controller.enqueue(new TextEncoder().encode("nested-admitted:" + nested.status));
+            } catch {
+              controller.enqueue(new TextEncoder().encode("nested-refused"));
+            }
+            controller.close();
+          }, 750);
+        },
+      }));
+    }
     return new Response("actor:" + this.env.LABEL);
   }
-  alarm() {}
+  async alarm() {
+    await this.context.storage.execute("CREATE TABLE IF NOT EXISTS retirement_alarm_runs (n INTEGER)");
+    await this.context.storage.execute("INSERT INTO retirement_alarm_runs VALUES (1)");
+  }
   async socketMessage(socket, data) { await socket.send("actor:" + data); }
   socketClose() {}
   socketError() {}
@@ -60,7 +90,11 @@ async function unusedPort(): Promise<number> {
   return port;
 }
 
-async function exercise(activeUpdate: boolean, namespaceAfterDeployment = false): Promise<void> {
+async function exercise(
+  activeUpdate: boolean,
+  namespaceAfterDeployment = false,
+  failedRetirement = false,
+): Promise<void> {
   if (!binary) throw new Error("pinned Workerd unavailable");
   const root = await mkdtemp(join(tmpdir(), "v2-actor-composition-"));
   const db = new Database(join(root, "state.sqlite"));
@@ -278,7 +312,95 @@ async function exercise(activeUpdate: boolean, namespaceAfterDeployment = false)
     const graphNow = await graph.readGraph(scope, AbortSignal.timeout(10_000));
     expect(graphNow).not.toBeNull();
     if (!graphNow) throw new Error("Actor graph missing after native invocation");
-    expect((await graph.readRealization(graphNow, AbortSignal.timeout(10_000))).kind).toBe("ready");
+    const readback = await graph.readRealization(graphNow, AbortSignal.timeout(10_000));
+    expect(readback.kind).toBe("ready");
+    if (failedRetirement) {
+      if (
+        readback.kind !== "ready" ||
+        !readback.realization.sourceOperationId ||
+        !readback.realization.incarnationId
+      )
+        throw new Error("Actor retirement fixture lacks an exact incarnation");
+      const armed = await physical.fetch(
+        { ...scope, id: "retirement-outer" },
+        new Request("http://actor.example.test/alarm-set"),
+      );
+      expect(await armed.text()).toBe("armed");
+      expect(
+        await physical.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000)),
+      ).toMatchObject({
+        kind: "confirmed",
+        pendingAlarmCount: 1,
+      });
+      const outer = await physical.fetch(
+        { ...scope, id: "retirement-outer" },
+        new Request("http://actor.example.test/held-nested", {
+          signal: AbortSignal.timeout(10_000),
+        }),
+      );
+      const reader = outer.body?.getReader();
+      expect(reader).toBeDefined();
+      expect(new TextDecoder().decode((await reader?.read())?.value)).toBe("head");
+      const retirementInput = {
+        workerResourceUid: worker.resourceUid,
+        targetKey,
+        sourceOperationId: readback.realization.sourceOperationId,
+        incarnationId: readback.realization.incarnationId,
+        generation: readback.realization.graph.generation,
+        versions: readback.realization.graph.versions.map((version) => ({
+          versionId: version.versionId,
+          workerVersionUid: version.workerVersionUid,
+          weight: version.weight,
+        })),
+        retirementOperationId: "accepted-deletion-whose-lease-was-lost",
+      };
+      let authorityReads = 0;
+      const retirement = physical.quiesceIncarnation(retirementInput, async () => {
+        authorityReads += 1;
+        return authorityReads === 1;
+      });
+      await expect(physical.quiesceIncarnation(retirementInput, async () => true)).rejects.toThrow(
+        "retirement already in progress",
+      );
+      expect(new TextDecoder().decode((await reader?.read())?.value)).toBe("nested-refused");
+      expect((await reader?.read())?.done).toBe(true);
+      await expect(retirement).rejects.toThrow("retirement authority changed");
+      expect(authorityReads).toBe(2);
+      // No application fetch may wake the carrier after the lost withdrawal
+      // proof; the retained alarm must resume from its current graph alone.
+      let alarm = await physical.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      for (
+        let attempt = 0;
+        attempt < 200 && (alarm.kind !== "confirmed" || alarm.pendingAlarmCount !== 0);
+        attempt += 1
+      ) {
+        await Bun.sleep(50);
+        alarm = await physical.observeNamespaceRuntime(scope, AbortSignal.timeout(5_000));
+      }
+      expect(alarm).toMatchObject({ kind: "confirmed", pendingAlarmCount: 0 });
+      const after = await physical.fetch(
+        { ...scope, id: "retirement-outer" },
+        new Request("http://actor.example.test/plain", {
+          signal: AbortSignal.timeout(10_000),
+        }),
+      );
+      expect(after.status).toBe(200);
+      expect(await after.text()).toBe("actor:composition");
+      let errorReads = 0;
+      await expect(
+        physical.quiesceIncarnation(retirementInput, async () => {
+          errorReads += 1;
+          if (errorReads === 2) throw new Error("SQL read unavailable");
+          return true;
+        }),
+      ).rejects.toThrow("retirement authority changed");
+      expect(errorReads).toBe(2);
+      const counted = await physical.fetch(
+        { ...scope, id: "retirement-outer" },
+        new Request("http://actor.example.test/alarm-count"),
+      );
+      expect(await counted.text()).toBe("1");
+    }
   } catch (error) {
     failure = error;
   }
@@ -322,5 +444,11 @@ test.skipIf(binary === undefined)(
 test.skipIf(binary === undefined)(
   "first active Actor Namespace CREATE warms and observes the accepted native graph",
   () => exercise(false, true),
+  60_000,
+);
+
+test.skipIf(binary === undefined)(
+  "Actor retirement releases its Namespace lane during a nested turn and restores the current child after a lost withdrawal claim",
+  () => exercise(false, true, true),
   60_000,
 );

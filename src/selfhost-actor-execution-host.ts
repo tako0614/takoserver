@@ -421,15 +421,13 @@ export function createSelfhostActorExecutionHost(options: {
     );
     return result;
   };
-  const retire = async (owner: Owner, beforeClose?: () => Promise<boolean>): Promise<void> => {
+  const retire = async (owner: Owner): Promise<void> => {
     const session = owner.session;
     if (session) {
       session.retiring = true;
       session.process.disableAlarmAdmission();
       if (session.active > 0 && !session.dead)
         await new Promise<void>((resolve) => session.idle.add(resolve));
-      if (beforeClose && !(await beforeClose()))
-        throw new ActorAuthorityUnavailable("Actor retirement authority changed");
       await (session.reap ?? session.process.close());
       for (const lease of session.privateBindingLeases) await lease.release();
       if (owner.session === session) delete owner.session;
@@ -440,8 +438,19 @@ export function createSelfhostActorExecutionHost(options: {
     }
   };
   const resumeAdmissionAfterSettlement = (owner: Owner, session: Session, identity: ActorScope) => {
-    if (session.admissionRecovery) return;
     const captured = { ...identity };
+    if (session.admissionRecovery) {
+      // A previous recovery may be observing this session just as retirement
+      // closes admission. Let it finish, then start a fresh current-graph read
+      // for this failed withdrawal instead of losing the wake obligation.
+      void session.admissionRecovery
+        .finally(() => {
+          if (owner.session === session && !session.dead && !session.retiring)
+            resumeAdmissionAfterSettlement(owner, session, captured);
+        })
+        .catch(() => {});
+      return;
+    }
     session.admissionRecovery = (async () => {
       while (
         !stopped &&
@@ -565,12 +574,18 @@ export function createSelfhostActorExecutionHost(options: {
       owners.set(key, owner);
     }
     const current = owner;
+    // A graph-change retirement may be draining while holding this Namespace
+    // lane. A nested call from the draining turn must not queue behind it.
+    if (current.session?.retiring) throw new ActorAuthorityUnavailable("Actor carrier retiring");
     // Only lifecycle selection is queued here. Individual IDs run under
     // native input gates, not a second generic application scheduler.
     const session = await exclusive(current, async () => {
       let openedByWarm: Session | undefined;
       let disabledCarrier: Session | undefined;
       if (stopped || current.revoked || revoked.has(key)) throw new Error("Actor owner stopped");
+      // A retiring carrier must refuse a nested same-Namespace invocation
+      // promptly. Waiting behind its drain would deadlock the outer turn.
+      if (current.session?.retiring) throw new ActorAuthorityUnavailable("Actor carrier retiring");
       if (!(await registeredScope(key, identity)))
         throw new ActorAuthorityUnavailable("Actor namespace is not registered");
       if (warm && !(await warm.stillAuthorized(signal)))
@@ -624,11 +639,7 @@ export function createSelfhostActorExecutionHost(options: {
           version.weight,
         ]),
       ]);
-      if (
-        current.session?.selection !== selection ||
-        current.session.dead ||
-        current.session.retiring
-      ) {
+      if (current.session?.selection !== selection || current.session.dead) {
         // An accepted Namespace update may outlive a hostname-only Worker
         // publication. Its old Actor carrier is no longer an exact readback,
         // and with no Endpoint there may be no public request to refresh it.
@@ -1215,16 +1226,47 @@ export function createSelfhostActorExecutionHost(options: {
         const candidate = owner.session;
         if (!candidate || candidate.authorityGraph.workerUid !== captured.workerResourceUid)
           continue;
-        await exclusive(owner, async () => {
+        const held = await exclusive(owner, async () => {
           const session = owner.session;
-          if (!session || session.authorityGraph.workerUid !== captured.workerResourceUid) return;
-          if (session.realization.sourceOperationId !== captured.sourceOperationId) return;
+          if (!session || session.authorityGraph.workerUid !== captured.workerResourceUid)
+            return null;
+          if (session.realization.sourceOperationId !== captured.sourceOperationId) return null;
           if (!matches(session))
             throw new ActorAuthorityUnavailable("Actor retirement incarnation changed");
+          if (session.retiring)
+            throw new ActorAuthorityUnavailable("Actor retirement already in progress");
           const scope = { ...session.authorityGraph.scope };
           if (!(await stillAuthorized(scope)) || owner.session !== session)
             throw new ActorAuthorityUnavailable("Actor retirement authority unavailable");
-          await retire(owner, () => stillAuthorized(scope));
+          session.retiring = true;
+          session.process.disableAlarmAdmission();
+          return { session, scope };
+        });
+        if (!held) continue;
+        // The outer Actor turn can need this Namespace's binding selection or
+        // the Workerd owner before it completes. Neither serial lane is held.
+        if (held.session.active > 0 && !held.session.dead)
+          await new Promise<void>((resolve) => held.session.idle.add(resolve));
+        await exclusive(owner, async () => {
+          const { session, scope } = held;
+          if (owner.session !== session || !matches(session))
+            throw new ActorAuthorityUnavailable("Actor retirement incarnation changed");
+          let authorized = false;
+          try {
+            authorized = await stillAuthorized(scope);
+          } catch {
+            // A lost SQL read is not permission to reap. Keep the same child
+            // and restore admission only after an independent current graph
+            // observation; never enable it merely because the old read failed.
+          }
+          if (!authorized) {
+            if (owner.session === session && !session.dead) {
+              session.retiring = false;
+              resumeAdmissionAfterSettlement(owner, session, scope);
+            }
+            throw new ActorAuthorityUnavailable("Actor retirement authority changed");
+          }
+          await retire(owner);
         });
       }
     },

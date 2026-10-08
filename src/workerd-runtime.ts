@@ -423,6 +423,8 @@ export interface WorkerdActorIncarnationRetirement {
   readonly generation: string;
   readonly versions: readonly SelfhostWeightedVersion[];
   readonly retirementOperationId: string;
+  /** Present for a directly executing DELETE; background retired groups use SQL's current claim. */
+  readonly retirementLeaseToken?: string;
 }
 
 /** Exact weighted identity behind the runtime's committed stable pointer. */
