@@ -63,7 +63,18 @@ and Workflow execution guard
 (`sha256:5588505e384cd54105cb4e1a46bb4c33ce6d33f222270f49ed7b3f3e88da84dc`):
 normal organization HTTP accepted a bound WorkerVersion and Deployment, the
 selected Worker called `env.PARENT.create`, and its guarded parent class called
-`env.CHILD.create/get/status` before native child completion. That is local
-native composition evidence, not Workflow Binding recovery after killing and
-restarting the Host in a new OS process. Public FormSupport, actual Hosted/live
-operation, and full Form support remain unqualified by this test.
+`env.CHILD.create/get/status` before native child completion.
+
+`tests/selfhost-v2-workflow-os-restart-native.test.ts` additionally uses the same
+SQLite, object store and private owner roots across Host SIGKILL and replacement.
+It verifies distinct Host and native Worker PIDs, retained accepted Operations,
+Binding get/status/create, parent step replay, child completion, and event-driven
+parent continuation. A same-spec Workflow PUT and dependency-ordered DELETE
+complete after restart. Event acceptance is durable; it does not promise
+immediate consumption or a particular intermediate status. Failed or uncertain
+cleanup retains the fixture roots instead of treating missing process identities
+as absence.
+
+This is local loopback/native recovery evidence. It does not cover a kill during
+an in-flight external effect, public TLS/Ingress, public FormSupport, Hosted/live
+operation, or full Form support.
