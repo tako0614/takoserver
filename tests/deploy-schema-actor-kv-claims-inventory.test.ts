@@ -41,7 +41,7 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
   });
   expect(source.files.at(-1)).toMatchObject({
     name: CURRENT_SOURCE_TAIL,
-    digest: "sha256:9c3ae430c5fce9800ed6181a8252e6c1e70168ace7b0935c2ad587d3ae4589eb",
+    digest: "sha256:88bf294753e8bd43809634410c4a8648cb3e0500e7400d53ec4c8f17fae46c84",
   });
   expect(artifact.names).toHaveLength(66);
   expect(artifact.names.at(-1)).toBe(MIGRATION);
