@@ -7,13 +7,25 @@ export interface V2WorkerInvocationHandle {
 }
 
 /** Fixed when the owning backend atomically admits against its live publication. */
+export type V2WorkerInvocationIngress =
+  | { readonly kind: "endpoint"; readonly endpointUid: string; readonly endpointGeneration: number }
+  | {
+      readonly kind: "service";
+      readonly callerWorkerUid: string;
+      readonly callerVersionUid: string;
+      readonly callerVersionGeneration: number;
+      readonly callerVersionOperationId: string;
+      readonly bindingName: string;
+      /** Nonsecret correlation only. Physical caller liveness is provider-owned. */
+      readonly callerExecutionRef: string;
+    };
+
 export interface V2WorkerInvocationSelection {
   readonly workerUid: string;
   readonly deploymentUid: string;
   readonly deploymentGeneration: number;
   readonly sourceOperationId: string;
-  readonly endpointUid: string;
-  readonly endpointGeneration: number;
+  readonly ingress: V2WorkerInvocationIngress;
   readonly versionUid: string;
   readonly versionGeneration: number;
   readonly versionOperationId: string;
@@ -98,8 +110,6 @@ const retirementIdentityKeys = [
   "deploymentUid",
   "deploymentGeneration",
   "sourceOperationId",
-  "endpointUid",
-  "endpointGeneration",
   "versionUid",
   "versionGeneration",
   "versionOperationId",
@@ -130,7 +140,6 @@ function record(
     "worker_uid",
     "deployment_uid",
     "source_operation_id",
-    "endpoint_uid",
     "version_uid",
     "version_operation_id",
     "native_identity",
@@ -140,7 +149,6 @@ function record(
   if (
     strings.some((key) => typeof row[key] !== "string") ||
     typeof row.deployment_generation !== "number" ||
-    typeof row.endpoint_generation !== "number" ||
     typeof row.version_generation !== "number" ||
     (row.phase !== "admitted" &&
       row.phase !== "send_authorized" &&
@@ -164,6 +172,48 @@ function record(
         !digestPattern.test(row.retirement_receipt_digest)))
   )
     return null;
+  const ingress: V2WorkerInvocationIngress | null =
+    (row.ingress_kind === "endpoint" || row.ingress_kind === undefined) &&
+    typeof row.endpoint_uid === "string" &&
+    row.endpoint_uid.length > 0 &&
+    typeof row.endpoint_generation === "number" &&
+    row.endpoint_generation > 0 &&
+    [
+      "service_caller_worker_uid",
+      "service_caller_version_uid",
+      "service_caller_version_generation",
+      "service_caller_version_operation_id",
+      "service_binding_name",
+      "service_caller_execution_ref",
+    ].every((key) => row[key] === null || row[key] === undefined)
+      ? {
+          kind: "endpoint",
+          endpointUid: row.endpoint_uid,
+          endpointGeneration: row.endpoint_generation,
+        }
+      : row.ingress_kind === "service" &&
+          row.endpoint_uid === null &&
+          row.endpoint_generation === null &&
+          [
+            "service_caller_worker_uid",
+            "service_caller_version_uid",
+            "service_caller_version_operation_id",
+            "service_binding_name",
+            "service_caller_execution_ref",
+          ].every((key) => typeof row[key] === "string" && (row[key] as string).length > 0) &&
+          typeof row.service_caller_version_generation === "number" &&
+          row.service_caller_version_generation > 0
+        ? {
+            kind: "service",
+            callerWorkerUid: row.service_caller_worker_uid as string,
+            callerVersionUid: row.service_caller_version_uid as string,
+            callerVersionGeneration: row.service_caller_version_generation,
+            callerVersionOperationId: row.service_caller_version_operation_id as string,
+            bindingName: row.service_binding_name as string,
+            callerExecutionRef: row.service_caller_execution_ref as string,
+          }
+        : null;
+  if (!ingress) return null;
   return Object.freeze({
     handle: Object.freeze({ invocationId: handle.invocationId, custodyToken: handle.custodyToken }),
     backendId: row.backend_id as string,
@@ -174,8 +224,7 @@ function record(
     deploymentUid: row.deployment_uid as string,
     deploymentGeneration: row.deployment_generation,
     sourceOperationId: row.source_operation_id as string,
-    endpointUid: row.endpoint_uid as string,
-    endpointGeneration: row.endpoint_generation,
+    ingress: Object.freeze(ingress),
     versionUid: row.version_uid as string,
     versionGeneration: row.version_generation,
     versionOperationId: row.version_operation_id as string,
@@ -272,6 +321,39 @@ export function createV2WorkerInvocationLifecycle(options: {
       const handle = ownHandle(input.handle);
       const receiptDigest = input.receiptDigest;
       const raw = input.expected;
+      const rawIngress = raw.ingress;
+      const ingress: V2WorkerInvocationIngress | null =
+        rawIngress?.kind === "endpoint" &&
+        typeof rawIngress.endpointUid === "string" &&
+        rawIngress.endpointUid.length > 0 &&
+        Number.isSafeInteger(rawIngress.endpointGeneration) &&
+        rawIngress.endpointGeneration > 0
+          ? Object.freeze({
+              kind: "endpoint",
+              endpointUid: rawIngress.endpointUid,
+              endpointGeneration: rawIngress.endpointGeneration,
+            })
+          : rawIngress?.kind === "service" &&
+              [
+                rawIngress.callerWorkerUid,
+                rawIngress.callerVersionUid,
+                rawIngress.callerVersionOperationId,
+                rawIngress.bindingName,
+                rawIngress.callerExecutionRef,
+              ].every((value) => typeof value === "string" && value.length > 0) &&
+              Number.isSafeInteger(rawIngress.callerVersionGeneration) &&
+              rawIngress.callerVersionGeneration > 0
+            ? Object.freeze({
+                kind: "service",
+                callerWorkerUid: rawIngress.callerWorkerUid,
+                callerVersionUid: rawIngress.callerVersionUid,
+                callerVersionGeneration: rawIngress.callerVersionGeneration,
+                callerVersionOperationId: rawIngress.callerVersionOperationId,
+                bindingName: rawIngress.bindingName,
+                callerExecutionRef: rawIngress.callerExecutionRef,
+              })
+            : null;
+      if (!ingress) return false;
       const expected: V2WorkerInvocationRetirementIdentity = Object.freeze({
         backendId: raw.backendId,
         targetKey: raw.targetKey,
@@ -281,8 +363,7 @@ export function createV2WorkerInvocationLifecycle(options: {
         deploymentUid: raw.deploymentUid,
         deploymentGeneration: raw.deploymentGeneration,
         sourceOperationId: raw.sourceOperationId,
-        endpointUid: raw.endpointUid,
-        endpointGeneration: raw.endpointGeneration,
+        ingress,
         versionUid: raw.versionUid,
         versionGeneration: raw.versionGeneration,
         versionOperationId: raw.versionOperationId,
@@ -308,7 +389,11 @@ export function createV2WorkerInvocationLifecycle(options: {
            WHERE invocation_id = ? AND custody_token = ?
              AND backend_id = ? AND target_key = ? AND principal = ? AND space = ?
              AND worker_uid = ? AND deployment_uid = ? AND deployment_generation = ?
-             AND source_operation_id = ? AND endpoint_uid = ? AND endpoint_generation = ?
+             AND source_operation_id = ? AND ingress_kind = ?
+             AND endpoint_uid IS ? AND endpoint_generation IS ?
+             AND service_caller_worker_uid IS ? AND service_caller_version_uid IS ?
+             AND service_caller_version_generation IS ? AND service_caller_version_operation_id IS ?
+             AND service_binding_name IS ? AND service_caller_execution_ref IS ?
              AND version_uid = ? AND version_generation = ? AND version_operation_id = ?
              AND native_identity = ? AND closure_digest = ? AND confirmed_receipt = ?
              AND phase = 'send_authorized' AND retired_at_ms IS NULL
@@ -326,8 +411,15 @@ export function createV2WorkerInvocationLifecycle(options: {
             expected.deploymentUid,
             expected.deploymentGeneration,
             expected.sourceOperationId,
-            expected.endpointUid,
-            expected.endpointGeneration,
+            expected.ingress.kind,
+            expected.ingress.kind === "endpoint" ? expected.ingress.endpointUid : null,
+            expected.ingress.kind === "endpoint" ? expected.ingress.endpointGeneration : null,
+            expected.ingress.kind === "service" ? expected.ingress.callerWorkerUid : null,
+            expected.ingress.kind === "service" ? expected.ingress.callerVersionUid : null,
+            expected.ingress.kind === "service" ? expected.ingress.callerVersionGeneration : null,
+            expected.ingress.kind === "service" ? expected.ingress.callerVersionOperationId : null,
+            expected.ingress.kind === "service" ? expected.ingress.bindingName : null,
+            expected.ingress.kind === "service" ? expected.ingress.callerExecutionRef : null,
             expected.versionUid,
             expected.versionGeneration,
             expected.versionOperationId,
@@ -343,7 +435,12 @@ export function createV2WorkerInvocationLifecycle(options: {
       const current = await read(handle);
       return (
         current?.retirement?.receiptDigest === receiptDigest &&
-        retirementIdentityKeys.every((key) => current[key] === expected[key])
+        retirementIdentityKeys.every((key) => current[key] === expected[key]) &&
+        Object.keys(expected.ingress).every(
+          (key) =>
+            current.ingress[key as keyof V2WorkerInvocationIngress] ===
+            expected.ingress[key as keyof V2WorkerInvocationIngress],
+        )
       );
     },
     async inspectDeployment(

@@ -69,6 +69,7 @@ const V2_QUEUE_BATCH_SETTLEMENTS = "0082_v2_queue_batch_settlements.sql";
 const V2_QUEUE_CONSUMER_ACCEPTANCE = "0083_v2_queue_consumer_acceptance.sql";
 const V2_INVOCATION_NO_NATIVE_DISPATCH = "0084_v2_worker_invocation_no_native_dispatch.sql";
 const V2_EDGE_KV_NATIVE_CUSTODY = "0085_v2_edge_kv_native_custody.sql";
+const V2_WORKER_SERVICE_INVOCATION_CUSTODY = "0086_v2_worker_service_invocation_custody.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -123,6 +124,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   V2_QUEUE_CONSUMER_ACCEPTANCE,
   V2_INVOCATION_NO_NATIVE_DISPATCH,
   V2_EDGE_KV_NATIVE_CUSTODY,
+  V2_WORKER_SERVICE_INVOCATION_CUSTODY,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -848,6 +850,7 @@ describe("bringing a local database up to date", () => {
       V2_QUEUE_CONSUMER_ACCEPTANCE,
       V2_INVOCATION_NO_NATIVE_DISPATCH,
       V2_EDGE_KV_NATIVE_CUSTODY,
+      V2_WORKER_SERVICE_INVOCATION_CUSTODY,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -1144,6 +1147,7 @@ describe("bringing a local database up to date", () => {
         V2_QUEUE_CONSUMER_ACCEPTANCE,
         V2_INVOCATION_NO_NATIVE_DISPATCH,
         V2_EDGE_KV_NATIVE_CUSTODY,
+        V2_WORKER_SERVICE_INVOCATION_CUSTODY,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1733,6 +1737,7 @@ describe("bringing a local database up to date", () => {
       V2_QUEUE_CONSUMER_ACCEPTANCE,
       V2_INVOCATION_NO_NATIVE_DISPATCH,
       V2_EDGE_KV_NATIVE_CUSTODY,
+      V2_WORKER_SERVICE_INVOCATION_CUSTODY,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1899,6 +1904,7 @@ describe("bringing a local database up to date", () => {
       V2_QUEUE_CONSUMER_ACCEPTANCE,
       V2_INVOCATION_NO_NATIVE_DISPATCH,
       V2_EDGE_KV_NATIVE_CUSTODY,
+      V2_WORKER_SERVICE_INVOCATION_CUSTODY,
     ]);
     expect(
       database
@@ -2872,6 +2878,7 @@ describe("bringing a local database up to date", () => {
       V2_QUEUE_CONSUMER_ACCEPTANCE,
       V2_INVOCATION_NO_NATIVE_DISPATCH,
       V2_EDGE_KV_NATIVE_CUSTODY,
+      V2_WORKER_SERVICE_INVOCATION_CUSTODY,
     ]);
     expect(
       database

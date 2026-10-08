@@ -735,7 +735,7 @@ describe("0061 accepted-authority cutover", () => {
           writeFileSync(join(directory, "0086_rogue.sql"), "-- rogue\n");
           void database;
         },
-        message: "exact audited source inventory 0001-0085",
+        message: "exact audited source inventory 0001-0086",
       },
       {
         label: "rogue predecessor shape",

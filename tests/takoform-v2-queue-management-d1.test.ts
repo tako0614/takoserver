@@ -75,10 +75,15 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
   try {
     const database = await runtime.getD1Database("STATE_DB");
     for (const migration of MIGRATIONS) {
-      for (const statement of splitMigration(migration.sql))
-        await database.prepare(statement).run();
+      for (const [index, statement] of splitMigration(migration.sql).entries()) {
+        try {
+          await database.prepare(statement).run();
+        } catch (error) {
+          throw new Error(`${migration.name} statement ${index + 1} failed`, { cause: error });
+        }
+      }
     }
-    expect(MIGRATIONS.at(-1)?.name).toBe("0085_v2_edge_kv_native_custody.sql");
+    expect(MIGRATIONS.at(-1)?.name).toBe("0086_v2_worker_service_invocation_custody.sql");
     const sql = createD1Sql(database);
     const principal = "org-d1";
     const space = "default";

@@ -92,6 +92,7 @@ export {
   type V2WorkerInvocationAdmission,
   type V2WorkerInvocationCustody,
   type V2WorkerInvocationHandle,
+  type V2WorkerInvocationIngress,
   type V2WorkerInvocationRecord,
   type V2WorkerInvocationRetirementIdentity,
   type V2WorkerInvocationRetirementInput,
@@ -120,6 +121,11 @@ export {
   type V2WorkerVersionResolution,
   type V2WorkerVersionSnapshot,
 } from "./worker-publication-state.ts";
+export {
+  exactV2ResolvedServiceBindings,
+  projectV2ResolvedServiceBindings,
+  type V2ResolvedServiceBinding,
+} from "./worker-service-resolution.ts";
 export {
   createV2WorkerVersionConfiguredInputSealer,
   type V2WorkerVersionConfiguredKeyring,

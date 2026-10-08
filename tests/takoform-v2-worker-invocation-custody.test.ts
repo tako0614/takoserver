@@ -20,8 +20,7 @@ const retirementIdentity = {
   deploymentUid: "deployment-one",
   deploymentGeneration: 1,
   sourceOperationId: "op-deployment-one",
-  endpointUid: "endpoint-one",
-  endpointGeneration: 1,
+  ingress: { kind: "endpoint", endpointUid: "endpoint-one", endpointGeneration: 1 },
   versionUid: "version-one",
   versionGeneration: 1,
   versionOperationId: "op-version-one",
@@ -72,8 +71,8 @@ async function seed(sql: Sql) {
   );
 }
 
-async function exercise(sql: Sql) {
-  await seed(sql);
+async function exercise(sql: Sql, alreadySeeded = false) {
+  if (!alreadySeeded) await seed(sql);
   const owner = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(2000) });
   const mutableHandle = { ...handle };
   const pendingRead = owner.read(mutableHandle);
@@ -319,7 +318,9 @@ test("proven no-native-dispatch after send authorization is a durable terminal, 
 test("0084 forward migration preserves old sent rows and exact lost-ACK terminal readback", async () => {
   const db = new Database(":memory:");
   try {
-    for (const migration of MIGRATIONS.filter(({ name }) => !name.startsWith("0084_")))
+    for (const migration of MIGRATIONS.filter(
+      ({ name }) => !name.startsWith("0084_") && !name.startsWith("0086_"),
+    ))
       db.exec(migration.sql);
     const sql = createSqliteSql(db);
     await seed(sql);
@@ -417,7 +418,23 @@ test("native D1 enforces the same monotonic invocation lifetime", async () => {
         await database.prepare(statement).run();
     }
     const sql = createD1Sql(database);
-    await exercise(sql);
+    await seed(sql);
+    const oldRow = await sql.query(
+      "SELECT * FROM tf_v2_worker_invocations WHERE invocation_id = ?",
+      [handle.invocationId],
+    );
+    const forward = MIGRATIONS.find(
+      ({ name }) => name === "0086_v2_worker_service_invocation_custody.sql",
+    );
+    if (!forward) throw new Error("missing 0086 source");
+    for (const statement of splitMigration(forward.sql)) await database.prepare(statement).run();
+    const migrated = await sql.query(
+      "SELECT * FROM tf_v2_worker_invocations WHERE invocation_id = ? /* after 0086 */",
+      [handle.invocationId],
+    );
+    expect(migrated[0]).toMatchObject(oldRow[0] ?? {});
+    expect(migrated[0]?.ingress_kind).toBe("endpoint");
+    await exercise(sql, true);
     const second = { invocationId: "d1-no-native-invocation", custodyToken: "d1-no-native-token" };
     await sql.run(
       `INSERT INTO tf_v2_worker_invocations
@@ -443,6 +460,214 @@ test("native D1 enforces the same monotonic invocation lifetime", async () => {
     });
   } finally {
     await runtime.dispose();
+  }
+});
+
+test("0086 preserves populated endpoint phases and opens exact endpoint-free Service lifecycle", async () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    for (const migration of MIGRATIONS.filter(({ name }) => !name.startsWith("0086_")))
+      db.exec(migration.sql);
+    const sql = createSqliteSql(db);
+    await seed(sql);
+    await sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+       (invocation_id, custody_token, backend_id, target_key, principal, space,
+        worker_uid, deployment_uid, deployment_generation, source_operation_id,
+        endpoint_uid, endpoint_generation, version_uid, version_generation,
+        version_operation_id, native_identity, closure_digest, confirmed_receipt,
+        admitted_at_ms)
+       SELECT 'old-retired', 'retired-custody-token', backend_id, target_key, principal, space,
+        worker_uid, deployment_uid, deployment_generation, source_operation_id,
+        endpoint_uid, endpoint_generation, version_uid, version_generation,
+        version_operation_id, native_identity, closure_digest, confirmed_receipt, admitted_at_ms
+       FROM tf_v2_worker_invocations WHERE invocation_id = ?`,
+      [handle.invocationId],
+    );
+    await sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+       (invocation_id, custody_token, backend_id, target_key, principal, space,
+        worker_uid, deployment_uid, deployment_generation, source_operation_id,
+        endpoint_uid, endpoint_generation, version_uid, version_generation,
+        version_operation_id, native_identity, closure_digest, confirmed_receipt,
+        admitted_at_ms)
+       SELECT 'old-no-dispatch', 'no-dispatch-token', backend_id, target_key, principal, space,
+        worker_uid, deployment_uid, deployment_generation, source_operation_id,
+        endpoint_uid, endpoint_generation, version_uid, version_generation,
+        version_operation_id, native_identity, closure_digest, confirmed_receipt, admitted_at_ms
+       FROM tf_v2_worker_invocations WHERE invocation_id = ?`,
+      [handle.invocationId],
+    );
+    const before = await sql.query("SELECT * FROM tf_v2_worker_invocations ORDER BY invocation_id");
+    await sql.run(
+      "UPDATE tf_v2_worker_invocations SET phase = 'send_authorized', send_authorized_at_ms = 1500 WHERE invocation_id <> ?",
+      [handle.invocationId],
+    );
+    await sql.run(
+      "UPDATE tf_v2_worker_invocations SET retired_at_ms = 1600, retirement_receipt_digest = ? WHERE invocation_id = 'old-retired'",
+      [`sha256:${"d".repeat(64)}`],
+    );
+    await sql.run(
+      "UPDATE tf_v2_worker_invocations SET no_native_dispatch_at_ms = 1600 WHERE invocation_id = 'old-no-dispatch'",
+    );
+    const populated = await sql.query(
+      "SELECT * FROM tf_v2_worker_invocations ORDER BY invocation_id",
+    );
+    expect(before).toHaveLength(3);
+    const migration = MIGRATIONS.find(({ name }) => name.startsWith("0086_"));
+    if (!migration) throw new Error("missing 0086 source");
+    db.exec(migration.sql);
+    // A new SQL text avoids bun:sqlite's cached pre-DDL SELECT * shape.
+    const after = await sql.query(
+      "SELECT * FROM tf_v2_worker_invocations ORDER BY invocation_id /* 0086 */",
+    );
+    expect(after).toHaveLength(3);
+    for (let index = 0; index < populated.length; index += 1) {
+      expect(after[index]).toMatchObject(populated[index] ?? {});
+      expect(after[index]?.ingress_kind).toBe("endpoint");
+    }
+    expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    await sql.run(`INSERT INTO tf_v2_resources
+      (uid, principal, form_url, space, name, backend_id, target_key, active_name,
+       generation, observed_generation, phase, spec_json, last_operation)
+      SELECT 'caller-version', principal, form_url, space, 'caller-version', backend_id,
+       target_key, 'caller-version', generation, observed_generation, phase, spec_json,
+       'op-caller-version' FROM tf_v2_resources WHERE uid = 'version-one'`);
+    await sql.run(`INSERT INTO tf_v2_operations
+      (id, resource_uid, principal, replay_key, request_fingerprint, action,
+       generation, status, effect, created_at, updated_at, retain_until,
+       backend_id, target_key, backend_key, accepted_spec_json)
+      SELECT 'op-caller-version', 'caller-version', principal, 'replay-caller-version',
+       request_fingerprint, action, generation, status, effect, created_at,
+       updated_at, retain_until, backend_id, target_key, 'key-caller-version',
+       accepted_spec_json FROM tf_v2_operations WHERE id = 'op-version-one'`);
+    const service = { invocationId: "service-001", custodyToken: "service-custody-token" };
+    const serviceInsert = `INSERT INTO tf_v2_worker_invocations
+      (invocation_id, custody_token, backend_id, target_key, principal, space,
+       worker_uid, deployment_uid, deployment_generation, source_operation_id,
+       ingress_kind, endpoint_uid, endpoint_generation, service_caller_worker_uid,
+       service_caller_version_uid, service_caller_version_generation,
+       service_caller_version_operation_id, service_binding_name, service_caller_execution_ref,
+       version_uid, version_generation, version_operation_id, native_identity,
+       closure_digest, confirmed_receipt, admitted_at_ms)
+      SELECT ?, ?, backend_id, target_key, principal, space,
+       worker_uid, deployment_uid, deployment_generation, source_operation_id,
+       'service', NULL, NULL, 'worker-one', 'caller-version', 1,
+       'op-caller-version', 'UPSTREAM', 'nonsecret-caller-slot-1',
+       version_uid, version_generation, version_operation_id, native_identity,
+       closure_digest, confirmed_receipt, admitted_at_ms
+      FROM tf_v2_worker_invocations WHERE invocation_id = ?`;
+    await sql.run(serviceInsert, [service.invocationId, service.custodyToken, handle.invocationId]);
+    const owner = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(2000) });
+    expect((await owner.read(service))?.ingress).toEqual({
+      kind: "service",
+      callerWorkerUid: "worker-one",
+      callerVersionUid: "caller-version",
+      callerVersionGeneration: 1,
+      callerVersionOperationId: "op-caller-version",
+      bindingName: "UPSTREAM",
+      callerExecutionRef: "nonsecret-caller-slot-1",
+    });
+    const noDispatch = {
+      invocationId: "service-no-dispatch",
+      custodyToken: "service-no-dispatch-token",
+    };
+    await sql.run(serviceInsert, [
+      noDispatch.invocationId,
+      noDispatch.custodyToken,
+      handle.invocationId,
+    ]);
+    expect(await owner.beginSend(noDispatch)).toBe(true);
+    expect(await owner.confirmNoNativeDispatch(noDispatch)).toBe(true);
+    expect(await owner.confirmNoNativeDispatch(noDispatch)).toBe(true);
+    expect(await owner.observeBody(noDispatch, "finished")).toBe(false);
+    expect((await owner.read(noDispatch))?.noNativeDispatchAtMs).toBe(2000);
+    await expect(
+      sql.run(
+        "UPDATE tf_v2_worker_invocations SET service_caller_execution_ref = 'rewritten' WHERE invocation_id = ?",
+        [service.invocationId],
+      ),
+    ).rejects.toThrow();
+    const deleteCaller = `INSERT INTO tf_v2_operations
+      (id, resource_uid, principal, replay_key, request_fingerprint, action,
+       generation, status, effect, created_at, updated_at, retain_until,
+       backend_id, target_key, backend_key, accepted_spec_json)
+      VALUES ('op-delete-caller-version', 'caller-version', 'org-1',
+       'replay-delete-caller-version', 'fp', 'delete', 2, 'queued', 'none',
+       '2026-10-07T00:00:00Z', '2026-10-07T00:00:00Z', '2026-10-08T00:00:00Z',
+       'backend-one', 'target-one', 'key-delete-caller-version', '{}')`;
+    await expect(sql.run(deleteCaller)).rejects.toThrow();
+    expect(await owner.beginSend(service)).toBe(true);
+    expect(await owner.observeBody(service, "finished")).toBe(true);
+    expect(await owner.inspectDeployment("deployment-one")).toEqual({
+      outstanding: 2,
+      bodyFinished: 1,
+    });
+    expect(
+      await owner.confirmNativeRetirement({
+        handle: service,
+        expected: {
+          ...retirementIdentity,
+          ingress: {
+            kind: "service",
+            callerWorkerUid: "worker-one",
+            callerVersionUid: "caller-version",
+            callerVersionGeneration: 1,
+            callerVersionOperationId: "op-caller-version",
+            bindingName: "UPSTREAM",
+            callerExecutionRef: "wrong-slot",
+          },
+        },
+        receiptDigest: `sha256:${"e".repeat(64)}`,
+      }),
+    ).toBe(false);
+    expect(
+      await owner.confirmNativeRetirement({
+        handle: service,
+        expected: {
+          ...retirementIdentity,
+          ingress: {
+            kind: "service",
+            callerWorkerUid: "worker-one",
+            callerVersionUid: "caller-version",
+            callerVersionGeneration: 1,
+            callerVersionOperationId: "op-caller-version",
+            bindingName: "UPSTREAM",
+            callerExecutionRef: "nonsecret-caller-slot-1",
+          },
+        },
+        receiptDigest: `sha256:${"e".repeat(64)}`,
+      }),
+    ).toBe(true);
+    expect(await owner.inspectDeployment("deployment-one")).toEqual({
+      outstanding: 1,
+      bodyFinished: 0,
+    });
+    await sql.run(deleteCaller);
+    await expect(
+      sql.run(serviceInsert.replace("'service', NULL, NULL", "'service', 'endpoint-one', NULL"), [
+        "mixed-001",
+        "mixed-custody-token",
+        handle.invocationId,
+      ]),
+    ).rejects.toThrow();
+    await expect(
+      sql.run(
+        serviceInsert.replace(
+          "'UPSTREAM', 'nonsecret-caller-slot-1'",
+          "NULL, 'nonsecret-caller-slot-1'",
+        ),
+        ["partial-001", "partial-custody-token", handle.invocationId],
+      ),
+    ).rejects.toThrow();
+    await expect(
+      sql.run("DELETE FROM tf_v2_worker_invocations WHERE invocation_id = ?", [
+        service.invocationId,
+      ]),
+    ).rejects.toThrow();
+  } finally {
+    db.close();
   }
 });
 
