@@ -427,7 +427,13 @@ export default { fetch(request) { return inspectVersion(request); } };`),
         hostEntrypoint: entry,
         // Keep implicit private plane modules implicit. Re-declaring a module
         // already supplied by dataPlane (or another private plane) is invalid.
-        hostModules: [...(site.hostModules ?? []), wrapper, helper],
+        hostModules: [
+          ...(site.hostModules ?? []),
+          // The former entrypoint becomes an additional module. Legacy Actor
+          // graphs can already list it; do not declare that same module twice.
+          ...(site.hostModules?.includes(wrapper) ? [] : [wrapper]),
+          helper,
+        ],
       },
       modules,
       hostModules,
