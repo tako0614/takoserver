@@ -105,8 +105,15 @@ The linearization order is deliberate:
 
 If the Node process dies, file-lock release alone is not a success receipt:
 the restarted sole writer must recover SQLite journal state and establish
-that no old process can still execute under another root. Until that check,
-drain remains pending. If D1 is unavailable or a drain CAS acknowledgement is
+that no old process can still execute under another root. Inside the invocation
+lock, the fixed `readSelectedBindings({handle, expected})` port must read the
+complete sealed SQLite name/UID set of the selected Version Operation. A
+current Version projection or the caller's grant alone cannot prove that set.
+The grant must match every name and UID exactly; a subset, extra entry, remap,
+duplicate, or unavailable proof refuses drain. Recover every distinct UID from
+that authoritative set before confirming, including databases not mentioned in
+the last SQL request. Until those checks, drain remains pending. If D1 is
+unavailable or a drain CAS acknowledgement is
 lost, reread the same row; do not infer completion or remint an invocation.
 Same-spec SQLiteDatabase PUT keeps the same UID/database. If its accepted
 vector changes after an SQL commit, the Worker result may be unknown, but
