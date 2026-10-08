@@ -102,6 +102,7 @@ const RUNTIME_EXPORTS = [
   "createV2WorkerVersionConfiguredInputSealer",
   "exactV2ResolvedServiceBindings",
   "inspectV2WorkerCodeVersionEligibility",
+  "inspectV2WorkerInvocationDrainSchema",
   "inspectV2WorkerInvocationSchema",
   "parseEdgeKVNamespaceSpec",
   "parseModuleWorkerSpec",

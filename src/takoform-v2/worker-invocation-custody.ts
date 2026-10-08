@@ -1,49 +1,31 @@
 import type { Clock, Sql } from "../ports.ts";
+import type {
+  V2WorkerInvocationHandle,
+  V2WorkerInvocationIngress,
+  V2WorkerInvocationRecord,
+  V2WorkerInvocationRetirementIdentity,
+  V2WorkerInvocationRetirementInput,
+  V2WorkerInvocationSelection,
+  V2WorkerSQLiteDrainInput,
+  V2WorkerSQLiteExternalUseInput,
+} from "../worker-invocation-port.ts";
 import {
   inspectV2WorkerInvocationSchema,
+  v2WorkerInvocationDrainSchemaReady,
+  v2WorkerInvocationLegacySchemaReady,
   v2WorkerInvocationSchemaReady,
 } from "./worker-invocation-schema.ts";
 
-/** Host-only handle. The gateway never sends this to a customer Worker. */
-export interface V2WorkerInvocationHandle {
-  readonly invocationId: string;
-  readonly custodyToken: string;
-}
-
-/** Fixed when the owning backend atomically admits against its live publication. */
-export type V2WorkerInvocationIngress =
-  | { readonly kind: "endpoint"; readonly endpointUid: string; readonly endpointGeneration: number }
-  | {
-      readonly kind: "cron";
-      readonly matchId: string;
-      readonly triggerOperationId: string;
-      readonly leaseToken: string;
-      readonly attempt: number;
-    }
-  | {
-      readonly kind: "service";
-      readonly callerWorkerUid: string;
-      readonly callerVersionUid: string;
-      readonly callerVersionGeneration: number;
-      readonly callerVersionOperationId: string;
-      readonly bindingName: string;
-      /** Nonsecret correlation only. Physical caller liveness is provider-owned. */
-      readonly callerExecutionRef: string;
-    };
-
-export interface V2WorkerInvocationSelection {
-  readonly workerUid: string;
-  readonly deploymentUid: string;
-  readonly deploymentGeneration: number;
-  readonly sourceOperationId: string;
-  readonly ingress: V2WorkerInvocationIngress;
-  readonly versionUid: string;
-  readonly versionGeneration: number;
-  readonly versionOperationId: string;
-  readonly nativeIdentity: string;
-  readonly closureDigest: `sha256:${string}`;
-  readonly confirmedReceipt: string;
-}
+export type {
+  V2WorkerInvocationHandle,
+  V2WorkerInvocationIngress,
+  V2WorkerInvocationRecord,
+  V2WorkerInvocationRetirementIdentity,
+  V2WorkerInvocationRetirementInput,
+  V2WorkerInvocationSelection,
+  V2WorkerSQLiteDrainInput,
+  V2WorkerSQLiteExternalUseInput,
+} from "../worker-invocation-port.ts";
 
 export interface V2WorkerCronRouteRelease {
   readonly versionUid: string;
@@ -86,34 +68,6 @@ export type V2WorkerInvocationAdmission =
     }
   | { readonly kind: "unavailable" };
 
-export interface V2WorkerInvocationRecord extends V2WorkerInvocationSelection {
-  readonly handle: V2WorkerInvocationHandle;
-  readonly backendId: string;
-  readonly targetKey: string;
-  readonly principal: string;
-  readonly space: string;
-  readonly phase: "admitted" | "send_authorized" | "pre_effect_refused";
-  readonly bodyState: "finished" | "canceled" | null;
-  /** Trusted owner proved the native fetch was never invoked after beginSend. */
-  readonly noNativeDispatchAtMs: number | null;
-  /** Provider-origin terminal execution receipt, never inferred from body EOF. */
-  readonly retirement: {
-    readonly retiredAtMs: number;
-    readonly receiptDigest: `sha256:${string}`;
-  } | null;
-}
-
-export type V2WorkerInvocationRetirementIdentity = V2WorkerInvocationSelection &
-  Pick<V2WorkerInvocationRecord, "backendId" | "targetKey" | "principal" | "space">;
-
-export interface V2WorkerInvocationRetirementInput {
-  readonly handle: V2WorkerInvocationHandle;
-  /** Snapshot from the trusted native Tail receiver, not customer log fields. */
-  readonly expected: V2WorkerInvocationRetirementIdentity;
-  /** Stable fingerprint of the verified provider-origin terminal trace. */
-  readonly receiptDigest: `sha256:${string}`;
-}
-
 /**
  * Portable custody of an already admitted invocation. Admission itself is a
  * backend-owned atomic comparison with its current native publication pointer;
@@ -125,6 +79,10 @@ export interface V2WorkerInvocationCustody {
   read(handle: V2WorkerInvocationHandle): Promise<V2WorkerInvocationRecord | null>;
   /** One authorization to initiate the native dispatch; no retry after uncertainty. */
   beginSend(handle: V2WorkerInvocationHandle): Promise<boolean>;
+  /** Atomic exact-authority fence before the first external SQLite send. */
+  armSQLiteExternalUse(input: V2WorkerSQLiteExternalUseInput): Promise<boolean>;
+  /** Trusted Node drain only, under its invocation lock after terminal Tail. */
+  confirmSQLiteDrained(input: V2WorkerSQLiteDrainInput): Promise<boolean>;
   /** Only a proven pre-effect refusal may become terminal. */
   refuseBeforeSend(handle: V2WorkerInvocationHandle): Promise<boolean>;
   /** Trusted physical owner only, while it still proves no native fetch occurred. */
@@ -313,6 +271,148 @@ function ownHandle(handle: V2WorkerInvocationHandle): V2WorkerInvocationHandle {
   return Object.freeze({ invocationId: handle.invocationId, custodyToken: handle.custodyToken });
 }
 
+function ownExpected(
+  input: V2WorkerInvocationRetirementIdentity,
+): V2WorkerInvocationRetirementIdentity | null {
+  const ingress = input?.ingress;
+  const ownedIngress: V2WorkerInvocationIngress | null =
+    ingress?.kind === "endpoint" &&
+    boundedText(ingress.endpointUid) &&
+    Number.isSafeInteger(ingress.endpointGeneration) &&
+    ingress.endpointGeneration > 0
+      ? {
+          kind: "endpoint",
+          endpointUid: ingress.endpointUid,
+          endpointGeneration: ingress.endpointGeneration,
+        }
+      : ingress?.kind === "service" &&
+          [
+            ingress.callerWorkerUid,
+            ingress.callerVersionUid,
+            ingress.callerVersionOperationId,
+            ingress.bindingName,
+            ingress.callerExecutionRef,
+          ].every((value) => boundedText(value)) &&
+          Number.isSafeInteger(ingress.callerVersionGeneration) &&
+          ingress.callerVersionGeneration > 0
+        ? {
+            kind: "service",
+            callerWorkerUid: ingress.callerWorkerUid,
+            callerVersionUid: ingress.callerVersionUid,
+            callerVersionGeneration: ingress.callerVersionGeneration,
+            callerVersionOperationId: ingress.callerVersionOperationId,
+            bindingName: ingress.bindingName,
+            callerExecutionRef: ingress.callerExecutionRef,
+          }
+        : ingress?.kind === "cron" &&
+            digestPattern.test(ingress.matchId) &&
+            boundedText(ingress.triggerOperationId) &&
+            boundedText(ingress.leaseToken, 255, 16) &&
+            Number.isSafeInteger(ingress.attempt) &&
+            ingress.attempt > 0
+          ? {
+              kind: "cron",
+              matchId: ingress.matchId,
+              triggerOperationId: ingress.triggerOperationId,
+              leaseToken: ingress.leaseToken,
+              attempt: ingress.attempt,
+            }
+          : null;
+  if (
+    !ownedIngress ||
+    retirementIdentityKeys.some((key) =>
+      typeof input[key] === "string"
+        ? !boundedText(input[key])
+        : !Number.isSafeInteger(input[key]) || input[key] <= 0,
+    ) ||
+    !digestPattern.test(input.closureDigest)
+  )
+    return null;
+  return Object.freeze({
+    backendId: input.backendId,
+    targetKey: input.targetKey,
+    principal: input.principal,
+    space: input.space,
+    workerUid: input.workerUid,
+    deploymentUid: input.deploymentUid,
+    deploymentGeneration: input.deploymentGeneration,
+    sourceOperationId: input.sourceOperationId,
+    ingress: Object.freeze(ownedIngress),
+    versionUid: input.versionUid,
+    versionGeneration: input.versionGeneration,
+    versionOperationId: input.versionOperationId,
+    nativeIdentity: input.nativeIdentity,
+    closureDigest: input.closureDigest,
+    confirmedReceipt: input.confirmedReceipt,
+  });
+}
+
+const sqliteExpectedWhere = `invocation_id = ? AND custody_token = ?
+  AND backend_id = ? AND target_key = ? AND principal = ? AND space = ?
+  AND worker_uid = ? AND deployment_uid = ? AND deployment_generation = ?
+  AND source_operation_id = ? AND ingress_kind = ?
+  AND endpoint_uid IS ? AND endpoint_generation IS ?
+  AND service_caller_worker_uid IS ? AND service_caller_version_uid IS ?
+  AND service_caller_version_generation IS ? AND service_caller_version_operation_id IS ?
+  AND service_binding_name IS ? AND service_caller_execution_ref IS ?
+  AND cron_match_id IS ? AND cron_trigger_operation_id IS ?
+  AND cron_lease_token IS ? AND cron_attempt IS ?
+  AND version_uid = ? AND version_generation = ? AND version_operation_id = ?
+  AND native_identity = ? AND closure_digest = ? AND confirmed_receipt = ?`;
+
+function sqliteExpectedParams(
+  handle: V2WorkerInvocationHandle,
+  expected: V2WorkerInvocationRetirementIdentity,
+): (string | number | null)[] {
+  const ingress = expected.ingress;
+  return [
+    handle.invocationId,
+    handle.custodyToken,
+    expected.backendId,
+    expected.targetKey,
+    expected.principal,
+    expected.space,
+    expected.workerUid,
+    expected.deploymentUid,
+    expected.deploymentGeneration,
+    expected.sourceOperationId,
+    ingress.kind,
+    ingress.kind === "endpoint" ? ingress.endpointUid : null,
+    ingress.kind === "endpoint" ? ingress.endpointGeneration : null,
+    ingress.kind === "service" ? ingress.callerWorkerUid : null,
+    ingress.kind === "service" ? ingress.callerVersionUid : null,
+    ingress.kind === "service" ? ingress.callerVersionGeneration : null,
+    ingress.kind === "service" ? ingress.callerVersionOperationId : null,
+    ingress.kind === "service" ? ingress.bindingName : null,
+    ingress.kind === "service" ? ingress.callerExecutionRef : null,
+    ingress.kind === "cron" ? ingress.matchId : null,
+    ingress.kind === "cron" ? ingress.triggerOperationId : null,
+    ingress.kind === "cron" ? ingress.leaseToken : null,
+    ingress.kind === "cron" ? ingress.attempt : null,
+    expected.versionUid,
+    expected.versionGeneration,
+    expected.versionOperationId,
+    expected.nativeIdentity,
+    expected.closureDigest,
+    expected.confirmedReceipt,
+  ];
+}
+
+function sameExpected(
+  current: V2WorkerInvocationRecord | null,
+  expected: V2WorkerInvocationRetirementIdentity,
+): boolean {
+  return (
+    current !== null &&
+    retirementIdentityKeys.every((key) => current[key] === expected[key]) &&
+    Object.keys(expected.ingress).every(
+      (key) =>
+        current.ingress[key as keyof V2WorkerInvocationIngress] ===
+        expected.ingress[key as keyof V2WorkerInvocationIngress],
+    )
+  );
+}
+
 function record(
   row: Row | undefined,
   handle: V2WorkerInvocationHandle,
@@ -360,7 +460,16 @@ function record(
         !Number.isSafeInteger(row.retired_at_ms) ||
         row.retired_at_ms < 0 ||
         typeof row.retirement_receipt_digest !== "string" ||
-        !digestPattern.test(row.retirement_receipt_digest)))
+        !digestPattern.test(row.retirement_receipt_digest))) ||
+    (row.sqlite_drain_state === undefined) !== (row.sqlite_drain_receipt_digest === undefined) ||
+    (row.sqlite_drain_state !== undefined &&
+      !(
+        (row.sqlite_drain_state === null && row.sqlite_drain_receipt_digest === null) ||
+        (row.sqlite_drain_state === "pending" && row.sqlite_drain_receipt_digest === null) ||
+        (row.sqlite_drain_state === "drained" &&
+          typeof row.sqlite_drain_receipt_digest === "string" &&
+          digestPattern.test(row.sqlite_drain_receipt_digest))
+      ))
   )
     return null;
   const ingress: V2WorkerInvocationIngress | null =
@@ -450,6 +559,14 @@ function record(
     phase: row.phase,
     bodyState: row.body_state,
     noNativeDispatchAtMs: row.no_native_dispatch_at_ms as number | null,
+    sqliteDrainState:
+      row.sqlite_drain_state === undefined
+        ? "unavailable"
+        : (row.sqlite_drain_state as "pending" | "drained" | null),
+    sqliteDrainReceiptDigest:
+      row.sqlite_drain_receipt_digest === undefined
+        ? null
+        : (row.sqlite_drain_receipt_digest as `sha256:${string}` | null),
     retirement:
       row.retired_at_ms === null
         ? null
@@ -468,6 +585,7 @@ export function createV2WorkerInvocationLifecycle(options: {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
   const anyReady = `(${v2WorkerInvocationSchemaReady("endpoint")}) OR (${v2WorkerInvocationSchemaReady("service")}) OR (${v2WorkerInvocationSchemaReady("cron")})`;
+  const readReady = `(${v2WorkerInvocationLegacySchemaReady("endpoint")}) OR (${v2WorkerInvocationLegacySchemaReady("service")}) OR (${v2WorkerInvocationLegacySchemaReady("cron")}) OR (${v2WorkerInvocationDrainSchemaReady()})`;
   function instant(): number {
     const value = now().getTime();
     if (!Number.isSafeInteger(value) || value < 0) throw new TypeError("invalid invocation clock");
@@ -477,10 +595,25 @@ export function createV2WorkerInvocationLifecycle(options: {
     const ownedHandle = ownHandle(handle);
     const rows = await sql.query(
       `SELECT * FROM tf_v2_worker_invocations WHERE invocation_id = ? AND custody_token = ?
-        AND (${anyReady}) LIMIT 2`,
+        AND (${readReady}) LIMIT 2`,
       [ownedHandle.invocationId, ownedHandle.custodyToken],
     );
     return rows.length === 1 ? record(rows[0], ownedHandle) : null;
+  }
+  async function readSQLite(
+    handle: V2WorkerInvocationHandle,
+  ): Promise<V2WorkerInvocationRecord | null> {
+    try {
+      const rows = await sql.query(
+        `SELECT * FROM tf_v2_worker_invocations
+         WHERE invocation_id = ? AND custody_token = ?
+           AND (${v2WorkerInvocationDrainSchemaReady()}) LIMIT 2`,
+        [handle.invocationId, handle.custodyToken],
+      );
+      return rows.length === 1 ? record(rows[0], handle) : null;
+    } catch {
+      return null;
+    }
   }
   return {
     async admitCron(raw: V2WorkerCronInvocationClaim): Promise<V2WorkerInvocationAdmission> {
@@ -654,6 +787,66 @@ export function createV2WorkerInvocationLifecycle(options: {
       }
     },
     read,
+    async armSQLiteExternalUse(input: V2WorkerSQLiteExternalUseInput): Promise<boolean> {
+      const handle = ownHandle(input.handle);
+      const expected = ownExpected(input.expected);
+      if (!expected) return false;
+      try {
+        const rows = await sql.query(
+          `UPDATE tf_v2_worker_invocations SET sqlite_drain_state = 'pending'
+           WHERE ${sqliteExpectedWhere}
+             AND phase = 'send_authorized' AND send_authorized_at_ms IS NOT NULL
+             AND retired_at_ms IS NULL AND retirement_receipt_digest IS NULL
+             AND no_native_dispatch_at_ms IS NULL
+             AND sqlite_drain_state IS NULL AND sqlite_drain_receipt_digest IS NULL
+             AND (${v2WorkerInvocationDrainSchemaReady()})
+           RETURNING invocation_id`,
+          sqliteExpectedParams(handle, expected),
+        );
+        if (rows.length === 1 && rows[0]?.invocation_id === handle.invocationId) return true;
+      } catch {
+        // A lost acknowledgement needs an exact live pending readback.
+      }
+      const current = await readSQLite(handle);
+      return (
+        sameExpected(current, expected) &&
+        current?.phase === "send_authorized" &&
+        current.retirement === null &&
+        current.noNativeDispatchAtMs === null &&
+        current.sqliteDrainState === "pending" &&
+        current.sqliteDrainReceiptDigest === null
+      );
+    },
+    async confirmSQLiteDrained(input: V2WorkerSQLiteDrainInput): Promise<boolean> {
+      const handle = ownHandle(input.handle);
+      const expected = ownExpected(input.expected);
+      const receiptDigest = input.receiptDigest;
+      if (!expected || !digestPattern.test(receiptDigest)) return false;
+      try {
+        const rows = await sql.query(
+          `UPDATE tf_v2_worker_invocations
+           SET sqlite_drain_state = 'drained', sqlite_drain_receipt_digest = ?
+           WHERE ${sqliteExpectedWhere}
+             AND phase = 'send_authorized' AND send_authorized_at_ms IS NOT NULL
+             AND retired_at_ms IS NOT NULL AND retirement_receipt_digest IS NOT NULL
+             AND no_native_dispatch_at_ms IS NULL
+             AND sqlite_drain_state = 'pending' AND sqlite_drain_receipt_digest IS NULL
+             AND (${v2WorkerInvocationDrainSchemaReady()})
+           RETURNING invocation_id`,
+          [receiptDigest, ...sqliteExpectedParams(handle, expected)],
+        );
+        if (rows.length === 1 && rows[0]?.invocation_id === handle.invocationId) return true;
+      } catch {
+        // Only an identical durable receipt resolves a lost acknowledgement.
+      }
+      const current = await readSQLite(handle);
+      return (
+        sameExpected(current, expected) &&
+        current?.retirement !== null &&
+        current?.sqliteDrainState === "drained" &&
+        current.sqliteDrainReceiptDigest === receiptDigest
+      );
+    },
     async beginSend(handle: V2WorkerInvocationHandle): Promise<boolean> {
       const ownedHandle = ownHandle(handle);
       // The pre-await schema probe only selects a compatible SQL shape. For
@@ -993,13 +1186,22 @@ export function createV2WorkerInvocationLifecycle(options: {
     async inspectDeployment(
       deploymentUid: string,
     ): Promise<{ readonly outstanding: number; readonly bodyFinished: number }> {
+      const schema = await inspectV2WorkerInvocationSchema(sql);
+      if (schema === null) throw new TypeError("invocation inventory unavailable");
+      const drainReady =
+        schema === "cron" &&
+        (await sql.query(`SELECT 1 WHERE ${v2WorkerInvocationDrainSchemaReady()}`)).length === 1;
+      const ready = drainReady
+        ? v2WorkerInvocationDrainSchemaReady()
+        : v2WorkerInvocationLegacySchemaReady(schema);
       const rows = await sql.query(
         `SELECT * FROM (SELECT count(*) AS outstanding,
            coalesce(sum(CASE WHEN body_state = 'finished' THEN 1 ELSE 0 END), 0) AS body_finished
          FROM tf_v2_worker_invocations
          WHERE deployment_uid = ? AND phase <> 'pre_effect_refused'
-           AND retired_at_ms IS NULL AND no_native_dispatch_at_ms IS NULL)
-         WHERE (${anyReady})`,
+           AND no_native_dispatch_at_ms IS NULL
+           AND ${drainReady ? "(retired_at_ms IS NULL OR sqlite_drain_state = 'pending')" : "retired_at_ms IS NULL"})
+         WHERE (${ready})`,
         [deploymentUid],
       );
       const row = rows[0];

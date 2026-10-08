@@ -4,7 +4,8 @@ import { WORKER_VERSION_FORM_URL } from "./forms/worker-specs.ts";
 import type { V2Execution } from "./types.ts";
 import {
   inspectV2WorkerInvocationSchema,
-  v2WorkerInvocationSchemaReady,
+  v2WorkerInvocationDrainSchemaReady,
+  v2WorkerInvocationLegacySchemaReady,
 } from "./worker-invocation-schema.ts";
 
 /** An immutable prior upload, copied under an accepted Version DELETE claim. */
@@ -143,7 +144,7 @@ const MISSING = `EXISTS (
         AND (item.upload_receipt IS effect.confirmed_receipt OR
           item.qualified_source_receipt = effect.confirmed_receipt))
 )`;
-function unsafePredicate(serviceAware: boolean): string {
+function unsafePredicate(serviceAware: boolean, drainAware: boolean): string {
   const invocationVersion = serviceAware
     ? `(invocation.version_uid = op.resource_uid OR
       (invocation.ingress_kind = 'service' AND
@@ -156,7 +157,7 @@ function unsafePredicate(serviceAware: boolean): string {
     WHERE ${invocationVersion}
       AND invocation.phase <> 'pre_effect_refused'
       AND invocation.no_native_dispatch_at_ms IS NULL
-      AND (invocation.retired_at_ms IS NULL OR invocation.retirement_receipt_digest IS NULL))
+      AND (invocation.retired_at_ms IS NULL OR invocation.retirement_receipt_digest IS NULL${drainAware ? " OR invocation.sqlite_drain_state = 'pending'" : ""}))
   OR EXISTS (SELECT 1 FROM tf_v2_operations source
     WHERE source.resource_uid = op.resource_uid AND source.action IN ('create','update')
       AND source.status = 'succeeded' AND source.effect = 'complete'
@@ -177,12 +178,16 @@ export function createV2NativeDeletionCustody(options: {
     readonly ready: string;
   } | null> {
     const kind = await inspectV2WorkerInvocationSchema(sql);
-    return kind === null
-      ? null
-      : {
-          unsafe: unsafePredicate(kind !== "endpoint"),
-          ready: v2WorkerInvocationSchemaReady(kind),
-        };
+    if (kind === null) return null;
+    const drainAware =
+      kind === "cron" &&
+      (await sql.query(`SELECT 1 WHERE ${v2WorkerInvocationDrainSchemaReady()}`)).length === 1;
+    return {
+      unsafe: unsafePredicate(kind !== "endpoint", drainAware),
+      ready: drainAware
+        ? v2WorkerInvocationDrainSchemaReady()
+        : v2WorkerInvocationLegacySchemaReady(kind),
+    };
   }
 
   function time(): number | null {

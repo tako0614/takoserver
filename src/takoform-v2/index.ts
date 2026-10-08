@@ -157,8 +157,11 @@ export {
   type V2WorkerInvocationRetirementIdentity,
   type V2WorkerInvocationRetirementInput,
   type V2WorkerInvocationSelection,
+  type V2WorkerSQLiteDrainInput,
+  type V2WorkerSQLiteExternalUseInput,
 } from "./worker-invocation-custody.ts";
 export {
+  inspectV2WorkerInvocationDrainSchema,
   inspectV2WorkerInvocationSchema,
   type V2WorkerInvocationSchema,
   v2WorkerInvocationSchemaReady,

@@ -83,7 +83,7 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
         }
       }
     }
-    expect(MIGRATIONS.at(-1)?.name).toBe("0087_v2_worker_cron_invocation_custody.sql");
+    expect(MIGRATIONS.at(-1)?.name).toBe("0088_v2_worker_sqlite_external_drain.sql");
     const sql = createD1Sql(database);
     const principal = "org-d1";
     const space = "default";

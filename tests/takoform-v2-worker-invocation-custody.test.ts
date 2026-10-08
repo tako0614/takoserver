@@ -8,6 +8,7 @@ import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createV2WorkerInvocationLifecycle } from "../src/takoform-v2/worker-invocation-custody.ts";
 import {
+  inspectV2WorkerInvocationDrainSchema,
   inspectV2WorkerInvocationSchema,
   v2WorkerInvocationSchemaReady,
 } from "../src/takoform-v2/worker-invocation-schema.ts";
@@ -324,7 +325,10 @@ test("0084 forward migration preserves old sent rows and exact lost-ACK terminal
   try {
     for (const migration of MIGRATIONS.filter(
       ({ name }) =>
-        !name.startsWith("0084_") && !name.startsWith("0086_") && !name.startsWith("0087_"),
+        !name.startsWith("0084_") &&
+        !name.startsWith("0086_") &&
+        !name.startsWith("0087_") &&
+        !name.startsWith("0088_"),
     ))
       db.exec(migration.sql);
     const sql = createSqliteSql(db);
@@ -649,7 +653,8 @@ test("0086 preserves populated endpoint phases and opens exact endpoint-free Ser
   try {
     db.exec("PRAGMA foreign_keys = ON");
     for (const migration of MIGRATIONS.filter(
-      ({ name }) => !name.startsWith("0086_") && !name.startsWith("0087_"),
+      ({ name }) =>
+        !name.startsWith("0086_") && !name.startsWith("0087_") && !name.startsWith("0088_"),
     ))
       db.exec(migration.sql);
     const sql = createSqliteSql(db);
@@ -858,11 +863,191 @@ test("0086 preserves populated endpoint phases and opens exact endpoint-free Ser
   }
 });
 
+test("native D1 fences external SQLite through Tail and exact trusted drain", async () => {
+  const runtime = new Miniflare({
+    workers: [
+      {
+        config: {
+          name: "v2-sqlite-drain-d1-test",
+          type: "worker",
+          compatibilityDate: "2026-08-18",
+          manifest: {
+            mainModule: "worker.js",
+            modules: {
+              "worker.js": {
+                type: "esm",
+                contents: "export default { fetch() { return new Response('ok'); } };",
+              },
+            },
+          },
+          env: { STATE_DB: { type: "d1", id: "v2-sqlite-drain-d1-test" } },
+          triggers: [],
+        },
+      },
+    ],
+  });
+  try {
+    const database = await runtime.getD1Database("STATE_DB");
+    for (const migration of MIGRATIONS.filter(
+      ({ name }) =>
+        name === "0070_takoform_v2.sql" ||
+        name === "0071_v2_sqlite_migration_set_custody.sql" ||
+        name === "0073_v2_reference_acceptance.sql" ||
+        name === "0074_v2_worker_native_effects.sql" ||
+        name === "0076_v2_worker_invocation_custody.sql" ||
+        name === "0077_v2_operation_acceptance_order.sql" ||
+        name === "0078_v2_worker_invocation_retirement.sql" ||
+        name === "0079_v2_worker_native_deletions.sql" ||
+        name === "0080_v2_worker_cron_trigger_matches.sql" ||
+        name === "0084_v2_worker_invocation_no_native_dispatch.sql",
+    )) {
+      for (const statement of splitMigration(migration.sql))
+        await database.prepare(statement).run();
+    }
+    const sql = createD1Sql(database);
+    await seed(sql);
+    const owner = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(2000) });
+    for (const name of [
+      "0086_v2_worker_service_invocation_custody.sql",
+      "0087_v2_worker_cron_invocation_custody.sql",
+    ]) {
+      const migration = MIGRATIONS.find((entry) => entry.name === name);
+      if (!migration) throw new Error(`missing ${name}`);
+      for (const statement of splitMigration(migration.sql))
+        await database.prepare(statement).run();
+      if (name.startsWith("0086_")) expect(await owner.beginSend(handle)).toBe(true);
+    }
+    // The earlier Endpoint SQL grant is preserved across the later migration.
+    const use = { handle, expected: retirementIdentity };
+    expect(await inspectV2WorkerInvocationDrainSchema(sql)).toBe(false);
+    expect(await owner.armSQLiteExternalUse(use)).toBe(false);
+    const migration = MIGRATIONS.find(
+      (entry) => entry.name === "0088_v2_worker_sqlite_external_drain.sql",
+    );
+    if (!migration) throw new Error("missing 0088 source");
+    for (const [index, statement] of splitMigration(migration.sql).entries()) {
+      await database.prepare(statement).run();
+      if (index === 0) {
+        expect(await inspectV2WorkerInvocationSchema(sql)).toBeNull();
+        expect(await owner.armSQLiteExternalUse(use)).toBe(false);
+      }
+    }
+    expect(await inspectV2WorkerInvocationDrainSchema(sql)).toBe(true);
+    expect(await owner.read(handle)).toMatchObject({ sqliteDrainState: null });
+    expect(
+      await owner.armSQLiteExternalUse({ ...use, handle: { ...handle, custodyToken: "wrong" } }),
+    ).toBe(false);
+    expect(
+      await owner.armSQLiteExternalUse({
+        ...use,
+        expected: { ...retirementIdentity, principal: "wrong" },
+      }),
+    ).toBe(false);
+    const outage: Sql = {
+      query: async () => {
+        throw new Error("D1 unavailable");
+      },
+      run: sql.run,
+      batch: sql.batch,
+    };
+    expect(await createV2WorkerInvocationLifecycle({ sql: outage }).armSQLiteExternalUse(use)).toBe(
+      false,
+    );
+    const lostArmAck: Sql = {
+      query: async (statement, params) => {
+        const rows = await sql.query(statement, params);
+        if (statement.includes("SET sqlite_drain_state = 'pending'"))
+          throw new Error("D1 arm ACK lost");
+        return rows;
+      },
+      run: sql.run,
+      batch: sql.batch,
+    };
+    expect(
+      await createV2WorkerInvocationLifecycle({ sql: lostArmAck }).armSQLiteExternalUse(use),
+    ).toBe(true);
+    expect(
+      await Promise.all([owner.armSQLiteExternalUse(use), owner.armSQLiteExternalUse(use)]),
+    ).toEqual([true, true]);
+    expect(await owner.read(handle)).toMatchObject({ sqliteDrainState: "pending" });
+    await expect(
+      sql.run(
+        "UPDATE tf_v2_worker_invocations SET no_native_dispatch_at_ms=2000 WHERE invocation_id=?",
+        [handle.invocationId],
+      ),
+    ).rejects.toThrow();
+    expect(await owner.confirmNativeRetirement({ ...use, receiptDigest: terminalReceipt })).toBe(
+      true,
+    );
+    expect(
+      await owner.confirmSQLiteDrained({
+        ...use,
+        receiptDigest: terminalReceipt,
+        expected: { ...retirementIdentity, nativeIdentity: "wrong" },
+      }),
+    ).toBe(false);
+    expect(await owner.armSQLiteExternalUse(use)).toBe(false);
+    expect(await owner.inspectDeployment("deployment-one")).toEqual({
+      outstanding: 1,
+      bodyFinished: 0,
+    });
+    const deletion = `INSERT INTO tf_v2_operations
+      (id,resource_uid,principal,replay_key,request_fingerprint,action,
+       generation,status,effect,created_at,updated_at,retain_until,
+       backend_id,target_key,backend_key,accepted_spec_json)
+      VALUES (?,'version-one','org-1',?,'fp','delete',2,'queued','none',
+        '2026-10-07T00:00:00Z','2026-10-07T00:00:00Z','2026-10-08T00:00:00Z',
+        'backend-one','target-one',?,'{}')`;
+    await expect(
+      sql.run(deletion, ["pending-delete", "pending-replay", "pending-key"]),
+    ).rejects.toThrow();
+    const freshOwner = createV2WorkerInvocationLifecycle({ sql, now: () => new Date(3000) });
+    const drainReceipt = `sha256:${"d".repeat(64)}` as const;
+    const lostDrainAck: Sql = {
+      query: async (statement, params) => {
+        const rows = await sql.query(statement, params);
+        if (statement.includes("SET sqlite_drain_state = 'drained'"))
+          throw new Error("D1 drain ACK lost");
+        return rows;
+      },
+      run: sql.run,
+      batch: sql.batch,
+    };
+    expect(
+      await createV2WorkerInvocationLifecycle({ sql: lostDrainAck }).confirmSQLiteDrained({
+        ...use,
+        receiptDigest: terminalReceipt,
+      }),
+    ).toBe(true);
+    expect(await freshOwner.confirmSQLiteDrained({ ...use, receiptDigest: drainReceipt })).toBe(
+      false,
+    );
+    expect(await freshOwner.confirmSQLiteDrained({ ...use, receiptDigest: terminalReceipt })).toBe(
+      true,
+    );
+    expect(await freshOwner.armSQLiteExternalUse(use)).toBe(false);
+    expect(await freshOwner.inspectDeployment("deployment-one")).toEqual({
+      outstanding: 0,
+      bodyFinished: 0,
+    });
+    await sql.run(deletion, ["drained-delete", "drained-replay", "drained-key"]);
+    await database
+      .prepare("DROP TRIGGER tf_v2_worker_native_deletion_sqlite_drain_send_guard")
+      .run();
+    expect(await inspectV2WorkerInvocationDrainSchema(sql)).toBe(false);
+    expect(await freshOwner.read(handle)).toBeNull();
+  } finally {
+    await runtime.dispose();
+  }
+});
+
 test("0087 preserves populated Endpoint and Service custody and fences incomplete schema closure", async () => {
   const db = new Database(":memory:");
   try {
     db.exec("PRAGMA foreign_keys = ON");
-    for (const migration of MIGRATIONS.filter(({ name }) => !name.startsWith("0087_")))
+    for (const migration of MIGRATIONS.filter(
+      ({ name }) => !name.startsWith("0087_") && !name.startsWith("0088_"),
+    ))
       db.exec(migration.sql);
     const sql = createSqliteSql(db);
     await seed(sql);
