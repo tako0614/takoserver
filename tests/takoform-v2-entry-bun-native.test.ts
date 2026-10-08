@@ -371,14 +371,18 @@ async function nativeActorWssExchange(
   });
   const reader = new NativeSocketReader(socket);
   const sendFrame = (opcode: number, payload: Buffer) => {
-    if (payload.byteLength > 125) throw new Error("native Actor WSS payload is too large");
+    if (payload.byteLength > 2 * 1024 * 1024)
+      throw new Error("native Actor WSS payload is too large");
     const mask = randomBytes(4);
-    const frame = Buffer.alloc(6 + payload.byteLength);
+    const headerBytes = payload.byteLength <= 125 ? 2 : payload.byteLength <= 65_535 ? 4 : 10;
+    const frame = Buffer.alloc(headerBytes + 4 + payload.byteLength);
     frame[0] = 0x80 | opcode;
-    frame[1] = 0x80 | payload.byteLength;
-    mask.copy(frame, 2);
+    frame[1] = 0x80 | (headerBytes === 2 ? payload.byteLength : headerBytes === 4 ? 126 : 127);
+    if (headerBytes === 4) frame.writeUInt16BE(payload.byteLength, 2);
+    if (headerBytes === 10) frame.writeBigUInt64BE(BigInt(payload.byteLength), 2);
+    mask.copy(frame, headerBytes);
     for (let index = 0; index < payload.byteLength; index += 1)
-      frame[6 + index] = (payload[index] ?? 0) ^ (mask[index % 4] ?? 0);
+      frame[headerBytes + 4 + index] = (payload[index] ?? 0) ^ (mask[index % 4] ?? 0);
     socket.write(frame);
   };
   const readFrame = async () => {
@@ -386,8 +390,13 @@ async function nativeActorWssExchange(
     const opcode = (header[0] ?? 0) & 0x0f;
     let size = (header[1] ?? 0) & 0x7f;
     if (size === 126) size = (await reader.bytes(2)).readUInt16BE(0);
-    else if (size === 127) throw new Error("native Actor WSS frame is too large");
-    if (size > 1_024 || ((header[1] ?? 0) & 0x80) !== 0)
+    else if (size === 127) {
+      const extended = (await reader.bytes(8)).readBigUInt64BE(0);
+      if (extended > BigInt(2 * 1024 * 1024 + 64))
+        throw new Error("native Actor WSS frame is too large");
+      size = Number(extended);
+    }
+    if (size > 2 * 1024 * 1024 + 64 || ((header[1] ?? 0) & 0x80) !== 0)
       throw new Error("native Actor WSS reply is invalid");
     return { opcode, payload: await reader.bytes(size) };
   };
@@ -409,11 +418,24 @@ async function nativeActorWssExchange(
     const accept = createHash("sha1")
       .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
       .digest("base64");
+    const lines = handshake.split("\r\n");
+    const headerValues = (name: string) =>
+      lines.slice(1).flatMap((line) => {
+        const colon = line.indexOf(":");
+        return colon >= 0 && line.slice(0, colon).toLowerCase() === name
+          ? [line.slice(colon + 1).trim()]
+          : [];
+      });
     if (
-      !/^HTTP\/1\.1 101\b/u.test(handshake) ||
-      !handshake.toLowerCase().includes(`sec-websocket-accept: ${accept.toLowerCase()}`)
+      !/^HTTP\/1\.1 101\b/u.test(lines[0] ?? "") ||
+      headerValues("sec-websocket-accept").length !== 1 ||
+      headerValues("sec-websocket-accept")[0] !== accept
     )
-      throw new Error(`native Actor WSS handshake rejected: ${handshake.split("\r\n")[0]}`);
+      throw new Error(`native Actor WSS handshake rejected: ${lines[0]}`);
+    expect(headerValues("x-actor-upgrade-marker")).toEqual(["native-header"]);
+    expect(headerValues("set-cookie")).toEqual(["actor-first=1; Path=/", "actor-second=2; Path=/"]);
+    expect(lines.some((line) => line.toLowerCase().startsWith("x-takoserver-private"))).toBe(false);
+    expect(handshake.includes("unix:") || handshake.includes("127.0.0.1")).toBe(false);
     if (mode === "welcome-close") {
       // No client frame is sent until the Actor's post-accept welcome arrives.
       const first = await readFrame().catch((error: unknown) => {
@@ -1380,6 +1402,9 @@ export class CounterActor {
     const path = new URL(request.url).pathname;
     if (path === "/actor-socket" || path === "/actor-socket-welcome") {
       const accepted = await this.context.sockets.accept(request);
+      accepted.response.headers.set("x-actor-upgrade-marker", "native-header");
+      accepted.response.headers.append("set-cookie", "actor-first=1; Path=/");
+      accepted.response.headers.append("set-cookie", "actor-second=2; Path=/");
       if (path === "/actor-socket-welcome") await accepted.socket.send("actor:welcome");
       return accepted.response;
     }
@@ -1708,6 +1733,12 @@ export class SqlWorkflow {
       expect(
         await nativeActorWssExchange(hostname, certificateFile, "finish", "welcome-close"),
       ).toEqual({ welcome: "actor:welcome", closeCode: 4000, closeReason: "done" });
+      const legalMessage = "x".repeat(2 * 1024 * 1024);
+      const legalEcho = await nativeActorWssExchange(hostname, certificateFile, legalMessage);
+      expect({
+        bytes: typeof legalEcho === "string" ? Buffer.byteLength(legalEcho) : 0,
+        matches: legalEcho === `actor:${legalMessage}`,
+      }).toEqual({ bytes: 2 * 1024 * 1024 + 6, matches: true });
       expect(await nativeHttps(hostname, "/actor-sql")).toEqual({
         status: 200,
         body: '[{"value":"once"}]',
