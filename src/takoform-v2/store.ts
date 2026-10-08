@@ -454,13 +454,16 @@ export function createV2Store(sql: Sql) {
       return write.changes === 1;
     },
     async markDispatch(id: string, token: string, at: string): Promise<boolean> {
-      const write = await sql.run(
+      // D1 meta.changes includes writes from 0081's transfer-clear trigger and
+      // the terminal projection trigger. RETURNING proves this Operation changed.
+      const rows = await sql.query(
         `UPDATE tf_v2_operations SET status = 'reconciling', effect = 'unknown',
           dispatch_possible = 1, updated_at = ?
-         WHERE id = ? AND lease_token = ? AND status = 'running'`,
+         WHERE id = ? AND lease_token = ? AND status = 'running'
+         RETURNING id`,
         [at, id, token],
       );
-      return write.changes === 1;
+      return rows.length === 1 && rows[0]?.id === id;
     },
     async ownsClaim(id: string, token: string): Promise<boolean> {
       return (
@@ -479,16 +482,17 @@ export function createV2Store(sql: Sql) {
       namesJson: string,
       reason: "expired" | "unavailable",
     ): Promise<boolean> {
-      const write = await sql.run(
+      const rows = await sql.query(
         `UPDATE tf_v2_operations SET status = 'waiting_input', updated_at = ?,
           input_required_names_json = ?, input_required_reason = ?,
           lease_token = NULL, lease_until_ms = NULL
          WHERE id = ? AND lease_token = ? AND status = 'running'
            AND dispatch_possible = 0 AND private_inputs_present = 1
-           AND EXISTS (SELECT 1 FROM tf_v2_private_inputs WHERE operation_id = ?)`,
+           AND EXISTS (SELECT 1 FROM tf_v2_private_inputs WHERE operation_id = ?)
+         RETURNING id`,
         [at, namesJson, reason, id, token, id],
       );
-      return write.changes === 1;
+      return rows.length === 1 && rows[0]?.id === id;
     },
     async failUnverifiable(
       id: string,
@@ -496,16 +500,17 @@ export function createV2Store(sql: Sql) {
       at: string,
       retainUntil: string,
     ): Promise<boolean> {
-      const write = await sql.run(
+      const rows = await sql.query(
         `UPDATE tf_v2_operations SET status = 'failed', effect = 'none', updated_at = ?,
           retain_until = CASE WHEN retain_until > ? THEN retain_until ELSE ? END,
           error_code = 'private_inputs_unverifiable',
           error_message = 'Private input comparison material is unavailable',
           lease_token = NULL, lease_until_ms = NULL
-         WHERE id = ? AND lease_token = ? AND status = 'running' AND dispatch_possible = 0`,
+         WHERE id = ? AND lease_token = ? AND status = 'running' AND dispatch_possible = 0
+         RETURNING id`,
         [at, retainUntil, retainUntil, id, token],
       );
-      return write.changes === 1;
+      return rows.length === 1 && rows[0]?.id === id;
     },
     async replenish(id: string, sealed: V2SealedPrivateInputs, at: string): Promise<boolean> {
       const writes = await sql.batch([
@@ -549,13 +554,14 @@ export function createV2Store(sql: Sql) {
       observedJson?: string;
       outputJson?: string;
     }): Promise<boolean> {
-      const write = await sql.run(
+      const rows = await sql.query(
         `UPDATE tf_v2_operations SET status = ?, effect = ?, updated_at = ?,
           retain_until = CASE WHEN retain_until > ? THEN retain_until ELSE ? END,
           next_attempt_at_ms = COALESCE(?, next_attempt_at_ms),
           error_code = ?, error_message = ?, result_observed_json = ?,
           result_output_json = ?, lease_token = NULL, lease_until_ms = NULL
-         WHERE id = ? AND lease_token = ? AND status = 'reconciling'`,
+         WHERE id = ? AND lease_token = ? AND status = 'reconciling'
+         RETURNING id`,
         [
           input.status,
           input.effect,
@@ -571,7 +577,7 @@ export function createV2Store(sql: Sql) {
           input.token,
         ],
       );
-      return write.changes === 1;
+      return rows.length === 1 && rows[0]?.id === input.id;
     },
   };
 }
