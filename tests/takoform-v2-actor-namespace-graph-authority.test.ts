@@ -8,7 +8,7 @@ import {
   MODULE_WORKER_FORM_URL,
   WORKER_DEPLOYMENT_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
-import type { WorkerdActiveActorGraph } from "../src/workerd-runtime.ts";
+import type { WorkerdActiveActorGraph, WorkerdActorForwardSocket } from "../src/workerd-runtime.ts";
 import type { WorkerdWorkerRuntimeOwner } from "../src/workerd-worker-runtime-owner.ts";
 
 const PRINCIPAL = "org:actor-authority-test";
@@ -241,6 +241,7 @@ const graph: WorkerdActiveActorGraph = {
 test("v2 Actor authority reads accepted Namespace SQL and never substitutes v1 Deployment", async () => {
   const f = fixture();
   let nativeReads = 0;
+  let actorForwardSockets: readonly WorkerdActorForwardSocket[] = [];
   const owner: Pick<
     WorkerdWorkerRuntimeOwner,
     "workerResourceUid" | "observeServing" | "observeActorGraph"
@@ -271,6 +272,7 @@ test("v2 Actor authority reads accepted Namespace SQL and never substitutes v1 D
           versions: [{ versionId: "v2-version-1", workerVersionUid: "version-1", weight: 10_000 }],
         },
         graph,
+        actorForwardSockets,
       };
     },
   };
@@ -319,6 +321,19 @@ test("v2 Actor authority reads accepted Namespace SQL and never substitutes v1 D
     expect(
       await authority.stillCurrent(accepted, result.realization, AbortSignal.timeout(1000)),
     ).toBe(true);
+    actorForwardSockets = [
+      {
+        tenantId: PRINCIPAL,
+        namespaceResourceUid: NAMESPACE,
+        token: "c".repeat(64),
+        httpSocketPath: "/tmp/proved-actor-http.sock",
+        upgradeSocketPath: "/tmp/proved-actor-upgrade.sock",
+      },
+    ];
+    expect(
+      await authority.stillCurrent(accepted, result.realization, AbortSignal.timeout(1000)),
+    ).toBe(false);
+    actorForwardSockets = [];
     expect((await authority.selectVersion(accepted, result.realization, 0))?.workerVersionUid).toBe(
       "version-1",
     );

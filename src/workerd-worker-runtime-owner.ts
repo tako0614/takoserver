@@ -281,6 +281,8 @@ export type WorkerdActorNativeGraphObservation =
       readonly script: string;
       readonly identity: WorkerdPublicationIdentity;
       readonly graph: WorkerdActiveActorGraph;
+      /** Exact private brokers from this serving incarnation, never a caller grant. */
+      readonly actorForwardSockets: readonly WorkerdActorForwardSocket[];
     }
   | { readonly kind: "unknown" };
 
@@ -4024,7 +4026,10 @@ export async function openWorkerdWorkerRuntimeOwner(
         !currentOwner()
       )
         return null;
-      return native;
+      return {
+        graph: native,
+        actorForwardSockets: incarnation.actorForward?.actorForwardSockets() ?? [],
+      };
     });
     if (!graph || !(await sqlCurrent())) return unknown;
     const finalOwner = await runSerial(async () => {
@@ -4042,6 +4047,8 @@ export async function openWorkerdWorkerRuntimeOwner(
           () => "foreign",
         )) === "owned" &&
         (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) === "live" &&
+        canonicalJson(current.incarnation.actorForward?.actorForwardSockets() ?? []) ===
+          canonicalJson(graph.actorForwardSockets) &&
         currentOwner() !== null
       );
     });
@@ -4052,7 +4059,8 @@ export async function openWorkerdWorkerRuntimeOwner(
       incarnationId: captured.incarnationId,
       script: scriptName(target.workerResourceUid),
       identity: captured.identity,
-      graph,
+      graph: graph.graph,
+      actorForwardSockets: graph.actorForwardSockets,
     };
   };
 

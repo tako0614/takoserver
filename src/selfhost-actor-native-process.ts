@@ -10,7 +10,11 @@ import {
   spawnWorkerdWithParentDeath,
   waitForStoppedWorkerdChild,
 } from "./workerd-linux-process.ts";
-import { type WorkerdActiveActorGraph, writeWorkerdPrivateExecution } from "./workerd-runtime.ts";
+import {
+  type WorkerdActiveActorGraph,
+  type WorkerdActorForwardSocket,
+  writeWorkerdPrivateExecution,
+} from "./workerd-runtime.ts";
 
 /** Internal, selected bytes only. Never accepted as provider desired state. */
 export interface WorkerdActorNamespaceOptions {
@@ -20,6 +24,8 @@ export interface WorkerdActorNamespaceOptions {
   /** Host-selected complete Actor InterfaceRef; omission keeps the released ABI. */
   readonly runtimeClassRef?: unknown;
   readonly graph: WorkerdActiveActorGraph;
+  /** Current provider incarnation's exact private broker sockets, not tenant input. */
+  readonly actorForwardSockets?: readonly WorkerdActorForwardSocket[];
   readonly signal: AbortSignal;
   /** Host authority callbacks; neither is exposed to application modules. */
   readonly admitAlarm: (
@@ -233,6 +239,7 @@ export async function openWorkerdActorNamespace(
       }
     : undefined;
   const graph = structuredClone(options.graph);
+  const actorForwardSockets = structuredClone(options.actorForwardSockets ?? []);
   if (
     !/^[a-f0-9]{64}$/u.test(graph.generationKey) ||
     !graph.generation ||
@@ -739,6 +746,7 @@ export default {
             modules: variantModules,
             hostModules: variantHostModules,
             className,
+            actorForwardSockets,
           }),
         ),
       },

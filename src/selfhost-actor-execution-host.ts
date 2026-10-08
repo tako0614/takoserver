@@ -548,6 +548,7 @@ export function createSelfhostActorExecutionHost(options: {
       const selection = JSON.stringify([
         graph,
         realization.authorityKey,
+        ...(realization.actorForwardSockets === undefined ? [] : [realization.actorForwardSockets]),
         residentGraph.generationKey,
         residentGraph.versions.map((version) => [
           version.variantKey,
@@ -667,6 +668,7 @@ export function createSelfhostActorExecutionHost(options: {
               ? {}
               : { runtimeClassRef: graph.runtimeClassRef }),
             graph: residentGraph,
+            actorForwardSockets: realization.actorForwardSockets ?? [],
             signal,
             beforeNativeExec: (nativeIdentity) => {
               if (!current.lease) throw new Error("Actor native lease unavailable");

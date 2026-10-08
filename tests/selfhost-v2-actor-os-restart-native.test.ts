@@ -39,6 +39,9 @@ export class CounterActor {
       const result = await this.context.storage.query("SELECT value FROM counter WHERE id = 1");
       return Response.json({ id: this.context.id, value: Number(result.rows[0]?.value ?? 0), version: this.env.VERSION });
     }
+    if (path === "/self-nested") {
+      return this.env.SELF.get(this.env.SELF.idFromName("other-room")).fetch(new Request("http://actor.invalid/read"));
+    }
     return new Response(null, { status: 404 });
   }
   async alarm() {}
@@ -51,14 +54,17 @@ export default {
     const path = new URL(request.url).pathname;
     const binding = path === "/self" ? env.SELF : path === "/other" ? env.OTHER : null;
     if (!binding) return new Response("target");
-    return binding.get(binding.idFromName("same-room")).fetch(new Request("http://actor.invalid/read"));
+    return binding.get(binding.idFromName("same-room")).fetch(new Request("http://actor.invalid/" + (path === "/other" ? "nested" : "read")));
   }
 };
 `);
 const callerCode = encoder.encode(`
 export class CallerActor {
   constructor(context, env) { this.context = context; this.env = env; }
-  async fetch() {
+  async fetch(request) {
+    if (new URL(request.url).pathname === "/nested") {
+      return this.env.ACTOR.get(this.env.ACTOR.idFromName("same-room")).fetch(new Request("http://actor.invalid/read"));
+    }
     return Response.json({ from: "caller-actor", id: this.context.id });
   }
   async alarm() {}
@@ -396,6 +402,15 @@ test.skipIf(binary === undefined)(
       };
       const written = await invoke(initial.port, "/write", "POST");
       expect(written).toMatchObject({ value: 1, version: "one" });
+      const nestedBefore = await request(
+        initial.port,
+        key.secret,
+        `/__fixture/serve/${target.resourceUid}/other`,
+      );
+      expect(nestedBefore.status).toBe(200);
+      expect(await nestedBefore.json()).toEqual(written);
+      const selfNestedBefore = await invoke(initial.port, "/self-nested");
+      expect(selfNestedBefore).toMatchObject({ value: 0, version: "one" });
       const firstHostPid = initial.pid;
       const oldCallerChild = await activeChild(root, caller.resourceUid);
       const oldTargetChild = await activeChild(root, target.resourceUid);
@@ -436,7 +451,9 @@ test.skipIf(binary === undefined)(
         `/__fixture/serve/${target.resourceUid}/other`,
       );
       expect(other.status).toBe(200);
-      expect(await other.json()).toMatchObject({ from: "caller-actor" });
+      expect(await other.json()).toEqual(written);
+      const selfNestedAfter = await invoke(second.port, "/self-nested");
+      expect(selfNestedAfter).toEqual(selfNestedBefore);
       const newActorChild = await activeActorChild(root, principal, namespace.resourceUid);
       actorChildren.push(newActorChild);
       expect(newActorChild.pid).not.toBe(oldActorChild.pid);
