@@ -4351,9 +4351,11 @@ export async function writeWorkerdPrivateExecution(options: {
     throw new Error("unusable private Actor version graph");
   }
   const companion = actor ? undefined : validDataPlaneAddress(options.companionAddress ?? "");
-  const planeAddress = site.dataPlane
-    ? validDataPlaneAddress(options.dataPlaneAddress ?? "")
-    : undefined;
+  const planeAddress =
+    options.dataPlaneAddress === undefined
+      ? undefined
+      : validDataPlaneAddress(options.dataPlaneAddress);
+  if (site.dataPlane && !planeAddress) throw new Error("private data plane listener unavailable");
   // Deliberately select declarations: never carry hostname, assets or event
   // ingress into a guarded class process. Their Host-private module bytes can
   // remain in the exact closed graph without installing their routing services.
@@ -4431,27 +4433,45 @@ export async function writeWorkerdPrivateExecution(options: {
       return `\n  (name = ${capnpText(name)}, external = (address = ${capnpText(`unix:${mapping.socketPath}`)}, http = ())),`;
     })
     .join("");
-  let dataServices = "";
-  if (prepared.manifest.dataPlane) {
-    const plane = prepared.manifest.dataPlane;
-    const module = requiredStoredModule(prepared.manifest.moduleFiles.hostPrivate, plane.module);
-    bindings.push(
-      `(name = "${hasWorkerdV2PrivateBindingProfile(prepared.manifest) ? WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING : DATA_SERVICE_BINDING}", service = "data")`,
-    );
+  const privateDataPlane = (
+    manifest: Manifest,
+    serviceName: string,
+    originName: string,
+    modulePrefix: string,
+  ): { readonly binding: string; readonly services: string } | null => {
+    if (!manifest.dataPlane) return null;
+    if (!planeAddress) throw new Error("private data plane listener unavailable");
+    const plane = validDataPlane(manifest.dataPlane);
+    if (plane.address !== planeAddress) {
+      throw new Error("private data plane listener changed");
+    }
+    const module = requiredStoredModule(manifest.moduleFiles.hostPrivate, plane.module);
+    const bindingName = hasWorkerdV2PrivateBindingProfile(manifest)
+      ? WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING
+      : DATA_SERVICE_BINDING;
+    if (manifest.vars?.some((entry) => entry.name === bindingName)) {
+      throw new Error("private data plane binding collision");
+    }
     const facadeBindings = [
-      `(name = "${DATA_PLANE_BINDING}", service = "data-origin")`,
+      `(name = ${capnpText(DATA_PLANE_BINDING)}, service = ${capnpText(originName)})`,
       ...validBindings(plane.vars).map(
         (binding) =>
           `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
       ),
     ];
-    dataServices = `
-  (name = "data", worker = (
-    modules = [(name = ${capnpText(plane.module)}, esModule = embed ${capnpText(`${HOST_PRIVATE_MODULE_DIRECTORY}/${module.key}`)})],
+    return {
+      binding: `(name = ${capnpText(bindingName)}, service = ${capnpText(serviceName)})`,
+      services: `
+  (name = ${capnpText(serviceName)}, worker = (
+    modules = [(name = ${capnpText(plane.module)}, esModule = embed ${capnpText(`${modulePrefix}${HOST_PRIVATE_MODULE_DIRECTORY}/${module.key}`)})],
     bindings = [${facadeBindings.join(", ")}], compatibilityDate = "2026-01-01", globalOutbound = "deny"
   )),
-  (name = "data-origin", external = (address = ${capnpText(planeAddress as string)}, http = ())),`;
-  }
+  (name = ${capnpText(originName)}, external = (address = ${capnpText(planeAddress)}, http = ())),`,
+    };
+  };
+  const topLevelDataPlane = privateDataPlane(prepared.manifest, "data", "data-origin", "");
+  if (topLevelDataPlane) bindings.push(topLevelDataPlane.binding);
+  const dataServices = topLevelDataPlane?.services ?? "";
   let actorServices = "";
   let actorVersionServices = "";
   let actorVersionExternals = "";
@@ -4461,6 +4481,7 @@ export async function writeWorkerdPrivateExecution(options: {
     readonly root: string;
     readonly version: Awaited<ReturnType<typeof prepareWorkerdSite>>;
   }[] = [];
+  let actorVersionDataServices = "";
   if (actor) {
     requiredStoredModule(prepared.manifest.moduleFiles.hostPrivate, actor.ownerModule);
     const actorInternalBindings = new Set([
@@ -4505,6 +4526,32 @@ export async function writeWorkerdPrivateExecution(options: {
         (binding) =>
           `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
       );
+      if (version.manifest.dataPlane) {
+        if (!hasWorkerdV2PrivateBindingProfile(version.manifest)) {
+          throw new Error("Actor retained data plane requires v2 private binding profile");
+        }
+        const plane = validDataPlane(version.manifest.dataPlane);
+        if (
+          plane.module !== SELFHOST_WORKER_DATA_SERVICE_MODULE ||
+          !Array.isArray(plane.vars) ||
+          plane.vars.length !== 1 ||
+          plane.vars[0]?.name !== SELFHOST_WORKER_DATA_TOKEN_BINDING ||
+          plane.vars[0].kind !== "text" ||
+          typeof plane.vars[0].value !== "string" ||
+          !plane.vars[0].value
+        ) {
+          throw new Error("Actor retained v2 data plane is unavailable");
+        }
+        const retained = privateDataPlane(
+          version.manifest,
+          `actor-version-${index}-selfhost-data`,
+          `actor-version-${index}-selfhost-data-origin`,
+          `${versionPrefix}/`,
+        );
+        if (!retained) throw new Error("Actor retained v2 data plane is unavailable");
+        versionBindings.push(retained.binding);
+        actorVersionDataServices += retained.services;
+      }
       // The class sees only its own immutable Version's declared bindings.
       // Reuse the provider Worker's exact incumbent brokers; never mint a new
       // token or infer a target from a request URL in the Actor child.
@@ -4584,7 +4631,7 @@ const config :Workerd.Config = (
     compatibilityFlags = [${(actor ? [...APPLICATION_COMPATIBILITY_FLAGS, "experimental"] : APPLICATION_COMPATIBILITY_FLAGS).map(capnpText).join(", ")}],
     globalOutbound = "deny"
   )),
-  ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${serviceExternals}${workflowExternals}${actorVersionServices}${actorVersionExternals}${actorServices}
+  ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${serviceExternals}${workflowExternals}${actorVersionServices}${actorVersionDataServices}${actorVersionExternals}${actorServices}
   (name = "deny", network = (allow = []))
  ],
  sockets = [(name = ${capnpText(actor ? "actor" : "workflow")}, address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = ${capnpText(actor ? "actor-owner" : "application")})${actor ? `, (name = "actor-duplex", address = ${capnpText(`unix:${actorProxySocketPath}`)}, http = (style = proxy), service = "actor-owner")` : ""}]

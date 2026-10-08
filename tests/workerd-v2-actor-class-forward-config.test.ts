@@ -4,7 +4,10 @@ import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
+import { SELFHOST_WORKER_DATA_SERVICE_MODULE } from "../src/providers/selfhost-data-service.ts";
+import { SELFHOST_WORKER_DATA_TOKEN_BINDING } from "../src/providers/selfhost-worker-wrapper.ts";
 import {
+  WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
   WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
   workerdV2PrivateActorBindingName,
 } from "../src/providers/workerd-v2-private-binding-names.ts";
@@ -156,6 +159,99 @@ test("two weighted class Versions may reuse the same exact broker, not an aliase
       },
     }),
   ).rejects.toThrow("unusable Actor class forward broker");
+});
+
+test("v2 Actor class retains each Version's exact SQLite facade on the current Host listener", async () => {
+  const input = fixture();
+  const first = input.actor.variants[0];
+  if (!first) throw new Error("Actor fixture unavailable");
+  const module = SELFHOST_WORKER_DATA_SERVICE_MODULE;
+  const dataPlane = {
+    address: "127.0.0.1:17778",
+    module,
+    vars: [
+      { name: SELFHOST_WORKER_DATA_TOKEN_BINDING, value: "test-token", kind: "text" as const },
+    ],
+  };
+  const moduleBytes = encoder.encode("export default {};");
+  const hostModules = new Map([...input.hostModules, [module, moduleBytes]]);
+  const variantHostModules = new Map([...first.hostModules, [module, moduleBytes]]);
+  const secondDataPlane = {
+    ...dataPlane,
+    vars: [
+      { name: SELFHOST_WORKER_DATA_TOKEN_BINDING, value: "second-token", kind: "text" as const },
+    ],
+  };
+  const selected = {
+    ...input,
+    site: { ...input.site, dataPlane },
+    hostModules,
+    dataPlaneAddress: "127.0.0.1:17778",
+    actor: {
+      ...input.actor,
+      variants: [
+        {
+          ...first,
+          site: {
+            ...first.site,
+            dataPlane,
+            vars: [{ name: "VERSION_MARKER", kind: "text" as const, value: "first" }],
+          },
+          hostModules: variantHostModules,
+        },
+        {
+          ...first,
+          site: {
+            ...first.site,
+            dataPlane: secondDataPlane,
+            vars: [{ name: "VERSION_MARKER", kind: "text" as const, value: "second" }],
+          },
+          hostModules: variantHostModules,
+        },
+      ],
+    },
+  };
+  const config = await readFile(await writeWorkerdPrivateExecution(selected), "utf8");
+  expect(config).toContain(
+    `(name = "${WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING}", service = "actor-version-0-selfhost-data")`,
+  );
+  expect(config).toContain('name = "actor-version-0-selfhost-data-origin"');
+  expect(config).toContain('address = "127.0.0.1:17778", http = ()');
+  const firstFacade = config.slice(
+    config.indexOf('(name = "actor-version-0-selfhost-data", worker = ('),
+    config.indexOf('(name = "actor-version-0-selfhost-data-origin"'),
+  );
+  const secondFacade = config.slice(
+    config.indexOf('(name = "actor-version-1-selfhost-data", worker = ('),
+    config.indexOf('(name = "actor-version-1-selfhost-data-origin"'),
+  );
+  expect(firstFacade).toContain(
+    `name = "${SELFHOST_WORKER_DATA_TOKEN_BINDING}", text = "test-token"`,
+  );
+  expect(firstFacade).not.toContain("second-token");
+  expect(secondFacade).toContain(
+    `name = "${SELFHOST_WORKER_DATA_TOKEN_BINDING}", text = "second-token"`,
+  );
+  expect(secondFacade).not.toContain("test-token");
+  const firstClass = config.slice(
+    config.indexOf('(name = "actor-version-0", worker = ('),
+    config.indexOf('(name = "actor-version-1", worker = ('),
+  );
+  const secondClass = config.slice(
+    config.indexOf('(name = "actor-version-1", worker = ('),
+    config.indexOf('(name = "actor-version-0-selfhost-data", worker = ('),
+  );
+  expect(firstClass).toContain('(name = "VERSION_MARKER", text = "first")');
+  expect(firstClass).not.toContain('(name = "VERSION_MARKER", text = "second")');
+  expect(secondClass).toContain('(name = "VERSION_MARKER", text = "second")');
+  expect(secondClass).not.toContain('(name = "VERSION_MARKER", text = "first")');
+  await expect(
+    writeWorkerdPrivateExecution({ ...selected, dataPlaneAddress: "127.0.0.1:17779" }),
+  ).rejects.toThrow("private data plane listener changed");
+  const { dataPlaneAddress: _current, ...withoutListener } = selected;
+  await expect(writeWorkerdPrivateExecution(withoutListener)).rejects.toThrow(
+    "private data plane listener unavailable",
+  );
 });
 
 test("v2 Actor class refuses a missing or different-token broker", async () => {

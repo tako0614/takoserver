@@ -127,6 +127,8 @@ export function createSelfhostActorExecutionHost(options: {
   readonly storageRoot: string;
   /** Same operator-selected executable used by the serving workerd owner. */
   readonly binary: string;
+  /** Current v2 SQLite broker listener captured by the Host boot, not owner state. */
+  readonly v2SqliteBindingAddress?: string;
   readonly authority?: ActorGraphAuthority;
   /** Retired v1 compatibility input, isolated in createLegacyActorGraphAuthority. */
   readonly graph?: ActorResourceGraphReader;
@@ -731,6 +733,9 @@ export function createSelfhostActorExecutionHost(options: {
               : { runtimeClassRef: graph.runtimeClassRef }),
             graph: residentGraph,
             actorForwardSockets: realization.actorForwardSockets ?? [],
+            ...(options.v2SqliteBindingAddress
+              ? { dataPlaneAddress: options.v2SqliteBindingAddress }
+              : {}),
             signal,
             beforeNativeExec: (nativeIdentity) => {
               if (!current.lease) throw new Error("Actor native lease unavailable");
