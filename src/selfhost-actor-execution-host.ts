@@ -23,6 +23,7 @@ import {
   type ActorRealizationRead,
   createLegacyActorGraphAuthority,
 } from "./selfhost-actor-graph-authority.ts";
+import { acquireActorNativeLease } from "./selfhost-actor-lease.ts";
 import {
   openWorkerdActorNamespace,
   type WorkerdActorNamespace,
@@ -49,6 +50,7 @@ interface Owner {
   tail: Promise<void>;
   session?: Session;
   locked: boolean;
+  lease?: Awaited<ReturnType<typeof acquireActorNativeLease>>;
   revoked?: boolean;
   refreshing?: Promise<void>;
 }
@@ -252,7 +254,8 @@ export function createSelfhostActorExecutionHost(options: {
     if (
       !(await pathExists(path)) &&
       !(await pathExists(join(options.storageRoot, "namespaces", key))) &&
-      !(await pathExists(join(options.storageRoot, "leases", key)))
+      !(await pathExists(join(options.storageRoot, "leases", key))) &&
+      !(await pathExists(join(options.storageRoot, "leases", `${key}.owner.json`)))
     ) {
       await mkdir(actorIdsRoot, { recursive: true, mode: 0o700 });
       await syncDirectory(options.storageRoot);
@@ -545,6 +548,7 @@ export function createSelfhostActorExecutionHost(options: {
       const selection = JSON.stringify([
         graph,
         realization.authorityKey,
+        ...(realization.actorForwardSockets === undefined ? [] : [realization.actorForwardSockets]),
         residentGraph.generationKey,
         residentGraph.versions.map((version) => [
           version.variantKey,
@@ -557,11 +561,11 @@ export function createSelfhostActorExecutionHost(options: {
         await retire(current);
         if (revoked.has(key)) throw new ActorAuthorityUnavailable("Actor namespace revoked");
         if (!current.locked) {
-          await mkdir(join(options.storageRoot, "leases"), { recursive: true, mode: 0o700 });
-          // Exclusive across Host instances. A crash leaves this lease in
-          // place and fails closed; automatic stale-lock recovery is not
-          // qualified or guessed from a PID. Admission stays disabled.
-          await mkdir(join(options.storageRoot, "leases", key), { mode: 0o700 });
+          current.lease = await acquireActorNativeLease({
+            storageRoot: options.storageRoot,
+            key,
+            scope: identity,
+          });
           current.locked = true;
         }
         // Registration can be revoked while authority reads or lease
@@ -664,7 +668,12 @@ export function createSelfhostActorExecutionHost(options: {
               ? {}
               : { runtimeClassRef: graph.runtimeClassRef }),
             graph: residentGraph,
+            actorForwardSockets: realization.actorForwardSockets ?? [],
             signal,
+            beforeNativeExec: (nativeIdentity) => {
+              if (!current.lease) throw new Error("Actor native lease unavailable");
+              return current.lease.recordNative(nativeIdentity);
+            },
             admitAlarm: (id, nonce, gateSignal) => admitEvent("alarm", id, nonce, gateSignal),
             completeAlarm(leaseId) {
               const session = admittedSession;
@@ -1168,7 +1177,13 @@ export function createSelfhostActorExecutionHost(options: {
       if (owner?.session || owner?.locked || !(await registeredScope(key, scope))) return false;
       const namespaces = join(options.storageRoot, "namespaces");
       const leases = join(options.storageRoot, "leases");
-      if ((await pathExists(join(namespaces, key))) || (await pathExists(join(leases, key))))
+      if (
+        (await pathExists(join(namespaces, key))) ||
+        (await pathExists(join(leases, key))) ||
+        (await pathExists(join(leases, `${key}.owner.json`))) ||
+        (await pathExists(join(leases, `${key}.child.json`))) ||
+        (await pathExists(join(leases, `${key}.recovering`)))
+      )
         return false;
       // A page-cache miss is not an absence receipt across Host processes.
       for (const directory of [registrations, namespaces, leases]) {
@@ -1182,7 +1197,10 @@ export function createSelfhostActorExecutionHost(options: {
         !(owner?.session || owner?.locked) &&
         (await registeredScope(key, scope)) &&
         !(await pathExists(join(namespaces, key))) &&
-        !(await pathExists(join(leases, key)))
+        !(await pathExists(join(leases, key))) &&
+        !(await pathExists(join(leases, `${key}.owner.json`))) &&
+        !(await pathExists(join(leases, `${key}.child.json`))) &&
+        !(await pathExists(join(leases, `${key}.recovering`)))
       );
     },
     async namespaceAbsent(scope: ActorScope): Promise<boolean> {
@@ -1194,7 +1212,10 @@ export function createSelfhostActorExecutionHost(options: {
       const absent = !(
         (await pathExists(registrationPath(key))) ||
         (await pathExists(join(options.storageRoot, "namespaces", key))) ||
-        (await pathExists(join(options.storageRoot, "leases", key)))
+        (await pathExists(join(options.storageRoot, "leases", key))) ||
+        (await pathExists(join(options.storageRoot, "leases", `${key}.owner.json`))) ||
+        (await pathExists(join(options.storageRoot, "leases", `${key}.child.json`))) ||
+        (await pathExists(join(options.storageRoot, "leases", `${key}.recovering`)))
       );
       if (!absent) return false;
       // A failed delete may have unlinked a lease without durably publishing
@@ -1213,7 +1234,10 @@ export function createSelfhostActorExecutionHost(options: {
       return !(
         (await pathExists(registrationPath(key))) ||
         (await pathExists(join(options.storageRoot, "namespaces", key))) ||
-        (await pathExists(join(options.storageRoot, "leases", key)))
+        (await pathExists(join(options.storageRoot, "leases", key))) ||
+        (await pathExists(join(options.storageRoot, "leases", `${key}.owner.json`))) ||
+        (await pathExists(join(options.storageRoot, "leases", `${key}.child.json`))) ||
+        (await pathExists(join(options.storageRoot, "leases", `${key}.recovering`)))
       );
     },
     async forgetNamespace(scope: ActorScope): Promise<void> {
@@ -1223,10 +1247,15 @@ export function createSelfhostActorExecutionHost(options: {
       }
       const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
       revoked.add(key);
-      const owner = owners.get(key);
+      let owner = owners.get(key);
+      if (!owner) {
+        owner = { tail: Promise.resolve(), locked: false };
+        owners.set(key, owner);
+      }
+      const heldOwner = owner;
       const forget = async (): Promise<void> => {
         if (stopped) throw new Error("Actor owner stopped");
-        if (owner?.session && owner.session.active > 0 && !owner.session.dead) {
+        if (heldOwner.session && heldOwner.session.active > 0 && !heldOwner.session.dead) {
           revoked.delete(key);
           throw new Error("Actor namespace has active executions");
         }
@@ -1237,17 +1266,18 @@ export function createSelfhostActorExecutionHost(options: {
           revoked.delete(key);
           throw new Error("Actor namespace still has Resource authority");
         }
-        if (owner) owner.revoked = true;
-        if (owner) await retire(owner);
+        heldOwner.revoked = true;
+        await retire(heldOwner);
         // Hold the cross-Host lease through registration and SQL removal.
         // Releasing it earlier would let a peer open the same native files.
-        if (!owner?.locked) {
-          await mkdir(join(options.storageRoot, "leases"), { recursive: true, mode: 0o700 });
-          await syncDirectory(options.storageRoot);
-          // An existing peer/stale lease fails closed; it is never stolen.
-          await mkdir(join(options.storageRoot, "leases", key), { mode: 0o700 });
-          await syncDirectory(join(options.storageRoot, "leases"));
-          if (owner) owner.locked = true;
+        if (!heldOwner.locked) {
+          const lease = await acquireActorNativeLease({
+            storageRoot: options.storageRoot,
+            key,
+            scope,
+          });
+          heldOwner.lease = lease;
+          heldOwner.locked = true;
         }
         if (await registeredScope(key, scope)) {
           await unlink(registrationPath(key));
@@ -1266,15 +1296,13 @@ export function createSelfhostActorExecutionHost(options: {
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
-        await rm(join(options.storageRoot, "leases", key), { recursive: true });
-        await options.afterLeaseUnlinkBeforeSync?.();
-        await syncDirectory(join(options.storageRoot, "leases"));
-        if (owner) owner.locked = false;
+        await heldOwner.lease?.release(options.afterLeaseUnlinkBeforeSync);
+        heldOwner.locked = false;
+        delete heldOwner.lease;
         coldStartFailures.delete(key);
         owners.delete(key);
       };
-      if (owner) await exclusive(owner, forget);
-      else await forget();
+      await exclusive(heldOwner, forget);
     },
     async fetch(scope: ActorScope & { readonly id: string }, request: Request): Promise<Response> {
       if (!scope.id || scope.id.includes("\u0000")) throw new Error("Actor namespace unavailable");
@@ -1444,13 +1472,14 @@ export function createSelfhostActorExecutionHost(options: {
         await ready.catch(() => {});
         // Retained SQL is never removed by execution-owner shutdown.
         await Promise.all(
-          [...owners].map(([key, owner]) =>
+          [...owners.values()].map((owner) =>
             exclusive(owner, async () => {
               await retire(owner);
               // Failed revocation retains its fence even during shutdown.
               if (owner.locked && !owner.revoked) {
-                await rm(join(options.storageRoot, "leases", key), { recursive: true });
+                await owner.lease?.release();
                 owner.locked = false;
+                delete owner.lease;
               }
             }),
           ),

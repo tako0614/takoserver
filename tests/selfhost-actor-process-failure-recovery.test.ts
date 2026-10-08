@@ -9,7 +9,40 @@ import {
   openWorkerdActorNamespace,
   type WorkerdActorNativeProcessAdapter,
 } from "../src/selfhost-actor-native-process.ts";
+import { type LinuxProcessIdentity, linuxProcessLiveness } from "../src/workerd-linux-process.ts";
 import type { WorkerdActiveActorGraph } from "../src/workerd-runtime.ts";
+
+test("Actor native custody ACK failure kills the stopped child before workerd can exec", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-native-ack-loss-"));
+  const storagePath = join(root, "state");
+  await mkdir(storagePath, { mode: 0o700 });
+  let captured: LinuxProcessIdentity | undefined;
+  try {
+    await expect(
+      openWorkerdActorNamespace("/bin/true", {
+        namespaceKey: createHash("sha256").update("actor-native-ack-loss").digest("hex"),
+        storagePath,
+        className: "Actor",
+        graph: graph(),
+        signal: AbortSignal.timeout(10_000),
+        admitAlarm: async () => null,
+        completeAlarm() {},
+        admitSocket: async () => null,
+        completeSocket() {},
+        async beforeNativeExec(identity) {
+          captured = identity;
+          expect(await linuxProcessLiveness(identity)).toBe("live");
+          throw new Error("custody ACK unavailable");
+        },
+      }),
+    ).rejects.toThrow("custody ACK unavailable");
+    expect(captured).toBeDefined();
+    if (captured) expect(await linuxProcessLiveness(captured)).toBe("stale");
+  } finally {
+    if (!captured || (await linuxProcessLiveness(captured)) === "stale")
+      await rm(root, { recursive: true, force: true });
+  }
+}, 12_000);
 
 function graph(): WorkerdActiveActorGraph {
   const mainModule = "main.mjs";

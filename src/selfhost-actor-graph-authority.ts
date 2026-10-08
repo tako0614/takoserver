@@ -4,6 +4,7 @@ import {
   readWorkerdActiveActorGraph,
   readWorkerdSelectedActiveVersion,
   type WorkerdActiveActorGraph,
+  type WorkerdActorForwardSocket,
   type WorkerdSelectedActiveVersion,
 } from "./workerd-runtime.ts";
 
@@ -27,6 +28,8 @@ export interface ActorExecutionRealization {
   readonly script: string;
   readonly graph: WorkerdActiveActorGraph;
   readonly authorityKey: string;
+  /** Current provider Worker incarnation's private broker sockets. V1 has none. */
+  readonly actorForwardSockets?: readonly WorkerdActorForwardSocket[];
 }
 
 export type ActorRealizationRead =
