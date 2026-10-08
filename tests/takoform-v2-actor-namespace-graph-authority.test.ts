@@ -2,13 +2,21 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
-import { createV2ActorNamespaceGraphAuthority } from "../src/takoform-v2/actor-namespace-graph-authority.ts";
+import {
+  createV2ActorNamespaceGraphAuthority,
+  hasAcceptedV2ActorIncarnationWithdrawal,
+} from "../src/takoform-v2/actor-namespace-graph-authority.ts";
 import { ACTOR_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/actor-namespace.ts";
 import {
   MODULE_WORKER_FORM_URL,
   WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
-import type { WorkerdActiveActorGraph, WorkerdActorForwardSocket } from "../src/workerd-runtime.ts";
+import type {
+  WorkerdActiveActorGraph,
+  WorkerdActorForwardSocket,
+  WorkerdActorIncarnationRetirement,
+} from "../src/workerd-runtime.ts";
 import type { WorkerdWorkerRuntimeOwner } from "../src/workerd-worker-runtime-owner.ts";
 
 const PRINCIPAL = "org:actor-authority-test";
@@ -21,6 +29,8 @@ const CREATE_NAMESPACE = "f63bc8f8-880c-4d06-83a1-cc82403979f2";
 const CREATE_DEPLOYMENT = "d76bbd33-87e9-42ec-902d-c0c15097e530";
 const DELETE_NAMESPACE = "4a925f71-b1ab-4abd-b9b0-d9850aca4e6d";
 const UPDATE_NAMESPACE = "a1e4cc39-30bd-4734-83b7-0674e7bda664";
+const DELETE_ENDPOINT = "bb97c884-96f6-4c88-a46e-50c359db3696";
+const RUNNING_DELETE_ENDPOINT = "2d690721-7c7c-42a4-9934-760c70f234ae";
 
 function fixture(options: { namespaceReferences?: boolean } = {}) {
   const db = new Database(":memory:");
@@ -31,6 +41,9 @@ function fixture(options: { namespaceReferences?: boolean } = {}) {
     name: string;
     form: string;
     operationId: string;
+    action?: "create" | "delete";
+    terminal?: boolean;
+    leaseToken?: string;
     spec: object;
     observed?: object;
   }) => {
@@ -58,7 +71,7 @@ function fixture(options: { namespaceReferences?: boolean } = {}) {
        (id, resource_uid, principal, replay_key, request_fingerprint,
         action, generation, status, effect, created_at, updated_at,
         retain_until, backend_id, target_key, backend_key, accepted_spec_json)
-       VALUES (?, ?, ?, ?, 'fingerprint', 'create', 1, 'queued', 'none',
+       VALUES (?, ?, ?, ?, 'fingerprint', ?, 1, 'queued', 'none',
          '2026-10-07T00:00:00Z', '2026-10-07T00:00:00Z', '2027-10-07T00:00:00Z',
          'actor-fixture-backend', ?, ?, ?)`,
     ).run(
@@ -66,6 +79,7 @@ function fixture(options: { namespaceReferences?: boolean } = {}) {
       input.uid,
       PRINCIPAL,
       `replay-${input.uid}`,
+      input.action ?? "create",
       TARGET,
       `backend-${input.uid}`,
       specJson,
@@ -83,7 +97,14 @@ function fixture(options: { namespaceReferences?: boolean } = {}) {
         input.operationId,
       );
     }
-    db.query("UPDATE tf_v2_operations SET status = 'running' WHERE id = ?").run(input.operationId);
+    db.query(
+      "UPDATE tf_v2_operations SET status = 'running', lease_token = ?, lease_until_ms = ? WHERE id = ?",
+    ).run(
+      input.leaseToken ?? null,
+      input.leaseToken ? Date.now() + 300_000 : null,
+      input.operationId,
+    );
+    if (input.terminal === false) return;
     db.query(
       "UPDATE tf_v2_operations SET status = 'reconciling', effect = 'unknown' WHERE id = ?",
     ).run(input.operationId);
@@ -114,6 +135,85 @@ function fixture(options: { namespaceReferences?: boolean } = {}) {
   });
   return { db, sql, insert };
 }
+
+test("Actor retirement requires a later accepted same-scope Worker graph withdrawal", async () => {
+  const f = fixture();
+  try {
+    f.insert({
+      uid: "deployment-actor-authority",
+      name: "deployment-actor-authority",
+      form: WORKER_DEPLOYMENT_FORM_URL,
+      operationId: CREATE_DEPLOYMENT,
+      spec: { worker: { resourceUid: WORKER }, versions: [] },
+    });
+    f.insert({
+      uid: "endpoint-actor-authority",
+      name: "endpoint-actor-authority",
+      form: WORKER_ENDPOINT_FORM_URL,
+      operationId: DELETE_ENDPOINT,
+      action: "delete",
+      spec: { worker: { resourceUid: WORKER } },
+    });
+    const input: WorkerdActorIncarnationRetirement = {
+      workerResourceUid: WORKER,
+      targetKey: TARGET,
+      sourceOperationId: CREATE_DEPLOYMENT,
+      incarnationId: "exact-owned-incarnation",
+      generation: "exact-owned-generation",
+      versions: [],
+      retirementOperationId: DELETE_ENDPOINT,
+    };
+    const scope = { tenantId: PRINCIPAL, namespaceResourceUid: NAMESPACE };
+    const check = (override: Partial<typeof input> = {}, scopeOverride = scope) =>
+      hasAcceptedV2ActorIncarnationWithdrawal({
+        sql: f.sql,
+        targetKey: TARGET,
+        input: { ...input, ...override },
+        scope: scopeOverride,
+      });
+    expect(await check()).toBe(true);
+    expect(await check({ targetKey: "other-target" })).toBe(false);
+    expect(await check({ sourceOperationId: DELETE_ENDPOINT })).toBe(false);
+    expect(await check({ retirementOperationId: CREATE_DEPLOYMENT })).toBe(false);
+    expect(await check({}, { ...scope, tenantId: "foreign-principal" })).toBe(false);
+    f.insert({
+      uid: "pending-endpoint-actor-authority",
+      name: "pending-endpoint-actor-authority",
+      form: WORKER_ENDPOINT_FORM_URL,
+      operationId: RUNNING_DELETE_ENDPOINT,
+      action: "delete",
+      terminal: false,
+      leaseToken: "exact-active-delete-claim",
+      spec: { worker: { resourceUid: WORKER } },
+    });
+    expect(
+      await check({
+        retirementOperationId: RUNNING_DELETE_ENDPOINT,
+        retirementLeaseToken: "exact-active-delete-claim",
+      }),
+    ).toBe(true);
+    expect(
+      await check({
+        retirementOperationId: RUNNING_DELETE_ENDPOINT,
+        retirementLeaseToken: "stale-delete-claim",
+      }),
+    ).toBe(false);
+    f.db
+      .query("UPDATE tf_v2_resources SET busy_operation = NULL WHERE uid = ?")
+      .run("pending-endpoint-actor-authority");
+    expect(
+      await check({
+        retirementOperationId: RUNNING_DELETE_ENDPOINT,
+        retirementLeaseToken: "exact-active-delete-claim",
+      }),
+    ).toBe(false);
+    // Historical completed withdrawal remains usable for a later exact
+    // physical retirement; it does not require resurrecting an old lease.
+    expect(await check()).toBe(true);
+  } finally {
+    f.db.close();
+  }
+});
 
 test("v2 Actor graph refuses an accepted Namespace without its sealed Worker reference and active edge", async () => {
   const scope = { tenantId: PRINCIPAL, namespaceResourceUid: NAMESPACE };
@@ -244,9 +344,15 @@ test("v2 Actor authority reads accepted Namespace SQL and never substitutes v1 D
   let actorForwardSockets: readonly WorkerdActorForwardSocket[] = [];
   const owner: Pick<
     WorkerdWorkerRuntimeOwner,
-    "workerResourceUid" | "observeServing" | "observeActorGraph"
+    | "workerResourceUid"
+    | "observeServing"
+    | "observeActorGraph"
+    | "acquireActorVersionPrivateBindings"
   > = {
     workerResourceUid: WORKER,
+    async acquireActorVersionPrivateBindings() {
+      return { kind: "unknown" };
+    },
     async observeServing() {
       return {
         kind: "serving",

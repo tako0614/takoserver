@@ -44,6 +44,7 @@ import {
   DEPLOYMENT_ROUTER_SOURCE,
   internalHostname,
   ROUTER_SOURCE,
+  readWorkerdActiveActorGraph,
   readWorkerdActiveDeployment,
   readWorkerdSelectedActiveVersion,
   readWorkerdSelectedPinnedVersionForRecovery,
@@ -2157,6 +2158,16 @@ test("v2 private Workflow forwarding uses exact five-field grants without legacy
   });
   expect(selected?.site.workflowForward).toEqual(
     withWorkflow.versions.find((version) => version.versionId.endsWith("-a"))?.site.workflowForward,
+  );
+  const actorGraph = await readWorkerdActiveActorGraph(
+    root,
+    "workflow-site",
+    withWorkflow.workerResourceUid,
+  );
+  expect(actorGraph?.versions.map((version) => version.site.workflowForward)).toEqual(
+    [...withWorkflow.versions]
+      .sort((a, b) => a.workerVersionUid.localeCompare(b.workerVersionUid))
+      .map((version) => version.site.workflowForward),
   );
   const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
   for (const socket of sockets) expect(config).toContain(`unix:${socket.socketPath}`);

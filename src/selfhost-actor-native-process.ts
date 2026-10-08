@@ -9,7 +9,11 @@ import {
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
   SELFHOST_WORKER_PROJECT_ENV_EXPORT,
 } from "./providers/selfhost-worker-wrapper.ts";
-import { hasWorkerdV2PrivateBindingProfile } from "./providers/workerd-v2-private-binding-names.ts";
+import {
+  hasWorkerdV2PrivateBindingProfile,
+  WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
+} from "./providers/workerd-v2-private-binding-names.ts";
+import type { ActorVersionPrivateBindingLease } from "./selfhost-actor-graph-authority.ts";
 import {
   type LinuxProcessIdentity,
   spawnWorkerdWithParentDeath,
@@ -31,6 +35,8 @@ export interface WorkerdActorNamespaceOptions {
   readonly graph: WorkerdActiveActorGraph;
   /** Current provider incarnation's exact private broker sockets, not tenant input. */
   readonly actorForwardSockets?: readonly WorkerdActorForwardSocket[];
+  /** Exact selected-incarnation leases held until this native child is reaped. */
+  readonly actorVersionPrivateBindings?: readonly ActorVersionPrivateBindingLease[];
   /** Current Host-owned v2 SQLite broker listener, never a saved Version address. */
   readonly dataPlaneAddress?: string;
   readonly signal: AbortSignal;
@@ -247,6 +253,12 @@ export async function openWorkerdActorNamespace(
     : undefined;
   const graph = structuredClone(options.graph);
   const actorForwardSockets = structuredClone(options.actorForwardSockets ?? []);
+  const privateBindings = new Map<string, ActorVersionPrivateBindingLease>();
+  for (const lease of options.actorVersionPrivateBindings ?? []) {
+    const key = JSON.stringify([lease.versionId, lease.workerVersionUid]);
+    if (privateBindings.has(key)) throw new Error("duplicate Actor private binding lease");
+    privateBindings.set(key, lease);
+  }
   if (
     !/^[a-f0-9]{64}$/u.test(graph.generationKey) ||
     !graph.generation ||
@@ -271,9 +283,46 @@ export async function openWorkerdActorNamespace(
     const hostModules = new Map(
       [...version.hostModules].map(([name, bytes]) => [name, new Uint8Array(bytes)]),
     );
+    const bindingKey = JSON.stringify([version.versionId, version.workerVersionUid]);
+    const bindingLease = privateBindings.get(bindingKey);
+    privateBindings.delete(bindingKey);
+    const workflowForward = site.workflowForward;
+    const workflowBindings: { name: string; socketPath: string }[] = [];
+    if (workflowForward) {
+      if (
+        workflowForward.schema !== "takoserver.v2-workflow-binding-forward@1" ||
+        site.hostEntrypoint !== WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE ||
+        !bindingLease ||
+        bindingLease.workflowServices.length !== workflowForward.bindings.length
+      )
+        throw new Error("Actor retained Workflow binding composition unavailable");
+      const leased = new Map(
+        bindingLease.workflowServices.map((service) => [service.name, service]),
+      );
+      if (leased.size !== bindingLease.workflowServices.length)
+        throw new Error("Actor retained Workflow binding composition unavailable");
+      for (const binding of workflowForward.bindings) {
+        if (!("workflowResourceUid" in binding))
+          throw new Error("Actor retained Workflow binding composition unavailable");
+        const service = leased.get(binding.serviceName);
+        if (
+          !service ||
+          service.publicName !== binding.publicName ||
+          service.workflowResourceUid !== binding.workflowResourceUid ||
+          service.token !== binding.token ||
+          service.snapshotDigest !== workflowForward.snapshotDigest
+        )
+          throw new Error("Actor retained Workflow binding composition unavailable");
+        workflowBindings.push({ name: service.name, socketPath: service.upstreamSocket });
+      }
+    } else if (bindingLease?.workflowServices.length) {
+      throw new Error("Actor private Workflow lease exceeds selected Version");
+    }
     if ((site.serviceBindings?.length ?? 0) > 0) {
       throw new Error("Actor retained service binding composition unavailable");
     }
+    if (bindingLease?.services.length)
+      throw new Error("Actor private service lease exceeds selected Version");
     if (site.dataPlane) {
       const plane = site.dataPlane;
       if (
@@ -443,8 +492,12 @@ export default { fetch(request) { return inspectVersion(request); } };`),
       helper,
       entry,
       inspectionToken,
+      workflowSourceEntrypoint: workflowForward ? wrapper : undefined,
+      workflowBindings,
     };
   });
+  if (privateBindings.size !== 0)
+    throw new Error("Actor private lease exceeds selected Version graph");
   const first = nativeVariants[0];
   if (!first) throw new Error("unusable Actor active graph");
   const occupied = new Set([
@@ -745,10 +798,15 @@ export default {
         return null;
       }
     };
+    const {
+      workflowForward: _topLevelWorkflow,
+      serviceBindings: _topLevelServices,
+      ...actorOwnerSite
+    } = first.site;
     const config = await writeWorkerdPrivateExecution({
       root,
       site: {
-        ...first.site,
+        ...actorOwnerSite,
         hostModules: [...(first.site.hostModules ?? []), owner],
       },
       modules: first.modules,
@@ -770,6 +828,8 @@ export default {
             modules: variantModules,
             hostModules: variantHostModules,
             className,
+            workflowSourceEntrypoint,
+            workflowBindings,
           }) => ({
             site: {
               ...variantSite,
@@ -779,6 +839,9 @@ export default {
             hostModules: variantHostModules,
             className,
             actorForwardSockets,
+            ...(workflowSourceEntrypoint === undefined
+              ? {}
+              : { workflowSourceEntrypoint, workflowBindings }),
           }),
         ),
       },

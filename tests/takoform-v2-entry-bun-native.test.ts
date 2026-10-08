@@ -1215,9 +1215,10 @@ test.skipIf(OPT_IN !== "1")(
       const result = await env.DB.query("SELECT value FROM item ORDER BY rowid");
       return Response.json(result.rows);
     }
-    if (path === "/actor-write" || path === "/actor-read" || path === "/actor-sql") {
+    if (path === "/actor-write" || path === "/actor-read" || path === "/actor-sql" || path === "/actor-workflow-create" || path === "/actor-workflow-status") {
       const actor = env.ACTOR.get(env.ACTOR.idFromName("room"));
-      return actor.fetch(new Request("http://actor.invalid/" + (path === "/actor-write" ? "write" : path === "/actor-sql" ? "sql" : "read")));
+      const actorPath = path === "/actor-write" ? "write" : path === "/actor-sql" ? "sql" : path === "/actor-workflow-create" ? "workflow-create" : path === "/actor-workflow-status" ? "workflow-status" : "read";
+      return actor.fetch(new Request("http://actor.invalid/" + actorPath + url.search));
     }
     if (path === "/workflow-create") {
       const id = url.searchParams.get("id") || "workflow-before";
@@ -1241,6 +1242,16 @@ export class CounterActor {
     if (path === "/sql") {
       const result = await this.env.DB.query("SELECT value FROM item ORDER BY rowid");
       return Response.json(result.rows);
+    }
+    if (path === "/workflow-create") {
+      const id = new URL(request.url).searchParams.get("id") || "actor-before";
+      const created = await this.env.WORKFLOW.create({ id, params: { value: id } });
+      return Response.json({ id: created.id, status: (await created.status()).status });
+    }
+    if (path === "/workflow-status") {
+      const id = new URL(request.url).searchParams.get("id") || "actor-before";
+      const instance = await this.env.WORKFLOW.get(id);
+      return Response.json(await instance.status());
     }
     if (path === "/write") {
       const result = await this.context.storage.execute("INSERT INTO counter VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET value = value + 1 RETURNING value");
@@ -1449,6 +1460,10 @@ export class SqlWorkflow {
         className: "CounterActor",
       };
       const namespace = await create(ACTOR_NAMESPACE_FORM_URL, "namespace", namespaceSpec);
+      const workflow = await create(DURABLE_WORKFLOW_FORM_URL, "workflow", {
+        worker: { resourceUid: worker.uid },
+        className: "SqlWorkflow",
+      });
       const sensitive = await jsonAt(
         port,
         "POST",
@@ -1496,6 +1511,7 @@ export class SqlWorkflow {
         requiredSensitiveVars: [],
         actorBindings: [{ name: "ACTOR", resource: { resourceUid: namespace.uid } }],
         sqliteBindings: [{ name: "DB", resource: { resourceUid: sqliteTarget.uid } }],
+        workflowBindings: [{ name: "WORKFLOW", resource: { resourceUid: workflow.uid } }],
       });
       const deployment = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
         worker: { resourceUid: worker.uid },
@@ -1513,6 +1529,24 @@ export class SqlWorkflow {
         auth,
       );
       const hostname = String((endpointRead.output as Json).hostname);
+      const workflowReady = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${workflow.uid}`,
+        202,
+        { spec: { worker: { resourceUid: worker.uid }, className: "SqlWorkflow" } },
+        {
+          ...auth,
+          "idempotency-key": "normal-v2-workflow-ready-update",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(await settled(port, token, String(workflowReady.id))).toMatchObject({
+        effect: "complete",
+      });
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${workflow.uid}`, 200, undefined, auth),
+      ).toMatchObject({ observed: { ready: true } });
       expect(await nativeHttps(hostname, "/before-crash")).toEqual({
         status: 200,
         body: "normal-v2:/before-crash",
@@ -1528,6 +1562,23 @@ export class SqlWorkflow {
       expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
         status: 200,
         body: '[{"value":"once"}]',
+      });
+      expect(await nativeHttps(hostname, "/actor-workflow-create?id=actor-before")).toEqual({
+        status: 200,
+        body: '{"id":"actor-before","status":"queued"}',
+      });
+      expect(await nativeWorkflowComplete(hostname, "actor-before")).toEqual({
+        status: "complete",
+        output: { values: ["once", "actor-before"] },
+      });
+      const actorWorkflowStatus = await nativeHttps(
+        hostname,
+        "/actor-workflow-status?id=actor-before",
+      );
+      expect(actorWorkflowStatus.status).toBe(200);
+      expect(JSON.parse(actorWorkflowStatus.body)).toMatchObject({
+        status: "complete",
+        output: { values: ["once", "actor-before"] },
       });
 
       const firstPid = serving.pid;
@@ -1548,7 +1599,7 @@ export class SqlWorkflow {
       });
       expect(await nativeHttps(hostname, "/actor-sql")).toEqual({
         status: 200,
-        body: '[{"value":"once"}]',
+        body: '[{"value":"once"},{"value":"actor-before"}]',
       });
       expect(await nativeHttps(hostname, "/actor-write")).toEqual({
         status: 200,
@@ -1566,7 +1617,7 @@ export class SqlWorkflow {
       });
       expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
         status: 200,
-        body: '[{"value":"once"}]',
+        body: '[{"value":"once"},{"value":"actor-before"}]',
       });
       const applicationUpdate = await jsonAt(
         port,
@@ -1585,7 +1636,7 @@ export class SqlWorkflow {
       });
       expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
         status: 200,
-        body: '[{"value":"once"}]',
+        body: '[{"value":"once"},{"value":"actor-before"}]',
       });
       const endpointUpdate = await jsonAt(
         port,
@@ -1605,6 +1656,15 @@ export class SqlWorkflow {
       expect(await nativeHttps(hostname, "/actor-read")).toEqual({
         status: 200,
         body: '{"value":2}',
+      });
+      const actorWorkflowAfterRestart = await nativeHttps(
+        hostname,
+        "/actor-workflow-status?id=actor-before",
+      );
+      expect(actorWorkflowAfterRestart.status).toBe(200);
+      expect(JSON.parse(actorWorkflowAfterRestart.body)).toMatchObject({
+        status: "complete",
+        output: { values: ["once", "actor-before"] },
       });
       const namespaceUpdate = await jsonAt(
         port,
@@ -1638,10 +1698,6 @@ export class SqlWorkflow {
         },
       );
       expect(await settled(port, token, String(update.id))).toMatchObject({ effect: "complete" });
-      const workflow = await create(DURABLE_WORKFLOW_FORM_URL, "workflow", {
-        worker: { resourceUid: worker.uid },
-        className: "SqlWorkflow",
-      });
       const workflowVersion = await create(WORKER_VERSION_FORM_URL, "workflow-version", {
         worker: { resourceUid: worker.uid },
         bundle: { resourceUid: bundle.uid },
@@ -1675,11 +1731,11 @@ export class SqlWorkflow {
       });
       expect(await nativeWorkflowComplete(hostname, "workflow-before")).toEqual({
         status: "complete",
-        output: { values: ["once", "workflow-before"] },
+        output: { values: ["once", "actor-before", "workflow-before"] },
       });
       expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
         status: 200,
-        body: '[{"value":"once"},{"value":"workflow-before"}]',
+        body: '[{"value":"once"},{"value":"actor-before"},{"value":"workflow-before"}]',
       });
       const workflowHostPid = serving.pid;
       await killHost(serving);
@@ -1688,11 +1744,11 @@ export class SqlWorkflow {
       expect(serving.pid).not.toBe(workflowHostPid);
       expect(await nativeWorkflowComplete(hostname, "workflow-before")).toEqual({
         status: "complete",
-        output: { values: ["once", "workflow-before"] },
+        output: { values: ["once", "actor-before", "workflow-before"] },
       });
       expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
         status: 200,
-        body: '[{"value":"once"},{"value":"workflow-before"}]',
+        body: '[{"value":"once"},{"value":"actor-before"},{"value":"workflow-before"}]',
       });
       expect(await nativeHttps(hostname, "/workflow-create?id=workflow-after")).toEqual({
         status: 200,
@@ -1700,11 +1756,11 @@ export class SqlWorkflow {
       });
       expect(await nativeWorkflowComplete(hostname, "workflow-after")).toEqual({
         status: "complete",
-        output: { values: ["once", "workflow-before", "workflow-after"] },
+        output: { values: ["once", "actor-before", "workflow-before", "workflow-after"] },
       });
       expect(await nativeHttps(hostname, "/sqlite-read")).toEqual({
         status: 200,
-        body: '[{"value":"once"},{"value":"workflow-before"},{"value":"workflow-after"}]',
+        body: '[{"value":"once"},{"value":"actor-before"},{"value":"workflow-before"},{"value":"workflow-after"}]',
       });
       const remove = async (uid: string, generation: number, name: string) => {
         const accepted = await jsonAt(port, "DELETE", `${V2}/resources/${uid}`, 202, undefined, {
@@ -1734,8 +1790,8 @@ export class SqlWorkflow {
       });
       await remove(deployment.uid, 2, "deployment");
       await remove(workflowVersion.uid, 1, "workflow-version");
-      await remove(workflow.uid, 1, "workflow");
       await remove(version.uid, 1, "version");
+      await remove(workflow.uid, 2, "workflow");
       await remove(namespace.uid, 3, "namespace");
       await remove(bundle.uid, 1, "bundle");
       await remove(application.uid, 2, "migration-application");

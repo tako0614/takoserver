@@ -414,6 +414,19 @@ export interface WorkerdPublicationIdentity {
   readonly versions: readonly SelfhostWeightedVersion[];
 }
 
+/** One physical incarnation's exact identity for an app-authorized Actor drain. */
+export interface WorkerdActorIncarnationRetirement {
+  readonly workerResourceUid: string;
+  readonly targetKey: string;
+  readonly sourceOperationId: string;
+  readonly incarnationId: string;
+  readonly generation: string;
+  readonly versions: readonly SelfhostWeightedVersion[];
+  readonly retirementOperationId: string;
+  /** Present for a directly executing DELETE; background retired groups use SQL's current claim. */
+  readonly retirementLeaseToken?: string;
+}
+
 /** Exact weighted identity behind the runtime's committed stable pointer. */
 export interface WorkerdActiveDeployment {
   readonly generation: string;
@@ -4219,6 +4232,10 @@ export async function writeWorkerdPrivateExecution(options: {
       readonly hostModules: ReadonlyMap<string, Uint8Array>;
       readonly className: string;
       readonly actorForwardSockets?: readonly WorkerdActorForwardSocket[];
+      /** Selected v2 outer wrapper before the Host-generated Actor entrypoint. */
+      readonly workflowSourceEntrypoint?: string;
+      /** Exact pinned broker sockets for this one immutable Version. */
+      readonly workflowBindings?: readonly { readonly name: string; readonly socketPath: string }[];
     }[];
   };
   readonly runSocketPath: string;
@@ -4535,18 +4552,95 @@ export async function writeWorkerdPrivateExecution(options: {
       // were verified from durable state, but are intentionally not composed
       // into the private class service.
       const { assets: _assets, events: _events, ...versionSite } = variant.site;
-      const version = await prepareWorkerdSite(
-        { ...versionSite, hostnames: [] },
+      const hasV2ActorWorkflow = versionSite.workflowForward?.schema === V2_WORKFLOW_FORWARD_SCHEMA;
+      if (
+        (hasV2ActorWorkflow &&
+          (variant.workflowSourceEntrypoint !== WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE ||
+            versionSite.hostEntrypoint === variant.workflowSourceEntrypoint ||
+            !versionSite.hostModules?.includes(variant.workflowSourceEntrypoint) ||
+            !variant.hostModules.has(variant.workflowSourceEntrypoint))) ||
+        (!hasV2ActorWorkflow &&
+          (variant.workflowSourceEntrypoint !== undefined ||
+            (variant.workflowBindings?.length ?? 0) !== 0))
+      )
+        throw new Error("unusable Actor class Workflow source");
+      const actorWorkflow = hasV2ActorWorkflow
+        ? validWorkflowForward(versionSite.workflowForward, true, true)
+        : undefined;
+      const actorWorkflowMappings = variant.workflowBindings ?? [];
+      const versionBindings: string[] = [];
+      if (actorWorkflowMappings.length !== (actorWorkflow?.bindings.length ?? 0))
+        throw new Error("Actor class Workflow broker unavailable");
+      const mappedWorkflow = new Map(
+        actorWorkflowMappings.map((mapping) => [mapping.name, mapping]),
+      );
+      if (mappedWorkflow.size !== actorWorkflowMappings.length)
+        throw new Error("unusable Actor class Workflow broker");
+      for (const [bindingIndex, binding] of (actorWorkflow?.bindings ?? []).entries()) {
+        const mapping = mappedWorkflow.get(binding.serviceName);
+        if (
+          !mapping ||
+          typeof mapping.socketPath !== "string" ||
+          !isAbsolute(mapping.socketPath) ||
+          resolve(mapping.socketPath) !== mapping.socketPath ||
+          mapping.socketPath.includes("\u0000") ||
+          Buffer.byteLength(mapping.socketPath) > 100 ||
+          !/^[a-f0-9]{22}\.sock$/u.test(
+            mapping.socketPath.slice(dirname(mapping.socketPath).length + 1),
+          ) ||
+          mapping.socketPath === runSocketPath ||
+          mapping.socketPath === actorProxySocketPath ||
+          servicePaths.has(mapping.socketPath)
+        )
+          throw new Error("unusable Actor class Workflow broker");
+        await requirePrivateSocketDirectory(dirname(mapping.socketPath));
+        const identity = await privateSocketMetadata(mapping.socketPath);
+        if (!identity) throw new Error("Actor class Workflow broker unavailable");
+        workflowSocketProofs.push({ path: mapping.socketPath, identity });
+        servicePaths.add(mapping.socketPath);
+        const brokerName = `actor-version-${index}-workflow-${bindingIndex}`;
+        versionBindings.push(
+          `(name = ${capnpText(binding.serviceName)}, service = ${capnpText(brokerName)})`,
+        );
+        actorVersionExternals += `\n  (name = ${capnpText(brokerName)}, external = (address = ${capnpText(`unix:${mapping.socketPath}`)}, http = ())),`;
+        mappedWorkflow.delete(binding.serviceName);
+      }
+      const validationVersionSite: WorkerdSite = hasV2ActorWorkflow
+        ? {
+            ...versionSite,
+            hostnames: [],
+            hostEntrypoint: variant.workflowSourceEntrypoint as string,
+            hostModules: [
+              ...(versionSite.hostModules ?? []).filter(
+                (name) => name !== variant.workflowSourceEntrypoint,
+              ),
+              versionSite.hostEntrypoint as string,
+            ],
+          }
+        : { ...versionSite, hostnames: [] };
+      const validatedVersion = await prepareWorkerdSite(
+        validationVersionSite,
         variant.modules,
         undefined,
         variant.hostModules,
       );
+      const version: PreparedWorkerdSite<Manifest> = hasV2ActorWorkflow
+        ? {
+            ...validatedVersion,
+            manifest: {
+              ...validatedVersion.manifest,
+              hostEntrypoint: versionSite.hostEntrypoint as string,
+            },
+          }
+        : validatedVersion;
       const versionRoot = join(root, "actor-versions", String(index));
       const versionPrefix = `./actor-versions/${index}`;
       actorPrepared.push({ root: versionRoot, version });
-      const versionBindings = validBindings(version.manifest.vars ?? []).map(
-        (binding) =>
-          `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
+      versionBindings.unshift(
+        ...validBindings(version.manifest.vars ?? []).map(
+          (binding) =>
+            `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
+        ),
       );
       if (version.manifest.dataPlane) {
         if (!hasWorkerdV2PrivateBindingProfile(version.manifest)) {
@@ -4661,6 +4755,15 @@ const config :Workerd.Config = (
   await writePreparedWorkerdSite(root, classPrepared);
   for (const { root: versionRoot, version } of actorPrepared) {
     await writePreparedWorkerdSite(versionRoot, version);
+  }
+  // Actor Version Workflow brokers were discovered after the top-level
+  // pre-render check. Recheck every pinned listener after all class bytes are
+  // written, immediately before the native config becomes launchable.
+  for (const proof of workflowSocketProofs) {
+    await requirePrivateSocketDirectory(dirname(proof.path));
+    const current = await privateSocketMetadata(proof.path);
+    if (!current || !samePrivateSocketIdentity(proof.identity, current))
+      throw new Error("private Workflow execution broker changed");
   }
   for (const proof of actorSocketProofs) {
     await requirePrivateSocketDirectory(dirname(proof.path));
@@ -5855,6 +5958,9 @@ export async function readWorkerdActiveActorGraph(
                 bindings: manifest.actorForward.bindings.map((binding) => ({ ...binding })),
               },
             }),
+        ...(manifest.workflowForward === undefined
+          ? {}
+          : { workflowForward: copyWorkflowForward(manifest.workflowForward) }),
         ...(manifest.vars === undefined
           ? {}
           : { vars: manifest.vars.map((binding) => ({ ...binding })) }),

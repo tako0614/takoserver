@@ -84,6 +84,7 @@ import {
   workerPortOwnership,
 } from "./workerd-linux-process.ts";
 import type {
+  WorkerdActorIncarnationRetirement as ActorIncarnationRetirement,
   HostedWorkerdRuntime,
   WorkerdActiveActorGraph,
   WorkerdActorForwardSocket,
@@ -234,6 +235,8 @@ interface IncarnationHandle {
   readonly workflowForward?: V2WorkflowForwardIncarnation;
   readonly invocations: Set<ActiveInvocation>;
   readonly workflowLeases: Set<Promise<void>>;
+  /** Acquired before an Actor child started, but release had uncertain outcome. */
+  readonly orphanedActorBindingLeases: Set<WorkerdPrivateServiceLease>;
   /** Native ServiceBinding calls pin the exact caller incarnation through body drain. */
   readonly serviceBindingLeases: Set<Promise<void>>;
   readonly serviceBindingForward?: V2ServiceBindingForwardIncarnation;
@@ -323,6 +326,34 @@ export interface WorkerdWorkerRuntimeOwner {
     readonly targetKey: string;
     readonly sourceOperationId: string;
   }): Promise<WorkerdActorNativeGraphObservation>;
+  /** Physical-only exact Version bridge; the Actor caller supplies its own accepted SQL fence. */
+  acquireActorVersionPrivateBindings(
+    input: {
+      readonly workerResourceUid: string;
+      readonly targetKey: string;
+      readonly sourceOperationId: string;
+      readonly incarnationId: string;
+      readonly generationKey: string;
+      readonly versions: readonly {
+        readonly versionId: string;
+        readonly workerVersionUid: string;
+        readonly weight: number;
+      }[];
+      readonly versionId: string;
+      readonly workerVersionUid: string;
+    },
+    signal: AbortSignal,
+  ): Promise<
+    | { readonly kind: "unknown" }
+    | {
+        readonly kind: "ready";
+        readonly versionId: string;
+        readonly workerVersionUid: string;
+        readonly services: WorkerdPrivateServiceLease["services"];
+        readonly workflowServices: WorkerdPrivateServiceLease["workflowServices"];
+        release(): Promise<void>;
+      }
+  >;
   /** Exact active code Version and private Service bridge for one Workflow run. */
   selectWorkflowExecution(input: {
     readonly workerUid: string;
@@ -629,6 +660,10 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
       completeRestoration(): Promise<void>;
       close(): Promise<void>;
     };
+  };
+  /** App-layer accepted Actor withdrawal before this owner's exact native group drain. */
+  readonly v2ActorRetirement?: {
+    quiesceIncarnation(input: ActorIncarnationRetirement): Promise<void>;
   };
   /** Composition alone defers the Actor postpass until every UID owner is recovered. */
   readonly deferActorRestoreAdmission?: boolean;
@@ -2625,8 +2660,37 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
   };
 
+  const actorRetirementInput = (
+    incarnation: IncarnationHandle,
+    retirementOperationId: string,
+    retirementLeaseToken?: string,
+  ): ActorIncarnationRetirement | null => {
+    const identity = incarnation.record.identity;
+    const processIdentity = incarnation.record.processIdentity;
+    if (!identity || !processIdentity) {
+      if (incarnation.workflowLeases.size > 0)
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      return null;
+    }
+    return {
+      workerResourceUid: options.workerResourceUid,
+      targetKey: options.targetKey,
+      sourceOperationId: incarnation.record.operationId,
+      incarnationId: physicalIncarnationId(incarnation.record.operationId, processIdentity),
+      generation: identity.generation,
+      versions: identity.versions.map(({ versionId, workerVersionUid, weight }) => ({
+        versionId,
+        workerVersionUid,
+        weight,
+      })),
+      retirementOperationId,
+      ...(retirementLeaseToken === undefined ? {} : { retirementLeaseToken }),
+    };
+  };
+
   async function retireIncarnation(
     incarnation: IncarnationHandle,
+    quiesceActor = true,
   ): Promise<WorkerdWorkerRetirementReceipt> {
     if (incarnation.retiring) return await incarnation.retiring;
     if (
@@ -2645,6 +2709,16 @@ export async function openWorkerdWorkerRuntimeOwner(
           retirementOperationId: operationId,
         }));
         incarnation.record = retiringRecord;
+        // These leases never escaped to an Actor child. A failed release is
+        // uncertain, so retry it before retiring the owning runtime.
+        for (const lease of [...incarnation.orphanedActorBindingLeases]) {
+          await lease.release();
+          incarnation.orphanedActorBindingLeases.delete(lease);
+        }
+        if (quiesceActor && options.v2ActorRetirement) {
+          const input = actorRetirementInput(incarnation, operationId);
+          if (input) await options.v2ActorRetirement.quiesceIncarnation(input);
+        }
         // A Workflow child may still be using an exact private Service socket.
         // Do not stop its upstream or release the socket namespace until the
         // caller's lease has completed; no elapsed timeout proves retirement.
@@ -3004,6 +3078,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       ...(serviceBindingForward ? { serviceBindingForward } : {}),
       invocations: new Set(),
       workflowLeases: new Set(),
+      orphanedActorBindingLeases: new Set(),
       serviceBindingLeases: new Set(),
     };
     handles.set(record.operationId, handle);
@@ -3679,12 +3754,40 @@ export async function openWorkerdWorkerRuntimeOwner(
     return receipt;
   };
 
-  const execute = (inputExecution: V2Execution): Promise<V2WorkerRuntimeOwnerExecutionResult> => {
+  const execute = async (
+    inputExecution: V2Execution,
+  ): Promise<V2WorkerRuntimeOwnerExecutionResult> => {
     let captured: V2Execution;
     try {
       captured = structuredClone(inputExecution);
     } catch {
-      return Promise.resolve({ kind: "not_dispatched", code: "worker_operation_invalid" });
+      return { kind: "not_dispatched", code: "worker_operation_invalid" };
+    }
+    if (
+      captured.form === WORKER_DEPLOYMENT_FORM_URL &&
+      captured.action === "delete" &&
+      captured.targetKey === options.targetKey &&
+      workerFromExecution(captured) === options.workerResourceUid &&
+      options.v2ActorRetirement
+    ) {
+      try {
+        // Do not hold the native owner's serial lane while an Actor response
+        // drains: that response may itself need this owner for a selected
+        // private binding. The later serial DELETE re-resolves the Operation.
+        const targets = await runSerial(async () =>
+          [...handles.values()]
+            .filter((handle) => handle.record.status !== "retired")
+            .map((handle) =>
+              actorRetirementInput(handle, captured.operationId, captured.leaseToken),
+            )
+            .filter((item): item is ActorIncarnationRetirement => item !== null),
+        );
+        for (const target of targets) {
+          await options.v2ActorRetirement.quiesceIncarnation(target);
+        }
+      } catch {
+        return { kind: "unknown" };
+      }
     }
     return runSerial(async () => {
       const execution = captured;
@@ -4068,6 +4171,154 @@ export async function openWorkerdWorkerRuntimeOwner(
     observeActorGraphPhysical(input, true);
   const observeActorGraphForAcceptedOperation: WorkerdWorkerRuntimeOwner["observeActorGraphForAcceptedOperation"] =
     (input) => observeActorGraphPhysical(input, false);
+
+  const acquireActorVersionPrivateBindings: WorkerdWorkerRuntimeOwner["acquireActorVersionPrivateBindings"] =
+    async (input, signal) => {
+      const unknown = { kind: "unknown" } as const;
+      // No caller-owned array or identifier is consulted after the first await.
+      const target = {
+        workerResourceUid: input.workerResourceUid,
+        targetKey: input.targetKey,
+        sourceOperationId: input.sourceOperationId,
+        incarnationId: input.incarnationId,
+        generationKey: input.generationKey,
+        versionId: input.versionId,
+        workerVersionUid: input.workerVersionUid,
+        versions: input.versions.map((version) => ({
+          versionId: version.versionId,
+          workerVersionUid: version.workerVersionUid,
+          weight: version.weight,
+        })),
+      };
+      signal.throwIfAborted();
+      const request = {
+        workerResourceUid: target.workerResourceUid,
+        targetKey: target.targetKey,
+        sourceOperationId: target.sourceOperationId,
+      };
+      const matches = (observation: WorkerdActorNativeGraphObservation): boolean =>
+        observation.kind === "ready" &&
+        observation.incarnationId === target.incarnationId &&
+        observation.graph.generationKey === target.generationKey &&
+        canonicalJson(
+          observation.graph.versions.map(({ versionId, workerVersionUid, weight }) => ({
+            versionId,
+            workerVersionUid,
+            weight,
+          })),
+        ) === canonicalJson(target.versions) &&
+        observation.graph.versions.some(
+          (version) =>
+            version.versionId === target.versionId &&
+            version.workerVersionUid === target.workerVersionUid,
+        );
+      const before = await observeActorGraphForAcceptedOperation(request);
+      if (!matches(before) || before.kind !== "ready") return unknown;
+      const captured = await runSerial(async () => {
+        const incarnation = active;
+        const record = recordFor(target.sourceOperationId);
+        if (
+          closed ||
+          suspending ||
+          admissionClosedBy !== null ||
+          !incarnation ||
+          incarnation.record.operationId !== target.sourceOperationId ||
+          state.activeOperationId !== target.sourceOperationId ||
+          record?.status !== "active" ||
+          !record.processIdentity ||
+          physicalIncarnationId(record.operationId, record.processIdentity) !== target.incarnationId
+        )
+          return null;
+        return { incarnation, recordKey: canonicalJson(record) };
+      });
+      if (!captured) return unknown;
+      // An earlier pre-child release failure must be cleaned before another
+      // reservation; it must not accumulate invisible pins in this process.
+      for (const orphan of [...captured.incarnation.orphanedActorBindingLeases]) {
+        await orphan.release();
+        captured.incarnation.orphanedActorBindingLeases.delete(orphan);
+      }
+      let lease: WorkerdPrivateServiceLease;
+      try {
+        lease = await captured.incarnation.runtime.acquirePrivateServiceBindings(
+          {
+            script: before.script,
+            generation: before.graph.generation,
+            generationKey: target.generationKey,
+            workerResourceUid: target.workerResourceUid,
+            versionId: target.versionId,
+            workerVersionUid: target.workerVersionUid,
+          },
+          signal,
+        );
+      } catch {
+        return unknown;
+      }
+      let unusedReleased = false;
+      const releaseUnused = async (): Promise<void> => {
+        if (unusedReleased) return;
+        try {
+          await lease.release();
+          unusedReleased = true;
+          captured.incarnation.orphanedActorBindingLeases.delete(lease);
+        } catch (error) {
+          captured.incarnation.orphanedActorBindingLeases.add(lease);
+          throw error;
+        }
+      };
+      try {
+        signal.throwIfAborted();
+        const after = await observeActorGraphForAcceptedOperation(request);
+        if (!matches(after) || after.kind !== "ready") {
+          await releaseUnused();
+          return unknown;
+        }
+        let finish!: () => void;
+        const done = new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        const registered = await runSerial(async () => {
+          const record = recordFor(target.sourceOperationId);
+          if (
+            signal.aborted ||
+            closed ||
+            suspending ||
+            admissionClosedBy !== null ||
+            active !== captured.incarnation ||
+            state.activeOperationId !== target.sourceOperationId ||
+            record?.status !== "active" ||
+            canonicalJson(record) !== captured.recordKey ||
+            !captured.incarnation.group.isReady()
+          )
+            return false;
+          captured.incarnation.workflowLeases.add(done);
+          return true;
+        });
+        if (!registered) {
+          await releaseUnused();
+          return unknown;
+        }
+        let released = false;
+        return {
+          kind: "ready",
+          versionId: target.versionId,
+          workerVersionUid: target.workerVersionUid,
+          services: lease.services.map((service) => ({ ...service })),
+          workflowServices: lease.workflowServices.map((service) => ({ ...service })),
+          async release() {
+            if (released) return;
+            await lease.release();
+            released = true;
+            captured.incarnation.workflowLeases.delete(done);
+            finish();
+          },
+        };
+      } catch (error) {
+        // A thrown read or abort still owns the newly acquired runtime lease.
+        await releaseUnused();
+        throw error;
+      }
+    };
 
   const selectWorkflowExecution: WorkerdWorkerRuntimeOwner["selectWorkflowExecution"] = async (
     input,
@@ -4669,7 +4920,9 @@ export async function openWorkerdWorkerRuntimeOwner(
       status: "retiring",
       retirementOperationId: operationId,
     }));
-    await retireIncarnation(candidate);
+    // This candidate never became the serving owner. No Actor carrier can be
+    // authorized by its source, and this path may run inside the owner lane.
+    await retireIncarnation(candidate, false);
   }
 
   async function activateIncarnation(
@@ -4806,7 +5059,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       }
     }
     const receipts = await Promise.allSettled(
-      live.map((incarnation) => retireIncarnation(incarnation)),
+      live.map((incarnation) => retireIncarnation(incarnation, false)),
     );
     if (receipts.some((receipt) => receipt.status === "rejected")) return { kind: "unknown" };
     if (!(await resolution.stillCurrent())) return { kind: "unknown" };
@@ -5894,6 +6147,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     observeServing,
     observeActorGraph,
     observeActorGraphForAcceptedOperation,
+    acquireActorVersionPrivateBindings,
     selectWorkflowExecution,
     observeVersionTarget,
     observeQueueTarget,

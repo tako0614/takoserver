@@ -1765,6 +1765,43 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
     if (exact.kind !== "ready") throw new Error("native Actor graph not observed");
     expect(await readPhysical()).toEqual(exact);
     expect(exact.graph.versions[0]?.modules.get("index.mjs")).toBeInstanceOf(Uint8Array);
+    const selectedVersion = exact.graph.versions[0];
+    if (!selectedVersion) throw new Error("Actor Version unavailable");
+    const bindingRequest = {
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      sourceOperationId: createId,
+      incarnationId: exact.incarnationId,
+      generationKey: exact.graph.generationKey,
+      versions: exact.graph.versions.map(({ versionId, workerVersionUid, weight }) => ({
+        versionId,
+        workerVersionUid,
+        weight,
+      })),
+      versionId: selectedVersion.versionId,
+      workerVersionUid: selectedVersion.workerVersionUid,
+    };
+    const signal = new AbortController().signal;
+    expect(
+      await owner.acquireActorVersionPrivateBindings(
+        { ...bindingRequest, targetKey: "foreign-target" },
+        signal,
+      ),
+    ).toEqual({ kind: "unknown" });
+    expect(
+      await owner.acquireActorVersionPrivateBindings(
+        { ...bindingRequest, generationKey: "stale" },
+        signal,
+      ),
+    ).toEqual({ kind: "unknown" });
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(
+      owner.acquireActorVersionPrivateBindings(bindingRequest, aborted.signal),
+    ).rejects.toThrow();
+    const actorBindings = await owner.acquireActorVersionPrivateBindings(bindingRequest, signal);
+    expect(actorBindings).toMatchObject({ kind: "ready", services: [], workflowServices: [] });
+    if (actorBindings.kind !== "ready") throw new Error("Actor private binding lease unavailable");
     expect(
       await owner.observeActorGraph({
         workerResourceUid: workerUid,
@@ -1790,6 +1827,12 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
     publication.setFenceCurrent(false);
     expect(await read()).toEqual({ kind: "unknown" });
     expect(await readPhysical()).toEqual(exact);
+    const duringOwnAcceptedUpdate = await owner.acquireActorVersionPrivateBindings(
+      bindingRequest,
+      signal,
+    );
+    expect(duringOwnAcceptedUpdate.kind).toBe("ready");
+    if (duringOwnAcceptedUpdate.kind === "ready") await duringOwnAcceptedUpdate.release();
     expect(
       await owner.observeActorGraphForAcceptedOperation({
         workerResourceUid: workerUid,
@@ -1802,6 +1845,7 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
     expect(await read()).toEqual({ kind: "unknown" });
     expect(await readPhysical()).toEqual(exact);
     publication.failAfterFenceChecks(null);
+    await actorBindings.release();
     expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
       kind: "confirmed",
       identity: null,
@@ -1820,11 +1864,45 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
   const createId = "0cfebc3b-3b9a-4a5b-a897-6713df09121e";
   const deleteId = "f1840189-4a30-41c2-bae2-9c086a5327c4";
   const publication = staticPublicationState(workerUid, true);
+  const request = {
+    workerUid,
+    targetKey: TARGET_KEY,
+    servingSourceOperationId: createId,
+    basisPoint: 0,
+  };
+  let readDuringActorDrain: (() => Promise<unknown>) | null = null;
+  let activeActorTurnRead: Promise<unknown> | null = null;
+  let continueActorTurn: (() => void) | null = null;
+  let actorDrainCalls = 0;
+  let allowActorDrain = false;
   const owner = await openWorkerdWorkerRuntimeOwner({
     rootDirectory: join(owned.root, "owners"),
     workerResourceUid: workerUid,
     targetKey: TARGET_KEY,
     publicationState: publication.source,
+    v2ActorRetirement: {
+      async quiesceIncarnation(input) {
+        actorDrainCalls += 1;
+        expect(input).toMatchObject({
+          workerResourceUid: workerUid,
+          targetKey: TARGET_KEY,
+          sourceOperationId: createId,
+          retirementOperationId: deleteId,
+        });
+        if (!readDuringActorDrain) throw new Error("Actor drain reader unavailable");
+        // An active Actor turn may need the owner for its private binding before
+        // it can drain. Retirement must not wait for that turn in runSerial.
+        expect(
+          await Promise.race([
+            readDuringActorDrain(),
+            Bun.sleep(2_000).then(() => {
+              throw new Error("Actor drain re-entered the owner serial lane");
+            }),
+          ]),
+        ).toMatchObject({ kind: "selected", sourceOperationId: createId });
+        if (!allowActorDrain) throw new Error("Actor child drain is unresolved");
+      },
+    },
     workerdBinary: owned.binary,
     listenerPortForOperation: unusedPort,
     spawn: owned.spawn,
@@ -1833,11 +1911,9 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
       exportedHandlers: ["fetch"],
     }),
   });
-  const request = {
-    workerUid,
-    targetKey: TARGET_KEY,
-    servingSourceOperationId: createId,
-    basisPoint: 0,
+  readDuringActorDrain = () => {
+    continueActorTurn?.();
+    return activeActorTurnRead ?? owner.selectWorkflowExecution(request);
   };
   try {
     expect(await owner.selectWorkflowExecution(request)).toEqual({ kind: "unknown" });
@@ -1871,6 +1947,16 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
     expect(await selection.stillCurrent()).toBe(false);
     expect(await owner.selectWorkflowExecution(request)).toEqual({ kind: "unknown" });
     publication.setFenceCurrent(true);
+    expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toEqual({
+      kind: "unknown",
+    });
+    expect(await selection.stillCurrent()).toBe(true);
+    allowActorDrain = true;
+    // The turn exists before DELETE. It enters the owner only after the Actor
+    // drain begins, as a Workflow/SQLite broker can during an active fetch.
+    activeActorTurnRead = new Promise<void>((resolve) => {
+      continueActorTurn = resolve;
+    }).then(() => owner.selectWorkflowExecution(request));
     let deleteFinished = false;
     const deletion = owner.execute(execution(workerUid, deleteId, "delete")).then((result) => {
       deleteFinished = true;
@@ -1884,6 +1970,7 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
       kind: "confirmed",
       identity: null,
     });
+    expect(actorDrainCalls).toBe(2);
     expect(await selection.stillCurrent()).toBe(false);
   } finally {
     await owner.close().catch(() => undefined);

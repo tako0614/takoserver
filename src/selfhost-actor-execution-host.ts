@@ -20,7 +20,9 @@ import {
   type ActorExecutionGraph,
   type ActorExecutionRealization,
   type ActorGraphAuthority,
+  type ActorIncarnationRetirement,
   type ActorRealizationRead,
+  type ActorVersionPrivateBindingLease,
   createLegacyActorGraphAuthority,
 } from "./selfhost-actor-graph-authority.ts";
 import { acquireActorNativeLease } from "./selfhost-actor-lease.ts";
@@ -40,12 +42,14 @@ interface Session {
   readonly process: WorkerdActorNamespace;
   readonly alarmLeases: Set<string>;
   readonly socketLeases: Set<string>;
+  readonly privateBindingLeases: readonly ActorVersionPrivateBindingLease[];
   active: number;
   readonly idle: Set<() => void>;
   dead: boolean;
   retiring: boolean;
   reap?: Promise<void>;
   admissionRecovery?: Promise<void>;
+  refreshAfterIdle?: boolean;
 }
 interface Owner {
   tail: Promise<void>;
@@ -54,6 +58,8 @@ interface Owner {
   lease?: Awaited<ReturnType<typeof acquireActorNativeLease>>;
   revoked?: boolean;
   refreshing?: Promise<void>;
+  /** Acquired before child startup; a failed release remains an owned cleanup obligation. */
+  pendingPrivateBindingLeases?: Set<ActorVersionPrivateBindingLease>;
 }
 
 interface ActorScope {
@@ -418,17 +424,34 @@ export function createSelfhostActorExecutionHost(options: {
   };
   const retire = async (owner: Owner): Promise<void> => {
     const session = owner.session;
-    if (!session) return;
-    session.retiring = true;
-    session.process.disableAlarmAdmission();
-    if (session.active > 0 && !session.dead)
-      await new Promise<void>((resolve) => session.idle.add(resolve));
-    await (session.reap ?? session.process.close());
-    if (owner.session === session) delete owner.session;
+    if (session) {
+      session.retiring = true;
+      session.process.disableAlarmAdmission();
+      if (session.active > 0 && !session.dead)
+        await new Promise<void>((resolve) => session.idle.add(resolve));
+      await (session.reap ?? session.process.close());
+      for (const lease of session.privateBindingLeases) await lease.release();
+      if (owner.session === session) delete owner.session;
+    }
+    for (const lease of owner.pendingPrivateBindingLeases ?? []) {
+      await lease.release();
+      owner.pendingPrivateBindingLeases?.delete(lease);
+    }
   };
   const resumeAdmissionAfterSettlement = (owner: Owner, session: Session, identity: ActorScope) => {
-    if (session.admissionRecovery) return;
     const captured = { ...identity };
+    if (session.admissionRecovery) {
+      // A previous recovery may be observing this session just as retirement
+      // closes admission. Let it finish, then start a fresh current-graph read
+      // for this failed withdrawal instead of losing the wake obligation.
+      void session.admissionRecovery
+        .finally(() => {
+          if (owner.session === session && !session.dead && !session.retiring)
+            resumeAdmissionAfterSettlement(owner, session, captured);
+        })
+        .catch(() => {});
+      return;
+    }
     session.admissionRecovery = (async () => {
       while (
         !stopped &&
@@ -533,6 +556,35 @@ export function createSelfhostActorExecutionHost(options: {
       });
   };
 
+  const retireIdleCarrier = async (owner: Owner, identity: ActorScope): Promise<void> => {
+    const session = owner.session;
+    if (session && !session.dead && session.active > 0) {
+      // This selector may itself be a nested call from the active Actor turn.
+      // It cannot wait for that turn while holding the Namespace lane. Keep
+      // the old carrier, refuse this admission, and retry once the turn ends.
+      if (!session.refreshAfterIdle) {
+        session.refreshAfterIdle = true;
+        session.idle.add(() => {
+          session.refreshAfterIdle = false;
+          if (owner.session !== session || session.retiring) return;
+          const refreshing = owner.refreshing;
+          if (refreshing) {
+            void refreshing
+              .finally(() => {
+                if (owner.session === session && !session.retiring)
+                  scheduleRefresh(owner, identity);
+              })
+              .catch(() => {});
+          } else scheduleRefresh(owner, identity);
+        });
+      }
+      throw new ActorAuthorityUnavailable("Actor carrier is in use");
+    }
+    // No await occurs between the active count check and retire's synchronous
+    // retiring flag, which also closes the native alarm/socket admission gate.
+    await retire(owner);
+  };
+
   const activate = async (
     identity: ActorScope,
     signal: AbortSignal,
@@ -552,12 +604,18 @@ export function createSelfhostActorExecutionHost(options: {
       owners.set(key, owner);
     }
     const current = owner;
+    // A graph-change retirement may be draining while holding this Namespace
+    // lane. A nested call from the draining turn must not queue behind it.
+    if (current.session?.retiring) throw new ActorAuthorityUnavailable("Actor carrier retiring");
     // Only lifecycle selection is queued here. Individual IDs run under
     // native input gates, not a second generic application scheduler.
     const session = await exclusive(current, async () => {
       let openedByWarm: Session | undefined;
       let disabledCarrier: Session | undefined;
       if (stopped || current.revoked || revoked.has(key)) throw new Error("Actor owner stopped");
+      // A retiring carrier must refuse a nested same-Namespace invocation
+      // promptly. Waiting behind its drain would deadlock the outer turn.
+      if (current.session?.retiring) throw new ActorAuthorityUnavailable("Actor carrier retiring");
       if (!(await registeredScope(key, identity)))
         throw new ActorAuthorityUnavailable("Actor namespace is not registered");
       if (warm && !(await warm.stillAuthorized(signal)))
@@ -568,18 +626,18 @@ export function createSelfhostActorExecutionHost(options: {
         graph.scope.tenantId !== identity.tenantId ||
         graph.scope.namespaceResourceUid !== identity.namespaceResourceUid
       ) {
-        if (!warm) await retire(current);
+        if (!warm) await retireIdleCarrier(current, identity);
         throw new ActorAuthorityUnavailable("Actor Resource unavailable");
       }
       if (!warm && !(await authority.hasRealization(graph))) {
-        await retire(current);
+        await retireIdleCarrier(current, identity);
         throw new ActorAuthorityUnavailable("Actor Worker realization unavailable");
       }
       const realized: ActorRealizationRead = warm
         ? { kind: "ready", realization: warm.realization }
         : await currentRealization(graph, signal);
       if (realized.kind === "authority_changed") {
-        if (!warm) await retire(current);
+        if (!warm) await retireIdleCarrier(current, identity);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
       if (realized.kind !== "ready") {
@@ -594,7 +652,7 @@ export function createSelfhostActorExecutionHost(options: {
           ? warm.stillAuthorized(signal)
           : authority.stillCurrent(graph, realization, signal)))
       ) {
-        if (!warm) await retire(current);
+        if (!warm) await retireIdleCarrier(current, identity);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
       signal.throwIfAborted();
@@ -615,11 +673,9 @@ export function createSelfhostActorExecutionHost(options: {
         // An accepted Namespace update may outlive a hostname-only Worker
         // publication. Its old Actor carrier is no longer an exact readback,
         // and with no Endpoint there may be no public request to refresh it.
-        // Do not interrupt an in-flight event: the held Operation can retry
-        // once that event releases the old carrier.
-        if (warm && current.session && current.session.active > 0 && !current.session.dead)
-          throw new ActorAuthorityUnavailable("Actor warm carrier is in use");
-        await retire(current);
+        // Do not interrupt an in-flight event: its release schedules a fresh
+        // selection against the latest accepted graph.
+        await retireIdleCarrier(current, identity);
         signal.throwIfAborted();
         if (revoked.has(key)) throw new ActorAuthorityUnavailable("Actor namespace revoked");
         if (!current.locked) {
@@ -638,6 +694,7 @@ export function createSelfhostActorExecutionHost(options: {
           throw new ActorAuthorityUnavailable("Actor warm candidate changed before native start");
         let process: WorkerdActorNamespace;
         let admittedSession: Session | undefined;
+        const acquiredPrivateBindings: ActorVersionPrivateBindingLease[] = [];
         const admitEvent = async (
           kind: "alarm" | "socket",
           id: string,
@@ -724,6 +781,37 @@ export function createSelfhostActorExecutionHost(options: {
         };
         try {
           if (revoked.has(key)) throw new ActorAuthorityUnavailable("Actor namespace revoked");
+          for (const version of residentGraph.versions) {
+            if (!version.site.workflowForward && !(version.site.serviceBindings?.length ?? 0))
+              continue;
+            if (!authority.acquireVersionPrivateBindings)
+              throw new ActorAuthorityUnavailable("Actor private binding authority unavailable");
+            const lease = await authority.acquireVersionPrivateBindings(
+              graph,
+              realization,
+              version,
+              warm
+                ? warm.stillAuthorized
+                : (checkSignal) => authority.stillCurrent(graph, realization, checkSignal),
+              signal,
+            );
+            if (
+              !lease ||
+              lease.versionId !== version.versionId ||
+              lease.workerVersionUid !== version.workerVersionUid
+            )
+              throw new ActorAuthorityUnavailable("Actor private binding lease unavailable");
+            current.pendingPrivateBindingLeases ??= new Set();
+            current.pendingPrivateBindingLeases.add(lease);
+            acquiredPrivateBindings.push(lease);
+          }
+          if (
+            !(await (warm
+              ? warm.stillAuthorized(signal)
+              : authority.stillCurrent(graph, realization, signal)))
+          )
+            throw new ActorAuthorityUnavailable("Actor private binding graph changed");
+          signal.throwIfAborted();
           process = await openWorkerdActorNamespace(options.binary, {
             namespaceKey: key,
             storagePath: join(options.storageRoot, "namespaces", key),
@@ -732,6 +820,7 @@ export function createSelfhostActorExecutionHost(options: {
               ? {}
               : { runtimeClassRef: graph.runtimeClassRef }),
             graph: residentGraph,
+            actorVersionPrivateBindings: acquiredPrivateBindings,
             actorForwardSockets: realization.actorForwardSockets ?? [],
             ...(options.v2SqliteBindingAddress
               ? { dataPlaneAddress: options.v2SqliteBindingAddress }
@@ -755,6 +844,15 @@ export function createSelfhostActorExecutionHost(options: {
             },
           });
         } catch (error) {
+          for (const lease of acquiredPrivateBindings) {
+            try {
+              await lease.release();
+              current.pendingPrivateBindingLeases?.delete(lease);
+            } catch {
+              // Keep the exact owner pin for a later serial retry. A failed
+              // release is not evidence that the broker reservation ended.
+            }
+          }
           throw new ActorNativeStartUnavailable(error);
         }
         const session: Session = {
@@ -766,12 +864,15 @@ export function createSelfhostActorExecutionHost(options: {
           process,
           alarmLeases: new Set(),
           socketLeases: new Set(),
+          privateBindingLeases: acquiredPrivateBindings,
           active: 0,
           idle: new Set(),
           dead: false,
           retiring: false,
         };
         admittedSession = session;
+        for (const lease of acquiredPrivateBindings)
+          current.pendingPrivateBindingLeases?.delete(lease);
         current.session = session;
         if (warm) openedByWarm = session;
         void process.exited.then(() => {
@@ -874,7 +975,8 @@ export function createSelfhostActorExecutionHost(options: {
           // A failed candidate is not a Resource DELETE. Stop only the child
           // opened by this warm attempt. A pre-existing carrier must remain
           // untouched when its candidate fails validation or readback.
-          if (openedByWarm && current.session === openedByWarm) await retire(current);
+          if (openedByWarm && current.session === openedByWarm)
+            await retireIdleCarrier(current, identity);
           else if (disabledCarrier && current.session === disabledCarrier)
             resumeAdmissionAfterSettlement(current, disabledCarrier, identity);
           throw error;
@@ -886,7 +988,7 @@ export function createSelfhostActorExecutionHost(options: {
       const basisPoint = (options.basisPoint ?? (() => randomInt(10_000)))();
       const finalVersion = await selectedVersion(graph, realization, basisPoint);
       if (stopped || !(await authority.stillCurrent(graph, realization, signal))) {
-        await retire(current);
+        await retireIdleCarrier(current, identity);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
       }
       if (!finalVersion || finalVersion.generationKey !== residentGraph.generationKey)
@@ -1127,6 +1229,76 @@ export function createSelfhostActorExecutionHost(options: {
 
   return {
     ready,
+    /** Drain only the exact resident child after its accepted successor withdrew its graph. */
+    async quiesceIncarnation(
+      input: ActorIncarnationRetirement,
+      stillAuthorized: (scope: ActorExecutionGraph["scope"]) => Promise<boolean>,
+    ): Promise<void> {
+      await ready;
+      if (stopped) throw new ActorAuthorityUnavailable("Actor owner stopped");
+      const captured = structuredClone(input);
+      if (typeof stillAuthorized !== "function")
+        throw new ActorAuthorityUnavailable("Actor retirement authority unavailable");
+      const matches = (session: Session): boolean =>
+        session.authorityGraph.workerUid === captured.workerResourceUid &&
+        session.realization.sourceOperationId === captured.sourceOperationId &&
+        session.realization.incarnationId === captured.incarnationId &&
+        session.graph.generation === captured.generation &&
+        canonicalJson(
+          session.graph.versions.map(({ versionId, workerVersionUid, weight }) => ({
+            versionId,
+            workerVersionUid,
+            weight,
+          })),
+        ) === canonicalJson(captured.versions);
+      for (const owner of owners.values()) {
+        const candidate = owner.session;
+        if (!candidate || candidate.authorityGraph.workerUid !== captured.workerResourceUid)
+          continue;
+        const held = await exclusive(owner, async () => {
+          const session = owner.session;
+          if (!session || session.authorityGraph.workerUid !== captured.workerResourceUid)
+            return null;
+          if (session.realization.sourceOperationId !== captured.sourceOperationId) return null;
+          if (!matches(session))
+            throw new ActorAuthorityUnavailable("Actor retirement incarnation changed");
+          if (session.retiring)
+            throw new ActorAuthorityUnavailable("Actor retirement already in progress");
+          const scope = { ...session.authorityGraph.scope };
+          if (!(await stillAuthorized(scope)) || owner.session !== session)
+            throw new ActorAuthorityUnavailable("Actor retirement authority unavailable");
+          session.retiring = true;
+          session.process.disableAlarmAdmission();
+          return { session, scope };
+        });
+        if (!held) continue;
+        // The outer Actor turn can need this Namespace's binding selection or
+        // the Workerd owner before it completes. Neither serial lane is held.
+        if (held.session.active > 0 && !held.session.dead)
+          await new Promise<void>((resolve) => held.session.idle.add(resolve));
+        await exclusive(owner, async () => {
+          const { session, scope } = held;
+          if (owner.session !== session || !matches(session))
+            throw new ActorAuthorityUnavailable("Actor retirement incarnation changed");
+          let authorized = false;
+          try {
+            authorized = await stillAuthorized(scope);
+          } catch {
+            // A lost SQL read is not permission to reap. Keep the same child
+            // and restore admission only after an independent current graph
+            // observation; never enable it merely because the old read failed.
+          }
+          if (!authorized) {
+            if (owner.session === session && !session.dead) {
+              session.retiring = false;
+              resumeAdmissionAfterSettlement(owner, session, scope);
+            }
+            throw new ActorAuthorityUnavailable("Actor retirement authority changed");
+          }
+          await retire(owner);
+        });
+      }
+    },
     coldStartFailures: (): readonly ActorColdStartFailure[] =>
       [...coldStartFailures.values()].map((failure) => ({ ...failure })),
     /** Physical native observation only; no Form readiness or SQL acceptance claim. */
