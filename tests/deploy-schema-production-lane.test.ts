@@ -47,16 +47,16 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0087_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0087_container_runtime_input_custody (id TEXT);\n",
+    "0088_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0088_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0088_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0088_container_runtime_input_rewrap (id TEXT);\n",
+    "0089_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0089_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0089_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0089_container_runtime_input_acceptance (id TEXT);\n",
+    "0090_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0090_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -702,7 +702,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0086");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0087");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1136,7 +1136,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0086");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0087");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1249,31 +1249,31 @@ describe("production-shaped D1 migration lane", () => {
   for (const drift of [
     {
       name: "missing",
-      expected: "selected D1 wave requires the exact audited source inventory 0001-0086",
+      expected: "selected D1 wave requires the exact audited source inventory 0001-0087",
     },
     { name: "changed", expected: "exact audited migration SHA-256" },
-    { name: "extra", expected: "exact audited source inventory 0001-0086" },
+    { name: "extra", expected: "exact audited source inventory 0001-0087" },
   ] as const) {
-    test(`current 0086 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
-      const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0086-${drift.name}-`));
+    test(`current 0087 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
+      const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0087-${drift.name}-`));
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const migration0086 = join(
+        const migration0087 = join(
           migrationDirectory,
-          "0086_v2_worker_service_invocation_custody.sql",
+          "0087_v2_worker_cron_invocation_custody.sql",
         );
         if (drift.name === "missing") {
-          rmSync(migration0086);
+          rmSync(migration0087);
         } else if (drift.name === "changed") {
           writeFileSync(
-            migration0086,
-            `${readFileSync(migration0086, "utf8")}\n-- mutated after source audit\n`,
+            migration0087,
+            `${readFileSync(migration0087, "utf8")}\n-- mutated after source audit\n`,
           );
         } else {
           writeFileSync(
-            join(migrationDirectory, "0087_unreviewed_extension.sql"),
-            "CREATE TABLE synthetic_0087_unreviewed_extension (id TEXT);\n",
+            join(migrationDirectory, "0088_unreviewed_extension.sql"),
+            "CREATE TABLE synthetic_0088_unreviewed_extension (id TEXT);\n",
             { mode: 0o600 },
           );
         }
