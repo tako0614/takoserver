@@ -692,21 +692,26 @@ The normal Bun entry now also constructs the v2 UID-owner composition against
 its canonical SQL, object store, clock and selected workerd binary. Before its
 public listener opens, it reopens only private owner directories explained by
 the same SQL Worker inventory and refuses missing serving owners or unexplained
-directories. This is a boot/recovery path, not a new public Form registration:
-the reusable internal Form factory is exercised only by local integration tests
-through normal organization-authenticated `buildApp` HTTP. A complete Worker
-Form claim still needs the remaining typed Binding and queue-handler contracts.
-The internal factory can compose ModuleWorker, WorkerVersion and WorkerDeployment
-without a WorkerEndpoint frontend; it registers no Endpoint Form in that case.
-Endpoint support separately requires all hostname, TLS and route-absence ports,
-and an incomplete frontend configuration refuses composition. The
+directories. The normal entry registers complete secret-free ModuleWorker,
+WorkerVersion and WorkerDeployment Forms only when both held WorkerBundle and
+StaticAssetBundle backends target its exact Worker target, the selected native
+binary and Actor/Workflow boot are available, all five private
+SQLite/KV/ObjectBucket/Queue planes are configured, and Worker owners have
+restored. It also registers the SQLiteDatabase, EdgeKVNamespace and
+ObjectBucket target lifecycle Forms from those same stores. A missing
+prerequisite leaves the whole Worker Form unsupported, not a narrower Binding
+profile. Endpoint Form support separately requires the actual selected HTTPS
+listener's hostname, TLS and route-absence ports; without it the other Worker
+Forms do not invent Endpoint readiness. The
 internal factory now accepts an already-created operator sealer and gives both
 Version admission and the native owner the same SQL-backed Resource-owned
 configured-input custody. A local test uses synthetic nonextractable keys and
 the selected native workerd artifact to prove HTTP create, same-value/omitted
 PUT, mismatch refusal, configured fetch, and Host-PID restart without putting
-the secret in public Resource output. It does not register the Worker Forms on
-the normal public entry or qualify live HTTPS delivery. The existing Bun-child
+the secret in public Resource output. The normal entry retains that sealer for
+existing ciphertext recovery, but its first public Worker admission is
+secret-free: new `privateInputs` (including `{}`) requires a separate complete
+capability. The existing Bun-child
 scheduled/asset tests remain stand-ins, not native workerd evidence.
 The ordinary Bun entry now parses its existing operator runtime-input keyring
 once under the same HTTPS/non-drain gate and passes its current and retained
@@ -824,27 +829,27 @@ workerd executable; Workflow additionally requires the operator's absolute
 `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY`. Native roots stay under the
 existing private data root. Boot restores the single SQL-backed Worker owner
 before opening ingress, polls Workflow due work as a separate tracked pass, and
-closes Workflow/Actor execution before suspending that owner. This is private
-source assembly only: the ordinary Host still does not register incomplete
-Worker Forms. `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` explicitly selects the
+closes Workflow/Actor execution before suspending that owner. This selection
+alone does not register incomplete Worker Forms.
+`TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` explicitly selects the
 existing v2 Worker Endpoint HTTPS boot in the ordinary Bun entry. It reuses
 `TAKOSERVER_WORKER_ENDPOINT_SUFFIX` and the existing Worker TLS certificate/key
 inputs, binds the shared listener on TCP 443, and rejects conflicts with the
 ordinary control, Workerd, data-plane, or legacy Container Endpoint HTTPS
 listener. Leaving the selection unset preserves the existing boot path. The
-selected listener is closed during ordered shutdown and if the ordinary Bun
-listener cannot start. This starts the SQL/native Endpoint frontend only; it
-does not mount the incomplete Worker Forms into the normal registry or mark
-them Ready. Local certificate/SNI and route checks are not public DNS, external
-CA trust, or reachability qualification, and this selection does not make
-complete Worker support live.
+selected listener is supplied to Endpoint Form admission and closed during
+ordered shutdown, synchronous Form assembly failure, and if the ordinary Bun
+listener cannot start. Its presence alone does not mark an Endpoint Ready:
+that requires exact publication and TLS/route readback. Local certificate/SNI
+and route checks are not public DNS, external CA trust, or reachability
+qualification.
 
 After owner restoration, `internalFormFactoryForEndpoint(boot.endpoint)` composes
 the same internal Form map against the existing Endpoint boot. It captures the
 three Endpoint ports and retains the exact SQL, object store and clock checks.
 It refuses composition before restoration or after owner suspension; a closed
 boot cannot supply a positive TLS witness. This resolves the composition cycle
-without changing normal-entry Form registration.
+without adding another frontend or Resource ledger.
 
 ## Existing installations
 
