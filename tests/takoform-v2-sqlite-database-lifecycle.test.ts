@@ -226,6 +226,127 @@ test("UID-owned native bytes survive process-like reopen and same-spec PUT; DELE
   }
 });
 
+test("operator proof port opens only the UID with its accepted original CREATE receipt", async () => {
+  const root = mkdtempSync(join(tmpdir(), "v2-sqlite-proof-port-"));
+  const database = control(root, true);
+  try {
+    const { engine } = host(root, database, () => new Date("2026-10-07T00:00:00Z"));
+    const accepted = await created(engine);
+    expect((await engine.runNext())?.status).toBe("succeeded");
+    let createOperationId = accepted.id;
+    const proofStore = createSelfhostV2SQLiteStore({
+      root: join(root, "native"),
+      targetKey: TARGET,
+      proofs: {
+        async currentClaim() {
+          return null;
+        },
+        async acceptedCreate(input) {
+          return {
+            createOperationId,
+            resourceUid: input.resourceUid,
+            principal: "alice",
+            space: "default",
+            backendId: SQLITE_DATABASE_BACKEND_ID,
+            targetKey: input.targetKey,
+          };
+        },
+      },
+    });
+    expect(
+      await proofStore.withAuthorizedDatabase({
+        resourceUid: accepted.resourceUid,
+        stillAuthorized: async () => true,
+        use(native) {
+          return native.prepare("SELECT count(*) AS count FROM _takoform_sqlite_migrations").get();
+        },
+      }),
+    ).toEqual({ count: 0 });
+    expect(
+      await proofStore.inspectOwnedDatabase({
+        resourceUid: accepted.resourceUid,
+        stillAuthorized: async () => true,
+      }),
+    ).toBe("confirmed");
+    expect(
+      await proofStore.inspectOwnedDatabase({
+        resourceUid: accepted.resourceUid,
+        stillAuthorized: async () => false,
+      }),
+    ).toBe("unknown");
+    createOperationId = "foreign-create";
+    await expect(
+      proofStore.withAuthorizedDatabase({
+        resourceUid: accepted.resourceUid,
+        stillAuthorized: async () => true,
+        use: () => "must not open",
+      }),
+    ).rejects.toMatchObject({ code: "backend_unavailable" });
+    expect(
+      await proofStore.inspectOwnedDatabase({
+        resourceUid: accepted.resourceUid,
+        stillAuthorized: async () => true,
+      }),
+    ).toBe("unknown");
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("operator proof port refuses a mismatched current CREATE claim before file effects", async () => {
+  const root = mkdtempSync(join(tmpdir(), "v2-sqlite-create-proof-"));
+  const nowMs = Date.parse("2026-10-07T00:00:00Z");
+  const execution = {
+    operationId: "create-one",
+    leaseToken: "lease-one",
+    backendKey: "database-one",
+    backendId: SQLITE_DATABASE_BACKEND_ID,
+    targetKey: TARGET,
+    resourceUid: "database-one",
+    principal: "alice",
+    action: "create" as const,
+    generation: 1,
+    form: SQLITE_DATABASE_FORM_URL,
+    space: "default",
+    name: "db",
+  };
+  let wrongGeneration = true;
+  try {
+    const store = createSelfhostV2SQLiteStore({
+      root: join(root, "native"),
+      targetKey: TARGET,
+      now: () => new Date(nowMs),
+      proofs: {
+        async currentClaim(input) {
+          return {
+            ...input,
+            generation: wrongGeneration ? 2 : 1,
+            leaseUntilMs: nowMs + 1_000,
+          };
+        },
+        async acceptedCreate(input) {
+          return {
+            createOperationId: execution.operationId,
+            resourceUid: input.resourceUid,
+            principal: "alice",
+            space: "default",
+            backendId: SQLITE_DATABASE_BACKEND_ID,
+            targetKey: input.targetKey,
+          };
+        },
+      },
+    });
+    expect(await store.ensureCreated(execution)).toBe("unknown");
+    expect(existsSync(join(root, "native", "resources", execution.resourceUid))).toBe(false);
+    wrongGeneration = false;
+    expect(await store.ensureCreated(execution)).toBe("present");
+    expect(await store.inspect(execution)).toBe("present");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("lost create acknowledgement reconciles the same UID and cannot replace foreign custody", async () => {
   const root = mkdtempSync(join(tmpdir(), "v2-sqlite-db-ack-"));
   let database = control(root, true);

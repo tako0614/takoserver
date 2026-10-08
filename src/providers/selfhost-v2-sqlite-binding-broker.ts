@@ -1,5 +1,11 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { parseStrictJson } from "../strict-json.ts";
+import type {
+  V2WorkerInvocationHandle,
+  V2WorkerInvocationRecord,
+  V2WorkerInvocationRetirementIdentity,
+  V2WorkerSQLiteDrainInput,
+} from "../worker-invocation-port.ts";
 import {
   createSelfhostV2SqlitePlane,
   type EdgeSqlValue,
@@ -37,6 +43,18 @@ export interface V2SqliteBindingGrant {
   readonly incarnationId: string;
   readonly servingSourceOperationId: string;
   readonly bindings: readonly { readonly name: string; readonly resourceUid: string }[];
+  /** Host-private WfP selection; absent from the existing self-host grant. */
+  readonly invocation?: {
+    readonly handle: V2WorkerInvocationHandle;
+    readonly expected: V2WorkerInvocationRetirementIdentity;
+  };
+}
+
+export interface V2SqliteInvocationAuthority {
+  /** Fixed D1 read of the exact existing custody row, not an arbitrary query. */
+  read(handle: V2WorkerInvocationHandle): Promise<V2WorkerInvocationRecord | null>;
+  /** Core statement-time CAS, called only after terminal proof and Node recovery. */
+  confirmSQLiteDrained(input: V2WorkerSQLiteDrainInput): Promise<boolean>;
 }
 
 export interface V2SqliteSelectedVersionObservation {
@@ -68,6 +86,8 @@ export interface V2SqliteBindingBrokerOptions {
     grant: V2SqliteBindingGrant,
     binding: string,
   ) => Promise<{ readonly resourceUid: string; readonly vector: string } | null>;
+  /** Opt-in WfP custody; require invocation-scoped grants when configured. */
+  readonly invocationAuthority?: V2SqliteInvocationAuthority;
 }
 
 /**
@@ -89,7 +109,7 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
   const stagingRoot = checkedSqlStagingRoot(options.stagingRoot);
 
   function issueGrant(input: V2SqliteBindingGrant): string {
-    const grant = checkedGrant(input, options.store.targetKey);
+    const grant = checkedGrant(input, options.store.targetKey, !!options.invocationAuthority);
     const payload = Buffer.from(JSON.stringify(grant)).toString("base64url");
     const signature = createHmac("sha256", key).update(payload).digest("base64url");
     return `${payload}.${signature}`;
@@ -117,6 +137,7 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
       return checkedGrant(
         JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")),
         options.store.targetKey,
+        !!options.invocationAuthority,
       );
     } catch {
       return null;
@@ -150,6 +171,36 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
       return null;
 
     return await options.resolveCurrentBinding(grant, binding);
+  }
+
+  async function invocationProof(
+    grant: V2SqliteBindingGrant,
+    terminal: boolean,
+  ): Promise<V2WorkerInvocationRecord | null> {
+    if (!options.invocationAuthority) return null;
+    const selected = grant.invocation;
+    if (!selected) return null;
+    const row = await options.invocationAuthority.read(selected.handle);
+    if (
+      !row ||
+      row.handle.invocationId !== selected.handle.invocationId ||
+      row.handle.custodyToken !== selected.handle.custodyToken ||
+      !sameInvocationIdentity(row, selected.expected) ||
+      row.principal !== grant.principal ||
+      row.space !== grant.space ||
+      row.targetKey !== grant.targetKey ||
+      row.workerUid !== grant.workerUid ||
+      row.versionUid !== grant.workerVersionUid ||
+      row.sourceOperationId !== grant.servingSourceOperationId ||
+      row.phase !== "send_authorized" ||
+      row.noNativeDispatchAtMs !== null ||
+      (terminal
+        ? row.sqliteDrainState !== "pending" && row.sqliteDrainState !== "drained"
+        : row.sqliteDrainState !== "pending") ||
+      (terminal ? row.retirement === null : row.retirement !== null)
+    )
+      return null;
+    return row;
   }
 
   async function handle(request: Request): Promise<Response | null> {
@@ -186,50 +237,61 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
     try {
       if (typeof binding !== "string" || typeof op !== "string")
         return refusal("backend_unavailable", 400);
-      const captured = await authorizedVector(grant, binding);
-      if (!captured) return refusal("backend_unavailable", 200);
-      const stillAuthorized = async () => {
-        const current = await authorizedVector(grant, binding);
-        return current?.resourceUid === captured.resourceUid && current.vector === captured.vector;
+      const execute = async () => {
+        const captured = await authorizedVector(grant, binding);
+        if (!captured) throw new SelfhostV2SqliteError("backend_unavailable");
+        const stillAuthorized = async () => {
+          if (options.invocationAuthority && !(await invocationProof(grant, false))) return false;
+          const current = await authorizedVector(grant, binding);
+          return (
+            current?.resourceUid === captured.resourceUid && current.vector === captured.vector
+          );
+        };
+        return await options.store.withAuthorizedDatabase({
+          resourceUid: captured.resourceUid,
+          stillAuthorized,
+          use: async (database) => {
+            if (!(await stillAuthorized())) throw new SelfhostV2SqliteError("backend_unavailable");
+            const plane = createSelfhostV2SqlitePlane({
+              database,
+              migrationLedger: SQLITE_MIGRATION_LEDGER,
+            });
+            let result: unknown;
+            if (op === "execute" || op === "query") {
+              const statement = body.kind === "staged" ? body.statementAt(0) : payload.statement;
+              if (!record(statement)) throw new SelfhostV2SqliteError("sql_error");
+              result =
+                op === "execute"
+                  ? await plane.execute(
+                      statement.sql as string,
+                      statement.params as readonly EdgeSqlValue[] | undefined,
+                    )
+                  : await plane.query(
+                      statement.sql as string,
+                      statement.params as readonly EdgeSqlValue[] | undefined,
+                    );
+            } else if (op === "transaction") {
+              if (body.kind === "staged") {
+                result = await plane.transactionStaged(function* () {
+                  for (let index = 0; index < body.count; index += 1) yield body.statementAt(index);
+                });
+              } else {
+                result = await plane.transaction(
+                  payload.statements as readonly SelfhostV2SqliteStatement[],
+                );
+              }
+            } else throw new SelfhostV2SqliteError("sql_error");
+            if (!(await stillAuthorized())) throw new SelfhostV2SqliteError("backend_unavailable");
+            return result;
+          },
+        });
       };
-      const value = await options.store.withAuthorizedDatabase({
-        resourceUid: captured.resourceUid,
-        stillAuthorized,
-        use: async (database) => {
-          if (!(await stillAuthorized())) throw new SelfhostV2SqliteError("backend_unavailable");
-          const plane = createSelfhostV2SqlitePlane({
-            database,
-            migrationLedger: SQLITE_MIGRATION_LEDGER,
-          });
-          let result: unknown;
-          if (op === "execute" || op === "query") {
-            const statement = body.kind === "staged" ? body.statementAt(0) : payload.statement;
-            if (!record(statement)) throw new SelfhostV2SqliteError("sql_error");
-            result =
-              op === "execute"
-                ? await plane.execute(
-                    statement.sql as string,
-                    statement.params as readonly EdgeSqlValue[] | undefined,
-                  )
-                : await plane.query(
-                    statement.sql as string,
-                    statement.params as readonly EdgeSqlValue[] | undefined,
-                  );
-          } else if (op === "transaction") {
-            if (body.kind === "staged") {
-              result = await plane.transactionStaged(function* () {
-                for (let index = 0; index < body.count; index += 1) yield body.statementAt(index);
-              });
-            } else {
-              result = await plane.transaction(
-                payload.statements as readonly SelfhostV2SqliteStatement[],
-              );
-            }
-          } else throw new SelfhostV2SqliteError("sql_error");
-          if (!(await stillAuthorized())) throw new SelfhostV2SqliteError("backend_unavailable");
-          return result;
-        },
-      });
+      const value = options.invocationAuthority
+        ? await options.store.withInvocationLock(
+            grant.invocation?.handle.invocationId ?? "",
+            execute,
+          )
+        : await execute();
       return new Response(JSON.stringify({ ok: true, value }), {
         status: 200,
         headers: { "content-type": SELFHOST_DATA_PLANE_CONTENT_TYPE },
@@ -247,14 +309,71 @@ export function createSelfhostV2SqliteBindingBroker(options: V2SqliteBindingBrok
     }
   }
 
-  return Object.freeze({ issueGrant, handle });
+  /** Trusted Tail path only; the HTTP handler never calls or exposes this. */
+  async function drainInvocation(input: V2SqliteBindingGrant): Promise<boolean> {
+    const authority = options.invocationAuthority;
+    if (!authority) throw new TypeError("SQLite invocation authority is not configured");
+    const grant = checkedGrant(input, options.store.targetKey, true);
+    const selected = grant.invocation;
+    if (!selected) return false;
+    return options.store.withInvocationLock(selected.handle.invocationId, async () => {
+      const terminal = await invocationProof(grant, true);
+      if (!terminal?.retirement) return false;
+      const expected = selected.expected;
+      const receiptDigest = `sha256:${createHash("sha256")
+        .update(
+          JSON.stringify([
+            1,
+            selected.handle.invocationId,
+            selected.handle.custodyToken,
+            expected.backendId,
+            expected.targetKey,
+            expected.principal,
+            expected.space,
+            expected.workerUid,
+            expected.deploymentUid,
+            expected.deploymentGeneration,
+            expected.sourceOperationId,
+            Object.entries(expected.ingress).sort(),
+            expected.versionUid,
+            expected.versionGeneration,
+            expected.versionOperationId,
+            expected.nativeIdentity,
+            expected.closureDigest,
+            expected.confirmedReceipt,
+            terminal.retirement.receiptDigest,
+            [...new Set(grant.bindings.map((entry) => entry.resourceUid))].sort(),
+          ]),
+        )
+        .digest("hex")}` as const;
+      if (terminal.sqliteDrainState === "drained") {
+        return terminal.sqliteDrainReceiptDigest === receiptDigest;
+      }
+      for (const uid of [...new Set(grant.bindings.map((entry) => entry.resourceUid))].sort()) {
+        if (!(await options.store.recoverOwnedDatabase(uid))) return false;
+      }
+      return await authority.confirmSQLiteDrained({
+        handle: selected.handle,
+        expected: selected.expected,
+        receiptDigest,
+      });
+    });
+  }
+
+  return Object.freeze({ issueGrant, handle, drainInvocation });
 }
 
-function checkedGrant(input: unknown, targetKey: string): V2SqliteBindingGrant {
+function checkedGrant(
+  input: unknown,
+  targetKey: string,
+  requireInvocation: boolean,
+): V2SqliteBindingGrant {
   if (
     !record(input) ||
     Object.keys(input).sort().join(",") !==
-      "bindings,incarnationId,nativeVersionId,principal,servingSourceOperationId,space,targetKey,workerUid,workerVersionUid"
+      (requireInvocation
+        ? "bindings,incarnationId,invocation,nativeVersionId,principal,servingSourceOperationId,space,targetKey,workerUid,workerVersionUid"
+        : "bindings,incarnationId,nativeVersionId,principal,servingSourceOperationId,space,targetKey,workerUid,workerVersionUid")
   ) {
     throw new TypeError("invalid SQLite binding grant");
   }
@@ -298,6 +417,34 @@ function checkedGrant(input: unknown, targetKey: string): V2SqliteBindingGrant {
     names.add(value.name);
     return { name: value.name, resourceUid: value.resourceUid };
   });
+  let invocation: V2SqliteBindingGrant["invocation"];
+  if (requireInvocation) {
+    const selected = input.invocation;
+    if (
+      !record(selected) ||
+      Object.keys(selected).sort().join(",") !== "expected,handle" ||
+      !record(selected.handle) ||
+      Object.keys(selected.handle).sort().join(",") !== "custodyToken,invocationId" ||
+      typeof selected.handle.invocationId !== "string" ||
+      selected.handle.invocationId.length < 1 ||
+      selected.handle.invocationId.length > 255 ||
+      typeof selected.handle.custodyToken !== "string" ||
+      selected.handle.custodyToken.length < 16 ||
+      selected.handle.custodyToken.length > 255 ||
+      !record(selected.expected) ||
+      selected.expected.targetKey !== targetKey ||
+      selected.expected.principal !== input.principal ||
+      selected.expected.space !== input.space ||
+      selected.expected.workerUid !== input.workerUid ||
+      selected.expected.versionUid !== input.workerVersionUid ||
+      selected.expected.sourceOperationId !== input.servingSourceOperationId
+    )
+      throw new TypeError("invalid SQLite invocation grant");
+    invocation = {
+      handle: selected.handle as unknown as V2WorkerInvocationHandle,
+      expected: selected.expected as unknown as V2WorkerInvocationRetirementIdentity,
+    };
+  }
   return {
     principal: input.principal as string,
     space: input.space as string,
@@ -308,7 +455,37 @@ function checkedGrant(input: unknown, targetKey: string): V2SqliteBindingGrant {
     incarnationId: input.incarnationId as string,
     servingSourceOperationId: input.servingSourceOperationId as string,
     bindings,
+    ...(invocation ? { invocation } : {}),
   };
+}
+
+function sameInvocationIdentity(
+  actual: V2WorkerInvocationRetirementIdentity,
+  expected: V2WorkerInvocationRetirementIdentity,
+): boolean {
+  for (const key of [
+    "backendId",
+    "targetKey",
+    "principal",
+    "space",
+    "workerUid",
+    "deploymentUid",
+    "deploymentGeneration",
+    "sourceOperationId",
+    "versionUid",
+    "versionGeneration",
+    "versionOperationId",
+    "nativeIdentity",
+    "closureDigest",
+    "confirmedReceipt",
+  ] as const) {
+    if (actual[key] !== expected[key]) return false;
+  }
+  return (
+    actual.ingress.kind === expected.ingress.kind &&
+    JSON.stringify(Object.entries(actual.ingress).sort()) ===
+      JSON.stringify(Object.entries(expected.ingress).sort())
+  );
 }
 
 function record(value: unknown): value is Record<string, unknown> {
