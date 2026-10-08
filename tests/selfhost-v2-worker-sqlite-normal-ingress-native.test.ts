@@ -483,6 +483,9 @@ test.skipIf(binary === null)(
       await expect(
         stat(join(root, "sqlite-custody", "resources", databaseUid, "database.sqlite")),
       ).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(
+        stat(join(root, "sqlite-custody", "resources", databaseUid)),
+      ).rejects.toMatchObject({ code: "ENOENT" });
       await remove(bundleUid, "bundle", 1);
       await remove(workerUid, "worker", 1);
     } catch (error) {
