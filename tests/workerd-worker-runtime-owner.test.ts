@@ -1765,6 +1765,43 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
     if (exact.kind !== "ready") throw new Error("native Actor graph not observed");
     expect(await readPhysical()).toEqual(exact);
     expect(exact.graph.versions[0]?.modules.get("index.mjs")).toBeInstanceOf(Uint8Array);
+    const selectedVersion = exact.graph.versions[0];
+    if (!selectedVersion) throw new Error("Actor Version unavailable");
+    const bindingRequest = {
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      sourceOperationId: createId,
+      incarnationId: exact.incarnationId,
+      generationKey: exact.graph.generationKey,
+      versions: exact.graph.versions.map(({ versionId, workerVersionUid, weight }) => ({
+        versionId,
+        workerVersionUid,
+        weight,
+      })),
+      versionId: selectedVersion.versionId,
+      workerVersionUid: selectedVersion.workerVersionUid,
+    };
+    const signal = new AbortController().signal;
+    expect(
+      await owner.acquireActorVersionPrivateBindings(
+        { ...bindingRequest, targetKey: "foreign-target" },
+        signal,
+      ),
+    ).toEqual({ kind: "unknown" });
+    expect(
+      await owner.acquireActorVersionPrivateBindings(
+        { ...bindingRequest, generationKey: "stale" },
+        signal,
+      ),
+    ).toEqual({ kind: "unknown" });
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(
+      owner.acquireActorVersionPrivateBindings(bindingRequest, aborted.signal),
+    ).rejects.toThrow();
+    const actorBindings = await owner.acquireActorVersionPrivateBindings(bindingRequest, signal);
+    expect(actorBindings).toMatchObject({ kind: "ready", services: [], workflowServices: [] });
+    if (actorBindings.kind !== "ready") throw new Error("Actor private binding lease unavailable");
     expect(
       await owner.observeActorGraph({
         workerResourceUid: workerUid,
@@ -1790,6 +1827,12 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
     publication.setFenceCurrent(false);
     expect(await read()).toEqual({ kind: "unknown" });
     expect(await readPhysical()).toEqual(exact);
+    const duringOwnAcceptedUpdate = await owner.acquireActorVersionPrivateBindings(
+      bindingRequest,
+      signal,
+    );
+    expect(duringOwnAcceptedUpdate.kind).toBe("ready");
+    if (duringOwnAcceptedUpdate.kind === "ready") await duringOwnAcceptedUpdate.release();
     expect(
       await owner.observeActorGraphForAcceptedOperation({
         workerResourceUid: workerUid,
@@ -1802,6 +1845,7 @@ test("Actor graph readback is pinned to current SQL and the live native incarnat
     expect(await read()).toEqual({ kind: "unknown" });
     expect(await readPhysical()).toEqual(exact);
     publication.failAfterFenceChecks(null);
+    await actorBindings.release();
     expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
       kind: "confirmed",
       identity: null,

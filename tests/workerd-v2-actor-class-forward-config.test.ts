@@ -9,7 +9,9 @@ import { SELFHOST_WORKER_DATA_TOKEN_BINDING } from "../src/providers/selfhost-wo
 import {
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
   WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE,
+  WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
   workerdV2PrivateActorBindingName,
+  workerdV2PrivateWorkflowBindingName,
 } from "../src/providers/workerd-v2-private-binding-names.ts";
 import { type WorkerdSite, writeWorkerdPrivateExecution } from "../src/workerd-runtime.ts";
 
@@ -252,6 +254,67 @@ test("v2 Actor class retains each Version's exact SQLite facade on the current H
   await expect(writeWorkerdPrivateExecution(withoutListener)).rejects.toThrow(
     "private data plane listener unavailable",
   );
+});
+
+test("v2 Actor class retains the selected Version's Workflow broker inside its native environment", async () => {
+  const input = fixture();
+  const first = input.actor.variants[0];
+  if (!first) throw new Error("Actor fixture unavailable");
+  const brokerRoot = mkdtempSync(join(tmpdir(), "awf-"));
+  roots.push(brokerRoot);
+  chmodSync(brokerRoot, 0o700);
+  const socketPath = join(brokerRoot, `${"d".repeat(22)}.sock`);
+  servers.push(Bun.serve({ unix: socketPath, fetch: () => new Response(null, { status: 204 }) }));
+  const workflow = {
+    schema: "takoserver.v2-workflow-binding-forward@1" as const,
+    snapshotDigest: `sha256:${"e".repeat(64)}` as const,
+    bindings: [
+      {
+        publicName: "WORKFLOW",
+        serviceName: workerdV2PrivateWorkflowBindingName(0),
+        tenantId: "tenant-1",
+        workflowResourceUid: "uid-DurableWorkflow-1",
+        token: "f".repeat(64),
+      },
+    ],
+  };
+  const hostModules = new Map(
+    [...first.hostModules]
+      .filter(([name]) => name !== first.site.hostEntrypoint)
+      .concat([
+        [
+          WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
+          encoder.encode("export default {};"),
+        ] as const,
+        ["__generated-actor-class-entry.js", encoder.encode("export default {};")] as const,
+      ]),
+  );
+  const selected = {
+    ...input,
+    actor: {
+      ...input.actor,
+      variants: [
+        {
+          ...first,
+          site: {
+            ...first.site,
+            hostEntrypoint: "__generated-actor-class-entry.js",
+            workflowForward: workflow,
+            hostModules: [
+              ...(first.site.hostModules ?? []),
+              WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
+            ],
+          },
+          hostModules,
+          workflowSourceEntrypoint: WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
+          workflowBindings: [{ name: workflow.bindings[0]?.serviceName as string, socketPath }],
+        },
+      ],
+    },
+  };
+  const config = await readFile(await writeWorkerdPrivateExecution(selected), "utf8");
+  expect(config).toContain(`name = "${workflow.bindings[0]?.serviceName}"`);
+  expect(config).toContain(`unix:${socketPath}`);
 });
 
 test("v2 Actor class refuses a missing or different-token broker", async () => {

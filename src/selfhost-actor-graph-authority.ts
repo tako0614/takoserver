@@ -30,6 +30,28 @@ export interface ActorExecutionRealization {
   readonly authorityKey: string;
   /** Current provider Worker incarnation's private broker sockets. V1 has none. */
   readonly actorForwardSockets?: readonly WorkerdActorForwardSocket[];
+  /** V2 physical receipt identity, never an independent SQL grant. */
+  readonly sourceOperationId?: string;
+  readonly incarnationId?: string;
+}
+
+export interface ActorVersionPrivateBindingLease {
+  readonly versionId: string;
+  readonly workerVersionUid: string;
+  readonly services: readonly {
+    readonly name: string;
+    readonly upstreamSocket: string;
+    readonly unavailableToken: string;
+  }[];
+  readonly workflowServices: readonly {
+    readonly name: string;
+    readonly publicName: string;
+    readonly workflowResourceUid: string;
+    readonly token: string;
+    readonly snapshotDigest: `sha256:${string}`;
+    readonly upstreamSocket: string;
+  }[];
+  release(): Promise<void>;
 }
 
 export type ActorRealizationRead =
@@ -58,6 +80,14 @@ export interface ActorGraphAuthority {
     realization: ActorExecutionRealization,
     basisPoint: number,
   ): Promise<WorkerdSelectedActiveVersion | null>;
+  /** Optional v2 physical bridge; caller must fence its own accepted graph before and after. */
+  acquireVersionPrivateBindings?(
+    graph: ActorExecutionGraph,
+    realization: ActorExecutionRealization,
+    version: WorkerdActiveActorGraph["versions"][number],
+    stillAuthorized: (signal: AbortSignal) => Promise<boolean>,
+    signal: AbortSignal,
+  ): Promise<ActorVersionPrivateBindingLease | null>;
   /** Compatibility read for the separately owned, retired v1 public path. */
   readLegacyGraph?(
     scope: ActorExecutionScope,

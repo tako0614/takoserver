@@ -244,9 +244,15 @@ test("v2 Actor authority reads accepted Namespace SQL and never substitutes v1 D
   let actorForwardSockets: readonly WorkerdActorForwardSocket[] = [];
   const owner: Pick<
     WorkerdWorkerRuntimeOwner,
-    "workerResourceUid" | "observeServing" | "observeActorGraph"
+    | "workerResourceUid"
+    | "observeServing"
+    | "observeActorGraph"
+    | "acquireActorVersionPrivateBindings"
   > = {
     workerResourceUid: WORKER,
+    async acquireActorVersionPrivateBindings() {
+      return { kind: "unknown" };
+    },
     async observeServing() {
       return {
         kind: "serving",

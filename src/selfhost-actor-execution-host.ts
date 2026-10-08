@@ -21,6 +21,7 @@ import {
   type ActorExecutionRealization,
   type ActorGraphAuthority,
   type ActorRealizationRead,
+  type ActorVersionPrivateBindingLease,
   createLegacyActorGraphAuthority,
 } from "./selfhost-actor-graph-authority.ts";
 import { acquireActorNativeLease } from "./selfhost-actor-lease.ts";
@@ -40,6 +41,7 @@ interface Session {
   readonly process: WorkerdActorNamespace;
   readonly alarmLeases: Set<string>;
   readonly socketLeases: Set<string>;
+  readonly privateBindingLeases: readonly ActorVersionPrivateBindingLease[];
   active: number;
   readonly idle: Set<() => void>;
   dead: boolean;
@@ -54,6 +56,8 @@ interface Owner {
   lease?: Awaited<ReturnType<typeof acquireActorNativeLease>>;
   revoked?: boolean;
   refreshing?: Promise<void>;
+  /** Acquired before child startup; a failed release remains an owned cleanup obligation. */
+  pendingPrivateBindingLeases?: Set<ActorVersionPrivateBindingLease>;
 }
 
 interface ActorScope {
@@ -418,13 +422,19 @@ export function createSelfhostActorExecutionHost(options: {
   };
   const retire = async (owner: Owner): Promise<void> => {
     const session = owner.session;
-    if (!session) return;
-    session.retiring = true;
-    session.process.disableAlarmAdmission();
-    if (session.active > 0 && !session.dead)
-      await new Promise<void>((resolve) => session.idle.add(resolve));
-    await (session.reap ?? session.process.close());
-    if (owner.session === session) delete owner.session;
+    if (session) {
+      session.retiring = true;
+      session.process.disableAlarmAdmission();
+      if (session.active > 0 && !session.dead)
+        await new Promise<void>((resolve) => session.idle.add(resolve));
+      await (session.reap ?? session.process.close());
+      for (const lease of session.privateBindingLeases) await lease.release();
+      if (owner.session === session) delete owner.session;
+    }
+    for (const lease of owner.pendingPrivateBindingLeases ?? []) {
+      await lease.release();
+      owner.pendingPrivateBindingLeases?.delete(lease);
+    }
   };
   const resumeAdmissionAfterSettlement = (owner: Owner, session: Session, identity: ActorScope) => {
     if (session.admissionRecovery) return;
@@ -638,6 +648,7 @@ export function createSelfhostActorExecutionHost(options: {
           throw new ActorAuthorityUnavailable("Actor warm candidate changed before native start");
         let process: WorkerdActorNamespace;
         let admittedSession: Session | undefined;
+        const acquiredPrivateBindings: ActorVersionPrivateBindingLease[] = [];
         const admitEvent = async (
           kind: "alarm" | "socket",
           id: string,
@@ -724,6 +735,37 @@ export function createSelfhostActorExecutionHost(options: {
         };
         try {
           if (revoked.has(key)) throw new ActorAuthorityUnavailable("Actor namespace revoked");
+          for (const version of residentGraph.versions) {
+            if (!version.site.workflowForward && !(version.site.serviceBindings?.length ?? 0))
+              continue;
+            if (!authority.acquireVersionPrivateBindings)
+              throw new ActorAuthorityUnavailable("Actor private binding authority unavailable");
+            const lease = await authority.acquireVersionPrivateBindings(
+              graph,
+              realization,
+              version,
+              warm
+                ? warm.stillAuthorized
+                : (checkSignal) => authority.stillCurrent(graph, realization, checkSignal),
+              signal,
+            );
+            if (
+              !lease ||
+              lease.versionId !== version.versionId ||
+              lease.workerVersionUid !== version.workerVersionUid
+            )
+              throw new ActorAuthorityUnavailable("Actor private binding lease unavailable");
+            current.pendingPrivateBindingLeases ??= new Set();
+            current.pendingPrivateBindingLeases.add(lease);
+            acquiredPrivateBindings.push(lease);
+          }
+          if (
+            !(await (warm
+              ? warm.stillAuthorized(signal)
+              : authority.stillCurrent(graph, realization, signal)))
+          )
+            throw new ActorAuthorityUnavailable("Actor private binding graph changed");
+          signal.throwIfAborted();
           process = await openWorkerdActorNamespace(options.binary, {
             namespaceKey: key,
             storagePath: join(options.storageRoot, "namespaces", key),
@@ -732,6 +774,7 @@ export function createSelfhostActorExecutionHost(options: {
               ? {}
               : { runtimeClassRef: graph.runtimeClassRef }),
             graph: residentGraph,
+            actorVersionPrivateBindings: acquiredPrivateBindings,
             actorForwardSockets: realization.actorForwardSockets ?? [],
             ...(options.v2SqliteBindingAddress
               ? { dataPlaneAddress: options.v2SqliteBindingAddress }
@@ -755,6 +798,15 @@ export function createSelfhostActorExecutionHost(options: {
             },
           });
         } catch (error) {
+          for (const lease of acquiredPrivateBindings) {
+            try {
+              await lease.release();
+              current.pendingPrivateBindingLeases?.delete(lease);
+            } catch {
+              // Keep the exact owner pin for a later serial retry. A failed
+              // release is not evidence that the broker reservation ended.
+            }
+          }
           throw new ActorNativeStartUnavailable(error);
         }
         const session: Session = {
@@ -766,12 +818,15 @@ export function createSelfhostActorExecutionHost(options: {
           process,
           alarmLeases: new Set(),
           socketLeases: new Set(),
+          privateBindingLeases: acquiredPrivateBindings,
           active: 0,
           idle: new Set(),
           dead: false,
           retiring: false,
         };
         admittedSession = session;
+        for (const lease of acquiredPrivateBindings)
+          current.pendingPrivateBindingLeases?.delete(lease);
         current.session = session;
         if (warm) openedByWarm = session;
         void process.exited.then(() => {

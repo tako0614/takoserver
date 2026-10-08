@@ -69,7 +69,10 @@ export interface V2ActorWorkerOwnerReader {
     workerUid: string,
   ): Promise<Pick<
     WorkerdWorkerRuntimeOwner,
-    "workerResourceUid" | "observeServing" | "observeActorGraph"
+    | "workerResourceUid"
+    | "observeServing"
+    | "observeActorGraph"
+    | "acquireActorVersionPrivateBindings"
   > | null>;
 }
 
@@ -351,6 +354,8 @@ export function createV2ActorNamespaceGraphAuthority(options: {
         graph: native.graph,
         authorityKey: realizationKey(native),
         actorForwardSockets: native.actorForwardSockets,
+        sourceOperationId: native.sourceOperationId,
+        incarnationId: native.incarnationId,
       };
     },
     hasRealization: activeDeployment,
@@ -372,6 +377,8 @@ export function createV2ActorNamespaceGraphAuthority(options: {
           graph: native.graph,
           authorityKey: realizationKey(native),
           actorForwardSockets: native.actorForwardSockets,
+          sourceOperationId: native.sourceOperationId,
+          incarnationId: native.incarnationId,
         },
       };
     },
@@ -390,6 +397,44 @@ export function createV2ActorNamespaceGraphAuthority(options: {
         (await activeDeployment(graph)) &&
         (await acceptedGraph(graph.scope))?.authorityKey === graph.authorityKey
       );
+    },
+    async acquireVersionPrivateBindings(graph, realization, version, stillAuthorized, signal) {
+      signal.throwIfAborted();
+      if (
+        !realization.sourceOperationId ||
+        !realization.incarnationId ||
+        realization.graph.workerResourceUid !== graph.workerUid ||
+        !realization.graph.versions.some(
+          (entry) =>
+            entry.versionId === version.versionId &&
+            entry.workerVersionUid === version.workerVersionUid &&
+            entry.weight === version.weight,
+        ) ||
+        !(await stillAuthorized(signal))
+      )
+        return null;
+      const owner = await options.owner.ownerForWorker(graph.workerUid);
+      if (!owner || owner.workerResourceUid !== graph.workerUid) return null;
+      const acquired = await owner.acquireActorVersionPrivateBindings(
+        {
+          workerResourceUid: graph.workerUid,
+          targetKey: options.targetKey,
+          sourceOperationId: realization.sourceOperationId,
+          incarnationId: realization.incarnationId,
+          generationKey: realization.graph.generationKey,
+          versions: realization.graph.versions.map(({ versionId, workerVersionUid, weight }) => ({
+            versionId,
+            workerVersionUid,
+            weight,
+          })),
+          versionId: version.versionId,
+          workerVersionUid: version.workerVersionUid,
+        },
+        signal,
+      );
+      // The physical owner only proves its incumbent incarnation. The Actor
+      // caller retains this lease before its final accepted-SQL recheck.
+      return acquired.kind === "ready" ? acquired : null;
     },
     async selectVersion(_graph, realization: ActorExecutionRealization, basisPoint) {
       const selected = selectSelfhostWeightedVersion(
