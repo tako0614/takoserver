@@ -37,6 +37,24 @@ export {
   type EdgeKVNamespaceStore,
 } from "./forms/edge-kv-namespace-backend.ts";
 export {
+  OBJECT_BUCKET_FORM_URL,
+  OBJECT_BUCKET_LIMITS,
+  ObjectBucketValidationError,
+  parseObjectBucketSpec,
+  validateObjectBucketUpdate,
+} from "./forms/object-bucket.ts";
+export {
+  createObjectBucketForm,
+  OBJECT_BUCKET_BACKEND_ID,
+  type ObjectBucketIdentity,
+  type ObjectBucketStore,
+} from "./forms/object-bucket-backend.ts";
+export {
+  createObjectBucketWorkerBindingAuthority,
+  type ObjectBucketWorkerBindingClaim,
+  type ObjectBucketWorkerBindingResolution,
+} from "./forms/object-bucket-worker-binding-authority.ts";
+export {
   createQueueWorkerBindingAuthority,
   type QueueWorkerBindingClaim,
   type QueueWorkerBindingResolution,

@@ -2,6 +2,10 @@ import { expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import type {
   JsonObject,
+  ObjectBucketIdentity,
+  ObjectBucketStore,
+  ObjectBucketWorkerBindingClaim,
+  ObjectBucketWorkerBindingResolution,
   QueueWorkerBindingClaim,
   QueueWorkerBindingResolution,
   SQLiteDatabaseNativePort,
@@ -20,6 +24,18 @@ import type {
 import * as extension from "@takoserver/core/takoform-v2";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
+import {
+  OBJECT_BUCKET_FORM_URL,
+  OBJECT_BUCKET_LIMITS,
+  ObjectBucketValidationError,
+  parseObjectBucketSpec,
+  validateObjectBucketUpdate,
+} from "../src/takoform-v2/forms/object-bucket.ts";
+import {
+  createObjectBucketForm,
+  OBJECT_BUCKET_BACKEND_ID,
+} from "../src/takoform-v2/forms/object-bucket-backend.ts";
+import { createObjectBucketWorkerBindingAuthority } from "../src/takoform-v2/forms/object-bucket-worker-binding-authority.ts";
 import { createQueueWorkerBindingAuthority } from "../src/takoform-v2/forms/queue-worker-binding-authority.ts";
 import {
   parseSQLiteDatabaseSpec,
@@ -56,6 +72,10 @@ const RUNTIME_EXPORTS = [
   "EDGE_KV_NAMESPACE_LIMITS",
   "EdgeKVNamespaceValidationError",
   "MODULE_WORKER_FORM_URL",
+  "OBJECT_BUCKET_FORM_URL",
+  "OBJECT_BUCKET_LIMITS",
+  "OBJECT_BUCKET_BACKEND_ID",
+  "ObjectBucketValidationError",
   "WORKER_DEPLOYMENT_FORM_URL",
   "WORKER_ENDPOINT_FORM_URL",
   "WORKER_VERSION_FORM_URL",
@@ -63,6 +83,8 @@ const RUNTIME_EXPORTS = [
   "WorkerFormValidationError",
   "createEdgeKVNamespaceForm",
   "createInternalV2ModuleWorkerForm",
+  "createObjectBucketForm",
+  "createObjectBucketWorkerBindingAuthority",
   "createV2EdgeKvNativeCustody",
   "createAtLeastOnceQueueForm",
   "createQueueWorkerBindingAuthority",
@@ -80,6 +102,7 @@ const RUNTIME_EXPORTS = [
   "inspectV2WorkerInvocationSchema",
   "parseEdgeKVNamespaceSpec",
   "parseModuleWorkerSpec",
+  "parseObjectBucketSpec",
   "parseSQLiteDatabaseSpec",
   "parseWorkerDeploymentSpec",
   "parseWorkerEndpointSpec",
@@ -98,6 +121,7 @@ const RUNTIME_EXPORTS = [
   "V2_QUEUE_BACKEND_ID",
   "validateEdgeKVNamespaceUpdate",
   "validateModuleWorkerUpdate",
+  "validateObjectBucketUpdate",
   "validateSQLiteDatabaseUpdate",
   "validateWorkerDeploymentUpdate",
   "validateWorkerEndpointUpdate",
@@ -107,6 +131,16 @@ const RUNTIME_EXPORTS = [
 test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", async () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
+  expect(extension.createObjectBucketForm).toBe(createObjectBucketForm);
+  expect(extension.createObjectBucketWorkerBindingAuthority).toBe(
+    createObjectBucketWorkerBindingAuthority,
+  );
+  expect(extension.OBJECT_BUCKET_FORM_URL).toBe(OBJECT_BUCKET_FORM_URL);
+  expect(extension.OBJECT_BUCKET_LIMITS).toBe(OBJECT_BUCKET_LIMITS);
+  expect(extension.OBJECT_BUCKET_BACKEND_ID).toBe(OBJECT_BUCKET_BACKEND_ID);
+  expect(extension.ObjectBucketValidationError).toBe(ObjectBucketValidationError);
+  expect(extension.parseObjectBucketSpec).toBe(parseObjectBucketSpec);
+  expect(extension.validateObjectBucketUpdate).toBe(validateObjectBucketUpdate);
   expect(extension.createSQLiteDatabaseForm).toBe(createSQLiteDatabaseForm);
   expect(extension.createSQLiteMigrationApplicationForm).toBe(createSQLiteMigrationApplicationForm);
   expect(extension.SQLITE_MIGRATION_APPLICATION_BACKEND_ID).toBe(
@@ -215,6 +249,41 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(queue.backend.id).toBe(V2_QUEUE_BACKEND_ID);
   expect(queue.backend.targetKey).toBe("target");
   queue.validateCreate({ messageRetentionSeconds: resolution.target.messageRetentionSeconds });
+
+  const bucketIdentity: ObjectBucketIdentity = {
+    principal: "principal",
+    space: "space",
+    targetKey: "target",
+    resourceUid: "bucket",
+  };
+  const bucketStore: ObjectBucketStore = {
+    create: async () => "ready",
+    reconcileCreate: async () => "ready",
+    observe: async () => "ready",
+    delete: async () => "deleted",
+  };
+  const bucketClaim: ObjectBucketWorkerBindingClaim = { ...claim, bindings: [] };
+  const bucketResolution: ObjectBucketWorkerBindingResolution = {
+    identity: bucketIdentity,
+    vector: "vector",
+  };
+  const bucket = extension.createObjectBucketForm({
+    store: bucketStore,
+    targetKey: bucketResolution.identity.targetKey,
+    backendId: "operator-r2-prefix-v1",
+  });
+  expect(bucket.backend.id).toBe("operator-r2-prefix-v1");
+  expect(bucket.backend.targetKey).toBe("target");
+  bucket.validateCreate({});
+  expect(
+    await extension
+      .createObjectBucketWorkerBindingAuthority({
+        sql,
+        targetKey: "target",
+        backendId: "operator-r2-prefix-v1",
+      })
+      .resolveCurrentBucketBinding(bucketClaim, "BUCKET"),
+  ).toBeNull();
 });
 
 test("v2 extension entrypoint bundles for a Worker without Node or workerd runtime", async () => {
