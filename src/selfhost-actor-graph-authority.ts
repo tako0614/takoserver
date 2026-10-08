@@ -5,6 +5,7 @@ import {
   readWorkerdSelectedActiveVersion,
   type WorkerdActiveActorGraph,
   type WorkerdActorForwardSocket,
+  type WorkerdActorIncarnationRetirement,
   type WorkerdSelectedActiveVersion,
 } from "./workerd-runtime.ts";
 
@@ -53,6 +54,9 @@ export interface ActorVersionPrivateBindingLease {
   }[];
   release(): Promise<void>;
 }
+
+/** Native incarnation being retired by a later accepted Worker publication. */
+export type ActorIncarnationRetirement = WorkerdActorIncarnationRetirement;
 
 export type ActorRealizationRead =
   | { readonly kind: "ready"; readonly realization: ActorExecutionRealization }

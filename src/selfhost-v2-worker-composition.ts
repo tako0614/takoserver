@@ -93,6 +93,7 @@ type EndpointPorts = Pick<
 type ActorOwnerForward = NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2ActorForward"]>;
 type ActorOwnerSource = Parameters<ActorOwnerForward["openIncarnation"]>[0];
 type ActorOwnerIncarnation = ReturnType<ActorOwnerForward["openIncarnation"]>;
+type ActorOwnerRetirement = NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2ActorRetirement"]>;
 type WorkflowOwnerForward = NonNullable<OpenWorkerdWorkerRuntimeOwnerOptions["v2WorkflowForward"]>;
 type WorkflowRunOnce = ReturnType<typeof createSelfhostV2WorkflowComposition>["runtime"]["runOne"];
 type WorkflowDuePoll = {
@@ -103,6 +104,8 @@ type WorkflowDuePoll = {
 
 /** Trusted app-layer boot; portable Worker composition only attaches its explicit ports. */
 export interface SelfhostV2ActorBootPort {
+  /** Exact accepted-source withdrawal; no matching Actor child is a no-op. */
+  quiesceIncarnation: ActorOwnerRetirement["quiesceIncarnation"];
   prepare(input: {
     readonly sql: Sql;
     readonly targetKey: string;
@@ -529,7 +532,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           typeof prepared.forwardBoot?.openIncarnation !== "function"
         )
           throw new TypeError("v2 Actor boot is incomplete");
-        return prepared;
+        return { ...prepared, quiesceIncarnation: options.v2Actor.quiesceIncarnation };
       })()
     : undefined;
   const workflow = options.v2Workflow
@@ -939,6 +942,9 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         ...(actor && row.deleted_at === null
           ? {
               deferActorRestoreAdmission: !restorationComplete,
+              v2ActorRetirement: {
+                quiesceIncarnation: actor.quiesceIncarnation,
+              },
               v2ActorForward: {
                 openIncarnation(source) {
                   return actor.forwardBoot.openIncarnation({ ...source, ...actorIdentity });

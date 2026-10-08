@@ -414,6 +414,17 @@ export interface WorkerdPublicationIdentity {
   readonly versions: readonly SelfhostWeightedVersion[];
 }
 
+/** One physical incarnation's exact identity for an app-authorized Actor drain. */
+export interface WorkerdActorIncarnationRetirement {
+  readonly workerResourceUid: string;
+  readonly targetKey: string;
+  readonly sourceOperationId: string;
+  readonly incarnationId: string;
+  readonly generation: string;
+  readonly versions: readonly SelfhostWeightedVersion[];
+  readonly retirementOperationId: string;
+}
+
 /** Exact weighted identity behind the runtime's committed stable pointer. */
 export interface WorkerdActiveDeployment {
   readonly generation: string;
@@ -4743,6 +4754,15 @@ const config :Workerd.Config = (
   for (const { root: versionRoot, version } of actorPrepared) {
     await writePreparedWorkerdSite(versionRoot, version);
   }
+  // Actor Version Workflow brokers were discovered after the top-level
+  // pre-render check. Recheck every pinned listener after all class bytes are
+  // written, immediately before the native config becomes launchable.
+  for (const proof of workflowSocketProofs) {
+    await requirePrivateSocketDirectory(dirname(proof.path));
+    const current = await privateSocketMetadata(proof.path);
+    if (!current || !samePrivateSocketIdentity(proof.identity, current))
+      throw new Error("private Workflow execution broker changed");
+  }
   for (const proof of actorSocketProofs) {
     await requirePrivateSocketDirectory(dirname(proof.path));
     const current = await privateSocketMetadata(proof.path);
@@ -5936,6 +5956,9 @@ export async function readWorkerdActiveActorGraph(
                 bindings: manifest.actorForward.bindings.map((binding) => ({ ...binding })),
               },
             }),
+        ...(manifest.workflowForward === undefined
+          ? {}
+          : { workflowForward: copyWorkflowForward(manifest.workflowForward) }),
         ...(manifest.vars === undefined
           ? {}
           : { vars: manifest.vars.map((binding) => ({ ...binding })) }),

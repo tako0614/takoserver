@@ -20,6 +20,7 @@ import {
   type ActorExecutionGraph,
   type ActorExecutionRealization,
   type ActorGraphAuthority,
+  type ActorIncarnationRetirement,
   type ActorRealizationRead,
   type ActorVersionPrivateBindingLease,
   createLegacyActorGraphAuthority,
@@ -420,13 +421,15 @@ export function createSelfhostActorExecutionHost(options: {
     );
     return result;
   };
-  const retire = async (owner: Owner): Promise<void> => {
+  const retire = async (owner: Owner, beforeClose?: () => Promise<boolean>): Promise<void> => {
     const session = owner.session;
     if (session) {
       session.retiring = true;
       session.process.disableAlarmAdmission();
       if (session.active > 0 && !session.dead)
         await new Promise<void>((resolve) => session.idle.add(resolve));
+      if (beforeClose && !(await beforeClose()))
+        throw new ActorAuthorityUnavailable("Actor retirement authority changed");
       await (session.reap ?? session.process.close());
       for (const lease of session.privateBindingLeases) await lease.release();
       if (owner.session === session) delete owner.session;
@@ -621,7 +624,11 @@ export function createSelfhostActorExecutionHost(options: {
           version.weight,
         ]),
       ]);
-      if (current.session?.selection !== selection || current.session.dead) {
+      if (
+        current.session?.selection !== selection ||
+        current.session.dead ||
+        current.session.retiring
+      ) {
         // An accepted Namespace update may outlive a hostname-only Worker
         // publication. Its old Actor carrier is no longer an exact readback,
         // and with no Endpoint there may be no public request to refresh it.
@@ -1182,6 +1189,45 @@ export function createSelfhostActorExecutionHost(options: {
 
   return {
     ready,
+    /** Drain only the exact resident child after its accepted successor withdrew its graph. */
+    async quiesceIncarnation(
+      input: ActorIncarnationRetirement,
+      stillAuthorized: (scope: ActorExecutionGraph["scope"]) => Promise<boolean>,
+    ): Promise<void> {
+      await ready;
+      if (stopped) throw new ActorAuthorityUnavailable("Actor owner stopped");
+      const captured = structuredClone(input);
+      if (typeof stillAuthorized !== "function")
+        throw new ActorAuthorityUnavailable("Actor retirement authority unavailable");
+      const matches = (session: Session): boolean =>
+        session.authorityGraph.workerUid === captured.workerResourceUid &&
+        session.realization.sourceOperationId === captured.sourceOperationId &&
+        session.realization.incarnationId === captured.incarnationId &&
+        session.graph.generation === captured.generation &&
+        canonicalJson(
+          session.graph.versions.map(({ versionId, workerVersionUid, weight }) => ({
+            versionId,
+            workerVersionUid,
+            weight,
+          })),
+        ) === canonicalJson(captured.versions);
+      for (const owner of owners.values()) {
+        const candidate = owner.session;
+        if (!candidate || candidate.authorityGraph.workerUid !== captured.workerResourceUid)
+          continue;
+        await exclusive(owner, async () => {
+          const session = owner.session;
+          if (!session || session.authorityGraph.workerUid !== captured.workerResourceUid) return;
+          if (session.realization.sourceOperationId !== captured.sourceOperationId) return;
+          if (!matches(session))
+            throw new ActorAuthorityUnavailable("Actor retirement incarnation changed");
+          const scope = { ...session.authorityGraph.scope };
+          if (!(await stillAuthorized(scope)) || owner.session !== session)
+            throw new ActorAuthorityUnavailable("Actor retirement authority unavailable");
+          await retire(owner, () => stillAuthorized(scope));
+        });
+      }
+    },
     coldStartFailures: (): readonly ActorColdStartFailure[] =>
       [...coldStartFailures.values()].map((failure) => ({ ...failure })),
     /** Physical native observation only; no Form readiness or SQL acceptance claim. */

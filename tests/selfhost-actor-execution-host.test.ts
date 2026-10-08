@@ -63,6 +63,23 @@ test("Actor owner rejects persisted relation/deployment gaps before native alloc
     await owner.ready;
     await owner.registerNamespace(scope);
     await owner.registerNamespace({ ...scope, tenantId: "other" });
+    let retirementAuthorityRead = false;
+    await owner.quiesceIncarnation(
+      {
+        workerResourceUid: f.target.metadata.uid,
+        targetKey: "target-with-no-resident-child",
+        sourceOperationId: "accepted-source-with-no-resident-child",
+        incarnationId: "incarnation-with-no-resident-child",
+        generation: "generation-with-no-resident-child",
+        versions: [],
+        retirementOperationId: "accepted-retirement-with-no-resident-child",
+      },
+      async () => {
+        retirementAuthorityRead = true;
+        return true;
+      },
+    );
+    expect(retirementAuthorityRead).toBe(false);
     expect(await owner.readCurrentGraph(scope, AbortSignal.timeout(1_000))).toBeNull();
     await expect(owner.fetch({ ...scope, id: "a" }, request())).rejects.toThrow(
       "realization unavailable",

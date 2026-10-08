@@ -1,6 +1,9 @@
 import type { Sql } from "./ports.ts";
 import type { createSelfhostActorExecutionHost } from "./selfhost-actor-execution-host.ts";
-import type { ActorGraphAuthority } from "./selfhost-actor-graph-authority.ts";
+import type {
+  ActorGraphAuthority,
+  ActorIncarnationRetirement,
+} from "./selfhost-actor-graph-authority.ts";
 import type { SelfhostV2ActorBootPort } from "./selfhost-v2-worker-composition.ts";
 import { createV2ActorBindingAuthority } from "./takoform-v2/actor-binding-authority.ts";
 import { createV2ActorForwardBoot } from "./takoform-v2/actor-forward-runtime.ts";
@@ -8,7 +11,10 @@ import {
   createV2ActorNamespaceForm,
   type V2ActorAcceptedOperationRuntimeObserver,
 } from "./takoform-v2/actor-namespace-backend.ts";
-import type { V2ActorAcceptedOperationGraphAuthority } from "./takoform-v2/actor-namespace-graph-authority.ts";
+import {
+  hasAcceptedV2ActorIncarnationWithdrawal,
+  type V2ActorAcceptedOperationGraphAuthority,
+} from "./takoform-v2/actor-namespace-graph-authority.ts";
 
 type PhysicalActorHost = Pick<
   ReturnType<typeof createSelfhostActorExecutionHost>,
@@ -19,6 +25,7 @@ type PhysicalActorHost = Pick<
   | "namespaceEmpty"
   | "forgetNamespace"
   | "namespaceAbsent"
+  | "quiesceIncarnation"
 > &
   V2ActorAcceptedOperationRuntimeObserver;
 
@@ -50,6 +57,7 @@ export function createSelfhostV2ActorBoot(options: {
     typeof options.physical?.namespaceEmpty !== "function" ||
     typeof options.physical?.forgetNamespace !== "function" ||
     typeof options.physical?.namespaceAbsent !== "function" ||
+    typeof options.physical?.quiesceIncarnation !== "function" ||
     typeof options.physical?.observeNamespaceRuntimeForAcceptedOperation !== "function" ||
     typeof options.physical?.warmNamespaceForAcceptedOperation !== "function"
   ) {
@@ -61,6 +69,13 @@ export function createSelfhostV2ActorBoot(options: {
   const physical = options.physical;
   const privateSocketDirectory = options.privateSocketDirectory;
   return Object.freeze({
+    async quiesceIncarnation(input: ActorIncarnationRetirement) {
+      const captured = structuredClone(input);
+      if (captured.targetKey !== targetKey) throw new Error("v2 Actor retirement target mismatch");
+      await physical.quiesceIncarnation(captured, (scope) =>
+        hasAcceptedV2ActorIncarnationWithdrawal({ sql, targetKey, input: captured, scope }),
+      );
+    },
     prepare(input: Parameters<SelfhostV2ActorBootPort["prepare"]>[0]) {
       if (
         input.sql !== sql ||

@@ -5,15 +5,91 @@ import type {
   ActorExecutionGraph,
   ActorExecutionRealization,
   ActorGraphAuthority,
+  ActorIncarnationRetirement,
 } from "../selfhost-actor-graph-authority.ts";
 import { selectSelfhostWeightedVersion } from "../selfhost-weighted-deployment.ts";
 import type { WorkerdWorkerRuntimeOwner } from "../workerd-worker-runtime-owner.ts";
 import { ACTOR_NAMESPACE_FORM_URL, parseActorNamespaceSpec } from "./forms/actor-namespace.ts";
-import { MODULE_WORKER_FORM_URL, WORKER_DEPLOYMENT_FORM_URL } from "./forms/worker-specs.ts";
+import {
+  MODULE_WORKER_FORM_URL,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+} from "./forms/worker-specs.ts";
 
 type Scope = ActorExecutionGraph["scope"];
 const DB_NOW_MS =
   "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
+
+/** App SQL authority for withdrawing one exact resident Actor incarnation. */
+export async function hasAcceptedV2ActorIncarnationWithdrawal(options: {
+  readonly sql: Sql;
+  readonly targetKey: string;
+  readonly input: ActorIncarnationRetirement;
+  readonly scope: { readonly tenantId: string; readonly namespaceResourceUid: string };
+}): Promise<boolean> {
+  const { sql, targetKey, input, scope } = options;
+  if (input.targetKey !== targetKey) return false;
+  const rows = await sql.query(
+    `SELECT 1 AS authorized
+     FROM tf_v2_operations AS source_op
+     JOIN tf_v2_resources AS source_resource ON source_resource.uid = source_op.resource_uid
+     JOIN tf_v2_operations AS retirement_op ON retirement_op.id = ?
+     JOIN tf_v2_resources AS retirement_resource
+       ON retirement_resource.uid = retirement_op.resource_uid
+     JOIN tf_v2_resources AS namespace ON namespace.uid = ?
+     JOIN tf_v2_resources AS worker ON worker.uid = ?
+     WHERE source_op.id = ?
+       AND source_op.principal = ? AND source_op.target_key = ?
+       AND source_op.status = 'succeeded' AND source_op.effect = 'complete'
+       AND source_op.acceptance_order > 0
+       AND source_resource.form_url IN (?, ?)
+       AND source_resource.principal = source_op.principal
+       AND source_resource.target_key = source_op.target_key
+       AND json_extract(source_op.accepted_spec_json, '$.worker.resourceUid') = ?
+       AND retirement_op.principal = source_op.principal
+       AND retirement_op.target_key = source_op.target_key
+       AND retirement_op.acceptance_order > source_op.acceptance_order
+       AND retirement_op.action IN ('create', 'update', 'delete')
+       AND (
+         (retirement_op.status = 'succeeded' AND retirement_op.effect = 'complete')
+         OR (retirement_op.status IN ('running', 'reconciling')
+             AND retirement_op.lease_token IS NOT NULL
+             AND retirement_op.lease_until_ms > ${DB_NOW_MS})
+       )
+       AND retirement_resource.form_url IN (?, ?)
+       AND retirement_resource.principal = retirement_op.principal
+       AND retirement_resource.target_key = retirement_op.target_key
+       AND retirement_resource.space = source_resource.space
+       AND json_extract(retirement_op.accepted_spec_json, '$.worker.resourceUid') = ?
+       AND namespace.form_url = ? AND namespace.principal = ?
+       AND namespace.space = source_resource.space AND namespace.target_key = ?
+       AND json_extract(namespace.spec_json, '$.worker.resourceUid') = ?
+       AND worker.form_url = ? AND worker.principal = source_op.principal
+       AND worker.space = source_resource.space AND worker.target_key = ?
+     LIMIT 2`,
+    [
+      input.retirementOperationId,
+      scope.namespaceResourceUid,
+      input.workerResourceUid,
+      input.sourceOperationId,
+      scope.tenantId,
+      targetKey,
+      WORKER_DEPLOYMENT_FORM_URL,
+      WORKER_ENDPOINT_FORM_URL,
+      input.workerResourceUid,
+      WORKER_DEPLOYMENT_FORM_URL,
+      WORKER_ENDPOINT_FORM_URL,
+      input.workerResourceUid,
+      ACTOR_NAMESPACE_FORM_URL,
+      scope.tenantId,
+      targetKey,
+      input.workerResourceUid,
+      MODULE_WORKER_FORM_URL,
+      targetKey,
+    ],
+  );
+  return rows.length === 1;
+}
 
 interface NamespaceRow {
   readonly uid: unknown;
@@ -267,6 +343,11 @@ export function createV2ActorNamespaceGraphAuthority(options: {
        WHERE deployment.form_url = ? AND deployment.principal = ?
          AND deployment.space = ? AND deployment.target_key = ?
          AND deployment.deleted_at IS NULL AND deployment.observed_generation > 0
+         AND NOT EXISTS (
+           SELECT 1 FROM tf_v2_operations pending_delete
+           WHERE pending_delete.id = deployment.busy_operation
+             AND pending_delete.action = 'delete'
+         )
          AND active_op.action IN ('create', 'update')
          AND active_op.status = 'succeeded' AND active_op.effect = 'complete'
          AND json_extract(active_op.accepted_spec_json, '$.worker.resourceUid') = ?

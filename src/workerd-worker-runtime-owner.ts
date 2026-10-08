@@ -84,6 +84,7 @@ import {
   workerPortOwnership,
 } from "./workerd-linux-process.ts";
 import type {
+  WorkerdActorIncarnationRetirement as ActorIncarnationRetirement,
   HostedWorkerdRuntime,
   WorkerdActiveActorGraph,
   WorkerdActorForwardSocket,
@@ -659,6 +660,10 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
       completeRestoration(): Promise<void>;
       close(): Promise<void>;
     };
+  };
+  /** App-layer accepted Actor withdrawal before this owner's exact native group drain. */
+  readonly v2ActorRetirement?: {
+    quiesceIncarnation(input: ActorIncarnationRetirement): Promise<void>;
   };
   /** Composition alone defers the Actor postpass until every UID owner is recovered. */
   readonly deferActorRestoreAdmission?: boolean;
@@ -2655,8 +2660,35 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
   };
 
+  const actorRetirementInput = (
+    incarnation: IncarnationHandle,
+    retirementOperationId: string,
+  ): ActorIncarnationRetirement | null => {
+    const identity = incarnation.record.identity;
+    const processIdentity = incarnation.record.processIdentity;
+    if (!identity || !processIdentity) {
+      if (incarnation.workflowLeases.size > 0)
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      return null;
+    }
+    return {
+      workerResourceUid: options.workerResourceUid,
+      targetKey: options.targetKey,
+      sourceOperationId: incarnation.record.operationId,
+      incarnationId: physicalIncarnationId(incarnation.record.operationId, processIdentity),
+      generation: identity.generation,
+      versions: identity.versions.map(({ versionId, workerVersionUid, weight }) => ({
+        versionId,
+        workerVersionUid,
+        weight,
+      })),
+      retirementOperationId,
+    };
+  };
+
   async function retireIncarnation(
     incarnation: IncarnationHandle,
+    quiesceActor = true,
   ): Promise<WorkerdWorkerRetirementReceipt> {
     if (incarnation.retiring) return await incarnation.retiring;
     if (
@@ -2680,6 +2712,10 @@ export async function openWorkerdWorkerRuntimeOwner(
         for (const lease of [...incarnation.orphanedActorBindingLeases]) {
           await lease.release();
           incarnation.orphanedActorBindingLeases.delete(lease);
+        }
+        if (quiesceActor && options.v2ActorRetirement) {
+          const input = actorRetirementInput(incarnation, operationId);
+          if (input) await options.v2ActorRetirement.quiesceIncarnation(input);
         }
         // A Workflow child may still be using an exact private Service socket.
         // Do not stop its upstream or release the socket namespace until the
@@ -3716,12 +3752,38 @@ export async function openWorkerdWorkerRuntimeOwner(
     return receipt;
   };
 
-  const execute = (inputExecution: V2Execution): Promise<V2WorkerRuntimeOwnerExecutionResult> => {
+  const execute = async (
+    inputExecution: V2Execution,
+  ): Promise<V2WorkerRuntimeOwnerExecutionResult> => {
     let captured: V2Execution;
     try {
       captured = structuredClone(inputExecution);
     } catch {
-      return Promise.resolve({ kind: "not_dispatched", code: "worker_operation_invalid" });
+      return { kind: "not_dispatched", code: "worker_operation_invalid" };
+    }
+    if (
+      captured.form === WORKER_DEPLOYMENT_FORM_URL &&
+      captured.action === "delete" &&
+      captured.targetKey === options.targetKey &&
+      workerFromExecution(captured) === options.workerResourceUid &&
+      options.v2ActorRetirement
+    ) {
+      try {
+        // Do not hold the native owner's serial lane while an Actor response
+        // drains: that response may itself need this owner for a selected
+        // private binding. The later serial DELETE re-resolves the Operation.
+        const targets = await runSerial(async () =>
+          [...handles.values()]
+            .filter((handle) => handle.record.status !== "retired")
+            .map((handle) => actorRetirementInput(handle, captured.operationId))
+            .filter((item): item is ActorIncarnationRetirement => item !== null),
+        );
+        for (const target of targets) {
+          await options.v2ActorRetirement.quiesceIncarnation(target);
+        }
+      } catch {
+        return { kind: "unknown" };
+      }
     }
     return runSerial(async () => {
       const execution = captured;
@@ -4854,7 +4916,9 @@ export async function openWorkerdWorkerRuntimeOwner(
       status: "retiring",
       retirementOperationId: operationId,
     }));
-    await retireIncarnation(candidate);
+    // This candidate never became the serving owner. No Actor carrier can be
+    // authorized by its source, and this path may run inside the owner lane.
+    await retireIncarnation(candidate, false);
   }
 
   async function activateIncarnation(
@@ -4991,7 +5055,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       }
     }
     const receipts = await Promise.allSettled(
-      live.map((incarnation) => retireIncarnation(incarnation)),
+      live.map((incarnation) => retireIncarnation(incarnation, false)),
     );
     if (receipts.some((receipt) => receipt.status === "rejected")) return { kind: "unknown" };
     if (!(await resolution.stillCurrent())) return { kind: "unknown" };

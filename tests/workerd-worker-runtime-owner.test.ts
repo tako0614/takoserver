@@ -1864,11 +1864,45 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
   const createId = "0cfebc3b-3b9a-4a5b-a897-6713df09121e";
   const deleteId = "f1840189-4a30-41c2-bae2-9c086a5327c4";
   const publication = staticPublicationState(workerUid, true);
+  const request = {
+    workerUid,
+    targetKey: TARGET_KEY,
+    servingSourceOperationId: createId,
+    basisPoint: 0,
+  };
+  let readDuringActorDrain: (() => Promise<unknown>) | null = null;
+  let activeActorTurnRead: Promise<unknown> | null = null;
+  let continueActorTurn: (() => void) | null = null;
+  let actorDrainCalls = 0;
+  let allowActorDrain = false;
   const owner = await openWorkerdWorkerRuntimeOwner({
     rootDirectory: join(owned.root, "owners"),
     workerResourceUid: workerUid,
     targetKey: TARGET_KEY,
     publicationState: publication.source,
+    v2ActorRetirement: {
+      async quiesceIncarnation(input) {
+        actorDrainCalls += 1;
+        expect(input).toMatchObject({
+          workerResourceUid: workerUid,
+          targetKey: TARGET_KEY,
+          sourceOperationId: createId,
+          retirementOperationId: deleteId,
+        });
+        if (!readDuringActorDrain) throw new Error("Actor drain reader unavailable");
+        // An active Actor turn may need the owner for its private binding before
+        // it can drain. Retirement must not wait for that turn in runSerial.
+        expect(
+          await Promise.race([
+            readDuringActorDrain(),
+            Bun.sleep(2_000).then(() => {
+              throw new Error("Actor drain re-entered the owner serial lane");
+            }),
+          ]),
+        ).toMatchObject({ kind: "selected", sourceOperationId: createId });
+        if (!allowActorDrain) throw new Error("Actor child drain is unresolved");
+      },
+    },
     workerdBinary: owned.binary,
     listenerPortForOperation: unusedPort,
     spawn: owned.spawn,
@@ -1877,11 +1911,9 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
       exportedHandlers: ["fetch"],
     }),
   });
-  const request = {
-    workerUid,
-    targetKey: TARGET_KEY,
-    servingSourceOperationId: createId,
-    basisPoint: 0,
+  readDuringActorDrain = () => {
+    continueActorTurn?.();
+    return activeActorTurnRead ?? owner.selectWorkflowExecution(request);
   };
   try {
     expect(await owner.selectWorkflowExecution(request)).toEqual({ kind: "unknown" });
@@ -1915,6 +1947,16 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
     expect(await selection.stillCurrent()).toBe(false);
     expect(await owner.selectWorkflowExecution(request)).toEqual({ kind: "unknown" });
     publication.setFenceCurrent(true);
+    expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toEqual({
+      kind: "unknown",
+    });
+    expect(await selection.stillCurrent()).toBe(true);
+    allowActorDrain = true;
+    // The turn exists before DELETE. It enters the owner only after the Actor
+    // drain begins, as a Workflow/SQLite broker can during an active fetch.
+    activeActorTurnRead = new Promise<void>((resolve) => {
+      continueActorTurn = resolve;
+    }).then(() => owner.selectWorkflowExecution(request));
     let deleteFinished = false;
     const deletion = owner.execute(execution(workerUid, deleteId, "delete")).then((result) => {
       deleteFinished = true;
@@ -1928,6 +1970,7 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
       kind: "confirmed",
       identity: null,
     });
+    expect(actorDrainCalls).toBe(2);
     expect(await selection.stillCurrent()).toBe(false);
   } finally {
     await owner.close().catch(() => undefined);
