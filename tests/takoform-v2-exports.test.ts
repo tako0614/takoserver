@@ -15,6 +15,7 @@ import type {
   V2BackendResult,
   V2Execution,
   V2Form,
+  V2HeldArtifactSourceOptions,
   V2ReferenceRequirement,
   V2WorkerModuleInspector,
   V2WorkerPublicationResolution,
@@ -24,6 +25,7 @@ import type {
 } from "@takoserver/core/takoform-v2";
 import * as extension from "@takoserver/core/takoform-v2";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
+import { createV2HeldArtifactSource } from "../src/takoform-v2/forms/artifact-source.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
 import {
   OBJECT_BUCKET_FORM_URL,
@@ -49,7 +51,10 @@ import {
   SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
 } from "../src/takoform-v2/forms/sqlite-migration-application-backend.ts";
 import { createSQLiteWorkerBindingAuthority } from "../src/takoform-v2/forms/sqlite-worker-binding-authority.ts";
-import { createWorkerBundleCustody } from "../src/takoform-v2/forms/worker-bundle-backend.ts";
+import {
+  createWorkerBundleCustody,
+  createWorkerBundleHost,
+} from "../src/takoform-v2/forms/worker-bundle-backend.ts";
 import { referencesForWorkerForm } from "../src/takoform-v2/forms/worker-references.ts";
 import {
   MODULE_WORKER_FORM_URL,
@@ -94,6 +99,8 @@ const RUNTIME_EXPORTS = [
   "createSQLiteMigrationApplicationForm",
   "createSQLiteWorkerBindingAuthority",
   "createWorkerBundleCustody",
+  "createWorkerBundleHost",
+  "createV2HeldArtifactSource",
   "createV2NativeEffectCustody",
   "createV2NativeDeletionCustody",
   "createV2ServiceBindingAuthority",
@@ -136,6 +143,8 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
   expect(extension.createWorkerBundleCustody).toBe(createWorkerBundleCustody);
+  expect(extension.createWorkerBundleHost).toBe(createWorkerBundleHost);
+  expect(extension.createV2HeldArtifactSource).toBe(createV2HeldArtifactSource);
   expect(extension.createObjectBucketForm).toBe(createObjectBucketForm);
   expect(extension.createObjectBucketWorkerBindingAuthority).toBe(
     createObjectBucketWorkerBindingAuthority,
@@ -210,6 +219,7 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   };
   const sqliteClaimType = (_claim: SQLiteWorkerBindingClaim): void => {};
   const workerBundleCustodyType = (_custody: WorkerBundleCustody): void => {};
+  const heldArtifactSourceOptionsType = (_options: V2HeldArtifactSourceOptions): void => {};
   expect(unresolved.kind).toBe("unresolved");
   expect([
     snapshotType,
@@ -219,7 +229,8 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
     sqlitePort,
     sqliteClaimType,
     workerBundleCustodyType,
-  ]).toHaveLength(7);
+    heldArtifactSourceOptionsType,
+  ]).toHaveLength(8);
 
   const claim: QueueWorkerBindingClaim = {
     principal: "principal",
