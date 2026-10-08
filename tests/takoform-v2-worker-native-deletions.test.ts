@@ -487,6 +487,64 @@ test("0086 interrupted after final table creation never reports absence, then re
   }
 });
 
+test("native DELETE refuses a guard disappearing after schema precheck", async () => {
+  const grant = await fixture();
+  try {
+    expect(await grant.custody.stageNext(grant.execution)).toBe("more");
+    expect(await grant.custody.stageNext(grant.execution)).toBe("ready");
+    const item = await grant.custody.next(grant.execution);
+    if (!item) throw new Error("missing native deletion item");
+    let dropped = false;
+    const racingSql: Sql = {
+      query: (statement, params) => grant.sql.query(statement, params),
+      batch: (statements) => grant.sql.batch(statements),
+      run(statement, params) {
+        if (!dropped && statement.includes("SET grant_lease_token = ?")) {
+          grant.db.exec("DROP TRIGGER tf_v2_worker_native_deletion_send_guard");
+          dropped = true;
+        }
+        return grant.sql.run(statement, params);
+      },
+    };
+    const racing = createV2NativeDeletionCustody({ sql: racingSql });
+    expect(await racing.grant(item, "etag-upload")).toBe("unknown");
+    expect(dropped).toBe(true);
+  } finally {
+    grant.close();
+  }
+
+  const absence = await fixture();
+  try {
+    expect(await absence.custody.stageNext(absence.execution)).toBe("more");
+    expect(await absence.custody.stageNext(absence.execution)).toBe("ready");
+    const item = await absence.custody.next(absence.execution);
+    if (!item) throw new Error("missing native deletion item");
+    expect(await absence.custody.grant(item, "etag-upload")).toBe("granted");
+    expect(await absence.custody.confirmAbsent(item, "owned-absence")).toBe(true);
+    expect(await absence.custody.allAbsent(absence.execution)).toBe(true);
+    let dropped = false;
+    const racingSql: Sql = {
+      run: (statement, params) => absence.sql.run(statement, params),
+      batch: (statements) => absence.sql.batch(statements),
+      query(statement, params) {
+        if (
+          !dropped &&
+          statement.includes("AND NOT EXISTS (SELECT 1 FROM tf_v2_worker_native_deletions item")
+        ) {
+          absence.db.exec("DROP TRIGGER tf_v2_worker_native_deletion_send_guard");
+          dropped = true;
+        }
+        return absence.sql.query(statement, params);
+      },
+    };
+    const racing = createV2NativeDeletionCustody({ sql: racingSql });
+    expect(await racing.allAbsent(absence.execution)).toBe(false);
+    expect(dropped).toBe(true);
+  } finally {
+    absence.close();
+  }
+});
+
 test("confirmed source stages, one DELETE grant persists across reopen, and lost ACK reconciles by absence", async () => {
   const f = await fixture();
   try {
