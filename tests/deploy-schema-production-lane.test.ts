@@ -51,12 +51,12 @@ const INVENTED_UNAUDITED_TAIL = [
     "CREATE TABLE synthetic_0089_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0089_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0089_container_runtime_input_rewrap (id TEXT);\n",
+    "0090_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0090_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0090_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0090_container_runtime_input_acceptance (id TEXT);\n",
+    "0091_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0091_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
