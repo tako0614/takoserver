@@ -213,7 +213,7 @@ export function createV2NativeDeletionCustody(options: {
     return (found[0] ?? null) as ItemRow | null;
   }
 
-  async function accepted(item: V2NativeDeletionItem): Promise<boolean> {
+  async function accepted(item: V2NativeDeletionItem, ready?: string): Promise<boolean> {
     const e = item.execution;
     return (
       (
@@ -224,7 +224,8 @@ export function createV2NativeDeletionCustody(options: {
         AND op.backend_key = ? AND op.backend_id = ? AND op.target_key = ?
         AND op.accepted_spec_json = ? AND r.principal = ? AND r.space = ?
         AND r.name = ? AND r.form_url = ? AND r.backend_id = op.backend_id
-        AND r.target_key = op.target_key LIMIT 1`,
+        AND r.target_key = op.target_key
+        ${ready ? `AND (${ready})` : ""} LIMIT 1`,
           [
             e.operationId,
             e.resourceUid,
@@ -341,7 +342,7 @@ export function createV2NativeDeletionCustody(options: {
       const predicate = await currentUnsafePredicate();
       if (predicate === null) return "unknown";
       if (existing.grant_lease_token !== null)
-        return (await accepted(item)) ? "already_granted" : "unknown";
+        return (await accepted(item, predicate.ready)) ? "already_granted" : "unknown";
       try {
         const changed = await sql.run(
           `UPDATE tf_v2_worker_native_deletions
@@ -378,7 +379,13 @@ export function createV2NativeDeletionCustody(options: {
       const item = captureItem(input);
       if (!validExecution(item.execution)) return { kind: "unknown" };
       const existing = await row(item);
-      if (!existing || !sameRow(existing, item) || !(await accepted(item)))
+      const predicate = await currentUnsafePredicate();
+      if (
+        !existing ||
+        !sameRow(existing, item) ||
+        predicate === null ||
+        !(await accepted(item, predicate.ready))
+      )
         return { kind: "unknown" };
       if (existing.confirmed_absence_receipt !== null)
         return {
@@ -421,7 +428,7 @@ export function createV2NativeDeletionCustody(options: {
       if (!existing || !sameRow(existing, item) || !(await accepted(item))) return false;
       const predicate = await currentUnsafePredicate();
       if (predicate === null) return false;
-      if (existing.confirmed_absence_receipt === receipt) return true;
+      if (existing.confirmed_absence_receipt === receipt) return accepted(item, predicate.ready);
       if (existing.confirmed_absence_receipt !== null) return false;
       const nowMs = time();
       if (nowMs === null) return false;
