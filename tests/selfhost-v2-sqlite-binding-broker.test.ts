@@ -315,6 +315,49 @@ test("a signed Version binding reaches only its current UID database and survive
   }
 });
 
+test("inline SQL refuses extra and duplicate envelope fields before executing", async () => {
+  const host = await fixture();
+  try {
+    const route = `http://localhost${SELFHOST_DATA_PLANE_SQL_PATH}`;
+    const headers = { authorization: `Bearer ${host.token}` };
+    const protocol = JSON.stringify(SELFHOST_DATA_PLANE_PROTOCOL);
+    const insert = (id: number) =>
+      JSON.stringify({ sql: `INSERT INTO records (id, body) VALUES (${id}, 'forbidden')` });
+    const invalidBodies = [
+      `{"statement":${insert(1)},"extra":true,"protocol":${protocol},"binding":"DB","op":"execute"}`,
+      `{"statement":${insert(2)},"binding":"OTHER","protocol":${protocol},"binding":"DB","op":"execute"}`,
+      `{"statement":${insert(3)},"b\\u0069nding":"OTHER","protocol":${protocol},"binding":"DB","op":"execute"}`,
+      `{"statements":[${insert(4)}],"extra":true,"protocol":${protocol},"binding":"DB","op":"transaction"}`,
+    ];
+    for (const body of invalidBodies) {
+      const response = await host.broker.handle(
+        new Request(route, { method: "POST", headers, body }),
+      );
+      expect(response?.status).toBe(400);
+      expect(await response?.json()).toEqual({
+        ok: false,
+        error: { code: "backend_unavailable" },
+      });
+    }
+    expect(await host.call("query", { sql: "SELECT count(*) AS count FROM records" })).toEqual({
+      ok: true,
+      value: { rows: [{ count: 0 }], rowsWritten: 0 },
+    });
+    expect(
+      await host.call("execute", {
+        sql: "INSERT INTO records (id, body) VALUES (?, ?)",
+        params: [5, '{"op":"execute","binding":"OTHER"}'],
+      }),
+    ).toEqual({ ok: true, value: { rows: [], rowsWritten: 1 } });
+    expect(await host.call("query", { sql: "SELECT body FROM records WHERE id = 5" })).toEqual({
+      ok: true,
+      value: { rows: [{ body: '{"op":"execute","binding":"OTHER"}' }], rowsWritten: 0 },
+    });
+  } finally {
+    host.close();
+  }
+});
+
 test("staged SQL rolls back a later invalid statement and removes its private input", async () => {
   const host = await fixture();
   try {
@@ -347,6 +390,43 @@ test("staged SQL rolls back a later invalid statement and removes its private in
     ).toEqual({
       ok: true,
       value: { rows: [{ count: 0 }], rowsWritten: 0 },
+    });
+    expect(readdirSync(join(host.root, "sql-input-staging"))).toEqual([]);
+  } finally {
+    host.close();
+  }
+});
+
+test("staged SQL retains a valid 42 MiB transaction outside the inline bound", async () => {
+  const host = await fixture();
+  try {
+    const body = JSON.stringify({
+      protocol: SELFHOST_DATA_PLANE_PROTOCOL,
+      binding: "DB",
+      op: "transaction",
+      statements: Array.from({ length: 42 }, (_, index) => ({
+        sql: "INSERT INTO records (id, body) VALUES (?, ?)",
+        params: [index + 1, "x".repeat(1_000_000)],
+      })),
+    });
+    expect(body.length).toBeGreaterThan(42_000_000);
+    const response = await host.broker.handle(
+      new Request(`http://localhost${SELFHOST_DATA_PLANE_SQL_PATH}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${host.token}` },
+        body,
+      }),
+    );
+    expect(response?.status).toBe(200);
+    const result = (await response?.json()) as {
+      ok: boolean;
+      value?: { results: { rowsWritten: number }[] };
+    };
+    expect(result.ok).toBe(true);
+    expect(result.value?.results.map((entry) => entry.rowsWritten)).toEqual(Array(42).fill(1));
+    expect(await host.call("query", { sql: "SELECT count(*) AS count FROM records" })).toEqual({
+      ok: true,
+      value: { rows: [{ count: 42 }], rowsWritten: 0 },
     });
     expect(readdirSync(join(host.root, "sql-input-staging"))).toEqual([]);
   } finally {
