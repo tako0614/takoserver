@@ -412,7 +412,7 @@ test("0084 forward migration preserves old sent rows and exact lost-ACK terminal
   }
 });
 
-test("native D1 enforces the same monotonic invocation lifetime", async () => {
+test("native D1 preserves invocation lifetime and beginSend across the full Cron schema", async () => {
   const runtime = new Miniflare({
     workers: [
       {
@@ -440,11 +440,14 @@ test("native D1 enforces the same monotonic invocation lifetime", async () => {
     for (const migration of MIGRATIONS.filter(
       ({ name }) =>
         name === "0070_takoform_v2.sql" ||
+        name === "0071_v2_sqlite_migration_set_custody.sql" ||
+        name === "0073_v2_reference_acceptance.sql" ||
         name === "0074_v2_worker_native_effects.sql" ||
         name === "0076_v2_worker_invocation_custody.sql" ||
         name === "0077_v2_operation_acceptance_order.sql" ||
         name === "0078_v2_worker_invocation_retirement.sql" ||
         name === "0079_v2_worker_native_deletions.sql" ||
+        name === "0080_v2_worker_cron_trigger_matches.sql" ||
         name === "0084_v2_worker_invocation_no_native_dispatch.sql",
     )) {
       for (const statement of splitMigration(migration.sql))
@@ -491,6 +494,151 @@ test("native D1 enforces the same monotonic invocation lifetime", async () => {
       noNativeDispatchAtMs: 2000,
       retirement: null,
     });
+    const cronForward = MIGRATIONS.find(
+      ({ name }) => name === "0087_v2_worker_cron_invocation_custody.sql",
+    );
+    if (!cronForward) throw new Error("missing 0087 source");
+    for (const statement of splitMigration(cronForward.sql))
+      await database.prepare(statement).run();
+    expect(await inspectV2WorkerInvocationSchema(sql)).toBe("cron");
+    const afterCronSchema = {
+      invocationId: "d1-endpoint-on-cron-schema",
+      custodyToken: "d1-endpoint-on-cron-schema-token",
+    };
+    await sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+       (invocation_id,custody_token,backend_id,target_key,principal,space,
+        worker_uid,deployment_uid,deployment_generation,source_operation_id,
+        ingress_kind,endpoint_uid,endpoint_generation,version_uid,version_generation,
+        version_operation_id,native_identity,closure_digest,confirmed_receipt,admitted_at_ms)
+       SELECT ?,?,backend_id,target_key,principal,space,worker_uid,deployment_uid,
+         deployment_generation,source_operation_id,'endpoint',endpoint_uid,
+         endpoint_generation,version_uid,version_generation,version_operation_id,
+         native_identity,closure_digest,confirmed_receipt,admitted_at_ms
+       FROM tf_v2_worker_invocations WHERE invocation_id=?`,
+      [afterCronSchema.invocationId, afterCronSchema.custodyToken, handle.invocationId],
+    );
+    expect(await owner.beginSend(afterCronSchema)).toBe(true);
+    expect((await owner.read(afterCronSchema))?.phase).toBe("send_authorized");
+    const serviceAfterCronSchema = {
+      invocationId: "d1-service-on-cron-schema",
+      custodyToken: "d1-service-on-cron-schema-token",
+    };
+    await sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+       (invocation_id,custody_token,backend_id,target_key,principal,space,
+        worker_uid,deployment_uid,deployment_generation,source_operation_id,
+        ingress_kind,service_caller_worker_uid,service_caller_version_uid,
+        service_caller_version_generation,service_caller_version_operation_id,
+        service_binding_name,service_caller_execution_ref,version_uid,version_generation,
+        version_operation_id,native_identity,closure_digest,confirmed_receipt,admitted_at_ms)
+       SELECT ?,?,backend_id,target_key,principal,space,worker_uid,deployment_uid,
+         deployment_generation,source_operation_id,'service',worker_uid,version_uid,
+         version_generation,version_operation_id,'CALLER','native-d1-slot',version_uid,
+         version_generation,version_operation_id,native_identity,closure_digest,
+         confirmed_receipt,admitted_at_ms
+       FROM tf_v2_worker_invocations WHERE invocation_id=?`,
+      [
+        serviceAfterCronSchema.invocationId,
+        serviceAfterCronSchema.custodyToken,
+        handle.invocationId,
+      ],
+    );
+    expect(await owner.beginSend(serviceAfterCronSchema)).toBe(true);
+    expect((await owner.read(serviceAfterCronSchema))?.phase).toBe("send_authorized");
+
+    // Seed an already-admitted physical Cron attempt. Its setup bypasses only
+    // the match/publication insert guards; beginSend must still prove the live
+    // lease, active graph, and confirmed native receipt in its D1 UPDATE.
+    await database.prepare("DROP TRIGGER tf_v2_worker_cron_match_insert_guard").run();
+    await database.prepare("DROP TRIGGER tf_v2_worker_native_effect_insert_guard").run();
+    await sql.run(`UPDATE tf_v2_resources SET observed_json=? WHERE uid='worker-one'`, [
+      JSON.stringify({ ready: true, activeDeploymentUid: "deployment-one" }),
+    ]);
+    await sql.run(
+      `UPDATE tf_v2_resources SET spec_json=?, observed_json=? WHERE uid='deployment-one'`,
+      [
+        JSON.stringify({
+          versions: [{ workerVersion: { resourceUid: "version-one" }, weight: 10_000 }],
+        }),
+        JSON.stringify({
+          ready: true,
+          active: true,
+          selectedVersions: [{ resourceUid: "version-one", weight: 10_000 }],
+        }),
+      ],
+    );
+    await sql.run(
+      `UPDATE tf_v2_resources SET spec_json=?, observed_json=? WHERE uid='version-one'`,
+      [JSON.stringify({ handlers: ["scheduled"] }), JSON.stringify({ ready: true })],
+    );
+    await sql.run(
+      `INSERT INTO tf_v2_worker_native_effects
+       (operation_id,resource_uid,principal,space,backend_key,backend_id,target_key,
+        generation,native_identity,closure_digest,grant_lease_token,granted_at_ms,
+        acknowledged_receipt,confirmed_receipt)
+       VALUES ('op-version-one','version-one','org-1','prod','key-version-one',
+         'backend-one','target-one',1,'script-one',?,'native-grant-001',1000,
+         'etag-one','etag-one')`,
+      [digest],
+    );
+    await sql.run(
+      `INSERT INTO tf_v2_resources
+       (uid,principal,form_url,space,name,backend_id,target_key,active_name,
+        generation,observed_generation,phase,spec_json,last_operation)
+       VALUES ('cron-trigger-one','org-1',
+         'https://edge.forms.takoform.com/forms/WorkerCronTrigger/0.3.0/',
+         'prod','cron-trigger','backend-one','target-one','cron-trigger',1,1,
+         'idle','{}','op-cron-trigger-one')`,
+    );
+    await sql.run(
+      `INSERT INTO tf_v2_operations
+       (id,resource_uid,principal,replay_key,request_fingerprint,action,
+        generation,status,effect,created_at,updated_at,retain_until,
+        backend_id,target_key,backend_key,accepted_spec_json)
+       VALUES ('op-cron-trigger-one','cron-trigger-one','org-1','replay-cron-trigger-one',
+         'fp','create',1,'succeeded','complete','2026-10-07T00:00:00Z',
+         '2026-10-07T00:00:00Z','2026-10-08T00:00:00Z','backend-one',
+         'target-one','key-cron-trigger-one','{}')`,
+    );
+    const cronMatch = `sha256:${"c".repeat(64)}`;
+    const cronLease = "native-d1-cron-lease-token";
+    await sql.run(
+      `INSERT INTO tf_v2_worker_cron_matches
+       (match_id,trigger_uid,principal,space,target_key,trigger_generation,
+        trigger_operation_id,trigger_settled_at,worker_uid,cron,scheduled_time_ms,
+        state,attempts,created_at_ms,next_attempt_at_ms,lease_token,lease_until_ms,
+        updated_at_ms)
+       VALUES (?,'cron-trigger-one','org-1','prod','target-one',1,
+         'op-cron-trigger-one','2026-10-07T00:00:00Z','worker-one','* * * * *',
+         1000,'dispatching',1,1000,1000,?,?,1000)`,
+      [cronMatch, cronLease, Date.now() + 60_000],
+    );
+    const cronAfterCronSchema = {
+      invocationId: "d1-cron-on-cron-schema",
+      custodyToken: "d1-cron-on-cron-schema-token",
+    };
+    await sql.run(
+      `INSERT INTO tf_v2_worker_invocations
+       (invocation_id,custody_token,backend_id,target_key,principal,space,
+        worker_uid,deployment_uid,deployment_generation,source_operation_id,
+        ingress_kind,cron_match_id,cron_trigger_operation_id,cron_lease_token,cron_attempt,
+        version_uid,version_generation,version_operation_id,native_identity,
+        closure_digest,confirmed_receipt,admitted_at_ms)
+       VALUES (?,?,'backend-one','target-one','org-1','prod','worker-one',
+         'deployment-one',1,'op-deployment-one','cron',?,
+         'op-cron-trigger-one',?,1,'version-one',1,'op-version-one',
+         'script-one',?,'etag-one',1000)`,
+      [
+        cronAfterCronSchema.invocationId,
+        cronAfterCronSchema.custodyToken,
+        cronMatch,
+        cronLease,
+        digest,
+      ],
+    );
+    expect(await owner.beginSend(cronAfterCronSchema)).toBe(true);
+    expect(await owner.beginSend(cronAfterCronSchema)).toBe(false);
   } finally {
     await runtime.dispose();
   }

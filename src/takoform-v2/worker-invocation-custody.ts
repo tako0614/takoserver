@@ -662,6 +662,9 @@ export function createV2WorkerInvocationLifecycle(options: {
       // any adapter delay, never the earlier host timestamp passed to SET.
       const schema = await inspectV2WorkerInvocationSchema(sql);
       if (!schema) return false;
+      // Keep the Cron predicates in bounded conjunctions. SQLite parses a
+      // long left-associated AND chain as a deep expression tree even when an
+      // Endpoint or Service row makes the Cron branch false at execution time.
       const cronGate =
         schema === "cron"
           ? `AND (ingress_kind <> 'cron' OR EXISTS (
@@ -672,26 +675,26 @@ export function createV2WorkerInvocationLifecycle(options: {
              JOIN tf_v2_resources version ON version.uid=tf_v2_worker_invocations.version_uid
              JOIN tf_v2_worker_native_effects publication
                ON publication.operation_id=tf_v2_worker_invocations.version_operation_id
-             WHERE m.match_id=tf_v2_worker_invocations.cron_match_id
+             WHERE (m.match_id=tf_v2_worker_invocations.cron_match_id
                AND m.trigger_operation_id=tf_v2_worker_invocations.cron_trigger_operation_id
                AND m.lease_token=tf_v2_worker_invocations.cron_lease_token
                AND m.attempts=tf_v2_worker_invocations.cron_attempt
                AND m.state='dispatching' AND m.lease_until_ms > ${SQL_LEASE_NOW}
                AND m.principal=tf_v2_worker_invocations.principal
                AND m.space=tf_v2_worker_invocations.space
-               AND m.target_key=tf_v2_worker_invocations.target_key
-               AND trigger_resource.principal=m.principal AND trigger_resource.space=m.space
+               AND m.target_key=tf_v2_worker_invocations.target_key)
+               AND (trigger_resource.principal=m.principal AND trigger_resource.space=m.space
                AND trigger_resource.target_key=m.target_key
                AND trigger_resource.form_url='${CRON_FORM}'
                AND trigger_resource.deleted_at IS NULL
-               AND trigger_resource.generation>=m.trigger_generation
-               AND worker.principal=m.principal AND worker.space=m.space
+               AND trigger_resource.generation>=m.trigger_generation)
+               AND (worker.principal=m.principal AND worker.space=m.space
                AND worker.target_key=m.target_key AND worker.form_url='${WORKER_FORM}'
                AND worker.deleted_at IS NULL AND worker.phase='idle'
                AND worker.busy_operation IS NULL AND worker.generation=worker.observed_generation
                AND json_type(worker.observed_json,'$.ready')='true'
-               AND json_extract(worker.observed_json,'$.activeDeploymentUid')=deployment.uid
-               AND deployment.principal=m.principal AND deployment.space=m.space
+               AND json_extract(worker.observed_json,'$.activeDeploymentUid')=deployment.uid)
+               AND (deployment.principal=m.principal AND deployment.space=m.space
                AND deployment.target_key=m.target_key AND deployment.form_url='${DEPLOYMENT_FORM}'
                AND deployment.deleted_at IS NULL AND deployment.phase='idle'
                AND deployment.busy_operation IS NULL
@@ -701,8 +704,8 @@ export function createV2WorkerInvocationLifecycle(options: {
                AND json_type(deployment.observed_json,'$.ready')='true'
                AND json_extract(deployment.observed_json,'$.active')=1
                AND json_array_length(json_extract(deployment.spec_json,'$.versions'))=
-                 json_array_length(json_extract(deployment.observed_json,'$.selectedVersions'))
-               AND NOT EXISTS (SELECT 1 FROM json_each(deployment.spec_json,'$.versions') desired
+                 json_array_length(json_extract(deployment.observed_json,'$.selectedVersions')))
+               AND (NOT EXISTS (SELECT 1 FROM json_each(deployment.spec_json,'$.versions') desired
                  WHERE NOT EXISTS (SELECT 1 FROM json_each(deployment.observed_json,'$.selectedVersions') observed
                    WHERE json_extract(observed.value,'$.resourceUid')=
                      json_extract(desired.value,'$.workerVersion.resourceUid')
@@ -717,8 +720,8 @@ export function createV2WorkerInvocationLifecycle(options: {
                    ON json_extract(observed.value,'$.resourceUid')=
                      json_extract(desired.value,'$.workerVersion.resourceUid')
                    AND json_extract(observed.value,'$.weight')=json_extract(desired.value,'$.weight')
-                 WHERE json_extract(desired.value,'$.workerVersion.resourceUid')=version.uid)
-               AND version.principal=m.principal AND version.space=m.space
+                 WHERE json_extract(desired.value,'$.workerVersion.resourceUid')=version.uid))
+               AND (version.principal=m.principal AND version.space=m.space
                AND version.target_key=m.target_key AND version.form_url='${VERSION_FORM}'
                AND version.deleted_at IS NULL AND version.phase='idle'
                AND version.busy_operation IS NULL
@@ -727,10 +730,10 @@ export function createV2WorkerInvocationLifecycle(options: {
                AND version.last_operation=tf_v2_worker_invocations.version_operation_id
                AND json_type(version.observed_json,'$.ready')='true'
                AND EXISTS (SELECT 1 FROM json_each(version.spec_json,'$.handlers') handler
-                 WHERE handler.value='scheduled')
-               AND publication.native_identity=tf_v2_worker_invocations.native_identity
+                 WHERE handler.value='scheduled'))
+               AND (publication.native_identity=tf_v2_worker_invocations.native_identity
                AND publication.closure_digest=tf_v2_worker_invocations.closure_digest
-               AND publication.confirmed_receipt=tf_v2_worker_invocations.confirmed_receipt
+               AND publication.confirmed_receipt=tf_v2_worker_invocations.confirmed_receipt)
            ))`
           : "";
       try {
