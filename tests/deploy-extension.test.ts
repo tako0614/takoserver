@@ -6,6 +6,8 @@ import type {
   D1SchemaState,
   MigrationArtifact,
   MigrationFile,
+  SchemaInvocation,
+  SchemaOptions,
 } from "@takoserver/core/deploy-extension";
 import * as deployExtension from "@takoserver/core/deploy-extension";
 
@@ -17,7 +19,7 @@ describe("curated deploy extension schema readback", () => {
       [
         process.execPath,
         "-e",
-        `const api = await import("@takoserver/core/deploy-extension"); console.log(JSON.stringify({ read: typeof api.readD1SchemaState, match: typeof api.applicationSchemaMatches, derive: typeof api.deriveExpectedApplicationShape, audit: typeof api.readAuditedMigrationArtifact, currentSource: typeof api.readCurrentAuditedMigrationSourceArtifact }));`,
+        `const api = await import("@takoserver/core/deploy-extension"); console.log(JSON.stringify({ read: typeof api.readD1SchemaState, match: typeof api.applicationSchemaMatches, derive: typeof api.deriveExpectedApplicationShape, audit: typeof api.readAuditedMigrationArtifact, currentSource: typeof api.readCurrentAuditedMigrationSourceArtifact, writer: typeof api.runD1Schema }));`,
       ],
       {
         cwd: REPOSITORY,
@@ -41,15 +43,37 @@ describe("curated deploy extension schema readback", () => {
       derive: "function",
       audit: "function",
       currentSource: "function",
+      writer: "function",
     });
     for (const forbidden of [
       "readMigrationArtifact",
       "readOperationGenerationMigrationArtifact",
-      "runD1Schema",
       "runD1SchemaRehearsalBaseline",
     ]) {
       expect(forbidden in deployExtension).toBe(false);
     }
+  });
+
+  test("exports the existing D1 writer and its invocation/options types without a second implementation", () => {
+    const invocation: SchemaInvocation = {
+      action: "status",
+      environment: "integration",
+      commit: "a".repeat(40),
+      throughMigration: "0088",
+    };
+    const options: SchemaOptions = {
+      v2ExistingMaintenance: {
+        historicalSourceRoot: "/fixture/historical",
+        providerExecutorQualification: {
+          read: async () => {
+            throw new Error("unused fixture");
+          },
+        },
+      },
+    };
+    expect(invocation.throughMigration).toBe("0088");
+    expect(options.v2ExistingMaintenance?.historicalSourceRoot).toBe("/fixture/historical");
+    expect(deployExtension.runD1Schema).toBeDefined();
   });
 
   test("exposes the audited current source without widening the legacy artifact", () => {
