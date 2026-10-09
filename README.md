@@ -661,11 +661,13 @@ managed extension may bind that same operator-selected database, but it does
 not copy the migration lineage or become a second schema writer. Source
 separation alone is not proof of a deployed managed installation.
 
-Workflow Host embedders have two separate source-library entries:
+Workflow Host embedders have three separate source-library entries:
 `@takoserver/core/workflow-runtime` exposes the platform-neutral coordinator and
-ports; `@takoserver/core/workflow-runtime/workerd` exposes trusted Bun/Linux
-guarded execution, resolved-Version graph compilation and selected-Version
-preparation. Neither is a provider extension or an app-facing Binding.
+ports; `@takoserver/core/workflow-runtime/transport` exposes an in-memory,
+one-use frame journal to trusted adapters;
+`@takoserver/core/workflow-runtime/workerd` exposes trusted Bun/Linux guarded
+execution, resolved-Version graph compilation and selected-Version preparation.
+None is a provider extension or an app-facing Binding.
 See [Workflow runtime](docs/workflow-runtime.md#host-runtime-library-entrypoints)
 for selection and lifecycle responsibilities. These entries do not ship a
 managed companion image, enable Workflow support, or change any API/Form version.

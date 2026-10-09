@@ -14,6 +14,7 @@
     "./takoform-worker-store": "./src/takoform/worker-store.ts",
     "./takoform-v2": "./src/takoform-v2/index.ts",
     "./workflow-runtime": "./src/workflow-runtime.ts",
+    "./workflow-runtime/transport": "./src/workflow-runtime-transport.ts",
     "./workflow-runtime/workerd": "./src/workflow-runtime-workerd.ts",
     "./actor-upgrade-handoff-source": "./src/actor-upgrade-handoff-source.ts",
     "./actor-namespace-facade-source": "./src/actor-namespace-facade-source.ts",
