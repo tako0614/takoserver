@@ -572,7 +572,13 @@ for (const path of walk("src")) {
       target === "src/takoform-v2/worker-queue-scheduler.ts" &&
       localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
       JSON.stringify(schedulerExportNames) ===
-        JSON.stringify(["createV2QueueScheduler", "V2QueueSchedulerOptions"].sort());
+        JSON.stringify(
+          [
+            "createV2QueueScheduler",
+            "V2QueueSchedulerCheckpoint",
+            "V2QueueSchedulerOptions",
+          ].sort(),
+        );
     if (
       !layer.may.includes(targetLayer.name) &&
       !exactExecutionTypeEdge &&
