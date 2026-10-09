@@ -118,10 +118,12 @@ export function createV2ActorNamespaceSqlGraphReader(options: {
   readonly sql: Sql;
   readonly targetKey: string;
 }): V2ActorNamespaceSqlGraphReader {
-  if (!options.targetKey) throw new TypeError("Actor targetKey is required");
+  const sql = options.sql;
+  const targetKey = options.targetKey;
+  if (!targetKey) throw new TypeError("Actor targetKey is required");
 
   const namespaceRow = async (scope: Scope): Promise<NamespaceRow | null> => {
-    const rows = (await options.sql.query(
+    const rows = (await sql.query(
       `SELECT namespace.uid, namespace.principal, namespace.space,
               namespace.backend_id,
               namespace.target_key, namespace.generation,
@@ -186,7 +188,7 @@ export function createV2ActorNamespaceSqlGraphReader(options: {
         scope.namespaceResourceUid,
         scope.tenantId,
         ACTOR_NAMESPACE_FORM_URL,
-        options.targetKey,
+        targetKey,
       ],
     )) as unknown as readonly NamespaceRow[];
     return rows.length === 1 ? (rows[0] ?? null) : null;
@@ -203,7 +205,7 @@ export function createV2ActorNamespaceSqlGraphReader(options: {
       row.uid !== scope.namespaceResourceUid ||
       row.principal !== scope.tenantId ||
       typeof row.space !== "string" ||
-      row.target_key !== options.targetKey ||
+      row.target_key !== targetKey ||
       row.deleted_at !== null ||
       (heldOperation
         ? row.busy_operation !== heldOperation.operationId ||
@@ -229,7 +231,7 @@ export function createV2ActorNamespaceSqlGraphReader(options: {
       row.worker_form_url !== MODULE_WORKER_FORM_URL ||
       row.worker_principal !== scope.tenantId ||
       row.worker_space !== row.space ||
-      row.worker_target_key !== options.targetKey ||
+      row.worker_target_key !== targetKey ||
       row.worker_deleted_at !== null ||
       row.worker_busy_operation !== null ||
       row.worker_phase !== "idle" ||
@@ -281,8 +283,18 @@ export function createV2ActorNamespaceSqlGraphReader(options: {
     scope: Scope,
     operation: { readonly operationId: string; readonly leaseToken: string },
   ): Promise<V2ActorAcceptedDeleteClaim | null> => {
-    if (!operation.operationId || !operation.leaseToken) return null;
-    const rows = await options.sql.query(
+    // Caller-owned objects may change while SQL is pending. Capture the exact
+    // query identity before the first await and never emit the caller objects.
+    const exactScope = {
+      tenantId: scope.tenantId,
+      namespaceResourceUid: scope.namespaceResourceUid,
+    };
+    const exactOperation = {
+      operationId: operation.operationId,
+      leaseToken: operation.leaseToken,
+    };
+    if (!exactOperation.operationId || !exactOperation.leaseToken) return null;
+    const rows = await sql.query(
       `SELECT namespace.uid, namespace.principal, namespace.space,
          namespace.backend_id, namespace.target_key, namespace.generation,
          namespace.observed_generation, namespace.spec_json,
@@ -334,18 +346,20 @@ export function createV2ActorNamespaceSqlGraphReader(options: {
        LIMIT 2`,
       [
         MODULE_WORKER_FORM_URL,
-        scope.namespaceResourceUid,
-        scope.tenantId,
+        exactScope.namespaceResourceUid,
+        exactScope.tenantId,
         ACTOR_NAMESPACE_FORM_URL,
-        options.targetKey,
-        operation.operationId,
-        operation.leaseToken,
+        targetKey,
+        exactOperation.operationId,
+        exactOperation.leaseToken,
         MODULE_WORKER_FORM_URL,
       ],
     );
     const row = rows.length === 1 ? rows[0] : undefined;
     if (
       !row ||
+      row.uid !== exactScope.namespaceResourceUid ||
+      row.principal !== exactScope.tenantId ||
       typeof row.space !== "string" ||
       typeof row.backend_id !== "string" ||
       typeof row.spec_json !== "string" ||
@@ -354,8 +368,8 @@ export function createV2ActorNamespaceSqlGraphReader(options: {
       typeof row.registered_generation !== "number" ||
       !Number.isSafeInteger(row.registered_generation) ||
       typeof row.registered_id !== "string" ||
-      row.held_id !== operation.operationId ||
-      row.held_lease_token !== operation.leaseToken ||
+      row.held_id !== exactOperation.operationId ||
+      row.held_lease_token !== exactOperation.leaseToken ||
       typeof row.worker_uid !== "string"
     )
       return null;
@@ -367,22 +381,22 @@ export function createV2ActorNamespaceSqlGraphReader(options: {
     }
     if (spec.worker.resourceUid !== row.worker_uid) return null;
     return {
-      scope: { ...scope },
+      scope: exactScope,
       space: row.space,
       backendId: row.backend_id,
       workerUid: row.worker_uid,
       className: spec.className,
-      operationId: operation.operationId,
-      leaseToken: operation.leaseToken,
+      operationId: exactOperation.operationId,
+      leaseToken: exactOperation.leaseToken,
       generation: row.generation,
       registeredOperationId: row.registered_id,
       registeredGeneration: row.registered_generation,
       authorityKey: canonicalJson({
-        scope,
+        scope: exactScope,
         space: row.space,
-        targetKey: options.targetKey,
+        targetKey,
         backendId: row.backend_id,
-        operationId: operation.operationId,
+        operationId: exactOperation.operationId,
         generation: row.generation,
         registeredOperationId: row.registered_id,
         registeredGeneration: row.registered_generation,
@@ -398,7 +412,7 @@ export function createV2ActorNamespaceSqlGraphReader(options: {
     if ((await acceptedGraph(graph.scope))?.authorityKey !== graph.authorityKey) return false;
     const row = await namespaceRow(graph.scope);
     if (!row || typeof row.space !== "string") return false;
-    const rows = await options.sql.query(
+    const rows = await sql.query(
       `SELECT 1 FROM tf_v2_resources deployment
        JOIN tf_v2_operations active_op
          ON active_op.resource_uid = deployment.uid
@@ -417,13 +431,7 @@ export function createV2ActorNamespaceSqlGraphReader(options: {
          AND json_extract(deployment.observed_json, '$.ready') = 1
          AND json_extract(deployment.observed_json, '$.active') = 1
        LIMIT 2`,
-      [
-        WORKER_DEPLOYMENT_FORM_URL,
-        graph.scope.tenantId,
-        row.space,
-        options.targetKey,
-        graph.workerUid,
-      ],
+      [WORKER_DEPLOYMENT_FORM_URL, graph.scope.tenantId, row.space, targetKey, graph.workerUid],
     );
     return rows.length === 1;
   };

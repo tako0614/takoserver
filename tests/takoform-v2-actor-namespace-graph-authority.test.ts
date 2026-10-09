@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
   createV2ActorNamespaceGraphAuthority,
@@ -416,6 +417,73 @@ test("held Namespace DELETE proves its prior registered graph without granting d
       registeredGeneration: 1,
       generation: 2,
     });
+    if (!claim) throw new Error("expected held DELETE claim");
+    const delayedReader = () => {
+      let enter!: () => void;
+      let release!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        enter = resolve;
+      });
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const delayedSql: Sql = {
+        ...f.sql,
+        async query(statement, params) {
+          enter();
+          await released;
+          return f.sql.query(statement, params);
+        },
+      };
+      const options: { sql: Sql; targetKey: string } = { sql: delayedSql, targetKey: TARGET };
+      return {
+        reader: createV2ActorNamespaceSqlGraphReader(options),
+        options,
+        entered,
+        release: () => release(),
+      };
+    };
+    const delayedScope = delayedReader();
+    const mutableScope = { ...scope };
+    const pendingScope = delayedScope.reader.readAcceptedDeleteOperation(mutableScope, operation);
+    await delayedScope.entered;
+    mutableScope.tenantId = "org:foreign";
+    mutableScope.namespaceResourceUid = "foreign-namespace";
+    delayedScope.release();
+    const scopeClaim = await pendingScope;
+    expect(scopeClaim?.scope).toEqual(scope);
+    expect(scopeClaim?.authorityKey).toBe(claim.authorityKey);
+    const delayedOperation = delayedReader();
+    const mutableOperation = { ...operation };
+    const pendingOperation = delayedOperation.reader.readAcceptedDeleteOperation(
+      scope,
+      mutableOperation,
+    );
+    await delayedOperation.entered;
+    mutableOperation.operationId = "foreign-operation";
+    mutableOperation.leaseToken = "foreign-lease";
+    delayedOperation.release();
+    const operationClaim = await pendingOperation;
+    expect(operationClaim?.operationId).toBe(operation.operationId);
+    expect(operationClaim?.leaseToken).toBe(operation.leaseToken);
+    expect(operationClaim?.authorityKey).toBe(claim.authorityKey);
+    const delayedTarget = delayedReader();
+    const pendingTarget = delayedTarget.reader.readAcceptedDeleteOperation(scope, operation);
+    await delayedTarget.entered;
+    delayedTarget.options.targetKey = "foreign-target";
+    delayedTarget.release();
+    expect((await pendingTarget)?.authorityKey).toBe(claim.authorityKey);
+    const mutableOptions: { sql: Sql; targetKey: string } = { sql: f.sql, targetKey: TARGET };
+    const fixedReader = createV2ActorNamespaceSqlGraphReader(mutableOptions);
+    mutableOptions.sql = {
+      ...f.sql,
+      async query() {
+        return [];
+      },
+    };
+    expect((await fixedReader.readAcceptedDeleteOperation(scope, operation))?.authorityKey).toBe(
+      claim.authorityKey,
+    );
     expect(
       await reader.readAcceptedDeleteOperation(scope, { ...operation, leaseToken: "wrong" }),
     ).toBeNull();
