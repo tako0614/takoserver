@@ -13,6 +13,9 @@ test("the public v2 eligibility export does not pull native Workerd modules into
     .getSourceFiles()
     .map((source) => source.fileName.replaceAll("\\", "/"));
   expect(sourceFiles.some((path) => path.endsWith("/src/workerd-runtime.ts"))).toBe(false);
+  expect(sourceFiles.some((path) => path.endsWith("/src/selfhost-actor-graph-authority.ts"))).toBe(
+    false,
+  );
   expect(sourceFiles.some((path) => path.endsWith("/src/takoform-v2/worker-code-runtime.ts"))).toBe(
     false,
   );

@@ -3,9 +3,11 @@ import type {
   createInternalV2ModuleWorkerForm,
   createObjectBucketForm,
   createObjectBucketWorkerBindingAuthority,
+  createV2ActorNamespaceForm,
   createV2EdgeKvNativeCustody,
   inspectV2WorkerCodeVersionEligibility,
   ObjectBucketStore,
+  V2ActorNamespacePhysicalPort,
   V2WorkerModuleInspector,
   V2WorkerRetirementReader,
   V2WorkerServingReader,
@@ -24,6 +26,8 @@ declare const bucketFormOptions: Parameters<typeof createObjectBucketForm>[0];
 declare const bucketAuthorityOptions: Parameters<
   typeof createObjectBucketWorkerBindingAuthority
 >[0];
+declare const actorFormOptions: Parameters<typeof createV2ActorNamespaceForm>[0];
+declare const actorPhysical: V2ActorNamespacePhysicalPort;
 
 void inspector;
 void input;
@@ -36,3 +40,5 @@ void kvDeleteGrant;
 void bucketStore;
 void bucketFormOptions;
 void bucketAuthorityOptions;
+void actorFormOptions;
+void actorPhysical;

@@ -1,9 +1,9 @@
-import { canonicalJson } from "../json.ts";
-import type { Sql } from "../ports.ts";
 import type {
   ActorExecutionGraph,
   ActorExecutionRealization,
-} from "../selfhost-actor-graph-authority.ts";
+} from "../actor-execution-contract.ts";
+import { canonicalJson } from "../json.ts";
+import type { Sql } from "../ports.ts";
 import type { WorkerModuleSemanticInspector } from "../worker-module-inspection-contract.ts";
 import {
   prepareV2ActorNamespaceAdmission,

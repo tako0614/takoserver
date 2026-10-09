@@ -1,40 +1,23 @@
+import type {
+  ActorExecutionGraph,
+  ActorExecutionRealization,
+  ActorExecutionScope,
+} from "./actor-execution-contract.ts";
 import type { ActorResourceGraph, ActorResourceGraphReader } from "./actor-resource-graph.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
 import {
   readWorkerdActiveActorGraph,
   readWorkerdSelectedActiveVersion,
   type WorkerdActiveActorGraph,
-  type WorkerdActorForwardSocket,
-  type WorkerdActorIncarnationRetirement,
   type WorkerdSelectedActiveVersion,
 } from "./workerd-runtime.ts";
 
-export interface ActorExecutionScope {
-  readonly tenantId: string;
-  readonly namespaceResourceUid: string;
-}
-
-/** An accepted namespace/Worker identity, without a provider-specific Resource shape. */
-export interface ActorExecutionGraph {
-  readonly scope: ActorExecutionScope;
-  readonly workerUid: string;
-  readonly className: string;
-  readonly runtimeClassRef?: unknown;
-  /** Opaque, exact accepted graph identity; not a readiness boolean. */
-  readonly authorityKey: string;
-}
-
-/** A selected native publication, including all weighted Version bytes. */
-export interface ActorExecutionRealization {
-  readonly script: string;
-  readonly graph: WorkerdActiveActorGraph;
-  readonly authorityKey: string;
-  /** Current provider Worker incarnation's private broker sockets. V1 has none. */
-  readonly actorForwardSockets?: readonly WorkerdActorForwardSocket[];
-  /** V2 physical receipt identity, never an independent SQL grant. */
-  readonly sourceOperationId?: string;
-  readonly incarnationId?: string;
-}
+export type {
+  ActorExecutionGraph,
+  ActorExecutionRealization,
+  ActorExecutionScope,
+  ActorIncarnationRetirement,
+} from "./actor-execution-contract.ts";
 
 export interface ActorVersionPrivateBindingLease {
   readonly versionId: string;
@@ -54,9 +37,6 @@ export interface ActorVersionPrivateBindingLease {
   }[];
   release(): Promise<void>;
 }
-
-/** Native incarnation being retired by a later accepted Worker publication. */
-export type ActorIncarnationRetirement = WorkerdActorIncarnationRetirement;
 
 export type ActorRealizationRead =
   | { readonly kind: "ready"; readonly realization: ActorExecutionRealization }
