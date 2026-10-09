@@ -116,7 +116,9 @@ function boundedText(value: unknown, maximum = 255, minimum = 1): value is strin
 
 // One statement is the Cron admission linearization point. No pre-await graph
 // observation or route JSON is itself authority; each is compared with current
-// accepted SQL rows and the exact confirmed native Version receipt here.
+// accepted SQL rows and the exact confirmed native Version receipt here. Keep
+// its unchanged conjunction in bounded groups: D1 rejects one left-deep WHERE
+// expression before any row can be admitted.
 const ADMIT_CRON_SQL = `INSERT INTO tf_v2_worker_invocations
   (invocation_id,custody_token,backend_id,target_key,principal,space,
    worker_uid,deployment_uid,deployment_generation,source_operation_id,
@@ -139,7 +141,7 @@ const ADMIT_CRON_SQL = `INSERT INTO tf_v2_worker_invocations
   JOIN tf_v2_worker_native_effects n ON n.operation_id=vop.id
   JOIN tf_v2_operation_reference_sets deployment_refs ON deployment_refs.operation_id=dop.id
   JOIN tf_v2_operation_reference_sets version_refs ON version_refs.operation_id=vop.id
-  WHERE m.match_id=? AND m.lease_token=? AND m.attempts=?
+  WHERE (m.match_id=? AND m.lease_token=? AND m.attempts=?
     AND m.target_key=? AND m.state='dispatching' AND m.lease_until_ms > ${SQL_LEASE_NOW}
     AND trigger_resource.form_url='${CRON_FORM}'
     AND trigger_resource.principal=m.principal AND trigger_resource.space=m.space
@@ -150,8 +152,8 @@ const ADMIT_CRON_SQL = `INSERT INTO tf_v2_worker_invocations
     AND trigger_op.action IN ('create','update') AND trigger_op.status='succeeded'
     AND trigger_op.effect='complete' AND trigger_op.updated_at=m.trigger_settled_at
     AND json_extract(trigger_op.accepted_spec_json,'$.worker.resourceUid')=m.worker_uid
-    AND json_extract(trigger_op.accepted_spec_json,'$.cron')=m.cron
-    AND worker.uid=? AND worker.form_url='${WORKER_FORM}'
+    AND json_extract(trigger_op.accepted_spec_json,'$.cron')=m.cron)
+    AND (worker.uid=? AND worker.form_url='${WORKER_FORM}'
     AND worker.principal=m.principal AND worker.space=m.space AND worker.target_key=m.target_key
     AND worker.deleted_at IS NULL AND worker.phase='idle' AND worker.busy_operation IS NULL
     AND worker.generation=worker.observed_generation
@@ -159,8 +161,8 @@ const ADMIT_CRON_SQL = `INSERT INTO tf_v2_worker_invocations
     AND worker_op.resource_uid=worker.uid AND worker_op.principal=m.principal
     AND worker_op.target_key=m.target_key AND worker_op.generation=worker.generation
     AND worker_op.action IN ('create','update') AND worker_op.status='succeeded'
-    AND worker_op.effect='complete' AND worker_op.accepted_spec_json=worker.spec_json
-    AND d.uid=? AND d.form_url='${DEPLOYMENT_FORM}'
+    AND worker_op.effect='complete' AND worker_op.accepted_spec_json=worker.spec_json)
+    AND (d.uid=? AND d.form_url='${DEPLOYMENT_FORM}'
     AND d.principal=m.principal AND d.space=m.space AND d.target_key=m.target_key
     AND d.deleted_at IS NULL AND d.phase='idle' AND d.busy_operation IS NULL
     AND d.generation=? AND d.observed_generation=d.generation
@@ -176,8 +178,8 @@ const ADMIT_CRON_SQL = `INSERT INTO tf_v2_worker_invocations
       WHERE ref.operation_id=dop.id AND ref.target_uid=worker.uid
         AND ref.form_url='${WORKER_FORM}' AND ref.readiness='observed')
     AND EXISTS (SELECT 1 FROM tf_v2_resource_references edge
-      WHERE edge.referrer_uid=d.uid AND edge.target_uid=worker.uid)
-    AND v.form_url='${VERSION_FORM}' AND v.principal=m.principal AND v.space=m.space
+      WHERE edge.referrer_uid=d.uid AND edge.target_uid=worker.uid))
+    AND (v.form_url='${VERSION_FORM}' AND v.principal=m.principal AND v.space=m.space
     AND v.target_key=m.target_key AND v.deleted_at IS NULL
     AND v.phase='idle' AND v.busy_operation IS NULL
     AND v.generation=? AND v.observed_generation=v.generation
@@ -203,8 +205,8 @@ const ADMIT_CRON_SQL = `INSERT INTO tf_v2_worker_invocations
     AND n.resource_uid=v.uid AND n.principal=m.principal AND n.space=m.space
     AND n.backend_id=v.backend_id AND n.target_key=m.target_key
     AND n.generation=v.generation AND n.confirmed_receipt IS NOT NULL
-    AND n.native_identity=? AND n.closure_digest=? AND n.confirmed_receipt=?
-    AND json_array_length(json_extract(d.spec_json,'$.versions')) =
+    AND n.native_identity=? AND n.closure_digest=? AND n.confirmed_receipt=?)
+    AND (json_array_length(json_extract(d.spec_json,'$.versions')) =
       json_array_length(json_extract(?,'$.releases'))
     AND json_array_length(json_extract(d.observed_json,'$.selectedVersions')) =
       json_array_length(json_extract(?,'$.releases'))
@@ -214,7 +216,7 @@ const ADMIT_CRON_SQL = `INSERT INTO tf_v2_worker_invocations
         AND json_extract(release.value,'$.scriptName')=n.native_identity
         AND json_extract(release.value,'$.descriptorDigest')=n.closure_digest
         AND json_extract(release.value,'$.providerEtag')=n.confirmed_receipt
-        AND json_extract(release.value,'$.weight')=?)
+        AND json_extract(release.value,'$.weight')=?))
     AND NOT EXISTS (SELECT 1 FROM json_each(?,'$.releases') release
       LEFT JOIN tf_v2_resources rv ON rv.uid=json_extract(release.value,'$.versionUid')
       LEFT JOIN tf_v2_operations rop ON rop.id=rv.last_operation
