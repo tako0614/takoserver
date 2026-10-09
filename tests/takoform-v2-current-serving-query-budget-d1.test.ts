@@ -51,6 +51,8 @@ async function exercise(versionCount: 2 | 8, largeVars = false): Promise<void> {
     let counting = false;
     let statements = 0;
     let checkedFenceRows = 0;
+    let checkedOperationInserts = 0;
+    let largestOperationRowBytes = 0;
     const count = (quantity = 1) => {
       if (counting) statements += quantity;
     };
@@ -87,6 +89,23 @@ async function exercise(versionCount: 2 | 8, largeVars = false): Promise<void> {
       },
       async batch(batch) {
         count(batch.length);
+        if (largeVars) {
+          for (const statement of batch) {
+            if (!statement.sql.startsWith("INSERT INTO tf_v2_operations")) continue;
+            checkedOperationInserts += 1;
+            // Miniflare does not enforce D1's published 2 MB row ceiling.
+            // The accepted spec and replay fingerprint occupy one Operation row.
+            const bytes = (statement.params ?? []).reduce<number>(
+              (total, value) =>
+                total +
+                (typeof value === "string" ? new TextEncoder().encode(value).byteLength : 8),
+              0,
+            );
+            largestOperationRowBytes = Math.max(largestOperationRowBytes, bytes);
+            if (bytes > 2_000_000)
+              throw new SqlError("unavailable", "simulated D1 Operation row exceeds 2 MB");
+          }
+        }
         return base.batch(batch);
       },
     };
@@ -224,7 +243,31 @@ async function exercise(versionCount: 2 | 8, largeVars = false): Promise<void> {
         expect(specBytes).toBeGreaterThan(1_000_000);
         expect(specBytes).toBeLessThanOrEqual(1_048_576);
       }
-      versions.push(await create(WORKER_VERSION_FORM_URL, `version-${v}`, spec));
+      const version = await create(WORKER_VERSION_FORM_URL, `version-${v}`, spec);
+      versions.push(version);
+      if (largeVars && v === 0) {
+        expect(checkedOperationInserts).toBeGreaterThan(0);
+        expect(largestOperationRowBytes).toBeGreaterThan(1_000_000);
+        expect(largestOperationRowBytes).toBeLessThanOrEqual(2_000_000);
+        const replay = await engine.acceptCreate({
+          principal: "org-budget",
+          key: `budget-create-operation-${nextKey}`,
+          input: { form: WORKER_VERSION_FORM_URL, space: "prod", name: `version-${v}`, spec },
+        });
+        expect(replay.id).toBe(version.id);
+        expect(
+          engine.acceptCreate({
+            principal: "org-budget",
+            key: `budget-create-operation-${nextKey}`,
+            input: {
+              form: WORKER_VERSION_FORM_URL,
+              space: "prod",
+              name: `version-${v}`,
+              spec: { ...spec, handlers: ["scheduled"] },
+            },
+          }),
+        ).rejects.toMatchObject({ code: "idempotency_conflict" });
+      }
     }
     source.clear(); // Serving must use held bytes, not the external source.
     const deployment = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {

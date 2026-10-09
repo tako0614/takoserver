@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalJson } from "../src/json.ts";
+import { bytesDigest, canonicalJson } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { readV2ConfiguredPrivateInputs } from "../src/takoform-v2/configured-private-inputs.ts";
@@ -17,6 +17,13 @@ const BASE = "https://host.example/apis/forms.takoform.com/v2";
 const KEY = "private-test-key-00000001";
 const CURSOR = new Uint8Array(32).fill(0x45);
 const ORIGINAL = { password: "horse-battery-秘密", token: "token:never-public" };
+
+async function requestDigest(value: unknown): Promise<string> {
+  const digest = await bytesDigest(
+    new TextEncoder().encode(`takoform-v2-request-fingerprint\0${canonicalJson(value)}`),
+  );
+  return `v2-request-sha256:${digest.slice("sha256:".length)}`;
+}
 
 test("Core rejects present malformed private-input policy and accepts inherited validation methods", async () => {
   const database = new Database(":memory:");
@@ -338,6 +345,14 @@ test("v2 private map survives lost HTTP response and SQLite reopen without publi
     );
     expect(replay.body.id).toBe(originalId);
     expect(replay.body.resourceUid).toBe(uid);
+    expect(
+      (await fetch(runtime.host, request("/resources", "POST", createBody(), KEY, "another")))
+        .status,
+    ).toBe(403);
+    expect(
+      (await fetch(runtime.host, request("/resources", "POST", createBody(), KEY, "reader")))
+        .status,
+    ).toBe(403);
     const conflict = await fetch(
       runtime.host,
       request("/resources", "POST", createBody({ ...ORIGINAL, token: "other" }), KEY),
@@ -708,7 +723,7 @@ test("accepted-key replay precedes changed Host or Form private capability", asy
   }
 });
 
-test("public HTTP replay retains pre-private zero-secret Create and Update fingerprints", async () => {
+test("public HTTP replay stores bounded zero-secret Create and Update fingerprints", async () => {
   const database = new Database(":memory:");
   migrateSqlite(database);
   const runtime = fixture(database, undefined, undefined, undefined, false);
@@ -721,7 +736,12 @@ test("public HTTP replay retains pre-private zero-secret Create and Update finge
         .query("SELECT request_fingerprint FROM tf_v2_operations WHERE id = ?")
         .get(created.body.id as string),
     ).toEqual({
-      request_fingerprint: canonicalJson({ method: "POST", path: "/resources", query: {}, body }),
+      request_fingerprint: await requestDigest({
+        method: "POST",
+        path: "/resources",
+        query: {},
+        body,
+      }),
     });
     expect((await fetch(runtime.host, request("/resources", "POST", body, KEY))).body.id).toBe(
       created.body.id,
@@ -747,7 +767,7 @@ test("public HTTP replay retains pre-private zero-secret Create and Update finge
         .query("SELECT request_fingerprint FROM tf_v2_operations WHERE id = ?")
         .get(updated.body.id as string),
     ).toEqual({
-      request_fingerprint: canonicalJson({
+      request_fingerprint: await requestDigest({
         method: "PUT",
         path: `/resources/${uid}`,
         query: {},
@@ -761,7 +781,7 @@ test("public HTTP replay retains pre-private zero-secret Create and Update finge
   }
 });
 
-test("omitted private field preserves the exact pre-private v2 replay fingerprint bytes", async () => {
+test("omitted private field preserves the pre-private v2 replay envelope in the digest", async () => {
   const database = new Database(":memory:");
   migrateSqlite(database);
   try {
@@ -792,7 +812,7 @@ test("omitted private field preserves the exact pre-private v2 replay fingerprin
       .query("SELECT request_fingerprint FROM tf_v2_operations WHERE id = ?")
       .get(created.id);
     expect(fingerprint).toEqual({
-      request_fingerprint: canonicalJson({
+      request_fingerprint: await requestDigest({
         method: "POST",
         path: "/resources",
         query: {},
@@ -812,7 +832,7 @@ test("omitted private field preserves the exact pre-private v2 replay fingerprin
         .query("SELECT request_fingerprint FROM tf_v2_operations WHERE id = ?")
         .get(updated.id),
     ).toEqual({
-      request_fingerprint: canonicalJson({
+      request_fingerprint: await requestDigest({
         method: "PUT",
         path: `/resources/${created.resourceUid}`,
         query: {},
@@ -820,6 +840,85 @@ test("omitted private field preserves the exact pre-private v2 replay fingerprin
         body: { spec: { value: 2 } },
       }),
     });
+
+    // A prior release stored canonical JSON. Keep exact replay compatibility
+    // without mutating any immutable Operation row or accepting foreign hashes.
+    const cloneOperation = (
+      id: string,
+      key: string,
+      fingerprint: string,
+      sourceId = created.id,
+    ) => {
+      database
+        .query(`INSERT INTO tf_v2_operations
+          (id, resource_uid, principal, replay_key, request_fingerprint, action,
+           generation, status, effect, created_at, updated_at, retain_until,
+           backend_id, target_key, backend_key, accepted_spec_json)
+          SELECT ?, resource_uid, principal, ?, ?, action, generation, status,
+            effect, created_at, updated_at, retain_until, backend_id, target_key,
+            ?, accepted_spec_json FROM tf_v2_operations WHERE id = ?`)
+        .run(id, key, fingerprint, id, sourceId);
+    };
+    const legacyKey = "legacy-raw-create-0001";
+    cloneOperation(
+      "legacy-raw-operation",
+      legacyKey,
+      canonicalJson({ method: "POST", path: "/resources", query: {}, body: input }),
+    );
+    expect(
+      await engine.replayExistingCreate({ principal: "org:one", key: legacyKey, body: input }),
+    ).toMatchObject({ id: "legacy-raw-operation" });
+    expect(
+      await engine.acceptCreate({ principal: "org:one", key: legacyKey, input }),
+    ).toMatchObject({ id: "legacy-raw-operation" });
+    expect(
+      engine.replayExistingCreate({
+        principal: "org:one",
+        key: legacyKey,
+        body: { ...input, spec: { value: 3 } },
+      }),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+    const legacyUpdateKey = "legacy-raw-update-0001";
+    cloneOperation(
+      "legacy-raw-update-operation",
+      legacyUpdateKey,
+      canonicalJson({
+        method: "PUT",
+        path: `/resources/${created.resourceUid}`,
+        query: {},
+        expectedGeneration: 1,
+        body: { spec: { value: 2 } },
+      }),
+      updated.id,
+    );
+    expect(
+      await engine.replayExistingUpdate({
+        principal: "org:one",
+        key: legacyUpdateKey,
+        uid: created.resourceUid,
+        expectedGeneration: 1,
+        body: { spec: { value: 2 } },
+      }),
+    ).toMatchObject({ id: "legacy-raw-update-operation" });
+    expect(
+      engine.replayExistingUpdate({
+        principal: "org:one",
+        key: legacyUpdateKey,
+        uid: created.resourceUid,
+        expectedGeneration: 2,
+        body: { spec: { value: 2 } },
+      }),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+    for (const [id, key, foreign] of [
+      ["malformed-hash-operation", "malformed-hash-key-0001", "v2-request-sha256:invalid"],
+      ["foreign-hash-operation", "foreign-hash-key-00001", `sha256:${"a".repeat(64)}`],
+    ]) {
+      if (!id || !key || !foreign) throw new Error("invalid replay fixture");
+      cloneOperation(id, key, foreign);
+      expect(
+        engine.replayExistingCreate({ principal: "org:one", key, body: input }),
+      ).rejects.toMatchObject({ code: "idempotency_conflict" });
+    }
   } finally {
     database.close();
   }

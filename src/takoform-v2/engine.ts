@@ -1,4 +1,4 @@
-import { canonicalJson } from "../json.ts";
+import { bytesDigest, canonicalJson } from "../json.ts";
 import { type JsonObject, SqlError, type SqlParam } from "../ports.ts";
 import { readV2ConfiguredPrivateInputs } from "./configured-private-inputs.ts";
 import { isV2FormUrl } from "./identity.ts";
@@ -91,6 +91,20 @@ function canonicalRequest(value: unknown): string {
     fail("invalid_request", 400);
   }
   return encoded;
+}
+
+const fingerprintDomain = "takoform-v2-request-fingerprint\0";
+const fingerprintPrefix = "v2-request-sha256:";
+
+interface RequestFingerprint {
+  readonly canonical: string;
+  readonly digest: string;
+}
+
+async function requestFingerprint(value: unknown): Promise<RequestFingerprint> {
+  const canonical = canonicalRequest(value);
+  const hash = await bytesDigest(new TextEncoder().encode(fingerprintDomain + canonical));
+  return { canonical, digest: `${fingerprintPrefix}${hash.slice("sha256:".length)}` };
 }
 
 /** Keep authorization, replay comparison and persistence on one owned request. */
@@ -246,13 +260,19 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
   async function replay(
     principal: string,
     key: string,
-    fingerprint: string,
+    fingerprint: RequestFingerprint,
     inputs?: V2PrivateInputMap,
   ) {
     const existing = await store.replay(principal, key);
     if (!existing) return null;
     await ownedResource(principal, existing.resource_uid, "write");
-    if (existing.request_fingerprint !== fingerprint) fail("idempotency_conflict", 409);
+    // Old rows contain canonical JSON. New rows contain a bounded, domain-separated
+    // digest; never rewrite an accepted Operation or adopt a foreign hash format.
+    if (
+      existing.request_fingerprint !== fingerprint.digest &&
+      existing.request_fingerprint !== fingerprint.canonical
+    )
+      fail("idempotency_conflict", 409);
     if (existing.private_inputs_present === 1) {
       if (inputs === undefined) fail("idempotency_conflict", 409);
       if (!(await comparePrivate(existing, inputs))) fail("idempotency_conflict", 409);
@@ -319,7 +339,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
   async function winnerAfterRace(
     principal: string,
     key: string,
-    fingerprint: string,
+    fingerprint: RequestFingerprint,
     inputs?: V2PrivateInputMap,
   ) {
     return replay(principal, key, fingerprint, inputs);
@@ -384,7 +404,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       return replay(
         input.principal,
         input.key,
-        canonicalRequest({
+        await requestFingerprint({
           method: "POST",
           path: "/resources",
           query: {},
@@ -407,7 +427,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       return replay(
         input.principal,
         input.key,
-        canonicalRequest({
+        await requestFingerprint({
           method: "PUT",
           path: `/resources/${input.uid}`,
           query: {},
@@ -433,7 +453,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         fail("invalid_request", 400);
       }
       await permitted(principal, desired.space, "write");
-      const fingerprint = canonicalRequest({
+      const fingerprint = await requestFingerprint({
         method: "POST",
         path: "/resources",
         query: {},
@@ -467,7 +487,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           key,
           uid: crypto.randomUUID(),
           generation: 1,
-          fingerprint,
+          fingerprint: fingerprint.digest,
           spec: desired.spec,
           formUrl: desired.form,
         }),
@@ -562,7 +582,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       if (!tokenPattern.test(input.key) || !validName(input.uid)) fail("invalid_request", 400);
       const privateInputs = snapshotPrivateInputs(input.privateInputs);
       const target = await ownedResource(input.principal, input.uid, "write");
-      const fingerprint = canonicalRequest({
+      const fingerprint = await requestFingerprint({
         method: "PUT",
         path: `/resources/${input.uid}`,
         query: {},
@@ -597,7 +617,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           key: input.key,
           uid: input.uid,
           generation: target.generation + 1,
-          fingerprint,
+          fingerprint: fingerprint.digest,
           spec: input.spec,
           formUrl: target.form_url,
         }),
@@ -677,7 +697,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       const input = snapshotRequest(request);
       if (!tokenPattern.test(input.key) || !validName(input.uid)) fail("invalid_request", 400);
       const target = await ownedResource(input.principal, input.uid, "write");
-      const fingerprint = canonicalRequest({
+      const fingerprint = await requestFingerprint({
         method: "DELETE",
         path: `/resources/${input.uid}`,
         query: {},
@@ -698,7 +718,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         key: input.key,
         uid: input.uid,
         generation: target.generation + 1,
-        fingerprint,
+        fingerprint: fingerprint.digest,
         spec: JSON.parse(target.spec_json) as JsonObject,
         formUrl: target.form_url,
       });
