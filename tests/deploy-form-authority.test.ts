@@ -18,6 +18,7 @@ import { canonicalSchemaShape } from "../scripts/deploy/migrations.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
+import { acquireWranglerVersionPublicationLease } from "../scripts/deploy/wrangler-state.ts";
 import { canonicalJson } from "../src/json.ts";
 import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
 import {
@@ -31,6 +32,7 @@ import {
   objectBucketSuppliesFixture,
 } from "./helpers/hosted-supply-fixtures.ts";
 import { integrationStorageVerificationOptions as baseIntegrationStorageVerificationOptions } from "./helpers/integration-storage-generation-verification.ts";
+import { expectPublicationLeaseHeld } from "./helpers/publication-lease.ts";
 
 const COMMIT = "a".repeat(40);
 const PREVIOUS_COMMIT = "b".repeat(40);
@@ -1914,29 +1916,60 @@ describe("route-less Form authority deploy surfaces", () => {
   test("migrates the exact historical public pin to one dynamic successor", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-historical-"));
     const currentTarget = evolvedIntegrationTarget();
+    const integrationWorkerName = currentTarget.formAuthority?.integrationWorkerName;
+    if (integrationWorkerName === undefined)
+      throw new Error("fixture has no integration authority Worker");
+    const publicationLeaseRoot = join(root, "publication-leases");
     let uploaded = false;
     try {
+      const callerTarget = structuredClone(currentTarget);
+      const stateTarget = structuredClone(callerTarget);
       const process = fakeProcess({
         onUpload() {
           uploaded = true;
         },
       });
-      const result = await runFormAuthority(
+      const baseState = historicalPinnedPublicState(stateTarget, { isUploaded: () => uploaded });
+      const state: FormAuthorityDeployState = {
+        ...baseState,
+        async workerDeployments(workerName) {
+          expect(workerName).not.toBe(`${integrationWorkerName}-mutated`);
+          if (workerName === integrationWorkerName) {
+            await expectPublicationLeaseHeld({
+              accountId: stateTarget.accountId,
+              workerName: integrationWorkerName,
+              root: publicationLeaseRoot,
+            });
+          }
+          return await baseState.workerDeployments(workerName);
+        },
+      };
+      const resultPromise = runFormAuthority(
         {
           surface: "takoserver-integration-form-authority-worker",
           action: "apply",
           environment: "integration",
           commit: COMMIT,
         },
-        currentTarget,
+        callerTarget,
         {
           run: process.run,
-          state: historicalPinnedPublicState(currentTarget, { isUploaded: () => uploaded }),
+          state,
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           review: "independent-reviewer",
+          publicationLeaseRoot,
         },
       );
+      Reflect.set(callerTarget, "accountId", `${stateTarget.accountId}-mutated`);
+      if (callerTarget.formAuthority === undefined)
+        throw new Error("fixture has no caller-owned authority selection");
+      Reflect.set(
+        callerTarget.formAuthority,
+        "integrationWorkerName",
+        `${integrationWorkerName}-mutated`,
+      );
+      const result = await resultPromise;
 
       expect(result).toMatchObject({
         previousVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
@@ -1944,6 +1977,12 @@ describe("route-less Form authority deploy surfaces", () => {
         publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
       });
       expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+      const released = await acquireWranglerVersionPublicationLease({
+        accountId: stateTarget.accountId,
+        workerName: integrationWorkerName,
+        root: publicationLeaseRoot,
+      });
+      await released.release();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

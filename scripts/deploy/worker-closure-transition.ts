@@ -68,6 +68,7 @@ import {
   assertSurfaceTransitionPredecessor,
   normalizedWorkerClosureDelta,
 } from "./worker-surface-transition.ts";
+import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 
 /**
  * Operator-private directory holding one `0600` file per declared secret name.
@@ -103,6 +104,8 @@ export interface WorkerClosureTransitionOptions {
   readonly wranglerPath?: string;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly review?: string;
+  /** Same-owner publication root shared with the D1 0088 maintenance wave. */
+  readonly publicationLeaseRoot?: string;
   /** Owner-private secret input root override for portable tests. */
   readonly secretDirectory?: string;
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
@@ -224,6 +227,8 @@ export async function runWorkerClosureTransition(
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-worker-closure-transition-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
+  let publicationLease: Awaited<ReturnType<typeof acquireWranglerVersionPublicationLease>> | null =
+    null;
   try {
     const cloudflareState =
       options.state === undefined
@@ -455,6 +460,11 @@ export async function runWorkerClosureTransition(
     }
     const artifact = prepared.seal(secretNames.length === 0 ? [] : ["secrets.json"]);
     artifact.assertUnchanged();
+    publicationLease = await acquireWranglerVersionPublicationLease({
+      accountId: target.accountId,
+      workerName: target.workerName,
+      ...(options.publicationLeaseRoot === undefined ? {} : { root: options.publicationLeaseRoot }),
+    });
     // Building and sealing sit outside the mutation window. Re-prove the exact
     // pinned predecessor immediately before the single upload.
     const requalifiedHistory = await currentHistory("preflight", target, state);
@@ -670,8 +680,12 @@ export async function runWorkerClosureTransition(
       providerExecutorAfter,
     );
   } finally {
-    unsealDirectory(root);
-    if (temporary) rmSync(root, { recursive: true, force: true });
+    try {
+      unsealDirectory(root);
+      if (temporary) rmSync(root, { recursive: true, force: true });
+    } finally {
+      await publicationLease?.release();
+    }
   }
 }
 

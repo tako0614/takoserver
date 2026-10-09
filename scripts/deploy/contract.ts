@@ -1366,6 +1366,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/artifact-blob-io-compatibility.ts",
         "scripts/deploy/schema.ts",
         "scripts/deploy/schema-0058-proof.ts",
+        "scripts/deploy/schema-v2-existing-transition.ts",
         "scripts/deploy/d1-migration-import.ts",
         "scripts/deploy/d1.ts",
         "scripts/deploy/wrangler-state.ts",
@@ -1385,7 +1386,7 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056, 0057 or status-only 0058. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current audited source inventory is exactly 0001-0075; unreviewed 0076+ tails are refused before qualification or provider mutation. The source-only 0067 through 0075 migrations do not expand the 0066 existing-target apply-qualified ceiling; the separate fresh-empty production D1 path remains pinned to the first 69 without granting an in-place wave. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the apply-qualified 0001-0066 lineage. Protected mutation remains capped at 0057; 0058 inspects an exact canonical 0057 predecessor but cannot apply until real owner evidence exists. " +
+          "forward-only apply. The current audited source inventory is exactly 0001-0088; the ordinary existing-target ceiling remains 0066, the fresh-empty production path remains 0069, and the separate fresh v2 artifact generation remains 0075. An explicit integration-only 0066-to-0088 selector requires canonical intermediate shapes, a closed 0068 invocation epoch, no affected v2 data, exact non-serving public Host and private CPE publisher proof, source-compatible historical predecessors and same-owner publication leases; no other selector inherits this authority. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the apply-qualified 0001-0066 lineage. Protected mutation remains capped at 0057; 0058 inspects an exact canonical 0057 predecessor but cannot apply until real owner evidence exists. " +
           "Integration may select one audited wave or a separately qualified existing-data additive " +
           "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +

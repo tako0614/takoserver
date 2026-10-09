@@ -25,6 +25,7 @@ import {
   LEGACY_PUBLIC_PARENT_SECRET,
   type WorkerClosureDelta,
 } from "../scripts/deploy/worker-state.ts";
+import { acquireWranglerVersionPublicationLease } from "../scripts/deploy/wrangler-state.ts";
 import { applyQualifiedSchemaState } from "./helpers/audited-schema-fixture.ts";
 import {
   cloudflareProviderExecutorTarget,
@@ -947,6 +948,101 @@ describe("reviewed Worker closure transition", () => {
       expect(failure).toBeInstanceOf(DeployError);
       expect((failure as DeployError).message).toContain("indeterminate");
       expect(lost.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    });
+  });
+
+  test("the shared Worker publication lease blocks a concurrent maintenance closure before upload", async () => {
+    await withRoot("takoserver-v2-closure-shared-lease-", async (root) => {
+      const selected = {
+        ...v2Target,
+        schemaMaintenanceMode: "pre-v2-0088-quiesced" as const,
+      } satisfies DeployTarget;
+      const shape = deriveExpectedApplicationShape(readMigrationArtifact().files.slice(0, 66));
+      const parts = fixture(root, {
+        selected,
+        local: schemaMigrations,
+        applied: schemaMigrations.slice(0, 66),
+        auditedShape: shape,
+        predecessor: { dropVar: SCHEMA_MODE_VAR, v2Startup: true },
+      });
+      const executor = providerExecutorInspection({ ready: false, schemaReady: false });
+      const exact = {
+        ...executor,
+        maintenance: {
+          mode: "pre-v2-0088-quiesced" as const,
+          accountId: selected.accountId,
+          databaseId: selected.d1.databaseId,
+          databaseName: selected.d1.databaseName,
+          workerName: selected.cloudflareProviderExecutor.workerName,
+          activeVersionId: executor.versionId ?? "",
+          activeDeploymentId: executor.deploymentId ?? "",
+          previousVersionId: executor.previousVersionId ?? "",
+          selectedSourceCommit: executor.commit ?? "",
+          selectedModuleDigestHex: executor.moduleDigestHex ?? "",
+          predecessorSourceCommit: LIVE_COMMIT,
+          predecessorVersionId: executor.previousVersionId ?? "",
+          observedNonCodeDigestHex: "9".repeat(64),
+        },
+      };
+      const leaseRoot = join(root, "leases");
+      const held = await acquireWranglerVersionPublicationLease({
+        accountId: selected.accountId,
+        workerName: selected.workerName,
+        root: leaseRoot,
+      });
+      const invocation = {
+        surface: "takoserver-worker-authority-cutover" as const,
+        action: "apply" as const,
+        environment: "integration" as const,
+        commit: COMMIT,
+        closurePredecessorVersionId: PREDECESSOR,
+        delta: {
+          retiredVars: [],
+          addedVars: [SCHEMA_MODE_VAR],
+          refreshedVars: [],
+          addedBindings: [],
+          addedSecrets: [],
+          rotatedSecrets: [],
+        },
+      };
+      const common = {
+        run: parts.run,
+        state: parts.state,
+        migrations: parts.migrations,
+        providerExecutorQualification: qualification(exact),
+        review: "reviewer@example.test",
+        secretDirectory: parts.secretDirectory,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        publicationLeaseRoot: leaseRoot,
+        fetcher: async () =>
+          Response.json(
+            {
+              error: {
+                code: "backend_unavailable",
+                message: "Host is quiesced for the v2 0088 schema maintenance transition",
+                details: { reason: "runtime-configuration" },
+              },
+            },
+            { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
+          ),
+      };
+      try {
+        await expect(
+          runWorkerClosureTransition(invocation, selected, {
+            ...common,
+            outputDirectory: join(root, "blocked"),
+          }),
+        ).rejects.toThrow("active kernel lease");
+        expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+      } finally {
+        await held.release();
+      }
+      const applied = await runWorkerClosureTransition(invocation, selected, {
+        ...common,
+        outputDirectory: join(root, "released"),
+      });
+      expect(applied).toMatchObject({ mutationApplied: true, maintenance: "pre-v2-0088-quiesced" });
+      expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
     });
   });
 

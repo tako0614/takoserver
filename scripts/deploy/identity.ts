@@ -50,6 +50,7 @@ import {
   type WorkerDeploymentChainEntry,
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
+import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 
 export type { PrivateKeyInput } from "./operator-authority.ts";
 export { provePrivateMatchesPublic, readPrivateJwk } from "./operator-authority.ts";
@@ -88,6 +89,8 @@ export interface OperatorIdentityOptions {
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
   readonly now?: () => Date;
+  /** Portable test seam; production uses the shared default publication-lease root. */
+  readonly publicationLeaseRoot?: string;
 }
 
 type PublicEd25519Jwk = NonNullable<DeployTarget["operatorIdentity"]>["publicJwk"];
@@ -108,6 +111,47 @@ export async function runOperatorIdentity(
   invocation: OperatorIdentityInvocation,
   target: DeployTarget,
   options: OperatorIdentityOptions = {},
+): Promise<Record<string, unknown>> {
+  // Keep the lease key and every later effect bound to the same caller-owned
+  // values. The public API accepts plain realized data, so snapshot it before
+  // the first await (lease acquisition may yield to arbitrary caller code).
+  const ownedInvocation = structuredClone(invocation);
+  const ownedTarget = structuredClone(target);
+  const ownedOptions: OperatorIdentityOptions = {
+    ...options,
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: { ...options.cloudflareEnvironment } }),
+  };
+  assertInvocation(ownedInvocation, ownedTarget);
+  const organizationId = ownedInvocation.organizationId;
+  if (organizationId === undefined || !ORGANIZATION_ID.test(organizationId)) {
+    throw preflightError("operator identity requires one exact --organization id");
+  }
+  if (!ownedTarget.operatorIdentity?.publicJwk) {
+    throw preflightError("operator identity surface requires target `operatorIdentity.publicJwk`");
+  }
+  const publicationLease =
+    ownedInvocation.action === "apply"
+      ? await acquireWranglerVersionPublicationLease({
+          accountId: ownedTarget.accountId,
+          workerName: ownedTarget.workerName,
+          ...(ownedOptions.publicationLeaseRoot === undefined
+            ? {}
+            : { root: ownedOptions.publicationLeaseRoot }),
+        })
+      : null;
+  try {
+    return await runOperatorIdentityWithLease(ownedInvocation, ownedTarget, ownedOptions);
+  } finally {
+    await publicationLease?.release();
+  }
+}
+
+async function runOperatorIdentityWithLease(
+  invocation: OperatorIdentityInvocation,
+  target: DeployTarget,
+  options: OperatorIdentityOptions,
 ): Promise<Record<string, unknown>> {
   assertInvocation(invocation, target);
   const organizationId = invocation.organizationId;

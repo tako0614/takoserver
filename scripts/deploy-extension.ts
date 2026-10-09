@@ -77,9 +77,11 @@ export {
   sealDirectory,
   unsealDirectory,
 } from "./deploy/qualification.ts";
+export type { SchemaInvocation, SchemaOptions } from "./deploy/schema.ts";
 export {
   readAuditedMigrationArtifact,
   readCurrentAuditedMigrationSourceArtifact,
+  runD1Schema,
 } from "./deploy/schema.ts";
 export type {
   DeployTarget,

@@ -12,7 +12,9 @@ import type { DeployEnvironment } from "../scripts/deploy/qualification.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { WorkerState } from "../scripts/deploy/worker-live.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
+import { acquireWranglerVersionPublicationLease } from "../scripts/deploy/wrangler-state.ts";
 import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
+import { expectPublicationLeaseHeld } from "./helpers/publication-lease.ts";
 
 const COMMIT = "a".repeat(40);
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
@@ -168,24 +170,40 @@ describe("operator identity authority", () => {
     const selected = await authorityFixture("integration");
     try {
       const process = processFixture("integration");
-      const state = transitionState(selected.target, null, process);
-      const requests: Request[] = [];
-      const result = await runOperatorIdentity(
-        invocation("integration", "apply"),
-        selected.target,
-        {
-          state,
-          migrations: migrations(),
-          run: process.run,
-          privateJwkPath: selected.privateJwkPath,
-          operatorIdentityPath: selected.identityPath,
-          review: "independent-reviewer",
-          outputDirectory: join(selected.root, "work"),
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
-          fetcher: ownerSessionFetcher(selected.publicKey, requests),
-          now: () => new Date("2026-09-03T12:00:00.000Z"),
+      const publicationLeaseRoot = join(selected.root, "publication-leases");
+      const callerTarget = structuredClone(selected.target);
+      const stateTarget = structuredClone(callerTarget);
+      const expectedWorkerName = callerTarget.workerName;
+      const baseState = transitionState(stateTarget, null, process);
+      const state: TransitionState = {
+        ...baseState,
+        async workerVersion(workerName, versionId) {
+          expect(workerName).toBe(expectedWorkerName);
+          await expectPublicationLeaseHeld({
+            accountId: stateTarget.accountId,
+            workerName: expectedWorkerName,
+            root: publicationLeaseRoot,
+          });
+          return await baseState.workerVersion(workerName, versionId);
         },
-      );
+      };
+      const requests: Request[] = [];
+      const resultPromise = runOperatorIdentity(invocation("integration", "apply"), callerTarget, {
+        state,
+        migrations: migrations(),
+        run: process.run,
+        privateJwkPath: selected.privateJwkPath,
+        operatorIdentityPath: selected.identityPath,
+        review: "independent-reviewer",
+        outputDirectory: join(selected.root, "work"),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "cloudflare-secret" },
+        fetcher: ownerSessionFetcher(selected.publicKey, requests),
+        now: () => new Date("2026-09-03T12:00:00.000Z"),
+        publicationLeaseRoot,
+      });
+      Reflect.set(callerTarget, "accountId", `${stateTarget.accountId}-mutated`);
+      Reflect.set(callerTarget, "workerName", `${expectedWorkerName}-mutated`);
+      const result = await resultPromise;
       expect(result).toMatchObject({
         kind: "takoserver.operator-identity-apply@v1",
         environment: "integration",
@@ -218,6 +236,12 @@ describe("operator identity authority", () => {
       expect(JSON.stringify(result.rollback)).not.toContain("wrangler");
       expect(process.uploads).toBe(1);
       expect(process.rollbacks).toBe(0);
+      const released = await acquireWranglerVersionPublicationLease({
+        accountId: selected.target.accountId,
+        workerName: selected.target.workerName,
+        root: publicationLeaseRoot,
+      });
+      await released.release();
       expect(
         requests.map((request) => `${request.method} ${new URL(request.url).pathname}`),
       ).toEqual([

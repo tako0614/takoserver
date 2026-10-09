@@ -16,7 +16,9 @@ import {
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { type WorkerState, workerVersionAnnotationProfile } from "../scripts/deploy/worker-live.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
+import { acquireWranglerVersionPublicationLease } from "../scripts/deploy/wrangler-state.ts";
 import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
+import { expectPublicationLeaseHeld } from "./helpers/publication-lease.ts";
 
 const COMMIT = "a".repeat(40);
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
@@ -50,11 +52,13 @@ class FakeDatabase implements SigningDatabase {
   readonly rows = new Map<string, SigningPublicKeyRow>();
   readonly inserts: { keyId: string; publicJwk: string }[] = [];
   readonly reads: { keyId: string; phase: "preflight" | "mutation" | "verification" }[] = [];
+  onRead?: () => Promise<void>;
 
   async readKey(
     keyId: string,
     phase: "preflight" | "mutation" | "verification",
   ): Promise<SigningPublicKeyRow | null> {
+    await this.onRead?.();
     this.reads.push({ keyId, phase });
     return this.rows.get(keyId) ?? null;
   }
@@ -322,6 +326,13 @@ describe("split signing authority surfaces", () => {
       const publicPath = join(root, "public.jwk");
       writeFileSync(publicPath, `${key.publicJwk}\n`, { mode: 0o600 });
       const db = new FakeDatabase();
+      const publicationLeaseRoot = join(root, "publication-leases");
+      db.onRead = () =>
+        expectPublicationLeaseHeld({
+          accountId: baseTarget.accountId,
+          workerName: baseTarget.workerName,
+          root: publicationLeaseRoot,
+        });
       const process = processFixture();
       const result = await runSigning(
         {
@@ -338,6 +349,7 @@ describe("split signing authority surfaces", () => {
           review: "reviewer@example.test",
           outputDirectory: join(root, "work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          publicationLeaseRoot,
         },
       );
       expect(result).toMatchObject({
@@ -347,6 +359,12 @@ describe("split signing authority surfaces", () => {
       });
       expect(db.inserts).toEqual([{ keyId: "key-current", publicJwk: key.publicJwk }]);
       expect(process.calls.some(({ command }) => command.includes("secret"))).toBe(false);
+      const released = await acquireWranglerVersionPublicationLease({
+        accountId: baseTarget.accountId,
+        workerName: baseTarget.workerName,
+        root: publicationLeaseRoot,
+      });
+      await released.release();
 
       const second = await runSigning(
         {
@@ -363,6 +381,7 @@ describe("split signing authority surfaces", () => {
           review: "reviewer@example.test",
           outputDirectory: join(root, "second-work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          publicationLeaseRoot,
         },
       ).catch((error) => error);
       expect(second).toBeInstanceOf(DeployError);
@@ -488,32 +507,53 @@ describe("split signing authority surfaces", () => {
       const db = new FakeDatabase();
       db.rows.set("key-current", row("key-current", key.publicJwk));
       const process = processFixture();
-      const result = await runSigning(
+      const callerTarget = structuredClone(baseTarget);
+      const stateTarget = structuredClone(callerTarget);
+      const expectedWorkerName = callerTarget.workerName;
+      const publicationLeaseRoot = join(root, "publication-leases");
+      const baseState = workerState({
+        target: stateTarget,
+        beforeSigning: "key-current",
+        afterAnnotations: { "workers/triggered_by": "secret" },
+        afterWhen: () =>
+          process.calls.some(
+            ({ command }) => command.includes("secret") && command.includes("put"),
+          ),
+      });
+      const state: WorkerState = {
+        ...baseState,
+        async workerDeployments(workerName) {
+          expect(workerName).toBe(expectedWorkerName);
+          await expectPublicationLeaseHeld({
+            accountId: stateTarget.accountId,
+            workerName: expectedWorkerName,
+            root: publicationLeaseRoot,
+          });
+          return await baseState.workerDeployments(workerName);
+        },
+      };
+      const resultPromise = runSigning(
         {
           surface: "takoserver-signing-repair",
           action: "apply",
           environment: "integration",
           commit: COMMIT,
         },
-        baseTarget,
+        callerTarget,
         {
           database: db,
-          state: workerState({
-            target: baseTarget,
-            beforeSigning: "key-current",
-            afterAnnotations: { "workers/triggered_by": "secret" },
-            afterWhen: () =>
-              process.calls.some(
-                ({ command }) => command.includes("secret") && command.includes("put"),
-              ),
-          }),
+          state,
           run: process.run,
           privateJwkPath: privatePath,
           review: "reviewer@example.test",
           outputDirectory: join(root, "work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          publicationLeaseRoot,
         },
       );
+      Reflect.set(callerTarget, "accountId", `${stateTarget.accountId}-mutated`);
+      Reflect.set(callerTarget, "workerName", `${expectedWorkerName}-mutated`);
+      const result = await resultPromise;
       expect(result).toMatchObject({
         kind: "takoserver.signing-repair-apply@v2",
         keyId: "key-current",
@@ -526,6 +566,12 @@ describe("split signing authority surfaces", () => {
       expect(mutations[0]?.input).toBe(privateRaw);
       expect(mutations[0]?.command.join(" ")).not.toContain(privateRaw.trim());
       expect(process.calls.some(({ command }) => command.includes("--secrets-file"))).toBe(false);
+      const released = await acquireWranglerVersionPublicationLease({
+        accountId: stateTarget.accountId,
+        workerName: expectedWorkerName,
+        root: publicationLeaseRoot,
+      });
+      await released.release();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

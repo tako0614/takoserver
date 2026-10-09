@@ -10,6 +10,7 @@ import {
   type RetirementOptions,
   type RetirementProcess,
   type RetirementState,
+  runAuthorityTransition,
   runRetirement as runRetirementOwned,
 } from "../scripts/deploy/retirement.ts";
 import type { SponsorshipCutoverProofGate } from "../scripts/deploy/sponsorship-cutover-proof.ts";
@@ -19,7 +20,9 @@ import {
   expectedTransitionBindingClosure,
   extractLegacyHostServiceBinding,
 } from "../scripts/deploy/worker-state.ts";
+import { acquireWranglerVersionPublicationLease } from "../scripts/deploy/wrangler-state.ts";
 import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
+import { expectPublicationLeaseHeld } from "./helpers/publication-lease.ts";
 
 const COMMIT = "a".repeat(40);
 const REPAIR_COMMIT = "d".repeat(40);
@@ -183,9 +186,25 @@ describe("reviewed Hosted legacy-edge retirement", () => {
 
   test("authority transition preserves legacy edge and secret in one candidate upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-authority-"));
+    const publicationLeaseRoot = join(root, "publication-leases");
     try {
-      const fixture = stateFixture("legacy");
-      const result = await runRetirement(
+      const callerTarget = structuredClone(target);
+      const expectedWorkerName = callerTarget.workerName;
+      const stateTarget = structuredClone(callerTarget);
+      const fixture = stateFixture("legacy", undefined, COMMIT, stateTarget);
+      const state: RetirementState = {
+        ...fixture.state,
+        async workerDeployments(workerName) {
+          expect(workerName).toBe(expectedWorkerName);
+          await expectPublicationLeaseHeld({
+            accountId: stateTarget.accountId,
+            workerName: expectedWorkerName,
+            root: publicationLeaseRoot,
+          });
+          return await fixture.state.workerDeployments(workerName);
+        },
+      };
+      const resultPromise = runAuthorityTransition(
         {
           surface: "takoserver-sponsorship-public-route-retirement",
           action: "apply",
@@ -193,15 +212,20 @@ describe("reviewed Hosted legacy-edge retirement", () => {
           commit: COMMIT,
           legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
         },
-        target,
+        callerTarget,
+        state,
+        fixture.run,
         {
-          run: fixture.run,
-          state: fixture.state,
           outputDirectory: root,
+          proofGate: testProofGate,
           review: "reviewer@example.test",
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          publicationLeaseRoot,
         },
       );
+      Reflect.set(callerTarget, "accountId", `${stateTarget.accountId}-mutated`);
+      Reflect.set(callerTarget, "workerName", `${expectedWorkerName}-mutated`);
+      const result = await resultPromise;
       expect(result).toMatchObject({
         state: "candidate",
         previousVersionId: VERSION_LEGACY,
@@ -213,6 +237,12 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       expect(mutations).toHaveLength(1);
       expect(mutations[0]?.command).toContain("--no-bundle");
       expect(mutations[0]?.command.join(" ")).not.toContain("secret delete");
+      const released = await acquireWranglerVersionPublicationLease({
+        accountId: stateTarget.accountId,
+        workerName: expectedWorkerName,
+        root: publicationLeaseRoot,
+      });
+      await released.release();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
