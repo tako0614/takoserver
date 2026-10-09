@@ -82,6 +82,7 @@ import {
   V2_QUEUE_CONSUMER_BACKEND_ID,
 } from "../src/takoform-v2/worker-queue-consumer-backend.ts";
 import { createV2WorkerVersionConfiguredInputSealer } from "../src/takoform-v2/worker-version-configured-inputs.ts";
+import { createV2WorkflowSelectedMaterials } from "../src/takoform-v2/workflow-selected-materials.ts";
 
 const RUNTIME_EXPORTS = [
   "EDGE_KV_NAMESPACE_BACKEND_ID",
@@ -124,6 +125,7 @@ const RUNTIME_EXPORTS = [
   "createV2WorkerInvocationLifecycle",
   "createV2WorkerPublicationState",
   "createV2WorkerVersionConfiguredInputSealer",
+  "createV2WorkflowSelectedMaterials",
   "exactV2ResolvedServiceBindings",
   "inspectV2WorkerCodeVersionEligibility",
   "inspectV2WorkerInvocationDrainSchema",
@@ -160,6 +162,7 @@ const RUNTIME_EXPORTS = [
 test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", async () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
+  expect(extension.createV2WorkflowSelectedMaterials).toBe(createV2WorkflowSelectedMaterials);
   expect(extension.createWorkerBundleCustody).toBe(createWorkerBundleCustody);
   expect(extension.createWorkerBundleHost).toBe(createWorkerBundleHost);
   expect(extension.createV2HeldArtifactSource).toBe(createV2HeldArtifactSource);
