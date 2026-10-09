@@ -50,6 +50,7 @@ async function exercise(versionCount: 2 | 8, largeVars = false): Promise<void> {
     const base = createD1Sql(database);
     let counting = false;
     let statements = 0;
+    let checkedFenceRows = 0;
     const count = (quantity = 1) => {
       if (counting) statements += quantity;
     };
@@ -61,7 +62,8 @@ async function exercise(versionCount: 2 | 8, largeVars = false): Promise<void> {
         // ceiling only to the new fence to catch JSON double-escaping here.
         // This is not live D1 admission proof: the existing replay query also
         // returns the large request fingerprint beside accepted_spec_json.
-        if (largeVars && statement.includes("SELECT kind, body FROM (")) {
+        if (largeVars && statement.includes("FROM (\nWITH selected(uid)")) {
+          checkedFenceRows += rows.length;
           for (const row of rows) {
             const bytes = Object.entries(row).reduce(
               (total, [key, value]) =>
@@ -249,6 +251,7 @@ async function exercise(versionCount: 2 | 8, largeVars = false): Promise<void> {
       },
     });
     if (ready.kind !== "ready") throw new Error(`${ready.code}: ${ready.message}`);
+    if (largeVars) expect(checkedFenceRows).toBeGreaterThan(0);
     const firstVersion = versions[0];
     const secondVersion = versions[1];
     const secondBundle = bundles[1];

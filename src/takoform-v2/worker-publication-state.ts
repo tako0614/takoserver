@@ -424,7 +424,6 @@ const operationColumns = [
   "resource_uid",
   "principal",
   "replay_key",
-  "request_fingerprint",
   "action",
   "generation",
   "status",
@@ -455,7 +454,7 @@ const currentServingFenceGraphSql = `
 WITH selected(uid) AS (SELECT value FROM json_each(?)),
      set_ids(id) AS (SELECT value FROM json_each(?)),
      resource_fields(field) AS (VALUES ('meta'), ('spec_json'), ('observed_json'), ('output_json')),
-     operation_fields(field) AS (VALUES ('meta'), ('accepted_spec_json'),
+     operation_fields(field) AS (VALUES ('meta'), ('request_fingerprint'), ('accepted_spec_json'),
                                ('result_observed_json'), ('result_output_json'), ('error_message')),
      relevant_resources AS (
        SELECT r.* FROM tf_v2_resources r
@@ -477,6 +476,7 @@ UNION ALL
 SELECT 'operation:' || f.field, op.id,
   CASE f.field
     WHEN 'meta' THEN ${rowJson("op", operationColumns)}
+    WHEN 'request_fingerprint' THEN op.request_fingerprint
     WHEN 'accepted_spec_json' THEN op.accepted_spec_json
     WHEN 'result_observed_json' THEN op.result_observed_json
     WHEN 'result_output_json' THEN op.result_output_json
@@ -674,6 +674,7 @@ export function createV2WorkerPublicationState(options: {
       ]) ||
       !hasCompleteRows(graph, "resource", ["spec_json", "observed_json", "output_json"]) ||
       !hasCompleteRows(graph, "operation", [
+        "request_fingerprint",
         "accepted_spec_json",
         "result_observed_json",
         "result_output_json",
