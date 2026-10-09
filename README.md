@@ -664,7 +664,8 @@ separation alone is not proof of a deployed managed installation.
 Workflow Host embedders have three separate source-library entries:
 `@takoserver/core/workflow-runtime` exposes the platform-neutral coordinator and
 ports; `@takoserver/core/workflow-runtime/transport` exposes an in-memory,
-one-use frame journal to trusted adapters;
+one-use frame journal, HTTP turn controller, and existing bundled trusted
+bootstrap source/digest to Host adapters;
 `@takoserver/core/workflow-runtime/workerd` exposes trusted Bun/Linux guarded
 execution, resolved-Version graph compilation and selected-Version preparation.
 None is a provider extension or an app-facing Binding.

@@ -587,8 +587,14 @@ Takoform API, Form, Interface or Binding version:
   genuine exhausted-step correlation. Raw instance construction, Promise
   machinery, JSON codec and transport/controller internals are not exported.
 - `@takoserver/core/workflow-runtime/transport` exposes only the existing
-  in-memory, one-use marker/payload journal and private HTTP turn controller
-  to trusted Host adapters. The controller reserves `exchange()` before the
+  in-memory, one-use marker/payload journal, private HTTP turn controller, and
+  bundled `WORKFLOW_HTTP_BOOTSTRAP_SOURCE`/`WORKFLOW_HTTP_BOOTSTRAP_DIGEST`
+  to trusted Host adapters. The bootstrap bytes are shared with the existing
+  self-host implementation; adapters do not copy the class/step executor.
+  Its wrapper/application imports remain deferred until RUN. The adapter must
+  qualify the private companion, frame provenance and physical stop barrier;
+  importing these bytes does not qualify another Host or change the existing
+  guard-backed self-host transport. The controller reserves `exchange()` before the
   journal synchronously dispatches the corresponding `acceptFrame()`; neither
   is a durable step receipt or authority grant. `seal()` is valid only after
   the adapter has independently closed and drained physical ingress; sealing

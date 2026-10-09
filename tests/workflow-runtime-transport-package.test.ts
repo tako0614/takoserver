@@ -4,6 +4,10 @@ import * as root from "@takoserver/core";
 import * as runtime from "@takoserver/core/workflow-runtime";
 import type { WorkflowHttpController } from "@takoserver/core/workflow-runtime/transport";
 import * as transport from "@takoserver/core/workflow-runtime/transport";
+import {
+  WORKFLOW_HTTP_BOOTSTRAP_DIGEST,
+  WORKFLOW_HTTP_BOOTSTRAP_SOURCE,
+} from "../src/generated/workflow-http-bootstrap.ts";
 import { createWorkflowHttpController } from "../src/workflow-http-controller.ts";
 import {
   createWorkflowTransportJournal,
@@ -13,11 +17,13 @@ import {
   WorkflowTransportJournalError,
 } from "../src/workflow-transport-journal.ts";
 
-test("trusted transport subpath exports only the existing journal and HTTP controller", () => {
+test("trusted transport subpath exports only existing transport and bootstrap primitives", () => {
   expect(Object.keys(transport).sort()).toEqual(
     [
       "createWorkflowHttpController",
       "createWorkflowTransportJournal",
+      "WORKFLOW_HTTP_BOOTSTRAP_DIGEST",
+      "WORKFLOW_HTTP_BOOTSTRAP_SOURCE",
       "WORKFLOW_TRANSPORT_MAX_PAYLOAD_BYTES",
       "WORKFLOW_TRANSPORT_MAX_PENDING_ENTRIES",
       "WORKFLOW_TRANSPORT_SEQUENCE_WINDOW",
@@ -25,6 +31,8 @@ test("trusted transport subpath exports only the existing journal and HTTP contr
     ].sort(),
   );
   expect(transport.createWorkflowTransportJournal).toBe(createWorkflowTransportJournal);
+  expect(transport.WORKFLOW_HTTP_BOOTSTRAP_SOURCE).toBe(WORKFLOW_HTTP_BOOTSTRAP_SOURCE);
+  expect(transport.WORKFLOW_HTTP_BOOTSTRAP_DIGEST).toBe(WORKFLOW_HTTP_BOOTSTRAP_DIGEST);
   expect(transport.createWorkflowHttpController).toBe(createWorkflowHttpController);
   const controller: WorkflowHttpController = transport.createWorkflowHttpController();
   expect(typeof controller.exchange).toBe("function");
@@ -38,6 +46,8 @@ test("trusted transport subpath exports only the existing journal and HTTP contr
   expect(transport.WORKFLOW_TRANSPORT_SEQUENCE_WINDOW).toBe(WORKFLOW_TRANSPORT_SEQUENCE_WINDOW);
   expect("createWorkflowTransportJournal" in root).toBe(false);
   expect("createWorkflowTransportJournal" in runtime).toBe(false);
+  expect("WORKFLOW_HTTP_BOOTSTRAP_SOURCE" in root).toBe(false);
+  expect("WORKFLOW_HTTP_BOOTSTRAP_SOURCE" in runtime).toBe(false);
 });
 
 test("the package transport preserves ordered dispatch and one-use seal", () => {
