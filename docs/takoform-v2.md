@@ -897,6 +897,11 @@ port: a provider adapter supplies exact registration, empty/absent readback,
 and (when active) accepted-operation runtime observation and warmup. The
 factory continues to own its SQL claim and reference checks; this export is
 not a native receipt or a new Form definition.
+Registration receives the captured accepted Operation ID and lease token as
+well as the Namespace scope. A physical adapter must verify that exact live
+accepted graph before binding a new durable Namespace registration; scope
+alone is not a registration grant. Existing one-argument self-host adapters
+remain structurally compatible and keep their existing behavior.
 `stillCurrent` checks only settled graphs. A create/reconcile caller holding a
 Namespace Operation must repeat `readAcceptedOperationGraph` with the same
 Operation ID and lease token after awaits, then compare its authority key.

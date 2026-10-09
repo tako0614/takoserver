@@ -85,7 +85,10 @@ export interface V2ActorNamespaceWarmCandidate {
 
 /** Physical ownership/readback port; the backend retains SQL and claim authority. */
 export interface V2ActorNamespacePhysicalPort {
-  registerNamespace(scope: V2ActorNamespaceScope): Promise<void>;
+  registerNamespace(
+    scope: V2ActorNamespaceScope,
+    operation: { readonly operationId: string; readonly leaseToken: string },
+  ): Promise<void>;
   namespaceEmpty(scope: V2ActorNamespaceScope): Promise<boolean>;
   forgetNamespace(scope: V2ActorNamespaceScope): Promise<void>;
   namespaceAbsent(scope: V2ActorNamespaceScope): Promise<boolean>;
@@ -696,7 +699,10 @@ export function createV2ActorNamespaceForm(options: {
     };
     const signal = AbortSignal.timeout(30_000);
     if (!(await stillAuthorized(signal))) return UNKNOWN;
-    await options.physical.registerNamespace(scope);
+    await options.physical.registerNamespace(scope, {
+      operationId: execution.operationId,
+      leaseToken: execution.leaseToken,
+    });
     if (!(await stillAuthorized(signal))) return UNKNOWN;
     let first = await observe(scope, expected, signal);
     if (first.kind !== "confirmed") {
@@ -778,7 +784,10 @@ export function createV2ActorNamespaceForm(options: {
       ) {
         return await activeObserved(execution, spec, scope);
       }
-      await options.physical.registerNamespace(scope);
+      await options.physical.registerNamespace(scope, {
+        operationId: execution.operationId,
+        leaseToken: execution.leaseToken,
+      });
       if (!(await options.physical.namespaceEmpty(scope))) return UNKNOWN;
       if (
         !(await ownsClaim(execution)) ||
