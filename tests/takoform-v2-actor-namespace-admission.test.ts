@@ -16,7 +16,10 @@ import {
   V2_ACTOR_NAMESPACE_BACKEND_ID,
 } from "../src/takoform-v2/actor-namespace-backend.ts";
 import { createV2ActorNamespaceGraphAuthority } from "../src/takoform-v2/actor-namespace-graph-authority.ts";
-import type { V2ActorAcceptedDeleteClaim } from "../src/takoform-v2/actor-namespace-sql-graph.ts";
+import {
+  createV2ActorNamespaceSqlGraphReader,
+  type V2ActorAcceptedDeleteClaim,
+} from "../src/takoform-v2/actor-namespace-sql-graph.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import {
   ACTOR_NAMESPACE_FORM_URL,
@@ -289,6 +292,111 @@ function fixture(physicalRoot?: string) {
     },
   };
 }
+
+test("Actor Binding accepts a Host-owned Version identity strategy without selfhost graph coupling", async () => {
+  const root = mkdtempSync(join(tmpdir(), "actor-binding-sdk-"));
+  const f = fixture(root);
+  try {
+    const worker = await f.worker();
+    const namespace = await f.create(ACTOR_NAMESPACE_FORM_URL, "binding-namespace", {
+      worker: { resourceUid: worker.resourceUid },
+      className: "CounterActor",
+    });
+    const code = await f.version(worker.resourceUid, "binding-code");
+    const [codeRow] = await f.sql.query("SELECT spec_json FROM tf_v2_resources WHERE uid = ?", [
+      code.resourceUid,
+    ]);
+    if (typeof codeRow?.spec_json !== "string" || !f.physical)
+      throw new Error("binding fixture source/physical registration unavailable");
+    const codeSpec = parseWorkerVersionSpec(JSON.parse(codeRow.spec_json));
+    if (!codeSpec.bundle) throw new Error("binding fixture bundle unavailable");
+    const version = await f.create(WORKER_VERSION_FORM_URL, "binding-version", {
+      worker: { resourceUid: worker.resourceUid },
+      bundle: { resourceUid: codeSpec.bundle.resourceUid },
+      handlers: ["fetch"],
+      actorBindings: [{ name: "ACTOR", resource: { resourceUid: namespace.resourceUid } }],
+    });
+    const sqlGraph = createV2ActorNamespaceSqlGraphReader({ sql: f.sql, targetKey: TARGET });
+    const identity = `provider-version:${version.resourceUid}:${version.id}`;
+    const authority = createV2ActorBindingAuthority({
+      sql: f.sql,
+      targetKey: TARGET,
+      namespaceGraph: sqlGraph,
+      physical: f.physical,
+      versionIdentity: async (source) => {
+        expect(Object.isFrozen(source)).toBe(true);
+        expect(source).toEqual({
+          principal: PRINCIPAL,
+          space: SPACE,
+          targetKey: TARGET,
+          workerUid: worker.resourceUid,
+          workerVersionUid: version.resourceUid,
+          workerVersionOperationId: version.id,
+          workerVersionGeneration: 1,
+          actorBindings: [{ name: "ACTOR", resourceUid: namespace.resourceUid }],
+        });
+        expect(Object.isFrozen(source.actorBindings)).toBe(true);
+        expect(Object.isFrozen(source.actorBindings[0])).toBe(true);
+        return identity;
+      },
+    });
+    const claim = {
+      principal: PRINCIPAL,
+      space: SPACE,
+      targetKey: TARGET,
+      workerUid: worker.resourceUid,
+      workerVersionUid: version.resourceUid,
+      workerVersionOperationId: version.id,
+      nativeVersionId: identity,
+      bindings: [{ name: "ACTOR", resourceUid: namespace.resourceUid }],
+    };
+    expect(await authority.resolveCurrentBinding(claim, "ACTOR")).toMatchObject({
+      tenantId: PRINCIPAL,
+      namespaceResourceUid: namespace.resourceUid,
+      className: "CounterActor",
+    });
+    expect(
+      await authority.resolveCurrentBinding(
+        { ...claim, nativeVersionId: "foreign-version" },
+        "ACTOR",
+      ),
+    ).toBeNull();
+    const selfhost = createV2ActorBindingAuthority({
+      sql: f.sql,
+      targetKey: TARGET,
+      namespaceGraph: sqlGraph,
+      physical: f.physical,
+    });
+    const selfhostIdentity = `v2-${createHash("sha256")
+      .update(`${version.resourceUid}\u00001`)
+      .digest("hex")}`;
+    expect(await selfhost.resolveCurrentBinding(claim, "ACTOR")).toBeNull();
+    expect(
+      await selfhost.resolveCurrentBinding(
+        { ...claim, nativeVersionId: selfhostIdentity },
+        "ACTOR",
+      ),
+    ).toMatchObject({ namespaceResourceUid: namespace.resourceUid });
+    expect(
+      await authority.resolveCurrentBinding({ ...claim, principal: "foreign-org" }, "ACTOR"),
+    ).toBeNull();
+    expect(
+      await authority.resolveCurrentBinding(
+        { ...claim, workerVersionOperationId: code.id },
+        "ACTOR",
+      ),
+    ).toBeNull();
+    expect(
+      await authority.resolveCurrentBinding(
+        { ...claim, bindings: [{ name: "ACTOR", resourceUid: "foreign-namespace" }] },
+        "ACTOR",
+      ),
+    ).toBeNull();
+  } finally {
+    f.db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("Actor Namespace admission allows pre-Deployment create, but not a duplicate Worker/class", async () => {
   const f = fixture();

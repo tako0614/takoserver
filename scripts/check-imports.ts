@@ -71,6 +71,7 @@ const LAYERS: readonly Layer[] = [
       "v2-queue-manager",
       "v2-actor-sql-graph",
       "v2-actor-physical-backend",
+      "v2-actor-binding-authority",
       "v2-workflow-selected-materials",
     ],
   },
@@ -261,7 +262,8 @@ const LAYERS: readonly Layer[] = [
     // Exact v2 accepted-reference adapter for the existing physical Actor port.
     name: "v2-actor-binding-authority",
     match: /^src\/takoform-v2\/actor-binding-authority\.ts$/u,
-    may: ["core", "app", "v2-form", "v2-actor-physical-backend"],
+    // Pure scope/graph types permit provider adapters without a self-host runtime import.
+    may: ["core", "app", "v2-form", "v2-actor-physical-backend", "native-contract"],
   },
   {
     // Outer Host-private v2 Actor forward boot, never a pure Form/parser layer.

@@ -27,6 +27,7 @@ import type {
 } from "@takoserver/core/takoform-v2";
 import * as extension from "@takoserver/core/takoform-v2";
 import type { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
+import { createV2ActorBindingAuthority } from "../src/takoform-v2/actor-binding-authority.ts";
 import { createV2ActorNamespaceForm } from "../src/takoform-v2/actor-namespace-backend.ts";
 import { createV2ActorNamespaceSqlGraphReader } from "../src/takoform-v2/actor-namespace-sql-graph.ts";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
@@ -108,6 +109,7 @@ const RUNTIME_EXPORTS = [
   "createV2EdgeKvNativeCustody",
   "createV2ActorNamespaceSqlGraphReader",
   "createV2ActorNamespaceForm",
+  "createV2ActorBindingAuthority",
   "createAtLeastOnceQueueForm",
   "createQueueWorkerBindingAuthority",
   "createQueueConsumerForm",
@@ -196,6 +198,7 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(extension.createV2EdgeKvNativeCustody).toBe(createV2EdgeKvNativeCustody);
   expect(extension.createV2ActorNamespaceSqlGraphReader).toBe(createV2ActorNamespaceSqlGraphReader);
   expect(extension.createV2ActorNamespaceForm).toBe(createV2ActorNamespaceForm);
+  expect(extension.createV2ActorBindingAuthority).toBe(createV2ActorBindingAuthority);
   const acceptsPhysicalPort = (_physical: V2ActorNamespacePhysicalPort): void => {};
   const existingSelfhostPort = (
     physical: ReturnType<typeof createSelfhostActorExecutionHost>,

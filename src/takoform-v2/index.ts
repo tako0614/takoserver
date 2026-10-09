@@ -7,6 +7,15 @@
  */
 export type { JsonObject, Sql } from "../ports.ts";
 export {
+  createV2ActorBindingAuthority,
+  type V2ActorBindingClaim,
+  type V2ActorBindingGraphPort,
+  type V2ActorBindingPhysicalPort,
+  type V2ActorBindingResolution,
+  type V2ActorBindingTarget,
+  type V2ActorBindingVersionIdentitySource,
+} from "./actor-binding-authority.ts";
+export {
   createV2ActorNamespaceForm,
   type V2ActorAcceptedOperationRuntimeObserver,
   type V2ActorNamespacePhysicalPort,

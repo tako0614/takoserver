@@ -1,8 +1,7 @@
 import { parseActorAbiRef } from "../actor-abi-ref.ts";
+import type { ActorExecutionGraph, ActorExecutionScope } from "../actor-execution-contract.ts";
 import { bytesDigest, canonicalJson } from "../json.ts";
 import type { Sql } from "../ports.ts";
-import type { createSelfhostActorExecutionHost } from "../selfhost-actor-execution-host.ts";
-import type { ActorGraphAuthority } from "../selfhost-actor-graph-authority.ts";
 import { V2_ACTOR_NAMESPACE_BACKEND_ID } from "./actor-namespace-backend.ts";
 import { ACTOR_NAMESPACE_FORM_URL, parseActorNamespaceSpec } from "./forms/actor-namespace.ts";
 import { referencesForWorkerVersion } from "./forms/worker-references.ts";
@@ -25,9 +24,7 @@ export interface V2ActorBindingResolution {
   readonly tenantId: string;
   readonly namespaceResourceUid: string;
   readonly className: string;
-  readonly runtimeClassRef: NonNullable<
-    Awaited<ReturnType<ActorGraphAuthority["readGraph"]>>
-  >["runtimeClassRef"];
+  readonly runtimeClassRef: ActorExecutionGraph["runtimeClassRef"];
   readonly vector: string;
 }
 
@@ -39,18 +36,60 @@ export interface V2ActorBindingTarget {
   readonly namespaceResourceUid: string;
 }
 
+export interface V2ActorBindingGraphPort {
+  readGraph(
+    scope: ActorExecutionScope,
+    signal: AbortSignal,
+  ): Promise<Pick<
+    ActorExecutionGraph,
+    "scope" | "workerUid" | "className" | "runtimeClassRef"
+  > | null>;
+}
+
+export interface V2ActorBindingPhysicalPort {
+  hasNamespace(scope: ActorExecutionScope): Promise<boolean>;
+}
+
+/** Accepted source scalars used by the Host's native publication identity. */
+export interface V2ActorBindingVersionIdentitySource {
+  readonly principal: string;
+  readonly space: string;
+  readonly targetKey: string;
+  readonly workerUid: string;
+  readonly workerVersionUid: string;
+  readonly workerVersionOperationId: string;
+  readonly workerVersionGeneration: number;
+  readonly actorBindings: readonly { readonly name: string; readonly resourceUid: string }[];
+}
+
 /** V2 SQL and physical namespace proof; no v1 Version store or ResourceDeployment. */
 export function createV2ActorBindingAuthority(options: {
   readonly sql: Sql;
   readonly targetKey: string;
-  readonly namespaceGraph: Pick<ActorGraphAuthority, "readGraph">;
-  readonly physical: Pick<ReturnType<typeof createSelfhostActorExecutionHost>, "hasNamespace">;
+  readonly namespaceGraph: V2ActorBindingGraphPort;
+  readonly physical: V2ActorBindingPhysicalPort;
+  /** Identity derivation is Host-owned; actual native readback remains the physical adapter's duty. */
+  readonly versionIdentity?: (source: V2ActorBindingVersionIdentitySource) => Promise<string>;
 }) {
   if (!options.sql || !options.targetKey || !options.namespaceGraph || !options.physical)
     throw new TypeError("Actor binding authority is required");
+  const sql = options.sql;
+  const targetKey = options.targetKey;
+  const readGraph = options.namespaceGraph.readGraph.bind(options.namespaceGraph);
+  const hasNamespace = options.physical.hasNamespace.bind(options.physical);
+  const versionIdentity =
+    options.versionIdentity ??
+    (async (source: V2ActorBindingVersionIdentitySource) => {
+      const digest = await bytesDigest(
+        new TextEncoder().encode(
+          `${source.workerVersionUid}\u0000${source.workerVersionGeneration}`,
+        ),
+      );
+      return `v2-${digest.slice("sha256:".length)}`;
+    });
 
   const captureVersion = async (claim: V2ActorBindingClaim) => {
-    const rows = await options.sql.query(
+    const rows = await sql.query(
       `SELECT r.uid, r.generation, r.last_operation, r.spec_json, r.observed_json,
               r.backend_id, op.id AS operation_id, op.generation AS operation_generation
        FROM tf_v2_resources r JOIN tf_v2_operations op ON op.id = r.last_operation
@@ -96,7 +135,7 @@ export function createV2ActorBindingAuthority(options: {
       return null;
     // A same-spec PUT advances the current Resource operation while the
     // admitted native Version still names its immutable source operation.
-    const sources = await options.sql.query(
+    const sources = await sql.query(
       `SELECT generation FROM tf_v2_operations
        WHERE id = ? AND resource_uid = ? AND principal = ? AND target_key = ?
          AND backend_id = ? AND action IN ('create','update')
@@ -119,12 +158,30 @@ export function createV2ActorBindingAuthority(options: {
       source.generation > row.generation
     )
       return null;
-    const digest = await bytesDigest(
-      new TextEncoder().encode(`${claim.workerVersionUid}\u0000${source.generation}`),
+    const expectedIdentity = await versionIdentity(
+      Object.freeze({
+        principal: claim.principal,
+        space: claim.space,
+        targetKey: claim.targetKey,
+        workerUid: claim.workerUid,
+        workerVersionUid: claim.workerVersionUid,
+        workerVersionOperationId: claim.workerVersionOperationId,
+        workerVersionGeneration: source.generation,
+        actorBindings: Object.freeze(
+          spec.actorBindings.map((binding) =>
+            Object.freeze({ name: binding.name, resourceUid: binding.resource.resourceUid }),
+          ),
+        ),
+      }),
     );
-    if (claim.nativeVersionId !== `v2-${digest.slice("sha256:".length)}`) return null;
+    if (
+      typeof expectedIdentity !== "string" ||
+      !expectedIdentity ||
+      claim.nativeVersionId !== expectedIdentity
+    )
+      return null;
     const expected = referencesForWorkerVersion(spec);
-    const sealed = await options.sql.query(
+    const sealed = await sql.query(
       "SELECT operation_id, sealed FROM tf_v2_operation_reference_sets WHERE operation_id IN (?, ?)",
       [row.operation_id, claim.workerVersionOperationId],
     );
@@ -133,17 +190,17 @@ export function createV2ActorBindingAuthority(options: {
       sealed.some((entry) => entry.sealed !== 1)
     )
       return null;
-    const refs = await options.sql.query(
+    const refs = await sql.query(
       `SELECT target_uid, form_url, readiness, target_spec_path, target_spec_equals
        FROM tf_v2_operation_references WHERE operation_id = ? ORDER BY target_uid`,
       [row.operation_id],
     );
-    const sourceRefs = await options.sql.query(
+    const sourceRefs = await sql.query(
       `SELECT target_uid, form_url, readiness, target_spec_path, target_spec_equals
        FROM tf_v2_operation_references WHERE operation_id = ? ORDER BY target_uid`,
       [claim.workerVersionOperationId],
     );
-    const edges = await options.sql.query(
+    const edges = await sql.query(
       `SELECT target_uid FROM tf_v2_resource_references
        WHERE referrer_uid = ? ORDER BY target_uid`,
       [claim.workerVersionUid],
@@ -178,13 +235,13 @@ export function createV2ActorBindingAuthority(options: {
   ): Promise<V2ActorBindingResolution | null> {
     try {
       const target = { ...source };
-      if (target.targetKey !== options.targetKey) return null;
+      if (target.targetKey !== targetKey) return null;
       const scope = {
         tenantId: target.principal,
         namespaceResourceUid: target.namespaceResourceUid,
       };
       const capture = async () => {
-        const rows = await options.sql.query(
+        const rows = await sql.query(
           `SELECT uid, spec_json, backend_id FROM tf_v2_resources
            WHERE uid = ? AND form_url = ? AND principal = ? AND space = ?
              AND target_key = ? AND deleted_at IS NULL LIMIT 2`,
@@ -207,7 +264,7 @@ export function createV2ActorBindingAuthority(options: {
         // Workers. The Namespace's accepted Worker reference owns class code.
         const namespaceWorkerUid = parseActorNamespaceSpec(JSON.parse(namespace.spec_json)).worker
           .resourceUid;
-        const graph = await options.namespaceGraph.readGraph(scope, AbortSignal.timeout(30_000));
+        const graph = await readGraph(scope, AbortSignal.timeout(30_000));
         if (
           !graph ||
           graph.workerUid !== namespaceWorkerUid ||
@@ -234,7 +291,7 @@ export function createV2ActorBindingAuthority(options: {
         };
       };
       const before = await capture();
-      if (!before || !(await options.physical.hasNamespace(scope))) return null;
+      if (!before || !(await hasNamespace(scope))) return null;
       const after = await capture();
       if (!after || after.vector !== before.vector) return null;
       return {
@@ -269,7 +326,7 @@ export function createV2ActorBindingAuthority(options: {
         })),
       };
       const name = bindingName;
-      if (claim.targetKey !== options.targetKey || !name) return null;
+      if (claim.targetKey !== targetKey || !name) return null;
       const selected = claim.bindings.filter((binding) => binding.name === name);
       if (selected.length !== 1 || !selected[0]) return null;
       const beforeVersion = await captureVersion(claim);
@@ -314,7 +371,7 @@ export function createV2ActorBindingAuthority(options: {
     try {
       const claim = structuredClone(source);
       if (
-        claim.targetKey !== options.targetKey ||
+        claim.targetKey !== targetKey ||
         persisted.tenantId !== claim.principal ||
         parseActorAbiRef(persisted.runtimeClassRef)?.kind !== "v2"
       )
@@ -324,7 +381,7 @@ export function createV2ActorBindingAuthority(options: {
         return false;
       const before = await captureVersion(claim);
       if (!before) return false;
-      const rows = await options.sql.query(
+      const rows = await sql.query(
         `SELECT r.spec_json, r.backend_id, r.generation, r.observed_generation, r.phase,
                 r.busy_operation, r.deleted_at, op.action, op.status, op.effect,
                 op.accepted_spec_json
