@@ -100,7 +100,14 @@ export function createV2WorkflowNativeSelection(options: {
     signal: AbortSignal,
   ): Promise<V2WorkflowNativeSelection> => {
     signal.throwIfAborted();
-    const workflowResourceUid = identity.scope.workflowResourceUid;
+    const capturedIdentity: WorkflowRunIdentity = {
+      ...identity,
+      scope: {
+        tenantId: identity.scope.tenantId,
+        workflowResourceUid: identity.scope.workflowResourceUid,
+      },
+    };
+    const workflowResourceUid = capturedIdentity.scope.workflowResourceUid;
     const selectedBasisPoint = basisPoint();
     if (
       !Number.isSafeInteger(selectedBasisPoint) ||
@@ -110,7 +117,7 @@ export function createV2WorkflowNativeSelection(options: {
       throw new WorkflowRuntimeError("invalid_runtime_input");
     let owner: V2WorkflowNativeOwnerPort | undefined;
     const materials = await selectMaterials(
-      identity,
+      capturedIdentity,
       signal,
       async (workerUid, targetKey) => {
         owner ??= await options.ownerForWorkerUid(workerUid);

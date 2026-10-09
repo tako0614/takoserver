@@ -43,7 +43,7 @@ const identity: WorkflowRunIdentity = {
   deadlineAt: Date.now() + 60_000,
 };
 
-function fixture() {
+function fixture(basisPoint: () => number = () => 7) {
   const db = new Database(":memory:");
   migrateSqlite(db);
   const sql = createSqliteSql(db);
@@ -281,7 +281,7 @@ function fixture() {
     },
     publicationState,
     inspector,
-    basisPoint: () => 7,
+    basisPoint,
   });
   return {
     db,
@@ -362,6 +362,21 @@ test("selected Workerd site never relabels accepted Workflow A after caller scop
     mutable.scope.workflowResourceUid = "workflow-B";
     release();
     expect((await selected).selection.workflowResourceUid).toBe(WORKFLOW_UID);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("selection captures Workflow scope before a mutable basis-point callback", async () => {
+  const mutable = { ...identity, scope: { ...identity.scope } };
+  const f = fixture(() => {
+    mutable.scope.workflowResourceUid = "workflow-B";
+    return 7;
+  });
+  try {
+    expect(
+      (await f.select(mutable, new AbortController().signal)).selection.workflowResourceUid,
+    ).toBe(WORKFLOW_UID);
   } finally {
     f.db.close();
   }
