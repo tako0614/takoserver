@@ -166,10 +166,13 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
   const formUrls = Object.freeze(Object.keys(options.forms));
   const privateInputsCapability = options.privateInputCustody !== undefined;
   for (const selected of Object.values(options.forms)) {
+    const policy = selected.privateInputs;
     if (
-      selected.privateInputs &&
-      (typeof selected.privateInputs.validateCreate !== "function" ||
-        typeof selected.privateInputs.validateUpdate !== "function")
+      policy !== undefined &&
+      (policy === null ||
+        typeof policy !== "object" ||
+        typeof policy.validateCreate !== "function" ||
+        typeof policy.validateUpdate !== "function")
     ) {
       throw new TypeError("incomplete v2 Form private input declaration");
     }

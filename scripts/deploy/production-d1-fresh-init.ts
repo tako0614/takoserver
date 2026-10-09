@@ -3,6 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { deriveExpectedApplicationShape } from "./application-schema-shape.ts";
+import { RemoteD1 } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import {
   DeployError,
@@ -30,6 +31,7 @@ import {
   requireEnvironment,
   resolveCloudflareCredential,
   runCommand,
+  wranglerCommand,
 } from "./process.ts";
 import {
   type FreshD1AttemptBinding,
@@ -44,8 +46,12 @@ import {
 } from "./qualification.ts";
 import {
   projectFreshProductionMigrationArtifact,
+  projectFreshProductionV2MigrationArtifact,
+  projectFreshProductionV2MigrationArtifact0089,
   readCurrentAuditedMigrationSourceArtifact,
   readSealedFreshProductionMigrationArtifact,
+  readSealedFreshProductionV2MigrationArtifact,
+  readSealedFreshProductionV2MigrationArtifact0089,
 } from "./schema.ts";
 import type { DeployTarget } from "./target.ts";
 import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
@@ -70,7 +76,21 @@ export interface ProductionD1FreshInitInvocation {
   readonly environment: DeployEnvironment;
   readonly commit: string;
   readonly generation: string;
+  readonly freshLineage?: "v2-0088" | "v2-0089";
 }
+
+export interface FreshV2DataReadback {
+  readonly tableCounts: Readonly<Record<string, number>>;
+  readonly ledgerRows: number;
+  readonly foreignKeyViolations: number;
+  readonly invocationEpoch: readonly Record<string, unknown>[];
+  readonly acceptanceCounter: readonly Record<string, unknown>[];
+}
+
+const FRESH_V2_SEED_TABLES = [
+  "tf_cloudflare_provider_invocation_epoch",
+  "tf_v2_operation_acceptance_counter",
+] as const;
 
 /**
  * The only provider capability this surface needs. It deliberately has no
@@ -96,6 +116,10 @@ export interface ProductionD1FreshInitOptions extends IntegrationStorageGenerate
   /** Narrow provider seam used by tests and local contract simulations. */
   readonly provider?: ProductionD1FreshInitProvider;
   readonly fetcher?: IntegrationStorageFetcher;
+  /** Test seam; the CLI always uses authoritative remote D1 queries. */
+  readonly freshV2DataReader?: {
+    read(phase: "preflight" | "verification", configPath: string): Promise<FreshV2DataReadback>;
+  };
 }
 
 interface FreshD1Names {
@@ -133,11 +157,15 @@ export async function runProductionD1FreshInit(
   options: ProductionD1FreshInitOptions = {},
 ): Promise<Record<string, unknown>> {
   const names = validateInvocation(invocation, target);
-  const sourceArtifact = projectFreshProductionMigrationArtifact(
-    readCurrentAuditedMigrationSourceArtifact(
-      options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
-    ),
+  const auditedSource = readCurrentAuditedMigrationSourceArtifact(
+    options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
   );
+  const sourceArtifact =
+    invocation.freshLineage === "v2-0088"
+      ? projectFreshProductionV2MigrationArtifact(auditedSource)
+      : invocation.freshLineage === "v2-0089"
+        ? projectFreshProductionV2MigrationArtifact0089(auditedSource)
+        : projectFreshProductionMigrationArtifact(auditedSource);
   const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
   const expectedApplicationShapeDigest = `sha256:${createHash("sha256")
     .update(expectedApplicationShape)
@@ -149,6 +177,7 @@ export async function runProductionD1FreshInit(
     invocation.generation,
   );
   const binding: FreshD1AttemptBinding = {
+    ...(invocation.freshLineage === undefined ? {} : { freshLineage: invocation.freshLineage }),
     accountId: target.accountId,
     generation: invocation.generation,
     databaseName: names.databaseName,
@@ -181,12 +210,14 @@ export async function runProductionD1FreshInit(
       options,
       custody,
       binding,
+      ...(invocation.freshLineage === undefined ? {} : { freshLineage: invocation.freshLineage }),
     });
     return {
       kind: "takoserver.production-d1-fresh-init-status@v1",
       surface: PRODUCTION_D1_FRESH_INIT_SURFACE,
       environment: "production",
       selectedCommit: invocation.commit,
+      ...(invocation.freshLineage === undefined ? {} : { freshLineage: invocation.freshLineage }),
       generation: invocation.generation,
       d1: {
         databaseName: names.databaseName,
@@ -244,6 +275,7 @@ async function inspectFreshD1Attempt(input: {
   readonly options: ProductionD1FreshInitOptions;
   readonly custody: FreshD1Custody;
   readonly binding: FreshD1AttemptBinding;
+  readonly freshLineage?: "v2-0088" | "v2-0089";
 }): Promise<FreshAttemptObservation> {
   const attempt = input.custody.read(input.binding);
   const inventory = await readInventory(input.provider, input.names, "preflight");
@@ -319,6 +351,16 @@ async function inspectFreshD1Attempt(input: {
         present.uuid,
         "preflight",
       );
+      if (input.freshLineage !== undefined) {
+        await assertFreshV2DataReadback(
+          "preflight",
+          input.freshLineage,
+          configPath,
+          input.environment,
+          input.expectedApplicationShape,
+          input.options,
+        );
+      }
       return { ...base, attemptState: "complete" };
     } catch {
       return { ...base, attemptState: "pending" };
@@ -343,6 +385,13 @@ function validateInvocation(
   }
   if (!GENERATION.test(invocation.generation)) {
     throw preflightError("--generation must be exactly 32 lowercase hexadecimal characters");
+  }
+  if (
+    invocation.freshLineage !== undefined &&
+    invocation.freshLineage !== "v2-0088" &&
+    invocation.freshLineage !== "v2-0089"
+  ) {
+    throw preflightError("unsupported fresh production migration lineage");
   }
   if (!ACCOUNT_ID.test(target.accountId)) {
     throw preflightError("production D1 fresh init requires one exact account id");
@@ -453,7 +502,12 @@ async function applyFreshProductionD1(
     for (const file of sourceArtifact.files) {
       copyFileSync(file.path, join(migrationOutput, file.name));
     }
-    const sealedArtifact = readSealedFreshProductionMigrationArtifact(migrationOutput);
+    const sealedArtifact =
+      invocation.freshLineage === "v2-0088"
+        ? readSealedFreshProductionV2MigrationArtifact(migrationOutput)
+        : invocation.freshLineage === "v2-0089"
+          ? readSealedFreshProductionV2MigrationArtifact0089(migrationOutput)
+          : readSealedFreshProductionMigrationArtifact(migrationOutput);
     if (
       sealedArtifact.digest !== sourceArtifact.digest ||
       JSON.stringify(sealedArtifact.names) !== JSON.stringify(sourceArtifact.names)
@@ -519,6 +573,9 @@ async function applyFreshProductionD1(
       );
     }
     custody.persistIdentified(binding, databaseId);
+    // The first seal predates provider create. Never re-seal bytes that changed
+    // while its acknowledgement or identity readback was outstanding.
+    migrationSeal.assertUnchanged();
 
     const generatedTarget: GeneratedD1Target = {
       accountId: target.accountId,
@@ -577,6 +634,16 @@ async function applyFreshProductionD1(
       expectedApplicationShape,
       databaseId,
     );
+    if (invocation.freshLineage !== undefined) {
+      await assertFreshV2DataReadback(
+        "verification",
+        invocation.freshLineage,
+        configPath,
+        providerEnvironment,
+        expectedApplicationShape,
+        options,
+      );
+    }
 
     const finalD1 = await providerCall(
       "verification",
@@ -600,6 +667,7 @@ async function applyFreshProductionD1(
       remoteRef: source.remoteRef,
       reviewer,
       generation: invocation.generation,
+      ...(invocation.freshLineage === undefined ? {} : { freshLineage: invocation.freshLineage }),
       d1: { databaseName: names.databaseName, databaseId },
       incumbent,
       migrationDigest: sourceArtifact.digest,
@@ -661,16 +729,155 @@ async function applyFreshProductionD1(
 
 /**
  * After the create boundary every failure is indeterminate and forward-only.
- * DeployError messages and details are already bounded and phase-tagged by the
- * shared engine, so they pass through unchanged; anything else is normalized so
- * no raw provider text can escape.
+ * Bounded mutation/verification errors retain their phase. A preflight-tagged
+ * local seal error after create cannot claim the target was untouched; it and
+ * unknown errors become a bounded mutation failure.
  */
 function normalizeAfterCreate(error: unknown, databaseId: string | null): DeployError {
-  if (error instanceof DeployError) return error;
+  if (error instanceof DeployError && error.phase !== "preflight") return error;
   return mutationError(
     "production D1 fresh init stopped after the create boundary; do not retry or adopt",
     `databaseId=${databaseId ?? "unknown"}`,
   );
+}
+
+/** Data proof is in addition to the canonical schema/ledger readback, never a prefix heuristic. */
+async function assertFreshV2DataReadback(
+  phase: "preflight" | "verification",
+  lineage: "v2-0088" | "v2-0089",
+  configPath: string,
+  environment: Readonly<Record<string, string>>,
+  expectedApplicationShape: string,
+  options: ProductionD1FreshInitOptions,
+): Promise<void> {
+  const shape: unknown = JSON.parse(expectedApplicationShape);
+  if (!Array.isArray(shape)) throw new DeployError(phase, "fresh v2 expected shape is malformed");
+  const tables = shape
+    .filter(
+      (row): row is { type: string; name: string } =>
+        typeof row === "object" &&
+        row !== null &&
+        row.type === "table" &&
+        typeof row.name === "string",
+    )
+    .map(({ name }) => name);
+  if (
+    tables.length === 0 ||
+    new Set(tables).size !== tables.length ||
+    tables.some((name) => !/^[A-Za-z_][A-Za-z_0-9]*$/u.test(name))
+  ) {
+    throw new DeployError(phase, "fresh v2 audited table inventory is malformed");
+  }
+  const readback =
+    options.freshV2DataReader === undefined
+      ? await readRemoteFreshV2Data(configPath, environment, tables, phase, options)
+      : await options.freshV2DataReader.read(phase, configPath);
+  if (
+    readback.ledgerRows !== (lineage === "v2-0089" ? 89 : 88) ||
+    readback.foreignKeyViolations !== 0 ||
+    Object.keys(readback.tableCounts).length !== tables.length ||
+    FRESH_V2_SEED_TABLES.some((name) => !tables.includes(name)) ||
+    tables.some(
+      (name) =>
+        readback.tableCounts[name] !==
+        (FRESH_V2_SEED_TABLES.includes(name as (typeof FRESH_V2_SEED_TABLES)[number]) ? 1 : 0),
+    ) ||
+    !matchesFreshV2Seed(
+      readback.invocationEpoch,
+      ["closed_at_ms", "epoch_id", "opened_at_ms", "singleton", "state"],
+      { singleton: 1, epoch_id: null, state: "closed", opened_at_ms: null, closed_at_ms: null },
+    ) ||
+    !matchesFreshV2Seed(readback.acceptanceCounter, ["id", "last_operation_id", "last_order"], {
+      id: 1,
+      last_order: 0,
+      last_operation_id: null,
+    })
+  ) {
+    throw new DeployError(
+      phase,
+      lineage === "v2-0089"
+        ? "fresh v2 D1 is not the exact empty 0089 database"
+        : "fresh v2 D1 is not the exact empty 0088 database",
+    );
+  }
+}
+
+function matchesFreshV2Seed(
+  rows: readonly Record<string, unknown>[],
+  expectedKeys: readonly string[],
+  expected: Readonly<Record<string, unknown>>,
+): boolean {
+  if (rows.length !== 1) return false;
+  const row = rows[0];
+  return (
+    row !== undefined &&
+    JSON.stringify(Object.keys(row).sort()) === JSON.stringify(expectedKeys) &&
+    expectedKeys.every((key) => row[key] === expected[key])
+  );
+}
+
+async function readRemoteFreshV2Data(
+  configPath: string,
+  environment: Readonly<Record<string, string>>,
+  tables: readonly string[],
+  phase: "preflight" | "verification",
+  options: ProductionD1FreshInitOptions,
+): Promise<FreshV2DataReadback> {
+  const database = new RemoteD1(configPath, {
+    environment,
+    run: options.run ?? runCommand,
+    wranglerCommand:
+      options.wranglerCommand ??
+      (options.wranglerPath === undefined
+        ? wranglerCommand
+        : (args) => [options.wranglerPath as string, ...args]),
+  });
+  const tableCounts: Record<string, number> = {};
+  for (let index = 0; index < tables.length; index += 16) {
+    const batch = tables.slice(index, index + 16);
+    const sql = `SELECT ${batch.map((name) => `(SELECT COUNT(*) FROM "${name}") AS "${name}"`).join(", ")}`;
+    const rows = await database.query(phase, "fresh v2 application row counts", sql);
+    if (rows.length !== 1 || Object.keys(rows[0] ?? {}).length !== batch.length) {
+      throw new DeployError(phase, "fresh v2 application row counts are malformed");
+    }
+    for (const name of batch) {
+      const value = rows[0]?.[name];
+      if (!Number.isSafeInteger(value) || (value as number) < 0) {
+        throw new DeployError(phase, "fresh v2 application row count is malformed");
+      }
+      tableCounts[name] = value as number;
+    }
+  }
+  const ledger = await database.query(
+    phase,
+    "fresh v2 migration ledger count",
+    "SELECT COUNT(*) AS count FROM d1_migrations",
+  );
+  if (ledger.length !== 1 || !Number.isSafeInteger(ledger[0]?.count)) {
+    throw new DeployError(phase, "fresh v2 migration ledger count is malformed");
+  }
+  const foreignKeys = await database.query(
+    phase,
+    "fresh v2 foreign-key integrity",
+    "SELECT 1 AS violation FROM pragma_foreign_key_check LIMIT 1",
+  );
+  const invocationEpoch = await database.query(
+    phase,
+    "fresh v2 invocation epoch seed",
+    "SELECT singleton, epoch_id, state, opened_at_ms, closed_at_ms FROM tf_cloudflare_provider_invocation_epoch LIMIT 2",
+  );
+  const acceptanceCounter = await database.query(
+    phase,
+    "fresh v2 acceptance counter seed",
+    "SELECT id, last_order, last_operation_id FROM tf_v2_operation_acceptance_counter LIMIT 2",
+  );
+  return {
+    tableCounts,
+    ledgerRows: ledger[0]?.count as number,
+    foreignKeyViolations: foreignKeys.length,
+    invocationEpoch,
+    acceptanceCounter,
+  };
 }
 
 /**

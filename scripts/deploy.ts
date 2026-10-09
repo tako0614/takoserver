@@ -95,7 +95,8 @@ const USAGE = `takoserver deploy
     rehearsal D1; the dump is NUL-normalized and the result is verified by readback, so a partial
     application is never reported as success.
   takoserver-production-d1-fresh-init creates one new empty production D1 and applies the complete
-    audited 0001-0066 lineage to it in one reviewed command. It is production-only, requires the
+    audited default 0001-0069 lineage, or explicit --fresh-lineage=v2-0088 or
+    --fresh-lineage=v2-0089, in one reviewed command. It is production-only, requires the
     explicit --generation=<32-lowercase-hex> and TAKOSERVER_DEPLOY_TARGET_PRODUCTION, and never
     reads, adopts, resets, archives or deletes the incumbent production database or its bucket.
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
@@ -192,6 +193,7 @@ type Invocation =
       readonly surface: ProductionD1FreshInitSurface;
       readonly action: "status" | "apply";
       readonly generation: string;
+      readonly freshLineage?: "v2-0088" | "v2-0089";
     })
   | (InvocationBase & {
       readonly surface: StorageDisposalSurface;
@@ -237,7 +239,7 @@ interface ParsedInvocation {
   readonly bootstrapVerifierBridge?: boolean;
   readonly bootstrapProbePredecessorVersionId?: string;
   readonly throughMigration?: SchemaWaveBoundary;
-  readonly freshLineage?: "v2-artifacts-0075";
+  readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089";
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly organizationId?: string;
   readonly keyName?: string;
@@ -306,7 +308,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let environment: DeployEnvironment | null = null;
   let commit: string | null = null;
   let generation: string | null = null;
-  let freshLineage: "v2-artifacts-0075" | null = null;
+  let freshLineage: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | null = null;
   let retiredTargetPath: string | null = null;
   let retiredDeploymentId: string | null = null;
   let retiredVersionId: string | null = null;
@@ -432,8 +434,11 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       continue;
     }
     if (flag.startsWith("--fresh-lineage=")) {
-      if (freshLineage !== null || flag !== "--fresh-lineage=v2-artifacts-0075") return null;
-      freshLineage = "v2-artifacts-0075";
+      if (freshLineage !== null) return null;
+      if (flag === "--fresh-lineage=v2-artifacts-0075") freshLineage = "v2-artifacts-0075";
+      else if (flag === "--fresh-lineage=v2-0088") freshLineage = "v2-0088";
+      else if (flag === "--fresh-lineage=v2-0089") freshLineage = "v2-0089";
+      else return null;
       continue;
     }
     if (flag.startsWith("--rebind-state-database-from=")) {
@@ -606,7 +611,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   }
   const storageGeneration = surfaceValue === "takoserver-integration-storage-generation";
   const productionFreshInit = surfaceValue === "takoserver-production-d1-fresh-init";
-  if (freshLineage !== null && !storageGeneration) return null;
+  if (
+    (storageGeneration && (freshLineage === "v2-0088" || freshLineage === "v2-0089")) ||
+    (productionFreshInit && freshLineage === "v2-artifacts-0075") ||
+    (freshLineage !== null && !storageGeneration && !productionFreshInit)
+  )
+    return null;
   if ((generation !== null) !== (storageGeneration || productionFreshInit)) return null;
   if (
     storageGeneration &&
@@ -620,8 +630,15 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return environment === "production" &&
       (action === "status" || action === "apply") &&
       generation !== null &&
-      args.length === 5
-      ? { surface: surfaceValue, action, environment, commit, generation }
+      args.length === (freshLineage === null ? 5 : 6)
+      ? {
+          surface: surfaceValue,
+          action,
+          environment,
+          commit,
+          generation,
+          ...(freshLineage === "v2-0088" || freshLineage === "v2-0089" ? { freshLineage } : {}),
+        }
       : null;
   }
   const closureDeltaNames = [
@@ -1129,6 +1146,9 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           environment: invocation.environment,
           commit: invocation.commit,
           generation: invocation.generation,
+          ...(invocation.freshLineage === undefined
+            ? {}
+            : { freshLineage: invocation.freshLineage }),
         } satisfies ProductionD1FreshInitInvocation,
         target,
       );

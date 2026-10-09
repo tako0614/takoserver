@@ -199,6 +199,10 @@ incumbent storage:
 ```sh
 bun run deploy -- takoserver-production-d1-fresh-init --status --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex>
 bun run deploy -- takoserver-production-d1-fresh-init --apply --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex>
+bun run deploy -- takoserver-production-d1-fresh-init --status --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0088
+bun run deploy -- takoserver-production-d1-fresh-init --apply --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0088
+bun run deploy -- takoserver-production-d1-fresh-init --status --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0089
+bun run deploy -- takoserver-production-d1-fresh-init --apply --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0089
 ```
 
 The fresh name is `takoserver-p-<generation>`, and a name that equals either the
@@ -211,17 +215,29 @@ the expected canonical application-schema digest, and reports the incumbent as
 untouched. `--apply` additionally requires an explicit
 `CLOUDFLARE_API_TOKEN` and `TAKOSERVER_INDEPENDENT_REVIEW`, qualifies one clean
 production commit, runs the migration gate once, seals the fixed audited
-0001–0069 names and bytes, proves the fresh name absent twice, creates one D1,
+0001–0069 names and bytes by default, proves the fresh name absent twice,
+creates one D1,
 proves the empty canonical shape, applies the lineage through one sealed
 `wrangler d1 execute --file` import, and verifies the exact lineage and
-application schema afterwards. The complete source inventory is audited through
-0074, but this fresh-empty-target path deliberately projects only the frozen
-0001–0069 payload. An empty self-host SQLite boot includes 0074, so its schema is
-not yet identical to this production bootstrap. Adding the v2 tables to a live
-production database requires a separately authorized migration path; source
-recognition does not raise the existing-target or protected migration-wave
-ceiling. Local SQLite stand-in checks are not evidence that the import has
-passed a native remote D1 or Hosted rollout qualification.
+application schema afterwards. The closed `--fresh-lineage=v2-0088` selector
+changes only this future, new, empty D1 initializer to the independently audited
+complete 0001–0088 payload. Separately, `--fresh-lineage=v2-0089` selects only
+the fixed audited 0001–0089 payload with the additive Cron match guard repair;
+it does not widen `v2-0088`. The default remains 0069. The selected profile is
+bound into retained attempt custody, so one account/generation cannot be
+reopened under another profile. Explicit v2 completion requires the selected
+exact 88- or 89-row migration ledger, canonical application schema, exactly the closed
+0068 invocation-epoch singleton and unused 0077 acceptance-counter singleton,
+zero rows in every other application table, and no foreign-key violations. An
+import with a lost acknowledgement is not replayed: status may report complete
+for the same generated UUID only after these readbacks prove it, while a partial prefix or
+unknown response remains pending. A retained or incomplete 0088 attempt is not
+advanced to 0089: that selector requires a distinct generation. There is no
+partial-prefix resume protocol.
+This source option does not authorize production database creation. It does not
+raise any existing-target or protected migration-wave ceiling, or bind, reset,
+adopt or replace the serving database. Local Miniflare qualification is not a
+remote D1 or Hosted rollout qualification.
 
 Both actions require `TAKOSERVER_D1_FRESH_INIT_CUSTODY_DIRECTORY`: an existing,
 owner-owned `0700` absolute directory outside every Git checkout, with no

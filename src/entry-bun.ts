@@ -37,7 +37,7 @@ import {
   createRuntimeInputAuthority,
   runtimeInputCanonicalOriginSupported,
 } from "./runtime-input-preparations.ts";
-import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
+import { parseRuntimeInputKeyAuthority } from "./runtime-input-seal-keyring.ts";
 import {
   openSelfhostActorPublicRuntime,
   type SelfhostActorPublicRuntime,
@@ -515,9 +515,10 @@ if (process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING && !runtimeInputsAvailable
       : `sensitive Worker runtime inputs are disabled: TAKOSERVER_PUBLIC_ORIGIN must be an https bare origin (got ${publicOrigin})`,
   );
 }
-const runtimeInputSealKeyRing = runtimeInputsAvailable
-  ? await parseRuntimeInputSealKeyRing(process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING as string)
+const runtimeInputKeyAuthority = runtimeInputsAvailable
+  ? await parseRuntimeInputKeyAuthority(process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING as string)
   : undefined;
+const runtimeInputSealKeyRing = runtimeInputKeyAuthority?.sealKeys;
 const runtimeInputs = runtimeInputSealKeyRing
   ? createRuntimeInputAuthority({
       sql,
@@ -1111,8 +1112,9 @@ if (v2WorkerEndpointHttpsSelection) {
 }
 
 // Exact Form support is all-or-nothing. A missing optional operator plane is
-// not a narrower public WorkerVersion profile. Keep the private input sealer
-// in the owner for ciphertext recovery, but admit only secret-free new specs.
+// not a narrower public WorkerVersion profile. Private admission additionally
+// requires the complete validated operator-key custody, while existing sealed
+// configured inputs remain recoverable even if the public Form is unavailable.
 const completeV2WorkerForms =
   workerdBinary !== null &&
   takoformV2Config.workerBundle?.targetKey === v2WorkerTargetKey &&
@@ -1160,7 +1162,9 @@ async function closeBeforePublicIngress(): Promise<void> {
 let app: ReturnType<typeof buildApp>;
 try {
   const v2FormFactory = completeV2WorkerForms
-    ? v2WorkerComposition.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
+    ? runtimeInputKeyAuthority
+      ? v2WorkerComposition.privateInputFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
+      : v2WorkerComposition.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
     : undefined;
   app = buildApp({
     sql,
@@ -1177,6 +1181,9 @@ try {
         : unconfigured),
     v2: takoformV2Config,
     ...(v2FormFactory ? { v2FormFactory } : {}),
+    ...(v2FormFactory && runtimeInputKeyAuthority
+      ? { v2PrivateInputCustody: runtimeInputKeyAuthority.privateInputCustody }
+      : {}),
     ...(payment.checkout ? { checkout: payment.checkout } : {}),
     publicOrigin,
     ...(process.env.TAKOSERVER_CONSOLE_ORIGIN

@@ -26,7 +26,10 @@ import type {
 } from "./public-host-identity.ts";
 import { createResourceDeploymentStore } from "./resource-deployments.ts";
 import { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
-import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
+import {
+  parseRuntimeInputKeyAuthority,
+  parseRuntimeInputSealKeyRing,
+} from "./runtime-input-seal-keyring.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
@@ -108,7 +111,7 @@ export interface WorkerEnv {
   readonly CLOUDFLARE_PROVIDER_EXECUTOR?: CloudflareProviderExecutorRpc;
   /** Non-secret endpoint suffix used for synchronous public address derivation. */
   readonly TAKOSERVER_MANAGED_BASE_DOMAIN?: string;
-  /** Operator-private AES key ring for one-shot Worker runtime inputs. */
+  /** Operator-private runtime-input ring; trusted v2 Form hooks also derive private custody. */
   readonly TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING?: string;
 }
 
@@ -208,6 +211,36 @@ export type WorkerEntryV2FormComposer = (context: {
   readonly objects: ObjectStoreAccess;
   readonly clock: Clock;
 }) => WorkerEntryV2FormMap | Promise<WorkerEntryV2FormMap>;
+
+/** Only an explicit operator-selected Form hook can activate generic custody. */
+function hasDataMethod(policy: object, name: "validateCreate" | "validateUpdate"): boolean {
+  for (let owner: object | null = policy; owner !== null; owner = Object.getPrototypeOf(owner)) {
+    const descriptor = Object.getOwnPropertyDescriptor(owner, name);
+    if (descriptor) return "value" in descriptor && typeof descriptor.value === "function";
+  }
+  return false;
+}
+
+function hasSelectedV2PrivateInputHooks(forms: WorkerEntryV2FormMap | undefined): boolean {
+  if (!forms || typeof forms !== "object" || Array.isArray(forms)) return false;
+  for (const url of Reflect.ownKeys(forms)) {
+    const entry = Object.getOwnPropertyDescriptor(forms, url);
+    if (typeof url !== "string" || !entry?.enumerable || !("value" in entry)) continue;
+    const form = entry.value;
+    if (!form || typeof form !== "object") continue;
+    const privateInputs = Object.getOwnPropertyDescriptor(form, "privateInputs");
+    if (!privateInputs || !("value" in privateInputs)) continue;
+    const policy = privateInputs.value;
+    if (
+      policy !== null &&
+      typeof policy === "object" &&
+      hasDataMethod(policy, "validateCreate") &&
+      hasDataMethod(policy, "validateUpdate")
+    )
+      return true;
+  }
+  return false;
+}
 
 export interface WorkerEntryOptions {
   /** Operator code only; no request or environment field selects the composer. */
@@ -744,9 +777,11 @@ async function composeApp(
   const objects = createR2ObjectStore(env.OBJECTS);
   const clock = () => new Date();
   let selectedV2Forms: WorkerEntryV2FormMap | undefined;
+  let selectedV2PrivateInputHooks = false;
   if (composeV2Forms !== undefined) {
     try {
       selectedV2Forms = await composeV2Forms({ env, sql, objects, clock });
+      selectedV2PrivateInputHooks = hasSelectedV2PrivateInputHooks(selectedV2Forms);
     } catch (error) {
       // A private composer can throw provider/credential text. Keep its cause
       // for operator diagnostics, but never make that text a public refusal.
@@ -758,10 +793,15 @@ async function composeApp(
   }
   const randomId = () => crypto.randomUUID();
   const originReservationBinding = createWorkerEndpointOriginReservationBindingHandle();
-  const runtimeInputs = env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING
+  const runtimeInputKeyAuthority = env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING
+    ? selectedV2PrivateInputHooks
+      ? await parseRuntimeInputKeyAuthority(env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING)
+      : { sealKeys: await parseRuntimeInputSealKeyRing(env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING) }
+    : undefined;
+  const runtimeInputs = runtimeInputKeyAuthority
     ? createRuntimeInputAuthority({
         sql,
-        sealKeys: await parseRuntimeInputSealKeyRing(env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING),
+        sealKeys: runtimeInputKeyAuthority.sealKeys,
         canonicalPublicOrigin: origin,
         clock,
       })
@@ -818,6 +858,11 @@ async function composeApp(
       ...dataServices,
       publicOrigin: origin,
       v2: v2Config,
+      ...(selectedV2PrivateInputHooks &&
+      runtimeInputKeyAuthority &&
+      "privateInputCustody" in runtimeInputKeyAuthority
+        ? { v2PrivateInputCustody: runtimeInputKeyAuthority.privateInputCustody }
+        : {}),
       ...(composeV2Forms === undefined
         ? {}
         : { v2FormFactory: () => selectedV2Forms as WorkerEntryV2FormMap }),

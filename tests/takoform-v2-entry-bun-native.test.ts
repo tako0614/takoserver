@@ -1396,6 +1396,7 @@ test.skipIf(OPT_IN !== "1")(
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
+    if (path === "/secret") return new Response(env.TOKEN || "missing-secret");
     if (path === "/sqlite-read") {
       const result = await env.DB.query("SELECT value FROM item ORDER BY rowid");
       return Response.json(result.rows);
@@ -1619,6 +1620,21 @@ export class SqlWorkflow {
       ).toMatchObject({ supported: false });
       await stopHost(serving);
       serving = null;
+      const noKeyBoot: Record<string, string> = { ...fullBoot };
+      delete noKeyBoot.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING;
+      serving = await startHost(root, port, config, noKeyBoot);
+      expect(
+        await jsonAt(
+          port,
+          "GET",
+          `${V2}/support?form=${encodeURIComponent(WORKER_VERSION_FORM_URL)}`,
+          200,
+          undefined,
+          auth,
+        ),
+      ).toMatchObject({ supported: true, privateInputs: false });
+      await stopHost(serving);
+      serving = null;
       serving = await startHost(root, port, config, fullBoot);
       const support = async (form: string) =>
         await jsonAt(
@@ -1630,8 +1646,9 @@ export class SqlWorkflow {
           auth,
         );
       for (const form of COMPLETE_WORKER_FORM_URLS) {
-        expect(await support(form)).toMatchObject({ supported: true, privateInputs: false });
+        expect(await support(form)).toMatchObject({ supported: true });
       }
+      expect(await support(WORKER_VERSION_FORM_URL)).toMatchObject({ privateInputs: true });
       expect(await support(SQLITE_MIGRATION_APPLICATION_FORM_URL)).toMatchObject({
         supported: true,
         privateInputs: false,
@@ -1690,30 +1707,11 @@ export class SqlWorkflow {
         worker: { resourceUid: worker.uid },
         className: "SqlWorkflow",
       });
-      const sensitive = await jsonAt(
-        port,
-        "POST",
-        `${V2}/resources`,
-        422,
-        {
-          form: WORKER_VERSION_FORM_URL,
-          space,
-          name: "sensitive-version",
-          spec: {
-            worker: { resourceUid: worker.uid },
-            bundle: { resourceUid: bundle.uid },
-            handlers: ["fetch"],
-            requiredSensitiveVars: ["SECRET"],
-          },
-        },
-        { ...auth, "idempotency-key": "normal-v2-sensitive-refused" },
-      );
-      expect(sensitive).toMatchObject({ code: "capability_required" });
       const emptyPrivateInput = await jsonAt(
         port,
         "POST",
         `${V2}/resources`,
-        422,
+        202,
         {
           form: WORKER_VERSION_FORM_URL,
           space,
@@ -1721,14 +1719,52 @@ export class SqlWorkflow {
           spec: {
             worker: { resourceUid: worker.uid },
             bundle: { resourceUid: bundle.uid },
-            handlers: ["fetch"],
+            handlers: ["fetch", "queue"],
             requiredSensitiveVars: [],
           },
           privateInputs: {},
         },
-        { ...auth, "idempotency-key": "normal-v2-private-input-refused" },
+        { ...auth, "idempotency-key": "normal-v2-private-input-empty" },
       );
-      expect(emptyPrivateInput).toMatchObject({ code: "capability_required" });
+      expect(await settled(port, token, String(emptyPrivateInput.id))).toMatchObject({
+        effect: "complete",
+      });
+      const emptyPrivateUid = String(emptyPrivateInput.resourceUid);
+      const emptyUpdateBody = {
+        spec: {
+          worker: { resourceUid: worker.uid },
+          bundle: { resourceUid: bundle.uid },
+          handlers: ["fetch", "queue"],
+          requiredSensitiveVars: [],
+        },
+        privateInputs: {},
+      };
+      const emptyUpdateHeaders = {
+        ...auth,
+        "idempotency-key": "normal-v2-private-input-empty-update",
+        "takoform-expected-generation": "1",
+      };
+      const emptyUpdate = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${emptyPrivateUid}`,
+        202,
+        emptyUpdateBody,
+        emptyUpdateHeaders,
+      );
+      expect(await settled(port, token, String(emptyUpdate.id))).toMatchObject({
+        effect: "complete",
+      });
+      expect(
+        await jsonAt(
+          port,
+          "PUT",
+          `${V2}/resources/${emptyPrivateUid}`,
+          200,
+          emptyUpdateBody,
+          emptyUpdateHeaders,
+        ),
+      ).toMatchObject({ id: emptyUpdate.id });
       const version = await create(WORKER_VERSION_FORM_URL, "version", {
         worker: { resourceUid: worker.uid },
         bundle: { resourceUid: bundle.uid },
@@ -2055,6 +2091,156 @@ export class SqlWorkflow {
         status: 200,
         body: '[{"value":"once"},{"value":"actor-before"},{"value":"workflow-before"},{"value":"workflow-after"}]',
       });
+      const secretValue = "native-private-input-synthetic-sentinel";
+      const secretSpec = {
+        worker: { resourceUid: worker.uid },
+        bundle: { resourceUid: bundle.uid },
+        handlers: ["fetch", "queue"],
+        requiredSensitiveVars: ["TOKEN"],
+      };
+      const secretBody = {
+        form: WORKER_VERSION_FORM_URL,
+        space,
+        name: "private-version",
+        spec: secretSpec,
+        privateInputs: { TOKEN: secretValue },
+      };
+      const secretHeaders = { ...auth, "idempotency-key": "normal-v2-private-version-create" };
+      const secret = await jsonAt(port, "POST", `${V2}/resources`, 202, secretBody, secretHeaders);
+      expect(await settled(port, token, String(secret.id))).toMatchObject({ effect: "complete" });
+      const secretUid = String(secret.resourceUid);
+      expect(
+        await jsonAt(port, "POST", `${V2}/resources`, 200, secretBody, secretHeaders),
+      ).toMatchObject({ id: secret.id, resourceUid: secretUid });
+      expect(
+        await jsonAt(
+          port,
+          "POST",
+          `${V2}/resources`,
+          409,
+          { ...secretBody, privateInputs: { TOKEN: "changed-synthetic-value" } },
+          secretHeaders,
+        ),
+      ).toMatchObject({ code: "idempotency_conflict" });
+      const wrongSecret = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${secretUid}`,
+        422,
+        { spec: secretSpec, privateInputs: { TOKEN: "changed-synthetic-value" } },
+        {
+          ...auth,
+          "idempotency-key": "normal-v2-private-version-changed",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(wrongSecret).toMatchObject({ code: "invalid_spec" });
+      const secretDeployment = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${deployment.uid}`,
+        202,
+        {
+          spec: {
+            worker: { resourceUid: worker.uid },
+            versions: [{ workerVersion: { resourceUid: secretUid }, weight: 10_000 }],
+          },
+        },
+        {
+          ...auth,
+          "idempotency-key": "normal-v2-private-version-deployment",
+          "takoform-expected-generation": "2",
+        },
+      );
+      expect(await settled(port, token, String(secretDeployment.id))).toMatchObject({
+        effect: "complete",
+      });
+      expect(await nativeHttps(hostname, "/secret")).toEqual({ status: 200, body: secretValue });
+      for (const path of [
+        `${V2}/resources/${secretUid}`,
+        `${V2}/operations/${String(secret.id)}`,
+      ]) {
+        const publicRecord = await jsonAt(port, "GET", path, 200, undefined, auth);
+        expect(JSON.stringify(publicRecord)).not.toContain(secretValue);
+      }
+      const secretSql = new Database(join(root, "control.sqlite"), { readonly: true });
+      try {
+        for (const table of [
+          "tf_v2_resources",
+          "tf_v2_operations",
+          "tf_v2_private_inputs",
+          "tf_v2_configured_private_inputs",
+        ]) {
+          expect(JSON.stringify(secretSql.query(`SELECT * FROM ${table}`).all())).not.toContain(
+            secretValue,
+          );
+        }
+      } finally {
+        secretSql.close();
+      }
+      for (const key of [BUNDLE_MANIFEST_KEY, BUNDLE_FILE_KEY]) {
+        expect((await readFile(join(root, "objects", key))).includes(secretValue)).toBe(false);
+      }
+      const rotatedBoot = {
+        ...fullBoot,
+        TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING: JSON.stringify({
+          current: { id: "v2-entry-next", key: base64UrlEncode(new Uint8Array(32).fill(0x70)) },
+          previous: [
+            { id: "v2-entry-fixture", key: base64UrlEncode(new Uint8Array(32).fill(0x6f)) },
+          ],
+        }),
+      };
+      const secretPid = serving.pid;
+      await killHost(serving);
+      serving = null;
+      serving = await startHost(root, port, config, rotatedBoot);
+      expect(serving.pid).not.toBe(secretPid);
+      expect(await nativeHttps(hostname, "/secret")).toEqual({ status: 200, body: secretValue });
+      const sameSecretUpdate = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${secretUid}`,
+        202,
+        { spec: secretSpec, privateInputs: { TOKEN: secretValue } },
+        {
+          ...auth,
+          "idempotency-key": "normal-v2-private-version-retained-update",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(await settled(port, token, String(sameSecretUpdate.id))).toMatchObject({
+        effect: "complete",
+      });
+      expect(
+        await jsonAt(
+          port,
+          "PUT",
+          `${V2}/resources/${secretUid}`,
+          200,
+          { spec: secretSpec, privateInputs: { TOKEN: secretValue } },
+          {
+            ...auth,
+            "idempotency-key": "normal-v2-private-version-retained-update",
+            "takoform-expected-generation": "1",
+          },
+        ),
+      ).toMatchObject({ id: sameSecretUpdate.id });
+      const omittedSecretUpdate = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${secretUid}`,
+        202,
+        { spec: secretSpec },
+        {
+          ...auth,
+          "idempotency-key": "normal-v2-private-version-omitted-update",
+          "takoform-expected-generation": "2",
+        },
+      );
+      expect(await settled(port, token, String(omittedSecretUpdate.id))).toMatchObject({
+        effect: "complete",
+      });
+      expect(await nativeHttps(hostname, "/secret")).toEqual({ status: 200, body: secretValue });
       const remove = async (uid: string, generation: number, name: string) => {
         const accepted = await jsonAt(port, "DELETE", `${V2}/resources/${uid}`, 202, undefined, {
           ...auth,
@@ -2082,8 +2268,10 @@ export class SqlWorkflow {
       expect(await settled(port, token, String(afterEndpointDelete.id))).toMatchObject({
         effect: "complete",
       });
-      await remove(deployment.uid, 2, "deployment");
+      await remove(deployment.uid, 3, "deployment");
+      await remove(secretUid, 3, "private-version");
       await remove(workflowVersion.uid, 1, "workflow-version");
+      await remove(emptyPrivateUid, 2, "empty-private-input-version");
       await remove(version.uid, 1, "version");
       await remove(workflow.uid, 2, "workflow");
       await remove(namespace.uid, 3, "namespace");
@@ -2107,7 +2295,7 @@ export class SqlWorkflow {
         fetch: () => new Response(null, { status: 503 }),
       });
       try {
-        await expect(startHost(root, port, config, fullBoot)).rejects.toThrow(
+        await expect(startHost(root, port, config, rotatedBoot)).rejects.toThrow(
           "normal Bun entry exited during startup",
         );
         // The existing Endpoint boot bound 443 before the ordinary Bun listener

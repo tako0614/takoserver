@@ -331,6 +331,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   internalFormFactoryForEndpoint(endpoint: EndpointPorts): V2OperatorFormFactory;
   /** Complete secret-free public admission; runtime ciphertext recovery remains configured. */
   secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory;
+  privateInputFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory;
 } {
   if (!options.targetKey || !options.rootDirectory || !options.sql || !options.objects) {
     throw new TypeError("v2 Worker composition requires SQL, objects, target and private root");
@@ -1315,7 +1316,10 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     });
     return (context) => createInternalForms(context, capturedEndpoint);
   }
-  function secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory {
+  function completeFormFactory(
+    endpoint: EndpointPorts | undefined,
+    allowPrivateInputs: boolean,
+  ): V2OperatorFormFactory {
     if (!restorationComplete || ownerAdmissionFrozen)
       throw new TypeError("v2 Worker owners must restore before Form composition");
     if (
@@ -1359,7 +1363,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       capturedEndpoint = Object.freeze({ assignHostname, observeTls, observeRouteAbsent });
     }
     return (context) => ({
-      ...createInternalForms(context, capturedEndpoint, false),
+      ...createInternalForms(context, capturedEndpoint, allowPrivateInputs),
       [SQLITE_DATABASE_FORM_URL]: createSQLiteDatabaseForm({ store: sqliteStore }),
       ...(migrationCustody
         ? {
@@ -1382,6 +1386,17 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         backendId: v2ObjectBucketBinding.backendId,
       }),
     });
+  }
+
+  function secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory {
+    return completeFormFactory(endpoint, false);
+  }
+
+  function privateInputFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory {
+    if (!configuredInputSealer || !configuredInputCustody) {
+      throw new TypeError("v2 Worker private input key authority is unavailable");
+    }
+    return completeFormFactory(endpoint, true);
   }
 
   return {
@@ -1527,5 +1542,6 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
     internalFormFactory,
     internalFormFactoryForEndpoint,
     secretFreeFormFactory,
+    privateInputFormFactory,
   };
 }

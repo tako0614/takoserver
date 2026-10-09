@@ -1,4 +1,4 @@
-# Self-host operations: install, admission, update, and recovery
+# Self-host operations: install, update, and recovery
 
 This guide covers the Bun self-host path from a source checkout to a first
 usable Takoform Host, then the operator's maintenance boundary. It documents
@@ -9,8 +9,18 @@ claim GA status.
 
 ## First install and first use
 
-1. From the selected, reviewed Takoserver checkout, install its locked
-   dependencies and start the Bun entrypoint:
+1. From the selected, reviewed Takoserver checkout, configure the current v2
+   entry before starting it. `TAKOSERVER_PUBLIC_ORIGIN` must be the canonical
+   bare external HTTPS origin. `TAKOSERVER_TAKOFORM_V2_CONFIG` is strict JSON with
+   HTTPS `documentation` and `authenticationDocumentation` URLs. Provide a
+   persistent `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY` containing at least 32 random
+   bytes as canonical, unpadded base64url; keep it stable across restarts and
+   outside source and logs. See [Takoform v2 operator setup](takoform-v2.md)
+   for the exact config shape and optional Form backends. Keep
+   `TAKOSERVER_DATA_ROOT` persistent (default `.takoserver`); if `TAKOSERVER_DB`
+   is external, include that database in backup and restore.
+
+   Install locked dependencies and start the Bun entrypoint:
 
    ```sh
    bun install --frozen-lockfile
@@ -51,98 +61,51 @@ claim GA status.
    `GET {host-origin}/v1/me` to see its organizations; if it needs to create
    one, call `POST {host-origin}/v1/organizations` with the session bearer and
    JSON body `{"name":"<organization name>"}`. Record the resulting
-   organization ID. Choose the exact stable Space identifier for admission;
-   the admission command does not create either the organization or Space. If
-   a manual resource client needs an organization API key, create one with
+   organization ID. The v2 organization lane uses that exact ID as its Space.
+   These `/v1` session, organization, and API-key routes are Takoserver product
+   APIs, not the Takoform Host API. If the client needs an organization API key,
+   create one with
    `POST {host-origin}/v1/organizations/{organizationId}/api-keys`, using the
    session bearer as an organization owner and a JSON object with exactly
-   `name`, `scopes`, and `expiresInSeconds`. Choose only the scopes the client
-   needs. The response's
-   key secret is shown only once; keep it out of logs and this repository and
-   store it with the installation's other credentials. A fresh Bun Host
-   intentionally serves no Forms before this step's explicit
-   admission. Confirm that the normal self-host Provider3 mode is selected;
-   the retired Cloudflare ObjectBucket drain mode cannot be used for admission.
+   `name`, `scopes`, and `expiresInSeconds`. Use `resources:read` for read-only
+   checks or `resources:write` for Resource operations; write includes read.
+   The key secret is shown only once. Keep it out of logs and this repository,
+   and store it with the installation's other credentials.
 
-3. Prepare the released Takoform Core verifier from this same source checkout.
-   Its Go module pins Core v1.1.0. Compute the artifact identity from the
-   checkout's own deploy helper, build the verifier, and start it only on a
-   host/network isolated from untrusted traffic. The verifier currently binds
-   `:8080` on all interfaces and has no bind-address flag; do not expose that
-   port publicly. Either restrict non-loopback access with the host's
-   operator-managed firewall, or run the verifier in a dedicated network
-   namespace. In the namespace case, the admission CLI must also run inside
-   that same namespace to reach `127.0.0.1:8080`; loopback in a different
-   namespace is a different interface:
+3. Configure artifact-backed Forms only when this Host will use them. See
+   [Takoform v2 operator setup](takoform-v2.md) for the supported blocks and
+   exact held-artifact format. The Host does not upload or fetch artifacts;
+   seed their exact bytes in the object store through operator-owned tooling and
+   grant them to `org:<organizationId>` in that same organization's Space.
+   `SQLiteMigrationSet`, `WorkerBundle`, and `StaticAssetBundle` retain
+   validated artifacts; they do not execute SQL, run a Worker, or serve assets.
 
-   ```sh
-   CORE_DIGEST="$(bun -e 'import { takoformCoreVerifierArtifactDigest } from "./scripts/deploy/form-authority.ts"; console.log(takoformCoreVerifierArtifactDigest())')"
-   (cd services/takoform-core-verifier && go build -o /absolute/operator-managed/path/takoform-core-verifier ./cmd/server)
-   TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST="$CORE_DIGEST" /absolute/operator-managed/path/takoform-core-verifier
-   ```
+   The complete local Worker Forms and SQLite/KV/ObjectBucket/Queue Bindings
+   are an optional native profile. It requires both bundles on the exact Worker
+   target, the accepted native `workerd`, Actor and Workflow boot, all five
+   private planes, and successful owner restoration. Endpoint support has a
+   separate HTTPS listener gate. Use the linked setup guide for exact settings;
+   a partial setup does not advertise a reduced Worker profile. Artifact-only
+   Forms do not require this native profile. Restart with the protected config
+   if its blocks or grants change.
 
-   Keep that verifier process available at the address reachable from the
-   admission CLI while planning and applying admission. Do not substitute a stock npm `workerd`
-   binary for `TAKOSERVER_WORKERD_BINARY`: Worker execution requires the exact
-   currently reviewed, accepted workerd artifact and source configuration.
-   Without that artifact, worker-backed execution is unavailable rather than
-   silently selecting npm's binary. This Linux/x64 Worker lane also requires
-   `/usr/bin/setpriv`, `/bin/sh`, and mounted Linux `/proc`. The Host uses them
-   to bind its workerd child to the Host process and verify that the configured
-   Worker TCP port belongs to that child. Missing support disables Worker
-   serving rather than falling back to an unbound child; SQLite and storage
-   remain independent.
+4. Check the current v2 surface. Fetch unauthenticated
+   `GET /.well-known/takoform/v2`, then use the organization API key to query
+   `GET /apis/forms.takoform.com/v2/support?form={exact-form-url}` for each
+   exact, versioned Form URL you intend to use. Proceed only when that exact URL
+   reports `supported: true`; support reflects the Forms configured in this
+   running Host. If a config change was needed after startup, restart it first.
 
-4. Stop the Bun Host through the supervisor actually used for this installation
-   and wait for its child `workerd` and all other writers to exit. Then run the
-   operator command from the selected source checkout. The first invocation is
-   plan-only; inspect its output. Apply only the plan you intend, using the
-   same checkout, verifier, data root, control database, Host origin,
-   organization, and Space. The CLI takes the data root from `--data-root` (or
-   `TAKOSERVER_DATA_ROOT`) but takes the database path only from
-   `TAKOSERVER_DB`; it has no database-path flag. If the running Host uses an
-   external `TAKOSERVER_DB`, pass that exact resolved path to both CLI
-   invocations. The examples below require the Host's effective database path
-   in either case: use the configured external path, or the resolved
-   `<data-root>/control.sqlite` default when the Host has no `TAKOSERVER_DB`.
-   If the Host's effective database path is unknown, do not run admission;
-   otherwise the CLI could open a different or newly created `control.sqlite`
-   instead of the Host's database.
-
-   ```sh
-   TAKOSERVER_DB=<resolved-control-database-path> \
-   bun scripts/selfhost-form-admission.ts <organizationId> <space> \
-     --data-root <resolved-data-root> --host-id <canonical-public-origin> \
-     --core-verifier http://127.0.0.1:8080
-   TAKOSERVER_DB=<resolved-control-database-path> \
-   bun scripts/selfhost-form-admission.ts <organizationId> <space> \
-     --data-root <resolved-data-root> --host-id <canonical-public-origin> \
-     --core-verifier http://127.0.0.1:8080 --apply
-   ```
-
-   Replace angle-bracket values with this installation's exact values,
-   including the absolute, resolved data-root and control-database paths the
-   Host uses. Pass `--data-root` even when the Host uses the default
-   `.takoserver`, resolved relative to the Host's working directory. Run both
-   commands in the same network namespace as the verifier, or use the same
-   explicitly secured bridge and matching reachable verifier URL. Do not put
-   secrets in the command: this admission path does not require a Cloudflare
-   token.
-   The command verifies the checkout-pinned Core identity, imports and verifies
-   all 17 embedded publisher packages, then installs the package set and
-   activates only the implemented subset for the selected organization/Space.
-   It does not promote all Forms as usable, or change the released Form
-   definitions. Re-running it replans from durable admission state.
-
-5. Restart the Host using its configured supervisor. Collect its stdout and
-   stderr, including the `takoserver listening` line. Check the public,
-   unauthenticated `GET /v1/forms` response and confirm it reports the expected
-   Host answer for the admitted definitions. Then sign in, create/use a scoped
-   organization API key as needed, perform one ordinary resource operation
-   through the supported console/client, and read it back through
-   `GET /v1/organizations/{organizationId}/resources/{resourceUid}`. A route
-   accepting connections or a process log line alone is not functional
-   readback.
+5. Using that Form's published input contract, create a Resource with the
+   organization API key and `resources:write` at
+   `POST /apis/forms.takoform.com/v2/resources`. Set `space` to the exact
+   organization ID and provide a unique `Idempotency-Key`. The Host accepts an
+   asynchronous Operation; poll
+   `GET /apis/forms.takoform.com/v2/operations/{operationId}` until terminal,
+   then read the Resource back with the same credential at
+   `GET /apis/forms.takoform.com/v2/resources/{resourceUid}`. Use the exact Form
+   URL and request shape from that published contract; there is no generic body
+   that applies to every Form.
 
 The Bun self-host exposes two unauthenticated, no-store operational probes,
 outside the Host API v1 and the shared OpenAPI route table:
@@ -257,11 +220,16 @@ For each update, first make the cold snapshot described below. Stop the Bun
 Host and all child/workload writers, deploy the selected source checkout and
 locked dependencies, then start that exact version under the existing
 protected configuration. Startup can apply forward SQLite migrations and
-resume queued work. Confirm startup diagnostics, the expected `GET /v1/forms`
-answer, and an authenticated readback of a known Resource before considering
-the update in service. If any post-start result is uncertain, stop further
-traffic/work through the existing supervisor and retain logs and the current
-database for diagnosis.
+resume queued work. Confirm startup diagnostics and the v2 discovery endpoint
+`GET /.well-known/takoform/v2`. With an organization API key, check each
+expected exact Form using
+`GET /apis/forms.takoform.com/v2/support?form={exact-form-url}`, then read
+back a known v2 Resource at
+`GET /apis/forms.takoform.com/v2/resources/{resourceUid}`. The legacy
+`GET /v1/forms` catalogue is not a v2 support check. Consider the update in
+service only after these current-surface checks succeed. If any post-start
+result is uncertain, stop further traffic/work through the existing supervisor
+and retain logs and the current database for diagnosis.
 
 Code rollback is not database rollback. To return to the previous code, stop
 the Host and all writers, confirm that the retained previous checkout's
@@ -365,6 +333,10 @@ installation, not as a no-write restore check. If source fencing, ownership of
 the public identity, or the fate of pending operations is uncertain, leave the
 restored copy stopped and resolve that uncertainty before activation.
 
+After activation, perform the same current v2 discovery, authenticated exact
+Form-support, and known v2 Resource-readback checks described for an update.
+The legacy `/v1/forms` catalogue does not establish v2 support.
+
 ## Automated proof and its limits
 
 The portable test `tests/self-host-backup-restore.test.ts` copies a disposable
@@ -375,7 +347,10 @@ external credentials or services, test a real filesystem snapshot, or replace
 an operator recovery drill.
 
 The optional native test `tests/selfhost-host-cold-restore-native.test.ts`
-starts the real Bun entrypoint and the accepted workerd artifact. It creates
+is skipped when the accepted workerd artifact is unavailable and starts the
+real Bun entrypoint when it runs. It retains an earlier v1 admission stage
+before a v2 transition; those v1 assertions are historical transition evidence,
+not the current v2 support check. It creates
 resources through the Host HTTP API, uploads and publishes a Worker, and checks
 its Endpoint over certificate-validated HTTPS. It then kills only the exact
 accepted workerd child and requires a distinct replacement under the same Bun
@@ -402,14 +377,15 @@ missing tool or cache fails the test instead of substituting a prebuilt binary.
 The Go build is bounded to two concurrent package builds and two active Go
 processors; this does not change the native Host or recovery time assertions.
 The verifier reports the current checkout's source-derived artifact digest and
-pins released Core v1.1.0. Before durable Form admission, the test submits the
-exact current 17-package publisher closure over its real loopback HTTP API,
-requires acceptance, then requires refusal of changed package bytes and a
-valid-but-wrong publisher ref at that same verification endpoint. The actual
+pins released Core v1.1.0. In the retained historical v1 admission stage, the
+test submits the exact 17-package publisher closure over its real loopback HTTP
+API, requires acceptance, then requires refusal of changed package bytes and a
+valid-but-wrong publisher ref at that same verification endpoint. The legacy
 self-host admission CLI then applies the unchanged closure through its existing
-`--core-verifier` interface. The native harness allows up to 120 seconds for
-that local apply process and 240 seconds for the entire native test; these are
-test budgets, not a production CLI or Host API deadline. The child-stop,
+`--core-verifier` interface. This verifies that historical stage, not the
+current v2 installation procedure. The native harness allows up to 120 seconds
+for that local apply process and 240 seconds for the entire native test; these
+are test budgets, not a production CLI or Host API deadline. The child-stop,
 Host-readiness, Worker-recovery, and cleanup bounds are unchanged.
 
 For example, provide Bun 1.4.0, Go, and the existing local Go caches in `PATH`
@@ -427,12 +403,13 @@ env -i PATH="$PATH" TMPDIR=/tmp \
 An unset artifact explicitly skips this native case; a portable check therefore
 does not prove native restore or Core publisher authenticity. A configured but
 unaccepted workerd artifact fails rather than substituting a different binary.
-The Go verifier and 17-package signatures are real current-source/Core proof;
-the operator assertion, operator key, and self-signed endpoint TLS certificate
-remain disposable local fixture identities. This test does not prove production
-deployment provenance, external credential or service recovery, pending event
-delivery, monitoring, or an operator disaster-recovery drill. Startup remains
-active as described above; there is no read-only restore mode.
+The Go verifier and 17-package signatures exercise the retained historical v1
+admission stage only; the operator assertion, operator key, and self-signed
+endpoint TLS certificate remain disposable local fixture identities. This
+test does not prove production deployment provenance, external credential or
+service recovery, pending event delivery, monitoring, or an operator
+disaster-recovery drill. Startup remains active as described above; there is
+no read-only restore mode.
 
 The serving supervisor writes bounded child-exit, automatic-restart attempt and
 delay, and recovery-success diagnostics through its existing log callback (the
@@ -442,3 +419,19 @@ not reported as crashes. A failure to write these diagnostics does not stop
 runtime recovery. Operators still need to collect logs and configure their own
 alerts: these messages are not a health API, monitoring service, or proof of
 operator recovery.
+
+## Historical reference: v1 signed package admission
+
+The former self-host admission path built a Takoform Core v1.1.0 verifier from
+the checkout, derived its artifact digest with the deploy helper, and used
+`scripts/selfhost-form-admission.ts` to verify and admit an exact closure of 17
+signed publisher packages. Its old catalogue check was `GET /v1/forms`. This
+package-verification and durable-admission workflow belongs to the former v1
+Host path; the current normal Bun entry does not require it. Current v2 support
+comes from the exact versioned Form URLs composed by source and the optional
+operator configuration described in [Takoform v2 operator setup](takoform-v2.md).
+
+The optional native cold-restore test retains a v1 admission stage followed by
+a v2 transition as historical compatibility evidence. Neither that fixture nor
+the former package-admission procedure is the current v2 install path or a
+current v2 support signal.

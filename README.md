@@ -14,15 +14,21 @@ not install Form packages, require their signatures, or translate into v1.
 Resources belong to an organization while each credential retains its own
 read/write permissions. See [v2 architecture and operator setup](docs/takoform-v2.md).
 
-Current source support is deliberately limited: the Bun entry can explicitly
-configure `SQLiteMigrationSet 0.2.0` using authorized Host-held bytes. This stores
-verified migration files; it does not execute SQL. Other v2 Form backends,
-Hosted D1 and WfP integration, downstream Provider adoption and deployment
-qualification remain separate work. A green portable gate is not a live rollout.
+The Bun entry can explicitly configure `SQLiteMigrationSet 0.2.0`,
+`WorkerBundle 0.2.0`, and `StaticAssetBundle 0.2.0` against authorized
+Host-held bytes. These Forms validate and retain artifacts; by themselves they do
+not apply SQL, execute a Worker, serve assets, or create an endpoint. A separate,
+opt-in local `workerd` composition advertises its Worker lifecycle Forms and
+SQLite/KV/ObjectBucket/Queue Bindings only when the complete native runtime and
+private data planes are configured and restored. Its exact gates, Form map, and
+limits are in [v2 architecture and operator setup](docs/takoform-v2.md).
+Hosted D1, Workers for Platforms, downstream Provider adoption, public TLS/live
+qualification, and deployment qualification are separate; source and local
+native evidence do not establish a deployed rollout.
 
-Before starting, set a canonical external HTTPS origin, the non-secret
-`TAKOSERVER_TAKOFORM_V2_CONFIG`, and a persistent operator-secret
-`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY` as described in that guide. Then run:
+Before starting, provide the canonical external HTTPS origin, the non-secret
+`TAKOSERVER_TAKOFORM_V2_CONFIG`, and the persistent operator-secret
+`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY` described in that guide. Then run:
 
 ```sh
 bun install --frozen-lockfile
@@ -31,9 +37,10 @@ bun src/entry-bun.ts
 
 The public v2 discovery is `/.well-known/takoform/v2`; technical support for an
 exact Form URL is queried at `/apis/forms.takoform.com/v2/support?form=...` with
-authentication. An empty configured Form map is explicit non-support, not a
-fallback to the old Host. The Bun HTTP listener requires an operator-controlled
-HTTPS front end for public use. Do not expose that backend listener directly.
+authentication. Support reflects the Forms actually composed at startup; an
+unavailable optional runtime is not advertised as a narrower substitute. The
+Bun HTTP listener requires an operator-controlled HTTPS front end for public
+use. Do not expose that backend listener directly.
 
 ## Legacy runtime and provider reference
 

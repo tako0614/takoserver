@@ -171,6 +171,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0086_v2_worker_service_invocation_custody.sql",
   "0087_v2_worker_cron_invocation_custody.sql",
   "0088_v2_worker_sqlite_external_drain.sql",
+  "0089_v2_worker_cron_match_guard_depth.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -349,8 +350,10 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:0375e932701b6596363468a784cdef91d56846f9e4a49cc65ff5890c0f2d0b7e",
   "0088_v2_worker_sqlite_external_drain.sql":
     "sha256:88bf294753e8bd43809634410c4a8648cb3e0500e7400d53ec4c8f17fae46c84",
+  "0089_v2_worker_cron_match_guard_depth.sql":
+    "sha256:eaed1f01e78de59c4488e5c882e984d6c5e5f9010e8e8bab51dac3a74f0fca7b",
 };
-// 0067-0088 are part of the exact source inventory only. None has an in-place apply wave.
+// 0067-0089 are part of the exact source inventory only. None has an in-place apply wave.
 const INTEGRATION_APPLY_CEILING_COUNT = 66;
 // Fresh production bootstrap is a distinct, still-frozen authority. Auditing
 // a new local source migration never silently adds it to this payload.
@@ -358,6 +361,25 @@ const FRESH_PRODUCTION_APPLY_CEILING_COUNT = 69;
 // Separate fixed fresh-only integration artifact payload. A future audited
 // source tail must not silently expand this selector.
 const FRESH_V2_ARTIFACT_APPLY_CEILING_COUNT = 75;
+// This selector names one reviewed payload, not the mutable audited source head.
+// Keep the digest independent of future AUDITED_MIGRATION_LINEAGE additions.
+const FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT = 88;
+const FRESH_PRODUCTION_V2_APPLY_END = "0088_v2_worker_sqlite_external_drain.sql";
+const FRESH_PRODUCTION_V2_APPLY_DIGEST =
+  "sha256:269d7e6074584225606040b22405e395ea1ffba170b001b3c05605af8d637e19";
+const FRESH_PRODUCTION_V2_APPLY_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
+  0,
+  FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT,
+);
+// A separate reviewed 0089 profile; never reinterpret v2-0088 as the new head.
+const FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT = 89;
+const FRESH_PRODUCTION_V2_0089_APPLY_END = "0089_v2_worker_cron_match_guard_depth.sql";
+const FRESH_PRODUCTION_V2_0089_APPLY_DIGEST =
+  "sha256:44d5cd59a772c51877d32f2f448ff929b7a50e0792ac99dea3522b1cb01545fa";
+const FRESH_PRODUCTION_V2_0089_APPLY_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
+  0,
+  FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT,
+);
 const APPLY_QUALIFIED_MIGRATION_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
   0,
   INTEGRATION_APPLY_CEILING_COUNT,
@@ -2509,7 +2531,7 @@ function selectSchemaWave(
     if (hasAvailabilityCutover) {
       if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
         throw preflightError(
-          "integration D1 cutover requires the exact audited source inventory 0001-0088",
+          "integration D1 cutover requires the exact audited source inventory 0001-0089",
         );
       }
       assertAuditedMigrationHashes(artifact.files);
@@ -2556,7 +2578,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0088",
+      "selected D1 wave requires the exact audited source inventory 0001-0089",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -2631,14 +2653,14 @@ function assertOperationGenerationMigrationHashes(
   );
 }
 
-/** Reads and validates the exact current 0001-0088 source corpus. */
+/** Reads and validates the exact current 0001-0089 source corpus. */
 export function readCurrentAuditedMigrationSourceArtifact(
   directory: string = resolve(REPOSITORY, "migrations"),
 ): ReturnType<typeof readMigrationArtifact> {
   const artifact = readMigrationArtifact(directory);
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0088",
+      "audited migration lineage must contain exactly 0001-0089",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }
@@ -2655,7 +2677,7 @@ export function projectApplyQualifiedMigrationArtifact(
 ): ReturnType<typeof readMigrationArtifact> {
   if (JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "apply-qualified migration projection requires the exact audited source inventory 0001-0088",
+      "apply-qualified migration projection requires the exact audited source inventory 0001-0089",
       `actual=${JSON.stringify(source.names)}`,
     );
   }
@@ -2674,7 +2696,7 @@ export function projectFreshV2ArtifactMigrationArtifact(
 ): ReturnType<typeof readMigrationArtifact> {
   if (JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "fresh v2 artifact projection requires the exact audited source inventory 0001-0088",
+      "fresh v2 artifact projection requires the exact audited source inventory 0001-0089",
       `actual=${JSON.stringify(source.names)}`,
     );
   }
@@ -2710,7 +2732,7 @@ export function projectFreshProductionMigrationArtifact(
 ): ReturnType<typeof readMigrationArtifact> {
   if (JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "fresh production projection requires the exact audited source inventory 0001-0088",
+      "fresh production projection requires the exact audited source inventory 0001-0089",
       `actual=${JSON.stringify(source.names)}`,
     );
   }
@@ -2733,6 +2755,91 @@ export function readSealedFreshProductionMigrationArtifact(
     );
   }
   assertAuditedMigrationHashes(artifact.files, FRESH_PRODUCTION_APPLY_CEILING_COUNT);
+  return artifact;
+}
+
+/** Closed fresh-only v2 profile; an audited future tail never widens this selector. */
+export function projectFreshProductionV2MigrationArtifact(
+  source: ReturnType<typeof readMigrationArtifact>,
+): ReturnType<typeof readMigrationArtifact> {
+  if (
+    FRESH_PRODUCTION_V2_APPLY_LINEAGE.length !== FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT ||
+    FRESH_PRODUCTION_V2_APPLY_LINEAGE.at(-1) !== FRESH_PRODUCTION_V2_APPLY_END ||
+    JSON.stringify(source.names.slice(0, FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT)) !==
+      JSON.stringify(FRESH_PRODUCTION_V2_APPLY_LINEAGE)
+  ) {
+    throw preflightError(
+      "fresh production v2 projection requires the fixed audited 0001-0088 prefix",
+    );
+  }
+  const files = source.files.slice(0, FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT);
+  assertAuditedMigrationHashes(files, FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT);
+  const artifact = createMigrationArtifact(files);
+  if (artifact.digest !== FRESH_PRODUCTION_V2_APPLY_DIGEST) {
+    throw preflightError("fresh production v2 payload differs from its fixed 0088 digest");
+  }
+  return artifact;
+}
+
+/** Refuses a partial or altered sealed v2 import before any provider mutation. */
+export function readSealedFreshProductionV2MigrationArtifact(
+  directory: string,
+): ReturnType<typeof readMigrationArtifact> {
+  const artifact = readMigrationArtifact(directory);
+  if (
+    JSON.stringify(artifact.names) !== JSON.stringify(FRESH_PRODUCTION_V2_APPLY_LINEAGE) ||
+    artifact.names.length !== FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT ||
+    artifact.names.at(-1) !== FRESH_PRODUCTION_V2_APPLY_END
+  ) {
+    throw preflightError("sealed fresh production v2 lineage must contain exactly 0001-0088");
+  }
+  assertAuditedMigrationHashes(artifact.files, FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT);
+  if (artifact.digest !== FRESH_PRODUCTION_V2_APPLY_DIGEST) {
+    throw preflightError("sealed fresh production v2 payload differs from its fixed 0088 digest");
+  }
+  return artifact;
+}
+
+/** Closed fresh-only 0089 profile; later audited source files cannot widen it. */
+export function projectFreshProductionV2MigrationArtifact0089(
+  source: ReturnType<typeof readMigrationArtifact>,
+): ReturnType<typeof readMigrationArtifact> {
+  if (
+    FRESH_PRODUCTION_V2_0089_APPLY_LINEAGE.length !==
+      FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT ||
+    FRESH_PRODUCTION_V2_0089_APPLY_LINEAGE.at(-1) !== FRESH_PRODUCTION_V2_0089_APPLY_END ||
+    JSON.stringify(source.names.slice(0, FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT)) !==
+      JSON.stringify(FRESH_PRODUCTION_V2_0089_APPLY_LINEAGE)
+  ) {
+    throw preflightError(
+      "fresh production v2-0089 projection requires the fixed audited 0001-0089 prefix",
+    );
+  }
+  const files = source.files.slice(0, FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT);
+  assertAuditedMigrationHashes(files, FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT);
+  const artifact = createMigrationArtifact(files);
+  if (artifact.digest !== FRESH_PRODUCTION_V2_0089_APPLY_DIGEST) {
+    throw preflightError("fresh production v2-0089 payload differs from its fixed digest");
+  }
+  return artifact;
+}
+
+/** A sealed v2-0089 import contains exactly 89 files, never a future tail. */
+export function readSealedFreshProductionV2MigrationArtifact0089(
+  directory: string,
+): ReturnType<typeof readMigrationArtifact> {
+  const artifact = readMigrationArtifact(directory);
+  if (
+    JSON.stringify(artifact.names) !== JSON.stringify(FRESH_PRODUCTION_V2_0089_APPLY_LINEAGE) ||
+    artifact.names.length !== FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT ||
+    artifact.names.at(-1) !== FRESH_PRODUCTION_V2_0089_APPLY_END
+  ) {
+    throw preflightError("sealed fresh production v2-0089 lineage must contain exactly 0001-0089");
+  }
+  assertAuditedMigrationHashes(artifact.files, FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT);
+  if (artifact.digest !== FRESH_PRODUCTION_V2_0089_APPLY_DIGEST) {
+    throw preflightError("sealed fresh production v2-0089 payload differs from its fixed digest");
+  }
   return artifact;
 }
 
@@ -2770,7 +2877,7 @@ export function readAuditedMigrationArtifact(
 
 /**
  * Reads the frozen 0001-0060 operation-generation corpus. This boundary is
- * intentionally separate from the current 0001-0088 source inventory: the
+ * intentionally separate from the current 0001-0089 source inventory: the
  * operation-generation cutover is historical evidence, not a claim about the
  * current migration tail.
  */
@@ -3186,7 +3293,7 @@ function inspectManagedQueueRetirementCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "managed Queue retirement cutover requires the exact audited source inventory 0001-0088",
+      "managed Queue retirement cutover requires the exact audited source inventory 0001-0089",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -3226,7 +3333,7 @@ function inspectManagedActorOwnerCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "Actor owner claim cutover requires the exact audited source inventory 0001-0088",
+      "Actor owner claim cutover requires the exact audited source inventory 0001-0089",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -3267,7 +3374,7 @@ function inspectRuntimeInputLeaseGenerationCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "runtime-input lease generation cutover requires the exact audited source inventory 0001-0088",
+      "runtime-input lease generation cutover requires the exact audited source inventory 0001-0089",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -3309,7 +3416,7 @@ function inspectActorKvCapabilityCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "Actor KV capability claim cutover requires the exact audited source inventory 0001-0088",
+      "Actor KV capability claim cutover requires the exact audited source inventory 0001-0089",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -3386,7 +3493,7 @@ async function inspectApplyProviderSelectionCutover(input: {
     }
     if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
       throw preflightError(
-        "accepted-authority cutover requires the exact audited source inventory 0001-0088",
+        "accepted-authority cutover requires the exact audited source inventory 0001-0089",
       );
     }
     assertAuditedMigrationHashes(input.artifact.files);
@@ -3428,7 +3535,7 @@ async function inspectApplyProviderSelectionCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "operation-generation cutover requires the exact audited source inventory 0001-0088",
+      "operation-generation cutover requires the exact audited source inventory 0001-0089",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);

@@ -34,6 +34,7 @@ const V2_EDGE_KV_NATIVE_CUSTODY = "0085_v2_edge_kv_native_custody.sql";
 const V2_WORKER_SERVICE_INVOCATION_CUSTODY = "0086_v2_worker_service_invocation_custody.sql";
 const V2_WORKER_CRON_INVOCATION_CUSTODY = "0087_v2_worker_cron_invocation_custody.sql";
 const V2_WORKER_SQLITE_EXTERNAL_DRAIN = "0088_v2_worker_sqlite_external_drain.sql";
+const V2_WORKER_CRON_MATCH_GUARD_DEPTH = "0089_v2_worker_cron_match_guard_depth.sql";
 
 const MUTATION_AUTHORITY_SUMMARY = JSON.stringify({
   formRef: {
@@ -273,6 +274,7 @@ describe("Takoform accepted-authority continuity migration", () => {
       V2_WORKER_SERVICE_INVOCATION_CUSTODY,
       V2_WORKER_CRON_INVOCATION_CUSTODY,
       V2_WORKER_SQLITE_EXTERNAL_DRAIN,
+      V2_WORKER_CRON_MATCH_GUARD_DEPTH,
     ]);
     expect(database.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
     expect(

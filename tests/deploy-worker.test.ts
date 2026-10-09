@@ -616,10 +616,9 @@ describe("split Takoserver Worker surfaces", () => {
   });
 
   test("derives the money, secret, and durable-store closure from the import graph", () => {
-    // A new runtime dependency of any of the five roots classifies without an
-    // edit here. Every module below beyond the roots themselves was already
-    // inside the public Form P/I closure, so making this walk authoritative
-    // widened the reviewed lane by exactly the five roots and nothing else.
+    // A new runtime dependency of any of the five roots classifies without
+    // changing the classifier. This snapshot makes each authority-closure
+    // expansion visible, including v2 custody reached through the key ring.
     expect(authorityImplementationClosure()).toEqual([
       "src/json.ts",
       "src/ledger.ts",
@@ -629,6 +628,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/runtime-input-preparations.ts",
       "src/runtime-input-seal-keyring.ts",
       "src/stripe-settlement.ts",
+      "src/takoform-v2/private-inputs.ts",
       "src/takoform/accepted-authority.ts",
       "src/takoform/apply-selection.ts",
       "src/takoform/dependency-fence.ts",
@@ -648,6 +648,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/runtime-input-preparations.ts",
       "src/runtime-input-seal-keyring.ts",
       "src/stripe-settlement.ts",
+      "src/takoform-v2/private-inputs.ts",
       "src/takoform/store.ts",
     ]);
   });
