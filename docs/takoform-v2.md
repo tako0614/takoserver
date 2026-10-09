@@ -902,6 +902,17 @@ well as the Namespace scope. A physical adapter must verify that exact live
 accepted graph before binding a new durable Namespace registration; scope
 alone is not a registration grant. Existing one-argument self-host adapters
 remain structurally compatible and keep their existing behavior.
+DELETE has a separate held-operation proof because DELETE acceptance does not
+seal a new reference set and the CREATE/UPDATE graph intentionally refuses
+deleting Resources. The proof binds the live DELETE lease and generation to
+the last successfully observed Namespace generation, its sealed Worker
+reference, and the original principal/Space/Namespace UID scope. The backend
+passes this claim to physical retirement and absence readback and rechecks it
+after each await. A physical adapter must verify the same claim against its
+own immutable registration before retiring anything; a missing registration
+or unconfirmed absence stays unknown, not successful DELETE. The existing
+one-argument self-host port remains structurally compatible. This public
+claim does not itself implement private Facet drain or prove native deletion.
 `stillCurrent` checks only settled graphs. A create/reconcile caller holding a
 Namespace Operation must repeat `readAcceptedOperationGraph` with the same
 Operation ID and lease token after awaits, then compare its authority key.

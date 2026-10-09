@@ -10,6 +10,10 @@ import {
   v2ActorDeploymentsAbsent,
 } from "./actor-namespace-admission.ts";
 import {
+  createV2ActorNamespaceSqlGraphReader,
+  type V2ActorAcceptedDeleteClaim,
+} from "./actor-namespace-sql-graph.ts";
+import {
   ACTOR_NAMESPACE_FORM_URL,
   ActorNamespaceValidationError,
   parseActorNamespaceSpec,
@@ -90,8 +94,11 @@ export interface V2ActorNamespacePhysicalPort {
     operation: { readonly operationId: string; readonly leaseToken: string },
   ): Promise<void>;
   namespaceEmpty(scope: V2ActorNamespaceScope): Promise<boolean>;
-  forgetNamespace(scope: V2ActorNamespaceScope): Promise<void>;
-  namespaceAbsent(scope: V2ActorNamespaceScope): Promise<boolean>;
+  forgetNamespace(scope: V2ActorNamespaceScope, claim: V2ActorAcceptedDeleteClaim): Promise<void>;
+  namespaceAbsent(
+    scope: V2ActorNamespaceScope,
+    claim: V2ActorAcceptedDeleteClaim,
+  ): Promise<boolean>;
   observeNamespaceRuntimeForAcceptedOperation?(
     scope: V2ActorNamespaceScope,
     expected: V2ActorNamespaceRuntimeTarget,
@@ -183,6 +190,10 @@ export function createV2ActorNamespaceForm(options: {
   };
 }): V2Form {
   if (!options.targetKey) throw new TypeError("Actor targetKey is required");
+  const deleteGraph = createV2ActorNamespaceSqlGraphReader({
+    sql: options.sql,
+    targetKey: options.targetKey,
+  });
 
   const ownsClaim = async (execution: V2Execution): Promise<boolean> => {
     const rows = await options.sql.query(
@@ -767,8 +778,36 @@ export function createV2ActorNamespaceForm(options: {
     try {
       if (!(await ownsClaim(execution))) return UNKNOWN;
       if (execution.action === "delete") {
-        await options.physical.forgetNamespace(scope);
-        if (!(await options.physical.namespaceAbsent(scope)) || !(await ownsClaim(execution)))
+        const operation = {
+          operationId: execution.operationId,
+          leaseToken: execution.leaseToken,
+        };
+        const claim = await deleteGraph.readAcceptedDeleteOperation(scope, operation);
+        if (
+          !claim ||
+          claim.space !== execution.space ||
+          claim.backendId !== execution.backendId ||
+          claim.generation !== execution.generation ||
+          claim.workerUid !== spec.worker.resourceUid ||
+          claim.className !== spec.className ||
+          !(await ownsClaim(execution))
+        )
+          return UNKNOWN;
+        const authorityKey = claim.authorityKey;
+        const physicalScope = Object.freeze({ ...scope });
+        const physicalClaim = Object.freeze({ ...claim, scope: Object.freeze({ ...claim.scope }) });
+        await options.physical.forgetNamespace(physicalScope, physicalClaim);
+        if (
+          (await deleteGraph.readAcceptedDeleteOperation(scope, operation))?.authorityKey !==
+          authorityKey
+        )
+          return UNKNOWN;
+        if (
+          !(await options.physical.namespaceAbsent(physicalScope, physicalClaim)) ||
+          (await deleteGraph.readAcceptedDeleteOperation(scope, operation))?.authorityKey !==
+            authorityKey ||
+          !(await ownsClaim(execution))
+        )
           return UNKNOWN;
         return { kind: "complete", observed: EMPTY_OBSERVED, output: {} };
       }

@@ -247,7 +247,15 @@ const LAYERS: readonly Layer[] = [
     // never broadens pure Form or generic v2 runtime access to app modules.
     name: "v2-actor-physical-backend",
     match: /^src\/takoform-v2\/actor-namespace-backend\.ts$/u,
-    may: ["core", "app", "native-contract", "v2-contract", "v2-form", "v2-actor-admission"],
+    may: [
+      "core",
+      "app",
+      "native-contract",
+      "v2-contract",
+      "v2-form",
+      "v2-actor-admission",
+      "v2-actor-sql-graph",
+    ],
   },
   {
     // Exact v2 accepted-reference adapter for the existing physical Actor port.

@@ -20,12 +20,31 @@ export interface V2ActorAcceptedSqlGraph {
   readonly authorityKey: string;
 }
 
+/** A held DELETE and the last successfully registered Namespace generation. */
+export interface V2ActorAcceptedDeleteClaim {
+  readonly scope: V2ActorAcceptedSqlScope;
+  readonly space: string;
+  readonly backendId: string;
+  readonly workerUid: string;
+  readonly className: string;
+  readonly operationId: string;
+  readonly leaseToken: string;
+  readonly generation: number;
+  readonly registeredOperationId: string;
+  readonly registeredGeneration: number;
+  readonly authorityKey: string;
+}
+
 export interface V2ActorNamespaceSqlGraphReader {
   readGraph(scope: V2ActorAcceptedSqlScope): Promise<V2ActorAcceptedSqlGraph | null>;
   readAcceptedOperationGraph(
     scope: V2ActorAcceptedSqlScope,
     operation: { readonly operationId: string; readonly leaseToken: string },
   ): Promise<V2ActorAcceptedSqlGraph | null>;
+  readAcceptedDeleteOperation(
+    scope: V2ActorAcceptedSqlScope,
+    operation: { readonly operationId: string; readonly leaseToken: string },
+  ): Promise<V2ActorAcceptedDeleteClaim | null>;
   hasNamespaceAuthority(scope: V2ActorAcceptedSqlScope): Promise<boolean>;
   hasActiveDeployment(
     graph: Pick<V2ActorAcceptedSqlGraph, "scope" | "authorityKey" | "workerUid">,
@@ -258,6 +277,121 @@ export function createV2ActorNamespaceSqlGraphReader(options: {
     };
   };
 
+  const acceptedDelete = async (
+    scope: Scope,
+    operation: { readonly operationId: string; readonly leaseToken: string },
+  ): Promise<V2ActorAcceptedDeleteClaim | null> => {
+    if (!operation.operationId || !operation.leaseToken) return null;
+    const rows = await options.sql.query(
+      `SELECT namespace.uid, namespace.principal, namespace.space,
+         namespace.backend_id, namespace.target_key, namespace.generation,
+         namespace.observed_generation, namespace.spec_json,
+         held.id AS held_id, held.lease_token AS held_lease_token,
+         registered.id AS registered_id, registered.generation AS registered_generation,
+         worker.uid AS worker_uid
+       FROM tf_v2_resources namespace
+       JOIN tf_v2_operations held ON held.id = namespace.last_operation
+       JOIN tf_v2_operations registered
+         ON registered.resource_uid = namespace.uid
+        AND registered.generation = namespace.observed_generation
+       JOIN tf_v2_operation_reference_sets reference_set
+         ON reference_set.operation_id = registered.id AND reference_set.sealed = 1
+       JOIN tf_v2_operation_references reference
+         ON reference.operation_id = registered.id
+        AND reference.form_url = ? AND reference.readiness = 'observed'
+        AND reference.target_spec_path IS NULL AND reference.target_spec_equals IS NULL
+       JOIN tf_v2_resources worker ON worker.uid = reference.target_uid
+       JOIN tf_v2_resource_references edge
+         ON edge.referrer_uid = namespace.uid AND edge.target_uid = worker.uid
+       WHERE namespace.uid = ? AND namespace.principal = ?
+         AND namespace.form_url = ? AND namespace.target_key = ?
+         AND namespace.deleted_at IS NULL AND namespace.phase = 'deleting'
+         AND namespace.busy_operation = held.id
+         AND namespace.generation = held.generation
+         AND namespace.observed_generation > 0
+         AND namespace.observed_generation < namespace.generation
+         AND held.id = ? AND held.lease_token = ?
+         AND held.action = 'delete' AND held.status = 'reconciling'
+         AND held.dispatch_possible = 1 AND held.lease_until_ms > ${DB_NOW_MS}
+         AND held.resource_uid = namespace.uid AND held.principal = namespace.principal
+         AND held.backend_id = namespace.backend_id
+         AND held.target_key = namespace.target_key
+         AND held.accepted_spec_json = namespace.spec_json
+         AND registered.action IN ('create', 'update')
+         AND registered.status = 'succeeded' AND registered.effect = 'complete'
+         AND registered.principal = namespace.principal
+         AND registered.backend_id = namespace.backend_id
+         AND registered.target_key = namespace.target_key
+         AND registered.accepted_spec_json = namespace.spec_json
+         AND worker.form_url = ? AND worker.principal = namespace.principal
+         AND worker.space = namespace.space AND worker.target_key = namespace.target_key
+         AND worker.deleted_at IS NULL
+         AND worker.uid = json_extract(namespace.spec_json, '$.worker.resourceUid')
+         AND NOT EXISTS (SELECT 1 FROM tf_v2_operation_references extra
+           WHERE extra.operation_id = registered.id AND extra.target_uid <> worker.uid)
+         AND NOT EXISTS (SELECT 1 FROM tf_v2_resource_references extra_edge
+           WHERE extra_edge.referrer_uid = namespace.uid AND extra_edge.target_uid <> worker.uid)
+       LIMIT 2`,
+      [
+        MODULE_WORKER_FORM_URL,
+        scope.namespaceResourceUid,
+        scope.tenantId,
+        ACTOR_NAMESPACE_FORM_URL,
+        options.targetKey,
+        operation.operationId,
+        operation.leaseToken,
+        MODULE_WORKER_FORM_URL,
+      ],
+    );
+    const row = rows.length === 1 ? rows[0] : undefined;
+    if (
+      !row ||
+      typeof row.space !== "string" ||
+      typeof row.backend_id !== "string" ||
+      typeof row.spec_json !== "string" ||
+      typeof row.generation !== "number" ||
+      !Number.isSafeInteger(row.generation) ||
+      typeof row.registered_generation !== "number" ||
+      !Number.isSafeInteger(row.registered_generation) ||
+      typeof row.registered_id !== "string" ||
+      row.held_id !== operation.operationId ||
+      row.held_lease_token !== operation.leaseToken ||
+      typeof row.worker_uid !== "string"
+    )
+      return null;
+    let spec: ReturnType<typeof parseActorNamespaceSpec>;
+    try {
+      spec = parseActorNamespaceSpec(JSON.parse(row.spec_json));
+    } catch {
+      return null;
+    }
+    if (spec.worker.resourceUid !== row.worker_uid) return null;
+    return {
+      scope: { ...scope },
+      space: row.space,
+      backendId: row.backend_id,
+      workerUid: row.worker_uid,
+      className: spec.className,
+      operationId: operation.operationId,
+      leaseToken: operation.leaseToken,
+      generation: row.generation,
+      registeredOperationId: row.registered_id,
+      registeredGeneration: row.registered_generation,
+      authorityKey: canonicalJson({
+        scope,
+        space: row.space,
+        targetKey: options.targetKey,
+        backendId: row.backend_id,
+        operationId: operation.operationId,
+        generation: row.generation,
+        registeredOperationId: row.registered_id,
+        registeredGeneration: row.registered_generation,
+        specJson: row.spec_json,
+        workerUid: row.worker_uid,
+      }),
+    };
+  };
+
   const activeDeployment = async (
     graph: Pick<V2ActorAcceptedSqlGraph, "scope" | "authorityKey" | "workerUid">,
   ): Promise<boolean> => {
@@ -300,6 +434,7 @@ export function createV2ActorNamespaceSqlGraphReader(options: {
       scope: Scope,
       operation: { readonly operationId: string; readonly leaseToken: string },
     ) => acceptedGraph(scope, operation),
+    readAcceptedDeleteOperation: acceptedDelete,
     async hasNamespaceAuthority(scope: Scope): Promise<boolean> {
       const row = await namespaceRow(scope);
       if (!row || row.deleted_at !== null) return false;
