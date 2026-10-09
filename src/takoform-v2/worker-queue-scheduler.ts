@@ -10,6 +10,9 @@ const PAGE = 16;
 const NOTICE_PAGE = 1;
 /** Process-local scheduling capacity, not send authority or an 0083 lease. */
 const MAX_IN_FLIGHT = 64;
+const CHECKPOINT_SCHEMA = "takoserver.v2-queue-scheduler-checkpoint@v1" as const;
+const CONSUMER_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const QUEUE_ID = /^takoform-v2-queue:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const DB_NOW_MS =
   "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
 
@@ -20,6 +23,13 @@ type DeliveryScope = {
   readonly space: string;
   readonly targetKey: string;
 };
+
+/** Data-only fair-scan position. This is not delivery or recovery authority. */
+export interface V2QueueSchedulerCheckpoint {
+  readonly schema: typeof CHECKPOINT_SCHEMA;
+  readonly consumerCursor: string;
+  readonly noticeCursor: readonly [string, string, number, string] | null;
+}
 
 interface DeliveryPort {
   deliverOnce(scope: DeliveryScope): Promise<{ readonly kind: DeliveryKind }>;
@@ -46,6 +56,90 @@ export interface V2QueueSchedulerOptions {
    */
   // biome-ignore lint/suspicious/noConfusingVoidType: hosts such as waitUntil return void
   readonly retainDelivery?: (delivery: Promise<DeliveryKind>) => void | false;
+  /** Omit only for a new scanner. Stored checkpoints are validated strictly. */
+  readonly checkpoint?: V2QueueSchedulerCheckpoint;
+}
+
+function ownDataRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+  )
+    throw new TypeError("v2 Queue scheduler checkpoint is invalid");
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== expectedKeys.length ||
+    keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))
+  )
+    throw new TypeError("v2 Queue scheduler checkpoint is invalid");
+  const output: Record<string, unknown> = Object.create(null);
+  for (const key of expectedKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable)
+      throw new TypeError("v2 Queue scheduler checkpoint is invalid");
+    output[key] = descriptor.value;
+  }
+  return output;
+}
+
+function checkpointTuple(value: unknown): readonly [string, string, number, string] | null {
+  if (value === null) return null;
+  if (!Array.isArray(value) || value.length !== 4 || Reflect.ownKeys(value).length !== 5)
+    throw new TypeError("v2 Queue scheduler checkpoint is invalid");
+  const tuple: unknown[] = [];
+  for (let index = 0; index < 4; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable)
+      throw new TypeError("v2 Queue scheduler checkpoint is invalid");
+    tuple.push(descriptor.value);
+  }
+  const [sourceQueueId, sourceConsumerId, generation, targetQueueId] = tuple;
+  if (
+    typeof sourceQueueId !== "string" ||
+    !QUEUE_ID.test(sourceQueueId) ||
+    typeof sourceConsumerId !== "string" ||
+    !CONSUMER_UID.test(sourceConsumerId) ||
+    !Number.isSafeInteger(generation) ||
+    (generation as number) < 1 ||
+    typeof targetQueueId !== "string" ||
+    !QUEUE_ID.test(targetQueueId)
+  )
+    throw new TypeError("v2 Queue scheduler checkpoint is invalid");
+  return Object.freeze([
+    sourceQueueId,
+    sourceConsumerId,
+    generation as number,
+    targetQueueId,
+  ] as const);
+}
+
+function parseCheckpoint(value: unknown): V2QueueSchedulerCheckpoint {
+  const record = ownDataRecord(value, ["schema", "consumerCursor", "noticeCursor"]);
+  if (
+    record.schema !== CHECKPOINT_SCHEMA ||
+    typeof record.consumerCursor !== "string" ||
+    (record.consumerCursor !== "" && !CONSUMER_UID.test(record.consumerCursor))
+  )
+    throw new TypeError("v2 Queue scheduler checkpoint is invalid");
+  return Object.freeze({
+    schema: CHECKPOINT_SCHEMA,
+    consumerCursor: record.consumerCursor,
+    noticeCursor: checkpointTuple(record.noticeCursor),
+  });
+}
+
+function initialCheckpoint(
+  options: V2QueueSchedulerOptions,
+): V2QueueSchedulerCheckpoint | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(options, "checkpoint");
+  if (!descriptor) {
+    if ("checkpoint" in options) throw new TypeError("v2 Queue scheduler checkpoint is invalid");
+    return undefined;
+  }
+  if (!("value" in descriptor) || !descriptor.enumerable)
+    throw new TypeError("v2 Queue scheduler checkpoint is invalid");
+  return descriptor.value === undefined ? undefined : parseCheckpoint(descriptor.value);
 }
 
 /**
@@ -59,8 +153,9 @@ export function createV2QueueScheduler(options: V2QueueSchedulerOptions) {
   if (recovering !== (typeof options.workerComposition?.restoreOwners === "function"))
     throw new TypeError("v2 Queue delivery requires exact native-owner restore and recovery");
 
-  let cursor = "";
-  let noticeCursor: readonly [string, string, number, string] | undefined;
+  const restoredCheckpoint = initialCheckpoint(options);
+  let cursor = restoredCheckpoint?.consumerCursor ?? "";
+  let noticeCursor = restoredCheckpoint?.noticeCursor ?? undefined;
   let inFlight: Promise<number> | undefined;
   let closePromise: Promise<void> | undefined;
   let closed = false;
@@ -530,6 +625,15 @@ export function createV2QueueScheduler(options: V2QueueSchedulerOptions) {
 
   return Object.freeze({
     tick,
+    checkpoint(): V2QueueSchedulerCheckpoint {
+      return Object.freeze({
+        schema: CHECKPOINT_SCHEMA,
+        consumerCursor: cursor,
+        noticeCursor: noticeCursor
+          ? Object.freeze([...noticeCursor] as [string, string, number, string])
+          : null,
+      });
+    },
     close() {
       if (closePromise) return closePromise;
       closed = true;

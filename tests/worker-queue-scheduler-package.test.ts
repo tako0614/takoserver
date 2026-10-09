@@ -1,16 +1,27 @@
 import { expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
-import type { V2QueueSchedulerOptions as ExtensionV2QueueSchedulerOptions } from "@takoserver/core/provider-extension";
+import type {
+  V2QueueSchedulerCheckpoint as ExtensionV2QueueSchedulerCheckpoint,
+  V2QueueSchedulerOptions as ExtensionV2QueueSchedulerOptions,
+} from "@takoserver/core/provider-extension";
 import * as providerExtension from "@takoserver/core/provider-extension";
-import type { V2QueueSchedulerOptions } from "../src/takoform-v2/worker-queue-scheduler.ts";
+import type {
+  V2QueueSchedulerCheckpoint,
+  V2QueueSchedulerOptions,
+} from "../src/takoform-v2/worker-queue-scheduler.ts";
 import { createV2QueueScheduler as sourceCreateV2QueueScheduler } from "../src/takoform-v2/worker-queue-scheduler.ts";
 
-test("provider-extension exposes only the existing Worker-safe Queue scheduler factory", () => {
+test("provider-extension exposes the Worker-safe Queue scheduler factory and types", () => {
   expect(providerExtension.createV2QueueScheduler).toBe(sourceCreateV2QueueScheduler);
   expect("createV2QueueScheduler" in providerExtension).toBe(true);
   const typeWitness = (options: ExtensionV2QueueSchedulerOptions): V2QueueSchedulerOptions =>
     options;
+  const checkpointWitness = (
+    checkpoint: ExtensionV2QueueSchedulerCheckpoint,
+  ): V2QueueSchedulerCheckpoint => checkpoint;
   expect(typeWitness).toBeDefined();
+  expect(checkpointWitness).toBeDefined();
+  expect("V2QueueSchedulerCheckpoint" in providerExtension).toBe(false);
 });
 
 test("Queue scheduler module bundles for a Worker without Node or Bun runtime", async () => {
