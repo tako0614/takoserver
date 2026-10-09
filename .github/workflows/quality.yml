@@ -20,7 +20,9 @@ jobs:
   quality:
     name: check and test
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The complete gate can exceed 30 minutes on a shared runner. Keep enough
+    # room for the D1 migration and build phases after tests; do not skip them.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pinned: v6.0.2
