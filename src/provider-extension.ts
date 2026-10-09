@@ -271,6 +271,14 @@ export {
 } from "./takoform/provider-delete-subeffect.ts";
 export { isSpaceId } from "./takoform/space-id.ts";
 export {
+  authorizeV2QueueBatchSend,
+  cancelV2QueueBatchBeforeSend,
+  confirmV2QueueBatchRetirement,
+  createV2QueueDelivery,
+  type V2QueueBatchExecutionIdentity,
+  verifyV2QueueSettlementScope,
+} from "./takoform-v2/worker-queue-delivery.ts";
+export {
   parseVectorIndexConfig,
   type VectorIndexConfig,
   VectorIndexInvalidSpecError,
