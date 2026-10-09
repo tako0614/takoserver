@@ -273,7 +273,14 @@ or execute Workers.
 Discovery always declares offerings and previews unavailable. It declares
 `privateInputs` only when `buildApp` receives explicit operator-selected
 `v2PrivateInputCustody`. The complete Bun Worker composition supplies it from
-the configured operator keyring; entries without that custody declare the
+the configured operator keyring. An operator extension using the Worker entry's
+`composeV2Forms` callback can also supply a Form map with an explicit private-input
+policy. With that map and a valid existing runtime-input keyring, the entry
+imports the keys once, preserves the original AES authority and derives the
+same transfer/comparison custody. The default Worker and a composer without
+private-input policies do not enable it. This generic custody does not supply
+the Form-specific configured-input sealer, native secret delivery or its probe;
+the extension still owns those ports. Entries without custody declare the
 capability unavailable. Per-Form support additionally requires an
 exact Form private-input policy and complete backend. Common limits are a 1 MiB
 request, 100 items per page and a 24-hour replay window.
