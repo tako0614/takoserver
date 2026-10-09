@@ -100,6 +100,7 @@ export function createV2WorkflowNativeSelection(options: {
     signal: AbortSignal,
   ): Promise<V2WorkflowNativeSelection> => {
     signal.throwIfAborted();
+    const workflowResourceUid = identity.scope.workflowResourceUid;
     const selectedBasisPoint = basisPoint();
     if (
       !Number.isSafeInteger(selectedBasisPoint) ||
@@ -219,7 +220,7 @@ export function createV2WorkflowNativeSelection(options: {
     return {
       selection: {
         tenantId: resource.principal,
-        workflowResourceUid: identity.scope.workflowResourceUid,
+        workflowResourceUid,
         workerResourceUid: selected.workerResourceUid,
         versionId: selected.versionId,
         workerVersionUid: selected.workerVersionUid,

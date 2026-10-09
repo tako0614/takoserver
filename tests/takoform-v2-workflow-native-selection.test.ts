@@ -339,6 +339,34 @@ test("accepted Workflow graph yields one verified selected Version and revokes o
   }
 });
 
+test("selected Workerd site never relabels accepted Workflow A after caller scope mutates to B", async () => {
+  const f = fixture();
+  try {
+    let release!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const atOwner = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const selectOwner = f.owner.selectWorkflowExecution;
+    f.owner.selectWorkflowExecution = async (input) => {
+      entered();
+      await held;
+      return selectOwner(input);
+    };
+    const mutable = { ...identity, scope: { ...identity.scope } };
+    const selected = f.select(mutable, new AbortController().signal);
+    await atOwner;
+    mutable.scope.workflowResourceUid = "workflow-B";
+    release();
+    expect((await selected).selection.workflowResourceUid).toBe(WORKFLOW_UID);
+  } finally {
+    f.db.close();
+  }
+});
+
 test("synthetic selected Version has no hostnames while accepted Worker serves an Endpoint", async () => {
   const f = fixture();
   try {
