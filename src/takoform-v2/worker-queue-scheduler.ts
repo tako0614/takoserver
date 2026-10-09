@@ -133,7 +133,10 @@ function initialCheckpoint(
   options: V2QueueSchedulerOptions,
 ): V2QueueSchedulerCheckpoint | undefined {
   const descriptor = Object.getOwnPropertyDescriptor(options, "checkpoint");
-  if (!descriptor) return undefined;
+  if (!descriptor) {
+    if ("checkpoint" in options) throw new TypeError("v2 Queue scheduler checkpoint is invalid");
+    return undefined;
+  }
   if (!("value" in descriptor) || !descriptor.enumerable)
     throw new TypeError("v2 Queue scheduler checkpoint is invalid");
   return descriptor.value === undefined ? undefined : parseCheckpoint(descriptor.value);

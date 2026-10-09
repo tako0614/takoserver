@@ -105,6 +105,22 @@ test("Queue scheduler checkpoint validation rejects corrupt or accessor-backed d
   });
   expect(() => createV2QueueScheduler(optionsWithAccessor)).toThrow(TypeError);
   expect(optionReads).toBe(0);
+  const inheritedCheckpoint = schedulerOptions({ query: async () => [] } as unknown as Sql);
+  Object.setPrototypeOf(inheritedCheckpoint, { checkpoint: valid });
+  expect(() => createV2QueueScheduler(inheritedCheckpoint)).toThrow(TypeError);
+  let inheritedReads = 0;
+  const inheritedAccessor = schedulerOptions({ query: async () => [] } as unknown as Sql);
+  Object.setPrototypeOf(
+    inheritedAccessor,
+    Object.defineProperty({}, "checkpoint", {
+      get() {
+        inheritedReads += 1;
+        return valid;
+      },
+    }),
+  );
+  expect(() => createV2QueueScheduler(inheritedAccessor)).toThrow(TypeError);
+  expect(inheritedReads).toBe(0);
 
   const mutableTuple = [
     "takoform-v2-queue:source",
