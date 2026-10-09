@@ -47,16 +47,16 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0089_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0089_container_runtime_input_custody (id TEXT);\n",
+    "0090_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0090_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0090_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0090_container_runtime_input_rewrap (id TEXT);\n",
+    "0091_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0091_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0091_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0091_container_runtime_input_acceptance (id TEXT);\n",
+    "0092_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0092_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -702,7 +702,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0088");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0089");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1136,7 +1136,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0088");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0089");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1249,28 +1249,28 @@ describe("production-shaped D1 migration lane", () => {
   for (const drift of [
     {
       name: "missing",
-      expected: "selected D1 wave requires the exact audited source inventory 0001-0088",
+      expected: "selected D1 wave requires the exact audited source inventory 0001-0089",
     },
     { name: "changed", expected: "exact audited migration SHA-256" },
-    { name: "extra", expected: "exact audited source inventory 0001-0088" },
+    { name: "extra", expected: "exact audited source inventory 0001-0089" },
   ] as const) {
-    test(`current 0088 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
-      const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0088-${drift.name}-`));
+    test(`current 0089 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
+      const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0089-${drift.name}-`));
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const migration0088 = join(migrationDirectory, "0088_v2_worker_sqlite_external_drain.sql");
+        const migration0089 = join(migrationDirectory, "0089_v2_worker_cron_match_guard_depth.sql");
         if (drift.name === "missing") {
-          rmSync(migration0088);
+          rmSync(migration0089);
         } else if (drift.name === "changed") {
           writeFileSync(
-            migration0088,
-            `${readFileSync(migration0088, "utf8")}\n-- mutated after source audit\n`,
+            migration0089,
+            `${readFileSync(migration0089, "utf8")}\n-- mutated after source audit\n`,
           );
         } else {
           writeFileSync(
-            join(migrationDirectory, "0089_unreviewed_extension.sql"),
-            "CREATE TABLE synthetic_0089_unreviewed_extension (id TEXT);\n",
+            join(migrationDirectory, "0090_unreviewed_extension.sql"),
+            "CREATE TABLE synthetic_0090_unreviewed_extension (id TEXT);\n",
             { mode: 0o600 },
           );
         }

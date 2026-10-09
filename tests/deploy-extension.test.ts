@@ -81,9 +81,9 @@ describe("curated deploy extension schema readback", () => {
     const legacy = deployExtension.readAuditedMigrationArtifact();
     const current = deployExtension.readCurrentAuditedMigrationSourceArtifact();
     expect(legacy.names).toHaveLength(66);
-    expect(current.names).toHaveLength(88);
+    expect(current.names).toHaveLength(89);
     expect(current.names.slice(0, legacy.names.length)).toEqual([...legacy.names]);
-    expect(current.files.at(-1)?.name).toBe("0088_v2_worker_sqlite_external_drain.sql");
+    expect(current.files.at(-1)?.name).toBe("0089_v2_worker_cron_match_guard_depth.sql");
   });
 
   test("reads a 0057 schema through the curated read-only database port", async () => {
