@@ -350,6 +350,14 @@ namespace. Neither controller nor preparation evaluates tenant code. The
 closed-graph module policy and `disallow_importable_env` remain required; the
 companion binding and journal nonce are not application env.
 
+The default self-host transport synchronously emits its private console
+marker before enqueuing each companion payload. A Host may instead select a
+private `emitMarker(sequence): Promise<void>` hook before tenant import. That
+branch awaits the trusted marker acknowledgement before any payload and never
+logs the journal token; an absent or rejected selected hook cannot confirm a
+frame. This hook is only a transport seam, not a durable journal, serving
+qualification, or public Workflow capability.
+
 `workflow-http-controller` implements one concrete request/response turn
 protocol. A call first lets the durable driver request its name, then requests
 pending arguments only when the driver needs them, and invokes an effect only
