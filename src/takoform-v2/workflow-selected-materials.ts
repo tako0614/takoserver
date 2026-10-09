@@ -220,7 +220,8 @@ export function createV2WorkflowSelectedMaterials(options: {
     readonly serving: V2WorkflowServingObservation;
     readonly snapshot: V2WorkerPublicationSnapshot;
     readonly version: NonNullable<V2WorkerPublicationSnapshot["deployment"]>["versions"][number];
-    readonly materials: V2WorkerVersionMaterials;
+    /** Workflow consumes held code, not the Version's static asset payload. */
+    readonly materials: Pick<V2WorkerVersionMaterials, "bundle">;
     stillCurrent(): Promise<boolean>;
   }> => {
     signal.throwIfAborted();
@@ -341,7 +342,7 @@ export function createV2WorkflowSelectedMaterials(options: {
       serving,
       snapshot: structuredClone(snapshot),
       version: structuredClone(version),
-      materials: structuredClone(materials),
+      materials: { bundle: structuredClone(bundle) },
       stillCurrent,
     };
   };

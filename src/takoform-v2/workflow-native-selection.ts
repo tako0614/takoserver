@@ -219,10 +219,12 @@ export function createV2WorkflowNativeSelection(options: {
       )
         throw unavailable();
     }
+    // Retain only the authority callback, not the selected material payload.
+    const materialsStillCurrent = materials.stillCurrent;
     const stillCurrent = async (): Promise<boolean> => {
       if (signal.aborted) return false;
       try {
-        return (await materials.stillCurrent()) && (await owned.stillCurrent()) && !signal.aborted;
+        return (await materialsStillCurrent()) && (await owned.stillCurrent()) && !signal.aborted;
       } catch {
         return false;
       }

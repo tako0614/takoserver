@@ -339,6 +339,55 @@ test("accepted Workflow graph yields one verified selected Version and revokes o
   }
 });
 
+test("Workflow material projection retains owned code without copying static asset payload", async () => {
+  const f = fixture();
+  try {
+    let assetReads = 0;
+    let originalCode: Uint8Array | undefined;
+    const resolve = f.publicationState.resolveCurrentServing;
+    f.publicationState.resolveCurrentServing = async (input) => {
+      const publication = await resolve(input);
+      return {
+        ...publication,
+        async readVersionMaterials() {
+          const materials = await publication.readVersionMaterials();
+          originalCode = materials.bundle.files[0];
+          Object.defineProperty(materials, "assets", {
+            enumerable: true,
+            get() {
+              assetReads += 1;
+              return { files: [new Uint8Array(256)] };
+            },
+          });
+          return materials;
+        },
+      };
+    };
+    const select = createV2WorkflowSelectedMaterials({
+      sql: f.sql,
+      targetKey: TARGET,
+      publicationState: f.publicationState,
+      inspector: f.inspector,
+    });
+    const selected = await select(
+      identity,
+      new AbortController().signal,
+      () => f.owner.observeServing(),
+      7,
+    );
+    expect(assetReads).toBe(0);
+    expect(Object.hasOwn(selected.materials, "assets")).toBe(false);
+    if (!originalCode) throw new Error("missing fixture code");
+    originalCode.fill(0);
+    expect(selected.materials.bundle?.files[0]).toEqual(source);
+    expect(await selected.stillCurrent()).toBe(true);
+    f.setPublicationCurrent(false);
+    expect(await selected.stillCurrent()).toBe(false);
+  } finally {
+    f.db.close();
+  }
+});
+
 test("selected Workerd site never relabels accepted Workflow A after caller scope mutates to B", async () => {
   const f = fixture();
   try {
