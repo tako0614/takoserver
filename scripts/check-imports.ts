@@ -113,7 +113,8 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "v2-queue-manager",
-    match: /^src\/takoform-v2\/worker-queue-(?:admission|backend|consumer-backend|delivery)\.ts$/u,
+    match:
+      /^src\/takoform-v2\/worker-queue-(?:admission|backend|consumer-backend|delivery|scheduler)\.ts$/u,
     may: ["core", "domain", "v2-contract", "v2-form", "v2-runtime", "v2-queue-manager"],
   },
   {
@@ -558,10 +559,25 @@ for (const path of walk("src")) {
       target === "src/takoform-v2/worker-queue-delivery.ts" &&
       localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
       JSON.stringify(queuePortExportNames) === JSON.stringify(exactQueuePortExportNames);
+    const schedulerExportBlock = readFileSync(path, "utf8").match(
+      /export\s*\{([^}]*)\}\s*from\s+["']\.\/takoform-v2\/worker-queue-scheduler\.ts["'];/u,
+    )?.[1];
+    const schedulerExportNames = schedulerExportBlock
+      ?.split(",")
+      .map((name) => name.trim().replace(/^type\s+/u, ""))
+      .filter((name) => name !== "")
+      .sort();
+    const exactSchedulerProviderExtensionEdge =
+      path === "src/provider-extension.ts" &&
+      target === "src/takoform-v2/worker-queue-scheduler.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      JSON.stringify(schedulerExportNames) ===
+        JSON.stringify(["createV2QueueScheduler", "V2QueueSchedulerOptions"].sort());
     if (
       !layer.may.includes(targetLayer.name) &&
       !exactExecutionTypeEdge &&
-      !exactQueueProviderExtensionEdge
+      !exactQueueProviderExtensionEdge &&
+      !exactSchedulerProviderExtensionEdge
     ) {
       violations.push(
         `${path} (${layer.name}) imports ${target} (${targetLayer.name}); ` +

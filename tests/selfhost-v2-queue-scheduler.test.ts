@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import type { JsonObject, SqlParam } from "../src/ports.ts";
+import { createV2QueueScheduler } from "../src/provider-extension.ts";
 import { createQueueCustody } from "../src/queue-custody.ts";
 import { createSelfhostV2QueueScheduler } from "../src/selfhost-v2-queue-scheduler.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -398,6 +399,77 @@ test("worker-wide recovery retains its 32-row cursor across scheduler ticks", as
     await scheduler.tick();
     expect(cursors).toEqual([undefined, "batch-032"]);
     await scheduler.close();
+  } finally {
+    database.close();
+  }
+});
+
+test("Worker scheduler retains synchronously before native delivery and refuses safely", async () => {
+  const database = new Database(":memory:");
+  try {
+    for (const migration of MIGRATIONS) database.exec(migration.sql);
+    const accepted = await acceptedConsumer(database);
+    const sql = accepted.sql;
+    const custody = createQueueCustody({ sql });
+    let deliveries = 0;
+    let retained: Promise<"idle" | "unknown" | "handler_resolved" | "handler_rejected"> | undefined;
+    const acceptedSchedule = createV2QueueScheduler({
+      sql,
+      custody,
+      delivery: {
+        async deliverOnce() {
+          deliveries += 1;
+          return { kind: "idle" as const };
+        },
+      },
+      retainDelivery(promise) {
+        retained = promise;
+        expect(deliveries).toBe(0);
+      },
+    });
+    await acceptedSchedule.tick();
+    expect(await retained).toBe("idle");
+    expect(deliveries).toBe(1);
+    await acceptedSchedule.close();
+
+    const scheduler = createV2QueueScheduler({
+      sql,
+      custody,
+      delivery: {
+        async deliverOnce() {
+          deliveries += 1;
+          return { kind: "idle" as const };
+        },
+      },
+      retainDelivery(promise) {
+        retained = promise;
+        expect(deliveries).toBe(1);
+        return false;
+      },
+    });
+
+    await scheduler.tick();
+    expect(await retained).toBe("unknown");
+    expect(deliveries).toBe(1);
+    await scheduler.close();
+
+    const refused = createV2QueueScheduler({
+      sql,
+      custody,
+      delivery: {
+        async deliverOnce() {
+          deliveries += 1;
+          return { kind: "idle" as const };
+        },
+      },
+      retainDelivery() {
+        expect(deliveries).toBe(1);
+        throw new Error("request lifetime is unavailable");
+      },
+    });
+    await expect(refused.tick()).rejects.toThrow("request lifetime is unavailable");
+    expect(deliveries).toBe(1);
+    await refused.close();
   } finally {
     database.close();
   }
