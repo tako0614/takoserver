@@ -91,6 +91,7 @@ export {
   createWorkerBundleHost,
   type WorkerBundleCustody,
 } from "./forms/worker-bundle-backend.ts";
+export { WORKER_CRON_TRIGGER_FORM_URL } from "./forms/worker-cron-trigger.ts";
 export {
   referencesForModuleWorker,
   referencesForWorkerDeployment,
@@ -143,6 +144,14 @@ export {
   inspectV2WorkerCodeVersionEligibility,
   type V2WorkerModuleInspector,
 } from "./worker-code-eligibility.ts";
+export {
+  createWorkerCronTriggerAdmissionReader,
+  createWorkerCronTriggerForm,
+  type WorkerCronScheduledCapability,
+  type WorkerCronTriggerAdmissionInput,
+  type WorkerCronTriggerAdmissionResolution,
+  type WorkerCronTriggerCapabilityReader,
+} from "./worker-cron-trigger-backend.ts";
 export {
   runWorkerCronTriggerTick,
   type WorkerCronTriggerDelivery,
