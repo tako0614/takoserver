@@ -166,7 +166,13 @@ type ReadyCapture = {
   readonly materials: ReadonlyMap<string, VersionMaterialTargets>;
 };
 type Capture = ReadyCapture | Unresolved;
-type CurrentReadyCapture = Omit<ReadyCapture, "sqlGuard">;
+type CurrentReadyCapture = Omit<ReadyCapture, "sqlGuard"> & {
+  readonly fence: {
+    readonly sourceOwnerUid: string;
+    readonly referenceSetIds: readonly string[];
+    readonly inboundTargetIds: readonly string[];
+  };
+};
 type CurrentCapture = CurrentReadyCapture | Unresolved;
 type VersionReadyCapture = {
   readonly kind: "ready";
@@ -389,6 +395,157 @@ function exactServingIdentity(
   );
 }
 
+// The current-serving caller can cross several native awaits in one Worker
+// invocation. Re-running capture() at every custody fence multiplies the full
+// graph walk by every held-file page. This projection is deliberately broader
+// than the successful capture: it includes the selected rows and the negative
+// sets whose *new* members would make a new capture fail. Each fence uses one
+// fresh row-per-fact query, never a cross-request or cross-await cache. The
+// inner compounds stay below D1's term limit and avoid one giant JSON row.
+const resourceColumns = [
+  "uid",
+  "principal",
+  "form_url",
+  "space",
+  "name",
+  "backend_id",
+  "target_key",
+  "active_name",
+  "generation",
+  "observed_generation",
+  "observed_at",
+  "phase",
+  "last_operation",
+  "busy_operation",
+  "deleted_at",
+] as const;
+const operationColumns = [
+  "id",
+  "resource_uid",
+  "principal",
+  "replay_key",
+  "action",
+  "generation",
+  "status",
+  "effect",
+  "created_at",
+  "updated_at",
+  "retain_until",
+  "backend_id",
+  "target_key",
+  "backend_key",
+  "dispatch_possible",
+  "next_attempt_at_ms",
+  "lease_token",
+  "lease_until_ms",
+  "error_code",
+  "private_inputs_present",
+  "input_required_names_json",
+  "input_required_reason",
+  "acceptance_order",
+] as const;
+function rowJson(alias: string, columns: readonly string[]): string {
+  // D1 permits at most 32 arguments to one SQL function. Large JSON/text
+  // fields are emitted separately as raw scalar rows, not re-escaped here.
+  return `json_array(${columns.map((column) => `${alias}.${column}`).join(", ")})`;
+}
+
+const currentServingFenceGraphSql = `
+WITH selected(uid) AS (SELECT value FROM json_each(?)),
+     set_ids(id) AS (SELECT value FROM json_each(?)),
+     resource_fields(field) AS (VALUES ('meta'), ('spec_json'), ('observed_json'), ('output_json')),
+     operation_fields(field) AS (VALUES ('meta'), ('request_fingerprint'), ('accepted_spec_json'),
+                               ('result_observed_json'), ('result_output_json'), ('error_message')),
+     relevant_resources AS (
+       SELECT r.* FROM tf_v2_resources r
+       WHERE r.uid IN (SELECT uid FROM selected)
+          OR r.uid IN (SELECT target_uid FROM tf_v2_operation_references
+                       WHERE operation_id IN (SELECT id FROM set_ids))
+          OR (r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
+              AND r.deleted_at IS NULL
+              AND json_extract(r.spec_json, '$.worker.resourceUid') = ?)
+     )
+SELECT 'resource:' || f.field AS kind, r.uid AS key,
+  CASE f.field
+    WHEN 'meta' THEN ${rowJson("r", resourceColumns)}
+    WHEN 'spec_json' THEN r.spec_json
+    WHEN 'observed_json' THEN r.observed_json
+    ELSE r.output_json END AS body
+  FROM relevant_resources r CROSS JOIN resource_fields f
+UNION ALL
+SELECT 'operation:' || f.field, op.id,
+  CASE f.field
+    WHEN 'meta' THEN ${rowJson("op", operationColumns)}
+    WHEN 'request_fingerprint' THEN op.request_fingerprint
+    WHEN 'accepted_spec_json' THEN op.accepted_spec_json
+    WHEN 'result_observed_json' THEN op.result_observed_json
+    WHEN 'result_output_json' THEN op.result_output_json
+    ELSE op.error_message END
+  FROM tf_v2_operations op CROSS JOIN operation_fields f
+  WHERE op.id = ? OR op.id IN (SELECT last_operation FROM relevant_resources)
+     OR op.id IN (SELECT busy_operation FROM relevant_resources)
+     OR op.id IN (SELECT id FROM set_ids)
+     OR EXISTS (SELECT 1 FROM relevant_resources r
+                WHERE r.uid = op.resource_uid AND r.form_url IN (?, ?)
+                  AND r.observed_generation < op.generation
+                  AND op.generation < r.generation AND op.effect IN ('partial', 'unknown'))
+UNION ALL
+SELECT 'reference_set', s.operation_id,
+  json_object('operation_id', s.operation_id, 'sealed', s.sealed)
+  FROM tf_v2_operation_reference_sets s WHERE s.operation_id IN (SELECT id FROM set_ids)
+UNION ALL
+SELECT 'reference', ref.operation_id || ':' || ref.target_uid,
+  json_object('operation_id', ref.operation_id,
+  'target_uid', ref.target_uid, 'form_url', ref.form_url, 'readiness', ref.readiness,
+  'target_spec_path', ref.target_spec_path, 'target_spec_equals', ref.target_spec_equals)
+  FROM tf_v2_operation_references ref WHERE ref.operation_id IN (SELECT id FROM set_ids)
+ORDER BY kind, key`;
+
+const currentServingFenceRelationsSql = `
+WITH selected(uid) AS (SELECT value FROM json_each(?)),
+     inbound(uid) AS (SELECT value FROM json_each(?)),
+     artifacts(uid) AS (SELECT value FROM json_each(?)),
+     owner_fields(field) AS (VALUES ('meta'), ('observation_json'))
+SELECT 'edge' AS kind, e.target_uid || ':' || e.referrer_uid AS key,
+  json_object('target_uid', e.target_uid, 'referrer_uid', e.referrer_uid) AS body
+  FROM tf_v2_resource_references e
+  WHERE e.target_uid IN (SELECT uid FROM inbound)
+     OR e.referrer_uid IN (SELECT uid FROM selected)
+UNION ALL
+SELECT 'owner:' || f.field, a.resource_uid,
+  CASE f.field WHEN 'meta' THEN
+    json_object('resource_uid', a.resource_uid, 'form_url', a.form_url,
+      'manifest_sha256', a.manifest_sha256, 'state', a.state,
+      'verified_operation_id', a.verified_operation_id)
+    ELSE a.observation_json END
+  FROM tf_v2_artifact_owners a CROSS JOIN owner_fields f
+  WHERE a.resource_uid IN (SELECT uid FROM artifacts)
+UNION ALL
+SELECT 'pending', '', json_object('present', EXISTS (
+  SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
+    WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
+      AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
+      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ? LIMIT 1))
+UNION ALL
+SELECT 'publisher', publisher.id, json_object('id', publisher.id,
+  'acceptance_order', publisher.acceptance_order)
+  FROM (SELECT op.id, op.acceptance_order FROM tf_v2_resources r
+    JOIN tf_v2_operations op ON op.id = r.last_operation
+    WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
+      AND op.principal = r.principal AND op.backend_id = r.backend_id
+      AND op.target_key = r.target_key AND op.status = 'succeeded'
+      AND op.effect = 'complete' AND r.observed_generation = op.generation
+      AND r.busy_operation IS NULL
+      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
+    ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2) publisher
+ORDER BY kind, key`;
+
+const currentServingFenceSql = `
+SELECT kind, key, body FROM (${currentServingFenceGraphSql})
+UNION ALL
+SELECT kind, key, body FROM (${currentServingFenceRelationsSql})
+ORDER BY kind, key`;
+
 /** No separate desired-state ledger: every read starts from the accepted v2 Operation. */
 export function createV2WorkerPublicationState(options: {
   sql: Sql;
@@ -408,6 +565,154 @@ export function createV2WorkerPublicationState(options: {
   async function operation(id: string): Promise<OperationRow | null> {
     return ((await sql.query("SELECT * FROM tf_v2_operations WHERE id = ?", [id]))[0] ??
       null) as OperationRow | null;
+  }
+  async function currentServingFence(
+    captured: CurrentServingCaptureInput,
+    initial: CurrentReadyCapture,
+  ): Promise<string> {
+    const snapshot = initial.snapshot;
+    const versions = snapshot.deployment?.versions ?? [];
+    const artifactIds = [...initial.materials.values()].flatMap((targets) =>
+      [targets.bundle?.uid, targets.assets?.uid].filter((uid): uid is string => uid !== undefined),
+    );
+    const selected = [
+      initial.fence.sourceOwnerUid,
+      snapshot.worker.uid,
+      ...(snapshot.deployment ? [snapshot.deployment.uid] : []),
+      ...(snapshot.endpoint ? [snapshot.endpoint.uid] : []),
+      ...versions.map((version) => version.uid),
+      ...artifactIds,
+    ];
+    const current = captured.currentServing;
+    const rows = await sql.query(currentServingFenceSql, [
+      JSON.stringify(selected),
+      JSON.stringify(initial.fence.referenceSetIds),
+      WORKER_DEPLOYMENT_FORM_URL,
+      WORKER_ENDPOINT_FORM_URL,
+      snapshot.worker.principal,
+      snapshot.worker.space,
+      current.workerUid,
+      current.sourceOperationId,
+      WORKER_DEPLOYMENT_FORM_URL,
+      WORKER_ENDPOINT_FORM_URL,
+      JSON.stringify(selected),
+      JSON.stringify(initial.fence.inboundTargetIds),
+      JSON.stringify(artifactIds),
+      WORKER_DEPLOYMENT_FORM_URL,
+      WORKER_ENDPOINT_FORM_URL,
+      current.workerUid,
+      WORKER_DEPLOYMENT_FORM_URL,
+      WORKER_ENDPOINT_FORM_URL,
+      snapshot.worker.principal,
+      snapshot.worker.space,
+      current.workerUid,
+    ]);
+    const graph = rows.filter(
+      (row) =>
+        (typeof row.kind === "string" && row.kind.startsWith("resource:")) ||
+        (typeof row.kind === "string" && row.kind.startsWith("operation:")) ||
+        row.kind === "reference_set" ||
+        row.kind === "reference",
+    );
+    const relations = rows.filter(
+      (row) =>
+        row.kind === "edge" ||
+        (typeof row.kind === "string" && row.kind.startsWith("owner:")) ||
+        row.kind === "pending" ||
+        row.kind === "publisher",
+    );
+    const values = (rows: readonly Record<string, unknown>[], kind: string): unknown[] =>
+      rows
+        .filter((row) => row.kind === kind)
+        .map((row) => {
+          if (typeof row.body !== "string")
+            throw new SqlError("unavailable", "Serving fence is malformed");
+          return JSON.parse(row.body) as unknown;
+        });
+    const hasFirst = (rows: readonly unknown[], ids: readonly string[]): boolean => {
+      const found = new Set(rows.map((row) => (Array.isArray(row) ? row[0] : null)));
+      return ids.every((id) => found.has(id));
+    };
+    const hasCompleteRows = (
+      source: readonly Record<string, unknown>[],
+      noun: string,
+      rawFields: readonly string[],
+    ): boolean => {
+      const cells = new Map<string, unknown>();
+      for (const row of source) {
+        if (
+          typeof row.kind !== "string" ||
+          typeof row.key !== "string" ||
+          !Object.hasOwn(row, "body")
+        )
+          return false;
+        const identity = `${row.kind}\0${row.key}`;
+        if (cells.has(identity)) return false;
+        cells.set(identity, row.body);
+      }
+      const ids = source.filter((row) => row.kind === `${noun}:meta`).map((row) => row.key);
+      return ids.every(
+        (id) =>
+          typeof id === "string" &&
+          rawFields.every((field) => {
+            const identity = `${noun}:${field}\0${id}`;
+            const body = cells.get(identity);
+            return cells.has(identity) && (typeof body === "string" || body === null);
+          }),
+      );
+    };
+    const referenceSets = values(graph, "reference_set");
+    const owners = values(relations, "owner:meta");
+    const pending = values(relations, "pending");
+    const publishers = values(relations, "publisher");
+    if (
+      rows.length !== graph.length + relations.length ||
+      !hasFirst(values(graph, "resource:meta"), selected) ||
+      !hasFirst(values(graph, "operation:meta"), [
+        current.sourceOperationId,
+        ...initial.fence.referenceSetIds,
+      ]) ||
+      !hasCompleteRows(graph, "resource", ["spec_json", "observed_json", "output_json"]) ||
+      !hasCompleteRows(graph, "operation", [
+        "request_fingerprint",
+        "accepted_spec_json",
+        "result_observed_json",
+        "result_output_json",
+        "error_message",
+      ]) ||
+      !hasCompleteRows(relations, "owner", ["observation_json"]) ||
+      !initial.fence.referenceSetIds.every((id) =>
+        referenceSets.some(
+          (row) =>
+            row !== null &&
+            typeof row === "object" &&
+            !Array.isArray(row) &&
+            (row as { operation_id?: unknown }).operation_id === id,
+        ),
+      ) ||
+      !artifactIds.every((id) =>
+        owners.some(
+          (row) =>
+            row !== null &&
+            typeof row === "object" &&
+            !Array.isArray(row) &&
+            (row as { resource_uid?: unknown }).resource_uid === id,
+        ),
+      ) ||
+      pending.length !== 1 ||
+      pending[0] === null ||
+      typeof pending[0] !== "object" ||
+      (pending[0] as { present?: unknown }).present !== 0 ||
+      !publishers.some(
+        (row) =>
+          row !== null &&
+          typeof row === "object" &&
+          !Array.isArray(row) &&
+          (row as { id?: unknown }).id === current.sourceOperationId,
+      )
+    )
+      throw new SqlError("unavailable", "Serving fence evidence is incomplete");
+    return canonicalJson({ graph, relations } as unknown as JsonObject);
   }
   async function hasUnresolvedPriorEffect(row: ResourceRow): Promise<boolean> {
     if (row.observed_generation >= row.generation) return false;
@@ -1315,7 +1620,13 @@ export function createV2WorkerPublicationState(options: {
     // SQL graph reads above may await after the first lease check. Do not
     // return a once-valid claim as ready after its known deadline elapsed.
     if (current) {
-      return { kind: "ready", snapshot, vector, materials };
+      return {
+        kind: "ready",
+        snapshot,
+        vector,
+        materials,
+        fence: { sourceOwnerUid: own.uid, referenceSetIds, inboundTargetIds },
+      };
     }
     const finalNow = now().getTime();
     if (!Number.isFinite(finalNow) || op.lease_until_ms === null || op.lease_until_ms <= finalNow) {
@@ -1721,10 +2032,19 @@ export function createV2WorkerPublicationState(options: {
         return unresolved("graph_unresolved", "Current serving SQL graph is unavailable");
       }
       if (initial.kind === "unresolved") return initial;
+      let initialFence: string;
+      try {
+        initialFence = await currentServingFence(captured, initial);
+        const confirmed = await capture(captured);
+        if (confirmed.kind !== "ready" || confirmed.vector !== initial.vector) {
+          return unresolved("graph_unresolved", "Current serving graph changed during capture");
+        }
+      } catch {
+        return unresolved("graph_unresolved", "Current serving SQL fence is unavailable");
+      }
       const stillAuthorized = async (): Promise<boolean> => {
         try {
-          const latest = await capture(captured);
-          return latest.kind === "ready" && latest.vector === initial.vector;
+          return (await currentServingFence(captured, initial)) === initialFence;
         } catch {
           return false;
         }
