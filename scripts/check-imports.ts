@@ -69,6 +69,7 @@ const LAYERS: readonly Layer[] = [
       "v2-runtime",
       "v2-service-binding-authority",
       "v2-queue-manager",
+      "v2-actor-sql-graph",
     ],
   },
   {
@@ -203,12 +204,19 @@ const LAYERS: readonly Layer[] = [
     ],
   },
   {
+    // Portable accepted Actor graph predicates shared by self-host and
+    // provider-owned native adapters. No Workerd or Node owner is reachable.
+    name: "v2-actor-sql-graph",
+    match: /^src\/takoform-v2\/actor-namespace-sql-graph\.ts$/u,
+    may: ["core", "v2-form"],
+  },
+  {
     // Outer adapter: accepted v2 SQL/native authority meets the existing
     // physical Actor port, whose explicit legacy adapter lives in one module.
     // This is not a pure Form parser or a new native-import permission for it.
     name: "v2-actor-graph-authority",
     match: /^src\/takoform-v2\/actor-namespace-graph-authority\.ts$/u,
-    may: ["core", "adapter", "app", "v2-form", "v2-runtime"],
+    may: ["core", "adapter", "app", "v2-form", "v2-runtime", "v2-actor-sql-graph"],
   },
   {
     // Actor acceptance reads v2 SQL and held Form bytes through typed ports;

@@ -7,6 +7,12 @@
  */
 export type { JsonObject, Sql } from "../ports.ts";
 export {
+  createV2ActorNamespaceSqlGraphReader,
+  type V2ActorAcceptedSqlGraph,
+  type V2ActorAcceptedSqlScope,
+  type V2ActorNamespaceSqlGraphReader,
+} from "./actor-namespace-sql-graph.ts";
+export {
   readV2ConfiguredPrivateInputs,
   type V2ConfiguredPrivateInputIdentity,
   type V2ConfiguredPrivateInputs,
