@@ -66,8 +66,17 @@ describe("existing integration v2 0066 to 0088 selected wave", () => {
       return { epochState, providerInvocationCount: 0, v2ResourceCount };
     },
   });
+  const statusOptions = (
+    count: number,
+    epochState: "absent" | "closed" | "open" = count < 68 ? "absent" : "closed",
+    v2ResourceCount = 0,
+  ) => ({
+    reader: reader(count, epochState, v2ResourceCount),
+    // This is a status fixture, not an operator's ambient Wrangler login.
+    cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "fixture-token" },
+  });
   test("status selects the audited 0066 predecessor without raising the default ceiling", async () => {
-    const result = await runD1Schema(status, target, { reader: reader(66) });
+    const result = await runD1Schema(status, target, statusOptions(66));
     expect(result).toMatchObject({
       fromMigration: "0066_cloudflare_managed_actor_kv_capability_claims.sql",
       throughMigration: "0088_v2_worker_sqlite_external_drain.sql",
@@ -78,7 +87,7 @@ describe("existing integration v2 0066 to 0088 selected wave", () => {
 
   test("canonical partial prefixes remain status-only without publication proof", async () => {
     for (const count of [67, 68, 69, 75, 86, 87]) {
-      const result = await runD1Schema(status, target, { reader: reader(count) });
+      const result = await runD1Schema(status, target, statusOptions(count));
       expect(result).toMatchObject({
         appliedMigrations: source.names.slice(0, count),
         pendingMigrations: source.names.slice(count),
@@ -88,10 +97,10 @@ describe("existing integration v2 0066 to 0088 selected wave", () => {
   });
 
   test("an opened 0068 epoch or accepted v2 data prevents the existing-target wave", async () => {
-    await expect(runD1Schema(status, target, { reader: reader(69, "open") })).rejects.toThrow(
+    await expect(runD1Schema(status, target, statusOptions(69, "open"))).rejects.toThrow(
       "closed 0068",
     );
-    await expect(runD1Schema(status, target, { reader: reader(87, "closed", 1) })).rejects.toThrow(
+    await expect(runD1Schema(status, target, statusOptions(87, "closed", 1))).rejects.toThrow(
       "no affected v2 data",
     );
   });
