@@ -11,6 +11,7 @@ import type {
   SQLiteDatabaseNativePort,
   SQLiteWorkerBindingClaim,
   Sql,
+  V2ActorNamespacePhysicalPort,
   V2Backend,
   V2BackendResult,
   V2Execution,
@@ -25,6 +26,8 @@ import type {
   WorkerBundleCustody,
 } from "@takoserver/core/takoform-v2";
 import * as extension from "@takoserver/core/takoform-v2";
+import type { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
+import { createV2ActorNamespaceForm } from "../src/takoform-v2/actor-namespace-backend.ts";
 import { createV2ActorNamespaceSqlGraphReader } from "../src/takoform-v2/actor-namespace-sql-graph.ts";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
 import { createV2HeldArtifactSource } from "../src/takoform-v2/forms/artifact-source.ts";
@@ -103,6 +106,7 @@ const RUNTIME_EXPORTS = [
   "createObjectBucketWorkerBindingAuthority",
   "createV2EdgeKvNativeCustody",
   "createV2ActorNamespaceSqlGraphReader",
+  "createV2ActorNamespaceForm",
   "createAtLeastOnceQueueForm",
   "createQueueWorkerBindingAuthority",
   "createQueueConsumerForm",
@@ -188,6 +192,12 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(extension.AT_LEAST_ONCE_QUEUE_FORM_URL).toBe(AT_LEAST_ONCE_QUEUE_FORM_URL);
   expect(extension.createV2EdgeKvNativeCustody).toBe(createV2EdgeKvNativeCustody);
   expect(extension.createV2ActorNamespaceSqlGraphReader).toBe(createV2ActorNamespaceSqlGraphReader);
+  expect(extension.createV2ActorNamespaceForm).toBe(createV2ActorNamespaceForm);
+  const acceptsPhysicalPort = (_physical: V2ActorNamespacePhysicalPort): void => {};
+  const existingSelfhostPort = (
+    physical: ReturnType<typeof createSelfhostActorExecutionHost>,
+  ): void => acceptsPhysicalPort(physical);
+  expect(typeof existingSelfhostPort).toBe("function");
   expect(extension.createInternalV2ModuleWorkerForm).toBe(createInternalV2ModuleWorkerForm);
   expect(extension.createV2WorkerVersionConfiguredInputSealer).toBe(
     createV2WorkerVersionConfiguredInputSealer,

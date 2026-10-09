@@ -892,6 +892,11 @@ and held-operation lease check without importing the Workerd process owner.
 The reader neither selects native bytes nor proves a physical Actor owner:
 after native/material awaits, callers must recheck the SQL graph and active
 Deployment before admitting delivery.
+The existing ActorNamespace Form factory also exports a structural physical
+port: a provider adapter supplies exact registration, empty/absent readback,
+and (when active) accepted-operation runtime observation and warmup. The
+factory continues to own its SQL claim and reference checks; this export is
+not a native receipt or a new Form definition.
 `stillCurrent` checks only settled graphs. A create/reconcile caller holding a
 Namespace Operation must repeat `readAcceptedOperationGraph` with the same
 Operation ID and lease token after awaits, then compare its authority key.

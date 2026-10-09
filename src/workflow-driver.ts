@@ -203,6 +203,8 @@ export interface WorkflowDriver {
   ): Promise<JsonObject | undefined>;
   /** Private host control used when the application settles around a step. */
   definitionMismatch(): Promise<never>;
+  /** Host-private stop fence: close future mutations synchronously, then drain accepted SQL work. */
+  stopBarrier?(): Promise<void>;
 }
 
 /** Infrastructure/private-protocol failures never become application run_threw. */

@@ -70,6 +70,7 @@ const LAYERS: readonly Layer[] = [
       "v2-service-binding-authority",
       "v2-queue-manager",
       "v2-actor-sql-graph",
+      "v2-actor-physical-backend",
     ],
   },
   {
@@ -230,7 +231,7 @@ const LAYERS: readonly Layer[] = [
     // never broadens pure Form or generic v2 runtime access to app modules.
     name: "v2-actor-physical-backend",
     match: /^src\/takoform-v2\/actor-namespace-backend\.ts$/u,
-    may: ["core", "app", "v2-contract", "v2-form", "v2-actor-admission"],
+    may: ["core", "app", "native-contract", "v2-contract", "v2-form", "v2-actor-admission"],
   },
   {
     // Exact v2 accepted-reference adapter for the existing physical Actor port.
@@ -427,6 +428,13 @@ const LAYERS: readonly Layer[] = [
     may: ["release-data"],
   },
   {
+    // Pure type declarations shared by the native Workerd owner and the
+    // portable Actor Form; these exact files may not load runtime values.
+    name: "native-contract",
+    match: /^src\/(?:workerd-site|actor-execution)-contract\.ts$/u,
+    may: ["core", "adapter", "native-contract"],
+  },
+  {
     name: "core",
     match:
       /^src\/(?:ports|json|strict-json|artifact-path|cron|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
@@ -439,7 +447,7 @@ const LAYERS: readonly Layer[] = [
     name: "adapter",
     match:
       /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-object-store|selfhost-endpoint-https-tls|selfhost-v2-worker-endpoint-upstream-websocket|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
-    may: ["core", "adapter"],
+    may: ["core", "adapter", "native-contract"],
   },
   {
     name: "domain",
@@ -462,6 +470,7 @@ const LAYERS: readonly Layer[] = [
     may: [
       "core",
       "adapter",
+      "native-contract",
       "domain",
       "routes",
       "app",
@@ -503,7 +512,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "package-surface",
     match:
-      /^src\/(?:index|provider-extension|workflow-runtime|workflow-runtime-workerd)\.ts$|^src\/takoform\/integration-actor-(?:host|form-authority)\.ts$/u,
+      /^src\/(?:index|provider-extension|workflow-runtime|workflow-runtime-transport|workflow-runtime-workerd)\.ts$|^src\/takoform\/integration-actor-(?:host|form-authority)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "package-surface"],
   },
 ];

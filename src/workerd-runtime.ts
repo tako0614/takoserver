@@ -19,8 +19,6 @@ import {
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseActorAbiRef } from "./actor-abi-ref.ts";
 import { isValidArtifactPath } from "./artifact-path.ts";
-import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
-import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 import { bytesDigest } from "./json.ts";
 import {
   SELFHOST_WORKER_DATA_PLANE_BINDING,
@@ -58,7 +56,48 @@ import {
   selectSelfhostWeightedVersion,
 } from "./selfhost-weighted-deployment.ts";
 import { TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES } from "./takoform/limits.ts";
+import type {
+  WorkerdActiveActorGraph,
+  WorkerdActorForward,
+  WorkerdActorForwardBinding,
+  WorkerdActorForwardSocket,
+  WorkerdAssetDeclaration,
+  WorkerdBinding,
+  WorkerdDataPlane,
+  WorkerdEventGate,
+  WorkerdLegacyWorkflowForwardBinding,
+  WorkerdModuleMediaType,
+  WorkerdQueueSettlement,
+  WorkerdServiceBinding,
+  WorkerdSite,
+  WorkerdV2KvPlane,
+  WorkerdV2ObjectBucketPlane,
+  WorkerdV2WorkflowForwardBinding,
+  WorkerdWorkflowForward,
+  WorkerdWorkflowForwardBinding,
+} from "./workerd-site-contract.ts";
 import { createWorkerdWorkerModuleInspector } from "./workerd-worker-module-inspector.ts";
+
+export type {
+  WorkerdActiveActorGraph,
+  WorkerdActorForward,
+  WorkerdActorForwardBinding,
+  WorkerdActorForwardSocket,
+  WorkerdActorIncarnationRetirement,
+  WorkerdBinding,
+  WorkerdDataPlane,
+  WorkerdEventGate,
+  WorkerdLegacyWorkflowForwardBinding,
+  WorkerdModuleMediaType,
+  WorkerdQueueSettlement,
+  WorkerdServiceBinding,
+  WorkerdSite,
+  WorkerdV2KvPlane,
+  WorkerdV2ObjectBucketPlane,
+  WorkerdV2WorkflowForwardBinding,
+  WorkerdWorkflowForward,
+  WorkerdWorkflowForwardBinding,
+} from "./workerd-site-contract.ts";
 
 /**
  * The files and the configuration workerd runs from.
@@ -88,23 +127,6 @@ import { createWorkerdWorkerModuleInspector } from "./workerd-worker-module-insp
  * a process died must never be the one workerd picks up.
  */
 
-/** One environment entry the module sees on `env`. */
-export interface WorkerdBinding {
-  readonly name: string;
-  readonly value: string;
-  /** `text` is a string; `json` is parsed by the runtime before the module sees it. */
-  readonly kind: "text" | "json";
-}
-
-/** One Host-private native service binding on a tenant entrypoint. */
-export interface WorkerdServiceBinding {
-  readonly name: string;
-  readonly target: string;
-  readonly targetResourceUid: string;
-  /** Per-caller marker used only by the unavailable router. */
-  readonly unavailableToken: string;
-}
-
 /** Host-owned broker socket for one exact v2 caller Binding router. */
 export interface WorkerdV2ServiceBindingBrokerSocket {
   readonly socketPath: string;
@@ -115,22 +137,6 @@ export interface WorkerdV2ServiceBindingBrokerSocket {
   };
 }
 
-/** Media types workerd can use for a module declaration in this runtime. */
-export type WorkerdModuleMediaType =
-  | "application/javascript+module"
-  | "text/plain"
-  | "application/octet-stream"
-  | "application/wasm";
-
-interface WorkerdAssetDeclaration {
-  readonly notFoundHandling: "none" | "single-page-application";
-  readonly runWorkerFirst: boolean;
-  /** Explicit v2 code+asset path grammar; omitted for legacy code sites. */
-  readonly strictPaths?: true;
-  /** Exact normalized media type for every logical asset path. */
-  readonly mediaTypes: Readonly<Record<string, string>>;
-}
-
 interface WorkerdAssetManifestEntry {
   /** Operator-private flat filename, never a tenant-visible path. */
   readonly key: string;
@@ -138,61 +144,6 @@ interface WorkerdAssetManifestEntry {
   readonly size: number;
   readonly digest: `sha256:${string}`;
 }
-
-export interface WorkerdActorForwardBinding {
-  readonly publicName: string;
-  readonly tenantId: string;
-  readonly namespaceResourceUid: string;
-  readonly httpService: string;
-  readonly upgradeService: string;
-  /** Host-private bearer already embedded in the generated outer wrapper. */
-  readonly token: string;
-  /** Host-selected full ABI identity; omission retains the released Actor profile. */
-  readonly runtimeClassRef?: TakoformInterfaceRef;
-}
-
-export interface WorkerdActorForward {
-  readonly schema: "takoserver.selfhost-actor-forward@v1";
-  readonly bindings: readonly WorkerdActorForwardBinding[];
-}
-
-/** Unpublished Host-only Workflow forward projection from one immutable V10 snapshot. */
-export interface WorkerdLegacyWorkflowForwardBinding {
-  readonly publicName: string;
-  readonly serviceName: string;
-  readonly tenantId: string;
-  readonly workflowResourceUid: string;
-  readonly workflowFormRef: TakoformV1Alpha3FormRef;
-  readonly bindingRef: TakoformBindingRef;
-  readonly runtimeClassRef: TakoformInterfaceRef;
-  /** Host-private bearer already embedded in the generated outer wrapper. */
-  readonly token: string;
-}
-
-/** Internal v2 SQL-authorized Workflow grant, without legacy digest FormRefs. */
-export interface WorkerdV2WorkflowForwardBinding {
-  readonly publicName: string;
-  readonly serviceName: string;
-  readonly tenantId: string;
-  readonly workflowResourceUid: string;
-  readonly token: string;
-}
-
-export type WorkerdWorkflowForwardBinding =
-  | WorkerdLegacyWorkflowForwardBinding
-  | WorkerdV2WorkflowForwardBinding;
-
-export type WorkerdWorkflowForward =
-  | {
-      readonly schema: "takoserver.selfhost-workflow-binding-forward@v1";
-      readonly snapshotDigest: `sha256:${string}`;
-      readonly bindings: readonly WorkerdLegacyWorkflowForwardBinding[];
-    }
-  | {
-      readonly schema: "takoserver.v2-workflow-binding-forward@1";
-      readonly snapshotDigest: `sha256:${string}`;
-      readonly bindings: readonly WorkerdV2WorkflowForwardBinding[];
-    };
 
 /** One immutable Workflow binding projection requested by the current graph. */
 export interface WorkerdWorkflowForwardPublication {
@@ -228,15 +179,6 @@ export interface WorkerdWorkflowForwardSocket {
   readonly socketPath: string;
 }
 
-export interface WorkerdActorForwardSocket {
-  readonly tenantId: string;
-  readonly namespaceResourceUid: string;
-  /** Present for exact per-Version brokers; absent only on legacy static mappings. */
-  readonly token?: string;
-  readonly httpSocketPath: string;
-  readonly upgradeSocketPath: string;
-}
-
 /** Exact immutable publication identities handed to the Host-private Actor owner. */
 export interface WorkerdActorForwardPublication {
   readonly script: string;
@@ -266,94 +208,6 @@ interface WorkerdStoredModule {
 interface WorkerdModuleStorageManifest {
   readonly application: readonly WorkerdStoredModule[];
   readonly hostPrivate: readonly WorkerdStoredModule[];
-}
-
-export interface WorkerdSite {
-  readonly kind?: never;
-  /** Directory holding this script's modules. */
-  readonly directory: string;
-  readonly mainModule: string;
-  /**
-   * Host-private entrypoint that imports the exact application main.
-   *
-   * Its logical spelling may equal `mainModule`: provenance, not a reserved
-   * filename, keeps the two identities distinct.
-   */
-  readonly hostEntrypoint?: string;
-  /** Additional Host-private modules, distinct from the application namespace. */
-  readonly hostModules?: readonly string[];
-  readonly hostnames: readonly string[];
-  /** Durable identity of the desired publication, including its routes. */
-  readonly generation?: string;
-  /** Exact logical Worker incarnation. Absent only on a retained legacy site. */
-  readonly workerResourceUid?: string;
-  /** Whether this exact active Version declared the worker.runtime fetch handler. */
-  readonly fetchHandler?: boolean;
-  /** Logical fetch bindings; target selection never consults a request URL. */
-  readonly serviceBindings?: readonly WorkerdServiceBinding[];
-  /** Unpublished Host-only Actor forward projection; never a worker.service binding. */
-  readonly actorForward?: WorkerdActorForward;
-  /** Unpublished Host-only Workflow binding projection; never public support. */
-  readonly workflowForward?: WorkerdWorkflowForward;
-  /**
-   * How the Host-owned HTTP router composes this script with its asset lookup.
-   * Absent means it declared no assets and public traffic reaches the script
-   * directly. Neither service is projected into the tenant environment.
-   */
-  readonly assets?: WorkerdAssetDeclaration;
-  /**
-   * Environment entries for this script. Absent and empty both render nothing,
-   * so a script that declares none produces the same bytes it always did.
-   */
-  readonly vars?: readonly WorkerdBinding[];
-  /**
-   * Modules to declare beside the main one, in order.
-   *
-   * workerd resolves an import against the module registry the configuration
-   * builds, so a module that is on disk but not named here cannot be imported.
-   * Absent renders exactly the single-module configuration it always did.
-   */
-  readonly modules?: readonly string[];
-  /**
-   * Exact media types for every module in `mainModule` plus `modules`.
-   *
-   * Absent keeps the historical `esModule` declaration for every module. When
-   * present, every declared module must have one entry and every entry must
-   * name a declared module; the runtime never guesses from a file extension.
-   */
-  readonly moduleMediaTypes?: Readonly<Record<string, WorkerdModuleMediaType>>;
-  /**
-   * The Host-owned facade service this script's generated entrypoint calls.
-   *
-   * Absent means this script binds no KV namespace and no SQLite database, and
-   * renders exactly the configuration it always did. Present renders a second
-   * service beside the script — its own module, its own bindings — and gives
-   * the script a plain service binding to it. The token and the loopback
-   * address are declared there and never on the script, because workerd hands
-   * every binding of a service to every module that service runs.
-   */
-  readonly dataPlane?: WorkerdDataPlane;
-  /**
-   * The Host-owned gate a queue batch or a cron match reaches this script
-   * through.
-   *
-   * Absent means nothing delivers events to this script, and it renders exactly
-   * the configuration it always did. Present renders one more service beside
-   * the script — its own module, its own token — and a route on a hostname of
-   * this Host's own that reaches the gate and never the script. The gate is the
-   * only holder of a binding that names the script's event entrypoint, so a
-   * customer request at the script's own hostname reaches `fetch` and nothing
-   * else.
-   */
-  readonly events?: WorkerdEventGate;
-  /** Opt-in v2 Queue private RPC facade; never projected into tenant env. */
-  readonly queueSettlement?: WorkerdQueueSettlement;
-  /** Opt-in v2 ObjectBucket binding service; grant is never on the tenant service. */
-  readonly v2ObjectBucketPlane?: WorkerdV2ObjectBucketPlane;
-  /** Opt-in v2 KV binding service; grant is never on the tenant service. */
-  readonly v2KvPlane?: WorkerdV2KvPlane;
-  /** Opt-in v2 Queue producer service; not the handler settlement service. */
-  readonly v2QueueProducerPlane?: WorkerdV2KvPlane;
 }
 
 /** A module-less Worker Version served only by the Host-owned asset router. */
@@ -414,19 +268,6 @@ export interface WorkerdPublicationIdentity {
   readonly versions: readonly SelfhostWeightedVersion[];
 }
 
-/** One physical incarnation's exact identity for an app-authorized Actor drain. */
-export interface WorkerdActorIncarnationRetirement {
-  readonly workerResourceUid: string;
-  readonly targetKey: string;
-  readonly sourceOperationId: string;
-  readonly incarnationId: string;
-  readonly generation: string;
-  readonly versions: readonly SelfhostWeightedVersion[];
-  readonly retirementOperationId: string;
-  /** Present for a directly executing DELETE; background retired groups use SQL's current claim. */
-  readonly retirementLeaseToken?: string;
-}
-
 /** Exact weighted identity behind the runtime's committed stable pointer. */
 export interface WorkerdActiveDeployment {
   readonly generation: string;
@@ -457,55 +298,6 @@ export interface WorkerdSelectedActiveVersion<
   readonly modules: ReadonlyMap<string, Uint8Array>;
   readonly hostModules: ReadonlyMap<string, Uint8Array>;
   readonly assets?: ReadonlyMap<string, Uint8Array>;
-}
-
-/** The complete, atomically verified graph used by one native Actor owner. */
-export interface WorkerdActiveActorGraph {
-  readonly generation: string;
-  readonly generationKey: string;
-  readonly workerResourceUid: string;
-  readonly versions: readonly (SelfhostWeightedVersion & {
-    readonly variantKey: string;
-    readonly site: WorkerdSite;
-    readonly modules: ReadonlyMap<string, Uint8Array>;
-    readonly hostModules: ReadonlyMap<string, Uint8Array>;
-  })[];
-}
-
-/** The gate service one script receives its events through. */
-export interface WorkerdEventGate {
-  /** Module inside the script's directory that implements the gate. */
-  readonly module: string;
-  /** Bindings for the gate alone; this is where the event token lives. */
-  readonly vars: readonly WorkerdBinding[];
-}
-
-/** The facade service one script's entrypoint reaches its storage through. */
-export interface WorkerdDataPlane {
-  /** Loopback address of this Host's KV and SQL planes. */
-  readonly address: string;
-  /** Module inside the script's directory that implements the facade. */
-  readonly module: string;
-  /** Bindings for the facade service alone; this is where the token lives. */
-  readonly vars: readonly WorkerdBinding[];
-}
-
-export interface WorkerdQueueSettlement {
-  readonly address: string;
-  readonly module: string;
-  readonly vars: readonly WorkerdBinding[];
-}
-
-/** A per-Version v2 object service with one exact signed Worker grant. */
-export interface WorkerdV2ObjectBucketPlane {
-  readonly address: string;
-  readonly token: string;
-}
-
-/** A per-Version private KV data-service route. */
-export interface WorkerdV2KvPlane {
-  readonly address: string;
-  readonly token: string;
 }
 
 /** The seam a provider publishes through: files present, config rewritten. */
