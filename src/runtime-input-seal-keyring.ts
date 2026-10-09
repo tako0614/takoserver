@@ -1,8 +1,18 @@
 import type { RuntimeInputSealKey } from "./runtime-input-preparations.ts";
+import {
+  type V2PrivateInputCustody,
+  type V2PrivateInputKey,
+  validatePrivateInputCustody,
+} from "./takoform-v2/private-inputs.ts";
 
 const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const RAW_AES_256 = /^[A-Za-z0-9_-]{43}$/u;
 const MAX_PREVIOUS_KEYS = 2;
+const encoder = new TextEncoder();
+const V2_CUSTODY_SALT = encoder.encode("takoserver/selfhost/v2/private-input-custody@v1");
+const V2_TRANSFER_INFO = encoder.encode("transfer/AES-256-GCM@v1");
+const V2_COMPARISON_INFO = encoder.encode("comparison/HMAC-SHA-256@v1");
+const V2_TRANSFER_TTL_SECONDS = 300;
 
 export interface RuntimeInputSealKeyRing {
   readonly current: RuntimeInputSealKey;
@@ -17,6 +27,26 @@ export interface RuntimeInputSealKeyRing {
  * are imported into non-extractable WebCrypto keys and then overwritten.
  */
 export async function parseRuntimeInputSealKeyRing(raw: string): Promise<RuntimeInputSealKeyRing> {
+  return (await parseKeyRing(raw, false)).sealKeys;
+}
+
+/** Import the same validated operator ring once for legacy and v2 custody. */
+export async function parseSelfhostRuntimeInputKeyAuthority(raw: string): Promise<{
+  readonly sealKeys: RuntimeInputSealKeyRing;
+  readonly privateInputCustody: V2PrivateInputCustody;
+}> {
+  const parsed = await parseKeyRing(raw, true);
+  if (!parsed.privateInputCustody) throw invalidKeyRing();
+  return { sealKeys: parsed.sealKeys, privateInputCustody: parsed.privateInputCustody };
+}
+
+async function parseKeyRing(
+  raw: string,
+  withPrivateCustody: boolean,
+): Promise<{
+  readonly sealKeys: RuntimeInputSealKeyRing;
+  readonly privateInputCustody?: V2PrivateInputCustody;
+}> {
   let value: unknown;
   try {
     value = JSON.parse(raw);
@@ -33,6 +63,8 @@ export async function parseRuntimeInputSealKeyRing(raw: string): Promise<Runtime
   if (new Set(ids).size !== ids.length) throw invalidKeyRing();
 
   const imported: RuntimeInputSealKey[] = [];
+  const transfer: V2PrivateInputKey[] = [];
+  const comparison: V2PrivateInputKey[] = [];
   for (const candidate of encoded) {
     const bytes = decodeKey(candidate.key);
     try {
@@ -44,6 +76,27 @@ export async function parseRuntimeInputSealKeyRing(raw: string): Promise<Runtime
         ["encrypt", "decrypt"],
       );
       imported.push({ keyId: candidate.id, key });
+      if (withPrivateCustody) {
+        const base = await crypto.subtle.importKey("raw", bytes, "HKDF", false, ["deriveKey"]);
+        const [transferKey, comparisonKey] = await Promise.all([
+          crypto.subtle.deriveKey(
+            { name: "HKDF", hash: "SHA-256", salt: V2_CUSTODY_SALT, info: V2_TRANSFER_INFO },
+            base,
+            { name: "AES-GCM", length: 256 },
+            false,
+            ["encrypt", "decrypt"],
+          ),
+          crypto.subtle.deriveKey(
+            { name: "HKDF", hash: "SHA-256", salt: V2_CUSTODY_SALT, info: V2_COMPARISON_INFO },
+            base,
+            { name: "HMAC", hash: "SHA-256", length: 256 },
+            false,
+            ["sign", "verify"],
+          ),
+        ]);
+        transfer.push({ id: candidate.id, key: transferKey });
+        comparison.push({ id: candidate.id, key: comparisonKey });
+      }
     } catch {
       throw invalidKeyRing();
     } finally {
@@ -53,10 +106,24 @@ export async function parseRuntimeInputSealKeyRing(raw: string): Promise<Runtime
   const current = imported[0];
   if (!current) throw invalidKeyRing();
   const previous = imported.slice(1);
-  return {
-    current,
-    ...(previous.length === 0 ? {} : { previous }),
+  const sealKeys = { current, ...(previous.length === 0 ? {} : { previous }) };
+  if (!withPrivateCustody) return { sealKeys };
+  const transferCurrent = transfer[0];
+  const comparisonCurrent = comparison[0];
+  if (!transferCurrent || !comparisonCurrent) throw invalidKeyRing();
+  const privateInputCustody: V2PrivateInputCustody = {
+    transfer: {
+      current: transferCurrent,
+      ...(transfer.length > 1 ? { previous: transfer.slice(1) } : {}),
+    },
+    comparison: {
+      current: comparisonCurrent,
+      ...(comparison.length > 1 ? { previous: comparison.slice(1) } : {}),
+    },
+    transferTtlSeconds: V2_TRANSFER_TTL_SECONDS,
   };
+  validatePrivateInputCustody(privateInputCustody);
+  return { sealKeys, privateInputCustody };
 }
 
 function parseEncodedKey(value: unknown): { readonly id: string; readonly key: string } {
