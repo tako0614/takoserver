@@ -239,3 +239,8 @@ export {
   type V2WorkerVersionPrivateIdentity,
   type V2WorkerVersionSealedInputs,
 } from "./worker-version-configured-inputs.ts";
+export {
+  createV2WorkflowSelectedMaterials,
+  type V2WorkflowAcceptedResource,
+  type V2WorkflowServingObservation,
+} from "./workflow-selected-materials.ts";

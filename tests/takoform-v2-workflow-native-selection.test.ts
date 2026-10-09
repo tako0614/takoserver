@@ -18,6 +18,7 @@ import {
 import { DURABLE_WORKFLOW_BACKEND_ID } from "../src/takoform-v2/workflow-backend.ts";
 import { createV2WorkflowForwardRuntime } from "../src/takoform-v2/workflow-forward-runtime.ts";
 import { createV2WorkflowNativeSelection } from "../src/takoform-v2/workflow-native-selection.ts";
+import { createV2WorkflowSelectedMaterials } from "../src/takoform-v2/workflow-selected-materials.ts";
 import type { WorkflowRunIdentity } from "../src/workflow-execution.ts";
 
 const PRINCIPAL = "org:workflow-native";
@@ -284,6 +285,10 @@ function fixture() {
   });
   return {
     db,
+    sql,
+    owner,
+    publicationState,
+    inspector,
     select,
     selected,
     snapshot,
@@ -303,6 +308,36 @@ function fixture() {
     },
   };
 }
+
+test("accepted Workflow graph yields one verified selected Version and revokes on Resource deletion", async () => {
+  const f = fixture();
+  try {
+    const select = createV2WorkflowSelectedMaterials({
+      sql: f.sql,
+      targetKey: TARGET,
+      publicationState: f.publicationState,
+      inspector: f.inspector,
+    });
+    const selected = await select(
+      identity,
+      new AbortController().signal,
+      () => f.owner.observeServing(),
+      7,
+    );
+    expect(selected.version.uid).toBe(VERSION_UID);
+    expect(selected.snapshot.sourceOperationId).toBe(SOURCE_OPERATION);
+    expect(selected.resource.className).toBe("ReportWorkflow");
+    expect(selected.materials.bundle?.files[0]).toEqual(source);
+    expect(await selected.stillCurrent()).toBe(true);
+    f.servingHostnames.push("changed.example.test");
+    expect(await selected.stillCurrent()).toBe(false);
+    f.servingHostnames.splice(0);
+    f.db.query("UPDATE tf_v2_resources SET phase = 'deleting' WHERE uid = ?").run(WORKFLOW_UID);
+    expect(await selected.stillCurrent()).toBe(false);
+  } finally {
+    f.db.close();
+  }
+});
 
 test("synthetic selected Version has no hostnames while accepted Worker serves an Endpoint", async () => {
   const f = fixture();

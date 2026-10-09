@@ -71,6 +71,7 @@ const LAYERS: readonly Layer[] = [
       "v2-queue-manager",
       "v2-actor-sql-graph",
       "v2-actor-physical-backend",
+      "v2-workflow-selected-materials",
     ],
   },
   {
@@ -125,9 +126,24 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "v2-contract", "v2-form", "v2-workflow-manager"],
   },
   {
+    // Accepted Workflow graph and held class bytes, shared by Workerd and WfP.
+    // Physical sites, private leases and Cloudflare native readback stay outside.
+    name: "v2-workflow-selected-materials",
+    match: /^src\/takoform-v2\/workflow-selected-materials\.ts$/u,
+    may: ["core", "domain", "app", "v2-form", "v2-runtime", "v2-workflow-manager"],
+  },
+  {
     name: "v2-workflow-native-selection",
     match: /^src\/takoform-v2\/workflow-native-selection\.ts$/u,
-    may: ["core", "domain", "adapter", "app", "v2-form", "v2-runtime", "v2-workflow-manager"],
+    may: [
+      "core",
+      "domain",
+      "adapter",
+      "app",
+      "v2-form",
+      "v2-runtime",
+      "v2-workflow-selected-materials",
+    ],
   },
   {
     name: "v2-workflow-forward-runtime",
