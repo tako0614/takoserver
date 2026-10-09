@@ -587,13 +587,18 @@ Three software-library subpaths expose the reusable runtime without changing any
 Takoform API, Form, Interface or Binding version:
 
 - `@takoserver/core/workflow-runtime` is the platform-neutral coordinator and
-  Host port. It exports `createWorkflowRuntime`, the execution/driver/instance
+  Host port. It exports `createWorkflowRuntime`,
+  `createV2WorkflowResourceAuthority`, the execution/driver/instance
   types, `SqlError`, `WorkflowInstanceError`, and the runtime/input error brands
   and guards. An alternative Host needs the checked-input guards to preserve
   lazy argument validation without misclassifying an application's own
   `TypeError`. `WorkflowStepError` is type-only; `isWorkflowStepError` preserves
   genuine exhausted-step correlation. Raw instance construction, Promise
   machinery, JSON codec and transport/controller internals are not exported.
+  A Host selecting v2 uses `createV2WorkflowResourceAuthority(sql)` with the
+  exact same `Sql` object passed to `createWorkflowRuntime`. The opaque authority
+  selects accepted v2 Resource checks; a brand from another SQL port is refused.
+  It does not establish native publication or expose SQL through a tenant Binding.
 - `@takoserver/core/workflow-runtime/transport` exposes only the existing
   in-memory, one-use marker/payload journal, private HTTP turn controller, and
   bundled `WORKFLOW_HTTP_BOOTSTRAP_SOURCE`/`WORKFLOW_HTTP_BOOTSTRAP_DIGEST`
