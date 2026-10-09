@@ -157,9 +157,11 @@ not registered; support is not inferred from internal components or tests.
 WorkerVersion declarations can reference SQLite, KV, ObjectBucket, Queue
 Producer, ModuleWorker Service, Actor, and Workflow Bindings. The referenced
 Forms and execution brokers must be present in the same complete composition;
-declaring a Binding does not enable its target independently. New Worker
-admission in this entry is secret-free: configured `privateInputs` are not
-accepted through the default public composition.
+declaring a Binding does not enable its target independently. With this complete
+composition and a valid `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`, the entry also
+accepts WorkerVersion `privateInputs`. Without the operator keyring, new private
+inputs remain unavailable; existing configured ciphertext is never used to
+generate replacement keys.
 
 This is local source support, not Hosted D1 or Workers for Platforms support.
 The support endpoint reports the Forms composed by that running instance.
@@ -248,12 +250,13 @@ unless D1 has the complete 0075 artifact-progress closure and 0081 private-input
 acceptance, comparison, transfer and transition closure. Core Operation inserts
 name the 0081 presence column even when operator custody is absent. An omitted Form block remains
 unsupported; an explicit empty `heldArtifacts` list permits management of
-existing custody but denies new source acquisition. The current owning deploy
-contract applies at most 0066 to existing/integration D1 and 0069 to a fresh
-production D1; 0075 and 0081 are only in the audited source inventory. Thus this Worker
-path is source/local-test qualified, not currently publishable as a working
-artifact Form through the owning deploy path. A separately authorized schema
-wave must precede enabling any of the three Form blocks in a deployment.
+existing custody but denies new source acquisition. The owning deploy path
+includes an explicit integration transition from canonical 0066 through 0088,
+with retained-state checks and source/native maintenance qualification. The
+default existing-D1 ceiling remains 0066 and fresh production remains 0069;
+selecting a different audited lineage is a separate operator action. The schema
+transition must complete before enabling Form blocks that require it. Source
+and local D1 evidence do not establish a deployed migration.
 This artifact-configured normal Worker startup guard checks required columns,
 tables and trigger markers; it is not byte-for-byte DDL attestation or live
 migration qualification.
@@ -261,9 +264,10 @@ Neither entry advertises WfP or Worker execution through this configuration.
 These Forms are management and custody surfaces only; they do not serve assets
 or execute Workers.
 Discovery always declares offerings and previews unavailable. It declares
-`privateInputs` only when `buildApp` receives an explicit operator-selected
-`v2PrivateInputCustody` keyring; the default public entries omit it and still
-declare the capability unavailable. Per-Form support additionally requires an
+`privateInputs` only when `buildApp` receives explicit operator-selected
+`v2PrivateInputCustody`. The complete Bun Worker composition supplies it from
+the configured operator keyring; entries without that custody declare the
+capability unavailable. Per-Form support additionally requires an
 exact Form private-input policy and complete backend. Common limits are a 1 MiB
 request, 100 items per page and a 24-hour replay window.
 
@@ -753,7 +757,7 @@ The normal Bun entry now also constructs the v2 UID-owner composition against
 its canonical SQL, object store, clock and selected workerd binary. Before its
 public listener opens, it reopens only private owner directories explained by
 the same SQL Worker inventory and refuses missing serving owners or unexplained
-directories. The normal entry registers complete secret-free ModuleWorker,
+directories. The normal entry registers complete ModuleWorker,
 WorkerVersion and WorkerDeployment Forms only when both held WorkerBundle and
 StaticAssetBundle backends target its exact Worker target, the selected native
 binary and Actor/Workflow boot are available, all five private
@@ -773,16 +777,25 @@ Version admission and the native owner the same SQL-backed Resource-owned
 configured-input custody. A local test uses synthetic nonextractable keys and
 the selected native workerd artifact to prove HTTP create, same-value/omitted
 PUT, mismatch refusal, configured fetch, and Host-PID restart without putting
-the secret in public Resource output. The normal entry retains that sealer for
-existing ciphertext recovery, but its first public Worker admission is
-secret-free: new `privateInputs` (including `{}`) requires a separate complete
-capability. The existing Bun-child
-scheduled/asset tests remain stand-ins, not native workerd evidence.
-The ordinary Bun entry now parses its existing operator runtime-input keyring
-once under the same HTTPS/non-drain gate and passes its current and retained
-nonextractable keys to the v2 owner sealer before restoration. An absent or
-unavailable key still refuses sensitive Versions without deleting ciphertext;
-no key is generated from local ciphertext or public configuration.
+the secret in public Resource output. The ordinary Bun entry parses its existing
+operator runtime-input keyring once under the HTTPS/non-drain gate. It retains
+the original current and previous AES keys for configured-input recovery and
+derives nonextractable v2 transfer AES-GCM and comparison HMAC-SHA-256 keys with
+distinct HKDF domain labels. The complete factory uses the same configured
+sealer for admission and the runtime owner, and supplies the transfer/comparison
+custody to the v2 engine. No key is generated from ciphertext or public config.
+Keep retained key IDs available while their Resource ciphertext or Operation
+comparison material is still needed. An absent or unavailable key refuses
+sensitive Versions without deleting ciphertext.
+
+The ordinary-entry native test additionally covers empty and nonempty private
+input maps, accepted retries, changed-value refusal, secret-bearing HTTPS
+execution, Host SIGKILL/new-PID recovery with a rotated retained key, updates,
+and dependency-ordered deletion. It checks public Resource/Operation responses
+and persisted SQL/object files for plaintext disclosure. Its synthetic keys,
+local certificate and isolated network namespace are not production key
+rotation or public TLS qualification. Other Bun-child stand-in tests do not
+become native workerd evidence through this connection.
 
 The optional Bun setting `TAKOSERVER_V2_WORKER_PRIVATE_PLANES` selects private
 SQLite, KV, ObjectBucket, Queue settlement and Queue Producer services. It is an
