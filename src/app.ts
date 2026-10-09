@@ -71,6 +71,7 @@ import { TakoformHostError } from "./takoform/types.ts";
 import {
   createTakoformV2Application,
   type V2OperatorFormFactory,
+  type V2OperatorFormSelectionFactory,
 } from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
 import type { V2PrivateInputCustody } from "./takoform-v2/private-inputs.ts";
@@ -120,8 +121,10 @@ export interface AppPorts {
   readonly publicOrigin: string;
   /** Required, explicit v2 wire identity and supported Form composition. */
   readonly v2: V2ApplicationConfig;
-  /** Operator-selected complete v2 backends, composed against this app's SQL, objects and clock. */
+  /** Code-selected complete and retained-only v2 backends on one Host authority. */
   readonly v2FormFactory?: V2OperatorFormFactory;
+  /** Code-selected full and retained-only maps; exclusive with v2FormFactory. */
+  readonly v2FormSelectionFactory?: V2OperatorFormSelectionFactory;
   /** Explicit operator-private v2 keyring; absent disables privateInputs. */
   readonly v2PrivateInputCustody?: V2PrivateInputCustody;
   /** Current Cloudflare Worker Version, retained only as operation and audit provenance. */
@@ -315,6 +318,9 @@ export function buildApp(ports: AppPorts): App {
     config: ports.v2,
     clock,
     ...(ports.v2FormFactory === undefined ? {} : { formFactory: ports.v2FormFactory }),
+    ...(ports.v2FormSelectionFactory === undefined
+      ? {}
+      : { formSelectionFactory: ports.v2FormSelectionFactory }),
     ...(ports.v2PrivateInputCustody === undefined
       ? {}
       : { privateInputCustody: ports.v2PrivateInputCustody }),

@@ -200,6 +200,12 @@ export interface V2EngineOptions {
   authorize(principal: string, space: string, access: "read" | "write"): Promise<boolean>;
   /** Only fully implemented, exact Form URLs are entered here. */
   forms: Readonly<Record<string, V2Form>>;
+  /**
+   * Internal adapters for already accepted Resources/Operations only. These
+   * URLs are never public Form support and cannot accept a new CREATE/UPDATE.
+   * Keep exact backend identity available for replay, recovery and DELETE.
+   */
+  retainedForms?: Readonly<Record<string, V2Form>>;
   /** Operator-selected keys; absence keeps the entire optional Host capability disabled. */
   privateInputCustody?: V2PrivateInputCustody;
 }
