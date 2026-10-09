@@ -201,6 +201,8 @@ bun run deploy -- takoserver-production-d1-fresh-init --status --environment=pro
 bun run deploy -- takoserver-production-d1-fresh-init --apply --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex>
 bun run deploy -- takoserver-production-d1-fresh-init --status --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0088
 bun run deploy -- takoserver-production-d1-fresh-init --apply --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0088
+bun run deploy -- takoserver-production-d1-fresh-init --status --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0089
+bun run deploy -- takoserver-production-d1-fresh-init --apply --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0089
 ```
 
 The fresh name is `takoserver-p-<generation>`, and a name that equals either the
@@ -219,15 +221,19 @@ proves the empty canonical shape, applies the lineage through one sealed
 `wrangler d1 execute --file` import, and verifies the exact lineage and
 application schema afterwards. The closed `--fresh-lineage=v2-0088` selector
 changes only this future, new, empty D1 initializer to the independently audited
-complete 0001–0088 payload. The default remains 0069. The selected profile is
+complete 0001–0088 payload. Separately, `--fresh-lineage=v2-0089` selects only
+the fixed audited 0001–0089 payload with the additive Cron match guard repair;
+it does not widen `v2-0088`. The default remains 0069. The selected profile is
 bound into retained attempt custody, so one account/generation cannot be
-reopened under the other profile. Explicit v2 completion requires the exact
-88-row migration ledger, canonical application schema, exactly the closed
+reopened under another profile. Explicit v2 completion requires the selected
+exact 88- or 89-row migration ledger, canonical application schema, exactly the closed
 0068 invocation-epoch singleton and unused 0077 acceptance-counter singleton,
 zero rows in every other application table, and no foreign-key violations. An
 import with a lost acknowledgement is not replayed: status may report complete
 for the same generated UUID only after these readbacks prove it, while a partial prefix or
-unknown response remains pending. There is no partial-prefix resume protocol.
+unknown response remains pending. A retained or incomplete 0088 attempt is not
+advanced to 0089: that selector requires a distinct generation. There is no
+partial-prefix resume protocol.
 This source option does not authorize production database creation. It does not
 raise any existing-target or protected migration-wave ceiling, or bind, reset,
 adopt or replace the serving database. Local Miniflare qualification is not a

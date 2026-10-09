@@ -24,7 +24,7 @@ type Stage = (typeof STAGES)[number];
 /** One fresh-generation authority binding, never an existing-target migration proof. */
 export interface FreshD1AttemptBinding {
   /** Absent for historical/default 0069 receipts so their serialized bytes remain readable. */
-  readonly freshLineage?: "v2-0088";
+  readonly freshLineage?: "v2-0088" | "v2-0089";
   readonly accountId: string;
   readonly generation: string;
   readonly databaseName: string;

@@ -47,9 +47,11 @@ import {
 import {
   projectFreshProductionMigrationArtifact,
   projectFreshProductionV2MigrationArtifact,
+  projectFreshProductionV2MigrationArtifact0089,
   readCurrentAuditedMigrationSourceArtifact,
   readSealedFreshProductionMigrationArtifact,
   readSealedFreshProductionV2MigrationArtifact,
+  readSealedFreshProductionV2MigrationArtifact0089,
 } from "./schema.ts";
 import type { DeployTarget } from "./target.ts";
 import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
@@ -74,7 +76,7 @@ export interface ProductionD1FreshInitInvocation {
   readonly environment: DeployEnvironment;
   readonly commit: string;
   readonly generation: string;
-  readonly freshLineage?: "v2-0088";
+  readonly freshLineage?: "v2-0088" | "v2-0089";
 }
 
 export interface FreshV2DataReadback {
@@ -161,7 +163,9 @@ export async function runProductionD1FreshInit(
   const sourceArtifact =
     invocation.freshLineage === "v2-0088"
       ? projectFreshProductionV2MigrationArtifact(auditedSource)
-      : projectFreshProductionMigrationArtifact(auditedSource);
+      : invocation.freshLineage === "v2-0089"
+        ? projectFreshProductionV2MigrationArtifact0089(auditedSource)
+        : projectFreshProductionMigrationArtifact(auditedSource);
   const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
   const expectedApplicationShapeDigest = `sha256:${createHash("sha256")
     .update(expectedApplicationShape)
@@ -271,7 +275,7 @@ async function inspectFreshD1Attempt(input: {
   readonly options: ProductionD1FreshInitOptions;
   readonly custody: FreshD1Custody;
   readonly binding: FreshD1AttemptBinding;
-  readonly freshLineage?: "v2-0088";
+  readonly freshLineage?: "v2-0088" | "v2-0089";
 }): Promise<FreshAttemptObservation> {
   const attempt = input.custody.read(input.binding);
   const inventory = await readInventory(input.provider, input.names, "preflight");
@@ -347,9 +351,10 @@ async function inspectFreshD1Attempt(input: {
         present.uuid,
         "preflight",
       );
-      if (input.freshLineage === "v2-0088") {
+      if (input.freshLineage !== undefined) {
         await assertFreshV2DataReadback(
           "preflight",
+          input.freshLineage,
           configPath,
           input.environment,
           input.expectedApplicationShape,
@@ -381,7 +386,11 @@ function validateInvocation(
   if (!GENERATION.test(invocation.generation)) {
     throw preflightError("--generation must be exactly 32 lowercase hexadecimal characters");
   }
-  if (invocation.freshLineage !== undefined && invocation.freshLineage !== "v2-0088") {
+  if (
+    invocation.freshLineage !== undefined &&
+    invocation.freshLineage !== "v2-0088" &&
+    invocation.freshLineage !== "v2-0089"
+  ) {
     throw preflightError("unsupported fresh production migration lineage");
   }
   if (!ACCOUNT_ID.test(target.accountId)) {
@@ -496,7 +505,9 @@ async function applyFreshProductionD1(
     const sealedArtifact =
       invocation.freshLineage === "v2-0088"
         ? readSealedFreshProductionV2MigrationArtifact(migrationOutput)
-        : readSealedFreshProductionMigrationArtifact(migrationOutput);
+        : invocation.freshLineage === "v2-0089"
+          ? readSealedFreshProductionV2MigrationArtifact0089(migrationOutput)
+          : readSealedFreshProductionMigrationArtifact(migrationOutput);
     if (
       sealedArtifact.digest !== sourceArtifact.digest ||
       JSON.stringify(sealedArtifact.names) !== JSON.stringify(sourceArtifact.names)
@@ -623,9 +634,10 @@ async function applyFreshProductionD1(
       expectedApplicationShape,
       databaseId,
     );
-    if (invocation.freshLineage === "v2-0088") {
+    if (invocation.freshLineage !== undefined) {
       await assertFreshV2DataReadback(
         "verification",
+        invocation.freshLineage,
         configPath,
         providerEnvironment,
         expectedApplicationShape,
@@ -732,6 +744,7 @@ function normalizeAfterCreate(error: unknown, databaseId: string | null): Deploy
 /** Data proof is in addition to the canonical schema/ledger readback, never a prefix heuristic. */
 async function assertFreshV2DataReadback(
   phase: "preflight" | "verification",
+  lineage: "v2-0088" | "v2-0089",
   configPath: string,
   environment: Readonly<Record<string, string>>,
   expectedApplicationShape: string,
@@ -760,7 +773,7 @@ async function assertFreshV2DataReadback(
       ? await readRemoteFreshV2Data(configPath, environment, tables, phase, options)
       : await options.freshV2DataReader.read(phase, configPath);
   if (
-    readback.ledgerRows !== 88 ||
+    readback.ledgerRows !== (lineage === "v2-0089" ? 89 : 88) ||
     readback.foreignKeyViolations !== 0 ||
     Object.keys(readback.tableCounts).length !== tables.length ||
     FRESH_V2_SEED_TABLES.some((name) => !tables.includes(name)) ||
@@ -780,7 +793,12 @@ async function assertFreshV2DataReadback(
       last_operation_id: null,
     })
   ) {
-    throw new DeployError(phase, "fresh v2 D1 is not the exact empty 0088 database");
+    throw new DeployError(
+      phase,
+      lineage === "v2-0089"
+        ? "fresh v2 D1 is not the exact empty 0089 database"
+        : "fresh v2 D1 is not the exact empty 0088 database",
+    );
   }
 }
 

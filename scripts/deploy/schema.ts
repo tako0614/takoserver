@@ -371,6 +371,15 @@ const FRESH_PRODUCTION_V2_APPLY_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
   0,
   FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT,
 );
+// A separate reviewed 0089 profile; never reinterpret v2-0088 as the new head.
+const FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT = 89;
+const FRESH_PRODUCTION_V2_0089_APPLY_END = "0089_v2_worker_cron_match_guard_depth.sql";
+const FRESH_PRODUCTION_V2_0089_APPLY_DIGEST =
+  "sha256:44d5cd59a772c51877d32f2f448ff929b7a50e0792ac99dea3522b1cb01545fa";
+const FRESH_PRODUCTION_V2_0089_APPLY_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
+  0,
+  FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT,
+);
 const APPLY_QUALIFIED_MIGRATION_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
   0,
   INTEGRATION_APPLY_CEILING_COUNT,
@@ -2787,6 +2796,49 @@ export function readSealedFreshProductionV2MigrationArtifact(
   assertAuditedMigrationHashes(artifact.files, FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT);
   if (artifact.digest !== FRESH_PRODUCTION_V2_APPLY_DIGEST) {
     throw preflightError("sealed fresh production v2 payload differs from its fixed 0088 digest");
+  }
+  return artifact;
+}
+
+/** Closed fresh-only 0089 profile; later audited source files cannot widen it. */
+export function projectFreshProductionV2MigrationArtifact0089(
+  source: ReturnType<typeof readMigrationArtifact>,
+): ReturnType<typeof readMigrationArtifact> {
+  if (
+    FRESH_PRODUCTION_V2_0089_APPLY_LINEAGE.length !==
+      FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT ||
+    FRESH_PRODUCTION_V2_0089_APPLY_LINEAGE.at(-1) !== FRESH_PRODUCTION_V2_0089_APPLY_END ||
+    JSON.stringify(source.names.slice(0, FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT)) !==
+      JSON.stringify(FRESH_PRODUCTION_V2_0089_APPLY_LINEAGE)
+  ) {
+    throw preflightError(
+      "fresh production v2-0089 projection requires the fixed audited 0001-0089 prefix",
+    );
+  }
+  const files = source.files.slice(0, FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT);
+  assertAuditedMigrationHashes(files, FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT);
+  const artifact = createMigrationArtifact(files);
+  if (artifact.digest !== FRESH_PRODUCTION_V2_0089_APPLY_DIGEST) {
+    throw preflightError("fresh production v2-0089 payload differs from its fixed digest");
+  }
+  return artifact;
+}
+
+/** A sealed v2-0089 import contains exactly 89 files, never a future tail. */
+export function readSealedFreshProductionV2MigrationArtifact0089(
+  directory: string,
+): ReturnType<typeof readMigrationArtifact> {
+  const artifact = readMigrationArtifact(directory);
+  if (
+    JSON.stringify(artifact.names) !== JSON.stringify(FRESH_PRODUCTION_V2_0089_APPLY_LINEAGE) ||
+    artifact.names.length !== FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT ||
+    artifact.names.at(-1) !== FRESH_PRODUCTION_V2_0089_APPLY_END
+  ) {
+    throw preflightError("sealed fresh production v2-0089 lineage must contain exactly 0001-0089");
+  }
+  assertAuditedMigrationHashes(artifact.files, FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT);
+  if (artifact.digest !== FRESH_PRODUCTION_V2_0089_APPLY_DIGEST) {
+    throw preflightError("sealed fresh production v2-0089 payload differs from its fixed digest");
   }
   return artifact;
 }

@@ -95,7 +95,8 @@ const USAGE = `takoserver deploy
     rehearsal D1; the dump is NUL-normalized and the result is verified by readback, so a partial
     application is never reported as success.
   takoserver-production-d1-fresh-init creates one new empty production D1 and applies the complete
-    audited default 0001-0069 lineage, or explicit --fresh-lineage=v2-0088, in one reviewed command. It is production-only, requires the
+    audited default 0001-0069 lineage, or explicit --fresh-lineage=v2-0088 or
+    --fresh-lineage=v2-0089, in one reviewed command. It is production-only, requires the
     explicit --generation=<32-lowercase-hex> and TAKOSERVER_DEPLOY_TARGET_PRODUCTION, and never
     reads, adopts, resets, archives or deletes the incumbent production database or its bucket.
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
@@ -192,7 +193,7 @@ type Invocation =
       readonly surface: ProductionD1FreshInitSurface;
       readonly action: "status" | "apply";
       readonly generation: string;
-      readonly freshLineage?: "v2-0088";
+      readonly freshLineage?: "v2-0088" | "v2-0089";
     })
   | (InvocationBase & {
       readonly surface: StorageDisposalSurface;
@@ -238,7 +239,7 @@ interface ParsedInvocation {
   readonly bootstrapVerifierBridge?: boolean;
   readonly bootstrapProbePredecessorVersionId?: string;
   readonly throughMigration?: SchemaWaveBoundary;
-  readonly freshLineage?: "v2-artifacts-0075" | "v2-0088";
+  readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089";
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly organizationId?: string;
   readonly keyName?: string;
@@ -307,7 +308,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let environment: DeployEnvironment | null = null;
   let commit: string | null = null;
   let generation: string | null = null;
-  let freshLineage: "v2-artifacts-0075" | "v2-0088" | null = null;
+  let freshLineage: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | null = null;
   let retiredTargetPath: string | null = null;
   let retiredDeploymentId: string | null = null;
   let retiredVersionId: string | null = null;
@@ -436,6 +437,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       if (freshLineage !== null) return null;
       if (flag === "--fresh-lineage=v2-artifacts-0075") freshLineage = "v2-artifacts-0075";
       else if (flag === "--fresh-lineage=v2-0088") freshLineage = "v2-0088";
+      else if (flag === "--fresh-lineage=v2-0089") freshLineage = "v2-0089";
       else return null;
       continue;
     }
@@ -610,7 +612,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   const storageGeneration = surfaceValue === "takoserver-integration-storage-generation";
   const productionFreshInit = surfaceValue === "takoserver-production-d1-fresh-init";
   if (
-    (storageGeneration && freshLineage === "v2-0088") ||
+    (storageGeneration && (freshLineage === "v2-0088" || freshLineage === "v2-0089")) ||
     (productionFreshInit && freshLineage === "v2-artifacts-0075") ||
     (freshLineage !== null && !storageGeneration && !productionFreshInit)
   )
@@ -635,7 +637,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
           environment,
           commit,
           generation,
-          ...(freshLineage === "v2-0088" ? { freshLineage } : {}),
+          ...(freshLineage === "v2-0088" || freshLineage === "v2-0089" ? { freshLineage } : {}),
         }
       : null;
   }

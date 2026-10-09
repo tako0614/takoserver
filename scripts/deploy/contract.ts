@@ -1113,8 +1113,9 @@ export const DEPLOY_CONTRACT = {
           "the fresh name as takoserver-p-<generation>; TAKOSERVER_DEPLOY_TARGET_PRODUCTION must " +
           "name the incumbent production target, whose D1 identity is printed and never read by a " +
           "provider operation. The scoped migration gate runs once; omitted --fresh-lineage " +
-          "keeps the fixed audited 0001-0069 payload, while only explicit " +
-          "--fresh-lineage=v2-0088 selects the fixed audited 0001-0088 payload; selected names " +
+          "keeps the fixed audited 0001-0069 payload. Explicit --fresh-lineage=v2-0088 " +
+          "selects only the fixed 0001-0088 payload; explicit --fresh-lineage=v2-0089 " +
+          "selects only the separately fixed 0001-0089 payload. Selected names " +
           "and bytes are sealed before creation. A required preexisting owner-private " +
           "TAKOSERVER_D1_FRESH_INIT_CUSTODY_DIRECTORY retains one account/generation attempt " +
           "across process failure. A separately digested import file preserves " +
@@ -1130,7 +1131,8 @@ export const DEPLOY_CONTRACT = {
         "independent-review": review,
         "post-conditions":
           "One new D1 is created, proved empty, migrated through one Wrangler file import and read " +
-          "back as the selected exact 0001-0069 or explicit 0001-0088 lineage with a matching " +
+          "back as the selected exact 0001-0069, explicit 0001-0088 or explicit 0001-0089 " +
+          "lineage with a matching " +
           "application schema; explicit v2 also proves only two canonical seed rows, " +
           "zero other application data and FK integrity. " +
           "The result prints " +
