@@ -358,6 +358,16 @@ const FRESH_PRODUCTION_APPLY_CEILING_COUNT = 69;
 // Separate fixed fresh-only integration artifact payload. A future audited
 // source tail must not silently expand this selector.
 const FRESH_V2_ARTIFACT_APPLY_CEILING_COUNT = 75;
+// This selector names one reviewed payload, not the mutable audited source head.
+// Keep the digest independent of future AUDITED_MIGRATION_LINEAGE additions.
+const FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT = 88;
+const FRESH_PRODUCTION_V2_APPLY_END = "0088_v2_worker_sqlite_external_drain.sql";
+const FRESH_PRODUCTION_V2_APPLY_DIGEST =
+  "sha256:269d7e6074584225606040b22405e395ea1ffba170b001b3c05605af8d637e19";
+const FRESH_PRODUCTION_V2_APPLY_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
+  0,
+  FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT,
+);
 const APPLY_QUALIFIED_MIGRATION_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
   0,
   INTEGRATION_APPLY_CEILING_COUNT,
@@ -2736,17 +2746,27 @@ export function readSealedFreshProductionMigrationArtifact(
   return artifact;
 }
 
-/** Closed fresh-only v2 profile: all 88 currently audited bytes, never an existing-target wave. */
+/** Closed fresh-only v2 profile; an audited future tail never widens this selector. */
 export function projectFreshProductionV2MigrationArtifact(
   source: ReturnType<typeof readMigrationArtifact>,
 ): ReturnType<typeof readMigrationArtifact> {
-  if (JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+  if (
+    FRESH_PRODUCTION_V2_APPLY_LINEAGE.length !== FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT ||
+    FRESH_PRODUCTION_V2_APPLY_LINEAGE.at(-1) !== FRESH_PRODUCTION_V2_APPLY_END ||
+    JSON.stringify(source.names.slice(0, FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT)) !==
+      JSON.stringify(FRESH_PRODUCTION_V2_APPLY_LINEAGE)
+  ) {
     throw preflightError(
-      "fresh production v2 projection requires the exact audited 0001-0088 source",
+      "fresh production v2 projection requires the fixed audited 0001-0088 prefix",
     );
   }
-  assertAuditedMigrationHashes(source.files);
-  return createMigrationArtifact(source.files);
+  const files = source.files.slice(0, FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT);
+  assertAuditedMigrationHashes(files, FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT);
+  const artifact = createMigrationArtifact(files);
+  if (artifact.digest !== FRESH_PRODUCTION_V2_APPLY_DIGEST) {
+    throw preflightError("fresh production v2 payload differs from its fixed 0088 digest");
+  }
+  return artifact;
 }
 
 /** Refuses a partial or altered sealed v2 import before any provider mutation. */
@@ -2754,10 +2774,17 @@ export function readSealedFreshProductionV2MigrationArtifact(
   directory: string,
 ): ReturnType<typeof readMigrationArtifact> {
   const artifact = readMigrationArtifact(directory);
-  if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+  if (
+    JSON.stringify(artifact.names) !== JSON.stringify(FRESH_PRODUCTION_V2_APPLY_LINEAGE) ||
+    artifact.names.length !== FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT ||
+    artifact.names.at(-1) !== FRESH_PRODUCTION_V2_APPLY_END
+  ) {
     throw preflightError("sealed fresh production v2 lineage must contain exactly 0001-0088");
   }
-  assertAuditedMigrationHashes(artifact.files);
+  assertAuditedMigrationHashes(artifact.files, FRESH_PRODUCTION_V2_APPLY_CEILING_COUNT);
+  if (artifact.digest !== FRESH_PRODUCTION_V2_APPLY_DIGEST) {
+    throw preflightError("sealed fresh production v2 payload differs from its fixed 0088 digest");
+  }
   return artifact;
 }
 

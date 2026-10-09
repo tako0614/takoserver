@@ -21,7 +21,11 @@ import type {
   IntegrationStorageD1Database,
   IntegrationStorageGenerationProcess,
 } from "../scripts/deploy/integration-storage-generation.ts";
-import { canonicalSchemaShape, type D1SchemaState } from "../scripts/deploy/migrations.ts";
+import {
+  canonicalSchemaShape,
+  type D1SchemaState,
+  readMigrationArtifact,
+} from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import {
   PRODUCTION_D1_FRESH_INIT_SURFACE,
@@ -31,7 +35,11 @@ import {
   type ProductionD1FreshInitProvider,
   runProductionD1FreshInit,
 } from "../scripts/deploy/production-d1-fresh-init.ts";
-import { readCurrentAuditedMigrationSourceArtifact } from "../scripts/deploy/schema.ts";
+import {
+  projectFreshProductionV2MigrationArtifact,
+  readCurrentAuditedMigrationSourceArtifact,
+  readSealedFreshProductionV2MigrationArtifact,
+} from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
@@ -282,6 +290,44 @@ describe("production D1 fresh init", () => {
         "deploy refused: no target was touched",
       );
     }
+  });
+  test("v2-0088 projection remains fixed when a synthetic 0089 source is added", () => {
+    const future = join(fixtureRoot, "future-migrations");
+    cpSync(currentMigrations, future, { recursive: true });
+    writeFileSync(join(future, "0089_future.sql"), "CREATE TABLE future_only (id TEXT);\n");
+    const projected = projectFreshProductionV2MigrationArtifact(readMigrationArtifact(future));
+    expect(projected.names).toEqual(V2_MIGRATIONS.map(({ name }) => name));
+    expect(projected.digest).toBe(
+      "sha256:269d7e6074584225606040b22405e395ea1ffba170b001b3c05605af8d637e19",
+    );
+    expect(projected.files).toHaveLength(88);
+    expect(readSealedFreshProductionV2MigrationArtifact(currentMigrations).digest).toBe(
+      projected.digest,
+    );
+    expect(() => readSealedFreshProductionV2MigrationArtifact(future)).toThrow("exactly 0001-0088");
+  });
+
+  test("v2-0088 projection and sealed reader reject a short or byte-drifted prefix", () => {
+    const missing = join(fixtureRoot, "missing-v2-tail");
+    cpSync(currentMigrations, missing, { recursive: true });
+    rmSync(join(missing, "0088_v2_worker_sqlite_external_drain.sql"));
+    expect(() => projectFreshProductionV2MigrationArtifact(readMigrationArtifact(missing))).toThrow(
+      "fixed audited 0001-0088 prefix",
+    );
+    expect(() => readSealedFreshProductionV2MigrationArtifact(missing)).toThrow(
+      "exactly 0001-0088",
+    );
+
+    const drifted = join(fixtureRoot, "drifted-v2-tail");
+    cpSync(currentMigrations, drifted, { recursive: true });
+    const tail = join(drifted, "0088_v2_worker_sqlite_external_drain.sql");
+    writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- synthetic drift\n`);
+    expect(() => projectFreshProductionV2MigrationArtifact(readMigrationArtifact(drifted))).toThrow(
+      "exact audited migration SHA-256",
+    );
+    expect(() => readSealedFreshProductionV2MigrationArtifact(drifted)).toThrow(
+      "exact audited migration SHA-256",
+    );
   });
   test("real local Miniflare D1 initializes empty through all 88 audited files", async () => {
     const source = readCurrentAuditedMigrationSourceArtifact(currentMigrations);
