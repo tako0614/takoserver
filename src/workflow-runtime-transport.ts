@@ -4,6 +4,10 @@
  * The caller must establish a physical ingress barrier before calling seal().
  */
 export {
+  createWorkflowHttpController,
+  type WorkflowHttpController,
+} from "./workflow-http-controller.ts";
+export {
   createWorkflowTransportJournal,
   WORKFLOW_TRANSPORT_MAX_PAYLOAD_BYTES,
   WORKFLOW_TRANSPORT_MAX_PENDING_ENTRIES,

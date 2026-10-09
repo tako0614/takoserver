@@ -587,11 +587,13 @@ Takoform API, Form, Interface or Binding version:
   genuine exhausted-step correlation. Raw instance construction, Promise
   machinery, JSON codec and transport/controller internals are not exported.
 - `@takoserver/core/workflow-runtime/transport` exposes only the existing
-  in-memory, one-use marker/payload journal to trusted Host adapters. Its
-  synchronous dispatch callback is bookkeeping, not a durable step receipt or
-  authority grant. `seal()` is valid only after the adapter has independently
-  closed and drained physical ingress; sealing does not stop native delivery.
-  This subpath is not a tenant Binding or a public wire protocol.
+  in-memory, one-use marker/payload journal and private HTTP turn controller
+  to trusted Host adapters. The controller reserves `exchange()` before the
+  journal synchronously dispatches the corresponding `acceptFrame()`; neither
+  is a durable step receipt or authority grant. `seal()` is valid only after
+  the adapter has independently closed and drained physical ingress; sealing
+  does not stop native delivery. This subpath is not a tenant Binding or a
+  public wire protocol.
 - `@takoserver/core/workflow-runtime/workerd` is trusted Bun/Linux composition,
   not a module to import into a Cloudflare Worker or tenant application. It
   exports `compileWorkerdVersionGraph`, `createWorkerdWorkflowExecutionHost` and

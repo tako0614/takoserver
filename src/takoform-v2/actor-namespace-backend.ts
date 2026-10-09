@@ -1,6 +1,5 @@
 import { canonicalJson } from "../json.ts";
 import type { Sql } from "../ports.ts";
-import type { createSelfhostActorExecutionHost } from "../selfhost-actor-execution-host.ts";
 import type {
   ActorExecutionGraph,
   ActorExecutionRealization,
@@ -50,16 +49,64 @@ const EMPTY_OBSERVED = {
   openSocketCount: 0,
 } as const;
 
-export type V2ActorAcceptedOperationRuntimeObserver = Pick<
-  ReturnType<typeof createSelfhostActorExecutionHost>,
-  "observeNamespaceRuntimeForAcceptedOperation" | "warmNamespaceForAcceptedOperation"
->;
+export type V2ActorNamespaceScope = ActorExecutionGraph["scope"];
 
-type PhysicalActorHost = Pick<
-  ReturnType<typeof createSelfhostActorExecutionHost>,
-  "registerNamespace" | "namespaceEmpty" | "forgetNamespace" | "namespaceAbsent"
-> &
-  Partial<V2ActorAcceptedOperationRuntimeObserver>;
+/** Exact held native target. This is not an accepted-SQL or delivery grant. */
+export interface V2ActorNamespaceRuntimeTarget {
+  readonly workerUid: string;
+  readonly className: string;
+  readonly sourceOperationId: string;
+  readonly incarnationId: string;
+  readonly generationKey: string;
+  readonly versions: readonly {
+    readonly versionId: string;
+    readonly workerVersionUid: string;
+    readonly weight: number;
+  }[];
+}
+
+export type V2ActorNamespaceRuntimeObservation =
+  | { readonly kind: "unknown" }
+  | {
+      readonly kind: "confirmed";
+      readonly epoch: string;
+      readonly observedAt: number;
+      readonly activeActorCount: number;
+      readonly pendingAlarmCount: number;
+      readonly openSocketCount: number;
+    };
+
+export interface V2ActorNamespaceWarmCandidate {
+  readonly graph: ActorExecutionGraph;
+  readonly realization: ActorExecutionRealization;
+  readonly expected: V2ActorNamespaceRuntimeTarget;
+  readonly stillAuthorized: (signal: AbortSignal) => Promise<boolean>;
+}
+
+/** Physical ownership/readback port; the backend retains SQL and claim authority. */
+export interface V2ActorNamespacePhysicalPort {
+  registerNamespace(scope: V2ActorNamespaceScope): Promise<void>;
+  namespaceEmpty(scope: V2ActorNamespaceScope): Promise<boolean>;
+  forgetNamespace(scope: V2ActorNamespaceScope): Promise<void>;
+  namespaceAbsent(scope: V2ActorNamespaceScope): Promise<boolean>;
+  observeNamespaceRuntimeForAcceptedOperation?(
+    scope: V2ActorNamespaceScope,
+    expected: V2ActorNamespaceRuntimeTarget,
+    signal: AbortSignal,
+  ): Promise<V2ActorNamespaceRuntimeObservation>;
+  warmNamespaceForAcceptedOperation?(
+    scope: V2ActorNamespaceScope,
+    candidate: V2ActorNamespaceWarmCandidate,
+    signal: AbortSignal,
+  ): Promise<V2ActorNamespaceRuntimeObservation>;
+}
+
+export type V2ActorAcceptedOperationRuntimeObserver = Required<
+  Pick<
+    V2ActorNamespacePhysicalPort,
+    "observeNamespaceRuntimeForAcceptedOperation" | "warmNamespaceForAcceptedOperation"
+  >
+>;
 
 interface ActorOwner {
   readonly workerResourceUid: string;
@@ -117,7 +164,7 @@ export function createV2ActorNamespaceForm(options: {
   readonly targetKey: string;
   readonly bundleCustody: Pick<WorkerBundleCustody, "readHeldVerified">;
   readonly inspector: Pick<WorkerModuleSemanticInspector, "inspectActorClass">;
-  readonly physical: PhysicalActorHost;
+  readonly physical: V2ActorNamespacePhysicalPort;
   readonly ownerForWorker?: (workerUid: string) => Promise<ActorOwner | null>;
   readonly acceptedGraph?: {
     readAcceptedOperationGraph(

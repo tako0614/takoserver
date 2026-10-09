@@ -70,6 +70,7 @@ const LAYERS: readonly Layer[] = [
       "v2-service-binding-authority",
       "v2-queue-manager",
       "v2-actor-sql-graph",
+      "v2-actor-physical-backend",
     ],
   },
   {

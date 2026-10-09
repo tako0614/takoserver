@@ -7,6 +7,15 @@
  */
 export type { JsonObject, Sql } from "../ports.ts";
 export {
+  createV2ActorNamespaceForm,
+  type V2ActorAcceptedOperationRuntimeObserver,
+  type V2ActorNamespacePhysicalPort,
+  type V2ActorNamespaceRuntimeObservation,
+  type V2ActorNamespaceRuntimeTarget,
+  type V2ActorNamespaceScope,
+  type V2ActorNamespaceWarmCandidate,
+} from "./actor-namespace-backend.ts";
+export {
   createV2ActorNamespaceSqlGraphReader,
   type V2ActorAcceptedSqlGraph,
   type V2ActorAcceptedSqlScope,

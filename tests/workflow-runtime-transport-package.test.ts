@@ -2,7 +2,9 @@ import { expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import * as root from "@takoserver/core";
 import * as runtime from "@takoserver/core/workflow-runtime";
+import type { WorkflowHttpController } from "@takoserver/core/workflow-runtime/transport";
 import * as transport from "@takoserver/core/workflow-runtime/transport";
+import { createWorkflowHttpController } from "../src/workflow-http-controller.ts";
 import {
   createWorkflowTransportJournal,
   WORKFLOW_TRANSPORT_MAX_PAYLOAD_BYTES,
@@ -11,9 +13,10 @@ import {
   WorkflowTransportJournalError,
 } from "../src/workflow-transport-journal.ts";
 
-test("trusted transport subpath exports the existing one-use journal only", () => {
+test("trusted transport subpath exports only the existing journal and HTTP controller", () => {
   expect(Object.keys(transport).sort()).toEqual(
     [
+      "createWorkflowHttpController",
       "createWorkflowTransportJournal",
       "WORKFLOW_TRANSPORT_MAX_PAYLOAD_BYTES",
       "WORKFLOW_TRANSPORT_MAX_PENDING_ENTRIES",
@@ -22,6 +25,11 @@ test("trusted transport subpath exports the existing one-use journal only", () =
     ].sort(),
   );
   expect(transport.createWorkflowTransportJournal).toBe(createWorkflowTransportJournal);
+  expect(transport.createWorkflowHttpController).toBe(createWorkflowHttpController);
+  const controller: WorkflowHttpController = transport.createWorkflowHttpController();
+  expect(typeof controller.exchange).toBe("function");
+  expect(typeof controller.acceptFrame).toBe("function");
+  controller.close();
   expect(transport.WorkflowTransportJournalError).toBe(WorkflowTransportJournalError);
   expect(transport.WORKFLOW_TRANSPORT_MAX_PAYLOAD_BYTES).toBe(WORKFLOW_TRANSPORT_MAX_PAYLOAD_BYTES);
   expect(transport.WORKFLOW_TRANSPORT_MAX_PENDING_ENTRIES).toBe(
