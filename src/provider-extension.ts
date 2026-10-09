@@ -280,6 +280,7 @@ export {
 } from "./takoform-v2/worker-queue-delivery.ts";
 export {
   createV2QueueScheduler,
+  type V2QueueSchedulerCheckpoint,
   type V2QueueSchedulerOptions,
 } from "./takoform-v2/worker-queue-scheduler.ts";
 export {
