@@ -2736,6 +2736,31 @@ export function readSealedFreshProductionMigrationArtifact(
   return artifact;
 }
 
+/** Closed fresh-only v2 profile: all 88 currently audited bytes, never an existing-target wave. */
+export function projectFreshProductionV2MigrationArtifact(
+  source: ReturnType<typeof readMigrationArtifact>,
+): ReturnType<typeof readMigrationArtifact> {
+  if (JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    throw preflightError(
+      "fresh production v2 projection requires the exact audited 0001-0088 source",
+    );
+  }
+  assertAuditedMigrationHashes(source.files);
+  return createMigrationArtifact(source.files);
+}
+
+/** Refuses a partial or altered sealed v2 import before any provider mutation. */
+export function readSealedFreshProductionV2MigrationArtifact(
+  directory: string,
+): ReturnType<typeof readMigrationArtifact> {
+  const artifact = readMigrationArtifact(directory);
+  if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    throw preflightError("sealed fresh production v2 lineage must contain exactly 0001-0088");
+  }
+  assertAuditedMigrationHashes(artifact.files);
+  return artifact;
+}
+
 /** Reads an explicitly sealed 0001-0066 payload; a 0067 file is refused. */
 export function readSealedApplyQualifiedMigrationArtifact(
   directory: string,

@@ -213,7 +213,14 @@ function isPlatformSchemaMetadata(row: Record<string, unknown>): boolean {
     row.name === "d1_migrations" ||
     row.tbl_name === "d1_migrations" ||
     row.name === "_cf_KV" ||
-    row.tbl_name === "_cf_KV"
+    row.tbl_name === "_cf_KV" ||
+    (row.type === "table" &&
+      row.name === "_cf_METADATA" &&
+      row.tbl_name === "_cf_METADATA" &&
+      typeof row.sql === "string" &&
+      /^CREATE TABLE _cf_METADATA\s*\(\s*key INTEGER PRIMARY KEY,\s*value BLOB\s*\)$/u.test(
+        row.sql,
+      ))
   );
 }
 

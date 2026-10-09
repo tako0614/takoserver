@@ -1112,8 +1112,10 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Production only. One explicit --generation=<32-lowercase-hex> derives ` +
           "the fresh name as takoserver-p-<generation>; TAKOSERVER_DEPLOY_TARGET_PRODUCTION must " +
           "name the incumbent production target, whose D1 identity is printed and never read by a " +
-          "provider operation. The scoped migration gate runs once; the fixed audited 0001-0069 " +
-          "names and bytes are sealed before creation. A required preexisting owner-private " +
+          "provider operation. The scoped migration gate runs once; omitted --fresh-lineage " +
+          "keeps the fixed audited 0001-0069 payload, while only explicit " +
+          "--fresh-lineage=v2-0088 selects the fixed audited 0001-0088 payload; selected names " +
+          "and bytes are sealed before creation. A required preexisting owner-private " +
           "TAKOSERVER_D1_FRESH_INIT_CUSTODY_DIRECTORY retains one account/generation attempt " +
           "across process failure. A separately digested import file preserves " +
           "every migration byte and adds only Wranglers migration-ledger DDL and inserts.",
@@ -1121,13 +1123,17 @@ export const DEPLOY_CONTRACT = {
           "The fresh name must be absent at inspection and again at the creation fence; an existing " +
           "database is never adopted, reset or re-migrated. The new D1 UUID/name and exact empty " +
           "canonical shape are checked before migration; durable intent is fsynced before create. " +
-          "The exact 0001-0069 lineage, canonical " +
-          "schema digest and application-schema match are checked after. The incumbent database and " +
+          "The selected exact lineage, canonical schema digest and application-schema match " +
+          "are checked after; v2 additionally requires only the exact 0068/0077 seed singletons, " +
+          "zero other application rows, exact ledger count and foreign-key integrity. The incumbent database and " +
           "object bucket are outside this surface provider capability.",
         "independent-review": review,
         "post-conditions":
           "One new D1 is created, proved empty, migrated through one Wrangler file import and read " +
-          "back as the exact 0001-0069 lineage with a matching application schema. The result prints " +
+          "back as the selected exact 0001-0069 or explicit 0001-0088 lineage with a matching " +
+          "application schema; explicit v2 also proves only two canonical seed rows, " +
+          "zero other application data and FK integrity. " +
+          "The result prints " +
           "the exact d1.databaseName/d1.databaseId a successor target descriptor needs and reports " +
           "targetBinding not-written. No Worker, route, namespace, secret, R2 object state or " +
           "current target is changed. Reopening the same generation is read-only; no create or import is redispatched.",
@@ -1140,7 +1146,9 @@ export const DEPLOY_CONTRACT = {
           `${highRiskFailure} Both actions require an explicit CLOUDFLARE_API_TOKEN and apply also ` +
           "requires TAKOSERVER_INDEPENDENT_REVIEW. There is no OAuth or integration fallback and no " +
           "--dry-run beyond the side-effect-free --status probe. Missing, replaced or malformed " +
-          "attempt custody is refusal, not evidence of no prior dispatch; preserve it and choose a " +
+          "attempt custody or a different lineage for the same generation is refusal, not evidence " +
+          "of no prior dispatch. A lost import acknowledgement is read-only reconciled only after " +
+          "exact complete readback; a partial prefix never permits replay. Preserve custody and choose a " +
           "distinct generation after an indeterminate effect." +
           inputContract(applyReviewInput),
       },

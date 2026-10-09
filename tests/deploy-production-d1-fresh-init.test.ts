@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Miniflare } from "miniflare";
 import { applicationSchemaMatches } from "../scripts/deploy/application-schema-shape.ts";
 import { DEPLOY_CONTRACT } from "../scripts/deploy/contract.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
@@ -30,6 +31,7 @@ import {
   type ProductionD1FreshInitProvider,
   runProductionD1FreshInit,
 } from "../scripts/deploy/production-d1-fresh-init.ts";
+import { readCurrentAuditedMigrationSourceArtifact } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
@@ -38,7 +40,9 @@ import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
 const fixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-production-d1-tests-"));
 const currentMigrations = copyCurrentSchemaFixture(join(fixtureRoot, "current-migrations"));
 const APPLY_MIGRATIONS = MIGRATIONS.slice(0, 69);
+const V2_MIGRATIONS = MIGRATIONS.slice(0, 88);
 const expectedApplicationShape = applicationShape(currentMigrations);
+const expectedV2ApplicationShape = applicationShape(currentMigrations, V2_MIGRATIONS);
 const COMMIT = "a".repeat(40);
 const GENERATION = "b".repeat(32);
 const ACCOUNT_ID = "a10162d23653f1ad1193dabf520a5dd0";
@@ -72,6 +76,30 @@ const completeState = stateWithShape(
   APPLY_MIGRATIONS.map(({ name }) => name),
   expectedApplicationShape,
 );
+const v2CompleteState = stateWithShape(
+  V2_MIGRATIONS.map(({ name }) => name),
+  expectedV2ApplicationShape,
+);
+const v2TableCounts = Object.fromEntries(
+  (JSON.parse(expectedV2ApplicationShape) as { type: string; name: string }[])
+    .filter((row) => row.type === "table")
+    .map(({ name }) => [
+      name,
+      name === "tf_cloudflare_provider_invocation_epoch" ||
+      name === "tf_v2_operation_acceptance_counter"
+        ? 1
+        : 0,
+    ]),
+);
+const v2CompleteDataReadback = {
+  tableCounts: v2TableCounts,
+  ledgerRows: 88,
+  foreignKeyViolations: 0,
+  invocationEpoch: [
+    { singleton: 1, epoch_id: null, state: "closed", opened_at_ms: null, closed_at_ms: null },
+  ],
+  acceptanceCounter: [{ id: 1, last_order: 0, last_operation_id: null }],
+};
 
 afterAll(() => rmSync(fixtureRoot, { recursive: true, force: true }));
 
@@ -83,10 +111,10 @@ function stateWithShape(applied: readonly string[], shape: string): D1SchemaStat
   };
 }
 
-function applicationShape(directory: string): string {
+function applicationShape(directory: string, migrations = APPLY_MIGRATIONS): string {
   const database = new Database(":memory:");
   try {
-    for (const { name } of APPLY_MIGRATIONS) {
+    for (const { name } of migrations) {
       database.exec(readFileSync(join(directory, name), "utf8"));
     }
     const rows = database
@@ -107,6 +135,21 @@ function applicationShape(directory: string): string {
   } finally {
     database.close();
   }
+}
+
+function d1Statements(source: string): readonly string[] {
+  const result: string[] = [];
+  let rest = source.replace(/^\s*--.*$/gmu, "").trim();
+  while (rest) {
+    const end = /^CREATE\s+(?:TEMP\s+)?TRIGGER\b/iu.test(rest)
+      ? /^END\s*;/imu.exec(rest)
+      : /;/u.exec(rest);
+    if (!end) throw new Error("incomplete audited migration statement");
+    const length = end.index + end[0].length;
+    result.push(rest.slice(0, length));
+    rest = rest.slice(length).trim();
+  }
+  return result;
 }
 
 function ok(stdout = ""): CommandResult {
@@ -210,12 +253,188 @@ async function rejected(operation: Promise<unknown>): Promise<DeployError> {
 }
 
 describe("production D1 fresh init", () => {
+  test("CLI accepts only the closed production v2 selector before target lookup", () => {
+    const base = [
+      process.execPath,
+      "--no-env-file",
+      "scripts/deploy.ts",
+      PRODUCTION_D1_FRESH_INIT_SURFACE,
+      "--status",
+      "--environment=production",
+      `--commit=${COMMIT}`,
+      `--generation=${GENERATION}`,
+    ];
+    const env = {
+      PATH: process.env.PATH ?? "",
+      TAKOSERVER_DEPLOY_TARGET_PRODUCTION: "/nonexistent/synthetic-production-target.json",
+    };
+    const accepted = Bun.spawnSync([...base, "--fresh-lineage=v2-0088"], { env });
+    expect(new TextDecoder().decode(accepted.stderr)).toContain(
+      "deploy target descriptor not found",
+    );
+    for (const flags of [
+      ["--fresh-lineage=v2-artifacts-0075"],
+      ["--fresh-lineage=v2-0089"],
+      ["--fresh-lineage=v2-0088", "--fresh-lineage=v2-0088"],
+    ]) {
+      const refused = Bun.spawnSync([...base, ...flags], { env });
+      expect(new TextDecoder().decode(refused.stderr)).toContain(
+        "deploy refused: no target was touched",
+      );
+    }
+  });
+  test("real local Miniflare D1 initializes empty through all 88 audited files", async () => {
+    const source = readCurrentAuditedMigrationSourceArtifact(currentMigrations);
+    expect(source.names).toEqual(V2_MIGRATIONS.map(({ name }) => name));
+    const runtime = new Miniflare({
+      workers: [
+        {
+          config: {
+            name: "fresh-v2-d1-test",
+            type: "worker",
+            compatibilityDate: "2026-08-18",
+            manifest: {
+              mainModule: "worker.js",
+              modules: {
+                "worker.js": {
+                  type: "esm",
+                  contents: "export default {fetch(){return new Response('ok')}}",
+                },
+              },
+            },
+            env: { STATE_DB: { type: "d1", id: "fresh-v2-d1-test" } },
+            triggers: [],
+          },
+        },
+      ],
+    });
+    try {
+      const db = await runtime.getD1Database("STATE_DB");
+      const initiallyEmpty = await db
+        .prepare("SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'")
+        .all();
+      expect(initiallyEmpty.results).toEqual([]);
+      await db
+        .prepare(
+          "CREATE TABLE d1_migrations(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, applied_at TEXT NOT NULL)",
+        )
+        .run();
+      for (const [index, migration] of V2_MIGRATIONS.entries()) {
+        const file = source.files[index];
+        expect(migration.sql).toBe(readFileSync(file?.path as string, "utf8"));
+        for (const statement of d1Statements(migration.sql)) await db.prepare(statement).run();
+        await db
+          .prepare("INSERT INTO d1_migrations(name,applied_at) VALUES (?, 'fixture')")
+          .bind(migration.name)
+          .run();
+      }
+      const ledger = await db.prepare("SELECT name FROM d1_migrations ORDER BY id").all();
+      expect(ledger.results.map((row) => row.name)).toEqual([...source.names]);
+      const rows = await db
+        .prepare(
+          "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .all();
+      const shape = canonicalSchemaShape(
+        (rows.results as Record<string, unknown>[]).filter(
+          (row) =>
+            row.name !== "d1_migrations" &&
+            row.tbl_name !== "d1_migrations" &&
+            row.name !== "_cf_KV" &&
+            row.tbl_name !== "_cf_KV",
+        ),
+      );
+      expect(
+        applicationSchemaMatches(stateWithShape(source.names, shape), expectedV2ApplicationShape),
+      ).toBe(true);
+      const noncanonical: Array<[string, unknown]> = [];
+      for (const name of Object.keys(v2TableCounts)) {
+        const counted = await db.prepare(`SELECT COUNT(*) AS count FROM "${name}"`).first();
+        if (counted?.count !== v2TableCounts[name]) noncanonical.push([name, counted?.count]);
+      }
+      expect(noncanonical).toEqual([]);
+      expect(
+        await db
+          .prepare(
+            "SELECT singleton, epoch_id, state, opened_at_ms, closed_at_ms FROM tf_cloudflare_provider_invocation_epoch",
+          )
+          .all(),
+      ).toMatchObject({ results: v2CompleteDataReadback.invocationEpoch });
+      expect(
+        await db
+          .prepare(
+            "SELECT id, last_order, last_operation_id FROM tf_v2_operation_acceptance_counter",
+          )
+          .all(),
+      ).toMatchObject({ results: v2CompleteDataReadback.acceptanceCounter });
+      const foreignKeys = await db
+        .prepare("SELECT 1 AS violation FROM pragma_foreign_key_check LIMIT 1")
+        .all();
+      expect(foreignKeys.results).toEqual([]);
+    } finally {
+      await runtime.dispose();
+    }
+  }, 60000);
   test("declares the kernel lease tool needed before its create boundary", () => {
     const surface = DEPLOY_CONTRACT.surfaces.find(
       ({ surface }) => surface === PRODUCTION_D1_FRESH_INIT_SURFACE,
     );
     expect(surface?.requiresTools).toContain("flock");
     expect(surface?.covers).toContain("scripts/deploy/wrangler-state.ts");
+  });
+
+  test("schema comparison excludes only the exact D1 metadata table, not foreign shape", () => {
+    const expected = JSON.parse(expectedV2ApplicationShape) as Array<{
+      type: string;
+      name: string;
+      table: string;
+      sql: string;
+    }>;
+    const metadata = {
+      type: "table",
+      name: "_cf_METADATA",
+      table: "_cf_METADATA",
+      sql: "CREATE TABLE _cf_METADATA (key INTEGER PRIMARY KEY, value BLOB)",
+    };
+    const shapeWith = (row: typeof metadata) =>
+      canonicalSchemaShape(
+        [...expected, row]
+          .sort((left, right) =>
+            `${left.type}\0${left.name}`.localeCompare(`${right.type}\0${right.name}`),
+          )
+          .map(({ type, name, table, sql }) => ({ type, name, tbl_name: table, sql })),
+      );
+    const actual = shapeWith(metadata);
+    expect(applicationSchemaMatches(stateWithShape([], actual), expectedV2ApplicationShape)).toBe(
+      true,
+    );
+    expect(
+      applicationSchemaMatches(
+        stateWithShape([], shapeWith({ ...metadata, name: "_cf_UNKNOWN", table: "_cf_UNKNOWN" })),
+        expectedV2ApplicationShape,
+      ),
+    ).toBe(false);
+    expect(
+      applicationSchemaMatches(
+        stateWithShape([], shapeWith({ ...metadata, table: "other" })),
+        expectedV2ApplicationShape,
+      ),
+    ).toBe(false);
+    expect(
+      applicationSchemaMatches(
+        stateWithShape(
+          [],
+          shapeWith({ ...metadata, sql: "CREATE TABLE _cf_METADATA (payload TEXT)" }),
+        ),
+        expectedV2ApplicationShape,
+      ),
+    ).toBe(false);
+    expect(
+      applicationSchemaMatches(
+        { ...stateWithShape([], actual), shapeDigest: `sha256:${"0".repeat(64)}` },
+        expectedV2ApplicationShape,
+      ),
+    ).toBe(false);
   });
 
   test("fresh production stays at 0069 while self-host source bootstraps through 0075", () => {
@@ -265,6 +484,299 @@ describe("production D1 fresh init", () => {
       databaseId: INCUMBENT_ID,
     });
     expect(fixture.calls).toEqual([`listD1:${FRESH_NAME}`]);
+  });
+
+  test("explicit fresh v2 status selects the exact audited 0088 source while default stays 0069", async () => {
+    const fixture = providerFixture();
+    const result = await runProductionD1FreshInit(
+      { ...invocation, action: "status", freshLineage: "v2-0088" },
+      target,
+      {
+        provider: fixture.provider,
+        custodyDirectory: newCustodyDirectory(),
+        migrationDirectory: currentMigrations,
+      },
+    );
+    expect(result).toMatchObject({
+      freshLineage: "v2-0088",
+      migrationCount: 88,
+      throughMigration: "0088_v2_worker_sqlite_external_drain.sql",
+      readyForApply: true,
+    });
+  });
+
+  test("explicit fresh v2 imports once and requires only canonical seed rows and FK integrity", async () => {
+    const fixture = providerFixture();
+    const process = processFixture();
+    const result = await runProductionD1FreshInit(
+      { ...invocation, freshLineage: "v2-0088" },
+      target,
+      {
+        ...options(fixture.provider, [emptyState, v2CompleteState], process),
+        freshV2DataReader: {
+          async read() {
+            return v2CompleteDataReadback;
+          },
+        },
+      },
+    );
+    expect(result).toMatchObject({
+      freshLineage: "v2-0088",
+      appliedMigrations: V2_MIGRATIONS.map(({ name }) => name),
+      schemaShapeDigest: v2CompleteState.shapeDigest,
+      d1: { databaseId: DATABASE_ID },
+    });
+    expect(process.commands.filter((command) => command.includes("--file"))).toHaveLength(1);
+    expect(fixture.calls.filter((call) => call.startsWith("createD1:"))).toHaveLength(1);
+  });
+
+  test("v2 lost import acknowledgement is read-only complete only after full data/FK proof", async () => {
+    const fixture = providerFixture();
+    const process = processFixture();
+    const custodyDirectory = newCustodyDirectory();
+    let imports = 0;
+    const run: IntegrationStorageGenerationProcess = async (command, runOptions) => {
+      if (command.includes("--file")) {
+        imports += 1;
+        throw new Error("lost import acknowledgement");
+      }
+      return await process.run(command, runOptions);
+    };
+    const selected = { ...invocation, freshLineage: "v2-0088" as const };
+    await rejected(
+      runProductionD1FreshInit(selected, target, {
+        ...options(fixture.provider, [emptyState], process),
+        custodyDirectory,
+        run,
+        freshV2DataReader: {
+          async read() {
+            return v2CompleteDataReadback;
+          },
+        },
+      }),
+    );
+    expect(imports).toBe(1);
+    const statusOptions = {
+      provider: fixture.provider,
+      custodyDirectory,
+      migrationDirectory: currentMigrations,
+      reader: {
+        async read() {
+          return v2CompleteState;
+        },
+      },
+      freshV2DataReader: {
+        async read() {
+          return v2CompleteDataReadback;
+        },
+      },
+    };
+    const status = await runProductionD1FreshInit(
+      { ...selected, action: "status" },
+      target,
+      statusOptions,
+    );
+    expect(status).toMatchObject({
+      attemptState: "complete",
+      readyForApply: false,
+      d1: { databaseId: DATABASE_ID },
+    });
+    const wrongProfile = await rejected(
+      runProductionD1FreshInit(invocation, target, statusOptions),
+    );
+    expect(wrongProfile.phase).toBe("mutation");
+    const repeated = await rejected(
+      runProductionD1FreshInit(selected, target, {
+        ...options(fixture.provider, [emptyState, v2CompleteState]),
+        custodyDirectory,
+      }),
+    );
+    expect(repeated.message).toContain("retained attempt");
+    expect(imports).toBe(1);
+  });
+
+  test("v2 refuses incomplete ledger, nonempty data and FK violations after import", async () => {
+    const selected = { ...invocation, freshLineage: "v2-0088" as const };
+    for (const defect of ["ledger", "row", "foreign-key"] as const) {
+      const fixture = providerFixture();
+      const process = processFixture();
+      const tableCounts = { ...v2TableCounts };
+      if (defect === "row") tableCounts.tf_v2_resources = 1;
+      const error = await rejected(
+        runProductionD1FreshInit(selected, target, {
+          ...options(fixture.provider, [emptyState, v2CompleteState], process),
+          freshV2DataReader: {
+            async read() {
+              return {
+                ...v2CompleteDataReadback,
+                tableCounts,
+                ledgerRows: defect === "ledger" ? 87 : 88,
+                foreignKeyViolations: defect === "foreign-key" ? 1 : 0,
+              };
+            },
+          },
+        }),
+      );
+      expect(error.phase).toBe("verification");
+      expect(fixture.calls.filter((call) => call.startsWith("getD1:"))).toHaveLength(1);
+      expect(process.commands.filter((command) => command.includes("--file"))).toHaveLength(1);
+    }
+  });
+
+  test("v2 refuses missing, extra, opened or consumed canonical seed rows", async () => {
+    const defects = [
+      { invocationEpoch: [] },
+      {
+        invocationEpoch: [
+          ...v2CompleteDataReadback.invocationEpoch,
+          ...v2CompleteDataReadback.invocationEpoch,
+        ],
+      },
+      { invocationEpoch: [{ ...v2CompleteDataReadback.invocationEpoch[0], state: "open" }] },
+      { acceptanceCounter: [] },
+      { acceptanceCounter: [{ ...v2CompleteDataReadback.acceptanceCounter[0], last_order: 1 }] },
+    ];
+    for (const defect of defects) {
+      const fixture = providerFixture();
+      const error = await rejected(
+        runProductionD1FreshInit({ ...invocation, freshLineage: "v2-0088" }, target, {
+          ...options(fixture.provider, [emptyState, v2CompleteState]),
+          freshV2DataReader: {
+            async read() {
+              return { ...v2CompleteDataReadback, ...defect };
+            },
+          },
+        }),
+      );
+      expect(error.phase).toBe("verification");
+      expect(fixture.calls.filter((call) => call.startsWith("getD1:"))).toHaveLength(1);
+    }
+  });
+
+  test("v2 partial import remains pending and never gets a second import", async () => {
+    const fixture = providerFixture();
+    const process = processFixture();
+    const custodyDirectory = newCustodyDirectory();
+    const selected = { ...invocation, freshLineage: "v2-0088" as const };
+    let imports = 0;
+    const run: IntegrationStorageGenerationProcess = async (command, runOptions) => {
+      if (command.includes("--file")) {
+        imports += 1;
+        throw new Error("unknown import response");
+      }
+      return await process.run(command, runOptions);
+    };
+    await rejected(
+      runProductionD1FreshInit(selected, target, {
+        ...options(fixture.provider, [emptyState], process),
+        custodyDirectory,
+        run,
+      }),
+    );
+    const partialState = stateWithShape(
+      V2_MIGRATIONS.slice(0, 75).map(({ name }) => name),
+      expectedV2ApplicationShape,
+    );
+    const status = await runProductionD1FreshInit({ ...selected, action: "status" }, target, {
+      provider: fixture.provider,
+      custodyDirectory,
+      migrationDirectory: currentMigrations,
+      reader: {
+        async read() {
+          return partialState;
+        },
+      },
+    });
+    expect(status).toMatchObject({ attemptState: "pending", readyForApply: false });
+    const repeated = await rejected(
+      runProductionD1FreshInit(selected, target, {
+        ...options(fixture.provider, [emptyState, v2CompleteState]),
+        custodyDirectory,
+      }),
+    );
+    expect(repeated.message).toContain("retained attempt");
+    expect(imports).toBe(1);
+  });
+
+  test("v2 refuses a partial sealed import file changed during create without dispatch", async () => {
+    const outputDirectory = mkdtempSync(join(fixtureRoot, "partial-v2-payload-"));
+    const fixture = providerFixture({
+      onCreate() {
+        writeFileSync(
+          join(outputDirectory, "release", "payload", "migration-import.sql"),
+          "SELECT 1;\n",
+        );
+      },
+    });
+    const process = processFixture();
+    const error = await rejected(
+      runProductionD1FreshInit({ ...invocation, freshLineage: "v2-0088" }, target, {
+        ...options(fixture.provider, [emptyState, v2CompleteState], process),
+        outputDirectory,
+      }),
+    );
+    expect(error.phase).toBe("mutation");
+    expect(fixture.calls.filter((call) => call.startsWith("createD1:"))).toHaveLength(1);
+    expect(process.commands.filter((command) => command.includes("--file"))).toHaveLength(0);
+  });
+
+  test("v2 withholds import from a nonempty new D1", async () => {
+    const fixture = providerFixture();
+    const process = processFixture();
+    const nonempty = stateWithShape([V2_MIGRATIONS[0]?.name as string], "[]\n");
+    const error = await rejected(
+      runProductionD1FreshInit(
+        { ...invocation, freshLineage: "v2-0088" },
+        target,
+        options(fixture.provider, [nonempty, v2CompleteState], process),
+      ),
+    );
+    expect(error.phase).toBe("mutation");
+    expect(process.commands.filter((command) => command.includes("--file"))).toHaveLength(0);
+  });
+
+  test("v2 retained attempt refuses a foreign same-name UUID without another effect", async () => {
+    const fixture = providerFixture();
+    const custodyDirectory = newCustodyDirectory();
+    const process = processFixture();
+    let imports = 0;
+    const run: IntegrationStorageGenerationProcess = async (command, runOptions) => {
+      if (command.includes("--file")) {
+        imports += 1;
+        throw new Error("unknown import response");
+      }
+      return await process.run(command, runOptions);
+    };
+    const selected = { ...invocation, freshLineage: "v2-0088" as const };
+    await rejected(
+      runProductionD1FreshInit(selected, target, {
+        ...options(fixture.provider, [emptyState], process),
+        custodyDirectory,
+        run,
+      }),
+    );
+    const foreignId = "00000000-0000-4000-8000-000000000062";
+    const foreign: ProductionD1FreshInitProvider = {
+      async listD1() {
+        return [{ name: FRESH_NAME, uuid: foreignId }];
+      },
+      async getD1() {
+        throw new Error("must not read foreign UUID");
+      },
+      async createD1() {
+        throw new Error("must not create");
+      },
+    };
+    const error = await rejected(
+      runProductionD1FreshInit({ ...selected, action: "status" }, target, {
+        provider: foreign,
+        custodyDirectory,
+        migrationDirectory: currentMigrations,
+      }),
+    );
+    expect(error.phase).toBe("mutation");
+    expect(imports).toBe(1);
+    expect(fixture.calls.filter((call) => call.startsWith("createD1:"))).toHaveLength(1);
   });
 
   test("status never adopts an existing database of the derived name", async () => {
