@@ -126,7 +126,11 @@ export type {
   WorkerClosureTransitionInvocation,
   WorkerClosureTransitionOptions,
 } from "./deploy/worker-closure-transition.ts";
-export { runWorkerClosureTransition } from "./deploy/worker-closure-transition.ts";
+export {
+  CLOSURE_SECRET_DIRECTORY_ENV,
+  readClosureSecretInputs,
+  runWorkerClosureTransition,
+} from "./deploy/worker-closure-transition.ts";
 export type {
   ExpectedBindingClosure,
   WorkerClosureDelta,

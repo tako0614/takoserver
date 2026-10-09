@@ -10,10 +10,46 @@ import type {
   SchemaOptions,
 } from "@takoserver/core/deploy-extension";
 import * as deployExtension from "@takoserver/core/deploy-extension";
+import {
+  CLOSURE_SECRET_DIRECTORY_ENV,
+  readClosureSecretInputs,
+} from "../scripts/deploy/worker-closure-transition.ts";
 
 const REPOSITORY = resolve(import.meta.dir, "..");
 
 describe("curated deploy extension schema readback", () => {
+  test("exports the existing closure secret reader without needing Cloudflare credentials", async () => {
+    expect(deployExtension.CLOSURE_SECRET_DIRECTORY_ENV).toBe(CLOSURE_SECRET_DIRECTORY_ENV);
+    expect(deployExtension.readClosureSecretInputs).toBe(readClosureSecretInputs);
+
+    const probe = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        `const api = await import("@takoserver/core/deploy-extension"); console.log(JSON.stringify({ reader: typeof api.readClosureSecretInputs, directoryEnv: api.CLOSURE_SECRET_DIRECTORY_ENV }));`,
+      ],
+      {
+        cwd: REPOSITORY,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { HOME: process.env.HOME ?? "/tmp", PATH: dirname(process.execPath) },
+      },
+    );
+    const [exitCode, stdout, stderr] = await Promise.all([
+      probe.exited,
+      new Response(probe.stdout).text(),
+      new Response(probe.stderr).text(),
+    ]);
+
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout.trim())).toEqual({
+      reader: "function",
+      directoryEnv: CLOSURE_SECRET_DIRECTORY_ENV,
+    });
+  });
+
   test("imports without Cloudflare credentials or Wrangler on PATH", async () => {
     const probe = Bun.spawn(
       [
