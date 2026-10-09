@@ -135,14 +135,16 @@ claim GA status.
    definitions. Re-running it replans from durable admission state.
 
 5. Restart the Host using its configured supervisor. Collect its stdout and
-   stderr, including the `takoserver listening` line. Check the public,
-   unauthenticated `GET /v1/forms` response and confirm it reports the expected
-   Host answer for the admitted definitions. Then sign in, create/use a scoped
-   organization API key as needed, perform one ordinary resource operation
-   through the supported console/client, and read it back through
-   `GET /v1/organizations/{organizationId}/resources/{resourceUid}`. A route
-   accepting connections or a process log line alone is not functional
-   readback.
+   stderr, including the `takoserver listening` line. The `GET /v1/forms`
+   catalogue used by the legacy admission procedure above is retained as a
+   historical check; it is not the current v2 support signal. For the current
+   normal entry, check `GET /.well-known/takoform/v2`, then authenticate with
+   an organization API key and query the exact expected Form URL at
+   `GET /apis/forms.takoform.com/v2/support?form={exact-form-url}`. Confirm the
+   response says `supported: true` only for Forms this Host is configured to
+   implement. Read a known v2 Resource back with the same credential at
+   `GET /apis/forms.takoform.com/v2/resources/{resourceUid}`. A route accepting
+   connections or a process log line alone is not functional readback.
 
 The Bun self-host exposes two unauthenticated, no-store operational probes,
 outside the Host API v1 and the shared OpenAPI route table:
@@ -257,11 +259,16 @@ For each update, first make the cold snapshot described below. Stop the Bun
 Host and all child/workload writers, deploy the selected source checkout and
 locked dependencies, then start that exact version under the existing
 protected configuration. Startup can apply forward SQLite migrations and
-resume queued work. Confirm startup diagnostics, the expected `GET /v1/forms`
-answer, and an authenticated readback of a known Resource before considering
-the update in service. If any post-start result is uncertain, stop further
-traffic/work through the existing supervisor and retain logs and the current
-database for diagnosis.
+resume queued work. Confirm startup diagnostics and the v2 discovery endpoint
+`GET /.well-known/takoform/v2`. With an organization API key, check each
+expected exact Form using
+`GET /apis/forms.takoform.com/v2/support?form={exact-form-url}`, then read
+back a known v2 Resource at
+`GET /apis/forms.takoform.com/v2/resources/{resourceUid}`. The legacy
+`GET /v1/forms` catalogue is not a v2 support check. Consider the update in
+service only after these current-surface checks succeed. If any post-start
+result is uncertain, stop further traffic/work through the existing supervisor
+and retain logs and the current database for diagnosis.
 
 Code rollback is not database rollback. To return to the previous code, stop
 the Host and all writers, confirm that the retained previous checkout's
@@ -365,6 +372,10 @@ installation, not as a no-write restore check. If source fencing, ownership of
 the public identity, or the fate of pending operations is uncertain, leave the
 restored copy stopped and resolve that uncertainty before activation.
 
+After activation, perform the same current v2 discovery, authenticated exact
+Form-support, and known v2 Resource-readback checks described for an update.
+The legacy `/v1/forms` catalogue does not establish v2 support.
+
 ## Automated proof and its limits
 
 The portable test `tests/self-host-backup-restore.test.ts` copies a disposable
@@ -375,7 +386,10 @@ external credentials or services, test a real filesystem snapshot, or replace
 an operator recovery drill.
 
 The optional native test `tests/selfhost-host-cold-restore-native.test.ts`
-starts the real Bun entrypoint and the accepted workerd artifact. It creates
+is skipped when the accepted workerd artifact is unavailable and starts the
+real Bun entrypoint when it runs. It retains an earlier v1 admission stage
+before a v2 transition; those v1 assertions are historical transition evidence,
+not the current v2 support check. It creates
 resources through the Host HTTP API, uploads and publishes a Worker, and checks
 its Endpoint over certificate-validated HTTPS. It then kills only the exact
 accepted workerd child and requires a distinct replacement under the same Bun
