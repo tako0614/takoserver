@@ -253,8 +253,15 @@ unsupported; an explicit empty `heldArtifacts` list permits management of
 existing custody but denies new source acquisition. The owning deploy path
 includes an explicit integration transition from canonical 0066 through 0088,
 with retained-state checks and source/native maintenance qualification. The
-default existing-D1 ceiling remains 0066 and fresh production remains 0069;
-selecting a different audited lineage is a separate operator action. The schema
+default existing-D1 ceiling remains 0066 and fresh production remains 0069.
+The existing fresh-production writer also accepts two explicit, fixed payloads:
+`--fresh-lineage=v2-0088` and `--fresh-lineage=v2-0089`. The latter adds the
+forward-only Cron match guard correction for D1's expression-depth limit;
+selecting it does not widen the earlier payload or existing-database wave.
+Each fresh attempt creates a new identity, preserves the incumbent database,
+and validates the selected schema, lineage, canonical seed rows and FK integrity.
+An unknown acknowledgement permits readback, not another import. A partial
+prefix is retained for a separate repair decision. The schema
 transition must complete before enabling Form blocks that require it. Source
 and local D1 evidence do not establish a deployed migration.
 This artifact-configured normal Worker startup guard checks required columns,

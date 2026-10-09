@@ -1182,12 +1182,52 @@ test("fails closed when the selected Worker Version lacks the scheduled handler"
 
 test("real D1 preserves an 0088 Cron match, records a new match, and refuses graph drift", async () => {
   const source = openDb();
-  const graph = seedGraph(source);
+  const { graph, release } = seedPublishedGraph(source);
+  let admitNext = false;
+  let admitted: unknown;
+  let staleAdmission: unknown;
+  let lostLeaseAdmission: unknown;
+  let staleBegin = true;
+  let began = false;
+  let duplicateBegan = true;
+  let custody: ReturnType<typeof createV2WorkerInvocationLifecycle> | undefined;
+  let admissionSqlError: string | undefined;
   const delivery: WorkerCronTriggerDelivery = {
-    async invokeScheduled() {
+    async invokeScheduled(input) {
+      if (admitNext) {
+        if (!custody) throw new Error("missing D1 custody");
+        if (!custodySqlForDrift) throw new Error("missing D1 graph");
+        const claim = cronClaim(graph, release, input);
+        await custodySqlForDrift.run("UPDATE tf_v2_resources SET observed_json=? WHERE uid=?", [
+          '{"ready":false}',
+          graph.versionUid,
+        ]);
+        staleAdmission = await custody.admitCron(claim);
+        await custodySqlForDrift.run("UPDATE tf_v2_resources SET observed_json=? WHERE uid=?", [
+          '{"ready":true}',
+          graph.versionUid,
+        ]);
+        lostLeaseAdmission = await custody.admitCron({
+          ...claim,
+          match: { ...claim.match, leaseToken: "different-lease-token" },
+        });
+        admitted = await custody.admitCron(claim);
+        await custodySqlForDrift.run("UPDATE tf_v2_resources SET observed_json=? WHERE uid=?", [
+          '{"ready":false}',
+          graph.versionUid,
+        ]);
+        staleBegin = await custody.beginSend(claim.handle);
+        await custodySqlForDrift.run("UPDATE tf_v2_resources SET observed_json=? WHERE uid=?", [
+          '{"ready":true}',
+          graph.versionUid,
+        ]);
+        began = await custody.beginSend(claim.handle);
+        duplicateBegan = await custody.beginSend(claim.handle);
+      }
       return { kind: "handler_resolved", workerVersionUid: graph.versionUid };
     },
   };
+  let custodySqlForDrift: Sql | undefined;
   expect(
     (
       await runWorkerCronTriggerTick({
@@ -1243,6 +1283,8 @@ test("real D1 preserves an 0088 Cron match, records a new match, and refuses gra
     await copyRows("tf_v2_operations");
     await copyRows("tf_v2_operation_reference_sets");
     await copyRows("tf_v2_operation_references");
+    await sql.run("DROP TRIGGER tf_v2_worker_native_effect_insert_guard");
+    await copyRows("tf_v2_worker_native_effects");
     // Model a protected 0088 database with an already-recorded obligation.
     await sql.run("DROP TRIGGER tf_v2_worker_cron_match_insert_guard");
     await copyRows("tf_v2_worker_cron_matches");
@@ -1330,6 +1372,37 @@ test("real D1 preserves an 0088 Cron match, records a new match, and refuses gra
     expect(await sql.query("SELECT state FROM tf_v2_worker_cron_matches")).toEqual([
       { state: "resolved" },
       { state: "resolved" },
+    ]);
+    await sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+      '{"ready":true}',
+      graph.versionUid,
+    ]);
+    tickAt = Date.now();
+    const custodySql: Sql = {
+      ...sql,
+      async run(statement, params) {
+        try {
+          return await sql.run(statement, params);
+        } catch (error) {
+          if (statement.includes("INSERT INTO tf_v2_worker_invocations"))
+            admissionSqlError = error instanceof Error ? error.message : String(error);
+          throw error;
+        }
+      },
+    };
+    custodySqlForDrift = sql;
+    custody = createV2WorkerInvocationLifecycle({ sql: custodySql });
+    admitNext = true;
+    expect((await tick()).claimed).toBe(1);
+    expect(admissionSqlError).toBeUndefined();
+    expect(staleAdmission).toEqual({ kind: "unavailable" });
+    expect(lostLeaseAdmission).toEqual({ kind: "unavailable" });
+    expect(admitted).toMatchObject({ kind: "granted" });
+    expect(staleBegin).toBe(false);
+    expect(began).toBe(true);
+    expect(duplicateBegan).toBe(false);
+    expect(await sql.query("SELECT ingress_kind, phase FROM tf_v2_worker_invocations")).toEqual([
+      { ingress_kind: "cron", phase: "send_authorized" },
     ]);
   } finally {
     source.close();

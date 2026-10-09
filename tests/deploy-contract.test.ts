@@ -448,7 +448,11 @@ describe("Takoserver split deploy entrypoint", () => {
       if (surface.triggers.includes("published-identity")) {
         expect(surface.obligations["no-overwrite"]).toEqual(expect.any(String));
       }
-      expect(JSON.stringify(surface)).not.toContain("ledger");
+      // Deployment orchestration has no ledger/plan controls. D1's durable
+      // migration records are legitimate data, not that removed controller.
+      expect(surface).not.toHaveProperty("ledger");
+      expect(surface).not.toHaveProperty("plan");
+      expect(JSON.stringify(surface)).not.toContain("--ledger");
       expect(JSON.stringify(surface)).not.toContain("--plan");
     }
   });
