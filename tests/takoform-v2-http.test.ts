@@ -336,6 +336,186 @@ test("public v2 routes drive the durable engine without GET-triggered execution"
   }
 });
 
+test("retained-only Form recovery never advertises or accepts new support", async () => {
+  const { database, router: completeRouter } = setup();
+  try {
+    const body = {
+      form: FIXTURE_FORM,
+      space: "fixture-space",
+      name: "retained",
+      spec: { value: "original" },
+    };
+    const created = await response(
+      completeRouter,
+      call("/resources", {
+        method: "POST",
+        headers: { "idempotency-key": KEY_A },
+        body: JSON.stringify(body),
+      }),
+    );
+    expect(created.status).toBe(202);
+    const original = (await created.json()) as { id: string; resourceUid: string };
+
+    const { backend, calls } = fixtureBackend();
+    let now = Date.now() + 1_000;
+    const transfer = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+      "encrypt",
+      "decrypt",
+    ]);
+    const comparison = await crypto.subtle.generateKey({ name: "HMAC", hash: "SHA-256" }, false, [
+      "sign",
+      "verify",
+    ]);
+    const engine = createTakoformV2Engine({
+      sql: createSqliteSql(database),
+      now: () => new Date(now),
+      replayWindowSeconds: 300,
+      leaseMilliseconds: 1,
+      authorize: async (principal, space) =>
+        principal === "fixture-principal" && space === "fixture-space",
+      forms: {},
+      privateInputCustody: {
+        transfer: { current: { id: "retained-transfer", key: transfer } },
+        comparison: { current: { id: "retained-comparison", key: comparison } },
+        transferTtlSeconds: 300,
+      },
+      retainedForms: {
+        [FIXTURE_FORM]: {
+          validateCreate() {
+            throw new Error("retained Form cannot validate a fresh create");
+          },
+          validateUpdate() {
+            throw new Error("retained Form cannot validate a fresh update");
+          },
+          privateInputs: {
+            validateCreate() {},
+            validateUpdate() {},
+          },
+          backend,
+        },
+      },
+    });
+    const router = createTakoformV2Routes(engine, {
+      baseUrl: BASE_URL,
+      documentation: "https://docs.example/takoform-v2",
+      authenticationDocumentation: "https://docs.example/takoform-v2/authentication",
+      authenticationSchemes: ["Bearer"],
+      maxRequestBytes: 4_096,
+      maxPageSize: 10,
+      replayWindowSeconds: 300,
+      cursorSigningKey: FIXTURE_CURSOR_KEY,
+      authenticate: async (request) => ({
+        principal:
+          request.headers.get("authorization") === "Bearer other-token"
+            ? "other-principal"
+            : "fixture-principal",
+        access: "write",
+      }),
+    });
+    const support = await response(
+      router,
+      call(`/support?form=${encodeURIComponent(FIXTURE_FORM)}`, { method: "GET" }),
+    );
+    expect(await support.json()).toEqual({
+      form: FIXTURE_FORM,
+      supported: false,
+      operations: [],
+      privateInputs: false,
+    });
+    expect((await response(router, call(`/resources/${original.resourceUid}`))).status).toBe(200);
+    expect(
+      (
+        await response(
+          router,
+          call(`/resources/${original.resourceUid}`, {
+            headers: { authorization: "Bearer other-token" },
+          }),
+        )
+      ).status,
+    ).toBe(404);
+    expect(
+      await engine.supportsPrivateInputsForUpdate("fixture-principal", original.resourceUid),
+    ).toBe(false);
+    const replay = await response(
+      router,
+      call("/resources", {
+        method: "POST",
+        headers: { "idempotency-key": KEY_A },
+        body: JSON.stringify(body),
+      }),
+    );
+    expect((await replay.json()).id).toBe(original.id);
+    const fresh = await response(
+      router,
+      call("/resources", {
+        method: "POST",
+        headers: { "idempotency-key": KEY_B },
+        body: JSON.stringify({ ...body, name: "new" }),
+      }),
+    );
+    expect(fresh.status).toBe(422);
+    expect((await fresh.json()).code).toBe("unsupported_form");
+    const update = await response(
+      router,
+      call(`/resources/${original.resourceUid}`, {
+        method: "PUT",
+        headers: { "idempotency-key": KEY_C, "takoform-expected-generation": "1" },
+        body: JSON.stringify({ spec: { value: "new" } }),
+      }),
+    );
+    expect(update.status).toBe(422);
+    expect((await update.json()).code).toBe("unsupported_form");
+    const privateUpdate = await response(
+      router,
+      call(`/resources/${original.resourceUid}`, {
+        method: "PUT",
+        headers: {
+          "idempotency-key": "update-private-000001",
+          "takoform-expected-generation": "1",
+        },
+        body: JSON.stringify({ spec: { value: "new" }, privateInputs: { secret: "value" } }),
+      }),
+    );
+    expect(privateUpdate.status).toBe(422);
+    expect((await privateUpdate.json()).code).toBe("capability_required");
+    expect((await engine.runNext())?.status).toBe("reconciling");
+    now += 2_000;
+    expect((await engine.runNext())?.status).toBe("succeeded");
+    expect(calls).toEqual(["execute:create", "reconcile:create"]);
+    const acceptedUpdate = await response(
+      completeRouter,
+      call(`/resources/${original.resourceUid}`, {
+        method: "PUT",
+        headers: { "idempotency-key": KEY_C, "takoform-expected-generation": "1" },
+        body: JSON.stringify({ spec: { value: "accepted-before-retention" } }),
+      }),
+    );
+    expect(acceptedUpdate.status).toBe(202);
+    const oldUpdate = (await acceptedUpdate.json()) as { id: string };
+    const updateReplay = await response(
+      router,
+      call(`/resources/${original.resourceUid}`, {
+        method: "PUT",
+        headers: { "idempotency-key": KEY_C, "takoform-expected-generation": "1" },
+        body: JSON.stringify({ spec: { value: "accepted-before-retention" } }),
+      }),
+    );
+    expect((await updateReplay.json()).id).toBe(oldUpdate.id);
+    expect((await engine.runNext())?.status).toBe("succeeded");
+    const deleted = await response(
+      router,
+      call(`/resources/${original.resourceUid}`, {
+        method: "DELETE",
+        headers: { "idempotency-key": KEY_D, "takoform-expected-generation": "2" },
+      }),
+    );
+    expect(deleted.status).toBe(202);
+    expect((await engine.runNext())?.status).toBe("succeeded");
+  } finally {
+    database.close();
+  }
+});
+
 test("v2 rejects ambiguous requests and keeps authentication and errors uncacheable", async () => {
   const { database, router } = setup();
   try {

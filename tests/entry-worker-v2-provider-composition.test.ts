@@ -237,6 +237,67 @@ test("selected v2 Form uses the normal Worker fetch and scheduled Host executor"
   }
 }, 120_000);
 
+test("Worker entry composes retained-only Forms without claiming public support", async () => {
+  const { runtime, env } = await fixture("v2-entry-retained-form");
+  try {
+    const full = createWorkerEntry({ composeV2Forms: () => ({ [FORM]: completeForm() }) });
+    const body = { form: FORM, space: ORG, name: "retained", spec: { value: "one" } };
+    const created = await request(full, env, "/resources", {
+      method: "POST",
+      headers: { "idempotency-key": "worker-retained-create-0001" },
+      body: JSON.stringify(body),
+    });
+    expect(created.status).toBe(202);
+    const accepted = (await created.json()) as { id: string; resourceUid: string };
+
+    const retained = createWorkerEntry({
+      composeV2Forms: () => ({
+        forms: {},
+        retainedForms: {
+          [FORM]: {
+            ...completeForm(),
+            validateCreate() {
+              throw new Error("retained Form cannot accept a fresh create");
+            },
+            validateUpdate() {
+              throw new Error("retained Form cannot accept a fresh update");
+            },
+          },
+        },
+      }),
+    });
+    const support = await request(retained, env, `/support?form=${encodeURIComponent(FORM)}`);
+    expect(await support.json()).toEqual({
+      form: FORM,
+      supported: false,
+      operations: [],
+      privateInputs: false,
+    });
+    const replay = await request(retained, env, "/resources", {
+      method: "POST",
+      headers: { "idempotency-key": "worker-retained-create-0001" },
+      body: JSON.stringify(body),
+    });
+    expect((await replay.json()).id).toBe(accepted.id);
+    const fresh = await request(retained, env, "/resources", {
+      method: "POST",
+      headers: { "idempotency-key": "worker-retained-create-0002" },
+      body: JSON.stringify({ ...body, name: "new" }),
+    });
+    expect(fresh.status).toBe(422);
+    expect((await fresh.json()).code).toBe("unsupported_form");
+    await retained.scheduled({}, env);
+    expect(await (await request(retained, env, `/operations/${accepted.id}`)).json()).toMatchObject(
+      {
+        status: "succeeded",
+      },
+    );
+    expect((await request(retained, env, `/resources/${accepted.resourceUid}`)).status).toBe(200);
+  } finally {
+    await runtime.dispose();
+  }
+}, 120_000);
+
 test("Worker entry factories do not share Form maps for the same Env", async () => {
   const { runtime, env } = await fixture("v2-entry-instance-isolation");
   try {
@@ -369,6 +430,34 @@ test("malformed and duplicate selected Form maps refuse startup", async () => {
     const duplicateRefusal = await rejected.text();
     expect(duplicateRefusal).toContain("runtime-configuration");
     expect(duplicateRefusal).not.toContain("duplicate v2 Form URL");
+    const overlap = createWorkerEntry({
+      composeV2Forms: () => ({
+        forms: { [FORM]: completeForm() },
+        retainedForms: { [FORM]: completeForm() },
+      }),
+    });
+    expect((await request(overlap, env, `/support?form=${encodeURIComponent(FORM)}`)).status).toBe(
+      503,
+    );
+    const extra = createWorkerEntry({
+      composeV2Forms: () =>
+        ({ forms: {}, retainedForms: {}, unexpected: completeForm() }) as unknown as Record<
+          string,
+          V2Form
+        >,
+    });
+    expect((await request(extra, env, `/support?form=${encodeURIComponent(FORM)}`)).status).toBe(
+      503,
+    );
+    const invalidRetainedUrl = createWorkerEntry({
+      composeV2Forms: () => ({
+        forms: {},
+        retainedForms: { "not-a-form-url": completeForm() },
+      }),
+    });
+    expect(
+      (await request(invalidRetainedUrl, env, `/support?form=${encodeURIComponent(FORM)}`)).status,
+    ).toBe(503);
   } finally {
     await runtime.dispose();
   }

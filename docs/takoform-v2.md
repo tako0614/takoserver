@@ -24,10 +24,20 @@ actual resources and report confirmed completion, known partial failure, known
 absence of effect, or uncertainty. A timeout is not proof of absence.
 
 The Form map is explicit code configuration. Registering a URL does not fetch
-the author's site, install a package, or grant permission. Support and execution
-must use the same configured map; an adapter is registered only when it fulfills
-the Form's required operations. v1 admission, package signatures and HTTP
+the author's site, install a package, or grant permission. Public support and
+fresh acceptance use the same complete map; a Form is advertised only when its
+adapter fulfills all required behavior. v1 admission, package signatures and HTTP
 prepare calls are not part of this path.
+
+The code-only `retainedForms` map is a separate internal selection for exact
+adapters needed by already accepted Resources and Operations. It uses the same
+Host engine, SQL ledger, owner checks and stored backend identity as complete
+Forms, but never appears in public `/support` or accepts a fresh CREATE/UPDATE.
+Existing exact-key replay, read, recovery and reference-safe DELETE remain
+available. The normal Worker entry can select `{ forms, retainedForms }` in its
+code composer; its previous bare map still means complete public Forms. Neither
+map placement nor a private fixture by itself proves conformance to a Form's
+whole required ABI. The normal Bun entry retains its complete-capability gate.
 
 Read requests never execute an operation. The embedding application runs the
 executor independently, including after a process restart. The accepted backend

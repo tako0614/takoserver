@@ -3,7 +3,8 @@ import { createTakoformV2Routes, type TakoformV2HttpOptions } from "./routes.ts"
 import type { V2EngineOptions } from "./types.ts";
 
 /**
- * One explicit Form map and one durable authority for the v2 wire and executor.
+ * One durable authority for the v2 wire and executor, with public support kept
+ * separate from retained-only adapters for already accepted Resources.
  * Embedders must schedule runNext independently; reads never dispatch work.
  * This constructor does not migrate a database or replace an existing Host.
  */

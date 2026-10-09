@@ -178,8 +178,14 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
   const retryMs = Math.max(1_000, leaseMs);
   const store = createV2Store(options.sql);
   const formUrls = Object.freeze(Object.keys(options.forms));
+  const retainedForms = options.retainedForms ?? {};
+  for (const url of Object.keys(retainedForms)) {
+    if (!isV2FormUrl(url) || Object.hasOwn(options.forms, url)) {
+      throw new TypeError("retained Form URL must be exact and absent from public support");
+    }
+  }
   const privateInputsCapability = options.privateInputCustody !== undefined;
-  for (const selected of Object.values(options.forms)) {
+  for (const selected of [...Object.values(options.forms), ...Object.values(retainedForms)]) {
     const policy = selected.privateInputs;
     if (
       policy !== undefined &&
@@ -288,8 +294,24 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
     return found;
   }
 
+  function supportsCompleteForm(formUrl: string): boolean {
+    const selected = Object.hasOwn(options.forms, formUrl) ? options.forms[formUrl] : undefined;
+    return (
+      selected !== undefined &&
+      (privateInputsCapability || selected.privateInputs?.requiredForEveryInstance !== true)
+    );
+  }
+
+  function retainedOrCompleteForm(formUrl: string) {
+    return Object.hasOwn(options.forms, formUrl)
+      ? options.forms[formUrl]
+      : Object.hasOwn(retainedForms, formUrl)
+        ? retainedForms[formUrl]
+        : undefined;
+  }
+
   function existingForm(formUrl: string) {
-    const found = Object.hasOwn(options.forms, formUrl) ? options.forms[formUrl] : undefined;
+    const found = retainedOrCompleteForm(formUrl);
     if (!found) fail("temporarily_unavailable", 503);
     return found;
   }
@@ -355,10 +377,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         return null;
       }
       const target = await store.resource(candidate.resource_uid);
-      const selected =
-        target && Object.hasOwn(options.forms, target.form_url)
-          ? options.forms[target.form_url]
-          : undefined;
+      const selected = target ? retainedOrCompleteForm(target.form_url) : undefined;
       if (
         selected &&
         target &&
@@ -380,18 +399,18 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
     formUrls,
     privateInputsCapability,
     supportsForm(formUrl: string): boolean {
-      const selected = options.forms[formUrl];
-      return (
-        selected !== undefined &&
-        (privateInputsCapability || selected.privateInputs?.requiredForEveryInstance !== true)
-      );
+      return supportsCompleteForm(formUrl);
     },
     supportsPrivateInputs(formUrl: string): boolean {
       return privateInputsCapability && options.forms[formUrl]?.privateInputs !== undefined;
     },
     async supportsPrivateInputsForUpdate(principal: string, uid: string): Promise<boolean> {
       const target = await ownedResource(principal, uid, "write");
-      return privateInputsCapability && boundForm(target).privateInputs !== undefined;
+      return (
+        supportsCompleteForm(target.form_url) &&
+        privateInputsCapability &&
+        boundForm(target).privateInputs !== undefined
+      );
     },
     /** Known-key lookup precedes all fresh-request capability and shape checks. */
     async replayExistingCreate(request: {
@@ -594,6 +613,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       });
       const prior = await replay(input.principal, input.key, fingerprint, privateInputs);
       if (prior) return prior;
+      form(target.form_url);
       if (target.deleted_at) fail("gone", 410);
       if (target.busy_operation) fail("resource_busy", 409);
       if (target.generation !== input.expectedGeneration) fail("generation_conflict", 409);

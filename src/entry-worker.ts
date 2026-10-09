@@ -200,17 +200,21 @@ export function workerCredentials(
   };
 }
 
-/** Code-selected Forms added to the canonical Host map at Worker startup. */
+/** Code-selected full Form map, or full plus retained-only maps, at Worker startup. */
 type WorkerEntryV2FormMap = ReturnType<
   NonNullable<Parameters<typeof buildApp>[0]["v2FormFactory"]>
 >;
+type WorkerEntryV2FormMaps = ReturnType<
+  NonNullable<Parameters<typeof buildApp>[0]["v2FormSelectionFactory"]>
+>;
+type WorkerEntryV2FormSelection = WorkerEntryV2FormMap | WorkerEntryV2FormMaps;
 
 export type WorkerEntryV2FormComposer = (context: {
   readonly env: WorkerEnv;
   readonly sql: Sql;
   readonly objects: ObjectStoreAccess;
   readonly clock: Clock;
-}) => WorkerEntryV2FormMap | Promise<WorkerEntryV2FormMap>;
+}) => WorkerEntryV2FormSelection | Promise<WorkerEntryV2FormSelection>;
 
 /** Only an explicit operator-selected Form hook can activate generic custody. */
 function hasDataMethod(policy: object, name: "validateCreate" | "validateUpdate"): boolean {
@@ -221,23 +225,34 @@ function hasDataMethod(policy: object, name: "validateCreate" | "validateUpdate"
   return false;
 }
 
-function hasSelectedV2PrivateInputHooks(forms: WorkerEntryV2FormMap | undefined): boolean {
-  if (!forms || typeof forms !== "object" || Array.isArray(forms)) return false;
-  for (const url of Reflect.ownKeys(forms)) {
-    const entry = Object.getOwnPropertyDescriptor(forms, url);
-    if (typeof url !== "string" || !entry?.enumerable || !("value" in entry)) continue;
-    const form = entry.value;
-    if (!form || typeof form !== "object") continue;
-    const privateInputs = Object.getOwnPropertyDescriptor(form, "privateInputs");
-    if (!privateInputs || !("value" in privateInputs)) continue;
-    const policy = privateInputs.value;
-    if (
-      policy !== null &&
-      typeof policy === "object" &&
-      hasDataMethod(policy, "validateCreate") &&
-      hasDataMethod(policy, "validateUpdate")
-    )
-      return true;
+function hasSelectedV2PrivateInputHooks(
+  selection: WorkerEntryV2FormSelection | undefined,
+): boolean {
+  if (!selection || typeof selection !== "object" || Array.isArray(selection)) return false;
+  const maps = Object.hasOwn(selection, "retainedForms")
+    ? [
+        Object.getOwnPropertyDescriptor(selection, "forms")?.value,
+        Object.getOwnPropertyDescriptor(selection, "retainedForms")?.value,
+      ]
+    : [selection];
+  for (const forms of maps) {
+    if (!forms || typeof forms !== "object" || Array.isArray(forms)) continue;
+    for (const url of Reflect.ownKeys(forms)) {
+      const entry = Object.getOwnPropertyDescriptor(forms, url);
+      if (typeof url !== "string" || !entry?.enumerable || !("value" in entry)) continue;
+      const form = entry.value;
+      if (!form || typeof form !== "object") continue;
+      const privateInputs = Object.getOwnPropertyDescriptor(form, "privateInputs");
+      if (!privateInputs || !("value" in privateInputs)) continue;
+      const policy = privateInputs.value;
+      if (
+        policy !== null &&
+        typeof policy === "object" &&
+        hasDataMethod(policy, "validateCreate") &&
+        hasDataMethod(policy, "validateUpdate")
+      )
+        return true;
+    }
   }
   return false;
 }
@@ -776,7 +791,7 @@ async function composeApp(
   }
   const objects = createR2ObjectStore(env.OBJECTS);
   const clock = () => new Date();
-  let selectedV2Forms: WorkerEntryV2FormMap | undefined;
+  let selectedV2Forms: WorkerEntryV2FormSelection | undefined;
   let selectedV2PrivateInputHooks = false;
   if (composeV2Forms !== undefined) {
     try {
@@ -865,7 +880,11 @@ async function composeApp(
         : {}),
       ...(composeV2Forms === undefined
         ? {}
-        : { v2FormFactory: () => selectedV2Forms as WorkerEntryV2FormMap }),
+        : selectedV2Forms &&
+            (Object.hasOwn(selectedV2Forms, "forms") ||
+              Object.hasOwn(selectedV2Forms, "retainedForms"))
+          ? { v2FormSelectionFactory: () => selectedV2Forms as WorkerEntryV2FormMaps }
+          : { v2FormFactory: () => selectedV2Forms as WorkerEntryV2FormMap }),
       ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
       forms: formSource.forms,
       bindings: formSource.bindings,
