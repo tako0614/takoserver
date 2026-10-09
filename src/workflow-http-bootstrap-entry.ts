@@ -14,6 +14,7 @@ import {
  * reachable from this graph.
  */
 const create = Object.create;
+const hasOwn = Object.hasOwn;
 const isArray = Array.isArray;
 const get = Reflect.get;
 const trusted = adoptTrustedWorkflowPromise;
@@ -27,6 +28,8 @@ export interface WorkflowHttpBootstrapOptions {
   readonly className: string;
   readonly instanceId: string;
   readonly params?: JsonObject;
+  /** Trusted Host-private marker transport; never projected into tenant env. */
+  readonly emitMarker?: (sequence: number) => Promise<void>;
   /** Complete relative module specifier for the Host-generated env wrapper. */
   readonly wrapperModule: string;
   /** Complete relative module specifier for the tenant application module. */
@@ -47,7 +50,8 @@ type LoadedWorkflowModules = Awaited<ReturnType<WorkflowHttpWorkerOptions["load"
 export function createWorkflowHttpBootstrap(
   options: WorkflowHttpBootstrapOptions,
 ): ReturnType<typeof createWorkflowHttpWorker> {
-  const { token, className, instanceId, params, wrapperModule, applicationModule } = options;
+  const { token, className, instanceId, params, emitMarker, wrapperModule, applicationModule } =
+    options;
   if (
     typeof wrapperModule !== "string" ||
     wrapperModule.length === 0 ||
@@ -62,6 +66,7 @@ export function createWorkflowHttpBootstrap(
     className,
     instanceId,
     ...(params === undefined ? {} : { params }),
+    ...(hasOwn(options, "emitMarker") ? { emitMarker } : {}),
     async load(): Promise<LoadedWorkflowModules> {
       // The generated helper is the root logical module, so complete `./...`
       // specifiers resolve in workerd's module namespace. Dynamic imports

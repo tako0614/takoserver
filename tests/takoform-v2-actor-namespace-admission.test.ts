@@ -142,6 +142,10 @@ function fixture(physicalRoot?: string) {
         }),
       })
     : null;
+  const registrations: Array<{
+    scope: { tenantId: string; namespaceResourceUid: string };
+    operation: { operationId: string; leaseToken: string };
+  }> = [];
   const fixtureActor = form({
     validateCreate: parseActorNamespaceSpec,
     validateUpdate: validateActorNamespaceUpdate,
@@ -170,7 +174,13 @@ function fixture(physicalRoot?: string) {
         targetKey: TARGET,
         bundleCustody: bundleHost.custody,
         inspector,
-        physical,
+        physical: {
+          ...physical,
+          async registerNamespace(scope, operation) {
+            registrations.push({ scope, operation });
+            await physical.registerNamespace(scope);
+          },
+        },
       })
     : fixtureActor;
   const engine = createTakoformV2Engine({
@@ -249,6 +259,7 @@ function fixture(physicalRoot?: string) {
     version,
     admission,
     physical,
+    registrations,
     setInspection(value: typeof inspection) {
       inspection = value;
     },
@@ -357,6 +368,15 @@ test("pre-Deployment Actor backend settles only after durable physical namespace
     const created = await f.create(ACTOR_NAMESPACE_FORM_URL, "empty-namespace", spec, false);
     expect(await f.engine.runNext()).toMatchObject({ id: created.id, status: "succeeded" });
     const scope = { tenantId: PRINCIPAL, namespaceResourceUid: created.resourceUid };
+    expect(f.registrations).toEqual([
+      {
+        scope,
+        operation: {
+          operationId: created.id,
+          leaseToken: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        },
+      },
+    ]);
     expect(await f.physical.namespaceEmpty(scope)).toBe(true);
     expect(
       await f.sql.query("SELECT observed_json FROM tf_v2_resources WHERE uid = ?", [
@@ -380,6 +400,22 @@ test("pre-Deployment Actor backend settles only after durable physical namespace
       spec,
     });
     expect(await f.engine.runNext()).toMatchObject({ id: updated.id, status: "succeeded" });
+    expect(f.registrations).toEqual([
+      {
+        scope,
+        operation: {
+          operationId: created.id,
+          leaseToken: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        },
+      },
+      {
+        scope,
+        operation: {
+          operationId: updated.id,
+          leaseToken: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        },
+      },
+    ]);
     const sourceVersion = await f.version(worker.resourceUid, "unweighted-source-version");
     const versionRow = (
       await f.sql.query("SELECT spec_json FROM tf_v2_resources WHERE uid = ?", [

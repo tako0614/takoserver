@@ -150,6 +150,8 @@ export interface WorkflowHttpWorkerOptions {
   readonly className: string;
   readonly instanceId: string;
   readonly params?: JsonObject;
+  /** Host-private journal ACK; present only for a non-console marker transport. */
+  readonly emitMarker?: (sequence: number) => Promise<void>;
   /** Dynamic closed-graph import; the generated env wrapper must load first. */
   readonly load: () => Promise<{
     readonly namespace: Readonly<Record<string, unknown>>;
@@ -166,11 +168,13 @@ export interface WorkflowHttpWorkerOptions {
 export function createWorkflowHttpWorker(options: WorkflowHttpWorkerOptions): {
   fetch(request: Request, rawEnv: Readonly<Record<string, unknown>>): Promise<Response>;
 } {
-  const { token, className, instanceId, load } = options;
+  const { token, className, instanceId, load, emitMarker } = options;
+  const selectedMarker = hasOwn(options, "emitMarker");
+  if (selectedMarker && typeof emitMarker !== "function") throw unavailable();
   // workerd lazily loads its native console formatter on the first call.
   // Initialize that backing module before tenant startup as well as capturing
   // the entry function. This ordinary empty line is discarded by the guard.
-  apply(log, logReceiver, [""]);
+  if (!selectedMarker) apply(log, logReceiver, [""]);
   const params =
     options.params === undefined ? undefined : parseDocument(encodeDocument(options.params));
   let started = false;
@@ -184,8 +188,19 @@ export function createWorkflowHttpWorker(options: WorkflowHttpWorkerOptions): {
   async function exchange(payload: string): Promise<Record<string, unknown>> {
     sequence += 1;
     if (!isInteger(sequence)) throw unavailable();
-    // Marker emission MUST remain synchronous and precede the network enqueue.
-    apply(log, logReceiver, [`TAKOSERVER_WORKFLOW_JOURNAL:${token}:${sequence}`]);
+    if (selectedMarker) {
+      // The trusted Host must confirm the journal marker before any payload
+      // can reach the companion. A rejected or malformed ACK is unknown.
+      try {
+        if (!emitMarker) throw unavailable();
+        await trusted(emitMarker(sequence));
+      } catch {
+        throw unavailable();
+      }
+    } else {
+      // The self-host marker remains synchronous before network enqueue.
+      apply(log, logReceiver, [`TAKOSERVER_WORKFLOW_JOURNAL:${token}:${sequence}`]);
+    }
     try {
       const init = create(null) as RequestInit;
       init.method = "POST";
