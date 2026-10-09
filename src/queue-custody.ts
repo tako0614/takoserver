@@ -290,6 +290,8 @@ const V2_VERSION_FORM = "https://edge.forms.takoform.com/forms/WorkerVersion/0.5
 const V2_QUEUE_BACKEND = "selfhost-v2-at-least-once-queue-sql-v1";
 // Evaluated for every INSERT inside the same BEGIN IMMEDIATE/implicit D1 batch.
 // No pre-read can turn a concurrently accepted Queue DELETE into an admission.
+// Keep the unchanged conjunction in bounded groups: D1 rejects its flat
+// left-deep expression before any producer message can be inserted.
 const V2_PRODUCER_GUARD = `EXISTS (
   SELECT 1 FROM tf_v2_resources queue
   JOIN tf_v2_operations queue_op ON queue_op.id = queue.last_operation
@@ -299,7 +301,7 @@ const V2_PRODUCER_GUARD = `EXISTS (
   JOIN tf_v2_operation_reference_sets refs ON refs.operation_id = version_op.id
   JOIN tf_v2_operation_references ref ON ref.operation_id = refs.operation_id
   JOIN tf_v2_resource_references edge ON edge.referrer_uid = version.uid
-  WHERE queue.uid = ? AND queue.form_url = '${V2_QUEUE_FORM}'
+  WHERE (queue.uid = ? AND queue.form_url = '${V2_QUEUE_FORM}'
     AND queue.backend_id = '${V2_QUEUE_BACKEND}'
     AND queue.principal = ? AND queue.space = ? AND queue.target_key = ?
     AND queue.deleted_at IS NULL AND queue.phase = 'idle'
@@ -311,8 +313,8 @@ const V2_PRODUCER_GUARD = `EXISTS (
     AND queue_op.effect = 'complete' AND queue_op.action IN ('create','update')
     AND queue_op.accepted_spec_json = queue.spec_json
     AND json_extract(queue.spec_json, '$.messageRetentionSeconds') = ?
-    AND COALESCE(json_extract(queue.spec_json, '$.deliveryDelaySeconds'), 0) = ?
-    AND version.form_url = '${V2_VERSION_FORM}'
+    AND COALESCE(json_extract(queue.spec_json, '$.deliveryDelaySeconds'), 0) = ?)
+    AND (version.form_url = '${V2_VERSION_FORM}'
     AND version.principal = queue.principal AND version.space = queue.space
     AND version.target_key = queue.target_key AND version.deleted_at IS NULL
     AND version.phase = 'idle' AND version.busy_operation IS NULL
@@ -324,21 +326,21 @@ const V2_PRODUCER_GUARD = `EXISTS (
     AND version_op.generation = version.generation
     AND version_op.status = 'succeeded' AND version_op.effect = 'complete'
     AND version_op.action IN ('create','update')
-    AND version_op.accepted_spec_json = version.spec_json
-    AND source_op.resource_uid = version.uid AND source_op.principal = version.principal
+    AND version_op.accepted_spec_json = version.spec_json)
+    AND (source_op.resource_uid = version.uid AND source_op.principal = version.principal
     AND source_op.backend_id = version.backend_id
     AND source_op.target_key = version.target_key
     AND source_op.generation <= version.generation
     AND source_op.status = 'succeeded' AND source_op.effect = 'complete'
     AND source_op.action IN ('create','update')
-    AND source_op.accepted_spec_json = version.spec_json
-    AND json_extract(version.spec_json, '$.worker.resourceUid') = ?
+    AND source_op.accepted_spec_json = version.spec_json)
+    AND (json_extract(version.spec_json, '$.worker.resourceUid') = ?
     AND EXISTS (SELECT 1 FROM json_each(version.spec_json, '$.queueProducerBindings') binding
       WHERE json_extract(binding.value, '$.name') = ?
         AND json_extract(binding.value, '$.resource.resourceUid') = queue.uid)
     AND refs.sealed = 1 AND ref.target_uid = queue.uid
     AND ref.form_url = queue.form_url AND ref.readiness = 'observed'
-    AND edge.target_uid = queue.uid
+    AND edge.target_uid = queue.uid)
 )`;
 // The physical WfP source may retire while a request is awaiting SQL. This
 // exact 0086 row must still be send-authorized at each INSERT's linearization

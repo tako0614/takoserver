@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { bytesDigest } from "../src/json.ts";
 import type { Sql } from "../src/ports.ts";
@@ -9,6 +10,7 @@ import {
   SELFHOST_DATA_PLANE_QUEUE_PATH,
 } from "../src/providers/selfhost-worker-wrapper.ts";
 import { createQueueCustody } from "../src/queue-custody.ts";
+import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
 import { createQueueWorkerBindingAuthority } from "../src/takoform-v2/forms/queue-worker-binding-authority.ts";
@@ -560,3 +562,147 @@ test("v2 source admission rejects malformed, foreign, stale and terminal identit
     db.close();
   }
 });
+
+test("real D1 admits one exact v2 Queue producer batch and refuses source or graph drift", async () => {
+  const source = new Database(":memory:");
+  const runtime = new Miniflare({
+    workers: [
+      {
+        config: {
+          name: "v2-queue-producer-d1-test",
+          type: "worker",
+          compatibilityDate: "2026-08-18",
+          manifest: {
+            mainModule: "worker.js",
+            modules: {
+              "worker.js": {
+                type: "esm",
+                contents: "export default { fetch() { return new Response('ok'); } };",
+              },
+            },
+          },
+          env: { STATE_DB: { type: "d1", id: "v2-queue-producer-d1-test" } },
+          triggers: [],
+        },
+      },
+    ],
+  });
+  try {
+    for (const migration of MIGRATIONS) source.exec(migration.sql);
+    seedProducerGraph(source);
+    const sourceInvocation = {
+      invocationId: "producer-d1-source",
+      custodyToken: "producer-d1-custody-token",
+      incarnationId: "producer-d1-native-incarnation",
+      servingSourceOperationId: VERSION_OPERATION,
+    };
+    insertSourceInvocation(source, sourceInvocation);
+    const database = await runtime.getD1Database("STATE_DB");
+    for (const migration of MIGRATIONS) {
+      for (const statement of splitD1Migration(migration.sql))
+        await database.prepare(statement).run();
+    }
+    const sql = createD1Sql(database);
+    await sql.run("DROP TRIGGER tf_v2_operation_reference_set_guard");
+    await sql.run("DROP TRIGGER tf_v2_operation_reference_guard");
+    for (const table of [
+      "tf_v2_resources",
+      "tf_v2_operations",
+      "tf_v2_operation_reference_sets",
+      "tf_v2_operation_references",
+      "tf_v2_worker_invocations",
+    ]) {
+      for (const raw of source.query(`SELECT * FROM ${table}`).all()) {
+        const row = raw as Record<string, string | number | null>;
+        const entries = Object.entries(row).filter(([name]) => name !== "acceptance_order");
+        await sql.run(
+          `INSERT INTO ${table} (${entries.map(([name]) => `"${name}"`).join(", ")}) VALUES (${entries.map(() => "?").join(", ")})`,
+          entries.map(([, value]) => value),
+        );
+      }
+    }
+    const custody = createQueueCustody({ sql });
+    const claim = { ...producerClaim, sourceInvocation };
+    const admit = (claimForAttempt: typeof claim, messageId: string) =>
+      custody.admitV2Batch({
+        claim: claimForAttempt,
+        target: producerTarget,
+        messages: [{ messageId, body: new Uint8Array([77]) }],
+      });
+    expect(await admit(claim, "d1-first")).toBe(true);
+    await expect(admit(claim, "d1-first")).rejects.toThrow("UNIQUE constraint");
+    expect(await admit({ ...claim, principal: "org:foreign" }, "d1-foreign")).toBe(false);
+    expect(await admit({ ...claim, space: "other" }, "d1-space")).toBe(false);
+    expect(
+      await admit({ ...claim, workerVersionOperationId: `${DEPLOYMENT}-op` }, "d1-stale-op"),
+    ).toBe(false);
+    await sql.run("UPDATE tf_v2_resources SET observed_json=? WHERE uid=?", [
+      '{"ready":false}',
+      VERSION,
+    ]);
+    expect(await admit(claim, "d1-stale-version")).toBe(false);
+    await sql.run("UPDATE tf_v2_resources SET observed_json=? WHERE uid=?", [
+      '{"ready":true,"resolvedBindings":true,"bundleVerified":true}',
+      VERSION,
+    ]);
+    expect(
+      await admit(
+        {
+          ...claim,
+          sourceInvocation: { ...sourceInvocation, custodyToken: "different-custody-token" },
+        },
+        "d1-lease",
+      ),
+    ).toBe(false);
+    const lostAckSql: Sql = {
+      ...sql,
+      async batch(statements) {
+        await sql.batch(statements);
+        throw new Error("fixture-lost-ack-after-commit");
+      },
+    };
+    await expect(
+      createQueueCustody({ sql: lostAckSql }).admitV2Batch({
+        claim,
+        target: producerTarget,
+        messages: [{ messageId: "d1-lost-ack", body: new Uint8Array([78]) }],
+      }),
+    ).rejects.toThrow("fixture-lost-ack-after-commit");
+    await expect(admit(claim, "d1-lost-ack")).rejects.toThrow("UNIQUE constraint");
+    await sql.run(
+      "UPDATE tf_v2_worker_invocations SET retired_at_ms=?, retirement_receipt_digest=? WHERE invocation_id=?",
+      [Date.now(), `sha256:${"b".repeat(64)}`, sourceInvocation.invocationId],
+    );
+    expect(await admit(claim, "d1-retired")).toBe(false);
+    expect(
+      await sql.query("SELECT message_id FROM selfhost_queue_messages ORDER BY message_id"),
+    ).toEqual([{ message_id: "d1-first" }, { message_id: "d1-lost-ack" }]);
+  } finally {
+    source.close();
+    await runtime.dispose();
+  }
+});
+
+function splitD1Migration(source: string): readonly string[] {
+  const statements: string[] = [];
+  let rest = source.replace(/^\s*--.*$/gmu, "").trim();
+  while (rest.length > 0) {
+    if (/^CREATE\s+(?:TEMP\s+)?TRIGGER\b/iu.test(rest)) {
+      const end = /^END\s*;/imu.exec(rest);
+      if (!end || end.index === undefined) throw new Error("incomplete migration trigger");
+      const boundary = end.index + end[0].length;
+      statements.push(rest.slice(0, boundary).trim());
+      rest = rest.slice(boundary).trim();
+      continue;
+    }
+    const boundary = rest.indexOf(";");
+    if (boundary < 0) {
+      statements.push(rest);
+      break;
+    }
+    const statement = rest.slice(0, boundary).trim();
+    if (statement) statements.push(statement);
+    rest = rest.slice(boundary + 1).trim();
+  }
+  return statements;
+}
