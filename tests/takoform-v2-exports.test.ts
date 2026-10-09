@@ -16,6 +16,7 @@ import type {
   V2Execution,
   V2Form,
   V2HeldArtifactSourceOptions,
+  V2QueueConsumerCapability,
   V2ReferenceRequirement,
   V2WorkerModuleInspector,
   V2WorkerPublicationResolution,
@@ -39,6 +40,7 @@ import {
   OBJECT_BUCKET_BACKEND_ID,
 } from "../src/takoform-v2/forms/object-bucket-backend.ts";
 import { createObjectBucketWorkerBindingAuthority } from "../src/takoform-v2/forms/object-bucket-worker-binding-authority.ts";
+import { QUEUE_CONSUMER_FORM_URL } from "../src/takoform-v2/forms/queue-consumer.ts";
 import { createQueueWorkerBindingAuthority } from "../src/takoform-v2/forms/queue-worker-binding-authority.ts";
 import {
   parseSQLiteDatabaseSpec,
@@ -71,6 +73,10 @@ import {
   createAtLeastOnceQueueForm,
   V2_QUEUE_BACKEND_ID,
 } from "../src/takoform-v2/worker-queue-backend.ts";
+import {
+  createQueueConsumerForm,
+  V2_QUEUE_CONSUMER_BACKEND_ID,
+} from "../src/takoform-v2/worker-queue-consumer-backend.ts";
 import { createV2WorkerVersionConfiguredInputSealer } from "../src/takoform-v2/worker-version-configured-inputs.ts";
 
 const RUNTIME_EXPORTS = [
@@ -82,6 +88,7 @@ const RUNTIME_EXPORTS = [
   "OBJECT_BUCKET_FORM_URL",
   "OBJECT_BUCKET_LIMITS",
   "OBJECT_BUCKET_BACKEND_ID",
+  "QUEUE_CONSUMER_FORM_URL",
   "ObjectBucketValidationError",
   "WORKER_CRON_TRIGGER_FORM_URL",
   "WORKER_DEPLOYMENT_FORM_URL",
@@ -96,6 +103,7 @@ const RUNTIME_EXPORTS = [
   "createV2EdgeKvNativeCustody",
   "createAtLeastOnceQueueForm",
   "createQueueWorkerBindingAuthority",
+  "createQueueConsumerForm",
   "createSQLiteDatabaseForm",
   "createSQLiteMigrationApplicationForm",
   "createSQLiteWorkerBindingAuthority",
@@ -133,6 +141,7 @@ const RUNTIME_EXPORTS = [
   "SQLITE_MIGRATION_APPLICATION_BACKEND_ID",
   "v2WorkerInvocationSchemaReady",
   "V2_QUEUE_BACKEND_ID",
+  "V2_QUEUE_CONSUMER_BACKEND_ID",
   "validateEdgeKVNamespaceUpdate",
   "validateModuleWorkerUpdate",
   "validateObjectBucketUpdate",
@@ -169,6 +178,9 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(extension.validateSQLiteDatabaseUpdate).toBe(validateSQLiteDatabaseUpdate);
   expect(extension.runWorkerCronTriggerTick).toBe(runWorkerCronTriggerTick);
   expect(extension.createQueueWorkerBindingAuthority).toBe(createQueueWorkerBindingAuthority);
+  expect(extension.createQueueConsumerForm).toBe(createQueueConsumerForm);
+  expect(extension.V2_QUEUE_CONSUMER_BACKEND_ID).toBe(V2_QUEUE_CONSUMER_BACKEND_ID);
+  expect(extension.QUEUE_CONSUMER_FORM_URL).toBe(QUEUE_CONSUMER_FORM_URL);
   expect(extension.createAtLeastOnceQueueForm).toBe(createAtLeastOnceQueueForm);
   expect(extension.V2_QUEUE_BACKEND_ID).toBe(V2_QUEUE_BACKEND_ID);
   expect(extension.AT_LEAST_ONCE_QUEUE_FORM_URL).toBe(AT_LEAST_ONCE_QUEUE_FORM_URL);
@@ -223,6 +235,7 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   const sqliteClaimType = (_claim: SQLiteWorkerBindingClaim): void => {};
   const workerBundleCustodyType = (_custody: WorkerBundleCustody): void => {};
   const heldArtifactSourceOptionsType = (_options: V2HeldArtifactSourceOptions): void => {};
+  const queueConsumerCapabilityType = (_capability: V2QueueConsumerCapability): void => {};
   expect(unresolved.kind).toBe("unresolved");
   expect([
     snapshotType,
@@ -233,7 +246,8 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
     sqliteClaimType,
     workerBundleCustodyType,
     heldArtifactSourceOptionsType,
-  ]).toHaveLength(8);
+    queueConsumerCapabilityType,
+  ]).toHaveLength(9);
 
   const claim: QueueWorkerBindingClaim = {
     principal: "principal",

@@ -58,6 +58,7 @@ export {
   type ObjectBucketWorkerBindingClaim,
   type ObjectBucketWorkerBindingResolution,
 } from "./forms/object-bucket-worker-binding-authority.ts";
+export { QUEUE_CONSUMER_FORM_URL } from "./forms/queue-consumer.ts";
 export {
   createQueueWorkerBindingAuthority,
   type QueueWorkerBindingClaim,
@@ -207,6 +208,11 @@ export {
   createAtLeastOnceQueueForm,
   V2_QUEUE_BACKEND_ID,
 } from "./worker-queue-backend.ts";
+export {
+  createQueueConsumerForm,
+  V2_QUEUE_CONSUMER_BACKEND_ID,
+  type V2QueueConsumerCapability,
+} from "./worker-queue-consumer-backend.ts";
 export {
   exactV2ResolvedServiceBindings,
   projectV2ResolvedServiceBindings,

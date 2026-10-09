@@ -534,7 +534,35 @@ for (const path of walk("src")) {
       /import\s+type\s+\{\s*V2Execution\s*\}\s+from\s+["']\.\/takoform-v2\/types\.ts["'];/u.test(
         readFileSync(path, "utf8"),
       );
-    if (!layer.may.includes(targetLayer.name) && !exactExecutionTypeEdge) {
+    // The public operator-extension seam may name only this exact native
+    // Queue authority port. Keep the dependency narrow; do not admit the
+    // v2-queue-manager layer to package-surface in general.
+    const queuePortExportBlock = readFileSync(path, "utf8").match(
+      /export\s*\{([^}]*)\}\s*from\s+["']\.\/takoform-v2\/worker-queue-delivery\.ts["'];/u,
+    )?.[1];
+    const queuePortExportNames = queuePortExportBlock
+      ?.split(",")
+      .map((name) => name.trim().replace(/^type\s+/u, ""))
+      .filter((name) => name !== "")
+      .sort();
+    const exactQueuePortExportNames = [
+      "authorizeV2QueueBatchSend",
+      "cancelV2QueueBatchBeforeSend",
+      "confirmV2QueueBatchRetirement",
+      "createV2QueueDelivery",
+      "V2QueueBatchExecutionIdentity",
+      "verifyV2QueueSettlementScope",
+    ].sort();
+    const exactQueueProviderExtensionEdge =
+      path === "src/provider-extension.ts" &&
+      target === "src/takoform-v2/worker-queue-delivery.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      JSON.stringify(queuePortExportNames) === JSON.stringify(exactQueuePortExportNames);
+    if (
+      !layer.may.includes(targetLayer.name) &&
+      !exactExecutionTypeEdge &&
+      !exactQueueProviderExtensionEdge
+    ) {
       violations.push(
         `${path} (${layer.name}) imports ${target} (${targetLayer.name}); ` +
           `${layer.name} may import only ${layer.may.join(", ")}`,
