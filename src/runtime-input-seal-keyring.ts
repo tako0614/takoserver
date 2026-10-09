@@ -31,7 +31,7 @@ export async function parseRuntimeInputSealKeyRing(raw: string): Promise<Runtime
 }
 
 /** Import the same validated operator ring once for legacy and v2 custody. */
-export async function parseSelfhostRuntimeInputKeyAuthority(raw: string): Promise<{
+export async function parseRuntimeInputKeyAuthority(raw: string): Promise<{
   readonly sealKeys: RuntimeInputSealKeyRing;
   readonly privateInputCustody: V2PrivateInputCustody;
 }> {

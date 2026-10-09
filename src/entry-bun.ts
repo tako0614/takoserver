@@ -37,7 +37,7 @@ import {
   createRuntimeInputAuthority,
   runtimeInputCanonicalOriginSupported,
 } from "./runtime-input-preparations.ts";
-import { parseSelfhostRuntimeInputKeyAuthority } from "./runtime-input-seal-keyring.ts";
+import { parseRuntimeInputKeyAuthority } from "./runtime-input-seal-keyring.ts";
 import {
   openSelfhostActorPublicRuntime,
   type SelfhostActorPublicRuntime,
@@ -516,9 +516,7 @@ if (process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING && !runtimeInputsAvailable
   );
 }
 const runtimeInputKeyAuthority = runtimeInputsAvailable
-  ? await parseSelfhostRuntimeInputKeyAuthority(
-      process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING as string,
-    )
+  ? await parseRuntimeInputKeyAuthority(process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING as string)
   : undefined;
 const runtimeInputSealKeyRing = runtimeInputKeyAuthority?.sealKeys;
 const runtimeInputs = runtimeInputSealKeyRing

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import {
+  parseRuntimeInputKeyAuthority,
   parseRuntimeInputSealKeyRing,
-  parseSelfhostRuntimeInputKeyAuthority,
 } from "../src/runtime-input-seal-keyring.ts";
 import { createSelfhostV2ConfiguredInputSealer } from "../src/selfhost-v2-configured-input-sealer.ts";
 import { WORKER_VERSION_FORM_URL } from "../src/takoform-v2/forms/worker-specs.ts";
@@ -57,7 +57,7 @@ test("rejects malformed, noncanonical, duplicated, and open key rings", async ()
 });
 
 test("one retained operator key ring supplies separate non-extractable v2 transfer and comparison keys", async () => {
-  const { sealKeys, privateInputCustody } = await parseSelfhostRuntimeInputKeyAuthority(
+  const { sealKeys, privateInputCustody } = await parseRuntimeInputKeyAuthority(
     JSON.stringify({
       current: { id: "runtime-2026-08", key: KEY_A },
       previous: [{ id: "runtime-2026-07", key: KEY_B }],
@@ -88,7 +88,7 @@ test("rotation retains old configured ciphertext and both private-input keys, th
     current: { id: "new", key: KEY_B },
     previous: [{ id: "old", key: KEY_A }],
   });
-  const old = await parseSelfhostRuntimeInputKeyAuthority(oldRaw);
+  const old = await parseRuntimeInputKeyAuthority(oldRaw);
   const identity = {
     principal: "org:fixture",
     space: "fixture",
@@ -114,7 +114,7 @@ test("rotation retains old configured ciphertext and both private-input keys, th
     generation: 1,
   };
   const transient = await sealPrivateInputs(old.privateInputCustody, binding, value, Date.now());
-  const rotated = await parseSelfhostRuntimeInputKeyAuthority(rotatedRaw);
+  const rotated = await parseRuntimeInputKeyAuthority(rotatedRaw);
   expect(
     await createSelfhostV2ConfiguredInputSealer(rotated.sealKeys).open(identity, configured),
   ).toEqual(value);
@@ -168,7 +168,7 @@ test("rotation retains old configured ciphertext and both private-input keys, th
       { TOKEN: "changed-synthetic-value" },
     ),
   ).toBe(false);
-  const currentOnly = await parseSelfhostRuntimeInputKeyAuthority(
+  const currentOnly = await parseRuntimeInputKeyAuthority(
     JSON.stringify({ current: { id: "new", key: KEY_B } }),
   );
   expect(
