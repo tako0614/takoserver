@@ -43,7 +43,6 @@ export type {
   WorkflowStopReason,
 } from "./workflow-execution.ts";
 export { createWorkflowRuntime } from "./workflow-execution.ts";
-
 export type {
   WorkflowCreateInput,
   WorkflowCreateResult,
@@ -59,3 +58,7 @@ export type {
   WorkflowSweepOptions,
 } from "./workflow-instances.ts";
 export { WorkflowInstanceError } from "./workflow-instances.ts";
+export {
+  createV2WorkflowResourceAuthority,
+  type V2WorkflowResourceAuthority,
+} from "./workflow-v2-resource-authority.ts";

@@ -13,6 +13,7 @@ const EXPECTED_RUNTIME_EXPORTS = [
   "WorkflowInstanceError",
   "WorkflowRuntimeError",
   "createWorkflowRuntime",
+  "createV2WorkflowResourceAuthority",
   "isWorkflowCallInputError",
   "isWorkflowCallInputTypeError",
   "isWorkflowRuntimeError",
@@ -21,6 +22,7 @@ const EXPECTED_RUNTIME_EXPORTS = [
 
 const CONCRETE_ONLY_EXPORTS = [
   "createWorkflowRuntime",
+  "createV2WorkflowResourceAuthority",
   "WorkflowCallInputError",
   "WorkflowRuntimeError",
   "isWorkflowCallInputError",
@@ -69,6 +71,21 @@ test("a package-only consumer can implement the neutral Host ports", () => {
   const runtime = createPackageOnlyRuntime();
   expect(runtime).toHaveProperty("instances");
   expect(typeof runtime.runOne).toBe("function");
+});
+
+test("the package can select v2 authority from the exact instance SQL port", () => {
+  const sql: workflowRuntime.Sql = {
+    query: async () => [],
+    run: async () => ({ rows: [], changes: 0 }),
+    batch: async (statements) => statements.map(() => ({ rows: [], changes: 0 })),
+  };
+  const authority = workflowRuntime.createV2WorkflowResourceAuthority(sql);
+  expect(authority).toEqual({ kind: "takoserver.v2-workflow-resource-authority" });
+  expect(Object.isFrozen(authority)).toBe(true);
+  expect(typeof createPackageOnlyRuntime(true).runOne).toBe("function");
+  expect(() => createPackageOnlyRuntime(authority)).toThrow(
+    "v2 Workflow authority belongs to another SQL store",
+  );
 });
 
 test("workflow-runtime browser closure has no Bun, node, or process dependency", async () => {
