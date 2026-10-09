@@ -72,6 +72,7 @@ const LAYERS: readonly Layer[] = [
       "v2-actor-sql-graph",
       "v2-actor-physical-backend",
       "v2-actor-binding-authority",
+      "v2-workflow-binding-authority",
       "v2-workflow-selected-materials",
     ],
   },

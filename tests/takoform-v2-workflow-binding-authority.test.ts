@@ -21,7 +21,10 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { DURABLE_WORKFLOW_BACKEND_ID } from "../src/takoform-v2/workflow-backend.ts";
-import { createV2WorkflowBindingAuthority } from "../src/takoform-v2/workflow-binding-authority.ts";
+import {
+  createV2WorkflowBindingAuthority,
+  type V2WorkflowBindingVersionIdentitySource,
+} from "../src/takoform-v2/workflow-binding-authority.ts";
 
 const PRINCIPAL = "org:workflow-binding";
 const SPACE = "production";
@@ -138,6 +141,68 @@ test("an accepted Workflow UID is bindable before it is Ready, and same-spec gen
     ).toBeNull();
     expect(await authority.resolveCurrentBinding(claim, "OTHER")).toBeNull();
 
+    // A provider derives its actual native source identity; Core still owns
+    // accepted source operations, sealed references and current target authority.
+    const wfpNativeVersionId = `v2w-${createHash("sha256")
+      .update(`${version.resourceUid}\u00001\u0000workflow`)
+      .digest("hex")
+      .slice(0, 48)}`;
+    const identityInputs: V2WorkflowBindingVersionIdentitySource[] = [];
+    const wfpAuthority = createV2WorkflowBindingAuthority({
+      sql,
+      targetKey: TARGET,
+      versionIdentity: async (source) => {
+        identityInputs.push(source);
+        expect(Object.isFrozen(source)).toBe(true);
+        expect(Object.isFrozen(source.workflowBindings)).toBe(true);
+        expect(source.workflowBindings.every(Object.isFrozen)).toBe(true);
+        expect(source).toEqual({
+          principal: PRINCIPAL,
+          space: SPACE,
+          targetKey: TARGET,
+          workerUid: worker.resourceUid,
+          workerVersionUid: version.resourceUid,
+          workerVersionOperationId: version.id,
+          workerVersionGeneration: 1,
+          workflowBindings: [{ name: "FLOW", resourceUid: workflow.resourceUid }],
+        });
+        return wfpNativeVersionId;
+      },
+    });
+    const wfpClaim = { ...claim, nativeVersionId: wfpNativeVersionId };
+    expect(await wfpAuthority.resolveCurrentBinding(wfpClaim, "FLOW")).toMatchObject({
+      tenantId: PRINCIPAL,
+      workflowResourceUid: workflow.resourceUid,
+      className: "ReportWorkflow",
+    });
+    expect(identityInputs).toHaveLength(2);
+    expect(await authority.resolveCurrentBinding(wfpClaim, "FLOW")).toBeNull();
+    expect(
+      await wfpAuthority.resolveCurrentBinding({ ...wfpClaim, nativeVersionId }, "FLOW"),
+    ).toBeNull();
+    expect(
+      await wfpAuthority.resolveCurrentBinding({ ...wfpClaim, principal: "org:other" }, "FLOW"),
+    ).toBeNull();
+    expect(
+      await wfpAuthority.resolveCurrentBinding(
+        { ...wfpClaim, workerVersionOperationId: worker.id },
+        "FLOW",
+      ),
+    ).toBeNull();
+    expect(
+      await wfpAuthority.resolveCurrentBinding(
+        { ...wfpClaim, bindings: [{ name: "FLOW", resourceUid: worker.resourceUid }] },
+        "FLOW",
+      ),
+    ).toBeNull();
+    expect(
+      await createV2WorkflowBindingAuthority({
+        sql,
+        targetKey: TARGET,
+        versionIdentity: async () => "",
+      }).resolveCurrentBinding(wfpClaim, "FLOW"),
+    ).toBeNull();
+
     const workflowUpdate = await engine.acceptUpdate({
       principal: PRINCIPAL,
       key: "workflow-binding-workflow-update-key",
@@ -157,12 +222,14 @@ test("an accepted Workflow UID is bindable before it is Ready, and same-spec gen
     expect(await authority.resolveCurrentBinding(claim, "FLOW")).not.toBeNull();
     expect(await engine.runNext()).toMatchObject({ id: versionUpdate.id, status: "succeeded" });
     expect(await authority.resolveCurrentBinding(claim, "FLOW")).not.toBeNull();
+    expect(await wfpAuthority.resolveCurrentBinding(wfpClaim, "FLOW")).not.toBeNull();
 
     await sql.run(
       "DELETE FROM tf_v2_resource_references WHERE referrer_uid = ? AND target_uid = ?",
       [version.resourceUid, workflow.resourceUid],
     );
     expect(await authority.resolveCurrentBinding(claim, "FLOW")).toBeNull();
+    expect(await wfpAuthority.resolveCurrentBinding(wfpClaim, "FLOW")).toBeNull();
   } finally {
     db.close();
   }

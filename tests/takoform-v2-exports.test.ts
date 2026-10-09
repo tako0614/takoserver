@@ -83,6 +83,7 @@ import {
   V2_QUEUE_CONSUMER_BACKEND_ID,
 } from "../src/takoform-v2/worker-queue-consumer-backend.ts";
 import { createV2WorkerVersionConfiguredInputSealer } from "../src/takoform-v2/worker-version-configured-inputs.ts";
+import { createV2WorkflowBindingAuthority } from "../src/takoform-v2/workflow-binding-authority.ts";
 import { createV2WorkflowSelectedMaterials } from "../src/takoform-v2/workflow-selected-materials.ts";
 
 const RUNTIME_EXPORTS = [
@@ -110,6 +111,7 @@ const RUNTIME_EXPORTS = [
   "createV2ActorNamespaceSqlGraphReader",
   "createV2ActorNamespaceForm",
   "createV2ActorBindingAuthority",
+  "createV2WorkflowBindingAuthority",
   "createAtLeastOnceQueueForm",
   "createQueueWorkerBindingAuthority",
   "createQueueConsumerForm",
@@ -199,6 +201,7 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(extension.createV2ActorNamespaceSqlGraphReader).toBe(createV2ActorNamespaceSqlGraphReader);
   expect(extension.createV2ActorNamespaceForm).toBe(createV2ActorNamespaceForm);
   expect(extension.createV2ActorBindingAuthority).toBe(createV2ActorBindingAuthority);
+  expect(extension.createV2WorkflowBindingAuthority).toBe(createV2WorkflowBindingAuthority);
   const acceptsPhysicalPort = (_physical: V2ActorNamespacePhysicalPort): void => {};
   const existingSelfhostPort = (
     physical: ReturnType<typeof createSelfhostActorExecutionHost>,

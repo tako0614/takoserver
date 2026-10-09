@@ -249,6 +249,13 @@ export {
   type V2WorkerVersionSealedInputs,
 } from "./worker-version-configured-inputs.ts";
 export {
+  createV2WorkflowBindingAuthority,
+  type V2WorkflowBindingClaim,
+  type V2WorkflowBindingResolution,
+  type V2WorkflowBindingTarget,
+  type V2WorkflowBindingVersionIdentitySource,
+} from "./workflow-binding-authority.ts";
+export {
   createV2WorkflowSelectedMaterials,
   type V2WorkflowAcceptedResource,
   type V2WorkflowServingObservation,
