@@ -213,6 +213,14 @@ export type WorkerEntryV2FormComposer = (context: {
 }) => WorkerEntryV2FormMap | Promise<WorkerEntryV2FormMap>;
 
 /** Only an explicit operator-selected Form hook can activate generic custody. */
+function hasDataMethod(policy: object, name: "validateCreate" | "validateUpdate"): boolean {
+  for (let owner: object | null = policy; owner !== null; owner = Object.getPrototypeOf(owner)) {
+    const descriptor = Object.getOwnPropertyDescriptor(owner, name);
+    if (descriptor) return "value" in descriptor && typeof descriptor.value === "function";
+  }
+  return false;
+}
+
 function hasSelectedV2PrivateInputHooks(forms: WorkerEntryV2FormMap | undefined): boolean {
   if (!forms || typeof forms !== "object" || Array.isArray(forms)) return false;
   for (const url of Reflect.ownKeys(forms)) {
@@ -221,7 +229,15 @@ function hasSelectedV2PrivateInputHooks(forms: WorkerEntryV2FormMap | undefined)
     const form = entry.value;
     if (!form || typeof form !== "object") continue;
     const privateInputs = Object.getOwnPropertyDescriptor(form, "privateInputs");
-    if (privateInputs && "value" in privateInputs && privateInputs.value !== undefined) return true;
+    if (!privateInputs || !("value" in privateInputs)) continue;
+    const policy = privateInputs.value;
+    if (
+      policy !== null &&
+      typeof policy === "object" &&
+      hasDataMethod(policy, "validateCreate") &&
+      hasDataMethod(policy, "validateUpdate")
+    )
+      return true;
   }
   return false;
 }

@@ -2,6 +2,7 @@ import { createWorkerEntry, type WorkerEnv } from "../../src/entry-worker.ts";
 import type { V2Form } from "../../src/takoform-v2/types.ts";
 
 const FORM = "https://forms.example.test/fixture/PrivateWorkerEntry/1.0.0";
+const MALFORMED_FORM = "https://forms.example.test/fixture/MalformedPrivateWorkerEntry/1.0.0";
 const EXPECTED = "synthetic-worker-entry-private-value";
 
 const privateForm: V2Form = {
@@ -43,7 +44,23 @@ const privateForm: V2Form = {
   },
 };
 
-const selected = createWorkerEntry({ composeV2Forms: () => ({ [FORM]: privateForm }) });
+const selected = createWorkerEntry({
+  composeV2Forms: ({ env }) => {
+    const variant = (env as WorkerEnv & { TEST_PRIVATE_INPUT_POLICY?: string })
+      .TEST_PRIVATE_INPUT_POLICY;
+    if (variant === undefined) return { [FORM]: privateForm };
+    const malformed = {
+      ...privateForm,
+      privateInputs: {
+        null: null,
+        false: false,
+        zero: 0,
+        empty: "",
+      }[variant],
+    } as unknown as V2Form;
+    return { [FORM]: privateForm, [MALFORMED_FORM]: malformed };
+  },
+});
 const ordinary = createWorkerEntry();
 
 /** Test-only dispatch runs the actual Worker entry and scheduled pass inside Miniflare. */

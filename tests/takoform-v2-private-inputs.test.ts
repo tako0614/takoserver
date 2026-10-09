@@ -18,6 +18,48 @@ const KEY = "private-test-key-00000001";
 const CURSOR = new Uint8Array(32).fill(0x45);
 const ORIGINAL = { password: "horse-battery-秘密", token: "token:never-public" };
 
+test("Core rejects present malformed private-input policy and accepts inherited validation methods", async () => {
+  const database = new Database(":memory:");
+  const backend: V2Backend = {
+    id: "policy-fixture",
+    targetKey: "policy-fixture",
+    async execute() {
+      return { kind: "complete", observed: {}, output: {} };
+    },
+    async reconcile() {
+      return { kind: "unknown" };
+    },
+  };
+  const form: V2Form = { validateCreate() {}, validateUpdate() {}, backend };
+  const base = {
+    sql: createSqliteSql(database),
+    replayWindowSeconds: 3600,
+    authorize: async () => true,
+  };
+  try {
+    for (const policy of [null, false, 0, ""]) {
+      expect(() =>
+        createTakoformV2Engine({
+          ...base,
+          forms: { [FORM]: { ...form, privateInputs: policy } as unknown as V2Form },
+        }),
+      ).toThrow("incomplete v2 Form private input declaration");
+    }
+    class InheritedPolicy {
+      validateCreate() {}
+      validateUpdate() {}
+    }
+    const engine = createTakoformV2Engine({
+      ...base,
+      forms: { [FORM]: { ...form, privateInputs: new InheritedPolicy() } },
+      privateInputCustody: await keys(),
+    });
+    expect(engine.supportsPrivateInputs(FORM)).toBe(true);
+  } finally {
+    database.close();
+  }
+});
+
 async function keys(previous?: V2PrivateInputCustody): Promise<V2PrivateInputCustody> {
   const [transfer, comparison] = await Promise.all([
     crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]),

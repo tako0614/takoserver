@@ -10,6 +10,7 @@ import { createD1Sql } from "../src/sql-d1.ts";
 const ORIGIN = "https://api.private-entry.test";
 const BASE = `${ORIGIN}/apis/forms.takoform.com/v2`;
 const FORM = "https://forms.example.test/fixture/PrivateWorkerEntry/1.0.0";
+const MALFORMED_FORM = "https://forms.example.test/fixture/MalformedPrivateWorkerEntry/1.0.0";
 const ORG = "org-private-entry";
 const TOKEN = "synthetic-private-entry-api-key";
 const SECRET = "synthetic-worker-entry-private-value";
@@ -44,6 +45,7 @@ async function runtimeWithKey(
   name: string,
   keyring?: string,
   persistence?: string,
+  malformedPolicy?: string,
 ): Promise<Miniflare> {
   const build = await Bun.build({
     entrypoints: [
@@ -83,6 +85,9 @@ async function runtimeWithKey(
             },
             ...(keyring
               ? { TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING: { type: "text", value: keyring } }
+              : {}),
+            ...(malformedPolicy
+              ? { TEST_PRIVATE_INPUT_POLICY: { type: "text", value: malformedPolicy } }
               : {}),
           },
           triggers: [],
@@ -192,6 +197,42 @@ test("real Worker entry admits private inputs only with operator keys and truste
     expect((await (await runtime.getR2Bucket("OBJECTS")).list()).objects).toEqual([]);
   } finally {
     await runtime.dispose();
+  }
+}, 120_000);
+
+test("malformed private-input policy refuses Worker startup even alongside a valid private Form", async () => {
+  for (const variant of ["null", "false", "zero", "empty"]) {
+    const runtime = await runtimeWithKey(
+      `v2-private-entry-malformed-${variant}`,
+      JSON.stringify({ current: { id: "fixture-a", key: KEY_A } }),
+      undefined,
+      variant,
+    );
+    try {
+      await seed(runtime);
+      for (const form of [FORM, MALFORMED_FORM]) {
+        const response = await request(runtime, `/support?form=${encodeURIComponent(form)}`);
+        expect(response.status).toBe(503);
+        const refusal = await response.text();
+        expect(refusal).toContain("runtime-configuration");
+        expect(refusal).not.toContain("incomplete v2 Form private input declaration");
+      }
+      const refused = await request(runtime, "/resources", {
+        method: "POST",
+        headers: { "idempotency-key": `private-entry-malformed-${variant}` },
+        body: JSON.stringify({
+          form: FORM,
+          space: ORG,
+          name: "never-accepted",
+          spec: { kind: "fixture" },
+          privateInputs: { TOKEN: SECRET },
+        }),
+      });
+      expect(refused.status).toBe(503);
+      expect(await refused.text()).not.toContain(SECRET);
+    } finally {
+      await runtime.dispose();
+    }
   }
 }, 120_000);
 
