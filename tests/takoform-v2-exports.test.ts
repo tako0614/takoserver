@@ -27,6 +27,7 @@ import type {
 } from "@takoserver/core/takoform-v2";
 import * as extension from "@takoserver/core/takoform-v2";
 import type { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
+import { createV2ActorBindingAuthority } from "../src/takoform-v2/actor-binding-authority.ts";
 import { createV2ActorNamespaceForm } from "../src/takoform-v2/actor-namespace-backend.ts";
 import { createV2ActorNamespaceSqlGraphReader } from "../src/takoform-v2/actor-namespace-sql-graph.ts";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
@@ -82,6 +83,8 @@ import {
   V2_QUEUE_CONSUMER_BACKEND_ID,
 } from "../src/takoform-v2/worker-queue-consumer-backend.ts";
 import { createV2WorkerVersionConfiguredInputSealer } from "../src/takoform-v2/worker-version-configured-inputs.ts";
+import { createV2WorkflowBindingAuthority } from "../src/takoform-v2/workflow-binding-authority.ts";
+import { createV2WorkflowSelectedMaterials } from "../src/takoform-v2/workflow-selected-materials.ts";
 
 const RUNTIME_EXPORTS = [
   "EDGE_KV_NAMESPACE_BACKEND_ID",
@@ -107,6 +110,8 @@ const RUNTIME_EXPORTS = [
   "createV2EdgeKvNativeCustody",
   "createV2ActorNamespaceSqlGraphReader",
   "createV2ActorNamespaceForm",
+  "createV2ActorBindingAuthority",
+  "createV2WorkflowBindingAuthority",
   "createAtLeastOnceQueueForm",
   "createQueueWorkerBindingAuthority",
   "createQueueConsumerForm",
@@ -124,6 +129,7 @@ const RUNTIME_EXPORTS = [
   "createV2WorkerInvocationLifecycle",
   "createV2WorkerPublicationState",
   "createV2WorkerVersionConfiguredInputSealer",
+  "createV2WorkflowSelectedMaterials",
   "exactV2ResolvedServiceBindings",
   "inspectV2WorkerCodeVersionEligibility",
   "inspectV2WorkerInvocationDrainSchema",
@@ -160,6 +166,7 @@ const RUNTIME_EXPORTS = [
 test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", async () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
+  expect(extension.createV2WorkflowSelectedMaterials).toBe(createV2WorkflowSelectedMaterials);
   expect(extension.createWorkerBundleCustody).toBe(createWorkerBundleCustody);
   expect(extension.createWorkerBundleHost).toBe(createWorkerBundleHost);
   expect(extension.createV2HeldArtifactSource).toBe(createV2HeldArtifactSource);
@@ -193,6 +200,8 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(extension.createV2EdgeKvNativeCustody).toBe(createV2EdgeKvNativeCustody);
   expect(extension.createV2ActorNamespaceSqlGraphReader).toBe(createV2ActorNamespaceSqlGraphReader);
   expect(extension.createV2ActorNamespaceForm).toBe(createV2ActorNamespaceForm);
+  expect(extension.createV2ActorBindingAuthority).toBe(createV2ActorBindingAuthority);
+  expect(extension.createV2WorkflowBindingAuthority).toBe(createV2WorkflowBindingAuthority);
   const acceptsPhysicalPort = (_physical: V2ActorNamespacePhysicalPort): void => {};
   const existingSelfhostPort = (
     physical: ReturnType<typeof createSelfhostActorExecutionHost>,

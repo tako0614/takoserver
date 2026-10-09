@@ -1,0 +1,349 @@
+import { canonicalJson } from "../json.ts";
+import type { JsonObject, Sql } from "../ports.ts";
+import type { WorkerModuleSemanticInspector } from "../worker-module-inspection-contract.ts";
+import { WorkflowRuntimeError } from "../workflow-driver.ts";
+import type { WorkflowRunIdentity } from "../workflow-execution.ts";
+import type { WorkflowScope } from "../workflow-instances.ts";
+import { DURABLE_WORKFLOW_FORM_URL, parseDurableWorkflowSpec } from "./forms/durable-workflow.ts";
+import { MODULE_WORKER_FORM_URL } from "./forms/worker-specs.ts";
+import type {
+  createV2WorkerPublicationState,
+  V2WorkerCurrentServingIdentity,
+  V2WorkerPublicationSnapshot,
+  V2WorkerVersionMaterials,
+} from "./worker-publication-state.ts";
+import { DURABLE_WORKFLOW_BACKEND_ID } from "./workflow-backend.ts";
+
+export interface V2WorkflowServingObservation extends V2WorkerCurrentServingIdentity {
+  readonly kind: "serving";
+  readonly targetKey: string;
+  readonly sourceOperationId: string;
+}
+
+type PublicationState = Pick<
+  ReturnType<typeof createV2WorkerPublicationState>,
+  "resolveCurrentServing"
+>;
+
+export type V2WorkflowAcceptedResource = {
+  readonly principal: string;
+  readonly space: string;
+  readonly workerUid: string;
+  readonly className: string;
+  readonly vector: string;
+};
+
+const unavailable = () => new WorkflowRuntimeError("host_unavailable");
+
+/** Read from the accepted Resource/Operation ledger, never v1 tf_resources. */
+async function captureResource(
+  sql: Sql,
+  targetKey: string,
+  scope: WorkflowScope,
+): Promise<V2WorkflowAcceptedResource> {
+  const rows = await sql.query("SELECT * FROM tf_v2_resources WHERE uid = ?", [
+    scope.workflowResourceUid,
+  ]);
+  const row = rows.length === 1 ? rows[0] : undefined;
+  if (
+    !row ||
+    row.uid !== scope.workflowResourceUid ||
+    row.principal !== scope.tenantId ||
+    typeof row.space !== "string" ||
+    row.space.length === 0 ||
+    row.target_key !== targetKey ||
+    row.form_url !== DURABLE_WORKFLOW_FORM_URL ||
+    row.backend_id !== DURABLE_WORKFLOW_BACKEND_ID ||
+    row.deleted_at !== null ||
+    !["idle", "pending"].includes(String(row.phase)) ||
+    typeof row.generation !== "number" ||
+    typeof row.observed_generation !== "number" ||
+    row.observed_generation < 1 ||
+    typeof row.last_operation !== "string" ||
+    typeof row.spec_json !== "string" ||
+    typeof row.observed_json !== "string"
+  )
+    throw unavailable();
+  const operations = await sql.query("SELECT * FROM tf_v2_operations WHERE id = ?", [
+    row.last_operation,
+  ]);
+  const currentOperation = operations.length === 1 ? operations[0] : undefined;
+  const pending = row.phase === "pending";
+  if (
+    !currentOperation ||
+    currentOperation.resource_uid !== row.uid ||
+    currentOperation.principal !== row.principal ||
+    currentOperation.backend_id !== row.backend_id ||
+    currentOperation.target_key !== targetKey ||
+    currentOperation.generation !== row.generation ||
+    currentOperation.accepted_spec_json !== row.spec_json ||
+    (pending
+      ? row.busy_operation !== currentOperation.id ||
+        row.generation <= row.observed_generation ||
+        currentOperation.action !== "update" ||
+        !["queued", "running", "waiting_input", "reconciling"].includes(
+          String(currentOperation.status),
+        )
+      : row.busy_operation !== null ||
+        row.generation !== row.observed_generation ||
+        !["create", "update"].includes(String(currentOperation.action)) ||
+        currentOperation.status !== "succeeded" ||
+        currentOperation.effect !== "complete")
+  )
+    throw unavailable();
+  const previous = pending
+    ? await sql.query(
+        `SELECT * FROM tf_v2_operations WHERE resource_uid = ? AND generation = ?
+         AND action IN ('create','update') AND status = 'succeeded' AND effect = 'complete'`,
+        [row.uid as string, row.observed_generation],
+      )
+    : operations;
+  const operation = previous.length === 1 ? previous[0] : undefined;
+  if (
+    !operation ||
+    operation.resource_uid !== row.uid ||
+    operation.principal !== row.principal ||
+    operation.backend_id !== row.backend_id ||
+    operation.target_key !== targetKey ||
+    operation.generation !== row.observed_generation ||
+    operation.accepted_spec_json !== row.spec_json
+  )
+    throw unavailable();
+  let spec: ReturnType<typeof parseDurableWorkflowSpec>;
+  try {
+    const observed: unknown = JSON.parse(row.observed_json);
+    if (
+      !observed ||
+      typeof observed !== "object" ||
+      Array.isArray(observed) ||
+      !("ready" in observed) ||
+      observed.ready !== true
+    )
+      throw unavailable();
+    spec = parseDurableWorkflowSpec(JSON.parse(row.spec_json));
+  } catch {
+    throw unavailable();
+  }
+  const referenceOperations = pending ? [operation, currentOperation] : [operation];
+  const [referenceSnapshots, edges, workers] = await Promise.all([
+    Promise.all(
+      referenceOperations.map(async (sourceOperation) => {
+        const [sets, references] = await Promise.all([
+          sql.query("SELECT * FROM tf_v2_operation_reference_sets WHERE operation_id = ?", [
+            sourceOperation.id as string,
+          ]),
+          sql.query("SELECT * FROM tf_v2_operation_references WHERE operation_id = ?", [
+            sourceOperation.id as string,
+          ]),
+        ]);
+        const set = sets.length === 1 ? sets[0] : undefined;
+        const reference = references.length === 1 ? references[0] : undefined;
+        if (
+          set?.sealed !== 1 ||
+          reference?.target_uid !== spec.worker.resourceUid ||
+          reference.form_url !== MODULE_WORKER_FORM_URL ||
+          reference.readiness !== "observed" ||
+          reference.target_spec_path !== null ||
+          reference.target_spec_equals !== null
+        )
+          throw unavailable();
+        return { set, reference };
+      }),
+    ),
+    sql.query("SELECT * FROM tf_v2_resource_references WHERE target_uid = ? AND referrer_uid = ?", [
+      spec.worker.resourceUid,
+      row.uid as string,
+    ]),
+    sql.query("SELECT * FROM tf_v2_resources WHERE uid = ?", [spec.worker.resourceUid]),
+  ]);
+  const edge = edges.length === 1 ? edges[0] : undefined;
+  const worker = workers.length === 1 ? workers[0] : undefined;
+  if (
+    edge?.target_uid !== spec.worker.resourceUid ||
+    edge.referrer_uid !== row.uid ||
+    worker?.form_url !== MODULE_WORKER_FORM_URL ||
+    worker.principal !== row.principal ||
+    worker.space !== row.space ||
+    worker.deleted_at !== null ||
+    !["idle", "pending"].includes(String(worker.phase)) ||
+    typeof worker.observed_generation !== "number" ||
+    worker.observed_generation < 1
+  )
+    throw unavailable();
+  return {
+    principal: row.principal as string,
+    space: row.space,
+    workerUid: spec.worker.resourceUid,
+    className: spec.className,
+    vector: canonicalJson({
+      resource: row as JsonObject,
+      operation: operation as JsonObject,
+      pendingOperation: pending ? (currentOperation as JsonObject) : null,
+      referenceSnapshots: referenceSnapshots as unknown as JsonObject,
+      edge: edge as JsonObject,
+      worker: worker as JsonObject,
+    }),
+  };
+}
+
+/**
+ * Accepted SQL and held-byte class authority shared by physical runtimes.
+ * The serving observer is Host-owned; this helper does not assert that any
+ * Workerd site or WfP script/Facet is physically present.
+ */
+export function createV2WorkflowSelectedMaterials(options: {
+  readonly sql: Sql;
+  readonly targetKey: string;
+  readonly publicationState: PublicationState;
+  readonly inspector: Pick<WorkerModuleSemanticInspector, "inspectWorkflowClass">;
+}) {
+  if (
+    !options.sql ||
+    typeof options.sql.query !== "function" ||
+    !options.targetKey ||
+    typeof options.publicationState?.resolveCurrentServing !== "function" ||
+    typeof options.inspector?.inspectWorkflowClass !== "function"
+  ) {
+    throw new TypeError("v2 Workflow selected materials need accepted SQL and held-byte ports");
+  }
+
+  return async (
+    identity: WorkflowRunIdentity,
+    signal: AbortSignal,
+    observeServing: (
+      workerUid: string,
+      targetKey: string,
+    ) => Promise<V2WorkflowServingObservation | { readonly kind: "unknown" }>,
+    basisPoint: number,
+  ): Promise<{
+    readonly resource: V2WorkflowAcceptedResource;
+    readonly serving: V2WorkflowServingObservation;
+    readonly snapshot: V2WorkerPublicationSnapshot;
+    readonly version: NonNullable<V2WorkerPublicationSnapshot["deployment"]>["versions"][number];
+    /** Workflow consumes held code, not the Version's static asset payload. */
+    readonly materials: Pick<V2WorkerVersionMaterials, "bundle">;
+    stillCurrent(): Promise<boolean>;
+  }> => {
+    signal.throwIfAborted();
+    if (
+      typeof observeServing !== "function" ||
+      !Number.isSafeInteger(basisPoint) ||
+      basisPoint < 0 ||
+      basisPoint >= 10_000
+    )
+      throw new WorkflowRuntimeError("invalid_runtime_input");
+    const scope = {
+      tenantId: identity.scope.tenantId,
+      workflowResourceUid: identity.scope.workflowResourceUid,
+    };
+    const resource = await captureResource(options.sql, options.targetKey, scope).catch(() => {
+      throw unavailable();
+    });
+    const observed = await observeServing(resource.workerUid, options.targetKey).catch(() => {
+      throw unavailable();
+    });
+    if (
+      observed.kind !== "serving" ||
+      observed.workerResourceUid !== resource.workerUid ||
+      observed.targetKey !== options.targetKey ||
+      typeof observed.sourceOperationId !== "string" ||
+      observed.sourceOperationId.length === 0
+    )
+      throw unavailable();
+    const serving: V2WorkflowServingObservation = structuredClone(observed);
+    let ceiling = 0;
+    // The accepted publication resolves the complete weighted identity. Use
+    // the same UID codepoint order as native selection without importing its
+    // self-host-only adapter layer.
+    const selected = [...serving.versions]
+      .sort((left, right) =>
+        left.workerVersionUid < right.workerVersionUid
+          ? -1
+          : left.workerVersionUid > right.workerVersionUid
+            ? 1
+            : 0,
+      )
+      .find((item) => {
+        ceiling += item.weight;
+        return basisPoint < ceiling;
+      });
+    if (!selected) throw unavailable();
+    const publication = await options.publicationState
+      .resolveCurrentServing({
+        workerUid: resource.workerUid,
+        targetKey: options.targetKey,
+        sourceOperationId: serving.sourceOperationId,
+        expectedIdentity: {
+          generation: serving.generation,
+          workerResourceUid: serving.workerResourceUid,
+          hostnames: serving.hostnames,
+          versions: serving.versions,
+        },
+      })
+      .catch(() => {
+        throw unavailable();
+      });
+    if (publication.kind !== "ready") throw unavailable();
+    const snapshot = publication.snapshot;
+    const version = snapshot.deployment?.versions.find(
+      (item) => item.uid === selected.workerVersionUid,
+    );
+    if (
+      snapshot.sourceOperationId !== serving.sourceOperationId ||
+      snapshot.worker.uid !== resource.workerUid ||
+      snapshot.worker.principal !== resource.principal ||
+      snapshot.worker.space !== resource.space ||
+      !snapshot.deployment ||
+      !version ||
+      version.spec.worker.resourceUid !== resource.workerUid
+    )
+      throw unavailable();
+    const materials = await publication.readVersionMaterials(version.uid).catch(() => {
+      throw unavailable();
+    });
+    const bundle = materials.bundle;
+    if (!bundle || bundle.manifest.files.length !== bundle.files.length) throw unavailable();
+    const verdict = await options.inspector
+      .inspectWorkflowClass({
+        mainModule: bundle.manifest.entrypoint,
+        modules: bundle.manifest.files.map((file, index) => ({
+          name: file.path,
+          digest: `sha256:${file.sha256}`,
+          mediaType: file.mediaType,
+          bytes: new Uint8Array(bundle.files[index] as Uint8Array),
+        })),
+        className: resource.className,
+      })
+      .catch(() => {
+        throw unavailable();
+      });
+    if (verdict.outcome !== "valid") throw unavailable();
+    const stillCurrent = async (): Promise<boolean> => {
+      if (signal.aborted) return false;
+      try {
+        const [latest, latestServing] = await Promise.all([
+          captureResource(options.sql, options.targetKey, scope),
+          observeServing(resource.workerUid, options.targetKey),
+        ]);
+        return (
+          latest.vector === resource.vector &&
+          canonicalJson(latestServing as JsonObject) ===
+            canonicalJson(serving as unknown as JsonObject) &&
+          (await publication.stillCurrent()) &&
+          !signal.aborted
+        );
+      } catch {
+        return false;
+      }
+    };
+    if (!(await stillCurrent())) throw unavailable();
+    return {
+      resource,
+      serving,
+      snapshot: structuredClone(snapshot),
+      version: structuredClone(version),
+      materials: { bundle: structuredClone(bundle) },
+      stillCurrent,
+    };
+  };
+}

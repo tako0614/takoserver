@@ -1,9 +1,11 @@
 import {
   type Clock,
+  createV2WorkflowResourceAuthority,
   createWorkflowRuntime,
   type JsonObject,
   type Row,
   type Sql,
+  type V2WorkflowResourceAuthority,
   type WorkflowApplicationOutcome,
   type WorkflowDriver,
   type WorkflowExecutionHost,
@@ -47,12 +49,20 @@ const host: WorkflowExecutionHost = {
 };
 
 /** A downstream package consumer can implement the neutral ports without internals. */
-export function createPackageOnlyRuntime(): WorkflowRuntime {
+export function createPackageOnlyRuntime(
+  v2Authority: boolean | V2WorkflowResourceAuthority = false,
+): WorkflowRuntime {
   return createWorkflowRuntime({
     sql,
     clock,
     randomId: () => "a".repeat(64),
     waitUntil: async (_epochMs, _signal) => undefined,
     host,
+    ...(v2Authority
+      ? {
+          v2ResourceAuthority:
+            v2Authority === true ? createV2WorkflowResourceAuthority(sql) : v2Authority,
+        }
+      : {}),
   });
 }

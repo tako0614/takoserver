@@ -7,6 +7,15 @@
  */
 export type { JsonObject, Sql } from "../ports.ts";
 export {
+  createV2ActorBindingAuthority,
+  type V2ActorBindingClaim,
+  type V2ActorBindingGraphPort,
+  type V2ActorBindingPhysicalPort,
+  type V2ActorBindingResolution,
+  type V2ActorBindingTarget,
+  type V2ActorBindingVersionIdentitySource,
+} from "./actor-binding-authority.ts";
+export {
   createV2ActorNamespaceForm,
   type V2ActorAcceptedOperationRuntimeObserver,
   type V2ActorNamespacePhysicalPort,
@@ -239,3 +248,15 @@ export {
   type V2WorkerVersionPrivateIdentity,
   type V2WorkerVersionSealedInputs,
 } from "./worker-version-configured-inputs.ts";
+export {
+  createV2WorkflowBindingAuthority,
+  type V2WorkflowBindingClaim,
+  type V2WorkflowBindingResolution,
+  type V2WorkflowBindingTarget,
+  type V2WorkflowBindingVersionIdentitySource,
+} from "./workflow-binding-authority.ts";
+export {
+  createV2WorkflowSelectedMaterials,
+  type V2WorkflowAcceptedResource,
+  type V2WorkflowServingObservation,
+} from "./workflow-selected-materials.ts";

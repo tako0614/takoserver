@@ -18,6 +18,7 @@ import {
 import { DURABLE_WORKFLOW_BACKEND_ID } from "../src/takoform-v2/workflow-backend.ts";
 import { createV2WorkflowForwardRuntime } from "../src/takoform-v2/workflow-forward-runtime.ts";
 import { createV2WorkflowNativeSelection } from "../src/takoform-v2/workflow-native-selection.ts";
+import { createV2WorkflowSelectedMaterials } from "../src/takoform-v2/workflow-selected-materials.ts";
 import type { WorkflowRunIdentity } from "../src/workflow-execution.ts";
 
 const PRINCIPAL = "org:workflow-native";
@@ -42,7 +43,7 @@ const identity: WorkflowRunIdentity = {
   deadlineAt: Date.now() + 60_000,
 };
 
-function fixture() {
+function fixture(basisPoint: () => number = () => 7) {
   const db = new Database(":memory:");
   migrateSqlite(db);
   const sql = createSqliteSql(db);
@@ -280,10 +281,14 @@ function fixture() {
     },
     publicationState,
     inspector,
-    basisPoint: () => 7,
+    basisPoint,
   });
   return {
     db,
+    sql,
+    owner,
+    publicationState,
+    inspector,
     select,
     selected,
     snapshot,
@@ -303,6 +308,128 @@ function fixture() {
     },
   };
 }
+
+test("accepted Workflow graph yields one verified selected Version and revokes on Resource deletion", async () => {
+  const f = fixture();
+  try {
+    const select = createV2WorkflowSelectedMaterials({
+      sql: f.sql,
+      targetKey: TARGET,
+      publicationState: f.publicationState,
+      inspector: f.inspector,
+    });
+    const selected = await select(
+      identity,
+      new AbortController().signal,
+      () => f.owner.observeServing(),
+      7,
+    );
+    expect(selected.version.uid).toBe(VERSION_UID);
+    expect(selected.snapshot.sourceOperationId).toBe(SOURCE_OPERATION);
+    expect(selected.resource.className).toBe("ReportWorkflow");
+    expect(selected.materials.bundle?.files[0]).toEqual(source);
+    expect(await selected.stillCurrent()).toBe(true);
+    f.servingHostnames.push("changed.example.test");
+    expect(await selected.stillCurrent()).toBe(false);
+    f.servingHostnames.splice(0);
+    f.db.query("UPDATE tf_v2_resources SET phase = 'deleting' WHERE uid = ?").run(WORKFLOW_UID);
+    expect(await selected.stillCurrent()).toBe(false);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("Workflow material projection retains owned code without copying static asset payload", async () => {
+  const f = fixture();
+  try {
+    let assetReads = 0;
+    let originalCode: Uint8Array | undefined;
+    const resolve = f.publicationState.resolveCurrentServing;
+    f.publicationState.resolveCurrentServing = async (input) => {
+      const publication = await resolve(input);
+      return {
+        ...publication,
+        async readVersionMaterials() {
+          const materials = await publication.readVersionMaterials();
+          originalCode = materials.bundle.files[0];
+          Object.defineProperty(materials, "assets", {
+            enumerable: true,
+            get() {
+              assetReads += 1;
+              return { files: [new Uint8Array(256)] };
+            },
+          });
+          return materials;
+        },
+      };
+    };
+    const select = createV2WorkflowSelectedMaterials({
+      sql: f.sql,
+      targetKey: TARGET,
+      publicationState: f.publicationState,
+      inspector: f.inspector,
+    });
+    const selected = await select(
+      identity,
+      new AbortController().signal,
+      () => f.owner.observeServing(),
+      7,
+    );
+    expect(assetReads).toBe(0);
+    expect(Object.hasOwn(selected.materials, "assets")).toBe(false);
+    if (!originalCode) throw new Error("missing fixture code");
+    originalCode.fill(0);
+    expect(selected.materials.bundle?.files[0]).toEqual(source);
+    expect(await selected.stillCurrent()).toBe(true);
+    f.setPublicationCurrent(false);
+    expect(await selected.stillCurrent()).toBe(false);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("selected Workerd site never relabels accepted Workflow A after caller scope mutates to B", async () => {
+  const f = fixture();
+  try {
+    let release!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const atOwner = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const selectOwner = f.owner.selectWorkflowExecution;
+    f.owner.selectWorkflowExecution = async (input) => {
+      entered();
+      await held;
+      return selectOwner(input);
+    };
+    const mutable = { ...identity, scope: { ...identity.scope } };
+    const selected = f.select(mutable, new AbortController().signal);
+    await atOwner;
+    mutable.scope.workflowResourceUid = "workflow-B";
+    release();
+    expect((await selected).selection.workflowResourceUid).toBe(WORKFLOW_UID);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("selection captures Workflow scope before a mutable basis-point callback", async () => {
+  const mutable = { ...identity, scope: { ...identity.scope } };
+  const f = fixture(() => {
+    mutable.scope.workflowResourceUid = "workflow-B";
+    return 7;
+  });
+  try {
+    expect(
+      (await f.select(mutable, new AbortController().signal)).selection.workflowResourceUid,
+    ).toBe(WORKFLOW_UID);
+  } finally {
+    f.db.close();
+  }
+});
 
 test("synthetic selected Version has no hostnames while accepted Worker serves an Endpoint", async () => {
   const f = fixture();

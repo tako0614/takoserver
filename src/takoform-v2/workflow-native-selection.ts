@@ -1,8 +1,6 @@
 import { createHash, randomInt } from "node:crypto";
-import { canonicalJson } from "../json.ts";
-import type { JsonObject, Sql } from "../ports.ts";
+import type { Sql } from "../ports.ts";
 import { v2SqliteWorkerProjection } from "../providers/selfhost-v2-sqlite-worker-projection.ts";
-import { compareSelfhostWeightedVersions } from "../selfhost-weighted-deployment.ts";
 import type { WorkerModuleSemanticInspector } from "../worker-module-inspection-contract.ts";
 import type {
   WorkerdPrivateServiceLease,
@@ -11,25 +9,14 @@ import type {
 import type { WorkerdWorkflowSelection } from "../workerd-workflow-preparation.ts";
 import { WorkflowRuntimeError } from "../workflow-driver.ts";
 import type { WorkflowRunIdentity } from "../workflow-execution.ts";
-import type { WorkflowScope } from "../workflow-instances.ts";
-import { DURABLE_WORKFLOW_FORM_URL, parseDurableWorkflowSpec } from "./forms/durable-workflow.ts";
-import { MODULE_WORKER_FORM_URL } from "./forms/worker-specs.ts";
 import { V2_SQLITE_ADAPTER_MODULE, V2_SQLITE_INTRINSIC_MODULE } from "./worker-code-runtime.ts";
-import type {
-  createV2WorkerPublicationState,
-  V2WorkerCurrentServingIdentity,
-} from "./worker-publication-state.ts";
-import { DURABLE_WORKFLOW_BACKEND_ID } from "./workflow-backend.ts";
+import type { createV2WorkerPublicationState } from "./worker-publication-state.ts";
+import {
+  createV2WorkflowSelectedMaterials,
+  type V2WorkflowServingObservation,
+} from "./workflow-selected-materials.ts";
 
-type CurrentServing = {
-  readonly kind: "serving";
-  readonly workerResourceUid: string;
-  readonly targetKey: string;
-  readonly sourceOperationId: string;
-  readonly generation: string;
-  readonly hostnames: readonly string[];
-  readonly versions: readonly { readonly workerVersionUid: string; readonly weight: number }[];
-};
+type CurrentServing = V2WorkflowServingObservation;
 
 /** Host-private owner port. Only the owner may read its current physical site. */
 export interface V2WorkflowNativeOwnerPort {
@@ -62,172 +49,13 @@ type PublicationState = Pick<
   "resolveCurrentServing"
 >;
 
+const unavailable = () => new WorkflowRuntimeError("host_unavailable");
+
 export interface V2WorkflowNativeSelection {
   readonly selection: WorkerdWorkflowSelection;
   readonly incarnationId: string;
   stillCurrent(): Promise<boolean>;
   acquirePrivateServiceBindings(signal: AbortSignal): Promise<WorkerdPrivateServiceLease>;
-}
-
-type ResourceCapture = {
-  readonly principal: string;
-  readonly space: string;
-  readonly workerUid: string;
-  readonly className: string;
-  readonly vector: string;
-};
-
-const unavailable = () => new WorkflowRuntimeError("host_unavailable");
-
-/** Read from the accepted Resource/Operation ledger, never v1 tf_resources. */
-async function captureResource(
-  sql: Sql,
-  targetKey: string,
-  scope: WorkflowScope,
-): Promise<ResourceCapture> {
-  const rows = await sql.query("SELECT * FROM tf_v2_resources WHERE uid = ?", [
-    scope.workflowResourceUid,
-  ]);
-  const row = rows.length === 1 ? rows[0] : undefined;
-  if (
-    !row ||
-    row.uid !== scope.workflowResourceUid ||
-    row.principal !== scope.tenantId ||
-    typeof row.space !== "string" ||
-    row.space.length === 0 ||
-    row.target_key !== targetKey ||
-    row.form_url !== DURABLE_WORKFLOW_FORM_URL ||
-    row.backend_id !== DURABLE_WORKFLOW_BACKEND_ID ||
-    row.deleted_at !== null ||
-    !["idle", "pending"].includes(String(row.phase)) ||
-    typeof row.generation !== "number" ||
-    typeof row.observed_generation !== "number" ||
-    row.observed_generation < 1 ||
-    typeof row.last_operation !== "string" ||
-    typeof row.spec_json !== "string" ||
-    typeof row.observed_json !== "string"
-  )
-    throw unavailable();
-  const operations = await sql.query("SELECT * FROM tf_v2_operations WHERE id = ?", [
-    row.last_operation,
-  ]);
-  const currentOperation = operations.length === 1 ? operations[0] : undefined;
-  const pending = row.phase === "pending";
-  if (
-    !currentOperation ||
-    currentOperation.resource_uid !== row.uid ||
-    currentOperation.principal !== row.principal ||
-    currentOperation.backend_id !== row.backend_id ||
-    currentOperation.target_key !== targetKey ||
-    currentOperation.generation !== row.generation ||
-    currentOperation.accepted_spec_json !== row.spec_json ||
-    (pending
-      ? row.busy_operation !== currentOperation.id ||
-        row.generation <= row.observed_generation ||
-        currentOperation.action !== "update" ||
-        !["queued", "running", "waiting_input", "reconciling"].includes(
-          String(currentOperation.status),
-        )
-      : row.busy_operation !== null ||
-        row.generation !== row.observed_generation ||
-        !["create", "update"].includes(String(currentOperation.action)) ||
-        currentOperation.status !== "succeeded" ||
-        currentOperation.effect !== "complete")
-  )
-    throw unavailable();
-  const previous = pending
-    ? await sql.query(
-        `SELECT * FROM tf_v2_operations WHERE resource_uid = ? AND generation = ?
-         AND action IN ('create','update') AND status = 'succeeded' AND effect = 'complete'`,
-        [row.uid as string, row.observed_generation],
-      )
-    : operations;
-  const operation = previous.length === 1 ? previous[0] : undefined;
-  if (
-    !operation ||
-    operation.resource_uid !== row.uid ||
-    operation.principal !== row.principal ||
-    operation.backend_id !== row.backend_id ||
-    operation.target_key !== targetKey ||
-    operation.generation !== row.observed_generation ||
-    operation.accepted_spec_json !== row.spec_json
-  )
-    throw unavailable();
-  let spec: ReturnType<typeof parseDurableWorkflowSpec>;
-  try {
-    const observed: unknown = JSON.parse(row.observed_json);
-    if (
-      !observed ||
-      typeof observed !== "object" ||
-      Array.isArray(observed) ||
-      !("ready" in observed) ||
-      observed.ready !== true
-    )
-      throw unavailable();
-    spec = parseDurableWorkflowSpec(JSON.parse(row.spec_json));
-  } catch {
-    throw unavailable();
-  }
-  const referenceOperations = pending ? [operation, currentOperation] : [operation];
-  const [referenceSnapshots, edges, workers] = await Promise.all([
-    Promise.all(
-      referenceOperations.map(async (sourceOperation) => {
-        const [sets, references] = await Promise.all([
-          sql.query("SELECT * FROM tf_v2_operation_reference_sets WHERE operation_id = ?", [
-            sourceOperation.id as string,
-          ]),
-          sql.query("SELECT * FROM tf_v2_operation_references WHERE operation_id = ?", [
-            sourceOperation.id as string,
-          ]),
-        ]);
-        const set = sets.length === 1 ? sets[0] : undefined;
-        const reference = references.length === 1 ? references[0] : undefined;
-        if (
-          set?.sealed !== 1 ||
-          reference?.target_uid !== spec.worker.resourceUid ||
-          reference.form_url !== MODULE_WORKER_FORM_URL ||
-          reference.readiness !== "observed" ||
-          reference.target_spec_path !== null ||
-          reference.target_spec_equals !== null
-        )
-          throw unavailable();
-        return { set, reference };
-      }),
-    ),
-    sql.query("SELECT * FROM tf_v2_resource_references WHERE target_uid = ? AND referrer_uid = ?", [
-      spec.worker.resourceUid,
-      row.uid as string,
-    ]),
-    sql.query("SELECT * FROM tf_v2_resources WHERE uid = ?", [spec.worker.resourceUid]),
-  ]);
-  const edge = edges.length === 1 ? edges[0] : undefined;
-  const worker = workers.length === 1 ? workers[0] : undefined;
-  if (
-    edge?.target_uid !== spec.worker.resourceUid ||
-    edge.referrer_uid !== row.uid ||
-    worker?.form_url !== MODULE_WORKER_FORM_URL ||
-    worker.principal !== row.principal ||
-    worker.space !== row.space ||
-    worker.deleted_at !== null ||
-    !["idle", "pending"].includes(String(worker.phase)) ||
-    typeof worker.observed_generation !== "number" ||
-    worker.observed_generation < 1
-  )
-    throw unavailable();
-  return {
-    principal: row.principal as string,
-    space: row.space,
-    workerUid: spec.worker.resourceUid,
-    className: spec.className,
-    vector: canonicalJson({
-      resource: row as JsonObject,
-      operation: operation as JsonObject,
-      pendingOperation: pending ? (currentOperation as JsonObject) : null,
-      referenceSnapshots: referenceSnapshots as unknown as JsonObject,
-      edge: edge as JsonObject,
-      worker: worker as JsonObject,
-    }),
-  };
 }
 
 function cloneSelected(input: WorkerdSelectedActiveVersion): WorkerdSelectedActiveVersion {
@@ -266,36 +94,24 @@ export function createV2WorkflowNativeSelection(options: {
   )
     throw new TypeError("v2 Workflow native selection needs accepted SQL and Host owner ports");
   const basisPoint = options.basisPoint ?? (() => randomInt(10_000));
+  const selectMaterials = createV2WorkflowSelectedMaterials(options);
   return async (
     identity: WorkflowRunIdentity,
     signal: AbortSignal,
   ): Promise<V2WorkflowNativeSelection> => {
     signal.throwIfAborted();
-    const scope = {
-      tenantId: identity.scope.tenantId,
-      workflowResourceUid: identity.scope.workflowResourceUid,
-    };
-    const resource = await captureResource(options.sql, options.targetKey, scope).catch(() => {
-      throw unavailable();
+    const capturedIdentity: WorkflowRunIdentity = Object.freeze({
+      scope: Object.freeze({
+        tenantId: identity.scope.tenantId,
+        workflowResourceUid: identity.scope.workflowResourceUid,
+      }),
+      instanceId: identity.instanceId,
+      executionId: identity.executionId,
+      createdAt: identity.createdAt,
+      epoch: identity.epoch,
+      owner: identity.owner,
+      deadlineAt: identity.deadlineAt,
     });
-    const owner = await options.ownerForWorkerUid(resource.workerUid).catch(() => {
-      throw unavailable();
-    });
-    if (
-      typeof owner?.observeServing !== "function" ||
-      typeof owner.selectWorkflowExecution !== "function"
-    )
-      throw unavailable();
-    const serving = await owner.observeServing({
-      workerResourceUid: resource.workerUid,
-      targetKey: options.targetKey,
-    });
-    if (
-      serving.kind !== "serving" ||
-      serving.workerResourceUid !== resource.workerUid ||
-      serving.targetKey !== options.targetKey
-    )
-      throw unavailable();
     const selectedBasisPoint = basisPoint();
     if (
       !Number.isSafeInteger(selectedBasisPoint) ||
@@ -303,14 +119,23 @@ export function createV2WorkflowNativeSelection(options: {
       selectedBasisPoint >= 10_000
     )
       throw new WorkflowRuntimeError("invalid_runtime_input");
-    let accumulatedWeight = 0;
-    const expectedWeighted = [...serving.versions]
-      .sort(compareSelfhostWeightedVersions)
-      .find((item) => {
-        accumulatedWeight += item.weight;
-        return selectedBasisPoint < accumulatedWeight;
-      });
-    if (!expectedWeighted) throw unavailable();
+    let owner: V2WorkflowNativeOwnerPort | undefined;
+    const materials = await selectMaterials(
+      capturedIdentity,
+      signal,
+      async (workerUid, targetKey) => {
+        owner ??= await options.ownerForWorkerUid(workerUid);
+        if (
+          typeof owner?.observeServing !== "function" ||
+          typeof owner.selectWorkflowExecution !== "function"
+        )
+          throw unavailable();
+        return owner.observeServing({ workerResourceUid: workerUid, targetKey });
+      },
+      selectedBasisPoint,
+    );
+    if (!owner) throw unavailable();
+    const { resource, serving, version } = materials;
     const owned = await owner.selectWorkflowExecution({
       workerUid: resource.workerUid,
       targetKey: options.targetKey,
@@ -320,37 +145,13 @@ export function createV2WorkflowNativeSelection(options: {
     if (
       owned.kind !== "selected" ||
       owned.sourceOperationId !== serving.sourceOperationId ||
-      owned.selected.workerVersionUid !== expectedWeighted.workerVersionUid ||
+      owned.selected.workerVersionUid !== version.uid ||
       typeof owned.incarnationId !== "string" ||
       owned.incarnationId.length === 0
     )
       throw unavailable();
     const selected = cloneSelected(owned.selected);
-    const expectedIdentity: V2WorkerCurrentServingIdentity = {
-      generation: serving.generation,
-      workerResourceUid: serving.workerResourceUid,
-      hostnames: serving.hostnames,
-      versions: serving.versions,
-    };
-    const publication = await options.publicationState.resolveCurrentServing({
-      workerUid: resource.workerUid,
-      targetKey: options.targetKey,
-      sourceOperationId: serving.sourceOperationId,
-      expectedIdentity,
-    });
-    if (publication.kind !== "ready") throw unavailable();
-    const snapshot = publication.snapshot;
-    const version = snapshot.deployment?.versions.find(
-      (item) => item.uid === selected.workerVersionUid,
-    );
     if (
-      snapshot.sourceOperationId !== serving.sourceOperationId ||
-      snapshot.worker.uid !== resource.workerUid ||
-      snapshot.worker.principal !== resource.principal ||
-      snapshot.worker.space !== resource.space ||
-      !snapshot.deployment ||
-      snapshot.deployment.spec.worker.resourceUid !== resource.workerUid ||
-      !version ||
       selected.workerResourceUid !== resource.workerUid ||
       selected.generation !== serving.generation ||
       selected.site.workerResourceUid !== resource.workerUid ||
@@ -364,10 +165,7 @@ export function createV2WorkflowNativeSelection(options: {
           .digest("hex")}`
     )
       throw unavailable();
-    const materials = await publication.readVersionMaterials(version.uid).catch(() => {
-      throw unavailable();
-    });
-    const bundle = materials.bundle;
+    const bundle = materials.materials.bundle;
     if (!bundle || bundle.manifest.files.length !== bundle.files.length) throw unavailable();
     let sqliteProjected: ReadonlyMap<string, Uint8Array>;
     try {
@@ -421,27 +219,12 @@ export function createV2WorkflowNativeSelection(options: {
       )
         throw unavailable();
     }
-    const verdict = await options.inspector.inspectWorkflowClass({
-      mainModule: bundle.manifest.entrypoint,
-      modules: bundle.manifest.files.map((file, index) => ({
-        name: file.path,
-        digest: `sha256:${file.sha256}`,
-        mediaType: file.mediaType,
-        bytes: new Uint8Array(bundle.files[index] as Uint8Array),
-      })),
-      className: resource.className,
-    });
-    if (verdict.outcome !== "valid") throw unavailable();
+    // Retain only the authority callback, not the selected material payload.
+    const materialsStillCurrent = materials.stillCurrent;
     const stillCurrent = async (): Promise<boolean> => {
       if (signal.aborted) return false;
       try {
-        const latest = await captureResource(options.sql, options.targetKey, scope);
-        return (
-          latest.vector === resource.vector &&
-          (await publication.stillCurrent()) &&
-          (await owned.stillCurrent()) &&
-          !signal.aborted
-        );
+        return (await materialsStillCurrent()) && (await owned.stillCurrent()) && !signal.aborted;
       } catch {
         return false;
       }
@@ -450,7 +233,7 @@ export function createV2WorkflowNativeSelection(options: {
     return {
       selection: {
         tenantId: resource.principal,
-        workflowResourceUid: scope.workflowResourceUid,
+        workflowResourceUid: capturedIdentity.scope.workflowResourceUid,
         workerResourceUid: selected.workerResourceUid,
         versionId: selected.versionId,
         workerVersionUid: selected.workerVersionUid,

@@ -40,6 +40,18 @@ export interface V2WorkflowBindingResolution {
   readonly vector: string;
 }
 
+/** Accepted immutable source used by the Host's native publication identity. */
+export interface V2WorkflowBindingVersionIdentitySource {
+  readonly principal: string;
+  readonly space: string;
+  readonly targetKey: string;
+  readonly workerUid: string;
+  readonly workerVersionUid: string;
+  readonly workerVersionOperationId: string;
+  readonly workerVersionGeneration: number;
+  readonly workflowBindings: readonly { readonly name: string; readonly resourceUid: string }[];
+}
+
 type Row = Record<string, unknown>;
 const current = (row: Row, op: Row): boolean =>
   op.resource_uid === row.uid &&
@@ -155,10 +167,22 @@ async function exactReferences(
 export function createV2WorkflowBindingAuthority(options: {
   readonly sql: Sql;
   readonly targetKey: string;
+  /** Host-owned identity derivation; native publication/readback is checked by the adapter. */
+  readonly versionIdentity?: (source: V2WorkflowBindingVersionIdentitySource) => Promise<string>;
 }) {
   if (!options?.sql || !options.targetKey)
     throw new TypeError("Workflow Binding authority is required");
   const { sql, targetKey } = options;
+  const versionIdentity =
+    options.versionIdentity ??
+    (async (source: V2WorkflowBindingVersionIdentitySource) => {
+      const digest = await bytesDigest(
+        new TextEncoder().encode(
+          `${source.workerVersionUid}\u0000${source.workerVersionGeneration}`,
+        ),
+      );
+      return `v2-${digest.slice("sha256:".length)}`;
+    });
 
   async function captureTarget(
     source: V2WorkflowBindingTarget,
@@ -286,10 +310,28 @@ export function createV2WorkflowBindingAuthority(options: {
       sourceGeneration > row.observed_generation
     )
       return null;
-    const digest = await bytesDigest(
-      new TextEncoder().encode(`${claim.workerVersionUid}\u0000${sourceGeneration}`),
+    const expectedIdentity = await versionIdentity(
+      Object.freeze({
+        principal: claim.principal,
+        space: claim.space,
+        targetKey: claim.targetKey,
+        workerUid: claim.workerUid,
+        workerVersionUid: claim.workerVersionUid,
+        workerVersionOperationId: claim.workerVersionOperationId,
+        workerVersionGeneration: sourceGeneration,
+        workflowBindings: Object.freeze(
+          spec.workflowBindings.map((binding) =>
+            Object.freeze({ name: binding.name, resourceUid: binding.resource.resourceUid }),
+          ),
+        ),
+      }),
     );
-    if (claim.nativeVersionId !== `v2-${digest.slice("sha256:".length)}`) return null;
+    if (
+      typeof expectedIdentity !== "string" ||
+      !expectedIdentity ||
+      claim.nativeVersionId !== expectedIdentity
+    )
+      return null;
     if (
       !(await exactReferences(
         sql,

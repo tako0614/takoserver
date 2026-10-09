@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
   createV2ActorNamespaceGraphAuthority,
@@ -370,6 +371,137 @@ test("held Namespace PUT has an exact private graph without opening ordinary bus
         leaseToken,
       }),
     ).toBeNull();
+  } finally {
+    f.db.close();
+  }
+});
+
+test("held Namespace DELETE proves its prior registered graph without granting delivery", async () => {
+  const f = fixture();
+  const scope = { tenantId: PRINCIPAL, namespaceResourceUid: NAMESPACE };
+  const reader = createV2ActorNamespaceSqlGraphReader({ sql: f.sql, targetKey: TARGET });
+  const leaseToken = "d".repeat(64);
+  try {
+    const spec = JSON.stringify({ worker: { resourceUid: WORKER }, className: "CounterActor" });
+    f.db
+      .query(
+        `INSERT INTO tf_v2_operations
+       (id, resource_uid, principal, replay_key, request_fingerprint,
+        action, generation, status, effect, created_at, updated_at,
+        retain_until, backend_id, target_key, backend_key, accepted_spec_json,
+        dispatch_possible, lease_token, lease_until_ms)
+       VALUES (?, ?, ?, 'delete-replay', 'delete-fingerprint', 'delete', 2,
+         'reconciling', 'unknown', '2026-10-07T00:00:00Z', '2026-10-07T00:00:00Z',
+         '2027-10-07T00:00:00Z', 'actor-fixture-backend', ?, 'delete-backend', ?,
+         1, ?, ?)`,
+      )
+      .run(DELETE_NAMESPACE, NAMESPACE, PRINCIPAL, TARGET, spec, leaseToken, Date.now() + 60_000);
+    f.db
+      .query(
+        `UPDATE tf_v2_resources SET generation = 2, phase = 'deleting',
+       busy_operation = ?, last_operation = ? WHERE uid = ?`,
+      )
+      .run(DELETE_NAMESPACE, DELETE_NAMESPACE, NAMESPACE);
+    const operation = { operationId: DELETE_NAMESPACE, leaseToken };
+    expect(await reader.readGraph(scope)).toBeNull();
+    expect(await reader.readAcceptedOperationGraph(scope, operation)).toBeNull();
+    const claim = await reader.readAcceptedDeleteOperation(scope, operation);
+    expect(claim).toMatchObject({
+      scope,
+      space: SPACE,
+      backendId: "actor-fixture-backend",
+      workerUid: WORKER,
+      className: "CounterActor",
+      operationId: DELETE_NAMESPACE,
+      registeredOperationId: CREATE_NAMESPACE,
+      registeredGeneration: 1,
+      generation: 2,
+    });
+    if (!claim) throw new Error("expected held DELETE claim");
+    const delayedReader = () => {
+      let enter!: () => void;
+      let release!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        enter = resolve;
+      });
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const delayedSql: Sql = {
+        ...f.sql,
+        async query(statement, params) {
+          enter();
+          await released;
+          return f.sql.query(statement, params);
+        },
+      };
+      const options: { sql: Sql; targetKey: string } = { sql: delayedSql, targetKey: TARGET };
+      return {
+        reader: createV2ActorNamespaceSqlGraphReader(options),
+        options,
+        entered,
+        release: () => release(),
+      };
+    };
+    const delayedScope = delayedReader();
+    const mutableScope = { ...scope };
+    const pendingScope = delayedScope.reader.readAcceptedDeleteOperation(mutableScope, operation);
+    await delayedScope.entered;
+    mutableScope.tenantId = "org:foreign";
+    mutableScope.namespaceResourceUid = "foreign-namespace";
+    delayedScope.release();
+    const scopeClaim = await pendingScope;
+    expect(scopeClaim?.scope).toEqual(scope);
+    expect(scopeClaim?.authorityKey).toBe(claim.authorityKey);
+    const delayedOperation = delayedReader();
+    const mutableOperation = { ...operation };
+    const pendingOperation = delayedOperation.reader.readAcceptedDeleteOperation(
+      scope,
+      mutableOperation,
+    );
+    await delayedOperation.entered;
+    mutableOperation.operationId = "foreign-operation";
+    mutableOperation.leaseToken = "foreign-lease";
+    delayedOperation.release();
+    const operationClaim = await pendingOperation;
+    expect(operationClaim?.operationId).toBe(operation.operationId);
+    expect(operationClaim?.leaseToken).toBe(operation.leaseToken);
+    expect(operationClaim?.authorityKey).toBe(claim.authorityKey);
+    const delayedTarget = delayedReader();
+    const pendingTarget = delayedTarget.reader.readAcceptedDeleteOperation(scope, operation);
+    await delayedTarget.entered;
+    delayedTarget.options.targetKey = "foreign-target";
+    delayedTarget.release();
+    expect((await pendingTarget)?.authorityKey).toBe(claim.authorityKey);
+    const mutableOptions: { sql: Sql; targetKey: string } = { sql: f.sql, targetKey: TARGET };
+    const fixedReader = createV2ActorNamespaceSqlGraphReader(mutableOptions);
+    mutableOptions.sql = {
+      ...f.sql,
+      async query() {
+        return [];
+      },
+    };
+    expect((await fixedReader.readAcceptedDeleteOperation(scope, operation))?.authorityKey).toBe(
+      claim.authorityKey,
+    );
+    expect(
+      await reader.readAcceptedDeleteOperation(scope, { ...operation, leaseToken: "wrong" }),
+    ).toBeNull();
+    expect(
+      await reader.readAcceptedDeleteOperation({ ...scope, tenantId: "org:foreign" }, operation),
+    ).toBeNull();
+    f.db
+      .query("UPDATE tf_v2_operations SET dispatch_possible = 0 WHERE id = ?")
+      .run(DELETE_NAMESPACE);
+    expect(await reader.readAcceptedDeleteOperation(scope, operation)).toBeNull();
+    f.db
+      .query("UPDATE tf_v2_operations SET dispatch_possible = 1 WHERE id = ?")
+      .run(DELETE_NAMESPACE);
+    f.db.query("UPDATE tf_v2_resources SET observed_generation = 0 WHERE uid = ?").run(NAMESPACE);
+    expect(await reader.readAcceptedDeleteOperation(scope, operation)).toBeNull();
+    f.db.query("UPDATE tf_v2_resources SET observed_generation = 1 WHERE uid = ?").run(NAMESPACE);
+    f.db.query("DELETE FROM tf_v2_resource_references WHERE referrer_uid = ?").run(NAMESPACE);
+    expect(await reader.readAcceptedDeleteOperation(scope, operation)).toBeNull();
   } finally {
     f.db.close();
   }

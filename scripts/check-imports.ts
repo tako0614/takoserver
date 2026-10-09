@@ -71,6 +71,9 @@ const LAYERS: readonly Layer[] = [
       "v2-queue-manager",
       "v2-actor-sql-graph",
       "v2-actor-physical-backend",
+      "v2-actor-binding-authority",
+      "v2-workflow-binding-authority",
+      "v2-workflow-selected-materials",
     ],
   },
   {
@@ -125,9 +128,24 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "v2-contract", "v2-form", "v2-workflow-manager"],
   },
   {
+    // Accepted Workflow graph and held class bytes, shared by Workerd and WfP.
+    // Physical sites, private leases and Cloudflare native readback stay outside.
+    name: "v2-workflow-selected-materials",
+    match: /^src\/takoform-v2\/workflow-selected-materials\.ts$/u,
+    may: ["core", "domain", "app", "v2-form", "v2-runtime", "v2-workflow-manager"],
+  },
+  {
     name: "v2-workflow-native-selection",
     match: /^src\/takoform-v2\/workflow-native-selection\.ts$/u,
-    may: ["core", "domain", "adapter", "app", "v2-form", "v2-runtime", "v2-workflow-manager"],
+    may: [
+      "core",
+      "domain",
+      "adapter",
+      "app",
+      "v2-form",
+      "v2-runtime",
+      "v2-workflow-selected-materials",
+    ],
   },
   {
     name: "v2-workflow-forward-runtime",
@@ -231,13 +249,22 @@ const LAYERS: readonly Layer[] = [
     // never broadens pure Form or generic v2 runtime access to app modules.
     name: "v2-actor-physical-backend",
     match: /^src\/takoform-v2\/actor-namespace-backend\.ts$/u,
-    may: ["core", "app", "native-contract", "v2-contract", "v2-form", "v2-actor-admission"],
+    may: [
+      "core",
+      "app",
+      "native-contract",
+      "v2-contract",
+      "v2-form",
+      "v2-actor-admission",
+      "v2-actor-sql-graph",
+    ],
   },
   {
     // Exact v2 accepted-reference adapter for the existing physical Actor port.
     name: "v2-actor-binding-authority",
     match: /^src\/takoform-v2\/actor-binding-authority\.ts$/u,
-    may: ["core", "app", "v2-form", "v2-actor-physical-backend"],
+    // Pure scope/graph types permit provider adapters without a self-host runtime import.
+    may: ["core", "app", "v2-form", "v2-actor-physical-backend", "native-contract"],
   },
   {
     // Outer Host-private v2 Actor forward boot, never a pure Form/parser layer.
