@@ -3,8 +3,11 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Miniflare } from "miniflare";
+import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
+import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { WORKER_CRON_TRIGGER_FORM_URL } from "../src/takoform-v2/forms/worker-cron-trigger.ts";
 import {
@@ -1176,3 +1179,184 @@ test("fails closed when the selected Worker Version lacks the scheduled handler"
     db.close();
   }
 });
+
+test("real D1 preserves an 0088 Cron match, records a new match, and refuses graph drift", async () => {
+  const source = openDb();
+  const graph = seedGraph(source);
+  const delivery: WorkerCronTriggerDelivery = {
+    async invokeScheduled() {
+      return { kind: "handler_resolved", workerVersionUid: graph.versionUid };
+    },
+  };
+  expect(
+    (
+      await runWorkerCronTriggerTick({
+        sql: createSqliteSql(source),
+        now: () => new Date(MATCH_AT + 10_000),
+        delivery,
+        targetKey: TARGET_KEY,
+      })
+    ).recorded,
+  ).toBe(1);
+  const runtime = new Miniflare({
+    workers: [
+      {
+        config: {
+          name: "v2-cron-scheduler-d1-test",
+          type: "worker",
+          compatibilityDate: "2026-08-18",
+          manifest: {
+            mainModule: "worker.js",
+            modules: {
+              "worker.js": {
+                type: "esm",
+                contents: "export default { fetch() { return new Response('ok'); } };",
+              },
+            },
+          },
+          env: { STATE_DB: { type: "d1", id: "v2-cron-scheduler-d1-test" } },
+          triggers: [],
+        },
+      },
+    ],
+  });
+  try {
+    const database = await runtime.getD1Database("STATE_DB");
+    for (const migration of MIGRATIONS.filter(({ name }) => /^00(?:7\d|8[0-8])_/.test(name))) {
+      for (const statement of splitD1Migration(migration.sql))
+        await database.prepare(statement).run();
+    }
+    const sql = createD1Sql(database);
+    await sql.run("DROP TRIGGER tf_v2_operation_reference_set_guard");
+    await sql.run("DROP TRIGGER tf_v2_operation_reference_guard");
+    const copyRows = async (table: string) => {
+      for (const raw of source.query(`SELECT * FROM ${table}`).all()) {
+        const row = raw as Record<string, string | number | null>;
+        const entries = Object.entries(row).filter(([name]) => name !== "acceptance_order");
+        await sql.run(
+          `INSERT INTO ${table} (${entries.map(([name]) => `"${name}"`).join(", ")}) VALUES (${entries.map(() => "?").join(", ")})`,
+          entries.map(([, value]) => value),
+        );
+      }
+    };
+    await copyRows("tf_v2_resources");
+    await copyRows("tf_v2_operations");
+    await copyRows("tf_v2_operation_reference_sets");
+    await copyRows("tf_v2_operation_references");
+    // Model a protected 0088 database with an already-recorded obligation.
+    await sql.run("DROP TRIGGER tf_v2_worker_cron_match_insert_guard");
+    await copyRows("tf_v2_worker_cron_matches");
+    const oldGuard = splitD1Migration(
+      MIGRATIONS.find(({ name }) => name === "0080_v2_worker_cron_trigger_matches.sql")?.sql ?? "",
+    ).find((statement) =>
+      statement.startsWith("CREATE TRIGGER tf_v2_worker_cron_match_insert_guard"),
+    );
+    if (!oldGuard) throw new Error("missing 0080 Cron match guard");
+    await sql.run(oldGuard);
+    const priorMatches = await sql.query("SELECT * FROM tf_v2_worker_cron_matches");
+    expect(priorMatches).toHaveLength(1);
+    for (const statement of splitD1Migration(
+      MIGRATIONS.find(({ name }) => name === "0089_v2_worker_cron_match_guard_depth.sql")?.sql ??
+        "",
+    ))
+      await database.prepare(statement).run();
+    expect(await sql.query("SELECT * FROM tf_v2_worker_cron_matches")).toEqual(priorMatches);
+    let tickAt = MATCH_AT + 70_000;
+    const now = () => new Date(tickAt);
+    const tick = () => runWorkerCronTriggerTick({ sql, now, delivery, targetKey: TARGET_KEY });
+    expect((await tick()).recorded).toBe(1);
+    expect(
+      await sql.query(
+        "SELECT trigger_uid, worker_uid, state FROM tf_v2_worker_cron_matches ORDER BY scheduled_time_ms",
+      ),
+    ).toEqual([
+      { trigger_uid: graph.cronUid, worker_uid: graph.workerUid, state: "resolved" },
+      { trigger_uid: graph.cronUid, worker_uid: graph.workerUid, state: "resolved" },
+    ]);
+
+    const racedTick = async (mutate: () => Promise<unknown>): Promise<void> => {
+      tickAt += 60_000;
+      let mutated = false;
+      const racedSql: Sql = {
+        ...sql,
+        async query(statement, params) {
+          const rows = await sql.query(statement, params);
+          if (
+            !mutated &&
+            statement.includes("FROM tf_v2_resources r") &&
+            statement.includes("ORDER BY r.uid")
+          ) {
+            mutated = true;
+            await mutate();
+          }
+          return rows;
+        },
+      };
+      const outcome = await runWorkerCronTriggerTick({
+        sql: racedSql,
+        now,
+        delivery,
+        targetKey: TARGET_KEY,
+      });
+      expect(mutated).toBe(true);
+      expect(outcome.recorded).toBe(0);
+    };
+    await racedTick(() =>
+      sql.run("UPDATE tf_v2_resources SET last_operation = ? WHERE uid = ?", [
+        graph.versionOperation,
+        graph.cronUid,
+      ]),
+    );
+    await sql.run("UPDATE tf_v2_resources SET last_operation = ? WHERE uid = ?", [
+      graph.cronOperation,
+      graph.cronUid,
+    ]);
+    await racedTick(() =>
+      sql.run("DELETE FROM tf_v2_resource_references WHERE target_uid = ? AND referrer_uid = ?", [
+        graph.workerUid,
+        graph.cronUid,
+      ]),
+    );
+    await sql.run("INSERT INTO tf_v2_resource_references VALUES (?, ?)", [
+      graph.workerUid,
+      graph.cronUid,
+    ]);
+    await racedTick(() =>
+      sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+        '{"ready":false}',
+        graph.versionUid,
+      ]),
+    );
+    expect(await sql.query("SELECT state FROM tf_v2_worker_cron_matches")).toEqual([
+      { state: "resolved" },
+      { state: "resolved" },
+    ]);
+  } finally {
+    source.close();
+    await runtime.dispose();
+  }
+});
+
+function splitD1Migration(source: string): readonly string[] {
+  const statements: string[] = [];
+  let rest = source.replace(/^\s*--.*$/gmu, "").trim();
+  while (rest.length > 0) {
+    if (/^CREATE\s+(?:TEMP\s+)?TRIGGER\b/iu.test(rest)) {
+      const end = /^END\s*;/imu.exec(rest);
+      if (!end || end.index === undefined) throw new Error("incomplete migration trigger");
+      const boundary = end.index + end[0].length;
+      statements.push(rest.slice(0, boundary).trim());
+      rest = rest.slice(boundary).trim();
+      continue;
+    }
+    const boundary = rest.indexOf(";");
+    if (boundary < 0) {
+      statements.push(rest);
+      break;
+    }
+    const statement = rest.slice(0, boundary).trim();
+    if (statement) statements.push(statement);
+    rest = rest.slice(boundary + 1).trim();
+  }
+  return statements;
+}

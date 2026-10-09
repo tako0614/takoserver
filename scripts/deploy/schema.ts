@@ -171,6 +171,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0086_v2_worker_service_invocation_custody.sql",
   "0087_v2_worker_cron_invocation_custody.sql",
   "0088_v2_worker_sqlite_external_drain.sql",
+  "0089_v2_worker_cron_match_guard_depth.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -349,8 +350,10 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:0375e932701b6596363468a784cdef91d56846f9e4a49cc65ff5890c0f2d0b7e",
   "0088_v2_worker_sqlite_external_drain.sql":
     "sha256:88bf294753e8bd43809634410c4a8648cb3e0500e7400d53ec4c8f17fae46c84",
+  "0089_v2_worker_cron_match_guard_depth.sql":
+    "sha256:eaed1f01e78de59c4488e5c882e984d6c5e5f9010e8e8bab51dac3a74f0fca7b",
 };
-// 0067-0088 are part of the exact source inventory only. None has an in-place apply wave.
+// 0067-0089 are part of the exact source inventory only. None has an in-place apply wave.
 const INTEGRATION_APPLY_CEILING_COUNT = 66;
 // Fresh production bootstrap is a distinct, still-frozen authority. Auditing
 // a new local source migration never silently adds it to this payload.
