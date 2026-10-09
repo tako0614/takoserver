@@ -80,9 +80,10 @@ describe("existing integration v2 0066 to 0088 selected wave", () => {
     expect(result).toMatchObject({
       fromMigration: "0066_cloudflare_managed_actor_kv_capability_claims.sql",
       throughMigration: "0088_v2_worker_sqlite_external_drain.sql",
-      pendingMigrations: source.names.slice(66),
+      pendingMigrations: source.names.slice(66, 88),
       readyForApply: false,
     });
+    expect(result.pendingMigrations).not.toContain(source.names[88]);
   });
 
   test("canonical partial prefixes remain status-only without publication proof", async () => {
@@ -90,9 +91,10 @@ describe("existing integration v2 0066 to 0088 selected wave", () => {
       const result = await runD1Schema(status, target, statusOptions(count));
       expect(result).toMatchObject({
         appliedMigrations: source.names.slice(0, count),
-        pendingMigrations: source.names.slice(count),
+        pendingMigrations: source.names.slice(count, 88),
         readyForApply: false,
       });
+      expect(result.pendingMigrations).not.toContain(source.names[88]);
     }
   });
 
