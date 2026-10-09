@@ -152,6 +152,7 @@ async function exercise(versionCount: 2 | 8): Promise<void> {
     };
     const digest = async (bytes: Uint8Array) => (await bytesDigest(bytes)).slice(7);
     const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
+    const bundles = [];
     const versions = [];
     for (let v = 0; v < versionCount; v += 1) {
       const files = [];
@@ -177,6 +178,7 @@ async function exercise(versionCount: 2 | 8): Promise<void> {
       const bundle = await create(WORKER_BUNDLE_FORM_URL, `bundle-${v}`, {
         artifact: { url: manifestUrl, sha256: await digest(manifest) },
       });
+      bundles.push(bundle);
       versions.push(
         await create(WORKER_VERSION_FORM_URL, `version-${v}`, {
           worker: { resourceUid: worker.resourceUid },
@@ -212,7 +214,9 @@ async function exercise(versionCount: 2 | 8): Promise<void> {
     if (ready.kind !== "ready") throw new Error(`${ready.code}: ${ready.message}`);
     const firstVersion = versions[0];
     const secondVersion = versions[1];
-    if (!firstVersion || !secondVersion) throw new Error("weighted fixture is incomplete");
+    const secondBundle = bundles[1];
+    if (!firstVersion || !secondVersion || !secondBundle)
+      throw new Error("weighted fixture is incomplete");
     for (let i = 0; i < 5; i += 1) expect(await ready.stillCurrent()).toBe(true);
     expect((await ready.readVersionMaterials(firstVersion.resourceUid)).bundle?.files.length).toBe(
       2,
@@ -231,9 +235,24 @@ async function exercise(versionCount: 2 | 8): Promise<void> {
       secondVersion.resourceUid,
     ]);
     expect(await ready.stillCurrent()).toBe(true);
+    const observed = (
+      await sql.query("SELECT observed_json FROM tf_v2_resources WHERE uid = ?", [
+        secondVersion.resourceUid,
+      ])
+    )[0]?.observed_json;
+    if (typeof observed !== "string") throw new Error("Version observation is unavailable");
     await sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
       JSON.stringify({ ready: false, resolvedBindings: false, bundleVerified: false }),
       secondVersion.resourceUid,
+    ]);
+    expect(await ready.stillCurrent()).toBe(false);
+    await sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+      observed,
+      secondVersion.resourceUid,
+    ]);
+    expect(await ready.stillCurrent()).toBe(true);
+    await sql.run("DELETE FROM tf_v2_artifact_chunks WHERE resource_uid = ? AND file_index = 1", [
+      secondBundle.resourceUid,
     ]);
     expect(await ready.stillCurrent()).toBe(false);
   } finally {
