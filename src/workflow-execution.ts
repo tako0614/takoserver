@@ -958,6 +958,15 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     }
 
     const driver: WorkflowDriver = {
+      async stopBarrier() {
+        // A physical stop may originate outside finish()/park().  Closing the
+        // mutation gate alone would leave the outer application waiting on
+        // interrupted forever; report a typed Host failure on that path.
+        if (!finishing) failInfrastructure(new WorkflowRuntimeError("host_unavailable"));
+        // finish()/park() already own their outcome.  In every case the Host
+        // must not acknowledge stop while an accepted mutation is unresolved.
+        await drainMutations();
+      },
       do(prepareName, preparePending) {
         return serialize(async () => {
           const rawName = await prepareName();

@@ -74,10 +74,12 @@ function fixture(
       signal: ReturnType<typeof latch<WorkflowApplicationOutcome>>;
     }
   >();
+  let openedIdentity: WorkflowRunIdentity | undefined;
   const hooks = {
     application: async (_driver: WorkflowDriver): Promise<JsonObject | undefined> => undefined,
     beforeOpen: async (): Promise<void> => undefined,
     beforeStop: async (): Promise<void> => undefined,
+    afterStop: (): void => undefined,
     beforeExtend: async (): Promise<void> => undefined,
     outcome: undefined as WorkflowApplicationOutcome | undefined,
   };
@@ -87,6 +89,7 @@ function fixture(
     async openPaused(identity, _input, hardDeadline) {
       calls.opened += 1;
       await hooks.beforeOpen();
+      openedIdentity = identity;
       const execution = {
         deadline: hardDeadline,
         stopped: false,
@@ -129,6 +132,7 @@ function fixture(
       if (!execution) return "not_registered";
       execution.stopped = true;
       execution.signal.reject(new WorkflowRuntimeError("host_unavailable"));
+      hooks.afterStop();
       return "stopped";
     },
   };
@@ -163,6 +167,10 @@ function fixture(
     runtime,
     hooks,
     calls,
+    async stopCurrent() {
+      if (!openedIdentity) throw new Error("no opened Workflow run");
+      return host.stop(openedIdentity, "lease_lost");
+    },
     async create(id = "instance") {
       await runtime.instances.create(SCOPE, { id });
     },
@@ -1849,6 +1857,128 @@ describe("internal Workflow execution coordinator", () => {
       count: 0,
     });
     await f.runtime.instances.terminate(SCOPE, "instance");
+  });
+
+  test("an external stop waits for a held step commit before acknowledgement", async () => {
+    const committing = latch<void>();
+    const releaseCommit = latch<void>();
+    const f = fixture((sql) => ({
+      ...sql,
+      async run(statement, params) {
+        if (statement.includes("UPDATE tf_workflow_steps SET state = 'complete'")) {
+          committing.resolve();
+          await releaseCommit.promise;
+        }
+        return sql.run(statement, params);
+      },
+    }));
+    await f.create();
+    let driver!: WorkflowDriver;
+    f.hooks.application = async (step) => {
+      driver = step;
+      await step.do(
+        () => "held-commit",
+        () => ({ retryDelaysSeconds: [], effect: () => ({ committed: true }) }),
+      );
+      return { completed: true };
+    };
+    const run = f.runtime.runOne(SCOPE, "instance");
+    void run.catch(() => undefined);
+    await committing.promise;
+    f.hooks.beforeStop = async () => {
+      await driver.stopBarrier?.();
+    };
+    let acknowledged = false;
+    f.hooks.afterStop = () => {
+      acknowledged = true;
+    };
+    const termination = f.runtime.instances.terminate(SCOPE, "instance");
+    await flush();
+    const earlyAck = acknowledged;
+    let lateEffects = 0;
+    void driver.do(
+      () => "late-after-stop",
+      () => ({ retryDelaysSeconds: [], effect: () => ({ count: ++lateEffects }) }),
+    );
+    releaseCommit.resolve();
+    await termination;
+    await expect(run).rejects.toMatchObject({ code: "host_unavailable" });
+    expect(earlyAck).toBe(false);
+    expect(acknowledged).toBe(true);
+    expect(lateEffects).toBe(0);
+    expect(f.row()).toMatchObject({ status: "terminated", run_owner: null });
+  });
+
+  test.each(["sleep", "wait"] as const)(
+    "a %s park keeps its outcome when Host stop uses the driver barrier",
+    async (kind) => {
+      const f = fixture();
+      await f.create();
+      let driver!: WorkflowDriver;
+      f.hooks.application = async (step) => {
+        driver = step;
+        if (kind === "sleep")
+          await step.sleep(
+            () => "parked",
+            () => 60,
+          );
+        else
+          await step.waitForEvent(
+            () => "parked",
+            () => ({ type: "signal", timeoutSeconds: 60 }),
+          );
+        return undefined;
+      };
+      f.hooks.beforeStop = async () => {
+        await driver.stopBarrier?.();
+      };
+      expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+      expect(f.row()).toMatchObject({
+        status: kind === "sleep" ? "sleeping" : "waiting",
+        run_owner: null,
+      });
+    },
+  );
+
+  test("an external Host timeout settles its run and fences the old driver from a new epoch", async () => {
+    const f = fixture();
+    await f.create();
+    const entered = latch<void>();
+    let driver!: WorkflowDriver;
+    f.hooks.application = async (step) => {
+      driver = step;
+      entered.resolve();
+      return new Promise<JsonObject>(() => undefined);
+    };
+    f.hooks.beforeStop = async () => {
+      await driver.stopBarrier?.();
+    };
+    const first = f.runtime.runOne(SCOPE, "instance");
+    void first.catch(() => undefined);
+    await entered.promise;
+    expect(await f.stopCurrent()).toBe("stopped");
+    await expect(first).rejects.toMatchObject({ code: "host_unavailable" });
+    expect(f.row()).toMatchObject({ status: "running", run_owner: null });
+
+    const staleDriver = driver;
+    f.hooks.application = async (step) => {
+      driver = step;
+      return { resumed: true };
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "complete",
+      output: { resumed: true },
+    });
+    let lateEffects = 0;
+    void staleDriver.do(
+      () => "stale-epoch",
+      () => ({ retryDelaysSeconds: [], effect: () => ({ count: ++lateEffects }) }),
+    );
+    await flush();
+    expect(lateEffects).toBe(0);
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_steps").get()).toEqual({
+      count: 0,
+    });
   });
 
   test("a failed termination stop preserves its intent, owner and journal for retry", async () => {
