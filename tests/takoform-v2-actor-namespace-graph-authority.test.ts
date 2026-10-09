@@ -6,6 +6,7 @@ import {
   createV2ActorNamespaceGraphAuthority,
   hasAcceptedV2ActorIncarnationWithdrawal,
 } from "../src/takoform-v2/actor-namespace-graph-authority.ts";
+import { createV2ActorNamespaceSqlGraphReader } from "../src/takoform-v2/actor-namespace-sql-graph.ts";
 import { ACTOR_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/actor-namespace.ts";
 import {
   MODULE_WORKER_FORM_URL,
@@ -245,9 +246,48 @@ test("v2 Actor graph refuses an accepted Namespace without its sealed Worker ref
   }
 });
 
+test("portable v2 Actor SQL reader accepts the exact graph without a native owner", async () => {
+  const f = fixture();
+  const scope = { tenantId: PRINCIPAL, namespaceResourceUid: NAMESPACE };
+  const reader = createV2ActorNamespaceSqlGraphReader({ sql: f.sql, targetKey: TARGET });
+  try {
+    const current = await reader.readGraph(scope);
+    expect(current).toMatchObject({
+      scope,
+      space: SPACE,
+      workerUid: WORKER,
+      className: "CounterActor",
+      namespaceOperationId: CREATE_NAMESPACE,
+      workerOperationId: CREATE_WORKER,
+    });
+    if (!current) throw new Error("expected accepted graph");
+    expect(await reader.hasActiveDeployment(current)).toBe(false);
+    f.insert({
+      uid: "deployment-actor-authority",
+      name: "deployment-actor-authority",
+      form: WORKER_DEPLOYMENT_FORM_URL,
+      operationId: CREATE_DEPLOYMENT,
+      spec: { worker: { resourceUid: WORKER }, versions: [] },
+      observed: { ready: true, active: true },
+    });
+    expect(await reader.hasActiveDeployment(current)).toBe(true);
+    expect(await reader.stillCurrent(current)).toBe(true);
+    expect(
+      await reader.readGraph({ tenantId: "org:foreign", namespaceResourceUid: NAMESPACE }),
+    ).toBeNull();
+    f.db
+      .query("DELETE FROM tf_v2_resource_references WHERE referrer_uid = ? AND target_uid = ?")
+      .run(NAMESPACE, WORKER);
+    expect(await reader.stillCurrent(current)).toBe(false);
+  } finally {
+    f.db.close();
+  }
+});
+
 test("held Namespace PUT has an exact private graph without opening ordinary busy delivery", async () => {
   const f = fixture();
   const scope = { tenantId: PRINCIPAL, namespaceResourceUid: NAMESPACE };
+  const sqlGraph = createV2ActorNamespaceSqlGraphReader({ sql: f.sql, targetKey: TARGET });
   const authority = createV2ActorNamespaceGraphAuthority({
     sql: f.sql,
     targetKey: TARGET,
@@ -302,11 +342,25 @@ test("held Namespace PUT has an exact private graph without opening ordinary bus
         leaseToken: "b".repeat(64),
       }),
     ).toBeNull();
+    expect(
+      await sqlGraph.readAcceptedOperationGraph(scope, {
+        operationId: UPDATE_NAMESPACE,
+        leaseToken: "b".repeat(64),
+      }),
+    ).toBeNull();
     const held = await authority.readAcceptedOperationGraph(scope, {
       operationId: UPDATE_NAMESPACE,
       leaseToken,
     });
     expect(held).toMatchObject({ scope, workerUid: WORKER, className: "CounterActor" });
+    expect(
+      (
+        await sqlGraph.readAcceptedOperationGraph(scope, {
+          operationId: UPDATE_NAMESPACE,
+          leaseToken,
+        })
+      )?.authorityKey,
+    ).toBe(held?.authorityKey);
     f.db
       .query("DELETE FROM tf_v2_resource_references WHERE referrer_uid = ? AND target_uid = ?")
       .run(NAMESPACE, WORKER);

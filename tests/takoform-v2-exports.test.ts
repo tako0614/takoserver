@@ -25,6 +25,7 @@ import type {
   WorkerBundleCustody,
 } from "@takoserver/core/takoform-v2";
 import * as extension from "@takoserver/core/takoform-v2";
+import { createV2ActorNamespaceSqlGraphReader } from "../src/takoform-v2/actor-namespace-sql-graph.ts";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
 import { createV2HeldArtifactSource } from "../src/takoform-v2/forms/artifact-source.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
@@ -101,6 +102,7 @@ const RUNTIME_EXPORTS = [
   "createObjectBucketForm",
   "createObjectBucketWorkerBindingAuthority",
   "createV2EdgeKvNativeCustody",
+  "createV2ActorNamespaceSqlGraphReader",
   "createAtLeastOnceQueueForm",
   "createQueueWorkerBindingAuthority",
   "createQueueConsumerForm",
@@ -185,6 +187,7 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(extension.V2_QUEUE_BACKEND_ID).toBe(V2_QUEUE_BACKEND_ID);
   expect(extension.AT_LEAST_ONCE_QUEUE_FORM_URL).toBe(AT_LEAST_ONCE_QUEUE_FORM_URL);
   expect(extension.createV2EdgeKvNativeCustody).toBe(createV2EdgeKvNativeCustody);
+  expect(extension.createV2ActorNamespaceSqlGraphReader).toBe(createV2ActorNamespaceSqlGraphReader);
   expect(extension.createInternalV2ModuleWorkerForm).toBe(createInternalV2ModuleWorkerForm);
   expect(extension.createV2WorkerVersionConfiguredInputSealer).toBe(
     createV2WorkerVersionConfiguredInputSealer,

@@ -885,6 +885,18 @@ WebSocket upgrade, active same-spec update counts, and first active creation.
 These internal paths alone do not register ActorNamespace Form support or
 establish Hosted or ordinary-entry qualification.
 
+The accepted Namespace/Worker SQL graph check is also available as a
+Worker-compatible, read-only source extension. The self-host Actor authority
+uses that same reader; an operator-owned runtime can consume its exact graph
+and held-operation lease check without importing the Workerd process owner.
+The reader neither selects native bytes nor proves a physical Actor owner:
+after native/material awaits, callers must recheck the SQL graph and active
+Deployment before admitting delivery.
+`stillCurrent` checks only settled graphs. A create/reconcile caller holding a
+Namespace Operation must repeat `readAcceptedOperationGraph` with the same
+Operation ID and lease token after awaits, then compare its authority key.
+It cannot substitute the ordinary settled check for that leased proof.
+
 An Actor Binding may target a Namespace whose class is provided by a different
 Worker. Admission checks the caller's accepted Version and sealed reference
 separately from the Namespace's provider Worker, within the same authorized
