@@ -100,14 +100,18 @@ export function createV2WorkflowNativeSelection(options: {
     signal: AbortSignal,
   ): Promise<V2WorkflowNativeSelection> => {
     signal.throwIfAborted();
-    const capturedIdentity: WorkflowRunIdentity = {
-      ...identity,
-      scope: {
+    const capturedIdentity: WorkflowRunIdentity = Object.freeze({
+      scope: Object.freeze({
         tenantId: identity.scope.tenantId,
         workflowResourceUid: identity.scope.workflowResourceUid,
-      },
-    };
-    const workflowResourceUid = capturedIdentity.scope.workflowResourceUid;
+      }),
+      instanceId: identity.instanceId,
+      executionId: identity.executionId,
+      createdAt: identity.createdAt,
+      epoch: identity.epoch,
+      owner: identity.owner,
+      deadlineAt: identity.deadlineAt,
+    });
     const selectedBasisPoint = basisPoint();
     if (
       !Number.isSafeInteger(selectedBasisPoint) ||
@@ -227,7 +231,7 @@ export function createV2WorkflowNativeSelection(options: {
     return {
       selection: {
         tenantId: resource.principal,
-        workflowResourceUid,
+        workflowResourceUid: capturedIdentity.scope.workflowResourceUid,
         workerResourceUid: selected.workerResourceUid,
         versionId: selected.versionId,
         workerVersionUid: selected.workerVersionUid,
