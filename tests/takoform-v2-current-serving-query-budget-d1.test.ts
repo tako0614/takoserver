@@ -1,14 +1,15 @@
 import { expect, test } from "bun:test";
 import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { bytesDigest } from "../src/json.ts";
-import type { JsonObject, Sql } from "../src/ports.ts";
+import { bytesDigest, canonicalJson } from "../src/json.ts";
+import { type JsonObject, type Sql, SqlError } from "../src/ports.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
 import { createWorkerBundleHost } from "../src/takoform-v2/forms/worker-bundle-backend.ts";
 import {
   MODULE_WORKER_FORM_URL,
+  parseWorkerVersionSpec,
   WORKER_DEPLOYMENT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
@@ -17,7 +18,7 @@ import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-public
 
 const targetKey = "current-serving-budget-d1";
 
-async function exercise(versionCount: 2 | 8): Promise<void> {
+async function exercise(versionCount: 2 | 8, largeVars = false): Promise<void> {
   const runtime = new Miniflare({
     workers: [
       {
@@ -55,7 +56,28 @@ async function exercise(versionCount: 2 | 8): Promise<void> {
     const sql: Sql = {
       async query(statement, params) {
         count();
-        return base.query(statement, params);
+        const rows = await base.query(statement, params);
+        // Miniflare accepts oversized result rows. Apply D1's published row
+        // ceiling only to the new fence to catch JSON double-escaping here.
+        // This is not live D1 admission proof: the existing replay query also
+        // returns the large request fingerprint beside accepted_spec_json.
+        if (largeVars && statement.includes("SELECT kind, body FROM (")) {
+          for (const row of rows) {
+            const bytes = Object.entries(row).reduce(
+              (total, [key, value]) =>
+                total +
+                key.length +
+                (typeof value === "string"
+                  ? new TextEncoder().encode(value).byteLength
+                  : Array.isArray(value)
+                    ? value.length
+                    : 8),
+              0,
+            );
+            if (bytes > 2_000_000) throw new SqlError("unavailable", "D1 result row exceeds 2 MB");
+          }
+        }
+        return rows;
       },
       async run(statement, params) {
         count();
@@ -179,13 +201,28 @@ async function exercise(versionCount: 2 | 8): Promise<void> {
         artifact: { url: manifestUrl, sha256: await digest(manifest) },
       });
       bundles.push(bundle);
-      versions.push(
-        await create(WORKER_VERSION_FORM_URL, `version-${v}`, {
-          worker: { resourceUid: worker.resourceUid },
-          bundle: { resourceUid: bundle.resourceUid },
-          handlers: ["fetch"],
-        }),
-      );
+      const vars =
+        largeVars && v === 0
+          ? Object.fromEntries(
+              Array.from({ length: 64 }, (_, index) => [
+                `V${String(index).padStart(2, "0")}`,
+                "\\".repeat(7_950),
+              ]),
+            )
+          : {};
+      const spec = {
+        worker: { resourceUid: worker.resourceUid },
+        bundle: { resourceUid: bundle.resourceUid },
+        handlers: ["fetch"],
+        ...(largeVars && v === 0 ? { vars } : {}),
+      };
+      if (largeVars && v === 0) {
+        expect(parseWorkerVersionSpec(spec).vars).toHaveProperty("V00");
+        const specBytes = new TextEncoder().encode(canonicalJson(spec)).byteLength;
+        expect(specBytes).toBeGreaterThan(1_000_000);
+        expect(specBytes).toBeLessThanOrEqual(1_048_576);
+      }
+      versions.push(await create(WORKER_VERSION_FORM_URL, `version-${v}`, spec));
     }
     source.clear(); // Serving must use held bytes, not the external source.
     const deployment = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
@@ -217,7 +254,7 @@ async function exercise(versionCount: 2 | 8): Promise<void> {
     const secondBundle = bundles[1];
     if (!firstVersion || !secondVersion || !secondBundle)
       throw new Error("weighted fixture is incomplete");
-    for (let i = 0; i < 5; i += 1) expect(await ready.stillCurrent()).toBe(true);
+    for (let i = 0; i < (largeVars ? 1 : 5); i += 1) expect(await ready.stillCurrent()).toBe(true);
     expect((await ready.readVersionMaterials(firstVersion.resourceUid)).bundle?.files.length).toBe(
       2,
     );
@@ -268,6 +305,11 @@ test(
 test(
   "real D1 keeps eight weighted multi-file Versions within the Core query budget",
   () => exercise(8),
+  60_000,
+);
+test(
+  "the D1 fence keeps a Form-legal escaped Version spec below the result-row cap",
+  () => exercise(2, true),
   60_000,
 );
 

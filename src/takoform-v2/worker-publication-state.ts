@@ -415,9 +415,6 @@ const resourceColumns = [
   "observed_generation",
   "observed_at",
   "phase",
-  "spec_json",
-  "observed_json",
-  "output_json",
   "last_operation",
   "busy_operation",
   "deleted_at",
@@ -438,30 +435,28 @@ const operationColumns = [
   "backend_id",
   "target_key",
   "backend_key",
-  "accepted_spec_json",
   "dispatch_possible",
   "next_attempt_at_ms",
   "lease_token",
   "lease_until_ms",
   "error_code",
-  "error_message",
-  "result_observed_json",
-  "result_output_json",
   "private_inputs_present",
   "input_required_names_json",
   "input_required_reason",
   "acceptance_order",
 ] as const;
 function rowJson(alias: string, columns: readonly string[]): string {
-  // D1 permits at most 32 arguments to one SQL function. Both whole-row
-  // vectors fit as positional arrays (18 Resource / 28 Operation values),
-  // whereas json_object would double the argument count.
+  // D1 permits at most 32 arguments to one SQL function. Large JSON/text
+  // fields are emitted separately as raw scalar rows, not re-escaped here.
   return `json_array(${columns.map((column) => `${alias}.${column}`).join(", ")})`;
 }
 
 const currentServingFenceGraphSql = `
 WITH selected(uid) AS (SELECT value FROM json_each(?)),
      set_ids(id) AS (SELECT value FROM json_each(?)),
+     resource_fields(field) AS (VALUES ('meta'), ('spec_json'), ('observed_json'), ('output_json')),
+     operation_fields(field) AS (VALUES ('meta'), ('accepted_spec_json'),
+                               ('result_observed_json'), ('result_output_json'), ('error_message')),
      relevant_resources AS (
        SELECT r.* FROM tf_v2_resources r
        WHERE r.uid IN (SELECT uid FROM selected)
@@ -471,11 +466,22 @@ WITH selected(uid) AS (SELECT value FROM json_each(?)),
               AND r.deleted_at IS NULL
               AND json_extract(r.spec_json, '$.worker.resourceUid') = ?)
      )
-SELECT 'resource' AS kind, ${rowJson("r", resourceColumns)} AS body
-  FROM relevant_resources r
+SELECT 'resource:' || f.field AS kind, r.uid AS key,
+  CASE f.field
+    WHEN 'meta' THEN ${rowJson("r", resourceColumns)}
+    WHEN 'spec_json' THEN r.spec_json
+    WHEN 'observed_json' THEN r.observed_json
+    ELSE r.output_json END AS body
+  FROM relevant_resources r CROSS JOIN resource_fields f
 UNION ALL
-SELECT 'operation', ${rowJson("op", operationColumns)}
-  FROM tf_v2_operations op
+SELECT 'operation:' || f.field, op.id,
+  CASE f.field
+    WHEN 'meta' THEN ${rowJson("op", operationColumns)}
+    WHEN 'accepted_spec_json' THEN op.accepted_spec_json
+    WHEN 'result_observed_json' THEN op.result_observed_json
+    WHEN 'result_output_json' THEN op.result_output_json
+    ELSE op.error_message END
+  FROM tf_v2_operations op CROSS JOIN operation_fields f
   WHERE op.id = ? OR op.id IN (SELECT last_operation FROM relevant_resources)
      OR op.id IN (SELECT busy_operation FROM relevant_resources)
      OR op.id IN (SELECT id FROM set_ids)
@@ -484,36 +490,44 @@ SELECT 'operation', ${rowJson("op", operationColumns)}
                   AND r.observed_generation < op.generation
                   AND op.generation < r.generation AND op.effect IN ('partial', 'unknown'))
 UNION ALL
-SELECT 'reference_set', json_object('operation_id', s.operation_id, 'sealed', s.sealed)
+SELECT 'reference_set', s.operation_id,
+  json_object('operation_id', s.operation_id, 'sealed', s.sealed)
   FROM tf_v2_operation_reference_sets s WHERE s.operation_id IN (SELECT id FROM set_ids)
 UNION ALL
-SELECT 'reference', json_object('operation_id', ref.operation_id,
+SELECT 'reference', ref.operation_id || ':' || ref.target_uid,
+  json_object('operation_id', ref.operation_id,
   'target_uid', ref.target_uid, 'form_url', ref.form_url, 'readiness', ref.readiness,
   'target_spec_path', ref.target_spec_path, 'target_spec_equals', ref.target_spec_equals)
   FROM tf_v2_operation_references ref WHERE ref.operation_id IN (SELECT id FROM set_ids)
-ORDER BY kind, body`;
+ORDER BY kind, key`;
 
 const currentServingFenceRelationsSql = `
 WITH selected(uid) AS (SELECT value FROM json_each(?)),
      inbound(uid) AS (SELECT value FROM json_each(?)),
-     artifacts(uid) AS (SELECT value FROM json_each(?))
-SELECT 'edge' AS kind, json_object('target_uid', e.target_uid, 'referrer_uid', e.referrer_uid) AS body
+     artifacts(uid) AS (SELECT value FROM json_each(?)),
+     owner_fields(field) AS (VALUES ('meta'), ('observation_json'))
+SELECT 'edge' AS kind, e.target_uid || ':' || e.referrer_uid AS key,
+  json_object('target_uid', e.target_uid, 'referrer_uid', e.referrer_uid) AS body
   FROM tf_v2_resource_references e
   WHERE e.target_uid IN (SELECT uid FROM inbound)
      OR e.referrer_uid IN (SELECT uid FROM selected)
 UNION ALL
-SELECT 'owner', json_object('resource_uid', a.resource_uid, 'form_url', a.form_url,
-  'manifest_sha256', a.manifest_sha256, 'state', a.state,
-  'observation_json', a.observation_json, 'verified_operation_id', a.verified_operation_id)
-  FROM tf_v2_artifact_owners a WHERE a.resource_uid IN (SELECT uid FROM artifacts)
+SELECT 'owner:' || f.field, a.resource_uid,
+  CASE f.field WHEN 'meta' THEN
+    json_object('resource_uid', a.resource_uid, 'form_url', a.form_url,
+      'manifest_sha256', a.manifest_sha256, 'state', a.state,
+      'verified_operation_id', a.verified_operation_id)
+    ELSE a.observation_json END
+  FROM tf_v2_artifact_owners a CROSS JOIN owner_fields f
+  WHERE a.resource_uid IN (SELECT uid FROM artifacts)
 UNION ALL
-SELECT 'pending', json_object('present', EXISTS (
+SELECT 'pending', '', json_object('present', EXISTS (
   SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
     WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
       AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
       AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ? LIMIT 1))
 UNION ALL
-SELECT 'publisher', json_object('id', publisher.id,
+SELECT 'publisher', publisher.id, json_object('id', publisher.id,
   'acceptance_order', publisher.acceptance_order)
   FROM (SELECT op.id, op.acceptance_order FROM tf_v2_resources r
     JOIN tf_v2_operations op ON op.id = r.last_operation
@@ -524,13 +538,13 @@ SELECT 'publisher', json_object('id', publisher.id,
       AND r.busy_operation IS NULL
       AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
     ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2) publisher
-ORDER BY kind, body`;
+ORDER BY kind, key`;
 
 const currentServingFenceSql = `
-SELECT kind, body FROM (${currentServingFenceGraphSql})
+SELECT kind, key, body FROM (${currentServingFenceGraphSql})
 UNION ALL
-SELECT kind, body FROM (${currentServingFenceRelationsSql})
-ORDER BY kind, body`;
+SELECT kind, key, body FROM (${currentServingFenceRelationsSql})
+ORDER BY kind, key`;
 
 /** No separate desired-state ledger: every read starts from the accepted v2 Operation. */
 export function createV2WorkerPublicationState(options: {
@@ -595,15 +609,15 @@ export function createV2WorkerPublicationState(options: {
     ]);
     const graph = rows.filter(
       (row) =>
-        row.kind === "resource" ||
-        row.kind === "operation" ||
+        (typeof row.kind === "string" && row.kind.startsWith("resource:")) ||
+        (typeof row.kind === "string" && row.kind.startsWith("operation:")) ||
         row.kind === "reference_set" ||
         row.kind === "reference",
     );
     const relations = rows.filter(
       (row) =>
         row.kind === "edge" ||
-        row.kind === "owner" ||
+        (typeof row.kind === "string" && row.kind.startsWith("owner:")) ||
         row.kind === "pending" ||
         row.kind === "publisher",
     );
@@ -619,16 +633,53 @@ export function createV2WorkerPublicationState(options: {
       const found = new Set(rows.map((row) => (Array.isArray(row) ? row[0] : null)));
       return ids.every((id) => found.has(id));
     };
+    const hasCompleteRows = (
+      source: readonly Record<string, unknown>[],
+      noun: string,
+      rawFields: readonly string[],
+    ): boolean => {
+      const cells = new Map<string, unknown>();
+      for (const row of source) {
+        if (
+          typeof row.kind !== "string" ||
+          typeof row.key !== "string" ||
+          !Object.hasOwn(row, "body")
+        )
+          return false;
+        const identity = `${row.kind}\0${row.key}`;
+        if (cells.has(identity)) return false;
+        cells.set(identity, row.body);
+      }
+      const ids = source.filter((row) => row.kind === `${noun}:meta`).map((row) => row.key);
+      return ids.every(
+        (id) =>
+          typeof id === "string" &&
+          rawFields.every((field) => {
+            const identity = `${noun}:${field}\0${id}`;
+            const body = cells.get(identity);
+            return cells.has(identity) && (typeof body === "string" || body === null);
+          }),
+      );
+    };
     const referenceSets = values(graph, "reference_set");
-    const owners = values(relations, "owner");
+    const owners = values(relations, "owner:meta");
     const pending = values(relations, "pending");
     const publishers = values(relations, "publisher");
     if (
-      !hasFirst(values(graph, "resource"), selected) ||
-      !hasFirst(values(graph, "operation"), [
+      rows.length !== graph.length + relations.length ||
+      !hasFirst(values(graph, "resource:meta"), selected) ||
+      !hasFirst(values(graph, "operation:meta"), [
         current.sourceOperationId,
         ...initial.fence.referenceSetIds,
       ]) ||
+      !hasCompleteRows(graph, "resource", ["spec_json", "observed_json", "output_json"]) ||
+      !hasCompleteRows(graph, "operation", [
+        "accepted_spec_json",
+        "result_observed_json",
+        "result_output_json",
+        "error_message",
+      ]) ||
+      !hasCompleteRows(relations, "owner", ["observation_json"]) ||
       !initial.fence.referenceSetIds.every((id) =>
         referenceSets.some(
           (row) =>
