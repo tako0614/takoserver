@@ -892,6 +892,10 @@ and held-operation lease check without importing the Workerd process owner.
 The reader neither selects native bytes nor proves a physical Actor owner:
 after native/material awaits, callers must recheck the SQL graph and active
 Deployment before admitting delivery.
+`stillCurrent` checks only settled graphs. A create/reconcile caller holding a
+Namespace Operation must repeat `readAcceptedOperationGraph` with the same
+Operation ID and lease token after awaits, then compare its authority key.
+It cannot substitute the ordinary settled check for that leased proof.
 
 An Actor Binding may target a Namespace whose class is provided by a different
 Worker. Admission checks the caller's accepted Version and sealed reference

@@ -30,6 +30,11 @@ export interface V2ActorNamespaceSqlGraphReader {
   hasActiveDeployment(
     graph: Pick<V2ActorAcceptedSqlGraph, "scope" | "authorityKey" | "workerUid">,
   ): Promise<boolean>;
+  /**
+   * Rechecks a settled graph only. After an await in a held-operation path,
+   * repeat readAcceptedOperationGraph with the original operation ID and lease
+   * token, then compare authorityKey; stillCurrent cannot authorize that path.
+   */
   stillCurrent(graph: Pick<V2ActorAcceptedSqlGraph, "scope" | "authorityKey">): Promise<boolean>;
 }
 
