@@ -2082,6 +2082,33 @@ test("recovery tolerance requires the queued Operation to be the exact unstarted
   }
 });
 
+test("recovery tolerance admits only the queued successor's reserved edges, never an unrelated one", async () => {
+  const scenario = recoveryScenarios.find((item) => item.change === "deployment-retarget");
+  if (!scenario) throw new Error("missing scenario");
+  const f = fixture();
+  try {
+    const graph = await recoveryGraph(f, scenario);
+    const tolerant = { ...graph.input, tolerateUnstartedSuccessors: true };
+    // The queued retarget reserved an extra active edge to its new Version.
+    expect((await serve(f, tolerant)).kind).toBe("ready");
+    const bundle = f.db.query("SELECT uid FROM tf_v2_resources WHERE name = 'bundle'").get() as {
+      uid: string;
+    } | null;
+    if (!bundle) throw new Error("missing bundle");
+    // An edge neither the committed set nor the queued successor holds.
+    f.db
+      .query("INSERT INTO tf_v2_resource_references (target_uid, referrer_uid) VALUES (?, ?)")
+      .run(bundle.uid, graph.deployment.resourceUid);
+    expect(await serve(f, tolerant)).toMatchObject({ kind: "unresolved" });
+    f.db
+      .query("DELETE FROM tf_v2_resource_references WHERE target_uid = ? AND referrer_uid = ?")
+      .run(bundle.uid, graph.deployment.resourceUid);
+    expect((await serve(f, tolerant)).kind).toBe("ready");
+  } finally {
+    f.close();
+  }
+});
+
 test("a queued successor that settles becomes the only current serving source", async () => {
   const scenario = recoveryScenarios[0];
   if (!scenario) throw new Error("missing scenario");
