@@ -20,6 +20,24 @@ claim GA status.
    `TAKOSERVER_DATA_ROOT` persistent (default `.takoserver`); if `TAKOSERVER_DB`
    is external, include that database in backup and restore.
 
+   Choose a short data root, such as `/var/lib/takoserver`. At startup the Host
+   resolves `TAKOSERVER_DATA_ROOT` once to an absolute, canonical path: a
+   relative value, including the default, is relative to the working
+   directory, and symlinks in the existing part of the path are resolved. When
+   the result differs from the configured value, the process prints it. Actor
+   and Workflow runtimes bind private Unix sockets in `<data root>/s`, and a
+   Unix socket path is limited to about 100 bytes. The resolved data root
+   therefore may be at most 61 bytes whenever Actors or Workflows run. The
+   native Actor processes also bind sockets below `TMPDIR`, which may be at
+   most 73 bytes. If `TAKOSERVER_V2_WORKER_RUNTIME_BOOT` selects `actor` or
+   `workflow` and the root is longer, startup stops with a message that names
+   the variable, its length, and the maximum. Otherwise the Host starts, prints
+   that Actor admission is unavailable and why, and serves its other Forms. The
+   directories in `s/` are recreated at each start. Builds before this layout
+   used `actor-forward-sockets/` and the `*-private-sockets/` and
+   `workflow-temporary/` directories in `v2-runtime/` for the same purpose; a
+   stopped Host may delete them.
+
    Install locked dependencies and start the Bun entrypoint:
 
    ```sh
