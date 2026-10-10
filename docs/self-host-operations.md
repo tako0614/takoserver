@@ -271,8 +271,9 @@ This procedure prepares a cold copy of one Bun self-host installation. It is
 not a tested disaster-recovery guarantee: the repository has no operator
 snapshot/restore command, no restore mode that suppresses startup work, and no
 full live-operator restore drill. The tests below cover local readers and an
-optional isolated native Host restore; neither replaces an operator recovery
-drill.
+optional isolated native Host restore, and the ordinary journey native test
+restores a cold snapshot of a v2 installation (Worker, SQLite, Queue) to the
+same root; none of them replaces an operator recovery drill.
 
 ## What belongs to one installation
 
@@ -316,7 +317,8 @@ credential-bearing state.
    switch for a copy.
 3. With the installation quiescent, make a filesystem copy of the complete
    data root to the protected destination, preserving file contents,
-   directories, and restrictive permissions. If `TAKOSERVER_DB` is outside the
+   directories, hard links, ownership, and restrictive permissions (for
+   example with `cp -a`). If `TAKOSERVER_DB` is outside the
    root, copy its main file and any existing SQLite `-wal`, `-shm`, or rollback
    journal sidecars in the same stopped window. Do not copy a live SQLite file,
    copy only its main file while sidecars may be changing, or guess which
@@ -461,14 +463,29 @@ artifact Operation has durably staged only a prefix and Queue messages are in
 flight; restarts, replays the same key and checks that the Operation settles
 once, the Worker is still served without a client republish and every message
 has exactly one terminal ack (a rejected attempt is retried in its own batch);
-and finally deletes everything in reference order, with a refused premature
-delete on the way, and checks the artifact tables, the SQLite directory, the
-workerd children and TCP 443.
+takes a cold snapshot as in steps 2-3 of the cold snapshot below (stop every
+writer, copy the complete root with `cp -a`) while the Queue is drained and no
+Operation is pending, deletes the original root entirely, restores the copy to
+the same configured root and boots it, then checks that the Worker serves its
+last Version without a client republish, its SQLite rows and the Deployment
+readback are exactly as they were at the snapshot, and a new message is handled
+once by the restored Version with nothing older redelivered; and finally
+deletes everything in reference order,
+with a refused premature delete on the way, and checks the artifact tables,
+the SQLite directory, the workerd children and TCP 443.
 
 This is a local, loopback, single-host result with a self-signed certificate
-and operator-seeded artifact bytes. It does not cover a `scheduled` handler,
-Actor or Workflow use, public DNS or certificate trust, Hosted/WfP, a host
-reboot or an operator disaster-recovery drill. Messages in flight at the
+and operator-seeded artifact bytes. Its restore is to the same path on the
+same machine. Its TLS files, signing and operator keys are inside the root and
+are lost and restored with it; the environment (paths, port, keyring, v2
+configuration) and the workerd and guard binaries outside the root are
+unchanged. The runtime owner's private socket directory lives under `/tmp`,
+outside the root, so it survived; a restore onto a machine without it is
+handled by the code but not exercised here. It is not a restore with pending
+work, to a different path or machine, of an external `TAKOSERVER_DB`, or an
+operator disaster-recovery drill with source fencing. It does not cover a `scheduled`
+handler, Actor or Workflow use, public DNS or certificate trust, Hosted/WfP or
+a host reboot. Messages in flight at the
 crash are redelivered at least once, and a batch reserved but not yet sent is
 held for its 120 second reservation before redelivery.
 
