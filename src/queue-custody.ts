@@ -1142,7 +1142,8 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       ) {
         throw new TypeError("v2 Queue producer admission identity is invalid");
       }
-      if ("sourceInvocation" in claim && "sourceQueueBatch" in claim) {
+      const hasSourceQueueBatch = "sourceQueueBatch" in claim;
+      if ("sourceInvocation" in claim && hasSourceQueueBatch) {
         throw new TypeError("v2 Queue producer admission has multiple sources");
       }
       const source =
@@ -1173,45 +1174,44 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       if (source && source.custodyToken.length < 16) {
         throw new TypeError("v2 Queue source custody token is invalid");
       }
-      const sourceBatch =
-        "sourceQueueBatch" in claim
-          ? {
-              batchId: token(claim.sourceQueueBatch?.batchId, 256, "v2 Queue source batch id"),
-              reservationToken: token(
-                claim.sourceQueueBatch?.reservationToken,
-                128,
-                "v2 Queue source reservation token",
-              ),
-              queueId: token(claim.sourceQueueBatch?.queueId, 512, "v2 Queue source queue id"),
-              consumerUid: token(
-                claim.sourceQueueBatch?.consumerUid,
-                128,
-                "v2 Queue source consumer uid",
-              ),
-              generation: claim.sourceQueueBatch?.generation,
-              workerUid: token(
-                claim.sourceQueueBatch?.workerUid,
-                128,
-                "v2 Queue source worker uid",
-              ),
-              servingSourceOperationId: token(
-                claim.sourceQueueBatch?.servingSourceOperationId,
-                128,
-                "v2 Queue source serving operation id",
-              ),
-              workerVersionUid: token(
-                claim.sourceQueueBatch?.workerVersionUid,
-                128,
-                "v2 Queue source version uid",
-              ),
-              workerVersionGeneration: claim.sourceQueueBatch?.workerVersionGeneration,
-              incarnationOperationId: token(
-                claim.sourceQueueBatch?.incarnationOperationId,
-                128,
-                "v2 Queue source incarnation operation id",
-              ),
-            }
-          : null;
+      const rawSourceQueueBatch = hasSourceQueueBatch ? claim.sourceQueueBatch : null;
+      if (hasSourceQueueBatch && !rawSourceQueueBatch) {
+        throw new TypeError("v2 Queue source batch identity is invalid");
+      }
+      const sourceBatch = rawSourceQueueBatch
+        ? {
+            batchId: token(rawSourceQueueBatch.batchId, 256, "v2 Queue source batch id"),
+            reservationToken: token(
+              rawSourceQueueBatch.reservationToken,
+              128,
+              "v2 Queue source reservation token",
+            ),
+            queueId: token(rawSourceQueueBatch.queueId, 512, "v2 Queue source queue id"),
+            consumerUid: token(
+              rawSourceQueueBatch.consumerUid,
+              128,
+              "v2 Queue source consumer uid",
+            ),
+            generation: rawSourceQueueBatch.generation,
+            workerUid: token(rawSourceQueueBatch.workerUid, 128, "v2 Queue source worker uid"),
+            servingSourceOperationId: token(
+              rawSourceQueueBatch.servingSourceOperationId,
+              128,
+              "v2 Queue source serving operation id",
+            ),
+            workerVersionUid: token(
+              rawSourceQueueBatch.workerVersionUid,
+              128,
+              "v2 Queue source version uid",
+            ),
+            workerVersionGeneration: rawSourceQueueBatch.workerVersionGeneration,
+            incarnationOperationId: token(
+              rawSourceQueueBatch.incarnationOperationId,
+              128,
+              "v2 Queue source incarnation operation id",
+            ),
+          }
+        : null;
       if (
         sourceBatch &&
         (!Number.isSafeInteger(sourceBatch.generation) ||
