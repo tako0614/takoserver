@@ -390,7 +390,10 @@ const V2_SOURCE_QUEUE_BATCH_GUARD = `EXISTS (
     AND json_extract(consumer.observed_json, '$.consumerAttached') = 1
     AND json_extract(consumer.spec_json, '$.queue.resourceUid') = substr(execution.queue_id, 19)
     AND json_extract(consumer.spec_json, '$.worker.resourceUid') = execution.worker_uid
-    AND consumer_op.resource_uid = consumer.uid AND consumer_op.generation = consumer.generation
+    AND consumer_op.resource_uid = consumer.uid AND consumer_op.principal = consumer.principal
+    AND consumer_op.backend_id = consumer.backend_id
+    AND consumer_op.target_key = consumer.target_key
+    AND consumer_op.generation = consumer.generation
     AND consumer_op.status = 'succeeded' AND consumer_op.effect = 'complete'
     AND consumer_op.action IN ('create','update')
     AND consumer_op.accepted_spec_json = consumer.spec_json
@@ -404,12 +407,17 @@ const V2_SOURCE_QUEUE_BATCH_GUARD = `EXISTS (
     AND source_queue.observed_generation = source_queue.generation
     AND json_extract(source_queue.observed_json, '$.queueExists') = 1
     AND source_queue_op.resource_uid = source_queue.uid
+    AND source_queue_op.principal = source_queue.principal
+    AND source_queue_op.backend_id = source_queue.backend_id
+    AND source_queue_op.target_key = source_queue.target_key
     AND source_queue_op.generation = source_queue.generation
     AND source_queue_op.status = 'succeeded' AND source_queue_op.effect = 'complete'
     AND source_queue_op.action IN ('create','update')
     AND source_queue_op.accepted_spec_json = source_queue.spec_json)
     AND (serving_op.status = 'succeeded' AND serving_op.effect = 'complete'
-    AND serving_op.principal = execution.principal AND serving_op.target_key = execution.target_key
+    AND serving_op.principal = execution.principal
+    AND serving_op.backend_id = serving.backend_id
+    AND serving_op.target_key = execution.target_key
     AND serving_op.accepted_spec_json = serving.spec_json
     AND serving.principal = execution.principal AND serving.space = execution.space
     AND serving.target_key = execution.target_key AND serving.phase = 'idle'
@@ -454,6 +462,9 @@ const V2_SOURCE_QUEUE_BATCH_GUARD = `EXISTS (
     AND json_extract(source_version.observed_json, '$.ready') = 1
     AND json_extract(source_version.spec_json, '$.worker.resourceUid') = execution.worker_uid
     AND source_version_op.id = ? AND source_version_op.resource_uid = source_version.uid
+    AND source_version_op.principal = source_version.principal
+    AND source_version_op.backend_id = source_version.backend_id
+    AND source_version_op.target_key = source_version.target_key
     AND source_version_op.generation = source_version.generation
     AND source_version_op.status = 'succeeded' AND source_version_op.effect = 'complete'
     AND source_version_op.action IN ('create','update')
