@@ -453,6 +453,17 @@ async function descendants(rootPid: number): Promise<{ pid: number; command: str
   return found;
 }
 
+/** A filesystem copy that keeps contents, directories and permissions. */
+async function copyTree(source: string, destination: string): Promise<void> {
+  const copy = Bun.spawn(["cp", "-a", "--", source, destination], {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [code, stderr] = await Promise.all([copy.exited, new Response(copy.stderr).text()]);
+  if (code !== 0) throw new Error(`cp -a ${source} failed (${code}): ${stderr.slice(-2000)}`);
+}
+
 function alive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -715,11 +726,13 @@ function endpointFixture(label: string): Uint8Array {
 }
 
 test.skipIf(OPT_IN !== "1")(
-  "ordinary self-host journey: install, serve, update, SIGKILL mid-Operation, recover, delete",
+  "ordinary self-host journey: install, serve, update, SIGKILL mid-Operation, recover, cold restore, delete",
   async () => {
     startedHosts.length = 0;
     const environment = await prepareEnvironment();
     const { root, port, certificate, fullBoot } = environment;
+    // A complete cold copy holds keys and tenant data: never keep it.
+    const coldBackup = `${root}-cold-backup`;
     let host: Host | null = null;
     let completed = false;
     try {
@@ -1158,6 +1171,60 @@ test.skipIf(OPT_IN !== "1")(
       await handled("m-after-restart");
       await waitForQueueReceipt(root, afterRestartMessage, "retired");
 
+      // ---- 6b. Cold backup, loss of the data root, restore -----------------------
+      // As docs/self-host-operations.md describes: stop every writer, copy the
+      // complete root as one unit, then lose the original entirely and restore
+      // the copy to the same configured root on the replacement.
+      const receiptsAtBackup = (await get("/receipts")).body;
+      const deploymentAtBackup = await jsonAt(
+        port,
+        "GET",
+        `${V2}/resources/${deployment.uid}`,
+        200,
+        undefined,
+        auth,
+      );
+      const backupChildren = (await descendants(host.child.pid)).filter((entry) =>
+        entry.command.includes("workerd"),
+      );
+      expect(backupChildren.length).toBeGreaterThan(0);
+      await stopHost(host);
+      host = null;
+      const quiescent = Date.now() + 10_000;
+      while (backupChildren.some((child) => alive(child.pid)) && Date.now() < quiescent) {
+        await Bun.sleep(100);
+      }
+      expect(backupChildren.filter((child) => alive(child.pid))).toEqual([]);
+      await copyTree(root, coldBackup);
+      await rm(root, { recursive: true, force: true });
+      await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+      await copyTree(coldBackup, root);
+      host = await startHost(root, port, configV2, fullBoot);
+      const restoredHost = host;
+      const restoredNote = Date.now() + 5_000;
+      while (!restoredHost.output().includes("restored 1 v2 Worker owner(s)")) {
+        if (Date.now() > restoredNote) throw new Error("restored Host did not restore its Worker");
+        await Bun.sleep(100);
+      }
+      // The Worker serves its last Version with its data, without a republish.
+      expect(await get("/version", (r) => r.body === "journey-v2")).toEqual({
+        status: 200,
+        body: "journey-v2",
+      });
+      expect((await get("/receipts")).body).toBe(receiptsAtBackup);
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${deployment.uid}`, 200, undefined, auth),
+      ).toEqual(deploymentAtBackup);
+      // Delivery resumes on the restored copy, once.
+      const afterRestoreMessage = await sent("m-after-restore");
+      await handled("m-after-restore");
+      await waitForQueueReceipt(root, afterRestoreMessage, "retired");
+      expect(
+        (JSON.parse((await get("/receipts")).body) as { value: string }[]).filter(
+          (receipt) => receipt.value === "m-after-restore",
+        ),
+      ).toHaveLength(1);
+
       // ---- 7. Delete in reference order -------------------------------------------
       const remove = async (uid: string, generation: number, name: string) => {
         const accepted = await jsonAt(port, "DELETE", `${V2}/resources/${uid}`, 202, undefined, {
@@ -1233,6 +1300,7 @@ test.skipIf(OPT_IN !== "1")(
       completed = true;
     } finally {
       await Promise.allSettled([stopHost(host)]);
+      await rm(coldBackup, { recursive: true, force: true });
       if (completed) await rm(root, { recursive: true, force: true });
       else {
         for (const [index, started] of startedHosts.entries()) {

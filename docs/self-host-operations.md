@@ -271,8 +271,9 @@ This procedure prepares a cold copy of one Bun self-host installation. It is
 not a tested disaster-recovery guarantee: the repository has no operator
 snapshot/restore command, no restore mode that suppresses startup work, and no
 full live-operator restore drill. The tests below cover local readers and an
-optional isolated native Host restore; neither replaces an operator recovery
-drill.
+optional isolated native Host restore, and the ordinary journey native test
+restores a cold snapshot of a v2 installation (Worker, SQLite, Queue) to the
+same root; none of them replaces an operator recovery drill.
 
 ## What belongs to one installation
 
@@ -461,14 +462,23 @@ artifact Operation has durably staged only a prefix and Queue messages are in
 flight; restarts, replays the same key and checks that the Operation settles
 once, the Worker is still served without a client republish and every message
 has exactly one terminal ack (a rejected attempt is retried in its own batch);
-and finally deletes everything in reference order, with a refused premature
-delete on the way, and checks the artifact tables, the SQLite directory, the
-workerd children and TCP 443.
+takes a cold snapshot as described above (stop every writer, copy the
+complete root with `cp -a`), deletes the original root entirely, restores the
+copy to the same configured root and boots it, then checks that the Worker
+serves its last Version without a republish, its SQLite rows and the
+Deployment readback are exactly as they were at the snapshot, and a new
+message is handled once; and finally deletes everything in reference order,
+with a refused premature delete on the way, and checks the artifact tables,
+the SQLite directory, the workerd children and TCP 443.
 
 This is a local, loopback, single-host result with a self-signed certificate
-and operator-seeded artifact bytes. It does not cover a `scheduled` handler,
-Actor or Workflow use, public DNS or certificate trust, Hosted/WfP, a host
-reboot or an operator disaster-recovery drill. Messages in flight at the
+and operator-seeded artifact bytes. Its restore is to the same path on the
+same machine, with the external configuration (TLS files, workerd artifact,
+v2 configuration) unchanged; it is not a restore to a different path or
+machine, a restore of an external `TAKOSERVER_DB`, or an operator
+disaster-recovery drill with source fencing. It does not cover a `scheduled`
+handler, Actor or Workflow use, public DNS or certificate trust, Hosted/WfP or
+a host reboot. Messages in flight at the
 crash are redelivered at least once, and a batch reserved but not yet sent is
 held for its 120 second reservation before redelivery.
 
