@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
   createSelfhostV2SqliteQueueBindingBroker,
   type V2QueueSQLiteGrant,
@@ -353,6 +354,46 @@ test("Queue store releases every shard and revokes its physical witness after an
       ).toBe("confirmed");
     }
   } finally {
+    host.cleanup();
+  }
+});
+
+test("Queue physical-set locks use canonical shard order and release an earlier shard on failure", async () => {
+  const host = await fixture();
+  const entries = host.grant.bindings.map(({ resourceUid }) => ({
+    resourceUid,
+    shard: createHash("sha256").update(resourceUid).digest("hex").slice(0, 2),
+  }));
+  entries.sort((left, right) => left.shard.localeCompare(right.shard));
+  const first = entries[0];
+  const second = entries[1];
+  if (!first || !second || first.shard === second.shard) throw new Error("invalid shard fixture");
+  const blocker = new DatabaseSync(join(host.nativeRoot, "locks", `${second.shard}.sqlite`));
+  try {
+    blocker.exec("PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE");
+    await expect(
+      host.store.withVerifiedDatabaseSet({
+        resourceUid: "database-one",
+        principal: "alice",
+        space: "default",
+        bindings: [...host.grant.bindings].reverse(),
+        stillAuthorized: async () => true,
+        use: async () => {
+          throw new Error("unreachable SQL");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "busy" });
+    // The first shard was acquired before the deliberately blocked second one
+    // and must already be released on the failed nested acquisition.
+    expect(
+      await host.store.inspectOwnedDatabase({
+        resourceUid: first.resourceUid,
+        stillAuthorized: async () => true,
+      }),
+    ).toBe("confirmed");
+  } finally {
+    blocker.exec("ROLLBACK");
+    blocker.close();
     host.cleanup();
   }
 });
