@@ -180,6 +180,8 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
         return true;
       },
       async readVersionMaterials() {
+        if (mode === "active-update-fail-after-candidate" && execution.operationId === updateId)
+          throw new Error("injected unavailable materials");
         // Crash-window fixture: the candidate incarnation is persisted and its
         // bootstrap child is already running when materials are first read.
         if (hangOperationId !== null && execution.operationId === hangOperationId) {
@@ -558,6 +560,29 @@ if (owner)
         throw new Error("candidate never reached publish");
       process.stdout.write(
         `${JSON.stringify({ kind: "candidate-hung", pid: process.pid, port })}\n`,
+      );
+    } else if (mode === "active-update-fail-after-candidate") {
+      if (!createId || !updateId) throw new Error("operation IDs missing");
+      const created = await owner.execute(execution(createId, "create"));
+      if (created.kind !== "confirmed" || created.identity === null)
+        throw new Error(`fixture create was not confirmed: ${JSON.stringify(created)}`);
+      const response = await owner.fetch(new Request("http://worker.fixture.test/"));
+      await writeFile(
+        servingPath,
+        canonicalJson({
+          sourceOperationId: createId,
+          generation: execution(createId, "create").generation,
+          identity: created.identity,
+          configIdentity: await response.text(),
+          spec: execution(createId, "create").spec,
+        }),
+        { mode: 0o600 },
+      );
+      // Never awaited: the candidate fails and is retired in-process while the
+      // test kills this host.
+      void owner.execute(execution(updateId, "update")).catch(() => undefined);
+      process.stdout.write(
+        `${JSON.stringify({ kind: "candidate-failing", pid: process.pid, port })}\n`,
       );
     } else if (mode === "replay") {
       const replayed = await owner.execute(execution(deleteId, "delete"));

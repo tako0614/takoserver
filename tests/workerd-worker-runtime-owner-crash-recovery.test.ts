@@ -21,7 +21,8 @@ const DELETE_ID = "8fd4c347-bacf-4d91-9453-70566b5959e5";
 const HOST_FIXTURE = new URL("./fixtures/workerd-runtime-owner-crash-host.ts", import.meta.url)
   .pathname;
 const CHILD_SOURCE = `
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 const [verb, watch, configPath] = process.argv.slice(-3);
 if (verb !== "serve" || watch !== "--watch" || !configPath) throw new Error("unexpected command");
 function identity() {
@@ -43,7 +44,12 @@ const server = Bun.serve({ hostname: "127.0.0.1", port: initial.port, fetch(requ
   }
   return new Response(current.generation);
 } });
-process.on("SIGTERM", () => server.stop(true));
+// While the test holds this marker the child outlives SIGTERM, so a retirement
+// stays in progress for the supervisor's exit-confirmation timeout.
+process.on("SIGTERM", () => {
+  if (existsSync(join(dirname(process.argv[1]), "hold-sigterm"))) return;
+  server.stop(true);
+});
 `;
 
 async function unusedPort(): Promise<number> {
@@ -91,6 +97,7 @@ async function startHost(
     | "create-hang-after-candidate"
     | "active-recover-reexecute"
     | "active-endpoint-delete-hang-after-candidate"
+    | "active-update-fail-after-candidate"
     | "active-recover-reexecute-endpoint-delete"
     | "open-only",
   root: string,
@@ -1475,3 +1482,67 @@ for (const field of ["identity", "configurationSha256"] as const) {
     }
   });
 }
+
+test("a Host killed while an in-process candidate failure is retiring still boots and settles it", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let host: HostProcess | undefined;
+  let successor: HostProcess | undefined;
+  const hold = join(owned.root, "hold-sigterm");
+  try {
+    // The update's candidate fails in-process (its materials are unavailable)
+    // and its child ignores SIGTERM, so the owner is still retiring it.
+    await writeFile(hold, "", { mode: 0o600 });
+    host = await startHost(
+      "active-update-fail-after-candidate",
+      owned.root,
+      owned.binary,
+      port,
+      UPDATE_ID,
+    );
+    expect(await readJsonLine(host)).toMatchObject({ kind: "candidate-failing", port });
+    const deadline = Date.now() + 20_000;
+    let retiring: StoredIncarnation | undefined;
+    while (Date.now() < deadline && !retiring) {
+      const state = await incarnations(owned.root).catch(() => null);
+      retiring = state?.incarnations.find(
+        (item) => item.operationId === UPDATE_ID && item.retirementOperationId === UPDATE_ID,
+      );
+      if (!retiring) await Bun.sleep(2);
+    }
+    if (!retiring) throw new Error("inconclusive: the candidate retirement never started");
+    await terminateHost(host);
+    host = undefined;
+    await rm(hold, { force: true });
+    // The first durable retirement intent of a never-activated candidate is the
+    // state boot recovery resumes, never an activated record's `retiring`.
+    expect(retiring).toMatchObject({ status: "uncertain", identity: null, receipt: null });
+    await waitForVacant(retiring.listenerPort);
+
+    successor = await startHost(
+      "active-recover-reexecute",
+      owned.root,
+      owned.binary,
+      port,
+      UPDATE_ID,
+    );
+    expect(await readJsonLine(successor)).toMatchObject({
+      kind: "recovered-active",
+      port,
+      reexecuted: { kind: "abandoned_before_activation", operationId: UPDATE_ID },
+    });
+    const after = await incarnations(owned.root);
+    expect(after.activeOperationId).toBe(CREATE_ID);
+    expect(after.incarnations.find((item) => item.operationId === UPDATE_ID)).toMatchObject({
+      status: "retired",
+      retirementOperationId: UPDATE_ID,
+      identity: null,
+      executionCopiesReleased: true,
+    });
+  } finally {
+    await rm(hold, { force: true });
+    if (host) await terminateHost(host);
+    if (successor) await terminateHost(successor);
+    await owned.cleanup();
+  }
+});

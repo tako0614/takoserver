@@ -2939,11 +2939,18 @@ export async function openWorkerdWorkerRuntimeOwner(
       return incarnation.record.receipt;
     const operationId = incarnation.record.retirementOperationId;
     if (!operationId) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    // A never-activated candidate retires as `uncertain` until it is
+    // `retired`: that is the state boot recovery resumes (see
+    // neverActivatedRetirement), so a Host killed mid-retirement still boots.
+    // `retiring` would need an activated record's physical-absence evidence.
+    const neverActivated =
+      incarnation.record.identity === null && incarnation.record.configurationSha256 === null;
+    const pendingStatus = neverActivated ? ("uncertain" as const) : ("retiring" as const);
     const task = (async () => {
       try {
         const retiringRecord = await updateRecord(incarnation.record.operationId, (current) => ({
           ...current,
-          status: "retiring",
+          status: pendingStatus,
           retirementOperationId: operationId,
         }));
         incarnation.record = retiringRecord;
@@ -2970,10 +2977,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         await incarnation.serviceBindingForward?.close();
         await incarnation.actorForward?.close();
         await incarnation.workflowForward?.close();
-        if (
-          incarnation.record.identity === null &&
-          incarnation.record.configurationSha256 === null
-        ) {
+        if (neverActivated) {
           // A candidate that was never activated was never a serving source:
           // no Queue delivery names it and it has no pinned configuration to
           // bind a physical-absence receipt to. Prove its child gone and its
@@ -3007,7 +3011,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         }
         const receiptPersisted = await updateRecord(incarnation.record.operationId, (current) => ({
           ...current,
-          status: "retiring",
+          status: pendingStatus,
           receipt,
           executionCopiesCleanupStarted: true,
           executionCopiesCleanupManifestSha256: verified.cleanupManifestSha256,
@@ -5266,9 +5270,11 @@ export async function openWorkerdWorkerRuntimeOwner(
   }
 
   async function retireCandidate(candidate: IncarnationHandle, operationId: string): Promise<void> {
+    // A candidate is never activated: record the retirement intent exactly as
+    // boot recovery records it for an abandoned candidate (retireIncarnation).
     candidate.record = await updateRecord(candidate.record.operationId, (current) => ({
       ...current,
-      status: "retiring",
+      status: "uncertain",
       retirementOperationId: operationId,
     }));
     // This candidate never became the serving owner. No Actor carrier can be
