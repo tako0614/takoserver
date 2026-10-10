@@ -1331,6 +1331,8 @@ export function createV2WorkerPublicationState(options: {
           phase: "idle",
           spec_json: op.accepted_spec_json,
         };
+      } else {
+        return unresolved("source_unsettled", "A later Worker publication has started");
       }
     }
     if (

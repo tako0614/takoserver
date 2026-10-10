@@ -1810,7 +1810,12 @@ type RecoveryScenario = {
   readonly name: string;
   readonly endpoint: boolean;
   readonly source: "deployment" | "endpoint";
-  readonly change: "deployment-update" | "endpoint-update" | "endpoint-delete" | "endpoint-create";
+  readonly change:
+    | "deployment-update"
+    | "deployment-retarget"
+    | "endpoint-update"
+    | "endpoint-delete"
+    | "endpoint-create";
 };
 const recoveryScenarios: readonly RecoveryScenario[] = [
   { name: "Endpoint update", endpoint: true, source: "endpoint", change: "endpoint-update" },
@@ -1820,6 +1825,12 @@ const recoveryScenarios: readonly RecoveryScenario[] = [
     endpoint: true,
     source: "endpoint",
     change: "deployment-update",
+  },
+  {
+    name: "Deployment retarget to a new Version",
+    endpoint: true,
+    source: "endpoint",
+    change: "deployment-retarget",
   },
   {
     name: "Deployment update of the source",
@@ -1836,7 +1847,7 @@ const recoveryScenarios: readonly RecoveryScenario[] = [
 ];
 
 async function recoveryGraph(f: ReturnType<typeof fixture>, scenario: RecoveryScenario) {
-  const { worker, version } = await f.basics();
+  const { worker, bundle, version } = await f.basics();
   const deploymentSpec = {
     worker: { resourceUid: worker.resourceUid },
     versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
@@ -1848,6 +1859,26 @@ async function recoveryGraph(f: ReturnType<typeof fixture>, scenario: RecoverySc
     : null;
   let pendingId: string;
   switch (scenario.change) {
+    case "deployment-retarget": {
+      const next = await f.create(WORKER_VERSION_FORM_URL, "version-next", {
+        worker: { resourceUid: worker.resourceUid },
+        bundle: { resourceUid: bundle.resourceUid },
+        handlers: ["fetch"],
+      });
+      pendingId = (
+        await f.engine.acceptUpdate({
+          principal: "org-1",
+          key: "recovery-deployment-retarget-01",
+          uid: deployment.resourceUid,
+          expectedGeneration: 1,
+          spec: {
+            worker: { resourceUid: worker.resourceUid },
+            versions: [{ workerVersion: { resourceUid: next.resourceUid }, weight: 10_000 }],
+          },
+        })
+      ).id;
+      break;
+    }
     case "deployment-update":
       pendingId = (
         await f.engine.acceptUpdate({
@@ -1923,9 +1954,7 @@ for (const scenario of recoveryScenarios) {
       if (ready.kind !== "ready") return;
       // The snapshot is the committed generation, never the queued spec.
       expect(ready.snapshot.sourceOperationId).toBe(graph.sourceId);
-      expect(ready.snapshot.deployment?.generation).toBe(
-        scenario.change === "deployment-update" ? 1 : 1,
-      );
+      expect(ready.snapshot.deployment?.generation).toBe(1);
       expect(ready.snapshot.deployment?.versions).toMatchObject([
         { uid: graph.version.resourceUid, weight: 10_000 },
       ]);
@@ -2043,6 +2072,26 @@ test("a queued successor that settles becomes the only current serving source", 
     const after = await f.reader.resolveCurrentServing(next);
     expect(after.kind).toBe("ready");
     if (after.kind === "ready") expect(after.snapshot.endpoint?.generation).toBe(2);
+  } finally {
+    f.close();
+  }
+});
+
+test("recovery tolerance refuses a queued Operation that already recorded a dispatch", async () => {
+  const scenario = recoveryScenarios[0];
+  if (!scenario) throw new Error("missing scenario");
+  const f = fixture();
+  try {
+    const graph = await recoveryGraph(f, scenario);
+    const tolerant = { ...graph.input, tolerateUnstartedSuccessors: true };
+    expect((await f.reader.resolveCurrentServing(tolerant)).kind).toBe("ready");
+    f.db
+      .query("UPDATE tf_v2_operations SET dispatch_possible = 1 WHERE id = ?")
+      .run(graph.pendingId);
+    expect(await f.reader.resolveCurrentServing(tolerant)).toMatchObject({
+      kind: "unresolved",
+      code: "source_unsettled",
+    });
   } finally {
     f.close();
   }

@@ -1215,13 +1215,31 @@ test.skipIf(OPT_IN !== "1")(
  * queued Operation exactly once.
  *
  * Scope of the proof: the Operation is accepted and not yet dispatched at the
- * crash. An Operation with a recorded dispatch (`reconciling`) is a different,
- * harder case that is intentionally still refused at boot; the test refuses to
- * run (inconclusive) rather than count such a crash as a pass.
+ * stop. Two nearby cases are still refused at boot and are pinned below or
+ * recorded in docs/self-host-operations.md rather than counted as a pass:
+ *  - an Operation whose dispatch was recorded (`reconciling`, simulated here
+ *    with the two engine writes that precede the native send), and
+ *  - a crash after the owner persisted a candidate incarnation but before it
+ *    was activated (the owner refuses to open with an unretired candidate;
+ *    reading the open path shows this, it is not exercised by this test).
+ * The test refuses to run (inconclusive) rather than count a crash that landed
+ * after a dispatch was recorded as the queued case.
  */
-for (const pending of ["deployment-update", "endpoint-update"] as const) {
+const PENDING_VARIANTS = [
+  { pending: "deployment-update", signal: "SIGKILL", dispatched: false },
+  { pending: "endpoint-update", signal: "SIGKILL", dispatched: false },
+  // A graceful stop suspends the owner and takes the same recovery path.
+  { pending: "deployment-update", signal: "SIGTERM", dispatched: false },
+  // The Operation engine marks a dispatch (claim, then `reconciling` with
+  // dispatch_possible=1) just before the native send. A crash after that
+  // point is still refused at boot: see the KNOWN GAP in the header above.
+  { pending: "deployment-update", signal: "SIGKILL", dispatched: true },
+] as const;
+for (const { pending, signal, dispatched } of PENDING_VARIANTS) {
   test.skipIf(OPT_IN !== "1")(
-    `a queued ${pending} at SIGKILL boots again and runs once`,
+    dispatched
+      ? `KNOWN GAP: a dispatched ${pending} at ${signal} is still refused at boot`
+      : `a queued ${pending} at ${signal} boots again and runs once`,
     async () => {
       startedHosts.length = 0;
       const environment = await prepareEnvironment();
@@ -1326,7 +1344,8 @@ for (const pending of ["deployment-update", "endpoint-update"] as const) {
           { spec },
           { ...auth, "idempotency-key": updateKey, "takoform-expected-generation": "1" },
         );
-        await killHost(host);
+        if (signal === "SIGKILL") await killHost(host);
+        else await stopHost(host);
         host = null;
         const atCrash = withControl(
           root,
@@ -1350,6 +1369,44 @@ for (const pending of ["deployment-update", "endpoint-update"] as const) {
           );
         }
 
+        if (dispatched) {
+          // Reproduce exactly the two engine writes that precede a native send,
+          // on the durable queued Operation the crash left behind.
+          const writable = new Database(join(root, "control.sqlite"));
+          try {
+            writable
+              .query(
+                `UPDATE tf_v2_operations SET status = 'running', effect = 'none',
+                   lease_token = 'crash-lease', lease_until_ms = 1
+                 WHERE id = ? AND status = 'queued'`,
+              )
+              .run(String(update.id));
+            writable
+              .query(
+                `UPDATE tf_v2_operations SET status = 'reconciling', effect = 'unknown',
+                   dispatch_possible = 1 WHERE id = ? AND status = 'running'`,
+              )
+              .run(String(update.id));
+          } finally {
+            writable.close();
+          }
+          await expect(startHost(root, port, config, fullBoot)).rejects.toThrow(
+            /ownership_uncertain/u,
+          );
+          expect(
+            withControl(
+              root,
+              (control) =>
+                control
+                  .query(
+                    "SELECT status, effect, dispatch_possible FROM tf_v2_operations WHERE id = ?",
+                  )
+                  .all(String(update.id)) as Json[],
+            ),
+          ).toEqual([{ status: "reconciling", effect: "unknown", dispatch_possible: 1 }]);
+          completed = true;
+          return;
+        }
         host = await startHost(root, port, config, fullBoot);
         expect(host.output()).not.toContain("ownership_uncertain");
         expect(await settled(port, token, String(update.id))).toMatchObject({

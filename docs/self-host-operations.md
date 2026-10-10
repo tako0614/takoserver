@@ -455,14 +455,24 @@ held for its 120 second reservation before redelivery.
 
 Known gaps this test records, not fixes:
 
-- **A pending Deployment or Endpoint Operation blocks restart.** If the Host
-  stops (SIGKILL, or a graceful SIGTERM) while a WorkerDeployment or
-  WorkerEndpoint Operation for a published Worker is queued, boot restore asks
-  for the current-serving proof, which is refused while such an Operation is
-  pending, and the Operation only runs after restore. The Host exits with
-  `ownership_uncertain` on every start and the installation needs manual
-  repair. The data is left untouched. The second test in that file pins this
-  fail-closed behaviour so that a fix has to update it.
+- **A Deployment or Endpoint Operation interrupted after dispatch blocks
+  restart.** If the Host stops (SIGKILL, or a graceful SIGTERM) while such an
+  Operation is only queued, boot recovery now adopts the incarnation that was
+  serving and the Operation runs once afterwards (three tests pin this). The
+  Operation must have effect `none` and no recorded dispatch, so it cannot have
+  changed what is natively serving. Two neighbouring cases are still refused
+  with `ownership_uncertain`, leave the data untouched and need manual repair:
+  an Operation whose dispatch was already recorded (`reconciling`; a test
+  simulates the two engine writes that precede the native send and pins the
+  refusal), and a stop after the runtime owner persisted a candidate
+  incarnation but before activating it, which the owner refuses to open with
+  (found by reading the open path; no test reproduces it). Fixing them needs
+  the owner to retire a stale candidate and then tolerate an Operation whose
+  dispatch left no durable native record; both change owner crash recovery and
+  are a separate design decision. By reading the Endpoint frontend (not
+  measured), the Endpoint route is not served while a Deployment or Endpoint
+  update is pending, exactly as in an uninterrupted Host; the tests wait for
+  the Operation to settle before checking the response.
 - **The readiness probe does not observe v2 Worker owners.** While v2 Workers
   are serving, `/_takoserver/health/ready` reports `workerRuntime:
   "not-required"` and `supervisor: "idle"`; it can not report their failure.
