@@ -1214,32 +1214,41 @@ test.skipIf(OPT_IN !== "1")(
  * have changed native state), and the normal Operation engine then runs the
  * queued Operation exactly once.
  *
- * Scope of the proof: the Operation is accepted and not yet dispatched at the
- * stop. Two nearby cases are still refused at boot and are pinned below or
- * recorded in docs/self-host-operations.md rather than counted as a pass:
- *  - an Operation whose dispatch was recorded (`reconciling`, simulated here
- *    with the two engine writes that precede the native send), and
- *  - a crash after the owner persisted a candidate incarnation but before it
- *    was activated (the owner refuses to open with an unretired candidate;
- *    reading the open path shows this, it is not exercised by this test).
+ * Scope of the proof, by crash window:
+ *  - queued: accepted, no dispatch recorded. Boot adopts the committed
+ *    incarnation and the engine runs the Operation once.
+ *  - dispatched, owner untouched: the engine recorded the dispatch
+ *    (`reconciling`, simulated here with the two engine writes that precede the
+ *    native send) but the owner had persisted nothing. The owner vouches that
+ *    the Operation never served, boot adopts the committed incarnation and the
+ *    engine re-drives the Operation once through a fresh incarnation.
+ *  - dispatched, candidate persisted (real SIGKILL once the owner persisted a
+ *    candidate incarnation and its child): boot abandons the dead candidate and
+ *    serves the committed incarnation. The Operation id is never reused for a
+ *    second incarnation, so the Operation itself stays `reconciling` — pinned
+ *    below as a KNOWN GAP, not counted as a completed update.
+ *  - dispatched AND already activated by the owner but unsettled in SQL, or a
+ *    DELETE that started: still refused at boot (docs/self-host-operations.md).
  * The test refuses to run (inconclusive) rather than count a crash that landed
- * after a dispatch was recorded as the queued case.
+ * in a different window than the one it names.
  */
 const PENDING_VARIANTS = [
-  { pending: "deployment-update", signal: "SIGKILL", dispatched: false },
-  { pending: "endpoint-update", signal: "SIGKILL", dispatched: false },
+  { pending: "deployment-update", signal: "SIGKILL", window: "queued" },
+  { pending: "endpoint-update", signal: "SIGKILL", window: "queued" },
   // A graceful stop suspends the owner and takes the same recovery path.
-  { pending: "deployment-update", signal: "SIGTERM", dispatched: false },
+  { pending: "deployment-update", signal: "SIGTERM", window: "queued" },
   // The Operation engine marks a dispatch (claim, then `reconciling` with
-  // dispatch_possible=1) just before the native send. A crash after that
-  // point is still refused at boot: see the KNOWN GAP in the header above.
-  { pending: "deployment-update", signal: "SIGKILL", dispatched: true },
+  // dispatch_possible=1) just before the native send.
+  { pending: "deployment-update", signal: "SIGKILL", window: "dispatched" },
+  { pending: "deployment-update", signal: "SIGKILL", window: "candidate" },
 ] as const;
-for (const { pending, signal, dispatched } of PENDING_VARIANTS) {
+for (const { pending, signal, window } of PENDING_VARIANTS) {
   test.skipIf(OPT_IN !== "1")(
-    dispatched
-      ? `KNOWN GAP: a dispatched ${pending} at ${signal} is still refused at boot`
-      : `a queued ${pending} at ${signal} boots again and runs once`,
+    window === "candidate"
+      ? `KNOWN GAP: a ${pending} killed with its candidate incarnation persisted boots again but stays reconciling`
+      : window === "dispatched"
+        ? `a dispatched ${pending} that never reached the owner at ${signal} boots again and runs once`
+        : `a queued ${pending} at ${signal} boots again and runs once`,
     async () => {
       startedHosts.length = 0;
       const environment = await prepareEnvironment();
@@ -1344,6 +1353,36 @@ for (const { pending, signal, dispatched } of PENDING_VARIANTS) {
           { spec },
           { ...auth, "idempotency-key": updateKey, "takoform-expected-generation": "1" },
         );
+        if (window === "candidate") {
+          // Kill as soon as the owner has persisted a candidate incarnation and
+          // recorded its child, and before it can be activated.
+          const statePath = join(
+            root,
+            "v2-worker-owners",
+            createHash("sha256").update(worker, "utf8").digest("hex"),
+            "runtime-owner.json",
+          );
+          const deadline = Date.now() + 60_000;
+          let seen = false;
+          while (Date.now() < deadline && !seen) {
+            const text = await readFile(statePath, "utf8").catch(() => null);
+            if (text !== null) {
+              const owner = JSON.parse(text) as {
+                activeOperationId: string | null;
+                incarnations: { operationId: string; status: string; processIdentity: unknown }[];
+              };
+              seen = owner.incarnations.some(
+                (item) =>
+                  item.operationId === String(update.id) &&
+                  item.status === "candidate" &&
+                  item.processIdentity !== null,
+              );
+            }
+            if (!seen) await Bun.sleep(2);
+          }
+          if (!seen)
+            throw new Error("inconclusive: the update never reached a candidate incarnation");
+        }
         if (signal === "SIGKILL") await killHost(host);
         else await stopHost(host);
         host = null;
@@ -1358,9 +1397,15 @@ for (const { pending, signal, dispatched } of PENDING_VARIANTS) {
         );
         expect(atCrash).toHaveLength(1);
         expect(atCrash[0]?.id).toBe(String(update.id));
-        // The crash must land before any dispatch was recorded for this to be
-        // the queued-Operation case; a dispatched one is a different gap.
-        if (
+        if (window === "candidate") {
+          // The engine recorded the dispatch before the owner persisted the candidate.
+          if (atCrash[0]?.status !== "reconciling" || atCrash[0]?.dispatch_possible !== 1) {
+            throw new Error(
+              `inconclusive: Operation was ${String(atCrash[0]?.status)} (dispatch_possible=${String(atCrash[0]?.dispatch_possible)})`,
+            );
+          }
+        } else if (
+          // Queued case: the crash must land before any dispatch was recorded.
           !["queued", "running", "waiting_input"].includes(String(atCrash[0]?.status)) ||
           atCrash[0]?.dispatch_possible !== 0
         ) {
@@ -1369,7 +1414,7 @@ for (const { pending, signal, dispatched } of PENDING_VARIANTS) {
           );
         }
 
-        if (dispatched) {
+        if (window === "dispatched") {
           // Reproduce exactly the two engine writes that precede a native send,
           // on the durable queued Operation the crash left behind.
           const writable = new Database(join(root, "control.sqlite"));
@@ -1390,25 +1435,44 @@ for (const { pending, signal, dispatched } of PENDING_VARIANTS) {
           } finally {
             writable.close();
           }
-          await expect(startHost(root, port, config, fullBoot)).rejects.toThrow(
-            /ownership_uncertain/u,
-          );
+        }
+        host = await startHost(root, port, config, fullBoot);
+        expect(host.output()).not.toContain("ownership_uncertain");
+        if (window === "candidate") {
+          // The abandoned candidate's Operation id is never reused, so the
+          // Operation keeps retrying without a new effect: it is not lost and
+          // not duplicated, but it does not complete either. While an update is
+          // pending the Endpoint is not served (the same as an uninterrupted
+          // Host mid-update), so this Worker stays unavailable (503) until the
+          // Operation is resolved; the Host itself and its control API are up.
+          expect(
+            await endpointEventually(hostname, certificate, "/", (r) => r.status === 503),
+          ).toMatchObject({ status: 503 });
+          await jsonAt(port, "GET", `${V2}/resources/${deploymentUid}`, 200, undefined, auth);
+          await Bun.sleep(3_000);
+          expect(
+            withControl(
+              root,
+              (control) =>
+                control
+                  .query("SELECT status, effect FROM tf_v2_operations WHERE replay_key = ?")
+                  .all(updateKey) as Json[],
+            ),
+          ).toEqual([{ status: "reconciling", effect: "unknown" }]);
           expect(
             withControl(
               root,
               (control) =>
                 control
                   .query(
-                    "SELECT status, effect, dispatch_possible FROM tf_v2_operations WHERE id = ?",
+                    "SELECT COUNT(*) AS count FROM tf_v2_operations WHERE resource_uid = ? AND action = 'update'",
                   )
-                  .all(String(update.id)) as Json[],
+                  .all(target) as Json[],
             ),
-          ).toEqual([{ status: "reconciling", effect: "unknown", dispatch_possible: 1 }]);
+          ).toEqual([{ count: 1 }]);
           completed = true;
           return;
         }
-        host = await startHost(root, port, config, fullBoot);
-        expect(host.output()).not.toContain("ownership_uncertain");
         expect(await settled(port, token, String(update.id))).toMatchObject({
           effect: "complete",
         });

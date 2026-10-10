@@ -181,6 +181,18 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
     } as V2WorkerPublicationResolution;
   },
   async resolveCurrentServing(input) {
+    if (input.tolerateUnstartedSuccessors === true && input.neverServedOperation !== undefined) {
+      // What the owner is willing to vouch for at boot recovery, for the test to read.
+      await writeFile(
+        join(rootDirectory as string, "never-served.json"),
+        JSON.stringify({
+          update: input.neverServedOperation(updateId ?? ""),
+          create: input.neverServedOperation(createId ?? ""),
+          unknown: input.neverServedOperation("00000000-0000-4000-8000-000000000000"),
+        }),
+        { mode: 0o600 },
+      );
+    }
     if (mode === "active-recover-sql-unavailable") {
       return {
         kind: "unresolved",

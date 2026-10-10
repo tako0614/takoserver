@@ -324,15 +324,47 @@ const unstartedStatuses = new Set(["queued", "running", "waiting_input"]);
  * changed what is natively serving, so boot recovery may adopt the previously
  * committed incarnation while it waits.
  */
-function unstartedOperation(op: OperationRow): boolean {
-  return unstartedStatuses.has(op.status) && op.effect === "none" && op.dispatch_possible === 0;
+function unstartedOperation(op: OperationRow, neverServed?: NeverServedOperation): boolean {
+  if (unstartedStatuses.has(op.status) && op.effect === "none" && op.dispatch_possible === 0)
+    return true;
+  return dispatchedNeverServed(op.id, op.status, op.effect, op.dispatch_possible, neverServed);
+}
+
+/**
+ * Owner-side proof that an Operation never reached native serving. A dispatched
+ * Operation (`reconciling`, dispatch recorded) may have been sent to the owner,
+ * so it is tolerated only when the owner vouches from its own durable state that
+ * no incarnation of that Operation ever served (no record at all, or a candidate
+ * it proved dead and retired without activation).
+ */
+export type NeverServedOperation = (operationId: string) => boolean;
+
+function dispatchedNeverServed(
+  id: unknown,
+  status: unknown,
+  effect: unknown,
+  dispatchPossible: unknown,
+  neverServed: NeverServedOperation | undefined,
+): boolean {
+  return (
+    neverServed !== undefined &&
+    typeof id === "string" &&
+    status === "reconciling" &&
+    effect === "unknown" &&
+    dispatchPossible === 1 &&
+    neverServed(id) === true
+  );
 }
 
 /** A queued update/delete accepted over a committed generation of `row`. */
-function unstartedSuccessor(op: OperationRow | null, row: ResourceRow): op is OperationRow {
+function unstartedSuccessor(
+  op: OperationRow | null,
+  row: ResourceRow,
+  neverServed?: NeverServedOperation,
+): op is OperationRow {
   return (
     op !== null &&
-    unstartedOperation(op) &&
+    unstartedOperation(op, neverServed) &&
     op.id === row.last_operation &&
     op.id === row.busy_operation &&
     op.resource_uid === row.uid &&
@@ -350,10 +382,14 @@ function unstartedSuccessor(op: OperationRow | null, row: ResourceRow): op is Op
 }
 
 /** A queued first publication: nothing was ever committed for this Resource. */
-function unstartedCreate(op: OperationRow | null, row: ResourceRow): op is OperationRow {
+function unstartedCreate(
+  op: OperationRow | null,
+  row: ResourceRow,
+  neverServed?: NeverServedOperation,
+): op is OperationRow {
   return (
     op !== null &&
-    unstartedOperation(op) &&
+    unstartedOperation(op, neverServed) &&
     op.action === "create" &&
     op.id === row.last_operation &&
     op.id === row.busy_operation &&
@@ -371,7 +407,11 @@ function unstartedCreate(op: OperationRow | null, row: ResourceRow): op is Opera
 }
 
 /** Fence-side recheck of the same predicate from the reported pending rows. */
-function unstartedPendingRows(rows: readonly unknown[], sourceOperationId: string): boolean {
+function unstartedPendingRows(
+  rows: readonly unknown[],
+  sourceOperationId: string,
+  neverServed?: NeverServedOperation,
+): boolean {
   return (
     rows.length <= MAX_UNSTARTED_SUCCESSORS &&
     rows.every(
@@ -380,9 +420,8 @@ function unstartedPendingRows(rows: readonly unknown[], sourceOperationId: strin
         typeof row[0] === "string" &&
         row[0] !== sourceOperationId &&
         typeof row[4] === "string" &&
-        unstartedStatuses.has(row[4]) &&
-        row[5] === "none" &&
-        row[6] === 0,
+        ((unstartedStatuses.has(row[4]) && row[5] === "none" && row[6] === 0) ||
+          dispatchedNeverServed(row[0], row[4], row[5], row[6], neverServed)),
     )
   );
 }
@@ -818,7 +857,7 @@ export function createV2WorkerPublicationState(options: {
         ),
       ) ||
       !(current.tolerateUnstartedSuccessors
-        ? unstartedPendingRows(pending, current.sourceOperationId)
+        ? unstartedPendingRows(pending, current.sourceOperationId, current.neverServedOperation)
         : pending.length === 1 &&
           pending[0] !== null &&
           typeof pending[0] === "object" &&
@@ -1281,6 +1320,7 @@ export function createV2WorkerPublicationState(options: {
       sourceOperationId: string;
       expectedIdentity: V2WorkerCurrentServingIdentity;
       tolerateUnstartedSuccessors: boolean;
+      neverServedOperation?: NeverServedOperation;
     };
   };
   async function capture(input: LivePublicationCaptureInput): Promise<Capture>;
@@ -1318,7 +1358,7 @@ export function createV2WorkerPublicationState(options: {
     ) {
       const successor = await operation(own.busy_operation);
       if (
-        unstartedSuccessor(successor, own) &&
+        unstartedSuccessor(successor, own, current.neverServedOperation) &&
         op.status === "succeeded" &&
         op.generation === own.observed_generation &&
         successor.generation === op.generation + 1
@@ -1426,7 +1466,10 @@ export function createV2WorkerPublicationState(options: {
             queuedResource.principal !== op.principal ||
             queuedResource.space !== own.space ||
             workerUidFromOperation(queued) !== workerUid ||
-            !(unstartedSuccessor(queued, queuedResource) || unstartedCreate(queued, queuedResource))
+            !(
+              unstartedSuccessor(queued, queuedResource, current.neverServedOperation) ||
+              unstartedCreate(queued, queuedResource, current.neverServedOperation)
+            )
           ) {
             return unresolved("source_unsettled", "A later Worker publication has started");
           }
@@ -2225,6 +2268,12 @@ export function createV2WorkerPublicationState(options: {
        * keeps the strict fence that refuses while any publication is pending.
        */
       tolerateUnstartedSuccessors?: boolean;
+      /**
+       * With `tolerateUnstartedSuccessors` only: the owner's proof that an
+       * Operation which already recorded a dispatch never reached native
+       * serving. Without it a dispatched Operation is refused.
+       */
+      neverServedOperation?: NeverServedOperation;
     }): Promise<V2WorkerCurrentServingResolution> {
       // The owner can await while reading SQL. Sample its persisted marker once,
       // before any await, so caller mutation cannot retarget this readback.
@@ -2236,6 +2285,10 @@ export function createV2WorkerPublicationState(options: {
             targetKey: input.targetKey,
             sourceOperationId: input.sourceOperationId,
             tolerateUnstartedSuccessors: input.tolerateUnstartedSuccessors === true,
+            ...(input.tolerateUnstartedSuccessors === true &&
+            input.neverServedOperation !== undefined
+              ? { neverServedOperation: input.neverServedOperation }
+              : {}),
             expectedIdentity: {
               generation: input.expectedIdentity.generation,
               workerResourceUid: input.expectedIdentity.workerResourceUid,

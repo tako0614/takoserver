@@ -2096,3 +2096,101 @@ test("recovery tolerance refuses a queued Operation that already recorded a disp
     f.close();
   }
 });
+
+for (const scenario of recoveryScenarios) {
+  test(`recovery adopts the committed graph while a dispatched ${scenario.name} is vouched never served`, async () => {
+    const f = fixture();
+    try {
+      const graph = await recoveryGraph(f, scenario);
+      const token = `dispatched-${graph.pendingId}`;
+      expect(
+        await f.store.claim(graph.pendingId, token, f.currentClock(), f.currentClock() + 60_000),
+      ).toBe(true);
+      expect(
+        await f.store.markDispatch(
+          graph.pendingId,
+          token,
+          new Date(f.currentClock()).toISOString(),
+        ),
+      ).toBe(true);
+      const tolerant = { ...graph.input, tolerateUnstartedSuccessors: true };
+      // Without the owner's proof a dispatched Operation is refused, in every mode.
+      expect(await f.reader.resolveCurrentServing(graph.input)).toMatchObject({
+        kind: "unresolved",
+      });
+      expect(await f.reader.resolveCurrentServing(tolerant)).toMatchObject({
+        kind: "unresolved",
+      });
+      // A proof for some other Operation, or a refusing proof, does not help.
+      expect(
+        await f.reader.resolveCurrentServing({
+          ...tolerant,
+          neverServedOperation: (id: string) => id !== graph.pendingId,
+        }),
+      ).toMatchObject({ kind: "unresolved" });
+      expect(
+        await f.reader.resolveCurrentServing({ ...tolerant, neverServedOperation: () => false }),
+      ).toMatchObject({ kind: "unresolved" });
+      // The proof is only honoured under the tolerant boot-recovery mode.
+      expect(
+        await f.reader.resolveCurrentServing({
+          ...graph.input,
+          neverServedOperation: (id: string) => id === graph.pendingId,
+        }),
+      ).toMatchObject({ kind: "unresolved" });
+
+      const ready = await f.reader.resolveCurrentServing({
+        ...tolerant,
+        neverServedOperation: (id: string) => id === graph.pendingId,
+      });
+      expect(ready).toMatchObject({ kind: "ready" });
+      if (ready.kind !== "ready") return;
+      // The snapshot is the committed generation, never the dispatched spec.
+      expect(ready.snapshot.sourceOperationId).toBe(graph.sourceId);
+      expect(ready.snapshot.deployment?.generation).toBe(1);
+      expect(await ready.stillCurrent()).toBe(true);
+      // Settling it moves the committed source, so the earlier proof stops holding.
+      f.db
+        .query(
+          "UPDATE tf_v2_operations SET status = 'failed', effect = 'none', error_code = 'x', error_message = 'y' WHERE id = ?",
+        )
+        .run(graph.pendingId);
+      expect(await ready.stillCurrent()).toBe(false);
+    } finally {
+      f.close();
+    }
+  });
+}
+
+test("a vouched dispatched Operation still has to be the exact successor of the committed generation", async () => {
+  const scenario = recoveryScenarios[0];
+  if (!scenario) throw new Error("missing scenario");
+  const f = fixture();
+  try {
+    const graph = await recoveryGraph(f, scenario);
+    const token = `dispatched-${graph.pendingId}`;
+    await f.store.claim(graph.pendingId, token, f.currentClock(), f.currentClock() + 60_000);
+    await f.store.markDispatch(graph.pendingId, token, new Date(f.currentClock()).toISOString());
+    const vouched = {
+      ...graph.input,
+      tolerateUnstartedSuccessors: true,
+      neverServedOperation: (id: string) => id === graph.pendingId,
+    };
+    expect((await f.reader.resolveCurrentServing(vouched)).kind).toBe("ready");
+    // The vouch only covers an Operation that recorded a dispatch.
+    f.db
+      .query("UPDATE tf_v2_operations SET dispatch_possible = 0 WHERE id = ?")
+      .run(graph.pendingId);
+    expect(await f.reader.resolveCurrentServing(vouched)).toMatchObject({ kind: "unresolved" });
+    f.db
+      .query("UPDATE tf_v2_operations SET dispatch_possible = 1 WHERE id = ?")
+      .run(graph.pendingId);
+    expect((await f.reader.resolveCurrentServing(vouched)).kind).toBe("ready");
+    f.db
+      .query("UPDATE tf_v2_resources SET generation = generation + 1 WHERE uid = ?")
+      .run(graph.endpoint?.resourceUid ?? "");
+    expect(await f.reader.resolveCurrentServing(vouched)).toMatchObject({ kind: "unresolved" });
+  } finally {
+    f.close();
+  }
+});

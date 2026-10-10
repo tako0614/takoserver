@@ -919,6 +919,12 @@ test("a successor host abandons a never-activated candidate left by a killed upd
     });
     expect(after.incarnations).toHaveLength(2);
     expect(await workerPortOwnership(candidatePort, undefined)).toBe("vacant");
+    // What the owner vouches for when the SQL fence meets a dispatched Operation:
+    // the abandoned candidate and an Operation it never saw never served; the
+    // incumbent that is serving is never vouched for.
+    expect(
+      JSON.parse(await readFile(join(owned.root, "owners", "never-served.json"), "utf8")),
+    ).toEqual({ update: true, create: false, unknown: true });
   } finally {
     if (host) await terminateHost(host);
     if (successor) await terminateHost(successor);

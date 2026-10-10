@@ -455,24 +455,43 @@ held for its 120 second reservation before redelivery.
 
 Known gaps this test records, not fixes:
 
-- **A Deployment or Endpoint Operation interrupted after dispatch blocks
-  restart.** If the Host stops (SIGKILL, or a graceful SIGTERM) while such an
-  Operation is only queued, boot recovery now adopts the incarnation that was
-  serving and the Operation runs once afterwards (three tests pin this). The
-  Operation must have effect `none` and no recorded dispatch, so it cannot have
-  changed what is natively serving. Two neighbouring cases are still refused
-  with `ownership_uncertain`, leave the data untouched and need manual repair:
-  an Operation whose dispatch was already recorded (`reconciling`; a test
-  simulates the two engine writes that precede the native send and pins the
-  refusal), and a stop after the runtime owner persisted a candidate
-  incarnation but before activating it, which the owner refuses to open with
-  (found by reading the open path; no test reproduces it). Fixing them needs
-  the owner to retire a stale candidate and then tolerate an Operation whose
-  dispatch left no durable native record; both change owner crash recovery and
-  are a separate design decision. By reading the Endpoint frontend (not
-  measured), the Endpoint route is not served while a Deployment or Endpoint
-  update is pending, exactly as in an uninterrupted Host; the tests wait for
-  the Operation to settle before checking the response.
+- **A Host stopped during a Deployment or Endpoint Operation: which windows
+  recover.** The runtime owner persists a candidate incarnation (and then its
+  child process identity) before any native effect, and activates it with one
+  atomic owner-state write that also demotes the incumbent. So at any stop the
+  committed incumbent is the only thing that served, and a candidate that was
+  not activated never served. Recovery relies only on that durable state:
+  - *Queued* (accepted, no dispatch recorded): boot adopts the incarnation that
+    was serving; the Operation runs once afterwards (three tests).
+  - *Dispatched, owner untouched* (`reconciling`, but the owner persisted
+    nothing): the owner vouches that the Operation never served, boot adopts the
+    serving incarnation, and the engine re-drives the Operation once through a
+    fresh incarnation (a test simulates the two engine writes that precede the
+    native send).
+  - *Candidate persisted, not activated* (a real SIGKILL once the owner holds a
+    candidate and its child): on a stale-owner takeover the owner proves the
+    recorded child is dead and its listener vacant, records the retirement under
+    the candidate's own Operation ID, writes the group's retirement receipt
+    without starting a child, and finishes the normal retired-copy cleanup. A
+    candidate with no recorded child identity, a live child or a foreign
+    listener is still refused, and an abandoned Operation ID is never reused.
+    **Known gap:** because the ID is not reused, the interrupted Operation stays
+    `reconciling` and keeps retrying without a new effect; it is not lost and
+    not duplicated, but it does not complete, and the Worker takes no further
+    Operation until it is settled. Completing or failing such an Operation
+    needs a decision: either a fresh incarnation for the same Operation (which
+    changes the exact `takoserver-v2-operation:<id>` generation marker the
+    engine verifies) or a definitive no-effect settlement from the owner. By
+    reading the owner (not measured), the same wedge already follows an
+    in-process failure after the candidate was retired.
+
+  Still refused with `ownership_uncertain` (data untouched, manual repair): an
+  Operation the owner already activated but SQL never settled, a DELETE that
+  closed admission, a candidate whose child identity was never recorded, and a
+  dispatched Operation the owner cannot vouch for. By reading the Endpoint
+  frontend (not measured), the Endpoint route is not served while a Deployment
+  or Endpoint update is pending, exactly as in an uninterrupted Host; the tests
+  wait for the Operation to settle before checking the response.
 - **The readiness probe does not observe v2 Worker owners.** While v2 Workers
   are serving, `/_takoserver/health/ready` reports `workerRuntime:
   "not-required"` and `supervisor: "idle"`; it can not report their failure.

@@ -157,6 +157,8 @@ type PublicationState = {
     readonly expectedIdentity: WorkerdPublicationIdentity;
     /** Boot recovery only; see createV2WorkerPublicationState. */
     readonly tolerateUnstartedSuccessors?: boolean;
+    /** Boot recovery only; the owner's proof that a dispatched Operation never served. */
+    readonly neverServedOperation?: (operationId: string) => boolean;
   }): Promise<
     | {
         readonly kind: "ready";
@@ -3610,6 +3612,33 @@ export async function openWorkerdWorkerRuntimeOwner(
     if (basisPoint !== 10_000) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   };
 
+  /**
+   * Owner-side proof for boot recovery that an Operation the SQL engine already
+   * dispatched never reached native serving. The owner persists a candidate
+   * incarnation before any native effect and activates it with one atomic state
+   * write, so an Operation is provably unserved when it has no record, or its
+   * only record is a candidate proven dead and retired without activation. An
+   * active, draining or still-retiring record, or an admission closed by the
+   * Operation, is never vouched for.
+   */
+  const operationNeverServed = (operationId: string): boolean => {
+    if (
+      state.admissionClosedBy !== null ||
+      state.deletionPublicationConfirmed ||
+      operationId === state.activeOperationId
+    )
+      return false;
+    const record = state.incarnations.find((item) => item.operationId === operationId);
+    return (
+      record === undefined ||
+      (record.identity === null &&
+        record.configurationSha256 === null &&
+        record.retirementOperationId === record.operationId &&
+        record.status === "retired" &&
+        record.receipt !== null)
+    );
+  };
+
   const recoverActiveIncarnation = async (): Promise<void> => {
     // An old Queue grant may remain send-authorized. Record exact physical
     // absence before restore can replace the active record's process identity.
@@ -3634,6 +3663,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       sourceOperationId,
       expectedIdentity: activeRecord.identity,
       tolerateUnstartedSuccessors: true,
+      neverServedOperation: operationNeverServed,
     });
     if (
       resolution.kind !== "ready" ||
