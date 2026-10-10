@@ -495,9 +495,13 @@ test:
   fails the write; a failing background pass now logs its name and a bounded
   cause, and a Queue reservation that was never sent is refunded with retries
   bounded to one second in total before it falls back to its 120 second expiry.
-  A lock that outlasted the five second wait is not retried, because each
-  attempt would block the Host for that long again. Do not read the live
-  database anyway; stop the Host first.
+  A refund whose lock outlasted the five second wait is not retried, because
+  each attempt would block the Host for that long again. A Queue batch whose
+  handler finished but whose retirement failed this way is different: its
+  Consumer would stay occupied until the next restart, so the same handler
+  receipt is retried on later delivery passes, after 1, 2, 4 ... seconds and at
+  most once a minute. Do not read the live database anyway; stop the Host
+  first.
 - **The boot note for an unpublishable Worker endpoint is one coherent
   statement.** It says endpoints cannot be created in this profile, names the
   address they would have, and gives the remedy once.
