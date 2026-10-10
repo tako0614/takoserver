@@ -307,9 +307,10 @@ function withControl<T>(root: string, read: (database: Database) => T): T {
 }
 
 /**
- * The Host owns every write to control.sqlite and sets no busy timeout, so a
- * reader polling at a high rate makes its own commits fail with "database is
- * locked". Poll slowly, and never from a hot loop.
+ * The Host owns every write to control.sqlite. Its bounded busy timeout turns
+ * a short read here into a delay of a Host commit, and a read held past that
+ * bound into a failed one, so a hot polling loop still slows the Host under
+ * test. Poll slowly, and never from a hot loop.
  */
 async function waitForQueueReceipt(
   root: string,
@@ -1328,6 +1329,13 @@ test.skipIf(OPT_IN !== "1")(
       completed = true;
     } finally {
       await Promise.allSettled([stopHost(host)]);
+      // If a fixed boot ever makes the refused startHost above succeed, that
+      // Host is not in `host`; never leak it, its port or its children.
+      for (const started of startedHosts) {
+        if (started.child.exitCode !== null) continue;
+        started.child.kill("SIGKILL");
+        await Promise.race([started.child.exited, Bun.sleep(5_000)]);
+      }
       if (completed) await rm(root, { recursive: true, force: true });
       else {
         for (const [index, started] of startedHosts.entries()) {
