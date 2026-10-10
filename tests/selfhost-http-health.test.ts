@@ -505,18 +505,50 @@ test("ready reports serving v2 Worker owners instead of not-required", async () 
   });
 });
 
-test("ready is not ready when any v2 Worker owner is unavailable", async () => {
+test("one unavailable tenant Worker degrades readiness without failing the control plane", async () => {
+  // /ready shares the port with the control API. A load balancer that pulled
+  // the Host for one broken tenant Worker would take the operator API with it.
   const result = await readReady(
     v2Health({ observe: async () => ({ owners: 3, serving: 2, unavailable: 1 }) }),
   );
-  expect(result.status).toBe(503);
+  expect(result.status).toBe(200);
   expect(result.body).toEqual({
-    status: "not_ready",
+    status: "ready",
     database: "readable",
-    workerRuntime: "unavailable",
+    workerRuntime: "serving",
     supervisor: "idle",
+    degraded: true,
     v2Workers: { owners: 3, serving: 2, unavailable: 1 },
   });
+
+  const allDown = await readReady(
+    v2Health({ observe: async () => ({ owners: 2, serving: 0, unavailable: 2 }) }),
+  );
+  expect(allDown.status).toBe(200);
+  expect(allDown.body.status).toBe("ready");
+  expect(allDown.body.degraded).toBe(true);
+  expect(allDown.body.v2Workers).toEqual({ owners: 2, serving: 0, unavailable: 2 });
+});
+
+test("an unreadable database still fails readiness even with serving v2 owners", async () => {
+  const handler = createSelfhostHealthHandler({
+    sql: {
+      async query() {
+        throw new Error("database is locked");
+      },
+    },
+    startupRestore: "empty",
+    supervisor: {
+      snapshot: () => ({ state: "idle" as const }),
+      async probeReadiness() {
+        return { snapshot: { state: "idle" as const }, listenerReady: null };
+      },
+    },
+    v2Workers: { observe: async () => ({ owners: 1, serving: 1, unavailable: 0 }) },
+  });
+  const response = await handler(new Request("http://host.test/_takoserver/health/ready"));
+  expect(response?.status).toBe(503);
+  expect(((await response?.json()) as { database: string }).database).toBe("unavailable");
 });
 
 test("a v2 composition with no owners keeps the no-workload meaning", async () => {
@@ -558,6 +590,7 @@ test("a v2 observation that throws or hangs is not ready, and restore failure ke
   );
   expect(failedRestoreWithDeadOwner.status).toBe(503);
   expect(failedRestoreWithDeadOwner.body.workerRuntime).toBe("restore-failed");
+  expect(failedRestoreWithDeadOwner.body.degraded).toBe(true);
 });
 
 test("without a v2 composition the response keeps exactly its legacy keys", async () => {

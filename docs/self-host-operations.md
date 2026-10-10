@@ -114,9 +114,11 @@ outside the Host API v1 and the shared OpenAPI route table:
   responding. It does not query SQLite or the Worker runtime.
 - `GET /_takoserver/health/ready` performs one read-only `SELECT 1` query with
   a one-second response deadline, then makes one bounded, read-only listener
-  observation of the accepted workerd child. It returns `200` only when SQLite
-  answered and the required runtime's listener is currently reachable or the
-  runtime is not required; otherwise it returns `503`.
+  observation of the accepted legacy workerd child. It returns `200` only when
+  SQLite answered and the legacy runtime's listener is currently reachable or
+  that runtime is not required; otherwise it returns `503`. v2 Worker owners
+  are reported separately (below) and, on their own, only mark the response
+  `degraded`.
 
 The readiness body contains only fixed state labels: `database` is `readable`
 or `unavailable`; `workerRuntime` is `not-required`, `starting`, `serving`,
@@ -128,12 +130,21 @@ the fields distinguish observed service availability from process lifecycle.
 v2 Worker owners supervise their own workerd children outside that
 supervisor, so when the Host has a v2 Worker composition the body also carries
 `v2Workers: { owners, serving, unavailable }`: counts of opened owners, of
-owners whose recorded active incarnation is ready, and of owners that recorded
-an active incarnation whose child is not ready (crashed or being replaced). One
-unavailable owner, or an owner state that could not be read within the deadline,
-makes `workerRuntime` `unavailable` and the response `503`; serving owners turn
-a would-be `not-required` into `serving`. The counts carry no Worker UID or
-hostname. An empty successful boot restore with no published Workers is
+owners whose recorded active incarnation's child group is ready, and of owners
+that recorded an active incarnation whose child is not ready (crashed or being
+replaced). For v2, "serving" means the owner's supervised child holds its
+listener port; the probe does not send an HTTP request to a tenant Worker, so
+it is not the listener reachability check described above. An owner whose
+Deployment is being deleted counts as neither serving nor unavailable.
+
+Serving owners turn a would-be `not-required` into `serving`. One or more
+unavailable owners add `degraded: true` but keep the response `200` when SQLite
+answered: this probe shares its port with the control API, and one broken
+tenant Worker must not make a load balancer withdraw the operator API. Read
+`degraded` and the counts to alert on tenant Workers. The response is `503`
+only when SQLite did not answer, the boot restore failed, the legacy runtime
+is unavailable, or the v2 owner state could not be read within the deadline.
+The counts carry no Worker UID or hostname. An empty successful boot restore with no published Workers is
 `not-required`, not a failure. A failed boot restore remains `restore-failed`
 for this process even if a later child passes its listener check: that check
 does not prove the entire durable published graph was restored. A process

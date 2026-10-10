@@ -31,6 +31,12 @@ export interface SelfhostHealthResponse {
   readonly database?: "readable" | "unavailable";
   readonly workerRuntime?: SelfhostRuntimeHealth;
   readonly supervisor?: WorkerdSupervisorState;
+  /**
+   * Present (always `true`) when at least one v2 Worker owner is unavailable.
+   * The control plane can still be ready: one tenant Worker's failure must not
+   * make a load balancer pull the operator API that shares this port.
+   */
+  readonly degraded?: true;
   /** Present only when a v2 Worker composition is mounted and could be read. */
   readonly v2Workers?: SelfhostV2WorkerHealth;
 }
@@ -156,17 +162,20 @@ export function createSelfhostHealthHandler(input: {
         ? "unavailable"
         : runtimeHealth(input.startupRestore, snapshot.state);
     const v2 = input.v2Workers ? await observeV2Workers(input.v2Workers, timeoutMs) : undefined;
-    // Restore failure and a failed legacy runtime keep precedence. An owner the
-    // Host could not read, or one that lost its child, is unavailable; v2
-    // owners that serve turn "no workload" into "serving".
+    // Restore failure and a failed legacy runtime keep precedence. A v2
+    // observation that failed or hung is not ready: the Host could not tell.
+    // v2 owners that serve turn "no workload" into "serving". An individual
+    // unavailable owner is a tenant Worker's failure, reported as `degraded`
+    // and in the counts, not a reason to fail the shared control plane.
     const workerRuntime: SelfhostRuntimeHealth =
       runtime === "restore-failed" || runtime === "unavailable"
         ? runtime
-        : v2 === null || (v2 !== undefined && v2.unavailable > 0)
+        : v2 === null
           ? "unavailable"
           : v2 !== undefined && v2.serving > 0 && runtime === "not-required"
             ? "serving"
             : runtime;
+    const degraded = v2 !== undefined && v2 !== null && v2.unavailable > 0;
     const ready =
       databaseReady && (workerRuntime === "not-required" || workerRuntime === "serving");
     return healthResponse(
@@ -177,6 +186,7 @@ export function createSelfhostHealthHandler(input: {
         // Preserve the live child phase even when a boot restore failure takes
         // precedence; a later serving boolean does not prove that full restore.
         supervisor: snapshot.state,
+        ...(degraded ? { degraded: true as const } : {}),
         ...(v2 ? { v2Workers: v2 } : {}),
       },
       ready ? 200 : 503,
