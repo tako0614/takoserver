@@ -495,6 +495,9 @@ test:
   fails the write; a failing background pass now logs its name and a bounded
   cause, and a Queue reservation that was never sent is refunded with retries
   bounded to one second in total before it falls back to its 120 second expiry.
+  A Queue batch whose handler finished but whose retirement failed this way is
+  retired from that same handler receipt on a later delivery pass, so its
+  Consumer is not left occupied until the next restart.
   A lock that outlasted the five second wait is not retried, because each
   attempt would block the Host for that long again. Do not read the live
   database anyway; stop the Host first.
