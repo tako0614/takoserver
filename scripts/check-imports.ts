@@ -63,6 +63,7 @@ const LAYERS: readonly Layer[] = [
     may: [
       "core",
       "v2-contract",
+      "v2-config",
       "v2-private",
       "v2-state",
       "v2-form",
