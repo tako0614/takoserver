@@ -1279,6 +1279,14 @@ async function requireSafeStateForNewOwner(
   allowProcessRecovery = false,
 ): Promise<void> {
   if (hasOnlyRetiredOrRetirementPendingIncarnations(snapshot.state)) {
+    if (allowDeleteReplayOnly && allowProcessRecovery && neverActivatedResidue(snapshot.state)) {
+      // An earlier boot already abandoned these candidates (possibly killed
+      // before it finished their retirement). This is not a DELETE replay:
+      // nothing was ever activated, so nothing can be serving.
+      await requireNeverActivatedChildrenGone(snapshot.state);
+      await requireVacantOwnerListeners(snapshot.state);
+      return;
+    }
     if (
       allowDeleteReplayOnly &&
       (snapshot.state.admissionClosedBy === null || !snapshot.state.deletionPublicationConfirmed)
@@ -1355,6 +1363,59 @@ function neverServedResidue(state: PersistedOwnerState): boolean {
           record.retirementOperationId !== null),
     )
   );
+}
+
+/**
+ * A record retired, or still retiring, under its own Operation ID that was
+ * never activated: what an abandoned (or in-process failed) candidate becomes.
+ */
+function neverActivatedRetiredRecord(record: IncarnationRecord): boolean {
+  return (
+    neverActivatedRetirement(record) ||
+    (record.status === "retired" &&
+      record.receipt !== null &&
+      record.retirementOperationId === record.operationId &&
+      record.identity === null &&
+      record.configurationSha256 === null)
+  );
+}
+
+/**
+ * The state an earlier boot leaves after it abandoned the candidate of a first
+ * publication (or of a re-create after DELETE), whether or not that boot lived
+ * to finish the retirement: no active incarnation, admission open, at least one
+ * record retired or retiring under its own Operation ID without ever being
+ * activated, and every other record a receipted retirement of an earlier
+ * lifecycle. A stale-owner takeover of this state is not a DELETE replay.
+ */
+function neverActivatedResidue(state: PersistedOwnerState): boolean {
+  return (
+    state.activeOperationId === null &&
+    state.admissionClosedBy === null &&
+    !state.deletionPublicationConfirmed &&
+    state.endpointRouteAbsence === null &&
+    state.incarnations.some(neverActivatedRetiredRecord) &&
+    state.incarnations.every(
+      (record) =>
+        neverActivatedRetiredRecord(record) ||
+        (record.status === "retired" &&
+          record.receipt !== null &&
+          record.retirementOperationId !== null),
+    )
+  );
+}
+
+/** A never-activated record without a retirement receipt needs its own child-death proof. */
+async function requireNeverActivatedChildrenGone(state: PersistedOwnerState): Promise<void> {
+  for (const record of state.incarnations) {
+    if (record.status === "retired") continue;
+    if (
+      !neverActivatedRetirement(record) ||
+      !record.processIdentity ||
+      (await linuxProcessLiveness(record.processIdentity)) !== "stale"
+    )
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
 }
 
 function recoverableIncarnationSet(state: PersistedOwnerState): boolean {
