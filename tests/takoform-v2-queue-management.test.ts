@@ -1674,6 +1674,281 @@ test("old physical Queue execution retires only with exact persisted absence pro
   }
 });
 
+/**
+ * A Consumer with maxConcurrency 1 whose one finished batch cannot be retired
+ * while a lock holds: the first `locks` retirement UPDATEs fail.
+ */
+async function lockedRetirement(f: ReturnType<typeof fixture>, name: string, locks: number) {
+  const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, `${name}-queue`, {
+    messageRetentionSeconds: 3600,
+  });
+  const worker = await f.create(MODULE_WORKER_FORM_URL, `${name}-worker`, {});
+  const version = await f.create(WORKER_VERSION_FORM_URL, `${name}-version`, {
+    worker: { resourceUid: worker.resourceUid },
+  });
+  f.setServingVersion(version.resourceUid);
+  const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, `${name}-deployment`, {
+    worker: { resourceUid: worker.resourceUid },
+  });
+  f.setServingSource(deployment.id);
+  const consumer = await f.create(
+    QUEUE_CONSUMER_FORM_URL,
+    `${name}-consumer`,
+    consumerSpec(queue.resourceUid, worker.resourceUid, { maxConcurrency: 1 }),
+  );
+  const custody = createQueueCustody({ sql: f.sql });
+  const admit = async (messageId: string) =>
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId, body: new Uint8Array([1]) },
+    );
+  let remainingLocks = locks;
+  let clock = 0;
+  let childGone = false;
+  const retirementAttempts: number[] = [];
+  const sql: Sql = {
+    query: (statement, params) => f.sql.query(statement, params),
+    batch: (statements) => f.sql.batch(statements),
+    async run(statement, params) {
+      if (statement.includes("SET state = 'retired'")) {
+        retirementAttempts.push(clock);
+        if (remainingLocks > 0) {
+          remainingLocks -= 1;
+          throw new Error("database is locked");
+        }
+      }
+      return await f.sql.run(statement, params);
+    },
+  };
+  const target = {
+    workerVersionUid: version.resourceUid,
+    workerVersionGeneration: 1,
+    incarnationOperationId: "live-physical-incarnation",
+  };
+  const sent: string[] = [];
+  const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+  const privatePort = Number(reservation.port);
+  await reservation.stop(true);
+  const composition = createSelfhostV2QueueComposition({
+    sql,
+    custody,
+    capability: f.capability,
+    settlementKey: new Uint8Array(32).fill(7),
+    privatePort,
+    now: () => clock,
+    ownerForWorkerUid: async () =>
+      ({
+        // The child that ran the batch is alive until the test says otherwise.
+        async observeQueuePhysicalAbsence(input: {
+          workerUid: string;
+          incarnationId: string;
+          servingSourceOperationId: string;
+        }) {
+          if (!childGone || input.incarnationId !== target.incarnationOperationId)
+            return { kind: "unknown" as const };
+          return { kind: "confirmed_absent" as const, ...input, receiptDigest: "e".repeat(64) };
+        },
+        async invokeQueue(input: {
+          readonly batchId: string;
+          authorizeSend(value: typeof target): Promise<string>;
+        }) {
+          if ((await input.authorizeSend(target)) !== "authorized") return { kind: "unknown" };
+          sent.push(input.batchId);
+          // Retirement receipts are unique per batch.
+          const receiptDigest = String(sent.length).repeat(64);
+          return { kind: "handler_resolved", ...target, receiptDigest };
+        },
+      }) as unknown as WorkerdWorkerRuntimeOwner,
+  });
+  return {
+    composition,
+    admit,
+    sent,
+    workerUid: worker.resourceUid,
+    scope: { consumerUid: consumer.resourceUid, principal, space, targetKey },
+    at: (millis: number) => {
+      clock = millis;
+    },
+    loseChild: () => {
+      childGone = true;
+    },
+    retirementAttempts: () => retirementAttempts.length,
+    retirementAttemptTimes: () => [...retirementAttempts],
+    executions: async () =>
+      await f.sql.query(
+        "SELECT batch_id,state,retirement_kind,retirement_receipt_digest FROM queue_v2_batch_executions ORDER BY rowid",
+      ),
+    settlements: async () =>
+      await f.sql.query("SELECT state,outcome FROM queue_v2_batch_settlements ORDER BY rowid"),
+  };
+}
+
+test("a finished batch whose retirement hit a lock retires from its remembered receipt", async () => {
+  const f = fixture();
+  let locked: Awaited<ReturnType<typeof lockedRetirement>> | undefined;
+  try {
+    locked = await lockedRetirement(f, "locked", 2);
+    const { composition, scope, sent } = locked;
+    await locked.admit("locked-message");
+
+    locked.at(0);
+    expect(await composition.deliverOnce(scope)).toEqual({ kind: "unknown" });
+    expect(sent).toHaveLength(1);
+    expect(locked.retirementAttempts()).toBe(1);
+    expect(await locked.executions()).toMatchObject([
+      { batch_id: sent[0], state: "send_authorized" },
+    ]);
+    // Before the backoff elapses, a pass does not touch the locked row again,
+    // the batch stays occupied with its message leased, and nothing is resent.
+    for (const millis of [0, 999]) {
+      locked.at(millis);
+      expect(await composition.deliverOnce(scope)).toEqual({ kind: "idle" });
+    }
+    expect(locked.retirementAttempts()).toBe(1);
+    locked.at(1_000);
+    expect(await composition.deliverOnce(scope)).toEqual({ kind: "idle" });
+    expect(locked.retirementAttempts()).toBe(2);
+    // The second failure doubles the wait.
+    locked.at(2_999);
+    expect(await composition.deliverOnce(scope)).toEqual({ kind: "idle" });
+    expect(locked.retirementAttempts()).toBe(2);
+    expect(await locked.executions()).toMatchObject([{ state: "send_authorized" }]);
+    expect(sent).toHaveLength(1);
+
+    // The lock is gone: the same receipt retires the batch and the default ACK lands.
+    locked.at(3_000);
+    expect(await composition.deliverOnce(scope)).toEqual({ kind: "idle" });
+    expect(locked.retirementAttempts()).toBe(3);
+    expect(await locked.executions()).toEqual([
+      {
+        batch_id: sent[0],
+        state: "retired",
+        retirement_kind: "handler_and_wait_until",
+        retirement_receipt_digest: "1".repeat(64),
+      },
+    ]);
+    expect(await locked.settlements()).toEqual([{ state: "settled", outcome: "ack" }]);
+    expect(sent).toHaveLength(1);
+
+    // The Consumer's only slot is free again: the next message is delivered at once.
+    await locked.admit("next-message");
+    expect(await composition.deliverOnce(scope)).toEqual({ kind: "handler_resolved" });
+    expect(sent).toHaveLength(2);
+    expect(await locked.executions()).toMatchObject([{ state: "retired" }, { state: "retired" }]);
+  } finally {
+    await locked?.composition.close();
+    f.database.close();
+  }
+});
+
+test("the worker-wide recovery pass retires a remembered handler receipt too", async () => {
+  const f = fixture();
+  let locked: Awaited<ReturnType<typeof lockedRetirement>> | undefined;
+  try {
+    locked = await lockedRetirement(f, "recovery", 1);
+    const { composition, scope, sent } = locked;
+    await locked.admit("recovery-message");
+    locked.at(0);
+    expect(await composition.deliverOnce(scope)).toEqual({ kind: "unknown" });
+    const scan = { workerUid: locked.workerUid };
+    // Not yet due, and the child is alive: the page stays unresolved.
+    expect(await composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "unknown",
+      retired: 0,
+      nextCursor: null,
+    });
+    expect(locked.retirementAttempts()).toBe(1);
+    locked.at(1_000);
+    expect(await composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "reconciled",
+      retired: 1,
+      nextCursor: null,
+    });
+    expect(await locked.executions()).toEqual([
+      {
+        batch_id: sent[0],
+        state: "retired",
+        retirement_kind: "handler_and_wait_until",
+        retirement_receipt_digest: "1".repeat(64),
+      },
+    ]);
+    expect(await locked.settlements()).toEqual([{ state: "settled", outcome: "ack" }]);
+    // The receipt is spent: a later page has nothing left to retire.
+    expect(await composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "reconciled",
+      retired: 0,
+      nextCursor: null,
+    });
+    expect(locked.retirementAttempts()).toBe(2);
+  } finally {
+    await locked?.composition.close();
+    f.database.close();
+  }
+});
+
+test("remembered receipt retries back off to at most once a minute", async () => {
+  const f = fixture();
+  let locked: Awaited<ReturnType<typeof lockedRetirement>> | undefined;
+  try {
+    locked = await lockedRetirement(f, "capped", 100);
+    await locked.admit("capped-message");
+    locked.at(0);
+    expect(await locked.composition.deliverOnce(locked.scope)).toEqual({ kind: "unknown" });
+    // One-second polls for five minutes.
+    const scan = { workerUid: locked.workerUid };
+    for (let second = 1; second <= 300; second += 1) {
+      locked.at(second * 1_000);
+      await locked.composition.reconcileWorkerAuthorizedAbsence(scan);
+    }
+    expect(locked.retirementAttemptTimes()).toEqual([
+      0, 1_000, 3_000, 7_000, 15_000, 31_000, 63_000, 123_000, 183_000, 243_000,
+    ]);
+  } finally {
+    await locked?.composition.close();
+    f.database.close();
+  }
+});
+
+test("a remembered receipt yields to proven physical absence before it is due", async () => {
+  const f = fixture();
+  let locked: Awaited<ReturnType<typeof lockedRetirement>> | undefined;
+  try {
+    locked = await lockedRetirement(f, "replaced", 1);
+    await locked.admit("replaced-message");
+    locked.at(0);
+    expect(await locked.composition.deliverOnce(locked.scope)).toEqual({ kind: "unknown" });
+    // The child is replaced before the receipt retry is due.
+    locked.loseChild();
+    locked.at(500);
+    const scan = { workerUid: locked.workerUid };
+    expect(await locked.composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "reconciled",
+      retired: 1,
+      nextCursor: null,
+    });
+    expect(await locked.executions()).toMatchObject([
+      { state: "retired", retirement_kind: "incarnation_absent" },
+    ]);
+    // The receipt is dropped with the absence retirement and never tried again;
+    // the message waits for its lease to expire and is redelivered.
+    locked.at(5_000);
+    expect(await locked.composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "reconciled",
+      retired: 0,
+      nextCursor: null,
+    });
+    expect(locked.retirementAttemptTimes()).toEqual([0, 500]);
+    expect(await locked.settlements()).toEqual([{ state: "pending", outcome: null }]);
+  } finally {
+    await locked?.composition.close();
+    f.database.close();
+  }
+});
+
 test("worker-wide authorized recovery advances a bounded 32-row keyset cursor", async () => {
   const rows = Array.from({ length: 34 }, (_, index) => ({
     batch_id: `batch-${String(index + 1).padStart(3, "0")}`,

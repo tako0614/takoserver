@@ -35,6 +35,46 @@ export interface SelfhostV2QueueCompositionOptions {
    * retries, so it will wait out its 120 second expiry. Cause only; no payload.
    */
   readonly onCancelFailure?: (cause: unknown) => void;
+  /** Internal deterministic-test clock for retirement retries; defaults to a monotonic clock. */
+  readonly now?: () => number;
+}
+
+interface UnretiredReceipt {
+  readonly execution: V2QueueBatchExecutionIdentity;
+  readonly receiptDigest: string;
+  readonly outcome: "ack" | "retry";
+  readonly claims: readonly {
+    readonly messageId: string;
+    readonly queueId: string;
+    readonly leaseToken: string;
+  }[];
+  /** Failed retirement attempts so far, and when the next one may run. */
+  attempts: number;
+  nextAttemptAt: number;
+}
+
+const RECEIPT_DIGEST = /^[a-f0-9]{64}$/u;
+// A lock that outlasted the busy timeout blocks the Host for that long on each
+// attempt, so later attempts back off: 1 s, 2 s, 4 s ... at most one minute.
+const RETIREMENT_RETRY_FIRST_MS = 1_000;
+const RETIREMENT_RETRY_MAX_MS = 60_000;
+
+function sameExecution(
+  left: V2QueueBatchExecutionIdentity,
+  right: V2QueueBatchExecutionIdentity,
+): boolean {
+  return (
+    left.batchId === right.batchId &&
+    left.reservationToken === right.reservationToken &&
+    left.queueUid === right.queueUid &&
+    left.consumerUid === right.consumerUid &&
+    left.generation === right.generation &&
+    left.workerUid === right.workerUid &&
+    left.servingSourceOperationId === right.servingSourceOperationId &&
+    left.workerVersionUid === right.workerVersionUid &&
+    left.workerVersionGeneration === right.workerVersionGeneration &&
+    left.incarnationOperationId === right.incarnationOperationId
+  );
 }
 
 /**
@@ -56,7 +96,8 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
     (options.renewalIntervalMillis !== undefined &&
       (!Number.isSafeInteger(options.renewalIntervalMillis) ||
         options.renewalIntervalMillis < 10 ||
-        options.renewalIntervalMillis > 30_000))
+        options.renewalIntervalMillis > 30_000)) ||
+    (options.now !== undefined && typeof options.now !== "function")
   )
     throw new TypeError("v2 Queue requires SQL, custody, native owner and private authority");
   const key = new Uint8Array(options.settlementKey);
@@ -109,6 +150,81 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
       .update("default-settlement/v2\0")
       .update(JSON.stringify([batchId, messageId, outcome]))
       .digest("base64url");
+
+  /**
+   * Handler receipts whose SQL 0083 retirement failed after the handler
+   * finished (for example a lock that outlasted the busy timeout), keyed by
+   * batch. The child that ran the batch is still alive, so physical absence
+   * never retires it, and its Consumer would stay occupied until a restart
+   * replaced that child. The receipt is exact and deterministic, so later
+   * passes repeat the same CAS, with backoff. Memory only: after a restart the
+   * child is gone and absence applies. A row that left `send_authorized` some
+   * other way is never listed again, so its receipt is simply dropped at the
+   * next restart. No message bodies.
+   */
+  const unretiredReceipts = new Map<string, UnretiredReceipt>();
+  // Monotonic, so a wall-clock step back cannot postpone a retry.
+  const now = options.now ?? (() => performance.now());
+
+  function deferRetirement(receipt: UnretiredReceipt): void {
+    receipt.attempts += 1;
+    receipt.nextAttemptAt =
+      now() +
+      Math.min(RETIREMENT_RETRY_MAX_MS, RETIREMENT_RETRY_FIRST_MS * 2 ** (receipt.attempts - 1));
+  }
+
+  async function retireByReceipt(receipt: UnretiredReceipt): Promise<boolean> {
+    const retired = await confirmV2QueueBatchRetirement(options.sql, {
+      execution: receipt.execution,
+      kind: "handler_and_wait_until",
+      receiptDigest: receipt.receiptDigest,
+    }).catch(() => "unknown" as const);
+    return retired === "retired" || retired === "already_retired";
+  }
+
+  // ModuleWorker's default is per pending message. Earlier tenant ACK/retry
+  // is terminal; an unknown SQL result is not treated as success.
+  async function settleDefaults(receipt: UnretiredReceipt): Promise<boolean> {
+    const { execution, outcome } = receipt;
+    for (const claim of receipt.claims) {
+      const settled = await options.custody
+        .settleRegisteredBatchMessage({
+          batchId: execution.batchId,
+          messageId: claim.messageId,
+          expected: {
+            queueId: claim.queueId,
+            consumerId: execution.consumerUid,
+            generation: execution.generation,
+            leaseToken: claim.leaseToken,
+          },
+          decision: { outcome },
+          settlementToken: defaultToken(execution.batchId, claim.messageId, outcome),
+        })
+        .catch(() => "unavailable" as const);
+      if (settled !== "settled" && settled !== "already_settled") return false;
+    }
+    return true;
+  }
+
+  /** A remembered exact handler receipt when due, else proven physical absence. */
+  async function retireAuthorized(execution: V2QueueBatchExecutionIdentity): Promise<boolean> {
+    const remembered = unretiredReceipts.get(execution.batchId);
+    const receipt =
+      remembered && sameExecution(remembered.execution, execution) ? remembered : null;
+    if (receipt && now() >= receipt.nextAttemptAt) {
+      if (await retireByReceipt(receipt)) {
+        unretiredReceipts.delete(execution.batchId);
+        // A failed default settlement leaves its lease to expire and redeliver.
+        await settleDefaults(receipt);
+        return true;
+      }
+      deferRetirement(receipt);
+    }
+    // A child alive is answered by the owner without a SQL write.
+    const absent = await retireOnlyIfPhysicallyAbsent(execution);
+    if (absent && receipt) unretiredReceipts.delete(execution.batchId);
+    return absent;
+  }
 
   /** SQL 0083 is a candidate, never native absence authority. */
   async function retireOnlyIfPhysicallyAbsent(
@@ -178,7 +294,7 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
     let retired = 0;
     let unknown = false;
     for (const execution of page.executions) {
-      if (await retireOnlyIfPhysicallyAbsent(execution)) retired += 1;
+      if (await retireAuthorized(execution)) retired += 1;
       else unknown = true;
     }
     return {
@@ -203,7 +319,7 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
     let retired = 0;
     let unknown = false;
     for (const execution of executions) {
-      if (await retireOnlyIfPhysicallyAbsent(execution)) retired += 1;
+      if (await retireAuthorized(execution)) retired += 1;
       else unknown = true;
     }
     return { kind: unknown ? "unknown" : "reconciled", retired };
@@ -228,8 +344,9 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
   }): Promise<{ readonly kind: "idle" | "unknown" | "handler_resolved" | "handler_rejected" }> {
     const scope = { ...input };
     // Recovery may have replaced a physical child while retaining its logical
-    // serving Operation. First retire only provably absent old executions;
-    // unresolved sends stay occupied and are never resent here.
+    // serving Operation. First retire only executions with a remembered exact
+    // handler receipt or a provably absent child; unresolved sends stay
+    // occupied and are never resent here.
     await reconcileAuthorizedAbsence(scope);
     const batch = await delivery
       .claimRegisteredBatch(scope)
@@ -286,33 +403,26 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
       await cancelBeforeSend(batch);
       return { kind: "unknown" };
     }
-    const retired = await confirmV2QueueBatchRetirement(options.sql, {
+    const receipt: UnretiredReceipt = {
       execution: execution(outcome),
-      kind: "handler_and_wait_until",
       receiptDigest: outcome.receiptDigest,
-    }).catch(() => "unknown" as const);
-    if (retired === "unknown") return { kind: "unknown" };
-
-    // ModuleWorker's default is per pending message. Earlier tenant ACK/retry
-    // is terminal; an unknown SQL result is not treated as success.
-    const decision = { outcome: outcome.kind === "handler_resolved" ? "ack" : "retry" } as const;
-    for (const claim of batch.claims) {
-      const settled = await options.custody
-        .settleRegisteredBatchMessage({
-          batchId: batch.batchId,
-          messageId: claim.messageId,
-          expected: {
-            queueId: claim.queueId,
-            consumerId: batch.consumerUid,
-            generation: batch.generation,
-            leaseToken: claim.leaseToken,
-          },
-          decision,
-          settlementToken: defaultToken(batch.batchId, claim.messageId, decision.outcome),
-        })
-        .catch(() => "unavailable" as const);
-      if (settled !== "settled" && settled !== "already_settled") return { kind: "unknown" };
+      outcome: outcome.kind === "handler_resolved" ? "ack" : "retry",
+      claims: batch.claims.map(({ messageId, queueId, leaseToken }) => ({
+        messageId,
+        queueId,
+        leaseToken,
+      })),
+      attempts: 0,
+      nextAttemptAt: 0,
+    };
+    if (!(await retireByReceipt(receipt))) {
+      if (RECEIPT_DIGEST.test(receipt.receiptDigest)) {
+        deferRetirement(receipt);
+        unretiredReceipts.set(batch.batchId, receipt);
+      }
+      return { kind: "unknown" };
     }
+    if (!(await settleDefaults(receipt))) return { kind: "unknown" };
     return { kind: outcome.kind };
   }
 
