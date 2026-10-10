@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -82,6 +82,7 @@ async function fixture(auxUid = "database-two") {
   };
   let primaryAvailable = true;
   let lostDrainAck = false;
+  let confirmCount = 0;
   let inspectNativeThroughSameStore = false;
   let inspectedNativeUid: string | null = null;
   let acceptedCreatePrincipal = "alice";
@@ -193,6 +194,7 @@ async function fixture(auxUid = "database-two") {
         : ({ kind: "unknown" } as const);
     },
     async confirmDrained(input: Parameters<V2QueueSQLiteProofPort["confirmDrained"]>[0]) {
+      confirmCount += 1;
       if (
         !primaryAvailable ||
         custody.kind !== "found" ||
@@ -250,6 +252,9 @@ async function fixture(auxUid = "database-two") {
     },
     getCustody() {
       return custody;
+    },
+    getConfirmCount() {
+      return confirmCount;
     },
     cleanup() {
       rmSync(root, { recursive: true, force: true });
@@ -768,6 +773,75 @@ test("Queue drain refuses missing primary proof, incomplete/foreign binding sets
     host.loseDrainAck();
     expect(await broker.drain(host.grant, terminal)).toBe(true);
     expect(host.getCustody()).toMatchObject({ sqliteDrainState: "drained" });
+  } finally {
+    host.cleanup();
+  }
+});
+
+test("Queue drained retry refuses a missing selected UID despite the exact Core receipt", async () => {
+  const host = await fixture();
+  try {
+    host.setTerminal();
+    expect(await host.makeBroker().drain(host.grant, terminal)).toBe(true);
+    expect(host.getCustody()).toMatchObject({ sqliteDrainState: "drained" });
+    rmSync(join(host.nativeRoot, "resources", "database-two"), {
+      recursive: true,
+      force: true,
+    });
+    expect(await host.makeBroker(host.createSecondStore()).drain(host.grant, terminal)).toBe(false);
+    expect(host.getCustody()).toMatchObject({ sqliteDrainState: "drained" });
+    expect(host.getConfirmCount()).toBe(1);
+  } finally {
+    host.cleanup();
+  }
+});
+
+test("Queue drained retry refuses a foreign original-CREATE marker despite the exact Core receipt", async () => {
+  const host = await fixture();
+  try {
+    host.setTerminal();
+    expect(await host.makeBroker().drain(host.grant, terminal)).toBe(true);
+    writeFileSync(
+      join(host.nativeRoot, "resources", "database-two", "owner.json"),
+      JSON.stringify({
+        version: 1,
+        resourceUid: "database-two",
+        targetKey,
+        createOperationId: "create-foreign",
+      }),
+    );
+    expect(await host.makeBroker(host.createSecondStore()).drain(host.grant, terminal)).toBe(false);
+    expect(host.getCustody()).toMatchObject({ sqliteDrainState: "drained" });
+    expect(host.getConfirmCount()).toBe(1);
+  } finally {
+    host.cleanup();
+  }
+});
+
+test("Queue drained retry accepts intact restarted UID owners without repeating the Core CAS", async () => {
+  const host = await fixture();
+  try {
+    host.setTerminal();
+    host.loseDrainAck();
+    expect(await host.makeBroker().drain(host.grant, terminal)).toBe(true);
+    expect(await host.makeBroker(host.createSecondStore()).drain(host.grant, terminal)).toBe(true);
+    expect(host.getConfirmCount()).toBe(1);
+  } finally {
+    host.cleanup();
+  }
+});
+
+test("Queue pending drain refuses a missing selected UID before the Core CAS", async () => {
+  const host = await fixture();
+  try {
+    host.setTerminal();
+    rmSync(join(host.nativeRoot, "resources", "database-two"), {
+      recursive: true,
+      force: true,
+    });
+    expect(await host.makeBroker().drain(host.grant, terminal)).toBe(false);
+    expect(host.getCustody()).toMatchObject({ sqliteDrainState: "pending" });
+    expect(host.getConfirmCount()).toBe(0);
   } finally {
     host.cleanup();
   }
