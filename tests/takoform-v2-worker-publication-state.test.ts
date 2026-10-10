@@ -2448,7 +2448,7 @@ for (const middle of ["none", "partial"] as const) {
 
 // Measured bound: the committed view is rebuilt from at most MAX_FAILED_TAIL
 // (8) consecutive failed/none Operations behind the committed generation.
-test("the committed view covers eight consecutive failed/none updates of the source, not nine", async () => {
+test("the committed view covers eight consecutive failed/none updates of the source Endpoint, not nine", async () => {
   const scenario = recoveryScenarios.find((item) => item.change === "endpoint-update");
   if (!scenario) throw new Error("missing scenario");
   const f = fixture();
@@ -2459,11 +2459,14 @@ test("the committed view covers eight consecutive failed/none updates of the sou
     expect(await f.engine.runNext()).toMatchObject({ id: graph.pendingId, status: "failed" });
     for (let generation = 2; generation <= 10; generation += 1) {
       const failedCount = generation - 1;
-      const ready = await serve(f, graph.input);
-      expect({ failedCount, kind: ready.kind }).toEqual({
-        failedCount,
-        kind: failedCount <= 8 ? "ready" : "unresolved",
-      });
+      // Both the strict fence and boot recovery's tolerant fence.
+      for (const input of [graph.input, { ...graph.input, tolerateUnstartedSuccessors: true }]) {
+        const ready = await serve(f, input);
+        expect({ failedCount, kind: ready.kind }).toEqual({
+          failedCount,
+          kind: failedCount <= 8 ? "ready" : "unresolved",
+        });
+      }
       if (generation === 10) break;
       const retry = await f.engine.acceptUpdate({
         principal: "org-1",

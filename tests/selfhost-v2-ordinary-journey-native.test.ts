@@ -1265,9 +1265,12 @@ test.skipIf(OPT_IN !== "1")(
  *    candidate incarnation and its child): boot abandons the dead candidate and
  *    serves the committed incarnation. The Operation ID is never given a second
  *    incarnation; the engine settles it failed with effect none, the Worker
- *    keeps serving the committed graph, and a re-apply publishes once.
+ *    keeps serving the committed graph, and a re-apply publishes once. An
+ *    Endpoint DELETE killed at its candidate settles the same way (owner
+ *    crash-recovery test, not this file).
  *  - dispatched AND already activated by the owner but unsettled in SQL, or a
- *    DELETE that started: still refused at boot (docs/self-host-operations.md).
+ *    Deployment DELETE that closed admission: still refused at boot
+ *    (docs/self-host-operations.md).
  * The test refuses to run (inconclusive) rather than count a crash that landed
  * in a different window than the one it names.
  */
