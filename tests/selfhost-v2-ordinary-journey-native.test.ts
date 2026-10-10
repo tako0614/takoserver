@@ -1207,135 +1207,194 @@ test.skipIf(OPT_IN !== "1")(
 );
 
 /**
- * KNOWN GAP, pinned so it cannot change silently. A Host that stops (here
- * SIGKILL, with the same result for SIGTERM) while a WorkerDeployment or
- * WorkerEndpoint Operation for a published Worker is queued cannot start
- * again: boot restore asks for the "current serving" proof, which is
- * refused while any such Operation is pending, and a pending Operation only
- * runs after restore. The Host fails closed and exits with
- * `ownership_uncertain` on every attempt, so the data is intact but the
- * installation needs manual repair. When this is fixed, the restart below
- * should succeed and the Operation should settle once; update this test then.
+ * A Host that stops (SIGKILL here, SIGTERM behaves the same) while a
+ * WorkerDeployment or WorkerEndpoint Operation for a published Worker is only
+ * queued must boot again. Boot recovery adopts the committed incarnation that
+ * was serving (the queued Operation has recorded no dispatch, so it cannot
+ * have changed native state), and the normal Operation engine then runs the
+ * queued Operation exactly once.
+ *
+ * Scope of the proof: the Operation is accepted and not yet dispatched at the
+ * crash. An Operation with a recorded dispatch (`reconciling`) is a different,
+ * harder case that is intentionally still refused at boot; the test refuses to
+ * run (inconclusive) rather than count such a crash as a pass.
  */
-test.skipIf(OPT_IN !== "1")(
-  "KNOWN GAP: a pending Endpoint Operation at SIGKILL makes boot restore fail closed",
-  async () => {
-    startedHosts.length = 0;
-    const environment = await prepareEnvironment();
-    const { root, port, certificate, fullBoot } = environment;
-    let host: Host | null = null;
-    let completed = false;
-    try {
-      const { space, token, auth } = await firstBoot(environment);
-      const bundle = await seedArtifact(
-        root,
-        "gap-worker",
-        [
-          {
-            path: "worker.js",
-            bytes: endpointFixture("gap-v1"),
-            mediaType: "application/javascript+module",
-          },
-        ],
-        "worker.js",
-        space,
-      );
-      const config = journeyConfig([], [bundle]);
-      host = await startHost(root, port, config, fullBoot);
-      const create = async (form: string, name: string, spec: Json) => {
-        const accepted = await jsonAt(
-          port,
-          "POST",
-          `${V2}/resources`,
-          202,
-          { form, space, name, spec },
-          { ...auth, "idempotency-key": `gap-${name}-create` },
+for (const pending of ["deployment-update", "endpoint-update"] as const) {
+  test.skipIf(OPT_IN !== "1")(
+    `a queued ${pending} at SIGKILL boots again and runs once`,
+    async () => {
+      startedHosts.length = 0;
+      const environment = await prepareEnvironment();
+      const { root, port, certificate, fullBoot } = environment;
+      let host: Host | null = null;
+      let completed = false;
+      try {
+        const { space, token, auth } = await firstBoot(environment);
+        const bundle = await seedArtifact(
+          root,
+          "gap-worker-v1",
+          [
+            {
+              path: "worker.js",
+              bytes: endpointFixture("gap-v1"),
+              mediaType: "application/javascript+module",
+            },
+          ],
+          "worker.js",
+          space,
         );
-        expect(await settled(port, token, String(accepted.id))).toMatchObject({
-          effect: "complete",
+        const bundleNext = await seedArtifact(
+          root,
+          "gap-worker-v2",
+          [
+            {
+              path: "worker.js",
+              bytes: endpointFixture("gap-v2"),
+              mediaType: "application/javascript+module",
+            },
+          ],
+          "worker.js",
+          space,
+        );
+        const config = journeyConfig([], [bundle, bundleNext]);
+        host = await startHost(root, port, config, fullBoot);
+        const create = async (form: string, name: string, spec: Json) => {
+          const accepted = await jsonAt(
+            port,
+            "POST",
+            `${V2}/resources`,
+            202,
+            { form, space, name, spec },
+            { ...auth, "idempotency-key": `gap-${name}-create` },
+          );
+          expect(await settled(port, token, String(accepted.id))).toMatchObject({
+            effect: "complete",
+          });
+          return String(accepted.resourceUid);
+        };
+        const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
+        const bundleUid = await create(WORKER_BUNDLE_FORM_URL, "bundle", {
+          artifact: { url: bundle.manifestUrl, sha256: bundle.manifestSha256 },
         });
-        return String(accepted.resourceUid);
-      };
-      const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
-      const bundleUid = await create(WORKER_BUNDLE_FORM_URL, "bundle", {
-        artifact: { url: bundle.manifestUrl, sha256: bundle.manifestSha256 },
-      });
-      const version = await create(WORKER_VERSION_FORM_URL, "version", {
-        worker: { resourceUid: worker },
-        bundle: { resourceUid: bundleUid },
-        handlers: ["fetch"],
-      });
-      await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
-        worker: { resourceUid: worker },
-        versions: [{ workerVersion: { resourceUid: version }, weight: 10_000 }],
-      });
-      const endpointUid = await create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
-        worker: { resourceUid: worker },
-      });
-      const endpointRead = await jsonAt(
-        port,
-        "GET",
-        `${V2}/resources/${endpointUid}`,
-        200,
-        undefined,
-        auth,
-      );
-      const hostname = String((endpointRead.output as Json).hostname);
-      expect(
-        await endpointEventually(hostname, certificate, "/", (r) => r.body === "gap-v1"),
-      ).toEqual({ status: 200, body: "gap-v1" });
+        const version = await create(WORKER_VERSION_FORM_URL, "version", {
+          worker: { resourceUid: worker },
+          bundle: { resourceUid: bundleUid },
+          handlers: ["fetch"],
+        });
+        const nextBundleUid = await create(WORKER_BUNDLE_FORM_URL, "bundle-next", {
+          artifact: { url: bundleNext.manifestUrl, sha256: bundleNext.manifestSha256 },
+        });
+        const nextVersion = await create(WORKER_VERSION_FORM_URL, "version-next", {
+          worker: { resourceUid: worker },
+          bundle: { resourceUid: nextBundleUid },
+          handlers: ["fetch"],
+        });
+        const deploymentUid = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+          worker: { resourceUid: worker },
+          versions: [{ workerVersion: { resourceUid: version }, weight: 10_000 }],
+        });
+        const endpointUid = await create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
+          worker: { resourceUid: worker },
+        });
+        const endpointRead = await jsonAt(
+          port,
+          "GET",
+          `${V2}/resources/${endpointUid}`,
+          200,
+          undefined,
+          auth,
+        );
+        const hostname = String((endpointRead.output as Json).hostname);
+        expect(
+          await endpointEventually(hostname, certificate, "/", (r) => r.body === "gap-v1"),
+        ).toEqual({ status: 200, body: "gap-v1" });
 
-      const updateKey = "gap-endpoint-update";
-      const update = await jsonAt(
-        port,
-        "PUT",
-        `${V2}/resources/${endpointUid}`,
-        202,
-        { spec: { worker: { resourceUid: worker } } },
-        { ...auth, "idempotency-key": updateKey, "takoform-expected-generation": "1" },
-      );
-      const pid = host.child.pid;
-      await killHost(host);
-      host = null;
-      const durable = withControl(
-        root,
-        (control) =>
-          control
-            .query("SELECT id, status FROM tf_v2_operations WHERE replay_key = ?")
-            .all(updateKey) as Json[],
-      );
-      expect(durable).toHaveLength(1);
-      // The crash fence must land before the Operation settled for this to be a gap case.
-      if (
-        !["queued", "running", "waiting_input", "reconciling"].includes(String(durable[0]?.status))
-      ) {
-        throw new Error(`inconclusive: Operation was already ${String(durable[0]?.status)}`);
-      }
-      expect(durable[0]?.id).toBe(String(update.id));
-
-      // Fail closed, deterministically, and the data stays untouched.
-      await expect(startHost(root, port, config, fullBoot)).rejects.toThrow(/ownership_uncertain/u);
-      expect(
-        withControl(
+        const updateKey = `gap-${pending}`;
+        const target = pending === "deployment-update" ? deploymentUid : endpointUid;
+        const spec: Json =
+          pending === "deployment-update"
+            ? {
+                worker: { resourceUid: worker },
+                versions: [{ workerVersion: { resourceUid: nextVersion }, weight: 10_000 }],
+              }
+            : { worker: { resourceUid: worker } };
+        const update = await jsonAt(
+          port,
+          "PUT",
+          `${V2}/resources/${target}`,
+          202,
+          { spec },
+          { ...auth, "idempotency-key": updateKey, "takoform-expected-generation": "1" },
+        );
+        await killHost(host);
+        host = null;
+        const atCrash = withControl(
           root,
           (control) =>
             control
-              .query("SELECT status FROM tf_v2_operations WHERE replay_key = ?")
+              .query(
+                "SELECT id, status, effect, dispatch_possible FROM tf_v2_operations WHERE replay_key = ?",
+              )
               .all(updateKey) as Json[],
-        ),
-      ).toEqual(durable.map((row) => ({ status: row.status })));
-      expect(pid).toBeGreaterThan(0);
-      completed = true;
-    } finally {
-      await Promise.allSettled([stopHost(host)]);
-      if (completed) await rm(root, { recursive: true, force: true });
-      else {
-        for (const [index, started] of startedHosts.entries()) {
-          await writeFile(join(root, `host-${index}.log`), started.output()).catch(() => undefined);
+        );
+        expect(atCrash).toHaveLength(1);
+        expect(atCrash[0]?.id).toBe(String(update.id));
+        // The crash must land before any dispatch was recorded for this to be
+        // the queued-Operation case; a dispatched one is a different gap.
+        if (
+          !["queued", "running", "waiting_input"].includes(String(atCrash[0]?.status)) ||
+          atCrash[0]?.dispatch_possible !== 0
+        ) {
+          throw new Error(
+            `inconclusive: Operation was ${String(atCrash[0]?.status)} (dispatch_possible=${String(atCrash[0]?.dispatch_possible)})`,
+          );
         }
-        process.stderr.write(`journey: data root and host logs retained at ${root}\n`);
+
+        host = await startHost(root, port, config, fullBoot);
+        expect(host.output()).not.toContain("ownership_uncertain");
+        expect(await settled(port, token, String(update.id))).toMatchObject({
+          effect: "complete",
+        });
+        const expected = pending === "deployment-update" ? "gap-v2" : "gap-v1";
+        expect(
+          await endpointEventually(hostname, certificate, "/", (r) => r.body === expected),
+        ).toEqual({ status: 200, body: expected });
+
+        // Exactly one Operation carries the update; it ran to completion once.
+        expect(
+          withControl(
+            root,
+            (control) =>
+              control
+                .query("SELECT status, effect FROM tf_v2_operations WHERE replay_key = ?")
+                .all(updateKey) as Json[],
+          ),
+        ).toEqual([{ status: "succeeded", effect: "complete" }]);
+        expect(
+          withControl(
+            root,
+            (control) =>
+              control
+                .query(
+                  "SELECT COUNT(*) AS count FROM tf_v2_operations WHERE resource_uid = ? AND action = 'update'",
+                )
+                .all(target) as Json[],
+          ),
+        ).toEqual([{ count: 1 }]);
+        completed = true;
+      } finally {
+        await Promise.allSettled([stopHost(host)]);
+        if (completed) await rm(root, { recursive: true, force: true });
+        else {
+          for (const [index, started] of startedHosts.entries()) {
+            await writeFile(join(root, `host-${index}.log`), started.output()).catch(
+              () => undefined,
+            );
+          }
+          process.stderr.write(`journey: data root and host logs retained at ${root}\n`);
+        }
       }
-    }
-  },
-  300_000,
-);
+    },
+    300_000,
+  );
+}

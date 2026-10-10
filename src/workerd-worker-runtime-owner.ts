@@ -155,6 +155,8 @@ type PublicationState = {
     readonly targetKey: string;
     readonly sourceOperationId: string;
     readonly expectedIdentity: WorkerdPublicationIdentity;
+    /** Boot recovery only; see createV2WorkerPublicationState. */
+    readonly tolerateUnstartedSuccessors?: boolean;
   }): Promise<
     | {
         readonly kind: "ready";
@@ -3488,11 +3490,17 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
     const sourceOperationId = sourceOperationIdFromIdentity(activeRecord.identity);
     if (!sourceOperationId) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    // A Host can stop while a later Deployment/Endpoint Operation is only
+    // queued. That Operation cannot have touched this owner: its candidate
+    // incarnation is persisted before any native effect, and a leftover
+    // candidate record is refused when the owner opens. Adopt the committed
+    // incarnation and let the normal Operation engine run the successor.
     const resolution = await currentServing({
       workerUid: options.workerResourceUid,
       targetKey: options.targetKey,
       sourceOperationId,
       expectedIdentity: activeRecord.identity,
+      tolerateUnstartedSuccessors: true,
     });
     if (
       resolution.kind !== "ready" ||

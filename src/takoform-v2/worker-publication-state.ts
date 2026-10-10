@@ -314,6 +314,79 @@ function settled(row: ResourceRow, op: OperationRow | null): boolean {
   );
 }
 
+const unstartedStatuses = new Set(["queued", "running", "waiting_input"]);
+
+/**
+ * An accepted Operation that cannot have reached a backend. The schema gives
+ * these statuses effect `none`, and `dispatch_possible` is recorded before any
+ * native call; every Worker publication effect starts from a dispatched
+ * `reconciling` claim (see isCurrentClaim). Such an Operation cannot have
+ * changed what is natively serving, so boot recovery may adopt the previously
+ * committed incarnation while it waits.
+ */
+function unstartedOperation(op: OperationRow): boolean {
+  return unstartedStatuses.has(op.status) && op.effect === "none" && op.dispatch_possible === 0;
+}
+
+/** A queued update/delete accepted over a committed generation of `row`. */
+function unstartedSuccessor(op: OperationRow | null, row: ResourceRow): op is OperationRow {
+  return (
+    op !== null &&
+    unstartedOperation(op) &&
+    op.id === row.last_operation &&
+    op.id === row.busy_operation &&
+    op.resource_uid === row.uid &&
+    op.principal === row.principal &&
+    op.backend_id === row.backend_id &&
+    op.target_key === row.target_key &&
+    op.generation === row.generation &&
+    row.generation === row.observed_generation + 1 &&
+    row.observed_generation > 0 &&
+    op.accepted_spec_json === row.spec_json &&
+    row.deleted_at === null &&
+    ((op.action === "update" && row.phase === "pending") ||
+      (op.action === "delete" && row.phase === "deleting"))
+  );
+}
+
+/** A queued first publication: nothing was ever committed for this Resource. */
+function unstartedCreate(op: OperationRow | null, row: ResourceRow): op is OperationRow {
+  return (
+    op !== null &&
+    unstartedOperation(op) &&
+    op.action === "create" &&
+    op.id === row.last_operation &&
+    op.id === row.busy_operation &&
+    op.resource_uid === row.uid &&
+    op.principal === row.principal &&
+    op.backend_id === row.backend_id &&
+    op.target_key === row.target_key &&
+    op.generation === 1 &&
+    row.generation === 1 &&
+    row.observed_generation === 0 &&
+    row.phase === "pending" &&
+    op.accepted_spec_json === row.spec_json &&
+    row.deleted_at === null
+  );
+}
+
+/** Fence-side recheck of the same predicate from the reported pending rows. */
+function unstartedPendingRows(rows: readonly unknown[], sourceOperationId: string): boolean {
+  return (
+    rows.length <= MAX_UNSTARTED_SUCCESSORS &&
+    rows.every(
+      (row) =>
+        Array.isArray(row) &&
+        typeof row[0] === "string" &&
+        row[0] !== sourceOperationId &&
+        typeof row[4] === "string" &&
+        unstartedStatuses.has(row[4]) &&
+        row[5] === "none" &&
+        row[6] === 0,
+    )
+  );
+}
+
 function outputHostname(row: ResourceRow): { hostname: string; url: string } | null {
   const output = parseObject(row.output_json);
   const hostname = output?.hostname;
@@ -501,7 +574,56 @@ SELECT 'reference', ref.operation_id || ':' || ref.target_uid,
   FROM tf_v2_operation_references ref WHERE ref.operation_id IN (SELECT id FROM set_ids)
 ORDER BY kind, key`;
 
-const currentServingFenceRelationsSql = `
+/**
+ * `tolerateUnstartedSuccessors` is only for boot recovery of an already active
+ * incarnation. The strict form requires that no Deployment/Endpoint Operation
+ * for the Worker is pending. The tolerant form instead reports each pending
+ * Operation (the caller accepts only ones that cannot have reached a backend)
+ * and derives publishers from the committed generation of a busy Resource.
+ */
+function currentServingFenceRelationsSql(tolerateUnstartedSuccessors: boolean): string {
+  const pending = tolerateUnstartedSuccessors
+    ? `SELECT 'pending', pending.id, json_array(pending.id, pending.resource_uid,
+    pending.action, pending.generation, pending.status, pending.effect,
+    pending.dispatch_possible, pending.lease_token, pending.lease_until_ms,
+    pending.acceptance_order)
+  FROM (SELECT op.id, op.resource_uid, op.action, op.generation, op.status, op.effect,
+      op.dispatch_possible, op.lease_token, op.lease_until_ms, op.acceptance_order
+    FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
+    WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
+      AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
+      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
+    ORDER BY op.id LIMIT ${MAX_UNSTARTED_SUCCESSORS + 1}) pending`
+    : `SELECT 'pending', '', json_object('present', EXISTS (
+  SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
+    WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
+      AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
+      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ? LIMIT 1))`;
+  const publisher = tolerateUnstartedSuccessors
+    ? `SELECT 'publisher', publisher.id, json_object('id', publisher.id,
+  'acceptance_order', publisher.acceptance_order)
+  FROM (SELECT op.id, op.acceptance_order FROM tf_v2_resources r
+    JOIN tf_v2_operations op ON op.resource_uid = r.uid AND op.generation = r.observed_generation
+    WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
+      AND op.principal = r.principal AND op.backend_id = r.backend_id
+      AND op.target_key = r.target_key AND op.status = 'succeeded'
+      AND op.effect = 'complete' AND r.observed_generation > 0
+      AND ((r.busy_operation IS NULL AND op.id = r.last_operation)
+        OR (r.busy_operation IS NOT NULL AND op.id <> r.busy_operation))
+      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
+    ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2) publisher`
+    : `SELECT 'publisher', publisher.id, json_object('id', publisher.id,
+  'acceptance_order', publisher.acceptance_order)
+  FROM (SELECT op.id, op.acceptance_order FROM tf_v2_resources r
+    JOIN tf_v2_operations op ON op.id = r.last_operation
+    WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
+      AND op.principal = r.principal AND op.backend_id = r.backend_id
+      AND op.target_key = r.target_key AND op.status = 'succeeded'
+      AND op.effect = 'complete' AND r.observed_generation = op.generation
+      AND r.busy_operation IS NULL
+      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
+    ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2) publisher`;
+  return `
 WITH selected(uid) AS (SELECT value FROM json_each(?)),
      inbound(uid) AS (SELECT value FROM json_each(?)),
      artifacts(uid) AS (SELECT value FROM json_each(?)),
@@ -521,29 +643,22 @@ SELECT 'owner:' || f.field, a.resource_uid,
   FROM tf_v2_artifact_owners a CROSS JOIN owner_fields f
   WHERE a.resource_uid IN (SELECT uid FROM artifacts)
 UNION ALL
-SELECT 'pending', '', json_object('present', EXISTS (
-  SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
-    WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
-      AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
-      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ? LIMIT 1))
+${pending}
 UNION ALL
-SELECT 'publisher', publisher.id, json_object('id', publisher.id,
-  'acceptance_order', publisher.acceptance_order)
-  FROM (SELECT op.id, op.acceptance_order FROM tf_v2_resources r
-    JOIN tf_v2_operations op ON op.id = r.last_operation
-    WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
-      AND op.principal = r.principal AND op.backend_id = r.backend_id
-      AND op.target_key = r.target_key AND op.status = 'succeeded'
-      AND op.effect = 'complete' AND r.observed_generation = op.generation
-      AND r.busy_operation IS NULL
-      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
-    ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2) publisher
+${publisher}
 ORDER BY kind, key`;
+}
 
+const MAX_UNSTARTED_SUCCESSORS = 4;
 const currentServingFenceSql = `
 SELECT kind, key, body FROM (${currentServingFenceGraphSql})
 UNION ALL
-SELECT kind, key, body FROM (${currentServingFenceRelationsSql})
+SELECT kind, key, body FROM (${currentServingFenceRelationsSql(false)})
+ORDER BY kind, key`;
+const tolerantCurrentServingFenceSql = `
+SELECT kind, key, body FROM (${currentServingFenceGraphSql})
+UNION ALL
+SELECT kind, key, body FROM (${currentServingFenceRelationsSql(true)})
 ORDER BY kind, key`;
 
 /** No separate desired-state ledger: every read starts from the accepted v2 Operation. */
@@ -584,29 +699,32 @@ export function createV2WorkerPublicationState(options: {
       ...artifactIds,
     ];
     const current = captured.currentServing;
-    const rows = await sql.query(currentServingFenceSql, [
-      JSON.stringify(selected),
-      JSON.stringify(initial.fence.referenceSetIds),
-      WORKER_DEPLOYMENT_FORM_URL,
-      WORKER_ENDPOINT_FORM_URL,
-      snapshot.worker.principal,
-      snapshot.worker.space,
-      current.workerUid,
-      current.sourceOperationId,
-      WORKER_DEPLOYMENT_FORM_URL,
-      WORKER_ENDPOINT_FORM_URL,
-      JSON.stringify(selected),
-      JSON.stringify(initial.fence.inboundTargetIds),
-      JSON.stringify(artifactIds),
-      WORKER_DEPLOYMENT_FORM_URL,
-      WORKER_ENDPOINT_FORM_URL,
-      current.workerUid,
-      WORKER_DEPLOYMENT_FORM_URL,
-      WORKER_ENDPOINT_FORM_URL,
-      snapshot.worker.principal,
-      snapshot.worker.space,
-      current.workerUid,
-    ]);
+    const rows = await sql.query(
+      current.tolerateUnstartedSuccessors ? tolerantCurrentServingFenceSql : currentServingFenceSql,
+      [
+        JSON.stringify(selected),
+        JSON.stringify(initial.fence.referenceSetIds),
+        WORKER_DEPLOYMENT_FORM_URL,
+        WORKER_ENDPOINT_FORM_URL,
+        snapshot.worker.principal,
+        snapshot.worker.space,
+        current.workerUid,
+        current.sourceOperationId,
+        WORKER_DEPLOYMENT_FORM_URL,
+        WORKER_ENDPOINT_FORM_URL,
+        JSON.stringify(selected),
+        JSON.stringify(initial.fence.inboundTargetIds),
+        JSON.stringify(artifactIds),
+        WORKER_DEPLOYMENT_FORM_URL,
+        WORKER_ENDPOINT_FORM_URL,
+        current.workerUid,
+        WORKER_DEPLOYMENT_FORM_URL,
+        WORKER_ENDPOINT_FORM_URL,
+        snapshot.worker.principal,
+        snapshot.worker.space,
+        current.workerUid,
+      ],
+    );
     const graph = rows.filter(
       (row) =>
         (typeof row.kind === "string" && row.kind.startsWith("resource:")) ||
@@ -699,10 +817,12 @@ export function createV2WorkerPublicationState(options: {
             (row as { resource_uid?: unknown }).resource_uid === id,
         ),
       ) ||
-      pending.length !== 1 ||
-      pending[0] === null ||
-      typeof pending[0] !== "object" ||
-      (pending[0] as { present?: unknown }).present !== 0 ||
+      !(current.tolerateUnstartedSuccessors
+        ? unstartedPendingRows(pending, current.sourceOperationId)
+        : pending.length === 1 &&
+          pending[0] !== null &&
+          typeof pending[0] === "object" &&
+          (pending[0] as { present?: unknown }).present === 0) ||
       !publishers.some(
         (row) =>
           row !== null &&
@@ -832,15 +952,29 @@ export function createV2WorkerPublicationState(options: {
   async function activeReferences(
     referrerUid: string,
     expected: readonly ReferenceRow[],
+    // Targets reserved by a queued successor. Acceptance inserts them as extra
+    // active edges before the committed set is replaced at success.
+    queuedTargets?: ReadonlySet<string>,
   ): Promise<readonly unknown[] | null> {
     const edges = await sql.query(
       `SELECT target_uid, referrer_uid FROM tf_v2_resource_references
        WHERE referrer_uid = ? ORDER BY target_uid`,
       [referrerUid],
     );
+    if (queuedTargets === undefined) {
+      if (
+        edges.length !== expected.length ||
+        expected.some((reference, index) => edges[index]?.target_uid !== reference.target_uid)
+      )
+        return null;
+      return edges;
+    }
+    const wanted = new Set(expected.map((reference) => reference.target_uid));
+    const present = new Set(edges.map((edge) => edge.target_uid));
     if (
-      edges.length !== expected.length ||
-      expected.some((reference, index) => edges[index]?.target_uid !== reference.target_uid)
+      present.size !== edges.length ||
+      [...wanted].some((uid) => !present.has(uid)) ||
+      [...present].some((uid) => !wanted.has(String(uid)) && !queuedTargets.has(String(uid)))
     )
       return null;
     return edges;
@@ -903,9 +1037,22 @@ export function createV2WorkerPublicationState(options: {
     workerUid: string;
     principal: string;
     space: string;
+    tolerateUnstartedSuccessors: boolean;
   }): Promise<readonly { readonly id: unknown; readonly acceptance_order: unknown }[]> {
     return (await sql.query(
-      `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
+      input.tolerateUnstartedSuccessors
+        ? `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
+       JOIN tf_v2_operations op ON op.resource_uid = r.uid AND op.generation = r.observed_generation
+       WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
+         AND op.principal = r.principal
+         AND op.backend_id = r.backend_id AND op.target_key = r.target_key
+         AND op.status = 'succeeded' AND op.effect = 'complete'
+         AND r.observed_generation > 0
+         AND ((r.busy_operation IS NULL AND op.id = r.last_operation)
+           OR (r.busy_operation IS NOT NULL AND op.id <> r.busy_operation))
+         AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
+       ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2`
+        : `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
        JOIN tf_v2_operations op ON op.id = r.last_operation
        WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
          AND op.principal = r.principal
@@ -1133,6 +1280,7 @@ export function createV2WorkerPublicationState(options: {
       targetKey: string;
       sourceOperationId: string;
       expectedIdentity: V2WorkerCurrentServingIdentity;
+      tolerateUnstartedSuccessors: boolean;
     };
   };
   async function capture(input: LivePublicationCaptureInput): Promise<Capture>;
@@ -1159,9 +1307,35 @@ export function createV2WorkerPublicationState(options: {
     if (current && pendingStatuses.has(op.status)) {
       return unresolved("source_unsettled", "The serving source Operation is not terminal");
     }
+    // Boot recovery only. The Resource may already carry a queued successor of
+    // the committed source generation. The committed view is the Resource as
+    // of `op`, which is immutable history; the successor is validated below.
+    let servingRow = own;
+    if (
+      current?.tolerateUnstartedSuccessors &&
+      own.busy_operation !== null &&
+      own.busy_operation !== op.id
+    ) {
+      const successor = await operation(own.busy_operation);
+      if (
+        unstartedSuccessor(successor, own) &&
+        op.status === "succeeded" &&
+        op.generation === own.observed_generation &&
+        successor.generation === op.generation + 1
+      ) {
+        servingRow = {
+          ...own,
+          generation: op.generation,
+          last_operation: op.id,
+          busy_operation: null,
+          phase: "idle",
+          spec_json: op.accepted_spec_json,
+        };
+      }
+    }
     if (
       current
-        ? !confirmedServingSource(op, own, current.targetKey)
+        ? !confirmedServingSource(op, servingRow, current.targetKey)
         : !execution || !isCurrentClaim(op, own, execution, now().getTime())
     ) {
       return unresolved("stale_claim", "The accepted operation lease is no longer current");
@@ -1232,9 +1406,39 @@ export function createV2WorkerPublicationState(options: {
       }
     }
 
-    const pending = current ? [] : await pendingPublication(workerUid);
+    let pending: OperationRow[] = current ? [] : await pendingPublication(workerUid);
+    // Resources whose queued successors were validated, with those Operations'
+    // sealed reference targets (reserved as extra active edges at acceptance).
+    const unstartedTargets = new Map<string, Set<string>>();
     if (current) {
-      if (await hasPendingPublication(workerUid)) {
+      if (current.tolerateUnstartedSuccessors) {
+        pending = await pendingPublication(workerUid);
+        if (pending.length > MAX_UNSTARTED_SUCCESSORS) {
+          return unresolved("source_unsettled", "Too many later Worker publications are queued");
+        }
+        for (const queued of pending) {
+          const queuedResource = await resource(queued.resource_uid);
+          if (
+            !queuedResource ||
+            queued.id === op.id ||
+            queuedResource.principal !== op.principal ||
+            queuedResource.space !== own.space ||
+            workerUidFromOperation(queued) !== workerUid ||
+            !(unstartedSuccessor(queued, queuedResource) || unstartedCreate(queued, queuedResource))
+          ) {
+            return unresolved("source_unsettled", "A later Worker publication has started");
+          }
+          // A DELETE reserves no references; CREATE/UPDATE seal a set at acceptance.
+          const queuedReferences = queued.action === "delete" ? [] : await references(queued.id);
+          if (!queuedReferences) {
+            return unresolved("source_unsettled", "A later Worker publication is not sealed");
+          }
+          unstartedTargets.set(
+            queuedResource.uid,
+            new Set(queuedReferences.map((reference) => reference.target_uid)),
+          );
+        }
+      } else if (await hasPendingPublication(workerUid)) {
         return unresolved("source_unsettled", "A later Worker publication is unresolved");
       }
     } else {
@@ -1285,7 +1489,9 @@ export function createV2WorkerPublicationState(options: {
     ): Promise<{ row: ResourceRow; accepted: JsonObject; op: OperationRow } | null | Unresolved> {
       const isOwnForm = form === chosenForm;
       if (isOwnForm && action === "delete") return null;
-      const row = isOwnForm ? own : rows.find((candidate) => candidate.observed_generation > 0);
+      const row = isOwnForm
+        ? servingRow
+        : rows.find((candidate) => candidate.observed_generation > 0);
       if (!row) return null;
       const chosenOp = isOwnForm
         ? op
@@ -1367,7 +1573,11 @@ export function createV2WorkerPublicationState(options: {
         );
       }
       if (current) {
-        const active = await activeReferences(chosenDeployment.row.uid, refRows);
+        const active = await activeReferences(
+          chosenDeployment.row.uid,
+          refRows,
+          unstartedTargets.get(chosenDeployment.row.uid),
+        );
         if (!active) {
           return unresolved("graph_unresolved", "Deployment active references changed");
         }
@@ -1500,7 +1710,11 @@ export function createV2WorkerPublicationState(options: {
         return unresolved("graph_unresolved", "Endpoint accepted owner or address is unavailable");
       }
       if (current) {
-        const active = await activeReferences(chosenEndpoint.row.uid, refRows);
+        const active = await activeReferences(
+          chosenEndpoint.row.uid,
+          refRows,
+          unstartedTargets.get(chosenEndpoint.row.uid),
+        );
         if (!active) {
           return unresolved("graph_unresolved", "Endpoint active references changed");
         }
@@ -1568,6 +1782,7 @@ export function createV2WorkerPublicationState(options: {
           workerUid,
           principal: op.principal,
           space: own.space,
+          tolerateUnstartedSuccessors: current.tolerateUnstartedSuccessors,
         })
       : null;
     if (
@@ -2001,6 +2216,13 @@ export function createV2WorkerPublicationState(options: {
       targetKey: string;
       sourceOperationId: string;
       expectedIdentity: V2WorkerCurrentServingIdentity;
+      /**
+       * Boot recovery of an already active incarnation only. Accept queued
+       * Deployment/Endpoint Operations that have no possible backend effect,
+       * and prove the committed generation they sit on. Every other caller
+       * keeps the strict fence that refuses while any publication is pending.
+       */
+      tolerateUnstartedSuccessors?: boolean;
     }): Promise<V2WorkerCurrentServingResolution> {
       // The owner can await while reading SQL. Sample its persisted marker once,
       // before any await, so caller mutation cannot retarget this readback.
@@ -2011,6 +2233,7 @@ export function createV2WorkerPublicationState(options: {
             workerUid: input.workerUid,
             targetKey: input.targetKey,
             sourceOperationId: input.sourceOperationId,
+            tolerateUnstartedSuccessors: input.tolerateUnstartedSuccessors === true,
             expectedIdentity: {
               generation: input.expectedIdentity.generation,
               workerResourceUid: input.expectedIdentity.workerResourceUid,
