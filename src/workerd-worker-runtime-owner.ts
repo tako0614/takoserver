@@ -541,7 +541,8 @@ export interface WorkerdWorkerRuntimeOwner {
    * `serving`: the recorded active incarnation's child group is ready.
    * `unavailable`: an active incarnation is recorded but its child is not
    * ready (crashed or being replaced). `idle`: nothing is recorded as active,
-   * or the owner is closing or suspended. It is not publication authority;
+   * the owner is closing or suspended, or a delete closed admission and is
+   * retiring it. It is not publication authority;
    * only `observeServing` plus the SQL proof is.
    */
   health(): "idle" | "serving" | "unavailable";
@@ -3931,8 +3932,14 @@ export async function openWorkerdWorkerRuntimeOwner(
 
   const health: WorkerdWorkerRuntimeOwner["health"] = () => {
     if (closed || suspending) return "idle";
+    // A Deployment delete closes admission and retires its incarnations on
+    // purpose. That is not a failed Worker, including while a retirement that
+    // needs a retry keeps admission closed.
+    if (admissionClosedBy !== null) return "idle";
     const incarnation = active;
     if (!incarnation || !state.activeOperationId) return "idle";
+    const status = incarnation.record.status;
+    if (status === "draining" || status === "retiring" || status === "retired") return "idle";
     return incarnation.record.operationId === state.activeOperationId &&
       incarnation.record.status === "active" &&
       incarnation.group.isReady()
