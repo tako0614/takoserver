@@ -171,12 +171,12 @@ export function createWorkerEndpointForm(options: {
     if (result.kind === "abandoned_before_activation") {
       // The owner proved this Operation's only incarnation never served and
       // retired it; nothing it published can still arrive. Settle with no
-      // effect so the committed graph keeps serving and a re-apply can retry.
-      if (
-        result.operationId !== execution.operationId ||
-        (execution.action !== "create" && execution.action !== "update") ||
-        !(await before.stillCurrent())
-      )
+      // effect: the Endpoint stays as of its last committed generation and a
+      // re-apply (or a re-issued DELETE) can retry. An Endpoint DELETE that
+      // still has a Deployment publishes its hostname-less graph through a
+      // candidate exactly like an update, so it settles the same way; the
+      // committed incarnation keeps its hostname.
+      if (result.operationId !== execution.operationId || !(await before.stillCurrent()))
         return unknown();
       return {
         kind: "no_effect",

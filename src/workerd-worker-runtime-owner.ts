@@ -4030,6 +4030,38 @@ export async function openWorkerdWorkerRuntimeOwner(
     return receipt;
   };
 
+  /**
+   * The Operation's only incarnation is a candidate retired under the
+   * Operation's own ID without ever being activated (no publication identity,
+   * no pinned configuration, a retirement receipt, its copies released). This
+   * holds for a create or update, and for an Endpoint DELETE, which publishes
+   * the hostname-less graph through a candidate exactly like an update. A
+   * Deployment DELETE never stages a candidate (see deleteDeployment).
+   */
+  const abandonedBeforeActivation = (
+    execution: V2Execution,
+  ): V2WorkerAbandonedBeforeActivationResult | null => {
+    const record = recordFor(execution.operationId);
+    if (
+      !record ||
+      !(
+        execution.action === "create" ||
+        execution.action === "update" ||
+        (execution.action === "delete" && execution.form === WORKER_ENDPOINT_FORM_URL)
+      ) ||
+      record.status !== "retired" ||
+      record.identity !== null ||
+      record.configurationSha256 !== null ||
+      record.retirementOperationId !== execution.operationId ||
+      record.receipt === null ||
+      !record.executionCopiesReleased ||
+      state.activeOperationId === execution.operationId ||
+      active?.record.operationId === execution.operationId
+    )
+      return null;
+    return { kind: "abandoned_before_activation", operationId: execution.operationId };
+  };
+
   const execute = async (
     inputExecution: V2Execution,
   ): Promise<V2WorkerRuntimeOwnerExecutionResult> => {
@@ -4139,22 +4171,10 @@ export async function openWorkerdWorkerRuntimeOwner(
         }
         return result;
       }
-      const prior = recordFor(execution.operationId);
-      if (prior) {
+      if (recordFor(execution.operationId)) {
         // The only definitive answer for an existing record: a candidate that
         // was retired under this Operation's own ID without ever activating.
-        if (
-          (execution.action === "create" || execution.action === "update") &&
-          prior.status === "retired" &&
-          prior.identity === null &&
-          prior.configurationSha256 === null &&
-          prior.retirementOperationId === execution.operationId &&
-          prior.receipt !== null &&
-          prior.executionCopiesReleased &&
-          state.activeOperationId !== execution.operationId
-        )
-          return { kind: "abandoned_before_activation", operationId: execution.operationId };
-        return { kind: "unknown" };
+        return abandonedBeforeActivation(execution) ?? { kind: "unknown" };
       }
 
       let incumbentIdentity: WorkerdPublicationIdentity | null = null;

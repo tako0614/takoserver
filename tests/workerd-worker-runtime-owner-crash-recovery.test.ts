@@ -90,6 +90,8 @@ async function startHost(
     | "active-update-hang-after-candidate"
     | "create-hang-after-candidate"
     | "active-recover-reexecute"
+    | "active-endpoint-delete-hang-after-candidate"
+    | "active-recover-reexecute-endpoint-delete"
     | "open-only",
   root: string,
   binary: string,
@@ -1287,6 +1289,70 @@ test("a retired record that was once activated is still treated as a DELETE repl
     expect(await readFile(path, "utf8")).toBe(tampered);
   } finally {
     for (const host of hosts) await terminateHost(host);
+    await owned.cleanup();
+  }
+});
+
+test("an Endpoint DELETE killed at its candidate settles without effect and the committed incarnation keeps its hostname", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let host: HostProcess | undefined;
+  let successor: HostProcess | undefined;
+  try {
+    // UPDATE_ID is the Endpoint DELETE here: with a Deployment present it
+    // publishes the hostname-less graph through a candidate, like an update.
+    host = await startHost(
+      "active-endpoint-delete-hang-after-candidate",
+      owned.root,
+      owned.binary,
+      port,
+      UPDATE_ID,
+    );
+    expect(await readJsonLine(host)).toMatchObject({ kind: "candidate-hung", port });
+    const before = await incarnations(owned.root);
+    const candidate = before.incarnations.find((item) => item.operationId === UPDATE_ID);
+    expect(candidate).toMatchObject({ status: "candidate", identity: null, receipt: null });
+    expect(candidate?.processIdentity).not.toBeNull();
+    expect(before.activeOperationId).toBe(CREATE_ID);
+    await terminateHost(host);
+    host = undefined;
+    await waitForVacant(candidate?.listenerPort as number);
+
+    successor = await startHost(
+      "active-recover-reexecute-endpoint-delete",
+      owned.root,
+      owned.binary,
+      port,
+      UPDATE_ID,
+    );
+    const recovered = await readJsonLine(successor);
+    // The re-driven DELETE gets the owner's definitive answer, not `unknown`
+    // forever, and no second incarnation is started for it.
+    expect(recovered).toMatchObject({
+      kind: "recovered-active",
+      port,
+      reexecuted: { kind: "abandoned_before_activation", operationId: UPDATE_ID },
+      serving: {
+        kind: "serving",
+        sourceOperationId: CREATE_ID,
+        hostnames: [`${WORKER_UID}.example.test`],
+      },
+    });
+    const after = await incarnations(owned.root);
+    expect(after.activeOperationId).toBe(CREATE_ID);
+    expect(after.incarnations).toHaveLength(2);
+    expect(after.incarnations.find((item) => item.operationId === UPDATE_ID)).toMatchObject({
+      status: "retired",
+      retirementOperationId: UPDATE_ID,
+      identity: null,
+      executionCopiesReleased: true,
+    });
+    expect(
+      JSON.parse(await readFile(join(owned.root, "owners", "never-served.json"), "utf8")),
+    ).toEqual({ update: true, create: false, unknown: true });
+  } finally {
+    if (host) await terminateHost(host);
+    if (successor) await terminateHost(successor);
     await owned.cleanup();
   }
 });

@@ -5,6 +5,7 @@ import { bytesDigest, canonicalJson } from "../../src/json.ts";
 import {
   parseWorkerDeploymentSpec,
   WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
 } from "../../src/takoform-v2/forms/worker-specs.ts";
 import type { V2Execution } from "../../src/takoform-v2/types.ts";
 import type { V2WorkerPublicationResolution } from "../../src/takoform-v2/worker-publication-state.ts";
@@ -43,7 +44,8 @@ const operationUid = createId ?? "";
 const fixtureWorkerUid: string = workerResourceUid;
 // The Operation whose publish blocks after its candidate incarnation exists.
 const hangOperationId =
-  mode === "active-update-hang-after-candidate"
+  mode === "active-update-hang-after-candidate" ||
+  mode === "active-endpoint-delete-hang-after-candidate"
     ? (updateId ?? null)
     : mode === "create-hang-after-candidate"
       ? (createId ?? null)
@@ -116,11 +118,15 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
         message: "fixture incumbent mismatch",
       };
     }
-    const parsedSpec = parseWorkerDeploymentSpec(execution.spec);
+    // An Endpoint DELETE re-publishes the committed Deployment without its
+    // hostname; its own spec names only the Worker.
+    const endpointForm = execution.form === WORKER_ENDPOINT_FORM_URL;
+    const servingSpec = endpointForm ? (await readCurrentServing())?.spec : execution.spec;
+    const parsedSpec = parseWorkerDeploymentSpec(servingSpec);
     const versionUid = parsedSpec.versions[0]?.workerVersion.resourceUid;
     if (!versionUid && execution.action !== "delete") throw new Error("fixture version missing");
     const deployment =
-      execution.action === "delete"
+      execution.action === "delete" && !endpointForm
         ? null
         : {
             uid: `deployment-${workerResourceUid}`,
@@ -143,10 +149,15 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
               },
             ],
           };
+    const address = {
+      hostname: `${workerResourceUid}.example.test`,
+      url: `https://${workerResourceUid}.example.test/`,
+    };
     return {
       kind: "ready",
       snapshot: {
         sourceOperationId: execution.operationId,
+        ...(endpointForm ? { acceptedEndpointOutput: address } : {}),
         worker: {
           uid: workerResourceUid,
           principal: execution.principal,
@@ -154,15 +165,15 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
           generation: 1,
         },
         deployment,
-        endpoint: {
-          uid: `endpoint-${workerResourceUid}`,
-          generation: 1,
-          spec: { worker: { resourceUid: workerResourceUid } },
-          output: {
-            hostname: `${workerResourceUid}.example.test`,
-            url: `https://${workerResourceUid}.example.test/`,
-          },
-        },
+        endpoint:
+          endpointForm && execution.action === "delete"
+            ? null
+            : {
+                uid: `endpoint-${workerResourceUid}`,
+                generation: 1,
+                spec: { worker: { resourceUid: workerResourceUid } },
+                output: address,
+              },
       },
       sqlGuard: { sql: "SELECT 1", params: [] },
       async stillCurrent() {
@@ -298,6 +309,26 @@ async function readActiveChildPid(): Promise<number | null> {
   );
 }
 
+function endpointDeleteExecution(operationId: string): V2Execution {
+  return {
+    operationId,
+    leaseToken: `lease-${operationId}`,
+    backendKey: `backend-${operationId}`,
+    backendId: "fixture-worker-endpoint-backend",
+    targetKey: TARGET_KEY,
+    resourceUid: `endpoint-${workerResourceUid}`,
+    principal: "org-runtime-owner",
+    action: "delete",
+    generation: 2,
+    form: WORKER_ENDPOINT_FORM_URL,
+    space: "production",
+    name: "crash-reopen-endpoint",
+    spec: { worker: { resourceUid: workerResourceUid as string } },
+    previousObserved: {},
+    previousOutput: {},
+  };
+}
+
 function execution(operationId: string, action: V2Execution["action"]): V2Execution {
   return {
     operationId,
@@ -428,7 +459,8 @@ if (owner)
     } else if (
       mode === "active-recover" ||
       mode === "active-recover-only" ||
-      mode === "active-recover-reexecute"
+      mode === "active-recover-reexecute" ||
+      mode === "active-recover-reexecute-endpoint-delete"
     ) {
       phase = "recover-fetch";
       const current = await readCurrentServing();
@@ -436,14 +468,24 @@ if (owner)
       const response = await owner.fetch(new Request("http://worker.fixture.test/"));
       const body = await response.text();
       if (body !== current.configIdentity) throw new Error(`recovered fetch mismatch: ${body}`);
-      if (mode === "active-recover-only" || mode === "active-recover-reexecute") {
+      if (
+        mode === "active-recover-only" ||
+        mode === "active-recover-reexecute" ||
+        mode === "active-recover-reexecute-endpoint-delete"
+      ) {
         // Re-driving the abandoned Operation never starts a second incarnation.
         const reexecuted =
           mode === "active-recover-reexecute" && updateId
             ? await owner.execute(execution(updateId, "update"))
-            : null;
+            : mode === "active-recover-reexecute-endpoint-delete" && updateId
+              ? await owner.execute(endpointDeleteExecution(updateId))
+              : null;
+        const serving =
+          mode === "active-recover-reexecute-endpoint-delete"
+            ? await owner.observeServing({ workerResourceUid, targetKey: TARGET_KEY })
+            : undefined;
         process.stdout.write(
-          `${JSON.stringify({ kind: "recovered-active", body, reexecuted, pid: process.pid, port })}\n`,
+          `${JSON.stringify({ kind: "recovered-active", body, reexecuted, serving, pid: process.pid, port })}\n`,
         );
         setInterval(() => undefined, 60_000);
       } else {
@@ -476,10 +518,11 @@ if (owner)
       process.stdout.write(`${JSON.stringify({ kind: "opened", pid: process.pid, port })}\n`);
     } else if (
       mode === "active-update-hang-after-candidate" ||
+      mode === "active-endpoint-delete-hang-after-candidate" ||
       mode === "create-hang-after-candidate"
     ) {
       if (!createId) throw new Error("create operation ID missing");
-      if (mode === "active-update-hang-after-candidate") {
+      if (mode !== "create-hang-after-candidate") {
         if (!updateId) throw new Error("update operation ID missing");
         const created = await owner.execute(execution(createId, "create"));
         if (created.kind !== "confirmed" || created.identity === null)
@@ -500,10 +543,12 @@ if (owner)
       // Never awaited: it blocks inside readVersionMaterials until this host is killed.
       void owner
         .execute(
-          execution(
-            mode === "create-hang-after-candidate" ? createId : (updateId as string),
-            mode === "create-hang-after-candidate" ? "create" : "update",
-          ),
+          mode === "active-endpoint-delete-hang-after-candidate"
+            ? endpointDeleteExecution(updateId as string)
+            : execution(
+                mode === "create-hang-after-candidate" ? createId : (updateId as string),
+                mode === "create-hang-after-candidate" ? "create" : "update",
+              ),
         )
         .catch(() => undefined);
       const markerPath = join(rootDirectory as string, "candidate-hung.json");
