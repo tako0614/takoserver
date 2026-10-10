@@ -114,9 +114,11 @@ outside the Host API v1 and the shared OpenAPI route table:
   responding. It does not query SQLite or the Worker runtime.
 - `GET /_takoserver/health/ready` performs one read-only `SELECT 1` query with
   a one-second response deadline, then makes one bounded, read-only listener
-  observation of the accepted workerd child. It returns `200` only when SQLite
-  answered and the required runtime's listener is currently reachable or the
-  runtime is not required; otherwise it returns `503`.
+  observation of the accepted legacy workerd child. It returns `200` only when
+  SQLite answered and the legacy runtime's listener is currently reachable or
+  that runtime is not required; otherwise it returns `503`. v2 Worker owners
+  are reported separately (below) and, on their own, only mark the response
+  `degraded`.
 
 The readiness body contains only fixed state labels: `database` is `readable`
 or `unavailable`; `workerRuntime` is `not-required`, `starting`, `serving`,
@@ -125,7 +127,24 @@ current child lifecycle state (`idle`, `starting`, `serving`, `recovering`, or
 `unavailable`). If the accepted child is still alive but its listener probe
 fails, `workerRuntime` is `unavailable` while `supervisor` remains `serving`;
 the fields distinguish observed service availability from process lifecycle.
-An empty successful boot restore with no published Workers is
+v2 Worker owners supervise their own workerd children outside that
+supervisor, so when the Host has a v2 Worker composition the body also carries
+`v2Workers: { owners, serving, unavailable }`: counts of opened owners, of
+owners whose recorded active incarnation's child group is ready, and of owners
+that recorded an active incarnation whose child is not ready (crashed or being
+replaced). For v2, "serving" means the owner's supervised child holds its
+listener port; the probe does not send an HTTP request to a tenant Worker, so
+it is not the listener reachability check described above. An owner whose
+Deployment is being deleted counts as neither serving nor unavailable.
+
+Serving owners turn a would-be `not-required` into `serving`. One or more
+unavailable owners add `degraded: true` but keep the response `200` when SQLite
+answered: this probe shares its port with the control API, and one broken
+tenant Worker must not make a load balancer withdraw the operator API. Read
+`degraded` and the counts to alert on tenant Workers. The response is `503`
+only when SQLite did not answer, the boot restore failed, the legacy runtime
+is unavailable, or the v2 owner state could not be read within the deadline.
+The counts carry no Worker UID or hostname. An empty successful boot restore with no published Workers is
 `not-required`, not a failure. A failed boot restore remains `restore-failed`
 for this process even if a later child passes its listener check: that check
 does not prove the entire durable published graph was restored. A process
@@ -419,6 +438,69 @@ not reported as crashes. A failure to write these diagnostics does not stop
 runtime recovery. Operators still need to collect logs and configure their own
 alerts: these messages are not a health API, monitoring service, or proof of
 operator recovery.
+
+### Ordinary journey native test and known gaps
+
+`tests/selfhost-v2-ordinary-journey-native.test.ts` follows this guide with
+real `bun src/entry-bun.ts` processes and real workerd children. It requires
+the same opt-in as the entry lifecycle test (`TAKOSERVER_V2_ENTRY_NATIVE=1`),
+the accepted `TAKOSERVER_WORKERD_BINARY`, a `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY`
+built from this checkout, Linux `/proc`, OpenSSL and a loopback network
+namespace with TCP 443, as for the other native entry tests.
+
+Its journey starts from an empty data root: the first boot prints the operator
+assertion and the later-assertion command, the assertion is exchanged for a
+session, and an organization and organization API key are created. The
+operator then seeds held artifacts, starts the complete Worker profile and
+checks support for each Form. It creates a Worker with `fetch` and `queue`
+handlers, a SQLite Binding with an applied migration, a Queue Producer Binding,
+a Deployment, an Endpoint and a Queue Consumer, and reads them back over
+certificate-validated HTTPS. It then seeds a second bundle, restarts, deploys a
+new Version and observes the new behaviour; SIGKILLs the Host while a 5 MiB
+artifact Operation has durably staged only a prefix and Queue messages are in
+flight; restarts, replays the same key and checks that the Operation settles
+once, the Worker is still served without a client republish and every message
+has exactly one terminal ack (a rejected attempt is retried in its own batch);
+and finally deletes everything in reference order, with a refused premature
+delete on the way, and checks the artifact tables, the SQLite directory, the
+workerd children and TCP 443.
+
+This is a local, loopback, single-host result with a self-signed certificate
+and operator-seeded artifact bytes. It does not cover a `scheduled` handler,
+Actor or Workflow use, public DNS or certificate trust, Hosted/WfP, a host
+reboot or an operator disaster-recovery drill. Messages in flight at the
+crash are redelivered at least once, and a batch reserved but not yet sent is
+held for its 120 second reservation before redelivery.
+
+Known gaps this test records, not fixes:
+
+- **A pending Deployment or Endpoint Operation blocks restart.** If the Host
+  stops (SIGKILL, or a graceful SIGTERM) while a WorkerDeployment or
+  WorkerEndpoint Operation for a published Worker is queued, boot restore asks
+  for the current-serving proof, which is refused while such an Operation is
+  pending, and the Operation only runs after restore. The Host exits with
+  `ownership_uncertain` on every start and the installation needs manual
+  repair. The data is left untouched. The second test in that file pins this
+  fail-closed behaviour so that a fix has to update it.
+Three gaps this test first recorded have since been fixed, each with its own
+test:
+
+- **Readiness observes v2 Worker owners** (see the `v2Workers` counts above).
+- **A busy control database waits five seconds, then fails.** The control
+  database sets a bounded `busy_timeout`, so a short external read (`sqlite3`,
+  a backup tool, a poller) delays a Host write instead of failing it. It
+  stays in rollback-journal mode on purpose: the documented cold backup copies
+  a stopped data root, and the tenant SQLite stores are deliberately
+  rollback-journal. A reader that holds the lock longer than five seconds still
+  fails the write; a failing background pass now logs its name and a bounded
+  cause, and a Queue reservation that was never sent is refunded with retries
+  bounded to one second in total before it falls back to its 120 second expiry.
+  A lock that outlasted the five second wait is not retried, because each
+  attempt would block the Host for that long again. Do not read the live
+  database anyway; stop the Host first.
+- **The boot note for an unpublishable Worker endpoint is one coherent
+  statement.** It says endpoints cannot be created in this profile, names the
+  address they would have, and gives the remedy once.
 
 ## Historical reference: v1 signed package admission
 

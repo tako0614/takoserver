@@ -442,9 +442,21 @@ const LAYERS: readonly Layer[] = [
     may: ["app", "v2-code-validation"],
   },
   {
+    name: "v2-selfhost-queue-cancel",
+    match: /^src\/selfhost-v2-queue-cancel\.ts$/u,
+    may: ["core", "v2-queue-manager"],
+  },
+  {
     name: "v2-selfhost-queue-composition",
     match: /^src\/selfhost-v2-queue-composition\.ts$/u,
-    may: ["core", "domain", "adapter", "v2-queue-manager", "v2-runtime"],
+    may: [
+      "core",
+      "domain",
+      "adapter",
+      "v2-queue-manager",
+      "v2-runtime",
+      "v2-selfhost-queue-cancel",
+    ],
   },
   {
     name: "v2-selfhost-queue-scheduler",

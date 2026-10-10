@@ -125,6 +125,14 @@ test("says at boot when this deployment can mint no Worker endpoint, and how to 
   expect(ported.diagnostic).toContain("https://<script>.e2e.selfhost.test:28988");
   expect(ported.diagnostic).toContain("TAKOSERVER_WORKERD_PORT=443");
   expect(ported.diagnostic).toContain("TAKOSERVER_WORKER_ENDPOINT_PORT=443");
+  // One coherent statement, not "would be published as X. no Worker endpoint
+  // can be published here": it must not promise publication and then deny it,
+  // and it must read as sentences when printed on every boot.
+  expect(ported.diagnostic).not.toContain("would be published as");
+  expect(ported.diagnostic).not.toMatch(/\. no /u);
+  expect(ported.diagnostic).toMatch(/^Worker endpoints cannot be created in this profile/u);
+  expect(ported.diagnostic).toContain("This deployment's address carries a port");
+  expect(ported.diagnostic?.match(/no Worker endpoint can be published here/giu)).toBeNull();
 
   // The loopback development default is not special: `http://*.localhost` is
   // exactly as unpublishable, and the sentence has to be exactly as clear.

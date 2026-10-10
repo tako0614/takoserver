@@ -184,7 +184,7 @@ export function createSelfhostV2RuntimeBoot(options: {
 export function startSelfhostV2ScheduledDuePass(
   shutdown: Pick<SelfhostEntryShutdown, "startInterval">,
   workers: Pick<ReturnType<typeof createSelfhostV2WorkerComposition>, "pollScheduledDue">,
-  onFailure: (name: string) => void,
+  onFailure: (name: string, cause?: unknown) => void,
 ): void {
   shutdown.startInterval(
     "takoform-v2-scheduled-due",
@@ -200,7 +200,7 @@ export function startSelfhostV2ScheduledDuePass(
 export function startSelfhostV2WorkflowDuePass(
   shutdown: Pick<SelfhostEntryShutdown, "startInterval">,
   workers: Pick<ReturnType<typeof createSelfhostV2WorkerComposition>, "pollWorkflowDue">,
-  onFailure: (name: string) => void,
+  onFailure: (name: string, cause?: unknown) => void,
 ): void {
   shutdown.startInterval(
     "takoform-v2-workflow-due",
