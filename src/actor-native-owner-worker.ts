@@ -561,7 +561,16 @@ export function createActorNativeOwner(
     readonly encodedActorId: string;
     readonly actorId: string;
     readonly env: Record<string, unknown>;
-  }) => Promise<(() => Promise<boolean>) | null>,
+  }) => Promise<
+    | (() => Promise<boolean>)
+    | {
+        /** Exact request-held authority, rechecked around the native snapshot. */
+        readonly guard: () => Promise<boolean>;
+        /** Host-held graph for this observation only; application turns stay settled-only. */
+        readonly readGraph: () => Promise<ActorOwnerGraph>;
+      }
+    | null
+  >,
 ) {
   if (observationSecret !== undefined && authorizeObservation !== undefined)
     throw new Error("Actor observation authority is ambiguous");
@@ -729,8 +738,22 @@ export function createActorNativeOwner(
               request.headers.get(TOKEN_HEADER) === (await expectedObservationBearer(encodedId))
             ? async () => true
             : null;
-        if (!authorized || !(await authorized())) return new Response(null, { status: 404 });
-        const graph = await this.currentGraph();
+        const guard = typeof authorized === "function" ? authorized : authorized?.guard;
+        if (!guard || !(await guard())) return new Response(null, { status: 404 });
+        const readObservedGraph = async (): Promise<ActorOwnerGraph> => {
+          if (typeof authorized === "function" || !authorized) return this.currentGraph();
+          const selected = await authorized.readGraph();
+          if (!validActorOwnerGraph(selected)) throw new Error("Actor graph unavailable");
+          const variantKeys: string[] = [];
+          for (let index = 0; index < selected.variantKeys.length; index += 1)
+            variantKeys[index] = selected.variantKeys[index] as string;
+          return {
+            generationKey: selected.generationKey,
+            epoch: selected.epoch,
+            variantKeys,
+          };
+        };
+        const graph = await readObservedGraph();
         const alarm = this.readAlarm();
         if (alarm.actorId !== null && alarm.actorId !== actorId)
           return new Response(null, { status: 503 });
@@ -746,12 +769,16 @@ export function createActorNativeOwner(
         socketIds.sort();
         for (let index = 1; index < socketIds.length; index += 1)
           if (socketIds[index] === socketIds[index - 1]) return new Response(null, { status: 503 });
-        const again = await this.currentGraph();
+        const again = await readObservedGraph();
+        let variantsChanged = again.variantKeys.length !== graph.variantKeys.length;
+        for (let index = 0; !variantsChanged && index < graph.variantKeys.length; index += 1)
+          variantsChanged = again.variantKeys[index] !== graph.variantKeys[index];
         if (
           this.poisoned ||
           again.epoch !== graph.epoch ||
           again.generationKey !== graph.generationKey ||
-          !(await authorized())
+          variantsChanged ||
+          !(await guard())
         )
           return new Response(null, { status: 503 });
         return Response.json({

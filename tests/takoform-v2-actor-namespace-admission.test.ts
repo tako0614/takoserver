@@ -72,6 +72,7 @@ function fixture(physicalRoot?: string, providerNative?: V2ActorNamespaceProvide
     },
   };
   const source = new Map<string, Uint8Array>();
+  let acceptedAuthorityOverride: string | null = null;
   const bundleHost = createWorkerBundleHost({
     sql,
     targetKey: TARGET,
@@ -179,8 +180,8 @@ function fixture(physicalRoot?: string, providerNative?: V2ActorNamespaceProvide
       targetKey: TARGET,
     });
   }
-  const actor = physical
-    ? createV2ActorNamespaceForm({
+  const actorOptions: Parameters<typeof createV2ActorNamespaceForm>[0] | null = physical
+    ? {
         sql,
         targetKey: TARGET,
         bundleCustody: bundleHost.custody,
@@ -200,11 +201,20 @@ function fixture(physicalRoot?: string, providerNative?: V2ActorNamespaceProvide
         ...(providerNative
           ? {
               providerNative,
-              acceptedGraph: createV2ActorNamespaceSqlGraphReader({ sql, targetKey: TARGET }),
+              acceptedGraph: {
+                async readAcceptedOperationGraph(scope, operation) {
+                  const reader = createV2ActorNamespaceSqlGraphReader({ sql, targetKey: TARGET });
+                  const graph = await reader.readAcceptedOperationGraph(scope, operation);
+                  return graph && acceptedAuthorityOverride !== null
+                    ? { ...graph, authorityKey: acceptedAuthorityOverride }
+                    : graph;
+                },
+              },
             }
           : {}),
-      })
-    : fixtureActor;
+      }
+    : null;
+  const actor = actorOptions ? createV2ActorNamespaceForm(actorOptions) : fixtureActor;
   const engine = createTakoformV2Engine({
     sql,
     replayWindowSeconds: 3600,
@@ -283,6 +293,13 @@ function fixture(physicalRoot?: string, providerNative?: V2ActorNamespaceProvide
     physical,
     registrations,
     deletions,
+    mutateActorComposition(targetKey: string, provider: V2ActorNamespaceProviderPort) {
+      if (!actorOptions) throw new Error("Actor composition unavailable");
+      Object.assign(actorOptions, { targetKey, providerNative: provider });
+    },
+    setAcceptedAuthorityOverride(value: string) {
+      acceptedAuthorityOverride = value;
+    },
     setInspection(value: typeof inspection) {
       inspection = value;
     },
@@ -855,13 +872,21 @@ for (const mode of [
   "wrong-weight",
   "changed-native",
   "lost-lease",
+  "mutated-composition",
+  "changed-accepted-graph",
+  "aliased-observation",
 ] as const) {
   test(`provider-neutral Actor active observation ${mode}`, async () => {
     const root = mkdtempSync(join(tmpdir(), "actor-v2-provider-"));
     let current: V2ActorNamespaceNativeSnapshot | null = null;
     let warmed = false;
     let warmCount = 0;
-    let onWarm: (() => Promise<void>) | undefined;
+    let onWarm:
+      | ((graph: { readonly authorityKey: string; readonly scope: object }) => Promise<void>)
+      | undefined;
+    let acceptedOperationId = "";
+    let observationCalls = 0;
+    let foreignProviderCalls = 0;
     const confirmed = {
       kind: "confirmed" as const,
       epoch: "native-epoch",
@@ -871,7 +896,10 @@ for (const mode of [
       openSocketCount: 3,
     };
     const providerNative: V2ActorNamespaceProviderPort = {
-      async observeNativeForAcceptedOperation() {
+      async observeNativeForAcceptedOperation(input) {
+        expect(Object.isFrozen(input.operation)).toBe(true);
+        expect(input.operation.operationId).toBe(acceptedOperationId);
+        expect(input.operation.leaseToken.length).toBeGreaterThan(0);
         return current && mode !== "unknown"
           ? { kind: "ready", snapshot: current }
           : { kind: "unknown" };
@@ -880,12 +908,19 @@ for (const mode of [
         expect(Object.isFrozen(snapshot)).toBe(true);
         expect(Object.isFrozen(snapshot.scope)).toBe(true);
         expect(Object.isFrozen(snapshot.versions)).toBe(true);
-        return warmed ? confirmed : { kind: "unknown" };
+        if (mode === "aliased-observation") {
+          observationCalls += 1;
+          if (observationCalls === 2) {
+            confirmed.epoch = "changed-epoch";
+            confirmed.activeActorCount = 99;
+          }
+        }
+        return warmed || mode === "aliased-observation" ? confirmed : { kind: "unknown" };
       },
       async warmNamespaceForAcceptedOperation(_scope, candidate, signal) {
         warmCount += 1;
         if (!(await candidate.stillAuthorized(signal))) return { kind: "unknown" };
-        await onWarm?.();
+        await onWarm?.(candidate.graph);
         warmed = true;
         return confirmed;
       },
@@ -905,6 +940,7 @@ for (const mode of [
         { worker: { resourceUid: worker.resourceUid }, className: "CounterActor" },
         false,
       );
+      acceptedOperationId = namespace.id;
       current = {
         scope: { tenantId: PRINCIPAL, namespaceResourceUid: namespace.resourceUid },
         workerUid: worker.resourceUid,
@@ -951,11 +987,38 @@ for (const mode of [
             namespace.id,
           ]);
         };
+      if (mode === "changed-accepted-graph")
+        onWarm = async (graph) => {
+          expect(Object.isFrozen(graph)).toBe(true);
+          expect(Object.isFrozen(graph.scope)).toBe(true);
+          expect(() => Object.assign(graph, { authorityKey: "changed-accepted" })).toThrow();
+          f.setAcceptedAuthorityOverride("changed-accepted");
+        };
+      if (mode === "mutated-composition") {
+        const foreignProvider: V2ActorNamespaceProviderPort = {
+          async observeNativeForAcceptedOperation() {
+            foreignProviderCalls += 1;
+            return { kind: "unknown" };
+          },
+          async observeNamespaceRuntimeForAcceptedOperation() {
+            foreignProviderCalls += 1;
+            return { kind: "unknown" };
+          },
+          async warmNamespaceForAcceptedOperation() {
+            foreignProviderCalls += 1;
+            return { kind: "unknown" };
+          },
+        };
+        f.onInspect(async () => {
+          f.mutateActorComposition("foreign-target", foreignProvider);
+        });
+      }
       const result = await f.engine.runNext();
       expect(result?.id).toBe(namespace.id);
-      if (mode === "positive") {
+      if (mode === "positive" || mode === "mutated-composition") {
         expect(result?.status).toBe("succeeded");
         expect(warmCount).toBe(1);
+        expect(foreignProviderCalls).toBe(0);
         expect(
           await f.sql.query("SELECT observed_json FROM tf_v2_resources WHERE uid = ?", [
             namespace.resourceUid,

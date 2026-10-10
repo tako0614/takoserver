@@ -105,6 +105,8 @@ export interface V2ActorNamespaceNativeSnapshot {
 export interface V2ActorNamespaceProviderPort {
   observeNativeForAcceptedOperation(input: {
     readonly scope: V2ActorNamespaceScope;
+    /** Held Namespace Operation, distinct from the native Worker publisher. */
+    readonly operation: { readonly operationId: string; readonly leaseToken: string };
     readonly workerUid: string;
     readonly className: string;
     readonly targetKey: string;
@@ -211,7 +213,7 @@ interface ActorOwner {
  * A missing Session may only be warmed under this backend's held Operation;
  * ordinary event delivery retains the strict settled graph reader.
  */
-export function createV2ActorNamespaceForm(options: {
+export function createV2ActorNamespaceForm(configuration: {
   readonly sql: Sql;
   readonly targetKey: string;
   readonly bundleCustody: Pick<WorkerBundleCustody, "readHeldVerified">;
@@ -232,6 +234,9 @@ export function createV2ActorNamespaceForm(options: {
     ): ActorExecutionRealization;
   };
 }): V2Form {
+  // The Host selects this composition once. An awaited provider cannot retarget
+  // an in-flight accepted Operation by mutating the factory's option bag.
+  const options = Object.freeze({ ...configuration });
   if (!options.targetKey) throw new TypeError("Actor targetKey is required");
   const deleteGraph = createV2ActorNamespaceSqlGraphReader({
     sql: options.sql,
@@ -609,6 +614,12 @@ export function createV2ActorNamespaceForm(options: {
       accepted.className !== spec.className
     )
       return UNKNOWN;
+    const acceptedAuthorityKey = accepted.authorityKey;
+    const heldGraph: ActorExecutionGraph = Object.freeze({
+      ...accepted,
+      scope: Object.freeze({ ...accepted.scope }),
+      authorityKey: acceptedAuthorityKey,
+    });
     const admission = await prepareV2ActorNamespaceAdmission({
       sql: options.sql,
       bundleCustody: options.bundleCustody,
@@ -628,6 +639,10 @@ export function createV2ActorNamespaceForm(options: {
       const readSnapshot = () =>
         provider.observeNativeForAcceptedOperation({
           scope,
+          operation: Object.freeze({
+            operationId: execution.operationId,
+            leaseToken: execution.leaseToken,
+          }),
           workerUid: spec.worker.resourceUid,
           className: spec.className,
           targetKey: options.targetKey,
@@ -680,6 +695,26 @@ export function createV2ActorNamespaceForm(options: {
         versions: Object.freeze(captured.versions.map((version) => Object.freeze({ ...version }))),
       });
       const snapshotKey = canonicalJson(snapshot);
+      const captureObservation = (
+        observed: V2ActorNamespaceRuntimeObservation,
+      ): V2ActorNamespaceRuntimeObservation =>
+        observed.kind === "confirmed" &&
+        typeof observed.epoch === "string" &&
+        observed.epoch.length > 0 &&
+        Number.isSafeInteger(observed.observedAt) &&
+        observed.observedAt >= 0 &&
+        [observed.activeActorCount, observed.pendingAlarmCount, observed.openSocketCount].every(
+          (value) => Number.isSafeInteger(value) && value >= 0,
+        )
+          ? Object.freeze({
+              kind: "confirmed",
+              epoch: observed.epoch,
+              observedAt: observed.observedAt,
+              activeActorCount: observed.activeActorCount,
+              pendingAlarmCount: observed.pendingAlarmCount,
+              openSocketCount: observed.openSocketCount,
+            })
+          : { kind: "unknown" };
       const stillAuthorized = async (signal: AbortSignal): Promise<boolean> => {
         signal.throwIfAborted();
         if (
@@ -693,7 +728,7 @@ export function createV2ActorNamespaceForm(options: {
               operationId: execution.operationId,
               leaseToken: execution.leaseToken,
             })
-          )?.authorityKey !== accepted.authorityKey
+          )?.authorityKey !== acceptedAuthorityKey
         )
           return false;
         const current = await readSnapshot();
@@ -715,7 +750,7 @@ export function createV2ActorNamespaceForm(options: {
               operationId: execution.operationId,
               leaseToken: execution.leaseToken,
             })
-          )?.authorityKey === accepted.authorityKey
+          )?.authorityKey === acceptedAuthorityKey
         );
       };
       const signal = AbortSignal.timeout(30_000);
@@ -725,32 +760,25 @@ export function createV2ActorNamespaceForm(options: {
         leaseToken: execution.leaseToken,
       });
       if (!(await stillAuthorized(signal))) return UNKNOWN;
-      let first = await provider.observeNamespaceRuntimeForAcceptedOperation(
-        scope,
-        snapshot,
-        signal,
+      let first = captureObservation(
+        await provider.observeNamespaceRuntimeForAcceptedOperation(scope, snapshot, signal),
       );
       if (first.kind !== "confirmed")
-        first = await provider.warmNamespaceForAcceptedOperation(
-          scope,
-          { graph: accepted, snapshot, stillAuthorized },
-          signal,
+        first = captureObservation(
+          await provider.warmNamespaceForAcceptedOperation(
+            scope,
+            { graph: heldGraph, snapshot, stillAuthorized },
+            signal,
+          ),
         );
       if (first.kind !== "confirmed" || !first.epoch || !(await stillAuthorized(signal)))
         return UNKNOWN;
-      const second = await provider.observeNamespaceRuntimeForAcceptedOperation(
-        scope,
-        snapshot,
-        signal,
+      const second = captureObservation(
+        await provider.observeNamespaceRuntimeForAcceptedOperation(scope, snapshot, signal),
       );
       if (
         second.kind !== "confirmed" ||
         second.epoch !== first.epoch ||
-        !Number.isSafeInteger(second.observedAt) ||
-        second.observedAt < 0 ||
-        ![second.activeActorCount, second.pendingAlarmCount, second.openSocketCount].every(
-          (value) => Number.isSafeInteger(value) && value >= 0,
-        ) ||
         !(await stillAuthorized(signal))
       )
         return UNKNOWN;
@@ -847,7 +875,7 @@ export function createV2ActorNamespaceForm(options: {
             operationId: execution.operationId,
             leaseToken: execution.leaseToken,
           })
-        )?.authorityKey !== accepted.authorityKey
+        )?.authorityKey !== acceptedAuthorityKey
       )
         return false;
       const currentServing = await owner.observeServing({
@@ -897,7 +925,7 @@ export function createV2ActorNamespaceForm(options: {
             operationId: execution.operationId,
             leaseToken: execution.leaseToken,
           })
-        )?.authorityKey === accepted.authorityKey
+        )?.authorityKey === acceptedAuthorityKey
       );
     };
     const signal = AbortSignal.timeout(30_000);
@@ -912,7 +940,7 @@ export function createV2ActorNamespaceForm(options: {
       first = await warm(
         scope,
         {
-          graph: accepted,
+          graph: heldGraph,
           realization: options.acceptedGraph.acceptedOperationRealization(native),
           expected,
           stillAuthorized,

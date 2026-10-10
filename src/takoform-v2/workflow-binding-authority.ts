@@ -50,6 +50,7 @@ export interface V2WorkflowBindingVersionIdentitySource {
   readonly workerVersionOperationId: string;
   readonly workerVersionGeneration: number;
   readonly workflowBindings: readonly { readonly name: string; readonly resourceUid: string }[];
+  readonly actorBindings: readonly { readonly name: string; readonly resourceUid: string }[];
 }
 
 type Row = Record<string, unknown>;
@@ -321,6 +322,11 @@ export function createV2WorkflowBindingAuthority(options: {
         workerVersionGeneration: sourceGeneration,
         workflowBindings: Object.freeze(
           spec.workflowBindings.map((binding) =>
+            Object.freeze({ name: binding.name, resourceUid: binding.resource.resourceUid }),
+          ),
+        ),
+        actorBindings: Object.freeze(
+          spec.actorBindings.map((binding) =>
             Object.freeze({ name: binding.name, resourceUid: binding.resource.resourceUid }),
           ),
         ),

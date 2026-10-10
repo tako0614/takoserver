@@ -292,9 +292,16 @@ test("Host-authorized native observation rechecks a held guard and keeps the sna
         env.CLASS === undefined
       )
         return null;
-      return async () => {
-        calls += 1;
-        return current && (!revokeAfterFirst || calls % 2 === 1);
+      return {
+        guard: async () => {
+          calls += 1;
+          return current && (!revokeAfterFirst || calls % 2 === 1);
+        },
+        readGraph: async () => ({
+          generationKey: "e".repeat(64),
+          epoch: "held-native",
+          variantKeys: ["held-default"],
+        }),
       };
     },
   );
@@ -329,7 +336,11 @@ test("Host-authorized native observation rechecks a held guard and keeps the sna
     expect((await observe("wrong-lease")).status).toBe(404);
     const confirmed = await observe("exact-lease");
     expect(confirmed.status).toBe(200);
-    expect(await confirmed.json()).toMatchObject({ actorId, epoch: "native" });
+    expect(await confirmed.json()).toMatchObject({
+      actorId,
+      generationKey: "e".repeat(64),
+      epoch: "held-native",
+    });
     expect(calls).toBe(2);
     revokeAfterFirst = true;
     expect((await observe("exact-lease")).status).toBe(503);
