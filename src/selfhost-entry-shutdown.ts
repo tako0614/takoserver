@@ -5,8 +5,12 @@ const SAFE_IDENTIFIER = /^[A-Za-z0-9_.-]{1,40}$/u;
  * One bounded, single-line description of why a background pass failed.
  *
  * Only the error's class name, a short code (for example `SQLITE_BUSY`) and its
- * message are used. Parameters, request bodies and arbitrary objects never are:
- * a pass that failed on something it was holding must not print it.
+ * message are used, truncated to a fixed length with control characters
+ * replaced, so one failure stays one log line. This code never serializes the
+ * error's other properties, bound parameters or arbitrary non-Error values.
+ * The message itself is whatever the failing library wrote and can echo
+ * fragments of its input (a SQL error can quote part of a statement), so it is
+ * bounded, not guaranteed free of data.
  */
 export function describeBackgroundFailure(cause: unknown): string {
   if (cause === undefined) return "unknown cause";
