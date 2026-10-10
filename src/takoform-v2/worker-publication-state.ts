@@ -717,6 +717,13 @@ UNION ALL
 SELECT kind, key, body FROM (${currentServingFenceRelationsSql(true)})
 ORDER BY kind, key`;
 
+interface CurrentServingInput {
+  readonly workerUid: string;
+  readonly targetKey: string;
+  readonly sourceOperationId: string;
+  readonly expectedIdentity: V2WorkerCurrentServingIdentity;
+}
+
 /** No separate desired-state ledger: every read starts from the accepted v2 Operation. */
 export function createV2WorkerPublicationState(options: {
   sql: Sql;
@@ -2159,6 +2166,95 @@ export function createV2WorkerPublicationState(options: {
     return { bundle, assets };
   }
 
+  /** Read-only SQL and held-material proof; native serving needs separate owner readback. */
+  async function resolveServing(
+    input: CurrentServingInput,
+    recovery: { readonly neverServedOperation?: NeverServedOperation } | null,
+  ): Promise<V2WorkerCurrentServingResolution> {
+    // The owner can await while reading SQL. Sample its persisted marker once,
+    // before any await, so caller mutation cannot retarget this readback.
+    let captured: CurrentServingCaptureInput;
+    try {
+      captured = {
+        currentServing: freezeDeep({
+          workerUid: input.workerUid,
+          targetKey: input.targetKey,
+          sourceOperationId: input.sourceOperationId,
+          tolerateUnstartedSuccessors: recovery !== null,
+          ...(recovery?.neverServedOperation !== undefined
+            ? { neverServedOperation: recovery.neverServedOperation }
+            : {}),
+          expectedIdentity: {
+            generation: input.expectedIdentity.generation,
+            workerResourceUid: input.expectedIdentity.workerResourceUid,
+            hostnames: [...input.expectedIdentity.hostnames],
+            versions: input.expectedIdentity.versions.map((version) => ({
+              workerVersionUid: version.workerVersionUid,
+              weight: version.weight,
+            })),
+          },
+        }),
+      };
+    } catch {
+      return unresolved("graph_unresolved", "Persisted serving identity is invalid");
+    }
+    let initial: CurrentCapture;
+    try {
+      initial = await capture(captured);
+    } catch {
+      return unresolved("graph_unresolved", "Current serving SQL graph is unavailable");
+    }
+    if (initial.kind === "unresolved") return initial;
+    let initialFence: string;
+    try {
+      initialFence = await currentServingFence(captured, initial);
+      const confirmed = await capture(captured);
+      if (confirmed.kind !== "ready" || confirmed.vector !== initial.vector) {
+        return unresolved("graph_unresolved", "Current serving graph changed during capture");
+      }
+    } catch {
+      return unresolved("graph_unresolved", "Current serving SQL fence is unavailable");
+    }
+    const stillAuthorized = async (): Promise<boolean> => {
+      try {
+        return (await currentServingFence(captured, initial)) === initialFence;
+      } catch {
+        return false;
+      }
+    };
+    const readVersionMaterials = async (versionUid: string): Promise<V2WorkerVersionMaterials> => {
+      const target = initial.materials.get(versionUid);
+      if (!target) {
+        throw new SqlError("unavailable", "Worker Version materials are not authorized");
+      }
+      return readMaterialsTargets(
+        target,
+        initial.snapshot.worker.principal,
+        initial.snapshot.worker.space,
+        stillAuthorized,
+      );
+    };
+    const verifyAllMaterials = async (): Promise<boolean> => {
+      try {
+        for (const version of initial.snapshot.deployment?.versions ?? []) {
+          await readVersionMaterials(version.uid);
+        }
+        return await stillAuthorized();
+      } catch {
+        return false;
+      }
+    };
+    if (!(await verifyAllMaterials())) {
+      return unresolved("graph_unresolved", "Current serving graph or held bytes are unavailable");
+    }
+    return {
+      kind: "ready",
+      snapshot: initial.snapshot,
+      stillCurrent: verifyAllMaterials,
+      readVersionMaterials,
+    };
+  }
+
   return {
     /** A bounded positive proof that this settled Worker currently has no serving Deployment. */
     async observeNoCurrentServing(input: {
@@ -2412,114 +2508,28 @@ export function createV2WorkerPublicationState(options: {
           ),
       };
     },
-    /** Read-only SQL and held-material proof; native serving needs separate owner readback. */
-    async resolveCurrentServing(input: {
-      workerUid: string;
-      targetKey: string;
-      sourceOperationId: string;
-      expectedIdentity: V2WorkerCurrentServingIdentity;
-      /**
-       * Boot recovery of an already active incarnation only. Accept queued
-       * Deployment/Endpoint Operations that have no possible backend effect,
-       * and prove the committed generation they sit on. Every other caller
-       * keeps the strict fence that refuses while any publication is pending.
-       */
-      tolerateUnstartedSuccessors?: boolean;
-      /**
-       * With `tolerateUnstartedSuccessors` only: the owner's proof that an
-       * Operation which already recorded a dispatch never reached native
-       * serving. Without it a dispatched Operation is refused.
-       */
-      neverServedOperation?: NeverServedOperation;
-    }): Promise<V2WorkerCurrentServingResolution> {
-      // The owner can await while reading SQL. Sample its persisted marker once,
-      // before any await, so caller mutation cannot retarget this readback.
-      let captured: CurrentServingCaptureInput;
-      try {
-        captured = {
-          currentServing: freezeDeep({
-            workerUid: input.workerUid,
-            targetKey: input.targetKey,
-            sourceOperationId: input.sourceOperationId,
-            tolerateUnstartedSuccessors: input.tolerateUnstartedSuccessors === true,
-            ...(input.tolerateUnstartedSuccessors === true &&
-            input.neverServedOperation !== undefined
-              ? { neverServedOperation: input.neverServedOperation }
-              : {}),
-            expectedIdentity: {
-              generation: input.expectedIdentity.generation,
-              workerResourceUid: input.expectedIdentity.workerResourceUid,
-              hostnames: [...input.expectedIdentity.hostnames],
-              versions: input.expectedIdentity.versions.map((version) => ({
-                workerVersionUid: version.workerVersionUid,
-                weight: version.weight,
-              })),
-            },
-          }),
-        };
-      } catch {
-        return unresolved("graph_unresolved", "Persisted serving identity is invalid");
-      }
-      let initial: CurrentCapture;
-      try {
-        initial = await capture(captured);
-      } catch {
-        return unresolved("graph_unresolved", "Current serving SQL graph is unavailable");
-      }
-      if (initial.kind === "unresolved") return initial;
-      let initialFence: string;
-      try {
-        initialFence = await currentServingFence(captured, initial);
-        const confirmed = await capture(captured);
-        if (confirmed.kind !== "ready" || confirmed.vector !== initial.vector) {
-          return unresolved("graph_unresolved", "Current serving graph changed during capture");
-        }
-      } catch {
-        return unresolved("graph_unresolved", "Current serving SQL fence is unavailable");
-      }
-      const stillAuthorized = async (): Promise<boolean> => {
-        try {
-          return (await currentServingFence(captured, initial)) === initialFence;
-        } catch {
-          return false;
-        }
-      };
-      const readVersionMaterials = async (
-        versionUid: string,
-      ): Promise<V2WorkerVersionMaterials> => {
-        const target = initial.materials.get(versionUid);
-        if (!target) {
-          throw new SqlError("unavailable", "Worker Version materials are not authorized");
-        }
-        return readMaterialsTargets(
-          target,
-          initial.snapshot.worker.principal,
-          initial.snapshot.worker.space,
-          stillAuthorized,
-        );
-      };
-      const verifyAllMaterials = async (): Promise<boolean> => {
-        try {
-          for (const version of initial.snapshot.deployment?.versions ?? []) {
-            await readVersionMaterials(version.uid);
-          }
-          return await stillAuthorized();
-        } catch {
-          return false;
-        }
-      };
-      if (!(await verifyAllMaterials())) {
-        return unresolved(
-          "graph_unresolved",
-          "Current serving graph or held bytes are unavailable",
-        );
-      }
-      return {
-        kind: "ready",
-        snapshot: initial.snapshot,
-        stillCurrent: verifyAllMaterials,
-        readVersionMaterials,
-      };
+    /** Strict current-serving proof: refuses while any Worker publication is pending. */
+    async resolveCurrentServing(
+      input: CurrentServingInput,
+    ): Promise<V2WorkerCurrentServingResolution> {
+      return await resolveServing(input, null);
+    },
+    /**
+     * Boot recovery of an already active incarnation only, never a route, Queue
+     * or Workflow reader. Accepts queued Deployment/Endpoint Operations that have
+     * no possible backend effect, and dispatched ones the owner proves never
+     * served (`neverServedOperation`), and proves the committed generation they
+     * sit on. Without the proof a dispatched Operation is refused.
+     */
+    async resolveCommittedServingForBootRecovery(
+      input: CurrentServingInput & { readonly neverServedOperation?: NeverServedOperation },
+    ): Promise<V2WorkerCurrentServingResolution> {
+      return await resolveServing(
+        input,
+        input.neverServedOperation === undefined
+          ? {}
+          : { neverServedOperation: input.neverServedOperation },
+      );
     },
     async resolve(input: {
       execution: V2Execution;

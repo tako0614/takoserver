@@ -155,10 +155,23 @@ type PublicationState = {
     readonly targetKey: string;
     readonly sourceOperationId: string;
     readonly expectedIdentity: WorkerdPublicationIdentity;
-    /** Boot recovery only; see createV2WorkerPublicationState. */
-    readonly tolerateUnstartedSuccessors?: boolean;
-    /** Boot recovery only; the owner's proof that a dispatched Operation never served. */
-    readonly neverServedOperation?: (operationId: string) => boolean;
+  }): Promise<
+    | {
+        readonly kind: "ready";
+        readonly snapshot: V2WorkerPublicationSnapshot;
+        stillCurrent(): Promise<boolean>;
+        readVersionMaterials?(versionUid: string): Promise<V2WorkerVersionMaterials>;
+      }
+    | { readonly kind: "unresolved"; readonly code: string; readonly message: string }
+  >;
+  /** Boot recovery only: see createV2WorkerPublicationState. */
+  resolveCommittedServingForBootRecovery?(input: {
+    readonly workerUid: string;
+    readonly targetKey: string;
+    readonly sourceOperationId: string;
+    readonly expectedIdentity: WorkerdPublicationIdentity;
+    /** The owner's proof that a dispatched Operation never served. */
+    readonly neverServedOperation: (operationId: string) => boolean;
   }): Promise<
     | {
         readonly kind: "ready";
@@ -3665,19 +3678,22 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
     const sourceOperationId = sourceOperationIdFromIdentity(activeRecord.identity);
     if (!sourceOperationId) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
-    // A Host can stop while a later Deployment/Endpoint Operation is only
-    // queued. That Operation cannot have touched this owner: its candidate
-    // incarnation is persisted before any native effect, and a leftover
-    // candidate record is refused when the owner opens. Adopt the committed
-    // incarnation and let the normal Operation engine run the successor.
-    const resolution = await currentServing({
+    // A Host can stop while a later Deployment/Endpoint Operation is queued, or
+    // dispatched without ever serving. Its candidate incarnation is persisted
+    // before any native effect, and a dead never-activated candidate was
+    // retired above. Adopt the committed incarnation, with the owner's own
+    // never-served proof, and let the normal Operation engine run or settle the
+    // successor. Only this boot path may ask for that tolerance.
+    const input = {
       workerUid: options.workerResourceUid,
       targetKey: options.targetKey,
       sourceOperationId,
       expectedIdentity: activeRecord.identity,
-      tolerateUnstartedSuccessors: true,
-      neverServedOperation: operationNeverServed,
-    });
+    };
+    const bootRecovery = options.publicationState.resolveCommittedServingForBootRecovery;
+    const resolution = bootRecovery
+      ? await bootRecovery({ ...input, neverServedOperation: operationNeverServed })
+      : await currentServing(input);
     if (
       resolution.kind !== "ready" ||
       resolution.snapshot.sourceOperationId !== sourceOperationId ||

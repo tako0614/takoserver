@@ -40,6 +40,7 @@ async function sparePort(): Promise<number> {
   return selected;
 }
 const operationUid = createId ?? "";
+const fixtureWorkerUid: string = workerResourceUid;
 // The Operation whose publish blocks after its candidate incarnation exists.
 const hangOperationId =
   mode === "active-update-hang-after-candidate"
@@ -180,95 +181,106 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
       },
     } as V2WorkerPublicationResolution;
   },
+  async resolveCommittedServingForBootRecovery(input) {
+    // What the owner is willing to vouch for at boot recovery, for the test to read.
+    await writeFile(
+      join(rootDirectory as string, "never-served.json"),
+      JSON.stringify({
+        update: input.neverServedOperation(updateId ?? ""),
+        create: input.neverServedOperation(createId ?? ""),
+        unknown: input.neverServedOperation("00000000-0000-4000-8000-000000000000"),
+      }),
+      { mode: 0o600 },
+    );
+    return await currentServingFixture(input);
+  },
   async resolveCurrentServing(input) {
-    if (input.tolerateUnstartedSuccessors === true && input.neverServedOperation !== undefined) {
-      // What the owner is willing to vouch for at boot recovery, for the test to read.
-      await writeFile(
-        join(rootDirectory as string, "never-served.json"),
-        JSON.stringify({
-          update: input.neverServedOperation(updateId ?? ""),
-          create: input.neverServedOperation(createId ?? ""),
-          unknown: input.neverServedOperation("00000000-0000-4000-8000-000000000000"),
-        }),
-        { mode: 0o600 },
-      );
-    }
-    if (mode === "active-recover-sql-unavailable") {
-      return {
-        kind: "unresolved",
-        code: "fixture_sql_unavailable",
-        message: "injected current-serving lookup failure",
-      };
-    }
-    const current = await readCurrentServing();
-    if (
-      !current ||
-      current.sourceOperationId !== input.sourceOperationId ||
-      canonicalJson(current.identity) !== canonicalJson(input.expectedIdentity)
-    ) {
-      return {
-        kind: "unresolved",
-        code: "fixture_source_mismatch",
-        message: "fixture source changed",
-      };
-    }
-    const parsedSpec = parseWorkerDeploymentSpec(current.spec);
-    const originalChildPid =
-      mode === "active-recover-reject-after-spawn" ? await readActiveChildPid() : null;
-    const snapshot = {
-      sourceOperationId: current.sourceOperationId,
-      worker: {
-        uid: workerResourceUid,
-        principal: "org-runtime-owner",
-        space: "production",
-        generation: 1,
-      },
-      deployment: {
-        uid: `deployment-${workerResourceUid}`,
-        generation: current.generation,
-        spec: parsedSpec,
-        versions: current.identity.versions.map(({ workerVersionUid, weight }) => ({
-          uid: workerVersionUid,
-          // The crash fixture has no WorkerVersion Resource ledger; this is
-          // synthetic provenance, not a Deployment Operation ID.
-          sourceOperationId: "fixture-worker-version-operation",
-          generation: current.generation,
-          weight,
-          spec: {
-            worker: { resourceUid: workerResourceUid },
-            handlers: [],
-            assets: {
-              bundle: { resourceUid: `assets-${operationUid}` },
-              runWorkerFirst: false,
-              notFoundHandling: "none",
-            },
-          } as never,
-        })),
-      },
-      endpoint: {
-        uid: `endpoint-${workerResourceUid}`,
-        generation: 1,
-        spec: { worker: { resourceUid: workerResourceUid } },
-        output: {
-          hostname: current.identity.hostnames[0] ?? "",
-          url: `https://${current.identity.hostnames[0] ?? ""}/`,
-        },
-      },
-    };
-    const stillCurrent = async () => {
-      const reread = await readCurrentServing();
-      return (
-        canonicalJson(reread) === canonicalJson(current) &&
-        (originalChildPid === null || (await readActiveChildPid()) === originalChildPid)
-      );
-    };
-    return {
-      kind: "ready" as const,
-      snapshot,
-      stillCurrent,
-    };
+    return await currentServingFixture(input);
   },
 };
+
+type CurrentServingReader = NonNullable<
+  OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]["resolveCurrentServing"]
+>;
+
+async function currentServingFixture(
+  input: Parameters<CurrentServingReader>[0],
+): ReturnType<CurrentServingReader> {
+  if (mode === "active-recover-sql-unavailable") {
+    return {
+      kind: "unresolved",
+      code: "fixture_sql_unavailable",
+      message: "injected current-serving lookup failure",
+    };
+  }
+  const current = await readCurrentServing();
+  if (
+    !current ||
+    current.sourceOperationId !== input.sourceOperationId ||
+    canonicalJson(current.identity) !== canonicalJson(input.expectedIdentity)
+  ) {
+    return {
+      kind: "unresolved",
+      code: "fixture_source_mismatch",
+      message: "fixture source changed",
+    };
+  }
+  const parsedSpec = parseWorkerDeploymentSpec(current.spec);
+  const originalChildPid =
+    mode === "active-recover-reject-after-spawn" ? await readActiveChildPid() : null;
+  const snapshot = {
+    sourceOperationId: current.sourceOperationId,
+    worker: {
+      uid: fixtureWorkerUid,
+      principal: "org-runtime-owner",
+      space: "production",
+      generation: 1,
+    },
+    deployment: {
+      uid: `deployment-${fixtureWorkerUid}`,
+      generation: current.generation,
+      spec: parsedSpec,
+      versions: current.identity.versions.map(({ workerVersionUid, weight }) => ({
+        uid: workerVersionUid,
+        // The crash fixture has no WorkerVersion Resource ledger; this is
+        // synthetic provenance, not a Deployment Operation ID.
+        sourceOperationId: "fixture-worker-version-operation",
+        generation: current.generation,
+        weight,
+        spec: {
+          worker: { resourceUid: fixtureWorkerUid },
+          handlers: [],
+          assets: {
+            bundle: { resourceUid: `assets-${operationUid}` },
+            runWorkerFirst: false,
+            notFoundHandling: "none",
+          },
+        } as never,
+      })),
+    },
+    endpoint: {
+      uid: `endpoint-${fixtureWorkerUid}`,
+      generation: 1,
+      spec: { worker: { resourceUid: fixtureWorkerUid } },
+      output: {
+        hostname: current.identity.hostnames[0] ?? "",
+        url: `https://${current.identity.hostnames[0] ?? ""}/`,
+      },
+    },
+  };
+  const stillCurrent = async () => {
+    const reread = await readCurrentServing();
+    return (
+      canonicalJson(reread) === canonicalJson(current) &&
+      (originalChildPid === null || (await readActiveChildPid()) === originalChildPid)
+    );
+  };
+  return {
+    kind: "ready" as const,
+    snapshot,
+    stillCurrent,
+  };
+}
 
 async function readActiveChildPid(): Promise<number | null> {
   const uidHash = createHash("sha256")

@@ -395,6 +395,25 @@ function fixture(distinctFormBackends = false, legacySchema = false) {
   };
 }
 
+type ServingInput = Parameters<ReturnType<typeof fixture>["reader"]["resolveCurrentServing"]>[0] & {
+  tolerateUnstartedSuccessors?: boolean;
+  neverServedOperation?: (operationId: string) => boolean;
+};
+
+/**
+ * Tests describe the boot-recovery tolerance as a flag; production reaches it
+ * only through the dedicated boot-recovery method, and the strict method
+ * ignores any proof it is handed.
+ */
+function serve(f: ReturnType<typeof fixture>, input: ServingInput) {
+  const { tolerateUnstartedSuccessors, neverServedOperation, ...strict } = input;
+  return tolerateUnstartedSuccessors === true
+    ? f.reader.resolveCommittedServingForBootRecovery(
+        neverServedOperation ? { ...strict, neverServedOperation } : strict,
+      )
+    : f.reader.resolveCurrentServing(strict);
+}
+
 test("accepted Deployment overlays only its own operation and fences every graph change", async () => {
   const f = fixture();
   try {
@@ -930,7 +949,7 @@ test("a historical source without acceptance order is unresolved after additive 
         versions: [{ workerVersionUid: version.resourceUid, weight: 10_000 }],
       },
     };
-    expect(await f.reader.resolveCurrentServing(oldInput)).toMatchObject({
+    expect(await serve(f, oldInput)).toMatchObject({
       kind: "unresolved",
       code: "graph_unresolved",
       message: "Serving source is not the unique latest publisher",
@@ -961,7 +980,7 @@ test("a historical source without acceptance order is unresolved after additive 
       ).files,
     ).toHaveLength(1);
     expect(
-      await f.reader.resolveCurrentServing({
+      await serve(f, {
         ...oldInput,
         sourceOperationId: current.id,
         expectedIdentity: {
@@ -1057,7 +1076,7 @@ test("current serving follows the latest Endpoint marker across distinct Form ba
       sourceOperationId: deployment.id,
       expectedIdentity: deploymentIdentity,
     };
-    const first = await f.reader.resolveCurrentServing(deploymentInput);
+    const first = await serve(f, deploymentInput);
     expect(first.kind).toBe("ready");
     if (first.kind !== "ready") return;
 
@@ -1078,10 +1097,10 @@ test("current serving follows the latest Endpoint marker across distinct Form ba
       expectedIdentity: endpointIdentity,
     };
     expect(await first.stillCurrent()).toBe(false);
-    expect(await f.reader.resolveCurrentServing(deploymentInput)).toMatchObject({
+    expect(await serve(f, deploymentInput)).toMatchObject({
       kind: "unresolved",
     });
-    const servingEndpoint = await f.reader.resolveCurrentServing(endpointInput);
+    const servingEndpoint = await serve(f, endpointInput);
     expect(servingEndpoint.kind).toBe("ready");
     if (servingEndpoint.kind !== "ready") return;
     expect(servingEndpoint.snapshot.endpoint?.output.hostname).toBe("assigned.example.test");
@@ -1093,7 +1112,7 @@ test("current serving follows the latest Endpoint marker across distinct Form ba
       expectedGeneration: 1,
     });
     expect(
-      await f.reader.resolveCurrentServing({
+      await serve(f, {
         ...endpointInput,
         sourceOperationId: deleted.id,
         expectedIdentity: {
@@ -1104,7 +1123,7 @@ test("current serving follows the latest Endpoint marker across distinct Form ba
       }),
     ).toMatchObject({ kind: "unresolved", code: "source_unsettled" });
     expect(await f.engine.runNext()).toMatchObject({ id: deleted.id, status: "succeeded" });
-    const afterDelete = await f.reader.resolveCurrentServing({
+    const afterDelete = await serve(f, {
       ...endpointInput,
       sourceOperationId: deleted.id,
       expectedIdentity: {
@@ -1157,13 +1176,13 @@ test("current serving compares the complete weighted Version set independent of 
         ],
       },
     };
-    const ready = await f.reader.resolveCurrentServing(base);
+    const ready = await serve(f, base);
     expect(ready.kind).toBe("ready");
     if (ready.kind !== "ready") return;
     const selectedVersion = base.expectedIdentity.versions[0];
     if (!selectedVersion) throw new Error("missing selected Version fixture");
     expect(
-      await f.reader.resolveCurrentServing({
+      await serve(f, {
         ...base,
         expectedIdentity: {
           ...base.expectedIdentity,
@@ -1172,7 +1191,7 @@ test("current serving compares the complete weighted Version set independent of 
       }),
     ).toMatchObject({ kind: "unresolved" });
     expect(
-      await f.reader.resolveCurrentServing({
+      await serve(f, {
         ...base,
         expectedIdentity: {
           ...base.expectedIdentity,
@@ -1185,7 +1204,7 @@ test("current serving compares the complete weighted Version set independent of 
       [second.resourceUid, bundle.resourceUid],
     );
     expect(await ready.stillCurrent()).toBe(false);
-    expect(await f.reader.resolveCurrentServing(base)).toMatchObject({ kind: "unresolved" });
+    expect(await serve(f, base)).toMatchObject({ kind: "unresolved" });
   } finally {
     f.close();
   }
@@ -1221,7 +1240,7 @@ test("current serving does not revive an older Deployment marker after a clock-r
       versions: [{ workerVersionUid: version.resourceUid, weight: 10_000 }],
     };
     expect(
-      await f.reader.resolveCurrentServing({
+      await serve(f, {
         workerUid: worker.resourceUid,
         targetKey: "fixture-workerd-root",
         sourceOperationId: deployment.id,
@@ -1232,7 +1251,7 @@ test("current serving does not revive an older Deployment marker after a clock-r
       }),
     ).toMatchObject({ kind: "unresolved" });
     expect(
-      await f.reader.resolveCurrentServing({
+      await serve(f, {
         workerUid: worker.resourceUid,
         targetKey: "fixture-workerd-root",
         sourceOperationId: deleted.id,
@@ -1954,17 +1973,17 @@ for (const scenario of recoveryScenarios) {
     try {
       const graph = await recoveryGraph(f, scenario);
       // The default fence is unchanged: any pending publication refuses.
-      expect(await f.reader.resolveCurrentServing(graph.input)).toMatchObject({
+      expect(await serve(f, graph.input)).toMatchObject({
         kind: "unresolved",
       });
       expect(
-        await f.reader.resolveCurrentServing({
+        await serve(f, {
           ...graph.input,
           tolerateUnstartedSuccessors: false,
         }),
       ).toMatchObject({ kind: "unresolved" });
 
-      const ready = await f.reader.resolveCurrentServing({
+      const ready = await serve(f, {
         ...graph.input,
         tolerateUnstartedSuccessors: true,
       });
@@ -1991,7 +2010,7 @@ for (const scenario of recoveryScenarios) {
         await f.store.claim(graph.pendingId, token, f.currentClock(), f.currentClock() + 60_000),
       ).toBe(true);
       expect(await ready.stillCurrent()).toBe(false);
-      const claimedOnly = await f.reader.resolveCurrentServing({
+      const claimedOnly = await serve(f, {
         ...graph.input,
         tolerateUnstartedSuccessors: true,
       });
@@ -2010,7 +2029,7 @@ for (const scenario of recoveryScenarios) {
       ).toBe(true);
       expect(await claimedOnly.stillCurrent()).toBe(false);
       expect(
-        await f.reader.resolveCurrentServing({
+        await serve(f, {
           ...graph.input,
           tolerateUnstartedSuccessors: true,
         }),
@@ -2028,11 +2047,11 @@ test("recovery tolerance requires the queued Operation to be the exact unstarted
   try {
     const graph = await recoveryGraph(f, scenario);
     const tolerant = { ...graph.input, tolerateUnstartedSuccessors: true };
-    expect((await f.reader.resolveCurrentServing(tolerant)).kind).toBe("ready");
+    expect((await serve(f, tolerant)).kind).toBe("ready");
 
     // The pending Operation is not a serving source, even if named as one.
     expect(
-      await f.reader.resolveCurrentServing({
+      await serve(f, {
         ...tolerant,
         sourceOperationId: graph.pendingId,
         expectedIdentity: {
@@ -2043,7 +2062,7 @@ test("recovery tolerance requires the queued Operation to be the exact unstarted
     ).toMatchObject({ kind: "unresolved" });
     // A different committed source is not the latest publisher.
     expect(
-      await f.reader.resolveCurrentServing({
+      await serve(f, {
         ...tolerant,
         sourceOperationId: graph.deployment.id,
         expectedIdentity: {
@@ -2057,7 +2076,7 @@ test("recovery tolerance requires the queued Operation to be the exact unstarted
     f.db
       .query("UPDATE tf_v2_resources SET generation = generation + 1 WHERE uid = ?")
       .run(graph.endpoint?.resourceUid ?? "");
-    expect(await f.reader.resolveCurrentServing(tolerant)).toMatchObject({ kind: "unresolved" });
+    expect(await serve(f, tolerant)).toMatchObject({ kind: "unresolved" });
   } finally {
     f.close();
   }
@@ -2070,15 +2089,15 @@ test("a queued successor that settles becomes the only current serving source", 
   try {
     const graph = await recoveryGraph(f, scenario);
     const tolerant = { ...graph.input, tolerateUnstartedSuccessors: true };
-    const before = await f.reader.resolveCurrentServing(tolerant);
+    const before = await serve(f, tolerant);
     expect(before.kind).toBe("ready");
     expect(await f.engine.runNext()).toMatchObject({ id: graph.pendingId, status: "succeeded" });
     if (before.kind === "ready") expect(await before.stillCurrent()).toBe(false);
     // The old source is superseded in both modes; the new one is current.
-    expect(await f.reader.resolveCurrentServing(graph.input)).toMatchObject({
+    expect(await serve(f, graph.input)).toMatchObject({
       kind: "unresolved",
     });
-    expect(await f.reader.resolveCurrentServing(tolerant)).toMatchObject({ kind: "unresolved" });
+    expect(await serve(f, tolerant)).toMatchObject({ kind: "unresolved" });
     const next = {
       ...graph.input,
       sourceOperationId: graph.pendingId,
@@ -2087,7 +2106,7 @@ test("a queued successor that settles becomes the only current serving source", 
         generation: `takoserver-v2-operation:${graph.pendingId}`,
       },
     };
-    const after = await f.reader.resolveCurrentServing(next);
+    const after = await serve(f, next);
     expect(after.kind).toBe("ready");
     if (after.kind === "ready") expect(after.snapshot.endpoint?.generation).toBe(2);
   } finally {
@@ -2102,11 +2121,11 @@ test("recovery tolerance refuses a queued Operation that already recorded a disp
   try {
     const graph = await recoveryGraph(f, scenario);
     const tolerant = { ...graph.input, tolerateUnstartedSuccessors: true };
-    expect((await f.reader.resolveCurrentServing(tolerant)).kind).toBe("ready");
+    expect((await serve(f, tolerant)).kind).toBe("ready");
     f.db
       .query("UPDATE tf_v2_operations SET dispatch_possible = 1 WHERE id = ?")
       .run(graph.pendingId);
-    expect(await f.reader.resolveCurrentServing(tolerant)).toMatchObject({
+    expect(await serve(f, tolerant)).toMatchObject({
       kind: "unresolved",
       code: "source_unsettled",
     });
@@ -2133,31 +2152,31 @@ for (const scenario of recoveryScenarios) {
       ).toBe(true);
       const tolerant = { ...graph.input, tolerateUnstartedSuccessors: true };
       // Without the owner's proof a dispatched Operation is refused, in every mode.
-      expect(await f.reader.resolveCurrentServing(graph.input)).toMatchObject({
+      expect(await serve(f, graph.input)).toMatchObject({
         kind: "unresolved",
       });
-      expect(await f.reader.resolveCurrentServing(tolerant)).toMatchObject({
+      expect(await serve(f, tolerant)).toMatchObject({
         kind: "unresolved",
       });
       // A proof for some other Operation, or a refusing proof, does not help.
       expect(
-        await f.reader.resolveCurrentServing({
+        await serve(f, {
           ...tolerant,
           neverServedOperation: (id: string) => id !== graph.pendingId,
         }),
       ).toMatchObject({ kind: "unresolved" });
-      expect(
-        await f.reader.resolveCurrentServing({ ...tolerant, neverServedOperation: () => false }),
-      ).toMatchObject({ kind: "unresolved" });
+      expect(await serve(f, { ...tolerant, neverServedOperation: () => false })).toMatchObject({
+        kind: "unresolved",
+      });
       // The proof is only honoured under the tolerant boot-recovery mode.
       expect(
-        await f.reader.resolveCurrentServing({
+        await serve(f, {
           ...graph.input,
           neverServedOperation: (id: string) => id === graph.pendingId,
         }),
       ).toMatchObject({ kind: "unresolved" });
 
-      const ready = await f.reader.resolveCurrentServing({
+      const ready = await serve(f, {
         ...tolerant,
         neverServedOperation: (id: string) => id === graph.pendingId,
       });
@@ -2194,20 +2213,20 @@ test("a vouched dispatched Operation still has to be the exact successor of the 
       tolerateUnstartedSuccessors: true,
       neverServedOperation: (id: string) => id === graph.pendingId,
     };
-    expect((await f.reader.resolveCurrentServing(vouched)).kind).toBe("ready");
+    expect((await serve(f, vouched)).kind).toBe("ready");
     // The vouch only covers an Operation that recorded a dispatch.
     f.db
       .query("UPDATE tf_v2_operations SET dispatch_possible = 0 WHERE id = ?")
       .run(graph.pendingId);
-    expect(await f.reader.resolveCurrentServing(vouched)).toMatchObject({ kind: "unresolved" });
+    expect(await serve(f, vouched)).toMatchObject({ kind: "unresolved" });
     f.db
       .query("UPDATE tf_v2_operations SET dispatch_possible = 1 WHERE id = ?")
       .run(graph.pendingId);
-    expect((await f.reader.resolveCurrentServing(vouched)).kind).toBe("ready");
+    expect((await serve(f, vouched)).kind).toBe("ready");
     f.db
       .query("UPDATE tf_v2_resources SET generation = generation + 1 WHERE uid = ?")
       .run(graph.endpoint?.resourceUid ?? "");
-    expect(await f.reader.resolveCurrentServing(vouched)).toMatchObject({ kind: "unresolved" });
+    expect(await serve(f, vouched)).toMatchObject({ kind: "unresolved" });
   } finally {
     f.close();
   }
@@ -2238,7 +2257,7 @@ for (const scenario of recoveryScenarios) {
       // Both the default fence and the boot-recovery fence must still resolve
       // the last committed source: a failed update changed nothing it serves.
       for (const input of [graph.input, { ...graph.input, tolerateUnstartedSuccessors: true }]) {
-        const ready = await f.reader.resolveCurrentServing(input);
+        const ready = await serve(f, input);
         expect(ready).toMatchObject({ kind: "ready" });
         if (ready.kind !== "ready") continue;
         expect(ready.snapshot.sourceOperationId).toBe(graph.sourceId);
@@ -2304,10 +2323,10 @@ async function readyWithAnyHostnames(
   ) => Parameters<ReturnType<typeof fixture>["reader"]["resolveCurrentServing"]>[0],
 ) {
   for (const hostnames of [["assigned.example.test"], []]) {
-    const result = await f.reader.resolveCurrentServing(make(hostnames));
+    const result = await serve(f, make(hostnames));
     if (result.kind === "ready") return result;
   }
-  return await f.reader.resolveCurrentServing(make(["assigned.example.test"]));
+  return await serve(f, make(["assigned.example.test"]));
 }
 
 test("boot recovery tolerates a queued re-apply behind a failed/none update of a non-source attachment", async () => {
@@ -2315,9 +2334,9 @@ test("boot recovery tolerates a queued re-apply behind a failed/none update of a
   try {
     const chain = await failedChain(f, "none");
     // The strict fence still refuses while e3 is pending.
-    expect(
-      await f.reader.resolveCurrentServing(chain.input(chain.d2.id, ["assigned.example.test"])),
-    ).toMatchObject({ kind: "unresolved" });
+    expect(await serve(f, chain.input(chain.d2.id, ["assigned.example.test"]))).toMatchObject({
+      kind: "unresolved",
+    });
     const ready = await readyWithAnyHostnames(f, (hostnames) => ({
       ...chain.input(chain.d2.id, hostnames),
       tolerateUnstartedSuccessors: true,
@@ -2338,7 +2357,7 @@ test("boot recovery refuses a queued re-apply behind a failed/partial update of 
     const chain = await failedChain(f, "partial");
     for (const hostnames of [["assigned.example.test"], []]) {
       expect(
-        await f.reader.resolveCurrentServing({
+        await serve(f, {
           ...chain.input(chain.d2.id, hostnames),
           tolerateUnstartedSuccessors: true,
         }),
@@ -2388,7 +2407,7 @@ for (const middle of ["none", "partial"] as const) {
         },
         tolerateUnstartedSuccessors: true,
       };
-      const result = await f.reader.resolveCurrentServing(tolerant);
+      const result = await serve(f, tolerant);
       expect(result.kind).toBe(middle === "none" ? "ready" : "unresolved");
       if (result.kind === "ready") {
         expect(result.snapshot.sourceOperationId).toBe(e1.id);
@@ -2413,7 +2432,7 @@ test("an attachment whose update failed with a partial effect is still refused",
       effect: "partial",
     });
     for (const input of [graph.input, { ...graph.input, tolerateUnstartedSuccessors: true }]) {
-      expect(await f.reader.resolveCurrentServing(input)).toMatchObject({ kind: "unresolved" });
+      expect(await serve(f, input)).toMatchObject({ kind: "unresolved" });
     }
   } finally {
     f.close();
@@ -2466,10 +2485,10 @@ for (const scenario of recoveryScenarios.filter(
           hostnames: scenario.endpoint ? ["assigned.example.test"] : [],
         },
       };
-      const after = await f.reader.resolveCurrentServing(next);
+      const after = await serve(f, next);
       expect(after).toMatchObject({ kind: "ready" });
       // The old committed source is superseded now.
-      expect(await f.reader.resolveCurrentServing(graph.input)).toMatchObject({
+      expect(await serve(f, graph.input)).toMatchObject({
         kind: "unresolved",
       });
     } finally {
@@ -2477,3 +2496,21 @@ for (const scenario of recoveryScenarios.filter(
     }
   });
 }
+
+test("the strict current-serving method ignores a boot-recovery tolerance smuggled in by an untyped caller", async () => {
+  const scenario = recoveryScenarios[0];
+  if (!scenario) throw new Error("missing scenario");
+  const f = fixture();
+  try {
+    const graph = await recoveryGraph(f, scenario);
+    const smuggled = {
+      ...graph.input,
+      tolerateUnstartedSuccessors: true,
+      neverServedOperation: () => true,
+    } as unknown as Parameters<typeof f.reader.resolveCurrentServing>[0];
+    expect(await f.reader.resolveCurrentServing(smuggled)).toMatchObject({ kind: "unresolved" });
+    expect((await f.reader.resolveCommittedServingForBootRecovery(graph.input)).kind).toBe("ready");
+  } finally {
+    f.close();
+  }
+});
