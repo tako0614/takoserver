@@ -69,6 +69,7 @@ import {
 import {
   closeSelfhostEntryOwnedResources,
   createSelfhostEntryShutdown,
+  describeBackgroundFailure,
 } from "./selfhost-entry-shutdown.ts";
 import {
   createSelfhostBunFetchHandler,
@@ -100,7 +101,7 @@ import {
   type SelfhostV2WorkerEndpointBoot,
 } from "./selfhost-v2-worker-endpoint-boot.ts";
 import { ensureSigningKey } from "./signing-key.ts";
-import { createSqliteSql } from "./sql-sqlite.ts";
+import { createSqliteSql, SQLITE_CONTROL_BUSY_TIMEOUT_MS } from "./sql-sqlite.ts";
 import {
   createSelfhostCronOwnerReader,
   createStandaloneProviderComposition,
@@ -335,6 +336,9 @@ if (databasePath !== ":memory:") mkdirSync(dirname(databasePath), { recursive: t
 // here because its HTTP API cannot provide the atomic batch capability the app
 // requires; the guard above runs before this database is opened or migrated.
 const controlDatabase = new Database(databasePath);
+// Before migration, which is the first writer: an operator's `sqlite3` or a
+// backup tool reading this file must delay a Host write, not fail it.
+controlDatabase.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
 // A self-hosted deployment starts with an empty file, so it is brought up
 // to this build's schema here. Forward only and recorded, so running it
 // again applies nothing and a database from a newer build is refused
@@ -768,6 +772,10 @@ try {
       },
       settlementKey: v2PrivatePlaneBoot.queue.signingKey,
       privatePort: v2PrivatePlaneBoot.queue.privatePort,
+      onCancelFailure: (cause) =>
+        process.stderr.write(
+          `self-host Queue reservation could not be refunded before send and will expire: ${describeBackgroundFailure(cause)}\n`,
+        ),
       ownerForWorkerUid: async (uid) => {
         if (!ownersRestored || !workers) {
           throw new Error("v2 Queue owner is not restored");
@@ -1401,6 +1409,13 @@ try {
   throw error;
 }
 
+/** Name plus a bounded cause: a lock, a refused port and a bug read differently. */
+const reportBackgroundFailure = (name: string, cause?: unknown): void => {
+  process.stderr.write(
+    `self-host background pass failed: ${name}: ${describeBackgroundFailure(cause)}\n`,
+  );
+};
+
 // Background settlement. The shutdown owner retains each timer and each pass
 // promise, so no new work starts past the signal fence and accepted work drains.
 entryShutdown.startInterval(
@@ -1415,7 +1430,7 @@ entryShutdown.startInterval(
     }
     if (queuePump) await queuePump.sweep();
   },
-  (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
+  reportBackgroundFailure,
 );
 entryShutdown.startInterval(
   "takoform-v2",
@@ -1423,15 +1438,11 @@ entryShutdown.startInterval(
   async () => {
     await app.tickTakoformV2();
   },
-  (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
+  reportBackgroundFailure,
 );
-startSelfhostV2ScheduledDuePass(entryShutdown, v2WorkerComposition, (name) =>
-  process.stderr.write(`self-host background pass failed: ${name}\n`),
-);
+startSelfhostV2ScheduledDuePass(entryShutdown, v2WorkerComposition, reportBackgroundFailure);
 if (v2RuntimeBoot?.v2Workflow) {
-  startSelfhostV2WorkflowDuePass(entryShutdown, v2WorkerComposition, (name) =>
-    process.stderr.write(`self-host background pass failed: ${name}\n`),
-  );
+  startSelfhostV2WorkflowDuePass(entryShutdown, v2WorkerComposition, reportBackgroundFailure);
 }
 entryShutdown.startInterval(
   "queue-wake",
@@ -1443,16 +1454,14 @@ entryShutdown.startInterval(
       .runPass("takoform-v2-queue-delivery", async () => {
         await v2QueueScheduler?.tick();
       })
-      .catch(() => {
-        process.stderr.write("self-host background pass failed: takoform-v2-queue-delivery\n");
-      });
+      .catch((cause: unknown) => reportBackgroundFailure("takoform-v2-queue-delivery", cause));
     void entryShutdown
       .runPass("queue-pump", async () => {
         await queuePump?.tick();
       })
-      .catch(() => process.stderr.write("self-host background pass failed: queue-pump\n"));
+      .catch((cause: unknown) => reportBackgroundFailure("queue-pump", cause));
   },
-  (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
+  reportBackgroundFailure,
 );
 entryShutdown.startInterval(
   "worker-scheduler",
@@ -1460,7 +1469,7 @@ entryShutdown.startInterval(
   async () => {
     await workerScheduler?.tick();
   },
-  (name) => process.stderr.write(`self-host background pass failed: ${name}\n`),
+  reportBackgroundFailure,
 );
 
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {

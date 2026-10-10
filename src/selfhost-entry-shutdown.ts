@@ -1,3 +1,40 @@
+const MAX_BACKGROUND_CAUSE_LENGTH = 240;
+const SAFE_IDENTIFIER = /^[A-Za-z0-9_.-]{1,40}$/u;
+
+/**
+ * One bounded, single-line description of why a background pass failed.
+ *
+ * Only the error's class name, a short code (for example `SQLITE_BUSY`) and its
+ * message are used. Parameters, request bodies and arbitrary objects never are:
+ * a pass that failed on something it was holding must not print it.
+ */
+export function describeBackgroundFailure(cause: unknown): string {
+  if (cause === undefined) return "unknown cause";
+  if (!(cause instanceof Error)) return "non-error cause";
+  const read = (read: () => unknown): string => {
+    try {
+      const value = read();
+      return typeof value === "string" ? value : "";
+    } catch {
+      return "";
+    }
+  };
+  const name = read(() => cause.name);
+  const code = read(() => (cause as { code?: unknown }).code);
+  const message = read(() => cause.message)
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: strips terminal control bytes from a log line
+    .replace(/[\u0000-\u001f\u007f]+/gu, " ")
+    .trim();
+  const head = [
+    SAFE_IDENTIFIER.test(name) ? name : "Error",
+    ...(SAFE_IDENTIFIER.test(code) ? [code] : []),
+  ].join(" ");
+  const text = message ? `${head}: ${message}` : head;
+  return text.length > MAX_BACKGROUND_CAUSE_LENGTH
+    ? `${text.slice(0, MAX_BACKGROUND_CAUSE_LENGTH - 1)}…`
+    : text;
+}
+
 export type SelfhostEntryShutdownStage = "ingress" | "drain" | "cleanup";
 
 export interface SelfhostEntryShutdownOptions {
@@ -19,7 +56,8 @@ export interface SelfhostEntryShutdown {
     name: string,
     milliseconds: number,
     run: () => void | Promise<void>,
-    onFailure: (name: string) => void,
+    /** `cause` is the rejection; print it only through `describeBackgroundFailure`. */
+    onFailure: (name: string, cause?: unknown) => void,
   ) => void;
   readonly runPass: (name: string, run: () => void | Promise<void>) => Promise<void>;
   readonly shutdown: () => Promise<boolean>;
@@ -232,7 +270,7 @@ export function createSelfhostEntryShutdown(
     startInterval(name, milliseconds, run, onFailure) {
       if (stopping) return;
       const timer = setInterval(() => {
-        void runPass(name, run).catch(() => onFailure(name));
+        void runPass(name, run).catch((cause: unknown) => onFailure(name, cause));
       }, milliseconds);
       timers.add(timer);
     },
