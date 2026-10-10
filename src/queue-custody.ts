@@ -461,7 +461,9 @@ const V2_SOURCE_QUEUE_BATCH_GUARD = `EXISTS (
     AND source_version.observed_generation = source_version.generation
     AND json_extract(source_version.observed_json, '$.ready') = 1
     AND json_extract(source_version.spec_json, '$.worker.resourceUid') = execution.worker_uid
-    AND source_version_op.id = ? AND source_version_op.resource_uid = source_version.uid
+    AND source_version_op.id = ?
+    AND source_version_op.id = execution.incarnation_operation_id
+    AND source_version_op.resource_uid = source_version.uid
     AND source_version_op.principal = source_version.principal
     AND source_version_op.backend_id = source_version.backend_id
     AND source_version_op.target_key = source_version.target_key

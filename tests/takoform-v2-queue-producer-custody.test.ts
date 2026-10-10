@@ -162,10 +162,13 @@ const producerTarget = {
   deliveryDelaySeconds: 0,
 };
 
-async function seedAuthorizedQueueBatch(db: Database) {
+async function seedAuthorizedQueueBatch(db: Database, incarnationOperationId?: string) {
   const sql = createSqliteSql(db);
   const custody = createQueueCustody({ sql });
   const sourceQueueId = v2QueueId(SOURCE_QUEUE);
+  const version = db
+    .prepare("SELECT generation, last_operation FROM tf_v2_resources WHERE uid=?")
+    .get(VERSION) as { generation: number; last_operation: string };
   settled(db, {
     uid: SOURCE_QUEUE,
     form: AT_LEAST_ONCE_QUEUE_FORM_URL,
@@ -211,8 +214,8 @@ async function seedAuthorizedQueueBatch(db: Database) {
     workerUid: WORKER,
     servingSourceOperationId: `${DEPLOYMENT}-op`,
     workerVersionUid: VERSION,
-    workerVersionGeneration: 1,
-    incarnationOperationId: "source-incarnation-op-001",
+    workerVersionGeneration: version.generation,
+    incarnationOperationId: incarnationOperationId ?? version.last_operation,
   };
   const now = Date.now();
   db.prepare(`INSERT INTO queue_v2_batch_executions
@@ -228,7 +231,7 @@ async function seedAuthorizedQueueBatch(db: Database) {
     WORKER,
     consumerSpec,
     sourceQueueBatch.servingSourceOperationId,
-    JSON.stringify([{ workerVersionUid: VERSION, generation: 1, weight: 10000 }]),
+    JSON.stringify([{ workerVersionUid: VERSION, generation: version.generation, weight: 10000 }]),
     TARGET,
     now,
     now + 120000,
@@ -252,6 +255,46 @@ async function seedAuthorizedQueueBatch(db: Database) {
     await authorizeV2QueueBatchSend(sql, { ...sourceQueueBatch, queueUid: SOURCE_QUEUE }),
   ).toBe("authorized");
   return sourceQueueBatch;
+}
+
+function completeSameSpecVersionUpdate(db: Database): string {
+  const update = "producer-version-queue-update-op";
+  db.prepare(`INSERT INTO tf_v2_operations
+    (id,resource_uid,principal,replay_key,request_fingerprint,action,generation,status,effect,
+     created_at,updated_at,retain_until,backend_id,target_key,backend_key,accepted_spec_json)
+    SELECT ?,resource_uid,principal,?,'fp','update',2,'queued','none',
+     created_at,updated_at,retain_until,backend_id,target_key,?,accepted_spec_json
+    FROM tf_v2_operations WHERE id=?`).run(
+    update,
+    "replay-version-queue-update",
+    "key-version-queue-update",
+    VERSION_OPERATION,
+  );
+  db.prepare(`UPDATE tf_v2_resources
+    SET generation=2, phase='pending', busy_operation=?, last_operation=? WHERE uid=?`).run(
+    update,
+    update,
+    VERSION,
+  );
+  db.prepare("INSERT INTO tf_v2_operation_reference_sets (operation_id,sealed) VALUES (?,0)").run(
+    update,
+  );
+  db.prepare(`INSERT INTO tf_v2_operation_references
+    (operation_id,target_uid,form_url,readiness)
+    SELECT ?,target_uid,form_url,readiness FROM tf_v2_operation_references
+    WHERE operation_id=?`).run(update, VERSION_OPERATION);
+  db.prepare("UPDATE tf_v2_operation_reference_sets SET sealed=1 WHERE operation_id=?").run(update);
+  db.prepare("UPDATE tf_v2_operations SET status='running' WHERE id=?").run(update);
+  db.prepare("UPDATE tf_v2_operations SET status='reconciling',effect='unknown' WHERE id=?").run(
+    update,
+  );
+  db.prepare("UPDATE tf_v2_operations SET status='succeeded',effect='complete' WHERE id=?").run(
+    update,
+  );
+  db.prepare(
+    "UPDATE tf_v2_resources SET observed_generation=2,phase='idle',busy_operation=NULL WHERE uid=?",
+  ).run(VERSION);
+  return update;
 }
 
 function insertSourceInvocation(
@@ -414,6 +457,58 @@ test("Queue handler batch admits into its binding only while exact 0083 and 0082
         (row) => row.message_id,
       ),
     ).toEqual(["accepted-one", "accepted-two", "source-message"]);
+  } finally {
+    db.close();
+  }
+});
+
+test("Queue source cannot pair a current batch with an older same-spec Version operation", async () => {
+  const db = new Database(":memory:");
+  try {
+    for (const migration of MIGRATIONS) db.exec(migration.sql);
+    seedProducerGraph(db);
+    const currentOperation = completeSameSpecVersionUpdate(db);
+    const sourceQueueBatch = await seedAuthorizedQueueBatch(db);
+    expect(sourceQueueBatch.workerVersionGeneration).toBe(2);
+    expect(sourceQueueBatch.incarnationOperationId).toBe(currentOperation);
+    const custody = createQueueCustody({ sql: createSqliteSql(db) });
+    const send = (workerVersionOperationId: string, messageId: string) =>
+      custody.admitV2Batch({
+        claim: { ...producerClaim, workerVersionOperationId, sourceQueueBatch },
+        target: producerTarget,
+        messages: [{ messageId, body: new Uint8Array([4]) }],
+      });
+    expect(await send(VERSION_OPERATION, "old-same-spec-source")).toBe(false);
+    expect(await send(currentOperation, "current-source")).toBe(true);
+    expect(
+      db
+        .prepare("SELECT message_id FROM selfhost_queue_messages WHERE queue_id=?")
+        .all(producerTarget.queueId),
+    ).toEqual([{ message_id: "current-source" }]);
+  } finally {
+    db.close();
+  }
+});
+
+test("Queue source incarnation Operation must be the accepted current Version Operation", async () => {
+  const db = new Database(":memory:");
+  try {
+    for (const migration of MIGRATIONS) db.exec(migration.sql);
+    seedProducerGraph(db);
+    const sourceQueueBatch = await seedAuthorizedQueueBatch(db, "unrelated-incarnation-op");
+    const custody = createQueueCustody({ sql: createSqliteSql(db) });
+    expect(
+      await custody.admitV2Batch({
+        claim: { ...producerClaim, sourceQueueBatch },
+        target: producerTarget,
+        messages: [{ messageId: "unrelated-incarnation-send", body: new Uint8Array([5]) }],
+      }),
+    ).toBe(false);
+    expect(
+      db
+        .prepare("SELECT count(*) AS n FROM selfhost_queue_messages WHERE queue_id=?")
+        .get(producerTarget.queueId),
+    ).toEqual({ n: 0 });
   } finally {
     db.close();
   }
