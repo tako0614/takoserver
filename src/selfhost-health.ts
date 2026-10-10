@@ -16,11 +16,29 @@ export type SelfhostRuntimeHealth =
   | "restore-failed"
   | "unavailable";
 
+/** Counts only: no Worker UID, hostname or path is ever put in a probe body. */
+export interface SelfhostV2WorkerHealth {
+  /** Owners this Host has opened for v2 Workers. */
+  readonly owners: number;
+  /** Owners whose recorded active incarnation is ready. */
+  readonly serving: number;
+  /** Owners that recorded an active incarnation which is not ready. */
+  readonly unavailable: number;
+}
+
 export interface SelfhostHealthResponse {
   readonly status: "ready" | "not_ready" | "live";
   readonly database?: "readable" | "unavailable";
   readonly workerRuntime?: SelfhostRuntimeHealth;
   readonly supervisor?: WorkerdSupervisorState;
+  /**
+   * Present (always `true`) when at least one v2 Worker owner is unavailable.
+   * The control plane can still be ready: one tenant Worker's failure must not
+   * make a load balancer pull the operator API that shares this port.
+   */
+  readonly degraded?: true;
+  /** Present only when a v2 Worker composition is mounted and could be read. */
+  readonly v2Workers?: SelfhostV2WorkerHealth;
 }
 
 export type SelfhostHealthHandler = (request: Request) => Promise<Response | undefined>;
@@ -62,6 +80,38 @@ function runtimeHealth(
   return supervisor;
 }
 
+/**
+ * One bounded read of the v2 owners. A thrown or hung observation is a result,
+ * not an exception: the probe must answer, and "could not tell" is not ready.
+ */
+async function observeV2Workers(
+  v2Workers: { observe(): Promise<SelfhostV2WorkerHealth> },
+  timeoutMs: number,
+): Promise<SelfhostV2WorkerHealth | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  const observed = Promise.resolve()
+    .then(() => v2Workers.observe())
+    .then((value) =>
+      Number.isSafeInteger(value.owners) &&
+      Number.isSafeInteger(value.serving) &&
+      Number.isSafeInteger(value.unavailable) &&
+      value.owners >= 0 &&
+      value.serving >= 0 &&
+      value.unavailable >= 0
+        ? { owners: value.owners, serving: value.serving, unavailable: value.unavailable }
+        : null,
+    )
+    .catch(() => null);
+  try {
+    return await Promise.race([observed, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 function healthResponse(body: SelfhostHealthResponse, status: number): Response {
   return Response.json(body, {
     status,
@@ -78,6 +128,12 @@ export function createSelfhostHealthHandler(input: {
   readonly sql: Pick<Sql, "query">;
   readonly startupRestore: SelfhostStartupRestoreOutcome;
   readonly supervisor: Pick<WorkerdSupervisor, "snapshot" | "probeReadiness">;
+  /**
+   * The v2 Worker owners run their own workerd children outside `supervisor`.
+   * Without this, serving v2 Workers read as `not-required` and a dead one was
+   * invisible. Absent when the Host has no v2 Worker composition.
+   */
+  readonly v2Workers?: { observe(): Promise<SelfhostV2WorkerHealth> };
   readonly databaseCheckTimeoutMs?: number;
 }): SelfhostHealthHandler {
   const timeoutMs = input.databaseCheckTimeoutMs ?? DEFAULT_DATABASE_CHECK_TIMEOUT_MS;
@@ -105,15 +161,33 @@ export function createSelfhostHealthHandler(input: {
       input.startupRestore !== "failed"
         ? "unavailable"
         : runtimeHealth(input.startupRestore, snapshot.state);
-    const ready = databaseReady && (runtime === "not-required" || runtime === "serving");
+    const v2 = input.v2Workers ? await observeV2Workers(input.v2Workers, timeoutMs) : undefined;
+    // Restore failure and a failed legacy runtime keep precedence. A v2
+    // observation that failed or hung is not ready: the Host could not tell.
+    // v2 owners that serve turn "no workload" into "serving". An individual
+    // unavailable owner is a tenant Worker's failure, reported as `degraded`
+    // and in the counts, not a reason to fail the shared control plane.
+    const workerRuntime: SelfhostRuntimeHealth =
+      runtime === "restore-failed" || runtime === "unavailable"
+        ? runtime
+        : v2 === null
+          ? "unavailable"
+          : v2 !== undefined && v2.serving > 0 && runtime === "not-required"
+            ? "serving"
+            : runtime;
+    const degraded = v2 !== undefined && v2 !== null && v2.unavailable > 0;
+    const ready =
+      databaseReady && (workerRuntime === "not-required" || workerRuntime === "serving");
     return healthResponse(
       {
         status: ready ? "ready" : "not_ready",
         database: databaseReady ? "readable" : "unavailable",
-        workerRuntime: runtime,
+        workerRuntime,
         // Preserve the live child phase even when a boot restore failure takes
         // precedence; a later serving boolean does not prove that full restore.
         supervisor: snapshot.state,
+        ...(degraded ? { degraded: true as const } : {}),
+        ...(v2 ? { v2Workers: v2 } : {}),
       },
       ready ? 200 : 503,
     );

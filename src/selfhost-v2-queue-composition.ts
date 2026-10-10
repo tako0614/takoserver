@@ -5,10 +5,10 @@ import {
   createV2QueueSettlementEndpoint,
 } from "./providers/selfhost-v2-queue-transport.ts";
 import type { QueueCustody } from "./queue-custody.ts";
+import { cancelQueueReservationBeforeSend } from "./selfhost-v2-queue-cancel.ts";
 import type { V2QueueConsumerCapability } from "./takoform-v2/worker-queue-consumer-backend.ts";
 import {
   authorizeV2QueueBatchSend,
-  cancelV2QueueBatchBeforeSend,
   confirmV2QueueBatchRetirement,
   createV2QueueDelivery,
   listV2AuthorizedQueueExecutions,
@@ -30,6 +30,11 @@ export interface SelfhostV2QueueCompositionOptions {
   readonly privatePort: number;
   /** Internal deterministic-test cadence; production defaults to 30s. */
   readonly renewalIntervalMillis?: number;
+  /**
+   * Called when a never-sent reservation could not be refunded after bounded
+   * retries, so it will wait out its 120 second expiry. Cause only; no payload.
+   */
+  readonly onCancelFailure?: (cause: unknown) => void;
 }
 
 /**
@@ -204,6 +209,17 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
     return { kind: unknown ? "unknown" : "reconciled", retired };
   }
 
+  /** Refund a provably unsent reservation, retrying a transient lock. */
+  const cancelBeforeSend = (batch: {
+    readonly batchId: string;
+    readonly reservationToken: string;
+  }): Promise<boolean> =>
+    cancelQueueReservationBeforeSend({
+      sql: options.sql,
+      batch,
+      ...(options.onCancelFailure ? { report: options.onCancelFailure } : {}),
+    });
+
   async function deliverOnce(input: {
     readonly consumerUid: string;
     readonly principal: string;
@@ -223,7 +239,7 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
     try {
       owner = await options.ownerForWorkerUid(batch.workerUid);
     } catch {
-      await cancelV2QueueBatchBeforeSend(options.sql, batch).catch(() => false);
+      await cancelBeforeSend(batch);
       return { kind: "unknown" };
     }
     const execution = (target: {
@@ -267,7 +283,7 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
     if (outcome.kind === "unknown") {
       // Only a provably unsent reservation can be refunded. An authorized
       // batch remains occupied after response loss, even if every ACK landed.
-      await cancelV2QueueBatchBeforeSend(options.sql, batch).catch(() => false);
+      await cancelBeforeSend(batch);
       return { kind: "unknown" };
     }
     const retired = await confirmV2QueueBatchRetirement(options.sql, {

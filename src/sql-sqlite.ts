@@ -16,11 +16,24 @@ import {
  * primitive than D1 can honour — the two implementations must stay
  * interchangeable, and `BatchOnlySql` in the tests proves it.
  */
+/**
+ * How long a contended control-database statement waits before it fails.
+ *
+ * Operators read this file while the Host writes (`sqlite3`, backup tools,
+ * pollers). SQLite fails a contended statement immediately by default, which
+ * surfaced as an anonymous `database is locked` background-pass failure. The
+ * wait is bounded because `bun:sqlite` blocks the calling thread while it
+ * waits: a holder that never lets go must end in an error, not a hung Host.
+ * It matches the data-plane stores' bound.
+ */
+export const SQLITE_CONTROL_BUSY_TIMEOUT_MS = 5_000;
+
 export function createSqliteSql(database: Database): Sql {
   if (!database || typeof database.query !== "function") {
     throw new TypeError("a bun:sqlite Database is required");
   }
   database.exec("PRAGMA foreign_keys = ON");
+  database.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
 
   const execute = (statement: SqlStatement): SqlWrite => {
     const params = [...(statement.params ?? [])].map(bindable);

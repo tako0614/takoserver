@@ -454,3 +454,166 @@ test("database errors never put paths, secrets, or raw details in the public res
   expect(body).not.toContain("operator-token");
   expect(body).not.toContain("raw database detail");
 });
+
+/**
+ * v2 Worker owners run their own workerd children under their own supervision,
+ * not the legacy supervisor this probe observes. While they serve, the probe
+ * said `workerRuntime: "not-required"`, `supervisor: "idle"` and could not
+ * report their failure. The legacy keys keep their meaning; `v2Workers` is
+ * additive and only present when a v2 composition is mounted.
+ */
+function v2Health(
+  v2Workers: { observe(): Promise<{ owners: number; serving: number; unavailable: number }> },
+  startupRestore: "empty" | "restored" | "failed" = "empty",
+  databaseCheckTimeoutMs?: number,
+) {
+  return createSelfhostHealthHandler({
+    sql: {
+      async query() {
+        return [{ selfhost_health: 1 }];
+      },
+    },
+    startupRestore,
+    supervisor: {
+      snapshot: () => ({ state: "idle" as const }),
+      async probeReadiness() {
+        return { snapshot: { state: "idle" as const }, listenerReady: null };
+      },
+    },
+    v2Workers,
+    ...(databaseCheckTimeoutMs ? { databaseCheckTimeoutMs } : {}),
+  });
+}
+
+async function readReady(handler: ReturnType<typeof v2Health>) {
+  const response = await handler(new Request("http://host.test/_takoserver/health/ready"));
+  if (!response) throw new Error("readiness route did not answer");
+  return { status: response.status, body: await response.json() };
+}
+
+test("ready reports serving v2 Worker owners instead of not-required", async () => {
+  const result = await readReady(
+    v2Health({ observe: async () => ({ owners: 2, serving: 2, unavailable: 0 }) }),
+  );
+  expect(result.status).toBe(200);
+  expect(result.body).toEqual({
+    status: "ready",
+    database: "readable",
+    workerRuntime: "serving",
+    supervisor: "idle",
+    v2Workers: { owners: 2, serving: 2, unavailable: 0 },
+  });
+});
+
+test("one unavailable tenant Worker degrades readiness without failing the control plane", async () => {
+  // /ready shares the port with the control API. A load balancer that pulled
+  // the Host for one broken tenant Worker would take the operator API with it.
+  const result = await readReady(
+    v2Health({ observe: async () => ({ owners: 3, serving: 2, unavailable: 1 }) }),
+  );
+  expect(result.status).toBe(200);
+  expect(result.body).toEqual({
+    status: "ready",
+    database: "readable",
+    workerRuntime: "serving",
+    supervisor: "idle",
+    degraded: true,
+    v2Workers: { owners: 3, serving: 2, unavailable: 1 },
+  });
+
+  const allDown = await readReady(
+    v2Health({ observe: async () => ({ owners: 2, serving: 0, unavailable: 2 }) }),
+  );
+  expect(allDown.status).toBe(200);
+  expect(allDown.body.status).toBe("ready");
+  expect(allDown.body.degraded).toBe(true);
+  expect(allDown.body.v2Workers).toEqual({ owners: 2, serving: 0, unavailable: 2 });
+});
+
+test("an unreadable database still fails readiness even with serving v2 owners", async () => {
+  const handler = createSelfhostHealthHandler({
+    sql: {
+      async query() {
+        throw new Error("database is locked");
+      },
+    },
+    startupRestore: "empty",
+    supervisor: {
+      snapshot: () => ({ state: "idle" as const }),
+      async probeReadiness() {
+        return { snapshot: { state: "idle" as const }, listenerReady: null };
+      },
+    },
+    v2Workers: { observe: async () => ({ owners: 1, serving: 1, unavailable: 0 }) },
+  });
+  const response = await handler(new Request("http://host.test/_takoserver/health/ready"));
+  if (!response) throw new Error("readiness route did not answer");
+  expect(response.status).toBe(503);
+  expect(((await response.json()) as { database: string }).database).toBe("unavailable");
+});
+
+test("a v2 composition with no owners keeps the no-workload meaning", async () => {
+  const result = await readReady(
+    v2Health({ observe: async () => ({ owners: 0, serving: 0, unavailable: 0 }) }),
+  );
+  expect(result.status).toBe(200);
+  expect(result.body.workerRuntime).toBe("not-required");
+  expect(result.body.v2Workers).toEqual({ owners: 0, serving: 0, unavailable: 0 });
+});
+
+test("a v2 observation that throws or hangs is not ready, and restore failure keeps precedence", async () => {
+  const thrown = await readReady(
+    v2Health({
+      observe: async () => {
+        throw new Error("owner state unreadable");
+      },
+    }),
+  );
+  expect(thrown.status).toBe(503);
+  expect(thrown.body.workerRuntime).toBe("unavailable");
+  expect(thrown.body.v2Workers).toBeUndefined();
+
+  const hung = await readReady(
+    v2Health({ observe: () => new Promise(() => undefined) }, "empty", 20),
+  );
+  expect(hung.status).toBe(503);
+  expect(hung.body.workerRuntime).toBe("unavailable");
+
+  const failedRestore = await readReady(
+    v2Health({ observe: async () => ({ owners: 1, serving: 1, unavailable: 0 }) }, "failed"),
+  );
+  expect(failedRestore.status).toBe(503);
+  expect(failedRestore.body.workerRuntime).toBe("restore-failed");
+
+  // The cause that is true outranks a v2 count read from a failed restore.
+  const failedRestoreWithDeadOwner = await readReady(
+    v2Health({ observe: async () => ({ owners: 2, serving: 1, unavailable: 1 }) }, "failed"),
+  );
+  expect(failedRestoreWithDeadOwner.status).toBe(503);
+  expect(failedRestoreWithDeadOwner.body.workerRuntime).toBe("restore-failed");
+  expect(failedRestoreWithDeadOwner.body.degraded).toBe(true);
+});
+
+test("without a v2 composition the response keeps exactly its legacy keys", async () => {
+  const handler = createSelfhostHealthHandler({
+    sql: {
+      async query() {
+        return [{ selfhost_health: 1 }];
+      },
+    },
+    startupRestore: "empty",
+    supervisor: {
+      snapshot: () => ({ state: "idle" as const }),
+      async probeReadiness() {
+        return { snapshot: { state: "idle" as const }, listenerReady: null };
+      },
+    },
+  });
+  const response = await handler(new Request("http://host.test/_takoserver/health/ready"));
+  expect(Object.keys((await response?.json()) as object).sort()).toEqual([
+    "database",
+    "status",
+    "supervisor",
+    "workerRuntime",
+  ]);
+});

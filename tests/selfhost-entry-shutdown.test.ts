@@ -4,6 +4,7 @@ import { Agent, request as httpRequest, type IncomingMessage } from "node:http";
 import {
   closeSelfhostEntryOwnedResources,
   createSelfhostEntryShutdown,
+  describeBackgroundFailure,
 } from "../src/selfhost-entry-shutdown.ts";
 
 function deferred<T = void>() {
@@ -307,4 +308,53 @@ test("unproven Container close preserves every dependent owner after Workerd exi
 
   expect(closed).toBe(false);
   expect(calls).toEqual(["workerd"]);
+});
+
+test("a failing background pass reports its name and a bounded, single-line cause", async () => {
+  const reports: { name: string; cause: unknown }[] = [];
+  const failed = deferred();
+  const lifecycle = createSelfhostEntryShutdown({
+    stopIngress: async () => undefined,
+    finishShutdown: async () => undefined,
+    onFailure: () => undefined,
+    onSuccess: () => undefined,
+  });
+  lifecycle.startInterval(
+    "takoform-v2",
+    5,
+    async () => {
+      throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+    },
+    (name, cause) => {
+      reports.push({ name, cause });
+      failed.resolve();
+    },
+  );
+  await failed.promise;
+  await lifecycle.shutdown();
+
+  expect(reports[0]?.name).toBe("takoform-v2");
+  expect(describeBackgroundFailure(reports[0]?.cause)).toBe(
+    "Error SQLITE_BUSY: database is locked",
+  );
+});
+
+test("a background failure cause is bounded and carries no control characters", () => {
+  const noisy = new Error(`first line\nsecond\u0000line\t${"x".repeat(1_000)}`);
+  const described = describeBackgroundFailure(noisy);
+  expect(described.length).toBeLessThanOrEqual(240);
+  expect([...described].every((c) => c.charCodeAt(0) > 31 && c.charCodeAt(0) !== 127)).toBe(true);
+  expect(described.startsWith("Error: first line second line")).toBe(true);
+
+  // Never throws and never prints an object it cannot describe.
+  expect(describeBackgroundFailure(undefined)).toBe("unknown cause");
+  expect(describeBackgroundFailure({ toString: () => "x".repeat(10) })).toBe("non-error cause");
+  expect(describeBackgroundFailure("plain string")).toBe("non-error cause");
+  const hostile = new Error("boom");
+  Object.defineProperty(hostile, "code", {
+    get() {
+      throw new Error("getter");
+    },
+  });
+  expect(describeBackgroundFailure(hostile)).toBe("Error: boom");
 });
