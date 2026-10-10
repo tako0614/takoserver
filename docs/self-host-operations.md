@@ -460,9 +460,11 @@ Known gaps this test records, not fixes:
   child process identity) before any native effect, and activates it with one
   atomic owner-state write that also demotes the incumbent. So at any stop the
   committed incumbent is the only thing that served, and a candidate that was
-  not activated never served. Recovery relies only on that durable state:
+  not activated never served. Recovery relies only on that durable state, and
+  only the owner's boot recovery may ask the current-serving fence for this
+  tolerance (a dedicated reader method; every other reader is strict):
   - *Queued* (accepted, no dispatch recorded): boot adopts the incarnation that
-    was serving; the Operation runs once afterwards (three tests).
+    was serving; the Operation runs once afterwards (three real-Host tests).
   - *Dispatched, owner untouched* (`reconciling`, but the owner persisted
     nothing): the owner vouches that the Operation never served, boot adopts the
     serving incarnation, and the engine re-drives the Operation once through a
@@ -472,26 +474,34 @@ Known gaps this test records, not fixes:
     candidate and its child): on a stale-owner takeover the owner proves the
     recorded child is dead and its listener vacant, records the retirement under
     the candidate's own Operation ID, writes the group's retirement receipt
-    without starting a child, and finishes the normal retired-copy cleanup. A
-    candidate with no recorded child identity, a live child or a foreign
-    listener is still refused, and an abandoned Operation ID is never reused.
-    **Known gap:** because the ID is not reused, the interrupted Operation stays
-    `reconciling` and keeps retrying without a new effect; it is not lost and
-    not duplicated, but it does not complete, and the Worker takes no further
-    Operation until it is settled. Completing or failing such an Operation
-    needs a decision: either a fresh incarnation for the same Operation (which
-    changes the exact `takoserver-v2-operation:<id>` generation marker the
-    engine verifies) or a definitive no-effect settlement from the owner. By
-    reading the owner (not measured), the same wedge already follows an
-    in-process failure after the candidate was retired.
+    without starting a child, and finishes the normal retired-copy cleanup. The
+    Operation ID is never given a second incarnation: when the engine re-drives
+    the Operation, the owner answers with that proof and the backend settles it
+    through the normal failure path as `failed` with effect `none`
+    (`worker_incarnation_retired_before_activation`). The committed graph keeps
+    serving, and re-applying the change publishes once. The retry waits for the
+    killed Host's claim lease to expire (about one minute), and while the
+    Operation is pending the Worker's Endpoint answers 503, as during any pending
+    update. A candidate with no recorded child identity, a live child or a
+    foreign listener is still refused.
+
+  A Deployment or Endpoint Operation that ends `failed` with effect `none` no
+  longer takes its Worker down: the attachment is read as of its last committed
+  generation (from immutable Operation history, never the failed spec), and boot
+  recovery also accepts a queued re-apply behind it. This is measured at the
+  current-serving fence for in-process failures of every attachment shape, and
+  end to end on a real Host for the restart case above. A failure with effect
+  `partial`, or any unknown or non-contiguous history, is refused as before.
 
   Still refused with `ownership_uncertain` (data untouched, manual repair): an
   Operation the owner already activated but SQL never settled, a DELETE that
   closed admission, a candidate whose child identity was never recorded, and a
-  dispatched Operation the owner cannot vouch for. By reading the Endpoint
-  frontend (not measured), the Endpoint route is not served while a Deployment
-  or Endpoint update is pending, exactly as in an uninterrupted Host; the tests
-  wait for the Operation to settle before checking the response.
+  dispatched Operation the owner cannot vouch for. By reading the backends (not
+  measured), a Deployment or Endpoint backend answers `unknown` for every
+  refusal before it reaches the owner (an unresolved graph, a
+  `publication_conflict`), so such an Operation stays `reconciling` and keeps
+  retrying: boot is not blocked, because the owner vouches it never served, but
+  the Worker's Endpoint is not served until the Operation is settled.
 - **The readiness probe does not observe v2 Worker owners.** While v2 Workers
   are serving, `/_takoserver/health/ready` reports `workerRuntime:
   "not-required"` and `supervisor: "idle"`; it can not report their failure.
