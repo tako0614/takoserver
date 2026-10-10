@@ -1,6 +1,19 @@
 import { Buffer } from "node:buffer";
 import { type DatabaseSync, type SQLInputValue, constants as SQLITE } from "node:sqlite";
 import { canonicalJson } from "../json.ts";
+import type {
+  EdgeSqlRow,
+  EdgeSqlValue,
+  SelfhostV2SqliteResult,
+  SelfhostV2SqliteStatement,
+} from "../queue-v2-sqlite-contract.ts";
+
+export type {
+  EdgeSqlRow,
+  EdgeSqlValue,
+  SelfhostV2SqliteResult,
+  SelfhostV2SqliteStatement,
+} from "../queue-v2-sqlite-contract.ts";
 
 const MAX_SQL_BYTES = 100_000;
 const MAX_PARAMETERS = 100;
@@ -13,20 +26,6 @@ const MAX_ROW_BYTES = 2_000_000;
 const MAX_OUTPUT_BYTES = 8_388_608;
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 const UTF8 = new TextEncoder();
-
-export type EdgeSqlValue = null | number | string | Readonly<{ encoding: "base64"; data: string }>;
-
-export type EdgeSqlRow = Readonly<Record<string, EdgeSqlValue>>;
-
-export type SelfhostV2SqliteResult = Readonly<{
-  rows: readonly EdgeSqlRow[];
-  rowsWritten: number;
-}>;
-
-export type SelfhostV2SqliteStatement = Readonly<{
-  sql: string;
-  params?: readonly EdgeSqlValue[];
-}>;
 
 type BoundStatement = Readonly<{ sql: string; params: readonly SQLInputValue[] }>;
 type OutputBudget = { serializedRowsBytes: number };
