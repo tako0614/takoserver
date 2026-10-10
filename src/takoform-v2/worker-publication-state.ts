@@ -365,6 +365,34 @@ function unstartedSuccessor(
   // and `op` (see failedNoEffectTail). They never changed what serves.
   failedGap = 0,
 ): op is OperationRow {
+  return row.observed_generation > 0 && unstartedLaterOperation(op, row, neverServed, failedGap);
+}
+
+/**
+ * A queued update/delete of a Resource that never committed: its CREATE and
+ * every later Operation ended failed with effect none (a re-apply after a
+ * failed first publication). Like a queued first create, nothing of it was
+ * ever committed, so it contributes nothing to what serves.
+ */
+function unstartedAfterFailedCreate(
+  op: OperationRow | null,
+  row: ResourceRow,
+  neverServed: NeverServedOperation | undefined,
+  failedGap: number,
+): op is OperationRow {
+  return (
+    row.observed_generation === 0 &&
+    failedGap >= 1 &&
+    unstartedLaterOperation(op, row, neverServed, failedGap)
+  );
+}
+
+function unstartedLaterOperation(
+  op: OperationRow | null,
+  row: ResourceRow,
+  neverServed: NeverServedOperation | undefined,
+  failedGap: number,
+): op is OperationRow {
   return (
     op !== null &&
     unstartedOperation(op, neverServed) &&
@@ -378,7 +406,6 @@ function unstartedSuccessor(
     Number.isSafeInteger(failedGap) &&
     failedGap >= 0 &&
     row.generation === row.observed_generation + 1 + failedGap &&
-    row.observed_generation > 0 &&
     op.accepted_spec_json === row.spec_json &&
     row.deleted_at === null &&
     ((op.action === "update" && row.phase === "pending") ||
@@ -1608,6 +1635,12 @@ export function createV2WorkerPublicationState(options: {
             workerUidFromOperation(queued) !== workerUid ||
             !(
               unstartedSuccessor(queued, queuedResource, current.neverServedOperation, gap.count) ||
+              unstartedAfterFailedCreate(
+                queued,
+                queuedResource,
+                current.neverServedOperation,
+                gap.count,
+              ) ||
               (gap.count === 0 &&
                 unstartedCreate(queued, queuedResource, current.neverServedOperation))
             )
