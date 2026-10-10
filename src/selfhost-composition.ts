@@ -817,10 +817,18 @@ export function selfhostWorkerEndpointPublication(input: {
     SPECIMEN_SCRIPT_LABEL,
     "<script>",
   );
+  // The remedy is shared with the wire refusal and opens with its own
+  // "no Worker endpoint can be published here" clause. At boot that clause is
+  // already said by the first sentence, so it is dropped here rather than
+  // printed as a lowercase fragment after a sentence that promised the opposite.
+  const remedy = workerEndpointPublicationRemedy(defect).replace(
+    /^no Worker endpoint can be published here: /u,
+    "",
+  );
   return {
     publishable: false,
     diagnostic:
-      `Worker endpoints would be published as ${address}. ` +
-      workerEndpointPublicationRemedy(defect),
+      `Worker endpoints cannot be created in this profile (they would have the address ${address}). ` +
+      `${remedy.charAt(0).toUpperCase()}${remedy.slice(1)}`,
   };
 }
