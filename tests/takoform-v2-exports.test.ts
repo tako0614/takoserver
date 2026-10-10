@@ -29,9 +29,14 @@ import type {
 import * as extension from "@takoserver/core/takoform-v2";
 import type { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
 import { createV2ActorBindingAuthority } from "../src/takoform-v2/actor-binding-authority.ts";
-import { createV2ActorNamespaceForm } from "../src/takoform-v2/actor-namespace-backend.ts";
+import {
+  createV2ActorNamespaceForm,
+  createV2ActorNamespaceFormFrontFace,
+  V2_ACTOR_NAMESPACE_BACKEND_ID,
+} from "../src/takoform-v2/actor-namespace-backend.ts";
 import { createV2ActorNamespaceSqlGraphReader } from "../src/takoform-v2/actor-namespace-sql-graph.ts";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
+import { ACTOR_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/actor-namespace.ts";
 import { createV2HeldArtifactSource } from "../src/takoform-v2/forms/artifact-source.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
 import { DURABLE_WORKFLOW_FORM_URL } from "../src/takoform-v2/forms/durable-workflow.ts";
@@ -70,6 +75,7 @@ import {
   parseModuleWorkerSpec,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { createInternalV2ModuleWorkerForm } from "../src/takoform-v2/module-worker-lifecycle-backend.ts";
+import { TakoformV2Error } from "../src/takoform-v2/types.ts";
 import { inspectV2WorkerCodeVersionEligibility as portableEligibility } from "../src/takoform-v2/worker-code-eligibility.ts";
 import { inspectV2WorkerCodeVersionEligibility } from "../src/takoform-v2/worker-code-runtime.ts";
 import { runWorkerCronTriggerTick } from "../src/takoform-v2/worker-cron-trigger-scheduler.ts";
@@ -87,6 +93,7 @@ import {
 import { createV2WorkerVersionConfiguredInputSealer } from "../src/takoform-v2/worker-version-configured-inputs.ts";
 import {
   createDurableWorkflowForm,
+  createV2DurableWorkflowFormFrontFace,
   DURABLE_WORKFLOW_BACKEND_ID,
 } from "../src/takoform-v2/workflow-backend.ts";
 import { createV2WorkflowBindingAuthority } from "../src/takoform-v2/workflow-binding-authority.ts";
@@ -94,6 +101,7 @@ import { createV2WorkflowClassAdmission } from "../src/takoform-v2/workflow-clas
 import { createV2WorkflowSelectedMaterials } from "../src/takoform-v2/workflow-selected-materials.ts";
 
 const RUNTIME_EXPORTS = [
+  "ACTOR_NAMESPACE_FORM_URL",
   "EDGE_KV_NAMESPACE_BACKEND_ID",
   "EDGE_KV_NAMESPACE_FORM_URL",
   "EDGE_KV_NAMESPACE_LIMITS",
@@ -114,12 +122,14 @@ const RUNTIME_EXPORTS = [
   "WorkerFormValidationError",
   "createEdgeKVNamespaceForm",
   "createDurableWorkflowForm",
+  "createV2DurableWorkflowFormFrontFace",
   "createInternalV2ModuleWorkerForm",
   "createObjectBucketForm",
   "createObjectBucketWorkerBindingAuthority",
   "createV2EdgeKvNativeCustody",
   "createV2ActorNamespaceSqlGraphReader",
   "createV2ActorNamespaceForm",
+  "createV2ActorNamespaceFormFrontFace",
   "createV2ActorBindingAuthority",
   "createV2WorkflowBindingAuthority",
   "createV2WorkflowClassAdmission",
@@ -162,8 +172,10 @@ const RUNTIME_EXPORTS = [
   "runWorkerCronTriggerTick",
   "SQLITE_DATABASE_FORM_URL",
   "SQLITE_MIGRATION_APPLICATION_BACKEND_ID",
+  "TakoformV2Error",
   "v2WorkerInvocationSchemaReady",
   "V2_QUEUE_BACKEND_ID",
+  "V2_ACTOR_NAMESPACE_BACKEND_ID",
   "V2_QUEUE_CONSUMER_BACKEND_ID",
   "validateEdgeKVNamespaceUpdate",
   "validateModuleWorkerUpdate",
@@ -211,11 +223,20 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(extension.createV2EdgeKvNativeCustody).toBe(createV2EdgeKvNativeCustody);
   expect(extension.createV2ActorNamespaceSqlGraphReader).toBe(createV2ActorNamespaceSqlGraphReader);
   expect(extension.createV2ActorNamespaceForm).toBe(createV2ActorNamespaceForm);
+  expect(extension.createV2ActorNamespaceFormFrontFace).toBe(createV2ActorNamespaceFormFrontFace);
+  expect(extension.ACTOR_NAMESPACE_FORM_URL).toBe(ACTOR_NAMESPACE_FORM_URL);
+  expect(extension.V2_ACTOR_NAMESPACE_BACKEND_ID).toBe(V2_ACTOR_NAMESPACE_BACKEND_ID);
   expect(extension.createV2ActorBindingAuthority).toBe(createV2ActorBindingAuthority);
   expect(extension.createV2WorkflowBindingAuthority).toBe(createV2WorkflowBindingAuthority);
   expect(extension.createDurableWorkflowForm).toBe(createDurableWorkflowForm);
+  expect(extension.createV2DurableWorkflowFormFrontFace).toBe(createV2DurableWorkflowFormFrontFace);
   expect(extension.DURABLE_WORKFLOW_BACKEND_ID).toBe(DURABLE_WORKFLOW_BACKEND_ID);
   expect(extension.DURABLE_WORKFLOW_FORM_URL).toBe(DURABLE_WORKFLOW_FORM_URL);
+  expect(extension.TakoformV2Error).toBe(TakoformV2Error);
+  expect(new extension.TakoformV2Error("resource_busy", 409)).toMatchObject({
+    code: "resource_busy",
+    status: 409,
+  });
   expect(extension.createV2WorkflowClassAdmission).toBe(createV2WorkflowClassAdmission);
   const workflowFormFactory: (options: Parameters<typeof createDurableWorkflowForm>[0]) => V2Form =
     extension.createDurableWorkflowForm;

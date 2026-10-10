@@ -13,6 +13,7 @@ import {
   createV2ActorNamespaceSqlGraphReader,
   type V2ActorAcceptedDeleteClaim,
 } from "./actor-namespace-sql-graph.ts";
+import type { V2FormFrontFace } from "./form-frontface.ts";
 import {
   ACTOR_NAMESPACE_FORM_URL,
   ActorNamespaceValidationError,
@@ -37,6 +38,33 @@ import {
 } from "./types.ts";
 
 export const V2_ACTOR_NAMESPACE_BACKEND_ID = "selfhost-v2-actor-namespace-sql-v1";
+
+/** The exact synchronous Form policy, without SQL admission or physical ownership. */
+export function createV2ActorNamespaceFormFrontFace(): V2FormFrontFace {
+  return {
+    validateCreate(spec) {
+      try {
+        parseActorNamespaceSpec(spec);
+      } catch (error) {
+        if (error instanceof ActorNamespaceValidationError)
+          throw new TakoformV2Error("invalid_spec", 422);
+        throw error;
+      }
+    },
+    validateUpdate(previousSpec, spec) {
+      try {
+        validateActorNamespaceUpdate(previousSpec, spec);
+      } catch (error) {
+        if (error instanceof ActorNamespaceValidationError)
+          throw new TakoformV2Error("invalid_spec", 422);
+        throw error;
+      }
+    },
+    references: referencesForActorNamespace,
+    rejectDeleteWhileReferenced: true,
+  };
+}
+
 const DB_NOW_MS =
   "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
 const hostnamePattern =
@@ -1073,26 +1101,7 @@ export function createV2ActorNamespaceForm(configuration: {
   };
 
   return {
-    validateCreate(spec) {
-      try {
-        parseActorNamespaceSpec(spec);
-      } catch (error) {
-        if (error instanceof ActorNamespaceValidationError)
-          throw new TakoformV2Error("invalid_spec", 422);
-        throw error;
-      }
-    },
-    validateUpdate(previousSpec, spec) {
-      try {
-        validateActorNamespaceUpdate(previousSpec, spec);
-      } catch (error) {
-        if (error instanceof ActorNamespaceValidationError)
-          throw new TakoformV2Error("invalid_spec", 422);
-        throw error;
-      }
-    },
-    references: referencesForActorNamespace,
-    rejectDeleteWhileReferenced: true,
+    ...createV2ActorNamespaceFormFrontFace(),
     prepareAdmission(input) {
       return prepareV2ActorNamespaceAdmission({
         sql: options.sql,
