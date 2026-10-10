@@ -100,7 +100,9 @@ export function createDurableWorkflowForm(options: {
   readonly clock: Clock;
   readonly targetKey: string;
   readonly classAdmission: V2WorkflowClassAdmission;
-  readonly runtime: Pick<WorkflowRuntime, "instances" | "retireExpiredForResourceDelete">;
+  readonly runtime: Pick<WorkflowRuntime, "retireExpiredForResourceDelete"> & {
+    readonly instances: Pick<WorkflowRuntime["instances"], "terminate">;
+  };
 }): V2Form {
   const { sql, clock, targetKey, classAdmission, runtime } = options;
   if (

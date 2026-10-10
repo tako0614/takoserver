@@ -1,8 +1,11 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { Miniflare } from "miniflare";
+import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
-import type { JsonObject } from "../src/ports.ts";
+import type { JsonObject, Sql } from "../src/ports.ts";
+import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { DURABLE_WORKFLOW_FORM_URL } from "../src/takoform-v2/forms/durable-workflow.ts";
@@ -20,7 +23,10 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
-import { createDurableWorkflowForm } from "../src/takoform-v2/workflow-backend.ts";
+import {
+  createDurableWorkflowForm,
+  DURABLE_WORKFLOW_BACKEND_ID,
+} from "../src/takoform-v2/workflow-backend.ts";
 import { createV2WorkflowClassAdmission } from "../src/takoform-v2/workflow-class-admission.ts";
 import { createWorkerdWorkerModuleInspector } from "../src/workerd-worker-module-inspector.ts";
 import { createWorkflowRuntime } from "../src/workflow-execution.ts";
@@ -32,10 +38,10 @@ const SPACE = "production";
 const TARGET = "workflow-admission-local-target";
 const SPEC_CLASS = "ReportWorkflow";
 
-function fixture() {
+function fixture(sqlOverride?: Sql) {
   const db = new Database(":memory:");
   migrateSqlite(db);
-  const sql = createSqliteSql(db);
+  const sql = sqlOverride ?? createSqliteSql(db);
   const source = new Map<string, Uint8Array>();
   const bundleHost = createWorkerBundleHost({
     sql,
@@ -208,6 +214,26 @@ function fixture() {
   };
 }
 
+test("Durable Workflow Form accepts a terminate-only execution owner port", () => {
+  const f = fixture();
+  try {
+    const runtime = {
+      instances: { async terminate() {} },
+      async retireExpiredForResourceDelete() {},
+    } satisfies Parameters<typeof createDurableWorkflowForm>[0]["runtime"];
+    const form = createDurableWorkflowForm({
+      sql: f.sql,
+      clock: () => new Date(),
+      targetKey: TARGET,
+      classAdmission: f.admission,
+      runtime,
+    });
+    expect(form.backend.id).toBe(DURABLE_WORKFLOW_BACKEND_ID);
+  } finally {
+    f.db.close();
+  }
+});
+
 test("active plus pending weighted allocations both enter the exact inspected graph", async () => {
   const f = fixture();
   try {
@@ -349,3 +375,98 @@ test("accepted v2 Workflow Resource becomes Ready only after held weighted class
     f.db.close();
   }
 });
+
+function splitMigration(source: string): readonly string[] {
+  const statements: string[] = [];
+  let rest = source.replace(/^\s*--.*$/gmu, "").trim();
+  while (rest.length > 0) {
+    if (/^CREATE\s+(?:TEMP\s+)?TRIGGER\b/iu.test(rest)) {
+      const end = /^END\s*;/imu.exec(rest);
+      if (!end || end.index === undefined) throw new Error("incomplete migration trigger");
+      const boundary = end.index + end[0].length;
+      statements.push(rest.slice(0, boundary).trim());
+      rest = rest.slice(boundary).trim();
+      continue;
+    }
+    const boundary = rest.indexOf(";");
+    if (boundary < 0) {
+      statements.push(rest);
+      break;
+    }
+    const statement = rest.slice(0, boundary).trim();
+    if (statement) statements.push(statement);
+    rest = rest.slice(boundary + 1).trim();
+  }
+  return statements;
+}
+
+test("Miniflare D1 atomically accepts 1, 2, and 8 weighted Workflow class graphs and refuses drift", async () => {
+  const runtime = new Miniflare({
+    workers: [
+      {
+        config: {
+          name: "v2-workflow-class-admission-d1-test",
+          type: "worker",
+          compatibilityDate: "2026-08-18",
+          manifest: {
+            mainModule: "worker.js",
+            modules: {
+              "worker.js": {
+                type: "esm",
+                contents: "export default { fetch() { return new Response('ok'); } };",
+              },
+            },
+          },
+          env: { STATE_DB: { type: "d1", id: "v2-workflow-class-admission-d1-test" } },
+          triggers: [],
+        },
+      },
+    ],
+  });
+  let f: ReturnType<typeof fixture> | undefined;
+  try {
+    const database = await runtime.getD1Database("STATE_DB");
+    for (const migration of MIGRATIONS) {
+      for (const statement of splitMigration(migration.sql))
+        await database.prepare(statement).run();
+    }
+    f = fixture(createD1Sql(database));
+    for (const count of [1, 2, 8]) {
+      const worker = await f.create(MODULE_WORKER_FORM_URL, `d1-worker-${count}`, {});
+      const versions = [];
+      for (let index = 0; index < count; index++) {
+        versions.push(await f.version(worker.resourceUid, `d1-version-${count}-${index}`));
+      }
+      const weight = 10_000 / count;
+      await f.create(WORKER_DEPLOYMENT_FORM_URL, `d1-deployment-${count}`, {
+        worker: { resourceUid: worker.resourceUid },
+        versions: versions.map((version) => ({
+          workerVersion: { resourceUid: version.resourceUid },
+          weight,
+        })),
+      });
+      const prepared = await f.admission.prepare(f.request(worker.resourceUid));
+      expect(prepared.kind).toBe("qualified");
+      if (prepared.kind !== "qualified") throw new Error("expected qualified D1 graph");
+      expect(
+        await f.sql.query(`SELECT 1 WHERE ${prepared.predicate.sql}`, prepared.predicate.params),
+      ).toHaveLength(1);
+      await f.create(
+        DURABLE_WORKFLOW_FORM_URL,
+        `d1-workflow-${count}`,
+        f.request(worker.resourceUid).spec,
+      );
+      expect(await f.admission.observe(f.request(worker.resourceUid))).toBe("ready");
+      await f.sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+        '{"ready":false}',
+        versions[0]?.resourceUid ?? "",
+      ]);
+      expect(
+        await f.sql.query(`SELECT 1 WHERE ${prepared.predicate.sql}`, prepared.predicate.params),
+      ).toHaveLength(0);
+    }
+  } finally {
+    f?.db.close();
+    await runtime.dispose();
+  }
+}, 120_000);

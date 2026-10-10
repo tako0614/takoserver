@@ -73,9 +73,15 @@ function exactRows(evidence: Evidence): V2AdmissionPredicate {
   )
     throw busy();
   if (evidence.rows.length === 0) return { sql: "1", params: [] };
-  const compare = columns
-    .map((column) => `actual."${column}" IS json_extract(expected.value, '$."${column}"')`)
-    .join(" AND ");
+  // A left-deep AND over every captured column exceeds D1's expression depth
+  // once the Host embeds this CAS in its atomic acceptance batch. Row-value
+  // IS retains each column's null-safe scalar comparison without that depth.
+  const actual = columns.map((column) => `actual."${column}"`);
+  const expected = columns.map((column) => `json_extract(expected.value, '$."${column}"')`);
+  const compare =
+    columns.length === 1
+      ? `${actual[0]} IS ${expected[0]}`
+      : `(${actual.join(", ")}) IS (${expected.join(", ")})`;
   const keys = evidence.key
     .map((column) => `actual."${column}" = json_extract(expected.value, '$."${column}"')`)
     .join(" AND ");
