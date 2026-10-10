@@ -18,7 +18,9 @@ export {
 export {
   createV2ActorNamespaceForm,
   type V2ActorAcceptedOperationRuntimeObserver,
+  type V2ActorNamespaceNativeSnapshot,
   type V2ActorNamespacePhysicalPort,
+  type V2ActorNamespaceProviderPort,
   type V2ActorNamespaceRuntimeObservation,
   type V2ActorNamespaceRuntimeTarget,
   type V2ActorNamespaceScope,

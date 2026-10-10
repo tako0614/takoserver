@@ -556,7 +556,15 @@ export function createActorNativeOwner(
   readCurrentGraph?: (env: Record<string, unknown>) => Promise<ActorOwnerGraph>,
   selected?: ActorAbiProfile,
   observationSecret?: string,
+  authorizeObservation?: (input: {
+    readonly request: Request;
+    readonly encodedActorId: string;
+    readonly actorId: string;
+    readonly env: Record<string, unknown>;
+  }) => Promise<(() => Promise<boolean>) | null>,
 ) {
+  if (observationSecret !== undefined && authorizeObservation !== undefined)
+    throw new Error("Actor observation authority is ambiguous");
   const profile = actorAbiProfile(selected);
   const expectedObservationBearer =
     observationSecret === undefined ? undefined : actorAlarmBearer(observationSecret);
@@ -708,13 +716,20 @@ export function createActorNativeOwner(
         if (this.poisoned || !this.state.getWebSockets) return new Response(null, { status: 503 });
         const encodedId = request.headers.get(ID_HEADER);
         if (!encodedId) return new Response(null, { status: 503 });
-        if (
-          !expectedObservationBearer ||
-          request.headers.get(TOKEN_HEADER) !== (await expectedObservationBearer(encodedId))
-        )
-          return new Response(null, { status: 404 });
         const actorId = decodeURIComponent(encodedId);
         if (!actorId || actorId.includes("\u0000")) return new Response(null, { status: 503 });
+        const authorized = authorizeObservation
+          ? await authorizeObservation({
+              request,
+              encodedActorId: encodedId,
+              actorId,
+              env: this.env,
+            })
+          : expectedObservationBearer &&
+              request.headers.get(TOKEN_HEADER) === (await expectedObservationBearer(encodedId))
+            ? async () => true
+            : null;
+        if (!authorized || !(await authorized())) return new Response(null, { status: 404 });
         const graph = await this.currentGraph();
         const alarm = this.readAlarm();
         if (alarm.actorId !== null && alarm.actorId !== actorId)
@@ -735,7 +750,8 @@ export function createActorNativeOwner(
         if (
           this.poisoned ||
           again.epoch !== graph.epoch ||
-          again.generationKey !== graph.generationKey
+          again.generationKey !== graph.generationKey ||
+          !(await authorized())
         )
           return new Response(null, { status: 503 });
         return Response.json({

@@ -14,6 +14,8 @@ import { prepareV2ActorNamespaceAdmission } from "../src/takoform-v2/actor-names
 import {
   createV2ActorNamespaceForm,
   V2_ACTOR_NAMESPACE_BACKEND_ID,
+  type V2ActorNamespaceNativeSnapshot,
+  type V2ActorNamespaceProviderPort,
 } from "../src/takoform-v2/actor-namespace-backend.ts";
 import { createV2ActorNamespaceGraphAuthority } from "../src/takoform-v2/actor-namespace-graph-authority.ts";
 import {
@@ -46,7 +48,7 @@ const PRINCIPAL = "org:actor-admission";
 const SPACE = "production";
 const TARGET = "actor-admission-local-target";
 
-function fixture(physicalRoot?: string) {
+function fixture(physicalRoot?: string, providerNative?: V2ActorNamespaceProviderPort) {
   const db = new Database(":memory:");
   migrateSqlite(db);
   const rawSql = createSqliteSql(db);
@@ -195,6 +197,12 @@ function fixture(physicalRoot?: string) {
             await afterActorForget?.();
           },
         },
+        ...(providerNative
+          ? {
+              providerNative,
+              acceptedGraph: createV2ActorNamespaceSqlGraphReader({ sql, targetKey: TARGET }),
+            }
+          : {}),
       })
     : fixtureActor;
   const engine = createTakoformV2Engine({
@@ -836,6 +844,147 @@ test("Actor backend does not synthesize counts or settle an active Deployment", 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+for (const mode of [
+  "positive",
+  "unknown",
+  "stale-source",
+  "foreign-target",
+  "invalid-version",
+  "changed-version",
+  "wrong-weight",
+  "changed-native",
+  "lost-lease",
+] as const) {
+  test(`provider-neutral Actor active observation ${mode}`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "actor-v2-provider-"));
+    let current: V2ActorNamespaceNativeSnapshot | null = null;
+    let warmed = false;
+    let warmCount = 0;
+    let onWarm: (() => Promise<void>) | undefined;
+    const confirmed = {
+      kind: "confirmed" as const,
+      epoch: "native-epoch",
+      observedAt: 1,
+      activeActorCount: 2,
+      pendingAlarmCount: 1,
+      openSocketCount: 3,
+    };
+    const providerNative: V2ActorNamespaceProviderPort = {
+      async observeNativeForAcceptedOperation() {
+        return current && mode !== "unknown"
+          ? { kind: "ready", snapshot: current }
+          : { kind: "unknown" };
+      },
+      async observeNamespaceRuntimeForAcceptedOperation(_scope, snapshot) {
+        expect(Object.isFrozen(snapshot)).toBe(true);
+        expect(Object.isFrozen(snapshot.scope)).toBe(true);
+        expect(Object.isFrozen(snapshot.versions)).toBe(true);
+        return warmed ? confirmed : { kind: "unknown" };
+      },
+      async warmNamespaceForAcceptedOperation(_scope, candidate, signal) {
+        warmCount += 1;
+        if (!(await candidate.stillAuthorized(signal))) return { kind: "unknown" };
+        await onWarm?.();
+        warmed = true;
+        return confirmed;
+      },
+    };
+    const f = fixture(root, providerNative);
+    if (!f.physical) throw new Error("physical fixture missing");
+    try {
+      const worker = await f.worker();
+      const version = await f.version(worker.resourceUid, "provider-version");
+      const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "provider-deployment", {
+        worker: { resourceUid: worker.resourceUid },
+        versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+      });
+      const namespace = await f.create(
+        ACTOR_NAMESPACE_FORM_URL,
+        "provider-namespace",
+        { worker: { resourceUid: worker.resourceUid }, className: "CounterActor" },
+        false,
+      );
+      current = {
+        scope: { tenantId: PRINCIPAL, namespaceResourceUid: namespace.resourceUid },
+        workerUid: worker.resourceUid,
+        className: "CounterActor",
+        targetKey: TARGET,
+        sourceOperationId: deployment.id,
+        incarnationId: `incarnation:${deployment.id}`,
+        generation: `takoserver-v2-operation:${deployment.id}`,
+        generationKey: `generation:${deployment.id}`,
+        hostnames: [],
+        versions: [
+          {
+            versionId: `native:${version.resourceUid}`,
+            workerVersionUid: version.resourceUid,
+            weight: 10_000,
+          },
+        ],
+      };
+      if (mode === "stale-source") current = { ...current, sourceOperationId: "stale-op" };
+      if (mode === "foreign-target") current = { ...current, targetKey: "foreign-target" };
+      const weightedVersion = current.versions[0];
+      if (!weightedVersion) throw new Error("fixture native Version missing");
+      if (mode === "invalid-version")
+        current = { ...current, versions: [{ ...weightedVersion, versionId: "" }] };
+      if (mode === "wrong-weight")
+        current = { ...current, versions: [{ ...weightedVersion, weight: 9_999 }] };
+      if (mode === "changed-native")
+        onWarm = async () => {
+          if (!current) throw new Error("fixture native snapshot missing");
+          current = { ...current, incarnationId: "changed-incarnation" };
+        };
+      if (mode === "changed-version")
+        onWarm = async () => {
+          if (!current) throw new Error("fixture native snapshot missing");
+          current = {
+            ...current,
+            versions: [{ ...weightedVersion, versionId: "replaced-native-version" }],
+          };
+        };
+      if (mode === "lost-lease")
+        onWarm = async () => {
+          await f.sql.run("UPDATE tf_v2_operations SET lease_token = ? WHERE id = ?", [
+            "lost-lease",
+            namespace.id,
+          ]);
+        };
+      const result = await f.engine.runNext();
+      expect(result?.id).toBe(namespace.id);
+      if (mode === "positive") {
+        expect(result?.status).toBe("succeeded");
+        expect(warmCount).toBe(1);
+        expect(
+          await f.sql.query("SELECT observed_json FROM tf_v2_resources WHERE uid = ?", [
+            namespace.resourceUid,
+          ]),
+        ).toEqual([
+          {
+            observed_json: JSON.stringify({
+              activeActorCount: 2,
+              openSocketCount: 3,
+              pendingAlarmCount: 1,
+              ready: true,
+            }),
+          },
+        ]);
+      } else {
+        expect(result?.status).not.toBe("succeeded");
+        expect(
+          await f.sql.query("SELECT observed_json FROM tf_v2_resources WHERE uid = ?", [
+            namespace.resourceUid,
+          ]),
+        ).toEqual([{ observed_json: "{}" }]);
+      }
+    } finally {
+      await f.physical.close();
+      f.db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("an unrelated Worker's unresolved Deployment does not block pre-Deployment Actor Namespace", async () => {
   const f = fixture();
