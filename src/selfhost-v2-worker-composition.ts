@@ -318,6 +318,15 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   runWorkflowOnce: WorkflowRunOnce;
   /** Close guarded Workflow registrations before stopping selected Worker owners. */
   closeWorkflowHost(): Promise<void>;
+  /**
+   * Readiness probe only: counts of opened owners by recorded liveness. Never
+   * opens an owner, never writes, and carries no Worker identity.
+   */
+  observeOwnerHealth(): Promise<{
+    readonly owners: number;
+    readonly serving: number;
+    readonly unavailable: number;
+  }>;
   /** Stop exact known children but retain UID owner locks and durable accepted state. */
   suspendOwnersRetainingCustody(): Promise<void>;
   /** Close retired owners, then stop the private broker; active owners refuse. */
@@ -1425,6 +1434,25 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       if (!restoration) throw new Error("v2 Worker owners have not restored");
       await restoration;
       return await openOwner(uid);
+    },
+    async observeOwnerHealth() {
+      let serving = 0;
+      let unavailable = 0;
+      const openings = [...owners.values()];
+      for (const opening of openings) {
+        let owner: WorkerdWorkerRuntimeOwner;
+        try {
+          owner = await opening;
+        } catch {
+          // An opening that failed is not a serving owner.
+          unavailable += 1;
+          continue;
+        }
+        const state = owner.health();
+        if (state === "serving") serving += 1;
+        else if (state === "unavailable") unavailable += 1;
+      }
+      return { owners: openings.length, serving, unavailable };
     },
     pollWorkflowDue() {
       if (!workflow || !restorationComplete || ownerAdmissionFrozen || workflowHostClosing)

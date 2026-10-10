@@ -224,7 +224,9 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
   );
   let owner = await openWorkerdWorkerRuntimeOwner(options);
   try {
+    expect(owner.health()).toBe("idle");
     expect(await owner.execute(execution)).toMatchObject({ kind: "confirmed" });
+    expect(owner.health()).toBe("serving");
     await expect(openWorkerdWorkerRuntimeOwner(options)).rejects.toMatchObject({
       code: "ownership_uncertain",
     });
@@ -237,6 +239,7 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
     ).text();
     await expect(owner.close()).rejects.toMatchObject({ code: "ownership_uncertain" });
     await owner.suspend();
+    expect(owner.health()).toBe("idle");
     expect(await linuxProcessLiveness(oldProcess)).toBe("stale");
     expect(await workerPortOwnership(port, undefined)).toBe("vacant");
     const suspendedBytes = await readFile(statePath, "utf8");
@@ -287,8 +290,12 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
     ).toMatchObject({ kind: "confirmed", status: "active" });
     const restartedChild = children.find((child) => child.pid === afterRecord.processIdentity.pid);
     if (!restartedChild) throw new Error("restored child missing");
+    expect(owner.health()).toBe("serving");
     restartedChild.kill("SIGKILL");
     await restartedChild.exited;
+    // The supervisor replaces the child, so this window is brief. It must read
+    // as unavailable while the recorded child is gone, never as serving.
+    const healthWhileReplaced = new Set<string>([owner.health()]);
     const autoRestartDeadline = Date.now() + 5_000;
     let autoRestarted: StoredState | null = null;
     while (Date.now() < autoRestartDeadline) {
@@ -301,9 +308,12 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
         autoRestarted = candidate;
         break;
       }
+      healthWhileReplaced.add(owner.health());
       await Bun.sleep(20);
     }
     if (!autoRestarted) throw new Error("automatic child restart did not regain serving");
+    expect(healthWhileReplaced.has("unavailable")).toBe(true);
+    expect(owner.health()).toBe("serving");
     expect(autoRestarted.physicalAbsences.map((item) => item.incarnationId)).toContain(
       physicalId(OPERATION_ID, afterRecord.processIdentity),
     );

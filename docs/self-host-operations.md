@@ -125,7 +125,15 @@ current child lifecycle state (`idle`, `starting`, `serving`, `recovering`, or
 `unavailable`). If the accepted child is still alive but its listener probe
 fails, `workerRuntime` is `unavailable` while `supervisor` remains `serving`;
 the fields distinguish observed service availability from process lifecycle.
-An empty successful boot restore with no published Workers is
+v2 Worker owners supervise their own workerd children outside that
+supervisor, so when the Host has a v2 Worker composition the body also carries
+`v2Workers: { owners, serving, unavailable }`: counts of opened owners, of
+owners whose recorded active incarnation is ready, and of owners that recorded
+an active incarnation whose child is not ready (crashed or being replaced). One
+unavailable owner, or an owner state that could not be read within the deadline,
+makes `workerRuntime` `unavailable` and the response `503`; serving owners turn
+a would-be `not-required` into `serving`. The counts carry no Worker UID or
+hostname. An empty successful boot restore with no published Workers is
 `not-required`, not a failure. A failed boot restore remains `restore-failed`
 for this process even if a later child passes its listener check: that check
 does not prove the entire durable published graph was restored. A process
@@ -463,15 +471,23 @@ Known gaps this test records, not fixes:
   `ownership_uncertain` on every start and the installation needs manual
   repair. The data is left untouched. The second test in that file pins this
   fail-closed behaviour so that a fix has to update it.
-- **The readiness probe does not observe v2 Worker owners.** While v2 Workers
-  are serving, `/_takoserver/health/ready` reports `workerRuntime:
-  "not-required"` and `supervisor: "idle"`; it can not report their failure.
-- **The control database has no busy timeout.** It uses the default
-  rollback-journal mode, so a concurrent external reader (an operator's
-  `sqlite3`, a backup tool, a poller) can make a Host write fail with
-  `database is locked`. A background pass then logs only its name, and a
-  Queue batch whose reservation could not be cancelled stays reserved for 120
-  seconds. Do not read the live database; stop the Host first.
+Three gaps this test first recorded have since been fixed, each with its own
+test:
+
+- **Readiness observes v2 Worker owners** (see the `v2Workers` counts above).
+- **A busy control database waits five seconds, then fails.** The control
+  database sets a bounded `busy_timeout`, so a short external read (`sqlite3`,
+  a backup tool, a poller) delays a Host write instead of failing it. It
+  stays in rollback-journal mode on purpose: the documented cold backup copies
+  a stopped data root, and the tenant SQLite stores are deliberately
+  rollback-journal. A reader that holds the lock longer than five seconds still
+  fails the write; a failing background pass now logs its name and a bounded
+  cause, and a Queue reservation that was never sent is refunded with bounded
+  retries before it falls back to its 120 second expiry. Do not read the live
+  database anyway; stop the Host first.
+- **The boot note for an unpublishable Worker endpoint is one coherent
+  statement.** It says endpoints cannot be created in this profile, names the
+  address they would have, and gives the remedy once.
 
 ## Historical reference: v1 signed package admission
 

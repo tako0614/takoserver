@@ -1282,6 +1282,11 @@ const selfhostHealth = createSelfhostHealthHandler({
   sql,
   startupRestore,
   supervisor: workerd,
+  // v2 Worker owners supervise their own children; without this a serving v2
+  // Worker read as "not-required" and a dead one was invisible.
+  ...(v2WorkerComposition
+    ? { v2Workers: { observe: () => v2WorkerComposition.observeOwnerHealth() } }
+    : {}),
 });
 const takoformV2Ingress = createSelfhostTakoformV2Ingress({
   publicOrigin,

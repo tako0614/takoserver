@@ -536,6 +536,15 @@ export interface WorkerdWorkerRuntimeOwner {
     readonly space: string;
     readonly targetKey: string;
   }): ReturnType<WorkerdWorkerRuntimeOwner["observeScheduledCapability"]>;
+  /**
+   * Synchronous, side-effect-free liveness for the readiness probe only.
+   * `serving`: the recorded active incarnation's child group is ready.
+   * `unavailable`: an active incarnation is recorded but its child is not
+   * ready (crashed or being replaced). `idle`: nothing is recorded as active,
+   * or the owner is closing or suspended. It is not publication authority;
+   * only `observeServing` plus the SQL proof is.
+   */
+  health(): "idle" | "serving" | "unavailable";
   /** Release the owner lock only after every known incarnation has a durable receipt. */
   close(): Promise<void>;
   /** Host-private graceful stop: no DELETE, no retirement receipt, no lost custody. */
@@ -3920,6 +3929,17 @@ export async function openWorkerdWorkerRuntimeOwner(
     });
   };
 
+  const health: WorkerdWorkerRuntimeOwner["health"] = () => {
+    if (closed || suspending) return "idle";
+    const incarnation = active;
+    if (!incarnation || !state.activeOperationId) return "idle";
+    return incarnation.record.operationId === state.activeOperationId &&
+      incarnation.record.status === "active" &&
+      incarnation.group.isReady()
+      ? "serving"
+      : "unavailable";
+  };
+
   const observeServing: WorkerdWorkerRuntimeOwner["observeServing"] = (input) =>
     runSerial(async () => {
       const unknown = { kind: "unknown" } as const;
@@ -6218,6 +6238,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     observeQueueServingCapability,
     invokeQueue,
     invokeScheduled,
+    health,
     close,
     suspend,
   });
