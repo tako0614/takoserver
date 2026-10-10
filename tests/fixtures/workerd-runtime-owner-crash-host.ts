@@ -413,16 +413,25 @@ if (owner)
       process.stdout.write(
         `${JSON.stringify({ kind: mode === "retire" ? "retired" : mode === "active-create" ? "active-created" : mode === "active-update-draining" ? "active-updated-draining" : "empty-retired", pid: process.pid, port })}\n`,
       );
-    } else if (mode === "active-recover" || mode === "active-recover-only") {
+    } else if (
+      mode === "active-recover" ||
+      mode === "active-recover-only" ||
+      mode === "active-recover-reexecute"
+    ) {
       phase = "recover-fetch";
       const current = await readCurrentServing();
       if (!current) throw new Error("current serving fixture missing");
       const response = await owner.fetch(new Request("http://worker.fixture.test/"));
       const body = await response.text();
       if (body !== current.configIdentity) throw new Error(`recovered fetch mismatch: ${body}`);
-      if (mode === "active-recover-only") {
+      if (mode === "active-recover-only" || mode === "active-recover-reexecute") {
+        // Re-driving the abandoned Operation never starts a second incarnation.
+        const reexecuted =
+          mode === "active-recover-reexecute" && updateId
+            ? await owner.execute(execution(updateId, "update"))
+            : null;
         process.stdout.write(
-          `${JSON.stringify({ kind: "recovered-active", body, pid: process.pid, port })}\n`,
+          `${JSON.stringify({ kind: "recovered-active", body, reexecuted, pid: process.pid, port })}\n`,
         );
         setInterval(() => undefined, 60_000);
       } else {

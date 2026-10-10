@@ -37,6 +37,7 @@ import {
   WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import { linuxProcessLiveness } from "../src/workerd-linux-process.ts";
 
 const OPT_IN = process.env.TAKOSERVER_V2_ENTRY_NATIVE;
 const PUBLIC_ORIGIN = "https://journey.takoserver.test";
@@ -518,6 +519,43 @@ async function settled(port: number, token: string, operationId: string): Promis
     await Bun.sleep(250);
   }
   throw new Error("journey Operation settlement deadline exceeded");
+}
+
+async function terminal(port: number, token: string, operationId: string): Promise<Json> {
+  // A killed Host's claim is retried only after its lease expires.
+  const deadline = Date.now() + 180_000;
+  while (Date.now() < deadline) {
+    const operation = await jsonAt(port, "GET", `${V2}/operations/${operationId}`, 200, undefined, {
+      authorization: `Bearer ${token}`,
+    });
+    if (operation.status === "succeeded" || operation.status === "failed") return operation;
+    await Bun.sleep(250);
+  }
+  throw new Error("journey Operation terminal deadline exceeded");
+}
+
+interface OwnerRecord {
+  readonly operationId: string;
+  readonly status: string;
+  readonly identity: unknown;
+  readonly processIdentity: { pid: number; startTimeTicks?: string; bootId?: string } | null;
+}
+
+async function ownerState(
+  root: string,
+  workerUid: string,
+): Promise<{ activeOperationId: string | null; incarnations: OwnerRecord[] }> {
+  return JSON.parse(
+    await readFile(
+      join(
+        root,
+        "v2-worker-owners",
+        createHash("sha256").update(workerUid, "utf8").digest("hex"),
+        "runtime-owner.json",
+      ),
+      "utf8",
+    ),
+  );
 }
 
 interface Environment {
@@ -1224,9 +1262,9 @@ test.skipIf(OPT_IN !== "1")(
  *    engine re-drives the Operation once through a fresh incarnation.
  *  - dispatched, candidate persisted (real SIGKILL once the owner persisted a
  *    candidate incarnation and its child): boot abandons the dead candidate and
- *    serves the committed incarnation. The Operation id is never reused for a
- *    second incarnation, so the Operation itself stays `reconciling` — pinned
- *    below as a KNOWN GAP, not counted as a completed update.
+ *    serves the committed incarnation. The Operation ID is never given a second
+ *    incarnation; the engine settles it failed with effect none, the Worker
+ *    keeps serving the committed graph, and a re-apply publishes once.
  *  - dispatched AND already activated by the owner but unsettled in SQL, or a
  *    DELETE that started: still refused at boot (docs/self-host-operations.md).
  * The test refuses to run (inconclusive) rather than count a crash that landed
@@ -1245,7 +1283,7 @@ const PENDING_VARIANTS = [
 for (const { pending, signal, window } of PENDING_VARIANTS) {
   test.skipIf(OPT_IN !== "1")(
     window === "candidate"
-      ? `KNOWN GAP: a ${pending} killed with its candidate incarnation persisted boots again but stays reconciling`
+      ? `a ${pending} killed with its candidate incarnation persisted fails without effect, keeps serving, and a re-apply publishes once`
       : window === "dispatched"
         ? `a dispatched ${pending} that never reached the owner at ${signal} boots again and runs once`
         : `a queued ${pending} at ${signal} boots again and runs once`,
@@ -1356,21 +1394,11 @@ for (const { pending, signal, window } of PENDING_VARIANTS) {
         if (window === "candidate") {
           // Kill as soon as the owner has persisted a candidate incarnation and
           // recorded its child, and before it can be activated.
-          const statePath = join(
-            root,
-            "v2-worker-owners",
-            createHash("sha256").update(worker, "utf8").digest("hex"),
-            "runtime-owner.json",
-          );
           const deadline = Date.now() + 60_000;
           let seen = false;
           while (Date.now() < deadline && !seen) {
-            const text = await readFile(statePath, "utf8").catch(() => null);
-            if (text !== null) {
-              const owner = JSON.parse(text) as {
-                activeOperationId: string | null;
-                incarnations: { operationId: string; status: string; processIdentity: unknown }[];
-              };
+            const owner = await ownerState(root, worker).catch(() => null);
+            if (owner !== null) {
               seen = owner.incarnations.some(
                 (item) =>
                   item.operationId === String(update.id) &&
@@ -1439,37 +1467,92 @@ for (const { pending, signal, window } of PENDING_VARIANTS) {
         host = await startHost(root, port, config, fullBoot);
         expect(host.output()).not.toContain("ownership_uncertain");
         if (window === "candidate") {
-          // The abandoned candidate's Operation id is never reused, so the
-          // Operation keeps retrying without a new effect: it is not lost and
-          // not duplicated, but it does not complete either. While an update is
-          // pending the Endpoint is not served (the same as an uninterrupted
-          // Host mid-update), so this Worker stays unavailable (503) until the
-          // Operation is resolved; the Host itself and its control API are up.
-          expect(
-            await endpointEventually(hostname, certificate, "/", (r) => r.status === 503),
-          ).toMatchObject({ status: 503 });
-          await jsonAt(port, "GET", `${V2}/resources/${deploymentUid}`, 200, undefined, auth);
-          await Bun.sleep(3_000);
-          expect(
-            withControl(
-              root,
-              (control) =>
-                control
-                  .query("SELECT status, effect FROM tf_v2_operations WHERE replay_key = ?")
-                  .all(updateKey) as Json[],
-            ),
-          ).toEqual([{ status: "reconciling", effect: "unknown" }]);
+          // The owner proved the candidate never served and retired it under
+          // the Operation's own ID; the engine settles that Operation through
+          // its normal failure path, with no effect, exactly once.
+          expect(await terminal(port, token, String(update.id))).toMatchObject({
+            status: "failed",
+            effect: "none",
+          });
           expect(
             withControl(
               root,
               (control) =>
                 control
                   .query(
-                    "SELECT COUNT(*) AS count FROM tf_v2_operations WHERE resource_uid = ? AND action = 'update'",
+                    "SELECT status, effect, error_code FROM tf_v2_operations WHERE replay_key = ?",
+                  )
+                  .all(updateKey) as Json[],
+            ),
+          ).toEqual([
+            {
+              status: "failed",
+              effect: "none",
+              error_code: "worker_incarnation_retired_before_activation",
+            },
+          ]);
+          // The committed graph keeps serving: the failed update changed nothing.
+          expect(
+            await endpointEventually(hostname, certificate, "/", (r) => r.body === "gap-v1"),
+          ).toEqual({ status: 200, body: "gap-v1" });
+          // The user re-applies; a fresh Operation publishes once.
+          const reapply = await jsonAt(
+            port,
+            "PUT",
+            `${V2}/resources/${target}`,
+            202,
+            { spec },
+            {
+              ...auth,
+              "idempotency-key": `${updateKey}-reapply`,
+              "takoform-expected-generation": "2",
+            },
+          );
+          expect(await settled(port, token, String(reapply.id))).toMatchObject({
+            effect: "complete",
+          });
+          expect(
+            await endpointEventually(hostname, certificate, "/", (r) => r.body === "gap-v2"),
+          ).toEqual({ status: 200, body: "gap-v2" });
+          expect(
+            withControl(
+              root,
+              (control) =>
+                control
+                  .query(
+                    "SELECT status, effect FROM tf_v2_operations WHERE resource_uid = ? AND action = 'update' ORDER BY generation",
                   )
                   .all(target) as Json[],
             ),
-          ).toEqual([{ count: 1 }]);
+          ).toEqual([
+            { status: "failed", effect: "none" },
+            { status: "succeeded", effect: "complete" },
+          ]);
+          const owner = await ownerState(root, worker);
+          expect(owner.activeOperationId).toBe(String(reapply.id));
+          expect(
+            owner.incarnations.filter((item) => item.operationId === String(update.id)),
+          ).toMatchObject([{ status: "retired", identity: null }]);
+          expect(
+            owner.incarnations.filter((item) => item.operationId === String(reapply.id)),
+          ).toMatchObject([{ status: "active" }]);
+          // The replaced incumbent may legitimately keep draining (waitUntil
+          // grace); nothing else is between serving and retired.
+          expect(
+            owner.incarnations.filter(
+              (item) => item.status !== "active" && item.status !== "retired",
+            ).length,
+          ).toBeLessThanOrEqual(1);
+          expect(
+            owner.incarnations.filter(
+              (item) => item.status === "uncertain" || item.status === "candidate",
+            ),
+          ).toEqual([]);
+          // No child of a retired incarnation, including the abandoned candidate, is left running.
+          for (const record of owner.incarnations) {
+            if (record.status !== "retired" || !record.processIdentity) continue;
+            expect(await linuxProcessLiveness(record.processIdentity as never)).toBe("stale");
+          }
           completed = true;
           return;
         }
@@ -1502,6 +1585,13 @@ for (const { pending, signal, window } of PENDING_VARIANTS) {
                 .all(target) as Json[],
           ),
         ).toEqual([{ count: 1 }]);
+        // The owner published this exact Operation once and it is what serves,
+        // which also distinguishes an Endpoint update that serves the same bytes.
+        const owner = await ownerState(root, worker);
+        expect(owner.activeOperationId).toBe(String(update.id));
+        expect(
+          owner.incarnations.filter((item) => item.operationId === String(update.id)),
+        ).toMatchObject([{ status: "active" }]);
         completed = true;
       } finally {
         await Promise.allSettled([stopHost(host)]);

@@ -277,9 +277,22 @@ export class WorkerdWorkerRuntimeOwnerError extends Error {
 /** Explicit no-active-Deployment endpoint absence, never Worker teardown. */
 export type V2WorkerEndpointRouteAbsentResult = V2EndpointRouteAbsentReceipt;
 
+/**
+ * Every incarnation of this exact Operation is a candidate the owner proved
+ * never served: it was never activated, its recorded child is gone, and it is
+ * retired with the Operation's own ID. Nothing this Operation published can
+ * still arrive anywhere, so the backend may settle it with no effect. The
+ * Operation ID is never given a second incarnation.
+ */
+export interface V2WorkerAbandonedBeforeActivationResult {
+  readonly kind: "abandoned_before_activation";
+  readonly operationId: string;
+}
+
 export type V2WorkerRuntimeOwnerExecutionResult =
   | V2WorkerPublicationResult
-  | V2WorkerEndpointRouteAbsentResult;
+  | V2WorkerEndpointRouteAbsentResult
+  | V2WorkerAbandonedBeforeActivationResult;
 
 /** Host-local physical readback; SQL acceptance remains the caller's authority. */
 export type WorkerdActorNativeGraphObservation =
@@ -4039,7 +4052,23 @@ export async function openWorkerdWorkerRuntimeOwner(
         }
         return result;
       }
-      if (recordFor(execution.operationId)) return { kind: "unknown" };
+      const prior = recordFor(execution.operationId);
+      if (prior) {
+        // The only definitive answer for an existing record: a candidate that
+        // was retired under this Operation's own ID without ever activating.
+        if (
+          (execution.action === "create" || execution.action === "update") &&
+          prior.status === "retired" &&
+          prior.identity === null &&
+          prior.configurationSha256 === null &&
+          prior.retirementOperationId === execution.operationId &&
+          prior.receipt !== null &&
+          prior.executionCopiesReleased &&
+          state.activeOperationId !== execution.operationId
+        )
+          return { kind: "abandoned_before_activation", operationId: execution.operationId };
+        return { kind: "unknown" };
+      }
 
       let incumbentIdentity: WorkerdPublicationIdentity | null = null;
       if (active) {

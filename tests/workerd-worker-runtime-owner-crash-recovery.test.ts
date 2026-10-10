@@ -89,6 +89,7 @@ async function startHost(
     | "active-update-draining"
     | "active-update-hang-after-candidate"
     | "create-hang-after-candidate"
+    | "active-recover-reexecute"
     | "open-only",
   root: string,
   binary: string,
@@ -902,8 +903,20 @@ test("a successor host abandons a never-activated candidate left by a killed upd
     await waitForVacant(candidatePort);
     expect(await linuxProcessLiveness(candidateIdentity)).toBe("stale");
 
-    successor = await startHost("active-recover-only", owned.root, owned.binary, port, UPDATE_ID);
-    expect(await readJsonLine(successor)).toMatchObject({ kind: "recovered-active", port });
+    successor = await startHost(
+      "active-recover-reexecute",
+      owned.root,
+      owned.binary,
+      port,
+      UPDATE_ID,
+    );
+    // The engine re-drives the dispatched Operation: the owner answers with its
+    // proof instead of a second incarnation, so the backend can settle no effect.
+    expect(await readJsonLine(successor)).toMatchObject({
+      kind: "recovered-active",
+      port,
+      reexecuted: { kind: "abandoned_before_activation", operationId: UPDATE_ID },
+    });
 
     const after = await incarnations(owned.root);
     expect(after.activeOperationId).toBe(CREATE_ID);

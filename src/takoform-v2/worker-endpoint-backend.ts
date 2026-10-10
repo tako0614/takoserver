@@ -168,6 +168,23 @@ export function createWorkerEndpointForm(options: {
     } catch {
       return unknown();
     }
+    if (result.kind === "abandoned_before_activation") {
+      // The owner proved this Operation's only incarnation never served and
+      // retired it; nothing it published can still arrive. Settle with no
+      // effect so the committed graph keeps serving and a re-apply can retry.
+      if (
+        result.operationId !== execution.operationId ||
+        (execution.action !== "create" && execution.action !== "update") ||
+        !(await before.stillCurrent())
+      )
+        return unknown();
+      return {
+        kind: "no_effect",
+        code: "worker_incarnation_retired_before_activation",
+        message:
+          "This publication's Worker incarnation was retired before it was activated; nothing it published served. Re-apply to retry.",
+      };
+    }
     // `not_dispatched` describes this invocation only, never earlier effects.
     // `confirmed` identity:null is Deployment teardown, not Endpoint proof.
     const after = await options.publicationState.resolve({
