@@ -547,8 +547,9 @@ test("an unreadable database still fails readiness even with serving v2 owners",
     v2Workers: { observe: async () => ({ owners: 1, serving: 1, unavailable: 0 }) },
   });
   const response = await handler(new Request("http://host.test/_takoserver/health/ready"));
-  expect(response?.status).toBe(503);
-  expect(((await response?.json()) as { database: string }).database).toBe("unavailable");
+  if (!response) throw new Error("readiness route did not answer");
+  expect(response.status).toBe(503);
+  expect(((await response.json()) as { database: string }).database).toBe("unavailable");
 });
 
 test("a v2 composition with no owners keeps the no-workload meaning", async () => {
