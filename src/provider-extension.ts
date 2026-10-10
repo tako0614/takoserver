@@ -247,6 +247,17 @@ export {
   type QueueCustodyTarget,
   type QueueCustodyTransferNotice,
 } from "./queue-custody.ts";
+export type {
+  EdgeSqlRow,
+  EdgeSqlValue,
+  SelfhostV2SqliteResult,
+  SelfhostV2SqliteStatement,
+  SQLiteLockedPhysicalSet,
+  V2QueueSQLiteCall,
+  V2QueueSQLiteGrant,
+  V2QueueSQLiteProofPort,
+  V2QueueSQLiteSelectedBindings,
+} from "./queue-v2-sqlite-contract.ts";
 export { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
 export { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
 export { createD1Sql } from "./sql-d1.ts";

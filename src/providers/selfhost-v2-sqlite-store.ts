@@ -18,6 +18,12 @@ import {
 import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Clock, Sql } from "../ports.ts";
+import {
+  mintSQLiteLockedPhysicalSet,
+  type SQLiteLockedPhysicalSet,
+} from "../queue-v2-sqlite-physical-fence.ts";
+
+export type { SQLiteLockedPhysicalSet } from "../queue-v2-sqlite-physical-fence.ts";
 
 export const SQLITE_MIGRATION_LEDGER = Object.freeze({
   schema: "main",
@@ -39,18 +45,6 @@ const LEDGER_SCHEMA = `CREATE TABLE _takoform_sqlite_migrations (
 const LEDGER_SQL = LEDGER_SCHEMA.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ");
 
 type Presence = "present" | "absent" | "unknown";
-const physicalFenceBrand: unique symbol = Symbol("SQLite locked physical set");
-
-/** Minted only while every selected SQLite UID shard is locked and its original CREATE is proven. */
-export interface SQLiteLockedPhysicalSet {
-  readonly targetKey: string;
-  readonly principal: string;
-  readonly space: string;
-  readonly bindings: readonly Readonly<{ name: string; resourceUid: string }>[];
-  /** Fails closed if retained beyond the store's locked callback. */
-  assertHeld(): void;
-  readonly [physicalFenceBrand]: true;
-}
 
 /** Neutral structural input: this adapter never imports the v2 Form layer. */
 export interface SQLiteNativeExecution {
@@ -794,7 +788,7 @@ export function createSelfhostV2SQLiteStore(
           throw new SelfhostV2SQLiteStoreError("backend_unavailable");
       }
       let held = true;
-      const physical: SQLiteLockedPhysicalSet = Object.freeze({
+      const physical = mintSQLiteLockedPhysicalSet({
         targetKey: options.targetKey,
         principal: input.principal,
         space: input.space,
@@ -802,7 +796,6 @@ export function createSelfhostV2SQLiteStore(
         assertHeld() {
           if (!held) throw new SelfhostV2SQLiteStoreError("backend_unavailable");
         },
-        [physicalFenceBrand]: true as const,
       });
       try {
         if (!(await input.stillAuthorized(physical)))
