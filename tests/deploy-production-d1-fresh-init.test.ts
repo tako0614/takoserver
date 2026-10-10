@@ -317,6 +317,7 @@ describe("production D1 fresh init", () => {
     const sealed88 = join(fixtureRoot, "sealed-v2-0088");
     cpSync(currentMigrations, sealed88, { recursive: true });
     rmSync(join(sealed88, "0089_v2_worker_cron_match_guard_depth.sql"));
+    rmSync(join(sealed88, "0090_v2_queue_sqlite_external_drain.sql"));
     expect(readSealedFreshProductionV2MigrationArtifact(sealed88).digest).toBe(projected.digest);
     expect(() => readSealedFreshProductionV2MigrationArtifact(currentMigrations)).toThrow(
       "exactly 0001-0088",
@@ -327,6 +328,7 @@ describe("production D1 fresh init", () => {
     const missing = join(fixtureRoot, "missing-v2-tail");
     cpSync(currentMigrations, missing, { recursive: true });
     rmSync(join(missing, "0089_v2_worker_cron_match_guard_depth.sql"));
+    rmSync(join(missing, "0090_v2_queue_sqlite_external_drain.sql"));
     rmSync(join(missing, "0088_v2_worker_sqlite_external_drain.sql"));
     expect(() => projectFreshProductionV2MigrationArtifact(readMigrationArtifact(missing))).toThrow(
       "fixed audited 0001-0088 prefix",
@@ -338,6 +340,7 @@ describe("production D1 fresh init", () => {
     const drifted = join(fixtureRoot, "drifted-v2-tail");
     cpSync(currentMigrations, drifted, { recursive: true });
     rmSync(join(drifted, "0089_v2_worker_cron_match_guard_depth.sql"));
+    rmSync(join(drifted, "0090_v2_queue_sqlite_external_drain.sql"));
     const tail = join(drifted, "0088_v2_worker_sqlite_external_drain.sql");
     writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- synthetic drift\n`);
     expect(() => projectFreshProductionV2MigrationArtifact(readMigrationArtifact(drifted))).toThrow(
@@ -355,12 +358,14 @@ describe("production D1 fresh init", () => {
     expect(selected.digest).toBe(
       "sha256:44d5cd59a772c51877d32f2f448ff929b7a50e0792ac99dea3522b1cb01545fa",
     );
-    expect(readSealedFreshProductionV2MigrationArtifact0089(currentMigrations).digest).toBe(
-      selected.digest,
-    );
+    const sealed89 = join(fixtureRoot, "sealed-v2-0089");
+    cpSync(currentMigrations, sealed89, { recursive: true });
+    rmSync(join(sealed89, "0090_v2_queue_sqlite_external_drain.sql"));
+    expect(readSealedFreshProductionV2MigrationArtifact0089(sealed89).digest).toBe(selected.digest);
 
     const future = join(fixtureRoot, "future-v2-0090");
     cpSync(currentMigrations, future, { recursive: true });
+    rmSync(join(future, "0090_v2_queue_sqlite_external_drain.sql"));
     writeFileSync(join(future, "0090_future.sql"), "CREATE TABLE future_only (id TEXT);\n");
     expect(
       projectFreshProductionV2MigrationArtifact0089(readMigrationArtifact(future)).digest,
@@ -372,6 +377,7 @@ describe("production D1 fresh init", () => {
     const missing = join(fixtureRoot, "missing-v2-0089-tail");
     cpSync(currentMigrations, missing, { recursive: true });
     rmSync(join(missing, "0089_v2_worker_cron_match_guard_depth.sql"));
+    rmSync(join(missing, "0090_v2_queue_sqlite_external_drain.sql"));
     expect(() =>
       projectFreshProductionV2MigrationArtifact0089(readMigrationArtifact(missing)),
     ).toThrow("fixed audited 0001-0089 prefix");
@@ -381,6 +387,7 @@ describe("production D1 fresh init", () => {
 
     const drifted = join(fixtureRoot, "drifted-v2-0089-tail");
     cpSync(currentMigrations, drifted, { recursive: true });
+    rmSync(join(drifted, "0090_v2_queue_sqlite_external_drain.sql"));
     const tail = join(drifted, "0089_v2_worker_cron_match_guard_depth.sql");
     writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- synthetic drift\n`);
     expect(() =>
@@ -1266,13 +1273,13 @@ describe("production D1 fresh init", () => {
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const tail = join(migrationDirectory, "0089_v2_worker_cron_match_guard_depth.sql");
+        const tail = join(migrationDirectory, "0090_v2_queue_sqlite_external_drain.sql");
         if (drift === "missing") rmSync(tail);
         else if (drift === "changed") {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0090_unreviewed.sql"),
+            join(migrationDirectory, "0091_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }

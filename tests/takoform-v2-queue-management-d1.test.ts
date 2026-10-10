@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
+import type { Sql } from "../src/ports.ts";
 import { createQueueCustody } from "../src/queue-custody.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
@@ -19,9 +20,13 @@ import {
   type V2QueueConsumerCapability,
 } from "../src/takoform-v2/worker-queue-consumer-backend.ts";
 import {
+  armV2QueueBatchSQLiteExternalUse,
   authorizeV2QueueBatchSend,
   confirmV2QueueBatchRetirement,
+  confirmV2QueueBatchSQLiteDrained,
   createV2QueueDelivery,
+  readV2QueueBatchSQLiteCustody,
+  recordV2QueueBatchTerminal,
   v2QueueId,
 } from "../src/takoform-v2/worker-queue-delivery.ts";
 
@@ -49,6 +54,22 @@ function splitMigration(source: string): readonly string[] {
   return statements;
 }
 
+function loseOneWriteAck(sql: Sql, needle: string): Sql {
+  let lost = false;
+  return {
+    query: (statement, params) => sql.query(statement, params),
+    batch: (statements) => sql.batch(statements),
+    async run(statement, params) {
+      const result = await sql.run(statement, params);
+      if (!lost && statement.includes(needle)) {
+        lost = true;
+        throw new Error("injected lost SQL acknowledgement");
+      }
+      return result;
+    },
+  };
+}
+
 test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async () => {
   const runtime = new Miniflare({
     workers: [
@@ -74,7 +95,7 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
   });
   try {
     const database = await runtime.getD1Database("STATE_DB");
-    for (const migration of MIGRATIONS) {
+    for (const migration of MIGRATIONS.slice(0, -1)) {
       for (const [index, statement] of splitMigration(migration.sql).entries()) {
         try {
           await database.prepare(statement).run();
@@ -83,7 +104,9 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
         }
       }
     }
-    expect(MIGRATIONS.at(-1)?.name).toBe("0089_v2_worker_cron_match_guard_depth.sql");
+    const queueMigration = MIGRATIONS.at(-1);
+    expect(queueMigration?.name).toBe("0090_v2_queue_sqlite_external_drain.sql");
+    if (!queueMigration) throw new Error("missing Queue SQLite migration");
     const sql = createD1Sql(database);
     const principal = "org-d1";
     const space = "default";
@@ -355,6 +378,11 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
       incarnationOperationId: "d1-incarnation",
     };
     expect(await authorizeV2QueueBatchSend(sql, execution)).toBe("authorized");
+    expect(await armV2QueueBatchSQLiteExternalUse(sql, execution)).toBe(false);
+    expect(await readV2QueueBatchSQLiteCustody(sql, execution)).toEqual({ kind: "unknown" });
+    const queueStatements = splitMigration(queueMigration.sql);
+    for (const statement of queueStatements.slice(0, 2)) await database.prepare(statement).run();
+    expect(await armV2QueueBatchSQLiteExternalUse(sql, execution)).toBe(false);
     expect(
       await confirmV2QueueBatchRetirement(sql, {
         execution,
@@ -362,7 +390,141 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
         receiptDigest: "c".repeat(64),
       }),
     ).toBe("retired");
+    for (const statement of queueStatements.slice(2)) await database.prepare(statement).run();
+    expect(await armV2QueueBatchSQLiteExternalUse(sql, execution)).toBe(false);
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId: "d1-sqlite-message", body: new Uint8Array([3]) },
+    );
+    const sqliteBatch = await delivery.claimRegisteredBatch({
+      consumerUid: consumer.uid,
+      principal,
+      space,
+      targetKey,
+    });
+    expect(sqliteBatch.kind).toBe("ready");
+    if (sqliteBatch.kind !== "ready") throw new Error("SQLite batch was not registered");
+    const sqliteExecution = {
+      ...execution,
+      batchId: sqliteBatch.batchId,
+      reservationToken: sqliteBatch.reservationToken,
+      generation: sqliteBatch.generation,
+      incarnationOperationId: "d1-sqlite-incarnation",
+    };
+    expect(await authorizeV2QueueBatchSend(sql, sqliteExecution)).toBe("authorized");
+    expect(
+      await armV2QueueBatchSQLiteExternalUse(
+        loseOneWriteAck(sql, "sqlite_drain_state = 'pending'"),
+        sqliteExecution,
+      ),
+    ).toBe(true);
+    expect(await armV2QueueBatchSQLiteExternalUse(createD1Sql(database), sqliteExecution)).toBe(
+      true,
+    );
+    const wrongScope = { ...sqliteExecution, consumerUid: "another-consumer" };
+    expect(await armV2QueueBatchSQLiteExternalUse(sql, wrongScope)).toBe(false);
+    const terminal = { kind: "handler_and_wait_until" as const, receiptDigest: "d".repeat(64) };
+    const drainDigest = `sha256:${"e".repeat(64)}` as const;
+    expect(await readV2QueueBatchSQLiteCustody(sql, sqliteExecution)).toMatchObject({
+      kind: "found",
+      principal,
+      space,
+      targetKey,
+      sqliteDrainState: "pending",
+      terminal: null,
+    });
+    expect(
+      await confirmV2QueueBatchRetirement(sql, {
+        execution: sqliteExecution,
+        kind: terminal.kind,
+        receiptDigest: terminal.receiptDigest,
+      }),
+    ).toBe("unknown");
+    await expect(
+      sql.run(
+        `UPDATE queue_v2_batch_executions SET state='retired',
+      retired_at_ms=9999999999999,retirement_kind=?,retirement_receipt_digest=?
+      WHERE batch_id=?`,
+        [terminal.kind, terminal.receiptDigest, sqliteExecution.batchId],
+      ),
+    ).rejects.toThrow();
+    expect(
+      await recordV2QueueBatchTerminal(loseOneWriteAck(sql, "SET terminal_kind = ?"), {
+        execution: sqliteExecution,
+        ...terminal,
+      }),
+    ).toBe(true);
+    expect(
+      await recordV2QueueBatchTerminal(createD1Sql(database), {
+        execution: sqliteExecution,
+        ...terminal,
+      }),
+    ).toBe(true);
+    await expect(
+      sql.run(
+        `UPDATE queue_v2_batch_executions SET state='retired',
+      retired_at_ms=9999999999999,retirement_kind=?,retirement_receipt_digest=?
+      WHERE batch_id=?`,
+        [terminal.kind, terminal.receiptDigest, sqliteExecution.batchId],
+      ),
+    ).rejects.toThrow();
+    expect(
+      await recordV2QueueBatchTerminal(sql, {
+        execution: sqliteExecution,
+        kind: "incarnation_absent",
+        receiptDigest: "f".repeat(64),
+      }),
+    ).toBe(false);
+    expect(
+      await confirmV2QueueBatchSQLiteDrained(
+        loseOneWriteAck(sql, "SET sqlite_drain_state = 'drained'"),
+        {
+          execution: sqliteExecution,
+          terminal: { ...terminal, receiptDigest: "f".repeat(64) },
+          receiptDigest: drainDigest,
+        },
+      ),
+    ).toBe(false);
+    expect(
+      await confirmV2QueueBatchSQLiteDrained(createD1Sql(database), {
+        execution: sqliteExecution,
+        terminal,
+        receiptDigest: drainDigest,
+      }),
+    ).toBe(true);
+    expect(
+      await confirmV2QueueBatchSQLiteDrained(sql, {
+        execution: sqliteExecution,
+        terminal,
+        receiptDigest: drainDigest,
+      }),
+    ).toBe(true);
+    expect(
+      await confirmV2QueueBatchSQLiteDrained(sql, {
+        execution: sqliteExecution,
+        terminal,
+        receiptDigest: `sha256:${"f".repeat(64)}`,
+      }),
+    ).toBe(false);
+    expect(
+      await confirmV2QueueBatchRetirement(sql, {
+        execution: sqliteExecution,
+        kind: "incarnation_absent",
+        receiptDigest: "f".repeat(64),
+      }),
+    ).toBe("unknown");
+    expect(
+      await confirmV2QueueBatchRetirement(sql, { execution: sqliteExecution, ...terminal }),
+    ).toBe("retired");
+    expect(
+      await confirmV2QueueBatchRetirement(sql, { execution: sqliteExecution, ...terminal }),
+    ).toBe("already_retired");
+    expect(await armV2QueueBatchSQLiteExternalUse(sql, sqliteExecution)).toBe(false);
   } finally {
     await runtime.dispose();
   }
-});
+}, 30_000);

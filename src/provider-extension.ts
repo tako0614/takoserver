@@ -271,11 +271,17 @@ export {
 } from "./takoform/provider-delete-subeffect.ts";
 export { isSpaceId } from "./takoform/space-id.ts";
 export {
+  armV2QueueBatchSQLiteExternalUse,
   authorizeV2QueueBatchSend,
   cancelV2QueueBatchBeforeSend,
   confirmV2QueueBatchRetirement,
+  confirmV2QueueBatchSQLiteDrained,
   createV2QueueDelivery,
+  readV2QueueBatchSQLiteCustody,
+  recordV2QueueBatchTerminal,
   type V2QueueBatchExecutionIdentity,
+  type V2QueueBatchSQLiteCustody,
+  type V2QueueBatchTerminal,
   verifyV2QueueSettlementScope,
 } from "./takoform-v2/worker-queue-delivery.ts";
 export {

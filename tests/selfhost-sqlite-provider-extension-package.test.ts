@@ -4,6 +4,7 @@ import * as selfhost from "@takoserver/core/provider-extension/selfhost";
 import {
   createSelfhostV2SQLiteStore,
   createSelfhostV2SqliteBindingBroker,
+  createSelfhostV2SqliteQueueBindingBroker,
   createWorkerdWorkerModuleInspector,
   SELFHOST_DATA_PLANE_CONTENT_TYPE,
   SELFHOST_DATA_PLANE_PROTOCOL,
@@ -34,12 +35,16 @@ test("Node selfhost extension exposes the existing SQLite store and guarded brok
       "createSelfhostContainerRuntime",
       "createSelfhostV2SQLiteStore",
       "createSelfhostV2SqliteBindingBroker",
+      "createSelfhostV2SqliteQueueBindingBroker",
       "createWorkerdWorkerModuleInspector",
     ].sort(),
   );
   expect(createWorkerdWorkerModuleInspector).toBe(existingWorkerdInspector);
   expect(selfhost.createSelfhostV2SQLiteStore).toBe(createSelfhostV2SQLiteStore);
   expect(selfhost.createSelfhostV2SqliteBindingBroker).toBe(createSelfhostV2SqliteBindingBroker);
+  expect(selfhost.createSelfhostV2SqliteQueueBindingBroker).toBe(
+    createSelfhostV2SqliteQueueBindingBroker,
+  );
   expect(new SelfhostV2SQLiteStoreError("busy")).toMatchObject({ code: "busy" });
   expect(SELFHOST_DATA_PLANE_PROTOCOL).toBe("takoserver.selfhost-data@v1");
   expect(SELFHOST_DATA_PLANE_SQL_PATH).toBe("/.well-known/takoserver/selfhost-data/v1/sql");
