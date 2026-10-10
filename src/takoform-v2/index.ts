@@ -18,7 +18,9 @@ export {
 export {
   createV2ActorNamespaceForm,
   type V2ActorAcceptedOperationRuntimeObserver,
+  type V2ActorNamespaceNativeSnapshot,
   type V2ActorNamespacePhysicalPort,
+  type V2ActorNamespaceProviderPort,
   type V2ActorNamespaceRuntimeObservation,
   type V2ActorNamespaceRuntimeTarget,
   type V2ActorNamespaceScope,
@@ -50,6 +52,7 @@ export {
   type V2HeldArtifactSourceOptions,
 } from "./forms/artifact-source.ts";
 export { AT_LEAST_ONCE_QUEUE_FORM_URL } from "./forms/at-least-once-queue.ts";
+export { DURABLE_WORKFLOW_FORM_URL } from "./forms/durable-workflow.ts";
 export {
   EDGE_KV_NAMESPACE_FORM_URL,
   EDGE_KV_NAMESPACE_LIMITS,
@@ -249,12 +252,18 @@ export {
   type V2WorkerVersionSealedInputs,
 } from "./worker-version-configured-inputs.ts";
 export {
+  createDurableWorkflowForm,
+  DURABLE_WORKFLOW_BACKEND_ID,
+  type V2WorkflowClassAdmission,
+} from "./workflow-backend.ts";
+export {
   createV2WorkflowBindingAuthority,
   type V2WorkflowBindingClaim,
   type V2WorkflowBindingResolution,
   type V2WorkflowBindingTarget,
   type V2WorkflowBindingVersionIdentitySource,
 } from "./workflow-binding-authority.ts";
+export { createV2WorkflowClassAdmission } from "./workflow-class-admission.ts";
 export {
   createV2WorkflowSelectedMaterials,
   type V2WorkflowAcceptedResource,

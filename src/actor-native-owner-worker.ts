@@ -556,7 +556,24 @@ export function createActorNativeOwner(
   readCurrentGraph?: (env: Record<string, unknown>) => Promise<ActorOwnerGraph>,
   selected?: ActorAbiProfile,
   observationSecret?: string,
+  authorizeObservation?: (input: {
+    readonly request: Request;
+    readonly encodedActorId: string;
+    readonly actorId: string;
+    readonly env: Record<string, unknown>;
+  }) => Promise<
+    | (() => Promise<boolean>)
+    | {
+        /** Exact request-held authority, rechecked around the native snapshot. */
+        readonly guard: () => Promise<boolean>;
+        /** Host-held graph for this observation only; application turns stay settled-only. */
+        readonly readGraph: () => Promise<ActorOwnerGraph>;
+      }
+    | null
+  >,
 ) {
+  if (observationSecret !== undefined && authorizeObservation !== undefined)
+    throw new Error("Actor observation authority is ambiguous");
   const profile = actorAbiProfile(selected);
   const expectedObservationBearer =
     observationSecret === undefined ? undefined : actorAlarmBearer(observationSecret);
@@ -708,14 +725,35 @@ export function createActorNativeOwner(
         if (this.poisoned || !this.state.getWebSockets) return new Response(null, { status: 503 });
         const encodedId = request.headers.get(ID_HEADER);
         if (!encodedId) return new Response(null, { status: 503 });
-        if (
-          !expectedObservationBearer ||
-          request.headers.get(TOKEN_HEADER) !== (await expectedObservationBearer(encodedId))
-        )
-          return new Response(null, { status: 404 });
         const actorId = decodeURIComponent(encodedId);
         if (!actorId || actorId.includes("\u0000")) return new Response(null, { status: 503 });
-        const graph = await this.currentGraph();
+        const authorized = authorizeObservation
+          ? await authorizeObservation({
+              request,
+              encodedActorId: encodedId,
+              actorId,
+              env: this.env,
+            })
+          : expectedObservationBearer &&
+              request.headers.get(TOKEN_HEADER) === (await expectedObservationBearer(encodedId))
+            ? async () => true
+            : null;
+        const guard = typeof authorized === "function" ? authorized : authorized?.guard;
+        if (!guard || !(await guard())) return new Response(null, { status: 404 });
+        const readObservedGraph = async (): Promise<ActorOwnerGraph> => {
+          if (typeof authorized === "function" || !authorized) return this.currentGraph();
+          const selected = await authorized.readGraph();
+          if (!validActorOwnerGraph(selected)) throw new Error("Actor graph unavailable");
+          const variantKeys: string[] = [];
+          for (let index = 0; index < selected.variantKeys.length; index += 1)
+            variantKeys[index] = selected.variantKeys[index] as string;
+          return {
+            generationKey: selected.generationKey,
+            epoch: selected.epoch,
+            variantKeys,
+          };
+        };
+        const graph = await readObservedGraph();
         const alarm = this.readAlarm();
         if (alarm.actorId !== null && alarm.actorId !== actorId)
           return new Response(null, { status: 503 });
@@ -731,11 +769,16 @@ export function createActorNativeOwner(
         socketIds.sort();
         for (let index = 1; index < socketIds.length; index += 1)
           if (socketIds[index] === socketIds[index - 1]) return new Response(null, { status: 503 });
-        const again = await this.currentGraph();
+        const again = await readObservedGraph();
+        let variantsChanged = again.variantKeys.length !== graph.variantKeys.length;
+        for (let index = 0; !variantsChanged && index < graph.variantKeys.length; index += 1)
+          variantsChanged = again.variantKeys[index] !== graph.variantKeys[index];
         if (
           this.poisoned ||
           again.epoch !== graph.epoch ||
-          again.generationKey !== graph.generationKey
+          again.generationKey !== graph.generationKey ||
+          variantsChanged ||
+          !(await guard())
         )
           return new Response(null, { status: 503 });
         return Response.json({

@@ -267,3 +267,105 @@ test("native Actor observation counts a held response producer as one active Act
     database.close();
   }
 });
+
+test("Host-authorized native observation rechecks a held guard and keeps the snapshot private", async () => {
+  const database = new Database(":memory:");
+  const actorId = "held/actor";
+  const encodedId = encodeURIComponent(actorId);
+  let current = true;
+  let revokeAfterFirst = false;
+  let calls = 0;
+  const Owner = createActorNativeOwner(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    async () => ({}),
+    async () => ({ generationKey: "d".repeat(64), epoch: "native", variantKeys: ["default"] }),
+    undefined,
+    undefined,
+    async ({ request, actorId: authorizedId, encodedActorId, env }) => {
+      if (
+        authorizedId !== actorId ||
+        encodedActorId !== encodedId ||
+        request.headers.get("x-held-operation") !== "exact-lease" ||
+        env.CLASS === undefined
+      )
+        return null;
+      return {
+        guard: async () => {
+          calls += 1;
+          return current && (!revokeAfterFirst || calls % 2 === 1);
+        },
+        readGraph: async () => ({
+          generationKey: "e".repeat(64),
+          epoch: "held-native",
+          variantKeys: ["held-default"],
+        }),
+      };
+    },
+  );
+  const owner = new Owner(
+    {
+      facets: { get: () => ({ fetch: async () => new Response("application") }), abort() {} },
+      storage: {
+        sql: {
+          exec: (sql, ...params) => database.query(sql).all(...params) as Record<string, unknown>[],
+        },
+        setAlarm() {},
+        deleteAlarm() {},
+      },
+      getWebSockets: () => [],
+      waitUntil() {},
+    },
+    { CLASS: {} },
+  );
+  const observe = (lease?: string) =>
+    owner.fetch(
+      new Request("http://actor.invalid/__actor_observe__", {
+        method: "POST",
+        headers: {
+          "x-takoserver-private-actor-id": encodedId,
+          "x-takoserver-private-actor-observation": "snapshot-v1",
+          ...(lease ? { "x-held-operation": lease } : {}),
+        },
+      }),
+    );
+  try {
+    expect((await observe()).status).toBe(404);
+    expect((await observe("wrong-lease")).status).toBe(404);
+    const confirmed = await observe("exact-lease");
+    expect(confirmed.status).toBe(200);
+    expect(await confirmed.json()).toMatchObject({
+      actorId,
+      generationKey: "e".repeat(64),
+      epoch: "held-native",
+    });
+    expect(calls).toBe(2);
+    revokeAfterFirst = true;
+    expect((await observe("exact-lease")).status).toBe(503);
+    expect(calls).toBe(4);
+    revokeAfterFirst = false;
+    current = false;
+    expect((await observe("exact-lease")).status).toBe(404);
+    expect(calls).toBe(5);
+  } finally {
+    database.close();
+  }
+});
+
+test("native observation refuses simultaneous bearer and Host callback authorities", () => {
+  expect(() =>
+    createActorNativeOwner(
+      "a".repeat(64),
+      "b".repeat(64),
+      { generationKey: "g", epoch: "e", variantKeys: ["default"] },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "c".repeat(64),
+      async () => async () => true,
+    ),
+  ).toThrow("Actor observation authority is ambiguous");
+});

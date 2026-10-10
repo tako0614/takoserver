@@ -87,6 +87,50 @@ export interface V2ActorNamespaceWarmCandidate {
   readonly stillAuthorized: (signal: AbortSignal) => Promise<boolean>;
 }
 
+/** Host-private, exact native Worker publication. No Workerd site or socket is inferred. */
+export interface V2ActorNamespaceNativeSnapshot {
+  readonly scope: V2ActorNamespaceScope;
+  readonly workerUid: string;
+  readonly className: string;
+  readonly targetKey: string;
+  readonly sourceOperationId: string;
+  readonly incarnationId: string;
+  readonly generation: string;
+  readonly generationKey: string;
+  readonly hostnames: readonly string[];
+  readonly versions: V2ActorNamespaceRuntimeTarget["versions"];
+}
+
+/** Provider owns its native code/graph readback; Core owns accepted SQL and fences. */
+export interface V2ActorNamespaceProviderPort {
+  observeNativeForAcceptedOperation(input: {
+    readonly scope: V2ActorNamespaceScope;
+    /** Held Namespace Operation, distinct from the native Worker publisher. */
+    readonly operation: { readonly operationId: string; readonly leaseToken: string };
+    readonly workerUid: string;
+    readonly className: string;
+    readonly targetKey: string;
+    readonly sourceOperationId: string;
+  }): Promise<
+    | { readonly kind: "unknown" }
+    | { readonly kind: "ready"; readonly snapshot: V2ActorNamespaceNativeSnapshot }
+  >;
+  observeNamespaceRuntimeForAcceptedOperation(
+    scope: V2ActorNamespaceScope,
+    snapshot: V2ActorNamespaceNativeSnapshot,
+    signal: AbortSignal,
+  ): Promise<V2ActorNamespaceRuntimeObservation>;
+  warmNamespaceForAcceptedOperation(
+    scope: V2ActorNamespaceScope,
+    candidate: {
+      readonly graph: ActorExecutionGraph;
+      readonly snapshot: V2ActorNamespaceNativeSnapshot;
+      readonly stillAuthorized: (signal: AbortSignal) => Promise<boolean>;
+    },
+    signal: AbortSignal,
+  ): Promise<V2ActorNamespaceRuntimeObservation>;
+}
+
 /** Physical ownership/readback port; the backend retains SQL and claim authority. */
 export interface V2ActorNamespacePhysicalPort {
   registerNamespace(
@@ -169,19 +213,20 @@ interface ActorOwner {
  * A missing Session may only be warmed under this backend's held Operation;
  * ordinary event delivery retains the strict settled graph reader.
  */
-export function createV2ActorNamespaceForm(options: {
+export function createV2ActorNamespaceForm(configuration: {
   readonly sql: Sql;
   readonly targetKey: string;
   readonly bundleCustody: Pick<WorkerBundleCustody, "readHeldVerified">;
   readonly inspector: Pick<WorkerModuleSemanticInspector, "inspectActorClass">;
   readonly physical: V2ActorNamespacePhysicalPort;
   readonly ownerForWorker?: (workerUid: string) => Promise<ActorOwner | null>;
+  readonly providerNative?: V2ActorNamespaceProviderPort;
   readonly acceptedGraph?: {
     readAcceptedOperationGraph(
       scope: ActorExecutionGraph["scope"],
       operation: { readonly operationId: string; readonly leaseToken: string },
     ): Promise<ActorExecutionGraph | null>;
-    acceptedOperationRealization(
+    acceptedOperationRealization?(
       native: Extract<
         Awaited<ReturnType<NonNullable<ActorOwner["observeActorGraphForAcceptedOperation"]>>>,
         { readonly kind: "ready" }
@@ -189,6 +234,9 @@ export function createV2ActorNamespaceForm(options: {
     ): ActorExecutionRealization;
   };
 }): V2Form {
+  // The Host selects this composition once. An awaited provider cannot retarget
+  // an in-flight accepted Operation by mutating the factory's option bag.
+  const options = Object.freeze({ ...configuration });
   if (!options.targetKey) throw new TypeError("Actor targetKey is required");
   const deleteGraph = createV2ActorNamespaceSqlGraphReader({
     sql: options.sql,
@@ -555,7 +603,7 @@ export function createV2ActorNamespaceForm(options: {
   ): Promise<V2BackendResult> => {
     const observe = options.physical.observeNamespaceRuntimeForAcceptedOperation;
     const warm = options.physical.warmNamespaceForAcceptedOperation;
-    if (!observe || !warm || !options.ownerForWorker || !options.acceptedGraph) return UNKNOWN;
+    if (!options.acceptedGraph) return UNKNOWN;
     const accepted = await options.acceptedGraph.readAcceptedOperationGraph(scope, {
       operationId: execution.operationId,
       leaseToken: execution.leaseToken,
@@ -566,6 +614,12 @@ export function createV2ActorNamespaceForm(options: {
       accepted.className !== spec.className
     )
       return UNKNOWN;
+    const acceptedAuthorityKey = accepted.authorityKey;
+    const heldGraph: ActorExecutionGraph = Object.freeze({
+      ...accepted,
+      scope: Object.freeze({ ...accepted.scope }),
+      authorityKey: acceptedAuthorityKey,
+    });
     const admission = await prepareV2ActorNamespaceAdmission({
       sql: options.sql,
       bundleCustody: options.bundleCustody,
@@ -580,6 +634,172 @@ export function createV2ActorNamespaceForm(options: {
     const source = await activeSourceOperation(execution, spec.worker.resourceUid);
     if (!source) return UNKNOWN;
     const sourceOperationId = source.sourceOperationId;
+    if (options.providerNative) {
+      const provider = options.providerNative;
+      const readSnapshot = () =>
+        provider.observeNativeForAcceptedOperation({
+          scope,
+          operation: Object.freeze({
+            operationId: execution.operationId,
+            leaseToken: execution.leaseToken,
+          }),
+          workerUid: spec.worker.resourceUid,
+          className: spec.className,
+          targetKey: options.targetKey,
+          sourceOperationId,
+        });
+      const read = await readSnapshot();
+      if (read.kind !== "ready") return UNKNOWN;
+      const captured = structuredClone(read.snapshot);
+      const matchingSnapshot = (candidate: V2ActorNamespaceNativeSnapshot): boolean =>
+        candidate.scope.tenantId === scope.tenantId &&
+        candidate.scope.namespaceResourceUid === scope.namespaceResourceUid &&
+        candidate.workerUid === spec.worker.resourceUid &&
+        candidate.className === spec.className &&
+        candidate.targetKey === options.targetKey &&
+        candidate.sourceOperationId === sourceOperationId &&
+        candidate.generation === `takoserver-v2-operation:${sourceOperationId}` &&
+        typeof candidate.incarnationId === "string" &&
+        candidate.incarnationId.length > 0 &&
+        typeof candidate.generationKey === "string" &&
+        candidate.generationKey.length > 0 &&
+        canonicalJson(candidate.hostnames) === canonicalJson(source.hostnames) &&
+        Array.isArray(candidate.versions) &&
+        candidate.versions.length === source.versions.length &&
+        candidate.versions.every(
+          (version) =>
+            typeof version.versionId === "string" &&
+            version.versionId.length > 0 &&
+            typeof version.workerVersionUid === "string" &&
+            Number.isSafeInteger(version.weight) &&
+            version.weight > 0,
+        ) &&
+        new Set(candidate.versions.map((version) => version.versionId)).size ===
+          candidate.versions.length &&
+        canonicalJson(
+          candidate.versions
+            .map(({ workerVersionUid, weight }) => ({ workerVersionUid, weight }))
+            .sort((left, right) => left.workerVersionUid.localeCompare(right.workerVersionUid)),
+        ) === canonicalJson(source.versions);
+      if (!matchingSnapshot(captured)) return UNKNOWN;
+      const snapshot: V2ActorNamespaceNativeSnapshot = Object.freeze({
+        scope: Object.freeze({ ...captured.scope }),
+        workerUid: captured.workerUid,
+        className: captured.className,
+        targetKey: captured.targetKey,
+        sourceOperationId: captured.sourceOperationId,
+        incarnationId: captured.incarnationId,
+        generation: captured.generation,
+        generationKey: captured.generationKey,
+        hostnames: Object.freeze([...captured.hostnames]),
+        versions: Object.freeze(captured.versions.map((version) => Object.freeze({ ...version }))),
+      });
+      const snapshotKey = canonicalJson(snapshot);
+      const captureObservation = (
+        observed: V2ActorNamespaceRuntimeObservation,
+      ): V2ActorNamespaceRuntimeObservation =>
+        observed.kind === "confirmed" &&
+        typeof observed.epoch === "string" &&
+        observed.epoch.length > 0 &&
+        Number.isSafeInteger(observed.observedAt) &&
+        observed.observedAt >= 0 &&
+        [observed.activeActorCount, observed.pendingAlarmCount, observed.openSocketCount].every(
+          (value) => Number.isSafeInteger(value) && value >= 0,
+        )
+          ? Object.freeze({
+              kind: "confirmed",
+              epoch: observed.epoch,
+              observedAt: observed.observedAt,
+              activeActorCount: observed.activeActorCount,
+              pendingAlarmCount: observed.pendingAlarmCount,
+              openSocketCount: observed.openSocketCount,
+            })
+          : { kind: "unknown" };
+      const stillAuthorized = async (signal: AbortSignal): Promise<boolean> => {
+        signal.throwIfAborted();
+        if (
+          !(await ownsClaim(execution)) ||
+          !(await ownsReference(execution, spec.worker.resourceUid)) ||
+          !(await admissionCurrent(admission)) ||
+          canonicalJson(await activeSourceOperation(execution, spec.worker.resourceUid)) !==
+            canonicalJson(source) ||
+          (
+            await options.acceptedGraph?.readAcceptedOperationGraph(scope, {
+              operationId: execution.operationId,
+              leaseToken: execution.leaseToken,
+            })
+          )?.authorityKey !== acceptedAuthorityKey
+        )
+          return false;
+        const current = await readSnapshot();
+        signal.throwIfAborted();
+        if (
+          current.kind !== "ready" ||
+          !matchingSnapshot(current.snapshot) ||
+          canonicalJson(current.snapshot) !== snapshotKey
+        )
+          return false;
+        return (
+          (await ownsClaim(execution)) &&
+          (await ownsReference(execution, spec.worker.resourceUid)) &&
+          (await admissionCurrent(admission)) &&
+          canonicalJson(await activeSourceOperation(execution, spec.worker.resourceUid)) ===
+            canonicalJson(source) &&
+          (
+            await options.acceptedGraph?.readAcceptedOperationGraph(scope, {
+              operationId: execution.operationId,
+              leaseToken: execution.leaseToken,
+            })
+          )?.authorityKey === acceptedAuthorityKey
+        );
+      };
+      const signal = AbortSignal.timeout(30_000);
+      if (!(await stillAuthorized(signal))) return UNKNOWN;
+      await options.physical.registerNamespace(scope, {
+        operationId: execution.operationId,
+        leaseToken: execution.leaseToken,
+      });
+      if (!(await stillAuthorized(signal))) return UNKNOWN;
+      let first = captureObservation(
+        await provider.observeNamespaceRuntimeForAcceptedOperation(scope, snapshot, signal),
+      );
+      if (first.kind !== "confirmed")
+        first = captureObservation(
+          await provider.warmNamespaceForAcceptedOperation(
+            scope,
+            { graph: heldGraph, snapshot, stillAuthorized },
+            signal,
+          ),
+        );
+      if (first.kind !== "confirmed" || !first.epoch || !(await stillAuthorized(signal)))
+        return UNKNOWN;
+      const second = captureObservation(
+        await provider.observeNamespaceRuntimeForAcceptedOperation(scope, snapshot, signal),
+      );
+      if (
+        second.kind !== "confirmed" ||
+        second.epoch !== first.epoch ||
+        !(await stillAuthorized(signal))
+      )
+        return UNKNOWN;
+      return {
+        kind: "complete",
+        observed: {
+          ready: true,
+          activeActorCount: second.activeActorCount,
+          pendingAlarmCount: second.pendingAlarmCount,
+          openSocketCount: second.openSocketCount,
+        },
+        output: {},
+      };
+    }
+    if (
+      !observe ||
+      !warm ||
+      !options.ownerForWorker ||
+      !options.acceptedGraph.acceptedOperationRealization
+    )
+      return UNKNOWN;
     const owner = await options.ownerForWorker(spec.worker.resourceUid);
     if (!owner || owner.workerResourceUid !== spec.worker.resourceUid) return UNKNOWN;
     const serving = await owner.observeServing({
@@ -655,7 +875,7 @@ export function createV2ActorNamespaceForm(options: {
             operationId: execution.operationId,
             leaseToken: execution.leaseToken,
           })
-        )?.authorityKey !== accepted.authorityKey
+        )?.authorityKey !== acceptedAuthorityKey
       )
         return false;
       const currentServing = await owner.observeServing({
@@ -705,7 +925,7 @@ export function createV2ActorNamespaceForm(options: {
             operationId: execution.operationId,
             leaseToken: execution.leaseToken,
           })
-        )?.authorityKey === accepted.authorityKey
+        )?.authorityKey === acceptedAuthorityKey
       );
     };
     const signal = AbortSignal.timeout(30_000);
@@ -720,7 +940,7 @@ export function createV2ActorNamespaceForm(options: {
       first = await warm(
         scope,
         {
-          graph: accepted,
+          graph: heldGraph,
           realization: options.acceptedGraph.acceptedOperationRealization(native),
           expected,
           stillAuthorized,
@@ -774,7 +994,10 @@ export function createV2ActorNamespaceForm(options: {
     } catch {
       return UNKNOWN;
     }
-    const scope = { tenantId: execution.principal, namespaceResourceUid: execution.resourceUid };
+    const scope = Object.freeze({
+      tenantId: execution.principal,
+      namespaceResourceUid: execution.resourceUid,
+    });
     try {
       if (!(await ownsClaim(execution))) return UNKNOWN;
       if (execution.action === "delete") {

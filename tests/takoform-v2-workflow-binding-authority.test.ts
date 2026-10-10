@@ -6,6 +6,12 @@ import type { JsonObject } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import {
+  ACTOR_NAMESPACE_FORM_URL,
+  parseActorNamespaceSpec,
+  referencesForActorNamespace,
+  validateActorNamespaceUpdate,
+} from "../src/takoform-v2/forms/actor-namespace.ts";
+import {
   DURABLE_WORKFLOW_FORM_URL,
   durableWorkflowReferences,
   parseDurableWorkflowSpec,
@@ -57,6 +63,12 @@ test("an accepted Workflow UID is bindable before it is Ready, and same-spec gen
       replayWindowSeconds: 3600,
       authorize: async () => true,
       forms: {
+        [ACTOR_NAMESPACE_FORM_URL]: {
+          validateCreate: parseActorNamespaceSpec,
+          validateUpdate: validateActorNamespaceUpdate,
+          references: referencesForActorNamespace,
+          backend: complete({ ready: true }),
+        },
         [MODULE_WORKER_FORM_URL]: {
           validateCreate: parseModuleWorkerSpec,
           validateUpdate: (_previous, next) => parseModuleWorkerSpec(next),
@@ -165,6 +177,7 @@ test("an accepted Workflow UID is bindable before it is Ready, and same-spec gen
           workerVersionOperationId: version.id,
           workerVersionGeneration: 1,
           workflowBindings: [{ name: "FLOW", resourceUid: workflow.resourceUid }],
+          actorBindings: [],
         });
         return wfpNativeVersionId;
       },
@@ -176,6 +189,48 @@ test("an accepted Workflow UID is bindable before it is Ready, and same-spec gen
       className: "ReportWorkflow",
     });
     expect(identityInputs).toHaveLength(2);
+
+    const actor = await create(ACTOR_NAMESPACE_FORM_URL, "actor", {
+      worker: { resourceUid: worker.resourceUid },
+      className: "CounterActor",
+    });
+    const mixed = await create(WORKER_VERSION_FORM_URL, "mixed-version", {
+      ...versionSpec,
+      actorBindings: [{ name: "ACTOR", resource: { resourceUid: actor.resourceUid } }],
+    });
+    const mixedNativeVersionId = `v2m-${createHash("sha256")
+      .update(`${mixed.resourceUid}\u00001\u0000mixed`)
+      .digest("hex")
+      .slice(0, 48)}`;
+    const mixedAuthority = createV2WorkflowBindingAuthority({
+      sql,
+      targetKey: TARGET,
+      versionIdentity: async (source) => {
+        expect(Object.isFrozen(source)).toBe(true);
+        expect(Object.isFrozen(source.actorBindings)).toBe(true);
+        expect(source.actorBindings.every(Object.isFrozen)).toBe(true);
+        expect(source.actorBindings).toEqual([{ name: "ACTOR", resourceUid: actor.resourceUid }]);
+        const firstActorBinding = source.actorBindings[0];
+        if (!firstActorBinding) throw new Error("mixed Actor Binding missing");
+        expect(() =>
+          Object.assign(firstActorBinding, { resourceUid: "foreign-after-await" }),
+        ).toThrow();
+        await Promise.resolve();
+        expect(source.actorBindings).toEqual([{ name: "ACTOR", resourceUid: actor.resourceUid }]);
+        return mixedNativeVersionId;
+      },
+    });
+    expect(
+      await mixedAuthority.resolveCurrentBinding(
+        {
+          ...claim,
+          workerVersionUid: mixed.resourceUid,
+          workerVersionOperationId: mixed.id,
+          nativeVersionId: mixedNativeVersionId,
+        },
+        "FLOW",
+      ),
+    ).toMatchObject({ workflowResourceUid: workflow.resourceUid });
     expect(await authority.resolveCurrentBinding(wfpClaim, "FLOW")).toBeNull();
     expect(
       await wfpAuthority.resolveCurrentBinding({ ...wfpClaim, nativeVersionId }, "FLOW"),

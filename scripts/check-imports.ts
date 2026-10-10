@@ -53,9 +53,10 @@ interface Layer {
 
 const LAYERS: readonly Layer[] = [
   // v2 shares neutral primitives, not the v1 package/admission domain. The
-  // Queue Resource/Operation manager is exposed as a source-extension factory,
-  // but this does not register it in the normal Host. Keep other edges explicit
-  // so a protocol translator cannot enter unnoticed.
+  // Queue and Durable Workflow Resource/Operation managers are exposed as
+  // source-extension factories, but this does not register them in the normal
+  // Host. Keep other edges explicit so a protocol translator cannot enter
+  // unnoticed.
   {
     name: "v2-extension",
     match: /^src\/takoform-v2\/index\.ts$/u,
@@ -73,6 +74,7 @@ const LAYERS: readonly Layer[] = [
       "v2-actor-physical-backend",
       "v2-actor-binding-authority",
       "v2-workflow-binding-authority",
+      "v2-workflow-manager",
       "v2-workflow-selected-materials",
     ],
   },
