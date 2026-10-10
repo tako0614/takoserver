@@ -2970,7 +2970,24 @@ export async function openWorkerdWorkerRuntimeOwner(
         await incarnation.serviceBindingForward?.close();
         await incarnation.actorForward?.close();
         await incarnation.workflowForward?.close();
-        await persistPhysicalAbsence(incarnation.record);
+        if (
+          incarnation.record.identity === null &&
+          incarnation.record.configurationSha256 === null
+        ) {
+          // A candidate that was never activated was never a serving source:
+          // no Queue delivery names it and it has no pinned configuration to
+          // bind a physical-absence receipt to. Prove its child gone and its
+          // listener vacant instead (boot recovery retires an abandoned
+          // candidate the same way).
+          if (
+            !incarnation.record.processIdentity ||
+            (await linuxProcessLiveness(incarnation.record.processIdentity)) !== "stale" ||
+            (await workerPortOwnership(incarnation.record.listenerPort, undefined)) !== "vacant"
+          )
+            throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        } else {
+          await persistPhysicalAbsence(incarnation.record);
+        }
         await releasePrivateSockets(
           incarnation.record.operationId,
           await readFile(incarnation.group.configurationPath),
@@ -4144,6 +4161,11 @@ export async function openWorkerdWorkerRuntimeOwner(
       const existing = handles.get(execution.operationId);
       if (existing) {
         if (existing.record.status !== "candidate") {
+          // An in-process candidate failure keeps its retired handle until
+          // close; the persisted record gives the same definitive answer as
+          // after a restart.
+          const abandoned = abandonedBeforeActivation(execution);
+          if (abandoned && active !== existing) return abandoned;
           if (existing.record.status !== "active" || active !== existing)
             return { kind: "unknown" };
           const observed = await existing.publication.observe(execution);
