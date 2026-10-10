@@ -40,6 +40,13 @@ async function sparePort(): Promise<number> {
   return selected;
 }
 const operationUid = createId ?? "";
+// The Operation whose publish blocks after its candidate incarnation exists.
+const hangOperationId =
+  mode === "active-update-hang-after-candidate"
+    ? (updateId ?? null)
+    : mode === "create-hang-after-candidate"
+      ? (createId ?? null)
+      : null;
 const servingPath = join(rootDirectory, "current-serving.json");
 type CurrentServing = {
   sourceOperationId: string;
@@ -161,6 +168,14 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
         return true;
       },
       async readVersionMaterials() {
+        // Crash-window fixture: the candidate incarnation is persisted and its
+        // bootstrap child is already running when materials are first read.
+        if (hangOperationId !== null && execution.operationId === hangOperationId) {
+          await writeFile(join(rootDirectory as string, "candidate-hung.json"), "{}", {
+            mode: 0o600,
+          });
+          await new Promise<never>(() => undefined);
+        }
         return { bundle: null, assets: heldAssets };
       },
     } as V2WorkerPublicationResolution;
@@ -424,6 +439,48 @@ if (owner)
           `${JSON.stringify({ kind: "recovered-updated-deleted", body, pid: process.pid, port })}\n`,
         );
       }
+    } else if (mode === "open-only") {
+      process.stdout.write(`${JSON.stringify({ kind: "opened", pid: process.pid, port })}\n`);
+    } else if (
+      mode === "active-update-hang-after-candidate" ||
+      mode === "create-hang-after-candidate"
+    ) {
+      if (!createId) throw new Error("create operation ID missing");
+      if (mode === "active-update-hang-after-candidate") {
+        if (!updateId) throw new Error("update operation ID missing");
+        const created = await owner.execute(execution(createId, "create"));
+        if (created.kind !== "confirmed" || created.identity === null)
+          throw new Error(`fixture create was not confirmed: ${JSON.stringify(created)}`);
+        const response = await owner.fetch(new Request("http://worker.fixture.test/"));
+        await writeFile(
+          servingPath,
+          canonicalJson({
+            sourceOperationId: createId,
+            generation: execution(createId, "create").generation,
+            identity: created.identity,
+            configIdentity: await response.text(),
+            spec: execution(createId, "create").spec,
+          }),
+          { mode: 0o600 },
+        );
+      }
+      // Never awaited: it blocks inside readVersionMaterials until this host is killed.
+      void owner
+        .execute(
+          execution(
+            mode === "create-hang-after-candidate" ? createId : (updateId as string),
+            mode === "create-hang-after-candidate" ? "create" : "update",
+          ),
+        )
+        .catch(() => undefined);
+      const markerPath = join(rootDirectory as string, "candidate-hung.json");
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline && !(await Bun.file(markerPath).exists())) await Bun.sleep(5);
+      if (!(await Bun.file(markerPath).exists()))
+        throw new Error("candidate never reached publish");
+      process.stdout.write(
+        `${JSON.stringify({ kind: "candidate-hung", pid: process.pid, port })}\n`,
+      );
     } else if (mode === "replay") {
       const replayed = await owner.execute(execution(deleteId, "delete"));
       if (replayed.kind !== "confirmed" || replayed.identity !== null)

@@ -1041,7 +1041,10 @@ async function verifyKnownGroupContents(
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   });
   const retired = record.status === "retired";
-  const retirementPending = record.status === "draining" || record.status === "retiring";
+  const retirementPending =
+    record.status === "draining" ||
+    record.status === "retiring" ||
+    (record.status === "uncertain" && record.retirementOperationId !== null);
   const allowed =
     retired || retirementPending
       ? new Set([
@@ -1247,10 +1250,73 @@ async function requireSafeStateForNewOwner(
     if (allowDeleteReplayOnly) await requireVacantOwnerListeners(snapshot.state);
     return;
   }
+  if (allowProcessRecovery && neverServedResidue(snapshot.state)) {
+    await requireStaleIncarnationChildrenAndVacantListeners(snapshot.state);
+    await requireVacantOwnerListeners(snapshot.state);
+    return;
+  }
   if (!allowProcessRecovery || !recoverableIncarnationSet(snapshot.state)) {
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
   await requireStaleIncarnationChildrenAndVacantListeners(snapshot.state);
+}
+
+/**
+ * A candidate incarnation whose Host died before activation. Activation is one
+ * atomic owner-state write, so such a record never served: it has no publication
+ * identity, no pinned configuration, no receipt and no retirement, it is not the
+ * active incarnation, and its recorded child process is the only thing that
+ * could still be running. A candidate without that recorded child identity
+ * cannot be proven absent and is never abandoned.
+ */
+function abandonableCandidate(record: IncarnationRecord, state: PersistedOwnerState): boolean {
+  return (
+    record.status === "candidate" &&
+    record.operationId !== state.activeOperationId &&
+    record.processIdentity !== null &&
+    record.identity === null &&
+    record.configurationSha256 === null &&
+    !record.configurationRefreshPending &&
+    record.receipt === null &&
+    record.retirementOperationId === null &&
+    record.retireAtMs === null &&
+    !record.executionCopiesReleased &&
+    !record.executionCopiesCleanupStarted &&
+    record.executionCopiesCleanupManifestSha256 === null
+  );
+}
+
+/** An abandoned candidate retiring under its own Operation ID, possibly mid-cleanup. */
+function neverActivatedRetirement(record: IncarnationRecord): boolean {
+  return (
+    record.status === "uncertain" &&
+    record.retirementOperationId === record.operationId &&
+    record.processIdentity !== null &&
+    record.identity === null &&
+    record.configurationSha256 === null
+  );
+}
+
+/**
+ * Nothing was ever activated or is retiring: the Host died while its first
+ * publication (or a re-create after DELETE) was still a candidate.
+ */
+function neverServedResidue(state: PersistedOwnerState): boolean {
+  return (
+    state.activeOperationId === null &&
+    state.admissionClosedBy === null &&
+    !state.deletionPublicationConfirmed &&
+    state.endpointRouteAbsence === null &&
+    state.incarnations.some((record) => abandonableCandidate(record, state)) &&
+    state.incarnations.every(
+      (record) =>
+        abandonableCandidate(record, state) ||
+        neverActivatedRetirement(record) ||
+        (record.status === "retired" &&
+          record.receipt !== null &&
+          record.retirementOperationId !== null),
+    )
+  );
 }
 
 function recoverableIncarnationSet(state: PersistedOwnerState): boolean {
@@ -1269,6 +1335,7 @@ function recoverableIncarnationSet(state: PersistedOwnerState): boolean {
     if (record.status === "retired") {
       return record.receipt !== null && record.retirementOperationId !== null;
     }
+    if (abandonableCandidate(record, state) || neverActivatedRetirement(record)) return true;
     return (
       (record.status === "active" ||
         record.status === "draining" ||
@@ -1291,7 +1358,12 @@ async function requireStaleIncarnationChildrenAndVacantListeners(
 ): Promise<void> {
   const ports = new Set<number>();
   for (const record of state.incarnations) {
-    if (record.status !== "active" && record.status !== "draining" && record.status !== "retiring")
+    if (
+      record.status !== "active" &&
+      record.status !== "draining" &&
+      record.status !== "retiring" &&
+      !abandonableCandidate(record, state)
+    )
       continue;
     if (
       !record.processIdentity ||
@@ -2385,6 +2457,35 @@ export async function openWorkerdWorkerRuntimeOwner(
       options.workerResourceUid,
       ownerLock.recoveredFromStaleOwner,
     );
+    if (
+      ownerLock.recoveredFromStaleOwner &&
+      state.incarnations.some((item) => abandonableCandidate(item, state))
+    ) {
+      // The previous owner is a proven-dead process and never activated these
+      // candidates. Prove each recorded child is gone and its listener vacant
+      // before taking any decision, then durably record the retirement intent
+      // under the candidate's own Operation ID (exactly what an in-process
+      // candidate failure records). The physical retirement is finished below.
+      await requireStaleIncarnationChildrenAndVacantListeners(state);
+      const abandoning = state;
+      const converted: PersistedOwnerState = {
+        ...abandoning,
+        incarnations: abandoning.incarnations
+          .map((item) =>
+            abandonableCandidate(item, abandoning)
+              ? {
+                  ...item,
+                  status: "uncertain" as const,
+                  retirementOperationId: item.operationId,
+                }
+              : item,
+          )
+          .sort((left, right) => left.operationId.localeCompare(right.operationId))
+          .map(cloneRecord),
+      };
+      await atomicWrite(statePath, new TextEncoder().encode(canonicalJson(converted)));
+      state = converted;
+    }
     const hasServingIncarnations = state.incarnations.some(
       (item) => item.status === "active" || item.status === "draining",
     );
@@ -2491,6 +2592,37 @@ export async function openWorkerdWorkerRuntimeOwner(
     }));
   };
 
+  // The recorded child of an abandoned candidate is proven gone, but its group
+  // directory never got a retirement receipt. Reopen it as an idle recovered
+  // group (no child is started) and write the receipt, which also re-proves the
+  // pinned configuration bytes and the vacant listener.
+  const retireAbandonedCandidateGroup = async (record: IncarnationRecord): Promise<void> => {
+    const groupsRoot = join(directory, "incarnations", record.operationId, "groups");
+    const groupDirectory = join(groupsRoot, uidKey(options.workerResourceUid));
+    if (await lstat(join(groupDirectory, "retirement.json")).catch(() => null)) return;
+    if (record.processIdentity === null || record.retirementOperationId === null)
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    if (
+      (await linuxProcessLiveness(record.processIdentity)) !== "stale" ||
+      (await workerPortOwnership(record.listenerPort, undefined)) !== "vacant"
+    )
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const configuration = await readFile(join(groupDirectory, "workers", "workerd.capnp"));
+    const group = await openWorkerdWorkerExecutionGroup({
+      rootDirectory: groupsRoot,
+      workerResourceUid: options.workerResourceUid,
+      listenerPort: record.listenerPort,
+      configuration: Uint8Array.from(configuration),
+      configurationPath: "workers/workerd.capnp",
+      workerdBinary: options.workerdBinary,
+      recoverExisting: true,
+    });
+    await group.retire({
+      workerResourceUid: options.workerResourceUid,
+      operationId: record.retirementOperationId,
+    });
+  };
+
   // Retired receipts outlive their publisher process. Retry physical-copy
   // cleanup under this owner's lock before exposing any replay/observation API.
   // A still-active successor finishes its retiring predecessor only after the
@@ -2519,6 +2651,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       );
       let prepared = record;
       if (!record.executionCopiesCleanupStarted) {
+        if (neverActivatedRetirement(record)) await retireAbandonedCandidateGroup(record);
         const verified = await verifyRetiredWorkerdWorkerExecutionCopies({
           groupDirectory,
           workerResourceUid: options.workerResourceUid,
