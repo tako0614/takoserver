@@ -534,3 +534,111 @@ test("an unconfirmed send, mismatched receipt, or lost SQL fence never settles a
   expect(ownerCalls).toBe(9);
   expect(attachmentReads).toBeGreaterThan(7);
 });
+
+test("a candidate the owner retired before activation settles its Deployment Operation with no effect", async () => {
+  const operationId = "5d0f3c1e-8a2b-4c7d-9e6f-1a2b3c4d5e6f";
+  const workerUid = "worker-backend-abandoned";
+  const versionUid = "version-backend-abandoned";
+  const spec = parseWorkerDeploymentSpec({
+    worker: { resourceUid: workerUid },
+    versions: [{ workerVersion: { resourceUid: versionUid }, weight: 10_000 }],
+  });
+  const versionSpec = parseWorkerVersionSpec({
+    worker: { resourceUid: workerUid },
+    handlers: [],
+    assets: {
+      bundle: { resourceUid: "assets-backend-abandoned" },
+      runWorkerFirst: false,
+      notFoundHandling: "none",
+    },
+  });
+  const execution: V2Execution = {
+    operationId,
+    leaseToken: "lease-backend-abandoned",
+    backendKey: "backend-key-backend-abandoned",
+    backendId: "selfhost-v2-worker-deployment-owner-v1",
+    targetKey: TARGET_KEY,
+    resourceUid: "deployment-backend-abandoned",
+    principal: "org-fixture",
+    action: "update",
+    generation: 2,
+    form: WORKER_DEPLOYMENT_FORM_URL,
+    space: "prod",
+    name: "deployment",
+    spec: spec as unknown as JsonObject,
+    previousObserved: {},
+    previousOutput: {},
+  };
+  const snapshot = {
+    sourceOperationId: operationId,
+    worker: {
+      uid: workerUid,
+      principal: execution.principal,
+      space: execution.space,
+      generation: 1,
+    },
+    deployment: {
+      uid: execution.resourceUid,
+      generation: 2,
+      spec,
+      versions: [
+        {
+          uid: versionUid,
+          sourceOperationId: "fixture-version-operation",
+          generation: 1,
+          weight: 10_000,
+          spec: versionSpec,
+        },
+      ],
+    },
+    endpoint: null,
+  };
+  let fenceCurrent = true;
+  let result: Awaited<ReturnType<WorkerdWorkerRuntimeOwner["execute"]>> = {
+    kind: "abandoned_before_activation",
+    operationId,
+  };
+  const form = createWorkerDeploymentForm({
+    targetKey: TARGET_KEY,
+    publicationState: {
+      resolve: async () =>
+        ({
+          kind: "ready",
+          snapshot,
+          sqlGuard: { sql: "1", params: [] },
+          stillCurrent: async () => fenceCurrent,
+          readVersionMaterials: async () => ({ bundle: null, assets: null }),
+        }) as V2WorkerPublicationResolution,
+    },
+    scheduledAttachments: {
+      async requiresScheduledHandler() {
+        return {
+          kind: "ready" as const,
+          required: false,
+          attachmentUids: [],
+          stillCurrent: async () => true,
+        };
+      },
+    },
+    ownerForWorker: () => ({
+      workerResourceUid: workerUid,
+      async execute() {
+        return result;
+      },
+    }),
+  });
+  // Reconcile after the Host restarted: the owner's proof is definitive.
+  expect(await form.backend.reconcile(execution)).toEqual({
+    kind: "no_effect",
+    code: "worker_incarnation_retired_before_activation",
+    message:
+      "This publication's Worker incarnation was retired before it was activated; nothing it published served. Re-apply to retry.",
+  });
+  // The proof must name this exact Operation.
+  result = { kind: "abandoned_before_activation", operationId: "other-operation" };
+  expect(await form.backend.reconcile(execution)).toMatchObject({ kind: "unknown" });
+  // A lost SQL fence keeps the outcome unknown.
+  result = { kind: "abandoned_before_activation", operationId };
+  fenceCurrent = false;
+  expect(await form.backend.reconcile(execution)).toMatchObject({ kind: "unknown" });
+});

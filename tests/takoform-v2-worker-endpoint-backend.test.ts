@@ -423,3 +423,121 @@ async function exerciseEndpoint(deleteDeploymentFirst: boolean): Promise<void> {
 test("accepted Endpoint deletes its route with an active Deployment", () =>
   exerciseEndpoint(false));
 test("accepted Endpoint deletes its route after Deployment deletion", () => exerciseEndpoint(true));
+
+for (const action of ["create", "update", "delete"] as const) {
+  test(`an Endpoint ${action} whose candidate the owner retired before activation settles with no effect`, async () => {
+    const operationId = "6e1a2b3c-4d5e-4f6a-8b7c-9d0e1f2a3b4c";
+    const workerUid = "worker-endpoint-abandoned";
+    const endpointUid = "endpoint-backend-abandoned";
+    const address = { hostname: HOSTNAME, url: `https://${HOSTNAME}/` };
+    const deploymentSpec = parseWorkerDeploymentSpec({
+      worker: { resourceUid: workerUid },
+      versions: [{ workerVersion: { resourceUid: "version-endpoint-abandoned" }, weight: 10_000 }],
+    });
+    const execution: V2Execution = {
+      operationId,
+      leaseToken: "lease-endpoint-abandoned",
+      backendKey: "backend-key-endpoint-abandoned",
+      backendId: "selfhost-v2-worker-endpoint-owner-v1",
+      targetKey: TARGET_KEY,
+      resourceUid: endpointUid,
+      principal: "org-fixture",
+      action,
+      generation: action === "create" ? 1 : 2,
+      form: WORKER_ENDPOINT_FORM_URL,
+      space: "prod",
+      name: "endpoint",
+      spec: { worker: { resourceUid: workerUid } },
+      previousObserved: {},
+      previousOutput: address,
+    };
+    const snapshot = {
+      sourceOperationId: operationId,
+      acceptedEndpointOutput: address,
+      worker: { uid: workerUid, principal: "org-fixture", space: "prod", generation: 1 },
+      deployment: {
+        uid: "deployment-endpoint-abandoned",
+        generation: 1,
+        spec: deploymentSpec,
+        versions: [],
+      },
+      endpoint:
+        action === "delete"
+          ? null
+          : {
+              uid: endpointUid,
+              generation: execution.generation,
+              spec: { worker: { resourceUid: workerUid } },
+              output: address,
+            },
+    };
+    let fenceCurrent = true;
+    let result: V2WorkerRuntimeOwnerExecutionResult = {
+      kind: "abandoned_before_activation",
+      operationId,
+    };
+    let tlsReads = 0;
+    let routeReads = 0;
+    const form = createWorkerEndpointForm({
+      targetKey: TARGET_KEY,
+      publicationState: {
+        resolve: async () =>
+          ({
+            kind: "ready",
+            snapshot,
+            sqlGuard: { sql: "1", params: [] },
+            stillCurrent: async () => fenceCurrent,
+            readVersionMaterials: async () => ({ bundle: null, assets: null }),
+          }) as never,
+      },
+      ownerForWorker: () => ({ workerResourceUid: workerUid, execute: async () => result }),
+      assignHostname: () => HOSTNAME,
+      observeTls: async (input) => {
+        tlsReads += 1;
+        return { ...input, ready: true };
+      },
+      observeRouteAbsent: async (input) => {
+        routeReads += 1;
+        return { ...input, absent: true };
+      },
+    });
+    expect(await form.backend.reconcile(execution)).toEqual({
+      kind: "no_effect",
+      code: "worker_incarnation_retired_before_activation",
+      message:
+        "This publication's Worker incarnation was retired before it was activated; nothing it published served. Re-apply to retry.",
+    });
+    // The owner's proof settles it: no frontend observation is consulted.
+    expect({ tlsReads, routeReads }).toEqual({ tlsReads: 0, routeReads: 0 });
+    // The proof must name this exact Operation.
+    result = { kind: "abandoned_before_activation", operationId: "other-operation" };
+    expect(await form.backend.reconcile(execution)).toMatchObject({ kind: "unknown" });
+    // A SQL fence lost after the owner answered keeps the outcome unknown.
+    result = { kind: "abandoned_before_activation", operationId };
+    let checks = 0;
+    fenceCurrent = true;
+    const losingForm = createWorkerEndpointForm({
+      targetKey: TARGET_KEY,
+      publicationState: {
+        resolve: async () =>
+          ({
+            kind: "ready",
+            snapshot,
+            sqlGuard: { sql: "1", params: [] },
+            // Current for the checks before the owner call, then lost.
+            stillCurrent: async () => {
+              checks += 1;
+              return checks <= 2;
+            },
+            readVersionMaterials: async () => ({ bundle: null, assets: null }),
+          }) as never,
+      },
+      ownerForWorker: () => ({ workerResourceUid: workerUid, execute: async () => result }),
+      assignHostname: () => HOSTNAME,
+      observeTls: async (input) => ({ ...input, ready: true }),
+      observeRouteAbsent: async (input) => ({ ...input, absent: true }),
+    });
+    expect(await losingForm.backend.reconcile(execution)).toMatchObject({ kind: "unknown" });
+    expect(checks).toBe(3);
+  });
+}

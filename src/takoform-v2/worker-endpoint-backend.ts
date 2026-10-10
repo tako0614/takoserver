@@ -168,6 +168,23 @@ export function createWorkerEndpointForm(options: {
     } catch {
       return unknown();
     }
+    if (result.kind === "abandoned_before_activation") {
+      // The owner proved this Operation's only incarnation never served and
+      // retired it; nothing it published can still arrive. Settle with no
+      // effect: the Endpoint stays as of its last committed generation and a
+      // re-apply (or a re-issued DELETE) can retry. An Endpoint DELETE that
+      // still has a Deployment publishes its hostname-less graph through a
+      // candidate exactly like an update, so it settles the same way; the
+      // committed incarnation keeps its hostname.
+      if (result.operationId !== execution.operationId || !(await before.stillCurrent()))
+        return unknown();
+      return {
+        kind: "no_effect",
+        code: "worker_incarnation_retired_before_activation",
+        message:
+          "This publication's Worker incarnation was retired before it was activated; nothing it published served. Re-apply to retry.",
+      };
+    }
     // `not_dispatched` describes this invocation only, never earlier effects.
     // `confirmed` identity:null is Deployment teardown, not Endpoint proof.
     const after = await options.publicationState.resolve({

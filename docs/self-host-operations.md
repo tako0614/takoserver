@@ -472,17 +472,114 @@ reboot or an operator disaster-recovery drill. Messages in flight at the
 crash are redelivered at least once, and a batch reserved but not yet sent is
 held for its 120 second reservation before redelivery.
 
-Known gaps this test records, not fixes:
+What this test and its neighbours record:
 
-- **A pending Deployment or Endpoint Operation blocks restart.** If the Host
-  stops (SIGKILL, or a graceful SIGTERM) while a WorkerDeployment or
-  WorkerEndpoint Operation for a published Worker is queued, boot restore asks
-  for the current-serving proof, which is refused while such an Operation is
-  pending, and the Operation only runs after restore. The Host exits with
-  `ownership_uncertain` on every start and the installation needs manual
-  repair. The data is left untouched. The second test in that file pins this
-  fail-closed behaviour so that a fix has to update it.
-Three gaps this test first recorded have since been fixed, each with its own
+- **A Host stopped during a Deployment or Endpoint Operation: which windows
+  recover.** The runtime owner persists a candidate incarnation (and then its
+  child process identity) before any native effect, and activates it with one
+  atomic owner-state write that also demotes the incumbent. So at any stop the
+  committed incumbent is the only thing that served, and a candidate that was
+  not activated never served. Recovery relies only on that durable state, and
+  only the owner's boot recovery may ask the current-serving fence for this
+  tolerance (a dedicated reader method; every other reader is strict):
+  - *Queued* (accepted, no dispatch recorded): boot adopts the incarnation that
+    was serving; the Operation runs once afterwards (three real-Host tests).
+  - *Dispatched, owner untouched* (`reconciling`, but the owner persisted
+    nothing): the owner vouches that the Operation never served, boot adopts the
+    serving incarnation, and the engine re-drives the Operation once through a
+    fresh incarnation (a test simulates the two engine writes that precede the
+    native send).
+  - *Candidate persisted, not activated* (a real SIGKILL once the owner holds a
+    candidate and its child): on a stale-owner takeover the owner proves the
+    recorded child is dead and its listener vacant, records the retirement under
+    the candidate's own Operation ID, writes the group's retirement receipt
+    without starting a child, and finishes the normal retired-copy cleanup. The
+    Operation ID is never given a second incarnation: when the engine re-drives
+    the Operation, the owner answers with that proof and the backend settles it
+    through the normal failure path as `failed` with effect `none`
+    (`worker_incarnation_retired_before_activation`). This holds for a create,
+    an update, and an Endpoint DELETE while a Deployment exists (that DELETE
+    publishes the hostname-less graph through a candidate, like an update; the
+    committed incarnation keeps its hostname and the user re-issues the
+    DELETE). A Deployment DELETE never stages a candidate. Re-applying the
+    change publishes once. The retry waits for the killed Host's claim lease to
+    expire (about one minute), and while the Operation is pending the Worker's
+    Endpoint answers 503, as during any pending update. A candidate with no
+    recorded child identity, a live child or a foreign listener is still
+    refused, as is a record that carries a publication identity or a pinned
+    configuration (tests for each).
+  - *Killed again before the re-apply.* A first publication abandoned this way
+    leaves no active incarnation. A further SIGKILL or OOM before the user
+    re-applies, including one during the abandoning boot's own retirement step,
+    still boots: the stale-owner takeover recognises the never-activated
+    residue instead of demanding a DELETE replay (a test with two consecutive
+    real kills, and one that reproduces the durable state of a kill between
+    the retirement intent and the receipt).
+  - *Candidate failed inside a running Host.* The same proof is given without
+    a restart, so the Operation settles `failed` with effect `none` on the
+    engine's next retry (an owner and backend test). A Host killed while that
+    candidate is still being retired boots and settles it the same way (a
+    real-Host test).
+
+  A Deployment or Endpoint Operation that ends `failed` with effect `none`
+  never makes a non-committed graph serve. Until a later Operation of that
+  Resource succeeds, each surface behaves as follows (the forward-only
+  migrations whose guards decide this are not changed):
+  - *The current-serving fence* (the owner, boot recovery, the HTTPS frontend's
+    publication check) reads the attachment as of its last committed
+    generation, rebuilt from immutable Operation history, never the failed
+    spec. Measured at the fence for in-process failures of every attachment
+    shape, and end to end on a real Host for the restart case above. It covers
+    at most eight consecutive `failed`/`none` Operations of one Resource behind
+    its committed generation; a ninth makes the fence refuse again, in the
+    strict and the boot-recovery form, until a re-apply succeeds (measured for
+    the source Endpoint). A failure with effect `partial`, or any unknown or
+    non-contiguous history, is refused as before.
+  - *HTTP on the Endpoint hostname* keeps serving the committed graph after a
+    failed Deployment Operation (measured end to end). After a failed Endpoint
+    update or DELETE the hostname answers 503 until a later Endpoint Operation
+    succeeds: the frontend only routes an Endpoint Resource that is idle at its
+    observed generation with a succeeded last Operation (a frontend test pins
+    this). The owner still holds the committed incarnation.
+  - *Queue delivery pauses* when the failed Operation belongs to the Resource
+    that carries the serving source Operation (the Endpoint when an Endpoint
+    Operation published last, otherwise the Deployment). The 0083 batch
+    reservation and send-authorisation guards require that Resource idle at
+    its observed generation with the source as its last Operation, so no new
+    batch is reserved or sent; the same holds for Queue sends made from a
+    Queue handler. A failure of the other attachment does not trip those
+    guards. Code reading, not measured.
+  - *QueueConsumer create and update for the Worker are refused* after any
+    failed Deployment or Endpoint Operation (the admission predicate requires
+    the Deployment idle with a succeeded last Operation and no Worker
+    publication accepted after the serving source). Code reading.
+  - *Cron pauses* after a failed Deployment Operation: the 0089 match guard
+    requires the active Deployment idle at its observed generation with a
+    succeeded last Operation, so no match is recorded (a scheduler test pins
+    this). It does not read the Endpoint. Code reading for Cron invocation
+    admission, which requires the same of the Deployment.
+  - Queue sends made from an HTTP request are checked against the Queue, the
+    sending Version and the owner's live incarnation, not against the
+    attachments; whether they continue is not established here.
+
+  Boot recovery also accepts a re-apply that is only queued (or dispatched
+  but vouched never served) behind such failures, within the same eight
+  Operation bound, including a re-apply after a failed first create. The
+  queued cases are measured at the fence.
+
+  Still refused with `ownership_uncertain` (data untouched, manual repair): an
+  Operation the owner already activated but SQL never settled, a Deployment
+  DELETE that closed admission, a candidate whose child identity was never
+  recorded, a dispatched Operation the owner cannot vouch for, and more than
+  eight consecutive failed Operations of one attachment (the fence refusal is
+  measured; the resulting boot refusal is not). By reading the backends (not
+  measured), a Deployment or Endpoint backend answers `unknown` for every
+  refusal before it reaches the owner (an unresolved graph, a
+  `publication_conflict`), so such an Operation stays `reconciling` and keeps
+  retrying: boot is not blocked, because the owner vouches it never served,
+  but the Worker's Endpoint is not served until the Operation is settled.
+
+Three other gaps this test first recorded have since been fixed, each with its own
 test:
 
 - **Readiness observes v2 Worker owners** (see the `v2Workers` counts above).

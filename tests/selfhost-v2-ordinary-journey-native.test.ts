@@ -37,6 +37,7 @@ import {
   WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import { linuxProcessLiveness } from "../src/workerd-linux-process.ts";
 
 const OPT_IN = process.env.TAKOSERVER_V2_ENTRY_NATIVE;
 const PUBLIC_ORIGIN = "https://journey.takoserver.test";
@@ -519,6 +520,43 @@ async function settled(port: number, token: string, operationId: string): Promis
     await Bun.sleep(250);
   }
   throw new Error("journey Operation settlement deadline exceeded");
+}
+
+async function terminal(port: number, token: string, operationId: string): Promise<Json> {
+  // A killed Host's claim is retried only after its lease expires.
+  const deadline = Date.now() + 180_000;
+  while (Date.now() < deadline) {
+    const operation = await jsonAt(port, "GET", `${V2}/operations/${operationId}`, 200, undefined, {
+      authorization: `Bearer ${token}`,
+    });
+    if (operation.status === "succeeded" || operation.status === "failed") return operation;
+    await Bun.sleep(250);
+  }
+  throw new Error("journey Operation terminal deadline exceeded");
+}
+
+interface OwnerRecord {
+  readonly operationId: string;
+  readonly status: string;
+  readonly identity: unknown;
+  readonly processIdentity: { pid: number; startTimeTicks?: string; bootId?: string } | null;
+}
+
+async function ownerState(
+  root: string,
+  workerUid: string,
+): Promise<{ activeOperationId: string | null; incarnations: OwnerRecord[] }> {
+  return JSON.parse(
+    await readFile(
+      join(
+        root,
+        "v2-worker-owners",
+        createHash("sha256").update(workerUid, "utf8").digest("hex"),
+        "runtime-owner.json",
+      ),
+      "utf8",
+    ),
+  );
 }
 
 interface Environment {
@@ -1208,142 +1246,377 @@ test.skipIf(OPT_IN !== "1")(
 );
 
 /**
- * KNOWN GAP, pinned so it cannot change silently. A Host that stops (here
- * SIGKILL, with the same result for SIGTERM) while a WorkerDeployment or
- * WorkerEndpoint Operation for a published Worker is queued cannot start
- * again: boot restore asks for the "current serving" proof, which is
- * refused while any such Operation is pending, and a pending Operation only
- * runs after restore. The Host fails closed and exits with
- * `ownership_uncertain` on every attempt, so the data is intact but the
- * installation needs manual repair. When this is fixed, the restart below
- * should succeed and the Operation should settle once; update this test then.
+ * A Host that stops (SIGKILL here, SIGTERM behaves the same) while a
+ * WorkerDeployment or WorkerEndpoint Operation for a published Worker is only
+ * queued must boot again. Boot recovery adopts the committed incarnation that
+ * was serving (the queued Operation has recorded no dispatch, so it cannot
+ * have changed native state), and the normal Operation engine then runs the
+ * queued Operation exactly once.
+ *
+ * Scope of the proof, by crash window:
+ *  - queued: accepted, no dispatch recorded. Boot adopts the committed
+ *    incarnation and the engine runs the Operation once.
+ *  - dispatched, owner untouched: the engine recorded the dispatch
+ *    (`reconciling`, simulated here with the two engine writes that precede the
+ *    native send) but the owner had persisted nothing. The owner vouches that
+ *    the Operation never served, boot adopts the committed incarnation and the
+ *    engine re-drives the Operation once through a fresh incarnation.
+ *  - dispatched, candidate persisted (real SIGKILL once the owner persisted a
+ *    candidate incarnation and its child): boot abandons the dead candidate and
+ *    serves the committed incarnation. The Operation ID is never given a second
+ *    incarnation; the engine settles it failed with effect none, the Worker
+ *    keeps serving the committed graph, and a re-apply publishes once. An
+ *    Endpoint DELETE killed at its candidate settles the same way (owner
+ *    crash-recovery test, not this file).
+ *  - dispatched AND already activated by the owner but unsettled in SQL, or a
+ *    Deployment DELETE that closed admission: still refused at boot
+ *    (docs/self-host-operations.md).
+ * The test refuses to run (inconclusive) rather than count a crash that landed
+ * in a different window than the one it names.
  */
-test.skipIf(OPT_IN !== "1")(
-  "KNOWN GAP: a pending Endpoint Operation at SIGKILL makes boot restore fail closed",
-  async () => {
-    startedHosts.length = 0;
-    const environment = await prepareEnvironment();
-    const { root, port, certificate, fullBoot } = environment;
-    let host: Host | null = null;
-    let completed = false;
-    try {
-      const { space, token, auth } = await firstBoot(environment);
-      const bundle = await seedArtifact(
-        root,
-        "gap-worker",
-        [
-          {
-            path: "worker.js",
-            bytes: endpointFixture("gap-v1"),
-            mediaType: "application/javascript+module",
-          },
-        ],
-        "worker.js",
-        space,
-      );
-      const config = journeyConfig([], [bundle]);
-      host = await startHost(root, port, config, fullBoot);
-      const create = async (form: string, name: string, spec: Json) => {
-        const accepted = await jsonAt(
-          port,
-          "POST",
-          `${V2}/resources`,
-          202,
-          { form, space, name, spec },
-          { ...auth, "idempotency-key": `gap-${name}-create` },
+const PENDING_VARIANTS = [
+  { pending: "deployment-update", signal: "SIGKILL", window: "queued" },
+  { pending: "endpoint-update", signal: "SIGKILL", window: "queued" },
+  // A graceful stop suspends the owner and takes the same recovery path.
+  { pending: "deployment-update", signal: "SIGTERM", window: "queued" },
+  // The Operation engine marks a dispatch (claim, then `reconciling` with
+  // dispatch_possible=1) just before the native send.
+  { pending: "deployment-update", signal: "SIGKILL", window: "dispatched" },
+  { pending: "deployment-update", signal: "SIGKILL", window: "candidate" },
+] as const;
+for (const { pending, signal, window } of PENDING_VARIANTS) {
+  test.skipIf(OPT_IN !== "1")(
+    window === "candidate"
+      ? `a ${pending} killed with its candidate incarnation persisted fails without effect, keeps serving, and a re-apply publishes once`
+      : window === "dispatched"
+        ? `a dispatched ${pending} that never reached the owner at ${signal} boots again and runs once`
+        : `a queued ${pending} at ${signal} boots again and runs once`,
+    async () => {
+      startedHosts.length = 0;
+      const environment = await prepareEnvironment();
+      const { root, port, certificate, fullBoot } = environment;
+      let host: Host | null = null;
+      let completed = false;
+      try {
+        const { space, token, auth } = await firstBoot(environment);
+        const bundle = await seedArtifact(
+          root,
+          "gap-worker-v1",
+          [
+            {
+              path: "worker.js",
+              bytes: endpointFixture("gap-v1"),
+              mediaType: "application/javascript+module",
+            },
+          ],
+          "worker.js",
+          space,
         );
-        expect(await settled(port, token, String(accepted.id))).toMatchObject({
-          effect: "complete",
+        const bundleNext = await seedArtifact(
+          root,
+          "gap-worker-v2",
+          [
+            {
+              path: "worker.js",
+              bytes: endpointFixture("gap-v2"),
+              mediaType: "application/javascript+module",
+            },
+          ],
+          "worker.js",
+          space,
+        );
+        const config = journeyConfig([], [bundle, bundleNext]);
+        host = await startHost(root, port, config, fullBoot);
+        const create = async (form: string, name: string, spec: Json) => {
+          const accepted = await jsonAt(
+            port,
+            "POST",
+            `${V2}/resources`,
+            202,
+            { form, space, name, spec },
+            { ...auth, "idempotency-key": `gap-${name}-create` },
+          );
+          expect(await settled(port, token, String(accepted.id))).toMatchObject({
+            effect: "complete",
+          });
+          return String(accepted.resourceUid);
+        };
+        const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
+        const bundleUid = await create(WORKER_BUNDLE_FORM_URL, "bundle", {
+          artifact: { url: bundle.manifestUrl, sha256: bundle.manifestSha256 },
         });
-        return String(accepted.resourceUid);
-      };
-      const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
-      const bundleUid = await create(WORKER_BUNDLE_FORM_URL, "bundle", {
-        artifact: { url: bundle.manifestUrl, sha256: bundle.manifestSha256 },
-      });
-      const version = await create(WORKER_VERSION_FORM_URL, "version", {
-        worker: { resourceUid: worker },
-        bundle: { resourceUid: bundleUid },
-        handlers: ["fetch"],
-      });
-      await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
-        worker: { resourceUid: worker },
-        versions: [{ workerVersion: { resourceUid: version }, weight: 10_000 }],
-      });
-      const endpointUid = await create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
-        worker: { resourceUid: worker },
-      });
-      const endpointRead = await jsonAt(
-        port,
-        "GET",
-        `${V2}/resources/${endpointUid}`,
-        200,
-        undefined,
-        auth,
-      );
-      const hostname = String((endpointRead.output as Json).hostname);
-      expect(
-        await endpointEventually(hostname, certificate, "/", (r) => r.body === "gap-v1"),
-      ).toEqual({ status: 200, body: "gap-v1" });
+        const version = await create(WORKER_VERSION_FORM_URL, "version", {
+          worker: { resourceUid: worker },
+          bundle: { resourceUid: bundleUid },
+          handlers: ["fetch"],
+        });
+        const nextBundleUid = await create(WORKER_BUNDLE_FORM_URL, "bundle-next", {
+          artifact: { url: bundleNext.manifestUrl, sha256: bundleNext.manifestSha256 },
+        });
+        const nextVersion = await create(WORKER_VERSION_FORM_URL, "version-next", {
+          worker: { resourceUid: worker },
+          bundle: { resourceUid: nextBundleUid },
+          handlers: ["fetch"],
+        });
+        const deploymentUid = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+          worker: { resourceUid: worker },
+          versions: [{ workerVersion: { resourceUid: version }, weight: 10_000 }],
+        });
+        const endpointUid = await create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
+          worker: { resourceUid: worker },
+        });
+        const endpointRead = await jsonAt(
+          port,
+          "GET",
+          `${V2}/resources/${endpointUid}`,
+          200,
+          undefined,
+          auth,
+        );
+        const hostname = String((endpointRead.output as Json).hostname);
+        expect(
+          await endpointEventually(hostname, certificate, "/", (r) => r.body === "gap-v1"),
+        ).toEqual({ status: 200, body: "gap-v1" });
 
-      const updateKey = "gap-endpoint-update";
-      const update = await jsonAt(
-        port,
-        "PUT",
-        `${V2}/resources/${endpointUid}`,
-        202,
-        { spec: { worker: { resourceUid: worker } } },
-        { ...auth, "idempotency-key": updateKey, "takoform-expected-generation": "1" },
-      );
-      const pid = host.child.pid;
-      await killHost(host);
-      host = null;
-      const durable = withControl(
-        root,
-        (control) =>
-          control
-            .query("SELECT id, status FROM tf_v2_operations WHERE replay_key = ?")
-            .all(updateKey) as Json[],
-      );
-      expect(durable).toHaveLength(1);
-      // The crash fence must land before the Operation settled for this to be a gap case.
-      if (
-        !["queued", "running", "waiting_input", "reconciling"].includes(String(durable[0]?.status))
-      ) {
-        throw new Error(`inconclusive: Operation was already ${String(durable[0]?.status)}`);
-      }
-      expect(durable[0]?.id).toBe(String(update.id));
-
-      // Fail closed, deterministically, and the data stays untouched.
-      await expect(startHost(root, port, config, fullBoot)).rejects.toThrow(/ownership_uncertain/u);
-      expect(
-        withControl(
+        const updateKey = `gap-${pending}`;
+        const target = pending === "deployment-update" ? deploymentUid : endpointUid;
+        const spec: Json =
+          pending === "deployment-update"
+            ? {
+                worker: { resourceUid: worker },
+                versions: [{ workerVersion: { resourceUid: nextVersion }, weight: 10_000 }],
+              }
+            : { worker: { resourceUid: worker } };
+        const update = await jsonAt(
+          port,
+          "PUT",
+          `${V2}/resources/${target}`,
+          202,
+          { spec },
+          { ...auth, "idempotency-key": updateKey, "takoform-expected-generation": "1" },
+        );
+        if (window === "candidate") {
+          // Kill as soon as the owner has persisted a candidate incarnation and
+          // recorded its child, and before it can be activated.
+          const deadline = Date.now() + 60_000;
+          let seen = false;
+          while (Date.now() < deadline && !seen) {
+            const owner = await ownerState(root, worker).catch(() => null);
+            if (owner !== null) {
+              seen = owner.incarnations.some(
+                (item) =>
+                  item.operationId === String(update.id) &&
+                  item.status === "candidate" &&
+                  item.processIdentity !== null,
+              );
+            }
+            if (!seen) await Bun.sleep(2);
+          }
+          if (!seen)
+            throw new Error("inconclusive: the update never reached a candidate incarnation");
+        }
+        if (signal === "SIGKILL") await killHost(host);
+        else await stopHost(host);
+        host = null;
+        const atCrash = withControl(
           root,
           (control) =>
             control
-              .query("SELECT status FROM tf_v2_operations WHERE replay_key = ?")
+              .query(
+                "SELECT id, status, effect, dispatch_possible FROM tf_v2_operations WHERE replay_key = ?",
+              )
               .all(updateKey) as Json[],
-        ),
-      ).toEqual(durable.map((row) => ({ status: row.status })));
-      expect(pid).toBeGreaterThan(0);
-      completed = true;
-    } finally {
-      await Promise.allSettled([stopHost(host)]);
-      // If a fixed boot ever makes the refused startHost above succeed, that
-      // Host is not in `host`; never leak it, its port or its children.
-      for (const started of startedHosts) {
-        if (started.child.exitCode !== null) continue;
-        started.child.kill("SIGKILL");
-        await Promise.race([started.child.exited, Bun.sleep(5_000)]);
-      }
-      if (completed) await rm(root, { recursive: true, force: true });
-      else {
-        for (const [index, started] of startedHosts.entries()) {
-          await writeFile(join(root, `host-${index}.log`), started.output()).catch(() => undefined);
+        );
+        expect(atCrash).toHaveLength(1);
+        expect(atCrash[0]?.id).toBe(String(update.id));
+        if (window === "candidate") {
+          // The engine recorded the dispatch before the owner persisted the candidate.
+          if (atCrash[0]?.status !== "reconciling" || atCrash[0]?.dispatch_possible !== 1) {
+            throw new Error(
+              `inconclusive: Operation was ${String(atCrash[0]?.status)} (dispatch_possible=${String(atCrash[0]?.dispatch_possible)})`,
+            );
+          }
+        } else if (
+          // Queued case: the crash must land before any dispatch was recorded.
+          !["queued", "running", "waiting_input"].includes(String(atCrash[0]?.status)) ||
+          atCrash[0]?.dispatch_possible !== 0
+        ) {
+          throw new Error(
+            `inconclusive: Operation was ${String(atCrash[0]?.status)} (dispatch_possible=${String(atCrash[0]?.dispatch_possible)})`,
+          );
         }
-        process.stderr.write(`journey: data root and host logs retained at ${root}\n`);
+
+        if (window === "dispatched") {
+          // Reproduce exactly the two engine writes that precede a native send,
+          // on the durable queued Operation the crash left behind.
+          const writable = new Database(join(root, "control.sqlite"));
+          try {
+            writable
+              .query(
+                `UPDATE tf_v2_operations SET status = 'running', effect = 'none',
+                   lease_token = 'crash-lease', lease_until_ms = 1
+                 WHERE id = ? AND status = 'queued'`,
+              )
+              .run(String(update.id));
+            writable
+              .query(
+                `UPDATE tf_v2_operations SET status = 'reconciling', effect = 'unknown',
+                   dispatch_possible = 1 WHERE id = ? AND status = 'running'`,
+              )
+              .run(String(update.id));
+          } finally {
+            writable.close();
+          }
+        }
+        host = await startHost(root, port, config, fullBoot);
+        expect(host.output()).not.toContain("ownership_uncertain");
+        if (window === "candidate") {
+          // The owner proved the candidate never served and retired it under
+          // the Operation's own ID; the engine settles that Operation through
+          // its normal failure path, with no effect, exactly once.
+          expect(await terminal(port, token, String(update.id))).toMatchObject({
+            status: "failed",
+            effect: "none",
+          });
+          expect(
+            withControl(
+              root,
+              (control) =>
+                control
+                  .query(
+                    "SELECT status, effect, error_code FROM tf_v2_operations WHERE replay_key = ?",
+                  )
+                  .all(updateKey) as Json[],
+            ),
+          ).toEqual([
+            {
+              status: "failed",
+              effect: "none",
+              error_code: "worker_incarnation_retired_before_activation",
+            },
+          ]);
+          // The committed graph keeps serving: the failed update changed nothing.
+          expect(
+            await endpointEventually(hostname, certificate, "/", (r) => r.body === "gap-v1"),
+          ).toEqual({ status: 200, body: "gap-v1" });
+          // The user re-applies; a fresh Operation publishes once.
+          const reapply = await jsonAt(
+            port,
+            "PUT",
+            `${V2}/resources/${target}`,
+            202,
+            { spec },
+            {
+              ...auth,
+              "idempotency-key": `${updateKey}-reapply`,
+              "takoform-expected-generation": "2",
+            },
+          );
+          expect(await settled(port, token, String(reapply.id))).toMatchObject({
+            effect: "complete",
+          });
+          expect(
+            await endpointEventually(hostname, certificate, "/", (r) => r.body === "gap-v2"),
+          ).toEqual({ status: 200, body: "gap-v2" });
+          expect(
+            withControl(
+              root,
+              (control) =>
+                control
+                  .query(
+                    "SELECT status, effect FROM tf_v2_operations WHERE resource_uid = ? AND action = 'update' ORDER BY generation",
+                  )
+                  .all(target) as Json[],
+            ),
+          ).toEqual([
+            { status: "failed", effect: "none" },
+            { status: "succeeded", effect: "complete" },
+          ]);
+          const owner = await ownerState(root, worker);
+          expect(owner.activeOperationId).toBe(String(reapply.id));
+          expect(
+            owner.incarnations.filter((item) => item.operationId === String(update.id)),
+          ).toMatchObject([{ status: "retired", identity: null }]);
+          expect(
+            owner.incarnations.filter((item) => item.operationId === String(reapply.id)),
+          ).toMatchObject([{ status: "active" }]);
+          // The replaced incumbent may legitimately keep draining (waitUntil
+          // grace); nothing else is between serving and retired.
+          expect(
+            owner.incarnations.filter(
+              (item) => item.status !== "active" && item.status !== "retired",
+            ).length,
+          ).toBeLessThanOrEqual(1);
+          expect(
+            owner.incarnations.filter(
+              (item) => item.status === "uncertain" || item.status === "candidate",
+            ),
+          ).toEqual([]);
+          // No child of a retired incarnation, including the abandoned candidate, is left running.
+          for (const record of owner.incarnations) {
+            if (record.status !== "retired" || !record.processIdentity) continue;
+            expect(await linuxProcessLiveness(record.processIdentity as never)).toBe("stale");
+          }
+          completed = true;
+          return;
+        }
+        expect(await settled(port, token, String(update.id))).toMatchObject({
+          effect: "complete",
+        });
+        const expected = pending === "deployment-update" ? "gap-v2" : "gap-v1";
+        expect(
+          await endpointEventually(hostname, certificate, "/", (r) => r.body === expected),
+        ).toEqual({ status: 200, body: expected });
+
+        // Exactly one Operation carries the update; it ran to completion once.
+        expect(
+          withControl(
+            root,
+            (control) =>
+              control
+                .query("SELECT status, effect FROM tf_v2_operations WHERE replay_key = ?")
+                .all(updateKey) as Json[],
+          ),
+        ).toEqual([{ status: "succeeded", effect: "complete" }]);
+        expect(
+          withControl(
+            root,
+            (control) =>
+              control
+                .query(
+                  "SELECT COUNT(*) AS count FROM tf_v2_operations WHERE resource_uid = ? AND action = 'update'",
+                )
+                .all(target) as Json[],
+          ),
+        ).toEqual([{ count: 1 }]);
+        // The owner published this exact Operation once and it is what serves,
+        // which also distinguishes an Endpoint update that serves the same bytes.
+        const owner = await ownerState(root, worker);
+        expect(owner.activeOperationId).toBe(String(update.id));
+        expect(
+          owner.incarnations.filter((item) => item.operationId === String(update.id)),
+        ).toMatchObject([{ status: "active" }]);
+        completed = true;
+      } finally {
+        await Promise.allSettled([stopHost(host)]);
+        // A Host a failed assertion left running is not always in `host`;
+        // never leak it, its port or its children.
+        for (const started of startedHosts) {
+          if (started.child.exitCode !== null) continue;
+          started.child.kill("SIGKILL");
+          await Promise.race([started.child.exited, Bun.sleep(5_000)]);
+        }
+        if (completed) await rm(root, { recursive: true, force: true });
+        else {
+          for (const [index, started] of startedHosts.entries()) {
+            await writeFile(join(root, `host-${index}.log`), started.output()).catch(
+              () => undefined,
+            );
+          }
+          process.stderr.write(`journey: data root and host logs retained at ${root}\n`);
+        }
       }
-    }
-  },
-  300_000,
-);
+    },
+    300_000,
+  );
+}
