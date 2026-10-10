@@ -3,9 +3,9 @@ import { createHash } from "node:crypto";
 import { chmod, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalJson } from "../src/json.ts";
 import {
   linuxProcessLiveness,
+  readLinuxProcessIdentity,
   spawnWorkerdWithParentDeath,
   workerPortOwnership,
 } from "../src/workerd-linux-process.ts";
@@ -21,7 +21,8 @@ const DELETE_ID = "8fd4c347-bacf-4d91-9453-70566b5959e5";
 const HOST_FIXTURE = new URL("./fixtures/workerd-runtime-owner-crash-host.ts", import.meta.url)
   .pathname;
 const CHILD_SOURCE = `
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 const [verb, watch, configPath] = process.argv.slice(-3);
 if (verb !== "serve" || watch !== "--watch" || !configPath) throw new Error("unexpected command");
 function identity() {
@@ -43,7 +44,12 @@ const server = Bun.serve({ hostname: "127.0.0.1", port: initial.port, fetch(requ
   }
   return new Response(current.generation);
 } });
-process.on("SIGTERM", () => server.stop(true));
+// While the test holds this marker the child outlives SIGTERM, so a retirement
+// stays in progress for the supervisor's exit-confirmation timeout.
+process.on("SIGTERM", () => {
+  if (existsSync(join(dirname(process.argv[1]), "hold-sigterm"))) return;
+  server.stop(true);
+});
 `;
 
 async function unusedPort(): Promise<number> {
@@ -90,11 +96,15 @@ async function startHost(
     | "active-update-hang-after-candidate"
     | "create-hang-after-candidate"
     | "active-recover-reexecute"
+    | "active-endpoint-delete-hang-after-candidate"
+    | "active-update-fail-after-candidate"
+    | "active-recover-reexecute-endpoint-delete"
     | "open-only",
   root: string,
   binary: string,
   port: number,
   updateId = "",
+  createId = CREATE_ID,
 ): Promise<HostProcess> {
   return Bun.spawn(
     [
@@ -105,7 +115,7 @@ async function startHost(
       WORKER_UID,
       binary,
       String(port),
-      CREATE_ID,
+      createId,
       updateId,
       DELETE_ID,
     ],
@@ -165,6 +175,15 @@ async function ownerState(root: string): Promise<Record<string, unknown>> {
   return JSON.parse(
     await readFile(join(ownerDirectory(root), "runtime-owner.json"), "utf8"),
   ) as Record<string, unknown>;
+}
+
+/**
+ * The owner's own state encoding: insertion-ordered JSON plus a newline. A
+ * tampered state in any other encoding is refused by the parser, so a refusal
+ * would prove nothing about the rule the test means to pin.
+ */
+function ownerStateText(state: unknown): string {
+  return `${JSON.stringify(state)}\n`;
 }
 
 async function readSqlFailureMarker(root: string): Promise<{ code: string; pid: number }> {
@@ -676,7 +695,7 @@ test("an active record without its persisted child fingerprint remains unknown a
         ? { ...item, processIdentity: null, configurationSha256: null }
         : item,
     );
-    const tamperedState = canonicalJson(state);
+    const tamperedState = ownerStateText(state);
     await writeFile(path, tamperedState, { mode: 0o600 });
 
     successor = await startHost("active-recover", owned.root, owned.binary, port, UPDATE_ID);
@@ -1053,7 +1072,7 @@ test("a candidate without its persisted child identity is not abandoned", async 
     state.incarnations = state.incarnations.map((item) =>
       item.operationId === UPDATE_ID ? { ...item, processIdentity: null } : item,
     );
-    const tampered = canonicalJson(state);
+    const tampered = ownerStateText(state);
     await writeFile(path, tampered, { mode: 0o600 });
     successor = await startHost("active-recover-only", owned.root, owned.binary, port, UPDATE_ID);
     expect(await readJsonLine(successor)).toMatchObject({
@@ -1062,6 +1081,466 @@ test("a candidate without its persisted child identity is not abandoned", async 
     });
     expect(await readFile(path, "utf8")).toBe(tampered);
   } finally {
+    if (host) await terminateHost(host);
+    if (successor) await terminateHost(successor);
+    await owned.cleanup();
+  }
+});
+
+const REAPPLY_ID = "8c1f5e0a-3b7d-4e2a-9f61-0d2b7a4c9e13";
+
+/** Kill a first publication at its candidate, then boot once so it is abandoned. */
+async function abandonFirstPublication(
+  owned: Awaited<ReturnType<typeof fixture>>,
+  port: number,
+): Promise<{ readonly path: string; readonly candidateIdentity: unknown }> {
+  const host = await startHost("create-hang-after-candidate", owned.root, owned.binary, port);
+  try {
+    expect(await readJsonLine(host)).toMatchObject({ kind: "candidate-hung", port });
+  } finally {
+    await terminateHost(host);
+  }
+  await waitForVacant(port);
+  const path = join(ownerDirectory(owned.root), "runtime-owner.json");
+  const before = await incarnations(owned.root);
+  expect(before.incarnations[0]).toMatchObject({ status: "candidate", identity: null });
+  return { path, candidateIdentity: before.incarnations[0]?.processIdentity };
+}
+
+test("a first publication abandoned at boot survives a second Host kill before any re-apply", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  const hosts: HostProcess[] = [];
+  try {
+    await abandonFirstPublication(owned, port);
+    // Boot 1 abandons the candidate and keeps running; then the Host is
+    // killed again (SIGKILL/OOM) before the user re-applies.
+    const boot1 = await startHost("open-only", owned.root, owned.binary, port);
+    hosts.push(boot1);
+    expect(await readJsonLine(boot1)).toMatchObject({ kind: "opened", port });
+    const abandoned = await readFile(
+      join(ownerDirectory(owned.root), "runtime-owner.json"),
+      "utf8",
+    );
+    expect((await incarnations(owned.root)).incarnations[0]).toMatchObject({
+      status: "retired",
+      retirementOperationId: CREATE_ID,
+      identity: null,
+    });
+    await terminateHost(boot1);
+    hosts.pop();
+
+    // Boot 2 takes over a stale lock whose state has only a retired,
+    // never-activated record. That is not a DELETE replay and must boot.
+    const boot2 = await startHost("open-only", owned.root, owned.binary, port);
+    hosts.push(boot2);
+    expect(await readJsonLine(boot2)).toMatchObject({ kind: "opened", port });
+    expect(await readFile(join(ownerDirectory(owned.root), "runtime-owner.json"), "utf8")).toBe(
+      abandoned,
+    );
+    await terminateHost(boot2);
+    hosts.pop();
+
+    // A third boot after yet another kill can take the user's re-apply.
+    const reapply = await startHost(
+      "active-create",
+      owned.root,
+      owned.binary,
+      port,
+      "",
+      REAPPLY_ID,
+    );
+    hosts.push(reapply);
+    expect(await readJsonLine(reapply)).toMatchObject({ kind: "active-created", port });
+    const after = await incarnations(owned.root);
+    expect(after.activeOperationId).toBe(REAPPLY_ID);
+    expect(after.incarnations.find((item) => item.operationId === CREATE_ID)?.status).toBe(
+      "retired",
+    );
+  } finally {
+    for (const host of hosts) await terminateHost(host);
+    await owned.cleanup();
+  }
+});
+
+test("a boot killed between abandoning a first publication and its retirement receipt is resumed", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let successor: HostProcess | undefined;
+  try {
+    const { path } = await abandonFirstPublication(owned, port);
+    // Exactly the durable conversion an abandoning boot writes before it
+    // writes the group's retirement receipt; that boot then dies (its lock is
+    // left stale, like the original Host's).
+    const state = JSON.parse(await readFile(path, "utf8")) as {
+      incarnations: Record<string, unknown>[];
+    };
+    state.incarnations = state.incarnations.map((item) =>
+      item.operationId === CREATE_ID
+        ? { ...item, status: "uncertain", retirementOperationId: CREATE_ID }
+        : item,
+    );
+    await writeFile(path, ownerStateText(state), { mode: 0o600 });
+
+    successor = await startHost("open-only", owned.root, owned.binary, port);
+    expect(await readJsonLine(successor)).toMatchObject({ kind: "opened", port });
+    const after = await incarnations(owned.root);
+    expect(after.activeOperationId).toBeNull();
+    expect(after.incarnations).toHaveLength(1);
+    expect(after.incarnations[0]).toMatchObject({
+      operationId: CREATE_ID,
+      status: "retired",
+      retirementOperationId: CREATE_ID,
+      identity: null,
+      executionCopiesReleased: true,
+    });
+    expect(after.incarnations[0]?.receipt).not.toBeNull();
+  } finally {
+    if (successor) await terminateHost(successor);
+    await owned.cleanup();
+  }
+});
+
+test("a never-activated retirement is not resumed while its recorded child is alive", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let successor: HostProcess | undefined;
+  const live = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  try {
+    const { path } = await abandonFirstPublication(owned, port);
+    const liveIdentity = await readLinuxProcessIdentity(live.pid);
+    const state = JSON.parse(await readFile(path, "utf8")) as {
+      incarnations: Record<string, unknown>[];
+    };
+    state.incarnations = state.incarnations.map((item) =>
+      item.operationId === CREATE_ID
+        ? {
+            ...item,
+            status: "uncertain",
+            retirementOperationId: CREATE_ID,
+            processIdentity: liveIdentity,
+          }
+        : item,
+    );
+    const tampered = ownerStateText(state);
+    await writeFile(path, tampered, { mode: 0o600 });
+
+    successor = await startHost("open-only", owned.root, owned.binary, port);
+    expect(await readJsonLine(successor)).toMatchObject({
+      kind: "error",
+      code: "ownership_uncertain",
+    });
+    expect(await readFile(path, "utf8")).toBe(tampered);
+  } finally {
+    live.kill("SIGKILL");
+    await live.exited;
+    if (successor) await terminateHost(successor);
+    await owned.cleanup();
+  }
+});
+
+test("an abandoned first publication is not reopened while a foreign process holds its listener", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  const hosts: HostProcess[] = [];
+  let foreign: ReturnType<typeof Bun.serve> | undefined;
+  try {
+    await abandonFirstPublication(owned, port);
+    const boot1 = await startHost("open-only", owned.root, owned.binary, port);
+    hosts.push(boot1);
+    expect(await readJsonLine(boot1)).toMatchObject({ kind: "opened", port });
+    await terminateHost(boot1);
+    hosts.pop();
+    await waitForVacant(port);
+    foreign = Bun.serve({ hostname: "127.0.0.1", port, fetch: () => new Response("x") });
+
+    const path = join(ownerDirectory(owned.root), "runtime-owner.json");
+    const untouched = await readFile(path, "utf8");
+    const boot2 = await startHost("open-only", owned.root, owned.binary, port);
+    hosts.push(boot2);
+    expect(await readJsonLine(boot2)).toMatchObject({ kind: "error", code: "ownership_uncertain" });
+    expect(await readFile(path, "utf8")).toBe(untouched);
+  } finally {
+    foreign?.stop(true);
+    for (const host of hosts) await terminateHost(host);
+    await owned.cleanup();
+  }
+});
+
+test("a retired record that was once activated is still treated as a DELETE replay", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  const hosts: HostProcess[] = [];
+  try {
+    await abandonFirstPublication(owned, port);
+    const boot1 = await startHost("open-only", owned.root, owned.binary, port);
+    hosts.push(boot1);
+    expect(await readJsonLine(boot1)).toMatchObject({ kind: "opened", port });
+    await terminateHost(boot1);
+    hosts.pop();
+
+    // Same residue, but the record carries a pinned configuration: it may have
+    // been activated, so only an exact DELETE replay could take it over.
+    const path = join(ownerDirectory(owned.root), "runtime-owner.json");
+    const state = JSON.parse(await readFile(path, "utf8")) as {
+      incarnations: Record<string, unknown>[];
+    };
+    state.incarnations = state.incarnations.map((item) =>
+      item.operationId === CREATE_ID ? { ...item, configurationSha256: "0".repeat(64) } : item,
+    );
+    const tampered = ownerStateText(state);
+    await writeFile(path, tampered, { mode: 0o600 });
+    const boot2 = await startHost("open-only", owned.root, owned.binary, port);
+    hosts.push(boot2);
+    expect(await readJsonLine(boot2)).toMatchObject({ kind: "error", code: "ownership_uncertain" });
+    expect(await readFile(path, "utf8")).toBe(tampered);
+  } finally {
+    for (const host of hosts) await terminateHost(host);
+    await owned.cleanup();
+  }
+});
+
+test("an Endpoint DELETE killed at its candidate settles without effect and the committed incarnation keeps its hostname", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let host: HostProcess | undefined;
+  let successor: HostProcess | undefined;
+  try {
+    // UPDATE_ID is the Endpoint DELETE here: with a Deployment present it
+    // publishes the hostname-less graph through a candidate, like an update.
+    host = await startHost(
+      "active-endpoint-delete-hang-after-candidate",
+      owned.root,
+      owned.binary,
+      port,
+      UPDATE_ID,
+    );
+    expect(await readJsonLine(host)).toMatchObject({ kind: "candidate-hung", port });
+    const before = await incarnations(owned.root);
+    const candidate = before.incarnations.find((item) => item.operationId === UPDATE_ID);
+    expect(candidate).toMatchObject({ status: "candidate", identity: null, receipt: null });
+    expect(candidate?.processIdentity).not.toBeNull();
+    expect(before.activeOperationId).toBe(CREATE_ID);
+    await terminateHost(host);
+    host = undefined;
+    await waitForVacant(candidate?.listenerPort as number);
+
+    successor = await startHost(
+      "active-recover-reexecute-endpoint-delete",
+      owned.root,
+      owned.binary,
+      port,
+      UPDATE_ID,
+    );
+    const recovered = await readJsonLine(successor);
+    // The re-driven DELETE gets the owner's definitive answer, not `unknown`
+    // forever, and no second incarnation is started for it.
+    expect(recovered).toMatchObject({
+      kind: "recovered-active",
+      port,
+      reexecuted: { kind: "abandoned_before_activation", operationId: UPDATE_ID },
+      serving: {
+        kind: "serving",
+        sourceOperationId: CREATE_ID,
+        hostnames: [`${WORKER_UID}.example.test`],
+      },
+    });
+    const after = await incarnations(owned.root);
+    expect(after.activeOperationId).toBe(CREATE_ID);
+    expect(after.incarnations).toHaveLength(2);
+    expect(after.incarnations.find((item) => item.operationId === UPDATE_ID)).toMatchObject({
+      status: "retired",
+      retirementOperationId: UPDATE_ID,
+      identity: null,
+      executionCopiesReleased: true,
+    });
+    expect(
+      JSON.parse(await readFile(join(owned.root, "owners", "never-served.json"), "utf8")),
+    ).toEqual({ update: true, create: false, unknown: true });
+  } finally {
+    if (host) await terminateHost(host);
+    if (successor) await terminateHost(successor);
+    await owned.cleanup();
+  }
+});
+
+test("a candidate whose recorded child is still alive is not abandoned", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let host: HostProcess | undefined;
+  let successor: HostProcess | undefined;
+  const live = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  try {
+    host = await startHost(
+      "active-update-hang-after-candidate",
+      owned.root,
+      owned.binary,
+      port,
+      UPDATE_ID,
+    );
+    await readJsonLine(host);
+    const candidate = (await incarnations(owned.root)).incarnations.find(
+      (item) => item.operationId === UPDATE_ID,
+    );
+    await terminateHost(host);
+    host = undefined;
+    await waitForVacant(candidate?.listenerPort as number);
+
+    // The recorded child identity names a process that is still running.
+    const path = join(ownerDirectory(owned.root), "runtime-owner.json");
+    const state = JSON.parse(await readFile(path, "utf8")) as {
+      incarnations: Record<string, unknown>[];
+    };
+    const liveIdentity = await readLinuxProcessIdentity(live.pid);
+    state.incarnations = state.incarnations.map((item) =>
+      item.operationId === UPDATE_ID ? { ...item, processIdentity: liveIdentity } : item,
+    );
+    const tampered = ownerStateText(state);
+    await writeFile(path, tampered, { mode: 0o600 });
+    successor = await startHost("active-recover-only", owned.root, owned.binary, port, UPDATE_ID);
+    expect(await readJsonLine(successor)).toMatchObject({
+      kind: "error",
+      code: "ownership_uncertain",
+    });
+    expect(await readFile(path, "utf8")).toBe(tampered);
+  } finally {
+    live.kill("SIGKILL");
+    await live.exited;
+    if (host) await terminateHost(host);
+    if (successor) await terminateHost(successor);
+    await owned.cleanup();
+  }
+});
+
+for (const field of ["identity", "configurationSha256"] as const) {
+  test(`a retired record of the Operation that carries a ${field} is never vouched for or settled as abandoned`, async () => {
+    const owned = await fixture();
+    const port = await unusedPort();
+    const hosts: HostProcess[] = [];
+    try {
+      const first = await startHost(
+        "active-update-hang-after-candidate",
+        owned.root,
+        owned.binary,
+        port,
+        UPDATE_ID,
+      );
+      hosts.push(first);
+      await readJsonLine(first);
+      const candidate = (await incarnations(owned.root)).incarnations.find(
+        (item) => item.operationId === UPDATE_ID,
+      );
+      await terminateHost(first);
+      hosts.pop();
+      await waitForVacant(candidate?.listenerPort as number);
+      // Boot 1 abandons and retires the candidate, then is killed.
+      const boot1 = await startHost("active-recover-only", owned.root, owned.binary, port);
+      hosts.push(boot1);
+      expect(await readJsonLine(boot1)).toMatchObject({ kind: "recovered-active" });
+      await terminateHost(boot1);
+      hosts.pop();
+      await waitForVacant(port);
+
+      // The same retired record, but carrying what only activation records.
+      const path = join(ownerDirectory(owned.root), "runtime-owner.json");
+      const state = JSON.parse(await readFile(path, "utf8")) as {
+        incarnations: Record<string, unknown>[];
+      };
+      const active = state.incarnations.find((item) => item.operationId === CREATE_ID);
+      state.incarnations = state.incarnations.map((item) =>
+        item.operationId === UPDATE_ID
+          ? {
+              ...item,
+              [field]: field === "identity" ? active?.identity : "0".repeat(64),
+            }
+          : item,
+      );
+      expect(state.incarnations.find((item) => item.operationId === UPDATE_ID)).toMatchObject({
+        status: "retired",
+        retirementOperationId: UPDATE_ID,
+      });
+      await writeFile(path, ownerStateText(state), { mode: 0o600 });
+
+      const boot2 = await startHost(
+        "active-recover-reexecute",
+        owned.root,
+        owned.binary,
+        port,
+        UPDATE_ID,
+      );
+      hosts.push(boot2);
+      expect(await readJsonLine(boot2)).toMatchObject({
+        kind: "recovered-active",
+        reexecuted: { kind: "unknown" },
+      });
+      expect(
+        JSON.parse(await readFile(join(owned.root, "owners", "never-served.json"), "utf8")),
+      ).toEqual({ update: false, create: false, unknown: true });
+    } finally {
+      for (const host of hosts) await terminateHost(host);
+      await owned.cleanup();
+    }
+  });
+}
+
+test("a Host killed while an in-process candidate failure is retiring still boots and settles it", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  let host: HostProcess | undefined;
+  let successor: HostProcess | undefined;
+  const hold = join(owned.root, "hold-sigterm");
+  try {
+    // The update's candidate fails in-process (its materials are unavailable)
+    // and its child ignores SIGTERM, so the owner is still retiring it.
+    await writeFile(hold, "", { mode: 0o600 });
+    host = await startHost(
+      "active-update-fail-after-candidate",
+      owned.root,
+      owned.binary,
+      port,
+      UPDATE_ID,
+    );
+    expect(await readJsonLine(host)).toMatchObject({ kind: "candidate-failing", port });
+    const deadline = Date.now() + 20_000;
+    let retiring: StoredIncarnation | undefined;
+    while (Date.now() < deadline && !retiring) {
+      const state = await incarnations(owned.root).catch(() => null);
+      retiring = state?.incarnations.find(
+        (item) => item.operationId === UPDATE_ID && item.retirementOperationId === UPDATE_ID,
+      );
+      if (!retiring) await Bun.sleep(2);
+    }
+    if (!retiring) throw new Error("inconclusive: the candidate retirement never started");
+    await terminateHost(host);
+    host = undefined;
+    await rm(hold, { force: true });
+    // The first durable retirement intent of a never-activated candidate is the
+    // state boot recovery resumes, never an activated record's `retiring`.
+    expect(retiring).toMatchObject({ status: "uncertain", identity: null, receipt: null });
+    await waitForVacant(retiring.listenerPort);
+
+    successor = await startHost(
+      "active-recover-reexecute",
+      owned.root,
+      owned.binary,
+      port,
+      UPDATE_ID,
+    );
+    expect(await readJsonLine(successor)).toMatchObject({
+      kind: "recovered-active",
+      port,
+      reexecuted: { kind: "abandoned_before_activation", operationId: UPDATE_ID },
+    });
+    const after = await incarnations(owned.root);
+    expect(after.activeOperationId).toBe(CREATE_ID);
+    expect(after.incarnations.find((item) => item.operationId === UPDATE_ID)).toMatchObject({
+      status: "retired",
+      retirementOperationId: UPDATE_ID,
+      identity: null,
+      executionCopiesReleased: true,
+    });
+  } finally {
+    await rm(hold, { force: true });
     if (host) await terminateHost(host);
     if (successor) await terminateHost(successor);
     await owned.cleanup();

@@ -2082,6 +2082,33 @@ test("recovery tolerance requires the queued Operation to be the exact unstarted
   }
 });
 
+test("recovery tolerance admits only the queued successor's reserved edges, never an unrelated one", async () => {
+  const scenario = recoveryScenarios.find((item) => item.change === "deployment-retarget");
+  if (!scenario) throw new Error("missing scenario");
+  const f = fixture();
+  try {
+    const graph = await recoveryGraph(f, scenario);
+    const tolerant = { ...graph.input, tolerateUnstartedSuccessors: true };
+    // The queued retarget reserved an extra active edge to its new Version.
+    expect((await serve(f, tolerant)).kind).toBe("ready");
+    const bundle = f.db.query("SELECT uid FROM tf_v2_resources WHERE name = 'bundle'").get() as {
+      uid: string;
+    } | null;
+    if (!bundle) throw new Error("missing bundle");
+    // An edge neither the committed set nor the queued successor holds.
+    f.db
+      .query("INSERT INTO tf_v2_resource_references (target_uid, referrer_uid) VALUES (?, ?)")
+      .run(bundle.uid, graph.deployment.resourceUid);
+    expect(await serve(f, tolerant)).toMatchObject({ kind: "unresolved" });
+    f.db
+      .query("DELETE FROM tf_v2_resource_references WHERE target_uid = ? AND referrer_uid = ?")
+      .run(bundle.uid, graph.deployment.resourceUid);
+    expect((await serve(f, tolerant)).kind).toBe("ready");
+  } finally {
+    f.close();
+  }
+});
+
 test("a queued successor that settles becomes the only current serving source", async () => {
   const scenario = recoveryScenarios[0];
   if (!scenario) throw new Error("missing scenario");
@@ -2418,6 +2445,95 @@ for (const middle of ["none", "partial"] as const) {
     }
   });
 }
+
+// Measured bound: the committed view is rebuilt from at most MAX_FAILED_TAIL
+// (8) consecutive failed/none Operations behind the committed generation.
+test("the committed view covers eight consecutive failed/none updates of the source Endpoint, not nine", async () => {
+  const scenario = recoveryScenarios.find((item) => item.change === "endpoint-update");
+  if (!scenario) throw new Error("missing scenario");
+  const f = fixture();
+  try {
+    const graph = await recoveryGraph(f, scenario);
+    const endpointUid = graph.endpoint?.resourceUid ?? "";
+    f.failing.add(graph.pendingId);
+    expect(await f.engine.runNext()).toMatchObject({ id: graph.pendingId, status: "failed" });
+    for (let generation = 2; generation <= 10; generation += 1) {
+      const failedCount = generation - 1;
+      // Both the strict fence and boot recovery's tolerant fence.
+      for (const input of [graph.input, { ...graph.input, tolerateUnstartedSuccessors: true }]) {
+        const ready = await serve(f, input);
+        expect({ failedCount, kind: ready.kind }).toEqual({
+          failedCount,
+          kind: failedCount <= 8 ? "ready" : "unresolved",
+        });
+      }
+      if (generation === 10) break;
+      const retry = await f.engine.acceptUpdate({
+        principal: "org-1",
+        key: `failed-tail-retry-${generation}`.padEnd(24, "0"),
+        uid: endpointUid,
+        expectedGeneration: generation,
+        spec: { worker: { resourceUid: graph.worker.resourceUid } },
+      });
+      f.failing.add(retry.id);
+      expect(await f.engine.runNext()).toMatchObject({ id: retry.id, status: "failed" });
+    }
+  } finally {
+    f.close();
+  }
+});
+
+// A re-apply queued behind a failed/none first CREATE is an update of a
+// Resource that never committed. Like a queued first create it contributes
+// nothing to what serves, so boot recovery tolerates it while it is queued.
+test("boot recovery tolerates a queued re-apply behind a failed/none first Endpoint create", async () => {
+  const scenario = recoveryScenarios.find((item) => item.change === "endpoint-create");
+  if (!scenario) throw new Error("missing scenario");
+  const f = fixture();
+  try {
+    const graph = await recoveryGraph(f, scenario);
+    f.failing.add(graph.pendingId);
+    expect(await f.engine.runNext()).toMatchObject({
+      id: graph.pendingId,
+      status: "failed",
+      effect: "none",
+    });
+    const tolerant = { ...graph.input, tolerateUnstartedSuccessors: true };
+    // Nothing of the Endpoint was committed: the Deployment source still serves.
+    expect((await serve(f, graph.input)).kind).toBe("ready");
+    expect((await serve(f, tolerant)).kind).toBe("ready");
+    const failed = await f.store.operation(graph.pendingId);
+    if (!failed) throw new Error("missing failed create");
+    const reapply = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "reapply-failed-endpoint-create",
+      uid: failed.resource_uid,
+      expectedGeneration: 1,
+      spec: JSON.parse(failed.accepted_spec_json),
+    });
+    // The strict fence still refuses while the re-apply is pending.
+    expect(await serve(f, graph.input)).toMatchObject({ kind: "unresolved" });
+    const ready = await serve(f, tolerant);
+    expect(ready).toMatchObject({ kind: "ready" });
+    if (ready.kind !== "ready") return;
+    // The committed graph: the Deployment source and no Endpoint.
+    expect(ready.snapshot.sourceOperationId).toBe(graph.sourceId);
+    expect(ready.snapshot.endpoint ?? null).toBeNull();
+    expect(await ready.stillCurrent()).toBe(true);
+    // Once the re-apply records a dispatch it may have had an effect.
+    const token = `dispatched-${reapply.id}`;
+    expect(
+      await f.store.claim(reapply.id, token, f.currentClock(), f.currentClock() + 60_000),
+    ).toBe(true);
+    expect(
+      await f.store.markDispatch(reapply.id, token, new Date(f.currentClock()).toISOString()),
+    ).toBe(true);
+    expect(await ready.stillCurrent()).toBe(false);
+    expect(await serve(f, tolerant)).toMatchObject({ kind: "unresolved" });
+  } finally {
+    f.close();
+  }
+});
 
 test("an attachment whose update failed with a partial effect is still refused", async () => {
   const f = fixture();
