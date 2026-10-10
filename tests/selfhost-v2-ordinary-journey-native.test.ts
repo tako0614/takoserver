@@ -3,8 +3,9 @@
  * (docs/self-host-operations.md): first boot from an empty directory, sign in
  * with the assertion the process prints, configure the complete local Worker
  * profile, create and serve a Worker (fetch + queue + SQLite Binding), update
- * it, SIGKILL the Host while an update Operation is unsettled, recover, and
- * delete everything in reference order.
+ * it, SIGKILL the Host while an update Operation is unsettled, recover, take a
+ * cold snapshot of the stopped root and restore it after losing the original,
+ * and delete everything in reference order.
  *
  * Everything runs as real `bun src/entry-bun.ts` processes and real workerd
  * children. The only fixtures are the held artifact bytes the operator seeds
@@ -300,13 +301,14 @@ async function endpointEventually(
 
 /**
  * A read while the Host is writing would otherwise fail at once with
- * SQLITE_BUSY; wait for the Host's commit instead, as an operator's reader
- * with a busy timeout would.
+ * SQLITE_BUSY; wait briefly for the Host's commit instead, as an operator's
+ * reader with a busy timeout would. Kept short so a Host that holds its lock
+ * for long still fails the journey.
  */
 function withControl<T>(root: string, read: (database: Database) => T): T {
   const database = new Database(join(root, "control.sqlite"), { readonly: true });
   try {
-    database.exec("PRAGMA busy_timeout = 5000");
+    database.exec("PRAGMA busy_timeout = 1000");
     return read(database);
   } finally {
     database.close();
@@ -737,8 +739,10 @@ test.skipIf(OPT_IN !== "1")(
     startedHosts.length = 0;
     const environment = await prepareEnvironment();
     const { root, port, certificate, fullBoot } = environment;
-    // A complete cold copy holds keys and tenant data: never keep it.
+    // The cold copy holds the same (fixture) keys and tenant data as the root:
+    // removed on success, retained with the root for diagnosis on failure.
     const coldBackup = `${root}-cold-backup`;
+    let coldSnapshot: "none" | "taken" | "restored" = "none";
     let host: Host | null = null;
     let completed = false;
     try {
@@ -1180,8 +1184,12 @@ test.skipIf(OPT_IN !== "1")(
       // ---- 6b. Cold backup, loss of the data root, restore -----------------------
       // As docs/self-host-operations.md describes: stop every writer, copy the
       // complete root as one unit, then lose the original entirely and restore
-      // the copy to the same configured root on the replacement.
-      const receiptsAtBackup = (await get("/receipts")).body;
+      // the copy to the same configured root. The snapshot is taken with the
+      // Queue drained and no Operation pending.
+      const nonEmpty = (r: { status: number; body: string }) =>
+        r.status === 200 && r.body.startsWith("[{");
+      const rowsAtBackup = (await get("/rows", nonEmpty)).body;
+      const receiptsAtBackup = (await get("/receipts", nonEmpty)).body;
       const deploymentAtBackup = await jsonAt(
         port,
         "GET",
@@ -1202,9 +1210,11 @@ test.skipIf(OPT_IN !== "1")(
       }
       expect(backupChildren.filter((child) => alive(child.pid))).toEqual([]);
       await copyTree(root, coldBackup);
+      coldSnapshot = "taken";
       await rm(root, { recursive: true, force: true });
       await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
       await copyTree(coldBackup, root);
+      coldSnapshot = "restored";
       host = await startHost(root, port, configV2, fullBoot);
       const restoredHost = host;
       const restoredNote = Date.now() + 5_000;
@@ -1212,24 +1222,43 @@ test.skipIf(OPT_IN !== "1")(
         if (Date.now() > restoredNote) throw new Error("restored Host did not restore its Worker");
         await Bun.sleep(100);
       }
-      // The Worker serves its last Version with its data, without a republish.
+      // The Worker serves its last Version with its data, without a client republish.
       expect(await get("/version", (r) => r.body === "journey-v2")).toEqual({
         status: 200,
         body: "journey-v2",
       });
-      expect((await get("/receipts")).body).toBe(receiptsAtBackup);
+      expect((await get("/rows", nonEmpty)).body).toBe(rowsAtBackup);
+      expect((await get("/receipts", nonEmpty)).body).toBe(receiptsAtBackup);
       expect(
         await jsonAt(port, "GET", `${V2}/resources/${deployment.uid}`, 200, undefined, auth),
       ).toEqual(deploymentAtBackup);
-      // Delivery resumes on the restored copy, once.
+      // Delivery resumes on the restored copy: one new message, handled once by
+      // the restored Version, and nothing old is redelivered.
       const afterRestoreMessage = await sent("m-after-restore");
       await handled("m-after-restore");
       await waitForQueueReceipt(root, afterRestoreMessage, "retired");
-      expect(
-        (JSON.parse((await get("/receipts")).body) as { value: string }[]).filter(
-          (receipt) => receipt.value === "m-after-restore",
-        ),
-      ).toHaveLength(1);
+      expect(JSON.parse((await get("/receipts", nonEmpty)).body)).toEqual([
+        ...(JSON.parse(receiptsAtBackup) as Json[]),
+        { value: "m-after-restore", handler: "journey-v2" },
+      ]);
+      withControl(root, (control) => {
+        expect(
+          control
+            .query(
+              `SELECT count(*) AS n FROM queue_v2_batch_settlements
+               WHERE message_id = ? AND state = 'settled' AND outcome = 'ack'`,
+            )
+            .get(afterRestoreMessage),
+        ).toEqual({ n: 1 });
+        expect(
+          control
+            .query(
+              `SELECT count(*) AS n FROM queue_v2_batch_executions
+               WHERE state NOT IN ('retired', 'pre_effect_refused')`,
+            )
+            .get(),
+        ).toEqual({ n: 0 });
+      });
 
       // ---- 7. Delete in reference order -------------------------------------------
       const remove = async (uid: string, generation: number, name: string) => {
@@ -1306,13 +1335,24 @@ test.skipIf(OPT_IN !== "1")(
       completed = true;
     } finally {
       await Promise.allSettled([stopHost(host)]);
-      await rm(coldBackup, { recursive: true, force: true });
-      if (completed) await rm(root, { recursive: true, force: true });
-      else {
+      if (completed) {
+        await rm(coldBackup, { recursive: true, force: true }).catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+      } else {
+        // A failure between losing the root and restoring it leaves no root.
+        await mkdir(root, { recursive: true }).catch(() => undefined);
         for (const [index, started] of startedHosts.entries()) {
           await writeFile(join(root, `host-${index}.log`), started.output()).catch(() => undefined);
         }
         process.stderr.write(`journey: data root and host logs retained at ${root}\n`);
+        if (coldSnapshot === "none") {
+          // At most a partial copy: nothing to diagnose from it.
+          await rm(coldBackup, { recursive: true, force: true }).catch(() => undefined);
+        } else {
+          process.stderr.write(
+            `journey: cold snapshot (${coldSnapshot}) retained at ${coldBackup}\n`,
+          );
+        }
       }
     }
   },
