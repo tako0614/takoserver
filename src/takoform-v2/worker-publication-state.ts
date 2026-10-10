@@ -361,6 +361,9 @@ function unstartedSuccessor(
   op: OperationRow | null,
   row: ResourceRow,
   neverServed?: NeverServedOperation,
+  // Operations proven failed with effect none between the observed generation
+  // and `op` (see failedNoEffectTail). They never changed what serves.
+  failedGap = 0,
 ): op is OperationRow {
   return (
     op !== null &&
@@ -372,7 +375,9 @@ function unstartedSuccessor(
     op.backend_id === row.backend_id &&
     op.target_key === row.target_key &&
     op.generation === row.generation &&
-    row.generation === row.observed_generation + 1 &&
+    Number.isSafeInteger(failedGap) &&
+    failedGap >= 0 &&
+    row.generation === row.observed_generation + 1 + failedGap &&
     row.observed_generation > 0 &&
     op.accepted_spec_json === row.spec_json &&
     row.deleted_at === null &&
@@ -648,18 +653,20 @@ function currentServingFenceRelationsSql(tolerateUnstartedSuccessors: boolean): 
       AND op.target_key = r.target_key AND op.status = 'succeeded'
       AND op.effect = 'complete' AND r.observed_generation > 0
       AND ((r.busy_operation IS NULL AND op.id = r.last_operation)
+        OR (r.busy_operation IS NULL AND ${failedNoEffectTailSql})
         OR (r.busy_operation IS NOT NULL AND op.id <> r.busy_operation))
       AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
     ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2) publisher`
     : `SELECT 'publisher', publisher.id, json_object('id', publisher.id,
   'acceptance_order', publisher.acceptance_order)
   FROM (SELECT op.id, op.acceptance_order FROM tf_v2_resources r
-    JOIN tf_v2_operations op ON op.id = r.last_operation
+    JOIN tf_v2_operations op ON op.resource_uid = r.uid AND op.generation = r.observed_generation
     WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
       AND op.principal = r.principal AND op.backend_id = r.backend_id
       AND op.target_key = r.target_key AND op.status = 'succeeded'
-      AND op.effect = 'complete' AND r.observed_generation = op.generation
+      AND op.effect = 'complete' AND r.observed_generation > 0
       AND r.busy_operation IS NULL
+      AND (op.id = r.last_operation OR (${failedNoEffectTailSql}))
       AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
     ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2) publisher`;
   return `
@@ -689,6 +696,16 @@ ORDER BY kind, key`;
 }
 
 const MAX_UNSTARTED_SUCCESSORS = 4;
+/** Bound on consecutive failed/none Operations read behind a committed generation. */
+const MAX_FAILED_TAIL = 8;
+/**
+ * The Resource's newest Operations all ended failed with effect none, so it is
+ * still the Resource of its last observed generation (see committedView).
+ */
+const failedNoEffectTailSql = `r.phase = 'error' AND r.generation > r.observed_generation
+      AND NOT EXISTS (SELECT 1 FROM tf_v2_operations tail
+        WHERE tail.resource_uid = r.uid AND tail.generation > r.observed_generation
+          AND NOT (tail.status = 'failed' AND tail.effect = 'none'))`;
 const currentServingFenceSql = `
 SELECT kind, key, body FROM (${currentServingFenceGraphSql})
 UNION ALL
@@ -885,6 +902,104 @@ export function createV2WorkerPublicationState(options: {
         )
       ).length > 0
     );
+  }
+  /**
+   * Operations of `row` after its observed generation and before
+   * `beforeGeneration`, when every one of them ended failed with effect none.
+   * Returns their count and the sealed targets they still hold as active edges,
+   * or `null` for any other history.
+   */
+  async function failedNoEffectTail(
+    row: ResourceRow,
+    beforeGeneration: number,
+  ): Promise<{
+    readonly count: number;
+    readonly targets: Set<string>;
+    readonly last: OperationRow | null;
+  } | null> {
+    const count = beforeGeneration - row.observed_generation - 1;
+    if (!Number.isSafeInteger(count) || count < 0 || count > MAX_FAILED_TAIL) return null;
+    const tail = (await sql.query(
+      `SELECT * FROM tf_v2_operations WHERE resource_uid = ? AND generation > ?
+         AND generation < ? ORDER BY generation LIMIT ?`,
+      [row.uid, row.observed_generation, beforeGeneration, MAX_FAILED_TAIL + 1],
+    )) as unknown as OperationRow[];
+    if (
+      tail.length !== count ||
+      tail.some(
+        (item, index) =>
+          item.generation !== row.observed_generation + 1 + index ||
+          item.status !== "failed" ||
+          item.effect !== "none" ||
+          item.resource_uid !== row.uid ||
+          item.principal !== row.principal ||
+          item.backend_id !== row.backend_id ||
+          item.target_key !== row.target_key,
+      )
+    )
+      return null;
+    const targets = new Set<string>();
+    for (const item of tail) {
+      if (item.action === "delete") continue;
+      const sealed = await references(item.id);
+      if (!sealed) return null;
+      for (const reference of sealed) targets.add(reference.target_uid);
+    }
+    return { count, targets, last: tail[tail.length - 1] ?? null };
+  }
+
+  /**
+   * The serving view of a Resource whose newest Operations all ended `failed`
+   * with effect `none`. Effect counts changes to the managed thing, never the
+   * Resource record or its generation, so such a Resource still serves its last
+   * observed generation. The view is rebuilt from immutable Operation history:
+   * the committed Operation's accepted spec, never a failed spec. `view: null`
+   * means nothing was ever committed (a failed CREATE). `failedTargets` are the
+   * sealed targets the failed Operations still hold as active edges. Any other
+   * Resource (busy, partial, unknown, or not a pure failed/none tail) returns
+   * `null` and keeps every existing refusal.
+   */
+  async function committedView(
+    row: ResourceRow,
+  ): Promise<{ readonly view: ResourceRow | null; readonly failedTargets: Set<string> } | null> {
+    if (
+      row.busy_operation !== null ||
+      row.phase !== "error" ||
+      row.deleted_at !== null ||
+      row.observed_generation >= row.generation
+    )
+      return null;
+    const tail = await failedNoEffectTail(row, row.generation + 1);
+    if (!tail || tail.count < 1 || tail.last?.id !== row.last_operation) return null;
+    const failedTargets = tail.targets;
+    if (row.observed_generation === 0) return { view: null, failedTargets };
+    const committed = (await sql.query(
+      "SELECT * FROM tf_v2_operations WHERE resource_uid = ? AND generation = ? LIMIT 2",
+      [row.uid, row.observed_generation],
+    )) as unknown as OperationRow[];
+    const op = committed[0];
+    if (
+      committed.length !== 1 ||
+      !op ||
+      op.status !== "succeeded" ||
+      op.effect !== "complete" ||
+      (op.action !== "create" && op.action !== "update") ||
+      op.principal !== row.principal ||
+      op.backend_id !== row.backend_id ||
+      op.target_key !== row.target_key
+    )
+      return null;
+    return {
+      view: {
+        ...row,
+        generation: op.generation,
+        last_operation: op.id,
+        busy_operation: null,
+        phase: "idle",
+        spec_json: op.accepted_spec_json,
+      },
+      failedTargets,
+    };
   }
   async function references(id: string): Promise<ReferenceRow[] | null> {
     const set = await sql.query(
@@ -1088,16 +1203,18 @@ export function createV2WorkerPublicationState(options: {
          AND op.status = 'succeeded' AND op.effect = 'complete'
          AND r.observed_generation > 0
          AND ((r.busy_operation IS NULL AND op.id = r.last_operation)
+           OR (r.busy_operation IS NULL AND ${failedNoEffectTailSql})
            OR (r.busy_operation IS NOT NULL AND op.id <> r.busy_operation))
          AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
        ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2`
         : `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
-       JOIN tf_v2_operations op ON op.id = r.last_operation
+       JOIN tf_v2_operations op ON op.resource_uid = r.uid AND op.generation = r.observed_generation
        WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
          AND op.principal = r.principal
          AND op.backend_id = r.backend_id AND op.target_key = r.target_key
          AND op.status = 'succeeded' AND op.effect = 'complete'
-         AND r.observed_generation = op.generation AND r.busy_operation IS NULL
+         AND r.observed_generation > 0 AND r.busy_operation IS NULL
+         AND (op.id = r.last_operation OR (${failedNoEffectTailSql}))
          AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
        ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2`,
       [
@@ -1351,18 +1468,30 @@ export function createV2WorkerPublicationState(options: {
     // the committed source generation. The committed view is the Resource as
     // of `op`, which is immutable history; the successor is validated below.
     let servingRow = own;
+    // Every mode: a failed/none tail never changed what `op` serves.
+    const failedTargets = new Map<string, ReadonlySet<string>>();
+    if (current && own.busy_operation === null && own.last_operation !== op.id) {
+      const committed = await committedView(own);
+      if (committed?.view && committed.view.last_operation === op.id) {
+        servingRow = committed.view;
+        failedTargets.set(own.uid, committed.failedTargets);
+      }
+    }
     if (
       current?.tolerateUnstartedSuccessors &&
       own.busy_operation !== null &&
       own.busy_operation !== op.id
     ) {
       const successor = await operation(own.busy_operation);
+      const gap = successor ? await failedNoEffectTail(own, successor.generation) : null;
       if (
-        unstartedSuccessor(successor, own, current.neverServedOperation) &&
+        gap &&
+        unstartedSuccessor(successor, own, current.neverServedOperation, gap.count) &&
         op.status === "succeeded" &&
         op.generation === own.observed_generation &&
-        successor.generation === op.generation + 1
+        successor.generation === op.generation + 1 + gap.count
       ) {
+        if (gap.count > 0) failedTargets.set(own.uid, gap.targets);
         servingRow = {
           ...own,
           generation: op.generation,
@@ -1460,15 +1589,20 @@ export function createV2WorkerPublicationState(options: {
         }
         for (const queued of pending) {
           const queuedResource = await resource(queued.resource_uid);
+          const gap = queuedResource
+            ? await failedNoEffectTail(queuedResource, queued.generation)
+            : null;
           if (
             !queuedResource ||
+            !gap ||
             queued.id === op.id ||
             queuedResource.principal !== op.principal ||
             queuedResource.space !== own.space ||
             workerUidFromOperation(queued) !== workerUid ||
             !(
-              unstartedSuccessor(queued, queuedResource, current.neverServedOperation) ||
-              unstartedCreate(queued, queuedResource, current.neverServedOperation)
+              unstartedSuccessor(queued, queuedResource, current.neverServedOperation, gap.count) ||
+              (gap.count === 0 &&
+                unstartedCreate(queued, queuedResource, current.neverServedOperation))
             )
           ) {
             return unresolved("source_unsettled", "A later Worker publication has started");
@@ -1480,7 +1614,7 @@ export function createV2WorkerPublicationState(options: {
           }
           unstartedTargets.set(
             queuedResource.uid,
-            new Set(queuedReferences.map((reference) => reference.target_uid)),
+            new Set([...queuedReferences.map((reference) => reference.target_uid), ...gap.targets]),
           );
         }
       } else if (await hasPendingPublication(workerUid)) {
@@ -1495,10 +1629,33 @@ export function createV2WorkerPublicationState(options: {
       }
     }
 
-    const [deploymentRows, endpointRows] = await Promise.all([
+    const [rawDeploymentRows, rawEndpointRows] = await Promise.all([
       matchingResources(WORKER_DEPLOYMENT_FORM_URL, workerUid, op.principal, own.space, !!current),
       matchingResources(WORKER_ENDPOINT_FORM_URL, workerUid, op.principal, own.space, !!current),
     ]);
+    const committedRows = async (rows: readonly ResourceRow[]): Promise<ResourceRow[]> => {
+      const result: ResourceRow[] = [];
+      for (const row of rows) {
+        const committed = await committedView(row);
+        if (!committed) {
+          result.push(row);
+          continue;
+        }
+        failedTargets.set(row.uid, committed.failedTargets);
+        if (committed.view) result.push(committed.view);
+      }
+      return result;
+    };
+    const [deploymentRows, endpointRows] = [
+      await committedRows(rawDeploymentRows),
+      await committedRows(rawEndpointRows),
+    ];
+    const extraActiveTargets = (uid: string): ReadonlySet<string> | undefined => {
+      const unstarted = unstartedTargets.get(uid);
+      const failed = failedTargets.get(uid);
+      if (!unstarted && !failed) return undefined;
+      return new Set([...(unstarted ?? []), ...(failed ?? [])]);
+    };
     if (current && (deploymentRows.length > 1 || endpointRows.length > 1)) {
       return unresolved("publication_conflict", "More than one Worker attachment is present");
     }
@@ -1621,7 +1778,7 @@ export function createV2WorkerPublicationState(options: {
         const active = await activeReferences(
           chosenDeployment.row.uid,
           refRows,
-          unstartedTargets.get(chosenDeployment.row.uid),
+          extraActiveTargets(chosenDeployment.row.uid),
         );
         if (!active) {
           return unresolved("graph_unresolved", "Deployment active references changed");
@@ -1758,7 +1915,7 @@ export function createV2WorkerPublicationState(options: {
         const active = await activeReferences(
           chosenEndpoint.row.uid,
           refRows,
-          unstartedTargets.get(chosenEndpoint.row.uid),
+          extraActiveTargets(chosenEndpoint.row.uid),
         );
         if (!active) {
           return unresolved("graph_unresolved", "Endpoint active references changed");
