@@ -4,9 +4,12 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Miniflare } from "miniflare";
+import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql } from "../src/ports.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
+import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createV2ActorBindingAuthority } from "../src/takoform-v2/actor-binding-authority.ts";
 import { createV2ActorForwardBoot } from "../src/takoform-v2/actor-forward-runtime.ts";
@@ -48,10 +51,14 @@ const PRINCIPAL = "org:actor-admission";
 const SPACE = "production";
 const TARGET = "actor-admission-local-target";
 
-function fixture(physicalRoot?: string, providerNative?: V2ActorNamespaceProviderPort) {
+function fixture(
+  physicalRoot?: string,
+  providerNative?: V2ActorNamespaceProviderPort,
+  sqlOverride?: Sql,
+) {
   const db = new Database(":memory:");
   migrateSqlite(db);
-  const rawSql = createSqliteSql(db);
+  const rawSql = sqlOverride ?? createSqliteSql(db);
   let beforeActorBatch: (() => Promise<void>) | undefined;
   let afterActorForget: (() => Promise<void>) | undefined;
   const sql: Sql = {
@@ -1254,3 +1261,120 @@ test("Actor admission inspects held bytes for every accepted pending weighted Ve
     f.db.close();
   }
 });
+
+function splitMigration(source: string): readonly string[] {
+  const statements: string[] = [];
+  let rest = source.replace(/^\s*--.*$/gmu, "").trim();
+  while (rest.length > 0) {
+    if (/^CREATE\s+(?:TEMP\s+)?TRIGGER\b/iu.test(rest)) {
+      const end = /^END\s*;/imu.exec(rest);
+      if (!end || end.index === undefined) throw new Error("incomplete migration trigger");
+      const boundary = end.index + end[0].length;
+      statements.push(rest.slice(0, boundary).trim());
+      rest = rest.slice(boundary).trim();
+      continue;
+    }
+    const boundary = rest.indexOf(";");
+    if (boundary < 0) {
+      statements.push(rest);
+      break;
+    }
+    const statement = rest.slice(0, boundary).trim();
+    if (statement) statements.push(statement);
+    rest = rest.slice(boundary + 1).trim();
+  }
+  return statements;
+}
+
+test("Miniflare D1 accepts one weighted Actor class in the Host INSERT and refuses exact graph drift", async () => {
+  const runtime = new Miniflare({
+    workers: [
+      {
+        config: {
+          name: "v2-actor-namespace-admission-d1-test",
+          type: "worker",
+          compatibilityDate: "2026-08-18",
+          manifest: {
+            mainModule: "worker.js",
+            modules: {
+              "worker.js": {
+                type: "esm",
+                contents: "export default { fetch() { return new Response('ok'); } };",
+              },
+            },
+          },
+          env: { STATE_DB: { type: "d1", id: "v2-actor-namespace-admission-d1-test" } },
+          triggers: [],
+        },
+      },
+    ],
+  });
+  let f: ReturnType<typeof fixture> | undefined;
+  try {
+    const database = await runtime.getD1Database("STATE_DB");
+    for (const migration of MIGRATIONS) {
+      for (const statement of splitMigration(migration.sql))
+        await database.prepare(statement).run();
+    }
+    f = fixture(undefined, undefined, createD1Sql(database));
+    const worker = await f.worker();
+    const version = await f.version(worker.resourceUid, "d1-version");
+    await f.create(WORKER_DEPLOYMENT_FORM_URL, "d1-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    const spec = { worker: { resourceUid: worker.resourceUid }, className: "CounterActor" };
+    const predicate = await f.admission({
+      principal: PRINCIPAL,
+      space: SPACE,
+      resourceUid: "actor-d1-predicate-probe",
+      spec,
+    });
+    if (!predicate) throw new Error("Actor class unexpectedly incompatible");
+    const query = `SELECT 1 AS admitted WHERE ${predicate.sql}`;
+    expect(await f.sql.query(query, predicate.params)).toEqual([{ admitted: 1 }]);
+    const [versionRow] = await f.sql.query(
+      "SELECT observed_json FROM tf_v2_resources WHERE uid = ?",
+      [version.resourceUid],
+    );
+    if (typeof versionRow?.observed_json !== "string") throw new Error("missing Version row");
+    await f.sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+      '{"ready":false}',
+      version.resourceUid,
+    ]);
+    expect(await f.sql.query(query, predicate.params)).toHaveLength(0);
+    await f.sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+      versionRow.observed_json,
+      version.resourceUid,
+    ]);
+    expect(await f.sql.query(query, predicate.params)).toEqual([{ admitted: 1 }]);
+    await f.sql.run(
+      "UPDATE tf_v2_operations SET lease_token = ?, lease_until_ms = ? WHERE id = ?",
+      ["temporary-lease", 1000, version.id],
+    );
+    expect(await f.sql.query(query, predicate.params)).toHaveLength(0);
+    await f.sql.run(
+      "UPDATE tf_v2_operations SET lease_token = NULL, lease_until_ms = NULL WHERE id = ?",
+      [version.id],
+    );
+    expect(await f.sql.query(query, predicate.params)).toEqual([{ admitted: 1 }]);
+    const otherWorker = await f.create(MODULE_WORKER_FORM_URL, "d1-other-worker", {});
+    const otherVersion = await f.version(otherWorker.resourceUid, "d1-other-version");
+    await f.create(
+      WORKER_DEPLOYMENT_FORM_URL,
+      "d1-added-deployment",
+      {
+        worker: { resourceUid: otherWorker.resourceUid },
+        versions: [{ workerVersion: { resourceUid: otherVersion.resourceUid }, weight: 10_000 }],
+      },
+      false,
+    );
+    expect(await f.sql.query(query, predicate.params)).toHaveLength(0);
+    expect((await f.create(ACTOR_NAMESPACE_FORM_URL, "d1-namespace", spec, false)).status).toBe(
+      "queued",
+    );
+  } finally {
+    f?.db.close();
+    await runtime.dispose();
+  }
+}, 120_000);
