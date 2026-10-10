@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,7 +19,20 @@ const terminal = {
   receiptDigest: "a".repeat(64),
 };
 
-async function fixture() {
+function sameShardAs(uid: string): string {
+  const shard = createHash("sha256").update(uid).digest("hex").slice(0, 2);
+  for (let index = 0; index < 10_000; index += 1) {
+    const candidate = `database-collision-${index}`;
+    if (
+      candidate !== uid &&
+      createHash("sha256").update(candidate).digest("hex").slice(0, 2) === shard
+    )
+      return candidate;
+  }
+  throw new Error("missing deterministic shard collision");
+}
+
+async function fixture(auxUid = "database-two") {
   const root = mkdtempSync(join(tmpdir(), "v2-queue-sqlite-node-"));
   const nativeRoot = join(root, "native");
   const execution = {
@@ -42,7 +56,7 @@ async function fixture() {
     nativeVersionId: "native-version-one",
     bindings: [
       { name: "DB", resourceUid: "database-one" },
-      { name: "AUX", resourceUid: "database-two" },
+      { name: "AUX", resourceUid: auxUid },
     ],
   };
   let custody: V2QueueBatchSQLiteCustody = {
@@ -67,6 +81,9 @@ async function fixture() {
   };
   let primaryAvailable = true;
   let lostDrainAck = false;
+  let inspectNativeThroughSameStore = false;
+  let inspectedNativeUid: string | null = null;
+  let acceptedCreatePrincipal = "alice";
   const storeOptions = {
     root: nativeRoot,
     targetKey,
@@ -78,12 +95,11 @@ async function fixture() {
         };
       },
       async acceptedCreate(input: { readonly resourceUid: string }) {
-        if (input.resourceUid !== "database-one" && input.resourceUid !== "database-two")
-          return null;
+        if (input.resourceUid !== "database-one" && input.resourceUid !== auxUid) return null;
         return {
           createOperationId: `create-${input.resourceUid}`,
           resourceUid: input.resourceUid,
-          principal: "alice",
+          principal: acceptedCreatePrincipal,
           space: "default",
           backendId: "sqlite-backend",
           targetKey,
@@ -108,7 +124,7 @@ async function fixture() {
     };
   }
   const store = createSelfhostV2SQLiteStore(storeOptions);
-  for (const uid of ["database-one", "database-two"]) {
+  for (const uid of new Set(["database-one", auxUid])) {
     expect(await store.ensureCreated(createClaim(uid))).toBe("present");
   }
   await store.withAuthorizedDatabase({
@@ -132,6 +148,38 @@ async function fixture() {
         : null;
     },
     async observeNative() {
+      if (inspectNativeThroughSameStore) {
+        const inspected = inspectedNativeUid
+          ? [inspectedNativeUid]
+          : [...new Set(grant.bindings.map((binding) => binding.resourceUid))];
+        for (const resourceUid of inspected) {
+          if (
+            (await store.inspectOwnedDatabase({
+              resourceUid,
+              stillAuthorized: async () => true,
+            })) !== "confirmed"
+          )
+            return { kind: "unknown" as const };
+        }
+      }
+      return primaryAvailable
+        ? {
+            kind: "confirmed" as const,
+            workerUid: execution.workerUid,
+            versionId: grant.nativeVersionId,
+            incarnationId: execution.incarnationOperationId,
+            servingSourceOperationId: execution.servingSourceOperationId,
+            status: "active" as const,
+          }
+        : ({ kind: "unknown" } as const);
+    },
+    async observeNativeWithPhysicalFence(
+      _grant: V2QueueSQLiteGrant,
+      physical: {
+        assertHeld(): void;
+      },
+    ) {
+      physical.assertHeld();
       return primaryAvailable
         ? {
             kind: "confirmed" as const,
@@ -172,6 +220,13 @@ async function fixture() {
       if (custody.kind !== "found") throw new Error("missing custody");
       custody = { ...custody, terminal };
     },
+    setRetirement() {
+      if (custody.kind !== "found") throw new Error("missing custody");
+      custody = { ...custody, retirement: terminal };
+    },
+    setAcceptedCreatePrincipal(value: string) {
+      acceptedCreatePrincipal = value;
+    },
     setDrainState(value: "pending" | null) {
       if (custody.kind !== "found") throw new Error("missing custody");
       custody = { ...custody, sqliteDrainState: value };
@@ -188,6 +243,10 @@ async function fixture() {
     loseDrainAck() {
       lostDrainAck = true;
     },
+    inspectNativeThroughSameStore(onlyUid?: string) {
+      inspectNativeThroughSameStore = true;
+      inspectedNativeUid = onlyUid ?? null;
+    },
     getCustody() {
       return custody;
     },
@@ -199,6 +258,231 @@ async function fixture() {
     },
   };
 }
+
+test("Queue SQL native owner proof can re-enter the same UID store while SQL is fenced", async () => {
+  const host = await fixture();
+  try {
+    host.inspectNativeThroughSameStore();
+    expect(
+      await host.makeBroker().call({
+        grant: host.grant,
+        binding: "DB",
+        method: "execute",
+        statement: { sql: "INSERT INTO records(body) VALUES ('reentrant-native-proof')" },
+      }),
+    ).toMatchObject({ rowsWritten: 1 });
+  } finally {
+    host.cleanup();
+  }
+});
+
+test("Queue SQL refuses a composition without its restricted in-lock proof port", async () => {
+  const host = await fixture();
+  try {
+    expect(() =>
+      createSelfhostV2SqliteQueueBindingBroker({
+        store: host.store,
+        proofs: {
+          ...host.proofs,
+          observeNativeWithPhysicalFence: undefined as never,
+        },
+      }),
+    ).toThrow("trusted Queue SQLite Node proof ports are required");
+  } finally {
+    host.cleanup();
+  }
+});
+
+for (const auxUid of ["database-one", sameShardAs("database-one")]) {
+  test(`Queue SQL fences complete selected physical set with alias/shard UID ${auxUid}`, async () => {
+    const host = await fixture(auxUid);
+    try {
+      host.inspectNativeThroughSameStore(auxUid);
+      expect(
+        await host.makeBroker().call({
+          grant: host.grant,
+          binding: "DB",
+          method: "execute",
+          statement: { sql: "INSERT INTO records(body) VALUES ('whole-set')" },
+        }),
+      ).toMatchObject({ rowsWritten: 1 });
+      host.setAcceptedCreatePrincipal("mallory");
+      await expect(
+        host.makeBroker().call({
+          grant: host.grant,
+          binding: "DB",
+          method: "execute",
+          statement: { sql: "INSERT INTO records(body) VALUES ('forbidden')" },
+        }),
+      ).rejects.toMatchObject({ code: "backend_unavailable" });
+    } finally {
+      host.cleanup();
+    }
+  });
+}
+
+test("Queue store releases every shard and revokes its physical witness after an unknown", async () => {
+  const host = await fixture();
+  try {
+    let heldWitness:
+      | Parameters<V2QueueSQLiteProofPort["observeNativeWithPhysicalFence"]>[1]
+      | null = null;
+    await expect(
+      host.store.withVerifiedDatabaseSet({
+        resourceUid: "database-one",
+        principal: "alice",
+        space: "default",
+        bindings: [...host.grant.bindings].reverse(),
+        stillAuthorized: async (physical) => {
+          heldWitness = physical;
+          physical.assertHeld();
+          throw new Error("unknown native readback");
+        },
+        use: async () => {
+          throw new Error("unreachable SQL");
+        },
+      }),
+    ).rejects.toThrow("unknown native readback");
+    expect(() => heldWitness?.assertHeld()).toThrow("backend_unavailable");
+    for (const binding of host.grant.bindings) {
+      expect(
+        await host.store.inspectOwnedDatabase({
+          resourceUid: binding.resourceUid,
+          stillAuthorized: async () => true,
+        }),
+      ).toBe("confirmed");
+    }
+  } finally {
+    host.cleanup();
+  }
+});
+
+test("Queue SQL rechecks terminal, retirement, sealed set and vector after the full pre-lock proof", async () => {
+  for (const changed of ["terminal", "retirement", "selected", "vector"] as const) {
+    const host = await fixture();
+    try {
+      if (changed === "vector") {
+        const originalCurrent = host.proofs.resolveCurrentBinding;
+        let reads = 0;
+        host.proofs.resolveCurrentBinding = async (...args) => {
+          reads += 1;
+          return reads === 1
+            ? await originalCurrent(...args)
+            : { resourceUid: "database-one", vector: "changed-vector" };
+        };
+      }
+      const originalNative = host.proofs.observeNative;
+      host.proofs.observeNative = async () => {
+        const result = await originalNative();
+        if (changed === "terminal") host.setTerminal();
+        if (changed === "retirement") host.setRetirement();
+        if (changed === "selected") {
+          const selected = host.getSelected();
+          if (!selected) throw new Error("missing selected fixture");
+          host.setSelected({ ...selected, bindings: selected.bindings.slice(0, 1) });
+        }
+        return result;
+      };
+      await expect(
+        host.makeBroker().call({
+          grant: host.grant,
+          binding: "DB",
+          method: "execute",
+          statement: { sql: "INSERT INTO records(body) VALUES ('forbidden')" },
+        }),
+      ).rejects.toMatchObject({ code: "backend_unavailable" });
+      await host.store.withAuthorizedDatabase({
+        resourceUid: "database-one",
+        stillAuthorized: async () => true,
+        use(database) {
+          expect(database.prepare("SELECT count(*) AS count FROM records").get()).toEqual({
+            count: 0,
+          });
+        },
+      });
+    } finally {
+      host.cleanup();
+    }
+  }
+});
+
+test("Queue SQL refuses an in-lock native change before SQL and reports post-commit change as unknown", async () => {
+  for (const failAt of [2, 3]) {
+    const host = await fixture();
+    try {
+      const original = host.proofs.observeNativeWithPhysicalFence;
+      let reads = 0;
+      host.proofs.observeNativeWithPhysicalFence = async (...args) => {
+        reads += 1;
+        return reads === failAt ? { kind: "unknown" as const } : await original(...args);
+      };
+      await expect(
+        host.makeBroker().call({
+          grant: host.grant,
+          binding: "DB",
+          method: "execute",
+          statement: { sql: "INSERT INTO records(body) VALUES ('single-attempt')" },
+        }),
+      ).rejects.toMatchObject({ code: "backend_unavailable" });
+      expect(reads).toBe(failAt);
+      await host.store.withAuthorizedDatabase({
+        resourceUid: "database-one",
+        stillAuthorized: async () => true,
+        use(database) {
+          expect(database.prepare("SELECT count(*) AS count FROM records").get()).toEqual({
+            count: failAt === 2 ? 0 : 1,
+          });
+        },
+      });
+    } finally {
+      host.cleanup();
+    }
+  }
+});
+
+test("Queue SQL refuses aborted or expired calls before any SQL effect", async () => {
+  const host = await fixture();
+  try {
+    for (const control of [{ signal: AbortSignal.abort() }, { deadlineAtMs: Date.now() - 1 }]) {
+      await expect(
+        host.makeBroker().call({
+          grant: host.grant,
+          binding: "DB",
+          method: "execute",
+          statement: { sql: "INSERT INTO records(body) VALUES ('forbidden')" },
+          ...control,
+        }),
+      ).rejects.toMatchObject({ code: "backend_unavailable" });
+    }
+    const abort = new AbortController();
+    const original = host.proofs.observeNativeWithPhysicalFence;
+    host.proofs.observeNativeWithPhysicalFence = async (...args) => {
+      const observed = await original(...args);
+      abort.abort();
+      return observed;
+    };
+    await expect(
+      host.makeBroker().call({
+        grant: host.grant,
+        binding: "DB",
+        method: "execute",
+        statement: { sql: "INSERT INTO records(body) VALUES ('forbidden')" },
+        signal: abort.signal,
+      }),
+    ).rejects.toMatchObject({ code: "backend_unavailable" });
+    await host.store.withAuthorizedDatabase({
+      resourceUid: "database-one",
+      stillAuthorized: async () => true,
+      use(database) {
+        expect(database.prepare("SELECT count(*) AS count FROM records").get()).toEqual({
+          count: 0,
+        });
+      },
+    });
+  } finally {
+    host.cleanup();
+  }
+});
 
 test("Queue SQL refuses an unarmed batch, missing primary proof, or incomplete selected bindings", async () => {
   const host = await fixture();
@@ -315,12 +599,12 @@ test("Queue drain waits for the exact in-flight Node SQL call to close before co
     const held = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const original = host.store.withAuthorizedDatabase;
-    host.store.withAuthorizedDatabase = async (input) =>
+    const original = host.store.withVerifiedDatabaseSet;
+    host.store.withVerifiedDatabaseSet = async (input) =>
       await original({
         ...input,
-        use: async (database) => {
-          const result = await input.use(database);
+        use: async (database, physical) => {
+          const result = await input.use(database, physical);
           committed();
           await held;
           return result;
@@ -344,9 +628,20 @@ test("Queue drain waits for the exact in-flight Node SQL call to close before co
     expect(drained).toBe(false);
     expect(host.getCustody()).toMatchObject({ sqliteDrainState: "pending" });
     release();
-    expect(await writing).toMatchObject({ rowsWritten: 1 });
+    // The SQL committed before terminal, but the post-unlock full native read
+    // now sees terminal. This is an unknown effect, never a retry permission.
+    await expect(writing).rejects.toMatchObject({ code: "backend_unavailable" });
     expect(await draining).toBe(true);
     expect(host.getCustody()).toMatchObject({ sqliteDrainState: "drained" });
+    await host.store.withAuthorizedDatabase({
+      resourceUid: "database-one",
+      stillAuthorized: async () => true,
+      use(database) {
+        expect(database.prepare("SELECT body FROM records").get()).toMatchObject({
+          body: "before-close",
+        });
+      },
+    });
   } finally {
     host.cleanup();
   }
