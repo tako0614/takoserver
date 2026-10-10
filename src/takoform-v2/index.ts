@@ -172,6 +172,7 @@ export type {
   V2Form,
   V2ReferenceRequirement,
 } from "./types.ts";
+export { TakoformV2Error } from "./types.ts";
 export {
   inspectV2WorkerCodeVersionEligibility,
   type V2WorkerModuleInspector,

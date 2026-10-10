@@ -75,6 +75,7 @@ import {
   parseModuleWorkerSpec,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { createInternalV2ModuleWorkerForm } from "../src/takoform-v2/module-worker-lifecycle-backend.ts";
+import { TakoformV2Error } from "../src/takoform-v2/types.ts";
 import { inspectV2WorkerCodeVersionEligibility as portableEligibility } from "../src/takoform-v2/worker-code-eligibility.ts";
 import { inspectV2WorkerCodeVersionEligibility } from "../src/takoform-v2/worker-code-runtime.ts";
 import { runWorkerCronTriggerTick } from "../src/takoform-v2/worker-cron-trigger-scheduler.ts";
@@ -171,6 +172,7 @@ const RUNTIME_EXPORTS = [
   "runWorkerCronTriggerTick",
   "SQLITE_DATABASE_FORM_URL",
   "SQLITE_MIGRATION_APPLICATION_BACKEND_ID",
+  "TakoformV2Error",
   "v2WorkerInvocationSchemaReady",
   "V2_QUEUE_BACKEND_ID",
   "V2_ACTOR_NAMESPACE_BACKEND_ID",
@@ -230,6 +232,11 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(extension.createV2DurableWorkflowFormFrontFace).toBe(createV2DurableWorkflowFormFrontFace);
   expect(extension.DURABLE_WORKFLOW_BACKEND_ID).toBe(DURABLE_WORKFLOW_BACKEND_ID);
   expect(extension.DURABLE_WORKFLOW_FORM_URL).toBe(DURABLE_WORKFLOW_FORM_URL);
+  expect(extension.TakoformV2Error).toBe(TakoformV2Error);
+  expect(new extension.TakoformV2Error("resource_busy", 409)).toMatchObject({
+    code: "resource_busy",
+    status: 409,
+  });
   expect(extension.createV2WorkflowClassAdmission).toBe(createV2WorkflowClassAdmission);
   const workflowFormFactory: (options: Parameters<typeof createDurableWorkflowForm>[0]) => V2Form =
     extension.createDurableWorkflowForm;
