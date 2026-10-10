@@ -53,6 +53,7 @@ const RESERVATION_HEADER = "x-takoserver-private-actor-reservation";
 const RESERVATION_ACTION_HEADER = "x-takoserver-private-actor-reservation-action";
 const OBSERVATION_HEADER = "x-takoserver-private-actor-observation";
 const RESERVATION_MS = 30_000;
+const OBSERVATION_REVISION_LIMIT = Number.MAX_SAFE_INTEGER;
 // Host-owned inbound policy, not portable capacity or a native transport bound.
 // Count empty messages too, and retain charges through callback settlement.
 const SOCKET_INBOUND_COUNT = 64;
@@ -630,8 +631,6 @@ export function createActorNativeOwner(
         }
       | undefined;
     private readonly sockets = new Map<string, SocketRecord>();
-    private readonly observationInstance = randomBearer();
-    private observationRevision = 0;
     private activeContext = false;
     private readonly suppressedCloses = new WeakSet<NativeActorWebSocket>();
     private readonly stoppedInbound = new WeakSet<NativeActorWebSocket>();
@@ -664,6 +663,14 @@ export function createActorNativeOwner(
         storage.sql.exec(
           "CREATE TABLE IF NOT EXISTS actor_socket_reservations (socket_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, bearer TEXT NOT NULL, expires_at INTEGER NOT NULL)",
         );
+        storage.sql.exec(
+          "CREATE TABLE IF NOT EXISTS actor_observation_state (id INTEGER PRIMARY KEY CHECK(id = 1), instance TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision >= 0))",
+        );
+        storage.sql.exec(
+          "INSERT OR IGNORE INTO actor_observation_state (id, instance, revision) VALUES (1, ?, 0)",
+          randomBearer(),
+        );
+        this.readObservation();
         const recoveredSockets = state.getWebSockets?.() ?? [];
         for (let index = 0; index < recoveredSockets.length; index += 1) {
           const socket = recoveredSockets[index] as NativeActorWebSocket;
@@ -684,6 +691,7 @@ export function createActorNativeOwner(
             row.expiresAt > (SafeReflectApply(SafeNow, Date, []) as number)
           )
             continue;
+          this.advanceObservation();
           this.suppressedCloses.add(socket);
           socket.close(1008, "upgrade not committed");
           storage.sql.exec(
@@ -701,6 +709,43 @@ export function createActorNativeOwner(
     private requireStorage(): NonNullable<NativeState["storage"]> {
       if (!this.state.storage) throw new Error("Actor alarm storage unavailable");
       return this.state.storage;
+    }
+    private readObservation(): { readonly instance: string; readonly revision: number } {
+      const row = this.requireStorage()
+        .sql.exec("SELECT instance, revision FROM actor_observation_state WHERE id = 1")
+        [Symbol.iterator]()
+        .next().value;
+      if (
+        !row ||
+        typeof row.instance !== "string" ||
+        !/^[a-f0-9]{64}$/u.test(row.instance) ||
+        typeof row.revision !== "number" ||
+        !SafeIsSafeInteger(row.revision) ||
+        row.revision < 0 ||
+        row.revision >= OBSERVATION_REVISION_LIMIT
+      )
+        throw new Error("Actor observation state unavailable");
+      return { instance: row.instance, revision: row.revision };
+    }
+    private advanceObservation(): void {
+      // A route-less legacy owner without native storage cannot be observed.
+      if (!this.state.storage) return;
+      try {
+        const before = this.readObservation();
+        if (before.revision >= OBSERVATION_REVISION_LIMIT - 1)
+          throw new Error("Actor observation revision exhausted");
+        this.requireStorage().sql.exec(
+          "UPDATE actor_observation_state SET revision = revision + 1 WHERE id = 1 AND instance = ? AND revision = ?",
+          before.instance,
+          before.revision,
+        );
+        const after = this.readObservation();
+        if (after.instance !== before.instance || after.revision !== before.revision + 1)
+          throw new Error("Actor observation revision changed");
+      } catch (error) {
+        this.poisoned = true;
+        throw error;
+      }
     }
     private async currentGraph(): Promise<ActorOwnerGraph> {
       if (staticGraph) return staticGraph;
@@ -754,6 +799,7 @@ export function createActorNativeOwner(
           };
         };
         const graph = await readObservedGraph();
+        const stamp = this.readObservation();
         const alarm = this.readAlarm();
         if (alarm.actorId !== null && alarm.actorId !== actorId)
           return new Response(null, { status: 503 });
@@ -769,25 +815,30 @@ export function createActorNativeOwner(
         socketIds.sort();
         for (let index = 1; index < socketIds.length; index += 1)
           if (socketIds[index] === socketIds[index - 1]) return new Response(null, { status: 503 });
+        const activeActor = this.activeContext;
         const again = await readObservedGraph();
         let variantsChanged = again.variantKeys.length !== graph.variantKeys.length;
         for (let index = 0; !variantsChanged && index < graph.variantKeys.length; index += 1)
           variantsChanged = again.variantKeys[index] !== graph.variantKeys[index];
+        const stillAuthorized = await guard();
+        const finalStamp = this.readObservation();
         if (
           this.poisoned ||
           again.epoch !== graph.epoch ||
           again.generationKey !== graph.generationKey ||
           variantsChanged ||
-          !(await guard())
+          !stillAuthorized ||
+          finalStamp.instance !== stamp.instance ||
+          finalStamp.revision !== stamp.revision
         )
           return new Response(null, { status: 503 });
         return Response.json({
           actorId,
           epoch: graph.epoch,
           generationKey: graph.generationKey,
-          instance: this.observationInstance,
-          revision: this.observationRevision,
-          activeActor: this.activeContext,
+          instance: stamp.instance,
+          revision: stamp.revision,
+          activeActor,
           pendingAlarmCount: Number(alarm.pending !== null) + Number(alarm.obligation),
           openSocketCount: socketIds.length,
           socketIds,
@@ -798,8 +849,8 @@ export function createActorNativeOwner(
     }
     private contextRetired(): void {
       if (!this.activeContext) return;
+      this.advanceObservation();
       this.activeContext = false;
-      this.observationRevision += 1;
     }
     private async selectedChild(
       actorId: string,
@@ -825,8 +876,8 @@ export function createActorNativeOwner(
         throw new Error("Actor variant unavailable");
       const child = this.state.facets.get("actor", () => ({ class: selectedClass, id: actorId }));
       if (this.activeContext) throw new Error("Actor context overlap");
+      this.advanceObservation();
       this.activeContext = true;
-      this.observationRevision += 1;
       return child;
     }
     private readAlarm(): AlarmState {
@@ -900,12 +951,12 @@ export function createActorNativeOwner(
           // either direction leaves a harmless early wake, not a lost slot.
           if (!before.obligation && (before.pending === null || at < before.pending))
             await storage.setAlarm(at);
+          this.advanceObservation();
           storage.sql.exec("UPDATE actor_alarm_state SET pending_at = ? WHERE id = 1", at);
-          this.observationRevision += 1;
           await this.reconcile();
         } else if (action === "clear") {
+          this.advanceObservation();
           storage.sql.exec("UPDATE actor_alarm_state SET pending_at = NULL WHERE id = 1");
-          this.observationRevision += 1;
           await this.reconcile();
         }
         return Response.json({ at: this.readAlarm().pending });
@@ -980,6 +1031,7 @@ export function createActorNativeOwner(
       }
     }
     private discardPending(record: SocketRecord): void {
+      this.advanceObservation();
       record.status = "closed";
       this.sockets.delete(record.socketId);
       this.requireStorage().sql.exec(
@@ -1010,11 +1062,13 @@ export function createActorNativeOwner(
         const socketId = socketIds[index] as string;
         const record = this.liveSocket(socketId);
         if (record?.status === "transport-pending") this.discardPending(record);
-        else
+        else {
+          this.advanceObservation();
           this.requireStorage().sql.exec(
             "DELETE FROM actor_socket_reservations WHERE socket_id = ?",
             socketId,
           );
+        }
       }
       await this.reconcile();
     }
@@ -1087,6 +1141,7 @@ export function createActorNativeOwner(
           return new Response(null, { status: 404 });
         }
         try {
+          this.advanceObservation();
           this.requireStorage().sql.exec(
             "DELETE FROM actor_socket_reservations WHERE socket_id = ? AND bearer = ?",
             record.socketId,
@@ -1332,6 +1387,7 @@ export function createActorNativeOwner(
           return new Response(null, { status: 400 });
         if (close.reason !== undefined && typeof close.reason !== "string")
           return new Response(null, { status: 400 });
+        this.advanceObservation();
         if (record.status === "live")
           record.socket?.close(
             close.code as number | undefined,
@@ -1385,12 +1441,12 @@ export function createActorNativeOwner(
           // Durable watchdog is armed before the admitted obligation is run.
           // It survives a process loss, independent of native retry count.
           await this.requireStorage().setAlarm(watchdog);
+          this.advanceObservation();
           this.requireStorage().sql.exec(
             "UPDATE actor_alarm_state SET pending_at = ?, obligation = 1, retry_at = ? WHERE id = 1",
             state.obligation ? state.pending : null,
             watchdog,
           );
-          this.observationRevision += 1;
           return state.actorId;
         });
         if (claimed === null) return;
@@ -1518,20 +1574,20 @@ export function createActorNativeOwner(
               // Arm a successor before retiring its predecessor. If the owner
               // dies after settlement, the successor still has a native wake.
               if (state.pending !== null) await this.requireStorage().setAlarm(state.pending);
+              this.advanceObservation();
               this.requireStorage().sql.exec(
                 "UPDATE actor_alarm_state SET obligation = 0, retry_at = NULL WHERE id = 1",
               );
-              this.observationRevision += 1;
             } else {
               const retryAt = Date.now() + ALARM_RETRY_MS;
               // An early wake before this write sees the old watchdog and
               // reconciles; a crash after it retains the short retry timer.
               await this.requireStorage().setAlarm(retryAt);
+              this.advanceObservation();
               this.requireStorage().sql.exec(
                 "UPDATE actor_alarm_state SET retry_at = ? WHERE id = 1",
                 retryAt,
               );
-              this.observationRevision += 1;
             }
             await this.reconcile();
           });
@@ -1702,6 +1758,7 @@ export function createActorNativeOwner(
         this.inboundCount >= ACTOR_INBOUND_COUNT ||
         this.inboundBytes + bytes > profile.actorInboundBytes
       ) {
+        this.advanceObservation();
         this.discardInbound(socket);
         if (event.kind !== "message") {
           this.suppressedCloses.add(socket);
@@ -1720,7 +1777,10 @@ export function createActorNativeOwner(
         }
         return Promise.resolve();
       }
-      if (event.kind !== "message") this.closingInbound.add(socket);
+      if (event.kind !== "message") {
+        this.advanceObservation();
+        this.closingInbound.add(socket);
+      }
       if (!this.socketBatch) {
         const batch = new Set<InboundSocketEvent>();
         this.socketBatch = batch;
@@ -1908,6 +1968,7 @@ export function createActorNativeOwner(
         }
       }
       if (failed || event.kind !== "message") {
+        this.advanceObservation();
         const alreadyStopped = this.stoppedInbound.has(socket);
         this.discardInbound(socket);
         record.status = "closed";
@@ -1933,6 +1994,7 @@ export function createActorNativeOwner(
       const bytes =
         typeof data === "string" ? new TextEncoder().encode(data).byteLength : data.byteLength;
       if (bytes > profile.socketMessageBytes) {
+        this.advanceObservation();
         this.discardInbound(socket);
         socket.close(1009, "message too large");
         return Promise.resolve();
@@ -1985,11 +2047,13 @@ export function createActorNativeOwner(
           await this.control(async () => {
             const existing = this.readAlarm().actorId;
             if (existing !== null && existing !== id) throw new Error("Actor identity changed");
-            if (existing === null)
+            if (existing === null) {
+              this.advanceObservation();
               this.requireStorage().sql.exec(
                 "UPDATE actor_alarm_state SET actor_id = ? WHERE id = 1",
                 id,
               );
+            }
           });
         }
         const headers = new Headers(request.headers);
@@ -2206,6 +2270,7 @@ export function createActorNativeOwner(
               alarmTime(otherPending) ? otherPending : expiresAt,
             ]) as number;
             await storage.setAlarm(wake);
+            this.advanceObservation();
             storage.sql.exec(
               "INSERT INTO actor_socket_reservations (socket_id, actor_id, bearer, expires_at) VALUES (?, ?, ?, ?)",
               upgrade.socketId,
@@ -2233,6 +2298,14 @@ export function createActorNativeOwner(
               } as ResponseInit & { webSocket: NativeActorWebSocket }),
             );
           } catch (error) {
+            // A failed stamp already poisons observation; still retire a
+            // provisional transport instead of abandoning cleanup here.
+            if (!this.poisoned)
+              try {
+                this.advanceObservation();
+              } catch {
+                /* The observation lane is unavailable until owner recovery. */
+              }
             upgrade.status = "closed";
             this.sockets.delete(upgrade.socketId);
             if (this.state.storage)
