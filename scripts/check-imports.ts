@@ -121,7 +121,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "v2-queue-manager",
     match:
-      /^src\/takoform-v2\/worker-queue-(?:admission|backend|consumer-backend|delivery|scheduler)\.ts$/u,
+      /^src\/takoform-v2\/worker-queue-(?:admission|backend|consumer-backend|delivery|scheduler|schema)\.ts$/u,
     may: ["core", "domain", "v2-contract", "v2-form", "v2-runtime", "v2-queue-manager"],
   },
   {
@@ -466,7 +466,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|artifact-path|cron|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|artifact-path|cron|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.
@@ -594,10 +594,16 @@ for (const path of walk("src")) {
       .sort();
     const exactQueuePortExportNames = [
       "authorizeV2QueueBatchSend",
+      "armV2QueueBatchSQLiteExternalUse",
       "cancelV2QueueBatchBeforeSend",
       "confirmV2QueueBatchRetirement",
+      "confirmV2QueueBatchSQLiteDrained",
       "createV2QueueDelivery",
+      "readV2QueueBatchSQLiteCustody",
+      "recordV2QueueBatchTerminal",
       "V2QueueBatchExecutionIdentity",
+      "V2QueueBatchSQLiteCustody",
+      "V2QueueBatchTerminal",
       "verifyV2QueueSettlementScope",
     ].sort();
     const exactQueueProviderExtensionEdge =

@@ -1,6 +1,11 @@
 import { canonicalJson } from "../json.ts";
 import type { Sql } from "../ports.ts";
 import type { QueueCustody, QueueCustodyClaimedMessage } from "../queue-custody.ts";
+import type {
+  V2QueueBatchExecutionIdentity,
+  V2QueueBatchSQLiteCustody,
+  V2QueueBatchTerminal,
+} from "../queue-v2-batch-custody-contract.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "./forms/at-least-once-queue.ts";
 import { parseQueueConsumerSpec, QUEUE_CONSUMER_FORM_URL } from "./forms/queue-consumer.ts";
 import {
@@ -12,6 +17,12 @@ import {
 import type { V2Execution } from "./types.ts";
 import type { V2QueueConsumerCapability } from "./worker-queue-consumer-backend.ts";
 import { v2QueueBatchSQLiteSchemaReady } from "./worker-queue-schema.ts";
+
+export type {
+  V2QueueBatchExecutionIdentity,
+  V2QueueBatchSQLiteCustody,
+  V2QueueBatchTerminal,
+} from "../queue-v2-batch-custody-contract.ts";
 
 const DB_NOW_MS =
   "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
@@ -300,19 +311,6 @@ export type V2RegisteredQueueBatch = {
 
 export type V2QueueBatchSelection = V2RegisteredQueueBatch | { readonly kind: "idle" | "unknown" };
 
-export interface V2QueueBatchExecutionIdentity {
-  readonly batchId: string;
-  readonly reservationToken: string;
-  readonly queueUid: string;
-  readonly consumerUid: string;
-  readonly generation: number;
-  readonly workerUid: string;
-  readonly servingSourceOperationId: string;
-  readonly workerVersionUid: string;
-  readonly workerVersionGeneration: number;
-  readonly incarnationOperationId: string;
-}
-
 /**
  * Read only the bounded, immutable 0083 send-authorized identities for one
  * Consumer. This is a recovery candidate list, never physical-absence proof.
@@ -473,25 +471,6 @@ async function executionRow(sql: Sql, input: V2QueueBatchExecutionIdentity) {
   );
   return rows.length === 1 ? rows[0] : null;
 }
-
-export type V2QueueBatchTerminal = {
-  readonly kind: "handler_and_wait_until" | "incarnation_absent";
-  readonly receiptDigest: string;
-};
-
-export type V2QueueBatchSQLiteCustody =
-  | { readonly kind: "unknown" }
-  | {
-      readonly kind: "found";
-      /** Accepted 0083 scope; never substitute an untrusted grant's scope. */
-      readonly principal: string;
-      readonly space: string;
-      readonly targetKey: string;
-      readonly sqliteDrainState: null | "pending" | "drained";
-      readonly sqliteDrainReceiptDigest: null | `sha256:${string}`;
-      readonly terminal: null | V2QueueBatchTerminal;
-      readonly retirement: null | V2QueueBatchTerminal;
-    };
 
 const QUEUE_DIGEST = /^[a-f0-9]{64}$/u;
 const SQLITE_DRAIN_DIGEST = /^sha256:[a-f0-9]{64}$/u;

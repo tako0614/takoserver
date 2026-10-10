@@ -73,6 +73,7 @@ const V2_WORKER_SERVICE_INVOCATION_CUSTODY = "0086_v2_worker_service_invocation_
 const V2_WORKER_CRON_INVOCATION_CUSTODY = "0087_v2_worker_cron_invocation_custody.sql";
 const V2_WORKER_SQLITE_EXTERNAL_DRAIN = "0088_v2_worker_sqlite_external_drain.sql";
 const V2_WORKER_CRON_MATCH_GUARD_DEPTH = "0089_v2_worker_cron_match_guard_depth.sql";
+const V2_QUEUE_SQLITE_EXTERNAL_DRAIN = "0090_v2_queue_sqlite_external_drain.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -131,6 +132,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   V2_WORKER_CRON_INVOCATION_CUSTODY,
   V2_WORKER_SQLITE_EXTERNAL_DRAIN,
   V2_WORKER_CRON_MATCH_GUARD_DEPTH,
+  V2_QUEUE_SQLITE_EXTERNAL_DRAIN,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -860,6 +862,7 @@ describe("bringing a local database up to date", () => {
       V2_WORKER_CRON_INVOCATION_CUSTODY,
       V2_WORKER_SQLITE_EXTERNAL_DRAIN,
       V2_WORKER_CRON_MATCH_GUARD_DEPTH,
+      V2_QUEUE_SQLITE_EXTERNAL_DRAIN,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -1160,6 +1163,7 @@ describe("bringing a local database up to date", () => {
         V2_WORKER_CRON_INVOCATION_CUSTODY,
         V2_WORKER_SQLITE_EXTERNAL_DRAIN,
         V2_WORKER_CRON_MATCH_GUARD_DEPTH,
+        V2_QUEUE_SQLITE_EXTERNAL_DRAIN,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1753,6 +1757,7 @@ describe("bringing a local database up to date", () => {
       V2_WORKER_CRON_INVOCATION_CUSTODY,
       V2_WORKER_SQLITE_EXTERNAL_DRAIN,
       V2_WORKER_CRON_MATCH_GUARD_DEPTH,
+      V2_QUEUE_SQLITE_EXTERNAL_DRAIN,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1923,6 +1928,7 @@ describe("bringing a local database up to date", () => {
       V2_WORKER_CRON_INVOCATION_CUSTODY,
       V2_WORKER_SQLITE_EXTERNAL_DRAIN,
       V2_WORKER_CRON_MATCH_GUARD_DEPTH,
+      V2_QUEUE_SQLITE_EXTERNAL_DRAIN,
     ]);
     expect(
       database
@@ -2900,6 +2906,7 @@ describe("bringing a local database up to date", () => {
       V2_WORKER_CRON_INVOCATION_CUSTODY,
       V2_WORKER_SQLITE_EXTERNAL_DRAIN,
       V2_WORKER_CRON_MATCH_GUARD_DEPTH,
+      V2_QUEUE_SQLITE_EXTERNAL_DRAIN,
     ]);
     expect(
       database
