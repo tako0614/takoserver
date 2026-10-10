@@ -23,6 +23,7 @@ import type {
   V2WorkerPublicationResolution,
   V2WorkerPublicationSnapshot,
   V2WorkerVersionMaterials,
+  V2WorkflowClassAdmission,
   WorkerBundleCustody,
 } from "@takoserver/core/takoform-v2";
 import * as extension from "@takoserver/core/takoform-v2";
@@ -33,6 +34,7 @@ import { createV2ActorNamespaceSqlGraphReader } from "../src/takoform-v2/actor-n
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
 import { createV2HeldArtifactSource } from "../src/takoform-v2/forms/artifact-source.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
+import { DURABLE_WORKFLOW_FORM_URL } from "../src/takoform-v2/forms/durable-workflow.ts";
 import {
   OBJECT_BUCKET_FORM_URL,
   OBJECT_BUCKET_LIMITS,
@@ -83,13 +85,20 @@ import {
   V2_QUEUE_CONSUMER_BACKEND_ID,
 } from "../src/takoform-v2/worker-queue-consumer-backend.ts";
 import { createV2WorkerVersionConfiguredInputSealer } from "../src/takoform-v2/worker-version-configured-inputs.ts";
+import {
+  createDurableWorkflowForm,
+  DURABLE_WORKFLOW_BACKEND_ID,
+} from "../src/takoform-v2/workflow-backend.ts";
 import { createV2WorkflowBindingAuthority } from "../src/takoform-v2/workflow-binding-authority.ts";
+import { createV2WorkflowClassAdmission } from "../src/takoform-v2/workflow-class-admission.ts";
 import { createV2WorkflowSelectedMaterials } from "../src/takoform-v2/workflow-selected-materials.ts";
 
 const RUNTIME_EXPORTS = [
   "EDGE_KV_NAMESPACE_BACKEND_ID",
   "EDGE_KV_NAMESPACE_FORM_URL",
   "EDGE_KV_NAMESPACE_LIMITS",
+  "DURABLE_WORKFLOW_BACKEND_ID",
+  "DURABLE_WORKFLOW_FORM_URL",
   "EdgeKVNamespaceValidationError",
   "MODULE_WORKER_FORM_URL",
   "OBJECT_BUCKET_FORM_URL",
@@ -104,6 +113,7 @@ const RUNTIME_EXPORTS = [
   "AT_LEAST_ONCE_QUEUE_FORM_URL",
   "WorkerFormValidationError",
   "createEdgeKVNamespaceForm",
+  "createDurableWorkflowForm",
   "createInternalV2ModuleWorkerForm",
   "createObjectBucketForm",
   "createObjectBucketWorkerBindingAuthority",
@@ -112,6 +122,7 @@ const RUNTIME_EXPORTS = [
   "createV2ActorNamespaceForm",
   "createV2ActorBindingAuthority",
   "createV2WorkflowBindingAuthority",
+  "createV2WorkflowClassAdmission",
   "createAtLeastOnceQueueForm",
   "createQueueWorkerBindingAuthority",
   "createQueueConsumerForm",
@@ -202,6 +213,17 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(extension.createV2ActorNamespaceForm).toBe(createV2ActorNamespaceForm);
   expect(extension.createV2ActorBindingAuthority).toBe(createV2ActorBindingAuthority);
   expect(extension.createV2WorkflowBindingAuthority).toBe(createV2WorkflowBindingAuthority);
+  expect(extension.createDurableWorkflowForm).toBe(createDurableWorkflowForm);
+  expect(extension.DURABLE_WORKFLOW_BACKEND_ID).toBe(DURABLE_WORKFLOW_BACKEND_ID);
+  expect(extension.DURABLE_WORKFLOW_FORM_URL).toBe(DURABLE_WORKFLOW_FORM_URL);
+  expect(extension.createV2WorkflowClassAdmission).toBe(createV2WorkflowClassAdmission);
+  const workflowFormFactory: (options: Parameters<typeof createDurableWorkflowForm>[0]) => V2Form =
+    extension.createDurableWorkflowForm;
+  const workflowAdmissionFactory: (
+    options: Parameters<typeof createV2WorkflowClassAdmission>[0],
+  ) => V2WorkflowClassAdmission = extension.createV2WorkflowClassAdmission;
+  expect(typeof workflowFormFactory).toBe("function");
+  expect(typeof workflowAdmissionFactory).toBe("function");
   const acceptsPhysicalPort = (_physical: V2ActorNamespacePhysicalPort): void => {};
   const existingSelfhostPort = (
     physical: ReturnType<typeof createSelfhostActorExecutionHost>,
