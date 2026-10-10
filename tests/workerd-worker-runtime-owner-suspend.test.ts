@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +17,10 @@ import {
   spawnWorkerdWithParentDeath,
   workerPortOwnership,
 } from "../src/workerd-linux-process.ts";
-import { openWorkerdWorkerRuntimeOwner } from "../src/workerd-worker-runtime-owner.ts";
+import {
+  openWorkerdWorkerRuntimeOwner,
+  workerdWorkerPrivateSocketDirectory,
+} from "../src/workerd-worker-runtime-owner.ts";
 
 const WORKER_UID = "worker-graceful-suspend";
 const OPERATION_ID = "a5323426-8e22-4b4c-a362-f34ae3525f76";
@@ -24,6 +28,7 @@ const TARGET_KEY = "fixture-worker-graceful-suspend";
 type StoredState = {
   suspended: boolean;
   incarnations: Array<{
+    operationId: string;
     status: string;
     processIdentity: Parameters<typeof linuxProcessLiveness>[0];
   }>;
@@ -238,7 +243,16 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
       await owner.fetch(new Request("https://suspend.example.test/"))
     ).text();
     await expect(owner.close()).rejects.toMatchObject({ code: "ownership_uncertain" });
+    // The private Service socket namespace lives in /tmp, outside the data root.
+    const privateSockets = workerdWorkerPrivateSocketDirectory(
+      realpathSync(options.rootDirectory),
+      WORKER_UID,
+      oldRecord.operationId,
+    );
+    expect(existsSync(privateSockets)).toBe(true);
     await owner.suspend();
+    // Suspend removes the empty namespace; recovery recreates it.
+    expect(existsSync(privateSockets)).toBe(false);
     expect(owner.health()).toBe("idle");
     expect(await linuxProcessLiveness(oldProcess)).toBe("stale");
     expect(await workerPortOwnership(port, undefined)).toBe("vacant");
@@ -260,6 +274,7 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
     });
     await writeFile(statePath, suspendedBytes, { mode: 0o600 });
     owner = await openWorkerdWorkerRuntimeOwner(options);
+    expect(existsSync(privateSockets)).toBe(true);
     const after = JSON.parse(await readFile(statePath, "utf8")) as StoredState;
     const afterRecord = after.incarnations[0];
     if (!afterRecord) throw new Error("restored active record missing");
@@ -339,6 +354,7 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
       }),
     ).toEqual({ kind: "unknown" });
     await owner.suspend();
+    expect(existsSync(privateSockets)).toBe(false);
   } finally {
     for (const child of children)
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");

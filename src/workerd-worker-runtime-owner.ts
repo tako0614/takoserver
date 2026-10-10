@@ -2147,6 +2147,33 @@ function responseWithTrackedBody(response: Response, invocation: ActiveInvocatio
   });
 }
 
+/**
+ * One incarnation's private Service socket namespace.
+ *
+ * Linux's Unix-domain path limit excludes the ordinary (possibly very long)
+ * execution-copy root. This namespace is deterministic only within the exact
+ * owner lock; a pre-existing path is never adopted for a new incarnation. It
+ * lives outside the data root, so whatever retires or suspends the incarnation
+ * must also remove it: deleting the data root does not.
+ */
+export function workerdWorkerPrivateSocketDirectory(
+  canonicalOwnerRoot: string,
+  workerResourceUid: string,
+  operationId: string,
+): string {
+  return join(
+    "/tmp",
+    `tw-${createHash("sha256")
+      .update(canonicalOwnerRoot)
+      .update("\u0000")
+      .update(workerResourceUid)
+      .update("\u0000")
+      .update(operationId)
+      .digest("hex")
+      .slice(0, 20)}`,
+  );
+}
+
 export async function openWorkerdWorkerRuntimeOwner(
   inputOptions: OpenWorkerdWorkerRuntimeOwnerOptions,
 ): Promise<WorkerdWorkerRuntimeOwner> {
@@ -2278,21 +2305,8 @@ export async function openWorkerdWorkerRuntimeOwner(
   if (!ownerInfo?.isDirectory() || ownerInfo.isSymbolicLink() || (ownerInfo.mode & 0o077) !== 0)
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
 
-  // Linux's Unix-domain path limit excludes the ordinary (possibly very long)
-  // execution-copy root. This namespace is deterministic only within the exact
-  // owner lock; a pre-existing path is never adopted for a new incarnation.
   const privateSocketDirectoryFor = (operationId: string): string =>
-    join(
-      "/tmp",
-      `tw-${createHash("sha256")
-        .update(canonicalRoot)
-        .update("\u0000")
-        .update(options.workerResourceUid)
-        .update("\u0000")
-        .update(operationId)
-        .digest("hex")
-        .slice(0, 20)}`,
-    );
+    workerdWorkerPrivateSocketDirectory(canonicalRoot, options.workerResourceUid, operationId);
   const verifyPrivateSocketDirectory = async (path: string): Promise<void> => {
     const info = await lstat(path).catch(() => null);
     if (
@@ -2341,6 +2355,20 @@ export async function openWorkerdWorkerRuntimeOwner(
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
     return path;
+  };
+  // A graceful suspend has proved the child absent and closed this owner's
+  // brokers, so the namespace normally holds nothing. Remove it only while it
+  // is this owner's exact, verified, empty directory: recovery recreates it,
+  // and anything left inside (or a substituted path) stays for recovery to
+  // judge. This never fails a suspend.
+  const discardEmptyPrivateSockets = async (operationId: string): Promise<void> => {
+    const path = privateSocketDirectoryFor(operationId);
+    try {
+      await verifyPrivateSocketDirectory(path);
+      await rmdir(path);
+    } catch {
+      // Absent, replaced, or not empty: retained exactly as before.
+    }
   };
   const releasePrivateSockets = async (
     operationId: string,
@@ -6166,12 +6194,14 @@ export async function openWorkerdWorkerRuntimeOwner(
           await Promise.all([...handle.workflowLeases, ...handle.serviceBindingLeases]);
         }
         for (const handle of handles.values()) {
-          if (handle.record.status === "active" || handle.record.status === "draining") {
+          const stopped = handle.record.status === "active" || handle.record.status === "draining";
+          if (stopped) {
             await handle.group.suspendRetainingCustody();
           }
           await handle.serviceBindingForward?.close();
           await handle.actorForward?.close();
           await handle.workflowForward?.close();
+          if (stopped) await discardEmptyPrivateSockets(handle.record.operationId);
         }
         await persistPhysicalAbsences(true);
         await releaseOwnerLock(lockPath, directory, ownerLock);

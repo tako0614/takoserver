@@ -10,6 +10,7 @@ import {
   openWorkerdWorkerExecutionGroup,
   verifyRetiredWorkerdWorkerExecutionCopies,
 } from "../src/workerd-worker-execution-group.ts";
+import { removeOwnerPrivateSocketDirectories } from "./helpers/owner-private-sockets.ts";
 
 const WORKER_UID = "worker-crash-reopen";
 const CREATE_ID = "8f068b66-a849-4d9c-aa5a-ed4823101fc9";
@@ -129,6 +130,7 @@ async function fixture() {
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
       }
       await Promise.all(children.map((child) => child.exited));
+      await removeOwnerPrivateSocketDirectories(root);
       await rm(root, { recursive: true, force: true });
     },
   };
