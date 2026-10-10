@@ -25,6 +25,7 @@ export const SQLITE_MIGRATION_LEDGER = Object.freeze({
 } as const);
 
 const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
 const OPERATION_ID = RESOURCE_UID;
 const OWNER_VERSION = 1;
 const OWNER_FILE = "owner.json";
@@ -38,6 +39,18 @@ const LEDGER_SCHEMA = `CREATE TABLE _takoform_sqlite_migrations (
 const LEDGER_SQL = LEDGER_SCHEMA.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ");
 
 type Presence = "present" | "absent" | "unknown";
+const physicalFenceBrand: unique symbol = Symbol("SQLite locked physical set");
+
+/** Minted only while every selected SQLite UID shard is locked and its original CREATE is proven. */
+export interface SQLiteLockedPhysicalSet {
+  readonly targetKey: string;
+  readonly principal: string;
+  readonly space: string;
+  readonly bindings: readonly Readonly<{ name: string; resourceUid: string }>[];
+  /** Fails closed if retained beyond the store's locked callback. */
+  assertHeld(): void;
+  readonly [physicalFenceBrand]: true;
+}
 
 /** Neutral structural input: this adapter never imports the v2 Form layer. */
 export interface SQLiteNativeExecution {
@@ -178,8 +191,9 @@ export function createSelfhostV2SQLiteStore(
     }
   }
 
-  async function withLock<T>(uid: string, work: () => Promise<T>): Promise<T> {
-    const shard = createHash("sha256").update(uid).digest("hex").slice(0, 2);
+  const shardFor = (uid: string) => createHash("sha256").update(uid).digest("hex").slice(0, 2);
+
+  async function withShardLock<T>(shard: string, work: () => Promise<T>): Promise<T> {
     const mutex = new DatabaseSync(join(locks, `${shard}.sqlite`));
     let locked = false;
     try {
@@ -202,6 +216,21 @@ export function createSelfhostV2SQLiteStore(
       }
       mutex.close();
     }
+  }
+
+  async function withLocks<T>(uids: readonly string[], work: () => Promise<T>): Promise<T> {
+    const shards = [...new Set(uids.map((uid) => shardFor(uid)))].sort();
+    const acquire = async (index: number): Promise<T> => {
+      const shard = shards[index];
+      return shard === undefined
+        ? await work()
+        : await withShardLock(shard, () => acquire(index + 1));
+    };
+    return await acquire(0);
+  }
+
+  async function withLock<T>(uid: string, work: () => Promise<T>): Promise<T> {
+    return await withShardLock(shardFor(uid), work);
   }
 
   async function ownsClaim(input: SQLiteNativeExecution): Promise<boolean> {
@@ -312,7 +341,11 @@ export function createSelfhostV2SQLiteStore(
     return owner?.resourceUid === uid && owner.targetKey === options.targetKey;
   }
 
-  async function matchesAcceptedCreate(uid: string, owner: OwnerReceipt | null): Promise<boolean> {
+  async function matchesAcceptedCreate(
+    uid: string,
+    owner: OwnerReceipt | null,
+    expected?: { readonly principal: string; readonly space: string },
+  ): Promise<boolean> {
     if (!matchesOwner(owner, uid)) return false;
     if (options.proofs) {
       const created = await options.proofs.acceptedCreate({
@@ -328,13 +361,15 @@ export function createSelfhostV2SQLiteStore(
         created.principal.length > 0 &&
         typeof created.space === "string" &&
         created.space.length > 0 &&
+        (!expected ||
+          (created.principal === expected.principal && created.space === expected.space)) &&
         typeof created.backendId === "string" &&
         created.backendId.length > 0
       );
     }
     if (!options.sql) return false;
     const rows = await options.sql.query(
-      `SELECT created.id FROM tf_v2_resources r
+      `SELECT created.id, r.principal, r.space FROM tf_v2_resources r
        JOIN tf_v2_operations created ON created.resource_uid = r.uid
        WHERE r.uid = ? AND r.target_key = ? AND r.deleted_at IS NULL
          AND created.action = 'create' AND created.generation = 1
@@ -342,7 +377,12 @@ export function createSelfhostV2SQLiteStore(
          AND created.target_key = r.target_key LIMIT 2`,
       [uid, options.targetKey],
     );
-    return rows.length === 1 && rows[0]?.id === owner.createOperationId;
+    return (
+      rows.length === 1 &&
+      rows[0]?.id === owner.createOperationId &&
+      (!expected ||
+        (rows[0]?.principal === expected.principal && rows[0]?.space === expected.space))
+    );
   }
 
   function completeDirectory(directory: string, uid: string): boolean {
@@ -702,6 +742,85 @@ export function createSelfhostV2SQLiteStore(
     });
   }
 
+  /**
+   * Queue-only physical fence for native readback that would otherwise inspect
+   * this same store recursively. All selected UID shards are locked in one
+   * canonical order, including distinct UIDs that hash to the same shard.
+   */
+  async function withVerifiedDatabaseSet<T>(input: {
+    readonly resourceUid: string;
+    readonly principal: string;
+    readonly space: string;
+    readonly bindings: readonly Readonly<{ name: string; resourceUid: string }>[];
+    readonly stillAuthorized: (physical: SQLiteLockedPhysicalSet) => Promise<boolean>;
+    readonly use: (database: DatabaseSync, physical: SQLiteLockedPhysicalSet) => Promise<T> | T;
+  }): Promise<T> {
+    const uid = checkedId(input.resourceUid);
+    if (
+      typeof input.principal !== "string" ||
+      !input.principal ||
+      typeof input.space !== "string" ||
+      !input.space ||
+      !Array.isArray(input.bindings) ||
+      input.bindings.length < 1 ||
+      input.bindings.length > 64
+    )
+      throw new SelfhostV2SQLiteStoreError("backend_unavailable");
+    const names = new Set<string>();
+    const bindings = input.bindings.map((binding) => {
+      if (
+        !binding ||
+        typeof binding.name !== "string" ||
+        !BINDING_NAME.test(binding.name) ||
+        names.has(binding.name)
+      )
+        throw new SelfhostV2SQLiteStoreError("backend_unavailable");
+      names.add(binding.name);
+      return Object.freeze({ name: binding.name, resourceUid: checkedId(binding.resourceUid) });
+    });
+    if (!bindings.some((binding) => binding.resourceUid === uid))
+      throw new SelfhostV2SQLiteStoreError("backend_unavailable");
+    bindings.sort((left, right) => left.name.localeCompare(right.name));
+    const uids = [...new Set(bindings.map((binding) => binding.resourceUid))].sort();
+    return await withLocks(uids, async () => {
+      for (const resourceUid of uids) {
+        if (
+          presence(resourceUid) !== "present" ||
+          !(await matchesAcceptedCreate(resourceUid, ownerAt(resourceDir(resourceUid)), {
+            principal: input.principal,
+            space: input.space,
+          }))
+        )
+          throw new SelfhostV2SQLiteStoreError("backend_unavailable");
+      }
+      let held = true;
+      const physical: SQLiteLockedPhysicalSet = Object.freeze({
+        targetKey: options.targetKey,
+        principal: input.principal,
+        space: input.space,
+        bindings: Object.freeze(bindings),
+        assertHeld() {
+          if (!held) throw new SelfhostV2SQLiteStoreError("backend_unavailable");
+        },
+        [physicalFenceBrand]: true as const,
+      });
+      try {
+        if (!(await input.stillAuthorized(physical)))
+          throw new SelfhostV2SQLiteStoreError("backend_unavailable");
+        const database = new DatabaseSync(join(resourceDir(uid), DATABASE_FILE));
+        try {
+          database.exec("PRAGMA journal_mode = DELETE");
+          database.exec("PRAGMA foreign_keys = ON");
+          return await input.use(database, physical);
+        } finally {
+          if (database.isOpen) database.close();
+        }
+      } finally {
+        held = false;
+      }
+    });
+  }
+
   /** Physical UID ownership/readiness witness; never returns a database handle. */
   async function inspectOwnedDatabase(input: {
     readonly resourceUid: string;
@@ -733,6 +852,7 @@ export function createSelfhostV2SQLiteStore(
     inspect,
     ensureDeleted,
     withAuthorizedDatabase,
+    withVerifiedDatabaseSet,
     inspectOwnedDatabase,
     withInvocationLock,
     recoverOwnedDatabase,

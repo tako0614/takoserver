@@ -35,6 +35,7 @@ export {
   createSelfhostV2SQLiteStore,
   type SelfhostV2SQLiteStore,
   SelfhostV2SQLiteStoreError,
+  type SQLiteLockedPhysicalSet,
   type SQLiteNativeExecution,
   type SQLiteStoreProofPort,
 } from "./selfhost-v2-sqlite-store.ts";

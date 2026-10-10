@@ -103,6 +103,19 @@ The linearization order is deliberate:
 4. Drain takes that invocation lock, proves terminal and no executing SQL,
    then confirms D1 drained. Only then may retirement/delete predicates pass.
 
+For Queue SQL, the private native readback can itself ask the same Node store to
+inspect a SQLite binding. Re-entering a held UID lock (including a different UID
+on the same hash shard) would make that proof return unknown. The Node broker
+therefore locks every UID in the exact sealed SQLite binding set in canonical
+shard order and checks each original-CREATE physical owner. Only while those
+locks are held does it mint an opaque, expiring physical-set witness. The
+in-lock native readback still freshly verifies Core/current vectors and the
+native route, Version, script, and closure, but uses the witness to avoid only
+the recursive Node physical inspection. Full physical/native readbacks bracket
+the locked phase; a failed post-commit readback is an unknown SQL effect, not
+permission to send the statement again. A missing restricted proof port fails
+closed rather than falling back to a cached native answer.
+
 If the Node process dies, file-lock release alone is not a success receipt:
 the restarted sole writer must recover SQLite journal state and establish
 that no old process can still execute under another root. Inside the invocation

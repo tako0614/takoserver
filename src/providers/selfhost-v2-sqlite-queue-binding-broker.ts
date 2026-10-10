@@ -10,7 +10,11 @@ import {
   SelfhostV2SqliteError,
   type SelfhostV2SqliteStatement,
 } from "./selfhost-v2-sqlite-plane.ts";
-import { type SelfhostV2SQLiteStore, SQLITE_MIGRATION_LEDGER } from "./selfhost-v2-sqlite-store.ts";
+import {
+  type SelfhostV2SQLiteStore,
+  SQLITE_MIGRATION_LEDGER,
+  type SQLiteLockedPhysicalSet,
+} from "./selfhost-v2-sqlite-store.ts";
 
 const UID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const BINDING = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
@@ -66,6 +70,15 @@ export interface V2QueueSQLiteProofPort {
       }
     | { readonly kind: "unknown" }
   >;
+  /**
+   * The same native/current/closure readback, but without a recursive Node
+   * SQLite inspection. The store has locked and verified *every* selected UID
+   * in the opaque physical set before this method may be called.
+   */
+  observeNativeWithPhysicalFence(
+    grant: V2QueueSQLiteGrant,
+    physical: SQLiteLockedPhysicalSet,
+  ): ReturnType<V2QueueSQLiteProofPort["observeNative"]>;
   /** The one Core 0090 pending→drained CAS, not a Node-owned ledger. */
   confirmDrained(input: {
     readonly execution: V2QueueBatchExecutionIdentity;
@@ -80,12 +93,16 @@ export type V2QueueSQLiteCall =
       readonly binding: string;
       readonly method: "execute" | "query";
       readonly statement: SelfhostV2SqliteStatement;
+      readonly signal?: AbortSignal;
+      readonly deadlineAtMs?: number;
     }
   | {
       readonly grant: V2QueueSQLiteGrant;
       readonly binding: string;
       readonly method: "transaction";
       readonly statements: readonly SelfhostV2SqliteStatement[];
+      readonly signal?: AbortSignal;
+      readonly deadlineAtMs?: number;
     };
 
 function unavailable(): SelfhostV2SqliteError {
@@ -215,6 +232,7 @@ export function createSelfhostV2SqliteQueueBindingBroker(options: {
     typeof options.proofs.readSelectedBindings !== "function" ||
     typeof options.proofs.resolveCurrentBinding !== "function" ||
     typeof options.proofs.observeNative !== "function" ||
+    typeof options.proofs.observeNativeWithPhysicalFence !== "function" ||
     typeof options.proofs.confirmDrained !== "function"
   )
     throw new TypeError("trusted Queue SQLite Node proof ports are required");
@@ -250,7 +268,18 @@ export function createSelfhostV2SqliteQueueBindingBroker(options: {
   async function liveProof(
     grant: V2QueueSQLiteGrant,
     binding: string,
+    physical?: SQLiteLockedPhysicalSet,
   ): Promise<{ readonly resourceUid: string; readonly vector: string } | null> {
+    if (physical) {
+      physical.assertHeld();
+      if (
+        physical.targetKey !== grant.targetKey ||
+        physical.principal !== grant.principal ||
+        physical.space !== grant.space ||
+        !sameBindings(grant.bindings, physical.bindings)
+      )
+        return null;
+    }
     const exact = await readExact(grant);
     if (
       exact?.custody.sqliteDrainState !== "pending" ||
@@ -258,7 +287,10 @@ export function createSelfhostV2SqliteQueueBindingBroker(options: {
       exact.custody.retirement !== null
     )
       return null;
-    const native = await proofs.observeNative(grant);
+    const native = physical
+      ? await proofs.observeNativeWithPhysicalFence(grant, physical)
+      : await proofs.observeNative(grant);
+    physical?.assertHeld();
     if (
       native.kind !== "confirmed" ||
       native.workerUid !== grant.execution.workerUid ||
@@ -276,44 +308,75 @@ export function createSelfhostV2SqliteQueueBindingBroker(options: {
 
   async function call(input: V2QueueSQLiteCall): Promise<unknown> {
     const grant = checkedGrant(input.grant, store.targetKey);
+    const assertOpen = () => {
+      if (
+        input.signal?.aborted ||
+        (input.deadlineAtMs !== undefined &&
+          (!Number.isSafeInteger(input.deadlineAtMs) || Date.now() >= input.deadlineAtMs))
+      )
+        throw unavailable();
+    };
+    assertOpen();
     if (
       typeof input.binding !== "string" ||
       !BINDING.test(input.binding) ||
       (input.method !== "execute" && input.method !== "query" && input.method !== "transaction")
     )
       throw unavailable();
-    return await store.withInvocationLock(`queue:${grant.execution.batchId}`, async () => {
-      const captured = await liveProof(grant, input.binding);
-      if (!captured) throw unavailable();
-      const stillAuthorized = async () => {
-        const current = await liveProof(grant, input.binding);
-        return current?.resourceUid === captured.resourceUid && current.vector === captured.vector;
-      };
-      return await store.withAuthorizedDatabase({
-        resourceUid: captured.resourceUid,
-        stillAuthorized,
-        use: async (database) => {
-          if (!(await stillAuthorized())) throw unavailable();
-          const plane = createSelfhostV2SqlitePlane({
-            database,
-            migrationLedger: SQLITE_MIGRATION_LEDGER,
-          });
-          let result: unknown;
-          if (input.method === "transaction") {
-            result = await plane.transaction(input.statements);
-          } else {
-            const statement = input.statement;
-            result =
-              input.method === "execute"
-                ? await plane.execute(statement.sql, statement.params as readonly EdgeSqlValue[])
-                : await plane.query(statement.sql, statement.params as readonly EdgeSqlValue[]);
-          }
-          // An error after commit is an unknown effect, never permission to retry.
-          if (!(await stillAuthorized())) throw unavailable();
-          return result;
-        },
-      });
-    });
+    return await store.withInvocationLock(
+      `queue:${grant.execution.batchId}`,
+      async () => {
+        assertOpen();
+        const captured = await liveProof(grant, input.binding);
+        assertOpen();
+        if (!captured) throw unavailable();
+        const stillAuthorized = async (physical: SQLiteLockedPhysicalSet) => {
+          assertOpen();
+          const current = await liveProof(grant, input.binding, physical);
+          assertOpen();
+          return (
+            current?.resourceUid === captured.resourceUid && current.vector === captured.vector
+          );
+        };
+        const result = await store.withVerifiedDatabaseSet({
+          resourceUid: captured.resourceUid,
+          principal: grant.principal,
+          space: grant.space,
+          bindings: grant.bindings,
+          stillAuthorized,
+          use: async (database, physical) => {
+            if (!(await stillAuthorized(physical))) throw unavailable();
+            assertOpen();
+            const plane = createSelfhostV2SqlitePlane({
+              database,
+              migrationLedger: SQLITE_MIGRATION_LEDGER,
+            });
+            let value: unknown;
+            if (input.method === "transaction") {
+              value = await plane.transaction(input.statements);
+            } else {
+              const statement = input.statement;
+              value =
+                input.method === "execute"
+                  ? await plane.execute(statement.sql, statement.params as readonly EdgeSqlValue[])
+                  : await plane.query(statement.sql, statement.params as readonly EdgeSqlValue[]);
+            }
+            // An error after commit is an unknown effect, never permission to retry.
+            if (!(await stillAuthorized(physical))) throw unavailable();
+            assertOpen();
+            return value;
+          },
+        });
+        // Full physical/native readback is safe again after every UID lock closes.
+        // A failed readback after commit is an unknown effect, never a retry grant.
+        const after = await liveProof(grant, input.binding);
+        assertOpen();
+        if (after?.resourceUid !== captured.resourceUid || after.vector !== captured.vector)
+          throw unavailable();
+        return result;
+      },
+      input.signal ? { signal: input.signal } : {},
+    );
   }
 
   async function drain(
