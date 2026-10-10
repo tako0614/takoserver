@@ -298,9 +298,15 @@ async function endpointEventually(
   throw new Error(`journey Endpoint ${path} did not reach the expected answer: ${last}`);
 }
 
+/**
+ * A read while the Host is writing would otherwise fail at once with
+ * SQLITE_BUSY; wait for the Host's commit instead, as an operator's reader
+ * with a busy timeout would.
+ */
 function withControl<T>(root: string, read: (database: Database) => T): T {
   const database = new Database(join(root, "control.sqlite"), { readonly: true });
   try {
+    database.exec("PRAGMA busy_timeout = 5000");
     return read(database);
   } finally {
     database.close();
