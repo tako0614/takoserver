@@ -420,6 +420,59 @@ runtime recovery. Operators still need to collect logs and configure their own
 alerts: these messages are not a health API, monitoring service, or proof of
 operator recovery.
 
+### Ordinary journey native test and known gaps
+
+`tests/selfhost-v2-ordinary-journey-native.test.ts` follows this guide with
+real `bun src/entry-bun.ts` processes and real workerd children. It requires
+the same opt-in as the entry lifecycle test (`TAKOSERVER_V2_ENTRY_NATIVE=1`),
+the accepted `TAKOSERVER_WORKERD_BINARY`, a `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY`
+built from this checkout, Linux `/proc`, OpenSSL and a loopback network
+namespace with TCP 443, as for the other native entry tests.
+
+Its journey starts from an empty data root: the first boot prints the operator
+assertion and the later-assertion command, the assertion is exchanged for a
+session, and an organization and organization API key are created. The
+operator then seeds held artifacts, starts the complete Worker profile and
+checks support for each Form. It creates a Worker with `fetch` and `queue`
+handlers, a SQLite Binding with an applied migration, a Queue Producer Binding,
+a Deployment, an Endpoint and a Queue Consumer, and reads them back over
+certificate-validated HTTPS. It then seeds a second bundle, restarts, deploys a
+new Version and observes the new behaviour; SIGKILLs the Host while a 5 MiB
+artifact Operation has durably staged only a prefix and Queue messages are in
+flight; restarts, replays the same key and checks that the Operation settles
+once, the Worker is still served without a client republish and every message
+has exactly one terminal ack (a rejected attempt is retried in its own batch);
+and finally deletes everything in reference order, with a refused premature
+delete on the way, and checks the artifact tables, the SQLite directory, the
+workerd children and TCP 443.
+
+This is a local, loopback, single-host result with a self-signed certificate
+and operator-seeded artifact bytes. It does not cover a `scheduled` handler,
+Actor or Workflow use, public DNS or certificate trust, Hosted/WfP, a host
+reboot or an operator disaster-recovery drill. Messages in flight at the
+crash are redelivered at least once, and a batch reserved but not yet sent is
+held for its 120 second reservation before redelivery.
+
+Known gaps this test records, not fixes:
+
+- **A pending Deployment or Endpoint Operation blocks restart.** If the Host
+  stops (SIGKILL, or a graceful SIGTERM) while a WorkerDeployment or
+  WorkerEndpoint Operation for a published Worker is queued, boot restore asks
+  for the current-serving proof, which is refused while such an Operation is
+  pending, and the Operation only runs after restore. The Host exits with
+  `ownership_uncertain` on every start and the installation needs manual
+  repair. The data is left untouched. The second test in that file pins this
+  fail-closed behaviour so that a fix has to update it.
+- **The readiness probe does not observe v2 Worker owners.** While v2 Workers
+  are serving, `/_takoserver/health/ready` reports `workerRuntime:
+  "not-required"` and `supervisor: "idle"`; it can not report their failure.
+- **The control database has no busy timeout.** It uses the default
+  rollback-journal mode, so a concurrent external reader (an operator's
+  `sqlite3`, a backup tool, a poller) can make a Host write fail with
+  `database is locked`. A background pass then logs only its name, and a
+  Queue batch whose reservation could not be cancelled stays reserved for 120
+  seconds. Do not read the live database; stop the Host first.
+
 ## Historical reference: v1 signed package admission
 
 The former self-host admission path built a Takoform Core v1.1.0 verifier from
