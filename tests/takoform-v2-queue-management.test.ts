@@ -1674,121 +1674,207 @@ test("old physical Queue execution retires only with exact persisted absence pro
   }
 });
 
-test("a finished batch whose retirement hit a lock retires from its remembered receipt", async () => {
-  const f = fixture();
-  let composition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
-  try {
-    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "locked-queue", {
-      messageRetentionSeconds: 3600,
-    });
-    const worker = await f.create(MODULE_WORKER_FORM_URL, "locked-worker", {});
-    const version = await f.create(WORKER_VERSION_FORM_URL, "locked-version", {
-      worker: { resourceUid: worker.resourceUid },
-    });
-    f.setServingVersion(version.resourceUid);
-    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "locked-deployment", {
-      worker: { resourceUid: worker.resourceUid },
-    });
-    f.setServingSource(deployment.id);
-    const consumer = await f.create(
-      QUEUE_CONSUMER_FORM_URL,
-      "locked-consumer",
-      consumerSpec(queue.resourceUid, worker.resourceUid),
+/**
+ * A Consumer with maxConcurrency 1 whose one finished batch cannot be retired
+ * while a lock holds: the first `locks` retirement UPDATEs fail.
+ */
+async function lockedRetirement(f: ReturnType<typeof fixture>, name: string, locks: number) {
+  const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, `${name}-queue`, {
+    messageRetentionSeconds: 3600,
+  });
+  const worker = await f.create(MODULE_WORKER_FORM_URL, `${name}-worker`, {});
+  const version = await f.create(WORKER_VERSION_FORM_URL, `${name}-version`, {
+    worker: { resourceUid: worker.resourceUid },
+  });
+  f.setServingVersion(version.resourceUid);
+  const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, `${name}-deployment`, {
+    worker: { resourceUid: worker.resourceUid },
+  });
+  f.setServingSource(deployment.id);
+  const consumer = await f.create(
+    QUEUE_CONSUMER_FORM_URL,
+    `${name}-consumer`,
+    consumerSpec(queue.resourceUid, worker.resourceUid, { maxConcurrency: 1 }),
+  );
+  const custody = createQueueCustody({ sql: f.sql });
+  const admit = async (messageId: string) =>
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId, body: new Uint8Array([1]) },
     );
-    const custody = createQueueCustody({ sql: f.sql });
-    const admit = async (messageId: string) =>
-      await custody.admit(
-        {
-          queueId: v2QueueId(queue.resourceUid),
-          messageRetentionSeconds: 3600,
-          deliveryDelaySeconds: 0,
-        },
-        { messageId, body: new Uint8Array([1]) },
-      );
-    await admit("locked-message");
-    // A lock that outlasts the busy timeout fails the retirement UPDATE twice.
-    let lockedRetirements = 2;
-    const sql: Sql = {
-      query: (statement, params) => f.sql.query(statement, params),
-      batch: (statements) => f.sql.batch(statements),
-      async run(statement, params) {
-        if (lockedRetirements > 0 && statement.includes("SET state = 'retired'")) {
-          lockedRetirements -= 1;
+  let remainingLocks = locks;
+  let retirementAttempts = 0;
+  const sql: Sql = {
+    query: (statement, params) => f.sql.query(statement, params),
+    batch: (statements) => f.sql.batch(statements),
+    async run(statement, params) {
+      if (statement.includes("SET state = 'retired'")) {
+        retirementAttempts += 1;
+        if (remainingLocks > 0) {
+          remainingLocks -= 1;
           throw new Error("database is locked");
         }
-        return await f.sql.run(statement, params);
-      },
-    };
-    const target = {
-      workerVersionUid: version.resourceUid,
-      workerVersionGeneration: 1,
-      incarnationOperationId: "live-physical-incarnation",
-    };
-    const sent: string[] = [];
-    const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
-    const privatePort = Number(reservation.port);
-    await reservation.stop(true);
-    composition = createSelfhostV2QueueComposition({
-      sql,
-      custody,
-      capability: f.capability,
-      settlementKey: new Uint8Array(32).fill(7),
-      privatePort,
-      ownerForWorkerUid: async () =>
-        ({
-          // The child that ran the batch is alive, so absence never applies.
-          async observeQueuePhysicalAbsence() {
-            return { kind: "unknown" as const };
-          },
-          async invokeQueue(input: {
-            readonly batchId: string;
-            authorizeSend(value: typeof target): Promise<string>;
-          }) {
-            if ((await input.authorizeSend(target)) !== "authorized") return { kind: "unknown" };
-            sent.push(input.batchId);
-            // Retirement receipts are unique per batch.
-            const receiptDigest = (sent.length === 1 ? "b" : "c").repeat(64);
-            return { kind: "handler_resolved", ...target, receiptDigest };
-          },
-        }) as unknown as WorkerdWorkerRuntimeOwner,
-    });
-    const scope = { consumerUid: consumer.resourceUid, principal, space, targetKey };
-    const executions = async () =>
+      }
+      return await f.sql.run(statement, params);
+    },
+  };
+  const target = {
+    workerVersionUid: version.resourceUid,
+    workerVersionGeneration: 1,
+    incarnationOperationId: "live-physical-incarnation",
+  };
+  const sent: string[] = [];
+  let clock = 0;
+  const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+  const privatePort = Number(reservation.port);
+  await reservation.stop(true);
+  const composition = createSelfhostV2QueueComposition({
+    sql,
+    custody,
+    capability: f.capability,
+    settlementKey: new Uint8Array(32).fill(7),
+    privatePort,
+    now: () => clock,
+    ownerForWorkerUid: async () =>
+      ({
+        // The child that ran the batch is alive, so absence never applies.
+        async observeQueuePhysicalAbsence() {
+          return { kind: "unknown" as const };
+        },
+        async invokeQueue(input: {
+          readonly batchId: string;
+          authorizeSend(value: typeof target): Promise<string>;
+        }) {
+          if ((await input.authorizeSend(target)) !== "authorized") return { kind: "unknown" };
+          sent.push(input.batchId);
+          // Retirement receipts are unique per batch.
+          const receiptDigest = String(sent.length).repeat(64);
+          return { kind: "handler_resolved", ...target, receiptDigest };
+        },
+      }) as unknown as WorkerdWorkerRuntimeOwner,
+  });
+  return {
+    composition,
+    admit,
+    sent,
+    workerUid: worker.resourceUid,
+    scope: { consumerUid: consumer.resourceUid, principal, space, targetKey },
+    at: (millis: number) => {
+      clock = millis;
+    },
+    retirementAttempts: () => retirementAttempts,
+    executions: async () =>
       await f.sql.query(
         "SELECT batch_id,state,retirement_kind,retirement_receipt_digest FROM queue_v2_batch_executions ORDER BY rowid",
-      );
+      ),
+    settlements: async () =>
+      await f.sql.query("SELECT state,outcome FROM queue_v2_batch_settlements ORDER BY rowid"),
+  };
+}
 
+test("a finished batch whose retirement hit a lock retires from its remembered receipt", async () => {
+  const f = fixture();
+  let locked: Awaited<ReturnType<typeof lockedRetirement>> | undefined;
+  try {
+    locked = await lockedRetirement(f, "locked", 2);
+    const { composition, scope, sent } = locked;
+    await locked.admit("locked-message");
+
+    locked.at(0);
     expect(await composition.deliverOnce(scope)).toEqual({ kind: "unknown" });
     expect(sent).toHaveLength(1);
-    expect(await executions()).toMatchObject([{ batch_id: sent[0], state: "send_authorized" }]);
-    // Still locked: the batch stays occupied, its message leased, and nothing
-    // is sent again.
+    expect(locked.retirementAttempts()).toBe(1);
+    expect(await locked.executions()).toMatchObject([
+      { batch_id: sent[0], state: "send_authorized" },
+    ]);
+    // Before the backoff elapses, a pass does not touch the locked row again,
+    // the batch stays occupied with its message leased, and nothing is resent.
+    for (const millis of [0, 999]) {
+      locked.at(millis);
+      expect(await composition.deliverOnce(scope)).toEqual({ kind: "idle" });
+    }
+    expect(locked.retirementAttempts()).toBe(1);
+    locked.at(1_000);
     expect(await composition.deliverOnce(scope)).toEqual({ kind: "idle" });
+    expect(locked.retirementAttempts()).toBe(2);
+    // The second failure doubles the wait.
+    locked.at(2_999);
+    expect(await composition.deliverOnce(scope)).toEqual({ kind: "idle" });
+    expect(locked.retirementAttempts()).toBe(2);
+    expect(await locked.executions()).toMatchObject([{ state: "send_authorized" }]);
     expect(sent).toHaveLength(1);
-    expect(await executions()).toMatchObject([{ state: "send_authorized" }]);
 
     // The lock is gone: the same receipt retires the batch and the default ACK lands.
+    locked.at(3_000);
     expect(await composition.deliverOnce(scope)).toEqual({ kind: "idle" });
-    expect(await executions()).toEqual([
+    expect(locked.retirementAttempts()).toBe(3);
+    expect(await locked.executions()).toEqual([
       {
         batch_id: sent[0],
         state: "retired",
         retirement_kind: "handler_and_wait_until",
-        retirement_receipt_digest: "b".repeat(64),
+        retirement_receipt_digest: "1".repeat(64),
       },
     ]);
-    expect(await f.sql.query("SELECT state,outcome FROM queue_v2_batch_settlements")).toEqual([
-      { state: "settled", outcome: "ack" },
-    ]);
+    expect(await locked.settlements()).toEqual([{ state: "settled", outcome: "ack" }]);
     expect(sent).toHaveLength(1);
 
-    // The Consumer is free again: the next message is delivered at once.
-    await admit("next-message");
+    // The Consumer's only slot is free again: the next message is delivered at once.
+    await locked.admit("next-message");
     expect(await composition.deliverOnce(scope)).toEqual({ kind: "handler_resolved" });
     expect(sent).toHaveLength(2);
-    expect(await executions()).toMatchObject([{ state: "retired" }, { state: "retired" }]);
+    expect(await locked.executions()).toMatchObject([{ state: "retired" }, { state: "retired" }]);
   } finally {
-    await composition?.close();
+    await locked?.composition.close();
+    f.database.close();
+  }
+});
+
+test("the worker-wide recovery pass retires a remembered handler receipt too", async () => {
+  const f = fixture();
+  let locked: Awaited<ReturnType<typeof lockedRetirement>> | undefined;
+  try {
+    locked = await lockedRetirement(f, "recovery", 1);
+    const { composition, scope, sent } = locked;
+    await locked.admit("recovery-message");
+    locked.at(0);
+    expect(await composition.deliverOnce(scope)).toEqual({ kind: "unknown" });
+    const scan = { workerUid: locked.workerUid };
+    // Not yet due, and the child is alive: the page stays unresolved.
+    expect(await composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "unknown",
+      retired: 0,
+      nextCursor: null,
+    });
+    expect(locked.retirementAttempts()).toBe(1);
+    locked.at(1_000);
+    expect(await composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "reconciled",
+      retired: 1,
+      nextCursor: null,
+    });
+    expect(await locked.executions()).toEqual([
+      {
+        batch_id: sent[0],
+        state: "retired",
+        retirement_kind: "handler_and_wait_until",
+        retirement_receipt_digest: "1".repeat(64),
+      },
+    ]);
+    expect(await locked.settlements()).toEqual([{ state: "settled", outcome: "ack" }]);
+    // The receipt is spent: a later page has nothing left to retire.
+    expect(await composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "reconciled",
+      retired: 0,
+      nextCursor: null,
+    });
+    expect(locked.retirementAttempts()).toBe(2);
+  } finally {
+    await locked?.composition.close();
     f.database.close();
   }
 });
