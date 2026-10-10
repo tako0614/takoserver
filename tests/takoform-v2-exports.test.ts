@@ -11,6 +11,7 @@ import type {
   SQLiteDatabaseNativePort,
   SQLiteWorkerBindingClaim,
   Sql,
+  StaticAssetBundleCustody,
   V2ActorNamespacePhysicalPort,
   V2Backend,
   V2BackendResult,
@@ -35,6 +36,7 @@ import {
   V2_ACTOR_NAMESPACE_BACKEND_ID,
 } from "../src/takoform-v2/actor-namespace-backend.ts";
 import { createV2ActorNamespaceSqlGraphReader } from "../src/takoform-v2/actor-namespace-sql-graph.ts";
+import { parseTakoformV2PublicConfig } from "../src/takoform-v2/config.ts";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
 import { ACTOR_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/actor-namespace.ts";
 import { createV2HeldArtifactSource } from "../src/takoform-v2/forms/artifact-source.ts";
@@ -65,6 +67,8 @@ import {
   SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
 } from "../src/takoform-v2/forms/sqlite-migration-application-backend.ts";
 import { createSQLiteWorkerBindingAuthority } from "../src/takoform-v2/forms/sqlite-worker-binding-authority.ts";
+import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
+import { createStaticAssetBundleCustody } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
 import {
   createWorkerBundleCustody,
   createWorkerBundleHost,
@@ -139,6 +143,7 @@ const RUNTIME_EXPORTS = [
   "createSQLiteDatabaseForm",
   "createSQLiteMigrationApplicationForm",
   "createSQLiteWorkerBindingAuthority",
+  "createStaticAssetBundleCustody",
   "createWorkerBundleCustody",
   "createWorkerBundleHost",
   "createWorkerCronTriggerAdmissionReader",
@@ -159,6 +164,7 @@ const RUNTIME_EXPORTS = [
   "parseModuleWorkerSpec",
   "parseObjectBucketSpec",
   "parseSQLiteDatabaseSpec",
+  "parseTakoformV2PublicConfig",
   "parseWorkerDeploymentSpec",
   "parseWorkerEndpointSpec",
   "parseWorkerVersionSpec",
@@ -172,6 +178,7 @@ const RUNTIME_EXPORTS = [
   "runWorkerCronTriggerTick",
   "SQLITE_DATABASE_FORM_URL",
   "SQLITE_MIGRATION_APPLICATION_BACKEND_ID",
+  "STATIC_ASSET_BUNDLE_FORM_URL",
   "TakoformV2Error",
   "v2WorkerInvocationSchemaReady",
   "V2_QUEUE_BACKEND_ID",
@@ -191,6 +198,44 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
   expect(extension.createV2WorkflowSelectedMaterials).toBe(createV2WorkflowSelectedMaterials);
   expect(extension.createWorkerBundleCustody).toBe(createWorkerBundleCustody);
+  expect(extension.createStaticAssetBundleCustody).toBe(createStaticAssetBundleCustody);
+  expect(extension.STATIC_ASSET_BUNDLE_FORM_URL).toBe(STATIC_ASSET_BUNDLE_FORM_URL);
+  expect(extension.parseTakoformV2PublicConfig).toBe(parseTakoformV2PublicConfig);
+  const publicConfigInput = {
+    documentation: "https://docs.example.invalid/takoform-v2",
+    authenticationDocumentation: "https://docs.example.invalid/authentication",
+    staticAssetBundle: {
+      targetKey: "assets-target",
+      heldArtifacts: [
+        {
+          url: "https://artifacts.example.invalid/asset-manifest",
+          sha256: "a".repeat(64),
+          objectKey: "held/asset-manifest",
+          grants: [{ principal: "org:asset-owner", space: "production" }],
+        },
+      ],
+    },
+  };
+  const parsedConfig: ReturnType<typeof parseTakoformV2PublicConfig> =
+    extension.parseTakoformV2PublicConfig(JSON.stringify(publicConfigInput));
+  expect(parsedConfig.staticAssetBundle).toEqual(publicConfigInput.staticAssetBundle);
+  expect(parsedConfig).not.toHaveProperty("cursorSigningKey");
+  expect(() =>
+    extension.parseTakoformV2PublicConfig(
+      JSON.stringify({
+        ...publicConfigInput,
+        staticAssetBundle: {
+          ...publicConfigInput.staticAssetBundle,
+          heldArtifacts: [
+            {
+              ...publicConfigInput.staticAssetBundle.heldArtifacts[0],
+              grants: [{ principal: "", space: "production" }],
+            },
+          ],
+        },
+      }),
+    ),
+  ).toThrow("invalid_configuration");
   expect(extension.createWorkerBundleHost).toBe(createWorkerBundleHost);
   expect(extension.createV2HeldArtifactSource).toBe(createV2HeldArtifactSource);
   expect(extension.createObjectBucketForm).toBe(createObjectBucketForm);
@@ -299,6 +344,10 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
   };
   const sqliteClaimType = (_claim: SQLiteWorkerBindingClaim): void => {};
   const workerBundleCustodyType = (_custody: WorkerBundleCustody): void => {};
+  const staticAssetCustodyType = (_custody: StaticAssetBundleCustody): void => {};
+  const staticAssetCustodyFactory: (
+    options: Parameters<typeof createStaticAssetBundleCustody>[0],
+  ) => StaticAssetBundleCustody = extension.createStaticAssetBundleCustody;
   const heldArtifactSourceOptionsType = (_options: V2HeldArtifactSourceOptions): void => {};
   const queueConsumerCapabilityType = (_capability: V2QueueConsumerCapability): void => {};
   expect(unresolved.kind).toBe("unresolved");
@@ -310,9 +359,11 @@ test("the v2 package subpath is the existing SQL and Worker Form authority, not 
     sqlitePort,
     sqliteClaimType,
     workerBundleCustodyType,
+    staticAssetCustodyType,
+    staticAssetCustodyFactory,
     heldArtifactSourceOptionsType,
     queueConsumerCapabilityType,
-  ]).toHaveLength(9);
+  ]).toHaveLength(11);
 
   const claim: QueueWorkerBindingClaim = {
     principal: "principal",

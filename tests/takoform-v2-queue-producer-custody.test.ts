@@ -19,10 +19,11 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { V2_QUEUE_BACKEND_ID } from "../src/takoform-v2/worker-queue-backend.ts";
-import { v2QueueId } from "../src/takoform-v2/worker-queue-delivery.ts";
+import { authorizeV2QueueBatchSend, v2QueueId } from "../src/takoform-v2/worker-queue-delivery.ts";
 
 const TARGET = "v2-queue-producer-custody";
 const QUEUE = "producer-queue";
+const SOURCE_QUEUE = "producer-source-queue";
 const WORKER = "producer-worker";
 const BUNDLE = "producer-bundle";
 const VERSION = "producer-version";
@@ -30,6 +31,7 @@ const VERSION_OPERATION = "producer-version-op";
 const DEPLOYMENT = "producer-deployment";
 const ENDPOINT = "producer-endpoint";
 const BINDING = "TASKS";
+const CONSUMER = "producer-consumer";
 
 function settled(
   db: Database,
@@ -95,7 +97,7 @@ function seedProducerGraph(db: Database): void {
       uid,
       form,
       backend: "worker-backend",
-      spec: "{}",
+      spec: uid === DEPLOYMENT ? JSON.stringify({ worker: { resourceUid: WORKER } }) : "{}",
       observed: '{"ready":true}',
     });
   }
@@ -160,6 +162,141 @@ const producerTarget = {
   deliveryDelaySeconds: 0,
 };
 
+async function seedAuthorizedQueueBatch(db: Database, incarnationOperationId?: string) {
+  const sql = createSqliteSql(db);
+  const custody = createQueueCustody({ sql });
+  const sourceQueueId = v2QueueId(SOURCE_QUEUE);
+  const version = db
+    .prepare("SELECT generation, last_operation FROM tf_v2_resources WHERE uid=?")
+    .get(VERSION) as { generation: number; last_operation: string };
+  settled(db, {
+    uid: SOURCE_QUEUE,
+    form: AT_LEAST_ONCE_QUEUE_FORM_URL,
+    backend: V2_QUEUE_BACKEND_ID,
+    spec: JSON.stringify({ messageRetentionSeconds: 3600 }),
+    observed: '{"queueExists":true}',
+  });
+  const consumerSpec = JSON.stringify({
+    queue: { resourceUid: SOURCE_QUEUE },
+    worker: { resourceUid: WORKER },
+    maxBatchSize: 10,
+    maxBatchTimeoutSeconds: 0,
+    maxConcurrency: 2,
+    maxRetries: 2,
+    retryDelaySeconds: 5,
+  });
+  settled(db, {
+    uid: CONSUMER,
+    form: "https://edge.forms.takoform.com/forms/QueueConsumer/0.3.0/",
+    backend: "queue-consumer-backend",
+    spec: consumerSpec,
+    observed: '{"consumerAttached":true}',
+  });
+  await custody.activateConsumer({
+    queueId: sourceQueueId,
+    consumerId: CONSUMER,
+    generation: 1,
+    policy: { maxRetries: 2, retryDelaySeconds: 5 },
+  });
+  await custody.admit(
+    { ...producerTarget, queueId: sourceQueueId },
+    {
+      messageId: "source-message",
+      body: new Uint8Array([1]),
+    },
+  );
+  const sourceQueueBatch = {
+    batchId: "source-batch-001",
+    reservationToken: "source-reservation-001",
+    queueId: sourceQueueId,
+    consumerUid: CONSUMER,
+    generation: 1,
+    workerUid: WORKER,
+    servingSourceOperationId: `${DEPLOYMENT}-op`,
+    workerVersionUid: VERSION,
+    workerVersionGeneration: version.generation,
+    incarnationOperationId: incarnationOperationId ?? version.last_operation,
+  };
+  const now = Date.now();
+  db.prepare(`INSERT INTO queue_v2_batch_executions
+    (batch_id,reservation_token,queue_id,consumer_uid,consumer_generation,worker_uid,
+     consumer_spec_json,serving_source_operation_id,selected_versions_json,
+     principal,space,target_key,max_concurrency,reserved_at_ms,reservation_until_ms,state)
+    VALUES (?,?,?,?,?,?,?,?,?,'org:one','prod',?,2,?,?,'reserved')`).run(
+    sourceQueueBatch.batchId,
+    sourceQueueBatch.reservationToken,
+    sourceQueueId,
+    CONSUMER,
+    1,
+    WORKER,
+    consumerSpec,
+    sourceQueueBatch.servingSourceOperationId,
+    JSON.stringify([{ workerVersionUid: VERSION, generation: version.generation, weight: 10000 }]),
+    TARGET,
+    now,
+    now + 120000,
+  );
+  const claims = await custody.claim({
+    queueId: sourceQueueId,
+    consumerId: CONSUMER,
+    generation: 1,
+    limit: 1,
+    v2Attachment: { principal: "org:one", space: "prod", targetKey: TARGET },
+    v2Reservation: {
+      batchId: sourceQueueBatch.batchId,
+      reservationToken: sourceQueueBatch.reservationToken,
+    },
+  });
+  expect(claims).toHaveLength(1);
+  await custody.registerSettlementBatch(sourceQueueBatch.batchId, claims, {
+    reservationToken: sourceQueueBatch.reservationToken,
+  });
+  expect(
+    await authorizeV2QueueBatchSend(sql, { ...sourceQueueBatch, queueUid: SOURCE_QUEUE }),
+  ).toBe("authorized");
+  return sourceQueueBatch;
+}
+
+function completeSameSpecVersionUpdate(db: Database): string {
+  const update = "producer-version-queue-update-op";
+  db.prepare(`INSERT INTO tf_v2_operations
+    (id,resource_uid,principal,replay_key,request_fingerprint,action,generation,status,effect,
+     created_at,updated_at,retain_until,backend_id,target_key,backend_key,accepted_spec_json)
+    SELECT ?,resource_uid,principal,?,'fp','update',2,'queued','none',
+     created_at,updated_at,retain_until,backend_id,target_key,?,accepted_spec_json
+    FROM tf_v2_operations WHERE id=?`).run(
+    update,
+    "replay-version-queue-update",
+    "key-version-queue-update",
+    VERSION_OPERATION,
+  );
+  db.prepare(`UPDATE tf_v2_resources
+    SET generation=2, phase='pending', busy_operation=?, last_operation=? WHERE uid=?`).run(
+    update,
+    update,
+    VERSION,
+  );
+  db.prepare("INSERT INTO tf_v2_operation_reference_sets (operation_id,sealed) VALUES (?,0)").run(
+    update,
+  );
+  db.prepare(`INSERT INTO tf_v2_operation_references
+    (operation_id,target_uid,form_url,readiness)
+    SELECT ?,target_uid,form_url,readiness FROM tf_v2_operation_references
+    WHERE operation_id=?`).run(update, VERSION_OPERATION);
+  db.prepare("UPDATE tf_v2_operation_reference_sets SET sealed=1 WHERE operation_id=?").run(update);
+  db.prepare("UPDATE tf_v2_operations SET status='running' WHERE id=?").run(update);
+  db.prepare("UPDATE tf_v2_operations SET status='reconciling',effect='unknown' WHERE id=?").run(
+    update,
+  );
+  db.prepare("UPDATE tf_v2_operations SET status='succeeded',effect='complete' WHERE id=?").run(
+    update,
+  );
+  db.prepare(
+    "UPDATE tf_v2_resources SET observed_generation=2,phase='idle',busy_operation=NULL WHERE uid=?",
+  ).run(VERSION);
+  return update;
+}
+
 function insertSourceInvocation(
   db: Database,
   input: {
@@ -204,6 +341,178 @@ function insertSourceInvocation(
     phase === "pre_effect_refused" ? 1500 : null,
   );
 }
+
+test("Queue handler batch admits into its binding only while exact 0083 and 0082 source are current", async () => {
+  const db = new Database(":memory:");
+  try {
+    for (const migration of MIGRATIONS) db.exec(migration.sql);
+    seedProducerGraph(db);
+    const sourceQueueBatch = await seedAuthorizedQueueBatch(db);
+    const raw = createSqliteSql(db);
+    let beforeBatch: (() => void) | undefined;
+    const sql: Sql = {
+      ...raw,
+      async batch(statements) {
+        beforeBatch?.();
+        beforeBatch = undefined;
+        return raw.batch(statements);
+      },
+    };
+    const custody = createQueueCustody({ sql });
+    const send = (id: string, source = sourceQueueBatch) =>
+      custody.admitV2Batch({
+        claim: { ...producerClaim, sourceQueueBatch: source },
+        target: producerTarget,
+        messages: [
+          { messageId: `${id}-one`, body: new Uint8Array([1]) },
+          { messageId: `${id}-two`, body: new Uint8Array([2]) },
+        ],
+      });
+    expect(await send("accepted")).toBe(true);
+    expect(
+      db
+        .prepare("SELECT queue_id FROM selfhost_queue_messages WHERE message_id='accepted-one'")
+        .get(),
+    ).toEqual({ queue_id: producerTarget.queueId });
+    for (const [id, source] of [
+      ["foreign-batch", { ...sourceQueueBatch, batchId: "other-batch" }],
+      ["foreign-token", { ...sourceQueueBatch, reservationToken: "other-token" }],
+      ["foreign-source-queue", { ...sourceQueueBatch, queueId: producerTarget.queueId }],
+      ["foreign-consumer", { ...sourceQueueBatch, consumerUid: "other-consumer" }],
+      ["foreign-generation", { ...sourceQueueBatch, generation: 2 }],
+      ["foreign-version-generation", { ...sourceQueueBatch, workerVersionGeneration: 2 }],
+      ["foreign-incarnation", { ...sourceQueueBatch, incarnationOperationId: "other-incarnation" }],
+      ["foreign-serving", { ...sourceQueueBatch, servingSourceOperationId: "other-serving" }],
+    ] as const) {
+      expect(await send(id, source)).toBe(false);
+    }
+    expect(
+      await custody.admitV2Batch({
+        claim: { ...producerClaim, principal: "org:foreign", sourceQueueBatch },
+        target: producerTarget,
+        messages: [{ messageId: "foreign-principal", body: new Uint8Array([3]) }],
+      }),
+    ).toBe(false);
+    expect(
+      await custody.admitV2Batch({
+        claim: { ...producerClaim, bindingName: "OTHER", sourceQueueBatch },
+        target: producerTarget,
+        messages: [{ messageId: "foreign-binding-target", body: new Uint8Array([3]) }],
+      }),
+    ).toBe(false);
+    expect(
+      await custody.admitV2Batch({
+        claim: {
+          ...producerClaim,
+          workerVersionOperationId: `${DEPLOYMENT}-op`,
+          sourceQueueBatch,
+        },
+        target: producerTarget,
+        messages: [{ messageId: "foreign-version-operation", body: new Uint8Array([3]) }],
+      }),
+    ).toBe(false);
+    await expect(
+      custody.admitV2Batch({
+        claim: {
+          ...producerClaim,
+          sourceQueueBatch,
+          sourceInvocation: {
+            invocationId: "fake",
+            custodyToken: "fake-custody-token",
+            incarnationId: "fake",
+            servingSourceOperationId: VERSION_OPERATION,
+          },
+        },
+        target: producerTarget,
+        messages: [{ messageId: "ambiguous", body: new Uint8Array([3]) }],
+      }),
+    ).rejects.toThrow(TypeError);
+    beforeBatch = () => {
+      db.prepare(
+        "UPDATE tf_v2_resources SET phase='pending', busy_operation='new-op' WHERE uid=?",
+      ).run(CONSUMER);
+    };
+    expect(await send("raced-consumer")).toBe(false);
+    db.prepare("UPDATE tf_v2_resources SET phase='idle', busy_operation=NULL WHERE uid=?").run(
+      CONSUMER,
+    );
+    beforeBatch = () => {
+      db.prepare(
+        "UPDATE tf_v2_resources SET phase='pending', busy_operation='new-op' WHERE uid=?",
+      ).run(SOURCE_QUEUE);
+    };
+    expect(await send("raced-source-queue")).toBe(false);
+    db.prepare("UPDATE tf_v2_resources SET phase='idle', busy_operation=NULL WHERE uid=?").run(
+      SOURCE_QUEUE,
+    );
+    db.prepare(`UPDATE queue_v2_batch_executions SET state='retired',
+      retired_at_ms=send_authorized_at_ms+1,retirement_kind='handler_and_wait_until',
+      retirement_receipt_digest=? WHERE batch_id=?`).run(
+      `sha256:${"c".repeat(64)}`,
+      sourceQueueBatch.batchId,
+    );
+    expect(await send("completed-source")).toBe(false);
+    expect(
+      (await raw.query("SELECT message_id FROM selfhost_queue_messages ORDER BY message_id")).map(
+        (row) => row.message_id,
+      ),
+    ).toEqual(["accepted-one", "accepted-two", "source-message"]);
+  } finally {
+    db.close();
+  }
+});
+
+test("Queue source cannot pair a current batch with an older same-spec Version operation", async () => {
+  const db = new Database(":memory:");
+  try {
+    for (const migration of MIGRATIONS) db.exec(migration.sql);
+    seedProducerGraph(db);
+    const currentOperation = completeSameSpecVersionUpdate(db);
+    const sourceQueueBatch = await seedAuthorizedQueueBatch(db);
+    expect(sourceQueueBatch.workerVersionGeneration).toBe(2);
+    expect(sourceQueueBatch.incarnationOperationId).toBe(currentOperation);
+    const custody = createQueueCustody({ sql: createSqliteSql(db) });
+    const send = (workerVersionOperationId: string, messageId: string) =>
+      custody.admitV2Batch({
+        claim: { ...producerClaim, workerVersionOperationId, sourceQueueBatch },
+        target: producerTarget,
+        messages: [{ messageId, body: new Uint8Array([4]) }],
+      });
+    expect(await send(VERSION_OPERATION, "old-same-spec-source")).toBe(false);
+    expect(await send(currentOperation, "current-source")).toBe(true);
+    expect(
+      db
+        .prepare("SELECT message_id FROM selfhost_queue_messages WHERE queue_id=?")
+        .all(producerTarget.queueId),
+    ).toEqual([{ message_id: "current-source" }]);
+  } finally {
+    db.close();
+  }
+});
+
+test("Queue source incarnation Operation must be the accepted current Version Operation", async () => {
+  const db = new Database(":memory:");
+  try {
+    for (const migration of MIGRATIONS) db.exec(migration.sql);
+    seedProducerGraph(db);
+    const sourceQueueBatch = await seedAuthorizedQueueBatch(db, "unrelated-incarnation-op");
+    const custody = createQueueCustody({ sql: createSqliteSql(db) });
+    expect(
+      await custody.admitV2Batch({
+        claim: { ...producerClaim, sourceQueueBatch },
+        target: producerTarget,
+        messages: [{ messageId: "unrelated-incarnation-send", body: new Uint8Array([5]) }],
+      }),
+    ).toBe(false);
+    expect(
+      db
+        .prepare("SELECT count(*) AS n FROM selfhost_queue_messages WHERE queue_id=?")
+        .get(producerTarget.queueId),
+    ).toEqual({ n: 0 });
+  } finally {
+    db.close();
+  }
+});
 
 test("v2 producer admission is atomic with live Queue and sealed Version reference", async () => {
   const db = new Database(":memory:");
@@ -597,6 +906,7 @@ test("real D1 admits one exact v2 Queue producer batch and refuses source or gra
       servingSourceOperationId: VERSION_OPERATION,
     };
     insertSourceInvocation(source, sourceInvocation);
+    const sourceQueueBatch = await seedAuthorizedQueueBatch(source);
     const database = await runtime.getD1Database("STATE_DB");
     for (const migration of MIGRATIONS) {
       for (const statement of splitD1Migration(migration.sql))
@@ -605,12 +915,18 @@ test("real D1 admits one exact v2 Queue producer batch and refuses source or gra
     const sql = createD1Sql(database);
     await sql.run("DROP TRIGGER tf_v2_operation_reference_set_guard");
     await sql.run("DROP TRIGGER tf_v2_operation_reference_guard");
+    await sql.run("DROP TRIGGER queue_v2_batch_execution_reserve_guard");
+    await sql.run("DROP TRIGGER queue_v2_batch_execution_receipt_guard");
     for (const table of [
       "tf_v2_resources",
       "tf_v2_operations",
       "tf_v2_operation_reference_sets",
       "tf_v2_operation_references",
       "tf_v2_worker_invocations",
+      "queue_consumer_custody",
+      "selfhost_queue_messages",
+      "queue_v2_batch_executions",
+      "queue_v2_batch_settlements",
     ]) {
       for (const raw of source.query(`SELECT * FROM ${table}`).all()) {
         const row = raw as Record<string, string | number | null>;
@@ -630,6 +946,13 @@ test("real D1 admits one exact v2 Queue producer batch and refuses source or gra
         messages: [{ messageId, body: new Uint8Array([77]) }],
       });
     expect(await admit(claim, "d1-first")).toBe(true);
+    expect(
+      await custody.admitV2Batch({
+        claim: { ...producerClaim, sourceQueueBatch },
+        target: producerTarget,
+        messages: [{ messageId: "d1-from-queue", body: new Uint8Array([78]) }],
+      }),
+    ).toBe(true);
     await expect(admit(claim, "d1-first")).rejects.toThrow("UNIQUE constraint");
     expect(await admit({ ...claim, principal: "org:foreign" }, "d1-foreign")).toBe(false);
     expect(await admit({ ...claim, space: "other" }, "d1-space")).toBe(false);
@@ -676,7 +999,12 @@ test("real D1 admits one exact v2 Queue producer batch and refuses source or gra
     expect(await admit(claim, "d1-retired")).toBe(false);
     expect(
       await sql.query("SELECT message_id FROM selfhost_queue_messages ORDER BY message_id"),
-    ).toEqual([{ message_id: "d1-first" }, { message_id: "d1-lost-ack" }]);
+    ).toEqual([
+      { message_id: "d1-first" },
+      { message_id: "d1-from-queue" },
+      { message_id: "d1-lost-ack" },
+      { message_id: "source-message" },
+    ]);
   } finally {
     source.close();
     await runtime.dispose();

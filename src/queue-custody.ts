@@ -52,6 +52,8 @@ export interface QueueCustodyV2ProducerClaim {
     readonly incarnationId: string;
     readonly servingSourceOperationId: string;
   };
+  /** Exact Host-internal 0083 send grant for a Queue handler; not an invocation. */
+  readonly sourceQueueBatch?: QueueCustodyV2ExecutionIdentity;
 }
 
 export type QueueCustodyDeadLetterTarget = QueueCustodyTarget;
@@ -355,6 +357,131 @@ const V2_SOURCE_INVOCATION_GUARD = `EXISTS (
     AND invocation.phase = 'send_authorized'
     AND invocation.retired_at_ms IS NULL
     AND invocation.no_native_dispatch_at_ms IS NULL
+)`;
+// A Queue event has an 0083 send grant, not an 0086 HTTP/Cron invocation.
+// Recheck both captured execution identity and live 0082/Resource authority at
+// every INSERT; the producer target guard above independently fences the sink.
+const V2_SOURCE_QUEUE_BATCH_GUARD = `EXISTS (
+  SELECT 1 FROM queue_v2_batch_executions execution
+  JOIN tf_v2_resources consumer ON consumer.uid = execution.consumer_uid
+  JOIN tf_v2_operations consumer_op ON consumer_op.id = consumer.last_operation
+  JOIN queue_consumer_custody custody ON custody.queue_id = execution.queue_id
+  JOIN tf_v2_resources source_queue ON source_queue.uid = substr(execution.queue_id, 19)
+  JOIN tf_v2_operations source_queue_op ON source_queue_op.id = source_queue.last_operation
+  JOIN tf_v2_operations serving_op ON serving_op.id = execution.serving_source_operation_id
+  JOIN tf_v2_resources serving ON serving.uid = serving_op.resource_uid
+  JOIN tf_v2_resources source_version ON source_version.uid = execution.worker_version_uid
+  JOIN tf_v2_operations source_version_op ON source_version_op.id = source_version.last_operation
+  WHERE (execution.batch_id = ? AND execution.reservation_token = ?
+    AND execution.queue_id = ? AND execution.consumer_uid = ?
+    AND execution.consumer_generation = ? AND execution.worker_uid = ?
+    AND execution.serving_source_operation_id = ?
+    AND execution.worker_version_uid = ? AND execution.worker_version_generation = ?
+    AND execution.incarnation_operation_id = ? AND execution.state = 'send_authorized'
+    AND execution.retired_at_ms IS NULL AND execution.principal = ?
+    AND execution.space = ? AND execution.target_key = ?
+    AND execution.worker_uid = ? AND execution.worker_version_uid = ?)
+    AND (consumer.form_url = 'https://edge.forms.takoform.com/forms/QueueConsumer/0.3.0/'
+    AND consumer.principal = execution.principal AND consumer.space = execution.space
+    AND consumer.target_key = execution.target_key AND consumer.deleted_at IS NULL
+    AND consumer.phase = 'idle' AND consumer.busy_operation IS NULL
+    AND consumer.generation = consumer.observed_generation
+    AND consumer.spec_json = execution.consumer_spec_json
+    AND json_extract(consumer.observed_json, '$.consumerAttached') = 1
+    AND json_extract(consumer.spec_json, '$.queue.resourceUid') = substr(execution.queue_id, 19)
+    AND json_extract(consumer.spec_json, '$.worker.resourceUid') = execution.worker_uid
+    AND consumer_op.resource_uid = consumer.uid AND consumer_op.principal = consumer.principal
+    AND consumer_op.backend_id = consumer.backend_id
+    AND consumer_op.target_key = consumer.target_key
+    AND consumer_op.generation = consumer.generation
+    AND consumer_op.status = 'succeeded' AND consumer_op.effect = 'complete'
+    AND consumer_op.action IN ('create','update')
+    AND consumer_op.accepted_spec_json = consumer.spec_json
+    AND custody.consumer_id = consumer.uid AND custody.generation = execution.consumer_generation
+    AND custody.state = 'active')
+    AND (source_queue.form_url = '${V2_QUEUE_FORM}'
+    AND source_queue.backend_id = '${V2_QUEUE_BACKEND}'
+    AND source_queue.principal = execution.principal AND source_queue.space = execution.space
+    AND source_queue.target_key = execution.target_key AND source_queue.deleted_at IS NULL
+    AND source_queue.phase = 'idle' AND source_queue.busy_operation IS NULL
+    AND source_queue.observed_generation = source_queue.generation
+    AND json_extract(source_queue.observed_json, '$.queueExists') = 1
+    AND source_queue_op.resource_uid = source_queue.uid
+    AND source_queue_op.principal = source_queue.principal
+    AND source_queue_op.backend_id = source_queue.backend_id
+    AND source_queue_op.target_key = source_queue.target_key
+    AND source_queue_op.generation = source_queue.generation
+    AND source_queue_op.status = 'succeeded' AND source_queue_op.effect = 'complete'
+    AND source_queue_op.action IN ('create','update')
+    AND source_queue_op.accepted_spec_json = source_queue.spec_json)
+    AND (serving_op.status = 'succeeded' AND serving_op.effect = 'complete'
+    AND serving_op.principal = execution.principal
+    AND serving_op.backend_id = serving.backend_id
+    AND serving_op.target_key = execution.target_key
+    AND serving_op.accepted_spec_json = serving.spec_json
+    AND serving.principal = execution.principal AND serving.space = execution.space
+    AND serving.target_key = execution.target_key AND serving.phase = 'idle'
+    AND serving.busy_operation IS NULL AND serving.last_operation = serving_op.id
+    AND serving.generation = serving.observed_generation
+    AND serving.observed_generation = serving_op.generation
+    AND ((serving_op.action IN ('create','update') AND serving.deleted_at IS NULL) OR
+      (serving_op.action = 'delete' AND serving.form_url =
+        'https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/'
+        AND serving.deleted_at IS NOT NULL))
+    AND serving.form_url IN (
+      'https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/',
+      'https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/')
+    AND json_extract(serving_op.accepted_spec_json, '$.worker.resourceUid') = execution.worker_uid
+    AND NOT EXISTS (SELECT 1 FROM tf_v2_resources newer
+      JOIN tf_v2_operations newer_op ON newer_op.id = newer.last_operation
+      WHERE newer.form_url IN (
+        'https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/',
+        'https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/')
+        AND newer.principal = execution.principal AND newer.space = execution.space
+        AND newer.target_key = execution.target_key AND newer.busy_operation IS NULL
+        AND newer.observed_generation = newer_op.generation
+        AND newer_op.status = 'succeeded' AND newer_op.effect = 'complete'
+        AND json_extract(newer_op.accepted_spec_json, '$.worker.resourceUid') = execution.worker_uid
+        AND newer_op.acceptance_order > serving_op.acceptance_order)
+    AND NOT EXISTS (SELECT 1 FROM tf_v2_resources competing
+      WHERE competing.form_url IN (
+        'https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/',
+        'https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/')
+        AND competing.principal = execution.principal AND competing.space = execution.space
+        AND competing.target_key = execution.target_key AND competing.deleted_at IS NULL
+        AND competing.busy_operation IS NOT NULL
+        AND json_extract(competing.spec_json, '$.worker.resourceUid') = execution.worker_uid))
+    AND (source_version.form_url = '${V2_VERSION_FORM}'
+    AND source_version.principal = execution.principal
+    AND source_version.space = execution.space
+    AND source_version.target_key = execution.target_key
+    AND source_version.deleted_at IS NULL AND source_version.phase = 'idle'
+    AND source_version.busy_operation IS NULL
+    AND source_version.generation = execution.worker_version_generation
+    AND source_version.observed_generation = source_version.generation
+    AND json_extract(source_version.observed_json, '$.ready') = 1
+    AND json_extract(source_version.spec_json, '$.worker.resourceUid') = execution.worker_uid
+    AND source_version_op.id = ?
+    AND source_version_op.id = execution.incarnation_operation_id
+    AND source_version_op.resource_uid = source_version.uid
+    AND source_version_op.principal = source_version.principal
+    AND source_version_op.backend_id = source_version.backend_id
+    AND source_version_op.target_key = source_version.target_key
+    AND source_version_op.generation = source_version.generation
+    AND source_version_op.status = 'succeeded' AND source_version_op.effect = 'complete'
+    AND source_version_op.action IN ('create','update')
+    AND source_version_op.accepted_spec_json = source_version.spec_json
+    AND EXISTS (SELECT 1 FROM json_each(execution.selected_versions_json) selected
+      WHERE json_extract(selected.value, '$.workerVersionUid') = source_version.uid
+        AND json_extract(selected.value, '$.generation') = source_version.generation
+        AND json_extract(selected.value, '$.weight') BETWEEN 1 AND 10000))
+    AND execution.message_count = (SELECT count(*) FROM queue_v2_batch_settlements receipt
+      WHERE receipt.batch_id = execution.batch_id AND receipt.queue_id = execution.queue_id
+        AND receipt.consumer_id = execution.consumer_uid
+        AND receipt.generation = execution.consumer_generation
+        AND receipt.lease_token = execution.lease_token
+        AND receipt.execution_reservation_token = execution.reservation_token)
+    AND execution.message_count BETWEEN 1 AND 100
 )`;
 // This SELECT runs as the first statement of the same atomic Sql.batch as
 // all message/notice writes. A false claim deliberately raises a SQLite
@@ -1015,6 +1142,10 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       ) {
         throw new TypeError("v2 Queue producer admission identity is invalid");
       }
+      const hasSourceQueueBatch = "sourceQueueBatch" in claim;
+      if ("sourceInvocation" in claim && hasSourceQueueBatch) {
+        throw new TypeError("v2 Queue producer admission has multiple sources");
+      }
       const source =
         "sourceInvocation" in claim
           ? {
@@ -1043,13 +1174,63 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       if (source && source.custodyToken.length < 16) {
         throw new TypeError("v2 Queue source custody token is invalid");
       }
+      const rawSourceQueueBatch = hasSourceQueueBatch ? claim.sourceQueueBatch : null;
+      if (hasSourceQueueBatch && !rawSourceQueueBatch) {
+        throw new TypeError("v2 Queue source batch identity is invalid");
+      }
+      const sourceBatch = rawSourceQueueBatch
+        ? {
+            batchId: token(rawSourceQueueBatch.batchId, 256, "v2 Queue source batch id"),
+            reservationToken: token(
+              rawSourceQueueBatch.reservationToken,
+              128,
+              "v2 Queue source reservation token",
+            ),
+            queueId: token(rawSourceQueueBatch.queueId, 512, "v2 Queue source queue id"),
+            consumerUid: token(
+              rawSourceQueueBatch.consumerUid,
+              128,
+              "v2 Queue source consumer uid",
+            ),
+            generation: rawSourceQueueBatch.generation,
+            workerUid: token(rawSourceQueueBatch.workerUid, 128, "v2 Queue source worker uid"),
+            servingSourceOperationId: token(
+              rawSourceQueueBatch.servingSourceOperationId,
+              128,
+              "v2 Queue source serving operation id",
+            ),
+            workerVersionUid: token(
+              rawSourceQueueBatch.workerVersionUid,
+              128,
+              "v2 Queue source version uid",
+            ),
+            workerVersionGeneration: rawSourceQueueBatch.workerVersionGeneration,
+            incarnationOperationId: token(
+              rawSourceQueueBatch.incarnationOperationId,
+              128,
+              "v2 Queue source incarnation operation id",
+            ),
+          }
+        : null;
+      if (
+        sourceBatch &&
+        (!Number.isSafeInteger(sourceBatch.generation) ||
+          !Number.isSafeInteger(sourceBatch.workerVersionGeneration) ||
+          Number(sourceBatch.generation) < 1 ||
+          Number(sourceBatch.workerVersionGeneration) < 1 ||
+          !sourceBatch.queueId.startsWith("takoform-v2-queue:") ||
+          sourceBatch.workerUid !== claim.workerUid ||
+          sourceBatch.workerVersionUid !== claim.workerVersionUid)
+      ) {
+        throw new TypeError("v2 Queue source batch identity is invalid");
+      }
       const statements = admissionStatements(target, messages).map((statement): SqlStatement => {
         const suffix = "VALUES (?, ?, ?, ?, ?, ?, 0)";
         if (!statement.sql.endsWith(suffix)) {
           throw new Error("Queue admission statement changed unexpectedly");
         }
         return {
-          sql: `${statement.sql.slice(0, -suffix.length)}SELECT ?, ?, ?, ?, ?, ?, 0 WHERE ${V2_PRODUCER_GUARD}${source ? ` AND ${V2_SOURCE_INVOCATION_GUARD}` : ""}`,
+          sql: `${statement.sql.slice(0, -suffix.length)}SELECT ?, ?, ?, ?, ?, ?, 0 WHERE ${V2_PRODUCER_GUARD}${source ? ` AND ${V2_SOURCE_INVOCATION_GUARD}` : ""}${sourceBatch ? ` AND ${V2_SOURCE_QUEUE_BATCH_GUARD}` : ""}`,
           params: [
             ...(statement.params ?? []),
             claim.workerVersionUid,
@@ -1074,6 +1255,26 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                   claim.workerVersionOperationId,
                   source.incarnationId,
                   source.servingSourceOperationId,
+                ]
+              : []),
+            ...(sourceBatch
+              ? [
+                  sourceBatch.batchId,
+                  sourceBatch.reservationToken,
+                  sourceBatch.queueId,
+                  sourceBatch.consumerUid,
+                  sourceBatch.generation,
+                  sourceBatch.workerUid,
+                  sourceBatch.servingSourceOperationId,
+                  sourceBatch.workerVersionUid,
+                  sourceBatch.workerVersionGeneration,
+                  sourceBatch.incarnationOperationId,
+                  claim.principal,
+                  claim.space,
+                  claim.targetKey,
+                  claim.workerUid,
+                  claim.workerVersionUid,
+                  claim.workerVersionOperationId,
                 ]
               : []),
           ],

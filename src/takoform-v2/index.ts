@@ -34,6 +34,7 @@ export {
   type V2ActorAcceptedSqlScope,
   type V2ActorNamespaceSqlGraphReader,
 } from "./actor-namespace-sql-graph.ts";
+export { parseTakoformV2PublicConfig } from "./config.ts";
 export {
   readV2ConfiguredPrivateInputs,
   type V2ConfiguredPrivateInputIdentity,
@@ -118,6 +119,11 @@ export {
   createSQLiteWorkerBindingAuthority,
   type SQLiteWorkerBindingClaim,
 } from "./forms/sqlite-worker-binding-authority.ts";
+export { STATIC_ASSET_BUNDLE_FORM_URL } from "./forms/static-asset-bundle.ts";
+export {
+  createStaticAssetBundleCustody,
+  type StaticAssetBundleCustody,
+} from "./forms/static-asset-bundle-backend.ts";
 export {
   createWorkerBundleCustody,
   createWorkerBundleHost,
