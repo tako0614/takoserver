@@ -113,6 +113,7 @@ test("an accepted Workflow UID is bindable before it is Ready, and same-spec gen
       worker: { resourceUid: worker.resourceUid },
       bundle: { resourceUid: bundle.resourceUid },
       handlers: ["fetch"],
+      vars: { SETTINGS: { nested: [1, { enabled: true }] } },
       workflowBindings: [{ name: "FLOW", resource: { resourceUid: workflow.resourceUid } }],
     };
     const version = await create(WORKER_VERSION_FORM_URL, "version", versionSpec);
@@ -176,9 +177,18 @@ test("an accepted Workflow UID is bindable before it is Ready, and same-spec gen
           workerVersionUid: version.resourceUid,
           workerVersionOperationId: version.id,
           workerVersionGeneration: 1,
+          workerVersionSpec: parseWorkerVersionSpec(versionSpec),
           workflowBindings: [{ name: "FLOW", resourceUid: workflow.resourceUid }],
           actorBindings: [],
         });
+        expect(Object.isFrozen(source.workerVersionSpec)).toBe(true);
+        expect(Object.isFrozen(source.workerVersionSpec.vars)).toBe(true);
+        const settings = source.workerVersionSpec.vars.SETTINGS as { nested: unknown[] };
+        expect(Object.isFrozen(settings)).toBe(true);
+        expect(Object.isFrozen(settings.nested[1])).toBe(true);
+        expect(() => settings.nested.push("foreign")).toThrow();
+        await Promise.resolve();
+        expect(settings.nested).toEqual([1, { enabled: true }]);
         return wfpNativeVersionId;
       },
     });

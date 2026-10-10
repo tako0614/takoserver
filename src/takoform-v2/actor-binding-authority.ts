@@ -5,7 +5,11 @@ import type { Sql } from "../ports.ts";
 import { V2_ACTOR_NAMESPACE_BACKEND_ID } from "./actor-namespace-backend.ts";
 import { ACTOR_NAMESPACE_FORM_URL, parseActorNamespaceSpec } from "./forms/actor-namespace.ts";
 import { referencesForWorkerVersion } from "./forms/worker-references.ts";
-import { parseWorkerVersionSpec, WORKER_VERSION_FORM_URL } from "./forms/worker-specs.ts";
+import {
+  parseWorkerVersionSpec,
+  WORKER_VERSION_FORM_URL,
+  type WorkerVersionSpec,
+} from "./forms/worker-specs.ts";
 import { isReadyWorkerVersionObservation } from "./forms/worker-version-observed.ts";
 
 /** Immutable publication identity, never a tenant-supplied credential. */
@@ -59,7 +63,21 @@ export interface V2ActorBindingVersionIdentitySource {
   readonly workerVersionUid: string;
   readonly workerVersionOperationId: string;
   readonly workerVersionGeneration: number;
+  readonly workerVersionSpec: WorkerVersionSpec;
   readonly actorBindings: readonly { readonly name: string; readonly resourceUid: string }[];
+}
+
+function immutableVersionSpec(spec: WorkerVersionSpec): WorkerVersionSpec {
+  // The callback must not mutate the parsed spec still used for sealed-reference checks.
+  const snapshot = structuredClone(spec);
+  const freezeDeep = <T>(value: T): T => {
+    if (value !== null && typeof value === "object") {
+      for (const child of Object.values(value)) freezeDeep(child);
+      Object.freeze(value);
+    }
+    return value;
+  };
+  return freezeDeep(snapshot);
 }
 
 /** V2 SQL and physical namespace proof; no v1 Version store or ResourceDeployment. */
@@ -167,6 +185,7 @@ export function createV2ActorBindingAuthority(options: {
         workerVersionUid: claim.workerVersionUid,
         workerVersionOperationId: claim.workerVersionOperationId,
         workerVersionGeneration: source.generation,
+        workerVersionSpec: immutableVersionSpec(spec),
         actorBindings: Object.freeze(
           spec.actorBindings.map((binding) =>
             Object.freeze({ name: binding.name, resourceUid: binding.resource.resourceUid }),
