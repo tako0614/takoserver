@@ -1,15 +1,20 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { request } from "node:http";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Sql } from "../src/ports.ts";
 import { workerdV2PrivateWorkflowBindingName } from "../src/providers/workerd-v2-private-binding-names.ts";
+import {
+  SELFHOST_SOCKET_DIRECTORY_PREFIX,
+  SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES,
+  selfhostPrivateSocketRoot,
+} from "../src/selfhost-socket-layout.ts";
 import { createV2WorkflowForwardBoot } from "../src/takoform-v2/workflow-binding-boot.ts";
 import { projectV2WorkflowForward } from "../src/takoform-v2/workflow-binding-projection.ts";
 import type { WorkerdWorkflowForwardPublication } from "../src/workerd-runtime.ts";
 import type { WorkflowRuntime } from "../src/workflow-execution.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const OPERATION = "01234567-89ab-4cde-8f01-23456789abcd";
 const VERSION_OPERATION = "11234567-89ab-4cde-8f01-23456789abcd";
@@ -49,7 +54,7 @@ function call(socketPath: string, token: string): Promise<{ status: number; body
 }
 
 test("owner-pinned v2 Workflow socket dispatches via existing facade only while the accepted relation is current", async () => {
-  const root = await mkdtemp(join(tmpdir(), "v2-wfb-"));
+  const root = await mkdtempForSockets("v2-wfb-", SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES);
   let current = true;
   let creates = 0;
   const sql = {
@@ -179,7 +184,7 @@ test("owner-pinned v2 Workflow socket dispatches via existing facade only while 
 });
 
 test("an accepted three-Version graph opens all 192 Workflow brokers, above the former arbitrary cap", async () => {
-  const root = await mkdtemp(join(tmpdir(), "v2-wfb-many-"));
+  const root = await mkdtempForSockets("v2-wfb-many-", SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES);
   const specifications = new Map<
     string,
     {
@@ -316,5 +321,121 @@ test("an accepted three-Version graph opens all 192 Workflow brokers, above the 
     }
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+/** Reserve one real v2 Workflow broker below `privateSocketDirectory`; return its pathname. */
+async function reserveOneWorkflowBroker(privateSocketDirectory: string): Promise<string> {
+  const sql = {
+    async query(query: string) {
+      if (query.includes("FROM tf_v2_resources"))
+        return [
+          {
+            spec_json: JSON.stringify(versionSpec),
+            backend_id: "test-backend",
+            generation: 1,
+            principal: "org:one",
+            space: "production",
+          },
+        ];
+      if (query.includes("FROM tf_v2_operations"))
+        return [{ id: VERSION_OPERATION, generation: 1 }];
+      throw new Error("unrecognized SQL");
+    },
+  } as unknown as Sql;
+  const boot = createV2WorkflowForwardBoot({
+    sql,
+    targetKey: "target-one",
+    privateSocketDirectory,
+    instances: Object.fromEntries(
+      ["create", "get", "status", "sendEvent", "terminate"].map((name) => [
+        name,
+        async () => {
+          throw new Error(`unexpected ${name}`);
+        },
+      ]),
+    ) as unknown as WorkflowRuntime["instances"],
+    authority: {
+      async resolveCurrentBinding() {
+        return {
+          tenantId: "org:one",
+          workflowResourceUid: "workflow-one",
+          workerUid: "worker-one",
+          vector: "settled-vector",
+        };
+      },
+    },
+  });
+  const incarnation = boot.openIncarnation({
+    workerUid: "worker-one",
+    sourceOperationId: OPERATION,
+    scriptName: "script-one",
+    eventToken: "b".repeat(64),
+  });
+  try {
+    const grant = await incarnation.issueBinding(
+      {
+        principal: "org:one",
+        space: "production",
+        targetKey: "target-one",
+        workerUid: "worker-one",
+        workerVersionUid: versionUid,
+        workerVersionOperationId: VERSION_OPERATION,
+        nativeVersionId: versionId,
+        bindings: [{ name: "FLOW", resourceUid: "workflow-one" }],
+      },
+      "FLOW",
+    );
+    if (!grant) throw new Error("grant unavailable");
+    const projection = await projectV2WorkflowForward({
+      workerUid: "worker-one",
+      versionUid,
+      sourceOperationId: VERSION_OPERATION,
+      nativeVersionId: versionId,
+      principal: "org:one",
+      declarations: versionSpec.workflowBindings,
+      grants: [grant],
+    });
+    const publication: WorkerdWorkflowForwardPublication = {
+      script: "script-one",
+      workerResourceUid: "worker-one",
+      versionId,
+      workerVersionResourceUid: versionUid,
+      snapshotDigest: projection.snapshotDigest,
+      bindings: [{ ...grant, serviceName: workerdV2PrivateWorkflowBindingName(0) }],
+    };
+    const lease = await incarnation.workflowForwardLifecycle.reserve([publication]);
+    try {
+      const socket = incarnation.workflowForwardSockets([publication])[0];
+      if (!socket) throw new Error("socket unavailable");
+      return socket.socketPath;
+    } finally {
+      await lease.release();
+    }
+  } finally {
+    await incarnation.close();
+  }
+}
+
+test("v2 Workflow brokers bind below a data root of exactly the published maximum and refuse one byte more", async () => {
+  const base = await mkdtempForSockets("wfb-", SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES - 2);
+  try {
+    const exact = join(
+      base,
+      "d".repeat(SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES - Buffer.byteLength(base) - 1),
+    );
+    expect(Buffer.byteLength(exact)).toBe(SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES);
+    const socketPath = await reserveOneWorkflowBroker(selfhostPrivateSocketRoot(exact));
+    expect(
+      socketPath.startsWith(
+        `${selfhostPrivateSocketRoot(exact)}/${SELFHOST_SOCKET_DIRECTORY_PREFIX.workflowBrokers}`,
+      ),
+    ).toBe(true);
+    expect(Buffer.byteLength(socketPath)).toBe(99);
+    await expect(reserveOneWorkflowBroker(selfhostPrivateSocketRoot(`${exact}x`))).rejects.toThrow(
+      "v2 Workflow socket path unavailable",
+    );
+  } finally {
+    await rm(base, { recursive: true, force: true });
   }
 });

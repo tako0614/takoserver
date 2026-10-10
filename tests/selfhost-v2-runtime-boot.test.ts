@@ -1,12 +1,19 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync, statSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { createSelfhostEntryShutdown } from "../src/selfhost-entry-shutdown.ts";
 import {
+  SELFHOST_ACTOR_TMPDIR_MAX_BYTES,
+  SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES,
+  selfhostPrivateSocketRoot,
+} from "../src/selfhost-socket-layout.ts";
+import {
+  assertSelfhostV2RuntimeSocketBudget,
   createSelfhostV2RuntimeBoot,
   parseSelfhostV2RuntimeBoot,
   startSelfhostV2ScheduledDuePass,
@@ -14,6 +21,7 @@ import {
 } from "../src/selfhost-v2-runtime-boot.ts";
 import { createSelfhostV2WorkerComposition } from "../src/selfhost-v2-worker-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const TARGET = "selfhost-v2-worker-primary";
 
@@ -225,7 +233,7 @@ test("stalled or rejected Workflow poll is an independent tracked pass", async (
 });
 
 test("selected runtime ports restore on one SQLite and close Workflow before the Worker owner", async () => {
-  const root = await mkdtemp(join(tmpdir(), "selfhost-v2-runtime-boot-"));
+  const root = await mkdtempForSockets("svrb-", SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES);
   const database = new Database(join(root, "control.sqlite"));
   try {
     migrateSqlite(database);
@@ -249,6 +257,14 @@ test("selected runtime ports restore on one SQLite and close Workflow before the
     });
     expect(boot.v2Actor).toBeDefined();
     expect(boot.v2Workflow).toBeDefined();
+    // Listener directories share the data root's one short private socket root.
+    expect(statSync(selfhostPrivateSocketRoot(root)).mode & 0o777).toBe(0o700);
+    for (const former of [
+      "actor-private-sockets",
+      "workflow-private-sockets",
+      "workflow-temporary",
+    ])
+      expect(existsSync(join(root, "v2-runtime", former))).toBe(false);
     workers = createSelfhostV2WorkerComposition({
       sql,
       objects,
@@ -274,5 +290,50 @@ test("selected runtime ports restore on one SQLite and close Workflow before the
   } finally {
     database.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a selected capability refuses a data root or TMPDIR its sockets cannot fit, by name and before storage", async () => {
+  const base = await mkdtempForSockets("svrl-", SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES - 2);
+  const database = new Database(":memory:");
+  try {
+    const exact = join(
+      base,
+      "d".repeat(SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES - Buffer.byteLength(base) - 1),
+    );
+    const options = {
+      selection: { workflow: { maximumRegistrations: 1 } },
+      sql: createSqliteSql(database),
+      clock: () => new Date(),
+      targetKey: TARGET,
+      workerdBinary: process.execPath,
+      guardBinary: process.execPath,
+      ownerForWorkerUid: async () => null,
+    };
+    const over = `${exact}x`;
+    expect(() => createSelfhostV2RuntimeBoot({ ...options, dataRoot: over })).toThrow(
+      `TAKOSERVER_DATA_ROOT is ${over} (62 bytes), but the v2 Workflow runtime ` +
+        "(TAKOSERVER_V2_WORKER_RUNTIME_BOOT.workflow) places Unix sockets below it and allows " +
+        "at most 61 bytes; choose a shorter TAKOSERVER_DATA_ROOT",
+    );
+    expect(existsSync(over)).toBe(false);
+    expect(createSelfhostV2RuntimeBoot({ ...options, dataRoot: exact }).v2Workflow).toBeDefined();
+    expect(existsSync(selfhostPrivateSocketRoot(exact))).toBe(true);
+    // An Actor also binds below TMPDIR; a Workflow-only selection does not.
+    const longTemporary = `/${"t".repeat(SELFHOST_ACTOR_TMPDIR_MAX_BYTES)}`;
+    expect(() =>
+      assertSelfhostV2RuntimeSocketBudget({ actor: true }, exact, longTemporary),
+    ).toThrow(`TMPDIR is ${longTemporary} (74 bytes), but the v2 Actor runtime`);
+    expect(() =>
+      assertSelfhostV2RuntimeSocketBudget(
+        { workflow: { maximumRegistrations: 1 } },
+        exact,
+        longTemporary,
+      ),
+    ).not.toThrow();
+    expect(() => assertSelfhostV2RuntimeSocketBudget({ actor: true }, exact, "/tmp")).not.toThrow();
+  } finally {
+    database.close();
+    await rm(base, { recursive: true, force: true });
   }
 });

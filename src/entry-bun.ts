@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createActorResourceGraphReader } from "./actor-resource-graph.ts";
 import { buildApp, createAppResourceStoreBundle } from "./app.ts";
@@ -67,6 +68,11 @@ import {
   serveSelfhostDataPlanes,
 } from "./selfhost-data-planes.ts";
 import {
+  resolveSelfhostDataRoot,
+  SELFHOST_DATA_ROOT_VARIABLE,
+  SELFHOST_DEFAULT_DATA_ROOT,
+} from "./selfhost-data-root.ts";
+import {
   closeSelfhostEntryOwnedResources,
   createSelfhostEntryShutdown,
   describeBackgroundFailure,
@@ -79,6 +85,10 @@ import {
 } from "./selfhost-health.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
+import {
+  selfhostActorSocketDiagnostic,
+  selfhostPrivateSocketRoot,
+} from "./selfhost-socket-layout.ts";
 import { renderSelfhostOperatorSignInInstructions } from "./selfhost-startup-instructions.ts";
 import { createSelfhostTakoformV2Ingress } from "./selfhost-takoform-v2-ingress.ts";
 import {
@@ -90,6 +100,7 @@ import { createSelfhostV2ConfiguredInputSealer } from "./selfhost-v2-configured-
 import { createSelfhostV2QueueComposition } from "./selfhost-v2-queue-composition.ts";
 import { createSelfhostV2QueueScheduler } from "./selfhost-v2-queue-scheduler.ts";
 import {
+  assertSelfhostV2RuntimeSocketBudget,
   createSelfhostV2RuntimeBoot,
   parseSelfhostV2RuntimeBoot,
   startSelfhostV2ScheduledDuePass,
@@ -199,8 +210,21 @@ if (!publicOrigin || !runtimeInputCanonicalOriginSupported(publicOrigin)) {
 }
 const port = Number(process.env.PORT ?? 8787);
 
-/** Everything this machine keeps lives under one directory. */
-const dataRoot = process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver";
+/**
+ * Everything this machine keeps lives under one directory, resolved once to an
+ * absolute canonical path: the default is relative to the working directory,
+ * and the Actor, Workflow and private-plane owners accept nothing else.
+ */
+const configuredDataRoot = process.env[SELFHOST_DATA_ROOT_VARIABLE];
+const dataRoot = resolveSelfhostDataRoot(configuredDataRoot);
+if (dataRoot !== (configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT)) {
+  process.stdout.write(
+    `${SELFHOST_DATA_ROOT_VARIABLE} ${configuredDataRoot === undefined ? `(default ${SELFHOST_DEFAULT_DATA_ROOT})` : JSON.stringify(configuredDataRoot)} resolved to ${dataRoot}\n`,
+  );
+}
+// An explicitly selected v2 capability whose sockets cannot fit below this root
+// is a configuration error now, not an Operation that never confirms later.
+if (v2RuntimeSelection) assertSelfhostV2RuntimeSocketBudget(v2RuntimeSelection, dataRoot);
 const v2WorkerTargetKey = "selfhost-v2-worker-primary";
 const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
   ? Number(process.env.TAKOSERVER_WORKERD_PORT)
@@ -609,24 +633,40 @@ if (
   workerdBinary &&
   installedActorForm
 ) {
-  try {
-    actorRuntime = await openSelfhostActorPublicRuntime({
-      dataRoot,
-      runtimeRoot: dataRoot,
-      socketParent: join(dataRoot, "actor-forward-sockets"),
-      binary: workerdBinary,
-      graph: createActorResourceGraphReader({
-        store: resourceStores.inventory,
-        form: installedActorForm,
-      }),
-      deployments: resourceStores.deployments,
-      providerPackRef: "local",
-      providerInstallationRef: "local.primary",
-    });
-  } catch (error) {
-    process.stderr.write(
-      `the Actor owner could not restore: ${error instanceof Error ? error.message : "unknown error"}; Actor admission remains unavailable.\n`,
-    );
+  // The released Forms always include ActorNamespace, so this runtime is
+  // implied rather than selected: a data root or TMPDIR its sockets cannot fit
+  // below leaves Actor admission unavailable, said here by name, and every
+  // other Form serving.
+  const socketDiagnostic =
+    dataRoot === ":memory:"
+      ? undefined
+      : selfhostActorSocketDiagnostic({
+          dataRoot,
+          temporaryDirectory: tmpdir(),
+          feature: "the Actor runtime",
+        });
+  if (socketDiagnostic) {
+    process.stderr.write(`${socketDiagnostic}; Actor admission remains unavailable.\n`);
+  } else {
+    try {
+      actorRuntime = await openSelfhostActorPublicRuntime({
+        dataRoot,
+        runtimeRoot: dataRoot,
+        socketParent: selfhostPrivateSocketRoot(dataRoot),
+        binary: workerdBinary,
+        graph: createActorResourceGraphReader({
+          store: resourceStores.inventory,
+          form: installedActorForm,
+        }),
+        deployments: resourceStores.deployments,
+        providerPackRef: "local",
+        providerInstallationRef: "local.primary",
+      });
+    } catch (error) {
+      process.stderr.write(
+        `the Actor owner could not restore: ${error instanceof Error ? error.message : "unknown error"}; Actor admission remains unavailable.\n`,
+      );
+    }
   }
 }
 const workerdRuntime = createWorkerdRuntime({

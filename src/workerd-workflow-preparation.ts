@@ -4,6 +4,7 @@ import { isAbsolute, join } from "node:path";
 import { WORKFLOW_HTTP_BOOTSTRAP_SOURCE } from "./generated/workflow-http-bootstrap.ts";
 import type { TakoformInterfaceRef } from "./interface-ref.ts";
 import type { JsonObject } from "./ports.ts";
+import { SELFHOST_SOCKET_DIRECTORY_PREFIX } from "./selfhost-socket-layout.ts";
 import type { PreparedWorkerdWorkflow } from "./selfhost-workflow-execution-host.ts";
 import { prepareWorkflowHttpExecution } from "./selfhost-workflow-http-transport.ts";
 import type { WorkerdExecutionServiceGateway } from "./workerd-execution-guard.ts";
@@ -254,7 +255,9 @@ export async function prepareWorkerdWorkflowExecution(
     signal,
     async configure(companionAddress, configureSignal) {
       configureSignal.throwIfAborted();
-      const root = await mkdtemp(join(temporaryRoot, "twf-"));
+      const root = await mkdtemp(
+        join(temporaryRoot, SELFHOST_SOCKET_DIRECTORY_PREFIX.workflowExecution),
+      );
       let serviceLease: WorkerdPrivateServiceLease | undefined;
       let serviceLeaseReleased = false;
       const releaseServiceLease = async (): Promise<void> => {

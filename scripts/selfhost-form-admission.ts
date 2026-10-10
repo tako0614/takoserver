@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { createActorResourceGraphReader } from "../src/actor-resource-graph.ts";
 import { createAppResourceStoreBundle } from "../src/app.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
@@ -18,10 +18,12 @@ import {
   SELFHOST_TLS_ENVIRONMENT,
   selfhostWorkerEndpointScheme,
 } from "../src/selfhost-composition.ts";
+import { resolveSelfhostDataRoot } from "../src/selfhost-data-root.ts";
 import {
   createSelfhostProductionFormAuthorityComposition,
   deriveSelfhostFormAuthorityCatalog,
 } from "../src/selfhost-form-authority-composition.ts";
+import { selfhostPrivateSocketRoot } from "../src/selfhost-socket-layout.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
   createStandaloneProviderComposition,
@@ -231,8 +233,8 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
     );
     process.exit(2);
   }
-  const requestedDataRoot = flag("data-root") ?? process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver";
-  const dataRoot = resolve(requestedDataRoot);
+  // The same resolution as the Host entry, so both name one canonical root.
+  const dataRoot = resolveSelfhostDataRoot(flag("data-root") ?? process.env.TAKOSERVER_DATA_ROOT);
   const mode = resolveStandaloneProviderMode({
     retiredProviderMode: process.env.TAKOSERVER_RETIRED_PROVIDER_MODE,
     cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID,
@@ -250,7 +252,7 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
     throw new Error("self-host Form admission requires stable-selfhost, not recovery-only mode");
   }
   const databasePath = process.env.TAKOSERVER_DB ?? `${dataRoot}/control.sqlite`;
-  if (requestedDataRoot === ":memory:" || databasePath === ":memory:") {
+  if (dataRoot === ":memory:" || databasePath === ":memory:") {
     throw new Error("self-host Form admission requires durable local state");
   }
   const database = new Database(databasePath);
@@ -326,7 +328,7 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
         actorRuntime = await openSelfhostActorPublicRuntime({
           dataRoot,
           runtimeRoot: dataRoot,
-          socketParent: join(dataRoot, "actor-forward-sockets"),
+          socketParent: selfhostPrivateSocketRoot(dataRoot),
           binary: workerdSelection.binary,
           graph: createActorResourceGraphReader({
             store: resourceStores.inventory,

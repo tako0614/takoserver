@@ -479,7 +479,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|artifact-path|cron|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|artifact-path|cron|selfhost-socket-layout|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.
@@ -488,7 +488,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "adapter",
     match:
-      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-object-store|selfhost-endpoint-https-tls|selfhost-v2-worker-endpoint-upstream-websocket|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-object-store|selfhost-data-root|selfhost-endpoint-https-tls|selfhost-v2-worker-endpoint-upstream-websocket|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
     may: ["core", "adapter", "native-contract"],
   },
   {
@@ -674,6 +674,7 @@ const HOST_ONLY = [
   // A Worker has no filesystem. Reaching this would fail at runtime rather
   // than at the gate, and only for the requests that touched it.
   "src/objects-fs.ts",
+  "src/selfhost-data-root.ts",
   // Writing files and starting processes: a Worker can do neither.
   "src/workerd-runtime.ts",
   "src/workerd-supervisor.ts",

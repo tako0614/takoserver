@@ -8,9 +8,11 @@ import {
   WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
   workerdV2PrivateWorkflowBindingName,
 } from "../src/providers/workerd-v2-private-binding-names.ts";
+import { SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES } from "../src/selfhost-socket-layout.ts";
 import type { WorkerdPrivateServiceLease, WorkerdSite } from "../src/workerd-runtime.ts";
 import { prepareWorkerdWorkflowExecution } from "../src/workerd-workflow-preparation.ts";
 import type { WorkflowRunIdentity } from "../src/workflow-execution.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const encoder = new TextEncoder();
 const parentUid = "workflow-parent";
@@ -88,7 +90,7 @@ function preparation(
 }
 
 test("v2 Workflow-only class preparation pins exact broker UDS through child disposal", async () => {
-  const root = await mkdtemp(join(tmpdir(), "twf-v2-binding-"));
+  const root = await mkdtempForSockets("twf-v2-binding-", SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES);
   const socketPath = join(root, `${"d".repeat(22)}.sock`);
   const broker = createServer();
   await new Promise<void>((resolve, reject) => {

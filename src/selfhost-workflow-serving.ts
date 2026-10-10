@@ -14,6 +14,7 @@ import {
   type SelfhostVersionWorkflowBinding,
 } from "./providers/selfhost-version-bindings.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
+import { SELFHOST_SOCKET_DIRECTORY_PREFIX } from "./selfhost-socket-layout.ts";
 import { openSelfhostWorkflowBindingBroker } from "./selfhost-workflow-binding-broker.ts";
 import type { SelfhostWorkflowPrivateOwner } from "./selfhost-workflow-private-owner.ts";
 import { sameFormRef } from "./takoform/forms.ts";
@@ -139,7 +140,9 @@ export async function openSelfhostWorkflowServing(options: {
     (await realpath(options.socketParent)) !== options.socketParent
   )
     invalid();
-  const directory = await mkdtemp(join(options.socketParent, "workflow-"));
+  const directory = await mkdtemp(
+    join(options.socketParent, SELFHOST_SOCKET_DIRECTORY_PREFIX.workflowBrokers),
+  );
   if (Buffer.byteLength(join(directory, "01234567890123456789.sock")) > 100) {
     await rm(directory, { recursive: true, force: true });
     invalid();

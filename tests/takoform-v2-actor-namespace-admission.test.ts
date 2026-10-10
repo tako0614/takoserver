@@ -9,6 +9,10 @@ import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql } from "../src/ports.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
+import {
+  SELFHOST_SOCKET_DIRECTORY_PREFIX,
+  SELFHOST_UNIX_SOCKET_PATH_MAX_BYTES,
+} from "../src/selfhost-socket-layout.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createV2ActorBindingAuthority } from "../src/takoform-v2/actor-binding-authority.ts";
@@ -46,6 +50,7 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const PRINCIPAL = "org:actor-admission";
 const SPACE = "production";
@@ -712,7 +717,15 @@ test("Actor DELETE remains unconfirmed when its lease expires during physical re
 });
 
 test("accepted sealed WorkerVersion Actor binding resolves its exact physical namespace", async () => {
-  const root = mkdtempSync(join(tmpdir(), "actor-v2-binding-"));
+  // `<root>/brokers/a??????/<20 hex>.u.sock` must stay below 100 bytes.
+  const root = await mkdtempForSockets(
+    "actor-v2-binding-",
+    SELFHOST_UNIX_SOCKET_PATH_MAX_BYTES -
+      1 -
+      Buffer.byteLength(
+        `/brokers/${SELFHOST_SOCKET_DIRECTORY_PREFIX.actorBrokers}XXXXXX/${"0".repeat(20)}.u.sock`,
+      ),
+  );
   const f = fixture(root);
   if (!f.physical) throw new Error("physical Actor host fixture missing");
   try {

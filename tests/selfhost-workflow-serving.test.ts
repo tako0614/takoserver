@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { canonicalJson } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
@@ -12,6 +11,10 @@ import {
   deriveSelfhostWorkflowBindingToken,
 } from "../src/providers/selfhost-version-bindings.ts";
 import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
+import {
+  SELFHOST_SOCKET_DIRECTORY_PREFIX,
+  SELFHOST_UNIX_SOCKET_PATH_MAX_BYTES,
+} from "../src/selfhost-socket-layout.ts";
 import { openSelfhostWorkflowBindingBroker } from "../src/selfhost-workflow-binding-broker.ts";
 import { openSelfhostWorkflowServing } from "../src/selfhost-workflow-serving.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -22,6 +25,7 @@ import type { WorkerdWorkflowForwardBinding } from "../src/workerd-runtime.ts";
 import { createWorkflowInstances } from "../src/workflow-instances.ts";
 import { createWorkflowResourceGraphReader } from "../src/workflow-resource-graph.ts";
 import { createWorkflowResourceDeletionContribution } from "../src/workflow-resource-lifecycle.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const NOW = Date.UTC(2026, 9, 4);
 const TENANT = "tenant-workflow-serving";
@@ -63,7 +67,16 @@ async function fixture(
   } = {},
 ) {
   const { holdCreate, openBroker, afterFirstGraphRead } = options;
-  const root = await mkdtemp(join(tmpdir(), "takoserver-workflow-serving-"));
+  // The brokers bind `<root>/sockets/w??????/<20 hex>.sock`; a root under a
+  // long TMPDIR leaves no room for that, which is the runner's accident and
+  // not the behaviour under test.
+  const root = await mkdtempForSockets(
+    "tws-",
+    SELFHOST_UNIX_SOCKET_PATH_MAX_BYTES -
+      Buffer.byteLength(
+        `/sockets/${SELFHOST_SOCKET_DIRECTORY_PREFIX.workflowBrokers}XXXXXX/${"0".repeat(20)}.sock`,
+      ),
+  );
   const socketParent = join(root, "sockets");
   await chmod(root, 0o700);
   const db = new Database(":memory:");

@@ -22,6 +22,7 @@ import {
   SELFHOST_IDENTITY_CAPABILITY_KINDS,
 } from "../src/selfhost-composition.ts";
 import { deriveSelfhostFormAuthorityCatalog } from "../src/selfhost-form-authority-composition.ts";
+import { selfhostPrivateSocketRoot } from "../src/selfhost-socket-layout.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStandaloneProviderComposition } from "../src/standalone-provider-composition.ts";
 import { createAdmissionHandleIssuer } from "../src/takoform/admission.ts";
@@ -292,7 +293,7 @@ describe("self-host Form admission", () => {
       owner = await openSelfhostActorPublicRuntime({
         dataRoot: fixture.root,
         runtimeRoot: fixture.root,
-        socketParent: join(fixture.root, "actor-forward-sockets"),
+        socketParent: selfhostPrivateSocketRoot(fixture.root),
         binary: "/never-execute",
         graph: createActorResourceGraphReader({ store: stores.inventory, form: actorForm }),
         deployments: stores.deployments,

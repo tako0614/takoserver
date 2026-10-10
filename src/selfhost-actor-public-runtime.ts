@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { parseActorAbiRef } from "./actor-abi-ref.ts";
 import { canonicalJson, isSha256Digest } from "./json.ts";
@@ -16,6 +16,7 @@ import {
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
 import { createSelfhostActorExecutionHost } from "./selfhost-actor-execution-host.ts";
 import { openSelfhostActorForwardBrokers } from "./selfhost-actor-forward-brokers.ts";
+import { SELFHOST_SOCKET_DIRECTORY_PREFIX } from "./selfhost-socket-layout.ts";
 import type {
   ActorResourceGraphReader,
   ProviderWorkerClassRuntime,
@@ -257,7 +258,22 @@ export async function openSelfhostActorPublicRuntime(options: {
   )
     throw new Error("Actor owner configuration unavailable");
   await mkdir(options.socketParent, { recursive: true, mode: 0o700 });
-  const socketDirectory = await mkdtemp(join(options.socketParent, "actor-"));
+  // The parent is shared with the v2 runtime's listener directories; hold it to
+  // the same private, owned, canonical directory they require.
+  const parent = await lstat(options.socketParent);
+  if (
+    !parent.isDirectory() ||
+    parent.isSymbolicLink() ||
+    (parent.mode & 0o077) !== 0 ||
+    (process.getuid !== undefined && parent.uid !== process.getuid()) ||
+    (await realpath(options.socketParent)) !== options.socketParent
+  )
+    throw new Error(
+      `Actor socket directory ${options.socketParent} must be a private (0700) real directory owned by this user`,
+    );
+  const socketDirectory = await mkdtemp(
+    join(options.socketParent, SELFHOST_SOCKET_DIRECTORY_PREFIX.actorBrokers),
+  );
   const host = createSelfhostActorExecutionHost({
     runtimeRoot: options.runtimeRoot,
     storageRoot: join(options.dataRoot, "actor-namespaces"),

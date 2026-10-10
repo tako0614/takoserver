@@ -3,6 +3,7 @@ import { lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { canonicalJson } from "../json.ts";
 import type { Sql } from "../ports.ts";
+import { SELFHOST_SOCKET_DIRECTORY_PREFIX } from "../selfhost-socket-layout.ts";
 import { openSelfhostWorkflowBindingBroker } from "../selfhost-workflow-binding-broker.ts";
 import type {
   WorkerdV2WorkflowForwardBinding,
@@ -278,7 +279,9 @@ export function createV2WorkflowForwardBoot(options: {
           (await realpath(options.privateSocketDirectory)) !== options.privateSocketDirectory
         )
           throw new Error("v2 Workflow private root unavailable");
-        socketDirectory = await mkdtemp(join(options.privateSocketDirectory, "w-"));
+        socketDirectory = await mkdtemp(
+          join(options.privateSocketDirectory, SELFHOST_SOCKET_DIRECTORY_PREFIX.workflowBrokers),
+        );
         return socketDirectory;
       };
 
