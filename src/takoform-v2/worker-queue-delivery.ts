@@ -11,6 +11,7 @@ import {
 } from "./forms/worker-specs.ts";
 import type { V2Execution } from "./types.ts";
 import type { V2QueueConsumerCapability } from "./worker-queue-consumer-backend.ts";
+import { v2QueueBatchSQLiteSchemaReady } from "./worker-queue-schema.ts";
 
 const DB_NOW_MS =
   "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
@@ -473,6 +474,259 @@ async function executionRow(sql: Sql, input: V2QueueBatchExecutionIdentity) {
   return rows.length === 1 ? rows[0] : null;
 }
 
+export type V2QueueBatchTerminal = {
+  readonly kind: "handler_and_wait_until" | "incarnation_absent";
+  readonly receiptDigest: string;
+};
+
+export type V2QueueBatchSQLiteCustody =
+  | { readonly kind: "unknown" }
+  | {
+      readonly kind: "found";
+      /** Accepted 0083 scope; never substitute an untrusted grant's scope. */
+      readonly principal: string;
+      readonly space: string;
+      readonly targetKey: string;
+      readonly sqliteDrainState: null | "pending" | "drained";
+      readonly sqliteDrainReceiptDigest: null | `sha256:${string}`;
+      readonly terminal: null | V2QueueBatchTerminal;
+      readonly retirement: null | V2QueueBatchTerminal;
+    };
+
+const QUEUE_DIGEST = /^[a-f0-9]{64}$/u;
+const SQLITE_DRAIN_DIGEST = /^sha256:[a-f0-9]{64}$/u;
+
+/** Exact 0083 row readback. Missing or partial 0090 is never a usable proof. */
+export async function readV2QueueBatchSQLiteCustody(
+  sql: Sql,
+  value: V2QueueBatchExecutionIdentity,
+): Promise<V2QueueBatchSQLiteCustody> {
+  const input = executionIdentity(value);
+  try {
+    const rows = await sql.query(
+      `SELECT principal,space,target_key,state,worker_version_uid,
+              worker_version_generation,incarnation_operation_id,
+              sqlite_drain_state,sqlite_drain_receipt_digest,
+              terminal_kind,terminal_receipt_digest,
+              retirement_kind,retirement_receipt_digest
+       FROM queue_v2_batch_executions WHERE ${EXECUTION_SCOPE}
+         AND worker_version_uid = ? AND worker_version_generation = ?
+         AND incarnation_operation_id = ?
+         AND (${v2QueueBatchSQLiteSchemaReady()}) LIMIT 2`,
+      [
+        ...executionParams(input),
+        input.workerVersionUid,
+        input.workerVersionGeneration,
+        input.incarnationOperationId,
+      ],
+    );
+    const row = rows.length === 1 ? rows[0] : null;
+    if (
+      !row ||
+      typeof row.principal !== "string" ||
+      typeof row.space !== "string" ||
+      typeof row.target_key !== "string" ||
+      (row.state !== "send_authorized" && row.state !== "retired")
+    )
+      return { kind: "unknown" };
+    const drain = row.sqlite_drain_state;
+    const drainDigest = row.sqlite_drain_receipt_digest;
+    const terminalKind = row.terminal_kind;
+    const terminalDigest = row.terminal_receipt_digest;
+    const retirementKind = row.retirement_kind;
+    const retirementDigest = row.retirement_receipt_digest;
+    if (
+      !(
+        (drain === null &&
+          drainDigest === null &&
+          terminalKind === null &&
+          terminalDigest === null) ||
+        (drain === "pending" &&
+          drainDigest === null &&
+          ((terminalKind === null && terminalDigest === null) ||
+            ((terminalKind === "handler_and_wait_until" || terminalKind === "incarnation_absent") &&
+              typeof terminalDigest === "string" &&
+              QUEUE_DIGEST.test(terminalDigest)))) ||
+        (drain === "drained" &&
+          typeof drainDigest === "string" &&
+          SQLITE_DRAIN_DIGEST.test(drainDigest) &&
+          (terminalKind === "handler_and_wait_until" || terminalKind === "incarnation_absent") &&
+          typeof terminalDigest === "string" &&
+          QUEUE_DIGEST.test(terminalDigest))
+      ) ||
+      !(
+        (row.state === "send_authorized" && retirementKind === null && retirementDigest === null) ||
+        (row.state === "retired" &&
+          (retirementKind === "handler_and_wait_until" ||
+            retirementKind === "incarnation_absent") &&
+          typeof retirementDigest === "string" &&
+          QUEUE_DIGEST.test(retirementDigest) &&
+          (drain === null ||
+            (drain === "drained" &&
+              retirementKind === terminalKind &&
+              retirementDigest === terminalDigest)))
+      )
+    )
+      return { kind: "unknown" };
+    return {
+      kind: "found",
+      principal: row.principal,
+      space: row.space,
+      targetKey: row.target_key,
+      sqliteDrainState: drain,
+      sqliteDrainReceiptDigest: drainDigest as null | `sha256:${string}`,
+      terminal:
+        terminalKind === null
+          ? null
+          : {
+              kind: terminalKind as V2QueueBatchTerminal["kind"],
+              receiptDigest: terminalDigest as string,
+            },
+      retirement:
+        retirementKind === null
+          ? null
+          : {
+              kind: retirementKind as V2QueueBatchTerminal["kind"],
+              receiptDigest: retirementDigest as string,
+            },
+    };
+  } catch {
+    return { kind: "unknown" };
+  }
+}
+
+/** Arm before the first external SQLite action, while the execution is live. */
+export async function armV2QueueBatchSQLiteExternalUse(
+  sql: Sql,
+  value: V2QueueBatchExecutionIdentity,
+): Promise<boolean> {
+  const input = executionIdentity(value);
+  try {
+    const result = await sql.run(
+      `UPDATE queue_v2_batch_executions SET sqlite_drain_state = 'pending'
+       WHERE ${EXECUTION_SCOPE} AND state = 'send_authorized'
+         AND worker_version_uid = ? AND worker_version_generation = ?
+         AND incarnation_operation_id = ? AND retired_at_ms IS NULL
+         AND sqlite_drain_state IS NULL AND sqlite_drain_receipt_digest IS NULL
+         AND terminal_kind IS NULL AND terminal_receipt_digest IS NULL
+         AND (${v2QueueBatchSQLiteSchemaReady()})`,
+      [
+        ...executionParams(input),
+        input.workerVersionUid,
+        input.workerVersionGeneration,
+        input.incarnationOperationId,
+      ],
+    );
+    if (result.changes === 1) return true;
+  } catch {
+    // An exact pending readback resolves only an ambiguous SQL ACK.
+  }
+  const row = await readV2QueueBatchSQLiteCustody(sql, input);
+  return (
+    row.kind === "found" &&
+    row.sqliteDrainState === "pending" &&
+    row.sqliteDrainReceiptDigest === null &&
+    row.terminal === null &&
+    row.retirement === null
+  );
+}
+
+/** Trusted completion/positive physical absence, persisted before drain. */
+export async function recordV2QueueBatchTerminal(
+  sql: Sql,
+  value: { readonly execution: V2QueueBatchExecutionIdentity } & V2QueueBatchTerminal,
+): Promise<boolean> {
+  const input = executionIdentity(value.execution);
+  if (
+    (value.kind !== "handler_and_wait_until" && value.kind !== "incarnation_absent") ||
+    !QUEUE_DIGEST.test(value.receiptDigest)
+  )
+    throw new TypeError("Queue terminal proof is invalid");
+  try {
+    const result = await sql.run(
+      `UPDATE queue_v2_batch_executions
+       SET terminal_kind = ?,terminal_receipt_digest = ?
+       WHERE ${EXECUTION_SCOPE} AND state = 'send_authorized'
+         AND worker_version_uid = ? AND worker_version_generation = ?
+         AND incarnation_operation_id = ? AND retired_at_ms IS NULL
+         AND sqlite_drain_state = 'pending' AND sqlite_drain_receipt_digest IS NULL
+         AND terminal_kind IS NULL AND terminal_receipt_digest IS NULL
+         AND (${v2QueueBatchSQLiteSchemaReady()})`,
+      [
+        value.kind,
+        value.receiptDigest,
+        ...executionParams(input),
+        input.workerVersionUid,
+        input.workerVersionGeneration,
+        input.incarnationOperationId,
+      ],
+    );
+    if (result.changes === 1) return true;
+  } catch {
+    // A different durable terminal is a conflict, not retry authority.
+  }
+  const row = await readV2QueueBatchSQLiteCustody(sql, input);
+  return (
+    row.kind === "found" &&
+    row.sqliteDrainState === "pending" &&
+    row.terminal?.kind === value.kind &&
+    row.terminal.receiptDigest === value.receiptDigest &&
+    row.retirement === null
+  );
+}
+
+/** Trusted Node owner calls only after recovery of the full accepted UID set. */
+export async function confirmV2QueueBatchSQLiteDrained(
+  sql: Sql,
+  value: {
+    readonly execution: V2QueueBatchExecutionIdentity;
+    readonly terminal: V2QueueBatchTerminal;
+    readonly receiptDigest: `sha256:${string}`;
+  },
+): Promise<boolean> {
+  const input = executionIdentity(value.execution);
+  if (
+    (value.terminal.kind !== "handler_and_wait_until" &&
+      value.terminal.kind !== "incarnation_absent") ||
+    !QUEUE_DIGEST.test(value.terminal.receiptDigest) ||
+    !SQLITE_DRAIN_DIGEST.test(value.receiptDigest)
+  )
+    throw new TypeError("Queue SQLite drain proof is invalid");
+  try {
+    const result = await sql.run(
+      `UPDATE queue_v2_batch_executions
+       SET sqlite_drain_state = 'drained',sqlite_drain_receipt_digest = ?
+       WHERE ${EXECUTION_SCOPE} AND state = 'send_authorized'
+         AND worker_version_uid = ? AND worker_version_generation = ?
+         AND incarnation_operation_id = ? AND retired_at_ms IS NULL
+         AND sqlite_drain_state = 'pending' AND sqlite_drain_receipt_digest IS NULL
+         AND terminal_kind = ? AND terminal_receipt_digest = ?
+         AND (${v2QueueBatchSQLiteSchemaReady()})`,
+      [
+        value.receiptDigest,
+        ...executionParams(input),
+        input.workerVersionUid,
+        input.workerVersionGeneration,
+        input.incarnationOperationId,
+        value.terminal.kind,
+        value.terminal.receiptDigest,
+      ],
+    );
+    if (result.changes === 1) return true;
+  } catch {
+    // Read back the exact durable drain receipt after a lost acknowledgement.
+  }
+  const row = await readV2QueueBatchSQLiteCustody(sql, input);
+  return (
+    row.kind === "found" &&
+    row.sqliteDrainState === "drained" &&
+    row.sqliteDrainReceiptDigest === value.receiptDigest &&
+    row.terminal?.kind === value.terminal.kind &&
+    row.terminal.receiptDigest === value.terminal.receiptDigest &&
+    row.retirement === null
+  );
+}
+
 /** Pre-send only; a sent or retired execution cannot be canceled by a clock. */
 export async function cancelV2QueueBatchBeforeSend(
   sql: Sql,
@@ -577,13 +831,29 @@ export async function confirmV2QueueBatchRetirement(
   )
     throw new TypeError("Queue retirement proof is invalid");
   try {
+    // PRAGMA chooses a compatible SQL shape only. The UPDATE itself tests the
+    // drain column, so a concurrent arm cannot be retired by an old writer.
+    const columns = await sql.query("PRAGMA table_info(queue_v2_batch_executions)");
+    const hasDrain = columns.some((row) => row.name === "sqlite_drain_state");
+    const hasTerminal = columns.some((row) => row.name === "terminal_receipt_digest");
     const result = await sql.run(
       `UPDATE queue_v2_batch_executions
       SET state = 'retired',retired_at_ms = ${DB_NOW_MS},
           retirement_kind = ?,retirement_receipt_digest = ?
       WHERE ${EXECUTION_SCOPE} AND state = 'send_authorized'
         AND worker_version_uid = ? AND worker_version_generation = ?
-        AND incarnation_operation_id = ?`,
+        AND incarnation_operation_id = ?
+        ${
+          hasDrain && hasTerminal
+            ? `AND (sqlite_drain_state IS NULL OR (
+          sqlite_drain_state = 'drained' AND sqlite_drain_receipt_digest IS NOT NULL
+          AND terminal_kind = ? AND terminal_receipt_digest = ?
+          AND (${v2QueueBatchSQLiteSchemaReady()})))`
+            : hasDrain
+              ? `AND sqlite_drain_state IS NULL`
+              : `AND NOT EXISTS (SELECT 1 FROM pragma_table_info('queue_v2_batch_executions')
+            WHERE name = 'sqlite_drain_state')`
+        }`,
       [
         kind,
         digest,
@@ -591,6 +861,7 @@ export async function confirmV2QueueBatchRetirement(
         input.workerVersionUid,
         input.workerVersionGeneration,
         input.incarnationOperationId,
+        ...(hasDrain && hasTerminal ? [kind, digest] : []),
       ],
     );
     if (result.changes === 1) return "retired";
@@ -598,14 +869,33 @@ export async function confirmV2QueueBatchRetirement(
     /* Read the exact receipt after an ambiguous SQL acknowledgement. */
   }
   const row = await executionRow(sql, input);
-  return row?.state === "retired" &&
+  const exactRetired =
+    row?.state === "retired" &&
     row.worker_version_uid === input.workerVersionUid &&
     row.worker_version_generation === input.workerVersionGeneration &&
     row.incarnation_operation_id === input.incarnationOperationId &&
     row.retirement_kind === kind &&
-    row.retirement_receipt_digest === digest
-    ? "already_retired"
-    : "unknown";
+    row.retirement_receipt_digest === digest;
+  if (!exactRetired) return "unknown";
+  const custody = await readV2QueueBatchSQLiteCustody(sql, input);
+  if (custody.kind === "found") {
+    return custody.sqliteDrainState === null ||
+      (custody.sqliteDrainState === "drained" &&
+        custody.terminal?.kind === kind &&
+        custody.terminal.receiptDigest === digest)
+      ? "already_retired"
+      : "unknown";
+  }
+  // 0090 absent/partial cannot have admitted new SQLite use; old receipts
+  // remain valid provided the drain column is truly absent.
+  try {
+    const columns = await sql.query("PRAGMA table_info(queue_v2_batch_executions)");
+    return columns.some((column) => column.name === "sqlite_drain_state")
+      ? "unknown"
+      : "already_retired";
+  } catch {
+    return "unknown";
+  }
 }
 
 /**
