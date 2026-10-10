@@ -1,5 +1,6 @@
 import type { Clock, Sql } from "../ports.ts";
 import type { WorkflowRuntime } from "../workflow-execution.ts";
+import type { V2FormFrontFace } from "./form-frontface.ts";
 import {
   DURABLE_WORKFLOW_FORM_URL,
   type DurableWorkflowSpec,
@@ -17,6 +18,34 @@ import {
 } from "./types.ts";
 
 export const DURABLE_WORKFLOW_BACKEND_ID = "selfhost-v2-durable-workflow-v1";
+
+/** The exact synchronous Form policy, without class admission or runtime ownership. */
+export function createV2DurableWorkflowFormFrontFace(): V2FormFrontFace {
+  return {
+    validateCreate(spec) {
+      try {
+        parseDurableWorkflowSpec(spec);
+      } catch (error) {
+        if (error instanceof DurableWorkflowValidationError)
+          throw new TakoformV2Error("invalid_spec", 422);
+        throw error;
+      }
+    },
+    validateUpdate(previousSpec, spec) {
+      try {
+        validateDurableWorkflowUpdate(previousSpec, spec);
+      } catch (error) {
+        if (error instanceof DurableWorkflowValidationError)
+          throw new TakoformV2Error("invalid_spec", 422);
+        throw error;
+      }
+    },
+    references(spec) {
+      return durableWorkflowReferences(parseDurableWorkflowSpec(spec));
+    },
+    rejectDeleteWhileReferenced: true,
+  };
+}
 
 /**
  * A boot-selected held-byte/native class qualification. It must inspect every
@@ -257,27 +286,7 @@ export function createDurableWorkflowForm(options: {
   }
 
   return {
-    validateCreate(spec) {
-      try {
-        parseDurableWorkflowSpec(spec);
-      } catch (error) {
-        if (error instanceof DurableWorkflowValidationError)
-          throw new TakoformV2Error("invalid_spec", 422);
-        throw error;
-      }
-    },
-    validateUpdate(previousSpec, spec) {
-      try {
-        validateDurableWorkflowUpdate(previousSpec, spec);
-      } catch (error) {
-        if (error instanceof DurableWorkflowValidationError)
-          throw new TakoformV2Error("invalid_spec", 422);
-        throw error;
-      }
-    },
-    references(spec) {
-      return durableWorkflowReferences(parseDurableWorkflowSpec(spec));
-    },
+    ...createV2DurableWorkflowFormFrontFace(),
     async prepareAdmission(input) {
       if (input.form !== DURABLE_WORKFLOW_FORM_URL) throw new TakoformV2Error("invalid_spec", 422);
       const spec = parseDurableWorkflowSpec(input.spec);
@@ -292,7 +301,6 @@ export function createDurableWorkflowForm(options: {
       if (result.kind === "incompatible") return null;
       return result.predicate;
     },
-    rejectDeleteWhileReferenced: true,
     backend: {
       id: DURABLE_WORKFLOW_BACKEND_ID,
       targetKey,

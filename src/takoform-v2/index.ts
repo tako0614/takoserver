@@ -17,6 +17,8 @@ export {
 } from "./actor-binding-authority.ts";
 export {
   createV2ActorNamespaceForm,
+  createV2ActorNamespaceFormFrontFace,
+  V2_ACTOR_NAMESPACE_BACKEND_ID,
   type V2ActorAcceptedOperationRuntimeObserver,
   type V2ActorNamespaceNativeSnapshot,
   type V2ActorNamespacePhysicalPort,
@@ -47,6 +49,8 @@ export {
   type V2EdgeKvSettledTarget,
   type V2EdgeKvSettledTargetInput,
 } from "./edge-kv-native-custody.ts";
+export type { V2FormFrontFace } from "./form-frontface.ts";
+export { ACTOR_NAMESPACE_FORM_URL } from "./forms/actor-namespace.ts";
 export {
   createV2HeldArtifactSource,
   type V2HeldArtifactSourceOptions,
@@ -253,6 +257,7 @@ export {
 } from "./worker-version-configured-inputs.ts";
 export {
   createDurableWorkflowForm,
+  createV2DurableWorkflowFormFrontFace,
   DURABLE_WORKFLOW_BACKEND_ID,
   type V2WorkflowClassAdmission,
 } from "./workflow-backend.ts";
