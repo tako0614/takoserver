@@ -1707,13 +1707,15 @@ async function lockedRetirement(f: ReturnType<typeof fixture>, name: string, loc
       { messageId, body: new Uint8Array([1]) },
     );
   let remainingLocks = locks;
-  let retirementAttempts = 0;
+  let clock = 0;
+  let childGone = false;
+  const retirementAttempts: number[] = [];
   const sql: Sql = {
     query: (statement, params) => f.sql.query(statement, params),
     batch: (statements) => f.sql.batch(statements),
     async run(statement, params) {
       if (statement.includes("SET state = 'retired'")) {
-        retirementAttempts += 1;
+        retirementAttempts.push(clock);
         if (remainingLocks > 0) {
           remainingLocks -= 1;
           throw new Error("database is locked");
@@ -1728,7 +1730,6 @@ async function lockedRetirement(f: ReturnType<typeof fixture>, name: string, loc
     incarnationOperationId: "live-physical-incarnation",
   };
   const sent: string[] = [];
-  let clock = 0;
   const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
   const privatePort = Number(reservation.port);
   await reservation.stop(true);
@@ -1741,9 +1742,15 @@ async function lockedRetirement(f: ReturnType<typeof fixture>, name: string, loc
     now: () => clock,
     ownerForWorkerUid: async () =>
       ({
-        // The child that ran the batch is alive, so absence never applies.
-        async observeQueuePhysicalAbsence() {
-          return { kind: "unknown" as const };
+        // The child that ran the batch is alive until the test says otherwise.
+        async observeQueuePhysicalAbsence(input: {
+          workerUid: string;
+          incarnationId: string;
+          servingSourceOperationId: string;
+        }) {
+          if (!childGone || input.incarnationId !== target.incarnationOperationId)
+            return { kind: "unknown" as const };
+          return { kind: "confirmed_absent" as const, ...input, receiptDigest: "e".repeat(64) };
         },
         async invokeQueue(input: {
           readonly batchId: string;
@@ -1766,7 +1773,11 @@ async function lockedRetirement(f: ReturnType<typeof fixture>, name: string, loc
     at: (millis: number) => {
       clock = millis;
     },
-    retirementAttempts: () => retirementAttempts,
+    loseChild: () => {
+      childGone = true;
+    },
+    retirementAttempts: () => retirementAttempts.length,
+    retirementAttemptTimes: () => [...retirementAttempts],
     executions: async () =>
       await f.sql.query(
         "SELECT batch_id,state,retirement_kind,retirement_receipt_digest FROM queue_v2_batch_executions ORDER BY rowid",
@@ -1873,6 +1884,65 @@ test("the worker-wide recovery pass retires a remembered handler receipt too", a
       nextCursor: null,
     });
     expect(locked.retirementAttempts()).toBe(2);
+  } finally {
+    await locked?.composition.close();
+    f.database.close();
+  }
+});
+
+test("remembered receipt retries back off to at most once a minute", async () => {
+  const f = fixture();
+  let locked: Awaited<ReturnType<typeof lockedRetirement>> | undefined;
+  try {
+    locked = await lockedRetirement(f, "capped", 100);
+    await locked.admit("capped-message");
+    locked.at(0);
+    expect(await locked.composition.deliverOnce(locked.scope)).toEqual({ kind: "unknown" });
+    // One-second polls for five minutes.
+    const scan = { workerUid: locked.workerUid };
+    for (let second = 1; second <= 300; second += 1) {
+      locked.at(second * 1_000);
+      await locked.composition.reconcileWorkerAuthorizedAbsence(scan);
+    }
+    expect(locked.retirementAttemptTimes()).toEqual([
+      0, 1_000, 3_000, 7_000, 15_000, 31_000, 63_000, 123_000, 183_000, 243_000,
+    ]);
+  } finally {
+    await locked?.composition.close();
+    f.database.close();
+  }
+});
+
+test("a remembered receipt yields to proven physical absence before it is due", async () => {
+  const f = fixture();
+  let locked: Awaited<ReturnType<typeof lockedRetirement>> | undefined;
+  try {
+    locked = await lockedRetirement(f, "replaced", 1);
+    await locked.admit("replaced-message");
+    locked.at(0);
+    expect(await locked.composition.deliverOnce(locked.scope)).toEqual({ kind: "unknown" });
+    // The child is replaced before the receipt retry is due.
+    locked.loseChild();
+    locked.at(500);
+    const scan = { workerUid: locked.workerUid };
+    expect(await locked.composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "reconciled",
+      retired: 1,
+      nextCursor: null,
+    });
+    expect(await locked.executions()).toMatchObject([
+      { state: "retired", retirement_kind: "incarnation_absent" },
+    ]);
+    // The receipt is dropped with the absence retirement and never tried again;
+    // the message waits for its lease to expire and is redelivered.
+    locked.at(5_000);
+    expect(await locked.composition.reconcileWorkerAuthorizedAbsence(scan)).toEqual({
+      kind: "reconciled",
+      retired: 0,
+      nextCursor: null,
+    });
+    expect(locked.retirementAttemptTimes()).toEqual([0, 500]);
+    expect(await locked.settlements()).toEqual([{ state: "pending", outcome: null }]);
   } finally {
     await locked?.composition.close();
     f.database.close();

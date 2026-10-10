@@ -35,7 +35,7 @@ export interface SelfhostV2QueueCompositionOptions {
    * retries, so it will wait out its 120 second expiry. Cause only; no payload.
    */
   readonly onCancelFailure?: (cause: unknown) => void;
-  /** Internal deterministic-test clock for retirement retries; defaults to Date.now. */
+  /** Internal deterministic-test clock for retirement retries; defaults to a monotonic clock. */
   readonly now?: () => number;
 }
 
@@ -158,10 +158,13 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
    * never retires it, and its Consumer would stay occupied until a restart
    * replaced that child. The receipt is exact and deterministic, so later
    * passes repeat the same CAS, with backoff. Memory only: after a restart the
-   * child is gone and absence applies. No message bodies.
+   * child is gone and absence applies. A row that left `send_authorized` some
+   * other way is never listed again, so its receipt is simply dropped at the
+   * next restart. No message bodies.
    */
   const unretiredReceipts = new Map<string, UnretiredReceipt>();
-  const now = options.now ?? Date.now;
+  // Monotonic, so a wall-clock step back cannot postpone a retry.
+  const now = options.now ?? (() => performance.now());
 
   function deferRetirement(receipt: UnretiredReceipt): void {
     receipt.attempts += 1;
