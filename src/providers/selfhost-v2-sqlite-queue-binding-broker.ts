@@ -355,11 +355,17 @@ export function createSelfhostV2SqliteQueueBindingBroker(options: {
           )
           .digest("hex")}` as const;
         if (!DRAIN_RECEIPT.test(receiptDigest)) return false;
-        if (exact.custody.sqliteDrainState === "drained")
-          return exact.custody.sqliteDrainReceiptDigest === receiptDigest;
+        if (
+          exact.custody.sqliteDrainState === "drained" &&
+          exact.custody.sqliteDrainReceiptDigest !== receiptDigest
+        )
+          return false;
+        // A persisted Core receipt does not prove that the restarted Node
+        // owner still holds every selected physical UID and original CREATE.
         for (const uid of resourceUids) {
           if (!(await store.recoverOwnedDatabase(uid))) return false;
         }
+        if (exact.custody.sqliteDrainState === "drained") return true;
         try {
           if (await proofs.confirmDrained({ execution: grant.execution, terminal, receiptDigest }))
             return true;
