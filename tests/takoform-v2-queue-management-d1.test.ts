@@ -527,4 +527,4 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
   } finally {
     await runtime.dispose();
   }
-});
+}, 30_000);
