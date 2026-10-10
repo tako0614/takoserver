@@ -342,10 +342,12 @@ test("Actor Binding accepts a Host-owned Version identity strategy without selfh
       throw new Error("binding fixture source/physical registration unavailable");
     const codeSpec = parseWorkerVersionSpec(JSON.parse(codeRow.spec_json));
     if (!codeSpec.bundle) throw new Error("binding fixture bundle unavailable");
+    const bundleUid = codeSpec.bundle.resourceUid;
     const version = await f.create(WORKER_VERSION_FORM_URL, "binding-version", {
       worker: { resourceUid: worker.resourceUid },
-      bundle: { resourceUid: codeSpec.bundle.resourceUid },
+      bundle: { resourceUid: bundleUid },
       handlers: ["fetch"],
+      vars: { CONFIG: { regions: ["east", { enabled: true }] } },
       actorBindings: [{ name: "ACTOR", resource: { resourceUid: namespace.resourceUid } }],
     });
     const sqlGraph = createV2ActorNamespaceSqlGraphReader({ sql: f.sql, targetKey: TARGET });
@@ -365,8 +367,24 @@ test("Actor Binding accepts a Host-owned Version identity strategy without selfh
           workerVersionUid: version.resourceUid,
           workerVersionOperationId: version.id,
           workerVersionGeneration: 1,
+          workerVersionSpec: parseWorkerVersionSpec({
+            worker: { resourceUid: worker.resourceUid },
+            bundle: { resourceUid: bundleUid },
+            handlers: ["fetch"],
+            vars: { CONFIG: { regions: ["east", { enabled: true }] } },
+            actorBindings: [{ name: "ACTOR", resource: { resourceUid: namespace.resourceUid } }],
+          }),
           actorBindings: [{ name: "ACTOR", resourceUid: namespace.resourceUid }],
         });
+        expect(Object.isFrozen(source.workerVersionSpec)).toBe(true);
+        expect(Object.isFrozen(source.workerVersionSpec.vars)).toBe(true);
+        const config = source.workerVersionSpec.vars.CONFIG as { regions: unknown[] };
+        expect(Object.isFrozen(config)).toBe(true);
+        expect(Object.isFrozen(config.regions)).toBe(true);
+        expect(() => config.regions.push("foreign")).toThrow();
+        expect(Object.isFrozen(source.workerVersionSpec.actorBindings[0]?.resource)).toBe(true);
+        await Promise.resolve();
+        expect(config.regions).toEqual(["east", { enabled: true }]);
         expect(Object.isFrozen(source.actorBindings)).toBe(true);
         expect(Object.isFrozen(source.actorBindings[0])).toBe(true);
         return identity;

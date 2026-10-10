@@ -49,8 +49,22 @@ export interface V2WorkflowBindingVersionIdentitySource {
   readonly workerVersionUid: string;
   readonly workerVersionOperationId: string;
   readonly workerVersionGeneration: number;
+  readonly workerVersionSpec: WorkerVersionSpec;
   readonly workflowBindings: readonly { readonly name: string; readonly resourceUid: string }[];
   readonly actorBindings: readonly { readonly name: string; readonly resourceUid: string }[];
+}
+
+function immutableVersionSpec(spec: WorkerVersionSpec): WorkerVersionSpec {
+  // The callback must not mutate the parsed spec still used for sealed-reference checks.
+  const snapshot = structuredClone(spec);
+  const freezeDeep = <T>(value: T): T => {
+    if (value !== null && typeof value === "object") {
+      for (const child of Object.values(value)) freezeDeep(child);
+      Object.freeze(value);
+    }
+    return value;
+  };
+  return freezeDeep(snapshot);
 }
 
 type Row = Record<string, unknown>;
@@ -320,6 +334,7 @@ export function createV2WorkflowBindingAuthority(options: {
         workerVersionUid: claim.workerVersionUid,
         workerVersionOperationId: claim.workerVersionOperationId,
         workerVersionGeneration: sourceGeneration,
+        workerVersionSpec: immutableVersionSpec(spec),
         workflowBindings: Object.freeze(
           spec.workflowBindings.map((binding) =>
             Object.freeze({ name: binding.name, resourceUid: binding.resource.resourceUid }),
