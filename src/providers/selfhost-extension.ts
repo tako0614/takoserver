@@ -25,6 +25,13 @@ export {
   type V2SqliteSelectedVersionObservation,
 } from "./selfhost-v2-sqlite-binding-broker.ts";
 export {
+  createSelfhostV2SqliteQueueBindingBroker,
+  type V2QueueSQLiteCall,
+  type V2QueueSQLiteGrant,
+  type V2QueueSQLiteProofPort,
+  type V2QueueSQLiteSelectedBindings,
+} from "./selfhost-v2-sqlite-queue-binding-broker.ts";
+export {
   createSelfhostV2SQLiteStore,
   type SelfhostV2SQLiteStore,
   SelfhostV2SQLiteStoreError,
