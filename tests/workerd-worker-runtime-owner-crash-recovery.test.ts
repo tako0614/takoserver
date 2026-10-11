@@ -168,6 +168,16 @@ async function waitForVacant(port: number): Promise<void> {
   throw new Error("foreign listener did not become vacant");
 }
 
+/** A killed Host's child can outlive it briefly under load; boot refuses a live one. */
+async function waitForStale(identity: unknown): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if ((await linuxProcessLiveness(identity as never)) === "stale") return;
+    await Bun.sleep(20);
+  }
+  throw new Error("the killed Host's candidate child did not exit");
+}
+
 function ownerDirectory(root: string): string {
   const uidHash = createHash("sha256").update(WORKER_UID, "utf8").digest("hex");
   return join(root, "owners", uidHash);
@@ -1520,6 +1530,10 @@ test("a Host killed while an in-process candidate failure is retiring still boot
     // state boot recovery resumes, never an activated record's `retiring`.
     expect(retiring).toMatchObject({ status: "uncertain", identity: null, receipt: null });
     await waitForVacant(retiring.listenerPort);
+    // The SIGTERM-ignoring child exits once its Host is gone; a successor that
+    // starts first is right to refuse a live recorded child.
+    expect(retiring.processIdentity).not.toBeNull();
+    await waitForStale(retiring.processIdentity);
 
     successor = await startHost(
       "active-recover-reexecute",
