@@ -9,7 +9,9 @@ const API = "forms.takoform.com/v2" as const;
 const DISCOVERY_PATH = "/.well-known/takoform/v2";
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u;
-const GENERATION = /^[1-9][0-9]*$/u;
+// A decimal integer in 0..2^53-1 (Host API v2 §1). No Resource is at
+// generation 0, so a well-formed 0 is a stale generation, not a malformed one.
+const GENERATION = /^(?:0|[1-9][0-9]*)$/u;
 
 /** Identity and authority of this request's current credential, never shared mutable state. */
 export interface TakoformV2HttpPrincipal {
@@ -437,7 +439,7 @@ function expectedGenerationHeader(request: Request): number {
   if (value === null) throw new HttpInputError(428, "expected_generation_required");
   if (!GENERATION.test(value)) throw invalidRequest();
   const result = Number(value);
-  if (!Number.isSafeInteger(result) || result < 1) throw invalidRequest();
+  if (!Number.isSafeInteger(result)) throw invalidRequest();
   return result;
 }
 
