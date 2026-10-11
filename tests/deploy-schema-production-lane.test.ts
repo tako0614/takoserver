@@ -1873,6 +1873,8 @@ describe("production-shaped D1 migration lane", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0029-fence-"));
     try {
       chmodSync(root, 0o700);
+      await rehearsalReceiptChainThrough0036(root);
+      const predecessorFor = { "0033": "0028", "0036": "0033", "0043": "0036" } as const;
       const cases = [
         ["0033", 28, { malformedFormRef: [0, 0, 1] }],
         ["0033", 28, { duplicateResourceUid: [0, 0, 1] }],
@@ -1898,6 +1900,10 @@ describe("production-shaped D1 migration lane", () => {
             outputDirectory: join(root, `work-${index}`),
             leaseRoot: join(root, "leases"),
             receiptPath: join(root, `receipt-${index}.json`),
+            predecessorReceiptPath: join(
+              root,
+              `${predecessorFor[throughMigration]}.chain.receipt.json`,
+            ),
             review: "reviewer@example.test",
             cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           },

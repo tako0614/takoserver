@@ -15,6 +15,7 @@ import {
 } from "../scripts/deploy/retirement.ts";
 import type { SponsorshipCutoverProofGate } from "../scripts/deploy/sponsorship-cutover-proof.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
+import { runWorker, type WorkerOptions, type WorkerProcess } from "../scripts/deploy/worker.ts";
 import {
   assertExactVersionBindingClosure,
   expectedTransitionBindingClosure,
@@ -2160,7 +2161,219 @@ describe("reviewed Hosted legacy-edge retirement", () => {
       ),
     ).rejects.toThrow("direct candidate predecessor");
   });
+
+  // Every sub-runner below owns its own `bun run check` gate and receives the
+  // state its composing owner built before that gate.
+  for (const scenario of oauthRefreshScenarios()) {
+    test(`integration ${scenario.name} resolves the OAuth bearer again after its owner gate`, async () => {
+      const root = mkdtempSync(join(tmpdir(), "takoserver-retirement-oauth-refresh-"));
+      try {
+        const events: string[] = [];
+        const oauth = expiringOAuth(events);
+        const run: RetirementProcess = async (command, options) => {
+          const token = oauth.answer(command);
+          if (token !== undefined) return token;
+          const completed = await scenario.run(command, options);
+          oauth.afterCommand(command);
+          return completed;
+        };
+        const result = await withCloudflareApi(scenario.state, oauth.live, events, () =>
+          runRetirementOwned(scenario.invocation, scenario.target, {
+            run,
+            proofGate: scenario.proofGate,
+            outputDirectory: join(root, "work"),
+            publicationLeaseRoot: join(root, "leases"),
+            review: "reviewer@example.test",
+            cloudflareEnvironment: {},
+            fetcher: probeFetcher,
+          }).catch((error: unknown) => error),
+        );
+        expect(timeline(events)).toEqual([
+          "token:oauth-access-1",
+          "GET:Bearer oauth-access-1",
+          "gate",
+          "token:oauth-access-2",
+          "GET:Bearer oauth-access-2",
+        ]);
+        expect(result).toMatchObject(scenario.expected);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("integration Worker authority cutover hands its Host-runtime transition a bearer resolved after the gate", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-transition-oauth-refresh-"));
+    try {
+      const fixture = stateFixture("legacy");
+      const events: string[] = [];
+      const oauth = expiringOAuth(events);
+      const run: WorkerProcess = async (command, options) => {
+        const token = oauth.answer(command);
+        if (token !== undefined) return token;
+        const completed = await fixture.run(command, options);
+        oauth.afterCommand(command);
+        return completed;
+      };
+      const result = await withCloudflareApi(fixture.state, oauth.live, events, () =>
+        runWorker(
+          {
+            surface: "takoserver-worker-authority-cutover",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+          },
+          target,
+          {
+            run,
+            outputDirectory: join(root, "work"),
+            publicationLeaseRoot: join(root, "leases"),
+            review: "reviewer@example.test",
+            cloudflareEnvironment: {},
+            // The composed retirement options carry the injected proof gate.
+            proofGate: testProofGate,
+          } as WorkerOptions,
+        ).catch((error: unknown) => error),
+      );
+      expect(timeline(events)).toEqual([
+        "token:oauth-access-1",
+        "GET:Bearer oauth-access-1",
+        "gate",
+        "token:oauth-access-2",
+        "GET:Bearer oauth-access-2",
+      ]);
+      expect(result).toMatchObject({
+        state: "candidate",
+        previousVersionId: VERSION_LEGACY,
+        versionId: VERSION_CANDIDATE,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
+
+interface OAuthRefreshScenario {
+  readonly name: string;
+  readonly invocation: RetirementInvocation;
+  readonly target: DeployTarget;
+  readonly state: RetirementState;
+  readonly run: RetirementProcess;
+  readonly proofGate: SponsorshipCutoverProofGate;
+  readonly expected: Record<string, unknown>;
+}
+
+function oauthRefreshScenarios(): readonly OAuthRefreshScenario[] {
+  const legacy = stateFixture("legacy");
+  const candidate = stateFixture("candidate");
+  const token = stateFixture("token", undefined, REPAIR_COMMIT);
+  const postParent = post0043Fixture("post-parent");
+  const hostedRetired = post0043Fixture("hosted-retired");
+  const attributed = post0043Fixture("attributed");
+  // The post-0043 fixtures model one fixed lineage; the attribution repair
+  // upload advances H to A.
+  const post0043Run = stateFixture("legacy").run;
+  let attributionUploaded = false;
+  const attributionRepairState: RetirementState = {
+    workerDomains: () => (attributionUploaded ? attributed : hostedRetired).state.workerDomains(),
+    workerDeployments: (name) =>
+      (attributionUploaded ? attributed : hostedRetired).state.workerDeployments(name),
+    workerVersion: (name, id) =>
+      (attributionUploaded ? attributed : hostedRetired).state.workerVersion(name, id),
+    workerSecrets: (name) =>
+      (attributionUploaded ? attributed : hostedRetired).state.workerSecrets(name),
+  };
+  return [
+    {
+      name: "authority transition",
+      invocation: {
+        surface: "takoserver-sponsorship-public-route-retirement",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+        legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+      },
+      target,
+      state: legacy.state,
+      run: legacy.run,
+      proofGate: testProofGate,
+      expected: {
+        state: "candidate",
+        previousVersionId: VERSION_LEGACY,
+        versionId: VERSION_CANDIDATE,
+      },
+    },
+    {
+      name: "post-0043 route settlement",
+      invocation: {
+        surface: "takoserver-sponsorship-public-route-retirement",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+        legacyHostRuntimePredecessorVersionId: POST0043_VERSION_L,
+      },
+      target: POST0043_TARGET,
+      state: postParent.state,
+      run: post0043Run,
+      proofGate: postParent.proofGate,
+      expected: { state: "preexisting-route-removal-settled", versionId: POST0043_VERSION_P },
+    },
+    {
+      name: "topology retirement",
+      invocation: {
+        surface: "takoserver-host-runtime-topology-retirement",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+        legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+      },
+      target,
+      state: candidate.state,
+      run: candidate.run,
+      proofGate: testProofGate,
+      expected: { state: "topology-retired", versionId: VERSION_TOPOLOGY },
+    },
+    {
+      name: "attribution repair",
+      invocation: {
+        surface: "takoserver-worker-retirement-attribution-repair",
+        action: "apply",
+        environment: "integration",
+        commit: REPAIR_COMMIT,
+        legacyHostRuntimePredecessorVersionId: VERSION_LEGACY,
+        unattributedSuccessorVersionId: VERSION_TOKEN,
+      },
+      target,
+      state: token.state,
+      run: token.run,
+      proofGate: testProofGate,
+      expected: {
+        state: "token-retirement-attribution-repaired",
+        versionId: VERSION_ATTRIBUTION_REPAIRED,
+      },
+    },
+    {
+      name: "post-0043 attribution repair",
+      invocation: {
+        surface: "takoserver-worker-retirement-attribution-repair",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+        legacyHostRuntimePredecessorVersionId: POST0043_VERSION_L,
+        unattributedSuccessorVersionId: POST0043_VERSION_H,
+      },
+      target: POST0043_TARGET,
+      state: attributionRepairState,
+      run: async (command, options) => {
+        if (command.includes("--no-bundle")) attributionUploaded = true;
+        return await post0043Run(command, options);
+      },
+      proofGate: hostedRetired.proofGate,
+      expected: { state: "token-retirement-attribution-repaired", versionId: POST0043_VERSION_A },
+    },
+  ];
+}
 
 function post0043Fixture(
   head: "post-parent" | "hosted-retired" | "attributed",
@@ -2545,4 +2758,126 @@ async function probeFetcher(input: string): Promise<Response> {
       openapi: `${target.publicOrigin}/openapi.json`,
     },
   });
+}
+
+/**
+ * A Wrangler OAuth access token lives about one hour and `auth token --json`
+ * refreshes it only once it has already expired. This models one expiry while
+ * the owner gate runs: the gate invalidates the issued token, and the next
+ * `auth token` call mints `oauth-access-2`.
+ */
+function expiringOAuth(events: string[], gate = "bun run check") {
+  let issued = 0;
+  let live = "";
+  return {
+    live: () => live,
+    /** Answers `auth token --json`; every other command returns undefined. */
+    answer(command: readonly string[]): CommandResult | undefined {
+      if (command.slice(-3).join(" ") !== "auth token --json") return undefined;
+      if (live === "") {
+        issued += 1;
+        live = `oauth-access-${issued}`;
+      }
+      events.push(`token:${live}`);
+      return {
+        exitCode: 0,
+        stdout: `${JSON.stringify({ type: "oauth", token: live })}\n`,
+        stderr: "",
+      };
+    },
+    afterCommand(command: readonly string[]): void {
+      if (command.join(" ") !== gate) return;
+      events.push("gate");
+      live = "";
+    },
+  };
+}
+
+interface CloudflareApiState {
+  workerDomains(): Promise<readonly { readonly hostname: string; readonly service: string }[]>;
+  workerDeployments(workerName: string): Promise<readonly unknown[]>;
+  workerVersion(workerName: string, versionId: string): Promise<unknown>;
+  workerSecrets(workerName: string): Promise<readonly unknown[]>;
+  workerSubdomain?(
+    workerName: string,
+  ): Promise<{ readonly enabled: boolean; readonly previewsEnabled: boolean }>;
+  workerAccountSubdomain?(): Promise<string>;
+}
+
+/**
+ * Serves one portable Worker state as the Cloudflare REST API on the global
+ * fetch, which never reaches the network. Only the live OAuth access token is
+ * authorized; any other bearer receives the provider's 401.
+ */
+async function withCloudflareApi<T>(
+  state: CloudflareApiState,
+  live: () => string,
+  events: string[],
+  body: () => Promise<T>,
+): Promise<T> {
+  const original = globalThis.fetch;
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = new Request(input, init);
+      const bearer = request.headers.get("authorization");
+      events.push(`${request.method}:${bearer}`);
+      const url = new URL(request.url);
+      if (url.origin !== "https://api.cloudflare.com" || bearer !== `Bearer ${live()}`) {
+        return Response.json(
+          { success: false, result: null, errors: [{ code: 10000, message: "denied" }] },
+          { status: 401 },
+        );
+      }
+      return await cloudflareApiResponse(state, url);
+    },
+    { preconnect: original.preconnect },
+  );
+  try {
+    return await body();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+async function cloudflareApiResponse(state: CloudflareApiState, url: URL): Promise<Response> {
+  const ok = (result: unknown, extra: Record<string, unknown> = {}) =>
+    Response.json({ success: true, errors: [], messages: [], result, ...extra });
+  const path = url.pathname.replace(/^\/client\/v4\/accounts\/[0-9a-f]{32}\/workers/u, "");
+  const [collection, name, resource, id] = path.split("/").slice(1).map(decodeURIComponent);
+  if (path === "/domains") {
+    const domains = await state.workerDomains();
+    const perPage = Number(url.searchParams.get("per_page"));
+    return ok(domains, {
+      result_info: {
+        page: 1,
+        per_page: perPage,
+        count: domains.length,
+        total_count: domains.length,
+        total_pages: Math.ceil(domains.length / perPage),
+      },
+    });
+  }
+  if (path === "/subdomain" && state.workerAccountSubdomain !== undefined) {
+    return ok({ subdomain: await state.workerAccountSubdomain() });
+  }
+  if (collection === "scripts" && name !== undefined) {
+    if (resource === "deployments" && id === undefined) {
+      return ok({ deployments: await state.workerDeployments(name) });
+    }
+    if (resource === "versions" && id !== undefined) return ok(await state.workerVersion(name, id));
+    if (resource === "secrets") return ok(await state.workerSecrets(name));
+    if (resource === "subdomain" && state.workerSubdomain !== undefined) {
+      const subdomain = await state.workerSubdomain(name);
+      return ok({ enabled: subdomain.enabled, previews_enabled: subdomain.previewsEnabled });
+    }
+  }
+  return Response.json(
+    { success: false, result: null, errors: [{ code: 7003, message: `unmodelled ${path}` }] },
+    { status: 404 },
+  );
+}
+
+/** Events with consecutive repeats collapsed. */
+function timeline(events: readonly string[]): readonly string[] {
+  return events.filter((event, index) => event !== events[index - 1]);
 }

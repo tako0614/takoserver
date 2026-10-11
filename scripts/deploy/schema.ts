@@ -943,16 +943,20 @@ export async function runD1Schema(
     );
   }
   const run = options.run ?? runCommand;
-  const credential =
+  const resolveCredential = async () =>
+    await resolveCloudflareCredential(invocation.environment, {
+      cloudflareEnvironment: options.cloudflareEnvironment,
+      run,
+    });
+  let credential =
     invocation.environment === "integration" &&
     options.reader !== undefined &&
     invocation.action === "status" &&
     options.v2ExistingMaintenance?.publicWorkerState !== undefined
       ? undefined
-      : await resolveCloudflareCredential(invocation.environment, {
-          cloudflareEnvironment: options.cloudflareEnvironment,
-          run,
-        });
+      : await resolveCredential();
+  // Child processes never carry an OAuth bearer (Wrangler refreshes its own
+  // stored profile), and an explicit token resolves to the same value again.
   const environment = credential?.childEnvironment ?? {};
   const sourceMigrations = readMigrationArtifact(
     options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
@@ -1390,6 +1394,30 @@ export async function runD1Schema(
     if (rehearsalReceiptAlreadyExists && wave.pending.length > 0) {
       throw preflightError("rehearsal receipt already exists and will not be overwritten");
     }
+    // Read and match the operator-private receipt evidence before the long
+    // gates. The pre-gate state, wave and integrity are what the requalified
+    // reads after the gates must equal; those reads repeat every check.
+    const earlyReceiptEvidence =
+      invocation.environment === "production" || rehearsalReceiptAlreadyExists
+        ? readReceiptEvidence(receiptPath as string)
+        : null;
+    if (earlyReceiptEvidence) {
+      assertReceiptMatches(earlyReceiptEvidence.receipt, {
+        commit: source.commit,
+        wave,
+        pre: initial,
+        artifact: sourceMigrations,
+        preDataIntegrity: legacyCatchupIntegrity,
+      });
+    }
+    const earlyPredecessorReceiptEvidence =
+      invocation.environment === "rehearsal" && earlyReceiptEvidence === null
+        ? readPredecessorReceiptEvidence(options.predecessorReceiptPath, {
+            commit: source.commit,
+            wave,
+            artifact: sourceMigrations,
+          })
+        : null;
     if (wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)) {
       await checked(run, "preflight", "accepted-authority transition compatibility", [
         "bun",
@@ -1440,6 +1468,10 @@ export async function runD1Schema(
       "run",
       "check:migrations",
     ]);
+    // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+    // Wrangler refreshes only an already expired token). No Cloudflare read or
+    // write after the gate reuses a bearer resolved before it.
+    if (credential !== undefined) credential = await resolveCredential();
 
     const release = join(root, "release");
     const sealedMigrations = join(release, "migrations");
@@ -1621,6 +1653,9 @@ export async function runD1Schema(
       invocation.environment === "production" || rehearsalReceiptAlreadyExists
         ? readReceiptEvidence(receiptPath as string)
         : null;
+    if (receiptEvidence?.digest !== earlyReceiptEvidence?.digest) {
+      throw preflightError("D1 rehearsal receipt bytes changed during qualification");
+    }
     if (receiptEvidence) {
       assertReceiptMatches(receiptEvidence.receipt, {
         commit: source.commit,
@@ -1771,6 +1806,12 @@ export async function runD1Schema(
             })
           : receiptEvidence.receipt.predecessorReceipt
         : null;
+    if (
+      earlyPredecessorReceiptEvidence !== null &&
+      predecessorReceiptEvidence?.digest !== earlyPredecessorReceiptEvidence.digest
+    ) {
+      throw preflightError("D1 predecessor rehearsal receipt bytes changed during qualification");
+    }
     const rehearsalAttempt =
       invocation.environment === "rehearsal"
         ? prepareRehearsalAttempt(receiptPath as string, {

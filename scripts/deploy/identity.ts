@@ -164,26 +164,28 @@ async function runOperatorIdentityWithLease(
   }
   const desiredPublicJwkDigest = sha256(JSON.stringify(publicJwk));
   const run = options.run ?? runCommand;
+  const resolveCredential = async () =>
+    await resolveCloudflareCredential(invocation.environment, {
+      cloudflareEnvironment: options.cloudflareEnvironment,
+      run,
+    });
   const credential =
     invocation.environment === "integration" &&
     options.state !== undefined &&
     invocation.action === "status"
       ? undefined
-      : await resolveCloudflareCredential(invocation.environment, {
-          cloudflareEnvironment: options.cloudflareEnvironment,
-          run,
-        });
+      : await resolveCredential();
   const cloudflareEnvironment = credential?.childEnvironment ?? {};
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-identity-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
   try {
-    const state =
-      options.state ??
+    const createState = (token: string | undefined): CloudflareState =>
       new CloudflareState({
         accountId: target.accountId,
-        token: credential?.token ?? exactCloudflareToken(cloudflareEnvironment),
+        token: token ?? exactCloudflareToken(cloudflareEnvironment),
       });
+    let state: WorkerState = options.state ?? createState(credential?.token);
     const migrations =
       options.migrations ??
       remoteMigrationReader(
@@ -271,6 +273,11 @@ async function runOperatorIdentityWithLease(
         `${gate.stdout}${gate.stderr}`.trim(),
       );
     }
+    // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+    // Wrangler refreshes only an already expired token). No Cloudflare read or
+    // write after the gate reuses a bearer resolved before it. An injected state
+    // keeps its own credential.
+    if (options.state === undefined) state = createState((await resolveCredential()).token);
 
     const prepared = await prepareWorkerArtifact({
       root,

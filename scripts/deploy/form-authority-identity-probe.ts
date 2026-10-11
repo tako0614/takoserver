@@ -153,22 +153,25 @@ export async function runFormAuthorityIdentityProbe(
   }
   const selected = requireProbeTarget(target);
   const run = options.run ?? runCommand;
-  const credential =
+  const resolveCredential = async () =>
+    await resolveCloudflareCredential(invocation.environment, {
+      cloudflareEnvironment: options.cloudflareEnvironment,
+      run,
+    });
+  let credential =
     invocation.environment === "integration" &&
     options.state !== undefined &&
     invocation.action === "status"
       ? undefined
-      : await resolveCloudflareCredential(invocation.environment, {
-          cloudflareEnvironment: options.cloudflareEnvironment,
-          run,
-        });
+      : await resolveCredential();
   const environment = credential?.childEnvironment ?? {};
-  const state =
+  const createState = (resolved: typeof credential): FormAuthorityIdentityProbeState =>
     options.state ??
     new CloudflareState({
       accountId: target.accountId,
-      token: credential?.token ?? exactToken(environment),
+      token: resolved?.token ?? exactToken(resolved?.childEnvironment ?? {}),
     });
+  let state = createState(credential);
   const fetcher = options.fetcher ?? fetch;
   const publicBefore = await inspectPublic("preflight", target, state);
   const authorityWorkerPresent = await isBoundAuthorityWorkerPresent(target, state);
@@ -398,6 +401,13 @@ export async function runFormAuthorityIdentityProbe(
     await runFormAuthorityCodeGate(run, invocation.surface);
   } else {
     await checked(run, "scoped identity probe owner gate `bun run check`", ["bun", "run", "check"]);
+  }
+  // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+  // Wrangler refreshes only an already expired token). No Cloudflare read or
+  // write after the gate reuses a bearer resolved before it.
+  if (credential !== undefined) {
+    credential = await resolveCredential();
+    state = createState(credential);
   }
 
   const temporary = options.outputDirectory === undefined;

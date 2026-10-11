@@ -1,7 +1,15 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
@@ -394,7 +402,145 @@ describe("Takoserver integration Worker bootstrap", () => {
     rmSync(wrongKeyringDirectory, { recursive: true, force: true });
   });
 
+  test("unsafe or mismatched closure secret inputs refuse before the Host bootstrap gate", async () => {
+    const originalFetch = globalThis.fetch;
+    const network: string[] = [];
+    // No request may reach the network, whichever client the source builds.
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      network.push(String(input instanceof Request ? input.url : input));
+      return Response.json({ success: false, result: null, errors: [] }, { status: 401 });
+    }) as typeof globalThis.fetch;
+    const previousDirectory = process.env.TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY;
+    delete process.env.TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY;
+    const directories: string[] = [];
+    try {
+      const unsafeMode = writeSecretDirectory(target);
+      directories.push(unsafeMode);
+      chmodSync(join(unsafeMode, "TAKOSERVER_SIGNING_KEY"), 0o644);
+      const foreignKey = writeSecretDirectory(target);
+      directories.push(foreignKey);
+      writeFileSync(join(foreignKey, "TAKOSERVER_SIGNING_KEY"), makeKeyMaterial().privateRaw, {
+        mode: 0o600,
+      });
+      for (const [secretDirectory, message] of [
+        [undefined, "TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY"],
+        [unsafeMode, "TAKOSERVER_SIGNING_KEY"],
+        [foreignKey, "signing"],
+      ] as const) {
+        const fixture = bootstrapFixture({ target });
+        const error = await rejectedError(
+          apply(fixture, secretDirectory === undefined ? {} : { secretDirectory }),
+        );
+        expect(error).toBeInstanceOf(DeployError);
+        expect(error).toHaveProperty("phase", "preflight");
+        expect(error.message).toContain(message);
+        expect(fixture.commands).not.toContainEqual(["bun", "run", "typecheck:worker"]);
+        expect(
+          fixture.commands.some((command) => sameCommand(command, EXPECTED_BOOTSTRAP_TEST_COMMAND)),
+        ).toBe(false);
+        expect(fixture.lifecycleCalls).toHaveLength(0);
+      }
+      expect(network).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousDirectory === undefined) {
+        delete process.env.TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY;
+      } else {
+        process.env.TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY = previousDirectory;
+      }
+      for (const directory of directories) rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("resolves the integration OAuth bearer again after the Host bootstrap gate", async () => {
+    const fixture = bootstrapFixture({ target });
+    const secretDirectory = writeSecretDirectory(target);
+    const events: string[] = [];
+    const r2AfterGate: string[] = [];
+    let issued = 0;
+    let current = "";
+    const run: WorkerProcess = async (command, input) => {
+      if (command.slice(-3).join(" ") === "auth token --json") {
+        if (current === "") {
+          issued += 1;
+          current = `oauth-access-${issued}`;
+        }
+        events.push(`token:${current}`);
+        return ok(`${JSON.stringify({ type: "oauth", token: current })}\n`);
+      }
+      const completed = await fixture.run(command, input);
+      if (sameCommand(command, EXPECTED_BOOTSTRAP_TEST_COMMAND)) {
+        events.push("gate");
+        // The access token expires while the long Host bootstrap gate runs.
+        current = "";
+      }
+      return completed;
+    };
+    const rest = cloudflareRestFromState(fixture.state, target);
+    const previousToken = process.env.CLOUDFLARE_API_TOKEN;
+    delete process.env.CLOUDFLARE_API_TOKEN;
+    // No request may reach the network, whichever client the source builds.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const bearer = request.headers.get("authorization");
+      const gated = events.includes("gate");
+      events.push(`${gated ? "after" : "before"}:${bearer}`);
+      if (gated && new URL(request.url).pathname.includes("/r2/buckets/")) {
+        r2AfterGate.push(String(bearer));
+      }
+      if (current === "" || bearer !== `Bearer ${current}`) {
+        return Response.json(
+          { success: false, result: null, errors: [{ code: 10000 }], messages: [] },
+          { status: 401 },
+        );
+      }
+      return await rest(request);
+    }) as typeof globalThis.fetch;
+    try {
+      const result = await runIntegrationWorkerBootstrap(
+        { action: "apply", environment: "integration", commit: COMMIT },
+        target,
+        {
+          run,
+          sourceRepositoryRoot: sourceRoot,
+          schemaReader: fixture.schemaReader,
+          signingDatabase: fixture.signingDatabase,
+          deployLifecycle: fixture.deployLifecycle,
+          publicationLease: fixture.lease,
+          cloudflareEnvironment: {},
+          review: "independent-reviewer",
+          fetcher: publishedProductFetcher(target),
+          secretDirectory,
+        },
+      );
+      expect(result).toMatchObject({
+        kind: "takoserver.integration-worker-bootstrap-apply@v1",
+        mutationApplied: true,
+      });
+      expect(fixture.lifecycleCalls).toHaveLength(1);
+      const gate = events.indexOf("gate");
+      expect(gate).toBeGreaterThan(0);
+      expect(events.slice(0, gate)).toContain("before:Bearer oauth-access-1");
+      const afterGate = events.slice(gate + 1);
+      expect(afterGate[0]).toBe("token:oauth-access-2");
+      const afterReads = afterGate.filter((event) => event.startsWith("after:"));
+      expect(afterReads.length).toBeGreaterThan(0);
+      expect(afterReads.every((event) => event === "after:Bearer oauth-access-2")).toBe(true);
+      expect(r2AfterGate.length).toBeGreaterThan(0);
+      expect(r2AfterGate.every((bearer) => bearer === "Bearer oauth-access-2")).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN;
+      else process.env.CLOUDFLARE_API_TOKEN = previousToken;
+      rmSync(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
   test("each scoped gate failure preserves diagnostics and stops before artifact build or upload", async () => {
+    // Secret inputs are validated before the gate, so the gate is reached only
+    // with a complete, exact secret directory.
+    const secretDirectory = writeSecretDirectory(target);
     for (const gateFailureAt of ["typecheck", "tests"] as const) {
       const fixture = bootstrapFixture({
         target,
@@ -405,7 +551,7 @@ describe("Takoserver integration Worker bootstrap", () => {
           stderr: "gate stderr\n",
         },
       });
-      const error = await rejectedError(apply(fixture));
+      const error = await rejectedError(apply(fixture, { secretDirectory }));
       expect(error).toBeInstanceOf(DeployError);
       expect(error).toMatchObject({
         phase: "preflight",
@@ -424,6 +570,7 @@ describe("Takoserver integration Worker bootstrap", () => {
       expect(fixture.lifecycleCalls).toHaveLength(0);
       expect(fixture.uploaded).toBe(false);
     }
+    rmSync(secretDirectory, { recursive: true, force: true });
   });
 
   test("publishes one genuine first Version with Ed25519 proof and exact temporary secret closure", async () => {
@@ -1350,4 +1497,95 @@ async function rejectedError(operation: Promise<unknown>): Promise<DeployError |
     return error as DeployError | Error;
   }
   throw new Error("Expected the operation to reject");
+}
+
+/**
+ * Serves the typed fake state (and the selected R2 bucket) as the Cloudflare
+ * REST API, so the deploy builds its own clients and every read carries the
+ * bearer it was built with.
+ */
+function cloudflareRestFromState(
+  state: IntegrationWorkerBootstrapState,
+  selectedTarget: DeployTarget,
+): (request: Request) => Promise<Response> {
+  const envelope = (result: unknown, extra: Record<string, unknown> = {}): Response =>
+    Response.json({ success: true, errors: [], messages: [], result, ...extra });
+  return async (request) => {
+    const url = new URL(request.url);
+    const page = (entries: readonly unknown[]): Response =>
+      envelope(entries, {
+        result_info: {
+          page: Number(url.searchParams.get("page")),
+          per_page: Number(url.searchParams.get("per_page")),
+          count: entries.length,
+          total_count: entries.length,
+        },
+      });
+    const account = `/client/v4/accounts/${selectedTarget.accountId}`;
+    const path = url.pathname;
+    if (path === `${account}/workers/scripts`) {
+      return envelope((await state.workerScripts()).map((id) => ({ id })));
+    }
+    if (path === `${account}/workers/domains`) return page(await state.workerDomains());
+    if (path === `${account}/workers/subdomain` && state.workerAccountSubdomain !== undefined) {
+      return envelope({ subdomain: await state.workerAccountSubdomain() });
+    }
+    if (path === `${account}/r2/buckets/${selectedTarget.r2.bucketName}`) {
+      return envelope({ name: selectedTarget.r2.bucketName });
+    }
+    if (path === "/client/v4/zones") {
+      const zones =
+        url.searchParams.get("type") === "internal"
+          ? []
+          : [...new Set((await state.workerRoutes()).map(({ zoneId }) => zoneId))];
+      return page(zones.map((id) => ({ id })));
+    }
+    const zoneRoutes = /^\/client\/v4\/zones\/([^/]+)\/workers\/routes$/u.exec(path);
+    if (zoneRoutes) {
+      return envelope(
+        (await state.workerRoutes())
+          .filter(({ zoneId }) => zoneId === decodeURIComponent(zoneRoutes[1] as string))
+          .map(({ id, pattern, script }) => ({ id, pattern, script })),
+      );
+    }
+    const modules = new RegExp(`^${account}/workers/workers/([^/]+)/versions/([^/]+)$`, "u").exec(
+      path,
+    );
+    if (modules && state.workerVersionWithModules !== undefined) {
+      return envelope(
+        await state.workerVersionWithModules(
+          decodeURIComponent(modules[1] as string),
+          decodeURIComponent(modules[2] as string),
+        ),
+      );
+    }
+    const script = new RegExp(
+      `^${account}/workers/scripts/([^/]+)/(deployments|secrets|subdomain|schedules|settings|versions/([^/]+))$`,
+      "u",
+    ).exec(path);
+    if (script) {
+      const name = decodeURIComponent(script[1] as string);
+      if (script[2] === "deployments") {
+        return envelope({ deployments: await state.workerDeployments(name) });
+      }
+      if (script[2] === "secrets") return envelope(await state.workerSecrets(name));
+      if (script[2] === "settings") return envelope(await state.workerSettings(name));
+      if (script[2] === "schedules") {
+        return envelope({
+          schedules: (await state.workerSchedules(name)).map((cron) => ({ cron })),
+        });
+      }
+      if (script[2] === "subdomain" && state.workerSubdomain !== undefined) {
+        const subdomain = await state.workerSubdomain(name);
+        return envelope({
+          enabled: subdomain.enabled,
+          previews_enabled: subdomain.previewsEnabled,
+        });
+      }
+      if (script[3] !== undefined) {
+        return envelope(await state.workerVersion(name, decodeURIComponent(script[3])));
+      }
+    }
+    throw new Error(`unexpected Cloudflare REST path: ${path}`);
+  };
 }

@@ -198,16 +198,18 @@ export async function runWorkerClosureTransition(
   }
   const run = options.run ?? runCommand;
   const sourceRepositoryRoot = resolve(options.sourceRepositoryRoot ?? REPOSITORY);
+  const resolveCredential = async () =>
+    await resolveCloudflareCredential(invocation.environment, {
+      cloudflareEnvironment: options.cloudflareEnvironment,
+      run,
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+    });
   const credential =
     invocation.environment === "integration" &&
     options.state !== undefined &&
     invocation.action === "status"
       ? undefined
-      : await resolveCloudflareCredential(invocation.environment, {
-          cloudflareEnvironment: options.cloudflareEnvironment,
-          run,
-          ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
-        });
+      : await resolveCredential();
   const environment = credential?.childEnvironment ?? {};
   // A transition exists to publish a corrected target. Prove that the
   // correction composes before it can be uploaded.
@@ -234,15 +236,13 @@ export async function runWorkerClosureTransition(
   let publicationLease: Awaited<ReturnType<typeof acquireWranglerVersionPublicationLease>> | null =
     null;
   try {
+    const createCloudflareState = (token: string | undefined): CloudflareState =>
+      new CloudflareState({ accountId: target.accountId, token: token ?? exactToken(environment) });
     const cloudflareState =
-      options.state === undefined
-        ? new CloudflareState({
-            accountId: target.accountId,
-            token: credential?.token ?? exactToken(environment),
-          })
-        : null;
-    const state = options.state ?? cloudflareState;
-    if (state === null) throw preflightError("Worker state is unavailable");
+      options.state === undefined ? createCloudflareState(credential?.token) : null;
+    const initialState = options.state ?? cloudflareState;
+    if (initialState === null) throw preflightError("Worker state is unavailable");
+    let state: WorkerState = initialState;
     const providerExecutorQualification = isArtifactBlobIoQuiescedTarget(target)
       ? null
       : providerExecutorQualificationReader({
@@ -423,6 +423,13 @@ export async function runWorkerClosureTransition(
           `${result.stdout}${result.stderr}`.trim(),
         );
       }
+    }
+    // The owner gates can outlive a Wrangler OAuth access token (about one hour;
+    // Wrangler refreshes only an already expired token). No Cloudflare read or
+    // write after them reuses a bearer resolved before them. An injected state
+    // keeps its own credential.
+    if (cloudflareState !== null) {
+      state = createCloudflareState((await resolveCredential()).token);
     }
     const prepared = await prepareWorkerArtifact({
       root,

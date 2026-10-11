@@ -356,16 +356,18 @@ export async function runWorker(
   }
   const run = options.run ?? runCommand;
   const sourceRepositoryRoot = resolve(options.sourceRepositoryRoot ?? REPOSITORY);
+  const resolveCredential = async () =>
+    await resolveCloudflareCredential(invocation.environment, {
+      cloudflareEnvironment: options.cloudflareEnvironment,
+      run,
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+    });
   const credential =
     invocation.environment === "integration" &&
     options.state !== undefined &&
     invocation.action === "status"
       ? undefined
-      : await resolveCloudflareCredential(invocation.environment, {
-          cloudflareEnvironment: options.cloudflareEnvironment,
-          run,
-          ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
-        });
+      : await resolveCredential();
   const environment = credential?.childEnvironment ?? {};
   // Before any live read or upload: the selected target must compose the
   // Worker the same way the Worker composes itself on its first request.
@@ -381,15 +383,20 @@ export async function runWorker(
           run,
           sourceRepositoryRoot,
         );
+  const createCloudflareState = (token: string | undefined): CloudflareState =>
+    new CloudflareState({ accountId: target.accountId, token: token ?? exactToken(environment) });
   const cloudflareState =
-    options.state === undefined
-      ? new CloudflareState({
-          accountId: target.accountId,
-          token: credential?.token ?? exactToken(environment),
-        })
-      : null;
-  const state = options.state ?? cloudflareState;
-  if (state === null) throw preflightError("Worker state is unavailable");
+    options.state === undefined ? createCloudflareState(credential?.token) : null;
+  const initialState = options.state ?? cloudflareState;
+  if (initialState === null) throw preflightError("Worker state is unavailable");
+  let state: WorkerState = initialState;
+  // Rebuilds only the state this owner built; an injected state keeps its own
+  // credential. Each owner gate (here or in a sub-runner) calls it afterwards.
+  const refreshStateAfterGate =
+    cloudflareState === null
+      ? undefined
+      : async (): Promise<CloudflareState> =>
+          createCloudflareState((await resolveCredential()).token);
   const providerExecutorQualification = isArtifactBlobIoQuiescedTarget(target)
     ? null
     : providerExecutorQualificationReader({
@@ -428,7 +435,12 @@ export async function runWorker(
       target,
       state,
       run,
-      { ...options, cloudflareEnvironment: environment },
+      {
+        ...options,
+        cloudflareEnvironment: environment,
+        // The transition owns the next gate and rebuilds this state after it.
+        ...(refreshStateAfterGate === undefined ? {} : { refreshStateAfterGate }),
+      },
     );
     return withProviderExecutorQualification(transition, providerExecutorBefore);
   }
@@ -596,6 +608,10 @@ export async function runWorker(
     }
 
     await checked(run, "preflight", "scoped owner gate `bun run check`", ["bun", "run", "check"]);
+    // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+    // Wrangler refreshes only an already expired token). No Cloudflare read or
+    // write after the gate reuses a bearer resolved before it.
+    if (refreshStateAfterGate !== undefined) state = await refreshStateAfterGate();
 
     const prepared = await prepareWorkerArtifact({
       root,

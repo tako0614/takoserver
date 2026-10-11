@@ -149,24 +149,26 @@ export async function runPublicParentTokenRetirement(
   }
   validateInvocation(invocation, target);
   const run = options.run ?? runCommand;
+  const resolveCredential = async () =>
+    await resolveCloudflareCredential(invocation.environment, {
+      cloudflareEnvironment: options.cloudflareEnvironment,
+      run,
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+    });
   const credential =
     invocation.action === "status" && options.state !== undefined
       ? undefined
-      : await resolveCloudflareCredential(invocation.environment, {
-          cloudflareEnvironment: options.cloudflareEnvironment,
-          run,
-          ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
-        });
+      : await resolveCredential();
   const environment = credential?.childEnvironment ?? {};
+  const createCloudflareState = (token: string | undefined): CloudflareState =>
+    new CloudflareState({ accountId: target.accountId, token: token ?? exactToken(environment) });
   const cloudflareState =
-    options.state === undefined
-      ? new CloudflareState({
-          accountId: target.accountId,
-          token: credential?.token ?? exactToken(environment),
-        })
-      : null;
-  const state = options.state ?? cloudflareState;
-  if (state === null) throw preflightError("public parent-token retirement state is unavailable");
+    options.state === undefined ? createCloudflareState(credential?.token) : null;
+  const initialState = options.state ?? cloudflareState;
+  if (initialState === null) {
+    throw preflightError("public parent-token retirement state is unavailable");
+  }
+  let state: PublicParentTokenRetirementState = initialState;
   const qualification = providerExecutorQualificationReader({
     target,
     ...(options.providerExecutorQualification === undefined
@@ -223,6 +225,13 @@ export async function runPublicParentTokenRetirement(
   );
   await assertTargetComposes("preflight", target);
   await runOwnerGate(run);
+  // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+  // Wrangler refreshes only an already expired token). No Cloudflare read or
+  // write after the gate reuses a bearer resolved before it. An injected state
+  // keeps its own credential.
+  if (cloudflareState !== null) {
+    state = createCloudflareState((await resolveCredential()).token);
+  }
 
   const temporary = options.outputDirectory === undefined;
   const root =
