@@ -59,11 +59,15 @@ export async function ensureOperatorKey(
 }
 
 /**
- * A sign-in assertion for the operator themselves.
+ * An operator assertion, signed with the operator's private key.
  *
- * The same bytes `scripts/operator-key.ts sign-in` produces, minted in process
- * so that a first run does not require a second command to be usable. It is
- * printed once, on a machine whose operator is the person reading its output.
+ * The same shape `scripts/operator-key.ts` produces, minted in process so that
+ * a first run does not require a second command to be usable.
+ *
+ * A Host opens one session per sign-in assertion, and Ed25519 signs identical
+ * claims to identical bytes, so a `sign-in` assertion without its own `jti`
+ * gets a random one: two minted in the same second must not read as a replay
+ * of each other. Other purposes keep exactly the claims their caller gave.
  */
 export async function signOperatorAssertion(input: {
   readonly privateJwk: string;
@@ -78,10 +82,15 @@ export async function signOperatorAssertion(input: {
     false,
     ["sign"],
   );
+  const nonce =
+    input.claims.purpose === "sign-in" && input.claims.jti === undefined
+      ? { jti: crypto.randomUUID() }
+      : {};
   const payload = base64Url(
     new TextEncoder().encode(
       JSON.stringify({
         ...input.claims,
+        ...nonce,
         iat: input.nowSeconds,
         exp: input.nowSeconds + input.lifetimeSeconds,
       }),

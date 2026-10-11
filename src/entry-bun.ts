@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createActorResourceGraphReader } from "./actor-resource-graph.ts";
 import { buildApp, createAppResourceStoreBundle } from "./app.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
@@ -12,7 +12,12 @@ import {
 } from "./entry-v2-private-plane-boot.ts";
 import { parseSelfhostV2WorkerEndpointHttpsSelection } from "./entry-v2-worker-endpoint-boot.ts";
 import { resolveIdentity } from "./identity-setup.ts";
-import { migrateSqlite } from "./migrate-sqlite.ts";
+import {
+  type MigrationOptions,
+  migrateSqlite,
+  refuseUsedV1Installation,
+  UsedV1InstallationError,
+} from "./migrate-sqlite.ts";
 import { createFileObjectStore } from "./objects-fs.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
@@ -85,6 +90,11 @@ import {
   discardSelfhostReadinessProbeBody,
   type SelfhostStartupRestoreOutcome,
 } from "./selfhost-health.ts";
+import {
+  formatSelfhostListenAddress,
+  parseSelfhostListenHost,
+  SELFHOST_LISTEN_HOST_VARIABLE,
+} from "./selfhost-listen-address.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
 import {
@@ -92,7 +102,13 @@ import {
   selfhostPrivateSocketRoot,
 } from "./selfhost-socket-layout.ts";
 import { prepareSelfhostSocketRoot, sweepSelfhostSocketRoot } from "./selfhost-socket-root.ts";
-import { renderSelfhostOperatorSignInInstructions } from "./selfhost-startup-instructions.ts";
+import {
+  parseSelfhostOperatorAssertionPrint,
+  renderSelfhostOperatorSignInInstructions,
+  SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE,
+  SELFHOST_OPERATOR_SIGN_IN_IDENTITY,
+  selfhostOperatorAssertionDue,
+} from "./selfhost-startup-instructions.ts";
 import { createSelfhostTakoformV2Ingress } from "./selfhost-takoform-v2-ingress.ts";
 import {
   assertActiveSelfhostTenantRunCredentialSigningKey,
@@ -146,6 +162,15 @@ import { createWorkerdSupervisor } from "./workerd-supervisor.ts";
  * Cloudflare account credentials may back the explicitly selected provider
  * pack; they never create a separate storage-retail surface.
  */
+
+/**
+ * A used v1.0.0 installation is refused before anything was written to it, and
+ * the message is the whole explanation; a stack trace would only bury it.
+ */
+function exitWithUsedV1Refusal(error: UsedV1InstallationError): never {
+  process.stderr.write(`${error.message}\n`);
+  process.exit(1);
+}
 
 function required(name: string): string {
   const value = process.env[name];
@@ -212,6 +237,13 @@ if (!publicOrigin || !runtimeInputCanonicalOriginSupported(publicOrigin)) {
   throw new Error("TAKOSERVER_PUBLIC_ORIGIN must be a canonical HTTPS bare origin");
 }
 const port = Number(process.env.PORT ?? 8787);
+// Loopback unless the operator names an interface: see selfhost-listen-address.
+// Read before any state opens, so a mistyped address refuses to start rather
+// than serving on an interface nobody chose.
+const listenHost = parseSelfhostListenHost(process.env[SELFHOST_LISTEN_HOST_VARIABLE]);
+const forceOperatorAssertionPrint = parseSelfhostOperatorAssertionPrint(
+  process.env[SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE],
+);
 
 /**
  * Everything this machine keeps lives under one directory, resolved once to an
@@ -332,6 +364,43 @@ const providerMode = resolveStandaloneProviderMode({
   workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
 });
 const currentCandidates = selectPublicHostFormSource(process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE);
+
+// Organizations, keys, and the ledger are as durable as the files are: a
+// machine that forgets who its customers are, and what they are owed, on
+// restart is not a platform. Memory is kept for tests, which say so by
+// asking for it.
+const databasePath =
+  process.env.TAKOSERVER_DB ??
+  (dataRoot === ":memory:" ? ":memory:" : `${dataRoot}/control.sqlite`);
+const controlInstallation: MigrationOptions = {
+  installation: {
+    dataRoot,
+    databasePath,
+    externalDatabase:
+      databasePath !== ":memory:" && resolve(databasePath) !== join(dataRoot, "control.sqlite"),
+  },
+};
+// A used v1.0.0 installation is refused before this process writes anything:
+// before it creates a missing data root and before it opens the database for
+// writing, so neither an external TAKOSERVER_DB nor a new root is touched. The
+// probe only reads; whatever it cannot read (a missing file, a lock, a hot
+// journal a read-only handle may not roll back) is left to the ordinary open
+// below, whose migration repeats the same check.
+if (databasePath !== ":memory:" && existsSync(databasePath)) {
+  let refusal: UsedV1InstallationError | undefined;
+  let probe: Database | undefined;
+  try {
+    probe = new Database(databasePath, { readonly: true });
+    probe.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
+    refuseUsedV1Installation(probe, controlInstallation);
+  } catch (error) {
+    if (error instanceof UsedV1InstallationError) refusal = error;
+  } finally {
+    probe?.close();
+  }
+  if (refusal) exitWithUsedV1Refusal(refusal);
+}
+
 // Configuration is validated above without touching the filesystem. Keys,
 // tenant data and sockets live here: a new root starts private, while an
 // existing one keeps the permissions its operator gave it.
@@ -362,13 +431,6 @@ const selfhostContainer = createSelfhostContainerBootstrap({
   providerMode,
 });
 
-// Organizations, keys, and the ledger are as durable as the files are: a
-// machine that forgets who its customers are, and what they are owed, on
-// restart is not a platform. Memory is kept for tests, which say so by
-// asking for it.
-const databasePath =
-  process.env.TAKOSERVER_DB ??
-  (dataRoot === ":memory:" ? ":memory:" : `${dataRoot}/control.sqlite`);
 if (databasePath !== ":memory:") mkdirSync(dirname(databasePath), { recursive: true });
 
 // The Bun control plane always uses local SQLite. Shared D1 is not accepted
@@ -382,7 +444,15 @@ controlDatabase.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
 // to this build's schema here. Forward only and recorded, so running it
 // again applies nothing and a database from a newer build is refused
 // rather than repaired.
-const migrated = migrateSqlite(controlDatabase);
+const migrated = (() => {
+  try {
+    return migrateSqlite(controlDatabase, controlInstallation);
+  } catch (error) {
+    if (!(error instanceof UsedV1InstallationError)) throw error;
+    controlDatabase.close();
+    exitWithUsedV1Refusal(error);
+  }
+})();
 if (migrated.applied.length > 0) {
   process.stdout.write(
     `applied ${migrated.applied.length} migration(s): ${migrated.applied.join(", ")}\n`,
@@ -1466,6 +1536,7 @@ process.on("exit", () => {
 try {
   bunServer = Bun.serve({
     port,
+    hostname: listenHost,
     // Longer than the default, because publishing a site means uploading its
     // files and a request that is doing real work is not an idle one.
     idleTimeout: 120,
@@ -1560,7 +1631,10 @@ if (dataPlanes) {
   console.log(`self-host data planes listening on ${dataPlanes.address} (loopback only)`);
 }
 console.log(
-  `takoserver listening on :${port} as ${publicOrigin} ` +
+  // The bound address, not just the port: a loopback-only listener behind a
+  // proxy elsewhere is unreachable, and this line is where that shows.
+  `takoserver listening on ${formatSelfhostListenAddress(listenHost, bunServer?.port ?? port)} ` +
+    `as ${publicOrigin} ` +
     // Named from what is actually configured. A banner that says Cloudflare on
     // a machine with no account is the first thing an operator reads and the
     // first thing that misleads them.
@@ -1569,29 +1643,37 @@ console.log(
 
 // Having minted the way in, say what it is. A machine that generates a key and
 // leaves the operator to discover how to present it has automated the easy half.
+// The assertion is a credential written wherever stdout goes, so it is minted
+// only until the operator has signed in (or when explicitly asked), and the
+// session exchange refuses it a second time.
 if (identity.providers.some((provider) => provider.method === "operator-assertion")) {
   const stored = await readFile(operatorKeyPath, "utf8").catch(() => null);
   if (stored) {
-    const assertion = await signOperatorAssertion({
-      privateJwk: stored,
-      claims: {
-        purpose: "sign-in",
-        aud: publicOrigin,
-        provider: "google",
-        subject: "operator",
-        email: "operator@localhost",
-        displayName: "Operator",
-      },
-      nowSeconds: Math.floor(Date.now() / 1_000),
-      lifetimeSeconds: 600,
-    });
+    const assertion = (await selfhostOperatorAssertionDue({
+      sql,
+      forced: forceOperatorAssertionPrint,
+    }))
+      ? await signOperatorAssertion({
+          privateJwk: stored,
+          claims: {
+            purpose: "sign-in",
+            aud: publicOrigin,
+            provider: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.provider,
+            subject: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.subject,
+            email: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.email,
+            displayName: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.displayName,
+          },
+          nowSeconds: Math.floor(Date.now() / 1_000),
+          lifetimeSeconds: 600,
+        })
+      : undefined;
     console.log(
       renderSelfhostOperatorSignInInstructions({
         publicOrigin,
         ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
           ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
           : {}),
-        assertion,
+        ...(assertion === undefined ? {} : { assertion }),
         operatorKeyPath,
       }),
     );

@@ -250,11 +250,19 @@ supported.
 
 Two listeners face clients.
 
-**Control API.** The Bun listener serves plain HTTP on `PORT` on every
-interface. Firewall it so that only a TLS front end reaches it. The front end
-terminates HTTPS for `TAKOSERVER_PUBLIC_ORIGIN` and must pass the exact public
-`Host` header; `Forwarded` and `X-Forwarded-*` headers never select the
-authority. With Caddy, for example:
+**Control API.** The Bun listener serves plain HTTP on `PORT`, bound to
+`TAKOSERVER_LISTEN_HOST`: `127.0.0.1` by default, so only a TLS front end on
+the same machine reaches it. When the front end runs on another machine or in
+another network namespace, set `TAKOSERVER_LISTEN_HOST` to one canonical IP
+literal and firewall the port so that only the front end can reach it. In a
+container or Pod, `127.0.0.1` is the container's own loopback, so set
+`0.0.0.0` (or `::` for IPv4 and IPv6) and restrict access with a network
+policy or firewall. The startup line `takoserver listening on
+<address>:<port>` shows what was bound; [Self-host security](self-host-security.md#network-exposure)
+covers the listeners in full. The front end terminates HTTPS for
+`TAKOSERVER_PUBLIC_ORIGIN` and must pass the exact public `Host` header;
+`Forwarded` and `X-Forwarded-*` headers never select the authority. With
+Caddy on the same machine, for example:
 
 ```caddyfile
 api.example.com:8443 {
@@ -291,13 +299,18 @@ pre-v2 Worker socket settings (`TAKOSERVER_WORKERD_PORT`,
 Start the Host. The first boot creates the control database and signing keys
 under the data root and prints each applied migration. When no identity
 provider is configured, it prints an operator sign-in assertion valid for ten
-minutes. If `TAKOSERVER_CONSOLE_ORIGIN` is set, open the exact external console
+minutes. The assertion is single-use: the first session exchange spends it,
+and afterwards both another exchange and an owner proof refuse it. A boot
+prints a new one until the operator has signed in, or every time with
+`TAKOSERVER_PRINT_OPERATOR_ASSERTION=1`; after the first sign-in a boot prints
+only how to mint one. [Self-host security](self-host-security.md#sign-in-and-request-limits)
+explains why. If `TAKOSERVER_CONSOLE_ORIGIN` is set, open the exact external console
 origin named by the process and paste the assertion there. It is a separate
 console; the Bun Host does not serve a `/console` page. Treat the operator key
 under the data root and the printed assertion as credentials; keep them out of
 shell history, shared logs, and this repository. To create later assertions,
-run the printed command with the installation's key path and its public
-origin. Without `TAKOSERVER_PUBLIC_ORIGIN` the assertion is signed for
+run the printed command, which names the installation's key path and its
+public origin. Without `TAKOSERVER_PUBLIC_ORIGIN` the assertion is signed for
 `http://localhost:8787`, and the Host refuses it:
 
 ```sh
@@ -345,6 +358,9 @@ Then check the unauthenticated v2 discovery and the Host's readiness:
 curl -sS --fail-with-body "$HOST/.well-known/takoform/v2"
 curl -sS http://127.0.0.1:8787/_takoserver/health/ready
 ```
+
+The readiness probe goes to the listener directly; use the address in the
+`takoserver listening on` line if `TAKOSERVER_LISTEN_HOST` names another.
 
 ### 6. Seed held artifacts
 
@@ -414,8 +430,10 @@ Before it writes anything, the command refuses these states:
   table, which a non-dumpable process does (for example a `bun` given
   `cap_net_bind_service` with `setcap`). Another user's process cannot open
   files in a root private to this user and is not read. Run the command as the
-  Host's user and in the Host's PID namespace (not inside another container),
-  because processes in other PID namespaces are not in this `/proc`;
+  Host's user, on the Host's machine and in the Host's PID namespace, because
+  processes in other PID namespaces are not in this `/proc`: for a Host in a
+  container, run it inside that container (for example with `docker exec`),
+  not from the machine or from another container;
 - an organization the control database does not know;
 - a path with a component that starts with `.`, such as `.env` or
   `.git/config`, unless `--include-dotfiles` is given. A `StaticAssetBundle`
@@ -706,6 +724,145 @@ forward with a source version that understands it. A cold backup restore is a
 separate recovery operation with source fencing and identity ownership
 requirements below, not a routine code rollback.
 
+## Upgrading from v1.0.0
+
+The published v1.0.0 release (tag `v1.0.0`, the Latest GitHub Release of
+2026-08-20) is a Takoform Host API v1 Host. This source is a Host API v2 Host.
+Moving from v1.0.0 to it is a breaking major upgrade: a v1.0.0 installation
+that has been used is not upgraded in place, and no tool converts its records.
+Install the new version alongside it, on its own data root, and leave the
+v1.0.0 data root as it is.
+
+At startup the Bun Host reads an existing control database through a read-only
+connection before it writes anything. It refuses a used v1.0.0 installation:
+one whose database records wallet ledger history (any funding, hold or
+capture), a v1 Takoform Resource, or a v1 provider Deployment that was not
+deleted. Every v1.0.0 installation that created a Resource has ledger history,
+because the release's only Offering, ObjectBucket (`storage.object.standard`,
+500 minor units per bucket-month), holds and captures funds. The refusal names
+the data root and control database, or only the database when `TAKOSERVER_DB`
+names one outside the root. It says that the database is unchanged, links to
+this section, and exits with status 1. It comes before the Host creates a
+missing data root, keys, sockets or runtime probes, opens the database for
+writing, or opens a listener. The check repeats under the first migration's
+write lock. It still assumes that every writer is stopped (step 1): a v1.0.0
+process that writes after that first migration commits is not caught.
+
+One exception to "unchanged": if v1.0.0 stopped in the middle of a transaction
+and left a hot rollback journal (`control.sqlite-journal`), the read-only
+connection cannot read the file. SQLite then rolls the journal back when the
+Host opens the database for writing, before the check, as v1.0.0 would on its
+next start. That restores the last committed state; the refusal follows.
+
+A v1.0.0 database that was only booted, or only signed in to with Organizations
+and API keys, and was never funded or used for a Resource, keeps migrating in
+place. The migration keeps its Organizations, owner memberships and API key
+records. After it, v1.0.0 refuses the file, because it records migrations
+v1.0.0 does not know. Take the cold copy of step 1 first if you may want to
+return to v1.0.0.
+
+A v1.0.0 Bun Host configured with `TAKOSERVER_D1_DATABASE_ID` kept its control
+state in that Cloudflare D1 database, not in a local file. This version's Bun
+entry rejects the variable before it opens local state, and this check does
+not cover D1. Do not apply this source's migrations to that database: with
+`wrangler d1 migrations apply`, a v1.0.0 history with a ledger row records 0016
+and then stops at 0017's `CHECK constraint failed: valid = 1`, which leaves a
+database v1.0.0 no longer accepts. Leave it as it is and start this version on
+a new local data root.
+
+To move to the new version:
+
+1. Stop the v1.0.0 Host and every writer, then make the cold copy described in
+   [Cold snapshot](#cold-snapshot) of the complete v1.0.0 data root. v1.0.0
+   defaults to `.takoserver` relative to its working directory. Also copy
+   `TAKOSERVER_DB` if it was set outside the root. Keep the copy until the
+   v1.0.0 installation is retired.
+2. Prepare the new version's source in its own checkout with the
+   `git worktree add` and `bun install` steps of
+   [Update and code rollback](#update-and-code-rollback). Use only those steps:
+   the rest of that section starts the new version on the existing data root.
+   Configure it as a [first install](#first-install-and-first-use). Give it a
+   new, empty `TAKOSERVER_DATA_ROOT` and, if a separate database is used, a new
+   `TAKOSERVER_DB`. Never point it at the v1.0.0 root or database. Set the root
+   explicitly: both versions resolve the default `.takoserver` against the
+   working directory, so a shared working directory selects the v1.0.0 root.
+   To run both Hosts on one machine, give them distinct `PORT` and
+   `TAKOSERVER_WORKERD_PORT` values; both versions default to 8787 and 8788.
+3. Sign in to the new Host and create the Organizations that will own
+   Resources. Each Organization ID is a v2 Space. Mint new API keys. v1.0.0
+   sessions, API keys and wallet balances are not carried over.
+4. Recreate each v1 Resource through the v2 API, using a Form that the new
+   instance reports at
+   `GET /apis/forms.takoform.com/v2/support?form={exact-form-url}`. v1
+   Resources, Operations and provider Deployments are not converted, and the
+   new version does not serve, change or delete them. A v1.0.0 ObjectBucket was
+   reached with S3 credentials from
+   `POST /v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials`.
+   The v2 `ObjectBucket 0.2.0` is registered only in the complete local Worker
+   composition and is used through Worker bindings (see
+   [Bun self-host Form support](takoform-v2.md#bun-self-host-form-support)).
+   No tool copies objects between them. Read any data you need through v1.0.0
+   while it still runs on the old root.
+5. When nothing depends on the v1.0.0 Host, delete its Resources through the
+   v1.0.0 API so that it releases their provider state, then stop it. A v1.0.0
+   Host that was configured with a Cloudflare account kept its ObjectBuckets in
+   that account, and they stay there until they are deleted.
+
+The old release can still run on the old root. Start the v1.0.0 source (tag
+`v1.0.0`, with its own `bun install --frozen-lockfile`) with the same
+`TAKOSERVER_DATA_ROOT` and configuration as before. A refused start of the new
+version does not prevent this, because the refusal does not write.
+
+Earlier v2 source builds, made before this check existed, did write. On a used
+v1.0.0 root they recorded `0016_takos_id_organization_projection.sql` and then
+stopped with `migration 0017_wallet_credit_lots.sql failed: SQLiteError: CHECK
+constraint failed: valid = 1`. v1.0.0 then refuses that database with "this
+database has migrations this build does not know:
+0016_takos_id_organization_projection.sql". The new version still refuses it as
+a used v1 installation, and its message says that v1.0.0 refuses the file too.
+To run v1.0.0 again, restore the cold copy taken immediately before that
+start, following the fencing in [Restore boundary](#restore-boundary). The
+failed start stopped during migration, before the Host listened, and changed
+nothing but `control.sqlite`, so that copy loses only what 0016 changed.
+Without such a copy there is no supported way to make the file usable by
+v1.0.0 again. Do not delete the record or the tables by hand.
+
+Measured on 2026-10-11 with the v1.0.0 tag and this source, on the local
+self-host provider:
+
+- A v1.0.0 Host was driven over its HTTP API through operator sign-in, an
+  Organization, operator-signed funding, an API key and one ObjectBucket. Its
+  database recorded 0001 to 0015 and three ledger rows (funding, hold and
+  capture). The new version refused it. Every file's bytes and every file and
+  directory mode in the data root were unchanged, and nothing was added.
+- v1.0.0 restarted on that same root and served its Organization, the
+  ObjectBucket and the wallet balance.
+- The new version started on a new, empty root while v1.0.0 ran on the old one,
+  on distinct ports.
+- A booted-only and a signed-in-only v1.0.0 database migrated to the current
+  head.
+- A source build from before this check (commit `4d0d0450`) changed only
+  `control.sqlite` in the used root, recording 0016, and v1.0.0 then refused
+  it.
+- After a signed-in-only v1.0.0 database migrated in place, v1.0.0 refused it
+  as recording migrations it does not know.
+- On a scratch SQLite file left with a hot rollback journal, a read-only
+  connection failed with "attempt to write a readonly database" and left the
+  file unchanged; the next writable open rolled the journal back.
+- `wrangler d1 migrations apply --local` (wrangler 4.123.0) on a D1 database
+  holding the v1.0.0 migrations and one ledger row recorded 0016 and then
+  failed at 0017.
+- `tests/v1-installation-upgrade-boundary.test.ts` repeats, with the committed
+  v1.0.0 fixtures, the refusal through a read-only connection, the unchanged
+  files, an external `TAKOSERVER_DB` refused before a new data root is
+  created, a ledger write that lands just before the first migration lock, and
+  the in-place migration.
+
+Not measured: a v1.0.0 Host that used a Cloudflare account, Stripe funding or a
+remote D1 database; whether v1.0.0 sessions and API keys still authenticate
+after an unused database migrates in place; and copying object data to a v2
+ObjectBucket.
+
 ## Backup and restore preparation
 
 This procedure prepares a cold copy of one Bun self-host installation. It is
@@ -837,6 +994,16 @@ The test also builds `services/takoform-core-verifier` from this checkout into
 its mode-0700 temporary fixture using the locally installed Go toolchain and
 pre-existing Go module/build caches. It disables module-network access; a
 missing tool or cache fails the test instead of substituting a prebuilt binary.
+The build runs with `GOTOOLCHAIN=local`, so the installed `go` must be 1.26.0 or
+newer (the module's `go` line); 1.26.9 matches the audited toolchain. After any
+change to that module's `go.mod` or `go.sum`, refresh the offline cache once,
+with network access, before the next native run. Use the same `GOMODCACHE` the
+test will read (`TAKOSERVER_NATIVE_GO_MODULES` when set):
+
+```sh
+cd services/takoform-core-verifier && GOMODCACHE="${TAKOSERVER_NATIVE_GO_MODULES:-$(go env GOMODCACHE)}" go mod download
+```
+
 The Go build is bounded to two concurrent package builds and two active Go
 processors; this does not change the native Host or recovery time assertions.
 The verifier reports the current checkout's source-derived artifact digest and

@@ -1,7 +1,53 @@
+import type { Sql } from "./ports.ts";
+
+/**
+ * Set to `1` to print a fresh operator sign-in assertion on every boot, `0` (or
+ * unset or blank) to print one only until the operator has signed in.
+ */
+export const SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE = "TAKOSERVER_PRINT_OPERATOR_ASSERTION";
+
+/** The account a self-host's printed first-boot assertion signs in as. */
+export const SELFHOST_OPERATOR_SIGN_IN_IDENTITY = Object.freeze({
+  provider: "google",
+  subject: "operator",
+  email: "operator@localhost",
+  displayName: "Operator",
+} as const);
+
+export function parseSelfhostOperatorAssertionPrint(value: string | undefined): boolean {
+  if (value === undefined || value.trim() === "" || value === "0") return false;
+  if (value === "1") return true;
+  throw new TypeError(
+    `${SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE} must be 1 or 0; it is ${JSON.stringify(value)}`,
+  );
+}
+
+/**
+ * Whether this boot should mint and print an operator sign-in assertion.
+ *
+ * The printed assertion is a credential written to wherever stdout goes:
+ * journald, container logs, a terminal's scrollback. It is the first-run way
+ * in, so it is printed until the operator account exists, which happens on the
+ * first session exchange. After that a boot prints only how to mint one, and
+ * an operator who wants the old behaviour sets the override explicitly.
+ */
+export async function selfhostOperatorAssertionDue(input: {
+  readonly sql: Pick<Sql, "query">;
+  readonly forced: boolean;
+}): Promise<boolean> {
+  if (input.forced) return true;
+  const rows = await input.sql.query(
+    "SELECT 1 AS present FROM principals WHERE provider = ? AND provider_subject = ? LIMIT 1",
+    [SELFHOST_OPERATOR_SIGN_IN_IDENTITY.provider, SELFHOST_OPERATOR_SIGN_IN_IDENTITY.subject],
+  );
+  return rows.length === 0;
+}
+
 export interface SelfhostOperatorSignInInstructions {
   readonly publicOrigin: string;
   readonly consoleOrigin?: string | undefined;
-  readonly assertion: string;
+  /** Absent once the operator has signed in: the boot then prints no credential. */
+  readonly assertion?: string | undefined;
   readonly operatorKeyPath: string;
 }
 
@@ -9,8 +55,29 @@ export interface SelfhostOperatorSignInInstructions {
 export function renderSelfhostOperatorSignInInstructions(
   options: SelfhostOperatorSignInInstructions,
 ): string {
+  const identity = SELFHOST_OPERATOR_SIGN_IN_IDENTITY;
+  const later =
+    `bun scripts/operator-key.ts sign-in ${identity.provider} ${identity.subject} ` +
+    `${identity.email} ${identity.displayName}\n` +
+    `  (with TAKOSERVER_OPERATOR_KEY=${options.operatorKeyPath} ` +
+    `and TAKOSERVER_PUBLIC_ORIGIN=${options.publicOrigin})`;
+  const intro = `\nno identity provider is configured, so this deployment signs you in as its operator.\n`;
+
+  if (options.assertion === undefined) {
+    return (
+      intro +
+      `The operator has already signed in, so this boot prints no sign-in assertion.\n` +
+      `mint one: ${later}\n` +
+      `or restart with ${SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE}=1 to print one at startup.`
+    );
+  }
+
+  const singleUse =
+    `It is single-use: the first session exchange spends it, and afterwards both ` +
+    `another exchange and an owner proof refuse it. A boot prints a new one until ` +
+    `the operator has signed in, or every time with ${SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE}=1.`;
   const destination = options.consoleOrigin
-    ? `open ${options.consoleOrigin} and paste this (valid 10 minutes):\n\n${options.assertion}`
+    ? `open ${options.consoleOrigin} and paste this (valid 10 minutes):\n\n${options.assertion}\n\n${singleUse}`
     : `This Host serves its landing page and API, not a console.\n` +
       `Host: ${options.publicOrigin}/\n` +
       `API documentation: ${options.publicOrigin}/openapi.json\n` +
@@ -19,12 +86,7 @@ export function renderSelfhostOperatorSignInInstructions(
       `/v1/organizations, and /v1/organizations/{organizationId}/api-keys.\n` +
       `To seed held artifacts and create v2 Resources, follow "First install and first use" ` +
       `in docs/self-host-operations.md; no publisher admission is needed.\n\n` +
-      `Operator sign-in assertion (valid 10 minutes):\n\n${options.assertion}`;
+      `Operator sign-in assertion (valid 10 minutes):\n\n${options.assertion}\n\n${singleUse}`;
 
-  return (
-    `\nno identity provider is configured, so this deployment signs you in as its operator.\n` +
-    `${destination}\n\n` +
-    `later ones: bun scripts/operator-key.ts sign-in google operator operator@localhost Operator\n` +
-    `  (with TAKOSERVER_OPERATOR_KEY=${options.operatorKeyPath})`
-  );
+  return `${intro}${destination}\n\nlater ones: ${later}`;
 }

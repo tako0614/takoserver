@@ -92,7 +92,8 @@ credential in the Bun entry.
 
 With the v2 configuration above, startup creates the local schema and starts
 serving. When no identity provider is configured, it generates the operator key
-and prints a 10-minute sign-in assertion. Use the exact external console origin
+and prints a 10-minute, single-use sign-in assertion until the operator has
+first signed in. Use the exact external console origin
 if `TAKOSERVER_CONSOLE_ORIGIN` is configured; otherwise the Host also prints its
 origin, API documentation URL, and manual session/API onboarding instructions.
 The Bun Host itself does not serve a `/console` page. If an identity provider is
@@ -264,7 +265,9 @@ configured service dependencies may use protected files outside it.
 |---|---|
 | `TAKOSERVER_DATA_ROOT` | Objects, databases, published Workers, and the signing key. `.takoserver` in the working directory by default. |
 | `TAKOSERVER_DB` | Control database. A file under the data root by default. |
-| `PORT` | Where the API and console API listen, over HTTP on every interface (default 8787). |
+| `PORT` | Where the API and console API listen, over HTTP on `TAKOSERVER_LISTEN_HOST` (default 8787). |
+| `TAKOSERVER_LISTEN_HOST` | Interface address the API listener binds, as one canonical IP literal; blank reads as unset. `127.0.0.1` by default. In a container or Pod, `127.0.0.1` is the container's own loopback, so published ports, other containers, Services and probes are refused: set `0.0.0.0` (or `::` for IPv4 and IPv6), or the container's private address, and restrict access with a network policy or firewall. Before this default the listener bound every interface, like `::`. See [Self-host security](docs/self-host-security.md). |
+| `TAKOSERVER_PRINT_OPERATOR_ASSERTION` | `1` prints a fresh operator sign-in assertion on every boot; `0` or blank keeps the default, which prints one only until the operator has first signed in. |
 | `TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIALS` | Set to exactly `1` to mount the self-host runner-credential route. Absent or any other value leaves it at 404. |
 | `TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIAL_KEY_ID` | Optional dedicated key identity for self-host runner credentials. Changing it creates a separate private key file under the data root; it must differ from `TAKOSERVER_SIGNING_KEY_ID`. |
 | `TAKOSERVER_WORKERD_PORT` | Where the retained pre-v2 runtime serves published Workers (default 8788). |
@@ -337,8 +340,12 @@ cookies. Backend URLs and `Forwarded` / `X-Forwarded-*` headers do not select
 that authority. Cookie authentication continues to require the exact configured
 console `Origin`; TLS termination does not relax that browser boundary.
 
-Put the control API behind a TLS front end and do not expose the HTTP listener
-directly. A `WorkerEndpoint 0.3.0` publication is served by the Host itself:
+Put the control API behind a TLS front end. The HTTP listener binds
+`TAKOSERVER_LISTEN_HOST`, `127.0.0.1` by default, so a front end on the same
+machine reaches it over loopback and nothing else can. In a container or Pod
+set `0.0.0.0` (or `::`) and limit who can reach the port with a network policy
+or firewall; see [Self-host security](docs/self-host-security.md). A
+`WorkerEndpoint 0.3.0` publication is served by the Host itself:
 with `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` it binds TCP 443 on every IPv4
 address, which needs root or `CAP_NET_BIND_SERVICE`, and DNS must resolve
 `*.<suffix>` to the machine. A control API front end on the same machine
@@ -429,7 +436,11 @@ API begins answering; a machine that has published nothing starts no runtime.
 Sign-in and money are the two facts a server cannot determine for itself. With
 no identity provider configured, the operator answers the first by signature —
 so a fresh machine mints an operator key, keeps it beside its database, and
-prints an assertion good for ten minutes. Later ones:
+prints a single-use assertion good for ten minutes. The first session exchange
+spends it. A boot prints a new one until the operator has signed in, or every
+time with `TAKOSERVER_PRINT_OPERATOR_ASSERTION=1`
+([Self-host security](docs/self-host-security.md#sign-in-and-request-limits)).
+Later ones:
 
 ```
 TAKOSERVER_OPERATOR_KEY=.takoserver/operator-key.jwk \
@@ -817,64 +828,51 @@ bun run fmt       # the only thing that rewrites source
 
 `bun run check` is the gate. It is read-only and it does not skip.
 
-### Self-host and OpenTofu interoperability
+### Takoform v2 conformance
 
-`bun run test:selfhost-opentofu` is a separate native integration journey. It
-starts the real Bun Host, signs in with a fresh local operator key, creates an
-organization API key, and admits the signed Form closure through the real Core
-verifier. OpenTofu then creates an EdgeKVNamespace and SQLiteDatabase, checks a
-no-change plan, compares exact Form identities and UIDs with the Host, and
-destroys both resources. Success requires empty state and Host absence.
+`tests/takoform-v2-host-api-conformance.test.ts` runs Takoform's own Host API
+v2 HTTP baseline probe against a real `bun src/entry-bun.ts` process on
+loopback, once each for `SQLiteMigrationSet`, `WorkerBundle` and
+`StaticAssetBundle`. It is part of `bun run check`. The probe is vendored
+byte-exact from Takoform and pinned by size and SHA-256 in
+[`vendor/takoform/host-api-v2-conformance/`](vendor/takoform/host-api-v2-conformance/README.md);
+drifted bytes are refused before it runs.
 
-Prepare OpenTofu **1.12.5**, an unpacked filesystem mirror containing
-`registry.terraform.io/tako0614/takoform` **4.0.0**, and a verifier binary built
-from this checkout's `services/takoform-core-verifier`. Verify those artifacts
-before use; the verifier's reported build-context digest is not a binary hash.
-From a disposable Linux network namespace with only loopback enabled, run:
-
-```sh
-bun --no-env-file run test:selfhost-opentofu \
-  --tofu /absolute/path/to/tofu \
-  --provider-mirror /absolute/path/to/provider-mirror \
-  --core-verifier /absolute/path/to/takoform-core-verifier
-```
-
-Ports 8787 and 8080 must be free in that namespace. The command refuses external
-network interfaces, uses only fresh temporary state, and neither downloads
-tools nor reads existing operator credentials. It prints phase names and a
-sanitized result, stops its children and removes temporary state on exit.
-Failed mutations are not retried.
-
-To include actual Worker execution, supply both `--workerd` and `--openssl`:
+The opt-in companion runs the same probe against the complete local Worker
+profile's Forms that need no other Resource (`ModuleWorker`, `SQLiteDatabase`,
+`EdgeKVNamespace`, `ObjectBucket`, `AtLeastOnceQueue` and the three artifact
+Forms). It needs the pinned workerd, the Workflow guard and permission to bind
+443, so run it in a disposable network namespace:
 
 ```sh
-bun --no-env-file run test:selfhost-opentofu \
-  --tofu /absolute/path/to/tofu \
-  --provider-mirror /absolute/path/to/provider-mirror \
-  --core-verifier /absolute/path/to/takoform-core-verifier \
-  --workerd /absolute/path/to/closed-graph-workerd \
-  --openssl /absolute/path/to/openssl
+unshare --net sh -c 'ip link set lo up && \
+  TAKOSERVER_V2_ENTRY_NATIVE=1 \
+  TAKOSERVER_WORKERD_BINARY=/absolute/path/to/closed-graph-workerd \
+  TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY=/absolute/path/to/workflow-execution-guard \
+  bun test tests/takoform-v2-host-api-conformance-native.test.ts'
 ```
 
-Use the exact closed-graph workerd artifact accepted by this checkout, not the
-npm development binary. This mode also needs port 443 and permission to bind it
-inside the disposable namespace. It generates a temporary `*.app.localhost`
-certificate, configures the real Host's Worker TLS socket, and creates ModuleWorker, WorkerBundle,
-WorkerVersion, WorkerDeployment and WorkerEndpoint through the same Provider.
-The bundle is uploaded by the Provider, not installed directly into the runtime.
-SQLiteMigrationSet and SQLiteMigrationApplication create the application table
-through their normal lifecycle before the Worker is activated; the command does
-not seed the database directly or let runtime bindings execute schema DDL.
-The HTTPS request checks actual KV and SQLite operations through the declared
-bindings. The client trusts only the generated certificate and connects to
-loopback with the Host-assigned hostname; it changes no machine trust or DNS.
-Ready checks use the no-change plan's refreshed `prior_state` and a separate
-Host read, not the potentially stale state saved before dependent resources existed.
-All nine resources must then be removed through OpenTofu, with empty state and
-Host absence. The former endpoint must no longer serve the application.
+A pass means only that the probe's mandatory sequence passed for those
+fixtures. The probe reports restart durability, fault injection, concurrency,
+cross-principal authority, optional features and Form-specific behavior as not
+tested, and neither lane qualifies Hosted D1, Cloudflare or a deployment.
 
-Without the two extra arguments, the command retains the storage-only journey.
-Neither mode qualifies Cloudflare, Containers or a production deployment.
+### Historical: Host API v1 interoperability
+
+> These commands target the retired Host API v1 and do not work against the
+> current entry, which serves only `forms.takoform.com/v2`. They are kept as a
+> record of earlier evidence, not as current checks. No released
+> `terraform-provider-takoform` speaks Host API v2 yet (v4.1.0 is v1-only); v2
+> provider support is that repository's work, not Takoserver's.
+
+`bun run test:selfhost-opentofu` (`scripts/selfhost-opentofu-e2e.ts`) was a
+native journey for OpenTofu 1.12.5 and provider 4.0.0 against the v1 Bun Host:
+Core-verifier Form admission, EdgeKVNamespace and SQLiteDatabase CRUD with a
+no-change plan, and optionally a nine-resource workerd Worker journey. It waits
+for `/.well-known/takoform/v1` on a plain-HTTP origin, both of which the current
+entry refuses. `bun run conformance:takoform-v1`
+(`scripts/conformance-takoform-v1.ts`) runs the frozen stable-v1 suite against
+the separate v1 conformance entry and says nothing about the v2 Host.
 
 ## Licence
 
