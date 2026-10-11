@@ -737,8 +737,8 @@ files needed to recover the same identity and capabilities, including TLS
 certificate/private-key files, `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`, the
 `TAKOSERVER_TAKOFORM_V2_CONFIG` file with its held-artifact grants, the
 `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`, operator-supplied signing keys, and
-configured provider, payment, identity, or AI credentials. Do not put secret values in this repository or in a backup
-manifest. `TAKOSERVER_WORKERD_BINARY` must still resolve to the exact accepted
+configured provider, payment, identity, or AI credentials. Do not put secret
+values in this repository or in a backup manifest. `TAKOSERVER_WORKERD_BINARY` must still resolve to the exact accepted
 artifact for Worker execution; the selected snapshot is retained under the
 data root, but startup validates and selects from the configured input path.
 Preserve that artifact and its path/configuration through the operator's
