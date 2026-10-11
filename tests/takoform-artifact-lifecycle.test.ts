@@ -377,6 +377,26 @@ describe("Takoform artifact lifecycle", () => {
     expect(accepted.response.status).toBe(201);
   });
 
+  test("a blob PUT names its digest with a literal colon; the percent-encoded form is refused", async () => {
+    // Clients that encode the whole path segment send `sha256%3A<hex>`. The
+    // handler accepts only the literal `sha256:<hex>` and refuses the other
+    // spelling before storing anything, so the same bytes then upload once.
+    const target = fixture();
+    const bytes = new TextEncoder().encode("portable artifact URL contract");
+    const digest = await bytesDigest(bytes);
+    const started = await startUpload(target, await workerManifest(bytes), "artifact-url-colon");
+    expect(started.response.status).toBe(201);
+    const blob = `uploads/${encodeURIComponent(started.uploadId)}/blobs`;
+
+    const encoded = await target.call(`${blob}/${encodeURIComponent(digest)}`, {
+      method: "PUT",
+      body: bytes,
+    });
+    expect(encoded.status).toBe(400);
+    const literal = await target.call(`${blob}/${digest}`, { method: "PUT", body: bytes });
+    expect(literal.status).toBe(201);
+  });
+
   test("a committed upload cannot be abandoned through the public DELETE", async () => {
     const target = fixture();
     const bytes = new TextEncoder().encode(
