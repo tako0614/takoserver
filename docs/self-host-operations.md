@@ -89,7 +89,8 @@ claim GA status.
    The first boot initializes SQLite under `TAKOSERVER_DATA_ROOT` (default
    `.takoserver`) and creates signing keys. When no identity provider is
    configured, it prints an operator sign-in assertion valid for ten minutes.
-   The assertion opens one session; presenting it again is refused. Boots
+   The assertion opens one session; afterwards it is refused for another
+   session and for an owner proof. Boots
    print a new one only until the operator has signed in once; set
    `TAKOSERVER_PRINT_OPERATOR_ASSERTION=1` to print one on every boot.
    If `TAKOSERVER_CONSOLE_ORIGIN` is set, open the exact external console origin
@@ -103,8 +104,9 @@ claim GA status.
    `TAKOSERVER_PUBLIC_ORIGIN` set to its public origin.
 
    The API listens on `127.0.0.1` unless `TAKOSERVER_LISTEN_HOST` names another
-   interface. Trust boundaries, network exposure and OS hardening are covered
-   in [Self-host security](self-host-security.md).
+   interface; in a container or Pod, set it (for example to `0.0.0.0`). Trust
+   boundaries, network exposure and OS hardening are covered in
+   [Self-host security](self-host-security.md).
 
    When `TAKOSERVER_CONSOLE_ORIGIN` is unset, the Host serves its landing page
    and API, not a console. The process prints the Host origin and its

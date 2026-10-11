@@ -187,10 +187,38 @@ export interface SingleUseCredential {
 }
 
 /**
- * How long past its expiry a spent single-use credential is still remembered,
- * so a verifier clock running behind this store's cannot reopen it.
+ * How long past its expiry a spent single-use credential is still remembered.
+ *
+ * This bounds, and only bounds, the clock disagreement the store tolerates: a
+ * verifier clock up to this many seconds behind the store's still finds the
+ * entry while it can accept the credential. A verifier further behind could
+ * accept a pruned credential again. Both entries compose the verifier and the
+ * store from the same process wall clock, so in a real Host they agree.
  */
 const SINGLE_USE_PRUNE_SKEW_SECONDS = 300;
+
+/**
+ * Key convention for `runtime_grant_replays`, the shared lineage's replay
+ * cache: every key is `<namespace>:<rest>`, where the namespace matches
+ * `[a-z][a-z0-9-]{0,63}` and names the one writer that owns that key space.
+ * A writer prunes only its own namespace's range. `operator-sign-in` holds
+ * spent operator sign-in assertions keyed by their signed-payload digest.
+ * Runtime grants use a pluggable in-memory replay store today; if they are
+ * ever persisted here, they need a namespace of their own as well.
+ */
+const SINGLE_USE_NAMESPACE = /^[a-z][a-z0-9-]{0,63}$/u;
+const SINGLE_USE_DIGEST = /^sha256:[0-9a-f]{64}$/u;
+
+function singleUseKey(credential: SingleUseCredential): string {
+  if (
+    !SINGLE_USE_NAMESPACE.test(credential.namespace) ||
+    !SINGLE_USE_DIGEST.test(credential.digest) ||
+    !Number.isSafeInteger(credential.expiresAtEpochSeconds)
+  ) {
+    throw new AuthError("invalid");
+  }
+  return `${credential.namespace}:${credential.digest}`;
+}
 
 export type AuthErrorCode = "unauthenticated" | "permission_denied" | "not_found" | "invalid";
 
@@ -709,28 +737,20 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
    * Remembers a single-use credential until it expires, refusing a second
    * presentation.
    *
-   * The rows live in the shared lineage's generic replay cache,
-   * `runtime_grant_replays`, so every Host database (D1 and SQLite) already
-   * has the table and no schema change is needed. Each key is prefixed with
-   * the credential's namespace, so it cannot collide with a runtime grant id
-   * or another namespace. The primary key makes concurrent presentations race
-   * to exactly one winner.
+   * The rows live in `runtime_grant_replays` (see `singleUseKey` for the key
+   * convention), which every Host database (D1 and SQLite) already has, so no
+   * schema change is needed. The primary key makes concurrent presentations
+   * race to exactly one winner.
    *
-   * Expiry is the verifier's decision, made on its own clock. This store only
-   * has to remember a credential for as long as the verifier could still
-   * accept it, so it keeps each entry until at least one second from now and
-   * prunes an entry of its namespace only a skew margin after it expired.
+   * Expiry is the verifier's decision, made on its own clock. An entry is kept
+   * until its credential's expiry, and at least one second from now, and is
+   * pruned only `SINGLE_USE_PRUNE_SKEW_SECONDS` after that, within its own
+   * namespace.
    */
   const spendSingleUse = async (credential: SingleUseCredential): Promise<void> => {
     const nowSeconds = Math.floor(clock().getTime() / 1_000);
+    const key = singleUseKey(credential);
     const namespace = credential.namespace;
-    if (
-      !/^[a-z][a-z0-9-]{0,63}$/u.test(namespace) ||
-      !/^sha256:[0-9a-f]{64}$/u.test(credential.digest) ||
-      !Number.isSafeInteger(credential.expiresAtEpochSeconds)
-    ) {
-      throw new AuthError("invalid");
-    }
     // `;` sorts immediately after `:`, so this is the namespace's key range.
     await sql.run(
       `DELETE FROM runtime_grant_replays
@@ -742,13 +762,18 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
          (grant_id, expires_at_epoch_seconds, consumed_at_epoch_seconds)
        VALUES (?, ?, ?)
        ON CONFLICT(grant_id) DO NOTHING`,
-      [
-        `${namespace}:${credential.digest}`,
-        Math.max(credential.expiresAtEpochSeconds, nowSeconds + 1),
-        nowSeconds,
-      ],
+      [key, Math.max(credential.expiresAtEpochSeconds, nowSeconds + 1), nowSeconds],
     );
     if (spent.changes !== 1) throw new AuthError("unauthenticated");
+  };
+
+  /** Read-only: whether a single-use credential has already been spent. */
+  const singleUseSpent = async (credential: SingleUseCredential): Promise<boolean> => {
+    const rows = await sql.query(
+      "SELECT 1 AS spent FROM runtime_grant_replays WHERE grant_id = ? LIMIT 1",
+      [singleUseKey(credential)],
+    );
+    return rows.length > 0;
   };
 
   const accounts: Accounts = {
@@ -833,6 +858,13 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
         method,
         audience,
       });
+      // A proof spends nothing, so the deploy flow can prove with the same
+      // assertion its session exchange then redeems. A credential already
+      // spent proves nothing either: a copy leaked after use must not keep
+      // answering ownership questions until it expires.
+      if (verified.singleUse && (await singleUseSpent(verified.singleUse))) {
+        throw new AuthError("unauthenticated");
+      }
       const rows = await sql.query(
         `SELECT p.id AS principal_id,
                 o.id AS organization_id, o.name AS organization_name,

@@ -207,8 +207,8 @@ protected files outside it.
 | `TAKOSERVER_DATA_ROOT` | Objects, databases, published Workers, and the signing key. |
 | `TAKOSERVER_DB` | Control database. A file under the data root by default. |
 | `PORT` | Where the API and console API listen. |
-| `TAKOSERVER_LISTEN_HOST` | Interface address the API listener binds, as one canonical IP literal. `127.0.0.1` by default; set `0.0.0.0` or `::` only when the TLS proxy cannot reach loopback. See [Self-host security](docs/self-host-security.md). |
-| `TAKOSERVER_PRINT_OPERATOR_ASSERTION` | `1` prints a fresh operator sign-in assertion on every boot. By default one is printed only until the operator has first signed in. |
+| `TAKOSERVER_LISTEN_HOST` | Interface address the API listener binds, as one canonical IP literal; blank reads as unset. `127.0.0.1` by default. In a container or Pod, `127.0.0.1` is the container's own loopback, so published ports, other containers, Services and probes are refused: set `0.0.0.0` (or `::` for IPv4 and IPv6), or the container's private address, and restrict access with a network policy or firewall. Before this default the listener bound every interface, like `::`. See [Self-host security](docs/self-host-security.md). |
+| `TAKOSERVER_PRINT_OPERATOR_ASSERTION` | `1` prints a fresh operator sign-in assertion on every boot; `0` or blank keeps the default, which prints one only until the operator has first signed in. |
 | `TAKOSERVER_WORKERD_BINARY` | Absolute path to the exact pinned closed-graph artifact. An absent, substituted, or behaviorally incompatible binary disables Worker execution without silently selecting the npm workerd. |
 | `TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIALS` | Set to exactly `1` to mount the self-host runner-credential route. Absent or any other value leaves it at 404. |
 | `TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIAL_KEY_ID` | Optional dedicated key identity for self-host runner credentials. Changing it creates a separate private key file under the data root; it must differ from `TAKOSERVER_SIGNING_KEY_ID`. |

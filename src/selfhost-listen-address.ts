@@ -25,7 +25,8 @@ export const SELFHOST_DEFAULT_LISTEN_HOST = "127.0.0.1";
  * written into this one.
  */
 export function parseSelfhostListenHost(value: string | undefined): string {
-  if (value === undefined) return SELFHOST_DEFAULT_LISTEN_HOST;
+  // Blank reads as unset, as it does for the other self-host variables.
+  if (value === undefined || value.trim() === "") return SELFHOST_DEFAULT_LISTEN_HOST;
   // `isIPv4` already refuses leading zeros and short forms; an IPv6 literal
   // additionally has to be in the one spelling a URL would print.
   if (isIPv4(value) || isCanonicalIPv6(value)) return value;

@@ -21,7 +21,9 @@ describe("self-host operator sign-in startup instructions", () => {
     expect(output).not.toMatch(/https:\/\/[^/\s]+\/console/u);
     expect(output).toContain("fake-operator-assertion");
     expect(output).toContain("valid 10 minutes");
-    expect(output).toContain("opens one session");
+    expect(output).toContain("single-use: the first session exchange spends it");
+    expect(output).toContain("an owner proof refuse it");
+    expect(output).toContain("TAKOSERVER_PRINT_OPERATOR_ASSERTION=1");
     expect(output).toContain("TAKOSERVER_OPERATOR_KEY=/tmp/fake-operator-key.jwk");
   });
 
@@ -83,12 +85,14 @@ describe("self-host operator sign-in startup instructions", () => {
 });
 
 describe("whether a boot prints the operator sign-in assertion", () => {
-  test("the print override accepts only an explicit 1 or 0", () => {
+  test("the print override accepts only an explicit 1 or 0; blank reads as unset", () => {
     expect(SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE).toBe("TAKOSERVER_PRINT_OPERATOR_ASSERTION");
     expect(parseSelfhostOperatorAssertionPrint(undefined)).toBe(false);
+    expect(parseSelfhostOperatorAssertionPrint("")).toBe(false);
+    expect(parseSelfhostOperatorAssertionPrint(" ")).toBe(false);
     expect(parseSelfhostOperatorAssertionPrint("0")).toBe(false);
     expect(parseSelfhostOperatorAssertionPrint("1")).toBe(true);
-    for (const value of ["", " ", "true", "yes", "01", "1 "]) {
+    for (const value of ["true", "yes", "01", "1 "]) {
       expect(() => parseSelfhostOperatorAssertionPrint(value)).toThrow(
         /TAKOSERVER_PRINT_OPERATOR_ASSERTION must be 1 or 0/u,
       );

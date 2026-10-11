@@ -11,6 +11,9 @@ describe("self-host API listen address", () => {
     expect(SELFHOST_LISTEN_HOST_VARIABLE).toBe("TAKOSERVER_LISTEN_HOST");
     expect(SELFHOST_DEFAULT_LISTEN_HOST).toBe("127.0.0.1");
     expect(parseSelfhostListenHost(undefined)).toBe("127.0.0.1");
+    // Blank reads as unset, like the other self-host variables.
+    expect(parseSelfhostListenHost("")).toBe("127.0.0.1");
+    expect(parseSelfhostListenHost("  ")).toBe("127.0.0.1");
   });
 
   test("accepts canonical IPv4 and IPv6 interface literals, including the wildcards", () => {
@@ -24,8 +27,6 @@ describe("self-host API listen address", () => {
 
   test("refuses names, ports, brackets, blanks and non-canonical literals by naming the variable", () => {
     for (const value of [
-      "",
-      " ",
       "localhost",
       "example.test",
       "127.0.0.1:8787",

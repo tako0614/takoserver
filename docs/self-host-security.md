@@ -79,12 +79,28 @@ must be HTTPS but the Bun listener speaks plain HTTP, so every real deployment
 already has a TLS-terminating proxy in front. Listening on every interface
 would only add a second, unencrypted way in that skips the proxy. Set
 `TAKOSERVER_LISTEN_HOST` when the proxy runs on another machine or in another
-network namespace, for example `0.0.0.0` or `::`, and then firewall the port so
-that only the proxy can reach it. The value must be one canonical IP literal;
-a hostname, a port or brackets are refused at startup. The startup line
-`takoserver listening on … (address: …)` shows the address that was bound.
-This default was chosen for the v2 line: before it, the listener bound every
-interface.
+network namespace, and then firewall the port so that only the proxy can reach
+it. The value must be one canonical IP literal; a hostname, a port or brackets
+are refused at startup, and a blank value reads as unset. The startup line
+`takoserver listening on <address>:<port> as …` shows the address that was
+bound.
+
+**Containers and Pods.** Inside a container or a Kubernetes Pod, `127.0.0.1` is
+that container's own loopback. A published port (`docker run -p`), a proxy in
+another container, a Kubernetes Service and a kubelet `httpGet` probe all
+connect through the container's network interface, so with the default they
+are refused, and a failing liveness probe restarts the Pod in a loop. In a
+container, set `TAKOSERVER_LISTEN_HOST=0.0.0.0`, or `::` for both IPv4 and
+IPv6. Where the container's private address is known in advance, bind that
+address instead. Either way, limit who can reach the port with a network
+policy or a firewall.
+
+**Upgrading.** Before this default, the listener bound every IPv4 and IPv6
+interface, the same as `::` on Linux with the default dual-stack setting. If
+anything reaches the Host over a non-loopback address (another machine,
+another container, a Pod network, a health check), set
+`TAKOSERVER_LISTEN_HOST` before upgrading. `::` restores the previous
+behaviour exactly.
 
 ## Sign-in and request limits
 
@@ -95,11 +111,13 @@ interface.
   later ones with `bun scripts/operator-key.ts sign-in google operator
   operator@localhost Operator`, with `TAKOSERVER_OPERATOR_KEY` and
   `TAKOSERVER_PUBLIC_ORIGIN` set for this installation.
-- A sign-in assertion opens one session. The session exchange records it and
-  refuses it if it is presented again before it expires (ten minutes for the
-  printed one). An assertion that leaks through logs after it was used opens
-  nothing. One that leaks before it was used is still a credential until it is
-  used or expires, so keep startup output out of shared logs.
+- A sign-in assertion opens one session. The session exchange records it, and
+  until it expires (ten minutes for the printed one) both another session
+  exchange and `POST /v1/operator-owner-proof` refuse it. An owner proof made
+  before the exchange does not spend it. A copy that leaks through logs after
+  the assertion was used therefore opens nothing and proves nothing. A copy
+  that leaks before it was used is still a credential until it is used or
+  expires, so keep startup output out of shared logs.
 - The Host does not rate-limit requests. Guessing does not work against its
   credentials: sessions and API keys are random bearer secrets, and operator
   assertions need the operator's private key. Request floods and slow clients
@@ -122,8 +140,12 @@ interface.
    [Service]
    User=takoserver
    Group=takoserver
+   # The checkout stays read-only; all state goes to /var/lib/takoserver.
    WorkingDirectory=/opt/takoserver
    ExecStart=/usr/local/bin/bun src/entry-bun.ts
+   StateDirectory=takoserver
+   StateDirectoryMode=0700
+   Environment=TAKOSERVER_DATA_ROOT=/var/lib/takoserver
    EnvironmentFile=/etc/takoserver/env
    UMask=0077
    NoNewPrivileges=yes
@@ -131,7 +153,6 @@ interface.
    PrivateDevices=yes
    ProtectSystem=strict
    ProtectHome=yes
-   ReadWritePaths=/var/lib/takoserver
    ProtectKernelTunables=yes
    ProtectKernelModules=yes
    ProtectKernelLogs=yes
@@ -148,6 +169,12 @@ interface.
    AmbientCapabilities=
    ```
 
+   `TAKOSERVER_DATA_ROOT` must be set: with `ProtectSystem=strict` the
+   checkout is read-only, so the default data root `.takoserver` under the
+   working directory cannot be created and startup fails. `StateDirectory=`
+   creates `/var/lib/takoserver` owned by the service user with mode 0700, and
+   keeps it writable. If the environment file sets `TAKOSERVER_DATA_ROOT`, it
+   overrides the `Environment=` line; keep it under the state directory.
    `PrivateTmp=yes` also keeps the v2 socket directories in `/tmp/tw-<hash>`
    away from other users, and removes them when the service stops. Do not add
    `MemoryDenyWriteExecute=yes`: V8 needs writable and executable memory for

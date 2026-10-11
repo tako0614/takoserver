@@ -1579,14 +1579,14 @@ if (dataPlanes) {
   console.log(`self-host data planes listening on ${dataPlanes.address} (loopback only)`);
 }
 console.log(
-  `takoserver listening on :${port} as ${publicOrigin} ` +
-    // The bound interface is named because a loopback-only listener behind a
-    // proxy elsewhere is unreachable, and this line is where that shows.
-    `(address: ${formatSelfhostListenAddress(listenHost, bunServer?.port ?? port)}; ` +
+  // The bound address, not just the port: a loopback-only listener behind a
+  // proxy elsewhere is unreachable, and this line is where that shows.
+  `takoserver listening on ${formatSelfhostListenAddress(listenHost, bunServer?.port ?? port)} ` +
+    `as ${publicOrigin} ` +
     // Named from what is actually configured. A banner that says Cloudflare on
     // a machine with no account is the first thing an operator reads and the
     // first thing that misleads them.
-    `provisioning: ${providers.map((provider) => provider.id).join(", ") || "none"})`,
+    `(provisioning: ${providers.map((provider) => provider.id).join(", ") || "none"})`,
 );
 
 // Having minted the way in, say what it is. A machine that generates a key and
@@ -1610,9 +1610,6 @@ if (identity.providers.some((provider) => provider.method === "operator-assertio
             subject: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.subject,
             email: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.email,
             displayName: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.displayName,
-            // Two boots within one second must not mint byte-identical
-            // assertions, or the second would read as a replay of the first.
-            jti: crypto.randomUUID(),
           },
           nowSeconds: Math.floor(Date.now() / 1_000),
           lifetimeSeconds: 600,

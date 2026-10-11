@@ -2,7 +2,7 @@ import type { Sql } from "./ports.ts";
 
 /**
  * Set to `1` to print a fresh operator sign-in assertion on every boot, `0` (or
- * unset) to print one only until the operator has signed in.
+ * unset or blank) to print one only until the operator has signed in.
  */
 export const SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE = "TAKOSERVER_PRINT_OPERATOR_ASSERTION";
 
@@ -15,7 +15,7 @@ export const SELFHOST_OPERATOR_SIGN_IN_IDENTITY = Object.freeze({
 } as const);
 
 export function parseSelfhostOperatorAssertionPrint(value: string | undefined): boolean {
-  if (value === undefined || value === "0") return false;
+  if (value === undefined || value.trim() === "" || value === "0") return false;
   if (value === "1") return true;
   throw new TypeError(
     `${SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE} must be 1 or 0; it is ${JSON.stringify(value)}`,
@@ -73,8 +73,9 @@ export function renderSelfhostOperatorSignInInstructions(
   }
 
   const singleUse =
-    `It opens one session and is refused if presented again. ` +
-    `Until the operator first signs in, each boot prints a new one.`;
+    `It is single-use: the first session exchange spends it, and afterwards both ` +
+    `another exchange and an owner proof refuse it. A boot prints a new one until ` +
+    `the operator has signed in, or every time with ${SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE}=1.`;
   const destination = options.consoleOrigin
     ? `open ${options.consoleOrigin} and paste this (valid 10 minutes):\n\n${options.assertion}\n\n${singleUse}`
     : `This Host serves its landing page and API, not a console.\n` +

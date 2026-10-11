@@ -373,6 +373,41 @@ describe("operator sign-in over HTTP", () => {
       expect((await call(app, "POST", "/v1/sessions", signInWith(assertion))).status).toBe(401);
     });
 
+    test("a spent assertion no longer proves ownership, and the proof stays read-only", async () => {
+      const sql = createEphemeralSql();
+      const app = newApp(sql);
+      const assertion = await assert(SIGN_IN);
+      const owner = await call(app, "POST", "/v1/sessions", signInWith(assertion));
+      expect(owner.status).toBe(200);
+      const organization = await call(
+        app,
+        "POST",
+        "/v1/organizations",
+        { name: "Owned" },
+        { authorization: `Bearer ${String(owner.body.sessionToken)}` },
+      );
+      const organizationId = String((organization.body.organization as { id: string }).id);
+      const replayRows = async () =>
+        Number((await sql.query("SELECT COUNT(*) AS count FROM runtime_grant_replays"))[0]?.count);
+      const before = await replayRows();
+
+      const spent = await call(app, "POST", "/v1/operator-owner-proof", {
+        ...signInWith(assertion),
+        organizationId,
+      });
+      expect(spent.status).toBe(401);
+      expect(spent.body).toMatchObject({ error: { code: "unauthenticated" } });
+      expect(spent.body.organization).toBeUndefined();
+
+      now += 1_000;
+      const fresh = await call(app, "POST", "/v1/operator-owner-proof", {
+        ...signInWith(await assert(SIGN_IN)),
+        organizationId,
+      });
+      expect(fresh.status).toBe(200);
+      expect(await replayRows()).toBe(before);
+    });
+
     test("an assertion refused for another reason is not spent", async () => {
       const app = newApp();
       const assertion = await assert(SIGN_IN);
