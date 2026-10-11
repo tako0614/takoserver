@@ -953,6 +953,8 @@ const providerComposition = createStandaloneProviderComposition({
   retainedBindings: currentCandidates.retainedBindings,
   workerClassRuntimeContracts: currentCandidates.workerClassRuntimeContracts,
   dataRoot,
+  // SQLiteDatabase records carry the configured string; keep matching them.
+  recordedDataRoot: configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT,
   runtime: workerdRuntime,
   ...(actorRuntime ? { actorRuntime } : {}),
   workerRuntimeAvailable: workerdBinary !== null,

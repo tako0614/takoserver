@@ -446,6 +446,16 @@ export interface SelfhostProviderOptions {
   >;
   /** Where databases, materialized versions, and script state live. */
   readonly dataRoot: string;
+  /**
+   * The data root exactly as configured, when it differs from `dataRoot`.
+   *
+   * A SQLiteDatabase records `outputs.path` from this string and later
+   * recognizes its own record by an exact comparison, so Resources created
+   * under a relative (`.takoserver`) or symlinked setting keep matching after
+   * the entry resolves `dataRoot` to an absolute canonical directory. Only that
+   * record uses it; every filesystem operation uses `dataRoot`.
+   */
+  readonly recordedDataRoot?: string;
   /** The runtime deployments publish into. */
   readonly runtime: WorkerdRuntime;
   readonly artifacts: SelfhostArtifacts;
@@ -1064,8 +1074,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
 
   // Keep the recorded output path stable for legacy relative data roots;
   // filesystem callers use the normalized sibling below.
-  const databasePath = (name: string): string => selfhostDatabasePath(dataRoot, name);
-  const databaseFilesystemPath = (name: string): string => resolve(databasePath(name));
+  const recordedDataRoot = options.recordedDataRoot ?? dataRoot;
+  const databasePath = (name: string): string => selfhostDatabasePath(recordedDataRoot, name);
+  const databaseFilesystemPath = (name: string): string =>
+    resolve(selfhostDatabasePath(dataRoot, name));
 
   /**
    * The native name of one current ObjectBucket incarnation.

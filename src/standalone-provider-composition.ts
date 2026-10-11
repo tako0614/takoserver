@@ -237,6 +237,8 @@ export function createStandaloneProviderComposition(input: {
   readonly workerClassRuntimeContracts?: readonly WorkerClassRuntimeContract[];
   readonly edge: EdgeFormBundle;
   readonly dataRoot: string;
+  /** The configured data root string SQLiteDatabase records were written with. */
+  readonly recordedDataRoot?: string;
   readonly runtime: WorkerdRuntime;
   readonly actorRuntime?: SelfhostActorPublicRuntime;
   /** Opt-in native execution; no Form or Offering is synthesized from configuration. */
@@ -280,6 +282,7 @@ export function createStandaloneProviderComposition(input: {
         : {}),
       edge: input.edge,
       dataRoot: input.dataRoot,
+      ...(input.recordedDataRoot === undefined ? {} : { recordedDataRoot: input.recordedDataRoot }),
       runtime: input.runtime,
       ...(input.actorRuntime ? { actorRuntime: input.actorRuntime } : {}),
       ...(input.container ? { container: input.container } : {}),

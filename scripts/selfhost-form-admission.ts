@@ -18,7 +18,7 @@ import {
   SELFHOST_TLS_ENVIRONMENT,
   selfhostWorkerEndpointScheme,
 } from "../src/selfhost-composition.ts";
-import { resolveSelfhostDataRoot } from "../src/selfhost-data-root.ts";
+import { resolveSelfhostDataRoot, SELFHOST_DEFAULT_DATA_ROOT } from "../src/selfhost-data-root.ts";
 import {
   createSelfhostProductionFormAuthorityComposition,
   deriveSelfhostFormAuthorityCatalog,
@@ -234,7 +234,8 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
     process.exit(2);
   }
   // The same resolution as the Host entry, so both name one canonical root.
-  const dataRoot = resolveSelfhostDataRoot(flag("data-root") ?? process.env.TAKOSERVER_DATA_ROOT);
+  const configuredDataRoot = flag("data-root") ?? process.env.TAKOSERVER_DATA_ROOT;
+  const dataRoot = resolveSelfhostDataRoot(configuredDataRoot);
   const mode = resolveStandaloneProviderMode({
     retiredProviderMode: process.env.TAKOSERVER_RETIRED_PROVIDER_MODE,
     cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID,
@@ -389,6 +390,7 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
       stableBindings: candidates.bindings,
       edge: await buildEdgeForms(),
       dataRoot,
+      recordedDataRoot: configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT,
       runtime,
       ...(actorRuntime ? { actorRuntime } : {}),
       workerRuntimeAvailable: workerdSelection.binary !== null,

@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
 import { canonicalDigest } from "../src/json.ts";
 import {
@@ -255,6 +255,7 @@ interface ProviderCase {
   readonly dataPlaneMaintenance?: SelfhostDataPlaneMaintenance;
   readonly standardServiceIntegrations?: readonly SelfhostStandardServiceIntegration[];
   readonly listCronOwners?: SelfhostProviderOptions["listCronOwners"];
+  readonly recordedDataRoot?: string;
 }
 
 const SECRET_VALUE = "placeholder-encryption-value";
@@ -573,6 +574,9 @@ function provider(options: ProviderCase = {}) {
   return createSelfhostProvider({
     offerings: [],
     dataRoot: root,
+    ...(options.recordedDataRoot === undefined
+      ? {}
+      : { recordedDataRoot: options.recordedDataRoot }),
     runtime,
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     ...(options.workerEndpointScheme ? { workerEndpointScheme: options.workerEndpointScheme } : {}),
@@ -3376,6 +3380,62 @@ describe("KV and SQLite bindings", () => {
       ],
     });
     expect(recovered).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { dataBindingNames: ["KV", "DB"] } },
+    });
+  });
+
+  test("a SQLite record written under a relative data root still binds once the root is resolved", async () => {
+    // Earlier entries passed TAKOSERVER_DATA_ROOT (default `.takoserver`) as
+    // given, so the SQLiteDatabase output recorded that relative string. The
+    // entry now resolves the root; the provider must keep recognizing its own
+    // record while every filesystem operation uses the resolved directory.
+    const configured = relative(process.cwd(), root);
+    expect(configured.startsWith("/")).toBe(false);
+    const recorded = [
+      dataRelations(root)[0] as ProviderRelation,
+      deployedRelation(
+        "/sqliteBindings/0/resource",
+        "SQLiteDatabase",
+        "app",
+        `selfhost-sqlite:${SQLITE_DATABASE}:op_db`,
+        { engine: "sqlite", path: join(configured, "databases", `${SQLITE_DATABASE}.sqlite`) },
+      ),
+    ];
+    const versionInput = (operationId: string) => ({
+      operationId,
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v1"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        ...DATA_BINDING_SPEC,
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+        ...recorded,
+      ],
+    });
+    const resolvedOnly = provider({ dataPlaneAddress: address });
+    expect(
+      (
+        await resolvedOnly.apply({
+          operationId: "op_worker",
+          offering: offering("ModuleWorker"),
+          identity: identity("hello"),
+          spec: {},
+        })
+      ).phase,
+    ).toBe("succeeded");
+    // Without the configured string the record is not recognized as this Host's.
+    expect(await resolvedOnly.apply(versionInput("op_version_unrecorded"))).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec" },
+    });
+    const upgraded = provider({ dataPlaneAddress: address, recordedDataRoot: configured });
+    expect(await upgraded.apply(versionInput("op_version"))).toMatchObject({
       phase: "succeeded",
       result: { observed: { dataBindingNames: ["KV", "DB"] } },
     });

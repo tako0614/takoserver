@@ -180,6 +180,8 @@ export interface SelfhostCompositionOptions {
   /** Retained beta catalog used only for observation/deletion of recorded Deployments. */
   readonly edge: EdgeFormBundle;
   readonly dataRoot: string;
+  /** The configured data root string SQLiteDatabase records were written with. */
+  readonly recordedDataRoot?: string;
   readonly runtime: WorkerdRuntime;
   /** Completed, exact native owner and broker graph; no boolean availability hint. */
   readonly actorRuntime?: SelfhostActorPublicRuntime;
@@ -485,6 +487,9 @@ export function createSelfhostComposition(
     ...(recoveryOfferings.length ? { recoveryOfferings } : {}),
     nativeReadbackAuthorities,
     dataRoot: options.dataRoot,
+    ...(options.recordedDataRoot === undefined
+      ? {}
+      : { recordedDataRoot: options.recordedDataRoot }),
     runtime: options.runtime,
     artifacts: options.artifacts,
     ...(actorRuntime ? { actorNamespace: actorRuntime.actorNamespace } : {}),
