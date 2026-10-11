@@ -557,7 +557,15 @@ describe("Takoserver integration Worker bootstrap", () => {
         },
       );
       expect(historical).toMatchObject({ storageQualified: false });
-      const result = await apply(fixture, { secretDirectory });
+      // A generation that a Host already served is refused before any upload.
+      await expect(
+        apply(fixture, {
+          secretDirectory,
+          freshV2DataReader: freshData({ orgs: 1 }),
+        }),
+      ).rejects.toThrow("already holds data beyond its seeds and signing registration");
+      expect(fixture.lifecycleCalls).toHaveLength(0);
+      const result = await apply(fixture, { secretDirectory, freshV2DataReader: freshData() });
       expect(result).toMatchObject({ mutationApplied: true, appliedMigrations: V2_0088_APPLIED });
       expect(fixture.lifecycleCalls).toHaveLength(1);
       expect(fixture.configContents).toContain("sqliteMigrationSet");
@@ -1090,6 +1098,35 @@ async function readPublishedStatus(fixture: BootstrapFixture): Promise<Record<st
         : { v2StorageVerification: v2StorageOptions(fixture.target) }),
     },
   );
+}
+
+/** Unserved fresh v2-0088 data: seeds, one signing row and optional extra rows. */
+function freshData(extra: Readonly<Record<string, number>> = {}) {
+  const tables = (JSON.parse(COMPLETE_V2_0088_SCHEMA.shape) as { type: string; name: string }[])
+    .filter((row) => row.type === "table")
+    .map((row) => row.name);
+  const seeds = new Set([
+    "tf_cloudflare_provider_invocation_epoch",
+    "tf_v2_operation_acceptance_counter",
+  ]);
+  return {
+    async read() {
+      return {
+        tableCounts: Object.fromEntries(
+          tables.map((name) => [
+            name,
+            extra[name] ?? (seeds.has(name) ? 1 : name === "runtime_grant_keys" ? 1 : 0),
+          ]),
+        ),
+        ledgerRows: 88,
+        foreignKeyViolations: 0,
+        invocationEpoch: [
+          { singleton: 1, epoch_id: null, state: "closed", opened_at_ms: null, closed_at_ms: null },
+        ],
+        acceptanceCounter: [{ id: 1, last_order: 0, last_operation_id: null }],
+      };
+    },
+  };
 }
 
 function completeV2Schema(selectedTarget: DeployTarget): D1SchemaState {

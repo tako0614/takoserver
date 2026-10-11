@@ -575,17 +575,6 @@ async function statusStorageGeneration(
         d1.uuid,
         "preflight",
       );
-      const freshV2 = freshV2D1Lineage(invocation.freshLineage);
-      if (freshV2 !== null) {
-        await assertFreshV2DataReadback(
-          "preflight",
-          freshV2,
-          configPath,
-          provider.environment,
-          expectedShape,
-          { ...options, run: options.run ?? runCommand },
-        );
-      }
       complete = true;
     } catch {
       // An exact-name D1 may be partially imported or foreign. It is never
@@ -594,9 +583,31 @@ async function statusStorageGeneration(
     result.schemaReadback = complete
       ? `complete-${lineageCeiling(invocation.freshLineage)}`
       : "incomplete-or-divergent";
-    result.resume = complete
-      ? "Correlate the exact prior apply identity; separately review any missing R2 and target binding. No SQL re-import."
-      : "Quarantine this generation and plan separate owner-reviewed forward repair; no SQL re-import or new generation retry.";
+    const freshV2 = freshV2D1Lineage(invocation.freshLineage);
+    let dataEmpty: boolean | null = null;
+    if (complete && freshV2 !== null) {
+      try {
+        await assertFreshV2DataReadback(
+          "preflight",
+          freshV2,
+          configPath,
+          provider.environment,
+          expectedShape,
+          { ...options, run: options.run ?? runCommand },
+        );
+        dataEmpty = true;
+      } catch {
+        // A complete schema with application rows is a generation a Host (or
+        // the signing registration) has already written, not a broken import.
+        dataEmpty = false;
+      }
+      result.dataReadback = dataEmpty ? "empty-seeded" : "present";
+    }
+    result.resume = !complete
+      ? "Quarantine this generation and plan separate owner-reviewed forward repair; no SQL re-import or new generation retry."
+      : dataEmpty === false
+        ? "Complete schema with application data: this generation is in use. Keep it as the selected target; it is no longer a fresh candidate. No SQL re-import."
+        : "Correlate the exact prior apply identity; separately review any missing R2 and target binding. No SQL re-import.";
     return result;
   } finally {
     if (temporary) rmSync(root, { recursive: true, force: true });

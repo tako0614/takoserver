@@ -600,6 +600,7 @@ for (const lineage of ["v2-0088", "v2-0089"] as const) {
       );
       expect(status).toMatchObject({
         schemaReadback: `complete-${String(count).padStart(4, "0")}`,
+        dataReadback: "empty-seeded",
         readyForApply: false,
       });
       const generatedTarget = {
@@ -640,14 +641,18 @@ for (const lineage of ["v2-0088", "v2-0089"] as const) {
         "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
         [ORGANIZATION, "Fresh v2 D1", "principal-fresh-v2", now],
       );
-      // After any application row exists, status no longer reports an exact
-      // empty fresh generation; it never re-imports or adopts the database.
+      // After any application row exists the schema is still complete, but the
+      // generation is in use: status says so instead of asking for quarantine.
       const written = await runIntegrationStorageGeneration(
         { ...invocation, action: "status" },
         target,
         { provider, run, reader, freshV2DataReader },
       );
-      expect(written).toMatchObject({ schemaReadback: "incomplete-or-divergent" });
+      expect(written).toMatchObject({
+        schemaReadback: `complete-${String(count).padStart(4, "0")}`,
+        dataReadback: "present",
+      });
+      expect(String(written.resume)).toContain("in use");
       await sql.run(
         "INSERT INTO auth_tokens (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at, revoked_at) VALUES (?, ?, 'api_key', ?, ?, ?, ?, ?, ?, NULL)",
         [

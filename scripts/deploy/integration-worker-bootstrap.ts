@@ -14,6 +14,7 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
+import { assertFreshV2DataReadback, type FreshV2DataReader } from "./fresh-v2-data-readback.ts";
 import {
   CloudflareIntegrationStorageProvider,
   type FreshV2IntegrationStorageTargetProof,
@@ -174,6 +175,8 @@ export interface IntegrationWorkerBootstrapOptions {
   readonly r2Identity?: IntegrationWorkerBootstrapR2IdentityReader;
   /** Narrow read-only test seam; production verifies the selected generated pair remotely. */
   readonly v2StorageVerification?: IntegrationStorageGenerationTargetVerificationOptions;
+  /** Test seam for the fresh-lineage unserved-data proof; production reads remote D1. */
+  readonly freshV2DataReader?: FreshV2DataReader;
   readonly secretDirectory?: string;
   /** The exact keyring retained by the qualified CPE owner (never emitted). */
   readonly expectedRuntimeInputSealKeyring?: string;
@@ -309,6 +312,35 @@ export async function runIntegrationWorkerBootstrap(
     assertCompleteSchema(schemaBefore, artifactBefore, expectedShape);
     const v2StorageBefore =
       target.takoformV2 === undefined ? null : await readV2StorageProof(target, options);
+    // A fresh generation must still be unserved when its first Host appears:
+    // only the migration seeds and the append-only signing registration may
+    // exist. A copied or previously served database is refused, not adopted.
+    const assertUnserved = async () => {
+      const lineage = target.takoformV2?.storageLineage;
+      if (lineage === undefined) return;
+      try {
+        await assertFreshV2DataReadback(
+          "preflight",
+          lineage,
+          inspectionConfig,
+          environment,
+          expectedShape,
+          {
+            run,
+            ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+            ...(options.freshV2DataReader === undefined
+              ? {}
+              : { freshV2DataReader: options.freshV2DataReader }),
+            allowedTables: ["runtime_grant_keys"],
+          },
+        );
+      } catch {
+        throw preflightError(
+          "fresh v2 storage generation already holds data beyond its seeds and signing registration; first Host publication refused",
+        );
+      }
+    };
+    await assertUnserved();
 
     const provider = providerExecutorQualificationReader({
       target,
@@ -474,6 +506,7 @@ export async function runIntegrationWorkerBootstrap(
         if (v2StorageBefore !== null) {
           const storageFinal = await readV2StorageProof(target, options);
           assertSameV2StorageProof(v2StorageBefore, storageFinal, "preflight");
+          await assertUnserved();
         }
         const providerFinal = provider === null ? null : await provider.read("preflight");
         if (providerBefore !== null && providerFinal !== null) {

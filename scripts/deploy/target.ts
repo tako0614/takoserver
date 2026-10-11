@@ -537,6 +537,15 @@ export function parseDeployTarget(
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && target.takoformV2 === undefined) {
     throw preflightError("v2 0088 schema maintenance must retain the exact v2 Worker config");
   }
+  if (
+    target.schemaMaintenanceMode === "pre-v2-0088-quiesced" &&
+    target.takoformV2?.storageLineage !== undefined
+  ) {
+    // A fresh 0088/0089 generation has no 0066->0088 wave to quiesce for.
+    throw preflightError(
+      "v2 0088 schema maintenance cannot select a fresh `takoformV2.storageLineage` generation",
+    );
+  }
   if (target.takoformV2 !== undefined) {
     if (environment !== "integration") {
       throw preflightError("v2 Worker target composition is integration-only");

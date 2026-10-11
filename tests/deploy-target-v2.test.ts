@@ -260,6 +260,17 @@ describe("environment-exact deploy target", () => {
         "integration",
       ),
     ).toThrow("unexpected keys");
+    expect(() =>
+      parseDeployTarget(
+        descriptor({
+          environment: "integration",
+          takoformV2: { config, storageLineage: "v2-0088" },
+          schemaMaintenanceMode: "pre-v2-0088-quiesced",
+        }),
+        "fresh lineage under maintenance",
+        "integration",
+      ),
+    ).toThrow("cannot select a fresh");
   });
 
   test("refuses the retired cross-product runtime topology", () => {

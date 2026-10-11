@@ -29,6 +29,12 @@ export interface FreshV2DataReadbackOptions {
   ) => Promise<CommandResult>;
   readonly wranglerCommand?: (args: readonly string[]) => readonly string[];
   readonly wranglerPath?: string;
+  /**
+   * Tables a named pre-Host owner may already have written (for example the
+   * append-only signing registration in `runtime_grant_keys`). Every other
+   * table must still be exactly as the migrations left it.
+   */
+  readonly allowedTables?: readonly string[];
 }
 
 const FRESH_V2_SEED_TABLES = [
@@ -72,15 +78,20 @@ export async function assertFreshV2DataReadback(
     options.freshV2DataReader === undefined
       ? await readRemoteFreshV2Data(configPath, environment, tables, phase, options)
       : await options.freshV2DataReader.read(phase, configPath);
+  const allowed = new Set(options.allowedTables ?? []);
+  if ([...allowed].some((name) => !tables.includes(name)))
+    throw new DeployError(phase, "fresh v2 allowed table is not part of the audited schema");
   if (
     readback.ledgerRows !== (lineage === "v2-0089" ? 89 : 88) ||
     readback.foreignKeyViolations !== 0 ||
     Object.keys(readback.tableCounts).length !== tables.length ||
     FRESH_V2_SEED_TABLES.some((name) => !tables.includes(name)) ||
-    tables.some(
-      (name) =>
-        readback.tableCounts[name] !==
-        (FRESH_V2_SEED_TABLES.includes(name as (typeof FRESH_V2_SEED_TABLES)[number]) ? 1 : 0),
+    tables.some((name) =>
+      allowed.has(name)
+        ? !Number.isSafeInteger(readback.tableCounts[name]) ||
+          (readback.tableCounts[name] as number) < 0
+        : readback.tableCounts[name] !==
+          (FRESH_V2_SEED_TABLES.includes(name as (typeof FRESH_V2_SEED_TABLES)[number]) ? 1 : 0),
     ) ||
     !matchesFreshV2Seed(
       readback.invocationEpoch,

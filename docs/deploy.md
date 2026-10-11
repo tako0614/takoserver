@@ -149,7 +149,13 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
 
 A target that uses such a generation names it explicitly with
 `takoformV2.storageLineage: "v2-0088"` (or `"v2-0089"`). Absent keeps the
-historical `v2-artifacts-0075` expectation. The observed ledger never selects
+historical `v2-artifacts-0075` expectation; the lineage cannot be combined with
+`schemaMaintenanceMode: pre-v2-0088-quiesced`, because a fresh generation has
+no wave to quiesce for. The first bootstrap publication on such a target also
+re-reads the data before upload and at the final pre-deploy fence: only the two
+migration seeds and the append-only signing registration in
+`runtime_grant_keys` may exist, so a copied or already served database is
+refused rather than adopted. The observed ledger never selects
 its own expectation: the bootstrap, routine Worker and closure-transition
 storage proofs all read the selected lineage, and the routine pending-schema
 rule accepts exactly that closed prefix (the audited tail after it has no
@@ -160,9 +166,12 @@ failing with 503 after traffic moved.
 
 After a lost import acknowledgement or partial failure, never rerun `--apply`
 or mint a different generation as a retry. Selected `--status` reads the exact
-generated name/UUID and reports whether its ledger and canonical schema (and,
-for v2-0088/v2-0089, empty seeded data) are complete (`complete-0075`,
-`complete-0088` or `complete-0089`) or incomplete/divergent. It is diagnosis, not proof that the
+generated name/UUID and reports whether its ledger and canonical schema are
+complete (`complete-0075`, `complete-0088` or `complete-0089`) or
+incomplete/divergent. For v2-0088/v2-0089 a complete schema also reports
+`dataReadback`: `empty-seeded` for an untouched generation, or `present` once
+the signing registration or a Host has written rows; the latter is a generation
+in use, not a reason to quarantine it. It is diagnosis, not proof that the
 operator's earlier create owned that D1: correlate the original bounded
 database ID and source digest. Complete readback permits a separately reviewed
 forward continuation (for example, a missing R2); incomplete/divergent or
