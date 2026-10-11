@@ -281,13 +281,17 @@ the [release runbook](release.md#1-preconditions), with `$REL` checked out at
 4. Put `third-party/MANUAL.md` in place. It holds the upstream license text, at
    the pinned version, for each repository the loop reports and for each crate
    that has only a `LICENSE-EXPRESSION`, and says for each where the version is
-   pinned and where the text comes from. For this binary the file exists:
-   written on 2026-10-11, SHA-256
-   `f43f3222c02638532362b49a8f95d912ab12e4ecc3e38fc15693e1200942c5e2`, kept on
-   the reference host at
-   `/root/.local/share/takos/operator-runs/release-v2.0.0-rc.1/workerd-closed-graph-2026-08-11-notices/third-party/MANUAL.md`.
+   pinned and where the text comes from. For this binary the file is kept in
+   the repository as `workerd/notices/MANUAL.md` (written on 2026-10-11,
+   SHA-256 `f43f3222c02638532362b49a8f95d912ab12e4ecc3e38fc15693e1200942c5e2`):
+
+   ```sh
+   cp "$REL/workerd/notices/MANUAL.md" "$N/third-party/MANUAL.md"
+   ```
+
    Copy it while the loop reports exactly the repositories and crates below;
-   otherwise add the new entries the same way. It covers:
+   otherwise add the new entries to `workerd/notices/MANUAL.md` the same way,
+   and change the pinned build in the same pull request. It covers:
    - the seven repositories the loop reports: `+http+capnp-cpp` (the archive's
      `LICENSE` sits outside the `c++/` directory the build uses), `+http+simdutf`
      and `ada-url+` (single-header archives; texts from the `v9.0.0` and `v4.0.0`
