@@ -283,12 +283,13 @@ before use.
   source (#289). On 2026-10-11 it was run on a new non-production Cloudflare
   environment: storage, signing key, dispatch namespace, receipt authority,
   gateway, provider executor, Host bootstrap, operator sign-in, organization
-  and API key, hostname topology, module inspector and artifact preparation
-  completed, and the run found and fixed several defects that only a live
-  readback shows (the gateway's compatibility flags and the platform's default
-  observability fields were refused by the owners' own checks). The trusted
-  Tail, the canonical Host publication and the create, serve, update and delete
-  smoke have not been observed live, and this release does not imply a
+  and API key, hostname topology, module inspector, trusted Tail and the
+  canonical provider executor completed. The run found and fixed several
+  defects that only a live readback shows (the gateway's compatibility flags,
+  the platform's default observability fields and the Tail's environment Worker
+  name were refused by the owners' own checks). The last fix landed after the
+  run, so the canonical Host publication and the create, serve, update and
+  delete smoke have not been observed live. This release does not imply a
   production rollout.
 - **The attached closed-graph workerd is not built by CI.** All five
   `workerd-closed-graph-build` workflow runs failed (toolchain prerequisites,
