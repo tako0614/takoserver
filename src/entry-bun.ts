@@ -72,6 +72,7 @@ import {
   resolveSelfhostDataRoot,
   SELFHOST_DATA_ROOT_VARIABLE,
   SELFHOST_DEFAULT_DATA_ROOT,
+  SELFHOST_MEMORY_DATA_ROOT,
 } from "./selfhost-data-root.ts";
 import {
   closeSelfhostEntryOwnedResources,
@@ -223,6 +224,12 @@ if (dataRoot !== (configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT)) {
     `${SELFHOST_DATA_ROOT_VARIABLE} ${configuredDataRoot === undefined ? `(default ${SELFHOST_DEFAULT_DATA_ROOT})` : JSON.stringify(configuredDataRoot)} resolved to ${dataRoot}\n`,
   );
 }
+/**
+ * Where state that has no memory form lives: the data root itself, or for
+ * memory control state the default root, resolved like any other.
+ */
+const durableRoot =
+  dataRoot === SELFHOST_MEMORY_DATA_ROOT ? resolveSelfhostDataRoot(undefined) : dataRoot;
 // An explicitly selected v2 capability whose sockets cannot fit below this root
 // is a configuration error now, not an Operation that never confirms later.
 if (v2RuntimeSelection) assertSelfhostV2RuntimeSocketBudget(v2RuntimeSelection, dataRoot);
@@ -422,7 +429,7 @@ if (workerEndpointPublication.diagnostic) {
 
 const workerdSelection = await selectClosedGraphWorkerd({
   binary: process.env.TAKOSERVER_WORKERD_BINARY,
-  privateRoot: join(dataRoot === ":memory:" ? ".takoserver" : dataRoot, "runtime-probes"),
+  privateRoot: join(durableRoot, "runtime-probes"),
 });
 const workerdBinary = workerdSelection.binary;
 if (workerdSelection.diagnostic) process.stderr.write(`${workerdSelection.diagnostic}\n`);
@@ -836,7 +843,7 @@ try {
     objects,
     clock,
     config: takoformV2Config,
-    rootDirectory: join(dataRoot === ":memory:" ? ".takoserver" : dataRoot, "v2-worker-owners"),
+    rootDirectory: join(durableRoot, "v2-worker-owners"),
     targetKey: v2WorkerTargetKey,
     workerdBinary,
     ...(v2RuntimeBoot?.v2Actor ? { v2Actor: v2RuntimeBoot.v2Actor } : {}),
