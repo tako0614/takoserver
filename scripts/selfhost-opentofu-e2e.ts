@@ -15,6 +15,9 @@ import { signOperatorAssertion } from "../src/operator-key.ts";
 import { takoformCoreVerifierArtifactDigest } from "./deploy/form-authority.ts";
 
 /** Explicit native integration command, not a test double or deploy surface.
+ * Historical: it targets the retired Host API v1 (`/.well-known/takoform/v1` on
+ * a plain-HTTP origin) and cannot pass against the current v2-only Bun entry.
+ * Current v2 evidence is tests/takoform-v2-host-api-conformance*.test.ts.
  * Run inside a disposable, loopback-only network namespace with verified local
  * tools. The real Host, Core verifier and released Provider own every write.
  * The default qualifies storage CRUD; the optional workerd lane additionally

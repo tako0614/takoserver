@@ -1057,6 +1057,17 @@ recovery at a completed checkpoint; it does not prove recovery from a kill
 during a single SQL write, public TLS ingress, Hosted D1/R2, or native Worker
 execution.
 
+Takoform's own Host API v2 HTTP baseline probe, vendored and pinned under
+`vendor/takoform/host-api-v2-conformance/`, runs against a real normal Bun entry
+process in the portable gate for the three held-artifact Forms, and in the
+opt-in native lane for the complete Worker profile's reference-free Forms. Its
+first run found that `Takoform-Expected-Generation: 0` was answered
+`400 invalid_request`; the header is a decimal integer in `0..2^53-1`, so 0 is
+now a stale generation answered `409 generation_conflict`. The probe passing
+says only that its mandatory sequence passed: it reports restart, fault
+injection, concurrency, cross-principal authority, optional features and
+Form-specific behavior as not tested.
+
 Portable core tests, self-host resource use, Hosted resource use and downstream
 Provider/application installation are separate evidence. The complete portable
 gate is necessary before integration, but is not a live qualification or a
