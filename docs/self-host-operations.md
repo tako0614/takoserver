@@ -63,8 +63,8 @@ A self-host runs one of two profiles, selected by configuration:
 - Bun at the version in `.bun-version` (currently 1.4.0), installed where the
   `takoserver` user can run it. The installer's default location is the
   installing user's home, which `takoserver` cannot read when root runs it. As
-  root, this installs `/usr/local/bin/bun`, the path the
-  [systemd unit](self-host-security.md#recommended-os-hardening) uses:
+  root, this installs `/usr/local/bin/bun`, the path the wrapper script of
+  step 3 runs:
 
   ```sh
   curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash -s bun-v1.4.0
@@ -214,24 +214,25 @@ done
 bun -e 'console.log(Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url"))'
 ```
 
-Keep the environment in a file that only the `takoserver` user can read,
-because it holds the cursor key; step 6 sources it as that user. The
-directories under `/etc` belong to root, so create the file and the TLS
-directory as root first. The certificate key must be readable by the
-`takoserver` user:
+Keep the environment in a file owned by root, group `takoserver`, mode 0640,
+like the TLS key. It holds the cursor key, so only that group may read it;
+step 6 sources it as the `takoserver` user. The Host's user must not be able
+to change it: the wrapper below reads it at every start, so a Host whose
+tenant code escaped the sandbox could otherwise change the next start's
+configuration or the commands that start runs. As root, create the file and
+the TLS directory, then write the file with the cursor key printed above:
 
 ```sh
 install -d -m 0755 /etc/takoserver
-install -m 0600 -o takoserver -g takoserver /dev/null /etc/takoserver/takoserver.env
+install -m 0640 -o root -g takoserver /dev/null /etc/takoserver/takoserver.env
 install -d -m 0750 -o root -g takoserver /etc/takoserver/tls
 # then: install -m 0640 -o root -g takoserver <certificate> <key> /etc/takoserver/tls/
 ```
 
-Single quotes keep the JSON values intact both for a shell and for systemd
-`EnvironmentFile=`:
+Single quotes keep the JSON values intact when a shell sources the file:
 
 ```sh
-# /etc/takoserver/takoserver.env (owner takoserver, mode 0600)
+# /etc/takoserver/takoserver.env (owner root, group takoserver, mode 0640)
 TAKOSERVER_PUBLIC_ORIGIN=https://api.example.com:8443
 TAKOSERVER_DATA_ROOT=/var/lib/takoserver
 TAKOSERVER_TAKOFORM_V2_CURSOR_KEY=<the 43 characters printed above>
@@ -265,15 +266,18 @@ Replace the documentation URLs with this deployment's own:
 The service manager starts the Host from the checkout with these lines, for
 example through a small wrapper script that the
 [systemd unit](self-host-security.md#recommended-os-hardening) runs as the
-`takoserver` user:
+`takoserver` user. As root:
 
 ```sh
+cat > /usr/local/bin/takoserver-run <<'EOF'
 #!/bin/sh
-# /usr/local/bin/takoserver-run (owner root, mode 0755)
 cd /opt/takoserver || exit 1
 set -a; . /etc/takoserver/takoserver.env; set +a
 export TAKOSERVER_TAKOFORM_V2_CONFIG="$(cat /etc/takoserver/v2/takoform-v2.json)"
-exec bun --no-env-file src/entry-bun.ts
+exec /usr/local/bin/bun --no-env-file src/entry-bun.ts
+EOF
+chown root:root /usr/local/bin/takoserver-run
+chmod 0755 /usr/local/bin/takoserver-run
 ```
 
 Linux passes at most 131,072 bytes in one environment variable, including its
@@ -344,9 +348,11 @@ Container Endpoint listener.
 
 Because this listener holds 443 on every IPv4 address, a control API front end
 on the same machine needs another port, as in the example origin, or it runs
-on another machine. Without the selection, `WorkerEndpoint` is not advertised;
-the other Worker Forms are unaffected. The listener's local certificate and
-route checks do not prove public DNS, CA trust or reachability. The retained
+on another machine, with `TAKOSERVER_LISTEN_HOST` set to an address that
+machine can reach and the port firewalled as described above. Without the
+selection, `WorkerEndpoint` is not advertised; the other Worker Forms are
+unaffected. The listener's local certificate and route checks do not prove
+public DNS, CA trust or reachability. The retained
 pre-v2 Worker socket settings (`TAKOSERVER_WORKERD_PORT`,
 `TAKOSERVER_WORKER_ENDPOINT_PORT`) described in the README do not apply to
 `WorkerEndpoint 0.3.0`.
@@ -592,21 +598,33 @@ ENDPOINT=$(create WorkerEndpoint/0.3.0 hello-endpoint "$(jq -nc --arg w "$WORKER
 ```
 
 The `&&` chain stops at the first create that does not succeed, so no later
-Resource is created with an empty reference. Fix the cause, then run the
-chain again: a create that already has an Operation replays it under the same
-idempotency key, and a refused request is simply sent again. A WorkerVersion,
-Deployment or Endpoint Operation that cannot finish stays `reconciling` and
-retries; it writes nothing to the Host's output, so the `error` the helper
-prints is the only diagnostic.
+Resource is created with an empty reference. What to do next depends on where
+it stopped:
 
-Keep this order. An Endpoint accepted before its Worker has a succeeded
-Deployment does not settle: it stays `reconciling`
-(`worker_endpoint_unconfirmed`), every later Deployment Operation for that
-Worker stays `reconciling` behind it (`worker_publication_unconfirmed`), and
-DELETE refuses both with `resource_busy`. No API call recovers that Worker
-(measured on 2026-10-11); leave it and create a new `ModuleWorker`. After ten
-minutes of Host uptime, readiness counts the stuck Operations under
-`backlog.operations.reconciling` and reports `degraded`.
+- **The POST was refused** (the helper prints a `4xx` problem). Nothing was
+  stored for that request. Fix the cause and run the chain again: the creates
+  that already succeeded replay their Operations under the same idempotency
+  keys and print the same UIDs.
+- **An accepted Operation failed, or is still not `succeeded` after the
+  helper's two minutes.** Running the chain again does not retry it. For 24
+  hours the same key replays that same Operation, a changed request under the
+  same key is refused with `409 idempotency_conflict`, and a Resource name is
+  unique within the Space across all Forms. Because the helper derives each
+  key from the name, fix the cause and create the whole chain again under new
+  names, for example with `-2` appended to each name. Delete the old Resources
+  with step 11 once nothing references them.
+
+A WorkerVersion, Deployment or Endpoint Operation that cannot finish stays
+`reconciling` and retries; it writes nothing to the Host's output, so the
+`error` the helper prints is the only diagnostic.
+
+Keep this order. An Endpoint requested before its Worker's Deployment has
+succeeded is refused with `409 dependency_conflict` (its `detail` names the
+missing Deployment) and nothing is stored, so run the chain again once the
+Deployment succeeded. With OpenTofu, make the Endpoint `depends_on` its
+Deployment so they are not created in parallel. An Endpoint that an earlier
+Host accepted out of order settles `failed` (`worker_deployment_missing`)
+after the upgrade; delete it or re-apply it.
 
 Read any Resource back with
 `GET /apis/forms.takoform.com/v2/resources/{resourceUid}` using the same key.
@@ -798,11 +816,12 @@ entries, and the Endpoint answers `hello from sqlite`.
 
 ### 11. Delete Resources
 
-DELETE needs the Resource's current generation, like PUT; without
-`takoform-expected-generation` it is refused with `428`
-`expected_generation_required`. A Resource that another Resource still names
-is refused with `409` `dependency_conflict`, so delete in reference order.
-Leave out the Resources of steps 9 and 10 that you did not create:
+DELETE needs an `Idempotency-Key` and the Resource's current generation, like
+PUT. Without a valid key it is refused with `400`; with one but without
+`takoform-expected-generation`, with `428` `expected_generation_required`. A
+Resource that another Resource still names is refused with `409`
+`dependency_conflict`, so delete in reference order. Leave out the Resources of
+steps 9 and 10 that you did not create:
 
 ```sh
 remove() { # remove <resourceUid> <label>
@@ -901,7 +920,9 @@ the same operator-controlled process supervisor and protected configuration
 when selecting which checkout to run; this guide does not prescribe a service
 manager or its unit-file layout.
 
-For each update, first make the cold snapshot described below. Stop the Bun
+If an earlier build ran as root, check `/tmp` first, as described under
+[`/tmp` left at mode 0700](#ordinary-journey-native-test-and-known-gaps). For
+each update, first make the cold snapshot described below. Stop the Bun
 Host and all child/workload writers, deploy the selected source checkout and
 locked dependencies, then start that exact version under the existing
 protected configuration. Startup can apply forward SQLite migrations and
@@ -1368,6 +1389,21 @@ handler, Actor or Workflow use, public DNS or certificate trust, Hosted/WfP or
 a host reboot. Messages in flight at the
 crash are redelivered at least once, and a batch reserved but not yet sent is
 held for its 120 second reservation before redelivery.
+
+**`/tmp` left at mode 0700 by an earlier build.** Before that fix, a build
+that ran as root without `TMPDIR` set and without a private `/tmp` (systemd
+`PrivateTmp=yes`) set the machine's `/tmp` to mode 0700 the first time it
+inspected a Worker module, which locks every other user out of `/tmp`. On such
+a machine, check it as root and restore the standard mode:
+
+```sh
+stat -c %a /tmp     # 1777 is the standard mode
+chmod 1777 /tmp
+```
+
+A build run as a dedicated user could not change `/tmp`; there its
+WorkerVersions stayed `reconciling` instead, and they settle on a later retry
+once inspection can run.
 
 What this test and its neighbours record:
 

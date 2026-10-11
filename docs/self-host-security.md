@@ -165,8 +165,9 @@ behaviour exactly.
    LockPersonality=yes
    SystemCallArchitectures=native
    RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-   CapabilityBoundingSet=
-   AmbientCapabilities=
+   # WorkerEndpoint (TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1) binds TCP 443.
+   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+   AmbientCapabilities=CAP_NET_BIND_SERVICE
    ```
 
    `ExecStart` is the wrapper script of
@@ -183,23 +184,26 @@ behaviour exactly.
    `PrivateTmp=yes` also keeps the v2 socket directories in `/tmp/tw-<hash>`
    away from other users, and removes them when the service stops. Do not add
    `MemoryDenyWriteExecute=yes`: V8 needs writable and executable memory for
-   its JIT. To serve Workers on 443 without root, grant only
-   `AmbientCapabilities=CAP_NET_BIND_SERVICE` and
-   `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`. The complete local Worker
-   profile with `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` always binds 443, so
-   it needs these two lines instead of the empty ones above. Without that
-   selection you can also keep the ports above 1024 and let the proxy listen
-   on 443. If you configure the container
-   runtime, the Docker socket must be reachable, and that undoes most of this
-   isolation. Use it only on a machine whose operator accepts that.
+   its JIT. The two capability lines grant only `CAP_NET_BIND_SERVICE`, which
+   the Host needs to listen on 443 without root: the complete local Worker
+   profile of Self-host operations selects
+   `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1`, and that listener always binds
+   443. A configuration without any 443 listener, such as the artifact
+   profile, can leave both lines empty (`CapabilityBoundingSet=` and
+   `AmbientCapabilities=`) and keep its ports above 1024 behind the proxy. If
+   you configure the container runtime, the Docker socket must be reachable,
+   and that undoes most of this isolation. Use it only on a machine whose operator accepts that.
 3. **Set file permissions.** Keep the data root at mode 0700, owned by the
    Host's user. Every directory above it should be owned by root or that user
    and not be writable by others. With the v2 Actor or Workflow runtime
    enabled, the Host refuses to start otherwise (see
    [Self-host operations](self-host-operations.md)). Keep the environment file
-   at mode 0600, readable only by the Host's user: it holds the cursor key, and
-   the operator commands of Self-host operations source it as that user. Keep
-   backups of the data root as private as the data root itself: they contain
+   owned by root, group set to the Host's user, mode 0640, like the TLS key.
+   The operator commands of Self-host operations source it as that user, and
+   it holds the cursor key, so nobody else may read it. The Host's user must
+   not be able to change it: the wrapper reads it at every start, so a
+   compromised Host could otherwise change the next start's configuration or
+   the commands that start runs. Keep backups of the data root as private as the data root itself: they contain
    the operator key and the signing keys.
 4. **Limit network exposure.** Expose only the reverse proxy and the Worker
    listeners. Firewall the API port if `TAKOSERVER_LISTEN_HOST` is not
