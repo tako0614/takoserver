@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { canonicalJson } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
@@ -12,6 +11,10 @@ import {
   deriveSelfhostWorkflowBindingToken,
 } from "../src/providers/selfhost-version-bindings.ts";
 import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
+import {
+  SELFHOST_SOCKET_DIRECTORY_PREFIX,
+  SELFHOST_UNIX_SOCKET_PATH_MAX_BYTES,
+} from "../src/selfhost-socket-layout.ts";
 import { createSelfhostWorkflowPrivateOwner } from "../src/selfhost-workflow-private-owner.ts";
 import { openSelfhostWorkflowServing } from "../src/selfhost-workflow-serving.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -20,6 +23,7 @@ import { createTakoformStore } from "../src/takoform/store.ts";
 import type { InstalledTakoformForm } from "../src/takoform/types.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createWorkflowResourceGraphReader } from "../src/workflow-resource-graph.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const NOW = Date.UTC(2026, 9, 4);
 const TENANT = "tenant-serving-integrated";
@@ -100,9 +104,15 @@ async function insertLive(
 test("selected serving manager dispatches to a real private owner and drains before same-DB handoff", async () => {
   // Only the external guard/workerd child boundary is substituted: no class is
   // run. Resource, deployment, Version selection, owner, broker and UDS are real.
-  // Leave room for the broker's suffix under the 100-byte Unix socket limit,
-  // including a short RAM-backed TMPDIR such as /dev/shm/t.
-  const root = await mkdtemp(join(tmpdir(), "ts-workflow-owner-"));
+  // Leave room for `<root>/sockets/w??????/<20 hex>.sock` under the 100-byte
+  // Unix socket limit whatever TMPDIR the runner uses.
+  const root = await mkdtempForSockets(
+    "ts-workflow-owner-",
+    SELFHOST_UNIX_SOCKET_PATH_MAX_BYTES -
+      Buffer.byteLength(
+        `/sockets/${SELFHOST_SOCKET_DIRECTORY_PREFIX.workflowBrokers}XXXXXX/${"0".repeat(20)}.sock`,
+      ),
+  );
   await chmod(root, 0o700);
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);

@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 import { createActorResourceGraphReader } from "../src/actor-resource-graph.ts";
 import { createAppResourceStoreBundle } from "../src/app.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
@@ -18,10 +19,16 @@ import {
   SELFHOST_TLS_ENVIRONMENT,
   selfhostWorkerEndpointScheme,
 } from "../src/selfhost-composition.ts";
+import { resolveSelfhostDataRoot, SELFHOST_DEFAULT_DATA_ROOT } from "../src/selfhost-data-root.ts";
 import {
   createSelfhostProductionFormAuthorityComposition,
   deriveSelfhostFormAuthorityCatalog,
 } from "../src/selfhost-form-authority-composition.ts";
+import {
+  selfhostImplicitActorRuntime,
+  selfhostPrivateSocketRoot,
+} from "../src/selfhost-socket-layout.ts";
+import { prepareSelfhostSocketRoot } from "../src/selfhost-socket-root.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
   createStandaloneProviderComposition,
@@ -231,8 +238,9 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
     );
     process.exit(2);
   }
-  const requestedDataRoot = flag("data-root") ?? process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver";
-  const dataRoot = resolve(requestedDataRoot);
+  // The same resolution as the Host entry, so both name one canonical root.
+  const configuredDataRoot = flag("data-root") ?? process.env.TAKOSERVER_DATA_ROOT;
+  const dataRoot = resolveSelfhostDataRoot(configuredDataRoot);
   const mode = resolveStandaloneProviderMode({
     retiredProviderMode: process.env.TAKOSERVER_RETIRED_PROVIDER_MODE,
     cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID,
@@ -250,7 +258,7 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
     throw new Error("self-host Form admission requires stable-selfhost, not recovery-only mode");
   }
   const databasePath = process.env.TAKOSERVER_DB ?? `${dataRoot}/control.sqlite`;
-  if (requestedDataRoot === ":memory:" || databasePath === ":memory:") {
+  if (dataRoot === ":memory:" || databasePath === ":memory:") {
     throw new Error("self-host Form admission requires durable local state");
   }
   const database = new Database(databasePath);
@@ -321,12 +329,23 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
     })
       ? candidates.forms.find((form) => form.identity.formRef.kind === "ActorNamespace")
       : undefined;
-    if (workerdSelection.binary && actorForm) {
+    // The Host's own decision: a root, TMPDIR or socket directory that would
+    // leave the Host without Actor admission leaves this plan without it too.
+    const actorConfigured = workerdSelection.binary !== null && actorForm !== undefined;
+    const socketRootProblem = actorConfigured ? prepareSelfhostSocketRoot(dataRoot) : undefined;
+    const implicitActor = selfhostImplicitActorRuntime({
+      configured: actorConfigured,
+      dataRoot,
+      temporaryDirectory: tmpdir(),
+      ...(socketRootProblem ? { socketRootProblem } : {}),
+    });
+    if (implicitActor.diagnostic) process.stderr.write(`${implicitActor.diagnostic}\n`);
+    if (implicitActor.open && workerdSelection.binary && actorForm) {
       try {
         actorRuntime = await openSelfhostActorPublicRuntime({
           dataRoot,
           runtimeRoot: dataRoot,
-          socketParent: join(dataRoot, "actor-forward-sockets"),
+          socketParent: selfhostPrivateSocketRoot(dataRoot),
           binary: workerdSelection.binary,
           graph: createActorResourceGraphReader({
             store: resourceStores.inventory,
@@ -387,6 +406,7 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
       stableBindings: candidates.bindings,
       edge: await buildEdgeForms(),
       dataRoot,
+      recordedDataRoot: configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT,
       runtime,
       ...(actorRuntime ? { actorRuntime } : {}),
       workerRuntimeAvailable: workerdSelection.binary !== null,

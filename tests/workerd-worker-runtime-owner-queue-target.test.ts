@@ -18,6 +18,7 @@ import {
 import type { WorkerdPublicationIdentity } from "../src/workerd-runtime.ts";
 import type { WorkerdProcess } from "../src/workerd-supervisor.ts";
 import { openWorkerdWorkerRuntimeOwner } from "../src/workerd-worker-runtime-owner.ts";
+import { removeOwnerPrivateSocketDirectories } from "./helpers/owner-private-sockets.ts";
 
 const TARGET_KEY = "fixture-queue-target-owner";
 const WORKER_UID = "worker-queue-target";
@@ -145,6 +146,7 @@ async function closeFixtureOwner(
     for (const child of children)
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     await Promise.all(children.map((child) => child.exited));
+    await removeOwnerPrivateSocketDirectories(root);
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -541,6 +543,7 @@ test("suspend joins a draining retirement already waiting for exact child exit",
     for (const child of children)
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     await Promise.all(children.map((child) => child.exited));
+    await removeOwnerPrivateSocketDirectories(root);
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createActorResourceGraphReader } from "./actor-resource-graph.ts";
 import { buildApp, createAppResourceStoreBundle } from "./app.ts";
@@ -67,6 +68,13 @@ import {
   serveSelfhostDataPlanes,
 } from "./selfhost-data-planes.ts";
 import {
+  createSelfhostDataRootIfAbsent,
+  resolveSelfhostDataRoot,
+  SELFHOST_DATA_ROOT_VARIABLE,
+  SELFHOST_DEFAULT_DATA_ROOT,
+  SELFHOST_MEMORY_DATA_ROOT,
+} from "./selfhost-data-root.ts";
+import {
   closeSelfhostEntryOwnedResources,
   createSelfhostEntryShutdown,
   describeBackgroundFailure,
@@ -79,6 +87,11 @@ import {
 } from "./selfhost-health.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
+import {
+  selfhostImplicitActorRuntime,
+  selfhostPrivateSocketRoot,
+} from "./selfhost-socket-layout.ts";
+import { prepareSelfhostSocketRoot, sweepSelfhostSocketRoot } from "./selfhost-socket-root.ts";
 import { renderSelfhostOperatorSignInInstructions } from "./selfhost-startup-instructions.ts";
 import { createSelfhostTakoformV2Ingress } from "./selfhost-takoform-v2-ingress.ts";
 import {
@@ -90,6 +103,7 @@ import { createSelfhostV2ConfiguredInputSealer } from "./selfhost-v2-configured-
 import { createSelfhostV2QueueComposition } from "./selfhost-v2-queue-composition.ts";
 import { createSelfhostV2QueueScheduler } from "./selfhost-v2-queue-scheduler.ts";
 import {
+  assertSelfhostV2RuntimeSocketBudget,
   createSelfhostV2RuntimeBoot,
   parseSelfhostV2RuntimeBoot,
   startSelfhostV2ScheduledDuePass,
@@ -199,8 +213,27 @@ if (!publicOrigin || !runtimeInputCanonicalOriginSupported(publicOrigin)) {
 }
 const port = Number(process.env.PORT ?? 8787);
 
-/** Everything this machine keeps lives under one directory. */
-const dataRoot = process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver";
+/**
+ * Everything this machine keeps lives under one directory, resolved once to an
+ * absolute canonical path: the default is relative to the working directory,
+ * and the Actor, Workflow and private-plane owners accept nothing else.
+ */
+const configuredDataRoot = process.env[SELFHOST_DATA_ROOT_VARIABLE];
+const dataRoot = resolveSelfhostDataRoot(configuredDataRoot);
+if (dataRoot !== (configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT)) {
+  process.stdout.write(
+    `${SELFHOST_DATA_ROOT_VARIABLE} ${configuredDataRoot === undefined ? `(default ${SELFHOST_DEFAULT_DATA_ROOT})` : JSON.stringify(configuredDataRoot)} resolved to ${dataRoot}\n`,
+  );
+}
+/**
+ * Where state that has no memory form lives: the data root itself, or for
+ * memory control state the default root, resolved like any other.
+ */
+const durableRoot =
+  dataRoot === SELFHOST_MEMORY_DATA_ROOT ? resolveSelfhostDataRoot(undefined) : dataRoot;
+// An explicitly selected v2 capability whose sockets cannot fit below this root
+// is a configuration error now, not an Operation that never confirms later.
+if (v2RuntimeSelection) assertSelfhostV2RuntimeSocketBudget(v2RuntimeSelection, dataRoot);
 const v2WorkerTargetKey = "selfhost-v2-worker-primary";
 const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
   ? Number(process.env.TAKOSERVER_WORKERD_PORT)
@@ -298,6 +331,13 @@ const providerMode = resolveStandaloneProviderMode({
   suffixes: process.env.TAKOSERVER_SUFFIXES,
   workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
 });
+const currentCandidates = selectPublicHostFormSource(process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE);
+// Configuration is validated above without touching the filesystem. Keys,
+// tenant data and sockets live here: a new root starts private, while an
+// existing one keeps the permissions its operator gave it.
+if (createSelfhostDataRootIfAbsent(dataRoot)) {
+  process.stdout.write(`created ${dataRoot} (mode 0700)\n`);
+}
 const v2PrivatePlaneBoot = parseSelfhostV2PrivatePlaneBoot(
   process.env.TAKOSERVER_V2_WORKER_PRIVATE_PLANES,
   {
@@ -316,7 +356,6 @@ const v2PrivatePlaneBoot = parseSelfhostV2PrivatePlaneBoot(
 if (v2PrivatePlaneBoot && providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN) {
   throw new Error("v2 Worker private planes are unavailable in retired ObjectBucket drain mode");
 }
-const currentCandidates = selectPublicHostFormSource(process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE);
 const selfhostContainer = createSelfhostContainerBootstrap({
   environment: process.env,
   dataRoot,
@@ -391,7 +430,7 @@ if (workerEndpointPublication.diagnostic) {
 
 const workerdSelection = await selectClosedGraphWorkerd({
   binary: process.env.TAKOSERVER_WORKERD_BINARY,
-  privateRoot: join(dataRoot === ":memory:" ? ".takoserver" : dataRoot, "runtime-probes"),
+  privateRoot: join(durableRoot, "runtime-probes"),
 });
 const workerdBinary = workerdSelection.binary;
 if (workerdSelection.diagnostic) process.stderr.write(`${workerdSelection.diagnostic}\n`);
@@ -604,16 +643,44 @@ let actorRuntime: SelfhostActorPublicRuntime | undefined;
 const installedActorForm = currentCandidates.forms.find(
   (form) => form.identity.formRef.kind === "ActorNamespace",
 );
-if (
+const implicitActorConfigured =
   providerMode !== RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN &&
-  workerdBinary &&
-  installedActorForm
-) {
+  workerdBinary !== null &&
+  installedActorForm !== undefined;
+// Every Actor and Workflow listener directory lives in `<data root>/s`. Check
+// it once, before any of this process's listeners exist: an explicitly
+// selected v2 capability cannot start without it, and what a killed Host left
+// there is removed where its abandonment is proved.
+let socketRootProblem: string | undefined;
+if (dataRoot !== ":memory:" && (v2RuntimeSelection || implicitActorConfigured)) {
+  socketRootProblem = prepareSelfhostSocketRoot(dataRoot);
+  if (socketRootProblem && v2RuntimeSelection) {
+    throw new TypeError(`${socketRootProblem} (required by TAKOSERVER_V2_WORKER_RUNTIME_BOOT)`);
+  }
+  if (!socketRootProblem) {
+    const swept = await sweepSelfhostSocketRoot(dataRoot);
+    if (swept.removed.length > 0) {
+      process.stdout.write(
+        `removed ${swept.removed.length} abandoned socket director${
+          swept.removed.length === 1 ? "y" : "ies"
+        } in ${selfhostPrivateSocketRoot(dataRoot)}\n`,
+      );
+    }
+  }
+}
+const implicitActor = selfhostImplicitActorRuntime({
+  configured: implicitActorConfigured,
+  dataRoot,
+  temporaryDirectory: tmpdir(),
+  ...(socketRootProblem ? { socketRootProblem } : {}),
+});
+if (implicitActor.diagnostic) process.stderr.write(`${implicitActor.diagnostic}\n`);
+if (implicitActor.open && workerdBinary && installedActorForm) {
   try {
     actorRuntime = await openSelfhostActorPublicRuntime({
       dataRoot,
       runtimeRoot: dataRoot,
-      socketParent: join(dataRoot, "actor-forward-sockets"),
+      socketParent: selfhostPrivateSocketRoot(dataRoot),
       binary: workerdBinary,
       graph: createActorResourceGraphReader({
         store: resourceStores.inventory,
@@ -789,7 +856,7 @@ try {
     objects,
     clock,
     config: takoformV2Config,
-    rootDirectory: join(dataRoot === ":memory:" ? ".takoserver" : dataRoot, "v2-worker-owners"),
+    rootDirectory: join(durableRoot, "v2-worker-owners"),
     targetKey: v2WorkerTargetKey,
     workerdBinary,
     ...(v2RuntimeBoot?.v2Actor ? { v2Actor: v2RuntimeBoot.v2Actor } : {}),
@@ -907,6 +974,8 @@ const providerComposition = createStandaloneProviderComposition({
   retainedBindings: currentCandidates.retainedBindings,
   workerClassRuntimeContracts: currentCandidates.workerClassRuntimeContracts,
   dataRoot,
+  // SQLiteDatabase records carry the configured string; keep matching them.
+  recordedDataRoot: configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT,
   runtime: workerdRuntime,
   ...(actorRuntime ? { actorRuntime } : {}),
   workerRuntimeAvailable: workerdBinary !== null,

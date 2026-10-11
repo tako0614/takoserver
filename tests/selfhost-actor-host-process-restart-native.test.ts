@@ -17,6 +17,11 @@ import { join } from "node:path";
 import { type TLSSocket, connect as tlsConnect } from "node:tls";
 import { takoformCoreVerifierArtifactDigest } from "../scripts/deploy/form-authority.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
+import {
+  SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES,
+  SELFHOST_SOCKET_DIRECTORY_PREFIX,
+  selfhostPrivateSocketRoot,
+} from "../src/selfhost-socket-layout.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
@@ -216,12 +221,12 @@ test.skipIf(WORKERD === null)(
       mkdirSync(tlsDirectory, { recursive: true, mode: 0o700 });
       chmodSync(fixture, 0o700);
       const worstCaseUpgradeSocket = join(
-        dataRoot,
-        "actor-forward-sockets",
-        `actor-${"x".repeat(6)}`,
+        selfhostPrivateSocketRoot(dataRoot),
+        `${SELFHOST_SOCKET_DIRECTORY_PREFIX.actorBrokers}${"x".repeat(6)}`,
         `${"0".repeat(20)}.u.sock`,
       );
       expect(Buffer.byteLength(worstCaseUpgradeSocket)).toBeLessThan(100);
+      expect(Buffer.byteLength(dataRoot)).toBeLessThanOrEqual(SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES);
       await assertIsolatedSelfhostNativeEnvironment({
         fixedPorts: [HOST_PORT, PUBLIC_PROXY_PORT, CORE_PORT, WORKER_PORT],
       });

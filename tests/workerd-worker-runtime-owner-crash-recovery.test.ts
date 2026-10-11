@@ -14,6 +14,7 @@ import {
   openWorkerdWorkerExecutionGroup,
   verifyRetiredWorkerdWorkerExecutionCopies,
 } from "../src/workerd-worker-execution-group.ts";
+import { removeOwnerPrivateSocketDirectories } from "./helpers/owner-private-sockets.ts";
 
 const WORKER_UID = "worker-crash-reopen";
 const CREATE_ID = "8f068b66-a849-4d9c-aa5a-ed4823101fc9";
@@ -147,6 +148,7 @@ async function fixture() {
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
       }
       await Promise.all(children.map((child) => child.exited));
+      await removeOwnerPrivateSocketDirectories(root);
       await rm(root, { recursive: true, force: true });
     },
   };
@@ -164,6 +166,16 @@ async function waitForVacant(port: number): Promise<void> {
     await Bun.sleep(10);
   }
   throw new Error("foreign listener did not become vacant");
+}
+
+/** A killed Host's child can outlive it briefly under load; boot refuses a live one. */
+async function waitForStale(identity: unknown): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if ((await linuxProcessLiveness(identity as never)) === "stale") return;
+    await Bun.sleep(20);
+  }
+  throw new Error("the killed Host's candidate child did not exit");
 }
 
 function ownerDirectory(root: string): string {
@@ -1518,6 +1530,10 @@ test("a Host killed while an in-process candidate failure is retiring still boot
     // state boot recovery resumes, never an activated record's `retiring`.
     expect(retiring).toMatchObject({ status: "uncertain", identity: null, receipt: null });
     await waitForVacant(retiring.listenerPort);
+    // The SIGTERM-ignoring child exits once its Host is gone; a successor that
+    // starts first is right to refuse a live recorded child.
+    expect(retiring.processIdentity).not.toBeNull();
+    await waitForStale(retiring.processIdentity);
 
     successor = await startHost(
       "active-recover-reexecute",

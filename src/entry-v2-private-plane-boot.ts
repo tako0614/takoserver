@@ -9,6 +9,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { privateDirectoryChainProblem } from "./selfhost-data-root.ts";
 
 const CONFIG_NAME = "TAKOSERVER_V2_WORKER_PRIVATE_PLANES";
 /** Raw operator-created key files are bounded; no unbounded secret file reads. */
@@ -53,42 +54,8 @@ function exactFields(
 }
 
 function checkedPrivateDirectory(path: string, name: string): string {
-  if (!isAbsolute(path) || resolve(path) !== path) {
-    throw new TypeError(`${name} must be an absolute canonical private directory`);
-  }
-  const uid = process.getuid?.();
-  if (uid === undefined) throw new TypeError(`${name} requires local owner identity`);
-  let current = path;
-  let leaf = true;
-  while (true) {
-    let metadata: ReturnType<typeof lstatSync>;
-    try {
-      metadata = lstatSync(current);
-      if (
-        !metadata.isDirectory() ||
-        metadata.isSymbolicLink() ||
-        realpathSync(current) !== current
-      ) {
-        throw new Error("not a real directory");
-      }
-    } catch {
-      throw new TypeError(`${name} must use real directories`);
-    }
-    if (leaf) {
-      if (metadata.uid !== uid || (metadata.mode & 0o077) !== 0) {
-        throw new TypeError(`${name} must be owned and private`);
-      }
-      leaf = false;
-    } else if (
-      (metadata.mode & 0o022) !== 0 &&
-      !((metadata.mode & 0o1000) !== 0 && metadata.uid === 0)
-    ) {
-      throw new TypeError(`${name} has an unsafe writable ancestor`);
-    }
-    const parent = dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
+  const problem = privateDirectoryChainProblem(path, name);
+  if (problem) throw new TypeError(problem);
   return path;
 }
 
@@ -175,7 +142,10 @@ export function parseSelfhostV2PrivatePlaneBoot(
       throw new TypeError(`${CONFIG_NAME} has an unknown plane`);
     }
   }
-  const dataRoot = checkedPrivateDirectory(options.dataRoot, "v2 Worker data root");
+  const dataRoot = checkedPrivateDirectory(
+    options.dataRoot,
+    "v2 Worker data root (TAKOSERVER_DATA_ROOT)",
+  );
   const ports = new Set(options.reservedPorts ?? []);
   const keys: Uint8Array[] = [];
   const readPlane = (name: PlaneName): PlaneBoot | undefined => {

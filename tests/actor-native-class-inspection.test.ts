@@ -9,8 +9,13 @@ import {
 } from "../src/providers/selfhost-worker-prelude.ts";
 import { selfhostWorkerEntrypointSource } from "../src/providers/selfhost-worker-wrapper.ts";
 import { openWorkerdActorNamespace } from "../src/selfhost-actor-native-process.ts";
+import {
+  SELFHOST_ACTOR_TMPDIR_MAX_BYTES,
+  SELFHOST_SOCKET_DIRECTORY_PREFIX,
+} from "../src/selfhost-socket-layout.ts";
 import type { WorkerdActiveActorGraph } from "../src/workerd-runtime.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const binary = nativeEvidenceBinary("actor-qualification");
 const digest = process.env.TAKOSERVER_ACTOR_QUALIFICATION_SHA256;
@@ -131,6 +136,71 @@ test("selected Actor InterfaceRef reaches every generated child and owner withou
   } finally {
     await namespace?.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("native Actor sockets fit below a TMPDIR of the published maximum and refuse one byte more", async () => {
+  const base = await mkdtempForSockets("tmpa-", SELFHOST_ACTOR_TMPDIR_MAX_BYTES - 2);
+  const exact = join(
+    base,
+    "t".repeat(SELFHOST_ACTOR_TMPDIR_MAX_BYTES - Buffer.byteLength(base) - 1),
+  );
+  expect(Buffer.byteLength(exact)).toBe(SELFHOST_ACTOR_TMPDIR_MAX_BYTES);
+  await mkdir(exact, { mode: 0o700 });
+  await mkdir(`${exact}x`, { mode: 0o700 });
+  const previous = process.env.TMPDIR;
+  const open = async (temporary: string) => {
+    process.env.TMPDIR = temporary;
+    let configPath: string | null = null;
+    let finish!: (code: number) => void;
+    const exited = new Promise<number>((resolve) => {
+      finish = resolve;
+    });
+    const child = {
+      exitCode: null as number | null,
+      signalCode: null,
+      exited,
+      kill() {
+        this.exitCode = 137;
+        finish(137);
+      },
+    };
+    try {
+      const namespace = await openWorkerdActorNamespace("/unused/workerd", {
+        namespaceKey: "c".repeat(64),
+        storagePath: join(base, "state"),
+        className: "Actor",
+        graph: graph(),
+        signal: new AbortController().signal,
+        runtimeClassRef: forwardRef,
+        admitAlarm: async () => null,
+        completeAlarm() {},
+        admitSocket: async () => null,
+        completeSocket() {},
+        processAdapter: {
+          spawn(_binary, path) {
+            configPath = path;
+            return child;
+          },
+          probeReadiness: async () => new Response(null, { status: 204 }),
+        },
+      });
+      await namespace.close();
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previous;
+    }
+    return configPath as string | null;
+  };
+  try {
+    const configPath = await open(exact);
+    expect(
+      configPath?.startsWith(`${exact}/${SELFHOST_SOCKET_DIRECTORY_PREFIX.actorNamespace}`),
+    ).toBe(true);
+    expect(Buffer.byteLength(join(dirname(configPath ?? ""), "upgrade.sock"))).toBe(100);
+    await expect(open(`${exact}x`)).rejects.toThrow("unusable private Actor duplex socket");
+  } finally {
+    await rm(base, { recursive: true, force: true });
   }
 });
 

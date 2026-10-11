@@ -9,6 +9,10 @@ import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql } from "../src/ports.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
+import {
+  SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES,
+  selfhostPrivateSocketRoot,
+} from "../src/selfhost-socket-layout.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createV2ActorBindingAuthority } from "../src/takoform-v2/actor-binding-authority.ts";
@@ -46,6 +50,7 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const PRINCIPAL = "org:actor-admission";
 const SPACE = "production";
@@ -712,7 +717,12 @@ test("Actor DELETE remains unconfirmed when its lease expires during physical re
 });
 
 test("accepted sealed WorkerVersion Actor binding resolves its exact physical namespace", async () => {
-  const root = mkdtempSync(join(tmpdir(), "actor-v2-binding-"));
+  // The brokers bind below a data root of exactly the published maximum.
+  const root = await mkdtempForSockets("actor-v2-binding-", SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES - 2);
+  const socketDataRoot = join(
+    root,
+    "d".repeat(SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES - Buffer.byteLength(root) - 1),
+  );
   const f = fixture(root);
   if (!f.physical) throw new Error("physical Actor host fixture missing");
   try {
@@ -788,12 +798,52 @@ test("accepted sealed WorkerVersion Actor binding resolves its exact physical na
     ]) {
       expect(await authority.resolveCurrentBinding({ ...claim, ...foreign }, "ACTOR")).toBeNull();
     }
+    const physical = f.physical;
+    const openForward = (dataRoot: string, sourceOperationId: string) =>
+      createV2ActorForwardBoot({
+        sql: f.sql,
+        targetKey: TARGET,
+        authority,
+        physical,
+        privateSocketDirectory: selfhostPrivateSocketRoot(dataRoot),
+      }).openIncarnation({
+        principal: PRINCIPAL,
+        space: SPACE,
+        workerUid: caller.resourceUid,
+        sourceOperationId,
+        eventToken: "a".repeat(64),
+        scriptName: "actor-binding-test-script",
+      });
+    const publicationFor = (granted: NonNullable<typeof issued>) => ({
+      script: "actor-binding-test-script",
+      workerResourceUid: caller.resourceUid,
+      versionId: nativeVersionId,
+      workerVersionResourceUid: version.resourceUid,
+      bindings: [
+        {
+          publicName: granted.publicName,
+          tenantId: granted.tenantId,
+          namespaceResourceUid: granted.namespaceResourceUid,
+          httpService: "actor-test-http",
+          upgradeService: "actor-test-upgrade",
+          token: granted.token,
+          runtimeClassRef: granted.runtimeClassRef,
+        },
+      ],
+    });
+    const tooLong = openForward(`${socketDataRoot}x`, "9c44e450-1765-4366-919a-4c022f48d97c");
+    const tooLongGrant = await tooLong.issueBinding(claim, "ACTOR");
+    if (!tooLongGrant) throw new Error("Actor private grant unavailable");
+    await expect(
+      tooLong.actorForwardLifecycle.prepare([publicationFor(tooLongGrant)]),
+    ).rejects.toThrow("Actor private socket path unavailable");
+    await tooLong.close();
     const forward = createV2ActorForwardBoot({
       sql: f.sql,
       targetKey: TARGET,
       authority,
       physical: f.physical,
-      privateSocketDirectory: join(root, "brokers"),
+      privateSocketDirectory: selfhostPrivateSocketRoot(socketDataRoot),
     }).openIncarnation({
       principal: PRINCIPAL,
       space: SPACE,
@@ -828,6 +878,12 @@ test("accepted sealed WorkerVersion Actor binding resolves its exact physical na
       ],
     };
     await forward.actorForwardLifecycle.prepare([publication]);
+    for (const socket of forward.actorForwardSockets()) {
+      expect(
+        socket.upgradeSocketPath.startsWith(`${selfhostPrivateSocketRoot(socketDataRoot)}/a`),
+      ).toBe(true);
+      expect(Buffer.byteLength(socket.upgradeSocketPath)).toBe(99);
+    }
     expect(forward.actorForwardSockets()).toMatchObject([
       {
         tenantId: PRINCIPAL,

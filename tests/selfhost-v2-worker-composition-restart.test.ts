@@ -18,6 +18,7 @@ import {
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { type LinuxProcessIdentity, linuxProcessLiveness } from "../src/workerd-linux-process.ts";
 import type { WorkerdPublicationIdentity } from "../src/workerd-runtime.ts";
+import { removeOwnerPrivateSocketDirectories } from "./helpers/owner-private-sockets.ts";
 
 const API = "/apis/forms.takoform.com/v2";
 const HOST = "api.example.test";
@@ -387,6 +388,7 @@ for (const checkpoint of ["retired", "retiring"] as const) {
       ).toBe(200);
       await second.close();
       second = undefined;
+      await removeOwnerPrivateSocketDirectories(root);
       await rm(join(root, "v2-worker-owners", ownerKey), { recursive: true, force: true });
       await expect(startHost(root, binary, organization.id, manifestSha, fileSha)).rejects.toThrow(
         "missing_serving_owner",
@@ -394,6 +396,7 @@ for (const checkpoint of ["retired", "retiring"] as const) {
     } finally {
       await second?.close();
       await first?.close();
+      await removeOwnerPrivateSocketDirectories(root);
       await rm(root, { recursive: true, force: true });
     }
   });

@@ -11,6 +11,7 @@ import {
   WORKER_DEPLOYMENT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import { removeOwnerPrivateSocketDirectories } from "./helpers/owner-private-sockets.ts";
 
 const API = "/apis/forms.takoform.com/v2";
 const MANIFEST_URL = "https://artifacts.example.test/cron/manifest.json";
@@ -496,6 +497,7 @@ test(
     } finally {
       await first?.close();
       await second?.close();
+      await removeOwnerPrivateSocketDirectories(root);
       await rm(root, { recursive: true, force: true });
     }
   },

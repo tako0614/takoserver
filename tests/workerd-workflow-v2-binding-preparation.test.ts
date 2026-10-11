@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,9 +8,15 @@ import {
   WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
   workerdV2PrivateWorkflowBindingName,
 } from "../src/providers/workerd-v2-private-binding-names.ts";
+import {
+  SELFHOST_DATA_ROOT_SOCKET_BUDGET,
+  SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES,
+  selfhostPrivateSocketRoot,
+} from "../src/selfhost-socket-layout.ts";
 import type { WorkerdPrivateServiceLease, WorkerdSite } from "../src/workerd-runtime.ts";
 import { prepareWorkerdWorkflowExecution } from "../src/workerd-workflow-preparation.ts";
 import type { WorkflowRunIdentity } from "../src/workflow-execution.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const encoder = new TextEncoder();
 const parentUid = "workflow-parent";
@@ -88,7 +94,7 @@ function preparation(
 }
 
 test("v2 Workflow-only class preparation pins exact broker UDS through child disposal", async () => {
-  const root = await mkdtemp(join(tmpdir(), "twf-v2-binding-"));
+  const root = await mkdtempForSockets("twf-v2-binding-", SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES);
   const socketPath = join(root, `${"d".repeat(22)}.sock`);
   const broker = createServer();
   await new Promise<void>((resolve, reject) => {
@@ -269,5 +275,63 @@ test("Workflow-only class refuses when no exact broker lease can be acquired", a
     expect(await readdir(root)).toEqual([]);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Workflow execution directories fit below a data root of the published maximum and refuse one byte more", async () => {
+  const brokerRoot = await mkdtempForSockets("twfb-", SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES);
+  const socketPath = join(brokerRoot, `${"d".repeat(22)}.sock`);
+  const broker = createServer();
+  await new Promise<void>((resolve, reject) => {
+    broker.once("error", reject);
+    broker.listen(socketPath, resolve);
+  });
+  const maximum = SELFHOST_DATA_ROOT_SOCKET_BUDGET.workflowExecution;
+  const base = await mkdtempForSockets("twfr-", maximum - 2);
+  const lease = async (): Promise<WorkerdPrivateServiceLease> => ({
+    services: [],
+    workflowServices: [
+      {
+        name: serviceName,
+        publicName: "CHILD",
+        workflowResourceUid: childUid,
+        token,
+        snapshotDigest,
+        upstreamSocket: socketPath,
+      },
+    ],
+    async release() {},
+  });
+  try {
+    const exact = join(base, "d".repeat(maximum - Buffer.byteLength(base) - 1));
+    expect(Buffer.byteLength(exact)).toBe(maximum);
+    for (const root of [exact, `${exact}x`])
+      await mkdir(selfhostPrivateSocketRoot(root), {
+        recursive: true,
+        mode: 0o700,
+      });
+    const prepared = await prepareWorkerdWorkflowExecution(
+      preparation(selfhostPrivateSocketRoot(exact), selectedSite(), lease),
+    );
+    try {
+      const config = await readFile(prepared.configPath, "utf8");
+      const run = config.match(/unix:([^"]+\/run\.sock)/u)?.[1];
+      expect(run?.startsWith(`${selfhostPrivateSocketRoot(exact)}/twf-`)).toBe(true);
+      expect(Buffer.byteLength(run ?? "")).toBe(100);
+    } finally {
+      await prepared.drainAfterStop();
+      await prepared.dispose();
+    }
+    await expect(
+      prepareWorkerdWorkflowExecution(
+        preparation(selfhostPrivateSocketRoot(`${exact}x`), selectedSite(), lease),
+      ),
+    ).rejects.toThrow();
+    // A refused execution leaves no directory behind.
+    expect(await readdir(selfhostPrivateSocketRoot(`${exact}x`))).toEqual([]);
+  } finally {
+    await new Promise<void>((resolve) => broker.close(() => resolve()));
+    await rm(brokerRoot, { recursive: true, force: true });
+    await rm(base, { recursive: true, force: true });
   }
 });

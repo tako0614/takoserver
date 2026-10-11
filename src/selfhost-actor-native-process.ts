@@ -14,6 +14,7 @@ import {
   WORKERD_V2_PRIVATE_WORKFLOW_ENTRYPOINT_MODULE,
 } from "./providers/workerd-v2-private-binding-names.ts";
 import type { ActorVersionPrivateBindingLease } from "./selfhost-actor-graph-authority.ts";
+import { SELFHOST_SOCKET_DIRECTORY_PREFIX } from "./selfhost-socket-layout.ts";
 import {
   type LinuxProcessIdentity,
   spawnWorkerdWithParentDeath,
@@ -551,7 +552,7 @@ export default {
   }
 };`),
   );
-  const root = await mkdtemp(join(tmpdir(), "tactor-"));
+  const root = await mkdtemp(join(tmpdir(), SELFHOST_SOCKET_DIRECTORY_PREFIX.actorNamespace));
   await chmod(root, 0o700);
   const processAdapter =
     options.processAdapter ??

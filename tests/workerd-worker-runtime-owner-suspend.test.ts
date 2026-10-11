@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +17,11 @@ import {
   spawnWorkerdWithParentDeath,
   workerPortOwnership,
 } from "../src/workerd-linux-process.ts";
-import { openWorkerdWorkerRuntimeOwner } from "../src/workerd-worker-runtime-owner.ts";
+import {
+  openWorkerdWorkerRuntimeOwner,
+  workerdWorkerPrivateSocketDirectory,
+} from "../src/workerd-worker-runtime-owner.ts";
+import { removeOwnerPrivateSocketDirectories } from "./helpers/owner-private-sockets.ts";
 
 const WORKER_UID = "worker-graceful-suspend";
 const OPERATION_ID = "a5323426-8e22-4b4c-a362-f34ae3525f76";
@@ -24,6 +29,7 @@ const TARGET_KEY = "fixture-worker-graceful-suspend";
 type StoredState = {
   suspended: boolean;
   incarnations: Array<{
+    operationId: string;
     status: string;
     processIdentity: Parameters<typeof linuxProcessLiveness>[0];
   }>;
@@ -259,7 +265,17 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
       await owner.fetch(new Request("https://suspend.example.test/"))
     ).text();
     await expect(owner.close()).rejects.toMatchObject({ code: "ownership_uncertain" });
+    // The private Service socket namespace lives in /tmp, outside the data root.
+    const privateSockets = workerdWorkerPrivateSocketDirectory(
+      realpathSync(options.rootDirectory),
+      WORKER_UID,
+      oldRecord.operationId,
+    );
+    expect(existsSync(privateSockets)).toBe(true);
     await owner.suspend();
+    // Suspend keeps the namespace, still this user's, as custody for recovery:
+    // a name given up in a sticky /tmp could be claimed by another local user.
+    expect(statSync(privateSockets).uid).toBe(process.getuid?.() ?? -1);
     expect(owner.health()).toBe("idle");
     expect(await linuxProcessLiveness(oldProcess)).toBe("stale");
     expect(await workerPortOwnership(port, undefined)).toBe("vacant");
@@ -283,6 +299,7 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
     const servingCalls = currentServingCalls.length;
     phase = "reopen";
     owner = await openWorkerdWorkerRuntimeOwner(options);
+    expect(existsSync(privateSockets)).toBe(true);
     phase = "serving";
     // Boot recovery asked once (or more) with the tolerance and the owner's
     // never-served proof; no earlier serving-time read carried either.
@@ -372,10 +389,12 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
     // Serving-time reads after recovery stay strict as well.
     expect(currentServingCalls.some((call) => call.phase === "serving" && call.boot)).toBe(false);
     await owner.suspend();
+    expect(existsSync(privateSockets)).toBe(true);
   } finally {
     for (const child of children)
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     await Promise.all(children.map((child) => child.exited));
+    await removeOwnerPrivateSocketDirectories(root);
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
@@ -17,11 +17,17 @@ import {
   createSelfhostRuntimeBindingMaterializer,
   SELFHOST_ACTOR_MATERIAL_KIND,
 } from "../src/selfhost-runtime-binding-materializer.ts";
+import {
+  SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES,
+  SELFHOST_SOCKET_DIRECTORY_PREFIX,
+  selfhostPrivateSocketRoot,
+} from "../src/selfhost-socket-layout.ts";
 import type { WorkerdActorForwardPublication } from "../src/workerd-runtime.ts";
 import { fixture, scope } from "./helpers/actor-resource-fixture.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 test("Actor broker owner restores exact v8 Version tokens for two callers of one namespace", async () => {
-  const root = await mkdtemp(join(tmpdir(), "actor-public-runtime-"));
+  const root = await mkdtempForSockets("actor-public-runtime-", SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES);
   const f = fixture();
   await f.deployments.create({
     tenantId: scope.tenantId,
@@ -87,7 +93,7 @@ test("Actor broker owner restores exact v8 Version tokens for two callers of one
   const owner = await openSelfhostActorPublicRuntime({
     dataRoot: root,
     runtimeRoot: root,
-    socketParent: join(root, "sockets"),
+    socketParent: selfhostPrivateSocketRoot(root),
     binary: "/never-execute",
     graph: async (...args) => {
       graphReads += 1;
@@ -201,7 +207,7 @@ test("Actor broker owner restores exact v8 Version tokens for two callers of one
 });
 
 test("Actor v9 publication proves the stored, published, and current full ABI ref", async () => {
-  const root = await mkdtemp(join(tmpdir(), "actor-public-v9-"));
+  const root = await mkdtempForSockets("actor-public-v9-", SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES);
   const f = fixture();
   const selectedRef = ACTOR_ABI_INTERFACE_REFS.v2;
   let currentRef: TakoformInterfaceRef = selectedRef;
@@ -250,7 +256,7 @@ test("Actor v9 publication proves the stored, published, and current full ABI re
   const owner = await openSelfhostActorPublicRuntime({
     dataRoot: root,
     runtimeRoot: root,
-    socketParent: join(root, "sockets"),
+    socketParent: selfhostPrivateSocketRoot(root),
     binary: "/never-execute",
     graph: async (...args) => {
       const graph = await f.read(...args);
@@ -301,12 +307,15 @@ test("Actor v9 publication proves the stored, published, and current full ABI re
 });
 
 test("Actor reservations release failed attempts and reuse bounded broker slots across updates", async () => {
-  const root = await mkdtemp(join(tmpdir(), "actor-public-capacity-"));
+  const root = await mkdtempForSockets(
+    "actor-public-capacity-",
+    SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES,
+  );
   const f = fixture();
   const owner = await openSelfhostActorPublicRuntime({
     dataRoot: root,
     runtimeRoot: root,
-    socketParent: join(root, "sockets"),
+    socketParent: selfhostPrivateSocketRoot(root),
     binary: "/never-execute",
     graph: f.read,
     deployments: f.deployments,
@@ -423,6 +432,147 @@ test("Actor reservations release failed attempts and reuse bounded broker slots 
     expect(owner.isRestored()).toBe(false);
   } finally {
     await owner.close();
+    f.database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+/** Open the public Actor runtime below `dataRoot` and reserve one real broker pair. */
+async function reserveOneActorBrokerPair(dataRoot: string): Promise<readonly string[]> {
+  const f = fixture();
+  const owner = await openSelfhostActorPublicRuntime({
+    dataRoot,
+    runtimeRoot: dataRoot,
+    socketParent: selfhostPrivateSocketRoot(dataRoot),
+    binary: "/never-execute",
+    graph: f.read,
+    deployments: f.deployments,
+    providerPackRef: "selfhost",
+    providerInstallationRef: "local.primary",
+  });
+  try {
+    await f.deployments.create({
+      tenantId: scope.tenantId,
+      id: "deployment-holder",
+      resourceUid: f.target.metadata.uid,
+      offeringId: "worker-local",
+      providerPackRef: "selfhost",
+      providerInstallationRef: "local.primary",
+      nativeId: "selfhost-worker:worker:operation-1",
+      state: "active",
+      observed: {},
+      outputs: { scriptName: "worker" },
+    });
+    await owner.actorNamespace.registerNamespace(scope);
+    const actorBinding = {
+      name: "COUNTER",
+      tenantId: scope.tenantId,
+      namespaceResourceUid: scope.namespaceResourceUid,
+      workerResourceUid: f.target.metadata.uid,
+      className: "Counter",
+    };
+    const stored = await createSelfhostVersionBindingStore({
+      root: selfhostVersionBindingsRoot(dataRoot),
+    }).write("caller", "version-0", {
+      workerResourceUid: "uid-caller-worker",
+      workerVersionResourceUid: "uid-caller-version-0",
+      handlers: ["fetch"],
+      vars: [],
+      sensitiveVars: [],
+      serviceBindings: [],
+      actorBindings: [actorBinding],
+    });
+    if (!stored.eventToken) throw new Error("event token unavailable");
+    const lease = await owner.actorForwardLifecycle.reserve([
+      {
+        script: "caller",
+        workerResourceUid: "uid-caller-worker",
+        versionId: "version-0",
+        workerVersionResourceUid: "uid-caller-version-0",
+        bindings: [
+          {
+            publicName: actorBinding.name,
+            tenantId: actorBinding.tenantId,
+            namespaceResourceUid: actorBinding.namespaceResourceUid,
+            httpService: "__TAKOSERVER_ACTOR_HTTP_00000",
+            upgradeService: "__TAKOSERVER_ACTOR_UPGRADE_00000",
+            token: deriveSelfhostActorForwardToken({
+              eventToken: stored.eventToken,
+              workerVersionResourceUid: "uid-caller-version-0",
+              binding: actorBinding,
+            }),
+          },
+        ],
+      },
+    ]);
+    try {
+      return owner
+        .actorForwardSockets()
+        .flatMap((socket) => [socket.httpSocketPath, socket.upgradeSocketPath]);
+    } finally {
+      await lease.release();
+    }
+  } finally {
+    await owner.close();
+    f.database.close();
+  }
+}
+
+test("Actor brokers bind below a data root of exactly the published maximum and refuse one byte more", async () => {
+  const base = await mkdtempForSockets("apr-", SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES - 2);
+  try {
+    const exact = join(
+      base,
+      "d".repeat(SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES - Buffer.byteLength(base) - 1),
+    );
+    expect(Buffer.byteLength(exact)).toBe(SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES);
+    const paths = await reserveOneActorBrokerPair(exact);
+    expect(paths).toHaveLength(2);
+    for (const path of paths) {
+      expect(
+        path.startsWith(
+          `${selfhostPrivateSocketRoot(exact)}/${SELFHOST_SOCKET_DIRECTORY_PREFIX.actorBrokers}`,
+        ),
+      ).toBe(true);
+    }
+    expect(Math.max(...paths.map((path) => Buffer.byteLength(path)))).toBe(99);
+    await expect(reserveOneActorBrokerPair(`${exact}x`)).rejects.toThrow(
+      "Actor forward socket path unavailable",
+    );
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("the shared Actor socket parent must stay a private, owned, real directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-public-parent-"));
+  const f = fixture();
+  const open = (socketParent: string) =>
+    openSelfhostActorPublicRuntime({
+      dataRoot: root,
+      runtimeRoot: root,
+      socketParent,
+      binary: "/never-execute",
+      graph: f.read,
+      deployments: f.deployments,
+      providerPackRef: "selfhost",
+      providerInstallationRef: "local.primary",
+    });
+  try {
+    const shared = selfhostPrivateSocketRoot(root);
+    await mkdir(shared, { mode: 0o755 });
+    await chmod(shared, 0o755);
+    await expect(open(shared)).rejects.toThrow(
+      `Actor socket directory ${shared} must be a private (0700) real directory owned by this user`,
+    );
+    await chmod(shared, 0o700);
+    await symlink(shared, join(root, "alias"));
+    await expect(open(join(root, "alias"))).rejects.toThrow(
+      "must be a private (0700) real directory",
+    );
+    const owner = await open(shared);
+    await owner.close();
+  } finally {
     f.database.close();
     await rm(root, { recursive: true, force: true });
   }

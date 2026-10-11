@@ -1,9 +1,15 @@
 import { accessSync, constants, lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Clock, Sql } from "./ports.ts";
 import { createSelfhostActorExecutionHost } from "./selfhost-actor-execution-host.ts";
 import type { SelfhostEntryShutdown } from "./selfhost-entry-shutdown.ts";
+import {
+  selfhostActorSocketDiagnostic,
+  selfhostPrivateSocketRoot,
+  selfhostWorkflowSocketDiagnostic,
+} from "./selfhost-socket-layout.ts";
 import { createSelfhostV2ActorBoot } from "./selfhost-v2-actor-boot.ts";
 import type { createSelfhostV2WorkerComposition } from "./selfhost-v2-worker-composition.ts";
 import { createSelfhostV2WorkflowBoot } from "./selfhost-v2-workflow-boot.ts";
@@ -67,7 +73,35 @@ export function parseSelfhostV2RuntimeBoot(
   });
 }
 
-function privateDirectory(path: string): string {
+/**
+ * Refuse at boot, by name, a data root or TMPDIR too long for a selected
+ * capability's Unix sockets. Without this the boot succeeded and every
+ * publication that needed an Actor or Workflow listener stayed unconfirmed.
+ */
+export function assertSelfhostV2RuntimeSocketBudget(
+  selection: SelfhostV2RuntimeSelection,
+  dataRoot: string,
+  temporaryDirectory: string = tmpdir(),
+): void {
+  if (dataRoot === ":memory:") return;
+  const diagnostic =
+    (selection.actor
+      ? selfhostActorSocketDiagnostic({
+          dataRoot,
+          temporaryDirectory,
+          feature: `the v2 Actor runtime (${CONFIG_NAME}.actor)`,
+        })
+      : undefined) ??
+    (selection.workflow
+      ? selfhostWorkflowSocketDiagnostic({
+          dataRoot,
+          feature: `the v2 Workflow runtime (${CONFIG_NAME}.workflow)`,
+        })
+      : undefined);
+  if (diagnostic) throw new TypeError(diagnostic);
+}
+
+function privateDirectory(path: string, note = ""): string {
   mkdirSync(path, { recursive: true, mode: 0o700 });
   const stat = lstatSync(path);
   if (
@@ -77,7 +111,10 @@ function privateDirectory(path: string): string {
     (process.getuid?.() !== undefined && stat.uid !== process.getuid?.()) ||
     (stat.mode & 0o077) !== 0
   )
-    throw new TypeError("v2 runtime root must be an owned private real directory");
+    throw new TypeError(
+      `v2 runtime directory ${path} must be a real directory owned by this user with mode 0700` +
+        ` (it is mode ${(stat.mode & 0o7777).toString(8).padStart(4, "0")}, owner uid ${stat.uid})${note}`,
+    );
   return path;
 }
 
@@ -116,7 +153,16 @@ export function createSelfhostV2RuntimeBoot(options: {
   if (options.selection.workflow && !guard) {
     throw new TypeError("v2 Workflow guard is unavailable");
   }
+  assertSelfhostV2RuntimeSocketBudget(options.selection, resolve(options.dataRoot));
   const root = privateDirectory(join(resolve(options.dataRoot), "v2-runtime"));
+  // Listener directories are per incarnation and short-lived; they share the
+  // data root's one short private socket root instead of nesting under
+  // `v2-runtime`, which left room for only a 26-byte data root.
+  const socketRoot = () =>
+    privateDirectory(
+      selfhostPrivateSocketRoot(resolve(options.dataRoot)),
+      "; it holds only per-start listener directories and may be deleted while the Host is stopped",
+    );
   const actor = options.selection.actor
     ? (() => {
         const graph = createV2ActorNamespaceGraphAuthority({
@@ -140,7 +186,7 @@ export function createSelfhostV2RuntimeBoot(options: {
             targetKey: options.targetKey,
             namespaceGraph: graph,
             physical,
-            privateSocketDirectory: privateDirectory(join(root, "actor-private-sockets")),
+            privateSocketDirectory: socketRoot(),
           }),
         };
       })()
@@ -166,8 +212,8 @@ export function createSelfhostV2RuntimeBoot(options: {
           guardBinary: guard,
           workerdBinary: binary,
           maximumRegistrations: options.selection.workflow.maximumRegistrations,
-          privateSocketDirectory: privateDirectory(join(root, "workflow-private-sockets")),
-          temporaryRoot: privateDirectory(join(root, "workflow-temporary")),
+          privateSocketDirectory: socketRoot(),
+          temporaryRoot: socketRoot(),
           ...(address ? { dataPlaneAddress: () => address } : {}),
         })
       : undefined;

@@ -6,6 +6,7 @@ import { canonicalJson } from "../json.ts";
 import type { Sql } from "../ports.ts";
 import type { createSelfhostActorExecutionHost } from "../selfhost-actor-execution-host.ts";
 import { openSelfhostActorForwardBrokers } from "../selfhost-actor-forward-brokers.ts";
+import { SELFHOST_SOCKET_DIRECTORY_PREFIX } from "../selfhost-socket-layout.ts";
 import type {
   WorkerdActorForwardBinding,
   WorkerdActorForwardPublication,
@@ -292,7 +293,9 @@ export function createV2ActorForwardBoot(options: {
         const canonical = await realpath(privateRoot);
         if (canonical !== privateRoot)
           throw new Error("Actor private socket root is not canonical");
-        socketDirectory = await mkdtemp(join(privateRoot, "a-"));
+        socketDirectory = await mkdtemp(
+          join(privateRoot, SELFHOST_SOCKET_DIRECTORY_PREFIX.actorBrokers),
+        );
         return socketDirectory;
       };
 

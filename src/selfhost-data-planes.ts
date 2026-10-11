@@ -223,9 +223,9 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
     root: options.objectRoot,
     ...(options.clock ? { clock: options.clock } : {}),
   });
-  // Keep the public/output path supplied by the provider unchanged for legacy
-  // records, but use one absolute Host-owned path for filesystem operations.
-  // The Bun entry's default `.takoserver` root is relative.
+  // The Bun entry already passes an absolute canonical data root; resolving
+  // again keeps any other caller's relative root to one absolute
+  // Host-owned path for filesystem operations.
   const databasePath = (name: string): string => resolve(options.databasePath(name));
   let closeRequested = false;
   let closePromise: Promise<void> | undefined;

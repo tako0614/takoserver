@@ -2310,6 +2310,37 @@ function responseWithTrackedBody(response: Response, invocation: ActiveInvocatio
   });
 }
 
+/**
+ * One incarnation's private Service socket namespace.
+ *
+ * Linux's Unix-domain path limit excludes the ordinary (possibly very long)
+ * execution-copy root. This namespace is deterministic only within the exact
+ * owner lock; a pre-existing path is never adopted for a new incarnation.
+ *
+ * Only retirement removes it. A suspended or killed incarnation keeps it, owned
+ * by this user, until recovery reuses it: in a shared sticky `/tmp` a name this
+ * Host gave up could be created by another local user, and recovery would then
+ * refuse it as `ownership_uncertain`, failing the whole Host start. It lives
+ * outside the data root, so deleting a data root leaves it behind.
+ */
+export function workerdWorkerPrivateSocketDirectory(
+  canonicalOwnerRoot: string,
+  workerResourceUid: string,
+  operationId: string,
+): string {
+  return join(
+    "/tmp",
+    `tw-${createHash("sha256")
+      .update(canonicalOwnerRoot)
+      .update("\u0000")
+      .update(workerResourceUid)
+      .update("\u0000")
+      .update(operationId)
+      .digest("hex")
+      .slice(0, 20)}`,
+  );
+}
+
 export async function openWorkerdWorkerRuntimeOwner(
   inputOptions: OpenWorkerdWorkerRuntimeOwnerOptions,
 ): Promise<WorkerdWorkerRuntimeOwner> {
@@ -2441,21 +2472,8 @@ export async function openWorkerdWorkerRuntimeOwner(
   if (!ownerInfo?.isDirectory() || ownerInfo.isSymbolicLink() || (ownerInfo.mode & 0o077) !== 0)
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
 
-  // Linux's Unix-domain path limit excludes the ordinary (possibly very long)
-  // execution-copy root. This namespace is deterministic only within the exact
-  // owner lock; a pre-existing path is never adopted for a new incarnation.
   const privateSocketDirectoryFor = (operationId: string): string =>
-    join(
-      "/tmp",
-      `tw-${createHash("sha256")
-        .update(canonicalRoot)
-        .update("\u0000")
-        .update(options.workerResourceUid)
-        .update("\u0000")
-        .update(operationId)
-        .digest("hex")
-        .slice(0, 20)}`,
-    );
+    workerdWorkerPrivateSocketDirectory(canonicalRoot, options.workerResourceUid, operationId);
   const verifyPrivateSocketDirectory = async (path: string): Promise<void> => {
     const info = await lstat(path).catch(() => null);
     if (
