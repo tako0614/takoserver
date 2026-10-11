@@ -28,13 +28,15 @@ function descriptor(environment: "integration" | "rehearsal" | "production" = "i
     r2: { bucketName: `takoserver-objects-${environment}` },
     publicOrigin: `https://takoserver-api-${environment}.example.workers.dev`,
     signing: { currentKeyId: `takoserver-${environment}-2026-10` },
-    takoformV2: { config },
+    // The artifact Form config needs 0081, so it selects the fresh 0088 payload.
+    takoformV2: { config, storageLineage: "v2-0088" },
   };
 }
 
 test("v2 target preserves exact public JSON bytes and inventories only the cursor secret name", async () => {
   const selected = parseDeployTarget(descriptor(), "test target", "integration");
   expect(selected.takoformV2?.config).toBe(config);
+  expect(selected.takoformV2?.storageLineage).toBe("v2-0088");
   expect(
     (deploymentVariables(selected).vars as Record<string, string>).TAKOSERVER_TAKOFORM_V2_CONFIG,
   ).toBe(config);
@@ -61,6 +63,38 @@ test("v2 target preserves exact public JSON bytes and inventories only the curso
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("an artifact Form config on the historical 0075 lineage refuses to compose before upload", async () => {
+  const historical = parseDeployTarget(
+    { ...descriptor(), takoformV2: { config } },
+    "historical lineage target",
+    "integration",
+  );
+  await expect(assertTargetComposes("preflight", historical)).rejects.toThrow(
+    "configured v2 artifact Forms require the complete 0081 schema",
+  );
+  const withoutArtifacts = parseDeployTarget(
+    {
+      ...descriptor(),
+      takoformV2: {
+        config: JSON.stringify({
+          documentation: "https://docs.example.invalid/v2",
+          authenticationDocumentation: "https://docs.example.invalid/auth",
+        }),
+      },
+    },
+    "historical lineage target without artifact Forms",
+    "integration",
+  );
+  await expect(assertTargetComposes("preflight", withoutArtifacts)).resolves.toBeUndefined();
+  // A maintenance Host never starts Forms, so the 0081 rule does not apply to it.
+  const maintenance = parseDeployTarget(
+    { ...descriptor(), takoformV2: { config }, schemaMaintenanceMode: "pre-v2-0088-quiesced" },
+    "maintenance target",
+    "integration",
+  );
+  await expect(assertTargetComposes("preflight", maintenance)).resolves.toBeUndefined();
 });
 
 test("invalid, secret-bearing, or non-integration v2 descriptors refuse without echoing input", () => {
