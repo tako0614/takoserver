@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +21,7 @@ import {
   openWorkerdWorkerRuntimeOwner,
   workerdWorkerPrivateSocketDirectory,
 } from "../src/workerd-worker-runtime-owner.ts";
+import { removeOwnerPrivateSocketDirectories } from "./helpers/owner-private-sockets.ts";
 
 const WORKER_UID = "worker-graceful-suspend";
 const OPERATION_ID = "a5323426-8e22-4b4c-a362-f34ae3525f76";
@@ -251,8 +252,9 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
     );
     expect(existsSync(privateSockets)).toBe(true);
     await owner.suspend();
-    // Suspend removes the empty namespace; recovery recreates it.
-    expect(existsSync(privateSockets)).toBe(false);
+    // Suspend keeps the namespace, still this user's, as custody for recovery:
+    // a name given up in a sticky /tmp could be claimed by another local user.
+    expect(statSync(privateSockets).uid).toBe(process.getuid?.() ?? -1);
     expect(owner.health()).toBe("idle");
     expect(await linuxProcessLiveness(oldProcess)).toBe("stale");
     expect(await workerPortOwnership(port, undefined)).toBe("vacant");
@@ -354,11 +356,12 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
       }),
     ).toEqual({ kind: "unknown" });
     await owner.suspend();
-    expect(existsSync(privateSockets)).toBe(false);
+    expect(existsSync(privateSockets)).toBe(true);
   } finally {
     for (const child of children)
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     await Promise.all(children.map((child) => child.exited));
+    await removeOwnerPrivateSocketDirectories(root);
     await rm(root, { recursive: true, force: true });
   }
 });

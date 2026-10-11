@@ -2152,9 +2152,13 @@ function responseWithTrackedBody(response: Response, invocation: ActiveInvocatio
  *
  * Linux's Unix-domain path limit excludes the ordinary (possibly very long)
  * execution-copy root. This namespace is deterministic only within the exact
- * owner lock; a pre-existing path is never adopted for a new incarnation. It
- * lives outside the data root, so whatever retires or suspends the incarnation
- * must also remove it: deleting the data root does not.
+ * owner lock; a pre-existing path is never adopted for a new incarnation.
+ *
+ * Only retirement removes it. A suspended or killed incarnation keeps it, owned
+ * by this user, until recovery reuses it: in a shared sticky `/tmp` a name this
+ * Host gave up could be created by another local user, and recovery would then
+ * refuse it as `ownership_uncertain`, failing the whole Host start. It lives
+ * outside the data root, so deleting a data root leaves it behind.
  */
 export function workerdWorkerPrivateSocketDirectory(
   canonicalOwnerRoot: string,
@@ -2355,20 +2359,6 @@ export async function openWorkerdWorkerRuntimeOwner(
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
     return path;
-  };
-  // A graceful suspend has proved the child absent and closed this owner's
-  // brokers, so the namespace normally holds nothing. Remove it only while it
-  // is this owner's exact, verified, empty directory: recovery recreates it,
-  // and anything left inside (or a substituted path) stays for recovery to
-  // judge. This never fails a suspend.
-  const discardEmptyPrivateSockets = async (operationId: string): Promise<void> => {
-    const path = privateSocketDirectoryFor(operationId);
-    try {
-      await verifyPrivateSocketDirectory(path);
-      await rmdir(path);
-    } catch {
-      // Absent, replaced, or not empty: retained exactly as before.
-    }
   };
   const releasePrivateSockets = async (
     operationId: string,
@@ -6194,14 +6184,12 @@ export async function openWorkerdWorkerRuntimeOwner(
           await Promise.all([...handle.workflowLeases, ...handle.serviceBindingLeases]);
         }
         for (const handle of handles.values()) {
-          const stopped = handle.record.status === "active" || handle.record.status === "draining";
-          if (stopped) {
+          if (handle.record.status === "active" || handle.record.status === "draining") {
             await handle.group.suspendRetainingCustody();
           }
           await handle.serviceBindingForward?.close();
           await handle.actorForward?.close();
           await handle.workflowForward?.close();
-          if (stopped) await discardEmptyPrivateSockets(handle.record.operationId);
         }
         await persistPhysicalAbsences(true);
         await releaseOwnerLock(lockPath, directory, ownerLock);
