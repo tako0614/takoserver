@@ -333,19 +333,42 @@ that has been used is not upgraded in place, and no tool converts its records.
 Install the new version alongside it, on its own data root, and leave the
 v1.0.0 data root as it is.
 
-At startup the Bun Host reads the control database before any migration writes
-to it. It refuses a used v1.0.0 installation: one whose database records
-wallet ledger history (any funding, hold or capture), a v1 Takoform Resource,
-or a v1 provider Deployment that was not deleted. Every v1.0.0 installation
-that created a Resource has ledger history, because the release's only
-Offering, ObjectBucket (`storage.object.standard`, 500 minor units per
-bucket-month), holds and captures funds. The refusal names the data root and
-control database, says that the database is unchanged, links to this section,
-and exits with status 1. It stops before the Host creates keys, sockets or
-runtime probes or opens a listener. A v1.0.0 database that was only booted, or
-only signed in to with Organizations and API keys, and was never funded or used
-for a Resource, keeps migrating in place. The migration keeps its
-Organizations, owner memberships and API key records.
+At startup the Bun Host reads an existing control database through a read-only
+connection before it writes anything. It refuses a used v1.0.0 installation:
+one whose database records wallet ledger history (any funding, hold or
+capture), a v1 Takoform Resource, or a v1 provider Deployment that was not
+deleted. Every v1.0.0 installation that created a Resource has ledger history,
+because the release's only Offering, ObjectBucket (`storage.object.standard`,
+500 minor units per bucket-month), holds and captures funds. The refusal names
+the data root and control database, or only the database when `TAKOSERVER_DB`
+names one outside the root. It says that the database is unchanged, links to
+this section, and exits with status 1. It comes before the Host creates a
+missing data root, keys, sockets or runtime probes, opens the database for
+writing, or opens a listener. The check repeats under the first migration's
+write lock. It still assumes that every writer is stopped (step 1): a v1.0.0
+process that writes after that first migration commits is not caught.
+
+One exception to "unchanged": if v1.0.0 stopped in the middle of a transaction
+and left a hot rollback journal (`control.sqlite-journal`), the read-only
+connection cannot read the file. SQLite then rolls the journal back when the
+Host opens the database for writing, before the check, as v1.0.0 would on its
+next start. That restores the last committed state; the refusal follows.
+
+A v1.0.0 database that was only booted, or only signed in to with Organizations
+and API keys, and was never funded or used for a Resource, keeps migrating in
+place. The migration keeps its Organizations, owner memberships and API key
+records. After it, v1.0.0 refuses the file, because it records migrations
+v1.0.0 does not know. Take the cold copy of step 1 first if you may want to
+return to v1.0.0.
+
+A v1.0.0 Bun Host configured with `TAKOSERVER_D1_DATABASE_ID` kept its control
+state in that Cloudflare D1 database, not in a local file. This version's Bun
+entry rejects the variable before it opens local state, and this check does
+not cover D1. Do not apply this source's migrations to that database: with
+`wrangler d1 migrations apply`, a v1.0.0 history with a ledger row records 0016
+and then stops at 0017's `CHECK constraint failed: valid = 1`, which leaves a
+database v1.0.0 no longer accepts. Leave it as it is and start this version on
+a new local data root.
 
 To move to the new version:
 
@@ -354,11 +377,13 @@ To move to the new version:
    defaults to `.takoserver` relative to its working directory. Also copy
    `TAKOSERVER_DB` if it was set outside the root. Keep the copy until the
    v1.0.0 installation is retired.
-2. Prepare the new version in its own checkout, as in
-   [Update and code rollback](#update-and-code-rollback), and configure it as a
-   [first install](#first-install-and-first-use). Give it a new, empty
-   `TAKOSERVER_DATA_ROOT` and, if a separate database is used, a new
-   `TAKOSERVER_DB`. Never point it at the v1.0.0 root. Set the root
+2. Prepare the new version's source in its own checkout with the
+   `git worktree add` and `bun install` steps of
+   [Update and code rollback](#update-and-code-rollback). Use only those steps:
+   the rest of that section starts the new version on the existing data root.
+   Configure it as a [first install](#first-install-and-first-use). Give it a
+   new, empty `TAKOSERVER_DATA_ROOT` and, if a separate database is used, a new
+   `TAKOSERVER_DB`. Never point it at the v1.0.0 root or database. Set the root
    explicitly: both versions resolve the default `.takoserver` against the
    working directory, so a shared working directory selects the v1.0.0 root.
    To run both Hosts on one machine, give them distinct `PORT` and
@@ -419,14 +444,24 @@ self-host provider:
 - A source build from before this check (commit `4d0d0450`) changed only
   `control.sqlite` in the used root, recording 0016, and v1.0.0 then refused
   it.
-- `tests/v1-installation-upgrade-boundary.test.ts` repeats the refusal, the
-  unchanged files and the in-place migration with the committed v1.0.0
-  fixtures.
+- After a signed-in-only v1.0.0 database migrated in place, v1.0.0 refused it
+  as recording migrations it does not know.
+- On a scratch SQLite file left with a hot rollback journal, a read-only
+  connection failed with "attempt to write a readonly database" and left the
+  file unchanged; the next writable open rolled the journal back.
+- `wrangler d1 migrations apply --local` (wrangler 4.123.0) on a D1 database
+  holding the v1.0.0 migrations and one ledger row recorded 0016 and then
+  failed at 0017.
+- `tests/v1-installation-upgrade-boundary.test.ts` repeats, with the committed
+  v1.0.0 fixtures, the refusal through a read-only connection, the unchanged
+  files, an external `TAKOSERVER_DB` refused before a new data root is
+  created, a ledger write that lands just before the first migration lock, and
+  the in-place migration.
 
-Not measured: a v1.0.0 Host that used a Cloudflare account or Stripe funding;
-an external `TAKOSERVER_DB` (it goes through the same check); whether v1.0.0
-sessions and API keys still authenticate after an unused database migrates in
-place; and copying object data to a v2 ObjectBucket.
+Not measured: a v1.0.0 Host that used a Cloudflare account, Stripe funding or a
+remote D1 database; whether v1.0.0 sessions and API keys still authenticate
+after an unused database migrates in place; and copying object data to a v2
+ObjectBucket.
 
 ## Backup and restore preparation
 

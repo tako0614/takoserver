@@ -995,11 +995,12 @@ translator. Independent login, Console and standard-service APIs are separate
 and are not removed because their path contains `v1`.
 
 A Bun self-host installation of the published v1.0.0 release is not upgraded in
-place once it has been used. The Bun Host reads the control database before any
-migration writes to it. It refuses a database that records wallet ledger
-history, a v1 Takoform Resource or a v1 provider Deployment that was not
-deleted, and it leaves that database unchanged. An unused v1.0.0 database keeps
-migrating. The supported route is a fresh install alongside:
+place once it has been used. The Bun Host reads an existing control database
+through a read-only connection before it writes anything, including a missing
+data root. It refuses a database that records wallet ledger history, a v1
+Takoform Resource or a v1 provider Deployment that was not deleted, and it
+leaves that database unchanged. An unused v1.0.0 database keeps migrating. The
+supported route is a fresh install alongside:
 
 - make a cold copy of the v1.0.0 data root and otherwise leave it intact;
 - start this version on a new, empty data root;

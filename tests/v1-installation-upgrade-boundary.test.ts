@@ -11,8 +11,8 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MIGRATIONS } from "../src/db-schema.ts";
@@ -148,6 +148,11 @@ describe("a used v1.0.0 installation", () => {
         ).installation,
       ).toEqual(USED);
       database.close();
+      // A read-only connection, which SQLite refuses any write through, is
+      // enough to reach the same refusal.
+      const readOnly = new Database(path, { readonly: true });
+      expect(refusalOf(() => migrateSqlite(readOnly)).installation).toEqual(USED);
+      readOnly.close();
 
       expect(sha256(path)).toBe(before);
       expect(existsSync(`${path}-journal`)).toBe(false);
@@ -169,12 +174,96 @@ describe("a used v1.0.0 installation", () => {
       database.close();
       expect(refusal.message).toBe(
         [
-          `Takoserver will not start on data root ${root} (control database ${path}): it was created by the Takoserver v1.0.0 release (recorded migrations end at 0015_takoform_resource_relations.sql) and holds v1 state: 3 wallet ledger entries, 1 v1 Takoform Resource, 1 v1 provider Deployment.`,
-          "This build serves Takoform Host API v2 and does not upgrade a used v1 installation in place. It stopped before writing anything; the database is unchanged.",
+          `Takoserver will not start on data root ${root} (control database ${path}): it records the migrations of the Takoserver v1.0.0 release (ending at 0015_takoform_resource_relations.sql) and holds v1 state: 3 wallet ledger entries, 1 v1 Takoform Resource, 1 v1 provider Deployment.`,
+          "This build serves Takoform Host API v2 and does not upgrade a used v1 installation in place. It stopped before writing to the database; the database is unchanged.",
           "Leave this data root as it is and start this build on a new, empty TAKOSERVER_DATA_ROOT (and a new TAKOSERVER_DB, if one is set), then recreate the Resources through the v2 API. The v1.0.0 release can still run on this data root.",
           `See "Upgrading from v1.0.0" in docs/self-host-operations.md: ${DOCUMENTATION}`,
         ].join("\n"),
       );
+    });
+  });
+
+  test("an external TAKOSERVER_DB is named as that file, not as the data root", async () => {
+    await withRoot((root) => {
+      const path = join(root, "v1", "control.sqlite");
+      mkdirSync(join(root, "v1"));
+      writeV1Database(path, "used");
+      const database = new Database(path);
+      const refusal = refusalOf(() =>
+        migrateSqlite(database, {
+          installation: { dataRoot: join(root, "new"), databasePath: path, externalDatabase: true },
+        }),
+      );
+      database.close();
+      expect(refusal.message.split("\n")).toEqual([
+        `Takoserver will not start on control database ${path} (TAKOSERVER_DB): it records the migrations of the Takoserver v1.0.0 release (ending at 0015_takoform_resource_relations.sql) and holds v1 state: 3 wallet ledger entries, 1 v1 Takoform Resource, 1 v1 provider Deployment.`,
+        "This build serves Takoform Host API v2 and does not upgrade a used v1 installation in place. It stopped before writing to the database; the database is unchanged.",
+        `Leave ${path} as it is: point TAKOSERVER_DB at a new file or unset it, use a data root that v1.0.0 did not use, then recreate the Resources through the v2 API. The v1.0.0 release can still run on this database.`,
+        `See "Upgrading from v1.0.0" in docs/self-host-operations.md: ${DOCUMENTATION}`,
+      ]);
+      expect(refusal.message).not.toContain(join(root, "new"));
+    });
+  });
+
+  test("a history from before the release is not called v1.0.0's, nor said to still run it", () => {
+    const database = new Database(":memory:");
+    database.exec(
+      "CREATE TABLE applied_migrations (name TEXT PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL)",
+    );
+    for (const migration of MIGRATIONS.slice(0, 6)) {
+      database.exec(migration.sql);
+      database
+        .query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, 'then')")
+        .run(migration.name);
+    }
+    database.exec(
+      "INSERT INTO ledger (id, org_id, type, ref, settled_delta, held_delta, created_at) VALUES ('led_early', 'org_early', 'funding', 'early', 100, 0, 'then')",
+    );
+    const refusal = refusalOf(() => migrateSqlite(database));
+    expect(refusal.installation.v1ReleaseHistory).toBe(false);
+    expect(refusal.message).toContain(
+      "it records only migrations from before the Takoserver v1.0.0 release (ending at 0006_resource_attachments.sql)",
+    );
+    expect(refusal.message).not.toContain("can still run");
+    database.close();
+  });
+
+  test("a v1 write that lands before the first migration lock is refused under that lock", async () => {
+    await withRoot((root) => {
+      const path = join(root, "control.sqlite");
+      // Unused when first read; a v1.0.0 still running funds it just before
+      // the migrator takes its write lock.
+      writeV1Database(path, "empty");
+      const database = new Database(path);
+      let injected = false;
+      const racing: MigratableDatabase = {
+        exec(sql: string) {
+          if (!injected && sql.trim() === "BEGIN IMMEDIATE") {
+            injected = true;
+            const writer = new Database(path);
+            writer.exec(
+              "INSERT INTO ledger (id, org_id, type, ref, settled_delta, held_delta, created_at) VALUES ('led_late', 'org_late', 'funding', 'late', 100, 0, 'now')",
+            );
+            writer.close();
+          }
+          return database.exec(sql);
+        },
+        query(sql: string) {
+          return database.query(sql);
+        },
+      };
+      const refusal = refusalOf(() => migrateSqlite(racing));
+      expect(injected).toBe(true);
+      expect(refusal.installation).toEqual({
+        ...USED,
+        ledgerEntries: 1,
+        v1Resources: 0,
+        v1ProviderDeployments: 0,
+      });
+      // Nothing was migrated over the late write: 0016 never ran.
+      expect(recordedMigrations(database)).toEqual(V1_RELEASE_MIGRATIONS);
+      expect(count(database, "sqlite_schema")).toBe(88);
+      database.close();
     });
   });
 
@@ -358,6 +447,11 @@ describe("the Bun entry on a v1.0.0 data root", () => {
       await mkdir(dataRoot, { mode: 0o755 });
       const databasePath = join(dataRoot, "control.sqlite");
       writeV1Database(databasePath, "used");
+      // The rest of a v1.0.0 root, as placeholders the Host must not touch.
+      await writeFile(join(dataRoot, "operator-key.jwk"), "placeholder\n", { mode: 0o600 });
+      await writeFile(join(dataRoot, "signing-key.jwk"), "placeholder\n", { mode: 0o600 });
+      await mkdir(join(dataRoot, "objects"), { mode: 0o755 });
+      await writeFile(join(dataRoot, "objects", "placeholder"), "object bytes\n");
       const before = snapshot(dataRoot);
 
       const child = Bun.spawn([process.execPath, "--no-env-file", ENTRY], {
@@ -377,6 +471,37 @@ describe("the Bun entry on a v1.0.0 data root", () => {
       expect(await new Response(child.stdout as ReadableStream).text()).toBe("");
       // No key, socket directory, runtime probe or journal was created either.
       expect(snapshot(dataRoot)).toEqual(before);
+    });
+  }, 30_000);
+
+  test("refuses a used v1.0.0 TAKOSERVER_DB before it creates the new data root", async () => {
+    await withRoot(async (home) => {
+      const v1 = join(home, "v1");
+      await mkdir(v1, { mode: 0o755 });
+      const databasePath = join(v1, "control.sqlite");
+      writeV1Database(databasePath, "used");
+      const before = snapshot(v1);
+      const dataRoot = join(home, "new", "root");
+
+      const child = Bun.spawn([process.execPath, "--no-env-file", ENTRY], {
+        cwd: home,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...environment(home, await unusedPort(), dataRoot), TAKOSERVER_DB: databasePath },
+      });
+      expect(await exited(child)).toBe(1);
+      expect(await new Response(child.stderr as ReadableStream).text()).toBe(
+        `${
+          new UsedV1InstallationError(USED, {
+            installation: { dataRoot, databasePath, externalDatabase: true },
+          }).message
+        }\n`,
+      );
+      // Not "created <root> (mode 0700)": the refusal came first.
+      expect(await new Response(child.stdout as ReadableStream).text()).toBe("");
+      expect(existsSync(join(home, "new"))).toBe(false);
+      expect(snapshot(v1)).toEqual(before);
     });
   }, 30_000);
 

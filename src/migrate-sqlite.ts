@@ -42,6 +42,11 @@ export interface MigrationOptions {
   readonly installation?: {
     readonly dataRoot: string;
     readonly databasePath: string;
+    /**
+     * True when `TAKOSERVER_DB` names this database instead of the data root's
+     * own `control.sqlite`; the refusal then names that file, not the root.
+     */
+    readonly externalDatabase?: boolean;
   };
 }
 
@@ -60,7 +65,11 @@ const WALLET_CREDIT_LOTS_MIGRATION = "0017_wallet_credit_lots.sql";
 export interface UsedV1Installation {
   /** The newest recorded migration, at or before 0016. */
   readonly lastRecordedMigration: string;
-  /** Whether the recorded history includes everything v1.0.0 applies. */
+  /**
+   * Whether the recorded history includes every migration v1.0.0 applies.
+   * Without it the file predates the release, and v1.0.0 would first apply
+   * its own remaining migrations to it.
+   */
   readonly v1ReleaseHistory: boolean;
   /**
    * Migrations after v1.0.0's last one that an earlier start of a newer,
@@ -89,6 +98,19 @@ export class UsedV1InstallationError extends Error {
     this.name = "UsedV1InstallationError";
     this.installation = installation;
   }
+}
+
+/**
+ * Throws `UsedV1InstallationError` when the database is a used v1
+ * installation. It only reads, so a read-only handle is enough; the Bun entry
+ * calls it that way before it creates a missing data root.
+ */
+export function refuseUsedV1Installation(
+  database: MigratableDatabase,
+  options: MigrationOptions = {},
+): void {
+  const usedV1 = inspectUsedV1Installation(database);
+  if (usedV1) throw new UsedV1InstallationError(usedV1, options);
 }
 
 export function migrateSqlite(
@@ -143,8 +165,7 @@ function migrateExistingDatabase(
 ): MigrationReport {
   // Reads only, and first: a used v1 installation is refused while the file is
   // still byte-for-byte what v1.0.0 wrote.
-  const usedV1 = inspectUsedV1Installation(database);
-  if (usedV1) throw new UsedV1InstallationError(usedV1, options);
+  refuseUsedV1Installation(database, options);
 
   // Existing, partial, and otherwise non-empty databases retain the historic
   // per-migration checkpoint behavior.
@@ -171,11 +192,17 @@ function migrateExistingDatabase(
     // two of them.
     database.exec("BEGIN IMMEDIATE");
     try {
+      // The check above held no lock. Repeat it under the first write lock so
+      // a v1 write that landed in between is refused, not migrated over. Once
+      // that migration commits, the file is no longer what v1.0.0 wrote; a v1
+      // writer still running after it is outside the stopped-writers premise.
+      if (applied.length === 0) refuseUsedV1Installation(database, options);
       executeStatements(database, migration.sql);
       recordMigration(database, migration.name);
       database.exec("COMMIT");
     } catch (error) {
       database.exec("ROLLBACK");
+      if (error instanceof UsedV1InstallationError) throw error;
       throw new Error(`migration ${migration.name} failed: ${String(error)}`);
     }
     applied.push(migration.name);
@@ -239,12 +266,16 @@ function inspectUsedV1Installation(database: MigratableDatabase): UsedV1Installa
 
 /** The one operator-facing explanation of a used v1 installation refusal. */
 function describeUsedV1Installation(found: UsedV1Installation, options: MigrationOptions): string {
-  const files = options.installation
-    ? `data root ${options.installation.dataRoot} (control database ${options.installation.databasePath})`
-    : "this control database";
-  const origin = found.v1ReleaseHistory
-    ? "was created by the Takoserver v1.0.0 release"
-    : "was created by a Takoserver build earlier than v1.0.0";
+  const installation = options.installation;
+  const external = installation?.externalDatabase === true;
+  const files = !installation
+    ? "this control database"
+    : external
+      ? `control database ${installation.databasePath} (TAKOSERVER_DB)`
+      : `data root ${installation.dataRoot} (control database ${installation.databasePath})`;
+  const history = found.v1ReleaseHistory
+    ? `it records the migrations of the Takoserver v1.0.0 release (ending at ${found.lastRecordedMigration})`
+    : `it records only migrations from before the Takoserver v1.0.0 release (ending at ${found.lastRecordedMigration})`;
   const state = [
     quantity(found.ledgerEntries, "wallet ledger entry", "wallet ledger entries"),
     quantity(found.v1Resources, "v1 Takoform Resource", "v1 Takoform Resources"),
@@ -252,14 +283,21 @@ function describeUsedV1Installation(found: UsedV1Installation, options: Migratio
   ]
     .filter((entry) => entry !== undefined)
     .join(", ");
+  const subject = installation && !external ? "this data root" : "this database";
+  const keep =
+    installation && external
+      ? `Leave ${installation.databasePath} as it is: point TAKOSERVER_DB at a new file or unset it, use a data root that v1.0.0 did not use, then recreate the Resources through the v2 API.`
+      : `Leave ${subject} as it is and start this build on a new, empty TAKOSERVER_DATA_ROOT (and a new TAKOSERVER_DB, if one is set), then recreate the Resources through the v2 API.`;
   const oldRelease =
     found.recordedAfterV1Release.length > 0
-      ? `An earlier start of a newer build already recorded ${found.recordedAfterV1Release.join(", ")} here, so v1.0.0 refuses this file too; run v1.0.0 only on a copy taken before that start.`
-      : "The v1.0.0 release can still run on this data root.";
+      ? ` An earlier start of a newer build already recorded ${found.recordedAfterV1Release.join(", ")} here, so v1.0.0 refuses this file too; run v1.0.0 only on a copy taken before that start.`
+      : found.v1ReleaseHistory
+        ? ` The v1.0.0 release can still run on ${subject}.`
+        : "";
   return [
-    `Takoserver will not start on ${files}: it ${origin} (recorded migrations end at ${found.lastRecordedMigration}) and holds v1 state: ${state}.`,
-    "This build serves Takoform Host API v2 and does not upgrade a used v1 installation in place. It stopped before writing anything; the database is unchanged.",
-    `Leave this data root as it is and start this build on a new, empty TAKOSERVER_DATA_ROOT (and a new TAKOSERVER_DB, if one is set), then recreate the Resources through the v2 API. ${oldRelease}`,
+    `Takoserver will not start on ${files}: ${history} and holds v1 state: ${state}.`,
+    "This build serves Takoform Host API v2 and does not upgrade a used v1 installation in place. It stopped before writing to the database; the database is unchanged.",
+    `${keep}${oldRelease}`,
     `See "Upgrading from v1.0.0" in docs/self-host-operations.md: ${UPGRADING_FROM_V1_DOCUMENTATION}`,
   ].join("\n");
 }
