@@ -1290,6 +1290,117 @@ test("Host start refuses only never-authorized reservations and returns their me
   }
 });
 
+test("an expired registered batch is refused in the write that refunds its lease", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "expired-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "expired-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "expired-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "expired-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "expired-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid, { maxBatchSize: 1, maxConcurrency: 1 }),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    const queueId = v2QueueId(queue.resourceUid);
+    await custody.admit(
+      { queueId, messageRetentionSeconds: 3600, deliveryDelaySeconds: 0 },
+      { messageId: "expired-message", body: new Uint8Array([7]) },
+    );
+    const delivery = createV2QueueDelivery({ sql: f.sql, custody, capability: f.capability });
+    const scope = { consumerUid: consumer.resourceUid, principal, space, targetKey };
+    // A real selection supplies the exact accepted row values; give it back.
+    const template = await delivery.claimRegisteredBatch(scope);
+    if (template.kind !== "ready") throw new Error("template batch not registered");
+    expect(await cancelV2QueueBatchBeforeSend(f.sql, template)).toBe(true);
+    // Write a reservation whose 120 seconds end one second from now, so its
+    // database-time expiry is real rather than simulated.
+    const dbNow = `(CAST(strftime('%s', 'now') AS INTEGER) * 1000
+      + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))`;
+    const expiring = { batchId: "expiring-batch", reservationToken: "expiring-reservation" };
+    await f.sql.run(
+      `INSERT INTO queue_v2_batch_executions
+        (batch_id,reservation_token,queue_id,consumer_uid,consumer_generation,worker_uid,
+         consumer_spec_json,serving_source_operation_id,selected_versions_json,principal,space,
+         target_key,max_concurrency,reserved_at_ms,reservation_until_ms,state)
+       SELECT ?,?,queue_id,consumer_uid,consumer_generation,worker_uid,consumer_spec_json,
+              serving_source_operation_id,selected_versions_json,principal,space,target_key,
+              max_concurrency,${dbNow} - 119000,${dbNow} + 1000,'reserved'
+       FROM queue_v2_batch_executions WHERE batch_id = ?`,
+      [expiring.batchId, expiring.reservationToken, template.batchId],
+    );
+    const claims = await custody.claim({
+      queueId,
+      consumerId: consumer.resourceUid,
+      generation: template.generation,
+      limit: 1,
+      v2Attachment: { principal, space, targetKey },
+      v2Reservation: expiring,
+    });
+    expect(claims).toHaveLength(1);
+    await custody.registerSettlementBatch(expiring.batchId, claims, {
+      reservationToken: expiring.reservationToken,
+    });
+    const state = async () =>
+      await f.sql.query("SELECT state FROM queue_v2_batch_executions WHERE batch_id = ?", [
+        expiring.batchId,
+      ]);
+    expect(await state()).toEqual([{ state: "registered" }]);
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const [expired] = await f.sql.query(
+        `SELECT reservation_until_ms <= ${dbNow} AS expired
+         FROM queue_v2_batch_executions WHERE batch_id = ?`,
+        [expiring.batchId],
+      );
+      if (expired?.expired === 1) break;
+      if (Date.now() > deadline) throw new Error("reservation did not expire");
+      await Bun.sleep(50);
+    }
+    await f.sql.run("UPDATE selfhost_queue_messages SET lease_expires_at_ms = ?", [Date.now() - 1]);
+    // The reap runs before this claim selects anything; it refunds the lease
+    // of the never-sent batch and refuses that batch in the same write.
+    expect(
+      await custody.claim({
+        queueId,
+        consumerId: consumer.resourceUid,
+        generation: template.generation,
+        limit: 1,
+        v2Attachment: { principal, space, targetKey },
+      }),
+    ).toEqual([]);
+    expect(await state()).toEqual([{ state: "pre_effect_refused" }]);
+    expect(await f.sql.query("SELECT deliveries,lease_token FROM selfhost_queue_messages")).toEqual(
+      [{ deliveries: 0, lease_token: null }],
+    );
+    expect(
+      await authorizeV2QueueBatchSend(f.sql, {
+        ...expiring,
+        queueUid: queue.resourceUid,
+        consumerUid: consumer.resourceUid,
+        generation: template.generation,
+        workerUid: worker.resourceUid,
+        servingSourceOperationId: deployment.id,
+        workerVersionUid: version.resourceUid,
+        workerVersionGeneration: 1,
+        incarnationOperationId: "expired-incarnation",
+      }),
+    ).toBe("unknown");
+  } finally {
+    f.database.close();
+  }
+});
+
 test("a batch selection that throws is reported instead of vanishing into unknown", async () => {
   const f = fixture();
   let composition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;

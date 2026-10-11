@@ -806,6 +806,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
     );
     if (rows.length === 0) return false;
     const statements: SqlStatement[] = [];
+    const refusedLeases = new Set<string>();
     for (const row of rows) {
       const id = messageId(row.message_id);
       const enqueuedAt = positiveStoredInteger(row.enqueued_at_ms);
@@ -870,6 +871,21 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         // Before this DB-time deadline, a registered sender could still win
         // authorization. Never refund an attempt that might have been sent.
         if (row.execution_state !== "pre_effect_refused" && until > millis) continue;
+        if (row.execution_state !== "pre_effect_refused" && !refusedLeases.has(leaseToken)) {
+          // Refuse the expired execution in the same transaction as the
+          // refund. Otherwise a DB clock that steps back would reopen its send
+          // authorization for messages that were already given back.
+          refusedLeases.add(leaseToken);
+          statements.push({
+            sql: `UPDATE queue_v2_batch_executions SET state = 'pre_effect_refused'
+               WHERE queue_id = ? AND consumer_uid = ? AND consumer_generation = ?
+                 AND lease_token = ? AND state IN ('reserved','registered')
+                 AND reservation_until_ms <=
+                   (CAST(strftime('%s', 'now') AS INTEGER) * 1000
+                    + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))`,
+            params: [identity.queueId, identity.consumerId, identity.generation, leaseToken],
+          });
+        }
         statements.push({
           sql: `UPDATE selfhost_queue_messages
              SET visible_at_ms = ?,
