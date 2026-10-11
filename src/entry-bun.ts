@@ -226,11 +226,6 @@ if (dataRoot !== (configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT)) {
 // An explicitly selected v2 capability whose sockets cannot fit below this root
 // is a configuration error now, not an Operation that never confirms later.
 if (v2RuntimeSelection) assertSelfhostV2RuntimeSocketBudget(v2RuntimeSelection, dataRoot);
-// Keys, tenant data and sockets live here: a new root starts private, while an
-// existing one keeps the permissions its operator gave it.
-if (createSelfhostDataRootIfAbsent(dataRoot)) {
-  process.stdout.write(`created ${dataRoot} (mode 0700)\n`);
-}
 const v2WorkerTargetKey = "selfhost-v2-worker-primary";
 const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
   ? Number(process.env.TAKOSERVER_WORKERD_PORT)
@@ -328,6 +323,13 @@ const providerMode = resolveStandaloneProviderMode({
   suffixes: process.env.TAKOSERVER_SUFFIXES,
   workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
 });
+const currentCandidates = selectPublicHostFormSource(process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE);
+// Configuration is validated above without touching the filesystem. Keys,
+// tenant data and sockets live here: a new root starts private, while an
+// existing one keeps the permissions its operator gave it.
+if (createSelfhostDataRootIfAbsent(dataRoot)) {
+  process.stdout.write(`created ${dataRoot} (mode 0700)\n`);
+}
 const v2PrivatePlaneBoot = parseSelfhostV2PrivatePlaneBoot(
   process.env.TAKOSERVER_V2_WORKER_PRIVATE_PLANES,
   {
@@ -346,7 +348,6 @@ const v2PrivatePlaneBoot = parseSelfhostV2PrivatePlaneBoot(
 if (v2PrivatePlaneBoot && providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN) {
   throw new Error("v2 Worker private planes are unavailable in retired ObjectBucket drain mode");
 }
-const currentCandidates = selectPublicHostFormSource(process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE);
 const selfhostContainer = createSelfhostContainerBootstrap({
   environment: process.env,
   dataRoot,
