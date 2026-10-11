@@ -85,6 +85,10 @@ import {
   discardSelfhostReadinessProbeBody,
   type SelfhostStartupRestoreOutcome,
 } from "./selfhost-health.ts";
+import {
+  createSelfhostBackgroundPassRecorder,
+  createSelfhostBacklogObserver,
+} from "./selfhost-health-signals.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
 import {
@@ -1326,6 +1330,10 @@ if (selfhostContainerEndpointHttps) {
   );
 }
 
+// Every background pass below reports through this recorder as well as the
+// log line, so a pass that fails on every tick is visible to the probe.
+const backgroundPasses = createSelfhostBackgroundPassRecorder();
+
 /**
  * Bring the runtime back for the Workers this machine already published.
  *
@@ -1356,6 +1364,10 @@ const selfhostHealth = createSelfhostHealthHandler({
   ...(v2WorkerComposition
     ? { v2Workers: { observe: () => v2WorkerComposition.observeOwnerHealth() } }
     : {}),
+  // Stuck Operations and sent-but-unretired Queue batches answered 200 with
+  // nothing to show for them; they now degrade the response with counts.
+  backlog: createSelfhostBacklogObserver({ sql, now: clock }),
+  backgroundPasses,
 });
 const takoformV2Ingress = createSelfhostTakoformV2Ingress({
   publicOrigin,
@@ -1490,9 +1502,26 @@ const reportBackgroundFailure = (name: string, cause?: unknown): void => {
   );
 };
 
+/**
+ * The shutdown owner's pass API with each body observed by the recorder. Only
+ * the body is wrapped: single-flight per name, the stop fence and failure
+ * reporting stay exactly the shutdown owner's.
+ */
+const observedPasses = {
+  startInterval: (
+    name: string,
+    milliseconds: number,
+    run: () => void | Promise<void>,
+    onFailure: (name: string, cause?: unknown) => void,
+  ) =>
+    entryShutdown.startInterval(name, milliseconds, backgroundPasses.observe(name, run), onFailure),
+  runPass: (name: string, run: () => void | Promise<void>) =>
+    entryShutdown.runPass(name, backgroundPasses.observe(name, run)),
+};
+
 // Background settlement. The shutdown owner retains each timer and each pass
 // promise, so no new work starts past the signal fence and accepted work drains.
-entryShutdown.startInterval(
+observedPasses.startInterval(
   "settlement",
   30_000,
   async () => {
@@ -1506,7 +1535,7 @@ entryShutdown.startInterval(
   },
   reportBackgroundFailure,
 );
-entryShutdown.startInterval(
+observedPasses.startInterval(
   "takoform-v2",
   1_000,
   async () => {
@@ -1514,22 +1543,22 @@ entryShutdown.startInterval(
   },
   reportBackgroundFailure,
 );
-startSelfhostV2ScheduledDuePass(entryShutdown, v2WorkerComposition, reportBackgroundFailure);
+startSelfhostV2ScheduledDuePass(observedPasses, v2WorkerComposition, reportBackgroundFailure);
 if (v2RuntimeBoot?.v2Workflow) {
-  startSelfhostV2WorkflowDuePass(entryShutdown, v2WorkerComposition, reportBackgroundFailure);
+  startSelfhostV2WorkflowDuePass(observedPasses, v2WorkerComposition, reportBackgroundFailure);
 }
-entryShutdown.startInterval(
+observedPasses.startInterval(
   "queue-wake",
   1_000,
   () => {
     // Share only the wake timer. A blocked recovery scan must not hold the
     // other delivery lane; both named passes remain owned by shutdown.
-    void entryShutdown
+    void observedPasses
       .runPass("takoform-v2-queue-delivery", async () => {
         await v2QueueScheduler?.tick();
       })
       .catch((cause: unknown) => reportBackgroundFailure("takoform-v2-queue-delivery", cause));
-    void entryShutdown
+    void observedPasses
       .runPass("queue-pump", async () => {
         await queuePump?.tick();
       })
@@ -1537,7 +1566,7 @@ entryShutdown.startInterval(
   },
   reportBackgroundFailure,
 );
-entryShutdown.startInterval(
+observedPasses.startInterval(
   "worker-scheduler",
   5_000,
   async () => {
