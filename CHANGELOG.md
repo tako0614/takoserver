@@ -219,7 +219,32 @@ before use.
 - Native test lanes: socket roots stay within the Unix path limit under a long
   `TMPDIR`, and native fixtures follow the Cron, render-guard and dispatch
   changes (tests only). (#292)
-<!-- pending: #293 #294 #295 - add their Fixed entries after they merge -->
+- A Host killed while it was writing its runtime owner state or an execution
+  group's retirement receipt left the private temporary file behind, and every
+  later boot refused the Worker with `ownership_uncertain` until an operator
+  removed the file by hand. The successor now discards that interrupted write
+  under the lock it took from a proven-dead owner, and only for an exactly
+  named, owner-only, singly linked regular file; anything else is still
+  refused. (#296)
+- Module inspection ran `chmod 0700` on the system temporary directory. A
+  dedicated service user (the documented install) got `EPERM`, so every
+  WorkerVersion stayed `reconciling` and nothing was logged; as root it
+  changed `/tmp` for every user on the machine. The system directory is now
+  only the parent of a private directory. (#293)
+- Boot printed a note advising `TAKOSERVER_WORKERD_PORT=443` next to the v2
+  listener, where startup refuses that setting. (#293)
+- A WorkerEndpoint requested before its Worker's Deployment deadlocked: the
+  Endpoint stayed `reconciling`, a later Deployment waited behind it and
+  DELETE of either returned `409 resource_busy`. It is now refused at
+  acceptance with `409 dependency_conflict` whose `detail` names the missing
+  Deployment, and nothing is stored. One that an earlier Host accepted settles
+  `failed` (`worker_deployment_missing`) after the upgrade, and the Deployment
+  behind it publishes. (#295)
+- Legacy `edge.sql` facade calls from a self-host Worker were refused with
+  `backend_unavailable`: the generated wrapper streams the SQL body, and the
+  self-host data plane required `Content-Length`. The SQL route now also
+  accepts exactly `Transfer-Encoding: chunked` under the same 40 MiB ceiling;
+  KV and Queue still need a declared length that matches. (#294)
 
 ### Security
 
@@ -276,18 +301,21 @@ before use.
 - **Tenants are separated by V8 isolates only.** Every workerd child runs as
   the Host's user and inherits its environment; do not host mutually hostile
   tenants on one machine.
-- **Intermittent test.** `tests/workerd-worker-runtime-owner-crash-recovery.test.ts`
-  ("a Host killed while an in-process candidate failure is retiring still
-  boots and settles it") failed in two of five consecutive completed main CI
-  runs on 2026-10-11.
-- **Native lanes are not all green.** After #292, the remaining native
-  failures come from outside the tests: the self-host data plane refuses SQL
-  facade calls (four `selfhost-workerd-e2e` cases and
-  `workerd-native-workflow-data-bindings`), `selfhost-actor-execution-host` is
-  stale against an Actor contract change, and the `workerd-native-workflow-facets`
-  qualification probe is documented to fail. A Queue batch that was already
-  sent when its Host died still waits up to 120 seconds for its message lease.
-<!-- pending: #293 #294 #295 - update these limitations after they merge -->
+- **One native lane is a documented failure.** The
+  `workerd-native-workflow-facets` qualification probe is expected to fail.
+  A Queue batch that was already sent when its Host died still waits up to
+  120 seconds for its message lease.
+- **One Deployment per Worker.** A second WorkerDeployment for a Worker that
+  already has one is still accepted, then stays `reconciling`
+  (`publication_conflict`) and blocks that Worker's later publications, and
+  DELETE of it is refused. Change a Worker by updating its Deployment. A
+  second WorkerEndpoint that an earlier Host accepted has the same limit; new
+  ones are refused at acceptance.
+- **Actor rotation waits for the carrier to be idle.** A graph change that
+  arrives while an Actor carrier is serving a request, a stream, an admitted
+  alarm or an accepted socket is refused with a retryable answer, and a
+  long-lived socket delays the rotation until it ends
+  ([Takoform v2](docs/takoform-v2.md)).
 - **Conformance is a baseline.** The vendored v2 probe comes from an untagged
   Takoform commit (`ba0bf1c`); a pass covers only its mandatory sequence, not
   restarts, faults, concurrency or cross-principal authorization.
