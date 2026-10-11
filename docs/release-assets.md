@@ -71,7 +71,7 @@ bazel     Bazelisk 1.29.0, source-pinned Bazel 9.2.0
 
 Every build input is unchanged between `8ca90e2f` and the release commit; the
 runbook checks this with
-`git diff --exit-code 8ca90e2f <release commit> -- workerd scripts/build-workerd.ts src/workerd-artifact.ts scripts/workerd-toolchain-prerequisites.sh`
+`git diff --exit-code 8ca90e2f <release commit> -- workerd ':(exclude)workerd/notices' scripts/build-workerd.ts src/workerd-artifact.ts scripts/workerd-toolchain-prerequisites.sh`
 (empty on 2026-10-11 at `a6564aa7`).
 
 ### Reproducibility is not established

@@ -162,7 +162,8 @@ test -z "$(git -C "$REL" status --porcelain)"
     `workerd-closed-graph-2026-08-11-linux-x64` and verified as in
     [What an operator verifies](release-assets.md#what-an-operator-verifies);
   - its build inputs unchanged since the build commit:
-    `git -C "$REL" diff --exit-code 8ca90e2f "$X" -- workerd scripts/build-workerd.ts src/workerd-artifact.ts scripts/workerd-toolchain-prerequisites.sh`;
+    `git -C "$REL" diff --exit-code 8ca90e2f "$X" -- workerd ':(exclude)workerd/notices' scripts/build-workerd.ts src/workerd-artifact.ts scripts/workerd-toolchain-prerequisites.sh`
+    (`workerd/notices` holds the license texts of the notices bundle, not a build input);
   - the [notices bundle](release-assets.md#the-notices-bundle), generated with
     `<tag>` = `v$V` and `<commit>` = `$X`;
   - the guard digest from a `-trimpath` build at `X`, for the release notes;
