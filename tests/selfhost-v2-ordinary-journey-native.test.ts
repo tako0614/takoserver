@@ -9,7 +9,7 @@
  *
  * Everything runs as real `bun src/entry-bun.ts` processes and real workerd
  * children. The only fixtures are the held artifact bytes the operator seeds
- * and the self-signed endpoint certificate. It is a local, loopback-only
+ * with `scripts/selfhost-artifact.ts` and the self-signed endpoint certificate. It is a local, loopback-only
  * proof: no public DNS/TLS trust, no Cloudflare, no host reboot.
  */
 import { Database } from "bun:sqlite";
@@ -18,9 +18,8 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { base64UrlEncode } from "../src/json.ts";
-import { createFileObjectStore } from "../src/objects-fs.ts";
 import { ACTOR_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/actor-namespace.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
 import { DURABLE_WORKFLOW_FORM_URL } from "../src/takoform-v2/forms/durable-workflow.ts";
@@ -74,7 +73,6 @@ interface Host {
 /** Every Host this journey started, so a failure can keep their output. */
 const startedHosts: Host[] = [];
 
-const sha256 = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 const utf8 = (text: string): Uint8Array => new TextEncoder().encode(text);
 
 function workerModule(label: string): string {
@@ -125,7 +123,11 @@ interface SeededArtifact {
   readonly held: readonly HeldArtifact[];
 }
 
-/** Operator-owned tooling: put exact manifest and payload bytes in the object store. */
+/**
+ * The documented operator tool (`scripts/selfhost-artifact.ts seed`) puts the
+ * exact manifest and payload bytes into the stopped root and prints the
+ * held-artifact entries that grant them to the organization's Space.
+ */
 async function seedArtifact(
   root: string,
   name: string,
@@ -133,40 +135,59 @@ async function seedArtifact(
   entrypoint: string | null,
   space: string,
 ): Promise<SeededArtifact> {
-  const objects = createFileObjectStore({ root });
-  const grants = [{ principal: `org:${space}`, space }];
-  const held: HeldArtifact[] = [];
-  const manifestFiles = [];
-  for (const file of files) {
-    const url = `https://artifacts.example.test/${name}/${file.path}`;
-    const objectKey = `operator-held/journey/${name}/${file.path}`;
-    expect(
-      await objects.create(objectKey, file.bytes, { contentType: file.mediaType }),
-    ).not.toBeNull();
-    held.push({ url, sha256: sha256(file.bytes), objectKey, grants });
-    manifestFiles.push({
-      path: file.path,
-      url,
-      sha256: sha256(file.bytes),
-      mediaType: file.mediaType,
-    });
+  const source = await mkdtemp(join(tmpdir(), "jr-src-"));
+  try {
+    for (const file of files) {
+      await mkdir(dirname(join(source, file.path)), { recursive: true });
+      await writeFile(join(source, file.path), file.bytes);
+    }
+    const block = entrypoint === null ? "sqliteMigrationSet" : "workerBundle";
+    const seeder = Bun.spawn(
+      [
+        process.execPath,
+        "--no-env-file",
+        "scripts/selfhost-artifact.ts",
+        "seed",
+        entrypoint === null ? "sqlite-migration-set" : "worker-bundle",
+        source,
+        "--base-url",
+        `https://artifacts.example.test/${name}/`,
+        "--organization",
+        space,
+        ...(entrypoint === null ? [] : ["--entrypoint", entrypoint]),
+        ...files.flatMap((file) => ["--media-type", `${file.path}=${file.mediaType}`]),
+      ],
+      {
+        cwd: join(import.meta.dir, ".."),
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, TAKOSERVER_DATA_ROOT: root },
+      },
+    );
+    const [code, stdout, stderr] = await Promise.all([
+      seeder.exited,
+      new Response(seeder.stdout).text(),
+      new Response(seeder.stderr).text(),
+    ]);
+    if (code !== 0) {
+      throw new Error(`selfhost-artifact seed ${name} exited ${code}: ${stderr.slice(-2000)}`);
+    }
+    const seeded = JSON.parse(stdout) as {
+      readonly artifact: { readonly url: string; readonly sha256: string };
+      readonly configFragment: Record<string, { readonly heldArtifacts: HeldArtifact[] }>;
+    };
+    const held = seeded.configFragment[block]?.heldArtifacts ?? [];
+    expect(held).toHaveLength(files.length + 1);
+    for (const entry of held) expect(entry.grants).toEqual([{ principal: `org:${space}`, space }]);
+    return {
+      manifestUrl: seeded.artifact.url,
+      manifestSha256: seeded.artifact.sha256,
+      held,
+    };
+  } finally {
+    await rm(source, { recursive: true, force: true });
   }
-  const manifestBytes = utf8(
-    JSON.stringify(
-      entrypoint === null ? { files: manifestFiles } : { entrypoint, files: manifestFiles },
-    ),
-  );
-  const manifestUrl = `https://artifacts.example.test/${name}/manifest.json`;
-  const manifestKey = `operator-held/journey/${name}/manifest.json`;
-  expect(
-    await objects.create(manifestKey, manifestBytes, { contentType: "application/json" }),
-  ).not.toBeNull();
-  const manifestSha256 = sha256(manifestBytes);
-  return {
-    manifestUrl,
-    manifestSha256,
-    held: [{ url: manifestUrl, sha256: manifestSha256, objectKey: manifestKey, grants }, ...held],
-  };
 }
 
 function journeyConfig(

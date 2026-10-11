@@ -99,9 +99,11 @@ origin, API documentation URL, and manual session/API onboarding instructions.
 The Bun Host itself does not serve a `/console` page. If an identity provider is
 configured, use that provider's sign-in flow. Create or select the organization
 that will own resources; its exact ID is the v2 Space. Do not run old
-publisher-set admission as v2 setup. [Self-host operations](docs/self-host-operations.md)
-contains the historical runtime and repair procedures; the current v2 setup is
-the separate guide linked above.
+publisher-set admission as v2 setup. The v2 install path, from an empty data
+root to a served Worker, is
+[First install and first use](docs/self-host-operations.md#first-install-and-first-use);
+[v2 architecture and operator setup](docs/takoform-v2.md) defines each setting
+it uses.
 
 Ordinary Bun always keeps the stable self-host Provider3 execution pack.
 `CLOUDFLARE_ACCOUNT_ID` may separately back an explicitly reviewed ObjectBucket
@@ -196,25 +198,79 @@ the part that owns accounts, money, and the machines.
 
 ## Self-hosting
 
-By default, the self-host data root is `.takoserver`; set
-`TAKOSERVER_DATA_ROOT` to relocate it. `TAKOSERVER_DB` can put the control
-database outside that root, and configured service dependencies may use
-protected files outside it.
+[Self-host operations](docs/self-host-operations.md#first-install-and-first-use)
+is the install path, step by step, from a reviewed checkout to a Worker served
+over HTTPS. This section summarises it and lists the settings.
+
+The Bun entry (`src/entry-bun.ts`) runs one of two profiles, selected by
+configuration:
+
+- **Artifact profile.** The v2 Host API, operator sign-in, organizations, API
+  keys, and the artifact Forms `SQLiteMigrationSet`, `WorkerBundle` and
+  `StaticAssetBundle`, which validate and retain bytes without running them.
+  It needs Bun and the three required settings below.
+- **Complete local Worker profile.** Adds the Worker lifecycle Forms and their
+  SQLite, KV, ObjectBucket and Queue Bindings, run on Linux x86-64 by the
+  pinned closed-graph [workerd](workerd/README.md). The Host advertises them
+  only when every setting in the second table is present and the existing
+  Worker owners restore at startup; a partial setup advertises no reduced
+  Worker profile. `WorkerEndpoint` also needs the HTTPS listener on TCP 443
+  described below.
+
+Neither profile needs publisher-set admission: the v2 Host serves the Forms
+its configuration composes. `scripts/selfhost-form-admission.ts` and
+[Self-host admission](docs/form-authority.md#self-host-admission) belong to the
+retained v1 repair path and are not v2 setup.
+
+### Settings
+
+Three settings are required; startup stops without them:
 
 | Variable | What it does |
 |---|---|
-| `TAKOSERVER_PUBLIC_ORIGIN` | Canonical public API origin used for Host identity, operator audience, and the session cookie's Secure policy. Set the external HTTPS origin when the API is behind TLS termination. |
-| `TAKOSERVER_DATA_ROOT` | Objects, databases, published Workers, and the signing key. |
+| `TAKOSERVER_PUBLIC_ORIGIN` | Canonical bare `https://` origin of the control API, used for Host identity, operator audience, and the session cookie's Secure policy. The Bun listener speaks HTTP, so this is the origin of the TLS front end in front of it. |
+| `TAKOSERVER_TAKOFORM_V2_CONFIG` | Strict, non-secret JSON with `documentation` and `authenticationDocumentation` URLs and the optional `sqliteMigrationSet`, `workerBundle` and `staticAssetBundle` blocks of held artifacts. See [v2 operator setup](docs/takoform-v2.md#normal-application-and-operator-setup). |
+| `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY` | At least 32 random bytes as canonical, unpadded base64url. An operator secret; keep it stable across restarts. |
+
+The complete local Worker profile needs all of these, plus `workerBundle` and
+`staticAssetBundle` blocks that both use `targetKey`
+`selfhost-v2-worker-primary`:
+
+| Variable | What it does |
+|---|---|
+| `TAKOSERVER_WORKERD_BINARY` | Absolute path to the exact pinned closed-graph artifact. An absent, substituted, or behaviorally incompatible binary disables Worker execution without silently selecting the npm workerd. |
+| `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` | Absolute path, free of symbolic links, to `services/workflow-execution-guard` built from this checkout. |
+| `TAKOSERVER_V2_WORKER_RUNTIME_BOOT` | Actor and Workflow boot, for example `{"actor":true,"workflow":{"maximumRegistrations":64}}`. |
+| `TAKOSERVER_V2_WORKER_PRIVATE_PLANES` | The five private planes (SQLite, KV, ObjectBucket, Queue settlement and Queue Producer), each with its own fixed port and an operator-generated signing key file. |
+
+`TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` is not part of the profile and is
+optional; with it, WorkerVersion also accepts `privateInputs`.
+
+`WorkerEndpoint` additionally needs these:
+
+| Variable | What it does |
+|---|---|
+| `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS` | Exactly `1`. The Host itself listens for Worker Endpoints on `0.0.0.0:443`. |
+| `TAKOSERVER_WORKER_ENDPOINT_SUFFIX` | DNS suffix (at least two labels, not `localhost` or an IP address). Each Endpoint gets a one-label hostname under it. |
+| `TAKOSERVER_WORKERD_TLS_CERT_FILE` / `TAKOSERVER_WORKERD_TLS_KEY_FILE` | PEM certificate covering `*.<suffix>`, and its key. They also terminate TLS on the retained pre-v2 Worker socket. |
+| `TAKOSERVER_WORKERD_TLS_CERT` / `TAKOSERVER_WORKERD_TLS_KEY` | The same two halves as PEM text, for a deployment that has no file to point at. |
+
+Everything else is optional, and what is absent is absent rather than faked: a
+deployment with no Stripe key does not serve the route that would begin a
+payment, and its console offers the way it does take money instead.
+`TAKOSERVER_DB` can put the control database outside the data root, and
+configured service dependencies may use protected files outside it.
+
+| Variable | What it does |
+|---|---|
+| `TAKOSERVER_DATA_ROOT` | Objects, databases, published Workers, and the signing key. `.takoserver` in the working directory by default. |
 | `TAKOSERVER_DB` | Control database. A file under the data root by default. |
-| `PORT` | Where the API and console API listen. |
+| `PORT` | Where the API and console API listen, over HTTP on `TAKOSERVER_LISTEN_HOST` (default 8787). |
 | `TAKOSERVER_LISTEN_HOST` | Interface address the API listener binds, as one canonical IP literal; blank reads as unset. `127.0.0.1` by default. In a container or Pod, `127.0.0.1` is the container's own loopback, so published ports, other containers, Services and probes are refused: set `0.0.0.0` (or `::` for IPv4 and IPv6), or the container's private address, and restrict access with a network policy or firewall. Before this default the listener bound every interface, like `::`. See [Self-host security](docs/self-host-security.md). |
 | `TAKOSERVER_PRINT_OPERATOR_ASSERTION` | `1` prints a fresh operator sign-in assertion on every boot; `0` or blank keeps the default, which prints one only until the operator has first signed in. |
-| `TAKOSERVER_WORKERD_BINARY` | Absolute path to the exact pinned closed-graph artifact. An absent, substituted, or behaviorally incompatible binary disables Worker execution without silently selecting the npm workerd. |
 | `TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIALS` | Set to exactly `1` to mount the self-host runner-credential route. Absent or any other value leaves it at 404. |
 | `TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIAL_KEY_ID` | Optional dedicated key identity for self-host runner credentials. Changing it creates a separate private key file under the data root; it must differ from `TAKOSERVER_SIGNING_KEY_ID`. |
-| `TAKOSERVER_WORKERD_PORT` | Where published Workers are served. |
-| `TAKOSERVER_WORKERD_TLS_CERT_FILE` / `TAKOSERVER_WORKERD_TLS_KEY_FILE` | PEM paths. With both, workerd terminates TLS on that port and Worker endpoints are published as `https://`. |
-| `TAKOSERVER_WORKERD_TLS_CERT` / `TAKOSERVER_WORKERD_TLS_KEY` | The same two halves as PEM text, for a deployment that has no file to point at. |
+| `TAKOSERVER_WORKERD_PORT` | Where the retained pre-v2 runtime serves published Workers (default 8788). |
 | `TAKOSERVER_WORKER_ENDPOINT_PORT` | Port a published Worker address carries. The workerd port by default; set it when something else terminates in front of workerd. The scheme's own default (443, 80) publishes a portless address. |
 | `TAKOSERVER_SUFFIXES` | Hostname suffixes this deployment will serve. Empty means any. |
 | `TAKOSERVER_OPERATOR_PUBLIC_JWK` | Public half of the operator key. Generated under the data root if unset. |
@@ -242,6 +298,69 @@ exact active public half in the registry; a stale file, reused id, or revoked
 row fails closed and is never overwritten or revived automatically.
 The Cloudflare public Worker does not compose this route or import its signer.
 
+### Held artifacts and Workers
+
+The v2 artifact Forms never upload or fetch bytes. A create names an exact
+HTTPS URL and SHA-256, and the Host serves it only from bytes already in its
+object store, to the organizations its configuration grants. It reads those
+grants at startup. `scripts/selfhost-artifact.ts` puts the bytes there while
+the Host is stopped:
+
+```sh
+set -a; . /etc/takoserver/takoserver.env; set +a   # the Host's environment
+bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle ./dist \
+  --base-url https://artifacts.example.com/hello/v1/ \
+  --organization <organizationId> --entrypoint worker.js \
+  --config /etc/takoserver/v2/takoform-v2.json > hello-v1.json
+```
+
+It validates the files with the Form's own validator and stores them under
+content addresses in the data root's object store. It prints the `artifact`
+for the Resource spec and the exact config fragment that grants it, and with
+`--config` merges that fragment into the config file. It holds the control
+database's write lock while it runs, and refuses, before writing, a data root
+that another process has open or that it cannot prove unused, one that is not
+private to this user, an organization the control database does not know,
+dotfiles unless `--include-dotfiles`, and a config that would no longer fit in
+one environment variable. Run it as the Host's user in the Host's PID
+namespace. Restart
+the Host with the updated config, then create the `ModuleWorker`,
+`WorkerBundle`, `WorkerVersion`, `WorkerDeployment` and `WorkerEndpoint`
+Resources through `/apis/forms.takoform.com/v2/resources`. Steps 6 to 9 of the
+[install path](docs/self-host-operations.md#first-install-and-first-use) give
+the complete commands. `scripts/selfhost-artifact.ts verify` rechecks every
+configured entry read-only, including while the Host runs.
+
+### HTTPS and TCP 443
+
+The Bun API listener speaks HTTP, including when a front end terminates TLS.
+The configured public origin still owns operator sign-in and existing-owner
+proof audiences, and HTTPS deployments still issue and clear `Secure` session
+cookies. Backend URLs and `Forwarded` / `X-Forwarded-*` headers do not select
+that authority. Cookie authentication continues to require the exact configured
+console `Origin`; TLS termination does not relax that browser boundary.
+
+Put the control API behind a TLS front end. The HTTP listener binds
+`TAKOSERVER_LISTEN_HOST`, `127.0.0.1` by default, so a front end on the same
+machine reaches it over loopback and nothing else can. In a container or Pod
+set `0.0.0.0` (or `::`) and limit who can reach the port with a network policy
+or firewall; see [Self-host security](docs/self-host-security.md). A
+`WorkerEndpoint 0.3.0` publication is served by the Host itself:
+with `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` it binds TCP 443 on every IPv4
+address, which needs root or `CAP_NET_BIND_SERVICE`, and DNS must resolve
+`*.<suffix>` to the machine. A control API front end on the same machine
+therefore uses another port, for example
+`TAKOSERVER_PUBLIC_ORIGIN=https://api.example.com:8443`, or runs on another
+machine. Startup refuses the selection without the certificate pair and
+suffix, or when another self-host listener is already configured on 443.
+
+### Retained pre-v2 Worker socket
+
+The settings and rules in this subsection belong to the retained pre-v2
+runtime (`TAKOSERVER_WORKERD_PORT`, `TAKOSERVER_WORKER_ENDPOINT_PORT` and its
+`WorkerEndpoint@0.1.0` publication). They do not apply to `WorkerEndpoint
+0.3.0`, which uses the listener above.
+
 Without a certificate the Worker socket speaks plain HTTP and the origin this
 Host hands a Worker is `http://`, truthfully — an `https://` address the runtime
 does not serve is one nothing answers on. On the default `localhost` suffix that
@@ -251,7 +370,7 @@ plain HTTP on a name that is not loopback, so federation, signing, and
 self-addressing cannot work there. The process says so at boot rather than
 leaving it to be discovered.
 
-### Publishing a `WorkerEndpoint` needs TLS on 443
+#### Publishing a pre-v2 `WorkerEndpoint` needs TLS on 443
 
 A `WorkerEndpoint` is a published, portable address, and the released
 `WorkerEndpoint` Form states what one may look like: `https://` plus a dotted
@@ -312,33 +431,25 @@ A restarted deployment brings its published Workers back by itself. The runtime
 is started at boot for whatever this machine had already published, before the
 API begins answering; a machine that has published nothing starts no runtime.
 
-Nothing in that table is required to start. What is absent is absent rather than
-faked: a deployment with no Stripe key does not serve the route that would begin
-a payment, and its console offers the way it does take money instead.
-
-The Bun API listener speaks HTTP, including when a front end terminates TLS.
-The configured public origin still owns operator sign-in and existing-owner
-proof audiences, and HTTPS deployments still issue and clear `Secure` session
-cookies. Backend URLs and `Forwarded` / `X-Forwarded-*` headers do not select
-that authority. Cookie authentication continues to require the exact configured
-console `Origin`; TLS termination does not relax that browser boundary.
-
-A hosted Cloudflare deployment enables customer card funding only when its
-private deploy target explicitly sets `"stripeCheckout": true` **and** the
-Worker already has a `STRIPE_SECRET_KEY` secret. The target contains no secret
-value: the owner preflight fails if the named capability has no secret, while a
-lingering secret alone cannot expose Checkout when the target capability is
-absent.
+### Operator sign-in and funding
 
 Sign-in and money are the two facts a server cannot determine for itself. With
 no identity provider configured, the operator answers the first by signature —
 so a fresh machine mints an operator key, keeps it beside its database, and
-prints an assertion good for ten minutes. Later ones:
+prints a single-use assertion good for ten minutes. The first session exchange
+spends it. A boot prints a new one until the operator has signed in, or every
+time with `TAKOSERVER_PRINT_OPERATOR_ASSERTION=1`
+([Self-host security](docs/self-host-security.md#sign-in-and-request-limits)).
+Later ones:
 
 ```
 TAKOSERVER_OPERATOR_KEY=.takoserver/operator-key.jwk \
+TAKOSERVER_PUBLIC_ORIGIN=https://api.example.com \
   bun scripts/operator-key.ts sign-in google operator operator@localhost Operator
 ```
+
+`TAKOSERVER_PUBLIC_ORIGIN` must be the Host's own origin: without it the
+assertion is signed for `http://localhost:8787`, and the Host refuses it.
 
 The legacy/generated key also credits the wallet
 (`operator-key.ts funding <org> <ref> <minor>`) until Stripe is configured. An
@@ -348,13 +459,14 @@ the operator vouching in a form the server can check and nobody else can forge
 — not an identity provider, and it stops being the way in the moment a real one
 is configured.
 
-The Takoform Host of a fresh self-host serves no Form until the operator
-records the publisher-set admission chain. This is an explicit local operator
-action, separate from startup; it verifies the exact embedded publisher
-closure with the released Takoform Core verifier and activates this build's
-implemented subset for one organization and Space. It does not create the
-organization or Space. See [Self-host admission](docs/form-authority.md#self-host-admission)
-and the [end-to-end self-host operations guide](docs/self-host-operations.md).
+A hosted Cloudflare deployment enables customer card funding only when its
+private deploy target explicitly sets `"stripeCheckout": true` **and** the
+Worker already has a `STRIPE_SECRET_KEY` secret. The target contains no secret
+value: the owner preflight fails if the named capability has no secret, while a
+lingering secret alone cannot expose Checkout when the target capability is
+absent.
+
+### Data root and backups
 
 By default, durable state is rooted under `.takoserver`, but that directory is
 not always the complete backup set. Stop Takoserver, its child `workerd`, and
@@ -362,20 +474,33 @@ every other configured writer before copying the complete root. Include an
 external `TAKOSERVER_DB` and any existing SQLite `-wal`, `-shm`, or
 rollback-journal sidecars from the same quiescent window. Preserve protected
 external configuration and key material needed to restore the same identity
-separately; do not store secrets in this repository. See the
+separately: the exact `TAKOSERVER_TAKOFORM_V2_CONFIG`, the
+`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`, the private-plane key files and the native
+binaries, among others (the full list is in
+[What belongs to one installation](docs/self-host-operations.md#what-belongs-to-one-installation)).
+Do not store secrets in this repository, and do not copy the runtime-only
+socket directories such as `/tmp/tw-*`. See the
 [self-host backup and restore preparation](docs/self-host-operations.md) for
 the procedure and its limits.
 
 ```
 .takoserver/
-  control.sqlite      organizations, keys, the ledger, resources
-  signing-key.jwk     signs data-plane tokens
-  operator-key.jwk    signs operator assertions
-  objects/            customer objects, and uploaded bundles under art/
-  databases/          customer SQL databases
-  runtime-probes/     verified workerd snapshot and transient resolver probes
-  workers/            published Workers and the workerd config
+  control.sqlite        organizations, keys, the ledger, resources
+  signing-key.jwk       signs data-plane tokens
+  operator-key.jwk      signs operator assertions
+  objects/              customer objects, uploaded bundles under art/, seeded held artifacts under operator-held/
+  databases/            customer SQL databases
+  v2-sqlite-databases/  v2 SQLiteDatabase files
+  v2-kv-namespaces/     v2 EdgeKVNamespace data
+  v2-object-buckets/    v2 ObjectBucket objects
+  v2-worker-owners/     v2 Worker runtime owners
+  v2-runtime/           v2 Actor and Workflow runtime state
+  s/                    per-start private sockets; not needed in a backup
+  runtime-probes/       verified workerd snapshot and transient resolver probes
+  workers/              published Workers and the workerd config
 ```
+
+### The local Worker runtime
 
 Published Workers are served by a workerd process Takoserver starts on the first
 publish and leaves watching its configuration — a deploy rewrites the config,

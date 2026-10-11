@@ -520,9 +520,15 @@ authority surface decision.
 
 ## Self-host admission
 
+This section is the historical v1 procedure. A current v2 self-host serves the
+Forms its configuration composes and needs no admission chain; install it with
+[First install and first use](self-host-operations.md#first-install-and-first-use).
+The text below describes the retained v1 admission chain, kept for repair and
+for installations that still hold v1 records.
+
 A Bun self-host reads the same durable admission chain as the Worker but has
-no route-less authority Worker, so a fresh deployment serves zero Forms until
-its operator records the chain. The repository-owned operator command does
+no route-less authority Worker, so a fresh v1 deployment served zero Forms
+until its operator recorded the chain. The repository-owned operator command does
 exactly that for the embedded exact publisher set:
 
 ```sh
