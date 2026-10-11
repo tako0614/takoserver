@@ -1465,8 +1465,81 @@ test("a batch selection that throws is reported instead of vanishing into unknow
       }),
     ).toEqual({ kind: "unknown" });
     expect(reported.map((cause) => (cause as Error).message)).toEqual(["incomplete input"]);
+    // The reservation written before the throw was never sent, so it does not
+    // hold the Consumer for its 120 seconds.
+    expect(await f.sql.query("SELECT state FROM queue_v2_batch_executions")).toEqual([
+      { state: "pre_effect_refused" },
+    ]);
   } finally {
     await composition?.close();
+    f.database.close();
+  }
+});
+
+test("a claim whose acknowledgement was lost is refunded by its bound lease token", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "lost-ack-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "lost-ack-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "lost-ack-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "lost-ack-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "lost-ack-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid, { maxBatchSize: 1, maxConcurrency: 1 }),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId: "lost-ack-message", body: new Uint8Array([8]) },
+    );
+    // The claim commits, then its result is lost on the way back.
+    const lostAck: typeof custody = {
+      ...custody,
+      async claim(input) {
+        expect(await custody.claim(input)).toHaveLength(1);
+        throw new Error("disk I/O error");
+      },
+    };
+    const scope = { consumerUid: consumer.resourceUid, principal, space, targetKey };
+    await expect(
+      createV2QueueDelivery({
+        sql: f.sql,
+        custody: lostAck,
+        capability: f.capability,
+      }).claimRegisteredBatch(scope),
+    ).rejects.toThrow("disk I/O error");
+    expect(
+      await f.sql.query(
+        "SELECT state,lease_token IS NOT NULL AS bound FROM queue_v2_batch_executions",
+      ),
+    ).toEqual([{ state: "pre_effect_refused", bound: 1 }]);
+    expect(await f.sql.query("SELECT deliveries,lease_token FROM selfhost_queue_messages")).toEqual(
+      [{ deliveries: 0, lease_token: null }],
+    );
+    const next = await createV2QueueDelivery({
+      sql: f.sql,
+      custody,
+      capability: f.capability,
+    }).claimRegisteredBatch(scope);
+    if (next.kind !== "ready") throw new Error("refunded message was not redelivered");
+    expect(next.claims.map(({ messageId, attempts }) => ({ messageId, attempts }))).toEqual([
+      { messageId: "lost-ack-message", attempts: 1 },
+    ]);
+  } finally {
     f.database.close();
   }
 });
