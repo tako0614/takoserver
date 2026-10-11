@@ -1161,12 +1161,18 @@ operator disaster-recovery drill with source fencing. It does not cover a `sched
 handler, Actor or Workflow use, public DNS or certificate trust, Hosted/WfP or
 a host reboot. Messages in flight at the
 crash are redelivered at least once. A batch the killed Host reserved but never
-sent is refused when the Host starts again, before it listens, so its messages
-come back at once; a batch that was already sent keeps its messages until their
-lease (up to 120 seconds) runs out. The refusal needs no proof that the old
-process is gone: it is the pre-send cancel, which can only win while the batch
-has not been authorized, and the owner sends only after winning that
-authorization.
+sent is refused when the Host starts again, before it listens, and its messages
+come back at once. That holds when the refusal succeeds: if it gives up (a lock
+that outlasted the five second busy timeout, for example), that batch and any
+not yet refused wait for their 120 second reservation as before. The refusal
+needs no proof that the old process is gone: it is the pre-send cancel, which
+can only win while the batch has not been authorized, and the owner sends only
+after winning that authorization. A batch that was already sent is different.
+It must first be retired, by its handler's completion receipt or by proof that
+its Worker child is physically gone, and only then are its messages redelivered
+once their lease (up to 120 seconds) runs out. After a Host restart the old
+child is gone and that proof is normally available; a sent batch whose
+retirement cannot be proven stays occupied, with no time limit.
 
 What this test and its neighbours record:
 

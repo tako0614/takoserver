@@ -1176,8 +1176,9 @@ test.skipIf(OPT_IN !== "1")(
         status: 200,
         body: "journey-v2",
       });
-      // A batch sent at the crash keeps its messages leased until that lease
-      // runs out (up to 120 s) before redelivery, so allow for it.
+      // A batch sent at the crash is retired once its old child is proven
+      // gone, and its messages then wait for their lease (up to 120 s), so
+      // allow for it.
       for (const value of inFlight) await handled(value, 240_000);
       for (const id of flightIds) await waitForQueueReceipt(root, id, "retired", 240_000);
       const receipts = JSON.parse((await get("/receipts")).body) as {
