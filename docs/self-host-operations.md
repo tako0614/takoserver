@@ -454,6 +454,16 @@ The test also builds `services/takoform-core-verifier` from this checkout into
 its mode-0700 temporary fixture using the locally installed Go toolchain and
 pre-existing Go module/build caches. It disables module-network access; a
 missing tool or cache fails the test instead of substituting a prebuilt binary.
+The build runs with `GOTOOLCHAIN=local`, so the installed `go` must be 1.26.0 or
+newer (the module's `go` line); 1.26.9 matches the audited toolchain. After any
+change to that module's `go.mod` or `go.sum`, refresh the offline cache once,
+with network access, before the next native run. Use the same `GOMODCACHE` the
+test will read (`TAKOSERVER_NATIVE_GO_MODULES` when set):
+
+```sh
+cd services/takoform-core-verifier && GOMODCACHE="${TAKOSERVER_NATIVE_GO_MODULES:-$(go env GOMODCACHE)}" go mod download
+```
+
 The Go build is bounded to two concurrent package builds and two active Go
 processors; this does not change the native Host or recovery time assertions.
 The verifier reports the current checkout's source-derived artifact digest and
