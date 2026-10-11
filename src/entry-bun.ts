@@ -68,6 +68,7 @@ import {
   serveSelfhostDataPlanes,
 } from "./selfhost-data-planes.ts";
 import {
+  createSelfhostDataRootIfAbsent,
   resolveSelfhostDataRoot,
   SELFHOST_DATA_ROOT_VARIABLE,
   SELFHOST_DEFAULT_DATA_ROOT,
@@ -225,6 +226,11 @@ if (dataRoot !== (configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT)) {
 // An explicitly selected v2 capability whose sockets cannot fit below this root
 // is a configuration error now, not an Operation that never confirms later.
 if (v2RuntimeSelection) assertSelfhostV2RuntimeSocketBudget(v2RuntimeSelection, dataRoot);
+// Keys, tenant data and sockets live here: a new root starts private, while an
+// existing one keeps the permissions its operator gave it.
+if (createSelfhostDataRootIfAbsent(dataRoot)) {
+  process.stdout.write(`created ${dataRoot} (mode 0700)\n`);
+}
 const v2WorkerTargetKey = "selfhost-v2-worker-primary";
 const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
   ? Number(process.env.TAKOSERVER_WORKERD_PORT)

@@ -1,9 +1,12 @@
 import { expect, test } from "bun:test";
-import { existsSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveSelfhostDataRoot } from "../src/selfhost-data-root.ts";
+import {
+  createSelfhostDataRootIfAbsent,
+  resolveSelfhostDataRoot,
+} from "../src/selfhost-data-root.ts";
 
 async function withTemporary(run: (root: string) => Promise<void>): Promise<void> {
   const root = realpathSync(await mkdtemp(join(tmpdir(), "data-root-")));
@@ -51,5 +54,26 @@ test("a dangling symlink or a file component is refused instead of carried forwa
     );
     await writeFile(join(root, "file"), "not a directory");
     expect(() => resolveSelfhostDataRoot(join(root, "file", "data"), "/")).toThrow("(ENOTDIR)");
+  });
+});
+
+test("a missing data root is created 0700 whatever the umask, and an existing one is left alone", async () => {
+  await withTemporary(async (root) => {
+    const previous = process.umask(0o000);
+    try {
+      const fresh = join(root, "missing", "data");
+      expect(createSelfhostDataRootIfAbsent(fresh)).toBe(true);
+      expect(statSync(fresh).mode & 0o777).toBe(0o700);
+      expect(createSelfhostDataRootIfAbsent(fresh)).toBe(false);
+      const shared = join(root, "shared");
+      await mkdir(shared, { mode: 0o755 });
+      await chmod(shared, 0o755);
+      expect(createSelfhostDataRootIfAbsent(shared)).toBe(false);
+      expect(statSync(shared).mode & 0o777).toBe(0o755);
+      expect(createSelfhostDataRootIfAbsent(":memory:")).toBe(false);
+      expect(existsSync(":memory:")).toBe(false);
+    } finally {
+      process.umask(previous);
+    }
   });
 });

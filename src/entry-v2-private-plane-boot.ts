@@ -72,18 +72,24 @@ function checkedPrivateDirectory(path: string, name: string): string {
         throw new Error("not a real directory");
       }
     } catch {
-      throw new TypeError(`${name} must use real directories`);
+      throw new TypeError(`${name} must use real directories: ${current} is not one`);
     }
+    const mode = (metadata.mode & 0o7777).toString(8).padStart(4, "0");
     if (leaf) {
       if (metadata.uid !== uid || (metadata.mode & 0o077) !== 0) {
-        throw new TypeError(`${name} must be owned and private`);
+        throw new TypeError(
+          `${name} must be owned and private: ${current} has mode ${mode} and owner uid ` +
+            `${metadata.uid}, but needs mode 0700 and owner uid ${uid}`,
+        );
       }
       leaf = false;
     } else if (
       (metadata.mode & 0o022) !== 0 &&
       !((metadata.mode & 0o1000) !== 0 && metadata.uid === 0)
     ) {
-      throw new TypeError(`${name} has an unsafe writable ancestor`);
+      throw new TypeError(
+        `${name} has an unsafe writable ancestor: ${current} has mode ${mode} and owner uid ${metadata.uid}`,
+      );
     }
     const parent = dirname(current);
     if (parent === current) break;
@@ -175,7 +181,10 @@ export function parseSelfhostV2PrivatePlaneBoot(
       throw new TypeError(`${CONFIG_NAME} has an unknown plane`);
     }
   }
-  const dataRoot = checkedPrivateDirectory(options.dataRoot, "v2 Worker data root");
+  const dataRoot = checkedPrivateDirectory(
+    options.dataRoot,
+    "v2 Worker data root (TAKOSERVER_DATA_ROOT)",
+  );
   const ports = new Set(options.reservedPorts ?? []);
   const keys: Uint8Array[] = [];
   const readPlane = (name: PlaneName): PlaneBoot | undefined => {

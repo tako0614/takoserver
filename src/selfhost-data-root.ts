@@ -1,4 +1,4 @@
-import { lstatSync, realpathSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 
 /** The variable an operator sets; named by every data-root diagnostic. */
@@ -53,4 +53,22 @@ export function resolveSelfhostDataRoot(
     missing.unshift(basename(current));
     current = parent;
   }
+}
+
+/**
+ * Create the data root private (0700, with any missing parents) when it does
+ * not exist yet, and report whether it did. An existing directory is used
+ * exactly as it is: its permissions are the operator's, and the v2 private
+ * planes say by name when they require it to be private.
+ *
+ * Without this, the first writer created it with the default 0755 although it
+ * holds signing keys, tenant data and sockets.
+ */
+export function createSelfhostDataRootIfAbsent(dataRoot: string): boolean {
+  if (dataRoot === SELFHOST_MEMORY_DATA_ROOT) return false;
+  if (lstatSync(dataRoot, { throwIfNoEntry: false }) !== undefined) return false;
+  mkdirSync(dataRoot, { recursive: true, mode: 0o700 });
+  // The mode above is filtered by umask; the root itself is exactly 0700.
+  chmodSync(dataRoot, 0o700);
+  return true;
 }

@@ -4,8 +4,8 @@
  * too long for a selected v2 runtime capability's Unix sockets.
  */
 import { expect, test } from "bun:test";
-import { existsSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { base64UrlEncode } from "../src/json.ts";
@@ -158,6 +158,88 @@ test("a data root too long for a selected v2 Workflow runtime is refused at boot
     expect(fits.stderr).toContain(
       "v2 Actor/Workflow boot requires the configured held WorkerBundle",
     );
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+async function ready(child: ReturnType<typeof Bun.spawn>, port: number): Promise<boolean> {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline && child.exitCode === null) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/_takoserver/health/ready`, {
+        signal: AbortSignal.timeout(500),
+      });
+      await response.arrayBuffer();
+      if (response.status === 200) return true;
+    } catch {
+      // The listener may not have bound yet.
+    }
+    await Bun.sleep(50);
+  }
+  return false;
+}
+
+test("a data root the Host creates starts private, with any missing parents", async () => {
+  const base = realpathSync(await mkdtemp(join(tmpdir(), "data-root-create-")));
+  const dataRoot = join(base, "srv", "takoserver");
+  const port = await unusedPort();
+  let child: ReturnType<typeof Bun.spawn> | undefined;
+  const previousUmask = process.umask(0o002);
+  try {
+    child = Bun.spawn([process.execPath, "--no-env-file", ENTRY], {
+      cwd: base,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...baseEnvironment(base, port), TAKOSERVER_DATA_ROOT: dataRoot },
+    });
+    expect(await ready(child, port)).toBe(true);
+    expect(statSync(dataRoot).mode & 0o777).toBe(0o700);
+    expect(statSync(join(base, "srv")).mode & 0o777).toBe(0o700);
+    child.kill("SIGTERM");
+    expect(await exited(child)).toBe(0);
+    expect(await new Response(child.stdout as ReadableStream).text()).toContain(
+      `created ${dataRoot} (mode 0700)\n`,
+    );
+    child = undefined;
+  } finally {
+    process.umask(previousUmask);
+    if (child && child.exitCode === null) {
+      child.kill("SIGKILL");
+      await child.exited;
+    }
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("an existing shared data root keeps its mode and private planes name what they need", async () => {
+  const base = realpathSync(await mkdtemp(join(tmpdir(), "data-root-shared-")));
+  const dataRoot = join(base, "data");
+  try {
+    await mkdir(join(dataRoot, "keys"), { recursive: true, mode: 0o700 });
+    await chmod(dataRoot, 0o755);
+    const key = join(dataRoot, "keys", "queue.key");
+    await writeFile(key, new Uint8Array(32).fill(0x41), { mode: 0o600 });
+    const child = Bun.spawn([process.execPath, "--no-env-file", ENTRY], {
+      cwd: base,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+      env: {
+        ...baseEnvironment(base, await unusedPort()),
+        TAKOSERVER_DATA_ROOT: dataRoot,
+        TAKOSERVER_V2_WORKER_PRIVATE_PLANES: JSON.stringify({
+          queue: { privatePort: await unusedPort(), signingKeyFile: key },
+        }),
+      },
+    });
+    expect(await exited(child)).not.toBe(0);
+    expect(await new Response(child.stderr as ReadableStream).text()).toContain(
+      `v2 Worker data root (TAKOSERVER_DATA_ROOT) must be owned and private: ${dataRoot} has mode 0755 and owner uid ${process.getuid?.()}, but needs mode 0700 and owner uid ${process.getuid?.()}`,
+    );
+    // The Host never changes an existing root's permissions.
+    expect(statSync(dataRoot).mode & 0o777).toBe(0o755);
   } finally {
     await rm(base, { recursive: true, force: true });
   }

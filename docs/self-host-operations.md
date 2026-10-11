@@ -24,7 +24,11 @@ claim GA status.
    resolves `TAKOSERVER_DATA_ROOT` once to an absolute, canonical path: a
    relative value, including the default, is relative to the working
    directory, and symlinks in the existing part of the path are resolved. When
-   the result differs from the configured value, the process prints it. Actor
+   the result differs from the configured value, the process prints it. A
+   data root that does not exist yet is created with mode 0700, together with
+   any missing parent directories. An existing directory keeps its permissions.
+   The v2 private planes require it to be mode 0700 and owned by the Host's
+   user, and refuse otherwise with the path, mode, and owner. Actor
    and Workflow runtimes bind private Unix sockets in `<data root>/s`, and a
    Unix socket path is limited to about 100 bytes. The resolved data root
    therefore may be at most 61 bytes whenever Actors or Workflows run. The
