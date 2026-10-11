@@ -66,6 +66,7 @@ export const TAKOFORM_V2_SCHEMAS = {
       title: { type: "string" },
       status: { type: "integer", minimum: 400, maximum: 599 },
       code: { type: "string" },
+      detail: { type: "string" },
       operationId: identifier,
     },
   },

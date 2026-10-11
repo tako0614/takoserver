@@ -2630,3 +2630,83 @@ test("the strict current-serving method ignores a boot-recovery tolerance smuggl
     f.close();
   }
 });
+
+test("an Endpoint without an HTTP-serving Deployment is a refusal of the Operation, not a pending graph", async () => {
+  const endpointSpec = (worker: { resourceUid: string }) => ({
+    worker: { resourceUid: worker.resourceUid },
+  });
+  // No Deployment at all.
+  let f = fixture();
+  try {
+    const { worker } = await f.basics();
+    const endpoint = await f.create(
+      WORKER_ENDPOINT_FORM_URL,
+      "endpoint",
+      endpointSpec(worker),
+      false,
+    );
+    expect(await f.reader.resolve({ execution: await f.claim(endpoint.id) })).toMatchObject({
+      kind: "unresolved",
+      code: "deployment_missing",
+    });
+  } finally {
+    f.close();
+  }
+  // A Deployment whose weighted Version declares neither fetch nor assets.
+  f = fixture();
+  try {
+    const { worker, bundle } = await f.basics();
+    const queueOnly = await f.create(WORKER_VERSION_FORM_URL, "queue-only", {
+      worker: { resourceUid: worker.resourceUid },
+      bundle: { resourceUid: bundle.resourceUid },
+      handlers: ["queue"],
+    });
+    await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: queueOnly.resourceUid }, weight: 10_000 }],
+    });
+    const endpoint = await f.create(
+      WORKER_ENDPOINT_FORM_URL,
+      "endpoint",
+      endpointSpec(worker),
+      false,
+    );
+    expect(await f.reader.resolve({ execution: await f.claim(endpoint.id) })).toMatchObject({
+      kind: "unresolved",
+      code: "fetch_unavailable",
+    });
+  } finally {
+    f.close();
+  }
+  // A Deployment change that would leave an attached Endpoint without HTTP.
+  f = fixture();
+  try {
+    const { worker, bundle, version } = await f.basics();
+    const queueOnly = await f.create(WORKER_VERSION_FORM_URL, "queue-only", {
+      worker: { resourceUid: worker.resourceUid },
+      bundle: { resourceUid: bundle.resourceUid },
+      handlers: ["queue"],
+    });
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    await f.create(WORKER_ENDPOINT_FORM_URL, "endpoint", endpointSpec(worker));
+    const update = await f.engine.acceptUpdate({
+      principal: "org-1",
+      key: "update-deployment-fetchless-0001",
+      uid: deployment.resourceUid,
+      expectedGeneration: 1,
+      spec: {
+        worker: { resourceUid: worker.resourceUid },
+        versions: [{ workerVersion: { resourceUid: queueOnly.resourceUid }, weight: 10_000 }],
+      },
+    });
+    expect(await f.reader.resolve({ execution: await f.claim(update.id) })).toMatchObject({
+      kind: "unresolved",
+      code: "fetch_unavailable",
+    });
+  } finally {
+    f.close();
+  }
+});

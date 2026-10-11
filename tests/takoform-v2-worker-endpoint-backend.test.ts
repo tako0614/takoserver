@@ -541,3 +541,102 @@ for (const action of ["create", "update", "delete"] as const) {
     expect(checks).toBe(3);
   });
 }
+
+test("an Endpoint create or update the reader refuses for its Deployment settles with no effect; DELETE never does", async () => {
+  const workerUid = "worker-endpoint-refused";
+  const address = { hostname: HOSTNAME, url: `https://${HOSTNAME}/` };
+  let ownerCalls = 0;
+  let code = "deployment_missing";
+  const form = createWorkerEndpointForm({
+    targetKey: TARGET_KEY,
+    publicationState: {
+      resolve: async () => ({ kind: "unresolved", code, message: "fixture" }) as never,
+    },
+    ownerForWorker: () => ({
+      workerResourceUid: workerUid,
+      execute: async () => {
+        ownerCalls += 1;
+        return { kind: "unknown" };
+      },
+    }),
+    assignHostname: () => HOSTNAME,
+    observeTls: async (input) => ({ ...input, ready: true }),
+    observeRouteAbsent: async (input) => ({ ...input, absent: true }),
+  });
+  const execution = (action: "create" | "update" | "delete"): V2Execution => ({
+    operationId: "7e1a2b3c-4d5e-4f6a-8b7c-9d0e1f2a3b4c",
+    leaseToken: "lease-endpoint-refused",
+    backendKey: "backend-key-endpoint-refused",
+    backendId: "selfhost-v2-worker-endpoint-owner-v1",
+    targetKey: TARGET_KEY,
+    resourceUid: "endpoint-backend-refused",
+    principal: "org-fixture",
+    action,
+    generation: action === "create" ? 1 : 2,
+    form: WORKER_ENDPOINT_FORM_URL,
+    space: "prod",
+    name: "endpoint",
+    spec: { worker: { resourceUid: workerUid } },
+    previousObserved: {},
+    previousOutput: address,
+  });
+  for (const action of ["create", "update"] as const) {
+    code = "deployment_missing";
+    expect(await form.backend.execute(execution(action))).toMatchObject({
+      kind: "no_effect",
+      code: "worker_deployment_missing",
+    });
+    expect(await form.backend.reconcile(execution(action))).toMatchObject({
+      kind: "no_effect",
+      code: "worker_deployment_missing",
+    });
+    code = "fetch_unavailable";
+    expect(await form.backend.reconcile(execution(action))).toMatchObject({
+      kind: "no_effect",
+      code: "worker_fetch_handler_missing",
+    });
+    // A transient or ordering refusal is not a precondition: keep reconciling.
+    for (const transient of ["graph_unresolved", "publication_conflict", "stale_claim"]) {
+      code = transient;
+      expect(await form.backend.reconcile(execution(action))).toMatchObject({ kind: "unknown" });
+    }
+  }
+  for (const refused of ["deployment_missing", "fetch_unavailable"]) {
+    code = refused;
+    expect(await form.backend.reconcile(execution("delete"))).toMatchObject({ kind: "unknown" });
+  }
+  expect(ownerCalls).toBe(0);
+});
+
+test("Endpoint admission is one SQL predicate with a Problem detail naming the Deployment", async () => {
+  const form = createWorkerEndpointForm({
+    targetKey: TARGET_KEY,
+    publicationState: { resolve: async () => ({ kind: "unresolved" }) as never },
+    ownerForWorker: () => ({ workerResourceUid: "w", execute: async () => ({ kind: "unknown" }) }),
+    assignHostname: () => HOSTNAME,
+    observeTls: async (input) => ({ ...input, ready: true }),
+  });
+  const admission = await form.prepareAdmission?.({
+    action: "create",
+    principal: "org-fixture",
+    space: "prod",
+    form: WORKER_ENDPOINT_FORM_URL,
+    resourceUid: "endpoint-uid",
+    spec: { worker: { resourceUid: "worker-uid" } },
+  });
+  expect(admission?.sql).not.toContain(";");
+  expect(admission?.params).toContain("worker-uid");
+  expect(admission?.params).toContain("endpoint-uid");
+  expect(admission?.conflictCode).toBeUndefined();
+  expect(admission?.detail).toContain("active WorkerDeployment");
+  await expect(
+    form.prepareAdmission?.({
+      action: "create",
+      principal: "org-fixture",
+      space: "prod",
+      form: WORKER_ENDPOINT_FORM_URL,
+      resourceUid: "endpoint-uid",
+      spec: { worker: { resourceUid: "worker-uid" }, extra: true },
+    }) ?? Promise.resolve(null),
+  ).rejects.toMatchObject({ code: "invalid_spec", status: 422 });
+});
