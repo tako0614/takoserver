@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import { migrateSqlite, UsedV1InstallationError } from "../src/migrate-sqlite.ts";
 
 const ARTIFACT_LIFECYCLE = "0031_takoform_artifact_lifecycle.sql";
 const RUNTIME_INPUT_PREPARATIONS = "0032_worker_runtime_input_preparations.sql";
@@ -3128,7 +3128,29 @@ describe("bringing a local database up to date", () => {
       )
       .run();
 
-    expect(() => migrateSqlite(database)).toThrow(/0017_wallet_credit_lots\.sql failed/u);
+    // The Bun migrator refuses this history before any migration runs, as a
+    // used v1 installation (tests/v1-installation-upgrade-boundary.test.ts).
+    expect(() => migrateSqlite(database)).toThrow(UsedV1InstallationError);
+    expect(
+      (
+        database.query("SELECT COUNT(*) AS count FROM applied_migrations").get() as {
+          count: number;
+        }
+      ).count,
+    ).toBe(creditLots);
+
+    // 0017's own guard still refuses it wherever the migration files are
+    // applied directly (D1), statement by statement as a migrator would.
+    const creditLotStatements = (MIGRATIONS[creditLots]?.sql ?? "")
+      .replace(/^\s*--.*$/gmu, "")
+      .split(";")
+      .map((statement) => statement.trim())
+      .filter((statement) => statement.length > 0);
+    database.exec("BEGIN IMMEDIATE");
+    expect(() => {
+      for (const statement of creditLotStatements) database.exec(statement);
+    }).toThrow(/CHECK constraint failed: valid = 1/u);
+    database.exec("ROLLBACK");
     expect(
       database
         .query(

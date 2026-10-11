@@ -12,7 +12,7 @@ import {
 } from "./entry-v2-private-plane-boot.ts";
 import { parseSelfhostV2WorkerEndpointHttpsSelection } from "./entry-v2-worker-endpoint-boot.ts";
 import { resolveIdentity } from "./identity-setup.ts";
-import { migrateSqlite } from "./migrate-sqlite.ts";
+import { migrateSqlite, UsedV1InstallationError } from "./migrate-sqlite.ts";
 import { createFileObjectStore } from "./objects-fs.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
@@ -382,7 +382,18 @@ controlDatabase.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
 // to this build's schema here. Forward only and recorded, so running it
 // again applies nothing and a database from a newer build is refused
 // rather than repaired.
-const migrated = migrateSqlite(controlDatabase);
+const migrated = (() => {
+  try {
+    return migrateSqlite(controlDatabase, { installation: { dataRoot, databasePath } });
+  } catch (error) {
+    // A used v1.0.0 installation is refused before anything was written, and
+    // the message is the whole explanation; a stack trace would only bury it.
+    if (!(error instanceof UsedV1InstallationError)) throw error;
+    controlDatabase.close();
+    process.stderr.write(`${error.message}\n`);
+    process.exit(1);
+  }
+})();
 if (migrated.applied.length > 0) {
   process.stdout.write(
     `applied ${migrated.applied.length} migration(s): ${migrated.applied.join(", ")}\n`,
