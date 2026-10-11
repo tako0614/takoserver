@@ -47,7 +47,7 @@ Each release that carries the binary attaches exactly these files:
 | File | Content | SHA-256 | Size |
 | --- | --- | --- | --- |
 | `workerd-closed-graph-2026-08-11-linux-x64` | The pinned binary, uncompressed and unmodified, so that its digest is the pin. ELF x86-64, dynamically linked to `libc.so.6` and `libm.so.6` only (highest symbol version `GLIBC_2.38`), not stripped. `--version` prints `workerd 2026-08-11`. | `c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52` | 273,943,488 bytes |
-| `workerd-closed-graph-2026-08-11-notices.tar.gz` | The [notices bundle](#the-notices-bundle). | computed per release | — |
+| `workerd-closed-graph-2026-08-11-notices.tar.gz` | The [notices bundle](#the-notices-bundle). | computed per release | about 246 KB |
 | `SHA256SUMS` | Digests of the two files above. | — | — |
 
 GitHub's automatic source archives are not byte-stable and are not listed in
@@ -127,7 +127,8 @@ met. It is not legal advice.
   simdutf, SQLite, lol-html, workerd-cxx, LLVM libc++ and llvm-libc, the Rust
   standard library and 186 Rust crates. The binary also carries
   Pyodide-related loader code. The bundle carries their license files as
-  collected from the build, not as listed here.
+  collected from the build, not as listed here, with the Rust standard library
+  and libc++ notices taken from the toolchain.
 - **Trademark.** Apache-2.0 grants no trademark rights. The asset is named by
   function and pin, and the notice says it is not an official Cloudflare build.
 - **The guard** is not attached. Anyone who attaches it later must add the Go
@@ -143,8 +144,12 @@ workerd-closed-graph-2026-08-11-notices/
   LICENSE.workerd-Apache-2.0       upstream LICENSE from the pinned archive
   LICENSE.AGPL-3.0                 this repository's LICENSE
   patches/closed-module-graph.patch
-  third-party/<repository>/...     license, copying and notice files from the build
-  third-party/MANUAL.md            texts added by hand (see step 4 below)
+  third-party/<repository>/...     license, copying and notice files from the build,
+                                   at their paths inside the repository
+  third-party/rust-std-1.96.0/     the Rust standard library's notices (step 3)
+  third-party/llvm-libc++-20.1.8-2ubuntu8/copyright
+                                   the Ubuntu copyright file of libc++ and libc++abi (step 3)
+  third-party/MANUAL.md            texts added by hand (step 4)
 ```
 
 `NOTICE.md`:
@@ -186,13 +191,38 @@ identical to <commit>), 2026-10-07, Ubuntu 26.04 LTS x86-64, clang 20.1.8
 reproduced in a second environment.
 ```
 
-Generate the bundle on a host that holds a completed build state (`$B`, the
-`--state-root` of `bun run build:workerd`), from the release checkout `$REL`:
+#### Which tag and commit `NOTICE.md` names
+
+`<tag>` is `v$V` (`v2.0.0-rc.1`) and `<commit>` is the release commit `$X`
+that the tag will name ([release runbook](release.md#1-preconditions)). `$X`
+exists only after the release preparation is merged to `main`, and the bundle
+names it, so the order is fixed:
+
+1. Merge every change meant for the release, including this document, to
+   `main`, and fix `$X`.
+2. Generate the bundle with `$X` as below, then write `SHA256SUMS`
+   ([release runbook](release.md#1-preconditions), "The assets are ready").
+3. Create the tag on `$X` ([Tag](release.md#2-tag)).
+
+The bundle's digest is recorded only in `SHA256SUMS` and in the release
+evidence (the `takos-control` task ledger), never in a file of this repository:
+committing it would move `$X`, and the bundle would then name a commit that the
+tag does not point to. If `main` must change after step 2, the new commit is a
+new `$X` and needs a new bundle. The `tree/v$V` link in `NOTICE.md` resolves
+only once the tag is pushed.
+
+#### Generating the bundle
+
+Use a host that holds the completed build state of the pinned binary (`$B`,
+the `--state-root` of `bun run build:workerd`) and the compiler root it was
+built with (`$WORKERD_LLVM_ROOT`). `$REL`, `$RUN`, `$V` and `$X` are those of
+the [release runbook](release.md#1-preconditions), with `$REL` checked out at
+`$X`.
 
 1. Copy the fixed files:
 
    ```sh
-   N="$RUN/workerd-closed-graph-2026-08-11-notices"
+   N="$RUN/notices/workerd-closed-graph-2026-08-11-notices"
    mkdir -p "$N/patches" "$N/third-party"
    tar -xzOf "$B/downloads/workerd-0129b1e7aaf9afbc21cba79d215723d9839eb7a0.tar.gz" \
      workerd-0129b1e7aaf9afbc21cba79d215723d9839eb7a0/LICENSE > "$N/LICENSE.workerd-Apache-2.0"
@@ -200,10 +230,20 @@ Generate the bundle on a host that holds a completed build state (`$B`, the
    cp "$REL/workerd/patches/closed-module-graph.patch" "$N/patches/"
    ```
 
-2. Write `NOTICE.md` from the template above, with the tag and commit.
+2. Write `NOTICE.md` from the template above, which is the only `markdown`
+   block in this file, and check that no placeholder is left:
+
+   ```sh
+   sed -n '/^```markdown$/,/^```$/{/^```/d;p}' "$REL/docs/release-assets.md" \
+     | sed "s|<tag>|v$V|g; s|<commit>|$X|g" > "$N/NOTICE.md"
+   ! grep -n '<tag>\|<commit>' "$N/NOTICE.md"
+   ```
+
 3. Collect license files from every repository the build fetched, skipping only
    build tools (including more than is linked is acceptable; leaving one out is
-   not):
+   not). Each file keeps its path inside the repository, so a nested license
+   cannot overwrite the top-level one (when files were flattened, Perfetto's
+   `python/LICENSE` replaced its `LICENSE`):
 
    ```sh
    E="$(ls -d "$B"/bazel-output/*/external)"
@@ -213,9 +253,9 @@ Generate the bundle on a host that holds a completed build state (`$B`, the
        rules_rust++crate+crates_vendor__*) ;;
        @*|*.marker|rules_*|aspect_*|bazel_*|platforms*|apple_support*|*toolchain*|remotejdk*|remote_jdk*|local_*|*python*|nodejs*|*esbuild*|jq*|yq*|tar.bzl*|toml.bzl*|package_metadata*|*benchmark*|*protoc*) continue ;;
      esac
-     files="$(find -L "$d" -maxdepth 2 -type f \( -iname 'LICEN[CS]E*' -o -iname 'COPYING*' -o -iname 'NOTICE*' -o -iname 'UNLICENSE*' \))"
+     files="$(cd "$d" && find -L . -maxdepth 2 -type f \( -iname 'LICEN[CS]E*' -o -iname 'COPYING*' -o -iname 'NOTICE*' -o -iname 'UNLICENSE*' \) | sort)"
      if [ -n "$files" ]; then
-       mkdir -p "$N/third-party/$name" && printf '%s\n' "$files" | while read -r f; do cp "$f" "$N/third-party/$name/"; done
+       mkdir -p "$N/third-party/$name" && printf '%s\n' "$files" | while read -r f; do (cd "$d" && cp --parents "$f" "$N/third-party/$name/"); done
      elif [ -f "$d/Cargo.toml" ]; then
        mkdir -p "$N/third-party/$name" && grep -m1 -E '^license *=' "$d/Cargo.toml" > "$N/third-party/$name/LICENSE-EXPRESSION"
      else
@@ -224,21 +264,99 @@ Generate the bundle on a host that holds a completed build state (`$B`, the
    done
    ```
 
-4. In `third-party/MANUAL.md`, add the upstream license text, at the pinned
-   version, for each repository the loop reports and for each crate that has
-   only a `LICENSE-EXPRESSION`. In the reference build that was ada-url,
-   simdutf, lol-html and Pyodide, and 31 crates (the `swc_*` family and a few
-   others) whose packages ship no license file.
-5. Pack it reproducibly and record the digests:
+   The loop skips toolchains, but two toolchain runtimes are linked into the
+   binary, whose `.comment` section names rustc 1.96.0 and clang 20.1.8: the
+   Rust standard library and libc++/libc++abi from the Ubuntu
+   `llvm-toolchain-20` `1:20.1.8-2ubuntu8` packages (the `libc++abi-20-dev`
+   copyright file is the same bytes). Add their notices:
 
    ```sh
-   (cd "$RUN" && tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=2026-08-11 \
-       -cf - workerd-closed-graph-2026-08-11-notices | gzip -9 -n \
-       > workerd-closed-graph-2026-08-11-notices.tar.gz)
+   T="$E/rules_rust++rust+rust_linux_x86_64__x86_64-unknown-linux-gnu__stable_tools/share/doc/rust"
+   mkdir -p "$N/third-party/rust-std-1.96.0" "$N/third-party/llvm-libc++-20.1.8-2ubuntu8"
+   cp "$T/COPYRIGHT-library.html" "$N/third-party/rust-std-1.96.0/"
+   cp -R "$T/licenses" "$N/third-party/rust-std-1.96.0/"
+   cp "$WORKERD_LLVM_ROOT/usr/share/doc/libc++-20-dev/copyright" "$N/third-party/llvm-libc++-20.1.8-2ubuntu8/"
    ```
 
-As of 2026-10-11 the bundle has not been generated; it is a precondition of
-any release that attaches the binary.
+4. Put `third-party/MANUAL.md` in place. It holds the upstream license text, at
+   the pinned version, for each repository the loop reports and for each crate
+   that has only a `LICENSE-EXPRESSION`, and says for each where the version is
+   pinned and where the text comes from. For this binary the file exists:
+   written on 2026-10-11, SHA-256
+   `f43f3222c02638532362b49a8f95d912ab12e4ecc3e38fc15693e1200942c5e2`, kept on
+   the reference host at
+   `/root/.local/share/takos/operator-runs/release-v2.0.0-rc.1/workerd-closed-graph-2026-08-11-notices/third-party/MANUAL.md`.
+   Copy it while the loop reports exactly the repositories and crates below;
+   otherwise add the new entries the same way. It covers:
+   - the seven repositories the loop reports: `+http+capnp-cpp` (the archive's
+     `LICENSE` sits outside the `c++/` directory the build uses), `+http+simdutf`
+     and `ada-url+` (single-header archives; texts from the `v9.0.0` and `v4.0.0`
+     tags), `+pyodide+pyodide-314.0.4` (text from tag `314.0.4`),
+     `+new_local_repository+com_cloudflare_lol_html` (a wrapper with no source;
+     the `lol_html` crates' license is already collected), and `perfetto_cfg+`
+     and `workerd-v8+` (directories of the workerd archive itself, covered by
+     `LICENSE.workerd-Apache-2.0`);
+   - 30 crates whose packages ship no license file: 23 `swc-project/swc` crates
+     and `swc_sourcemap`, `base64-simd`, `vsimd`, `bytes-str`, `par-core`,
+     `link_args` and `selectors`, with the versions and checksums of the
+     workerd archive's `deps/rust/Cargo.lock`.
+
+5. Pack it reproducibly, with fixed modes, and check it against the 2026-10-11
+   run:
+
+   ```sh
+   find "$N" -type d -exec chmod 0755 {} + && find "$N" -type f -exec chmod 0644 {} +
+   (cd "$RUN/notices" && LC_ALL=C tar --format=gnu --sort=name --owner=0 --group=0 --numeric-owner \
+       --mtime=2026-08-11 -cf - workerd-closed-graph-2026-08-11-notices | gzip -9 -n \
+       > "$RUN/assets/workerd-closed-graph-2026-08-11-notices.tar.gz")
+   (cd "$N" && find . -type f ! -path ./NOTICE.md -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) | sha256sum
+   ```
+
+   With the same build state and `MANUAL.md`, the last line prints
+   `4fb8874fb109eb90d7f48e3007cdb9a9711b640cc5798cd8b3aacfccfa31e2c7`: only
+   `NOTICE.md` differs from the 2026-10-11 run.
+
+#### The 2026-10-11 run
+
+The procedure above was run on 2026-10-11 against the build state of the pinned
+binary (`/root/.local/share/takos/operator-runs/workerd-local-8ca90e2/build-state`),
+with `<tag>` = `v2.0.0-rc.1` and, because `$X` did not exist yet, `<commit>` =
+`db29e3d43865a6956b6ccb071e33877f77785d00`, the head of the release preparation
+branch before this record (build inputs unchanged since `8ca90e2f`). That bundle is a rehearsal:
+its `NOTICE.md` names a commit that the tag will not point to, so it is not
+uploaded, and the release regenerates the bundle with `$X`.
+
+| Item | Result |
+| --- | --- |
+| Bundle SHA-256 (rehearsal, `<commit>` = `db29e3d4`) | `73f6a698821f343c82bfeed2940b5f223b65029b1cac2b4902a08780525e1c7b` |
+| Size | 246,429 bytes; 342 files |
+| Everything except `NOTICE.md` (last line of step 5) | `4fb8874fb109eb90d7f48e3007cdb9a9711b640cc5798cd8b3aacfccfa31e2c7` |
+| `third-party/` | 208 directories: 176 repositories whose files step 3 collected, the two toolchain runtimes, and the 30 crates covered by `MANUAL.md` |
+| Placeholders in `NOTICE.md` | none left |
+| `patches/closed-module-graph.patch` | `61b3ed73af00898cbd1032c2750aab9360b7c5508c548218890a2810bae45f45`, as `NOTICE.md` states |
+| `LICENSE.workerd-Apache-2.0` | `0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594`, the same bytes as `LICENSE` in the pinned archive and at `cloudflare/workerd` `0129b1e7` on GitHub |
+| License text per directory | every `third-party/` directory holds a non-empty text, except the 30 crates, which `MANUAL.md` lists; `MANUAL.md` has an entry for each of the seven reported repositories |
+| Reproducibility | two packs of the same tree, a pack of a copy in another directory, and a full regeneration into an empty directory gave the same digest |
+
+What is not exact or not included:
+
+- **Not determined exactly** (part 3 of `MANUAL.md`). For the 23 swc crates the
+  commits their packages record are not on GitHub, so the text is swc's
+  `LICENSE`, unchanged on `main` from 2024-08-11 to 2026-10-11, a period that
+  covers all 23 publications. `swc_sourcemap` 10.0.2 ships no BSD-3-Clause
+  text, so the text and copyright line are those of `swc-project/swc-sourcemap`,
+  the repository it was moved from. `link_args` 0.6.0 (MIT OR Apache-2.0 OR
+  Zlib) has no license text or copyright line upstream at any commit, so only
+  the Apache-2.0 text is carried.
+- **Not covered by a notice in the bundle:** `libc` and `libm`, which are
+  linked dynamically from the operator's system, and what the linker adds from
+  the build host's glibc and GCC 15.2.0 (`.comment` names GCC): the startup
+  files and the static `libgcc`/`libgcc_eh`, which provides the `_Unwind_*`
+  unwinder. `libgcc` is GPL-3.0-or-later with the GCC Runtime Library
+  Exception 3.1; the bundle relies on that exception and adds no notice for
+  it, which the repository owner should confirm. No npm package is embedded:
+  workerd uses them only for types and build tooling, and the binary contains
+  no `node_modules` path.
 
 ## What an operator verifies
 
@@ -355,3 +473,8 @@ c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52  workerd-closed
 
 `sha256sum --check` reads only lines of this form, so the file holds nothing
 else. List exactly the attached files, never one that is not attached.
+
+The bundle's line exists only after the bundle is generated at the release
+commit, and it is not written into this repository
+([Which tag and commit `NOTICE.md` names](#which-tag-and-commit-noticemd-names)).
+The 2026-10-11 rehearsal digest `73f6a698…` is not that line.
