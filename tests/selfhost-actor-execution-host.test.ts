@@ -431,6 +431,39 @@ export class Counter extends Base {
       }
       return obligations;
     };
+    /** A request's JSON answer, or the refusal it settled with. */
+    const outcomeOf = (pending: Promise<Response>): Promise<unknown> =>
+      pending.then(
+        async (response) => {
+          const text = await response.text();
+          try {
+            return JSON.parse(text) as unknown;
+          } catch {
+            return text;
+          }
+        },
+        (error: unknown) => error,
+      );
+    /**
+     * Retries only the two refusals a graph change answers with while the old
+     * carrier is still busy or is being retired, and returns the first other
+     * outcome. Selection never drains behind an active turn, so a fresh
+     * request during a rotation is refused rather than queued.
+     */
+    const settledOutcome = async (send: () => Promise<Response>): Promise<unknown> => {
+      let outcome: unknown;
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        outcome = await outcomeOf(send());
+        const text = String(outcome);
+        if (
+          !(outcome instanceof Error) ||
+          (!text.includes("Actor carrier is in use") && !text.includes("Actor carrier retiring"))
+        )
+          return outcome;
+        await Bun.sleep(25);
+      }
+      return outcome;
+    };
     let owner = makeOwner();
     const identity = { ...scope, id: "カウンター/a" };
     try {
@@ -667,24 +700,19 @@ export class Counter extends Base {
       const heldReader = held.body?.getReader();
       expect(new TextDecoder().decode((await heldReader?.read())?.value)).toBe("head");
       // A weight-only change does not retire this graph. Publish a distinct
-      // generation to exercise deletion while a legitimate rotation drains.
+      // generation to exercise deletion while the old carrier is still busy.
       await runtime.publish?.("worker", publication("generation-1-rotation"));
       basisPoint = 0;
-      let remainingGraphReads = 2;
-      const selected = new Promise<void>((resolve) => {
-        afterGraphRead = () => {
-          remainingGraphReads -= 1;
-          if (remainingGraphReads === 0) {
-            afterGraphRead = undefined;
-            resolve();
-          }
-        };
-      });
-      const stale = owner.fetch(identity, request("/increment"));
-      await selected;
-      // The second request selected the new graph but must wait for the old
-      // graph's held body. Deletion in that gap must fence the selected bytes.
-      await Bun.sleep(10);
+      // The new graph cannot retire the old carrier while the held body keeps
+      // a turn active, and selection does not drain behind it: the selector
+      // may be a nested same-Namespace call from that very turn. The request
+      // is refused at once, before the held body has been read any further,
+      // and a fresh selection is scheduled for when the carrier goes idle.
+      const staleOutcome = await outcomeOf(owner.fetch(identity, request("/increment")));
+      expect(staleOutcome).toBeInstanceOf(Error);
+      expect(String(staleOutcome)).toContain("Actor carrier is in use");
+      // Deletion while the held body is still open must fence the refresh that
+      // its release schedules against the newly published graph.
       f.database
         .query(
           "UPDATE tf_resource_deletion_attestations SET state = 'pending' WHERE resource_uid = ?",
@@ -692,18 +720,13 @@ export class Counter extends Base {
         .run(scope.namespaceResourceUid);
       expect(new TextDecoder().decode((await heldReader?.read())?.value)).toBe("tail");
       expect((await heldReader?.read())?.done).toBe(true);
-      const staleOutcome = await stale.then(
-        async (response) => {
-          await response.body?.cancel();
-          return "incorrectly dispatched";
-        },
-        (error: unknown) => error,
-      );
-      expect(staleOutcome).toBeInstanceOf(Error);
-      expect(String(staleOutcome)).toContain("changed during selection");
-      // Deletion immediately denies the old UID; a same-name replacement starts
-      // a distinct durable namespace rather than adopting the predecessor SQL.
-      await expect(owner.fetch(identity, request())).rejects.toThrow("Resource unavailable");
+      // Deletion denies the old UID; a same-name replacement starts a distinct
+      // durable namespace rather than adopting the predecessor SQL. The
+      // release above starts the refresh that retires the old carrier, and a
+      // request racing that retirement is refused as retiring first.
+      const deletedOutcome = await settledOutcome(() => owner.fetch(identity, request()));
+      expect(deletedOutcome).toBeInstanceOf(Error);
+      expect(String(deletedOutcome)).toContain("Resource unavailable");
       f.database.query("DELETE FROM tf_resources WHERE uid = ?").run(scope.namespaceResourceUid);
       const replacement = resource(actorForm, "counter", "namespace-replacement");
       insert(f.database, replacement, [f.relation]);
@@ -751,7 +774,24 @@ export class Counter extends Base {
       };
       await (await owner.fetch(replacementIdentity, request("/alarm-set?delay=1000"))).json();
       await owner.close();
-      let replacementReads = 0;
+      // Hold the first graph read that follows this namespace's own native
+      // child start: that is the Host's final verification before it admits
+      // native events. Counting reads instead breaks whenever activation adds
+      // a fence before the child starts (the realization read and the private
+      // Binding fence both did), and then the hold lands before startup.
+      const replacementKey = createHash("sha256")
+        .update(JSON.stringify([scope.tenantId, replacement.metadata.uid]))
+        .digest("hex");
+      const replacementChildStarted = async (): Promise<boolean> => {
+        const configs = (await readFile(childConfigFile, "utf8")).trim().split("\n");
+        const latest = configs.at(-1);
+        if (!latest) return false;
+        try {
+          return (await readFile(latest, "utf8")).includes(replacementKey);
+        } catch {
+          return false;
+        }
+      };
       let releaseFinalGraph!: () => void;
       const heldFinalGraph = new Promise<void>((resolve) => {
         releaseFinalGraph = resolve;
@@ -762,12 +802,10 @@ export class Counter extends Base {
       });
       afterGraphRead = async (readScope) => {
         if (readScope.namespaceResourceUid !== replacement.metadata.uid) return;
-        replacementReads += 1;
-        if (replacementReads === 3) {
-          afterGraphRead = undefined;
-          reachedFinalGraph();
-          await heldFinalGraph;
-        }
+        if (!(await replacementChildStarted())) return;
+        afterGraphRead = undefined;
+        reachedFinalGraph();
+        await heldFinalGraph;
       };
       owner = makeOwner();
       try {
@@ -939,8 +977,8 @@ export class Counter extends Base {
         startsBeforeDeploymentChange,
       );
 
-      // Rotation is namespace-wide, so an alarm admitted for another ID is
-      // part of the drain even if no HTTP response is active in that ID.
+      // Rotation is namespace-wide, so an alarm admitted for another ID keeps
+      // the old carrier busy even if no HTTP response is active in that ID.
       const readHeldPhases = async (): Promise<string[]> => {
         const phases: string[] = [];
         for await (const relative of new Bun.Glob("**/*.sqlite").scan(
@@ -976,18 +1014,26 @@ export class Counter extends Base {
         (await readFile(childPidFile, "utf8")).trim().split("\n").at(-1),
       );
       await runtime.publish?.("worker", publication("generation-3"));
-      let rotationDone = false;
-      const rotation = owner
-        .fetch({ ...updateIdentity, id: "rotation-c" }, request())
-        .then(async (response) => {
-          rotationDone = true;
-          return response.json();
-        });
-      await Bun.sleep(100);
-      expect(rotationDone).toBe(false);
+      // The new generation is not selected while the old carrier is busy, and
+      // the request is not queued behind that alarm either: it is refused at
+      // once and the alarm keeps running in the process that admitted it.
+      const rotationRefused = await outcomeOf(
+        owner.fetch({ ...updateIdentity, id: "rotation-c" }, request()),
+      );
+      expect(rotationRefused).toBeInstanceOf(Error);
+      expect(String(rotationRefused)).toContain("Actor carrier is in use");
       expect(() => process.kill(heldProcessPid, 0)).not.toThrow();
-      await rotation;
-      expect(await readHeldPhases()).toContain("finish");
+      expect(await readHeldPhases()).toEqual(["start"]);
+      // When the alarm turn ends, the refresh it scheduled rotates to the new
+      // graph; a retried request is then served by a different native child.
+      const rotated = await settledOutcome(() =>
+        owner.fetch({ ...updateIdentity, id: "rotation-c" }, request()),
+      );
+      expect(rotated).toMatchObject({ id: "rotation-c", value: 0 });
+      expect(await readHeldPhases()).toEqual(["start", "finish"]);
+      expect(Number((await readFile(childPidFile, "utf8")).trim().split("\n").at(-1))).not.toBe(
+        heldProcessPid,
+      );
     } finally {
       await owner.close();
       f.database.close();

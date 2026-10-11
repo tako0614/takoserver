@@ -1,9 +1,15 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  SELFHOST_WORKER_DATA_PLANE_BINDING,
+  SELFHOST_WORKER_DATA_SERVICE_MODULE,
+  selfhostDataServiceSource,
+} from "../src/providers/selfhost-data-service.ts";
 import {
   SELFHOST_V2_QUEUE_EVENT_CONTENT_TYPE,
   SELFHOST_V2_QUEUE_EVENT_PATH,
@@ -58,6 +64,8 @@ import {
   WORKERD_V2_PRIVATE_KV_BINDING,
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
 } from "../src/providers/workerd-v2-private-binding-names.ts";
+import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
+import { createSqliteSql } from "../src/sql-sqlite.ts";
 
 /**
  * The generated entrypoint is the only thing standing between a tenant's module
@@ -1246,6 +1254,110 @@ test("SQL request serialization streams bounded chunks with exact JSON and captu
     );
   } finally {
     await generated.dispose();
+  }
+});
+
+test("the streamed SQL facade reaches a real Bun data plane through the generated data service", async () => {
+  // The three Host-generated halves together, over a real loopback socket for
+  // the last hop: the wrapper streams its envelope, the data service forwards
+  // that stream, and Bun's fetch therefore sends it chunked with no declared
+  // length. A plane that still required Content-Length refused every call.
+  const root = await mkdtemp(join(tmpdir(), "takoserver-selfhost-sql-chain-"));
+  const databaseRoot = join(root, "databases");
+  await mkdir(databaseRoot);
+  // Schema belongs to the administrative migration path; the facade refuses DDL.
+  const seeded = new Database(join(databaseRoot, "chain-db.sqlite"));
+  seeded.exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)");
+  seeded.close();
+  const control = new Database(":memory:");
+  const planes = serveSelfhostDataPlanes({
+    sql: createSqliteSql(control),
+    grant: async (script, versionId) =>
+      script === "worker" && versionId === "v1"
+        ? {
+            secret: "selfhost-chain-secret-0000",
+            kv: {},
+            sql: { DB: "chain-db" },
+            queue: {},
+            objects: {},
+          }
+        : null,
+    databasePath: (name) => join(databaseRoot, `${name}.sqlite`),
+    objectRoot: join(root, "objects"),
+  });
+  let generated: Awaited<ReturnType<typeof loadGenerated>> | undefined;
+  const forwardedContentLengths: (string | null)[] = [];
+  try {
+    await Bun.write(join(root, SELFHOST_WORKER_DATA_SERVICE_MODULE), selfhostDataServiceSource());
+    const dataService = (await import(
+      `${pathToFileURL(join(root, SELFHOST_WORKER_DATA_SERVICE_MODULE)).href}?test=${crypto.randomUUID()}`
+    )) as {
+      readonly default: {
+        fetch(request: Request, env: Record<string, unknown>): Promise<Response>;
+      };
+    };
+    const dataServiceEnv = {
+      [SELFHOST_WORKER_DATA_TOKEN_BINDING]: "worker.v1.selfhost-chain-secret-0000",
+      [SELFHOST_WORKER_DATA_PLANE_BINDING]: {
+        async fetch(url: string, init: RequestInit): Promise<Response> {
+          return await fetch(`http://127.0.0.1:${planes.port}${new URL(url).pathname}`, init);
+        },
+      },
+    };
+    const service = {
+      async fetch(url: string, init: RequestInit): Promise<Response> {
+        const request = new Request(url, init);
+        forwardedContentLengths.push(request.headers.get("content-length"));
+        return await dataService.default.fetch(request, dataServiceEnv);
+      },
+    };
+    generated = await loadGenerated(
+      `export default { async fetch(request, env) {
+         const cleared = await env.DB.execute("DELETE FROM notes WHERE id > ?", [0]);
+         const written = await env.DB.transaction([
+           { sql: "INSERT INTO notes (id, body) VALUES (?, ?)", params: [1, "first 😀"] },
+           { sql: "INSERT INTO notes (id, body) VALUES (?, ?)", params: [2, "x".repeat(70000)] },
+         ]);
+         const read = await env.DB.query("SELECT id, length(body) AS size FROM notes ORDER BY id");
+         return Response.json({ cleared, written, read });
+       } };`,
+      {
+        originalMainModule: "index.js",
+        publication: "sw1.v1",
+        probeHostname: PROBE_HOSTNAME,
+        declaredHandlers: ["fetch"],
+        bindings: [{ kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" }],
+      },
+    );
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      cleared: { rows: [], rowsWritten: 0 },
+      written: {
+        results: [
+          { rows: [], rowsWritten: 1 },
+          { rows: [], rowsWritten: 1 },
+        ],
+      },
+      read: {
+        rows: [
+          { id: 1, size: 7 },
+          { id: 2, size: 70000 },
+        ],
+        rowsWritten: 0,
+      },
+    });
+    // The wrapper's body really was an unknown-length stream on every call.
+    expect(forwardedContentLengths).toEqual([null, null, null]);
+  } finally {
+    await generated?.dispose();
+    await planes.stop(true);
+    control.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 
