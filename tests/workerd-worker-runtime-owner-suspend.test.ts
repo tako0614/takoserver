@@ -196,6 +196,18 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
       };
     },
   } as V2WorkerPublicationResolution;
+  // Which owner call sites ask the current-serving fence for the boot-recovery
+  // tolerance. Only boot recovery may carry it; every other reader must stay strict.
+  let phase: "serving" | "reopen" = "serving";
+  const currentServingCalls: { phase: string; boot: boolean; vouch: string }[] = [];
+  const serving = (input: {
+    sourceOperationId: string;
+    expectedIdentity: { generation: string };
+  }) =>
+    input.sourceOperationId === OPERATION_ID &&
+    input.expectedIdentity.generation === `takoserver-v2-operation:${OPERATION_ID}`
+      ? resolution
+      : { kind: "unresolved" as const, code: "stale", message: "fixture graph changed" };
   const options = {
     rootDirectory: join(root, "owners"),
     workerResourceUid: WORKER_UID,
@@ -204,10 +216,19 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
       async resolve() {
         return resolution;
       },
+      async resolveCommittedServingForBootRecovery(input: {
+        sourceOperationId: string;
+        expectedIdentity: { generation: string };
+        neverServedOperation: unknown;
+      }) {
+        currentServingCalls.push({ phase, boot: true, vouch: typeof input.neverServedOperation });
+        return serving(input);
+      },
       async resolveCurrentServing(input: {
         sourceOperationId: string;
         expectedIdentity: { generation: string };
       }) {
+        currentServingCalls.push({ phase, boot: false, vouch: "none" });
         return input.sourceOperationId === OPERATION_ID &&
           input.expectedIdentity.generation === `takoserver-v2-operation:${OPERATION_ID}`
           ? resolution
@@ -275,8 +296,18 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
       code: "ownership_uncertain",
     });
     await writeFile(statePath, suspendedBytes, { mode: 0o600 });
+    const servingCalls = currentServingCalls.length;
+    phase = "reopen";
     owner = await openWorkerdWorkerRuntimeOwner(options);
     expect(existsSync(privateSockets)).toBe(true);
+    phase = "serving";
+    // Boot recovery asked once (or more) with the tolerance and the owner's
+    // never-served proof; no earlier serving-time read carried either.
+    const recoveryCalls = currentServingCalls.slice(servingCalls);
+    expect(recoveryCalls.length).toBeGreaterThan(0);
+    expect(recoveryCalls.filter((call) => call.boot)).not.toHaveLength(0);
+    expect(recoveryCalls.every((call) => !call.boot || call.vouch === "function")).toBe(true);
+    expect(currentServingCalls.slice(0, servingCalls).some((call) => call.boot)).toBe(false);
     const after = JSON.parse(await readFile(statePath, "utf8")) as StoredState;
     const afterRecord = after.incarnations[0];
     if (!afterRecord) throw new Error("restored active record missing");
@@ -355,6 +386,8 @@ test("graceful suspend retains one graph, releases the lock only after old PID a
         servingSourceOperationId: OPERATION_ID,
       }),
     ).toEqual({ kind: "unknown" });
+    // Serving-time reads after recovery stay strict as well.
+    expect(currentServingCalls.some((call) => call.phase === "serving" && call.boot)).toBe(false);
     await owner.suspend();
     expect(existsSync(privateSockets)).toBe(true);
   } finally {

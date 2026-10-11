@@ -351,6 +351,53 @@ test("records one exact match, redelivers the same id after unknown ACK and SQL 
   }
 });
 
+test("Cron records no match after the active Deployment's latest Operation failed with effect none", async () => {
+  const db = openDb();
+  const graph = seedGraph(db);
+  // An update of the active Deployment that the engine settled failed/none,
+  // projected exactly as tf_v2_terminal_project leaves the Resource: still
+  // its committed observed generation, but phase 'error' and a failed last
+  // Operation. HTTP may keep serving the committed graph; Cron does not.
+  const failed = "deployment-operation-failed-none";
+  const at = "2026-10-07T11:59:30.000Z";
+  db.query(
+    `INSERT INTO tf_v2_operations
+     (id, resource_uid, principal, replay_key, request_fingerprint, action, generation,
+      status, effect, created_at, updated_at, retain_until, backend_id, target_key,
+      backend_key, accepted_spec_json, dispatch_possible, next_attempt_at_ms,
+      lease_token, lease_until_ms, error_code, error_message, result_observed_json,
+      result_output_json)
+     SELECT ?, uid, principal, 'replay-failed-none', 'fingerprint-failed-none', 'update', 2,
+            'failed', 'none', ?, ?, '2027-10-07T12:00:00.000Z', backend_id, target_key,
+            'backend-failed-none', spec_json, 1, 0, NULL, NULL,
+            'worker_incarnation_retired_before_activation', 'retired before activation',
+            NULL, NULL
+       FROM tf_v2_resources WHERE uid = ?`,
+  ).run(failed, at, at, graph.deploymentUid);
+  db.query(
+    `UPDATE tf_v2_resources SET generation = 2, phase = 'error', last_operation = ?
+     WHERE uid = ?`,
+  ).run(failed, graph.deploymentUid);
+  try {
+    const result = await runWorkerCronTriggerTick({
+      sql: createSqliteSql(db),
+      now: () => new Date(MATCH_AT + 10_000),
+      delivery: {
+        async invokeScheduled() {
+          throw new Error("must not dispatch while the Deployment is not settled");
+        },
+      },
+      targetKey: TARGET_KEY,
+    });
+    expect(result).toMatchObject({ recorded: 0, claimed: 0 });
+    expect(db.query("SELECT count(*) AS count FROM tf_v2_worker_cron_matches").get()).toEqual({
+      count: 0,
+    });
+  } finally {
+    db.close();
+  }
+});
+
 test("a claimed Cron match admits one exact physical attempt before native send", async () => {
   const db = openDb();
   try {

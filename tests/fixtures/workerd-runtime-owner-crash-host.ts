@@ -5,6 +5,7 @@ import { bytesDigest, canonicalJson } from "../../src/json.ts";
 import {
   parseWorkerDeploymentSpec,
   WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
 } from "../../src/takoform-v2/forms/worker-specs.ts";
 import type { V2Execution } from "../../src/takoform-v2/types.ts";
 import type { V2WorkerPublicationResolution } from "../../src/takoform-v2/worker-publication-state.ts";
@@ -40,6 +41,15 @@ async function sparePort(): Promise<number> {
   return selected;
 }
 const operationUid = createId ?? "";
+const fixtureWorkerUid: string = workerResourceUid;
+// The Operation whose publish blocks after its candidate incarnation exists.
+const hangOperationId =
+  mode === "active-update-hang-after-candidate" ||
+  mode === "active-endpoint-delete-hang-after-candidate"
+    ? (updateId ?? null)
+    : mode === "create-hang-after-candidate"
+      ? (createId ?? null)
+      : null;
 const servingPath = join(rootDirectory, "current-serving.json");
 type CurrentServing = {
   sourceOperationId: string;
@@ -108,11 +118,15 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
         message: "fixture incumbent mismatch",
       };
     }
-    const parsedSpec = parseWorkerDeploymentSpec(execution.spec);
+    // An Endpoint DELETE re-publishes the committed Deployment without its
+    // hostname; its own spec names only the Worker.
+    const endpointForm = execution.form === WORKER_ENDPOINT_FORM_URL;
+    const servingSpec = endpointForm ? (await readCurrentServing())?.spec : execution.spec;
+    const parsedSpec = parseWorkerDeploymentSpec(servingSpec);
     const versionUid = parsedSpec.versions[0]?.workerVersion.resourceUid;
     if (!versionUid && execution.action !== "delete") throw new Error("fixture version missing");
     const deployment =
-      execution.action === "delete"
+      execution.action === "delete" && !endpointForm
         ? null
         : {
             uid: `deployment-${workerResourceUid}`,
@@ -135,10 +149,15 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
               },
             ],
           };
+    const address = {
+      hostname: `${workerResourceUid}.example.test`,
+      url: `https://${workerResourceUid}.example.test/`,
+    };
     return {
       kind: "ready",
       snapshot: {
         sourceOperationId: execution.operationId,
+        ...(endpointForm ? { acceptedEndpointOutput: address } : {}),
         worker: {
           uid: workerResourceUid,
           principal: execution.principal,
@@ -146,102 +165,135 @@ const publicationState: OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]
           generation: 1,
         },
         deployment,
-        endpoint: {
-          uid: `endpoint-${workerResourceUid}`,
-          generation: 1,
-          spec: { worker: { resourceUid: workerResourceUid } },
-          output: {
-            hostname: `${workerResourceUid}.example.test`,
-            url: `https://${workerResourceUid}.example.test/`,
-          },
-        },
+        endpoint:
+          endpointForm && execution.action === "delete"
+            ? null
+            : {
+                uid: `endpoint-${workerResourceUid}`,
+                generation: 1,
+                spec: { worker: { resourceUid: workerResourceUid } },
+                output: address,
+              },
       },
       sqlGuard: { sql: "SELECT 1", params: [] },
       async stillCurrent() {
         return true;
       },
       async readVersionMaterials() {
+        if (mode === "active-update-fail-after-candidate" && execution.operationId === updateId)
+          throw new Error("injected unavailable materials");
+        // Crash-window fixture: the candidate incarnation is persisted and its
+        // bootstrap child is already running when materials are first read.
+        if (hangOperationId !== null && execution.operationId === hangOperationId) {
+          await writeFile(join(rootDirectory as string, "candidate-hung.json"), "{}", {
+            mode: 0o600,
+          });
+          await new Promise<never>(() => undefined);
+        }
         return { bundle: null, assets: heldAssets };
       },
     } as V2WorkerPublicationResolution;
   },
+  async resolveCommittedServingForBootRecovery(input) {
+    // What the owner is willing to vouch for at boot recovery, for the test to read.
+    await writeFile(
+      join(rootDirectory as string, "never-served.json"),
+      JSON.stringify({
+        update: input.neverServedOperation(updateId ?? ""),
+        create: input.neverServedOperation(createId ?? ""),
+        unknown: input.neverServedOperation("00000000-0000-4000-8000-000000000000"),
+      }),
+      { mode: 0o600 },
+    );
+    return await currentServingFixture(input);
+  },
   async resolveCurrentServing(input) {
-    if (mode === "active-recover-sql-unavailable") {
-      return {
-        kind: "unresolved",
-        code: "fixture_sql_unavailable",
-        message: "injected current-serving lookup failure",
-      };
-    }
-    const current = await readCurrentServing();
-    if (
-      !current ||
-      current.sourceOperationId !== input.sourceOperationId ||
-      canonicalJson(current.identity) !== canonicalJson(input.expectedIdentity)
-    ) {
-      return {
-        kind: "unresolved",
-        code: "fixture_source_mismatch",
-        message: "fixture source changed",
-      };
-    }
-    const parsedSpec = parseWorkerDeploymentSpec(current.spec);
-    const originalChildPid =
-      mode === "active-recover-reject-after-spawn" ? await readActiveChildPid() : null;
-    const snapshot = {
-      sourceOperationId: current.sourceOperationId,
-      worker: {
-        uid: workerResourceUid,
-        principal: "org-runtime-owner",
-        space: "production",
-        generation: 1,
-      },
-      deployment: {
-        uid: `deployment-${workerResourceUid}`,
-        generation: current.generation,
-        spec: parsedSpec,
-        versions: current.identity.versions.map(({ workerVersionUid, weight }) => ({
-          uid: workerVersionUid,
-          // The crash fixture has no WorkerVersion Resource ledger; this is
-          // synthetic provenance, not a Deployment Operation ID.
-          sourceOperationId: "fixture-worker-version-operation",
-          generation: current.generation,
-          weight,
-          spec: {
-            worker: { resourceUid: workerResourceUid },
-            handlers: [],
-            assets: {
-              bundle: { resourceUid: `assets-${operationUid}` },
-              runWorkerFirst: false,
-              notFoundHandling: "none",
-            },
-          } as never,
-        })),
-      },
-      endpoint: {
-        uid: `endpoint-${workerResourceUid}`,
-        generation: 1,
-        spec: { worker: { resourceUid: workerResourceUid } },
-        output: {
-          hostname: current.identity.hostnames[0] ?? "",
-          url: `https://${current.identity.hostnames[0] ?? ""}/`,
-        },
-      },
-    };
-    const stillCurrent = async () => {
-      const reread = await readCurrentServing();
-      return (
-        canonicalJson(reread) === canonicalJson(current) &&
-        (originalChildPid === null || (await readActiveChildPid()) === originalChildPid)
-      );
-    };
-    return {
-      kind: "ready" as const,
-      snapshot,
-      stillCurrent,
-    };
+    return await currentServingFixture(input);
   },
 };
+
+type CurrentServingReader = NonNullable<
+  OpenWorkerdWorkerRuntimeOwnerOptions["publicationState"]["resolveCurrentServing"]
+>;
+
+async function currentServingFixture(
+  input: Parameters<CurrentServingReader>[0],
+): ReturnType<CurrentServingReader> {
+  if (mode === "active-recover-sql-unavailable") {
+    return {
+      kind: "unresolved",
+      code: "fixture_sql_unavailable",
+      message: "injected current-serving lookup failure",
+    };
+  }
+  const current = await readCurrentServing();
+  if (
+    !current ||
+    current.sourceOperationId !== input.sourceOperationId ||
+    canonicalJson(current.identity) !== canonicalJson(input.expectedIdentity)
+  ) {
+    return {
+      kind: "unresolved",
+      code: "fixture_source_mismatch",
+      message: "fixture source changed",
+    };
+  }
+  const parsedSpec = parseWorkerDeploymentSpec(current.spec);
+  const originalChildPid =
+    mode === "active-recover-reject-after-spawn" ? await readActiveChildPid() : null;
+  const snapshot = {
+    sourceOperationId: current.sourceOperationId,
+    worker: {
+      uid: fixtureWorkerUid,
+      principal: "org-runtime-owner",
+      space: "production",
+      generation: 1,
+    },
+    deployment: {
+      uid: `deployment-${fixtureWorkerUid}`,
+      generation: current.generation,
+      spec: parsedSpec,
+      versions: current.identity.versions.map(({ workerVersionUid, weight }) => ({
+        uid: workerVersionUid,
+        // The crash fixture has no WorkerVersion Resource ledger; this is
+        // synthetic provenance, not a Deployment Operation ID.
+        sourceOperationId: "fixture-worker-version-operation",
+        generation: current.generation,
+        weight,
+        spec: {
+          worker: { resourceUid: fixtureWorkerUid },
+          handlers: [],
+          assets: {
+            bundle: { resourceUid: `assets-${operationUid}` },
+            runWorkerFirst: false,
+            notFoundHandling: "none",
+          },
+        } as never,
+      })),
+    },
+    endpoint: {
+      uid: `endpoint-${fixtureWorkerUid}`,
+      generation: 1,
+      spec: { worker: { resourceUid: fixtureWorkerUid } },
+      output: {
+        hostname: current.identity.hostnames[0] ?? "",
+        url: `https://${current.identity.hostnames[0] ?? ""}/`,
+      },
+    },
+  };
+  const stillCurrent = async () => {
+    const reread = await readCurrentServing();
+    return (
+      canonicalJson(reread) === canonicalJson(current) &&
+      (originalChildPid === null || (await readActiveChildPid()) === originalChildPid)
+    );
+  };
+  return {
+    kind: "ready" as const,
+    snapshot,
+    stillCurrent,
+  };
+}
 
 async function readActiveChildPid(): Promise<number | null> {
   const uidHash = createHash("sha256")
@@ -257,6 +309,26 @@ async function readActiveChildPid(): Promise<number | null> {
     state.incarnations.find((item) => item.operationId === state.activeOperationId)?.processIdentity
       ?.pid ?? null
   );
+}
+
+function endpointDeleteExecution(operationId: string): V2Execution {
+  return {
+    operationId,
+    leaseToken: `lease-${operationId}`,
+    backendKey: `backend-${operationId}`,
+    backendId: "fixture-worker-endpoint-backend",
+    targetKey: TARGET_KEY,
+    resourceUid: `endpoint-${workerResourceUid}`,
+    principal: "org-runtime-owner",
+    action: "delete",
+    generation: 2,
+    form: WORKER_ENDPOINT_FORM_URL,
+    space: "production",
+    name: "crash-reopen-endpoint",
+    spec: { worker: { resourceUid: workerResourceUid as string } },
+    previousObserved: {},
+    previousOutput: {},
+  };
 }
 
 function execution(operationId: string, action: V2Execution["action"]): V2Execution {
@@ -386,16 +458,36 @@ if (owner)
       process.stdout.write(
         `${JSON.stringify({ kind: mode === "retire" ? "retired" : mode === "active-create" ? "active-created" : mode === "active-update-draining" ? "active-updated-draining" : "empty-retired", pid: process.pid, port })}\n`,
       );
-    } else if (mode === "active-recover" || mode === "active-recover-only") {
+    } else if (
+      mode === "active-recover" ||
+      mode === "active-recover-only" ||
+      mode === "active-recover-reexecute" ||
+      mode === "active-recover-reexecute-endpoint-delete"
+    ) {
       phase = "recover-fetch";
       const current = await readCurrentServing();
       if (!current) throw new Error("current serving fixture missing");
       const response = await owner.fetch(new Request("http://worker.fixture.test/"));
       const body = await response.text();
       if (body !== current.configIdentity) throw new Error(`recovered fetch mismatch: ${body}`);
-      if (mode === "active-recover-only") {
+      if (
+        mode === "active-recover-only" ||
+        mode === "active-recover-reexecute" ||
+        mode === "active-recover-reexecute-endpoint-delete"
+      ) {
+        // Re-driving the abandoned Operation never starts a second incarnation.
+        const reexecuted =
+          mode === "active-recover-reexecute" && updateId
+            ? await owner.execute(execution(updateId, "update"))
+            : mode === "active-recover-reexecute-endpoint-delete" && updateId
+              ? await owner.execute(endpointDeleteExecution(updateId))
+              : null;
+        const serving =
+          mode === "active-recover-reexecute-endpoint-delete"
+            ? await owner.observeServing({ workerResourceUid, targetKey: TARGET_KEY })
+            : undefined;
         process.stdout.write(
-          `${JSON.stringify({ kind: "recovered-active", body, pid: process.pid, port })}\n`,
+          `${JSON.stringify({ kind: "recovered-active", body, reexecuted, serving, pid: process.pid, port })}\n`,
         );
         setInterval(() => undefined, 60_000);
       } else {
@@ -424,6 +516,74 @@ if (owner)
           `${JSON.stringify({ kind: "recovered-updated-deleted", body, pid: process.pid, port })}\n`,
         );
       }
+    } else if (mode === "open-only") {
+      process.stdout.write(`${JSON.stringify({ kind: "opened", pid: process.pid, port })}\n`);
+    } else if (
+      mode === "active-update-hang-after-candidate" ||
+      mode === "active-endpoint-delete-hang-after-candidate" ||
+      mode === "create-hang-after-candidate"
+    ) {
+      if (!createId) throw new Error("create operation ID missing");
+      if (mode !== "create-hang-after-candidate") {
+        if (!updateId) throw new Error("update operation ID missing");
+        const created = await owner.execute(execution(createId, "create"));
+        if (created.kind !== "confirmed" || created.identity === null)
+          throw new Error(`fixture create was not confirmed: ${JSON.stringify(created)}`);
+        const response = await owner.fetch(new Request("http://worker.fixture.test/"));
+        await writeFile(
+          servingPath,
+          canonicalJson({
+            sourceOperationId: createId,
+            generation: execution(createId, "create").generation,
+            identity: created.identity,
+            configIdentity: await response.text(),
+            spec: execution(createId, "create").spec,
+          }),
+          { mode: 0o600 },
+        );
+      }
+      // Never awaited: it blocks inside readVersionMaterials until this host is killed.
+      void owner
+        .execute(
+          mode === "active-endpoint-delete-hang-after-candidate"
+            ? endpointDeleteExecution(updateId as string)
+            : execution(
+                mode === "create-hang-after-candidate" ? createId : (updateId as string),
+                mode === "create-hang-after-candidate" ? "create" : "update",
+              ),
+        )
+        .catch(() => undefined);
+      const markerPath = join(rootDirectory as string, "candidate-hung.json");
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline && !(await Bun.file(markerPath).exists())) await Bun.sleep(5);
+      if (!(await Bun.file(markerPath).exists()))
+        throw new Error("candidate never reached publish");
+      process.stdout.write(
+        `${JSON.stringify({ kind: "candidate-hung", pid: process.pid, port })}\n`,
+      );
+    } else if (mode === "active-update-fail-after-candidate") {
+      if (!createId || !updateId) throw new Error("operation IDs missing");
+      const created = await owner.execute(execution(createId, "create"));
+      if (created.kind !== "confirmed" || created.identity === null)
+        throw new Error(`fixture create was not confirmed: ${JSON.stringify(created)}`);
+      const response = await owner.fetch(new Request("http://worker.fixture.test/"));
+      await writeFile(
+        servingPath,
+        canonicalJson({
+          sourceOperationId: createId,
+          generation: execution(createId, "create").generation,
+          identity: created.identity,
+          configIdentity: await response.text(),
+          spec: execution(createId, "create").spec,
+        }),
+        { mode: 0o600 },
+      );
+      // Never awaited: the candidate fails and is retired in-process while the
+      // test kills this host.
+      void owner.execute(execution(updateId, "update")).catch(() => undefined);
+      process.stdout.write(
+        `${JSON.stringify({ kind: "candidate-failing", pid: process.pid, port })}\n`,
+      );
     } else if (mode === "replay") {
       const replayed = await owner.execute(execution(deleteId, "delete"));
       if (replayed.kind !== "confirmed" || replayed.identity !== null)

@@ -314,6 +314,150 @@ function settled(row: ResourceRow, op: OperationRow | null): boolean {
   );
 }
 
+const unstartedStatuses = new Set(["queued", "running", "waiting_input"]);
+
+/**
+ * An accepted Operation that cannot have reached a backend. The schema gives
+ * these statuses effect `none`, and `dispatch_possible` is recorded before any
+ * native call; every Worker publication effect starts from a dispatched
+ * `reconciling` claim (see isCurrentClaim). Such an Operation cannot have
+ * changed what is natively serving, so boot recovery may adopt the previously
+ * committed incarnation while it waits.
+ */
+function unstartedOperation(op: OperationRow, neverServed?: NeverServedOperation): boolean {
+  if (unstartedStatuses.has(op.status) && op.effect === "none" && op.dispatch_possible === 0)
+    return true;
+  return dispatchedNeverServed(op.id, op.status, op.effect, op.dispatch_possible, neverServed);
+}
+
+/**
+ * Owner-side proof that an Operation never reached native serving. A dispatched
+ * Operation (`reconciling`, dispatch recorded) may have been sent to the owner,
+ * so it is tolerated only when the owner vouches from its own durable state that
+ * no incarnation of that Operation ever served (no record at all, or a candidate
+ * it proved dead and retired without activation).
+ */
+export type NeverServedOperation = (operationId: string) => boolean;
+
+function dispatchedNeverServed(
+  id: unknown,
+  status: unknown,
+  effect: unknown,
+  dispatchPossible: unknown,
+  neverServed: NeverServedOperation | undefined,
+): boolean {
+  return (
+    neverServed !== undefined &&
+    typeof id === "string" &&
+    status === "reconciling" &&
+    effect === "unknown" &&
+    dispatchPossible === 1 &&
+    neverServed(id) === true
+  );
+}
+
+/** A queued update/delete accepted over a committed generation of `row`. */
+function unstartedSuccessor(
+  op: OperationRow | null,
+  row: ResourceRow,
+  neverServed?: NeverServedOperation,
+  // Operations proven failed with effect none between the observed generation
+  // and `op` (see failedNoEffectTail). They never changed what serves.
+  failedGap = 0,
+): op is OperationRow {
+  return row.observed_generation > 0 && unstartedLaterOperation(op, row, neverServed, failedGap);
+}
+
+/**
+ * A queued update/delete of a Resource that never committed: its CREATE and
+ * every later Operation ended failed with effect none (a re-apply after a
+ * failed first publication). Like a queued first create, nothing of it was
+ * ever committed, so it contributes nothing to what serves.
+ */
+function unstartedAfterFailedCreate(
+  op: OperationRow | null,
+  row: ResourceRow,
+  neverServed: NeverServedOperation | undefined,
+  failedGap: number,
+): op is OperationRow {
+  return (
+    row.observed_generation === 0 &&
+    failedGap >= 1 &&
+    unstartedLaterOperation(op, row, neverServed, failedGap)
+  );
+}
+
+function unstartedLaterOperation(
+  op: OperationRow | null,
+  row: ResourceRow,
+  neverServed: NeverServedOperation | undefined,
+  failedGap: number,
+): op is OperationRow {
+  return (
+    op !== null &&
+    unstartedOperation(op, neverServed) &&
+    op.id === row.last_operation &&
+    op.id === row.busy_operation &&
+    op.resource_uid === row.uid &&
+    op.principal === row.principal &&
+    op.backend_id === row.backend_id &&
+    op.target_key === row.target_key &&
+    op.generation === row.generation &&
+    Number.isSafeInteger(failedGap) &&
+    failedGap >= 0 &&
+    row.generation === row.observed_generation + 1 + failedGap &&
+    op.accepted_spec_json === row.spec_json &&
+    row.deleted_at === null &&
+    ((op.action === "update" && row.phase === "pending") ||
+      (op.action === "delete" && row.phase === "deleting"))
+  );
+}
+
+/** A queued first publication: nothing was ever committed for this Resource. */
+function unstartedCreate(
+  op: OperationRow | null,
+  row: ResourceRow,
+  neverServed?: NeverServedOperation,
+): op is OperationRow {
+  return (
+    op !== null &&
+    unstartedOperation(op, neverServed) &&
+    op.action === "create" &&
+    op.id === row.last_operation &&
+    op.id === row.busy_operation &&
+    op.resource_uid === row.uid &&
+    op.principal === row.principal &&
+    op.backend_id === row.backend_id &&
+    op.target_key === row.target_key &&
+    op.generation === 1 &&
+    row.generation === 1 &&
+    row.observed_generation === 0 &&
+    row.phase === "pending" &&
+    op.accepted_spec_json === row.spec_json &&
+    row.deleted_at === null
+  );
+}
+
+/** Fence-side recheck of the same predicate from the reported pending rows. */
+function unstartedPendingRows(
+  rows: readonly unknown[],
+  sourceOperationId: string,
+  neverServed?: NeverServedOperation,
+): boolean {
+  return (
+    rows.length <= MAX_UNSTARTED_SUCCESSORS &&
+    rows.every(
+      (row) =>
+        Array.isArray(row) &&
+        typeof row[0] === "string" &&
+        row[0] !== sourceOperationId &&
+        typeof row[4] === "string" &&
+        ((unstartedStatuses.has(row[4]) && row[5] === "none" && row[6] === 0) ||
+          dispatchedNeverServed(row[0], row[4], row[5], row[6], neverServed)),
+    )
+  );
+}
+
 function outputHostname(row: ResourceRow): { hostname: string; url: string } | null {
   const output = parseObject(row.output_json);
   const hostname = output?.hostname;
@@ -501,7 +645,58 @@ SELECT 'reference', ref.operation_id || ':' || ref.target_uid,
   FROM tf_v2_operation_references ref WHERE ref.operation_id IN (SELECT id FROM set_ids)
 ORDER BY kind, key`;
 
-const currentServingFenceRelationsSql = `
+/**
+ * `tolerateUnstartedSuccessors` is only for boot recovery of an already active
+ * incarnation. The strict form requires that no Deployment/Endpoint Operation
+ * for the Worker is pending. The tolerant form instead reports each pending
+ * Operation (the caller accepts only ones that cannot have reached a backend)
+ * and derives publishers from the committed generation of a busy Resource.
+ */
+function currentServingFenceRelationsSql(tolerateUnstartedSuccessors: boolean): string {
+  const pending = tolerateUnstartedSuccessors
+    ? `SELECT 'pending', pending.id, json_array(pending.id, pending.resource_uid,
+    pending.action, pending.generation, pending.status, pending.effect,
+    pending.dispatch_possible, pending.lease_token, pending.lease_until_ms,
+    pending.acceptance_order)
+  FROM (SELECT op.id, op.resource_uid, op.action, op.generation, op.status, op.effect,
+      op.dispatch_possible, op.lease_token, op.lease_until_ms, op.acceptance_order
+    FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
+    WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
+      AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
+      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
+    ORDER BY op.id LIMIT ${MAX_UNSTARTED_SUCCESSORS + 1}) pending`
+    : `SELECT 'pending', '', json_object('present', EXISTS (
+  SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
+    WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
+      AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
+      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ? LIMIT 1))`;
+  const publisher = tolerateUnstartedSuccessors
+    ? `SELECT 'publisher', publisher.id, json_object('id', publisher.id,
+  'acceptance_order', publisher.acceptance_order)
+  FROM (SELECT op.id, op.acceptance_order FROM tf_v2_resources r
+    JOIN tf_v2_operations op ON op.resource_uid = r.uid AND op.generation = r.observed_generation
+    WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
+      AND op.principal = r.principal AND op.backend_id = r.backend_id
+      AND op.target_key = r.target_key AND op.status = 'succeeded'
+      AND op.effect = 'complete' AND r.observed_generation > 0
+      AND ((r.busy_operation IS NULL AND op.id = r.last_operation)
+        OR (r.busy_operation IS NULL AND ${failedNoEffectTailSql})
+        OR (r.busy_operation IS NOT NULL AND op.id <> r.busy_operation))
+      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
+    ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2) publisher`
+    : `SELECT 'publisher', publisher.id, json_object('id', publisher.id,
+  'acceptance_order', publisher.acceptance_order)
+  FROM (SELECT op.id, op.acceptance_order FROM tf_v2_resources r
+    JOIN tf_v2_operations op ON op.resource_uid = r.uid AND op.generation = r.observed_generation
+    WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
+      AND op.principal = r.principal AND op.backend_id = r.backend_id
+      AND op.target_key = r.target_key AND op.status = 'succeeded'
+      AND op.effect = 'complete' AND r.observed_generation > 0
+      AND r.busy_operation IS NULL
+      AND (op.id = r.last_operation OR (${failedNoEffectTailSql}))
+      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
+    ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2) publisher`;
+  return `
 WITH selected(uid) AS (SELECT value FROM json_each(?)),
      inbound(uid) AS (SELECT value FROM json_each(?)),
      artifacts(uid) AS (SELECT value FROM json_each(?)),
@@ -521,30 +716,40 @@ SELECT 'owner:' || f.field, a.resource_uid,
   FROM tf_v2_artifact_owners a CROSS JOIN owner_fields f
   WHERE a.resource_uid IN (SELECT uid FROM artifacts)
 UNION ALL
-SELECT 'pending', '', json_object('present', EXISTS (
-  SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
-    WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
-      AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
-      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ? LIMIT 1))
+${pending}
 UNION ALL
-SELECT 'publisher', publisher.id, json_object('id', publisher.id,
-  'acceptance_order', publisher.acceptance_order)
-  FROM (SELECT op.id, op.acceptance_order FROM tf_v2_resources r
-    JOIN tf_v2_operations op ON op.id = r.last_operation
-    WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
-      AND op.principal = r.principal AND op.backend_id = r.backend_id
-      AND op.target_key = r.target_key AND op.status = 'succeeded'
-      AND op.effect = 'complete' AND r.observed_generation = op.generation
-      AND r.busy_operation IS NULL
-      AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
-    ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2) publisher
+${publisher}
 ORDER BY kind, key`;
+}
 
+const MAX_UNSTARTED_SUCCESSORS = 4;
+/** Bound on consecutive failed/none Operations read behind a committed generation. */
+const MAX_FAILED_TAIL = 8;
+/**
+ * The Resource's newest Operations all ended failed with effect none, so it is
+ * still the Resource of its last observed generation (see committedView).
+ */
+const failedNoEffectTailSql = `r.phase = 'error' AND r.generation > r.observed_generation
+      AND NOT EXISTS (SELECT 1 FROM tf_v2_operations tail
+        WHERE tail.resource_uid = r.uid AND tail.generation > r.observed_generation
+          AND NOT (tail.status = 'failed' AND tail.effect = 'none'))`;
 const currentServingFenceSql = `
 SELECT kind, key, body FROM (${currentServingFenceGraphSql})
 UNION ALL
-SELECT kind, key, body FROM (${currentServingFenceRelationsSql})
+SELECT kind, key, body FROM (${currentServingFenceRelationsSql(false)})
 ORDER BY kind, key`;
+const tolerantCurrentServingFenceSql = `
+SELECT kind, key, body FROM (${currentServingFenceGraphSql})
+UNION ALL
+SELECT kind, key, body FROM (${currentServingFenceRelationsSql(true)})
+ORDER BY kind, key`;
+
+interface CurrentServingInput {
+  readonly workerUid: string;
+  readonly targetKey: string;
+  readonly sourceOperationId: string;
+  readonly expectedIdentity: V2WorkerCurrentServingIdentity;
+}
 
 /** No separate desired-state ledger: every read starts from the accepted v2 Operation. */
 export function createV2WorkerPublicationState(options: {
@@ -584,29 +789,32 @@ export function createV2WorkerPublicationState(options: {
       ...artifactIds,
     ];
     const current = captured.currentServing;
-    const rows = await sql.query(currentServingFenceSql, [
-      JSON.stringify(selected),
-      JSON.stringify(initial.fence.referenceSetIds),
-      WORKER_DEPLOYMENT_FORM_URL,
-      WORKER_ENDPOINT_FORM_URL,
-      snapshot.worker.principal,
-      snapshot.worker.space,
-      current.workerUid,
-      current.sourceOperationId,
-      WORKER_DEPLOYMENT_FORM_URL,
-      WORKER_ENDPOINT_FORM_URL,
-      JSON.stringify(selected),
-      JSON.stringify(initial.fence.inboundTargetIds),
-      JSON.stringify(artifactIds),
-      WORKER_DEPLOYMENT_FORM_URL,
-      WORKER_ENDPOINT_FORM_URL,
-      current.workerUid,
-      WORKER_DEPLOYMENT_FORM_URL,
-      WORKER_ENDPOINT_FORM_URL,
-      snapshot.worker.principal,
-      snapshot.worker.space,
-      current.workerUid,
-    ]);
+    const rows = await sql.query(
+      current.tolerateUnstartedSuccessors ? tolerantCurrentServingFenceSql : currentServingFenceSql,
+      [
+        JSON.stringify(selected),
+        JSON.stringify(initial.fence.referenceSetIds),
+        WORKER_DEPLOYMENT_FORM_URL,
+        WORKER_ENDPOINT_FORM_URL,
+        snapshot.worker.principal,
+        snapshot.worker.space,
+        current.workerUid,
+        current.sourceOperationId,
+        WORKER_DEPLOYMENT_FORM_URL,
+        WORKER_ENDPOINT_FORM_URL,
+        JSON.stringify(selected),
+        JSON.stringify(initial.fence.inboundTargetIds),
+        JSON.stringify(artifactIds),
+        WORKER_DEPLOYMENT_FORM_URL,
+        WORKER_ENDPOINT_FORM_URL,
+        current.workerUid,
+        WORKER_DEPLOYMENT_FORM_URL,
+        WORKER_ENDPOINT_FORM_URL,
+        snapshot.worker.principal,
+        snapshot.worker.space,
+        current.workerUid,
+      ],
+    );
     const graph = rows.filter(
       (row) =>
         (typeof row.kind === "string" && row.kind.startsWith("resource:")) ||
@@ -699,10 +907,12 @@ export function createV2WorkerPublicationState(options: {
             (row as { resource_uid?: unknown }).resource_uid === id,
         ),
       ) ||
-      pending.length !== 1 ||
-      pending[0] === null ||
-      typeof pending[0] !== "object" ||
-      (pending[0] as { present?: unknown }).present !== 0 ||
+      !(current.tolerateUnstartedSuccessors
+        ? unstartedPendingRows(pending, current.sourceOperationId, current.neverServedOperation)
+        : pending.length === 1 &&
+          pending[0] !== null &&
+          typeof pending[0] === "object" &&
+          (pending[0] as { present?: unknown }).present === 0) ||
       !publishers.some(
         (row) =>
           row !== null &&
@@ -726,6 +936,104 @@ export function createV2WorkerPublicationState(options: {
         )
       ).length > 0
     );
+  }
+  /**
+   * Operations of `row` after its observed generation and before
+   * `beforeGeneration`, when every one of them ended failed with effect none.
+   * Returns their count and the sealed targets they still hold as active edges,
+   * or `null` for any other history.
+   */
+  async function failedNoEffectTail(
+    row: ResourceRow,
+    beforeGeneration: number,
+  ): Promise<{
+    readonly count: number;
+    readonly targets: Set<string>;
+    readonly last: OperationRow | null;
+  } | null> {
+    const count = beforeGeneration - row.observed_generation - 1;
+    if (!Number.isSafeInteger(count) || count < 0 || count > MAX_FAILED_TAIL) return null;
+    const tail = (await sql.query(
+      `SELECT * FROM tf_v2_operations WHERE resource_uid = ? AND generation > ?
+         AND generation < ? ORDER BY generation LIMIT ?`,
+      [row.uid, row.observed_generation, beforeGeneration, MAX_FAILED_TAIL + 1],
+    )) as unknown as OperationRow[];
+    if (
+      tail.length !== count ||
+      tail.some(
+        (item, index) =>
+          item.generation !== row.observed_generation + 1 + index ||
+          item.status !== "failed" ||
+          item.effect !== "none" ||
+          item.resource_uid !== row.uid ||
+          item.principal !== row.principal ||
+          item.backend_id !== row.backend_id ||
+          item.target_key !== row.target_key,
+      )
+    )
+      return null;
+    const targets = new Set<string>();
+    for (const item of tail) {
+      if (item.action === "delete") continue;
+      const sealed = await references(item.id);
+      if (!sealed) return null;
+      for (const reference of sealed) targets.add(reference.target_uid);
+    }
+    return { count, targets, last: tail[tail.length - 1] ?? null };
+  }
+
+  /**
+   * The serving view of a Resource whose newest Operations all ended `failed`
+   * with effect `none`. Effect counts changes to the managed thing, never the
+   * Resource record or its generation, so such a Resource still serves its last
+   * observed generation. The view is rebuilt from immutable Operation history:
+   * the committed Operation's accepted spec, never a failed spec. `view: null`
+   * means nothing was ever committed (a failed CREATE). `failedTargets` are the
+   * sealed targets the failed Operations still hold as active edges. Any other
+   * Resource (busy, partial, unknown, or not a pure failed/none tail) returns
+   * `null` and keeps every existing refusal.
+   */
+  async function committedView(
+    row: ResourceRow,
+  ): Promise<{ readonly view: ResourceRow | null; readonly failedTargets: Set<string> } | null> {
+    if (
+      row.busy_operation !== null ||
+      row.phase !== "error" ||
+      row.deleted_at !== null ||
+      row.observed_generation >= row.generation
+    )
+      return null;
+    const tail = await failedNoEffectTail(row, row.generation + 1);
+    if (!tail || tail.count < 1 || tail.last?.id !== row.last_operation) return null;
+    const failedTargets = tail.targets;
+    if (row.observed_generation === 0) return { view: null, failedTargets };
+    const committed = (await sql.query(
+      "SELECT * FROM tf_v2_operations WHERE resource_uid = ? AND generation = ? LIMIT 2",
+      [row.uid, row.observed_generation],
+    )) as unknown as OperationRow[];
+    const op = committed[0];
+    if (
+      committed.length !== 1 ||
+      !op ||
+      op.status !== "succeeded" ||
+      op.effect !== "complete" ||
+      (op.action !== "create" && op.action !== "update") ||
+      op.principal !== row.principal ||
+      op.backend_id !== row.backend_id ||
+      op.target_key !== row.target_key
+    )
+      return null;
+    return {
+      view: {
+        ...row,
+        generation: op.generation,
+        last_operation: op.id,
+        busy_operation: null,
+        phase: "idle",
+        spec_json: op.accepted_spec_json,
+      },
+      failedTargets,
+    };
   }
   async function references(id: string): Promise<ReferenceRow[] | null> {
     const set = await sql.query(
@@ -832,15 +1140,29 @@ export function createV2WorkerPublicationState(options: {
   async function activeReferences(
     referrerUid: string,
     expected: readonly ReferenceRow[],
+    // Targets reserved by a queued successor. Acceptance inserts them as extra
+    // active edges before the committed set is replaced at success.
+    queuedTargets?: ReadonlySet<string>,
   ): Promise<readonly unknown[] | null> {
     const edges = await sql.query(
       `SELECT target_uid, referrer_uid FROM tf_v2_resource_references
        WHERE referrer_uid = ? ORDER BY target_uid`,
       [referrerUid],
     );
+    if (queuedTargets === undefined) {
+      if (
+        edges.length !== expected.length ||
+        expected.some((reference, index) => edges[index]?.target_uid !== reference.target_uid)
+      )
+        return null;
+      return edges;
+    }
+    const wanted = new Set(expected.map((reference) => reference.target_uid));
+    const present = new Set(edges.map((edge) => edge.target_uid));
     if (
-      edges.length !== expected.length ||
-      expected.some((reference, index) => edges[index]?.target_uid !== reference.target_uid)
+      present.size !== edges.length ||
+      [...wanted].some((uid) => !present.has(uid)) ||
+      [...present].some((uid) => !wanted.has(String(uid)) && !queuedTargets.has(String(uid)))
     )
       return null;
     return edges;
@@ -903,15 +1225,30 @@ export function createV2WorkerPublicationState(options: {
     workerUid: string;
     principal: string;
     space: string;
+    tolerateUnstartedSuccessors: boolean;
   }): Promise<readonly { readonly id: unknown; readonly acceptance_order: unknown }[]> {
     return (await sql.query(
-      `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
-       JOIN tf_v2_operations op ON op.id = r.last_operation
+      input.tolerateUnstartedSuccessors
+        ? `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
+       JOIN tf_v2_operations op ON op.resource_uid = r.uid AND op.generation = r.observed_generation
        WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
          AND op.principal = r.principal
          AND op.backend_id = r.backend_id AND op.target_key = r.target_key
          AND op.status = 'succeeded' AND op.effect = 'complete'
-         AND r.observed_generation = op.generation AND r.busy_operation IS NULL
+         AND r.observed_generation > 0
+         AND ((r.busy_operation IS NULL AND op.id = r.last_operation)
+           OR (r.busy_operation IS NULL AND ${failedNoEffectTailSql})
+           OR (r.busy_operation IS NOT NULL AND op.id <> r.busy_operation))
+         AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
+       ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2`
+        : `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
+       JOIN tf_v2_operations op ON op.resource_uid = r.uid AND op.generation = r.observed_generation
+       WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
+         AND op.principal = r.principal
+         AND op.backend_id = r.backend_id AND op.target_key = r.target_key
+         AND op.status = 'succeeded' AND op.effect = 'complete'
+         AND r.observed_generation > 0 AND r.busy_operation IS NULL
+         AND (op.id = r.last_operation OR (${failedNoEffectTailSql}))
          AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
        ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2`,
       [
@@ -1133,6 +1470,8 @@ export function createV2WorkerPublicationState(options: {
       targetKey: string;
       sourceOperationId: string;
       expectedIdentity: V2WorkerCurrentServingIdentity;
+      tolerateUnstartedSuccessors: boolean;
+      neverServedOperation?: NeverServedOperation;
     };
   };
   async function capture(input: LivePublicationCaptureInput): Promise<Capture>;
@@ -1159,9 +1498,49 @@ export function createV2WorkerPublicationState(options: {
     if (current && pendingStatuses.has(op.status)) {
       return unresolved("source_unsettled", "The serving source Operation is not terminal");
     }
+    // Boot recovery only. The Resource may already carry a queued successor of
+    // the committed source generation. The committed view is the Resource as
+    // of `op`, which is immutable history; the successor is validated below.
+    let servingRow = own;
+    // Every mode: a failed/none tail never changed what `op` serves.
+    const failedTargets = new Map<string, ReadonlySet<string>>();
+    if (current && own.busy_operation === null && own.last_operation !== op.id) {
+      const committed = await committedView(own);
+      if (committed?.view && committed.view.last_operation === op.id) {
+        servingRow = committed.view;
+        failedTargets.set(own.uid, committed.failedTargets);
+      }
+    }
+    if (
+      current?.tolerateUnstartedSuccessors &&
+      own.busy_operation !== null &&
+      own.busy_operation !== op.id
+    ) {
+      const successor = await operation(own.busy_operation);
+      const gap = successor ? await failedNoEffectTail(own, successor.generation) : null;
+      if (
+        gap &&
+        unstartedSuccessor(successor, own, current.neverServedOperation, gap.count) &&
+        op.status === "succeeded" &&
+        op.generation === own.observed_generation &&
+        successor.generation === op.generation + 1 + gap.count
+      ) {
+        if (gap.count > 0) failedTargets.set(own.uid, gap.targets);
+        servingRow = {
+          ...own,
+          generation: op.generation,
+          last_operation: op.id,
+          busy_operation: null,
+          phase: "idle",
+          spec_json: op.accepted_spec_json,
+        };
+      } else {
+        return unresolved("source_unsettled", "A later Worker publication has started");
+      }
+    }
     if (
       current
-        ? !confirmedServingSource(op, own, current.targetKey)
+        ? !confirmedServingSource(op, servingRow, current.targetKey)
         : !execution || !isCurrentClaim(op, own, execution, now().getTime())
     ) {
       return unresolved("stale_claim", "The accepted operation lease is no longer current");
@@ -1232,9 +1611,53 @@ export function createV2WorkerPublicationState(options: {
       }
     }
 
-    const pending = current ? [] : await pendingPublication(workerUid);
+    let pending: OperationRow[] = current ? [] : await pendingPublication(workerUid);
+    // Resources whose queued successors were validated, with those Operations'
+    // sealed reference targets (reserved as extra active edges at acceptance).
+    const unstartedTargets = new Map<string, Set<string>>();
     if (current) {
-      if (await hasPendingPublication(workerUid)) {
+      if (current.tolerateUnstartedSuccessors) {
+        pending = await pendingPublication(workerUid);
+        if (pending.length > MAX_UNSTARTED_SUCCESSORS) {
+          return unresolved("source_unsettled", "Too many later Worker publications are queued");
+        }
+        for (const queued of pending) {
+          const queuedResource = await resource(queued.resource_uid);
+          const gap = queuedResource
+            ? await failedNoEffectTail(queuedResource, queued.generation)
+            : null;
+          if (
+            !queuedResource ||
+            !gap ||
+            queued.id === op.id ||
+            queuedResource.principal !== op.principal ||
+            queuedResource.space !== own.space ||
+            workerUidFromOperation(queued) !== workerUid ||
+            !(
+              unstartedSuccessor(queued, queuedResource, current.neverServedOperation, gap.count) ||
+              unstartedAfterFailedCreate(
+                queued,
+                queuedResource,
+                current.neverServedOperation,
+                gap.count,
+              ) ||
+              (gap.count === 0 &&
+                unstartedCreate(queued, queuedResource, current.neverServedOperation))
+            )
+          ) {
+            return unresolved("source_unsettled", "A later Worker publication has started");
+          }
+          // A DELETE reserves no references; CREATE/UPDATE seal a set at acceptance.
+          const queuedReferences = queued.action === "delete" ? [] : await references(queued.id);
+          if (!queuedReferences) {
+            return unresolved("source_unsettled", "A later Worker publication is not sealed");
+          }
+          unstartedTargets.set(
+            queuedResource.uid,
+            new Set([...queuedReferences.map((reference) => reference.target_uid), ...gap.targets]),
+          );
+        }
+      } else if (await hasPendingPublication(workerUid)) {
         return unresolved("source_unsettled", "A later Worker publication is unresolved");
       }
     } else {
@@ -1246,10 +1669,33 @@ export function createV2WorkerPublicationState(options: {
       }
     }
 
-    const [deploymentRows, endpointRows] = await Promise.all([
+    const [rawDeploymentRows, rawEndpointRows] = await Promise.all([
       matchingResources(WORKER_DEPLOYMENT_FORM_URL, workerUid, op.principal, own.space, !!current),
       matchingResources(WORKER_ENDPOINT_FORM_URL, workerUid, op.principal, own.space, !!current),
     ]);
+    const committedRows = async (rows: readonly ResourceRow[]): Promise<ResourceRow[]> => {
+      const result: ResourceRow[] = [];
+      for (const row of rows) {
+        const committed = await committedView(row);
+        if (!committed) {
+          result.push(row);
+          continue;
+        }
+        failedTargets.set(row.uid, committed.failedTargets);
+        if (committed.view) result.push(committed.view);
+      }
+      return result;
+    };
+    const [deploymentRows, endpointRows] = [
+      await committedRows(rawDeploymentRows),
+      await committedRows(rawEndpointRows),
+    ];
+    const extraActiveTargets = (uid: string): ReadonlySet<string> | undefined => {
+      const unstarted = unstartedTargets.get(uid);
+      const failed = failedTargets.get(uid);
+      if (!unstarted && !failed) return undefined;
+      return new Set([...(unstarted ?? []), ...(failed ?? [])]);
+    };
     if (current && (deploymentRows.length > 1 || endpointRows.length > 1)) {
       return unresolved("publication_conflict", "More than one Worker attachment is present");
     }
@@ -1285,7 +1731,9 @@ export function createV2WorkerPublicationState(options: {
     ): Promise<{ row: ResourceRow; accepted: JsonObject; op: OperationRow } | null | Unresolved> {
       const isOwnForm = form === chosenForm;
       if (isOwnForm && action === "delete") return null;
-      const row = isOwnForm ? own : rows.find((candidate) => candidate.observed_generation > 0);
+      const row = isOwnForm
+        ? servingRow
+        : rows.find((candidate) => candidate.observed_generation > 0);
       if (!row) return null;
       const chosenOp = isOwnForm
         ? op
@@ -1367,7 +1815,11 @@ export function createV2WorkerPublicationState(options: {
         );
       }
       if (current) {
-        const active = await activeReferences(chosenDeployment.row.uid, refRows);
+        const active = await activeReferences(
+          chosenDeployment.row.uid,
+          refRows,
+          extraActiveTargets(chosenDeployment.row.uid),
+        );
         if (!active) {
           return unresolved("graph_unresolved", "Deployment active references changed");
         }
@@ -1500,7 +1952,11 @@ export function createV2WorkerPublicationState(options: {
         return unresolved("graph_unresolved", "Endpoint accepted owner or address is unavailable");
       }
       if (current) {
-        const active = await activeReferences(chosenEndpoint.row.uid, refRows);
+        const active = await activeReferences(
+          chosenEndpoint.row.uid,
+          refRows,
+          extraActiveTargets(chosenEndpoint.row.uid),
+        );
         if (!active) {
           return unresolved("graph_unresolved", "Endpoint active references changed");
         }
@@ -1568,6 +2024,7 @@ export function createV2WorkerPublicationState(options: {
           workerUid,
           principal: op.principal,
           space: own.space,
+          tolerateUnstartedSuccessors: current.tolerateUnstartedSuccessors,
         })
       : null;
     if (
@@ -1740,6 +2197,95 @@ export function createV2WorkerPublicationState(options: {
         : null;
     if (!(await stillAuthorized())) throw denied();
     return { bundle, assets };
+  }
+
+  /** Read-only SQL and held-material proof; native serving needs separate owner readback. */
+  async function resolveServing(
+    input: CurrentServingInput,
+    recovery: { readonly neverServedOperation?: NeverServedOperation } | null,
+  ): Promise<V2WorkerCurrentServingResolution> {
+    // The owner can await while reading SQL. Sample its persisted marker once,
+    // before any await, so caller mutation cannot retarget this readback.
+    let captured: CurrentServingCaptureInput;
+    try {
+      captured = {
+        currentServing: freezeDeep({
+          workerUid: input.workerUid,
+          targetKey: input.targetKey,
+          sourceOperationId: input.sourceOperationId,
+          tolerateUnstartedSuccessors: recovery !== null,
+          ...(recovery?.neverServedOperation !== undefined
+            ? { neverServedOperation: recovery.neverServedOperation }
+            : {}),
+          expectedIdentity: {
+            generation: input.expectedIdentity.generation,
+            workerResourceUid: input.expectedIdentity.workerResourceUid,
+            hostnames: [...input.expectedIdentity.hostnames],
+            versions: input.expectedIdentity.versions.map((version) => ({
+              workerVersionUid: version.workerVersionUid,
+              weight: version.weight,
+            })),
+          },
+        }),
+      };
+    } catch {
+      return unresolved("graph_unresolved", "Persisted serving identity is invalid");
+    }
+    let initial: CurrentCapture;
+    try {
+      initial = await capture(captured);
+    } catch {
+      return unresolved("graph_unresolved", "Current serving SQL graph is unavailable");
+    }
+    if (initial.kind === "unresolved") return initial;
+    let initialFence: string;
+    try {
+      initialFence = await currentServingFence(captured, initial);
+      const confirmed = await capture(captured);
+      if (confirmed.kind !== "ready" || confirmed.vector !== initial.vector) {
+        return unresolved("graph_unresolved", "Current serving graph changed during capture");
+      }
+    } catch {
+      return unresolved("graph_unresolved", "Current serving SQL fence is unavailable");
+    }
+    const stillAuthorized = async (): Promise<boolean> => {
+      try {
+        return (await currentServingFence(captured, initial)) === initialFence;
+      } catch {
+        return false;
+      }
+    };
+    const readVersionMaterials = async (versionUid: string): Promise<V2WorkerVersionMaterials> => {
+      const target = initial.materials.get(versionUid);
+      if (!target) {
+        throw new SqlError("unavailable", "Worker Version materials are not authorized");
+      }
+      return readMaterialsTargets(
+        target,
+        initial.snapshot.worker.principal,
+        initial.snapshot.worker.space,
+        stillAuthorized,
+      );
+    };
+    const verifyAllMaterials = async (): Promise<boolean> => {
+      try {
+        for (const version of initial.snapshot.deployment?.versions ?? []) {
+          await readVersionMaterials(version.uid);
+        }
+        return await stillAuthorized();
+      } catch {
+        return false;
+      }
+    };
+    if (!(await verifyAllMaterials())) {
+      return unresolved("graph_unresolved", "Current serving graph or held bytes are unavailable");
+    }
+    return {
+      kind: "ready",
+      snapshot: initial.snapshot,
+      stillCurrent: verifyAllMaterials,
+      readVersionMaterials,
+    };
   }
 
   return {
@@ -1995,96 +2541,28 @@ export function createV2WorkerPublicationState(options: {
           ),
       };
     },
-    /** Read-only SQL and held-material proof; native serving needs separate owner readback. */
-    async resolveCurrentServing(input: {
-      workerUid: string;
-      targetKey: string;
-      sourceOperationId: string;
-      expectedIdentity: V2WorkerCurrentServingIdentity;
-    }): Promise<V2WorkerCurrentServingResolution> {
-      // The owner can await while reading SQL. Sample its persisted marker once,
-      // before any await, so caller mutation cannot retarget this readback.
-      let captured: CurrentServingCaptureInput;
-      try {
-        captured = {
-          currentServing: freezeDeep({
-            workerUid: input.workerUid,
-            targetKey: input.targetKey,
-            sourceOperationId: input.sourceOperationId,
-            expectedIdentity: {
-              generation: input.expectedIdentity.generation,
-              workerResourceUid: input.expectedIdentity.workerResourceUid,
-              hostnames: [...input.expectedIdentity.hostnames],
-              versions: input.expectedIdentity.versions.map((version) => ({
-                workerVersionUid: version.workerVersionUid,
-                weight: version.weight,
-              })),
-            },
-          }),
-        };
-      } catch {
-        return unresolved("graph_unresolved", "Persisted serving identity is invalid");
-      }
-      let initial: CurrentCapture;
-      try {
-        initial = await capture(captured);
-      } catch {
-        return unresolved("graph_unresolved", "Current serving SQL graph is unavailable");
-      }
-      if (initial.kind === "unresolved") return initial;
-      let initialFence: string;
-      try {
-        initialFence = await currentServingFence(captured, initial);
-        const confirmed = await capture(captured);
-        if (confirmed.kind !== "ready" || confirmed.vector !== initial.vector) {
-          return unresolved("graph_unresolved", "Current serving graph changed during capture");
-        }
-      } catch {
-        return unresolved("graph_unresolved", "Current serving SQL fence is unavailable");
-      }
-      const stillAuthorized = async (): Promise<boolean> => {
-        try {
-          return (await currentServingFence(captured, initial)) === initialFence;
-        } catch {
-          return false;
-        }
-      };
-      const readVersionMaterials = async (
-        versionUid: string,
-      ): Promise<V2WorkerVersionMaterials> => {
-        const target = initial.materials.get(versionUid);
-        if (!target) {
-          throw new SqlError("unavailable", "Worker Version materials are not authorized");
-        }
-        return readMaterialsTargets(
-          target,
-          initial.snapshot.worker.principal,
-          initial.snapshot.worker.space,
-          stillAuthorized,
-        );
-      };
-      const verifyAllMaterials = async (): Promise<boolean> => {
-        try {
-          for (const version of initial.snapshot.deployment?.versions ?? []) {
-            await readVersionMaterials(version.uid);
-          }
-          return await stillAuthorized();
-        } catch {
-          return false;
-        }
-      };
-      if (!(await verifyAllMaterials())) {
-        return unresolved(
-          "graph_unresolved",
-          "Current serving graph or held bytes are unavailable",
-        );
-      }
-      return {
-        kind: "ready",
-        snapshot: initial.snapshot,
-        stillCurrent: verifyAllMaterials,
-        readVersionMaterials,
-      };
+    /** Strict current-serving proof: refuses while any Worker publication is pending. */
+    async resolveCurrentServing(
+      input: CurrentServingInput,
+    ): Promise<V2WorkerCurrentServingResolution> {
+      return await resolveServing(input, null);
+    },
+    /**
+     * Boot recovery of an already active incarnation only, never a route, Queue
+     * or Workflow reader. Accepts queued Deployment/Endpoint Operations that have
+     * no possible backend effect, and dispatched ones the owner proves never
+     * served (`neverServedOperation`), and proves the committed generation they
+     * sit on. Without the proof a dispatched Operation is refused.
+     */
+    async resolveCommittedServingForBootRecovery(
+      input: CurrentServingInput & { readonly neverServedOperation?: NeverServedOperation },
+    ): Promise<V2WorkerCurrentServingResolution> {
+      return await resolveServing(
+        input,
+        input.neverServedOperation === undefined
+          ? {}
+          : { neverServedOperation: input.neverServedOperation },
+      );
     },
     async resolve(input: {
       execution: V2Execution;

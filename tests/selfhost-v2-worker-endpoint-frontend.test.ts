@@ -361,6 +361,43 @@ describe("self-host v2 Worker Endpoint frontend adapter", () => {
     expect(publicationCalls[0]).toMatchObject({ sourceOperationId: DEPLOYMENT_OPERATION_ID });
   });
 
+  for (const action of ["update", "delete"] as const) {
+    test(`denies the hostname while the Endpoint's latest ${action} has failed with effect none`, async () => {
+      // tf_v2_terminal_project after a failed/none Operation: the committed
+      // generation stays observed, the Resource is in phase 'error' and its
+      // last Operation is the failed one (no result output). The publication
+      // reader may still resolve the committed graph; the frontend route
+      // itself requires a settled, succeeded Endpoint.
+      const [row] = endpointRows();
+      const failed = {
+        ...(row as Record<string, unknown>),
+        generation: 3,
+        observed_generation: 2,
+        phase: "error",
+        last_operation: UPDATE_OPERATION_ID,
+        operation_id: UPDATE_OPERATION_ID,
+        operation_generation: 3,
+        operation_action: action,
+        operation_status: "failed",
+        operation_effect: "none",
+        result_output_json: null,
+      } as unknown as Row;
+      const { frontend, fetchCalls } = fixture({ rows: [failed] });
+      const response = await frontend.fetch(
+        new Request(`https://${HOSTNAME}/`, { headers: { host: HOSTNAME } }),
+      );
+      expect(response?.status).toBe(503);
+      expect(fetchCalls).toHaveLength(0);
+      expect(
+        await frontend.routeDenies({
+          endpointUid: ENDPOINT_UID,
+          workerUid: WORKER_UID,
+          ...ADDRESS,
+        }),
+      ).toBe(true);
+    });
+  }
+
   test("terminates an unmatched reserved hostname instead of falling through to the app/API", async () => {
     const { frontend, fetchCalls } = fixture({ rows: [] });
     const response = await frontend.fetch(

@@ -812,6 +812,125 @@ test("Endpoint create/update/delete publish only its route through the same weig
   }
 });
 
+test("an in-process candidate failure settles its Operation with no effect, including an Endpoint DELETE", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-endpoint-abandoned-owner";
+  const publication = await endpointPublicationState(workerUid);
+  const ownerOptions = {
+    rootDirectory: join(owned.root, "owners"),
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+    inspectModule: async (
+      _input: WorkerModuleInspectionInput,
+    ): Promise<WorkerModuleInspectionResult> => ({
+      outcome: "valid",
+      exportedHandlers: ["fetch"],
+    }),
+  };
+  const owner = await openWorkerdWorkerRuntimeOwner(ownerOptions);
+  const deploymentCreate = execution(workerUid, "0c2b3f4e-5a6d-4e7f-8a9b-0c1d2e3f4a5b", "create");
+  const endpointCreate = endpointExecution(
+    workerUid,
+    "1d3c4a5f-6b7e-4f8a-9b0c-1d2e3f4a5b6c",
+    "create",
+  );
+  const endpointUpdate = endpointExecution(
+    workerUid,
+    "2e4d5b6a-7c8f-4a9b-8c1d-2e3f4a5b6c7d",
+    "update",
+  );
+  const endpointDelete = endpointExecution(
+    workerUid,
+    "3f5e6c7b-8d9a-4b0c-9d2e-3f4a5b6c7d8e",
+    "delete",
+  );
+  const redelete = endpointExecution(workerUid, "4a6f7d8c-9e0b-4c1d-8e3f-4a5b6c7d8e9f", "delete");
+  const deploymentDelete = execution(workerUid, "5b7a8e9d-0f1c-4d2e-9f4a-5b6c7d8e9f0a", "delete");
+  const endpointForm = createWorkerEndpointForm({
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    ownerForWorker: () => owner,
+    assignHostname: ({ resourceUid }) => `${resourceUid}.assigned.example.test`,
+    observeTls: async (input) => ({ ...input, ready: true }),
+    observeRouteAbsent: async (input) => ({ ...input, absent: true }),
+  });
+  const workerKey = createHash("sha256").update(workerUid, "utf8").digest("hex");
+  const record = async (operationId: string) =>
+    (
+      JSON.parse(
+        await Bun.file(join(ownerOptions.rootDirectory, workerKey, "runtime-owner.json")).text(),
+      ) as { incarnations: Record<string, unknown>[] }
+    ).incarnations.find((item) => item.operationId === operationId);
+  const serving = () =>
+    owner.observeServing({ workerResourceUid: workerUid, targetKey: TARGET_KEY });
+  const noEffect = {
+    kind: "no_effect",
+    code: "worker_incarnation_retired_before_activation",
+  };
+  try {
+    expect((await owner.execute(deploymentCreate)).kind).toBe("confirmed");
+    publication.setCurrent(deploymentCreate.operationId);
+    expect(await endpointForm.backend.execute(endpointCreate)).toMatchObject({
+      kind: "complete",
+    });
+    publication.setCurrent(endpointCreate.operationId);
+    const committed = await serving();
+    expect(committed).toMatchObject({
+      kind: "serving",
+      sourceOperationId: endpointCreate.operationId,
+      hostnames: [publication.output.hostname],
+    });
+
+    for (const failing of [endpointUpdate, endpointDelete]) {
+      // The SQL fence moves while the candidate publishes: the candidate is
+      // retired in place, under the Operation's own ID, without activation.
+      publication.setFenceCurrent(false);
+      expect((await owner.execute(failing)).kind).not.toBe("confirmed");
+      publication.setFenceCurrent(true);
+      expect(await record(failing.operationId)).toMatchObject({
+        status: "retired",
+        retirementOperationId: failing.operationId,
+        identity: null,
+        configurationSha256: null,
+        executionCopiesReleased: true,
+      });
+      expect((await record(failing.operationId))?.receipt).not.toBeNull();
+      // The engine's retry gets the definitive answer without a Host restart,
+      // and the backend settles it with no effect.
+      const children = owned.children.length;
+      expect(await owner.execute(failing)).toEqual({
+        kind: "abandoned_before_activation",
+        operationId: failing.operationId,
+      });
+      expect(await endpointForm.backend.reconcile(failing)).toMatchObject(noEffect);
+      expect(owned.children).toHaveLength(children);
+      // The committed incarnation, hostname included, is still what serves.
+      expect(await serving()).toEqual(committed);
+    }
+
+    // The user re-issues the DELETE: a fresh Operation publishes once.
+    expect(await endpointForm.backend.execute(redelete)).toMatchObject({
+      kind: "complete",
+      observed: { activeDeploymentRouteReady: false },
+    });
+    publication.setCurrent(redelete.operationId);
+    expect(await serving()).toMatchObject({
+      kind: "serving",
+      sourceOperationId: redelete.operationId,
+      hostnames: [],
+    });
+    expect((await owner.execute(deploymentDelete)).kind).toBe("confirmed");
+    await owner.close();
+  } finally {
+    await owner.close().catch(() => undefined);
+    await owned.cleanup();
+  }
+});
+
 test("no-Deployment Endpoint delete proves a complete empty owner namespace and refuses orphans", async () => {
   const owned = await fixture();
   const workerUid = "worker-endpoint-empty-owner";

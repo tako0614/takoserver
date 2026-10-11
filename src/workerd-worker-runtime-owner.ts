@@ -164,6 +164,23 @@ type PublicationState = {
       }
     | { readonly kind: "unresolved"; readonly code: string; readonly message: string }
   >;
+  /** Boot recovery only: see createV2WorkerPublicationState. */
+  resolveCommittedServingForBootRecovery?(input: {
+    readonly workerUid: string;
+    readonly targetKey: string;
+    readonly sourceOperationId: string;
+    readonly expectedIdentity: WorkerdPublicationIdentity;
+    /** The owner's proof that a dispatched Operation never served. */
+    readonly neverServedOperation: (operationId: string) => boolean;
+  }): Promise<
+    | {
+        readonly kind: "ready";
+        readonly snapshot: V2WorkerPublicationSnapshot;
+        stillCurrent(): Promise<boolean>;
+        readVersionMaterials?(versionUid: string): Promise<V2WorkerVersionMaterials>;
+      }
+    | { readonly kind: "unresolved"; readonly code: string; readonly message: string }
+  >;
 };
 
 type IncarnationStatus = "candidate" | "active" | "draining" | "retiring" | "retired" | "uncertain";
@@ -273,9 +290,22 @@ export class WorkerdWorkerRuntimeOwnerError extends Error {
 /** Explicit no-active-Deployment endpoint absence, never Worker teardown. */
 export type V2WorkerEndpointRouteAbsentResult = V2EndpointRouteAbsentReceipt;
 
+/**
+ * Every incarnation of this exact Operation is a candidate the owner proved
+ * never served: it was never activated, its recorded child is gone, and it is
+ * retired with the Operation's own ID. Nothing this Operation published can
+ * still arrive anywhere, so the backend may settle it with no effect. The
+ * Operation ID is never given a second incarnation.
+ */
+export interface V2WorkerAbandonedBeforeActivationResult {
+  readonly kind: "abandoned_before_activation";
+  readonly operationId: string;
+}
+
 export type V2WorkerRuntimeOwnerExecutionResult =
   | V2WorkerPublicationResult
-  | V2WorkerEndpointRouteAbsentResult;
+  | V2WorkerEndpointRouteAbsentResult
+  | V2WorkerAbandonedBeforeActivationResult;
 
 /** Host-local physical readback; SQL acceptance remains the caller's authority. */
 export type WorkerdActorNativeGraphObservation =
@@ -1049,7 +1079,10 @@ async function verifyKnownGroupContents(
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   });
   const retired = record.status === "retired";
-  const retirementPending = record.status === "draining" || record.status === "retiring";
+  const retirementPending =
+    record.status === "draining" ||
+    record.status === "retiring" ||
+    (record.status === "uncertain" && record.retirementOperationId !== null);
   const allowed =
     retired || retirementPending
       ? new Set([
@@ -1246,6 +1279,14 @@ async function requireSafeStateForNewOwner(
   allowProcessRecovery = false,
 ): Promise<void> {
   if (hasOnlyRetiredOrRetirementPendingIncarnations(snapshot.state)) {
+    if (allowDeleteReplayOnly && allowProcessRecovery && neverActivatedResidue(snapshot.state)) {
+      // An earlier boot already abandoned these candidates (possibly killed
+      // before it finished their retirement). This is not a DELETE replay:
+      // nothing was ever activated, so nothing can be serving.
+      await requireNeverActivatedChildrenGone(snapshot.state);
+      await requireVacantOwnerListeners(snapshot.state);
+      return;
+    }
     if (
       allowDeleteReplayOnly &&
       (snapshot.state.admissionClosedBy === null || !snapshot.state.deletionPublicationConfirmed)
@@ -1255,10 +1296,126 @@ async function requireSafeStateForNewOwner(
     if (allowDeleteReplayOnly) await requireVacantOwnerListeners(snapshot.state);
     return;
   }
+  if (allowProcessRecovery && neverServedResidue(snapshot.state)) {
+    await requireStaleIncarnationChildrenAndVacantListeners(snapshot.state);
+    await requireVacantOwnerListeners(snapshot.state);
+    return;
+  }
   if (!allowProcessRecovery || !recoverableIncarnationSet(snapshot.state)) {
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
   await requireStaleIncarnationChildrenAndVacantListeners(snapshot.state);
+}
+
+/**
+ * A candidate incarnation whose Host died before activation. Activation is one
+ * atomic owner-state write, so such a record never served: it has no publication
+ * identity, no pinned configuration, no receipt and no retirement, it is not the
+ * active incarnation, and its recorded child process is the only thing that
+ * could still be running. A candidate without that recorded child identity
+ * cannot be proven absent and is never abandoned.
+ */
+function abandonableCandidate(record: IncarnationRecord, state: PersistedOwnerState): boolean {
+  return (
+    record.status === "candidate" &&
+    record.operationId !== state.activeOperationId &&
+    record.processIdentity !== null &&
+    record.identity === null &&
+    record.configurationSha256 === null &&
+    !record.configurationRefreshPending &&
+    record.receipt === null &&
+    record.retirementOperationId === null &&
+    record.retireAtMs === null &&
+    !record.executionCopiesReleased &&
+    !record.executionCopiesCleanupStarted &&
+    record.executionCopiesCleanupManifestSha256 === null
+  );
+}
+
+/** An abandoned candidate retiring under its own Operation ID, possibly mid-cleanup. */
+function neverActivatedRetirement(record: IncarnationRecord): boolean {
+  return (
+    record.status === "uncertain" &&
+    record.retirementOperationId === record.operationId &&
+    record.processIdentity !== null &&
+    record.identity === null &&
+    record.configurationSha256 === null
+  );
+}
+
+/**
+ * Nothing was ever activated or is retiring: the Host died while its first
+ * publication (or a re-create after DELETE) was still a candidate.
+ */
+function neverServedResidue(state: PersistedOwnerState): boolean {
+  return (
+    state.activeOperationId === null &&
+    state.admissionClosedBy === null &&
+    !state.deletionPublicationConfirmed &&
+    state.endpointRouteAbsence === null &&
+    state.incarnations.some((record) => abandonableCandidate(record, state)) &&
+    state.incarnations.every(
+      (record) =>
+        abandonableCandidate(record, state) ||
+        neverActivatedRetirement(record) ||
+        (record.status === "retired" &&
+          record.receipt !== null &&
+          record.retirementOperationId !== null),
+    )
+  );
+}
+
+/**
+ * A record retired, or still retiring, under its own Operation ID that was
+ * never activated: what an abandoned (or in-process failed) candidate becomes.
+ */
+function neverActivatedRetiredRecord(record: IncarnationRecord): boolean {
+  return (
+    neverActivatedRetirement(record) ||
+    (record.status === "retired" &&
+      record.receipt !== null &&
+      record.retirementOperationId === record.operationId &&
+      record.identity === null &&
+      record.configurationSha256 === null)
+  );
+}
+
+/**
+ * The state an earlier boot leaves after it abandoned the candidate of a first
+ * publication (or of a re-create after DELETE), whether or not that boot lived
+ * to finish the retirement: no active incarnation, admission open, at least one
+ * record retired or retiring under its own Operation ID without ever being
+ * activated, and every other record a receipted retirement of an earlier
+ * lifecycle. A stale-owner takeover of this state is not a DELETE replay.
+ */
+function neverActivatedResidue(state: PersistedOwnerState): boolean {
+  return (
+    state.activeOperationId === null &&
+    state.admissionClosedBy === null &&
+    !state.deletionPublicationConfirmed &&
+    state.endpointRouteAbsence === null &&
+    state.incarnations.some(neverActivatedRetiredRecord) &&
+    state.incarnations.every(
+      (record) =>
+        neverActivatedRetiredRecord(record) ||
+        (record.status === "retired" &&
+          record.receipt !== null &&
+          record.retirementOperationId !== null),
+    )
+  );
+}
+
+/** A never-activated record without a retirement receipt needs its own child-death proof. */
+async function requireNeverActivatedChildrenGone(state: PersistedOwnerState): Promise<void> {
+  for (const record of state.incarnations) {
+    if (record.status === "retired") continue;
+    if (
+      !neverActivatedRetirement(record) ||
+      !record.processIdentity ||
+      (await linuxProcessLiveness(record.processIdentity)) !== "stale"
+    )
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  }
 }
 
 function recoverableIncarnationSet(state: PersistedOwnerState): boolean {
@@ -1277,6 +1434,7 @@ function recoverableIncarnationSet(state: PersistedOwnerState): boolean {
     if (record.status === "retired") {
       return record.receipt !== null && record.retirementOperationId !== null;
     }
+    if (abandonableCandidate(record, state) || neverActivatedRetirement(record)) return true;
     return (
       (record.status === "active" ||
         record.status === "draining" ||
@@ -1299,7 +1457,12 @@ async function requireStaleIncarnationChildrenAndVacantListeners(
 ): Promise<void> {
   const ports = new Set<number>();
   for (const record of state.incarnations) {
-    if (record.status !== "active" && record.status !== "draining" && record.status !== "retiring")
+    if (
+      record.status !== "active" &&
+      record.status !== "draining" &&
+      record.status !== "retiring" &&
+      !abandonableCandidate(record, state)
+    )
       continue;
     if (
       !record.processIdentity ||
@@ -2411,6 +2574,35 @@ export async function openWorkerdWorkerRuntimeOwner(
       options.workerResourceUid,
       ownerLock.recoveredFromStaleOwner,
     );
+    if (
+      ownerLock.recoveredFromStaleOwner &&
+      state.incarnations.some((item) => abandonableCandidate(item, state))
+    ) {
+      // The previous owner is a proven-dead process and never activated these
+      // candidates. Prove each recorded child is gone and its listener vacant
+      // before taking any decision, then durably record the retirement intent
+      // under the candidate's own Operation ID (exactly what an in-process
+      // candidate failure records). The physical retirement is finished below.
+      await requireStaleIncarnationChildrenAndVacantListeners(state);
+      const abandoning = state;
+      const converted: PersistedOwnerState = {
+        ...abandoning,
+        incarnations: abandoning.incarnations
+          .map((item) =>
+            abandonableCandidate(item, abandoning)
+              ? {
+                  ...item,
+                  status: "uncertain" as const,
+                  retirementOperationId: item.operationId,
+                }
+              : item,
+          )
+          .sort((left, right) => left.operationId.localeCompare(right.operationId))
+          .map(cloneRecord),
+      };
+      await atomicWrite(statePath, new TextEncoder().encode(canonicalJson(converted)));
+      state = converted;
+    }
     const hasServingIncarnations = state.incarnations.some(
       (item) => item.status === "active" || item.status === "draining",
     );
@@ -2517,6 +2709,37 @@ export async function openWorkerdWorkerRuntimeOwner(
     }));
   };
 
+  // The recorded child of an abandoned candidate is proven gone, but its group
+  // directory never got a retirement receipt. Reopen it as an idle recovered
+  // group (no child is started) and write the receipt, which also re-proves the
+  // pinned configuration bytes and the vacant listener.
+  const retireAbandonedCandidateGroup = async (record: IncarnationRecord): Promise<void> => {
+    const groupsRoot = join(directory, "incarnations", record.operationId, "groups");
+    const groupDirectory = join(groupsRoot, uidKey(options.workerResourceUid));
+    if (await lstat(join(groupDirectory, "retirement.json")).catch(() => null)) return;
+    if (record.processIdentity === null || record.retirementOperationId === null)
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    if (
+      (await linuxProcessLiveness(record.processIdentity)) !== "stale" ||
+      (await workerPortOwnership(record.listenerPort, undefined)) !== "vacant"
+    )
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    const configuration = await readFile(join(groupDirectory, "workers", "workerd.capnp"));
+    const group = await openWorkerdWorkerExecutionGroup({
+      rootDirectory: groupsRoot,
+      workerResourceUid: options.workerResourceUid,
+      listenerPort: record.listenerPort,
+      configuration: Uint8Array.from(configuration),
+      configurationPath: "workers/workerd.capnp",
+      workerdBinary: options.workerdBinary,
+      recoverExisting: true,
+    });
+    await group.retire({
+      workerResourceUid: options.workerResourceUid,
+      operationId: record.retirementOperationId,
+    });
+  };
+
   // Retired receipts outlive their publisher process. Retry physical-copy
   // cleanup under this owner's lock before exposing any replay/observation API.
   // A still-active successor finishes its retiring predecessor only after the
@@ -2545,6 +2768,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       );
       let prepared = record;
       if (!record.executionCopiesCleanupStarted) {
+        if (neverActivatedRetirement(record)) await retireAbandonedCandidateGroup(record);
         const verified = await verifyRetiredWorkerdWorkerExecutionCopies({
           groupDirectory,
           workerResourceUid: options.workerResourceUid,
@@ -2733,11 +2957,18 @@ export async function openWorkerdWorkerRuntimeOwner(
       return incarnation.record.receipt;
     const operationId = incarnation.record.retirementOperationId;
     if (!operationId) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    // A never-activated candidate retires as `uncertain` until it is
+    // `retired`: that is the state boot recovery resumes (see
+    // neverActivatedRetirement), so a Host killed mid-retirement still boots.
+    // `retiring` would need an activated record's physical-absence evidence.
+    const neverActivated =
+      incarnation.record.identity === null && incarnation.record.configurationSha256 === null;
+    const pendingStatus = neverActivated ? ("uncertain" as const) : ("retiring" as const);
     const task = (async () => {
       try {
         const retiringRecord = await updateRecord(incarnation.record.operationId, (current) => ({
           ...current,
-          status: "retiring",
+          status: pendingStatus,
           retirementOperationId: operationId,
         }));
         incarnation.record = retiringRecord;
@@ -2764,7 +2995,21 @@ export async function openWorkerdWorkerRuntimeOwner(
         await incarnation.serviceBindingForward?.close();
         await incarnation.actorForward?.close();
         await incarnation.workflowForward?.close();
-        await persistPhysicalAbsence(incarnation.record);
+        if (neverActivated) {
+          // A candidate that was never activated was never a serving source:
+          // no Queue delivery names it and it has no pinned configuration to
+          // bind a physical-absence receipt to. Prove its child gone and its
+          // listener vacant instead (boot recovery retires an abandoned
+          // candidate the same way).
+          if (
+            !incarnation.record.processIdentity ||
+            (await linuxProcessLiveness(incarnation.record.processIdentity)) !== "stale" ||
+            (await workerPortOwnership(incarnation.record.listenerPort, undefined)) !== "vacant"
+          )
+            throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        } else {
+          await persistPhysicalAbsence(incarnation.record);
+        }
         await releasePrivateSockets(
           incarnation.record.operationId,
           await readFile(incarnation.group.configurationPath),
@@ -2784,7 +3029,7 @@ export async function openWorkerdWorkerRuntimeOwner(
         }
         const receiptPersisted = await updateRecord(incarnation.record.operationId, (current) => ({
           ...current,
-          status: "retiring",
+          status: pendingStatus,
           receipt,
           executionCopiesCleanupStarted: true,
           executionCopiesCleanupManifestSha256: verified.cleanupManifestSha256,
@@ -3503,6 +3748,33 @@ export async function openWorkerdWorkerRuntimeOwner(
     if (basisPoint !== 10_000) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   };
 
+  /**
+   * Owner-side proof for boot recovery that an Operation the SQL engine already
+   * dispatched never reached native serving. The owner persists a candidate
+   * incarnation before any native effect and activates it with one atomic state
+   * write, so an Operation is provably unserved when it has no record, or its
+   * only record is a candidate proven dead and retired without activation. An
+   * active, draining or still-retiring record, or an admission closed by the
+   * Operation, is never vouched for.
+   */
+  const operationNeverServed = (operationId: string): boolean => {
+    if (
+      state.admissionClosedBy !== null ||
+      state.deletionPublicationConfirmed ||
+      operationId === state.activeOperationId
+    )
+      return false;
+    const record = state.incarnations.find((item) => item.operationId === operationId);
+    return (
+      record === undefined ||
+      (record.identity === null &&
+        record.configurationSha256 === null &&
+        record.retirementOperationId === record.operationId &&
+        record.status === "retired" &&
+        record.receipt !== null)
+    );
+  };
+
   const recoverActiveIncarnation = async (): Promise<void> => {
     // An old Queue grant may remain send-authorized. Record exact physical
     // absence before restore can replace the active record's process identity.
@@ -3516,12 +3788,22 @@ export async function openWorkerdWorkerRuntimeOwner(
     }
     const sourceOperationId = sourceOperationIdFromIdentity(activeRecord.identity);
     if (!sourceOperationId) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
-    const resolution = await currentServing({
+    // A Host can stop while a later Deployment/Endpoint Operation is queued, or
+    // dispatched without ever serving. Its candidate incarnation is persisted
+    // before any native effect, and a dead never-activated candidate was
+    // retired above. Adopt the committed incarnation, with the owner's own
+    // never-served proof, and let the normal Operation engine run or settle the
+    // successor. Only this boot path may ask for that tolerance.
+    const input = {
       workerUid: options.workerResourceUid,
       targetKey: options.targetKey,
       sourceOperationId,
       expectedIdentity: activeRecord.identity,
-    });
+    };
+    const bootRecovery = options.publicationState.resolveCommittedServingForBootRecovery;
+    const resolution = bootRecovery
+      ? await bootRecovery({ ...input, neverServedOperation: operationNeverServed })
+      : await currentServing(input);
     if (
       resolution.kind !== "ready" ||
       resolution.snapshot.sourceOperationId !== sourceOperationId ||
@@ -3787,6 +4069,38 @@ export async function openWorkerdWorkerRuntimeOwner(
     return receipt;
   };
 
+  /**
+   * The Operation's only incarnation is a candidate retired under the
+   * Operation's own ID without ever being activated (no publication identity,
+   * no pinned configuration, a retirement receipt, its copies released). This
+   * holds for a create or update, and for an Endpoint DELETE, which publishes
+   * the hostname-less graph through a candidate exactly like an update. A
+   * Deployment DELETE never stages a candidate (see deleteDeployment).
+   */
+  const abandonedBeforeActivation = (
+    execution: V2Execution,
+  ): V2WorkerAbandonedBeforeActivationResult | null => {
+    const record = recordFor(execution.operationId);
+    if (
+      !record ||
+      !(
+        execution.action === "create" ||
+        execution.action === "update" ||
+        (execution.action === "delete" && execution.form === WORKER_ENDPOINT_FORM_URL)
+      ) ||
+      record.status !== "retired" ||
+      record.identity !== null ||
+      record.configurationSha256 !== null ||
+      record.retirementOperationId !== execution.operationId ||
+      record.receipt === null ||
+      !record.executionCopiesReleased ||
+      state.activeOperationId === execution.operationId ||
+      active?.record.operationId === execution.operationId
+    )
+      return null;
+    return { kind: "abandoned_before_activation", operationId: execution.operationId };
+  };
+
   const execute = async (
     inputExecution: V2Execution,
   ): Promise<V2WorkerRuntimeOwnerExecutionResult> => {
@@ -3869,6 +4183,11 @@ export async function openWorkerdWorkerRuntimeOwner(
       const existing = handles.get(execution.operationId);
       if (existing) {
         if (existing.record.status !== "candidate") {
+          // An in-process candidate failure keeps its retired handle until
+          // close; the persisted record gives the same definitive answer as
+          // after a restart.
+          const abandoned = abandonedBeforeActivation(execution);
+          if (abandoned && active !== existing) return abandoned;
           if (existing.record.status !== "active" || active !== existing)
             return { kind: "unknown" };
           const observed = await existing.publication.observe(execution);
@@ -3896,7 +4215,11 @@ export async function openWorkerdWorkerRuntimeOwner(
         }
         return result;
       }
-      if (recordFor(execution.operationId)) return { kind: "unknown" };
+      if (recordFor(execution.operationId)) {
+        // The only definitive answer for an existing record: a candidate that
+        // was retired under this Operation's own ID without ever activating.
+        return abandonedBeforeActivation(execution) ?? { kind: "unknown" };
+      }
 
       let incumbentIdentity: WorkerdPublicationIdentity | null = null;
       if (active) {
@@ -4965,9 +5288,11 @@ export async function openWorkerdWorkerRuntimeOwner(
   }
 
   async function retireCandidate(candidate: IncarnationHandle, operationId: string): Promise<void> {
+    // A candidate is never activated: record the retirement intent exactly as
+    // boot recovery records it for an abandoned candidate (retireIncarnation).
     candidate.record = await updateRecord(candidate.record.operationId, (current) => ({
       ...current,
-      status: "retiring",
+      status: "uncertain",
       retirementOperationId: operationId,
     }));
     // This candidate never became the serving owner. No Actor carrier can be
