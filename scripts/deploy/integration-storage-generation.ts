@@ -16,6 +16,11 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
+import {
+  assertFreshV2DataReadback,
+  type FreshV2D1Lineage,
+  type FreshV2DataReader,
+} from "./fresh-v2-data-readback.ts";
 import { type D1SchemaState, readD1SchemaState } from "./migrations.ts";
 import {
   type CommandResult,
@@ -33,9 +38,13 @@ import {
 } from "./qualification.ts";
 import {
   projectApplyQualifiedMigrationArtifact,
+  projectFreshProductionV2MigrationArtifact,
+  projectFreshProductionV2MigrationArtifact0089,
   projectFreshV2ArtifactMigrationArtifact,
   readCurrentAuditedMigrationSourceArtifact,
   readSealedApplyQualifiedMigrationArtifact,
+  readSealedFreshProductionV2MigrationArtifact,
+  readSealedFreshProductionV2MigrationArtifact0089,
   readSealedFreshV2ArtifactMigrationArtifact,
   type SchemaReader,
 } from "./schema.ts";
@@ -71,13 +80,35 @@ class MigrationApplyError extends DeployError {
   }
 }
 
+/**
+ * Fresh-only integration payloads. `v2-artifacts-0075` is the historical
+ * artifact Host payload. `v2-0088` and `v2-0089` are the same closed,
+ * fixed-digest audited payloads as the production fresh-init profiles: a
+ * brand-new generation that already carries 0081 private inputs and the 0088
+ * drain (or 0089 Cron) schema, so a freshly bootstrapped Host never needs the
+ * in-place 0066→0088 wave and its historical predecessor-source proofs.
+ */
+export type IntegrationFreshLineage = "v2-artifacts-0075" | FreshV2D1Lineage;
+
+const INTEGRATION_FRESH_LINEAGES: readonly IntegrationFreshLineage[] = [
+  "v2-artifacts-0075",
+  "v2-0088",
+  "v2-0089",
+];
+
+export function isIntegrationFreshLineage(value: unknown): value is IntegrationFreshLineage {
+  return (
+    typeof value === "string" && (INTEGRATION_FRESH_LINEAGES as readonly string[]).includes(value)
+  );
+}
+
 export interface IntegrationStorageGenerationInvocation {
   readonly action: "status" | "apply";
   readonly environment: DeployEnvironment;
   readonly commit: string;
   readonly generation: string;
-  /** Exact fresh-only v2 artifact payload; omitted means the historical 0066 payload. */
-  readonly freshLineage?: "v2-artifacts-0075";
+  /** Exact fresh-only payload; omitted means the historical 0066 payload. */
+  readonly freshLineage?: IntegrationFreshLineage;
 }
 
 export interface IntegrationStorageD1Database {
@@ -142,6 +173,8 @@ export interface IntegrationStorageGenerationOptions {
     },
   ) => Promise<D1SchemaState>;
   readonly wranglerCommand?: (args: readonly string[]) => readonly string[];
+  /** Test seam for the fresh v2-0088/0089 empty-data proof; deploy uses remote D1. */
+  readonly freshV2DataReader?: FreshV2DataReader;
 }
 
 export interface IntegrationStorageGenerationTargetProof {
@@ -156,6 +189,11 @@ export interface IntegrationStorageGenerationTargetProof {
 export interface FreshV2ArtifactIntegrationStorageTargetProof
   extends IntegrationStorageGenerationTargetProof {
   readonly freshLineage: "v2-artifacts-0075";
+}
+
+export interface FreshV2IntegrationStorageTargetProof
+  extends IntegrationStorageGenerationTargetProof {
+  readonly freshLineage: IntegrationFreshLineage;
 }
 
 /**
@@ -234,11 +272,30 @@ export async function verifyFreshV2ArtifactIntegrationStorageTarget(
   return { ...proof, freshLineage: "v2-artifacts-0075" };
 }
 
+/**
+ * Read-only proof for one generated integration pair whose ledger is exactly
+ * the explicitly selected fresh lineage. The caller names the lineage; the
+ * observed ledger never selects its own expectation. Data is not rechecked:
+ * a running Host legitimately writes rows after the generation proof.
+ */
+export async function verifyFreshV2IntegrationStorageTarget(
+  target: DeployTarget,
+  environment: DeployEnvironment,
+  lineage: IntegrationFreshLineage,
+  options: IntegrationStorageGenerationTargetVerificationOptions = {},
+): Promise<FreshV2IntegrationStorageTargetProof> {
+  if (!isIntegrationFreshLineage(lineage)) {
+    throw preflightError("unsupported fresh integration migration lineage");
+  }
+  const proof = await verifyGeneratedStorageTarget(target, environment, options, lineage);
+  return { ...proof, freshLineage: lineage };
+}
+
 async function verifyGeneratedStorageTarget(
   target: DeployTarget,
   environment: DeployEnvironment,
   options: IntegrationStorageGenerationTargetVerificationOptions,
-  lineage: "apply-0066" | "v2-artifacts-0075",
+  lineage: "apply-0066" | IntegrationFreshLineage,
 ): Promise<IntegrationStorageGenerationTargetProof> {
   const generated = generatedStorageTarget(target, environment);
   const providerContext = await resolveTargetReadProvider(target, environment, options);
@@ -408,7 +465,10 @@ function validateInvocation(
   if (!GENERATION.test(invocation.generation)) {
     throw preflightError("--generation must be exactly 32 lowercase hexadecimal characters");
   }
-  if (invocation.freshLineage !== undefined && invocation.freshLineage !== "v2-artifacts-0075") {
+  if (
+    invocation.freshLineage !== undefined &&
+    !isIntegrationFreshLineage(invocation.freshLineage)
+  ) {
     throw preflightError("unsupported fresh integration migration lineage");
   }
   if (!ACCOUNT_ID.test(target.accountId)) {
@@ -520,10 +580,34 @@ async function statusStorageGeneration(
       // An exact-name D1 may be partially imported or foreign. It is never
       // promoted, reset or retried merely because its name matches.
     }
-    result.schemaReadback = complete ? "complete-0075" : "incomplete-or-divergent";
-    result.resume = complete
-      ? "Correlate the exact prior apply identity; separately review any missing R2 and target binding. No SQL re-import."
-      : "Quarantine this generation and plan separate owner-reviewed forward repair; no SQL re-import or new generation retry.";
+    result.schemaReadback = complete
+      ? `complete-${lineageCeiling(invocation.freshLineage)}`
+      : "incomplete-or-divergent";
+    const freshV2 = freshV2D1Lineage(invocation.freshLineage);
+    let dataEmpty: boolean | null = null;
+    if (complete && freshV2 !== null) {
+      try {
+        await assertFreshV2DataReadback(
+          "preflight",
+          freshV2,
+          configPath,
+          provider.environment,
+          expectedShape,
+          { ...options, run: options.run ?? runCommand },
+        );
+        dataEmpty = true;
+      } catch {
+        // A complete schema with application rows is a generation a Host (or
+        // the signing registration) has already written, not a broken import.
+        dataEmpty = false;
+      }
+      result.dataReadback = dataEmpty ? "empty-seeded" : "present";
+    }
+    result.resume = !complete
+      ? "Quarantine this generation and plan separate owner-reviewed forward repair; no SQL re-import or new generation retry."
+      : dataEmpty === false
+        ? "Complete schema with application data: this generation is in use. Keep it as the selected target; it is no longer a fresh candidate. No SQL re-import."
+        : "Correlate the exact prior apply identity; separately review any missing R2 and target binding. No SQL re-import.";
     return result;
   } finally {
     if (temporary) rmSync(root, { recursive: true, force: true });
@@ -532,12 +616,54 @@ async function statusStorageGeneration(
 
 function selectedSourceArtifact(
   directory: string,
-  lineage: "apply-0066" | "v2-artifacts-0075",
+  lineage: "apply-0066" | IntegrationFreshLineage,
 ): ReturnType<typeof readCurrentAuditedMigrationSourceArtifact> {
   const source = readCurrentAuditedMigrationSourceArtifact(directory);
-  return lineage === "apply-0066"
-    ? projectApplyQualifiedMigrationArtifact(source)
-    : projectFreshV2ArtifactMigrationArtifact(source);
+  switch (lineage) {
+    case "apply-0066":
+      return projectApplyQualifiedMigrationArtifact(source);
+    case "v2-artifacts-0075":
+      return projectFreshV2ArtifactMigrationArtifact(source);
+    case "v2-0088":
+      return projectFreshProductionV2MigrationArtifact(source);
+    case "v2-0089":
+      return projectFreshProductionV2MigrationArtifact0089(source);
+  }
+}
+
+function readSealedSelectedArtifact(
+  directory: string,
+  lineage: IntegrationFreshLineage | undefined,
+): ReturnType<typeof readCurrentAuditedMigrationSourceArtifact> {
+  switch (lineage) {
+    case undefined:
+      return readSealedApplyQualifiedMigrationArtifact(directory);
+    case "v2-artifacts-0075":
+      return readSealedFreshV2ArtifactMigrationArtifact(directory);
+    case "v2-0088":
+      return readSealedFreshProductionV2MigrationArtifact(directory);
+    case "v2-0089":
+      return readSealedFreshProductionV2MigrationArtifact0089(directory);
+  }
+}
+
+function freshV2D1Lineage(lineage: IntegrationFreshLineage | undefined): FreshV2D1Lineage | null {
+  return lineage === "v2-0088" || lineage === "v2-0089" ? lineage : null;
+}
+
+function lineageCeiling(
+  lineage: IntegrationFreshLineage | undefined,
+): "0066" | "0075" | "0088" | "0089" {
+  switch (lineage) {
+    case undefined:
+      return "0066";
+    case "v2-artifacts-0075":
+      return "0075";
+    case "v2-0088":
+      return "0088";
+    case "v2-0089":
+      return "0089";
+  }
 }
 
 interface ProviderContext {
@@ -637,10 +763,7 @@ async function applyStorageGeneration(
     for (const file of sourceArtifact.files) {
       copyFileSync(file.path, join(migrationOutput, file.name));
     }
-    const sealedArtifact =
-      invocation.freshLineage === "v2-artifacts-0075"
-        ? readSealedFreshV2ArtifactMigrationArtifact(migrationOutput)
-        : readSealedApplyQualifiedMigrationArtifact(migrationOutput);
+    const sealedArtifact = readSealedSelectedArtifact(migrationOutput, invocation.freshLineage);
     if (
       sealedArtifact.digest !== sourceArtifact.digest ||
       JSON.stringify(sealedArtifact.names) !== JSON.stringify(sourceArtifact.names)
@@ -745,6 +868,19 @@ async function applyStorageGeneration(
       expectedApplicationShape,
       databaseId,
     );
+    const freshV2 = freshV2D1Lineage(invocation.freshLineage);
+    if (freshV2 !== null) {
+      // The fresh v2 profiles also prove the exact empty seeded data before R2
+      // creation, the same independent readback the production profile uses.
+      await assertFreshV2DataReadback(
+        "verification",
+        freshV2,
+        configPath,
+        provider.environment,
+        expectedApplicationShape,
+        { ...options, run },
+      );
+    }
 
     const finalD1 = await providerCall(
       "verification",

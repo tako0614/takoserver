@@ -593,16 +593,18 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(accepted.exitCode).toBe(2);
       expect(accepted.stderr).toContain("deploy target descriptor not found");
       expect(accepted.stderr).not.toContain("no target was touched");
-      const selected = await deploy([
-        surface,
-        action,
-        "--environment=integration",
-        commit,
-        generation,
-        "--fresh-lineage=v2-artifacts-0075",
-      ]);
-      expect(selected.stderr).toContain("deploy target descriptor not found");
-      expect(selected.stderr).not.toContain("no target was touched");
+      for (const lineage of ["v2-artifacts-0075", "v2-0088", "v2-0089"]) {
+        const selected = await deploy([
+          surface,
+          action,
+          "--environment=integration",
+          commit,
+          generation,
+          `--fresh-lineage=${lineage}`,
+        ]);
+        expect(selected.stderr).toContain("deploy target descriptor not found");
+        expect(selected.stderr).not.toContain("no target was touched");
+      }
     }
     const malformed = [
       "",
@@ -631,6 +633,8 @@ describe("Takoserver split deploy entrypoint", () => {
       ]),
       ...extras.map((extra) => [...base, generation, extra]),
       [...base, generation, "--fresh-lineage=v2-artifacts-0074"],
+      [...base, generation, "--fresh-lineage=v2-0090"],
+      [...base, generation, "--fresh-lineage=v2-0088", "--fresh-lineage=v2-0089"],
       [
         ...base,
         generation,

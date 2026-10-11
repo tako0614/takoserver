@@ -939,6 +939,41 @@ describe("split Takoserver Worker surfaces", () => {
     ).toBe(false);
   });
 
+  test("explicit fresh v2 storage lineage admits exactly its closed prefix as the settled schema", () => {
+    const at = (count: number) => ({
+      local: canonicalMigrations,
+      applied: canonicalMigrations.slice(0, count),
+    });
+    const lineage0088 = {
+      ...v2Target,
+      takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0088" as const },
+    };
+    const lineage0089 = {
+      ...v2Target,
+      takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0089" as const },
+    };
+    expect(workerSchemaAllowsPending(lineage0088, at(88))).toBe(true);
+    expect(workerSchemaAllowsPending(lineage0089, at(89))).toBe(true);
+    for (const count of [66, 75, 87, 89, canonicalMigrations.length]) {
+      expect(workerSchemaAllowsPending(lineage0088, at(count))).toBe(false);
+    }
+    expect(workerSchemaAllowsPending(lineage0089, at(88))).toBe(false);
+    expect(
+      workerSchemaAllowsPending(lineage0088, {
+        ...at(88),
+        applied: [...canonicalMigrations.slice(0, 87), "0088_foreign.sql"],
+      }),
+    ).toBe(false);
+    expect(
+      workerSchemaAllowsPending(lineage0088, {
+        ...at(88),
+        local: [...canonicalMigrations.slice(0, 89), "0090_foreign.sql"],
+      }),
+    ).toBe(false);
+    // Without an explicit lineage the historical rule still refuses any pending tail.
+    expect(workerSchemaAllowsPending(v2Target, at(88))).toBe(false);
+  });
+
   test("v2 0088 maintenance probe requires the distinct current-mode response", async () => {
     const response = Response.json(
       {

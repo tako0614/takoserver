@@ -1038,6 +1038,7 @@ export const DEPLOY_CONTRACT = {
         "migrations",
         "scripts/deploy.ts",
         "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy/fresh-v2-data-readback.ts",
         "scripts/deploy/d1-migration-import.ts",
         "scripts/deploy/schema.ts",
         "scripts/deploy/migrations.ts",
@@ -1052,12 +1053,14 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
           "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
-          "the default fixed audited 0001-0066 names and bytes, or an explicit fixed " +
-          "--fresh-lineage=v2-artifacts-0075 payload, are sealed before creation. A separately " +
+          "the default fixed audited 0001-0066 names and bytes, or one explicit fixed " +
+          "--fresh-lineage=v2-artifacts-0075, v2-0088 or v2-0089 payload (the latter two are the " +
+          "same fixed-digest payloads as the production fresh-init profiles), are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
-          "selected 0001-0066 or fresh-v2 0001-0075 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
+          "selected 0001-0066, 0001-0075, 0001-0088 or 0001-0089 lineage and canonical schema after one Wrangler file import " +
+          "(v2-0088/v2-0089 also read back the exact empty seeded data and ledger count), then creates and reads back one new R2 bucket. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",
         reversal:
@@ -1088,6 +1091,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/production-d1-fresh-init-custody.ts",
         "scripts/deploy/wrangler-state.ts",
         "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy/fresh-v2-data-readback.ts",
         "scripts/deploy/d1-migration-import.ts",
         "scripts/deploy/application-schema-shape.ts",
         "scripts/deploy/schema.ts",

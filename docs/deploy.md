@@ -129,10 +129,49 @@ The operator-private target selects the candidate for that verifier; its
 current identity/schema proof is not historical proof of who created the D1.
 Retain the generation apply output as operator-private provenance.
 
+Two further fixed fresh payloads, `--fresh-lineage=v2-0088` and
+`--fresh-lineage=v2-0089`, select exactly the same closed, fixed-digest
+0001–0088 and 0001–0089 payloads as the production fresh-init profiles. They
+exist because a freshly bootstrapped Host cannot use the in-place 0066→0088
+wave: that wave requires Host and CPE maintenance predecessors built from
+historical pre-v2 sources. A fresh 0088/0089 generation already carries the
+0081 private-input and 0088 drain schema (and 0089 Cron guard depth), so the
+canonical v2 WfP owners can read their exact required ledger without any wave.
+After the schema readback, these two payloads also read back the exact empty
+data: ledger rows 88 or 89, no foreign-key violation, every application table
+empty except the two migration-owned seeds, and those seeds exactly as the
+migrations wrote them. R2 is created only after that proof. Select 0089 only for
+a canonical Cron profile; the canonical owners read exactly 0088 otherwise.
+
+```sh
+bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0088
+```
+
+A target that uses such a generation names it explicitly with
+`takoformV2.storageLineage: "v2-0088"` (or `"v2-0089"`). Absent keeps the
+historical `v2-artifacts-0075` expectation; the lineage cannot be combined with
+`schemaMaintenanceMode: pre-v2-0088-quiesced`, because a fresh generation has
+no wave to quiesce for. The first bootstrap publication on such a target also
+re-reads the data before upload and at the final pre-deploy fence: only the two
+migration seeds and the append-only signing registration in
+`runtime_grant_keys` may exist, so a copied or already served database is
+refused rather than adopted. The observed ledger never selects
+its own expectation: the bootstrap, routine Worker and closure-transition
+storage proofs all read the selected lineage, and the routine pending-schema
+rule accepts exactly that closed prefix (the audited tail after it has no
+in-place wave). A normal Host whose `takoformV2.config` declares artifact
+Forms needs 0081 at startup; such a target on the historical 0075 lineage is
+now refused by target composition before any read or upload, instead of
+failing with 503 after traffic moved.
+
 After a lost import acknowledgement or partial failure, never rerun `--apply`
 or mint a different generation as a retry. Selected `--status` reads the exact
 generated name/UUID and reports whether its ledger and canonical schema are
-complete 0075 or incomplete/divergent. It is diagnosis, not proof that the
+complete (`complete-0075`, `complete-0088` or `complete-0089`) or
+incomplete/divergent. For v2-0088/v2-0089 a complete schema also reports
+`dataReadback`: `empty-seeded` for an untouched generation, or `present` once
+the signing registration or a Host has written rows; the latter is a generation
+in use, not a reason to quarantine it. It is diagnosis, not proof that the
 operator's earlier create owned that D1: correlate the original bounded
 database ID and source digest. Complete readback permits a separately reviewed
 forward continuation (for example, a missing R2); incomplete/divergent or
@@ -356,7 +395,8 @@ changes use their existing lifecycle surfaces.
 An explicitly selected `takoformV2` integration target follows this **same**
 first-publication writer, not a second Host uploader. Its D1/R2 must be the
 exact generated `takoserver-i-<generation>` pair with the complete fixed
-0001–0075 migration ledger and every application schema object. That proof is
+migration ledger selected by `takoformV2.storageLineage` (0001–0075 when absent,
+0001–0088 or 0001–0089 when set) and every application schema object. That proof is
 read before upload, at the immediate upload fence, and after the acknowledged
 Version; identity, source digest, lineage and schema digest must stay equal.
 The v2 cursor key is an operator-private file named
@@ -989,9 +1029,10 @@ The routine surfaces are:
   `TAKOSERVER_TAKOFORM_V2_CONFIG`. The separately installed, stable
   `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY` is inventoried by name only, never
   generated, read into target data, or printed by deploy. The first v2 serving
-  composition is integration-only and requires the exact generated 0075 D1/R2
-  storage proof before publication and after readback, including an empty
-  artifact source map. A legacy `--status` remains read-only; explicit
+  composition is integration-only and requires the exact generated D1/R2
+  storage proof for the target's selected lineage (0075 by default, or the
+  explicit `takoformV2.storageLineage` 0088/0089) before publication and after
+  readback. Artifact Forms are refused on the 0075 lineage. A legacy `--status` remains read-only; explicit
   maintenance profiles remain separate and do not claim v2 readiness. An
   initial legacy 0066 storage bootstrap is not silently upgraded into 0075.
   Every environment requires

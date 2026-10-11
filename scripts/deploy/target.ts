@@ -28,6 +28,16 @@ import type { DeployEnvironment } from "./qualification.ts";
  * resources this repository may publish onto. It is operator-private and is
  * never committed: the repository stays account-neutral.
  */
+/** Explicit fresh integration v2 storage payloads beyond the historical 0075 default. */
+export type TakoformV2StorageLineage = "v2-0088" | "v2-0089";
+
+/** The exact fresh payload a v2 target's generated storage must carry. */
+export function takoformV2StorageLineage(
+  target: Pick<DeployTarget, "takoformV2">,
+): "v2-artifacts-0075" | TakoformV2StorageLineage {
+  return target.takoformV2?.storageLineage ?? "v2-artifacts-0075";
+}
+
 export interface DeployTarget {
   readonly kind: "takoserver.deploy-target@v2";
   readonly environment: DeployEnvironment;
@@ -36,8 +46,16 @@ export interface DeployTarget {
   readonly d1: { readonly databaseName: string; readonly databaseId: string };
   readonly r2: { readonly bucketName: string };
   readonly publicOrigin: string;
-  /** Exact non-secret v2 startup JSON; the cursor key is a separately managed Worker secret. */
-  readonly takoformV2?: { readonly config: string };
+  /**
+   * Exact non-secret v2 startup JSON; the cursor key is a separately managed Worker secret.
+   * `storageLineage` names the fixed fresh generation payload the selected
+   * generated D1 was created with. Absent keeps the historical
+   * `v2-artifacts-0075` payload; it is never inferred from the live ledger.
+   */
+  readonly takoformV2?: {
+    readonly config: string;
+    readonly storageLineage?: TakoformV2StorageLineage;
+  };
   /** Temporary pre-0043 runtime used only by the 0043 cutover protocol. */
   readonly artifactBlobIoMode?: "pre-0043-quiesced";
   /** Optional whole-Host source-only maintenance profile for an exact pending schema wave. */
@@ -518,6 +536,15 @@ export function parseDeployTarget(
   }
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && target.takoformV2 === undefined) {
     throw preflightError("v2 0088 schema maintenance must retain the exact v2 Worker config");
+  }
+  if (
+    target.schemaMaintenanceMode === "pre-v2-0088-quiesced" &&
+    target.takoformV2?.storageLineage !== undefined
+  ) {
+    // A fresh 0088/0089 generation has no 0066->0088 wave to quiesce for.
+    throw preflightError(
+      "v2 0088 schema maintenance cannot select a fresh `takoformV2.storageLineage` generation",
+    );
   }
   if (target.takoformV2 !== undefined) {
     if (environment !== "integration") {
@@ -1318,7 +1345,7 @@ function boolean(value: unknown, field: string): boolean {
 
 function takoformV2(value: unknown): NonNullable<DeployTarget["takoformV2"]> {
   if (!isRecord(value)) throw preflightError("deploy target `takoformV2` must be an object");
-  assertExactKeys(value, ["config"]);
+  assertExactKeys(value, ["config"], ["storageLineage"]);
   if (typeof value.config !== "string") {
     throw preflightError("deploy target `takoformV2.config` must be non-secret JSON text");
   }
@@ -1327,7 +1354,19 @@ function takoformV2(value: unknown): NonNullable<DeployTarget["takoformV2"]> {
   } catch {
     throw preflightError("deploy target `takoformV2.config` is invalid v2 startup JSON");
   }
-  return { config: value.config };
+  if (
+    value.storageLineage !== undefined &&
+    value.storageLineage !== "v2-0088" &&
+    value.storageLineage !== "v2-0089"
+  ) {
+    throw preflightError(
+      "deploy target `takoformV2.storageLineage` must be v2-0088 or v2-0089 when set",
+    );
+  }
+  return {
+    config: value.config,
+    ...(value.storageLineage === undefined ? {} : { storageLineage: value.storageLineage }),
+  };
 }
 
 function artifactBlobIoMode(value: unknown): { readonly artifactBlobIoMode?: "pre-0043-quiesced" } {

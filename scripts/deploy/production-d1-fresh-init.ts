@@ -3,7 +3,6 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { deriveExpectedApplicationShape } from "./application-schema-shape.ts";
-import { RemoteD1 } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import {
   DeployError,
@@ -12,6 +11,7 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
+import { assertFreshV2DataReadback, type FreshV2DataReader } from "./fresh-v2-data-readback.ts";
 import {
   applySealedMigrations,
   assertCompleteDatabase,
@@ -31,7 +31,6 @@ import {
   requireEnvironment,
   resolveCloudflareCredential,
   runCommand,
-  wranglerCommand,
 } from "./process.ts";
 import {
   type FreshD1AttemptBinding,
@@ -79,19 +78,6 @@ export interface ProductionD1FreshInitInvocation {
   readonly freshLineage?: "v2-0088" | "v2-0089";
 }
 
-export interface FreshV2DataReadback {
-  readonly tableCounts: Readonly<Record<string, number>>;
-  readonly ledgerRows: number;
-  readonly foreignKeyViolations: number;
-  readonly invocationEpoch: readonly Record<string, unknown>[];
-  readonly acceptanceCounter: readonly Record<string, unknown>[];
-}
-
-const FRESH_V2_SEED_TABLES = [
-  "tf_cloudflare_provider_invocation_epoch",
-  "tf_v2_operation_acceptance_counter",
-] as const;
-
 /**
  * The only provider capability this surface needs. It deliberately has no
  * delete, update, binding, Worker, route, namespace, R2 or target operation:
@@ -117,9 +103,7 @@ export interface ProductionD1FreshInitOptions extends IntegrationStorageGenerate
   readonly provider?: ProductionD1FreshInitProvider;
   readonly fetcher?: IntegrationStorageFetcher;
   /** Test seam; the CLI always uses authoritative remote D1 queries. */
-  readonly freshV2DataReader?: {
-    read(phase: "preflight" | "verification", configPath: string): Promise<FreshV2DataReadback>;
-  };
+  readonly freshV2DataReader?: FreshV2DataReader;
 }
 
 interface FreshD1Names {
@@ -739,145 +723,6 @@ function normalizeAfterCreate(error: unknown, databaseId: string | null): Deploy
     "production D1 fresh init stopped after the create boundary; do not retry or adopt",
     `databaseId=${databaseId ?? "unknown"}`,
   );
-}
-
-/** Data proof is in addition to the canonical schema/ledger readback, never a prefix heuristic. */
-async function assertFreshV2DataReadback(
-  phase: "preflight" | "verification",
-  lineage: "v2-0088" | "v2-0089",
-  configPath: string,
-  environment: Readonly<Record<string, string>>,
-  expectedApplicationShape: string,
-  options: ProductionD1FreshInitOptions,
-): Promise<void> {
-  const shape: unknown = JSON.parse(expectedApplicationShape);
-  if (!Array.isArray(shape)) throw new DeployError(phase, "fresh v2 expected shape is malformed");
-  const tables = shape
-    .filter(
-      (row): row is { type: string; name: string } =>
-        typeof row === "object" &&
-        row !== null &&
-        row.type === "table" &&
-        typeof row.name === "string",
-    )
-    .map(({ name }) => name);
-  if (
-    tables.length === 0 ||
-    new Set(tables).size !== tables.length ||
-    tables.some((name) => !/^[A-Za-z_][A-Za-z_0-9]*$/u.test(name))
-  ) {
-    throw new DeployError(phase, "fresh v2 audited table inventory is malformed");
-  }
-  const readback =
-    options.freshV2DataReader === undefined
-      ? await readRemoteFreshV2Data(configPath, environment, tables, phase, options)
-      : await options.freshV2DataReader.read(phase, configPath);
-  if (
-    readback.ledgerRows !== (lineage === "v2-0089" ? 89 : 88) ||
-    readback.foreignKeyViolations !== 0 ||
-    Object.keys(readback.tableCounts).length !== tables.length ||
-    FRESH_V2_SEED_TABLES.some((name) => !tables.includes(name)) ||
-    tables.some(
-      (name) =>
-        readback.tableCounts[name] !==
-        (FRESH_V2_SEED_TABLES.includes(name as (typeof FRESH_V2_SEED_TABLES)[number]) ? 1 : 0),
-    ) ||
-    !matchesFreshV2Seed(
-      readback.invocationEpoch,
-      ["closed_at_ms", "epoch_id", "opened_at_ms", "singleton", "state"],
-      { singleton: 1, epoch_id: null, state: "closed", opened_at_ms: null, closed_at_ms: null },
-    ) ||
-    !matchesFreshV2Seed(readback.acceptanceCounter, ["id", "last_operation_id", "last_order"], {
-      id: 1,
-      last_order: 0,
-      last_operation_id: null,
-    })
-  ) {
-    throw new DeployError(
-      phase,
-      lineage === "v2-0089"
-        ? "fresh v2 D1 is not the exact empty 0089 database"
-        : "fresh v2 D1 is not the exact empty 0088 database",
-    );
-  }
-}
-
-function matchesFreshV2Seed(
-  rows: readonly Record<string, unknown>[],
-  expectedKeys: readonly string[],
-  expected: Readonly<Record<string, unknown>>,
-): boolean {
-  if (rows.length !== 1) return false;
-  const row = rows[0];
-  return (
-    row !== undefined &&
-    JSON.stringify(Object.keys(row).sort()) === JSON.stringify(expectedKeys) &&
-    expectedKeys.every((key) => row[key] === expected[key])
-  );
-}
-
-async function readRemoteFreshV2Data(
-  configPath: string,
-  environment: Readonly<Record<string, string>>,
-  tables: readonly string[],
-  phase: "preflight" | "verification",
-  options: ProductionD1FreshInitOptions,
-): Promise<FreshV2DataReadback> {
-  const database = new RemoteD1(configPath, {
-    environment,
-    run: options.run ?? runCommand,
-    wranglerCommand:
-      options.wranglerCommand ??
-      (options.wranglerPath === undefined
-        ? wranglerCommand
-        : (args) => [options.wranglerPath as string, ...args]),
-  });
-  const tableCounts: Record<string, number> = {};
-  for (let index = 0; index < tables.length; index += 16) {
-    const batch = tables.slice(index, index + 16);
-    const sql = `SELECT ${batch.map((name) => `(SELECT COUNT(*) FROM "${name}") AS "${name}"`).join(", ")}`;
-    const rows = await database.query(phase, "fresh v2 application row counts", sql);
-    if (rows.length !== 1 || Object.keys(rows[0] ?? {}).length !== batch.length) {
-      throw new DeployError(phase, "fresh v2 application row counts are malformed");
-    }
-    for (const name of batch) {
-      const value = rows[0]?.[name];
-      if (!Number.isSafeInteger(value) || (value as number) < 0) {
-        throw new DeployError(phase, "fresh v2 application row count is malformed");
-      }
-      tableCounts[name] = value as number;
-    }
-  }
-  const ledger = await database.query(
-    phase,
-    "fresh v2 migration ledger count",
-    "SELECT COUNT(*) AS count FROM d1_migrations",
-  );
-  if (ledger.length !== 1 || !Number.isSafeInteger(ledger[0]?.count)) {
-    throw new DeployError(phase, "fresh v2 migration ledger count is malformed");
-  }
-  const foreignKeys = await database.query(
-    phase,
-    "fresh v2 foreign-key integrity",
-    "SELECT 1 AS violation FROM pragma_foreign_key_check LIMIT 1",
-  );
-  const invocationEpoch = await database.query(
-    phase,
-    "fresh v2 invocation epoch seed",
-    "SELECT singleton, epoch_id, state, opened_at_ms, closed_at_ms FROM tf_cloudflare_provider_invocation_epoch LIMIT 2",
-  );
-  const acceptanceCounter = await database.query(
-    phase,
-    "fresh v2 acceptance counter seed",
-    "SELECT id, last_order, last_operation_id FROM tf_v2_operation_acceptance_counter LIMIT 2",
-  );
-  return {
-    tableCounts,
-    ledgerRows: ledger[0]?.count as number,
-    foreignKeyViolations: foreignKeys.length,
-    invocationEpoch,
-    acceptanceCounter,
-  };
 }
 
 /**

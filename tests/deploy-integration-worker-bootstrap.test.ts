@@ -105,6 +105,12 @@ const COMPLETE_V2_SCHEMA = schemaState(
   applicationShape(join(sourceRoot, "migrations"), V2_APPLIED),
 );
 const WRONG_V2_SCHEMA = schemaState(V2_APPLIED, "[]\n");
+// An explicit fresh v2-0088 generation already carries 0081 private inputs.
+const V2_0088_APPLIED = MIGRATIONS.slice(0, 88).map(({ name }) => name);
+const COMPLETE_V2_0088_SCHEMA = schemaState(
+  V2_0088_APPLIED,
+  applicationShape(join(sourceRoot, "migrations"), V2_0088_APPLIED),
+);
 const V2_SCHEMA_WITH_SQL_TRIVIA = (() => {
   const rows = JSON.parse(COMPLETE_V2_SCHEMA.shape) as Array<{
     type: string;
@@ -162,13 +168,25 @@ const v2Target = {
     databaseId: "00000000-0000-4000-8000-000000000075",
   },
   r2: { bucketName: `takoserver-i-${V2_GENERATION}` },
+  // The historical 0075 payload has no 0081 schema, so it cannot carry an
+  // artifact Form configuration; see the v2-0088 target below.
   takoformV2: {
     config: JSON.stringify({
       documentation: "https://docs.example.test/v2",
       authenticationDocumentation: "https://docs.example.test/v2/authentication",
-      sqliteMigrationSet: { targetKey: "test-sqlite", heldArtifacts: [] },
     }),
   },
+} satisfies DeployTarget;
+
+const V2_ARTIFACT_CONFIG = JSON.stringify({
+  documentation: "https://docs.example.test/v2",
+  authenticationDocumentation: "https://docs.example.test/v2/authentication",
+  sqliteMigrationSet: { targetKey: "test-sqlite", heldArtifacts: [] },
+});
+const v2Target0088 = {
+  ...v2Target,
+  d1: { ...v2Target.d1, databaseId: "00000000-0000-4000-8000-000000000088" },
+  takoformV2: { config: V2_ARTIFACT_CONFIG, storageLineage: "v2-0088" },
 } satisfies DeployTarget;
 
 const runtimeInputSealKeyring = JSON.stringify({
@@ -489,6 +507,68 @@ describe("Takoserver integration Worker bootstrap", () => {
       });
       expect(fixture.configContents).toContain("TAKOSERVER_TAKOFORM_V2_CONFIG");
       expect(fixture.secretFileSeen && existsSync(fixture.secretFileSeen)).toBe(false);
+    } finally {
+      rmSync(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("v2 artifact Forms on the historical 0075 lineage are refused before any provider effect", async () => {
+    const artifactOn0075 = {
+      ...v2Target,
+      takoformV2: { config: V2_ARTIFACT_CONFIG },
+    } satisfies DeployTarget;
+    const fixture = bootstrapFixture({ target: artifactOn0075 });
+    const secretDirectory = writeSecretDirectory(artifactOn0075);
+    try {
+      await expect(apply(fixture, { secretDirectory })).rejects.toThrow(
+        "configured v2 artifact Forms require the complete 0081 schema",
+      );
+      expect(fixture.lifecycleCalls).toHaveLength(0);
+      expect(fixture.commands).toHaveLength(0);
+    } finally {
+      rmSync(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("explicit v2-0088 storage lineage bootstraps artifact Forms against the exact 0001-0088 proof", async () => {
+    const fixture = bootstrapFixture({ target: v2Target0088 });
+    const secretDirectory = writeSecretDirectory(v2Target0088);
+    try {
+      const status = await runIntegrationWorkerBootstrap(
+        { action: "status", environment: "integration", commit: COMMIT },
+        v2Target0088,
+        {
+          run: fixture.run,
+          state: fixture.state,
+          sourceRepositoryRoot: sourceRoot,
+          v2StorageVerification: v2StorageOptions(v2Target0088),
+        },
+      );
+      expect(status).toMatchObject({ storageQualified: true, nativeCreateEligible: true });
+      // The historical 0075 proof no longer qualifies a target that selected 0088.
+      const historical = await runIntegrationWorkerBootstrap(
+        { action: "status", environment: "integration", commit: COMMIT },
+        v2Target0088,
+        {
+          run: fixture.run,
+          state: fixture.state,
+          sourceRepositoryRoot: sourceRoot,
+          v2StorageVerification: v2StorageOptions(v2Target0088, async () => COMPLETE_V2_SCHEMA),
+        },
+      );
+      expect(historical).toMatchObject({ storageQualified: false });
+      // A generation that a Host already served is refused before any upload.
+      await expect(
+        apply(fixture, {
+          secretDirectory,
+          freshV2DataReader: freshData({ orgs: 1 }),
+        }),
+      ).rejects.toThrow("already holds data beyond its seeds and signing registration");
+      expect(fixture.lifecycleCalls).toHaveLength(0);
+      const result = await apply(fixture, { secretDirectory, freshV2DataReader: freshData() });
+      expect(result).toMatchObject({ mutationApplied: true, appliedMigrations: V2_0088_APPLIED });
+      expect(fixture.lifecycleCalls).toHaveLength(1);
+      expect(fixture.configContents).toContain("sqliteMigrationSet");
     } finally {
       rmSync(secretDirectory, { recursive: true, force: true });
     }
@@ -850,7 +930,7 @@ function bootstrapFixture(options: FixtureOptions): BootstrapFixture {
           : WRONG_V2_SCHEMA
         : target.takoformV2 === undefined
           ? COMPLETE_SCHEMA
-          : COMPLETE_V2_SCHEMA;
+          : completeV2Schema(target);
     },
   };
   const signingDatabase: Pick<SigningDatabase, "readKey"> = {
@@ -1020,9 +1100,44 @@ async function readPublishedStatus(fixture: BootstrapFixture): Promise<Record<st
   );
 }
 
+/** Unserved fresh v2-0088 data: seeds, one signing row and optional extra rows. */
+function freshData(extra: Readonly<Record<string, number>> = {}) {
+  const tables = (JSON.parse(COMPLETE_V2_0088_SCHEMA.shape) as { type: string; name: string }[])
+    .filter((row) => row.type === "table")
+    .map((row) => row.name);
+  const seeds = new Set([
+    "tf_cloudflare_provider_invocation_epoch",
+    "tf_v2_operation_acceptance_counter",
+  ]);
+  return {
+    async read() {
+      return {
+        tableCounts: Object.fromEntries(
+          tables.map((name) => [
+            name,
+            extra[name] ?? (seeds.has(name) ? 1 : name === "runtime_grant_keys" ? 1 : 0),
+          ]),
+        ),
+        ledgerRows: 88,
+        foreignKeyViolations: 0,
+        invocationEpoch: [
+          { singleton: 1, epoch_id: null, state: "closed", opened_at_ms: null, closed_at_ms: null },
+        ],
+        acceptanceCounter: [{ id: 1, last_order: 0, last_operation_id: null }],
+      };
+    },
+  };
+}
+
+function completeV2Schema(selectedTarget: DeployTarget): D1SchemaState {
+  return selectedTarget.takoformV2?.storageLineage === "v2-0088"
+    ? COMPLETE_V2_0088_SCHEMA
+    : COMPLETE_V2_SCHEMA;
+}
+
 function v2StorageOptions(
   selectedTarget: DeployTarget,
-  readState: () => Promise<D1SchemaState> = async () => COMPLETE_V2_SCHEMA,
+  readState: () => Promise<D1SchemaState> = async () => completeV2Schema(selectedTarget),
 ): IntegrationStorageGenerationTargetVerificationOptions {
   return {
     provider: {
