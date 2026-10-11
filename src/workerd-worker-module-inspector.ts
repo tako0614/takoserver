@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { ACTOR_NATIVE_BOOTSTRAP_SOURCE } from "./generated/actor-native-bootstrap.ts";
@@ -133,6 +133,54 @@ export function createWorkerdWorkerModuleInspector(
   };
 }
 
+/**
+ * One private 0700 directory for a single evaluator run.
+ *
+ * A configured `temporaryRoot` is this Host's own private parent, so it is
+ * created and tightened to 0700. Without one, the run goes below the system
+ * temporary directory (`os.tmpdir()`), which belongs to the machine and is
+ * only a parent here: it is never created or chmodded. Tightening it made a
+ * Host running as root set a shared `/tmp` to 0700 for every user, and made
+ * every inspection unavailable for a dedicated service user, which cannot
+ * chmod a root-owned `/tmp`. `mkdtemp` already creates the run directory 0700.
+ */
+async function privateInspectionDirectory(
+  temporaryRoot: string | undefined,
+  prefix: string,
+): Promise<string> {
+  let parent: string;
+  if (temporaryRoot === undefined) {
+    parent = await trustedSystemTemporaryParent();
+  } else {
+    await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
+    await chmod(temporaryRoot, 0o700);
+    parent = temporaryRoot;
+  }
+  const root = await mkdtemp(join(parent, prefix));
+  await chmod(root, 0o700);
+  return root;
+}
+
+/**
+ * `os.tmpdir()`, resolved, only when no other local user can rename or replace
+ * what this process creates below it: it is owned by root or by this user, and
+ * group and others cannot write it unless it is sticky, like `/tmp`. `TMPDIR`
+ * is environment input, not a trusted location.
+ */
+async function trustedSystemTemporaryParent(): Promise<string> {
+  const parent = await realpath(tmpdir());
+  const info = await stat(parent);
+  const uid = process.getuid?.();
+  if (
+    !info.isDirectory() ||
+    (uid !== undefined && info.uid !== 0 && info.uid !== uid) ||
+    ((info.mode & 0o022) !== 0 && (info.mode & 0o1000) === 0)
+  ) {
+    throw new Error("the system temporary directory is writable by other users");
+  }
+  return parent;
+}
+
 interface AdmittedSnapshot {
   readonly mainModule: string;
   readonly modules: readonly WorkerModuleInspectionModule[];
@@ -154,11 +202,7 @@ async function inspectSnapshot(input: {
 
   let root: string;
   try {
-    const temporaryRoot = input.temporaryRoot ?? tmpdir();
-    await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
-    await chmod(temporaryRoot, 0o700);
-    root = await mkdtemp(join(temporaryRoot, "takoserver-worker-inspection-"));
-    await chmod(root, 0o700);
+    root = await privateInspectionDirectory(input.temporaryRoot, "takoserver-worker-inspection-");
   } catch {
     return unavailable();
   }
@@ -232,11 +276,10 @@ async function inspectActorClassSnapshot(input: {
 
   let root: string;
   try {
-    const temporaryRoot = input.temporaryRoot ?? tmpdir();
-    await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
-    await chmod(temporaryRoot, 0o700);
-    root = await mkdtemp(join(temporaryRoot, "takoserver-actor-class-inspection-"));
-    await chmod(root, 0o700);
+    root = await privateInspectionDirectory(
+      input.temporaryRoot,
+      "takoserver-actor-class-inspection-",
+    );
   } catch {
     return unavailableActorClass();
   }
@@ -348,11 +391,10 @@ async function inspectWorkflowClassSnapshot(input: {
   if ("outcome" in admitted || input.binary === null) return unavailableWorkflowClass();
   let root: string;
   try {
-    const temporaryRoot = input.temporaryRoot ?? tmpdir();
-    await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
-    await chmod(temporaryRoot, 0o700);
-    root = await mkdtemp(join(temporaryRoot, "takoserver-workflow-class-inspection-"));
-    await chmod(root, 0o700);
+    root = await privateInspectionDirectory(
+      input.temporaryRoot,
+      "takoserver-workflow-class-inspection-",
+    );
   } catch {
     return unavailableWorkflowClass();
   }
