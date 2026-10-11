@@ -390,9 +390,14 @@ describe("self-host held artifact seeding", () => {
       first.configFragment.workerBundle?.heldArtifacts,
     );
 
-    // A second organization is added to the same exact entries' grants.
+    // Granting configured entries to another organization needs an explicit flag.
     const otherArgs = args.map((value) => (value === ORG ? OTHER_ORG : value));
-    const other = result(await run(otherArgs, install));
+    const unwidened = readFileSync(configPath, "utf8");
+    const silent = await run(otherArgs, install);
+    expect(silent.code).toBe(1);
+    expect(silent.stderr).toContain(`--add-grants to also grant them to org:${OTHER_ORG}`);
+    expect(readFileSync(configPath, "utf8")).toBe(unwidened);
+    const other = result(await run([...otherArgs, "--add-grants"], install));
     expect(other.artifact).toEqual(first.artifact);
     const widened = parseTakoformV2PublicConfig(readFileSync(configPath, "utf8"));
     expect(widened.workerBundle?.heldArtifacts).toHaveLength(2);
@@ -418,20 +423,93 @@ describe("self-host held artifact seeding", () => {
     expect(readFileSync(configPath, "utf8")).toBe(before);
   });
 
-  test("warns when the configuration no longer fits in one environment variable", async () => {
+  test("refuses a config that would no longer fit in one environment variable", async () => {
     const install = installation();
     const files: Record<string, string> = {};
     for (let index = 0; index < 450; index += 1) files[`a/${index}.txt`] = "x";
     const source = sourceTree(install.parent, "many", files);
     const configPath = join(install.parent, "takoform-v2.json");
     writeFileSync(configPath, JSON.stringify(DOCS));
-    const output = await run(
+    const before = readFileSync(configPath, "utf8");
+    const args = [
+      "seed",
+      "static-asset-bundle",
+      source,
+      "--base-url",
+      "https://artifacts.example.test/many/v1/",
+      "--organization",
+      ORG,
+    ];
+    const refused = await run([...args, "--config", configPath], install);
+    expect(refused.code).toBe(1);
+    expect(refused.stderr).toContain("131072 bytes in one environment variable");
+    expect(refused.stdout).toBe("");
+    // Refused before anything was written, and the config is unchanged.
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+    expect(heldObjectKeys(install.root)).toEqual([]);
+
+    // Without --config the fragment is still printed, with the same warning.
+    const fragmentOnly = await run(args, install);
+    expect(fragmentOnly.code).toBe(0);
+    expect(fragmentOnly.stderr).toContain("this fragment alone is");
+    // Identical bytes are held once, whatever number of paths name them.
+    expect(heldObjectKeys(install.root)).toHaveLength(2);
+  });
+
+  test("holds the control database's write lock while it seeds", async () => {
+    const install = installation();
+    const source = sourceTree(install.parent, "hello", { "worker.js": "export default {};\n" });
+    const args = [
+      "seed",
+      "worker-bundle",
+      source,
+      "--base-url",
+      "https://artifacts.example.test/hello/v1/",
+      "--organization",
+      ORG,
+    ];
+    // A writer this process cannot see in its process table (the fake one is
+    // empty) still holds the lock: the seed must refuse rather than race it.
+    const writer = new Database(join(install.root, "control.sqlite"));
+    writer.run("BEGIN IMMEDIATE");
+    try {
+      const refused = await run(args, install);
+      expect(refused.code).toBe(1);
+      expect(refused.stderr).toContain("cannot take the write lock");
+      expect(heldObjectKeys(install.root)).toEqual([]);
+    } finally {
+      writer.run("ROLLBACK");
+      writer.close();
+    }
+    expect((await run(args, install)).code).toBe(0);
+    // Released afterwards: a Host could write again.
+    const after = new Database(join(install.root, "control.sqlite"));
+    try {
+      after.run("BEGIN IMMEDIATE");
+      after.run("ROLLBACK");
+    } finally {
+      after.close();
+    }
+  });
+
+  test("refuses a config whose directory it cannot write, before writing anything", async () => {
+    // Root may write any directory; the refusal is about the Host's own user.
+    if (process.getuid?.() === 0) return;
+    const install = installation();
+    const source = sourceTree(install.parent, "hello", { "worker.js": "export default {};\n" });
+    const directory = join(install.parent, "v2");
+    mkdirSync(directory, { mode: 0o700 });
+    const configPath = join(directory, "takoform-v2.json");
+    writeFileSync(configPath, JSON.stringify(DOCS), { mode: 0o600 });
+    chmodSync(directory, 0o500);
+    cleanups.unshift(() => chmodSync(directory, 0o700));
+    const refused = await run(
       [
         "seed",
-        "static-asset-bundle",
+        "worker-bundle",
         source,
         "--base-url",
-        "https://artifacts.example.test/many/v1/",
+        "https://artifacts.example.test/hello/v1/",
         "--organization",
         ORG,
         "--config",
@@ -439,10 +517,81 @@ describe("self-host held artifact seeding", () => {
       ],
       install,
     );
-    expect(output.code).toBe(0);
-    expect(output.stderr).toContain("131072 bytes in one environment variable");
-    // Identical bytes are held once, whatever number of paths name them.
-    expect(heldObjectKeys(install.root)).toHaveLength(2);
+    expect(refused.code).toBe(1);
+    expect(refused.stderr).toContain(`cannot write ${directory}`);
+    expect(heldObjectKeys(install.root)).toEqual([]);
+    expect(readFileSync(configPath, "utf8")).toBe(JSON.stringify(DOCS));
+  });
+
+  test("never drops a concurrent seed's config update", async () => {
+    const one = installation();
+    const two = installation();
+    const configPath = join(one.parent, "takoform-v2.json");
+    writeFileSync(configPath, JSON.stringify(DOCS));
+    const worker = sourceTree(one.parent, "worker", { "worker.js": "export default {};\n" });
+    const site = sourceTree(two.parent, "site", { "index.html": "<p>x</p>" });
+    const seedInto = (install: Installation, form: string, source: string) =>
+      run(
+        [
+          "seed",
+          form,
+          source,
+          "--base-url",
+          `https://artifacts.example.test/${form}/v1/`,
+          "--organization",
+          ORG,
+          "--config",
+          configPath,
+        ],
+        install,
+      );
+    const outcomes = await Promise.all([
+      seedInto(one, "worker-bundle", worker),
+      seedInto(two, "static-asset-bundle", site),
+    ]);
+    const config = parseTakoformV2PublicConfig(readFileSync(configPath, "utf8"));
+    const blocks = { 0: config.workerBundle, 1: config.staticAssetBundle };
+    for (const [index, outcome] of outcomes.entries()) {
+      // A seed that reports success has its block in the file; one that lost
+      // the race says so and leaves the other's update in place.
+      if (outcome.code === 0) expect(blocks[index as 0 | 1]).toBeDefined();
+      else expect(outcome.stderr).toContain("changed since this command read it");
+    }
+    expect(outcomes.some((outcome) => outcome.code === 0)).toBe(true);
+  });
+
+  test("refuses dotfiles unless they are explicitly included", async () => {
+    const install = installation();
+    const base = ["--base-url", "https://artifacts.example.test/site/v1/", "--organization", ORG];
+    const secret = sourceTree(install.parent, "secret", {
+      "index.html": "<p>x</p>",
+      ".env": "TOKEN=do-not-publish",
+    });
+    const refused = await run(["seed", "static-asset-bundle", secret, ...base], install);
+    expect(refused.code).toBe(1);
+    expect(refused.stderr).toContain(".env");
+    expect(refused.stderr).not.toContain("do-not-publish");
+    const git = sourceTree(install.parent, "git", {
+      "index.html": "<p>x</p>",
+      ".git/config": "[core]",
+    });
+    expect((await run(["seed", "static-asset-bundle", git, ...base], install)).stderr).toContain(
+      ".git",
+    );
+    expect(heldObjectKeys(install.root)).toEqual([]);
+
+    const wellKnown = sourceTree(install.parent, "well-known", {
+      "index.html": "<p>x</p>",
+      ".well-known/security.txt": "Contact: mailto:security@example.test",
+    });
+    const included = await run(
+      ["seed", "static-asset-bundle", wellKnown, ...base, "--include-dotfiles"],
+      install,
+    );
+    expect(included.code).toBe(0);
+    // Every seeded file and the granted organization are listed for review.
+    expect(included.stderr).toContain(".well-known/security.txt (text/plain");
+    expect(included.stderr).toContain(`org:${ORG} (Organization ${ORG})`);
   });
 
   test("refuses while another process holds the installation's files open", async () => {
@@ -490,6 +639,24 @@ describe("self-host held artifact seeding", () => {
     expect(externalHeld.stderr).toContain("pid 424242");
     rmSync(join(holder, "9"));
     expect((await run(args, install, { TAKOSERVER_DB: link })).code).toBe(0);
+
+    // A process of this user whose descriptor table cannot be read could be
+    // the Host (a bun with file capabilities is not dumpable): unprovable.
+    const opaque = join(install.fakeProc, "434343");
+    mkdirSync(opaque);
+    writeFileSync(join(opaque, "fd"), "");
+    const hidden = await run(args, install, { TAKOSERVER_DB: link });
+    expect(hidden.code).toBe(1);
+    expect(hidden.stderr).toContain("pid 434343");
+    expect(hidden.stderr).toContain("do not show their open files");
+    // A zombie's table is never readable either, but it has closed every file.
+    writeFileSync(join(opaque, "stat"), "434343 (bun) Z 1 434343 434343 0 -1 4194560");
+    expect((await run(args, install, { TAKOSERVER_DB: link })).code).toBe(0);
+    rmSync(opaque, { recursive: true });
+    // One that has exited (no descriptor table at all) is not.
+    mkdirSync(opaque);
+    expect((await run(args, install, { TAKOSERVER_DB: link })).code).toBe(0);
+    rmSync(opaque, { recursive: true });
 
     // A process table that does not show this process proves nothing.
     const blind = join(install.parent, "blind-proc");
