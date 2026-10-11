@@ -90,8 +90,7 @@ test("only broker directories whose abandonment is proved are removed", async ()
     const mixed = await brokerDirectory(root, "aMixd01");
     await deadSockets([join(mixed, "3.u.sock")]);
     await writeFile(join(mixed, "note"), "not a socket");
-    const emptyBeforeBoot = await brokerDirectory(root, "wEmpt01");
-    const emptySinceBoot = await brokerDirectory(root, "wEmpt02");
+    const emptyOld = await brokerDirectory(root, "wEmpt01");
     const fresh = await brokerDirectory(root, "aFrsh01");
     await deadSockets([join(fresh, "4.u.sock")]);
     const shared = await brokerDirectory(root, "aShrd01");
@@ -103,19 +102,16 @@ test("only broker directories whose abandonment is proved are removed", async ()
     await deadSockets([join(elsewhere, "6.sock")]);
     await chmod(elsewhere, 0o700);
     await symlink(elsewhere, join(root, "s", "aLink01"));
-    for (const path of [dead, deadWorkflow, live, mixed, emptyBeforeBoot, shared, execution])
+    for (const path of [dead, deadWorkflow, live, mixed, emptyOld, shared, execution])
       await age(path, old);
-    // Written after this machine booted, though not in the last few seconds.
-    await age(emptySinceBoot, old + 2_000);
     try {
-      const result = await sweepSelfhostSocketRoot(root, { now, machineBootTimeMs: old + 1_000 });
-      expect([...result.removed].sort()).toEqual([dead, deadWorkflow, emptyBeforeBoot].sort());
-      for (const path of [dead, deadWorkflow, emptyBeforeBoot])
-        expect(existsSync(path)).toBe(false);
+      const result = await sweepSelfhostSocketRoot(root, { now });
+      expect([...result.removed].sort()).toEqual([dead, deadWorkflow].sort());
+      for (const path of [dead, deadWorkflow]) expect(existsSync(path)).toBe(false);
       // A live listener, a non-socket entry, a directory written moments ago,
-      // one not private, an empty one from this boot, an execution directory
-      // and a symlink are all left exactly as they were.
-      for (const path of [live, mixed, emptySinceBoot, fresh, shared, execution])
+      // one not private, an empty one however old (nothing proves its creator
+      // gone), an execution directory and a symlink are all left as they were.
+      for (const path of [live, mixed, emptyOld, fresh, shared, execution])
         expect(existsSync(path)).toBe(true);
       expect(existsSync(join(live, "2.u.sock"))).toBe(true);
       expect(lstatSync(join(root, "s", "aLink01")).isSymbolicLink()).toBe(true);
@@ -136,7 +132,6 @@ test("a directory that changes while it is examined is retained", async () => {
     await age(directory, now - HOUR);
     const result = await sweepSelfhostSocketRoot(root, {
       now,
-      machineBootTimeMs: 0,
       // A listener binds a new socket between the probe and the removal.
       socketState: async () => {
         await writeFile(join(directory, "late"), "");
@@ -154,7 +149,7 @@ test("nothing is swept from a socket directory that is not private", async () =>
     await deadSockets([join(directory, "0.u.sock")]);
     await age(directory, Date.now() - HOUR);
     await chmod(join(root, "s"), 0o750);
-    expect(await sweepSelfhostSocketRoot(root, { machineBootTimeMs: 0 })).toEqual({
+    expect(await sweepSelfhostSocketRoot(root)).toEqual({
       removed: [],
       retained: 0,
     });

@@ -26,7 +26,11 @@ claim GA status.
    directory, and symlinks in the existing part of the path are resolved. When
    the result differs from the configured value, the process prints it.
    SQLite databases created under an earlier relative or symlinked setting stay
-   bound to their Workers. A data root that does not exist yet is created with
+   bound to their Workers as long as `TAKOSERVER_DATA_ROOT` keeps the same
+   string; changing the string (for example from the default to an absolute
+   path, or restoring to a different path) is not supported for existing
+   SQLite databases. A data root belongs to one machine; do not share it over
+   a network filesystem. A data root that does not exist yet is created with
    mode 0700, together with any missing parent directories. An existing
    directory keeps its permissions. The v2 private planes require it to be mode
    0700 and owned by the Host's user, and refuse otherwise with the path, mode,
@@ -37,9 +41,12 @@ claim GA status.
    therefore may be at most 61 bytes whenever Actors or Workflows run. Native
    Actor processes, for both the v2 Actor runtime and the implied Actor
    runtime, also bind sockets below `TMPDIR`, which may be at most 73 bytes.
-   `s/` must be mode 0700 and owned by the Host's user, and no other user may
-   be able to write to the data root or any directory above it, except a
-   sticky root-owned one such as `/tmp`.
+   `s/` must be mode 0700 and owned by the Host's user. The data root and every
+   directory above it must be owned by root or by the Host's user, and no
+   other user may be able to write to them, except a sticky root-owned one such
+   as `/tmp`. A group-writable ancestor (for example under umask 002, or a
+   Kubernetes `fsGroup` volume with mode 2775) is refused; tighten it with
+   `chmod g-w`.
 
    If `TAKOSERVER_V2_WORKER_RUNTIME_BOOT` selects `actor` or `workflow` and one
    of these requirements is not met, startup stops with a message that names

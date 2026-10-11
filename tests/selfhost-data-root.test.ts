@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, chown, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createSelfhostDataRootIfAbsent,
+  privateDirectoryChainProblem,
   resolveSelfhostDataRoot,
 } from "../src/selfhost-data-root.ts";
 
@@ -77,3 +78,23 @@ test("a missing data root is created 0700 whatever the umask, and an existing on
     }
   });
 });
+
+// Only root can hand a directory to another uid, so this runs where the
+// tests run as root.
+test.skipIf(process.getuid?.() !== 0)(
+  "an ancestor owned by another user is refused even when only its owner can write it",
+  async () => {
+    await withTemporary(async (root) => {
+      const parent = join(root, "parent");
+      const leaf = join(parent, "data");
+      await mkdir(leaf, { recursive: true, mode: 0o700 });
+      await chmod(parent, 0o755);
+      await chmod(leaf, 0o700);
+      expect(privateDirectoryChainProblem(leaf, "TAKOSERVER_DATA_ROOT")).toBeUndefined();
+      await chown(parent, 65534, 65534);
+      expect(privateDirectoryChainProblem(leaf, "TAKOSERVER_DATA_ROOT")).toBe(
+        `TAKOSERVER_DATA_ROOT has an ancestor owned by another user: ${parent} has owner uid 65534, but needs owner uid 0 or 0`,
+      );
+    });
+  },
+);

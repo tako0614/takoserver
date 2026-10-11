@@ -78,8 +78,9 @@ export function createSelfhostDataRootIfAbsent(dataRoot: string): boolean {
  * `undefined` when it is.
  *
  * The leaf must be a real directory owned by this user and closed to group and
- * other (0700). Every ancestor must be a real directory that no other user can
- * write, except a sticky root-owned one such as `/tmp`: otherwise another user
+ * other (0700). Every ancestor must be a real directory owned by root or by
+ * this user that no other user can write, except a sticky root-owned one such
+ * as `/tmp`: otherwise another user (its owner, or one with write access)
  * could rename the leaf away and put their own directory in its place. The
  * same rule guards the v2 private planes and the socket directory.
  */
@@ -114,6 +115,8 @@ export function privateDirectoryChainProblem(path: string, name: string): string
         );
       }
       leaf = false;
+    } else if (metadata.uid !== 0 && metadata.uid !== uid) {
+      return `${name} has an ancestor owned by another user: ${current} has owner uid ${metadata.uid}, but needs owner uid 0 or ${uid}`;
     } else if (
       (metadata.mode & 0o022) !== 0 &&
       !((metadata.mode & 0o1000) !== 0 && metadata.uid === 0)

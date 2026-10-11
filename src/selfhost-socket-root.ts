@@ -1,4 +1,4 @@
-import { chmodSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync } from "node:fs";
 import { lstat, readdir, realpath, rmdir, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join } from "node:path";
@@ -62,19 +62,6 @@ function socketState(path: string): Promise<SocketState> {
   });
 }
 
-/** Wall-clock time this machine booted, or 0 when it cannot be read. */
-function machineBootTimeMs(): number {
-  try {
-    const line = readFileSync("/proc/stat", "utf8")
-      .split("\n")
-      .find((entry) => entry.startsWith("btime "));
-    const seconds = Number(line?.slice("btime ".length));
-    return Number.isSafeInteger(seconds) && seconds > 0 ? seconds * 1_000 : 0;
-  } catch {
-    return 0;
-  }
-}
-
 /**
  * Remove broker directories in `<data root>/s` that a previous Host process
  * left behind when it was killed, and only those whose abandonment is proved.
@@ -82,13 +69,11 @@ function machineBootTimeMs(): number {
  * There is no Host-wide lock on a data root, so nothing here assumes this is
  * the only Host. A directory is removed only when it is a broker directory
  * this user created privately (real, 0700, canonical), has not been written
- * for a while, and is either
- *
- * - holding only socket files that refuse connections: no process accepts on
- *   any of them, as a killed Host leaves them (a Host that closes a broker
- *   also unlinks its socket), or
- * - empty and last written before this machine booted, so no running process
- *   can have created it.
+ * for a while, and holds only socket files that refuse connections: no process
+ * accepts on any of them, as a killed Host leaves them (a Host that closes a
+ * broker also unlinks its socket). An empty directory proves nothing about
+ * its creator (a wall-clock boot time can move with the clock), so it stays.
+ * The proof assumes the data root is used by one machine only.
  *
  * Anything else, including Workflow execution directories, which also hold
  * configuration and modules, is retained. Each removal re-reads the directory
@@ -98,7 +83,6 @@ export async function sweepSelfhostSocketRoot(
   dataRoot: string,
   options: {
     readonly now?: number;
-    readonly machineBootTimeMs?: number;
     readonly socketState?: (path: string) => Promise<SocketState>;
   } = {},
 ): Promise<{ readonly removed: readonly string[]; readonly retained: number }> {
@@ -108,7 +92,6 @@ export async function sweepSelfhostSocketRoot(
   const root = selfhostPrivateSocketRoot(dataRoot);
   const uid = process.getuid?.();
   const now = options.now ?? Date.now();
-  const bootTimeMs = options.machineBootTimeMs ?? machineBootTimeMs();
   const probe = options.socketState ?? socketState;
   const privateDirectory = async (path: string) => {
     const info = await lstat(path).catch(() => null);
@@ -131,7 +114,7 @@ export async function sweepSelfhostSocketRoot(
       continue;
     }
     const children = await readdir(directory);
-    let abandoned = children.length === 0 ? info.mtimeMs < bootTimeMs : true;
+    let abandoned = children.length > 0;
     for (const child of children) {
       if (!abandoned) break;
       const path = join(directory, child);
