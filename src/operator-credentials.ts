@@ -19,10 +19,12 @@ import type { Clock } from "./ports.ts";
  * server can check and a third party cannot forge.
  *
  * Assertions are short-lived and single-purpose. A sign-in assertion names its
- * canonical Host audience, so it cannot be replayed at another deployment. A
- * funding assertion names its organization, so one cannot be redirected at
- * another, and its funding reference makes the ledger credit it exactly once no
- * matter how many times it is presented.
+ * canonical Host audience, so it cannot be replayed at another deployment, and
+ * it opens at most one session at this one: the verifier names the signed
+ * payload as a single-use key and the session exchange spends it. A funding
+ * assertion names its organization, so one cannot be redirected at another,
+ * and its funding reference makes the ledger credit it exactly once no matter
+ * how many times it is presented.
  */
 
 const MAX_ASSERTION_BYTES = 8 * 1_024;
@@ -57,7 +59,19 @@ export class OperatorAssertionError extends Error {
 interface Verified {
   readonly purpose: string;
   readonly claims: Record<string, unknown>;
+  /** The exact signed bytes; the signature covers this string and nothing else. */
+  readonly signedPayload: string;
+  readonly expiresAtEpochSeconds: number;
 }
+
+/**
+ * Where a spent sign-in assertion is remembered until it expires.
+ *
+ * The key is the digest of the signed payload, not of the whole string: the
+ * signature covers exactly that payload, and canonical base64url decoding
+ * leaves no second spelling of either half.
+ */
+export const OPERATOR_SIGN_IN_SINGLE_USE_NAMESPACE = "operator-sign-in";
 
 export interface OperatorPurposeVerifier {
   verify(assertion: string, purpose: string): Promise<Readonly<Record<string, unknown>>>;
@@ -139,7 +153,12 @@ function createVerifier(options: OperatorCredentialOptions) {
     ) {
       throw new OperatorAssertionError("expired");
     }
-    return { purpose, claims: record };
+    return {
+      purpose,
+      claims: record,
+      signedPayload: payloadPart,
+      expiresAtEpochSeconds: expiresAt as number,
+    };
   };
 }
 
@@ -151,7 +170,7 @@ export function createOperatorIdentity(
   const audience = canonicalOperatorAudience(options.audience);
   return {
     async verify({ provider, assertion, audience: requestAudience }) {
-      const { claims } = await verify(assertion, "sign-in");
+      const { claims, signedPayload, expiresAtEpochSeconds } = await verify(assertion, "sign-in");
       if (requestAudience !== audience || claims.aud !== audience) {
         throw new OperatorAssertionError("wrong_audience");
       }
@@ -166,9 +185,23 @@ export function createOperatorIdentity(
       ) {
         throw new OperatorAssertionError("malformed");
       }
-      return { providerSubject, email, displayName };
+      return {
+        providerSubject,
+        email,
+        displayName,
+        singleUse: {
+          namespace: OPERATOR_SIGN_IN_SINGLE_USE_NAMESPACE,
+          digest: await sha256Hex(signedPayload),
+          expiresAtEpochSeconds,
+        },
+      };
     },
   };
+}
+
+async function sha256Hex(value: string): Promise<`sha256:${string}`> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return `sha256:${[...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
 export function canonicalOperatorAudience(value: string): string {

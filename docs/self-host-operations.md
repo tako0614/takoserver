@@ -89,6 +89,10 @@ claim GA status.
    The first boot initializes SQLite under `TAKOSERVER_DATA_ROOT` (default
    `.takoserver`) and creates signing keys. When no identity provider is
    configured, it prints an operator sign-in assertion valid for ten minutes.
+   The assertion opens one session; afterwards it is refused for another
+   session and for an owner proof. Boots
+   print a new one only until the operator has signed in once; set
+   `TAKOSERVER_PRINT_OPERATOR_ASSERTION=1` to print one on every boot.
    If `TAKOSERVER_CONSOLE_ORIGIN` is set, open the exact external console origin
    named by the process and paste the assertion there. It is a separate console;
    the Bun Host does not serve a `/console` page. Treat the operator key under
@@ -96,7 +100,13 @@ claim GA status.
    shell history, shared logs, and this repository. To create later assertions,
    use the printed command
    `bun scripts/operator-key.ts sign-in google operator operator@localhost Operator`
-   with `TAKOSERVER_OPERATOR_KEY` set to that installation's key path.
+   with `TAKOSERVER_OPERATOR_KEY` set to that installation's key path and
+   `TAKOSERVER_PUBLIC_ORIGIN` set to its public origin.
+
+   The API listens on `127.0.0.1` unless `TAKOSERVER_LISTEN_HOST` names another
+   interface; in a container or Pod, set it (for example to `0.0.0.0`). Trust
+   boundaries, network exposure and OS hardening are covered in
+   [Self-host security](self-host-security.md).
 
    When `TAKOSERVER_CONSOLE_ORIGIN` is unset, the Host serves its landing page
    and API, not a console. The process prints the Host origin and its
@@ -532,9 +542,11 @@ operator authentication. Derive metrics from the ready body with an existing
 prober instead (for example a JSON exporter).
 
 Block `/_takoserver/` at the reverse proxy by default and poll it on the Host's
-own port. The probe carries no identifiers or secrets, but its Host-wide
-counts show how much work the Host has and whether it is keeping up; forward
-the path only to a load balancer or monitor that needs it.
+own port; with the default `TAKOSERVER_LISTEN_HOST` (`127.0.0.1`) only a local
+prober or a local reverse proxy reaches it. The probe carries no identifiers or
+secrets, but its Host-wide counts show how much work the Host has and whether
+it is keeping up; forward the path only to a load balancer or monitor that
+needs it.
 
 The serving supervisor writes bounded child-exit, automatic-restart attempt and
 delay, and recovery-success diagnostics through its existing log callback (the
