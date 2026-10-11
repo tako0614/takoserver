@@ -137,10 +137,7 @@ export async function sweepSelfhostSocketRoot(
       const path = join(directory, child);
       const entry = await lstat(path).catch(() => null);
       abandoned =
-        entry !== null &&
-        entry.isSocket() &&
-        entry.uid === uid &&
-        (await probe(path)) === "refused";
+        entry?.isSocket() === true && entry.uid === uid && (await probe(path)) === "refused";
     }
     // A listener binding into this directory since it was examined changes
     // its mtime; then nothing here is proved abandoned any more.
