@@ -46,9 +46,9 @@ export interface SelfhostHealthResponse {
   /** Present only when a v2 Worker composition is mounted and could be read. */
   readonly v2Workers?: SelfhostV2WorkerHealth;
   /**
-   * Counts of unsettled v2 work older than the threshold, or `unavailable`
-   * when the bounded read failed. Present only when an observer is composed
-   * and the database answered.
+   * The latest background sample of unsettled v2 work older than the
+   * threshold, or `unavailable` when no fresh sample exists. Present only when
+   * a sampler is composed and the database answered.
    */
   readonly backlog?: SelfhostBacklogHealth | "unavailable";
   /** Fixed pass names and counts only; present when a recorder is composed. */
@@ -95,46 +95,43 @@ function runtimeHealth(
 }
 
 /**
- * One bounded read of the backlog counts. A thrown, hung or malformed read is
- * `unavailable`: it degrades the answer but never makes it 503.
+ * The latest background sample, from memory. A throwing, malformed or stale
+ * snapshot is `unavailable`: it degrades the answer but never makes it 503,
+ * and the probe never runs the backlog SQL itself.
  */
-async function observeBacklog(
-  backlog: { observe(): Promise<SelfhostBacklogHealth> },
-  timeoutMs: number,
-): Promise<SelfhostBacklogHealth | "unavailable"> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<"unavailable">((resolve) => {
-    timer = setTimeout(() => resolve("unavailable"), timeoutMs);
-  });
+function observeBacklog(backlog: {
+  snapshot(): SelfhostBacklogHealth | "unavailable";
+}): SelfhostBacklogHealth | "unavailable" {
   const counted = (value: unknown): value is number =>
     typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-  const observed = Promise.resolve()
-    .then(() => backlog.observe())
-    .then((value): SelfhostBacklogHealth | "unavailable" =>
+  try {
+    const value = backlog.snapshot();
+    if (value === "unavailable") return value;
+    if (
       counted(value.olderThanSeconds) &&
+      counted(value.sampledSecondsAgo) &&
       counted(value.operations.queued) &&
       counted(value.operations.running) &&
       counted(value.operations.reconciling) &&
       counted(value.operations.waitingInput) &&
       counted(value.queueExecutions.sendAuthorized)
-        ? {
-            olderThanSeconds: value.olderThanSeconds,
-            operations: {
-              queued: value.operations.queued,
-              running: value.operations.running,
-              reconciling: value.operations.reconciling,
-              waitingInput: value.operations.waitingInput,
-            },
-            queueExecutions: { sendAuthorized: value.queueExecutions.sendAuthorized },
-          }
-        : "unavailable",
-    )
-    .catch(() => "unavailable" as const);
-  try {
-    return await Promise.race([observed, timeout]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    ) {
+      return {
+        olderThanSeconds: value.olderThanSeconds,
+        sampledSecondsAgo: value.sampledSecondsAgo,
+        operations: {
+          queued: value.operations.queued,
+          running: value.operations.running,
+          reconciling: value.operations.reconciling,
+          waitingInput: value.operations.waitingInput,
+        },
+        queueExecutions: { sendAuthorized: value.queueExecutions.sendAuthorized },
+      };
+    }
+  } catch {
+    // Fall through: the probe answers even when its sampler cannot.
   }
+  return "unavailable";
 }
 
 /** A recorder that throws or answers nonsense is reported as one failing pass. */
@@ -146,17 +143,7 @@ function observeBackgroundPasses(passes: {
     const counted = (n: unknown): n is number =>
       typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
     if (counted(value.failing) && counted(value.stalled)) {
-      const last = value.lastFailure;
-      return {
-        failing: value.failing,
-        stalled: value.stalled,
-        ...(last &&
-        typeof last.name === "string" &&
-        /^[a-z0-9][a-z0-9-]{0,63}$/u.test(last.name) &&
-        counted(last.ageSeconds)
-          ? { lastFailure: { name: last.name, ageSeconds: last.ageSeconds } }
-          : {}),
-      };
+      return { failing: value.failing, stalled: value.stalled };
     }
   } catch {
     // Fall through: the probe answers even when its recorder cannot.
@@ -207,8 +194,8 @@ function healthResponse(body: SelfhostHealthResponse, status: number): Response 
  * Read-only Bun self-host health routes. Runtime recovery remains owned by the
  * supervisor and startup restore; these requests only issue one bounded SQL
  * read, one bounded observation of the accepted child listener, and, when
- * composed, bounded reads of the v2 owners and the backlog counts plus an
- * in-memory pass snapshot. Only the first three can make the answer 503.
+ * composed, one bounded read of the v2 owners plus the in-memory backlog and
+ * pass snapshots. Only the first three can make the answer 503.
  */
 export function createSelfhostHealthHandler(input: {
   readonly sql: Pick<Sql, "query">;
@@ -221,11 +208,11 @@ export function createSelfhostHealthHandler(input: {
    */
   readonly v2Workers?: { observe(): Promise<SelfhostV2WorkerHealth> };
   /**
-   * Unsettled v2 Operations and sent Queue executions past a threshold. Read
-   * only after the database answered, with the same deadline; it can mark the
-   * response `degraded` but never makes it 503.
+   * Unsettled v2 Operations and sent Queue executions past a threshold, as
+   * sampled by a background pass. The probe reads only the in-memory snapshot,
+   * never the backlog SQL; it can mark the response `degraded` but never 503.
    */
-  readonly backlog?: { observe(): Promise<SelfhostBacklogHealth> };
+  readonly backlog?: { snapshot(): SelfhostBacklogHealth | "unavailable" };
   /** In-memory background pass outcomes; never a reason for 503 either. */
   readonly backgroundPasses?: { snapshot(): SelfhostBackgroundPassHealth };
   readonly databaseCheckTimeoutMs?: number;
@@ -269,10 +256,9 @@ export function createSelfhostHealthHandler(input: {
           : v2 !== undefined && v2.serving > 0 && runtime === "not-required"
             ? "serving"
             : runtime;
-    // Only after SQL answered: a backlog read on an unreadable database would
-    // spend a second deadline to report what `database` already says.
-    const backlog =
-      input.backlog && databaseReady ? await observeBacklog(input.backlog, timeoutMs) : undefined;
+    // Omitted when SQL did not answer: `database` already says why, and a
+    // sample taken before that is not news about the backlog.
+    const backlog = input.backlog && databaseReady ? observeBacklog(input.backlog) : undefined;
     const passes = input.backgroundPasses
       ? observeBackgroundPasses(input.backgroundPasses)
       : undefined;

@@ -88,6 +88,9 @@ import {
 import {
   createSelfhostBackgroundPassRecorder,
   createSelfhostBacklogObserver,
+  createSelfhostBacklogSampler,
+  observeSelfhostBackgroundPasses,
+  SELFHOST_BACKLOG_SAMPLE_INTERVAL_MS,
 } from "./selfhost-health-signals.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
@@ -1330,9 +1333,26 @@ if (selfhostContainerEndpointHttps) {
   );
 }
 
+/** Name plus a bounded cause: a lock, a refused port and a bug read differently. */
+const reportBackgroundFailure = (name: string, cause?: unknown): void => {
+  process.stderr.write(
+    `self-host background pass failed: ${name}: ${describeBackgroundFailure(cause)}\n`,
+  );
+};
 // Every background pass below reports through this recorder as well as the
 // log line, so a pass that fails on every tick is visible to the probe.
 const backgroundPasses = createSelfhostBackgroundPassRecorder();
+// Stuck Operations and sent-but-unretired Queue batches answered 200 with
+// nothing to show for them. A background pass samples them; the public probe
+// only reads the latest sample from memory and never runs this SQL itself.
+const backlogSampler = createSelfhostBacklogSampler({
+  observer: createSelfhostBacklogObserver({ sql, now: clock, startedAtMs: clock().getTime() }),
+});
+// The first sample exists before the listener opens, so readiness never
+// reports a missing sample for a Host that has just started.
+await backgroundPasses
+  .observe("health-backlog", () => backlogSampler.refresh())()
+  .catch((cause: unknown) => reportBackgroundFailure("health-backlog", cause));
 
 /**
  * Bring the runtime back for the Workers this machine already published.
@@ -1364,9 +1384,7 @@ const selfhostHealth = createSelfhostHealthHandler({
   ...(v2WorkerComposition
     ? { v2Workers: { observe: () => v2WorkerComposition.observeOwnerHealth() } }
     : {}),
-  // Stuck Operations and sent-but-unretired Queue batches answered 200 with
-  // nothing to show for them; they now degrade the response with counts.
-  backlog: createSelfhostBacklogObserver({ sql, now: clock }),
+  backlog: backlogSampler,
   backgroundPasses,
 });
 const takoformV2Ingress = createSelfhostTakoformV2Ingress({
@@ -1495,29 +1513,15 @@ try {
   throw error;
 }
 
-/** Name plus a bounded cause: a lock, a refused port and a bug read differently. */
-const reportBackgroundFailure = (name: string, cause?: unknown): void => {
-  process.stderr.write(
-    `self-host background pass failed: ${name}: ${describeBackgroundFailure(cause)}\n`,
-  );
-};
-
-/**
- * The shutdown owner's pass API with each body observed by the recorder. Only
- * the body is wrapped: single-flight per name, the stop fence and failure
- * reporting stay exactly the shutdown owner's.
- */
-const observedPasses = {
-  startInterval: (
-    name: string,
-    milliseconds: number,
-    run: () => void | Promise<void>,
-    onFailure: (name: string, cause?: unknown) => void,
-  ) =>
-    entryShutdown.startInterval(name, milliseconds, backgroundPasses.observe(name, run), onFailure),
-  runPass: (name: string, run: () => void | Promise<void>) =>
-    entryShutdown.runPass(name, backgroundPasses.observe(name, run)),
-};
+// Every pass body below is observed by the recorder; single-flight, the stop
+// fence and failure reporting stay exactly the shutdown owner's.
+const observedPasses = observeSelfhostBackgroundPasses(entryShutdown, backgroundPasses);
+observedPasses.startInterval(
+  "health-backlog",
+  SELFHOST_BACKLOG_SAMPLE_INTERVAL_MS,
+  () => backlogSampler.refresh(),
+  reportBackgroundFailure,
+);
 
 // Background settlement. The shutdown owner retains each timer and each pass
 // promise, so no new work starts past the signal fence and accepted work drains.
