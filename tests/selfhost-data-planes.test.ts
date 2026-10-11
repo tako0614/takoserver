@@ -11,6 +11,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
@@ -31,6 +32,7 @@ import {
 import {
   createSelfhostDataPlanes,
   type SelfhostDataPlaneGrant,
+  serveSelfhostDataPlanes,
 } from "../src/selfhost-data-planes.ts";
 import { createVectorIndexStore } from "../src/vector-index-store.ts";
 
@@ -125,9 +127,10 @@ async function post(
     headers: {
       authorization: `Bearer ${token}`,
       "content-type": "application/json",
-      // Declared, as every real caller declares it: the plane refuses a body
-      // whose length it was not told, so it never reads one it did not agree
-      // to. `new Request` does not set this by itself; a wire client does.
+      // Declared, as the data service declares every buffered body. Only the
+      // SQL route also accepts a chunked stream (see the chunked tests below);
+      // a body with neither framing is refused before it is read. `new
+      // Request` does not set this by itself; a wire client does.
       "content-length": String(new TextEncoder().encode(payload).byteLength),
     },
     body: payload,
@@ -938,6 +941,256 @@ test("a body with no declared length is refused before it is read", async () => 
   });
   const response = await planes.routes(request, new URL(request.url));
   expect(response?.status).toBe(400);
+});
+
+/**
+ * What the Bun listener hands this plane for a chunked body: the generated SQL
+ * wrapper streams its envelope, so workerd sends it with `Transfer-Encoding:
+ * chunked` and no declared length. The listener has already decoded the
+ * chunks; the header is still visible here.
+ */
+function streamedRequest(
+  path: string,
+  body: ReadableStream<Uint8Array>,
+  headers: Record<string, string> = {},
+): Request {
+  return new Request(`${ORIGIN}${path}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer alpha.v1.${ALPHA.secret}`,
+      "content-type": "application/json",
+      "transfer-encoding": "chunked",
+      ...headers,
+    },
+    body,
+    duplex: "half",
+  } as RequestInit);
+}
+
+/** A finite stream in small pieces, as the wrapper's bounded fragments arrive. */
+function pieces(text: string, size = 7): ReadableStream<Uint8Array> {
+  const bytes = new TextEncoder().encode(text);
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= bytes.byteLength) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(bytes.slice(offset, offset + size));
+      offset += size;
+    },
+  });
+}
+
+const envelope = (body: Record<string, unknown>) =>
+  JSON.stringify({ protocol: SELFHOST_DATA_PLANE_PROTOCOL, ...body });
+
+test("a chunked SQL envelope with no declared length runs, as the streaming wrapper sends it", async () => {
+  provisionFixture("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)");
+  const response = await planes.routes(
+    streamedRequest(
+      SELFHOST_DATA_PLANE_SQL_PATH,
+      pieces(
+        envelope({
+          binding: "DB",
+          op: "transaction",
+          statements: [
+            { sql: "INSERT INTO notes (id, body) VALUES (?, ?)", params: [1, "streamed 😀"] },
+            { sql: "INSERT INTO notes (id, body) VALUES (?, ?)", params: [2, "second"] },
+          ],
+        }),
+      ),
+    ),
+    new URL(`${ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`),
+  );
+  expect(response?.status).toBe(200);
+  expect(await response?.json()).toEqual({
+    ok: true,
+    value: {
+      results: [
+        { rows: [], rowsWritten: 1 },
+        { rows: [], rowsWritten: 1 },
+      ],
+    },
+  });
+  expect(fixtureDatabase().query("SELECT id, body FROM notes ORDER BY id").all()).toEqual([
+    { id: 1, body: "streamed 😀" },
+    { id: 2, body: "second" },
+  ]);
+});
+
+test("a chunked SQL body is cut off at the request ceiling instead of being buffered past it", async () => {
+  // A complete, well-formed envelope a little over the 40 MiB ceiling. Read to
+  // the end it would parse and reach SQLite; the ceiling is what refuses it,
+  // and it must refuse while the stream is still being produced.
+  const megabyte = new Uint8Array(1024 * 1024).fill(97);
+  const prefix = new TextEncoder().encode(
+    `{"protocol":${JSON.stringify(SELFHOST_DATA_PLANE_PROTOCOL)},"binding":"DB","op":"execute","statement":{"sql":"SELECT ?","params":["`,
+  );
+  const suffix = new TextEncoder().encode('"]}}');
+  const total = 48;
+  let produced = 0;
+  let pulledBytes = 0;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      const chunk = produced === 0 ? prefix : produced <= total ? megabyte : suffix;
+      if (produced > total + 1) {
+        controller.close();
+        return;
+      }
+      produced += 1;
+      pulledBytes += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const response = await planes.routes(
+    streamedRequest(SELFHOST_DATA_PLANE_SQL_PATH, body),
+    new URL(`${ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`),
+  );
+  expect(response?.status).toBe(400);
+  expect(await response?.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+  expect(cancelled).toBe(true);
+  expect(pulledBytes).toBeLessThan(42 * 1024 * 1024);
+});
+
+test("chunked framing is refused on the KV and Queue routes, whose bodies declare a length", async () => {
+  for (const [path, body] of [
+    [SELFHOST_DATA_PLANE_KV_PATH, { binding: "KV", op: "get", key: "k" }],
+    [SELFHOST_DATA_PLANE_QUEUE_PATH, { binding: "DELIVERY", op: "send", body: btoa("m") }],
+  ] as const) {
+    const response = await planes.routes(
+      streamedRequest(path, pieces(envelope(body))),
+      new URL(`${ORIGIN}${path}`),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+  }
+  expect(await messages()).toEqual([]);
+});
+
+test("a declared length beside chunked framing is refused as ambiguous", async () => {
+  provisionFixture("CREATE TABLE notes (id INTEGER PRIMARY KEY)");
+  const payload = envelope({
+    binding: "DB",
+    op: "execute",
+    statement: { sql: "INSERT INTO notes (id) VALUES (1)" },
+  });
+  const response = await planes.routes(
+    streamedRequest(SELFHOST_DATA_PLANE_SQL_PATH, pieces(payload), {
+      "content-length": String(new TextEncoder().encode(payload).byteLength),
+    }),
+    new URL(`${ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`),
+  );
+  expect(response?.status).toBe(400);
+  expect(await response?.json()).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+  expect(fixtureDatabase().query("SELECT id FROM notes").all()).toEqual([]);
+});
+
+test("a transfer coding other than exactly chunked is refused", async () => {
+  const payload = envelope({ binding: "DB", op: "execute", statement: { sql: "SELECT 1" } });
+  for (const coding of ["gzip, chunked", "identity", "chunked, chunked", ""]) {
+    const response = await planes.routes(
+      streamedRequest(SELFHOST_DATA_PLANE_SQL_PATH, pieces(payload), {
+        "transfer-encoding": coding,
+      }),
+      new URL(`${ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`),
+    );
+    expect(response?.status).toBe(400);
+  }
+});
+
+test("a body that does not match its declared length is refused", async () => {
+  provisionFixture("CREATE TABLE notes (id INTEGER PRIMARY KEY)");
+  const payload = envelope({
+    binding: "DB",
+    op: "execute",
+    statement: { sql: "INSERT INTO notes (id) VALUES (1)" },
+  });
+  const length = new TextEncoder().encode(payload).byteLength;
+  for (const declared of [length - 1, length + 1]) {
+    const request = new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer alpha.v1.${ALPHA.secret}`,
+        "content-type": "application/json",
+        "content-length": String(declared),
+      },
+      body: payload,
+    });
+    const response = await planes.routes(request, new URL(request.url));
+    expect(response?.status).toBe(400);
+  }
+  expect(fixtureDatabase().query("SELECT id FROM notes").all()).toEqual([]);
+});
+
+test("on the wire, a chunked SQL request is served and an ambiguously framed one is not", async () => {
+  // The plane's own listener, reached with raw HTTP/1.1 bytes so the framing
+  // is exactly what is written here rather than what a client library picks.
+  provisionFixture("CREATE TABLE notes (id INTEGER PRIMARY KEY)");
+  const served = serveSelfhostDataPlanes({
+    sql,
+    grant: async (script, versionId) => GRANTS[`${script}\u0000${versionId}`] ?? null,
+    databasePath: (name) => join(root, `${name}.sqlite`),
+    objectRoot: join(root, "objects"),
+    clock: () => now,
+  });
+  const raw = (head: string, body: string): Promise<string> =>
+    new Promise((resolveRaw, reject) => {
+      const socket = connect(served.port, "127.0.0.1", () => {
+        socket.write(`${head}\r\n\r\n${body}`);
+      });
+      let answer = "";
+      socket.setEncoding("utf8");
+      socket.on("data", (data) => {
+        answer += data;
+      });
+      socket.on("end", () => resolveRaw(answer));
+      socket.on("error", reject);
+    });
+  const insert = (id: number) =>
+    envelope({
+      binding: "DB",
+      op: "execute",
+      statement: { sql: "INSERT INTO notes (id) VALUES (?)", params: [id] },
+    });
+  const chunked = (text: string) => {
+    const bytes = new TextEncoder().encode(text);
+    const half = Math.floor(bytes.byteLength / 2);
+    const first = new TextDecoder().decode(bytes.slice(0, half));
+    const second = new TextDecoder().decode(bytes.slice(half));
+    return `${half.toString(16)}\r\n${first}\r\n${(bytes.byteLength - half).toString(16)}\r\n${second}\r\n0\r\n\r\n`;
+  };
+  const head = (...extra: string[]) =>
+    [
+      `POST ${SELFHOST_DATA_PLANE_SQL_PATH} HTTP/1.1`,
+      "Host: 127.0.0.1",
+      `Authorization: Bearer alpha.v1.${ALPHA.secret}`,
+      "Content-Type: application/json",
+      "Connection: close",
+      ...extra,
+    ].join("\r\n");
+  try {
+    const accepted = await raw(head("Transfer-Encoding: chunked"), chunked(insert(1)));
+    expect(accepted.split("\r\n")[0]).toBe("HTTP/1.1 200 OK");
+    expect(accepted).toContain('"ok":true');
+    const ambiguous = insert(2);
+    const refused = await raw(
+      head(
+        `Content-Length: ${new TextEncoder().encode(ambiguous).byteLength}`,
+        "Transfer-Encoding: chunked",
+      ),
+      chunked(ambiguous),
+    );
+    expect(refused.split("\r\n")[0]).toMatch(/^HTTP\/1\.1 400 /u);
+    expect(fixtureDatabase().query("SELECT id FROM notes ORDER BY id").all()).toEqual([{ id: 1 }]);
+  } finally {
+    await served.stop(true);
+  }
 });
 
 test("an unauthenticated caller is refused before the body is even measured", async () => {
