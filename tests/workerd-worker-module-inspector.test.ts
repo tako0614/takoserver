@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
+import { chmod, mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
 import type {
   WorkerModuleHandlerName,
@@ -564,6 +566,30 @@ test("does not mislabel a runtime process failure as tenant invalidity", async (
   }).inspect(input([module("worker.mjs", `export default { fetch() {} };`)]));
 
   expect(result).toEqual({ outcome: "unavailable", retryable: true });
+});
+
+test("uses the system temporary directory only as a parent, never chmodding it", async () => {
+  // Stands in for a shared, root-owned /tmp: a dedicated service user cannot
+  // chmod it, and a Host running as root must not tighten it for every user.
+  const shared = await mkdtemp(join(tmpdir(), "inspector-shared-tmp-"));
+  await chmod(shared, 0o755);
+  const previous = process.env.TMPDIR;
+  process.env.TMPDIR = shared;
+  try {
+    const result = await createWorkerdWorkerModuleInspector({
+      repositoryRoot,
+      binary: "/bin/false",
+    }).inspect(input([module("worker.mjs", `export default { fetch() {} };`)]));
+
+    expect(result).toEqual({ outcome: "unavailable", retryable: true });
+    expect((await stat(shared)).mode & 0o7777).toBe(0o755);
+    // The one-shot run directory was created below it and removed again.
+    expect(await readdir(shared)).toEqual([]);
+  } finally {
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
+    await rm(shared, { recursive: true, force: true });
+  }
 });
 
 test("refuses an unprovable byte identity before runtime execution", async () => {

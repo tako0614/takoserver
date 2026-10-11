@@ -133,6 +133,32 @@ export function createWorkerdWorkerModuleInspector(
   };
 }
 
+/**
+ * One private 0700 directory for a single evaluator run.
+ *
+ * A configured `temporaryRoot` is this Host's own private parent, so it is
+ * created and tightened to 0700. Without one, the run goes below the system
+ * temporary directory (`os.tmpdir()`), which belongs to the machine and is
+ * only a parent here: it is never created or chmodded. Tightening it made a
+ * Host running as root set a shared `/tmp` to 0700 for every user, and made
+ * every inspection unavailable for a dedicated service user, which cannot
+ * chmod a root-owned `/tmp`. `mkdtemp` already creates the run directory 0700.
+ */
+async function privateInspectionDirectory(
+  temporaryRoot: string | undefined,
+  prefix: string,
+): Promise<string> {
+  let parent = tmpdir();
+  if (temporaryRoot !== undefined) {
+    await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
+    await chmod(temporaryRoot, 0o700);
+    parent = temporaryRoot;
+  }
+  const root = await mkdtemp(join(parent, prefix));
+  await chmod(root, 0o700);
+  return root;
+}
+
 interface AdmittedSnapshot {
   readonly mainModule: string;
   readonly modules: readonly WorkerModuleInspectionModule[];
@@ -154,11 +180,7 @@ async function inspectSnapshot(input: {
 
   let root: string;
   try {
-    const temporaryRoot = input.temporaryRoot ?? tmpdir();
-    await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
-    await chmod(temporaryRoot, 0o700);
-    root = await mkdtemp(join(temporaryRoot, "takoserver-worker-inspection-"));
-    await chmod(root, 0o700);
+    root = await privateInspectionDirectory(input.temporaryRoot, "takoserver-worker-inspection-");
   } catch {
     return unavailable();
   }
@@ -232,11 +254,10 @@ async function inspectActorClassSnapshot(input: {
 
   let root: string;
   try {
-    const temporaryRoot = input.temporaryRoot ?? tmpdir();
-    await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
-    await chmod(temporaryRoot, 0o700);
-    root = await mkdtemp(join(temporaryRoot, "takoserver-actor-class-inspection-"));
-    await chmod(root, 0o700);
+    root = await privateInspectionDirectory(
+      input.temporaryRoot,
+      "takoserver-actor-class-inspection-",
+    );
   } catch {
     return unavailableActorClass();
   }
@@ -348,11 +369,10 @@ async function inspectWorkflowClassSnapshot(input: {
   if ("outcome" in admitted || input.binary === null) return unavailableWorkflowClass();
   let root: string;
   try {
-    const temporaryRoot = input.temporaryRoot ?? tmpdir();
-    await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
-    await chmod(temporaryRoot, 0o700);
-    root = await mkdtemp(join(temporaryRoot, "takoserver-workflow-class-inspection-"));
-    await chmod(root, 0o700);
+    root = await privateInspectionDirectory(
+      input.temporaryRoot,
+      "takoserver-workflow-class-inspection-",
+    );
   } catch {
     return unavailableWorkflowClass();
   }
