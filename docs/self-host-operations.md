@@ -339,29 +339,76 @@ drill.
 Back up the complete configured `TAKOSERVER_DATA_ROOT` as one unit (default:
 `.takoserver`). Do not assemble a backup from a hand-picked list of files. The
 root contains the local control database by default, object bytes and their
-metadata, customer SQL databases, published Worker bundles and active
-deployment data, self-host resource and event state, runtime probes, and
-private signing keys. Paths such as `objects/`, `databases/`, `workers/`,
-`selfhost/`, and `runtime-probes/` are implementation details; retaining the
-whole root also retains paths added by later versions.
+metadata (including the held artifact bytes an operator seeded for the v2
+Forms), customer SQL databases, published Worker bundles and active deployment
+data, the v2 Worker owners' incarnation state, the v2 SQLite, KV and
+ObjectBucket custody, self-host resource and event state, runtime probes, and
+the private keys the Host generated for itself (`operator-key.jwk`,
+`signing-key.jwk`, and a tenant-run signing key when that feature is enabled).
+Paths such as `objects/`, `databases/`, `workers/`, `selfhost/`,
+`v2-worker-owners/`, `v2-sqlite-databases/`, `v2-kv-namespaces/`,
+`v2-object-buckets/` and `runtime-probes/` are implementation details;
+retaining the whole root also retains paths added by later versions.
 
 `TAKOSERVER_DB` can put `control.sqlite` outside the data root. If it is set,
 that exact database is part of the backup set too. A backup is incomplete if
 either the root or that database is missing.
 
-The running configuration may also depend on material outside the root. Record
-the exact service configuration and protect any configured external values or
-files needed to recover the same identity and capabilities, including TLS
-certificate/private-key files, `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`,
-operator-supplied signing keys, and configured provider, payment, identity, or
-AI credentials. Do not put secret values in this repository or in a backup
-manifest. `TAKOSERVER_WORKERD_BINARY` must still resolve to the exact accepted
-artifact for Worker execution; the selected snapshot is retained under the
-data root, but startup validates and selects from the configured input path.
-Preserve that artifact and its path/configuration through the operator's
-protected mechanism. Keep external configuration and secrets at least as
-carefully as the data root; the database and files contain customer and
-credential-bearing state.
+The running configuration also depends on material outside the root. Record
+the exact service configuration and protect, through the operator's own
+protected mechanism, every external value and file needed to recover the same
+identity and capabilities. For the current v2 entry that includes:
+
+- `TAKOSERVER_TAKOFORM_V2_CONFIG`, verbatim. It names no files, but its
+  `heldArtifacts` entries name the object keys, digests and grants of bytes
+  that were seeded into the object store under the data root: the root backup
+  carries those bytes, and only this exact JSON makes the restored Host serve
+  them. Removing a Form block or held entry that Resources or Operations still
+  use is not a restore (see [Takoform v2 operator setup](takoform-v2.md)).
+- `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`. The Host refuses to start without it. A
+  different key loses no data, but every pagination cursor a client holds stops
+  being accepted.
+- `TAKOSERVER_V2_WORKER_PRIVATE_PLANES`, verbatim, and every file and
+  directory it names. Each selected plane's `signingKeyFile` is raw key
+  material the Host never generates and may live outside the root; restore it
+  unchanged, owner-private, at the same absolute path. Published Worker
+  incarnations carry binding grants signed with these keys, and a restore with
+  different keys is not exercised. The SQLite plane's `stagingRoot` must exist
+  as an owner-private directory before start, but it holds only transient
+  per-call staging, so it needs no backup. The custody roots themselves are the
+  `v2-*` directories under the data root.
+- The other v2 selections (`TAKOSERVER_V2_WORKER_RUNTIME_BOOT`,
+  `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS`), ports, and suffixes, as recorded
+  configuration.
+- TLS certificate/private-key files, `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`,
+  operator-supplied signing keys, and configured provider, payment, identity,
+  or AI credentials.
+- The exact native binaries. `TAKOSERVER_WORKERD_BINARY` must still resolve to
+  the exact accepted artifact for Worker execution; the selected snapshot is
+  retained under the data root, but startup validates and selects from the
+  configured input path. When Workflow boot is selected,
+  `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` is likewise outside the root.
+
+Do not put secret values in this repository or in a backup manifest. Keep
+external configuration and secrets at least as carefully as the data root; the
+database and files contain customer and credential-bearing state.
+
+Some paths exist only while a Host runs and are not part of the backup set:
+
+- `/tmp/tw-*` (always `/tmp`, not `TMPDIR`): one private Unix-socket directory
+  per v2 Worker incarnation, named by a hash of the owner directory's path, the
+  Worker UID and the Operation ID. It holds only sockets. A suspended or killed
+  incarnation keeps its directory until recovery reuses it, and recovery
+  creates it again when it is missing (the code handles a restore onto a
+  machine without it; that case is not exercised natively). Do not copy or
+  restore these directories. On a shared machine leave a live installation's
+  ones in place: if another local user creates the same name, recovery refuses
+  it with `ownership_uncertain`. Deleting a data root leaves its `/tmp/tw-*`
+  directories behind.
+- `<data root>/s/`: per-incarnation listener directories for the Actor and
+  Workflow runtimes. A copy of the root may contain them; they carry no state,
+  and boot removes the ones whose abandonment it proves.
+- `$TMPDIR/tactor-*`: socket directories of native Actor namespace processes.
 
 ## Cold snapshot
 
@@ -369,8 +416,9 @@ credential-bearing state.
    any external `TAKOSERVER_DB`. Use a destination that is not served by the
    source host.
 2. Stop the Takoserver service through its actual supervisor and wait until
-   `entry-bun.ts`, its child `workerd`, and any other process configured to
-   write this data has exited. A graceful stop is not enough until all writers
+   `entry-bun.ts`, all of its `workerd` children (the legacy runtime and each
+   v2 Worker owner's), any Workflow execution guard, and any other process
+   configured to write this data have exited. A graceful stop is not enough until all writers
    are gone. The Bun entry starts queue delivery and cron timers and restores
    published Workers automatically at startup; there is no read-only boot
    switch for a copy.
@@ -381,12 +429,14 @@ credential-bearing state.
    root, copy its main file and any existing SQLite `-wal`, `-shm`, or rollback
    journal sidecars in the same stopped window. Do not copy a live SQLite file,
    copy only its main file while sidecars may be changing, or guess which
-   sidecars can be omitted. This procedure intentionally requires a
-   stopped-and-quiescent installation rather than promising a live snapshot.
+   sidecars can be omitted. Do not copy the runtime-only socket directories
+   listed above. This procedure intentionally requires a stopped-and-quiescent
+   installation rather than promising a live snapshot.
 4. Record outside the secret-bearing files which source instance and time the
    copy represents, the resolved data-root and database paths, the product
    commit, and the configured external dependency references needed to locate
-   recovery material. Do not record credentials themselves.
+   recovery material, including the private-plane key-file paths and the
+   `stagingRoot`. Do not record credentials themselves.
 5. Keep the source stopped until the copy has completed. Then restart only the
    original instance if it is still the active installation.
 
@@ -404,11 +454,16 @@ endpoint, external services, or tenant traffic.
 For an actual recovery, first fence the source instance and all its writers and
 confirm they cannot return. Restore the complete root and any external database
 to the intended replacement, reinstate its protected configuration and
-required secrets, and verify that only the replacement owns the installation's
-network identity before starting it. Use a product build that understands the
-database's recorded migration history: SQLite upgrades are forward-only, and a
-build that does not know a recorded migration refuses the database rather than
-downgrading it. A restart may deliver queued work; treat that as resuming the
+required secrets (including the exact v2 configuration, the cursor key, the
+private-plane key files at their configured paths, and an existing private
+`stagingRoot`), and verify that only the replacement owns the installation's
+network identity before starting it. Keep the same `TAKOSERVER_DATA_ROOT`
+value: SQLite database records carry the configured root, and the v2 owners'
+socket namespaces are derived from the owner directory's path. Only a restore
+to the same path on the same machine is exercised. Use a product build that
+understands the database's recorded migration history: SQLite upgrades are
+forward-only, and a build that does not know a recorded migration refuses the
+database rather than downgrading it. A restart may deliver queued work; treat that as resuming the
 installation, not as a no-write restore check. If source fencing, ownership of
 the public identity, or the fate of pending operations is uncertain, leave the
 restored copy stopped and resolve that uncertainty before activation.
@@ -416,6 +471,70 @@ restored copy stopped and resolve that uncertainty before activation.
 After activation, perform the same current v2 discovery, authenticated exact
 Form-support, and known v2 Resource-readback checks described for an update.
 The legacy `/v1/forms` catalogue does not establish v2 support.
+
+## Monitoring
+
+Poll `GET /_takoserver/health/ready` on the Host's own port (`PORT`, default
+`8787`) every 10 to 30 seconds, from the machine itself or another trusted
+network position. Treat its two answers differently:
+
+- `503`, or no answer within a few seconds, means the Host cannot serve: SQLite
+  did not answer, the boot restore failed, the legacy runtime is unavailable,
+  or the v2 owner state could not be read. `database` and `workerRuntime` say
+  which.
+- `200` with `degraded: true` means the control plane serves but something
+  needs an operator. The probe never withdraws the shared API port for these.
+
+The degraded causes are reported as counts and fixed names only, with no
+Resource, Operation, organization, Worker or batch identifier and no error
+text:
+
+- `v2Workers.unavailable`: v2 Worker owners whose active incarnation's child
+  is not ready.
+- `backlog.operations`: v2 Operations accepted more than
+  `backlog.olderThanSeconds` (600) ago that are still `queued`, `running` or
+  `reconciling`. `waitingInput` counts Operations waiting for their client to
+  resupply private inputs; it is shown but does not degrade the Host.
+- `backlog.queueExecutions.sendAuthorized`: Queue batches sent to a Worker more
+  than 600 seconds ago and still not retired; their Consumer stays occupied.
+- `backlog: "unavailable"`: the backlog read failed or missed the probe's
+  one-second deadline. This degrades; it is not a 503.
+- `backgroundPasses.failing`: background passes (settlement, Takoform v2,
+  Queue delivery, Cron and others) whose most recent run failed. A pass stops
+  counting once it completes again. `stalled` counts passes whose current run
+  has lasted more than 600 seconds. `lastFailure` names the most recently
+  failed pass and its age in seconds; the matching stderr line
+  `self-host background pass failed: <name>: <bounded cause>` carries the
+  cause.
+
+The backlog reads run only after `SELECT 1` succeeded and use existing
+indexes, so their cost follows the size of the backlog and the number of Queue
+Consumers, not the Operation and execution history, which is never pruned.
+
+For example, a cron job or timer can alert on any non-zero exit of:
+
+```sh
+curl -fsS --max-time 5 http://127.0.0.1:8787/_takoserver/health/ready \
+  | jq -e '.status == "ready" and (.degraded | not)'
+```
+
+There is no metrics endpoint. The probe shares the public port and is
+unauthenticated, and a loopback check is not a privacy boundary behind a local
+reverse proxy, so a private metrics surface would need its own listener or
+operator authentication. Derive metrics from the ready body with an existing
+prober instead (for example a JSON exporter). If the reverse proxy forwards
+`/_takoserver/` from the public origin, anyone can read these Host-wide counts;
+they carry no identifiers or secrets, but do not forward the path if Host-wide
+activity should stay private.
+
+The serving supervisor writes bounded child-exit, automatic-restart attempt and
+delay, and recovery-success diagnostics through its existing log callback (the
+Bun entry forwards these to stdout). New recovery messages contain no config
+path or arbitrary child error text; deliberate stops and stale children are
+not reported as crashes. A failure to write these diagnostics does not stop
+runtime recovery. Collect stdout and stderr and configure alerts on them as
+well: these messages and the probe are not a monitoring service or proof of
+operator recovery.
 
 ## Automated proof and its limits
 
@@ -434,15 +553,6 @@ restore that also copies an external `TAKOSERVER_DB` and external TLS files in
 the same stopped window, and replacement of a killed Worker child without a
 Host restart (it measured the legacy runtime supervisor; no native test here
 kills a serving v2 Worker owner's child and waits for its replacement).
-
-The serving supervisor writes bounded child-exit, automatic-restart attempt and
-delay, and recovery-success diagnostics through its existing log callback (the
-Bun entry forwards these to stdout). New recovery messages contain no config
-path or arbitrary child error text; deliberate stops and stale children are
-not reported as crashes. A failure to write these diagnostics does not stop
-runtime recovery. Operators still need to collect logs and configure their own
-alerts: these messages are not a health API, monitoring service, or proof of
-operator recovery.
 
 ### Ordinary journey native test and known gaps
 
@@ -598,6 +708,8 @@ What this test and its neighbours record:
   `publication_conflict`), so such an Operation stays `reconciling` and keeps
   retrying: boot is not blocked, because the owner vouches it never served,
   but the Worker's Endpoint is not served until the Operation is settled.
+  After ten minutes readiness counts it under `backlog.operations.reconciling`
+  and reports `degraded` (see [Monitoring](#monitoring)).
 
 Three other gaps this test first recorded have since been fixed, each with its own
 test:
