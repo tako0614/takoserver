@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { canonicalWorkerEndpointOrigin } from "../src/provider-worker-endpoint-origin.ts";
 import {
   SELFHOST_TLS_ENVIRONMENT,
+  selfhostWorkerEndpointBootNote,
   selfhostWorkerEndpointPublication,
   selfhostWorkerEndpointScheme,
 } from "../src/selfhost-composition.ts";
@@ -148,6 +149,23 @@ test("says at boot when this deployment can mint no Worker endpoint, and how to 
   });
   expect(unnameable.publishable).toBe(false);
   expect(unnameable.diagnostic).toContain("TAKOSERVER_WORKER_ENDPOINT_SUFFIX");
+});
+
+test("the pre-v2 endpoint note is not printed beside the v2 Endpoint HTTPS listener", () => {
+  // The documented complete profile: v2 Endpoints on the Host's own 443, the
+  // retained workerd socket on its default port. The pre-v2 note's remedies
+  // (443 on that socket or endpoint port) are refused next to the listener.
+  const publication = selfhostWorkerEndpointPublication({
+    workerEndpointSuffix: "apps.example.com",
+    scheme: "https",
+    port: 8788,
+  });
+  expect(publication.publishable).toBe(false);
+  expect(selfhostWorkerEndpointBootNote(publication, true)).toBeUndefined();
+  expect(selfhostWorkerEndpointBootNote(publication, false)).toBe(publication.diagnostic);
+  expect(
+    selfhostWorkerEndpointBootNote(selfhostWorkerEndpointPublication({ scheme: "https" }), false),
+  ).toBeUndefined();
 });
 
 test.skipIf(WORKERD === null)(

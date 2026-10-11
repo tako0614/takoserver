@@ -51,6 +51,7 @@ import {
 import {
   hasExactLocalContainerEndpointCandidatePair,
   SELFHOST_TLS_ENVIRONMENT,
+  selfhostWorkerEndpointBootNote,
   selfhostWorkerEndpointPublication,
   selfhostWorkerEndpointScheme,
 } from "./selfhost-composition.ts";
@@ -496,14 +497,15 @@ if (workerEndpoint.warning) process.stderr.write(`${workerEndpoint.warning}\n`);
  * because everything else on the machine works: Workers run, storage answers,
  * queues drain, cron fires, and the runtime serves on its own socket.
  */
-const workerEndpointPublication = selfhostWorkerEndpointPublication({
-  workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
-  scheme: workerEndpoint.scheme,
-  port: workerEndpointPort,
-});
-if (workerEndpointPublication.diagnostic) {
-  process.stderr.write(`${workerEndpointPublication.diagnostic}\n`);
-}
+const workerEndpointBootNote = selfhostWorkerEndpointBootNote(
+  selfhostWorkerEndpointPublication({
+    workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
+    scheme: workerEndpoint.scheme,
+    port: workerEndpointPort,
+  }),
+  v2WorkerEndpointHttpsSelection !== undefined,
+);
+if (workerEndpointBootNote) process.stderr.write(`${workerEndpointBootNote}\n`);
 
 const workerdSelection = await selectClosedGraphWorkerd({
   binary: process.env.TAKOSERVER_WORKERD_BINARY,
