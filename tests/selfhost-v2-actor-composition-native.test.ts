@@ -1,13 +1,16 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { JsonObject } from "../src/ports.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
+import {
+  SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES,
+  SELFHOST_SOCKET_ROOT_NAME,
+} from "../src/selfhost-socket-layout.ts";
 import { createSelfhostV2ActorBoot } from "../src/selfhost-v2-actor-boot.ts";
 import { createSelfhostV2WorkerComposition } from "../src/selfhost-v2-worker-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -27,6 +30,7 @@ import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { spawnWorkerdWithParentDeath } from "../src/workerd-linux-process.ts";
 import { internalHostname } from "../src/workerd-runtime.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const binary = nativeEvidenceBinary("workerd-artifact");
 const principal = "actor-composition-principal";
@@ -91,7 +95,9 @@ async function exercise(
   graphChangeDuringNested = false,
 ): Promise<void> {
   if (!binary) throw new Error("pinned Workerd unavailable");
-  const root = await mkdtemp(join(tmpdir(), "v2-actor-composition-"));
+  // The Actor forward brokers bind <root>/s/aXXXXXX/<20 hex>.u.sock, so the
+  // root must leave room for the Unix socket bound whatever TMPDIR is.
+  const root = await mkdtempForSockets("v2-actor-composition-", SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES);
   const db = new Database(join(root, "state.sqlite"));
   let workers: ReturnType<typeof createSelfhostV2WorkerComposition> | undefined;
   let physical: ReturnType<typeof createSelfhostActorExecutionHost> | undefined;
@@ -214,7 +220,7 @@ async function exercise(
             return actorHost.fetch(identity, request);
           },
         },
-        privateSocketDirectory: join(root, "actor-brokers"),
+        privateSocketDirectory: join(root, SELFHOST_SOCKET_ROOT_NAME),
       }),
       listenerPortForOperation: async () => (listenerPort = await unusedPort()),
       spawn: (command) =>
