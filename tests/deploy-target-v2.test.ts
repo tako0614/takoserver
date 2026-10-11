@@ -8,6 +8,7 @@ import {
   loadManagedWorkerDispatchNamespaceTarget,
   loadTarget,
   parseDeployTarget,
+  takoformV2StorageLineage,
   targetPath,
 } from "../scripts/deploy/target.ts";
 import { ARTIFACT_RECOVERY_RETENTION_FORMAT } from "../src/artifact-recovery.ts";
@@ -220,6 +221,45 @@ describe("environment-exact deploy target", () => {
         "integration",
       ),
     ).toThrow("maintenance profile");
+  });
+
+  test("selects an explicit fresh v2 storage lineage only as v2-0088 or v2-0089", () => {
+    const config = JSON.stringify({
+      documentation: "https://docs.example.test/v2",
+      authenticationDocumentation: "https://docs.example.test/v2/authentication",
+    });
+    for (const storageLineage of ["v2-0088", "v2-0089"] as const) {
+      const selected = parseDeployTarget(
+        descriptor({ environment: "integration", takoformV2: { config, storageLineage } }),
+        "fresh v2 target",
+        "integration",
+      );
+      expect(selected.takoformV2).toEqual({ config, storageLineage });
+      expect(takoformV2StorageLineage(selected)).toBe(storageLineage);
+    }
+    const historical = parseDeployTarget(
+      descriptor({ environment: "integration", takoformV2: { config } }),
+      "historical v2 target",
+      "integration",
+    );
+    expect(historical.takoformV2).toEqual({ config });
+    expect(takoformV2StorageLineage(historical)).toBe("v2-artifacts-0075");
+    for (const storageLineage of ["v2-artifacts-0075", "v2-0090", "0088", 88, null]) {
+      expect(() =>
+        parseDeployTarget(
+          descriptor({ environment: "integration", takoformV2: { config, storageLineage } }),
+          "invalid lineage",
+          "integration",
+        ),
+      ).toThrow("storageLineage");
+    }
+    expect(() =>
+      parseDeployTarget(
+        descriptor({ environment: "integration", takoformV2: { config, lineage: "v2-0088" } }),
+        "unknown key",
+        "integration",
+      ),
+    ).toThrow("unexpected keys");
   });
 
   test("refuses the retired cross-product runtime topology", () => {

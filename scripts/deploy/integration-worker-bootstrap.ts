@@ -16,9 +16,9 @@ import {
 } from "./errors.ts";
 import {
   CloudflareIntegrationStorageProvider,
-  type FreshV2ArtifactIntegrationStorageTargetProof,
+  type FreshV2IntegrationStorageTargetProof,
   type IntegrationStorageGenerationTargetVerificationOptions,
-  verifyFreshV2ArtifactIntegrationStorageTarget,
+  verifyFreshV2IntegrationStorageTarget,
 } from "./integration-storage-generation.ts";
 import { canonicalSchemaShape, type D1SchemaState, readD1SchemaState } from "./migrations.ts";
 import {
@@ -37,6 +37,8 @@ import {
 } from "./qualification.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
 import {
+  projectFreshProductionV2MigrationArtifact,
+  projectFreshProductionV2MigrationArtifact0089,
   projectFreshV2ArtifactMigrationArtifact,
   readAuditedMigrationArtifact,
   readCurrentAuditedMigrationSourceArtifact,
@@ -48,7 +50,7 @@ import {
   type SigningDatabase,
   type SigningPublicKeyRow,
 } from "./signing.ts";
-import type { DeployTarget } from "./target.ts";
+import { type DeployTarget, takoformV2StorageLineage } from "./target.ts";
 import {
   assertProviderExecutorUnchanged,
   type ProviderExecutorInspection,
@@ -708,7 +710,7 @@ async function verifyBootstrap(input: {
   readonly artifact: ReturnType<PreparedWorkerArtifact["seal"]>;
   readonly schemaBefore: D1SchemaState;
   readonly artifactBefore: MigrationArtifact;
-  readonly v2StorageBefore: FreshV2ArtifactIntegrationStorageTargetProof | null;
+  readonly v2StorageBefore: FreshV2IntegrationStorageTargetProof | null;
   readonly expectedShape: string;
   readonly signingDatabase: Pick<SigningDatabase, "readKey">;
   readonly signingBefore: SigningEvidence;
@@ -1165,29 +1167,41 @@ function validateInvocation(
 
 function readBootstrapArtifact(sourceRoot: string, target: DeployTarget): MigrationArtifact {
   const directory = resolve(sourceRoot, "migrations");
-  return target.takoformV2 === undefined
-    ? readAuditedMigrationArtifact(directory)
-    : projectFreshV2ArtifactMigrationArtifact(readCurrentAuditedMigrationSourceArtifact(directory));
+  if (target.takoformV2 === undefined) return readAuditedMigrationArtifact(directory);
+  const source = readCurrentAuditedMigrationSourceArtifact(directory);
+  switch (takoformV2StorageLineage(target)) {
+    case "v2-artifacts-0075":
+      return projectFreshV2ArtifactMigrationArtifact(source);
+    case "v2-0088":
+      return projectFreshProductionV2MigrationArtifact(source);
+    case "v2-0089":
+      return projectFreshProductionV2MigrationArtifact0089(source);
+  }
 }
 
 async function readV2StorageProof(
   target: DeployTarget,
   options: IntegrationWorkerBootstrapOptions,
-): Promise<FreshV2ArtifactIntegrationStorageTargetProof> {
-  return await verifyFreshV2ArtifactIntegrationStorageTarget(target, "integration", {
-    ...(options.run === undefined ? {} : { run: options.run }),
-    ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
-    ...(options.cloudflareEnvironment === undefined
-      ? {}
-      : { cloudflareEnvironment: options.cloudflareEnvironment }),
-    ...options.v2StorageVerification,
-    migrationDirectory: resolve(options.sourceRepositoryRoot ?? REPOSITORY, "migrations"),
-  });
+): Promise<FreshV2IntegrationStorageTargetProof> {
+  return await verifyFreshV2IntegrationStorageTarget(
+    target,
+    "integration",
+    takoformV2StorageLineage(target),
+    {
+      ...(options.run === undefined ? {} : { run: options.run }),
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+      ...(options.cloudflareEnvironment === undefined
+        ? {}
+        : { cloudflareEnvironment: options.cloudflareEnvironment }),
+      ...options.v2StorageVerification,
+      migrationDirectory: resolve(options.sourceRepositoryRoot ?? REPOSITORY, "migrations"),
+    },
+  );
 }
 
 function assertSameV2StorageProof(
-  expected: FreshV2ArtifactIntegrationStorageTargetProof,
-  actual: FreshV2ArtifactIntegrationStorageTargetProof,
+  expected: FreshV2IntegrationStorageTargetProof,
+  actual: FreshV2IntegrationStorageTargetProof,
   phase: "preflight" | "verification",
 ): void {
   if (canonicalJson(expected) !== canonicalJson(actual)) {

@@ -10,7 +10,7 @@ import { type DeployPhase, mutationError, preflightError, verificationError } fr
 import {
   type IntegrationStorageGenerationTargetProof,
   type IntegrationStorageGenerationTargetVerificationOptions,
-  verifyFreshV2ArtifactIntegrationStorageTarget,
+  verifyFreshV2IntegrationStorageTarget,
   verifyIntegrationStorageGenerationTarget,
 } from "./integration-storage-generation.ts";
 import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
@@ -24,7 +24,11 @@ import {
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import { type WorkerVersionAuthorityProfile, writeWorkerConfig } from "./realized-config.ts";
-import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
+import {
+  type DeployTarget,
+  isArtifactBlobIoQuiescedTarget,
+  takoformV2StorageLineage,
+} from "./target.ts";
 import {
   assertProviderExecutorUnchanged,
   probeProduct,
@@ -867,9 +871,13 @@ function assertIntegrationStorageProofUnchanged(
 }
 
 function selectedStorageVerifier(target: DeployTarget) {
-  return target.takoformV2 === undefined
-    ? verifyIntegrationStorageGenerationTarget
-    : verifyFreshV2ArtifactIntegrationStorageTarget;
+  if (target.takoformV2 === undefined) return verifyIntegrationStorageGenerationTarget;
+  const lineage = takoformV2StorageLineage(target);
+  return (
+    selected: DeployTarget,
+    environment: DeployEnvironment,
+    options: Parameters<typeof verifyIntegrationStorageGenerationTarget>[2],
+  ) => verifyFreshV2IntegrationStorageTarget(selected, environment, lineage, options);
 }
 
 function expectedClosureTransitionSecrets(

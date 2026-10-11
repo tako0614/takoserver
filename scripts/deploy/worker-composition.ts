@@ -7,7 +7,11 @@ import {
 } from "../../src/worker-production-composition.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import { deploymentVariables } from "./realized-config.ts";
-import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
+import {
+  type DeployTarget,
+  isArtifactBlobIoQuiescedTarget,
+  takoformV2StorageLineage,
+} from "./target.ts";
 
 /**
  * A target's binding closure can be exactly right and still not describe a
@@ -80,7 +84,21 @@ export async function assertTargetComposes(
       if (realized.TAKOSERVER_TAKOFORM_V2_CONFIG !== target.takoformV2.config) {
         throw new TypeError("realized v2 startup configuration differs from the selected target");
       }
-      parseTakoformV2PublicConfig(realized.TAKOSERVER_TAKOFORM_V2_CONFIG);
+      const v2 = parseTakoformV2PublicConfig(realized.TAKOSERVER_TAKOFORM_V2_CONFIG);
+      // A normal Host with configured artifact Forms refuses to start without
+      // the complete 0075 and 0081 schema. The historical fresh v2 payload
+      // stops at 0075, so that pairing could only fail after traffic moved.
+      if (
+        target.schemaMaintenanceMode === undefined &&
+        takoformV2StorageLineage(target) === "v2-artifacts-0075" &&
+        (v2.sqliteMigrationSet !== undefined ||
+          v2.workerBundle !== undefined ||
+          v2.staticAssetBundle !== undefined)
+      ) {
+        throw new TypeError(
+          "configured v2 artifact Forms require the complete 0081 schema; select takoformV2.storageLineage v2-0088 or v2-0089 storage",
+        );
+      }
     }
     createWorkerProductionComposition({
       env,
