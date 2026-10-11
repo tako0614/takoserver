@@ -1,13 +1,16 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { buildApp } from "../src/app.ts";
 import { createAccounts } from "../src/auth.ts";
 import { bytesDigest } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import {
+  SELFHOST_SOCKET_ROOT_NAME,
+  SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES,
+} from "../src/selfhost-socket-layout.ts";
 import { createSelfhostV2WorkerComposition } from "../src/selfhost-v2-worker-composition.ts";
 import { createSelfhostV2WorkflowBoot } from "../src/selfhost-v2-workflow-boot.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -23,6 +26,7 @@ import {
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { spawnWorkerdWithParentDeath } from "../src/workerd-linux-process.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const ORIGIN = "https://api.example.test";
 const API = "/apis/forms.takoform.com/v2";
@@ -40,7 +44,12 @@ const guard = nativeEvidenceBinary(
 test.skipIf(workerd === undefined || guard === undefined)(
   "accepted v2 Workflow Binding reaches a child from a guarded native class",
   async () => {
-    const root = await mkdtemp(join(tmpdir(), "takoserver-v2-workflow-binding-native-"));
+    // Workflow brokers bind <root>/s/w-XXXXXX/<22 hex>.sock; bound the root so
+    // that path fits the Unix socket limit whatever TMPDIR is.
+    const root = await mkdtempForSockets(
+      "takoserver-v2-workflow-binding-native-",
+      SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES,
+    );
     const database = new Database(join(root, "host.sqlite"));
     let composition: ReturnType<typeof createSelfhostV2WorkerComposition> | undefined;
     let primaryError: unknown;
@@ -147,7 +156,7 @@ export default {
       };
       // The native broker owns a nested w-XXXXXX/22-hex Unix socket; keep the
       // test-local root below the runtime's strict 100-byte path bound.
-      const brokerRoot = join(root, "wf");
+      const brokerRoot = join(root, SELFHOST_SOCKET_ROOT_NAME);
       expect(
         Buffer.byteLength(join(brokerRoot, "w-XXXXXX", `${"a".repeat(22)}.sock`)),
       ).toBeLessThan(100);
