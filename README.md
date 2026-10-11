@@ -98,9 +98,11 @@ origin, API documentation URL, and manual session/API onboarding instructions.
 The Bun Host itself does not serve a `/console` page. If an identity provider is
 configured, use that provider's sign-in flow. Create or select the organization
 that will own resources; its exact ID is the v2 Space. Do not run old
-publisher-set admission as v2 setup. [Self-host operations](docs/self-host-operations.md)
-contains the historical runtime and repair procedures; the current v2 setup is
-the separate guide linked above.
+publisher-set admission as v2 setup. The v2 install path, from an empty data
+root to a served Worker, is
+[First install and first use](docs/self-host-operations.md#first-install-and-first-use);
+[v2 architecture and operator setup](docs/takoform-v2.md) defines each setting
+it uses.
 
 Ordinary Bun always keeps the stable self-host Provider3 execution pack.
 `CLOUDFLARE_ACCOUNT_ID` may separately back an explicitly reviewed ObjectBucket
@@ -239,7 +241,9 @@ The complete local Worker profile needs all of these, plus `workerBundle` and
 | `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` | Absolute path, free of symbolic links, to `services/workflow-execution-guard` built from this checkout. |
 | `TAKOSERVER_V2_WORKER_RUNTIME_BOOT` | Actor and Workflow boot, for example `{"actor":true,"workflow":{"maximumRegistrations":64}}`. |
 | `TAKOSERVER_V2_WORKER_PRIVATE_PLANES` | The five private planes (SQLite, KV, ObjectBucket, Queue settlement and Queue Producer), each with its own fixed port and an operator-generated signing key file. |
-| `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` | Optional. Enables WorkerVersion `privateInputs`. |
+
+`TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` is not part of the profile and is
+optional; with it, WorkerVersion also accepts `privateInputs`.
 
 `WorkerEndpoint` additionally needs these:
 
@@ -300,18 +304,23 @@ grants at startup. `scripts/selfhost-artifact.ts` puts the bytes there while
 the Host is stopped:
 
 ```sh
+set -a; . /etc/takoserver/takoserver.env; set +a   # the Host's environment
 bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle ./dist \
   --base-url https://artifacts.example.com/hello/v1/ \
   --organization <organizationId> --entrypoint worker.js \
-  --config /etc/takoserver/takoform-v2.json > hello-v1.json
+  --config /etc/takoserver/v2/takoform-v2.json > hello-v1.json
 ```
 
 It validates the files with the Form's own validator and stores them under
 content addresses in the data root's object store. It prints the `artifact`
 for the Resource spec and the exact config fragment that grants it, and with
-`--config` merges that fragment into the config file. It refuses, before
-writing, a data root another process has open, one that is not private to
-this user, and an organization the control database does not know. Restart
+`--config` merges that fragment into the config file. It holds the control
+database's write lock while it runs, and refuses, before writing, a data root
+that another process has open or that it cannot prove unused, one that is not
+private to this user, an organization the control database does not know,
+dotfiles unless `--include-dotfiles`, and a config that would no longer fit in
+one environment variable. Run it as the Host's user in the Host's PID
+namespace. Restart
 the Host with the updated config, then create the `ModuleWorker`,
 `WorkerBundle`, `WorkerVersion`, `WorkerDeployment` and `WorkerEndpoint`
 Resources through `/apis/forms.takoform.com/v2/resources`. Steps 6 to 9 of the
@@ -424,8 +433,12 @@ prints an assertion good for ten minutes. Later ones:
 
 ```
 TAKOSERVER_OPERATOR_KEY=.takoserver/operator-key.jwk \
+TAKOSERVER_PUBLIC_ORIGIN=https://api.example.com \
   bun scripts/operator-key.ts sign-in google operator operator@localhost Operator
 ```
+
+`TAKOSERVER_PUBLIC_ORIGIN` must be the Host's own origin: without it the
+assertion is signed for `http://localhost:8787`, and the Host refuses it.
 
 The legacy/generated key also credits the wallet
 (`operator-key.ts funding <org> <ref> <minor>`) until Stripe is configured. An
@@ -450,7 +463,8 @@ every other configured writer before copying the complete root. Include an
 external `TAKOSERVER_DB` and any existing SQLite `-wal`, `-shm`, or
 rollback-journal sidecars from the same quiescent window. Preserve protected
 external configuration and key material needed to restore the same identity
-separately; do not store secrets in this repository. See the
+separately, including the `TAKOSERVER_TAKOFORM_V2_CONFIG` file and the
+`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`; do not store secrets in this repository. See the
 [self-host backup and restore preparation](docs/self-host-operations.md) for
 the procedure and its limits.
 
@@ -462,6 +476,8 @@ the procedure and its limits.
   objects/              customer objects, uploaded bundles under art/, seeded held artifacts under operator-held/
   databases/            customer SQL databases
   v2-sqlite-databases/  v2 SQLiteDatabase files
+  v2-kv-namespaces/     v2 EdgeKVNamespace data
+  v2-object-buckets/    v2 ObjectBucket objects
   v2-worker-owners/     v2 Worker runtime owners
   v2-runtime/           v2 Actor and Workflow runtime state
   s/                    per-start private sockets; not needed in a backup

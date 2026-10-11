@@ -198,9 +198,17 @@ TAKOSERVER_WORKERD_TLS_CERT_FILE=/etc/takoserver/tls/apps.example.com.crt
 TAKOSERVER_WORKERD_TLS_KEY_FILE=/etc/takoserver/tls/apps.example.com.key
 ```
 
-Keep the v2 config in `/etc/takoserver/takoform-v2.json`, on one line and
-writable by the `takoserver` user, because step 6 updates it. It is not
-secret. Replace the documentation URLs with this deployment's own:
+Keep the v2 config on one line in a directory that belongs to the `takoserver`
+user, because step 6 replaces the file through a temporary file in the same
+directory and so needs to write the directory, not only the file. The config
+is not secret. For example, as root:
+
+```sh
+install -d -m 0700 -o takoserver -g takoserver /etc/takoserver/v2
+```
+
+Then, as the `takoserver` user, create `/etc/takoserver/v2/takoform-v2.json`.
+Replace the documentation URLs with this deployment's own:
 
 ```json
 {"documentation":"https://docs.example.com/resources","authenticationDocumentation":"https://docs.example.com/access","workerBundle":{"targetKey":"selfhost-v2-worker-primary","heldArtifacts":[]},"staticAssetBundle":{"targetKey":"selfhost-v2-worker-primary","heldArtifacts":[]}}
@@ -211,14 +219,20 @@ example through a small wrapper script:
 
 ```sh
 set -a; . /etc/takoserver/takoserver.env; set +a
-export TAKOSERVER_TAKOFORM_V2_CONFIG="$(cat /etc/takoserver/takoform-v2.json)"
+export TAKOSERVER_TAKOFORM_V2_CONFIG="$(cat /etc/takoserver/v2/takoform-v2.json)"
 exec bun --no-env-file src/entry-bun.ts
 ```
 
 Linux passes at most 131,072 bytes in one environment variable, including its
-name. Each held file adds about 300 bytes to the config, so a config with
-several hundred held files no longer fits; the CLI in step 6 warns when it
-writes one that does not.
+name. Each held file adds about 370 bytes to the config, so a config holds
+about 350 held files in all. The CLI in step 6 refuses to write a config that
+would no longer fit, and warns when a printed fragment alone does not. The
+Host reads a held entry only while a create stages its bytes: it copies the
+manifest and every file into its control database, and never reads the source
+again for a Resource whose create has succeeded. Once every Resource that names
+an artifact has been created, its entries can be removed from the config. A
+new Resource that names the same artifact then needs it seeded and granted
+again.
 
 An omitted or malformed required setting stops startup; it never selects v1
 or generates a cursor key. A complete-profile setting that is given but cannot
@@ -282,15 +296,26 @@ origin named by the process and paste the assertion there. It is a separate
 console; the Bun Host does not serve a `/console` page. Treat the operator key
 under the data root and the printed assertion as credentials; keep them out of
 shell history, shared logs, and this repository. To create later assertions,
-use the printed command
-`bun scripts/operator-key.ts sign-in google operator operator@localhost Operator`
-with `TAKOSERVER_OPERATOR_KEY` set to that installation's key path. If an
-identity provider is configured, complete that provider's sign-in flow
+run the printed command with the installation's key path and its public
+origin. Without `TAKOSERVER_PUBLIC_ORIGIN` the assertion is signed for
+`http://localhost:8787`, and the Host refuses it:
+
+```sh
+TAKOSERVER_OPERATOR_KEY=/var/lib/takoserver/operator-key.jwk \
+TAKOSERVER_PUBLIC_ORIGIN=https://api.example.com:8443 \
+  bun --no-env-file scripts/operator-key.ts sign-in google operator operator@localhost Operator
+```
+
+If an identity provider is configured, complete that provider's sign-in flow
 instead; the operator assertion is only available when the operator-assertion
 path is active.
 
 Exchange the assertion for a session, create the organization that will own
-Resources, and create an organization API key. Its ID is the v2 Space. These
+Resources, and create an organization API key. The organization's ID is the v2
+Space. Run this step and steps 6 to 9 in one shell as the `takoserver` user,
+from the checkout, because they share the `ORG`, `KEY` and other shell
+variables. Keep their working files in a directory outside the data root: the
+`takoserver` user's home is often the data root itself. These
 `/v1` session, organization and API-key routes are Takoserver product APIs, not
 the Takoform Host API. Use `resources:read` for read-only checks or
 `resources:write` for Resource operations; write includes read. The key secret
@@ -336,14 +361,15 @@ root and `TAKOSERVER_DB` exactly as the Host does:
 
 ```sh
 set -a; . /etc/takoserver/takoserver.env; set +a
-mkdir -p ~/hello/v1
-cat > ~/hello/v1/worker.js <<'EOF'
+WORK=/var/tmp/takoserver-first-use   # outside the data root
+mkdir -p -m 0700 "$WORK/hello/v1"
+cat > "$WORK/hello/v1/worker.js" <<'EOF'
 export default { fetch() { return new Response("hello from takoserver\n"); } };
 EOF
-bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle ~/hello/v1 \
+bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle "$WORK/hello/v1" \
   --base-url https://artifacts.example.com/hello/v1/ \
   --organization "$ORG" --entrypoint worker.js \
-  --config /etc/takoserver/takoform-v2.json > ~/hello/v1.json
+  --config /etc/takoserver/v2/takoform-v2.json > "$WORK/hello-v1.json"
 ```
 
 The command reads every regular file below the directory, in byte order of
@@ -354,12 +380,22 @@ object store. It reads every entry back through the Host's held-artifact
 source and prints a JSON result. `artifact` is the value for the Resource
 spec, `files` is the validated file list, and `configFragment` is the exact
 `TAKOSERVER_TAKOFORM_V2_CONFIG` block that grants every entry to
-`org:<organizationId>` in that organization's Space. With `--config`, it also
-merges the fragment into that file, adds new grants to existing entries, and
-never changes an existing block's `targetKey`. Without `--config`, merge
-`configFragment` into the config by hand. Repeat `--organization` to grant
-several organizations. Seeding the same bytes again stores nothing new and
-adds no duplicate entry.
+`org:<organizationId>` in that organization's Space. On standard error it
+lists every seeded file with its media type and size, and each granted
+organization with its name, so check both before restarting. With `--config`,
+it also merges the fragment into that file and never changes an existing
+block's `targetKey`. It replaces the file only if the file still holds what
+it read, so a concurrent update is never silently lost. Without `--config`,
+merge `configFragment` into the config by hand. Repeat `--organization` to
+grant several organizations. Seeding the same bytes again stores nothing new
+and adds no duplicate entry. Granting entries that the config already holds to
+another organization needs `--add-grants` as well.
+
+To revoke an organization's access to an artifact, remove its `org:<id>` grant
+(or the whole entry) from the config and restart the Host. That stops new
+Resources from acquiring the artifact. A Resource already created keeps the
+bytes it copied into the control database, so delete that organization's
+Resources too if it must lose them.
 
 Before it writes anything, the command refuses these states:
 
@@ -367,15 +403,30 @@ Before it writes anything, the command refuses these states:
 - a data root that is not owned by this user with mode 0700, or that has an
   ancestor another user can write (the rule the private planes use);
 - a missing control database;
+- a control database that another process is writing. The command takes the
+  database's write lock (`BEGIN IMMEDIATE`) before anything else and holds it
+  until it has finished, so a Host started meanwhile cannot write its control
+  database: its first write waits out the busy timeout and fails;
 - any other process with a file under the data root, or the control database,
-  open. A running Host always has its control database open. The command
-  checks the descriptors of every process in `/proc` that it can read, which
-  includes all processes of its own user, and refuses when `/proc` does not
-  show its own. This is why the Host and the command run as the same user;
+  open. A running Host always has its control database open. The command reads
+  the descriptor table of every process in `/proc`. It refuses when `/proc`
+  does not show its own table, and when a process of its own user hides its
+  table, which a non-dumpable process does (for example a `bun` given
+  `cap_net_bind_service` with `setcap`). Another user's process cannot open
+  files in a root private to this user and is not read. Run the command as the
+  Host's user and in the Host's PID namespace (not inside another container),
+  because processes in other PID namespaces are not in this `/proc`;
 - an organization the control database does not know;
+- a path with a component that starts with `.`, such as `.env` or
+  `.git/config`, unless `--include-dotfiles` is given. A `StaticAssetBundle`
+  publishes every file, including `.well-known/` ones;
+- a config that `--config` would make larger than one environment variable can
+  hold, or whose directory this user cannot write;
 - input the Form would reject: a symbolic link or special file, an invalid
   path, a file over the Form's size limits, a media type it cannot infer, or a
-  `WorkerBundle` whose entrypoint module is ambiguous or missing.
+  `WorkerBundle` whose entrypoint module is ambiguous or missing. Each file is
+  opened without following symbolic links and must still be the file it
+  listed.
 
 The base URL is an identity, not a location: nothing is fetched from it, and
 the manifest is `<base>manifest.json` and each file `<base>files/<path>`. A
@@ -398,7 +449,7 @@ through the same source, and lists each entry that is missing or whose bytes
 no longer match its digest:
 
 ```sh
-bun --no-env-file scripts/selfhost-artifact.ts verify --config /etc/takoserver/takoform-v2.json
+bun --no-env-file scripts/selfhost-artifact.ts verify --config /etc/takoserver/v2/takoform-v2.json
 ```
 
 ### 7. Check Form support
@@ -448,7 +499,7 @@ create() { # create <form> <name> <spec-json>
   echo "$2: Operation $operation is still $status" >&2; return 1
 }
 WORKER=$(create ModuleWorker/0.3.0 hello '{}')
-BUNDLE=$(create WorkerBundle/0.2.0 hello-bundle-v1 "$(jq -c '{artifact}' ~/hello/v1.json)")
+BUNDLE=$(create WorkerBundle/0.2.0 hello-bundle-v1 "$(jq -c '{artifact}' "$WORK/hello-v1.json")")
 VERSION=$(create WorkerVersion/0.5.0 hello-version-v1 "$(jq -nc --arg w "$WORKER" --arg b "$BUNDLE" \
   '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"]}')")
 DEPLOYMENT=$(create WorkerDeployment/0.4.0 hello-deployment "$(jq -nc --arg w "$WORKER" --arg v "$VERSION" \
@@ -479,7 +530,7 @@ spec. A `PUT` names the Deployment's current `generation`, read from
 `GET /resources/{resourceUid}`:
 
 ```sh
-BUNDLE_V2=$(create WorkerBundle/0.2.0 hello-bundle-v2 "$(jq -c '{artifact}' ~/hello/v2.json)")
+BUNDLE_V2=$(create WorkerBundle/0.2.0 hello-bundle-v2 "$(jq -c '{artifact}' "$WORK/hello-v2.json")")
 VERSION_V2=$(create WorkerVersion/0.5.0 hello-version-v2 "$(jq -nc --arg w "$WORKER" --arg b "$BUNDLE_V2" \
   '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"]}')")
 GENERATION=$(curl -sS --fail-with-body "$V2/resources/$DEPLOYMENT" \
@@ -683,9 +734,10 @@ either the root or that database is missing.
 The running configuration may also depend on material outside the root. Record
 the exact service configuration and protect any configured external values or
 files needed to recover the same identity and capabilities, including TLS
-certificate/private-key files, `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`,
-operator-supplied signing keys, and configured provider, payment, identity, or
-AI credentials. Do not put secret values in this repository or in a backup
+certificate/private-key files, `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`, the
+`TAKOSERVER_TAKOFORM_V2_CONFIG` file with its held-artifact grants, the
+`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`, operator-supplied signing keys, and
+configured provider, payment, identity, or AI credentials. Do not put secret values in this repository or in a backup
 manifest. `TAKOSERVER_WORKERD_BINARY` must still resolve to the exact accepted
 artifact for Worker execution; the selected snapshot is retained under the
 data root, but startup validates and selects from the configured input path.
