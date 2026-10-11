@@ -5,8 +5,12 @@
  *   bun scripts/release-notes.ts 2.0.0 --allow-unreleased   # preview only
  *
  * Read-only. It refuses a version that has no section, a section with an empty
- * body, and a section whose heading still says `Unreleased`, so a release is
- * never published from notes that were not finalized. See docs/release.md.
+ * body, a section whose heading still says `Unreleased`, and a section that
+ * still holds a `<!-- pending: … -->` marker for a pull request whose entry is
+ * not written yet, so a release is never published from notes that were not
+ * finalized. `--allow-unreleased` previews such a section. Repository-relative
+ * links become links into the version's tag, because a GitHub Release body has
+ * no file to resolve them against. See docs/release.md.
  */
 
 import { readFileSync } from "node:fs";
@@ -21,6 +25,17 @@ export interface ChangelogSection {
 
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
 const SECTION_HEADING = /^## \[([^\]]+)\] - (Unreleased|\d{4}-\d{2}-\d{2})$/u;
+const PENDING_MARKER = "<!-- pending:";
+const REPOSITORY = "https://github.com/tako0614/takoserver";
+const RELATIVE_LINK = /\]\((?![a-z][a-z0-9+.-]*:|#|\/)([^)\s]+)\)/giu;
+
+/** Points repository-relative Markdown link targets at the tag `v<version>`. */
+export function absoluteLinks(body: string, version: string): string {
+  return body.replace(
+    RELATIVE_LINK,
+    (_match, target: string) => `](${REPOSITORY}/blob/v${version}/${target})`,
+  );
+}
 
 export function isReleaseVersion(value: string): boolean {
   return SEMVER.test(value);
@@ -71,12 +86,19 @@ export function releaseNotes(
   }
   const [section] = matches;
   if (!section || section.body === "") throw new Error(`CHANGELOG.md section ${version} is empty`);
-  if (section.date === null && options.allowUnreleased !== true) {
-    throw new Error(
-      `CHANGELOG.md section ${version} is still marked Unreleased; set the release date first`,
-    );
+  if (options.allowUnreleased !== true) {
+    if (section.date === null) {
+      throw new Error(
+        `CHANGELOG.md section ${version} is still marked Unreleased; set the release date first`,
+      );
+    }
+    if (section.body.includes(PENDING_MARKER)) {
+      throw new Error(
+        `CHANGELOG.md section ${version} still has a pending marker; write or remove that entry first`,
+      );
+    }
   }
-  return `${section.body}\n`;
+  return `${absoluteLinks(section.body, version)}\n`;
 }
 
 if (import.meta.main) {

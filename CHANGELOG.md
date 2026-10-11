@@ -6,13 +6,41 @@ released in lockstep with other Takos products. Numbers in parentheses are pull
 requests in `tako0614/takoserver`. Each section is published verbatim as the
 GitHub Release notes of its tag (see [docs/release.md](docs/release.md)).
 
-## [2.0.0] - Unreleased
+## [2.0.0-rc.1] - Unreleased
+
+The first release candidate of Takoserver 2.0.0, published as a GitHub
+pre-release so that operators can try the v2 install path before 2.0.0 is
+final. 1.0.0 stays the latest release and keeps its security support until
+2.0.0 is released ([SECURITY.md](SECURITY.md)). Release candidates receive no
+backported fixes; report problems against the candidate and expect them fixed
+in the next candidate or in 2.0.0.
 
 Takoserver 2.0.0 is a Takoform **Host API v2** Host. It is a breaking major
 release: the Takoform lanes that 1.0.0 served are gone, a self-host that was
 used under 1.0.0 is not upgraded in place, and the Bun self-host needs explicit
-configuration before it starts. It covers about 1,550 commits and pull
-requests #13 to #289 merged since 1.0.0 (2026-08-20).
+configuration before it starts. This candidate covers about 1,550 commits and
+the pull requests merged since 1.0.0 (2026-08-20), from #13 onwards.
+
+### Release assets
+
+- `workerd-closed-graph-2026-08-11-linux-x64`: the pinned closed-graph
+  workerd, the only binary the Host accepts as `TAKOSERVER_WORKERD_BINARY`.
+  SHA-256 `c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52`,
+  273,943,488 bytes, `workerd --version` prints `workerd 2026-08-11`. Linux
+  x86-64 with glibc 2.38 or newer. It is upstream `cloudflare/workerd` with
+  Takoserver's closed-module-graph patches, distributed under
+  AGPL-3.0-or-later; it is not an official Cloudflare build.
+- `workerd-closed-graph-2026-08-11-notices.tar.gz`: the upstream Apache-2.0
+  license, the modification notice, the AGPL-3.0 text, the patches, the
+  Corresponding Source directions and the third-party notices for that binary.
+- `SHA256SUMS` for both files.
+
+The Workflow execution guard is not attached; build it from this tag with the
+reproducible command in [docs/release-assets.md](docs/release-assets.md), which
+gives SHA-256 `67709482e9d49b1df1af483f210a5038f1e0a2689f805adb33d5cfc76b2b0b20`
+for this guard source. The attached workerd was built outside CI and has not
+been reproduced in a second environment yet; verify it as described there
+before use.
 
 ### Breaking changes
 
@@ -64,7 +92,7 @@ requests #13 to #289 merged since 1.0.0 (2026-08-20).
   `c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52`) named by
   `TAKOSERVER_WORKERD_BINARY`, and Workflows also need
   `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY`. Anything else disables Worker
-  execution; it never falls back. See
+  execution; it never falls back. The binary is attached to this release; see
   [docs/release-assets.md](docs/release-assets.md).
 - **The API listener binds `127.0.0.1` by default.** 1.0.0 bound every
   interface. Set `TAKOSERVER_LISTEN_HOST` (one canonical IP literal) to change
@@ -182,6 +210,16 @@ requests #13 to #289 merged since 1.0.0 (2026-08-20).
 - workerd child lifetime and listener ownership, and draining of requests and
   owned processes before exit. (#170, #188)
 - Unfunded usage was marked billed. (#18)
+- A Host that died between claiming a Queue batch and authorizing its send
+  left the message leased: the expired-lease refund statement was missing a
+  closing parenthesis and failed with `incomplete input`, so the Consumer
+  stalled until message retention deleted the message. The refund works, the
+  Host refuses unsent reservations left by an earlier process before it
+  listens, and a failing batch selection is reported on stderr. (#291)
+- Native test lanes: socket roots stay within the Unix path limit under a long
+  `TMPDIR`, and native fixtures follow the Cron, render-guard and dispatch
+  changes (tests only). (#292)
+<!-- pending: #293 #294 #295 - add their Fixed entries after they merge -->
 
 ### Security
 
@@ -213,12 +251,12 @@ requests #13 to #289 merged since 1.0.0 (2026-08-20).
   canonical Hosted path became runnable on a fresh integration environment in
   source (#289), but it has not been run live, and this release does not imply
   a production rollout.
-- **The closed-graph workerd binary is not built by CI.** All five
+- **The attached closed-graph workerd is not built by CI.** All five
   `workerd-closed-graph-build` workflow runs failed (toolchain prerequisites,
-  time limits, and one completed build whose digest was not the pinned one),
-  so the pin has been reproduced only outside CI and no prebuilt binary is
-  published. Build it from source or obtain it
-  out of band and verify its SHA-256
+  time limits, and one completed build whose digest was not the pinned one).
+  The attached bytes come from one build on the operator's development host
+  that matches the pin; no second environment has reproduced them. Verify the
+  SHA-256, or build it from source
   ([docs/release-assets.md](docs/release-assets.md)). It runs only on Linux
   x86-64 with glibc 2.38 or newer, and it is pinned to upstream workerd
   `2026-08-11`: upstream fixes after that date need a new pinned artifact.
@@ -238,11 +276,18 @@ requests #13 to #289 merged since 1.0.0 (2026-08-20).
 - **Tenants are separated by V8 isolates only.** Every workerd child runs as
   the Host's user and inherits its environment; do not host mutually hostile
   tenants on one machine.
-- **Intermittent tests.** `tests/workerd-worker-runtime-owner-crash-recovery.test.ts`
+- **Intermittent test.** `tests/workerd-worker-runtime-owner-crash-recovery.test.ts`
   ("a Host killed while an in-process candidate failure is retiring still
-  boots and settles it") failed in two of the last five completed main CI
-  runs before this release, and the native ordinary journey has an
-  intermittent Queue crash-recovery wait (#287).
+  boots and settles it") failed in two of five consecutive completed main CI
+  runs on 2026-10-11.
+- **Native lanes are not all green.** After #292, the remaining native
+  failures come from outside the tests: the self-host data plane refuses SQL
+  facade calls (four `selfhost-workerd-e2e` cases and
+  `workerd-native-workflow-data-bindings`), `selfhost-actor-execution-host` is
+  stale against an Actor contract change, and the `workerd-native-workflow-facets`
+  qualification probe is documented to fail. A Queue batch that was already
+  sent when its Host died still waits up to 120 seconds for its message lease.
+<!-- pending: #293 #294 #295 - update these limitations after they merge -->
 - **Conformance is a baseline.** The vendored v2 probe comes from an untagged
   Takoform commit (`ba0bf1c`); a pass covers only its mandatory sequence, not
   restarts, faults, concurrency or cross-principal authorization.
