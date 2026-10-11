@@ -245,6 +245,12 @@ before use.
   self-host data plane required `Content-Length`. The SQL route now also
   accepts exactly `Transfer-Encoding: chunked` under the same 40 MiB ceiling;
   KV and Queue still need a declared length that matches. (#294)
+- `selfhost-artifact seed` could refuse with "cannot prove that no Host is
+  running" because an unrelated process of the same user was in the middle of
+  exiting: its descriptor table is unreadable for a moment, and the scan took it
+  for a Host that hides its files. A process that cannot be read is now looked
+  at again for up to half a second; one that stays unreadable is still refused.
+  (#298)
 
 ### Security
 
