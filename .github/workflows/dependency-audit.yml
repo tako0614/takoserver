@@ -12,9 +12,13 @@ on:
 permissions:
   contents: read
 
+# Only a pull request run may be cancelled: it rescans the whole base...head
+# range, so the newer run covers it. A push run scans only its own
+# before..after range and a scheduled run picks up new advisories, so neither is
+# cancelled by a later run or shares a group with the other event.
 concurrency:
-  group: takoserver-dependency-audit-${{ github.ref }}
-  cancel-in-progress: true
+  group: takoserver-dependency-audit-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -90,10 +94,12 @@ jobs:
     timeout-minutes: 15
     env:
       # Standard-library findings describe the toolchain that runs the scan, so
-      # the scan uses the one toolchain every Go module declares in its
-      # `toolchain` directive and the Core verifier image builds with. The
-      # portable gate (tests/go-vulnerability-audit.test.ts) keeps the three in
-      # agreement; change them together.
+      # the scan uses the one toolchain every Go module declares (its
+      # `toolchain` directive, else its `go` line) and the Core verifier image
+      # builds with; that image's build stage asserts `go env GOVERSION`, so a
+      # stale digest fails the build. The portable gate
+      # (tests/go-vulnerability-audit.test.ts) keeps all of them in agreement;
+      # change them together.
       GO_TOOLCHAIN_VERSION: "1.26.9"
       GOVULNCHECK_VERSION: v1.8.0
       GOTOOLCHAIN: local
@@ -138,7 +144,7 @@ jobs:
               else
                 while IFS= read -r -d '' path; do
                   case "$path" in
-                    *.go|go.mod|go.sum|go.work|go.work.sum|*/go.mod|*/go.sum|*/go.work|*/go.work.sum|Dockerfile|*/Dockerfile|.github/workflows/dependency-audit.yml)
+                    *.go|go.mod|go.sum|go.work|go.work.sum|*/go.mod|*/go.sum|*/go.work|*/go.work.sum|Dockerfile|*/Dockerfile|Dockerfile.*|*/Dockerfile.*|*.Dockerfile|.github/workflows/dependency-audit.yml)
                       required=true
                       break
                       ;;

@@ -1,4 +1,6 @@
 FROM golang:1.26.9-alpine3.23@sha256:6750308561953d451210ed1a8086d36c8c8bdcbf672d38d9d0d424b8a7a0216c AS build
+# The digest selects the image; this proves it carries the audited toolchain.
+RUN test "$(go env GOVERSION)" = "go1.26.9"
 
 WORKDIR /src
 COPY go.mod go.sum ./
