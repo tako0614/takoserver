@@ -171,6 +171,9 @@ export async function withOperatorOwnerSession<T>(
         subject: input.identity.subject,
         email: input.identity.email,
         displayName: input.identity.displayName,
+        // The Host opens one session per sign-in assertion; two proofs in the
+        // same second must not sign identical bytes.
+        jti: crypto.randomUUID(),
       },
       nowSeconds,
       lifetimeSeconds: PROOF_LIFETIME_SECONDS,

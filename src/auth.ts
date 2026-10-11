@@ -169,8 +169,28 @@ export interface ExternalIdentityVerifier {
       readonly name: string;
       readonly role: "owner" | "member";
     }[];
+    /**
+     * Present when the credential may open at most one session. The session
+     * exchange spends it before issuing a bearer; read-only proofs do not.
+     */
+    readonly singleUse?: SingleUseCredential;
   }>;
 }
+
+export interface SingleUseCredential {
+  /** Owner of the key space; spent keys of one namespace never collide with another's. */
+  readonly namespace: string;
+  /** `sha256:` digest of the exact bytes the credential's signature covers. */
+  readonly digest: `sha256:${string}`;
+  /** After this instant the verifier refuses the credential anyway. */
+  readonly expiresAtEpochSeconds: number;
+}
+
+/**
+ * How long past its expiry a spent single-use credential is still remembered,
+ * so a verifier clock running behind this store's cannot reopen it.
+ */
+const SINGLE_USE_PRUNE_SKEW_SECONDS = 300;
 
 export type AuthErrorCode = "unauthenticated" | "permission_denied" | "not_found" | "invalid";
 
@@ -685,6 +705,52 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     return { id, secret, createdAt, expiresAt };
   };
 
+  /**
+   * Remembers a single-use credential until it expires, refusing a second
+   * presentation.
+   *
+   * The rows live in the shared lineage's generic replay cache,
+   * `runtime_grant_replays`, so every Host database (D1 and SQLite) already
+   * has the table and no schema change is needed. Each key is prefixed with
+   * the credential's namespace, so it cannot collide with a runtime grant id
+   * or another namespace. The primary key makes concurrent presentations race
+   * to exactly one winner.
+   *
+   * Expiry is the verifier's decision, made on its own clock. This store only
+   * has to remember a credential for as long as the verifier could still
+   * accept it, so it keeps each entry until at least one second from now and
+   * prunes an entry of its namespace only a skew margin after it expired.
+   */
+  const spendSingleUse = async (credential: SingleUseCredential): Promise<void> => {
+    const nowSeconds = Math.floor(clock().getTime() / 1_000);
+    const namespace = credential.namespace;
+    if (
+      !/^[a-z][a-z0-9-]{0,63}$/u.test(namespace) ||
+      !/^sha256:[0-9a-f]{64}$/u.test(credential.digest) ||
+      !Number.isSafeInteger(credential.expiresAtEpochSeconds)
+    ) {
+      throw new AuthError("invalid");
+    }
+    // `;` sorts immediately after `:`, so this is the namespace's key range.
+    await sql.run(
+      `DELETE FROM runtime_grant_replays
+       WHERE grant_id > ? AND grant_id < ? AND expires_at_epoch_seconds <= ?`,
+      [`${namespace}:`, `${namespace};`, nowSeconds - SINGLE_USE_PRUNE_SKEW_SECONDS],
+    );
+    const spent = await sql.run(
+      `INSERT INTO runtime_grant_replays
+         (grant_id, expires_at_epoch_seconds, consumed_at_epoch_seconds)
+       VALUES (?, ?, ?)
+       ON CONFLICT(grant_id) DO NOTHING`,
+      [
+        `${namespace}:${credential.digest}`,
+        Math.max(credential.expiresAtEpochSeconds, nowSeconds + 1),
+        nowSeconds,
+      ],
+    );
+    if (spent.changes !== 1) throw new AuthError("unauthenticated");
+  };
+
   const accounts: Accounts = {
     async signIn({ provider, assertion, method, nonce, audience, sessionTtlSeconds }) {
       if (provider !== "takos-id" && provider !== "google" && provider !== "github") {
@@ -697,6 +763,10 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
         nonce,
         audience,
       });
+      // Spent before anything is written or issued: a replayed credential opens
+      // nothing, and a crash after this point burns it rather than leaving it
+      // usable twice.
+      if (verified.singleUse) await spendSingleUse(verified.singleUse);
       const rows = await sql.query(
         "SELECT id, email, display_name FROM principals WHERE provider = ? AND provider_subject = ?",
         [provider, verified.providerSubject],

@@ -64,6 +64,10 @@ function signInClaims(input: readonly string[]): Record<string, unknown> {
     subject,
     email,
     displayName,
+    // A Host opens one session per sign-in assertion. Without a nonce, two
+    // runs in the same second would sign identical bytes and the second
+    // would be refused as a replay of the first.
+    jti: crypto.randomUUID(),
   };
 }
 
