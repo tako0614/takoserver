@@ -954,8 +954,9 @@ requirements below, not a routine code rollback.
 
 ## Upgrading from v1.0.0
 
-The published v1.0.0 release (tag `v1.0.0`, the Latest GitHub Release of
-2026-08-20) is a Takoform Host API v1 Host. This source is a Host API v2 Host.
+The published v1.0.0 release (tag `v1.0.0`, the GitHub Release of
+2026-08-20) is a Takoform Host API v1-generation Host: it serves the
+`v1alpha3` and `v1beta1` lanes. This source is a Host API v2 Host.
 Moving from v1.0.0 to it is a breaking major upgrade: a v1.0.0 installation
 that has been used is not upgraded in place, and no tool converts its records.
 Install the new version alongside it, on its own data root, and leave the
