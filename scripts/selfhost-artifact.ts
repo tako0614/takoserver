@@ -7,8 +7,10 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
@@ -621,7 +623,7 @@ function stoppedInstallation(flag: string | undefined, io: SelfhostArtifactCliIo
   const databasePath = configuredDatabase
     ? resolve(io.cwd, configuredDatabase)
     : join(dataRoot, "control.sqlite");
-  if (!lstatSync(databasePath, { throwIfNoEntry: false })?.isFile()) {
+  if (!statSync(databasePath, { throwIfNoEntry: false })?.isFile()) {
     throw new Refusal(
       `control database ${databasePath} does not exist; start the Host once (first boot), create the organization, then stop it`,
     );
@@ -629,7 +631,8 @@ function stoppedInstallation(flag: string | undefined, io: SelfhostArtifactCliIo
   const holders = dataRootHolders({
     procRoot: io.procRoot,
     dataRoot,
-    files: [databasePath],
+    // Descriptors name the real file, so compare against its canonical path.
+    files: [realpathSync(databasePath)],
     selfPid: process.pid,
   });
   if (holders === "unprovable") {

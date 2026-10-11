@@ -8,6 +8,8 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -461,7 +463,8 @@ describe("self-host held artifact seeding", () => {
     // A process table entry whose descriptor points at the control database.
     const holder = join(install.fakeProc, "424242", "fd");
     mkdirSync(holder, { recursive: true });
-    symlinkSync(join(install.root, "control.sqlite"), join(holder, "7"));
+    // Descriptor links name canonical paths.
+    symlinkSync(join(realpathSync(install.root), "control.sqlite"), join(holder, "7"));
     const refused = await run(args, install);
     expect(refused.code).toBe(1);
     expect(refused.stderr).toContain("pid 424242");
@@ -470,62 +473,74 @@ describe("self-host held artifact seeding", () => {
 
     // So does one holding any file below the root.
     rmSync(join(holder, "7"));
-    symlinkSync(join(install.root, "objects", "art", "x"), join(holder, "8"));
+    symlinkSync(join(realpathSync(install.root), "objects", "art", "x"), join(holder, "8"));
     expect((await run(args, install)).code).toBe(1);
     rmSync(join(holder, "8"));
     expect((await run(args, install)).code).toBe(0);
 
+    // An external control database counts too, by its real path behind a link.
+    const external = join(install.parent, "external");
+    mkdirSync(external, { mode: 0o700 });
+    renameSync(join(install.root, "control.sqlite"), join(external, "control.sqlite"));
+    const link = join(install.parent, "control-link.sqlite");
+    symlinkSync(join(external, "control.sqlite"), link);
+    symlinkSync(join(realpathSync(external), "control.sqlite"), join(holder, "9"));
+    const externalHeld = await run(args, install, { TAKOSERVER_DB: link });
+    expect(externalHeld.code).toBe(1);
+    expect(externalHeld.stderr).toContain("pid 424242");
+    rmSync(join(holder, "9"));
+    expect((await run(args, install, { TAKOSERVER_DB: link })).code).toBe(0);
+
     // A process table that does not show this process proves nothing.
     const blind = join(install.parent, "blind-proc");
     mkdirSync(blind);
-    const unprovable = await run(args, install, {}, blind);
+    const unprovable = await run(args, install, { TAKOSERVER_DB: link }, blind);
     expect(unprovable.code).toBe(1);
     expect(unprovable.stderr).toContain("cannot prove");
   });
 
-  test.skipIf(process.platform !== "linux")(
-    "refuses while a real process has the control database open",
-    async () => {
-      const install = installation();
-      const source = sourceTree(install.parent, "hello", {
-        "worker.js": "export default {};\n",
-      });
-      const child = Bun.spawn(
-        [
-          process.execPath,
-          "-e",
-          "const { Database } = require('bun:sqlite');" +
-            "const db = new Database(process.argv[1]);" +
-            "db.query('SELECT 1').get();" +
-            "console.log('ready');" +
-            "setInterval(() => {}, 1000);",
-          join(install.root, "control.sqlite"),
-        ],
-        { stdin: "ignore", stdout: "pipe", stderr: "ignore" },
-      );
-      cleanups.push(() => child.kill("SIGKILL"));
-      const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
-      const first = await reader.read();
-      expect(new TextDecoder().decode(first.value)).toContain("ready");
-      const refused = await run(
-        [
-          "seed",
-          "worker-bundle",
-          source,
-          "--base-url",
-          "https://artifacts.example.test/hello/v1/",
-          "--organization",
-          ORG,
-        ],
-        install,
-        {},
-        "/proc",
-      );
-      expect(refused.code).toBe(1);
-      expect(refused.stderr).toContain(`pid ${child.pid}`);
-      expect(heldObjectKeys(install.root)).toEqual([]);
-    },
-  );
+  test("refuses while a real process has the control database open", async () => {
+    // The real process table is Linux /proc; elsewhere the fake one above stands in.
+    if (process.platform !== "linux") return;
+    const install = installation();
+    const source = sourceTree(install.parent, "hello", {
+      "worker.js": "export default {};\n",
+    });
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        "const { Database } = require('bun:sqlite');" +
+          "const db = new Database(process.argv[1]);" +
+          "db.query('SELECT 1').get();" +
+          "console.log('ready');" +
+          "setInterval(() => {}, 1000);",
+        join(install.root, "control.sqlite"),
+      ],
+      { stdin: "ignore", stdout: "pipe", stderr: "ignore" },
+    );
+    cleanups.push(() => child.kill("SIGKILL"));
+    const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toContain("ready");
+    const refused = await run(
+      [
+        "seed",
+        "worker-bundle",
+        source,
+        "--base-url",
+        "https://artifacts.example.test/hello/v1/",
+        "--organization",
+        ORG,
+      ],
+      install,
+      {},
+      "/proc",
+    );
+    expect(refused.code).toBe(1);
+    expect(refused.stderr).toContain(`pid ${child.pid}`);
+    expect(heldObjectKeys(install.root)).toEqual([]);
+  });
 
   test("refuses an installation it cannot trust or an organization it does not know", async () => {
     const install = installation();
