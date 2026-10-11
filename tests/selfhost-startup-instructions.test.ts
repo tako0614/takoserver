@@ -31,7 +31,10 @@ describe("self-host operator sign-in startup instructions", () => {
     expect(output).toContain(
       "/v1/me, /v1/organizations, and /v1/organizations/{organizationId}/api-keys",
     );
-    expect(output).toContain("docs/self-host-operations.md");
+    expect(output).toContain('"First install and first use" in docs/self-host-operations.md');
+    // The v2 Host composes its Forms from configuration; v1 admission is not a setup step.
+    expect(output).toContain("no publisher admission is needed");
+    expect(output).not.toContain("For publisher admission");
     expect(output).not.toMatch(/https:\/\/[^/\s]+\/console/u);
     expect(output).not.toContain("console.takoserver.com");
     expect(output).toContain("fake-operator-assertion");
