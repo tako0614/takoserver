@@ -897,7 +897,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                      (execution.state IN ('reserved','registered') AND
                       execution.reservation_until_ms <=
                         (CAST(strftime('%s', 'now') AS INTEGER) * 1000
-                         + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))))`,
+                         + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER)))))`,
           params: [millis, ...snapshotParams.slice(0, 15)],
         });
         continue;

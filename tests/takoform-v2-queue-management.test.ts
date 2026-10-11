@@ -1121,6 +1121,78 @@ test("a pre-send cancellation after SQLite handle reopen refunds the exact unsen
   }
 });
 
+test("a pre-send batch left by a dead Host is refunded and redelivered after its reservation", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "abandoned-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "abandoned-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "abandoned-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "abandoned-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "abandoned-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid, { maxBatchSize: 1, maxConcurrency: 1 }),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId: "abandoned-message", body: new Uint8Array([4]) },
+    );
+    const delivery = createV2QueueDelivery({ sql: f.sql, custody, capability: f.capability });
+    const scope = { consumerUid: consumer.resourceUid, principal, space, targetKey };
+    const abandoned = await delivery.claimRegisteredBatch(scope);
+    if (abandoned.kind !== "ready") throw new Error("abandoned batch not registered");
+    // The Host is killed here: the batch is claimed and registered, never
+    // authorized. Model the two deadlines passing without a send: the next
+    // pass's expiry write refuses the reservation, and the message lease that
+    // the claim set to the same 120 seconds has run out.
+    expect(
+      (
+        await f.sql.run(
+          `UPDATE queue_v2_batch_executions
+      SET state = 'pre_effect_refused' WHERE batch_id = ? AND state = 'registered'`,
+          [abandoned.batchId],
+        )
+      ).changes,
+    ).toBe(1);
+    await f.sql.run("UPDATE selfhost_queue_messages SET lease_expires_at_ms = ?", [Date.now() - 1]);
+    // The restarted Host's next pass refunds the expired lease of the refused
+    // batch and gives its own unsent reservation back at once.
+    expect((await delivery.claimRegisteredBatch(scope)).kind).toBe("idle");
+    expect(
+      await f.sql.query(
+        "SELECT deliveries,lease_token,lease_expires_at_ms FROM selfhost_queue_messages",
+      ),
+    ).toEqual([{ deliveries: 0, lease_token: null, lease_expires_at_ms: null }]);
+    expect(
+      await f.sql.query(
+        `SELECT count(*) AS open FROM queue_v2_batch_executions
+         WHERE state IN ('reserved','registered','send_authorized')`,
+      ),
+    ).toEqual([{ open: 0 }]);
+    const redelivered = await delivery.claimRegisteredBatch(scope);
+    if (redelivered.kind !== "ready") throw new Error("abandoned message was not redelivered");
+    expect(redelivered.claims.map(({ messageId, attempts }) => ({ messageId, attempts }))).toEqual([
+      { messageId: "abandoned-message", attempts: 1 },
+    ]);
+  } finally {
+    f.database.close();
+  }
+});
+
 test("a pending Deployment DELETE fences the old source before native Queue send", async () => {
   const f = fixture();
   try {
