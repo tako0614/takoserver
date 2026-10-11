@@ -395,9 +395,19 @@ export class Counter extends Base {
       }
       expect(lost).toEqual({ kind: "unknown" });
       await unlink(denySpawnFile);
-      expect(
-        await (await host.fetch(identity, new Request("http://actor.invalid/value"))).json(),
-      ).toEqual({
+      // Observation reports the lost child before its carrier is reaped. A
+      // request in that window is refused as retiring instead of queuing
+      // behind the reap, so wait for the reap rather than racing it.
+      let reopened: Response | undefined;
+      for (let attempt = 0; attempt < 100 && !reopened; attempt += 1) {
+        try {
+          reopened = await host.fetch(identity, new Request("http://actor.invalid/value"));
+        } catch (error) {
+          if (!String(error).includes("Actor carrier retiring")) throw error;
+          await Bun.sleep(20);
+        }
+      }
+      expect(await reopened?.json()).toEqual({
         id: identity.id,
         value: 0,
         version: "one",

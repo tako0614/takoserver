@@ -116,6 +116,7 @@ import type { WorkerdProcess } from "./workerd-supervisor.ts";
 import { workerdVersionServiceBindingName } from "./workerd-version-graph.ts";
 import {
   inspectWorkerdWorkerExecutionCopies,
+  isInterruptedWorkerdWorkerGroupWrite,
   openWorkerdWorkerExecutionGroup,
   releaseRetiredWorkerdWorkerExecutionCopies,
   verifyRetiredWorkerdWorkerExecutionCopies,
@@ -141,6 +142,9 @@ const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 const DRAIN_GRACE_MS = 15 * 60 * 1000;
 const LOCK_MAX_BYTES = 2_048;
 const RECOVERY_PREFIX = ".runtime-owner-recovery.";
+/** `atomicWrite`'s temporary of the owner state: `runtime-owner.json.<uuid>.tmp`. */
+const INTERRUPTED_STATE_WRITE =
+  /^runtime-owner\.json\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u;
 const ENDPOINT_HOSTNAME =
   /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/u;
 const PRIVATE_SOCKET_NAME = /^[0-9a-f]{64}\.sock$/u;
@@ -1071,6 +1075,41 @@ async function requireExactEntriesAfterRecoveryRace(
   }
 }
 
+/**
+ * A write renamed into place leaves its temporary behind only when its process
+ * died before the rename, so the temporary never became state. A Host killed
+ * mid-write would otherwise leave an entry the exact inventory refuses on every
+ * later boot. Call only under the lock taken from a proven-dead owner, when no
+ * live process can be writing here. Only an exact, private, singly linked
+ * regular file is discarded; anything else stays an evidence gap.
+ */
+async function discardInterruptedWrites(
+  directory: string,
+  isInterruptedWrite: (name: string) => boolean,
+): Promise<void> {
+  const entries = await readdir(directory).catch(() => {
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  });
+  const interrupted = entries.filter(isInterruptedWrite);
+  if (interrupted.length === 0) return;
+  if (interrupted.length > 64) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  for (const name of interrupted) {
+    const path = join(directory, name);
+    const info = await lstat(path, { bigint: true }).catch(() => null);
+    if (
+      !info?.isFile() ||
+      info.isSymbolicLink() ||
+      (info.mode & 0o077n) !== 0n ||
+      info.nlink !== 1n
+    )
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    await unlink(path).catch(() => {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    });
+  }
+  await syncDirectory(directory);
+}
+
 async function verifyKnownGroupContents(
   groupDirectory: string,
   record: IncarnationRecord,
@@ -1140,8 +1179,10 @@ async function verifyOwnerNamespace(
     ...(stateInfo ? [STATE_NAME] : []),
     ...(incarnationInfo ? ["incarnations"] : []),
   ];
-  if (recoveredFromStaleOwner) await requireExactEntriesAfterRecoveryRace(directory, topLevel);
-  else await requireExactEntries(directory, topLevel);
+  if (recoveredFromStaleOwner) {
+    await discardInterruptedWrites(directory, (name) => INTERRUPTED_STATE_WRITE.test(name));
+    await requireExactEntriesAfterRecoveryRace(directory, topLevel);
+  } else await requireExactEntries(directory, topLevel);
   if (stateInfo && (!stateInfo.isFile() || stateInfo.isSymbolicLink())) {
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
@@ -1171,6 +1212,8 @@ async function verifyOwnerNamespace(
     await requireExactEntries(groupsRoot, [workerKey]);
     const groupDirectory = join(groupsRoot, workerKey);
     await requirePrivateDirectory(groupDirectory);
+    if (recoveredFromStaleOwner)
+      await discardInterruptedWrites(groupDirectory, isInterruptedWorkerdWorkerGroupWrite);
     await verifyKnownGroupContents(groupDirectory, record);
   }
 }

@@ -1121,6 +1121,429 @@ test("a pre-send cancellation after SQLite handle reopen refunds the exact unsen
   }
 });
 
+test("a pre-send batch left by a dead Host is refunded and redelivered after its reservation", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "abandoned-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "abandoned-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "abandoned-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "abandoned-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "abandoned-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid, { maxBatchSize: 1, maxConcurrency: 1 }),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId: "abandoned-message", body: new Uint8Array([4]) },
+    );
+    const delivery = createV2QueueDelivery({ sql: f.sql, custody, capability: f.capability });
+    const scope = { consumerUid: consumer.resourceUid, principal, space, targetKey };
+    const abandoned = await delivery.claimRegisteredBatch(scope);
+    if (abandoned.kind !== "ready") throw new Error("abandoned batch not registered");
+    // The Host is killed here: the batch is claimed and registered, never
+    // authorized. Model the two deadlines passing without a send: the next
+    // pass's expiry write refuses the reservation, and the message lease that
+    // the claim set to the same 120 seconds has run out.
+    expect(
+      (
+        await f.sql.run(
+          `UPDATE queue_v2_batch_executions
+      SET state = 'pre_effect_refused' WHERE batch_id = ? AND state = 'registered'`,
+          [abandoned.batchId],
+        )
+      ).changes,
+    ).toBe(1);
+    await f.sql.run("UPDATE selfhost_queue_messages SET lease_expires_at_ms = ?", [Date.now() - 1]);
+    // The restarted Host's next pass refunds the expired lease of the refused
+    // batch and gives its own unsent reservation back at once.
+    expect((await delivery.claimRegisteredBatch(scope)).kind).toBe("idle");
+    expect(
+      await f.sql.query(
+        "SELECT deliveries,lease_token,lease_expires_at_ms FROM selfhost_queue_messages",
+      ),
+    ).toEqual([{ deliveries: 0, lease_token: null, lease_expires_at_ms: null }]);
+    expect(
+      await f.sql.query(
+        `SELECT count(*) AS open FROM queue_v2_batch_executions
+         WHERE state IN ('reserved','registered','send_authorized')`,
+      ),
+    ).toEqual([{ open: 0 }]);
+    const redelivered = await delivery.claimRegisteredBatch(scope);
+    if (redelivered.kind !== "ready") throw new Error("abandoned message was not redelivered");
+    expect(redelivered.claims.map(({ messageId, attempts }) => ({ messageId, attempts }))).toEqual([
+      { messageId: "abandoned-message", attempts: 1 },
+    ]);
+  } finally {
+    f.database.close();
+  }
+});
+
+test("Host start refuses only never-authorized reservations and returns their messages", async () => {
+  const f = fixture();
+  let composition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "boot-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "boot-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "boot-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "boot-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "boot-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid, { maxBatchSize: 1, maxConcurrency: 2 }),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    for (const messageId of ["boot-sent", "boot-unsent"])
+      await custody.admit(
+        {
+          queueId: v2QueueId(queue.resourceUid),
+          messageRetentionSeconds: 3600,
+          deliveryDelaySeconds: 0,
+        },
+        { messageId, body: new Uint8Array([6]) },
+      );
+    const delivery = createV2QueueDelivery({ sql: f.sql, custody, capability: f.capability });
+    const scope = { consumerUid: consumer.resourceUid, principal, space, targetKey };
+    const execution = (batch: { batchId: string; reservationToken: string }) => ({
+      batchId: batch.batchId,
+      reservationToken: batch.reservationToken,
+      queueUid: queue.resourceUid,
+      consumerUid: consumer.resourceUid,
+      generation: 1,
+      workerUid: worker.resourceUid,
+      servingSourceOperationId: deployment.id,
+      workerVersionUid: version.resourceUid,
+      workerVersionGeneration: 1,
+      incarnationOperationId: "boot-incarnation",
+    });
+    const sentBatch = await delivery.claimRegisteredBatch(scope);
+    if (sentBatch.kind !== "ready") throw new Error("sent batch not registered");
+    expect(await authorizeV2QueueBatchSend(f.sql, execution(sentBatch))).toBe("authorized");
+    const unsentBatch = await delivery.claimRegisteredBatch(scope);
+    if (unsentBatch.kind !== "ready") throw new Error("unsent batch not registered");
+    // The earlier process is killed here, with one batch sent and one not.
+    const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+    const privatePort = Number(reservation.port);
+    await reservation.stop(true);
+    composition = createSelfhostV2QueueComposition({
+      sql: f.sql,
+      custody,
+      capability: f.capability,
+      settlementKey: new Uint8Array(32).fill(8),
+      privatePort,
+      ownerForWorkerUid: async () => {
+        throw new Error("refusal never needs a native owner");
+      },
+    });
+    expect(await composition.refuseReservationsBeforeFirstDelivery()).toBe(1);
+    expect(
+      await f.sql.query("SELECT batch_id,state FROM queue_v2_batch_executions ORDER BY rowid"),
+    ).toEqual([
+      { batch_id: sentBatch.batchId, state: "send_authorized" },
+      { batch_id: unsentBatch.batchId, state: "pre_effect_refused" },
+    ]);
+    const lease = async (messageId: string | undefined) =>
+      await f.sql.query(
+        "SELECT deliveries,lease_token FROM selfhost_queue_messages WHERE message_id = ?",
+        [messageId ?? ""],
+      );
+    const unsentId = unsentBatch.claims[0]?.messageId;
+    if (!unsentId) throw new Error("unsent batch claimed no message");
+    expect(await lease(sentBatch.claims[0]?.messageId)).toEqual([
+      { deliveries: 1, lease_token: sentBatch.claims[0]?.leaseToken },
+    ]);
+    expect(await lease(unsentId)).toEqual([{ deliveries: 0, lease_token: null }]);
+    // Had the earlier writer been alive, it could no longer authorize the send.
+    expect(await authorizeV2QueueBatchSend(f.sql, execution(unsentBatch))).toBe("unknown");
+    expect(await composition.refuseReservationsBeforeFirstDelivery()).toBe(0);
+    const redelivered = await delivery.claimRegisteredBatch(scope);
+    if (redelivered.kind !== "ready") throw new Error("refused message was not redelivered");
+    expect(redelivered.claims.map(({ messageId, attempts }) => ({ messageId, attempts }))).toEqual([
+      { messageId: unsentId, attempts: 1 },
+    ]);
+  } finally {
+    await composition?.close();
+    f.database.close();
+  }
+});
+
+test("an expired registered batch is refused in the write that refunds its lease", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "expired-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "expired-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "expired-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "expired-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "expired-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid, { maxBatchSize: 1, maxConcurrency: 1 }),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    const queueId = v2QueueId(queue.resourceUid);
+    await custody.admit(
+      { queueId, messageRetentionSeconds: 3600, deliveryDelaySeconds: 0 },
+      { messageId: "expired-message", body: new Uint8Array([7]) },
+    );
+    const delivery = createV2QueueDelivery({ sql: f.sql, custody, capability: f.capability });
+    const scope = { consumerUid: consumer.resourceUid, principal, space, targetKey };
+    // A real selection supplies the exact accepted row values; give it back.
+    const template = await delivery.claimRegisteredBatch(scope);
+    if (template.kind !== "ready") throw new Error("template batch not registered");
+    expect(await cancelV2QueueBatchBeforeSend(f.sql, template)).toBe(true);
+    // Write a reservation whose 120 seconds end one second from now, so its
+    // database-time expiry is real rather than simulated.
+    const dbNow = `(CAST(strftime('%s', 'now') AS INTEGER) * 1000
+      + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))`;
+    const expiring = { batchId: "expiring-batch", reservationToken: "expiring-reservation" };
+    await f.sql.run(
+      `INSERT INTO queue_v2_batch_executions
+        (batch_id,reservation_token,queue_id,consumer_uid,consumer_generation,worker_uid,
+         consumer_spec_json,serving_source_operation_id,selected_versions_json,principal,space,
+         target_key,max_concurrency,reserved_at_ms,reservation_until_ms,state)
+       SELECT ?,?,queue_id,consumer_uid,consumer_generation,worker_uid,consumer_spec_json,
+              serving_source_operation_id,selected_versions_json,principal,space,target_key,
+              max_concurrency,${dbNow} - 119000,${dbNow} + 1000,'reserved'
+       FROM queue_v2_batch_executions WHERE batch_id = ?`,
+      [expiring.batchId, expiring.reservationToken, template.batchId],
+    );
+    const claims = await custody.claim({
+      queueId,
+      consumerId: consumer.resourceUid,
+      generation: template.generation,
+      limit: 1,
+      v2Attachment: { principal, space, targetKey },
+      v2Reservation: expiring,
+    });
+    expect(claims).toHaveLength(1);
+    await custody.registerSettlementBatch(expiring.batchId, claims, {
+      reservationToken: expiring.reservationToken,
+    });
+    const state = async () =>
+      await f.sql.query("SELECT state FROM queue_v2_batch_executions WHERE batch_id = ?", [
+        expiring.batchId,
+      ]);
+    expect(await state()).toEqual([{ state: "registered" }]);
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const [expired] = await f.sql.query(
+        `SELECT reservation_until_ms <= ${dbNow} AS expired
+         FROM queue_v2_batch_executions WHERE batch_id = ?`,
+        [expiring.batchId],
+      );
+      if (expired?.expired === 1) break;
+      if (Date.now() > deadline) throw new Error("reservation did not expire");
+      await Bun.sleep(50);
+    }
+    await f.sql.run("UPDATE selfhost_queue_messages SET lease_expires_at_ms = ?", [Date.now() - 1]);
+    // The reap runs before this claim selects anything; it refunds the lease
+    // of the never-sent batch and refuses that batch in the same write.
+    expect(
+      await custody.claim({
+        queueId,
+        consumerId: consumer.resourceUid,
+        generation: template.generation,
+        limit: 1,
+        v2Attachment: { principal, space, targetKey },
+      }),
+    ).toEqual([]);
+    expect(await state()).toEqual([{ state: "pre_effect_refused" }]);
+    expect(await f.sql.query("SELECT deliveries,lease_token FROM selfhost_queue_messages")).toEqual(
+      [{ deliveries: 0, lease_token: null }],
+    );
+    expect(
+      await authorizeV2QueueBatchSend(f.sql, {
+        ...expiring,
+        queueUid: queue.resourceUid,
+        consumerUid: consumer.resourceUid,
+        generation: template.generation,
+        workerUid: worker.resourceUid,
+        servingSourceOperationId: deployment.id,
+        workerVersionUid: version.resourceUid,
+        workerVersionGeneration: 1,
+        incarnationOperationId: "expired-incarnation",
+      }),
+    ).toBe("unknown");
+  } finally {
+    f.database.close();
+  }
+});
+
+test("a batch selection that throws is reported instead of vanishing into unknown", async () => {
+  const f = fixture();
+  let composition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "reported-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "reported-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "reported-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "reported-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "reported-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId: "reported-message", body: new Uint8Array([5]) },
+    );
+    const failing: typeof custody = {
+      ...custody,
+      async claim() {
+        throw new Error("incomplete input");
+      },
+    };
+    const reported: unknown[] = [];
+    const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+    const privatePort = Number(reservation.port);
+    await reservation.stop(true);
+    composition = createSelfhostV2QueueComposition({
+      sql: f.sql,
+      custody: failing,
+      capability: f.capability,
+      settlementKey: new Uint8Array(32).fill(9),
+      privatePort,
+      onClaimFailure: (cause) => {
+        reported.push(cause);
+        throw new Error("a failing reporter is contained");
+      },
+      ownerForWorkerUid: async () => {
+        throw new Error("no batch was selected, so no owner is needed");
+      },
+    });
+    expect(
+      await composition.deliverOnce({
+        consumerUid: consumer.resourceUid,
+        principal,
+        space,
+        targetKey,
+      }),
+    ).toEqual({ kind: "unknown" });
+    expect(reported.map((cause) => (cause as Error).message)).toEqual(["incomplete input"]);
+    // The reservation written before the throw was never sent, so it does not
+    // hold the Consumer for its 120 seconds.
+    expect(await f.sql.query("SELECT state FROM queue_v2_batch_executions")).toEqual([
+      { state: "pre_effect_refused" },
+    ]);
+  } finally {
+    await composition?.close();
+    f.database.close();
+  }
+});
+
+test("a claim whose acknowledgement was lost is refunded by its bound lease token", async () => {
+  const f = fixture();
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "lost-ack-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "lost-ack-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "lost-ack-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "lost-ack-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "lost-ack-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid, { maxBatchSize: 1, maxConcurrency: 1 }),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId: "lost-ack-message", body: new Uint8Array([8]) },
+    );
+    // The claim commits, then its result is lost on the way back.
+    const lostAck: typeof custody = {
+      ...custody,
+      async claim(input) {
+        expect(await custody.claim(input)).toHaveLength(1);
+        throw new Error("disk I/O error");
+      },
+    };
+    const scope = { consumerUid: consumer.resourceUid, principal, space, targetKey };
+    await expect(
+      createV2QueueDelivery({
+        sql: f.sql,
+        custody: lostAck,
+        capability: f.capability,
+      }).claimRegisteredBatch(scope),
+    ).rejects.toThrow("disk I/O error");
+    expect(
+      await f.sql.query(
+        "SELECT state,lease_token IS NOT NULL AS bound FROM queue_v2_batch_executions",
+      ),
+    ).toEqual([{ state: "pre_effect_refused", bound: 1 }]);
+    expect(await f.sql.query("SELECT deliveries,lease_token FROM selfhost_queue_messages")).toEqual(
+      [{ deliveries: 0, lease_token: null }],
+    );
+    const next = await createV2QueueDelivery({
+      sql: f.sql,
+      custody,
+      capability: f.capability,
+    }).claimRegisteredBatch(scope);
+    if (next.kind !== "ready") throw new Error("refunded message was not redelivered");
+    expect(next.claims.map(({ messageId, attempts }) => ({ messageId, attempts }))).toEqual([
+      { messageId: "lost-ack-message", attempts: 1 },
+    ]);
+  } finally {
+    f.database.close();
+  }
+});
+
 test("a pending Deployment DELETE fences the old source before native Queue send", async () => {
   const f = fixture();
   try {

@@ -135,7 +135,12 @@ test.skipIf(nativeParentLifetime === undefined)(
             throw new Error("reload must not happen");
           },
         });
-        await expect(runtime.reload()).rejects.toThrow(/activation state is unknown/);
+        // The render guard runs while the candidate graph is resolved, before
+        // activation truth changes, so reload rejects with the guard's own
+        // refusal rather than an unknown activation state.
+        await expect(runtime.reload()).rejects.toThrow(
+          /listener port is occupied by a process not owned by this Host/,
+        );
         expect(await readFile(config, "utf8")).toBe("previous private configuration");
       } finally {
         foreign.stop(true);

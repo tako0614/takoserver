@@ -1,6 +1,13 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
-import { cancelQueueReservationBeforeSend } from "../src/selfhost-v2-queue-cancel.ts";
+import {
+  cancelQueueReservationBeforeSend,
+  refuseQueueReservationsBeforeFirstDelivery,
+  SELFHOST_QUEUE_BOOT_REFUSAL_QUERY,
+} from "../src/selfhost-v2-queue-cancel.ts";
+import { createSqliteSql } from "../src/sql-sqlite.ts";
 
 /**
  * A reservation that was provably never sent is refunded by Core's
@@ -232,4 +239,170 @@ test("retries stop at the total time budget, not only at the attempt count", asy
   expect(calls).toBe(2);
   expect(sleeps).toEqual([100]);
   expect(reported).toHaveLength(1);
+});
+
+test("Host start refuses each unsent reservation and stops at the first refusal that gives up", async () => {
+  const startedAt = 1_791_687_371_000;
+  const rows = ["batch-1", "batch-2", "batch-3", "batch-4"].map((batchId) => ({
+    batch_id: batchId,
+    reservation_token: `token-${batchId}`,
+  }));
+  const scans: (readonly unknown[])[] = [];
+  const sql = {
+    async query(statement: string, params: readonly unknown[] = []) {
+      if (statement.includes("AS now")) return [{ now: startedAt }];
+      // The cancel helper's own readback after a refused cancel.
+      if (statement.includes("SELECT state FROM")) return [{ state: "send_authorized" }];
+      if (statement === SELFHOST_QUEUE_BOOT_REFUSAL_QUERY) {
+        scans.push(params);
+        return rows;
+      }
+      throw new Error(`unexpected query: ${statement}`);
+    },
+    async run() {
+      throw new Error("unexpected write");
+    },
+    async batch() {
+      throw new Error("unexpected write");
+    },
+  } as unknown as Sql;
+  const attempted: string[] = [];
+  const reported: unknown[] = [];
+  const refused = await refuseQueueReservationsBeforeFirstDelivery({
+    sql,
+    cancel: async (_sql, value) => {
+      attempted.push(value.batchId);
+      // batch-2 was sent meanwhile: Core refuses to cancel it, not a fault.
+      if (value.batchId === "batch-3") throw new Error("database is locked");
+      return value.batchId === "batch-1";
+    },
+    report: (cause) => reported.push(cause),
+  });
+  expect(scans).toEqual([[startedAt]]);
+  // The lock already cost a full busy_timeout; batch-4 is left to its expiry.
+  expect(attempted).toEqual(["batch-1", "batch-2", "batch-3"]);
+  expect(refused).toBe(1);
+  expect(reported.map((cause) => (cause as Error).message)).toEqual(["database is locked"]);
+});
+
+test("the Host start scan stays an index search over Consumers, with and without statistics", async () => {
+  const seeded = (): Database => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    // Direct rows only: the guards that admit them are not under test here.
+    for (const { name } of database
+      .query(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'queue_v2_batch_executions'",
+      )
+      .all() as { name: string }[])
+      database.exec(`DROP TRIGGER "${name}"`);
+    const insert = database.prepare(
+      `INSERT INTO queue_v2_batch_executions
+        (batch_id,reservation_token,lease_token,queue_id,consumer_uid,consumer_generation,
+         worker_uid,consumer_spec_json,serving_source_operation_id,selected_versions_json,
+         principal,space,target_key,max_concurrency,reserved_at_ms,reservation_until_ms,state,
+         message_count,worker_version_uid,worker_version_generation,incarnation_operation_id,
+         send_authorized_at_ms,retired_at_ms,retirement_kind,retirement_receipt_digest)
+       VALUES (?,?,?,'takoform-v2-queue:queue-1',?,1,'worker-1','{}','source-op','[]',
+         'org-one','default','target',10,?,?,?,?,?,?,?,?,?,?,?)`,
+    );
+    const row = (
+      batchId: string,
+      consumer: string,
+      state: "reserved" | "registered" | "send_authorized" | "retired",
+      reservedAt: number,
+    ) => {
+      const leased = state !== "reserved";
+      const sent = state === "send_authorized" || state === "retired";
+      const retired = state === "retired";
+      insert.run(
+        batchId,
+        `reservation-${batchId}`,
+        leased ? `lease-${batchId}` : null,
+        consumer,
+        reservedAt,
+        reservedAt + 120_000,
+        state,
+        leased ? 1 : null,
+        sent ? "version-1" : null,
+        sent ? 1 : null,
+        sent ? "incarnation-1" : null,
+        sent ? reservedAt + 1 : null,
+        retired ? reservedAt + 2 : null,
+        retired ? "handler_and_wait_until" : null,
+        retired ? `receipt-${batchId}` : null,
+      );
+    };
+    const now = Date.now();
+    database.transaction(() => {
+      for (let index = 0; index < 3_000; index += 1)
+        row(`history-${index}`, `consumer-${"abc"[index % 3]}`, "retired", now - 1e9 + index);
+      row("unsent-reserved", "consumer-a", "reserved", now - 5_000);
+      row("unsent-registered", "consumer-b", "registered", now - 5_000);
+      row("sent", "consumer-a", "send_authorized", now - 5_000);
+      // Reserved after the refusal started: its own claimer is still running.
+      row("later", "consumer-c", "reserved", now + 60_000);
+    })();
+    return database;
+  };
+  for (const collect of ["none", "ANALYZE", "PRAGMA optimize=0x10002"] as const) {
+    const database = seeded();
+    if (collect !== "none") database.exec(collect);
+    const plan = (
+      database.query(`EXPLAIN QUERY PLAN ${SELFHOST_QUEUE_BOOT_REFUSAL_QUERY}`).all(Date.now()) as {
+        detail: string;
+      }[]
+    ).map((line) => line.detail);
+    // Only the recursive CTE is scanned; every table access is an index seek
+    // driven by one Consumer UID at a time.
+    for (const line of plan) if (line.startsWith("SCAN ")) expect(line).toBe("SCAN consumer");
+    expect(plan).toContain(
+      "SEARCH next USING COVERING INDEX queue_v2_batch_executions_open_consumer (consumer_uid>?)",
+    );
+    expect(plan.at(-1)).toBe(
+      "SEARCH execution USING INDEX queue_v2_batch_executions_open_consumer (consumer_uid=? AND state=?)",
+    );
+    expect(
+      await refuseQueueReservationsBeforeFirstDelivery({ sql: createSqliteSql(database) }),
+    ).toBe(2);
+    expect(
+      database
+        .query(
+          "SELECT batch_id, state FROM queue_v2_batch_executions WHERE state <> 'retired' ORDER BY batch_id",
+        )
+        .all(),
+    ).toEqual([
+      { batch_id: "later", state: "reserved" },
+      { batch_id: "sent", state: "send_authorized" },
+      { batch_id: "unsent-registered", state: "pre_effect_refused" },
+      { batch_id: "unsent-reserved", state: "pre_effect_refused" },
+    ]);
+    database.close();
+  }
+});
+
+test("a missing open-Consumer index refuses the Host start scan instead of walking history", async () => {
+  const database = new Database(":memory:");
+  migrateSqlite(database);
+  database.exec("DROP INDEX queue_v2_batch_executions_open_consumer");
+  await expect(
+    refuseQueueReservationsBeforeFirstDelivery({ sql: createSqliteSql(database) }),
+  ).rejects.toThrow("no such index");
+  database.close();
+});
+
+test("Host start refusal needs the database clock before it touches any row", async () => {
+  const sql = {
+    async query() {
+      return [{ now: null }];
+    },
+  } as unknown as Sql;
+  await expect(
+    refuseQueueReservationsBeforeFirstDelivery({
+      sql,
+      cancel: async () => {
+        throw new Error("no row may be refused");
+      },
+    }),
+  ).rejects.toThrow("database clock");
 });

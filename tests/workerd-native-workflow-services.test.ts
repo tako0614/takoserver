@@ -22,6 +22,7 @@ import {
 } from "../src/workerd-runtime.ts";
 import { createWorkflowRuntime } from "../src/workflow-execution.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const workerd = nativeEvidenceBinary("workerd-artifact");
 const guardBinary = nativeEvidenceBinary(
@@ -173,7 +174,12 @@ test.skipIf(workerd === undefined || guardBinary === undefined)(
   "one guarded class keeps captured bindings while native targets rotate, disappear and reuse names",
   async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-services-"));
-    const sockets = await mkdtemp(join(tmpdir(), "tss-"));
+    // The runtime refuses a service socket directory whose <64 hex>.sock child
+    // would exceed 100 bytes; bound it so the case holds whatever TMPDIR is.
+    const sockets = await mkdtempForSockets(
+      "tss-",
+      100 - Buffer.byteLength(`/${"0".repeat(64)}.sock`),
+    );
     await chmod(sockets, 0o700);
     const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
     const port = Number(reserved.port);
