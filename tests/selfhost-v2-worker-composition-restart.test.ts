@@ -104,7 +104,17 @@ async function startHost(
       if (found) return found;
       const failure = events.find((item) => item.stage === "startup_error");
       if (failure) throw new Error(`Host startup refused: ${failure.code}`);
-      if (child.exitCode !== null) throw new Error(`Host exited before ${stage}: ${await stderr}`);
+      if (child.exitCode !== null) {
+        // The child can be reaped before its stdout pipe is drained. A refusal
+        // it printed just before exiting would otherwise read as a silent exit
+        // under load (observed as `Host exited before listening: `).
+        await reading;
+        const drained = events.find((item) => item.stage === stage);
+        if (drained) return drained;
+        const refused = events.find((item) => item.stage === "startup_error");
+        if (refused) throw new Error(`Host startup refused: ${refused.code}`);
+        throw new Error(`Host exited before ${stage}: ${await stderr}`);
+      }
       await Bun.sleep(10);
     }
     throw new Error(`Host did not emit ${stage}`);
