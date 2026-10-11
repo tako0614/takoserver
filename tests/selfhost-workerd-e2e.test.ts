@@ -327,7 +327,11 @@ function offering(kind: string): ProviderOffering {
       apiVersion: EDGE_API,
       kind,
       definitionVersion: "0.1.0",
-      schemaDigest: `sha256:${"a".repeat(64)}`,
+      // The provider owns only the released Cron Form, matched by its digest.
+      schemaDigest:
+        kind === "WorkerCronTrigger"
+          ? "sha256:ef4fdfc91638154766db821c97ef3d097619c610a5c3784888541ce307c82b8a"
+          : `sha256:${"a".repeat(64)}`,
     },
     providedInterfaces: [],
     bindingRefs: [],
@@ -1329,6 +1333,8 @@ async function bootEvents(
     });
   const local = createSelfhostProvider({
     offerings: [],
+    // A fresh data root holds no other Cron owner for this Worker.
+    listCronOwners: async () => ({ complete: true, owners: [] as const }),
     dataRoot: root,
     runtime,
     dataPlaneAddress: served.address,
@@ -1517,7 +1523,7 @@ async function bootEvents(
     const trigger = await local.apply({
       operationId: "op_cron",
       offering: offering("WorkerCronTrigger"),
-      identity: identity("hello-cron"),
+      identity: { ...identity("hello-cron"), uid: "uid-hello-cron" },
       spec: {
         worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
         cron: CRON,
@@ -2272,6 +2278,8 @@ async function bootEventsOnly(input: {
   // whole point of the case.
   const local = createSelfhostProvider({
     offerings: [],
+    // A fresh data root holds no other Cron owner for this Worker.
+    listCronOwners: async () => ({ complete: true, owners: [] as const }),
     dataRoot: root,
     runtime,
     suffixes: ["localhost"],
@@ -3317,7 +3325,7 @@ const attachCron = (local: ReturnType<typeof createSelfhostProvider>, cron: stri
   local.apply({
     operationId: "op_cron",
     offering: offering("WorkerCronTrigger"),
-    identity: identity("hello-cron"),
+    identity: { ...identity("hello-cron"), uid: "uid-hello-cron" },
     spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" }, cron },
     relations: [relation("/worker", "ModuleWorker", "hello")],
   });

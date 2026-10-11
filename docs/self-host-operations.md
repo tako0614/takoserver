@@ -1163,8 +1163,19 @@ work, to a different path or machine, of an external `TAKOSERVER_DB`, or an
 operator disaster-recovery drill with source fencing. It does not cover a `scheduled`
 handler, Actor or Workflow use, public DNS or certificate trust, Hosted/WfP or
 a host reboot. Messages in flight at the
-crash are redelivered at least once, and a batch reserved but not yet sent is
-held for its 120 second reservation before redelivery.
+crash are redelivered at least once. A batch the killed Host reserved but never
+sent is refused when the Host starts again, before it listens, and its messages
+come back at once. That holds when the refusal succeeds: if it gives up (a lock
+that outlasted the five second busy timeout, for example), that batch and any
+not yet refused wait for their 120 second reservation as before. The refusal
+needs no proof that the old process is gone: it is the pre-send cancel, which
+can only win while the batch has not been authorized, and the owner sends only
+after winning that authorization. A batch that was already sent is different.
+It must first be retired, by its handler's completion receipt or by proof that
+its Worker child is physically gone, and only then are its messages redelivered
+once their lease (up to 120 seconds) runs out. After a Host restart the old
+child is gone and that proof is normally available; a sent batch whose
+retirement cannot be proven stays occupied, with no time limit.
 
 What this test and its neighbours record:
 
@@ -1287,8 +1298,9 @@ test:
   a stopped data root, and the tenant SQLite stores are deliberately
   rollback-journal. A reader that holds the lock longer than five seconds still
   fails the write; a failing background pass now logs its name and a bounded
-  cause, and a Queue reservation that was never sent is refunded with retries
-  bounded to one second in total before it falls back to its 120 second expiry.
+  cause (including a Queue batch selection that threw), and a Queue
+  reservation that was never sent is refunded with retries bounded to one
+  second in total before it falls back to its 120 second expiry.
   A refund whose lock outlasted the five second wait is not retried, because
   each attempt would block the Host for that long again. A Queue batch whose
   handler finished but whose retirement failed this way is different: its
