@@ -5,7 +5,10 @@ import {
   createV2QueueSettlementEndpoint,
 } from "./providers/selfhost-v2-queue-transport.ts";
 import type { QueueCustody } from "./queue-custody.ts";
-import { cancelQueueReservationBeforeSend } from "./selfhost-v2-queue-cancel.ts";
+import {
+  cancelQueueReservationBeforeSend,
+  refuseQueueReservationsBeforeFirstDelivery,
+} from "./selfhost-v2-queue-cancel.ts";
 import type { V2QueueConsumerCapability } from "./takoform-v2/worker-queue-consumer-backend.ts";
 import {
   authorizeV2QueueBatchSend,
@@ -443,6 +446,17 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
     reconcileAuthorizedAbsence,
     reconcileWorkerAuthorizedAbsence,
     deliverOnce,
+    /**
+     * Call once at Host start, before the first delivery pass: refuses every
+     * unsent reservation an earlier process left, so its messages come back
+     * now. See refuseQueueReservationsBeforeFirstDelivery for why no proof
+     * that the earlier writer is gone is needed. Resolves to the count.
+     */
+    refuseReservationsBeforeFirstDelivery: (): Promise<number> =>
+      refuseQueueReservationsBeforeFirstDelivery({
+        sql: options.sql,
+        ...(options.onCancelFailure ? { report: options.onCancelFailure } : {}),
+      }),
     close: async () => {
       await server.stop(true);
     },

@@ -1000,6 +1000,24 @@ try {
   throw error;
 }
 const v2WorkerComposition = workers;
+if (v2QueueComposition) {
+  // No delivery pass has run in this process yet, so an unsent reservation
+  // was left by an earlier one. Refusing it is the pre-send cancel, safe even
+  // against a live writer; its messages come back now instead of after 120 s.
+  await v2QueueComposition
+    .refuseReservationsBeforeFirstDelivery()
+    .then((refused) => {
+      if (refused > 0)
+        process.stdout.write(
+          `refused ${refused} unsent v2 Queue reservation(s) left by an earlier process\n`,
+        );
+    })
+    .catch((cause: unknown) =>
+      process.stderr.write(
+        `self-host Queue reservations left by an earlier process will expire: ${describeBackgroundFailure(cause)}\n`,
+      ),
+    );
+}
 const v2QueueScheduler =
   v2QueueComposition && v2QueueCustody
     ? createSelfhostV2QueueScheduler({

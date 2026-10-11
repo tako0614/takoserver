@@ -1160,8 +1160,13 @@ work, to a different path or machine, of an external `TAKOSERVER_DB`, or an
 operator disaster-recovery drill with source fencing. It does not cover a `scheduled`
 handler, Actor or Workflow use, public DNS or certificate trust, Hosted/WfP or
 a host reboot. Messages in flight at the
-crash are redelivered at least once, and a batch reserved but not yet sent is
-held for its 120 second reservation before redelivery.
+crash are redelivered at least once. A batch the killed Host reserved but never
+sent is refused when the Host starts again, before it listens, so its messages
+come back at once; a batch that was already sent keeps its messages until their
+lease (up to 120 seconds) runs out. The refusal needs no proof that the old
+process is gone: it is the pre-send cancel, which can only win while the batch
+has not been authorized, and the owner sends only after winning that
+authorization.
 
 What this test and its neighbours record:
 
@@ -1284,8 +1289,9 @@ test:
   a stopped data root, and the tenant SQLite stores are deliberately
   rollback-journal. A reader that holds the lock longer than five seconds still
   fails the write; a failing background pass now logs its name and a bounded
-  cause, and a Queue reservation that was never sent is refunded with retries
-  bounded to one second in total before it falls back to its 120 second expiry.
+  cause (including a Queue batch selection that threw), and a Queue
+  reservation that was never sent is refunded with retries bounded to one
+  second in total before it falls back to its 120 second expiry.
   A refund whose lock outlasted the five second wait is not retried, because
   each attempt would block the Host for that long again. A Queue batch whose
   handler finished but whose retirement failed this way is different: its

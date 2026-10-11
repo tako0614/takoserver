@@ -109,3 +109,64 @@ export async function cancelQueueReservationBeforeSend(input: {
     await sleep(delay);
   }
 }
+
+const BOOT_PAGE = 64;
+const DB_NOW_MS =
+  "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
+
+/**
+ * Refuse, at Host start, every v2 Queue reservation that was never authorized.
+ *
+ * Call this before the process's first delivery pass. A `reserved` or
+ * `registered` row then belongs to an earlier process (normally one that was
+ * killed between claiming a batch and sending it), and without this its
+ * messages stay leased until the row's 120 second reservation runs out.
+ *
+ * No proof that the writer is gone is needed. Each row is refused by the
+ * pre-send cancel, which moves it to `pre_effect_refused` only while it is
+ * still `reserved` or `registered`, and refunds its messages in the same
+ * transaction. Send authorization is the competing move out of `registered`,
+ * and the runtime owner sends only when it wins. So a writer that is in fact
+ * alive (a second Host on the same database) loses that batch before effect;
+ * nothing is sent twice. Rows reserved after this call started are left to
+ * their own claimer.
+ *
+ * Returns how many rows this call refused. A row whose refusal gives up falls
+ * back to its expiry, exactly as before.
+ */
+export async function refuseQueueReservationsBeforeFirstDelivery(input: {
+  readonly sql: Sql;
+  readonly cancel?: typeof cancelV2QueueBatchBeforeSend;
+  readonly report?: (cause: unknown) => void;
+}): Promise<number> {
+  const { sql } = input;
+  const [clock] = await sql.query(`SELECT ${DB_NOW_MS} AS now`);
+  const startedAt = clock?.now;
+  if (typeof startedAt !== "number" || !Number.isSafeInteger(startedAt) || startedAt <= 0)
+    throw new Error("Queue boot refusal could not read the database clock");
+  let after = "";
+  let refused = 0;
+  for (;;) {
+    const rows = await sql.query(
+      `SELECT batch_id, reservation_token FROM queue_v2_batch_executions
+       WHERE state IN ('reserved','registered') AND reserved_at_ms <= ? AND batch_id > ?
+       ORDER BY batch_id LIMIT ${BOOT_PAGE}`,
+      [startedAt, after],
+    );
+    for (const row of rows) {
+      if (typeof row.batch_id !== "string" || typeof row.reservation_token !== "string") continue;
+      if (
+        await cancelQueueReservationBeforeSend({
+          sql,
+          batch: { batchId: row.batch_id, reservationToken: row.reservation_token },
+          ...(input.cancel ? { cancel: input.cancel } : {}),
+          ...(input.report ? { report: input.report } : {}),
+        })
+      )
+        refused += 1;
+    }
+    const last = rows.at(-1)?.batch_id;
+    if (rows.length < BOOT_PAGE || typeof last !== "string") return refused;
+    after = last;
+  }
+}

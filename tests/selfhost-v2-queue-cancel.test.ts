@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
 import type { Sql } from "../src/ports.ts";
-import { cancelQueueReservationBeforeSend } from "../src/selfhost-v2-queue-cancel.ts";
+import {
+  cancelQueueReservationBeforeSend,
+  refuseQueueReservationsBeforeFirstDelivery,
+} from "../src/selfhost-v2-queue-cancel.ts";
 
 /**
  * A reservation that was provably never sent is refunded by Core's
@@ -232,4 +235,67 @@ test("retries stop at the total time budget, not only at the attempt count", asy
   expect(calls).toBe(2);
   expect(sleeps).toEqual([100]);
   expect(reported).toHaveLength(1);
+});
+
+test("Host start refuses every page of unsent reservations written before it began", async () => {
+  const startedAt = 1_791_687_371_000;
+  const pages = [
+    Array.from({ length: 64 }, (_, index) => ({
+      batch_id: `batch-${String(index).padStart(3, "0")}`,
+      reservation_token: `token-${index}`,
+    })),
+    [{ batch_id: "batch-100", reservation_token: "token-100" }],
+  ];
+  const scans: (readonly unknown[])[] = [];
+  const sql = {
+    async query(statement: string, params: readonly unknown[] = []) {
+      if (statement.includes("AS now")) return [{ now: startedAt }];
+      // The cancel helper's own readback after a refused cancel.
+      if (statement.includes("SELECT state FROM")) return [{ state: "send_authorized" }];
+      if (statement.includes("FROM queue_v2_batch_executions") && statement.includes("LIMIT 64")) {
+        expect(statement).toContain("state IN ('reserved','registered')");
+        expect(statement).toContain("reserved_at_ms <= ?");
+        scans.push(params);
+        return pages[scans.length - 1] ?? [];
+      }
+      throw new Error(`unexpected query: ${statement}`);
+    },
+    async run() {
+      throw new Error("unexpected write");
+    },
+    async batch() {
+      throw new Error("unexpected write");
+    },
+  } as unknown as Sql;
+  const cancelled: string[] = [];
+  const refused = await refuseQueueReservationsBeforeFirstDelivery({
+    sql,
+    cancel: async (_sql, value) => {
+      cancelled.push(value.batchId);
+      // One row was sent or retired meanwhile; Core refuses to cancel it.
+      return value.batchId !== "batch-007";
+    },
+  });
+  expect(scans).toEqual([
+    [startedAt, ""],
+    [startedAt, "batch-063"],
+  ]);
+  expect(cancelled).toHaveLength(65);
+  expect(refused).toBe(64);
+});
+
+test("Host start refusal needs the database clock before it touches any row", async () => {
+  const sql = {
+    async query() {
+      return [{ now: null }];
+    },
+  } as unknown as Sql;
+  await expect(
+    refuseQueueReservationsBeforeFirstDelivery({
+      sql,
+      cancel: async () => {
+        throw new Error("no row may be refused");
+      },
+    }),
+  ).rejects.toThrow("database clock");
 });

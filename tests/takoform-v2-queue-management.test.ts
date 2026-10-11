@@ -1193,6 +1193,103 @@ test("a pre-send batch left by a dead Host is refunded and redelivered after its
   }
 });
 
+test("Host start refuses only never-authorized reservations and returns their messages", async () => {
+  const f = fixture();
+  let composition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "boot-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "boot-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "boot-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "boot-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "boot-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid, { maxBatchSize: 1, maxConcurrency: 2 }),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    for (const messageId of ["boot-sent", "boot-unsent"])
+      await custody.admit(
+        {
+          queueId: v2QueueId(queue.resourceUid),
+          messageRetentionSeconds: 3600,
+          deliveryDelaySeconds: 0,
+        },
+        { messageId, body: new Uint8Array([6]) },
+      );
+    const delivery = createV2QueueDelivery({ sql: f.sql, custody, capability: f.capability });
+    const scope = { consumerUid: consumer.resourceUid, principal, space, targetKey };
+    const execution = (batch: { batchId: string; reservationToken: string }) => ({
+      batchId: batch.batchId,
+      reservationToken: batch.reservationToken,
+      queueUid: queue.resourceUid,
+      consumerUid: consumer.resourceUid,
+      generation: 1,
+      workerUid: worker.resourceUid,
+      servingSourceOperationId: deployment.id,
+      workerVersionUid: version.resourceUid,
+      workerVersionGeneration: 1,
+      incarnationOperationId: "boot-incarnation",
+    });
+    const sentBatch = await delivery.claimRegisteredBatch(scope);
+    if (sentBatch.kind !== "ready") throw new Error("sent batch not registered");
+    expect(await authorizeV2QueueBatchSend(f.sql, execution(sentBatch))).toBe("authorized");
+    const unsentBatch = await delivery.claimRegisteredBatch(scope);
+    if (unsentBatch.kind !== "ready") throw new Error("unsent batch not registered");
+    // The earlier process is killed here, with one batch sent and one not.
+    const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+    const privatePort = Number(reservation.port);
+    await reservation.stop(true);
+    composition = createSelfhostV2QueueComposition({
+      sql: f.sql,
+      custody,
+      capability: f.capability,
+      settlementKey: new Uint8Array(32).fill(8),
+      privatePort,
+      ownerForWorkerUid: async () => {
+        throw new Error("refusal never needs a native owner");
+      },
+    });
+    expect(await composition.refuseReservationsBeforeFirstDelivery()).toBe(1);
+    expect(
+      await f.sql.query("SELECT batch_id,state FROM queue_v2_batch_executions ORDER BY rowid"),
+    ).toEqual([
+      { batch_id: sentBatch.batchId, state: "send_authorized" },
+      { batch_id: unsentBatch.batchId, state: "pre_effect_refused" },
+    ]);
+    const lease = async (messageId: string | undefined) =>
+      await f.sql.query(
+        "SELECT deliveries,lease_token FROM selfhost_queue_messages WHERE message_id = ?",
+        [messageId ?? ""],
+      );
+    const unsentId = unsentBatch.claims[0]?.messageId;
+    if (!unsentId) throw new Error("unsent batch claimed no message");
+    expect(await lease(sentBatch.claims[0]?.messageId)).toEqual([
+      { deliveries: 1, lease_token: sentBatch.claims[0]?.leaseToken },
+    ]);
+    expect(await lease(unsentId)).toEqual([{ deliveries: 0, lease_token: null }]);
+    // Had the earlier writer been alive, it could no longer authorize the send.
+    expect(await authorizeV2QueueBatchSend(f.sql, execution(unsentBatch))).toBe("unknown");
+    expect(await composition.refuseReservationsBeforeFirstDelivery()).toBe(0);
+    const redelivered = await delivery.claimRegisteredBatch(scope);
+    if (redelivered.kind !== "ready") throw new Error("refused message was not redelivered");
+    expect(redelivered.claims.map(({ messageId, attempts }) => ({ messageId, attempts }))).toEqual([
+      { messageId: unsentId, attempts: 1 },
+    ]);
+  } finally {
+    await composition?.close();
+    f.database.close();
+  }
+});
+
 test("a batch selection that throws is reported instead of vanishing into unknown", async () => {
   const f = fixture();
   let composition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
