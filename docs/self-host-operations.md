@@ -329,10 +329,10 @@ requirements below, not a routine code rollback.
 This procedure prepares a cold copy of one Bun self-host installation. It is
 not a tested disaster-recovery guarantee: the repository has no operator
 snapshot/restore command, no restore mode that suppresses startup work, and no
-full live-operator restore drill. The tests below cover local readers and an
-optional isolated native Host restore, and the ordinary journey native test
-restores a cold snapshot of a v2 installation (Worker, SQLite, Queue) to the
-same root; none of them replaces an operator recovery drill.
+full live-operator restore drill. The tests below cover local readers, and the
+ordinary journey native test restores a cold snapshot of a v2 installation
+(Worker, SQLite, Queue) to the same root; neither replaces an operator recovery
+drill.
 
 ## What belongs to one installation
 
@@ -426,70 +426,14 @@ not boot the entrypoint, prove a complete installation restore, exercise
 external credentials or services, test a real filesystem snapshot, or replace
 an operator recovery drill.
 
-The optional native test `tests/selfhost-host-cold-restore-native.test.ts`
-is skipped when the accepted workerd artifact is unavailable and starts the
-real Bun entrypoint when it runs. It retains an earlier v1 admission stage
-before a v2 transition; those v1 assertions are historical transition evidence,
-not the current v2 support check. It creates
-resources through the Host HTTP API, uploads and publishes a Worker, and checks
-its Endpoint over certificate-validated HTTPS. It then kills only the exact
-accepted workerd child and requires a distinct replacement under the same Bun
-Host process. Within 15 seconds, that replacement must serve the same HTTPS
-marker at the old URL without a Resource read, client republish, manual child
-spawn, or Host restart. The test checks process identity throughout; TLS
-validation failures, an unexpected HTTP status, or a different marker fail
-immediately rather than being retried. After the Host and its workerd
-descendants have exited and both listeners have closed, it copies the complete
-data root, an external control database directory (including any sidecars), and
-external TLS material in the same stopped window. A new Host starts from the
-copy. The test checks the old HTTPS URL before reading the Resource graph, then
-checks that UIDs, revisions, exposed outputs, and the Endpoint URL are retained.
-The client does not republish resources during recovery.
-
-This native case requires Linux `/proc`, Bun, OpenSSL, `unshare`, `ip`, an exact
-accepted workerd artifact, and permission to create a network namespace and
-bind port 443 there. Run it from the repository root in a separate loopback-only
-network namespace; do not borrow the ports or data root of an existing Host.
-The test also builds `services/takoform-core-verifier` from this checkout into
-its mode-0700 temporary fixture using the locally installed Go toolchain and
-pre-existing Go module/build caches. It disables module-network access; a
-missing tool or cache fails the test instead of substituting a prebuilt binary.
-The Go build is bounded to two concurrent package builds and two active Go
-processors; this does not change the native Host or recovery time assertions.
-The verifier reports the current checkout's source-derived artifact digest and
-pins released Core v1.1.0. In the retained historical v1 admission stage, the
-test submits the exact 17-package publisher closure over its real loopback HTTP
-API, requires acceptance, then requires refusal of changed package bytes and a
-valid-but-wrong publisher ref at that same verification endpoint. The legacy
-self-host admission CLI then applies the unchanged closure through its existing
-`--core-verifier` interface. This verifies that historical stage, not the
-current v2 installation procedure. The native harness allows up to 120 seconds
-for that local apply process and 240 seconds for the entire native test; these
-are test budgets, not a production CLI or Host API deadline. The child-stop,
-Host-readiness, Worker-recovery, and cleanup bounds are unchanged.
-
-For example, provide Bun 1.4.0, Go, and the existing local Go caches in `PATH`
-and the two cache variables; no module download or network fallback is used:
-
-```sh
-env -i PATH="$PATH" TMPDIR=/tmp \
-  TAKOSERVER_NATIVE_GO_CACHE=/path/to/existing/go-build-cache \
-  TAKOSERVER_NATIVE_GO_MODULES=/path/to/existing/go-module-cache \
-  TAKOSERVER_WORKERD_BINARY=/absolute/path/to/accepted-workerd \
-  unshare --net sh -c \
-  'ip link set lo up && bun --no-env-file test --timeout 240000 tests/selfhost-host-cold-restore-native.test.ts'
-```
-
-An unset artifact explicitly skips this native case; a portable check therefore
-does not prove native restore or Core publisher authenticity. A configured but
-unaccepted workerd artifact fails rather than substituting a different binary.
-The Go verifier and 17-package signatures exercise the retained historical v1
-admission stage only; the operator assertion, operator key, and self-signed
-endpoint TLS certificate remain disposable local fixture identities. This
-test does not prove production deployment provenance, external credential or
-service recovery, pending event delivery, monitoring, or an operator
-disaster-recovery drill. Startup remains active as described above; there is
-no read-only restore mode.
+An earlier optional native test drove a v1 Worker graph through a cold restore
+on the retired v1 Host API. The current entry cannot start it, so it was
+removed; the ordinary journey below is the native cold-restore evidence now.
+Two things only that test measured are not measured on the current entry: a
+restore that also copies an external `TAKOSERVER_DB` and external TLS files in
+the same stopped window, and replacement of a killed Worker child without a
+Host restart (it measured the legacy runtime supervisor; no native test here
+kills a serving v2 Worker owner's child and waits for its replacement).
 
 The serving supervisor writes bounded child-exit, automatic-restart attempt and
 delay, and recovery-success diagnostics through its existing log callback (the
@@ -690,7 +634,6 @@ Host path; the current normal Bun entry does not require it. Current v2 support
 comes from the exact versioned Form URLs composed by source and the optional
 operator configuration described in [Takoform v2 operator setup](takoform-v2.md).
 
-The optional native cold-restore test retains a v1 admission stage followed by
-a v2 transition as historical compatibility evidence. Neither that fixture nor
-the former package-admission procedure is the current v2 install path or a
-current v2 support signal.
+The former package-admission procedure is neither the current v2 install path
+nor a current v2 support signal. The native tests that drove it against the
+v1 Host API were removed once the current entry could no longer start them.

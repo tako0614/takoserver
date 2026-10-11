@@ -3,8 +3,8 @@
  *
  * Tests in `tests/` exercise optional native capabilities including the pinned
  * closed-graph `workerd` build, an unqualified Actor qualification candidate,
- * public Host ObjectBucket and artifact-upload journeys, a Queue HTTPS first-root
- * diagnostic, and local Docker lifecycle fixtures. Binary-backed capabilities
+ * the normal Bun v2 entry lifecycle, a Queue HTTPS first-root diagnostic, and
+ * local Docker lifecycle fixtures. Binary-backed capabilities
  * gate on operator-supplied paths; Docker capabilities gate on explicit opt-ins
  * and bounded fixtures.
  *
@@ -188,124 +188,6 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
     },
   },
   {
-    id: "worker-endpoint-public-create-diagnostic",
-    label: "self-host public WorkerEndpoint create and deferred Operation receipt diagnostic",
-    environment: "TAKOSERVER_NATIVE_WORKER_ENDPOINT_PUBLIC_CREATE",
-    companionEnvironment: ["TAKOSERVER_WORKERD_BINARY"],
-    proves:
-      "one released-Core-backed public Host WorkerEndpoint create, its 201 or deferred 202 receipt, exact-Operation readback when accepted, terminal Resource UID and public Resource readback; it does not prove ObjectBucket access, Resource update/delete, process restart, delivery durability or production readiness",
-    enable:
-      "TAKOSERVER_NATIVE_WORKER_ENDPOINT_PUBLIC_CREATE=1 and TAKOSERVER_WORKERD_BINARY set to the exact pinned closed-graph artifact",
-    inspect: (configured, environment, probe) => {
-      if (configured === undefined || configured.trim() === "") {
-        return {
-          state: "unconfigured",
-          detail:
-            "TAKOSERVER_NATIVE_WORKER_ENDPOINT_PUBLIC_CREATE is not configured; the bounded public WorkerEndpoint create diagnostic remains unproven",
-        };
-      }
-      if (configured !== "1") {
-        return {
-          state: "invalid",
-          detail: "TAKOSERVER_NATIVE_WORKER_ENDPOINT_PUBLIC_CREATE must be exactly 1",
-        };
-      }
-      const binary = environment.TAKOSERVER_WORKERD_BINARY;
-      if (binary === undefined || binary.trim() === "") {
-        return {
-          state: "invalid",
-          detail: "the WorkerEndpoint public-create diagnostic requires TAKOSERVER_WORKERD_BINARY",
-        };
-      }
-      const unusable = missingOrUnusable(binary, probe);
-      if (unusable) return unusable;
-      if (
-        process.platform !== WORKERD_CLOSED_GRAPH_ARTIFACT.platform ||
-        process.arch !== WORKERD_CLOSED_GRAPH_ARTIFACT.arch
-      ) {
-        return {
-          state: "invalid",
-          detail: `the pinned artifact supports ${WORKERD_CLOSED_GRAPH_ARTIFACT.platform}/${WORKERD_CLOSED_GRAPH_ARTIFACT.arch}, this host is ${process.platform}/${process.arch}`,
-        };
-      }
-      const digest = probe.sha256(binary);
-      if (digest === null) {
-        return { state: "invalid", detail: "the configured path could not be hashed" };
-      }
-      if (digest !== WORKERD_CLOSED_GRAPH_ARTIFACT.sha256) {
-        return {
-          state: "invalid",
-          detail: `the configured bytes are ${digest}; the pinned artifact is ${WORKERD_CLOSED_GRAPH_ARTIFACT.sha256}`,
-        };
-      }
-      return {
-        state: "ready",
-        detail:
-          "the exact diagnostic opt-in and pinned workerd artifact are configured; only the gated public Host WorkerEndpoint request can establish operation evidence",
-        readinessOnly: true,
-      };
-    },
-  },
-  {
-    id: "object-bucket-host-restart",
-    label: "self-host ObjectBucket public Host API and process restart",
-    environment: "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART",
-    companionEnvironment: ["TAKOSERVER_WORKERD_BINARY"],
-    proves:
-      "the released 17-package Core publisher closure, public Host ObjectBucket creation, local Worker HTTPS object access, distinct Host process restart against the same private root and SQLite database, bucket isolation, update/delete and file cleanup; only normal process exit/restart in an isolated loopback-only network namespace, not host reboot, SIGKILL, power loss or fsync durability",
-    enable:
-      "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART=1 and TAKOSERVER_WORKERD_BINARY set to the exact pinned closed-graph artifact",
-    inspect: (configured, environment, probe) => {
-      if (configured === undefined || configured.trim() === "") {
-        return {
-          state: "unconfigured",
-          detail:
-            "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART is not configured; public Host ObjectBucket process-restart evidence is disabled",
-        };
-      }
-      if (configured !== "1") {
-        return {
-          state: "invalid",
-          detail: "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART must be exactly 1",
-        };
-      }
-      const binary = environment.TAKOSERVER_WORKERD_BINARY;
-      if (binary === undefined || binary.trim() === "") {
-        return {
-          state: "invalid",
-          detail: "the ObjectBucket Host process-restart opt-in requires TAKOSERVER_WORKERD_BINARY",
-        };
-      }
-      const unusable = missingOrUnusable(binary, probe);
-      if (unusable) return unusable;
-      if (
-        process.platform !== WORKERD_CLOSED_GRAPH_ARTIFACT.platform ||
-        process.arch !== WORKERD_CLOSED_GRAPH_ARTIFACT.arch
-      ) {
-        return {
-          state: "invalid",
-          detail: `the pinned artifact supports ${WORKERD_CLOSED_GRAPH_ARTIFACT.platform}/${WORKERD_CLOSED_GRAPH_ARTIFACT.arch}, this host is ${process.platform}/${process.arch}`,
-        };
-      }
-      const digest = probe.sha256(binary);
-      if (digest === null) {
-        return { state: "invalid", detail: "the configured workerd artifact could not be hashed" };
-      }
-      if (digest !== WORKERD_CLOSED_GRAPH_ARTIFACT.sha256) {
-        return {
-          state: "invalid",
-          detail: `the configured workerd bytes are ${digest}; the pinned artifact is ${WORKERD_CLOSED_GRAPH_ARTIFACT.sha256}`,
-        };
-      }
-      return {
-        state: "ready",
-        detail:
-          "the dedicated ObjectBucket opt-in and pinned workerd artifact are configured; the gated isolated Host process-restart test must still run",
-        readinessOnly: true,
-      };
-    },
-  },
-  {
     id: "takoform-v2-bun-entry-lifecycle",
     label: "normal self-host Bun Takoform v2 entry lifecycle",
     environment: "TAKOSERVER_V2_ENTRY_NATIVE",
@@ -328,42 +210,6 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
         state: "ready",
         detail:
           "the exact opt-in is configured; only the gated normal Bun entry lifecycle test can establish runtime evidence",
-        readinessOnly: true,
-      };
-    },
-  },
-  {
-    id: "selfhost-artifact-upload",
-    label: "self-host public Host artifact upload lifecycle",
-    environment: "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE",
-    companionEnvironment: [],
-    proves:
-      "the local public Host WorkerBundle artifact API accepts V1 upload start/blob/commit followed by V2 upload start without Form admission; it does not prove Form admission, Worker execution, Cloud runtime behavior, or object data-plane durability",
-    enable: "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE=1 on Linux",
-    inspect: (configured) => {
-      if (configured === undefined || configured.trim() === "") {
-        return {
-          state: "unconfigured",
-          detail:
-            "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE is not configured; the public Host artifact upload test is disabled",
-        };
-      }
-      if (configured !== "1") {
-        return {
-          state: "invalid",
-          detail: "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE must be exactly 1",
-        };
-      }
-      if (process.platform !== "linux") {
-        return {
-          state: "invalid",
-          detail: "the self-host public Host artifact upload test requires Linux",
-        };
-      }
-      return {
-        state: "ready",
-        detail:
-          "the exact opt-in and Linux prerequisite are present; only the gated public Host artifact upload test can establish lifecycle evidence",
         readinessOnly: true,
       };
     },
