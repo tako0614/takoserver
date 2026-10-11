@@ -698,6 +698,13 @@ async function firstBoot(environment: Environment): Promise<{
   expect(await readdir(root)).not.toContain("control.sqlite");
   const host = await startHost(root, port, journeyConfig([], []), {});
   try {
+    // The Host prints its sign-in notes after it starts listening, so
+    // readiness can answer before the pipe has delivered them.
+    const notesDeadline = Date.now() + 5_000;
+    while (!host.output().includes("bun scripts/operator-key.ts sign-in google operator")) {
+      if (Date.now() > notesDeadline) break;
+      await Bun.sleep(50);
+    }
     const output = host.output();
     expect(output).toContain("applied ");
     expect(output).toContain("generated an operator key at ");
