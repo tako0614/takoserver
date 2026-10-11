@@ -20,6 +20,8 @@ const MANIFEST_NAME = "group.json";
 const CONFIG_NAME = "workerd.conf";
 const RECEIPT_NAME = "retirement.json";
 const RECEIPT_TEMP_PREFIX = ".retirement-";
+const INTERRUPTED_WRITE =
+  /^\.retirement-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const DEPLOYMENT_MANIFEST_NAME = "deployment.json";
 const DEPLOYMENT_PUBLICATIONS_NAME = ".publications";
 const WORKER_POINTER_NAME = "takoserver-site.json";
@@ -235,6 +237,14 @@ async function syncDirectory(path: string): Promise<void> {
   } finally {
     await handle?.close();
   }
+}
+
+/**
+ * The temporary `writeAtomic` leaves in a group directory when its process
+ * dies before the rename. It never became the manifest or the receipt.
+ */
+export function isInterruptedWorkerdWorkerGroupWrite(name: string): boolean {
+  return INTERRUPTED_WRITE.test(name);
 }
 
 async function writeAtomic(path: string, bytes: Uint8Array): Promise<void> {

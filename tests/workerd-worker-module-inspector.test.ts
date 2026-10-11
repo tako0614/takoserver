@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
 import type {
   WorkerModuleHandlerName,
@@ -564,6 +566,109 @@ test("does not mislabel a runtime process failure as tenant invalidity", async (
   }).inspect(input([module("worker.mjs", `export default { fetch() {} };`)]));
 
   expect(result).toEqual({ outcome: "unavailable", retryable: true });
+});
+
+/**
+ * A stand-in runtime that records the mode of the directory it runs in (its
+ * working directory is the one-shot inspection directory), then fails as a
+ * runtime process failure does.
+ */
+async function modeRecordingRuntime(): Promise<{
+  readonly binary: string;
+  readonly recorded: () => Promise<string | null>;
+  readonly remove: () => Promise<void>;
+}> {
+  const directory = await mkdtemp(join(tmpdir(), "inspector-recording-runtime-"));
+  const record = join(directory, "mode");
+  const binary = join(directory, "workerd");
+  await writeFile(binary, `#!/bin/sh\n/usr/bin/stat -c %a . > '${record}'\nexit 1\n`, {
+    mode: 0o700,
+  });
+  return {
+    binary,
+    recorded: async () => (await readFile(record, "utf8").catch(() => null))?.trim() ?? null,
+    remove: () => rm(directory, { recursive: true, force: true }),
+  };
+}
+
+async function withTemporaryDirectory<T>(path: string, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.TMPDIR;
+  process.env.TMPDIR = path;
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
+  }
+}
+
+test("uses the system temporary directory only as a parent, never chmodding it", async () => {
+  // Stands in for a shared, root-owned /tmp: a dedicated service user cannot
+  // chmod it, and a Host running as root must not tighten it for every user.
+  const shared = await mkdtemp(join(tmpdir(), "inspector-shared-tmp-"));
+  await chmod(shared, 0o755);
+  const runtime = await modeRecordingRuntime();
+  try {
+    const result = await withTemporaryDirectory(shared, () =>
+      createWorkerdWorkerModuleInspector({ repositoryRoot, binary: runtime.binary }).inspect(
+        input([module("worker.mjs", `export default { fetch() {} };`)]),
+      ),
+    );
+
+    expect(result).toEqual({ outcome: "unavailable", retryable: true });
+    // The run directory below it was private, and it is gone again.
+    expect(await runtime.recorded()).toBe("700");
+    expect((await stat(shared)).mode & 0o7777).toBe(0o755);
+    expect(await readdir(shared)).toEqual([]);
+  } finally {
+    await runtime.remove();
+    await rm(shared, { recursive: true, force: true });
+  }
+});
+
+test("refuses a system temporary directory that other users can write", async () => {
+  // World-writable without the sticky bit: another user could replace the run
+  // directory, so the runtime never starts and nothing is created there.
+  const open = await mkdtemp(join(tmpdir(), "inspector-open-tmp-"));
+  await chmod(open, 0o777);
+  const runtime = await modeRecordingRuntime();
+  try {
+    const result = await withTemporaryDirectory(open, () =>
+      createWorkerdWorkerModuleInspector({ repositoryRoot, binary: runtime.binary }).inspect(
+        input([module("worker.mjs", `export default { fetch() {} };`)]),
+      ),
+    );
+
+    expect(result).toEqual({ outcome: "unavailable", retryable: true });
+    expect(await runtime.recorded()).toBeNull();
+    expect(await readdir(open)).toEqual([]);
+  } finally {
+    await runtime.remove();
+    await rm(open, { recursive: true, force: true });
+  }
+});
+
+test("tightens a configured temporary root and runs in a private directory below it", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "inspector-configured-root-"));
+  const configured = join(parent, "module-inspection");
+  await mkdir(configured, { mode: 0o755 });
+  await chmod(configured, 0o755);
+  const runtime = await modeRecordingRuntime();
+  try {
+    const result = await createWorkerdWorkerModuleInspector({
+      repositoryRoot,
+      binary: runtime.binary,
+      temporaryRoot: configured,
+    }).inspect(input([module("worker.mjs", `export default { fetch() {} };`)]));
+
+    expect(result).toEqual({ outcome: "unavailable", retryable: true });
+    expect(await runtime.recorded()).toBe("700");
+    expect((await stat(configured)).mode & 0o7777).toBe(0o700);
+    expect(await readdir(configured)).toEqual([]);
+  } finally {
+    await runtime.remove();
+    await rm(parent, { recursive: true, force: true });
+  }
 });
 
 test("refuses an unprovable byte identity before runtime execution", async () => {

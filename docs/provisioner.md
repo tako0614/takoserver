@@ -1093,9 +1093,14 @@ staged, but it never refuses a write on the customer's behalf.
 Row count, row bytes, and result bytes are bounded inside the plane as the
 managed Durable Object bounds them (10,000 rows, 2 MB per row, 8 MiB per
 result), and enforced while the rows are read rather than after the answer is
-built. A request body must declare its length and stay under 40 MiB.
+built. A request body stays under 40 MiB. KV and Queue bodies must declare their
+length. A SQL body may instead arrive with `Transfer-Encoding: chunked` and no
+length, because the generated facade streams its SQL envelope; the plane counts
+the bytes as they arrive and refuses the call as `backend_unavailable` as soon
+as the count passes 40 MiB. A length beside a transfer coding, or any coding
+but `chunked`, is refused before the body is read.
 
-That last number is also the ceiling on a KV value in practice. `edge.kv`
+The 40 MiB request ceiling is also the ceiling on a KV value in practice. `edge.kv`
 permits 25 MiB, values cross this seam base64-encoded, and base64 is 4 bytes per
 3: a full 25 MiB value is about 33.3 MiB of body against the 40 MiB request cap
 and the same response cap, so the largest permitted value fits with room to

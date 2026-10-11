@@ -4,10 +4,18 @@ import { referencesForWorkerEndpoint } from "./forms/worker-references.ts";
 import {
   parseWorkerEndpointSpec,
   validateWorkerEndpointUpdate,
+  WORKER_DEPLOYMENT_FORM_URL,
   WORKER_ENDPOINT_FORM_URL,
+  WORKER_VERSION_FORM_URL,
   WorkerFormValidationError,
 } from "./forms/worker-specs.ts";
-import { TakoformV2Error, type V2BackendResult, type V2Execution, type V2Form } from "./types.ts";
+import {
+  TakoformV2Error,
+  type V2AdmissionPredicate,
+  type V2BackendResult,
+  type V2Execution,
+  type V2Form,
+} from "./types.ts";
 import { exactV2WorkerPublicationIdentity } from "./worker-deployment-backend.ts";
 import type {
   V2WorkerPublicationResolution,
@@ -55,6 +63,79 @@ const unknown = (): V2BackendResult => ({
   code: "worker_endpoint_unconfirmed",
   message: "The assigned HTTPS endpoint or route is not yet confirmed",
 });
+
+/**
+ * Form-defined refusals, settled `failed` with effect `none`. The SQL reader
+ * returns them only before any native send could be made for this Operation
+ * (see V2WorkerPublicationResolution), so nothing it published can arrive.
+ */
+const refusals = {
+  deployment_missing: {
+    kind: "no_effect",
+    code: "worker_deployment_missing",
+    message:
+      "The Worker has no active WorkerDeployment, so nothing was published. Create the WorkerDeployment, then re-apply or re-create this WorkerEndpoint.",
+  },
+  fetch_unavailable: {
+    kind: "no_effect",
+    code: "worker_fetch_handler_missing",
+    message:
+      "Every weighted Worker Version of the active WorkerDeployment must declare fetch or serve assets; nothing was published.",
+  },
+} as const satisfies Record<string, V2BackendResult>;
+
+const admissionDetail =
+  "A WorkerEndpoint needs its Worker's active WorkerDeployment, not being deleted, whose every weighted WorkerVersion declares fetch or serves assets, and no other WorkerEndpoint on that Worker. Create the WorkerDeployment first, then send this request again.";
+
+/**
+ * WorkerEndpoint 0.3.0 verifies before any effect that the Worker's active
+ * Deployment answers HTTP and that the Worker has no other Endpoint. This
+ * predicate runs inside the Resource/Operation acceptance statement, so a
+ * refused request stores nothing and an Endpoint is never queued ahead of its
+ * Worker's Deployment. Execution re-checks the exact graph under its claim.
+ */
+function endpointAdmission(input: {
+  readonly principal: string;
+  readonly space: string;
+  readonly resourceUid: string;
+  readonly spec: unknown;
+}): V2AdmissionPredicate {
+  const workerUid = parseWorkerEndpointSpec(input.spec).worker.resourceUid;
+  return {
+    sql: `EXISTS (SELECT 1 FROM tf_v2_resources deployment
+        WHERE deployment.form_url = ? AND deployment.principal = ? AND deployment.space = ?
+          AND deployment.deleted_at IS NULL AND deployment.phase <> 'deleting'
+          AND deployment.observed_generation >= 1
+          AND json_extract(deployment.spec_json, '$.worker.resourceUid') = ?
+          AND json_extract(deployment.observed_json, '$.active') = 1
+          AND json_extract(deployment.observed_json, '$.ready') = 1
+          AND NOT EXISTS (SELECT 1 FROM json_each(deployment.spec_json, '$.versions') selected
+            WHERE NOT EXISTS (SELECT 1 FROM tf_v2_resources version
+              WHERE version.uid = json_extract(selected.value, '$.workerVersion.resourceUid')
+                AND version.form_url = ? AND version.principal = deployment.principal
+                AND version.space = deployment.space AND version.deleted_at IS NULL
+                AND (EXISTS (SELECT 1 FROM json_each(version.spec_json, '$.handlers') handler
+                      WHERE handler.value = 'fetch')
+                  OR json_type(version.spec_json, '$.assets') = 'object'))))
+      AND NOT EXISTS (SELECT 1 FROM tf_v2_resources other
+        WHERE other.form_url = ? AND other.principal = ? AND other.space = ?
+          AND other.deleted_at IS NULL AND other.uid <> ?
+          AND json_extract(other.spec_json, '$.worker.resourceUid') = ?)`,
+    params: [
+      WORKER_DEPLOYMENT_FORM_URL,
+      input.principal,
+      input.space,
+      workerUid,
+      WORKER_VERSION_FORM_URL,
+      WORKER_ENDPOINT_FORM_URL,
+      input.principal,
+      input.space,
+      input.resourceUid,
+      workerUid,
+    ],
+    detail: admissionDetail,
+  };
+}
 
 function assignedAddress(hostname: unknown): AssignedAddress | null {
   if (typeof hostname !== "string" || !hostnamePattern.test(hostname)) return null;
@@ -149,7 +230,19 @@ export function createWorkerEndpointForm(options: {
     // The SQL reader owns the exact Operation/lease/backendKey, immutable UID,
     // sealed reference, accepted output, and complete active Worker graph.
     const before = await options.publicationState.resolve({ execution });
-    if (before.kind !== "ready" || !matchesExecution(before.snapshot, execution)) return unknown();
+    if (before.kind !== "ready") {
+      // An Endpoint accepted without an HTTP-serving Deployment (before this
+      // was refused at acceptance, or across a race) settles without effect,
+      // so it no longer holds the Worker's publication queue. DELETE has no
+      // such precondition: it removes the route with or without a Deployment.
+      if (
+        execution.action !== "delete" &&
+        (before.code === "deployment_missing" || before.code === "fetch_unavailable")
+      )
+        return refusals[before.code];
+      return unknown();
+    }
+    if (!matchesExecution(before.snapshot, execution)) return unknown();
     if (!(await before.stillCurrent())) return unknown();
     const address = acceptedAddress(before.snapshot);
     if (!address) return unknown();
@@ -309,6 +402,14 @@ export function createWorkerEndpointForm(options: {
     references(spec) {
       try {
         return referencesForWorkerEndpoint(parseWorkerEndpointSpec(spec));
+      } catch (error) {
+        if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
+        throw error;
+      }
+    },
+    async prepareAdmission(input) {
+      try {
+        return endpointAdmission(input);
       } catch (error) {
         if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
         throw error;

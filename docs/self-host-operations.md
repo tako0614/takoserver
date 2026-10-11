@@ -38,35 +38,71 @@ A self-host runs one of two profiles, selected by configuration:
 - Linux x86-64 with `/proc`, `/bin/sh` and `/usr/bin/setpriv`. The Worker
   runtime supports only this platform. The artifact CLI in step 6 also reads
   `/proc` to prove that the Host is stopped.
-- Bun at the version in `.bun-version` (currently 1.4.0). The examples below
-  also use `curl` and `jq`.
+- `git`, `curl`, `jq`, `unzip` (for the Bun installer) and `ca-certificates`.
+  On Debian or Ubuntu, as root:
+  `apt-get install --no-install-recommends git curl jq unzip ca-certificates`.
 - A dedicated user, for example `takoserver`, that runs the Host and every
   operator command in this guide. The data root and private key directories
-  must belong to that user.
-- For the complete local Worker profile, two native binaries:
+  must belong to that user. For example, as root:
+
+  ```sh
+  useradd --system --user-group --home-dir /var/lib/takoserver --no-create-home \
+    --shell /usr/sbin/nologin takoserver
+  ```
+
+  With that login shell, run the commands this guide gives as the
+  `takoserver` user in `runuser -u takoserver -- bash`.
+- The reviewed source commit, checked out where root owns it and the
+  `takoserver` user can only read it, for example as root:
+
+  ```sh
+  git clone https://github.com/tako0614/takoserver /opt/takoserver
+  git -C /opt/takoserver checkout --detach <reviewed-commit>
+  ```
+
+- Bun at the version in `.bun-version` (currently 1.4.0), installed where the
+  `takoserver` user can run it. The installer's default location is the
+  installing user's home, which `takoserver` cannot read when root runs it. As
+  root, this installs `/usr/local/bin/bun`, the path the wrapper script of
+  step 3 runs:
+
+  ```sh
+  curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash -s bun-v1.4.0
+  ```
+
+- For the complete local Worker profile, two native binaries. Install both
+  outside the checkout, where only an administrator can replace them, for
+  example in `/usr/local/libexec/takoserver` (`install -d -m 0755
+  /usr/local/libexec/takoserver` as root):
   - The pinned closed-graph `workerd` artifact. Build it with
     `bun run build:workerd` as described in
-    [the closed-graph workerd artifact](../workerd/README.md), or download the
-    artifact of the manual `workerd-closed-graph-build` workflow run for the
-    reviewed commit. `sha256sum` must print
+    [the closed-graph workerd artifact](../workerd/README.md); the build needs
+    Bazel and a pinned clang and takes hours. The manual
+    `workerd-closed-graph-build` workflow can build it on GitHub, but its
+    artifact exists only for a run that succeeded for the reviewed commit,
+    can be downloaded only by a signed-in GitHub user, and expires with the
+    run's artifact retention. On 2026-10-11 no run of that workflow had
+    succeeded, so no downloadable artifact existed. `sha256sum` must print
     `c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52`.
-    Install it where only an administrator can replace it and set
-    `TAKOSERVER_WORKERD_BINARY` to its absolute path. At startup the Host
+    Set `TAKOSERVER_WORKERD_BINARY` to its absolute path. At startup the Host
     checks its digest and closed-graph capability and runs a copy under the
     data root. A missing or different binary disables Worker execution; the
     Host never falls back to the npm `workerd`.
   - The Workflow execution guard, built from the same checkout with the Go
-    version in `services/workflow-execution-guard/go.mod`. Set
-    `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` to its absolute path:
+    toolchain named on the `toolchain` line of
+    `services/workflow-execution-guard/go.mod` (currently go1.26.9, from
+    <https://go.dev/dl/>). Set `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` to
+    its absolute path. As root:
 
     ```sh
-    cd services/workflow-execution-guard
-    go build -o /opt/takoserver/bin/workflow-execution-guard ./cmd/workflow-execution-guard
+    cd /opt/takoserver/services/workflow-execution-guard
+    go build -o /usr/local/libexec/takoserver/workflow-execution-guard ./cmd/workflow-execution-guard
     ```
 
-Install the locked dependencies in the reviewed checkout:
+Install the locked dependencies in the reviewed checkout, as root:
 
 ```sh
+cd /opt/takoserver
 bun install --frozen-lockfile
 ```
 
@@ -178,17 +214,30 @@ done
 bun -e 'console.log(Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url"))'
 ```
 
-Keep the environment in a file that only the `takoserver` user can read,
-because it holds the cursor key. Single quotes keep the JSON values intact
-both for a shell and for systemd `EnvironmentFile=`:
+Keep the environment in a file owned by root, group `takoserver`, mode 0640,
+like the TLS key. It holds the cursor key, so only that group may read it;
+step 6 sources it as the `takoserver` user. The Host's user must not be able
+to change it: the wrapper below reads it at every start, so a Host whose
+tenant code escaped the sandbox could otherwise change the next start's
+configuration or the commands that start runs. As root, create the file and
+the TLS directory, then write the file with the cursor key printed above:
 
 ```sh
-# /etc/takoserver/takoserver.env (owner takoserver, mode 0600)
+install -d -m 0755 /etc/takoserver
+install -m 0640 -o root -g takoserver /dev/null /etc/takoserver/takoserver.env
+install -d -m 0750 -o root -g takoserver /etc/takoserver/tls
+# then: install -m 0640 -o root -g takoserver <certificate> <key> /etc/takoserver/tls/
+```
+
+Single quotes keep the JSON values intact when a shell sources the file:
+
+```sh
+# /etc/takoserver/takoserver.env (owner root, group takoserver, mode 0640)
 TAKOSERVER_PUBLIC_ORIGIN=https://api.example.com:8443
 TAKOSERVER_DATA_ROOT=/var/lib/takoserver
 TAKOSERVER_TAKOFORM_V2_CURSOR_KEY=<the 43 characters printed above>
-TAKOSERVER_WORKERD_BINARY=/opt/takoserver/bin/workerd-c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52
-TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY=/opt/takoserver/bin/workflow-execution-guard
+TAKOSERVER_WORKERD_BINARY=/usr/local/libexec/takoserver/workerd-c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52
+TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY=/usr/local/libexec/takoserver/workflow-execution-guard
 TAKOSERVER_V2_WORKER_RUNTIME_BOOT='{"actor":true,"workflow":{"maximumRegistrations":64}}'
 TAKOSERVER_V2_WORKER_PRIVATE_PLANES='{"sqlite":{"privatePort":28101,"signingKeyFile":"/var/lib/takoserver/plane-keys/sqlite.key","stagingRoot":"/var/lib/takoserver/sqlite-staging"},"kv":{"privatePort":28102,"signingKeyFile":"/var/lib/takoserver/plane-keys/kv.key"},"objectBucket":{"privatePort":28103,"signingKeyFile":"/var/lib/takoserver/plane-keys/object-bucket.key"},"queue":{"privatePort":28104,"signingKeyFile":"/var/lib/takoserver/plane-keys/queue.key"},"queueProducer":{"privatePort":28105,"signingKeyFile":"/var/lib/takoserver/plane-keys/queue-producer.key"}}'
 # WorkerEndpoint (step 4)
@@ -215,12 +264,20 @@ Replace the documentation URLs with this deployment's own:
 ```
 
 The service manager starts the Host from the checkout with these lines, for
-example through a small wrapper script:
+example through a small wrapper script that the
+[systemd unit](self-host-security.md#recommended-os-hardening) runs as the
+`takoserver` user. As root:
 
 ```sh
+cat > /usr/local/bin/takoserver-run <<'EOF'
+#!/bin/sh
+cd /opt/takoserver || exit 1
 set -a; . /etc/takoserver/takoserver.env; set +a
 export TAKOSERVER_TAKOFORM_V2_CONFIG="$(cat /etc/takoserver/v2/takoform-v2.json)"
-exec bun --no-env-file src/entry-bun.ts
+exec /usr/local/bin/bun --no-env-file src/entry-bun.ts
+EOF
+chown root:root /usr/local/bin/takoserver-run
+chmod 0755 /usr/local/bin/takoserver-run
 ```
 
 Linux passes at most 131,072 bytes in one environment variable, including its
@@ -262,10 +319,14 @@ policy or firewall. The startup line `takoserver listening on
 covers the listeners in full. The front end terminates HTTPS for
 `TAKOSERVER_PUBLIC_ORIGIN` and must pass the exact public `Host` header;
 `Forwarded` and `X-Forwarded-*` headers never select the authority. With
-Caddy on the same machine, for example:
+Caddy on the same machine, for example (Caddy passes the incoming `Host`
+through unchanged, and the matcher keeps the operational probes of step 9 off
+the public origin, as [Monitoring](#monitoring) recommends):
 
 ```caddyfile
 api.example.com:8443 {
+  @probes path /_takoserver/*
+  respond @probes 404
   reverse_proxy 127.0.0.1:8787
 }
 ```
@@ -287,9 +348,11 @@ Container Endpoint listener.
 
 Because this listener holds 443 on every IPv4 address, a control API front end
 on the same machine needs another port, as in the example origin, or it runs
-on another machine. Without the selection, `WorkerEndpoint` is not advertised;
-the other Worker Forms are unaffected. The listener's local certificate and
-route checks do not prove public DNS, CA trust or reachability. The retained
+on another machine, with `TAKOSERVER_LISTEN_HOST` set to an address that
+machine can reach and the port firewalled as described above. Without the
+selection, `WorkerEndpoint` is not advertised; the other Worker Forms are
+unaffected. The listener's local certificate and route checks do not prove
+public DNS, CA trust or reachability. The retained
 pre-v2 Worker socket settings (`TAKOSERVER_WORKERD_PORT`,
 `TAKOSERVER_WORKER_ENDPOINT_PORT`) described in the README do not apply to
 `WorkerEndpoint 0.3.0`.
@@ -325,9 +388,10 @@ path is active.
 
 Exchange the assertion for a session, create the organization that will own
 Resources, and create an organization API key. The organization's ID is the v2
-Space. Run this step and steps 6 to 9 in one shell as the `takoserver` user,
+Space. Run this step and steps 6 to 11 in one shell as the `takoserver` user,
 from the checkout, because they share the `ORG`, `KEY` and other shell
-variables. Keep their working files in a directory outside the data root: the
+variables. Stop and start the service (step 6) from a separate administrator
+shell, so that this one keeps them. Keep their working files in a directory outside the data root: the
 `takoserver` user's home is often the data root itself. These
 `/v1` session, organization and API-key routes are Takoserver product APIs, not
 the Takoform Host API. Use `resources:read` for read-only checks or
@@ -351,7 +415,8 @@ KEY=$(curl -sS --fail-with-body "$HOST/v1/organizations/$ORG/api-keys" \
   jq -r .secret)
 ```
 
-A client that already has an organization reads its ID from `GET /v1/me`.
+A client that already has an organization reads its ID from `GET /v1/me`
+with its session token; that route refuses an organization API key.
 Then check the unauthenticated v2 discovery and the Host's readiness:
 
 ```sh
@@ -494,37 +559,72 @@ accepts an Operation, which is polled until it is terminal. Set `space` to the
 organization ID and send an `Idempotency-Key` of 16 to 128 characters; sending
 the same request with the same key again replays the same Operation instead of
 creating a second Resource. Each Form's published contract defines its spec;
-there is no generic body that applies to every Form. This helper creates one
-Resource and prints its UID:
+there is no generic body that applies to every Form. These helpers wait for an
+Operation, printing its `error` when it does not succeed, and create one
+Resource and print its UID:
 
 ```sh
+wait_operation() { # wait_operation <operation-id> <label>
+  for _ in $(seq 120); do
+    operation=$(curl -sS --fail-with-body "$V2/operations/$1" \
+      -H "authorization: Bearer $KEY") || { echo "$2: $operation" >&2; return 1; }
+    case $(printf '%s' "$operation" | jq -r .status) in
+      succeeded) return 0 ;;
+      failed) echo "$2: Operation $1 failed: $(printf '%s' "$operation" | jq -c .error)" >&2
+        return 1 ;;
+    esac
+    sleep 1
+  done
+  echo "$2: Operation $1 is still $(printf '%s' "$operation" | jq -c '{status, error}')" >&2
+  return 1
+}
 create() { # create <form> <name> <spec-json>
   accepted=$(jq -n --arg form "$F/$1/" --arg space "$ORG" --arg name "$2" --argjson spec "$3" \
       '{$form, $space, $name, $spec}' |
     curl -sS --fail-with-body "$V2/resources" -H "authorization: Bearer $KEY" \
       -H 'content-type: application/json' -H "idempotency-key: takoserver-first-use-$2" \
-      --data @-) || return 1
-  operation=$(printf '%s' "$accepted" | jq -r .id)
-  for _ in $(seq 120); do
-    status=$(curl -sS --fail-with-body "$V2/operations/$operation" \
-      -H "authorization: Bearer $KEY" | jq -r .status)
-    case $status in
-      succeeded) printf '%s' "$accepted" | jq -r .resourceUid; return 0 ;;
-      failed) echo "$2: Operation $operation failed" >&2; return 1 ;;
-    esac
-    sleep 1
-  done
-  echo "$2: Operation $operation is still $status" >&2; return 1
+      --data @-) || { echo "$2: $accepted" >&2; return 1; }
+  wait_operation "$(printf '%s' "$accepted" | jq -r .id)" "$2" || return 1
+  printf '%s' "$accepted" | jq -r .resourceUid
 }
-WORKER=$(create ModuleWorker/0.3.0 hello '{}')
-BUNDLE=$(create WorkerBundle/0.2.0 hello-bundle-v1 "$(jq -c '{artifact}' "$WORK/hello-v1.json")")
+WORKER=$(create ModuleWorker/0.3.0 hello '{}') &&
+BUNDLE=$(create WorkerBundle/0.2.0 hello-bundle-v1 "$(jq -c '{artifact}' "$WORK/hello-v1.json")") &&
 VERSION=$(create WorkerVersion/0.5.0 hello-version-v1 "$(jq -nc --arg w "$WORKER" --arg b "$BUNDLE" \
-  '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"]}')")
+  '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"]}')") &&
 DEPLOYMENT=$(create WorkerDeployment/0.4.0 hello-deployment "$(jq -nc --arg w "$WORKER" --arg v "$VERSION" \
-  '{worker: {resourceUid: $w}, versions: [{workerVersion: {resourceUid: $v}, weight: 10000}]}')")
+  '{worker: {resourceUid: $w}, versions: [{workerVersion: {resourceUid: $v}, weight: 10000}]}')") &&
 ENDPOINT=$(create WorkerEndpoint/0.3.0 hello-endpoint "$(jq -nc --arg w "$WORKER" \
   '{worker: {resourceUid: $w}}')")
 ```
+
+The `&&` chain stops at the first create that does not succeed, so no later
+Resource is created with an empty reference. What to do next depends on where
+it stopped:
+
+- **The POST was refused** (the helper prints a `4xx` problem). Nothing was
+  stored for that request. Fix the cause and run the chain again: the creates
+  that already succeeded replay their Operations under the same idempotency
+  keys and print the same UIDs.
+- **An accepted Operation failed, or is still not `succeeded` after the
+  helper's two minutes.** Running the chain again does not retry it. For 24
+  hours the same key replays that same Operation, a changed request under the
+  same key is refused with `409 idempotency_conflict`, and a Resource name is
+  unique within the Space across all Forms. Because the helper derives each
+  key from the name, fix the cause and create the whole chain again under new
+  names, for example with `-2` appended to each name. Delete the old Resources
+  with step 11 once nothing references them.
+
+A WorkerVersion, Deployment or Endpoint Operation that cannot finish stays
+`reconciling` and retries; it writes nothing to the Host's output, so the
+`error` the helper prints is the only diagnostic.
+
+Keep this order. An Endpoint requested before its Worker's Deployment has
+succeeded is refused with `409 dependency_conflict` (its `detail` names the
+missing Deployment) and nothing is stored, so run the chain again once the
+Deployment succeeded. With OpenTofu, make the Endpoint `depends_on` its
+Deployment so they are not created in parallel. An Endpoint that an earlier
+Host accepted out of order settles `failed` (`worker_deployment_missing`)
+after the upgrade; delete it or re-apply it.
 
 Read any Resource back with
 `GET /apis/forms.takoform.com/v2/resources/{resourceUid}` using the same key.
@@ -544,26 +644,36 @@ The Endpoint answers with the Worker's response, and readiness reports
 pass sections. A restart keeps serving published Workers without a client
 republish.
 
-To ship new code, seed the new bytes under a new base URL (stop, seed, start),
-create a new `WorkerBundle` and `WorkerVersion`, then replace the Deployment's
-spec. A `PUT` names the Deployment's current `generation`, read from
-`GET /resources/{resourceUid}`:
+To ship new code, seed the new bytes under a new base URL as in step 6: stop
+the Host, put the new files in `$WORK/hello/v2`, seed them, and start it again:
 
 ```sh
-BUNDLE_V2=$(create WorkerBundle/0.2.0 hello-bundle-v2 "$(jq -c '{artifact}' "$WORK/hello-v2.json")")
+bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle "$WORK/hello/v2" \
+  --base-url https://artifacts.example.com/hello/v2/ \
+  --organization "$ORG" --entrypoint worker.js \
+  --config /etc/takoserver/v2/takoform-v2.json > "$WORK/hello-v2.json"
+```
+
+Then create a new `WorkerBundle` and `WorkerVersion` and replace the
+Deployment's spec. A `PUT` names the Deployment's current `generation`, read
+from `GET /resources/{resourceUid}`:
+
+```sh
+BUNDLE_V2=$(create WorkerBundle/0.2.0 hello-bundle-v2 "$(jq -c '{artifact}' "$WORK/hello-v2.json")") &&
 VERSION_V2=$(create WorkerVersion/0.5.0 hello-version-v2 "$(jq -nc --arg w "$WORKER" --arg b "$BUNDLE_V2" \
-  '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"]}')")
+  '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"]}')") &&
 GENERATION=$(curl -sS --fail-with-body "$V2/resources/$DEPLOYMENT" \
-  -H "authorization: Bearer $KEY" | jq -r .generation)
-jq -nc --arg w "$WORKER" --arg v "$VERSION_V2" \
+  -H "authorization: Bearer $KEY" | jq -r .generation) &&
+updated=$(jq -nc --arg w "$WORKER" --arg v "$VERSION_V2" \
     '{spec: {worker: {resourceUid: $w}, versions: [{workerVersion: {resourceUid: $v}, weight: 10000}]}}' |
   curl -sS --fail-with-body -X PUT "$V2/resources/$DEPLOYMENT" \
     -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
     -H 'idempotency-key: takoserver-hello-deployment-v2' \
-    -H "takoform-expected-generation: $GENERATION" --data @- | jq -r .id
+    -H "takoform-expected-generation: $GENERATION" --data @-) &&
+wait_operation "$(printf '%s' "$updated" | jq -r .id)" hello-deployment-v2
 ```
 
-Poll that Operation as in step 8. `tests/selfhost-v2-ordinary-journey-native.test.ts`
+`tests/selfhost-v2-ordinary-journey-native.test.ts`
 runs this path with real Host and workerd processes and seeds through the same
 command; [the ordinary journey native test](#ordinary-journey-native-test-and-known-gaps)
 describes its scope and limits.
@@ -632,12 +742,119 @@ distinct. `GET /healthz` on the Cloudflare Worker entry is a separate runtime
 surface; these Bun-only diagnostics do not change that entry or the shared
 OpenAPI contract.
 
+### 10. Bind a SQLite database
+
+A Worker reaches a database only through a `sqliteBindings` entry of its
+WorkerVersion. The Binding offers `execute`, `query` and `transaction`; it
+cannot change the schema. Schema changes come from a
+`SQLiteMigrationApplication`, which applies a seeded `SQLiteMigrationSet` to
+an `SQLiteDatabase`. The published Forms define each spec:
+[WorkerVersion 0.5.0](https://edge.forms.takoform.com/forms/WorkerVersion/0.5.0/),
+[SQLiteDatabase 0.2.0](https://edge.forms.takoform.com/forms/SQLiteDatabase/0.2.0/)
+and [SQLiteMigrationApplication 0.2.0](https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/0.2.0/).
+
+`sqlite-migration-set` accepts only `.sql` files and applies them in the byte
+order of their paths. The first `seed --config` of a migration set adds the
+`sqliteMigrationSet` block, which composes `SQLiteMigrationApplication 0.2.0`.
+Stop the Host, then seed the migrations and a bundle whose code uses the
+Binding, here named `DB`:
+
+```sh
+mkdir -p -m 0700 "$WORK/migrations/v1" "$WORK/hello/v3"
+cat > "$WORK/migrations/v1/0001_greeting.sql" <<'EOF'
+CREATE TABLE greeting (value TEXT NOT NULL);
+INSERT INTO greeting VALUES ('from sqlite');
+EOF
+cat > "$WORK/hello/v3/worker.js" <<'EOF'
+export default {
+  async fetch(request, env) {
+    const result = await env.DB.query("SELECT value FROM greeting ORDER BY rowid");
+    return new Response("hello " + result.rows.map((row) => row.value).join(",") + "\n");
+  }
+};
+EOF
+bun --no-env-file scripts/selfhost-artifact.ts seed sqlite-migration-set "$WORK/migrations/v1" \
+  --base-url https://artifacts.example.com/migrations/v1/ \
+  --organization "$ORG" --config /etc/takoserver/v2/takoform-v2.json > "$WORK/migrations-v1.json"
+bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle "$WORK/hello/v3" \
+  --base-url https://artifacts.example.com/hello/v3/ \
+  --organization "$ORG" --entrypoint worker.js \
+  --config /etc/takoserver/v2/takoform-v2.json > "$WORK/hello-v3.json"
+```
+
+Start the Host and check support for `SQLiteDatabase/0.2.0`,
+`SQLiteMigrationSet/0.2.0` and `SQLiteMigrationApplication/0.2.0` as in step 7.
+Then create the database, apply the migrations, and ship the bundle as in
+step 9 with the Binding in the new Version's spec:
+
+```sh
+DATABASE=$(create SQLiteDatabase/0.2.0 hello-db '{}') &&
+MIGRATIONS=$(create SQLiteMigrationSet/0.2.0 hello-migrations-v1 \
+  "$(jq -c '{artifact}' "$WORK/migrations-v1.json")") &&
+APPLICATION=$(create SQLiteMigrationApplication/0.2.0 hello-migration-application \
+  "$(jq -nc --arg d "$DATABASE" --arg m "$MIGRATIONS" \
+    '{database: {resourceUid: $d}, migrationSet: {resourceUid: $m}}')") &&
+BUNDLE_V3=$(create WorkerBundle/0.2.0 hello-bundle-v3 "$(jq -c '{artifact}' "$WORK/hello-v3.json")") &&
+VERSION_V3=$(create WorkerVersion/0.5.0 hello-version-v3 "$(jq -nc --arg w "$WORKER" \
+  --arg b "$BUNDLE_V3" --arg d "$DATABASE" \
+  '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"],
+    sqliteBindings: [{name: "DB", resource: {resourceUid: $d}}]}')") &&
+GENERATION=$(curl -sS --fail-with-body "$V2/resources/$DEPLOYMENT" \
+  -H "authorization: Bearer $KEY" | jq -r .generation) &&
+updated=$(jq -nc --arg w "$WORKER" --arg v "$VERSION_V3" \
+    '{spec: {worker: {resourceUid: $w}, versions: [{workerVersion: {resourceUid: $v}, weight: 10000}]}}' |
+  curl -sS --fail-with-body -X PUT "$V2/resources/$DEPLOYMENT" \
+    -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+    -H 'idempotency-key: takoserver-hello-deployment-v3' \
+    -H "takoform-expected-generation: $GENERATION" --data @-) &&
+wait_operation "$(printf '%s' "$updated" | jq -r .id)" hello-deployment-v3 &&
+curl -sS "https://$NAME/"
+```
+
+`GET /resources/$APPLICATION` shows `observed.ready: true` and the applied
+entries, and the Endpoint answers `hello from sqlite`.
+
+### 11. Delete Resources
+
+DELETE needs an `Idempotency-Key` and the Resource's current generation, like
+PUT. Without a valid key it is refused with `400`; with one but without
+`takoform-expected-generation`, with `428` `expected_generation_required`. A
+Resource that another Resource still names is refused with `409`
+`dependency_conflict`, so delete in reference order. Leave out the Resources of
+steps 9 and 10 that you did not create:
+
+```sh
+remove() { # remove <resourceUid> <label>
+  generation=$(curl -sS --fail-with-body "$V2/resources/$1" \
+    -H "authorization: Bearer $KEY" | jq -r .generation) || return 1
+  removed=$(curl -sS --fail-with-body -X DELETE "$V2/resources/$1" \
+      -H "authorization: Bearer $KEY" -H "idempotency-key: takoserver-first-use-delete-$2" \
+      -H "takoform-expected-generation: $generation") || { echo "$2: $removed" >&2; return 1; }
+  wait_operation "$(printf '%s' "$removed" | jq -r .id)" "$2"
+}
+remove "$ENDPOINT" endpoint &&
+remove "$DEPLOYMENT" deployment &&
+remove "$VERSION_V3" version-v3 && remove "$VERSION_V2" version-v2 && remove "$VERSION" version-v1 &&
+remove "$BUNDLE_V3" bundle-v3 && remove "$BUNDLE_V2" bundle-v2 && remove "$BUNDLE" bundle-v1 &&
+remove "$APPLICATION" migration-application && remove "$MIGRATIONS" migration-set &&
+remove "$DATABASE" database &&
+remove "$WORKER" worker
+```
+
+Once the Endpoint is deleted its hostname answers `503`, and a deleted
+Resource reads back as `410`. Deleting the Deployment stops the Worker's
+`workerd` children, and deleting the database removes its file under
+`v2-sqlite-databases/`. The Worker's owner directory under
+`v2-worker-owners/` stays after the Worker is deleted. Deleting a Resource does
+not remove the held bytes seeded into the object store, or their entries in
+the config.
+
 ### Container Endpoint HTTPS listener
 
 The opt-in Bun self-host Container lane can own a dedicated HTTPS listener on
 TCP 443 for Container Endpoint traffic. It is Container-only: it does not front
 the Bun control listener, route Worker endpoints, or change the existing
-Workerd-owned Worker TLS behavior described by [ADR 0009](../adr/0009-a-self-host-publishes-the-scheme-its-socket-serves.md).
+Workerd-owned Worker TLS behavior described by [ADR 0009](adr/0009-a-self-host-publishes-the-scheme-its-socket-serves.md).
 Do not configure the Bun control listener or Workerd on port 443 at the same
 time. When the Container Endpoint lane is explicitly enabled, the Host also
 refuses a Worker endpoint port declaration of 443 because this dedicated
@@ -703,7 +920,9 @@ the same operator-controlled process supervisor and protected configuration
 when selecting which checkout to run; this guide does not prescribe a service
 manager or its unit-file layout.
 
-For each update, first make the cold snapshot described below. Stop the Bun
+If an earlier build ran as root, check `/tmp` first, as described under
+[`/tmp` left at mode 0700](#ordinary-journey-native-test-and-known-gaps). For
+each update, first make the cold snapshot described below. Stop the Bun
 Host and all child/workload writers, deploy the selected source checkout and
 locked dependencies, then start that exact version under the existing
 protected configuration. Startup can apply forward SQLite migrations and
@@ -975,6 +1194,8 @@ Paths such as `objects/`, `databases/`, `workers/`, `selfhost/`,
 `v2-worker-owners/`, `v2-sqlite-databases/`, `v2-kv-namespaces/`,
 `v2-object-buckets/` and `runtime-probes/` are implementation details;
 retaining the whole root also retains paths added by later versions.
+`runtime-probes/` holds the verified copy of the `workerd` binary, so even an
+almost empty installation's copy is about 270 MB.
 
 `TAKOSERVER_DB` can put `control.sqlite` outside the data root. If it is set,
 that exact database is part of the backup set too. A backup is incomplete if
@@ -1150,8 +1371,14 @@ with a refused premature delete on the way, and checks the artifact tables,
 the SQLite directory, the workerd children and TCP 443.
 
 This is a local, loopback, single-host result with a self-signed certificate
-and operator-seeded artifact bytes. Its restore is to the same path on the
-same machine. Its TLS files, signing and operator keys are inside the root and
+and operator-seeded artifact bytes. It runs as the invoking user with `HOME`
+and `TMPDIR` inside the data root, talks to the control listener directly
+rather than through a TLS front end, and so does not exercise a dedicated
+service user or a shared `/tmp`. A clean-room install on 2026-10-11, in a
+fresh Ubuntu 24.04 container as a dedicated user and following this guide,
+found that every WorkerVersion stayed `reconciling` there because module
+inspection tried to chmod `/tmp`; that is fixed. Its restore is to the same
+path on the same machine. Its TLS files, signing and operator keys are inside the root and
 are lost and restored with it; the environment (paths, port, keyring, v2
 configuration) and the workerd and guard binaries outside the root are
 unchanged. The runtime owner's private socket directory lives under `/tmp`,
@@ -1174,6 +1401,21 @@ its Worker child is physically gone, and only then are its messages redelivered
 once their lease (up to 120 seconds) runs out. After a Host restart the old
 child is gone and that proof is normally available; a sent batch whose
 retirement cannot be proven stays occupied, with no time limit.
+
+**`/tmp` left at mode 0700 by an earlier build.** Before that fix, a build
+that ran as root without `TMPDIR` set and without a private `/tmp` (systemd
+`PrivateTmp=yes`) set the machine's `/tmp` to mode 0700 the first time it
+inspected a Worker module, which locks every other user out of `/tmp`. On such
+a machine, check it as root and restore the standard mode:
+
+```sh
+stat -c %a /tmp     # 1777 is the standard mode
+chmod 1777 /tmp
+```
+
+A build run as a dedicated user could not change `/tmp`; there its
+WorkerVersions stayed `reconciling` instead, and they settle on a later retry
+once inspection can run.
 
 What this test and its neighbours record:
 
@@ -1223,6 +1465,16 @@ What this test and its neighbours record:
     engine's next retry (an owner and backend test). A Host killed while that
     candidate is still being retired boots and settles it the same way (a
     real-Host test).
+  - *Killed inside a state write.* The owner state and each execution group's
+    manifest and retirement receipt are written to a temporary and renamed
+    into place, so a kill that lands inside such a write leaves the temporary
+    behind (`runtime-owner.json.<uuid>.tmp`, or `.retirement-<uuid>` in a
+    group directory). It never became state. A stale-owner takeover discards
+    it before the namespace inventory; earlier releases refused that boot
+    with `ownership_uncertain` on every later start. Only that exact name as a
+    private, singly linked regular file is discarded; a symbolic link, a file
+    other users can read or any other unknown entry is still refused (tests
+    for each).
 
   A Deployment or Endpoint Operation that ends `failed` with effect `none`
   never makes a non-committed graph serve. Until a later Operation of that
@@ -1276,14 +1528,26 @@ What this test and its neighbours record:
   recorded, a dispatched Operation the owner cannot vouch for, and more than
   eight consecutive failed Operations of one attachment (the fence refusal is
   measured; the resulting boot refusal is not). By reading the backends (not
-  measured), a Deployment or Endpoint backend answers `unknown` for every
-  refusal before it reaches the owner (an unresolved graph, a
+  measured), a Deployment or Endpoint backend answers `unknown` for a refusal
+  before it reaches the owner that may still clear (an unresolved graph, a
   `publication_conflict`), so such an Operation stays `reconciling` and keeps
   retrying: boot is not blocked, because the owner vouches it never served,
   but the Worker's Endpoint is not served until the Operation is settled.
   Once it has been pending for ten minutes of Host uptime, readiness counts it
   under `backlog.operations.reconciling` and reports `degraded` (see
-  [Monitoring](#monitoring)).
+  [Monitoring](#monitoring)). A refusal of the Operation's own precondition
+  settles instead, `failed` with effect `none` (engine tests with the real
+  Deployment and Endpoint backends pin this). An Endpoint create or update
+  whose Worker has no active Deployment fails with `worker_deployment_missing`.
+  One whose weighted Versions declare neither `fetch` nor assets, or a
+  Deployment change that would leave an attached Endpoint with such a Version,
+  fails with `worker_fetch_handler_missing`. Later Operations for the Worker
+  then no longer wait behind it, and the failed Resource can be deleted or
+  re-applied.
+  An Endpoint without such a Deployment is now refused at acceptance with
+  `409 dependency_conflict` and a `detail` that names the missing Deployment
+  (measured on the native Endpoint lane), so an Endpoint reaches this path
+  only if an earlier Host accepted it.
 
 Three other gaps this test first recorded have since been fixed, each with its own
 test:

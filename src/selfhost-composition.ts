@@ -837,3 +837,21 @@ export function selfhostWorkerEndpointPublication(input: {
       `${remedy.charAt(0).toUpperCase()}${remedy.slice(1)}`,
   };
 }
+
+/**
+ * The boot line for {@link selfhostWorkerEndpointPublication}, if any.
+ *
+ * That note is about the retained pre-v2 `WorkerEndpoint@0.1.0` socket. With
+ * the v2 Endpoint HTTPS listener selected (`TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1`)
+ * it is not printed: `WorkerEndpoint 0.3.0` is served by that listener, and
+ * both remedies the note names (`TAKOSERVER_WORKERD_PORT=443` or
+ * `TAKOSERVER_WORKER_ENDPOINT_PORT=443`) are refused next to it at startup. It
+ * would tell an operator who configured Worker endpoints correctly that none
+ * can be created, and how to make startup fail.
+ */
+export function selfhostWorkerEndpointBootNote(
+  publication: { readonly diagnostic?: string },
+  v2WorkerEndpointHttpsSelected: boolean,
+): string | undefined {
+  return v2WorkerEndpointHttpsSelected ? undefined : publication.diagnostic;
+}

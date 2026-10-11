@@ -115,6 +115,11 @@ export interface V2AdmissionPredicate {
   readonly params: readonly SqlParam[];
   /** Failure classification for this predicate only; omitted preserves conflict. */
   readonly conflictCode?: "dependency_conflict" | "resource_busy";
+  /**
+   * Trusted, secret-free Problem `detail` for a `dependency_conflict` refusal by
+   * this predicate: it names what the Form requires. Never request values.
+   */
+  readonly detail?: string;
 }
 
 export interface V2Form {
@@ -224,6 +229,8 @@ export class TakoformV2Error extends Error {
     readonly status: number,
     message = code,
     readonly operationId?: string,
+    /** Optional secret-free Problem `detail`, from a trusted constant only. */
+    readonly detail?: string,
   ) {
     super(message);
     this.name = "TakoformV2Error";

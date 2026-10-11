@@ -80,8 +80,21 @@ export function createWorkerDeploymentForm(options: {
     // Space, accepted spec, sealed references, and current graph. The returned
     // snapshot is never a caller-provided desired-state authority.
     const before = await options.publicationState.resolve({ execution });
-    if (before.kind !== "ready" || !matchesExecution(before.snapshot, execution, spec))
+    if (before.kind !== "ready") {
+      // WorkerDeployment 0.4.0 must not activate a selection that leaves an
+      // attached Endpoint without HTTP. The reader refuses this before any
+      // native send could be made for the Operation, so it settles without
+      // effect instead of holding the Worker's publication queue.
+      if (execution.action !== "delete" && before.code === "fetch_unavailable")
+        return {
+          kind: "no_effect",
+          code: "worker_fetch_handler_missing",
+          message:
+            "The Worker has a WorkerEndpoint, so every selected Worker Version must declare fetch or serve assets",
+        };
       return unknown();
+    }
+    if (!matchesExecution(before.snapshot, execution, spec)) return unknown();
     if (!(await before.stillCurrent())) return unknown();
 
     let attachment: Extract<

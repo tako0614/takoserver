@@ -372,7 +372,7 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
 
     let body: unknown;
     try {
-      body = JSON.parse(await boundedText(request));
+      body = JSON.parse(await boundedText(request, sql ? "declared-or-chunked" : "declared"));
     } catch {
       return refusal("backend_unavailable", 400);
     }
@@ -678,22 +678,76 @@ function constantTimeEqual(left: string, right: string): boolean {
 }
 
 /**
- * The body, or a refusal before a byte of it is read.
+ * The body, read under a ceiling this process counts itself.
  *
- * A declared length is required rather than merely respected. Without one the
- * only ceiling is the server's own, the caller decides how long this process
- * spends reading, and the check that follows happens after the bytes have
- * already crossed. Everything that legitimately reaches this plane is a fixed
- * JSON envelope a workerd service sent, and workerd declares its length.
+ * Two framings legitimately reach this plane, and neither lets the caller
+ * decide how much this process buffers:
+ *
+ * - KV and Queue envelopes arrive with a declared length, because the
+ *   generated data service buffers them before forwarding. The length is
+ *   required on those routes, checked against the ceiling before a byte is
+ *   read, and must equal what actually arrives.
+ * - A SQL envelope is streamed. The generated wrapper serializes it in bounded
+ *   fragments (SQL's published limits are per statement and value, not one
+ *   aggregate size) and the data service forwards that stream, so workerd
+ *   sends it chunked with no declared length. The SQL route therefore also
+ *   accepts exactly `Transfer-Encoding: chunked` with no Content-Length beside
+ *   it, and stops reading the moment the running count passes the ceiling.
+ *
+ * Any other framing is refused before the body is touched: a length beside a
+ * transfer coding is the ambiguity request smuggling is built on, and any
+ * coding but plain `chunked` is one this plane would have to trust the
+ * listener to have decoded. Bun's parser refuses both on the wire already;
+ * refusing them here keeps this check from depending on that.
  */
-async function boundedText(request: Request): Promise<string> {
-  const declared = request.headers.get("content-length");
-  if (declared === null || !/^\d+$/u.test(declared) || Number(declared) > MAX_REQUEST_BYTES) {
+async function boundedText(
+  request: Request,
+  framing: "declared" | "declared-or-chunked",
+): Promise<string> {
+  const declaredText = request.headers.get("content-length");
+  const transferEncoding = request.headers.get("transfer-encoding");
+  let declared: number | undefined;
+  if (transferEncoding !== null) {
+    if (
+      framing !== "declared-or-chunked" ||
+      declaredText !== null ||
+      transferEncoding.trim().toLowerCase() !== "chunked"
+    ) {
+      throw new PlaneError("backend_unavailable");
+    }
+  } else {
+    if (declaredText === null || !/^\d+$/u.test(declaredText)) {
+      throw new PlaneError("backend_unavailable");
+    }
+    declared = Number(declaredText);
+    if (!Number.isSafeInteger(declared) || declared > MAX_REQUEST_BYTES) {
+      throw new PlaneError("backend_unavailable");
+    }
+  }
+  const limit = declared ?? MAX_REQUEST_BYTES;
+  if (request.body === null) {
+    if (declared === 0) return "";
     throw new PlaneError("backend_unavailable");
   }
-  const raw = await request.text();
-  if (utf8Length(raw) > Number(declared)) throw new PlaneError("backend_unavailable");
-  return raw;
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        await reader.cancel().catch(() => undefined);
+        throw new PlaneError("backend_unavailable");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (declared !== undefined && size !== declared) throw new PlaneError("backend_unavailable");
+  return new TextDecoder().decode(Buffer.concat(chunks, size));
 }
 
 /** The vector envelope is JSON; keep malformed/oversized bodies in its own error vocabulary. */
