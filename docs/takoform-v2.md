@@ -988,17 +988,34 @@ without adding another frontend or Resource ledger.
 
 ## Existing installations
 
-The additive v2 tables do not convert or delete existing v1 records. Preserving
-those records during source development is not a commitment to serve both Host
-API versions. The normal router removes the old Takoform HTTP entry rather than
-introducing a v2-to-v1 translator. Independent login, Console and standard-service
-APIs are separate and are not removed because their path contains `v1`.
+The additive v2 tables do not convert or delete existing v1 records. Keeping
+those records is not a commitment to serve both Host API versions. The normal
+router removes the old Takoform HTTP entry rather than introducing a v2-to-v1
+translator. Independent login, Console and standard-service APIs are separate
+and are not removed because their path contains `v1`.
 
-Before an installation switches, its operator must account for existing
-Resources, pending or uncertain Operations, provider state and old writers.
-Their treatment and the recovery route must be explicit; an unknown operation
-must not silently become a new create. No live migration, deployment or data
-deletion follows from adding this source module.
+A Bun self-host installation of the published v1.0.0 release is not upgraded in
+place once it has been used. The Bun Host reads the control database before any
+migration writes to it. It refuses a database that records wallet ledger
+history, a v1 Takoform Resource or a v1 provider Deployment that was not
+deleted, and it leaves that database unchanged. An unused v1.0.0 database keeps
+migrating. The supported route is a fresh install alongside:
+
+- make a cold copy of the v1.0.0 data root and otherwise leave it intact;
+- start this version on a new, empty data root;
+- recreate the v1 Resources through the v2 API.
+
+The v1.0.0 release can keep running on its old root for as long as its
+Resources or data are needed.
+[Upgrading from v1.0.0](self-host-operations.md#upgrading-from-v100) gives the
+procedure and separates what was measured from what was not.
+
+Any other existing installation, such as one built from unreleased source or
+one on the Worker entry, needs its operator to account for existing Resources,
+pending or uncertain Operations, provider state and old writers before it
+switches. Their treatment and the recovery route must be explicit; an unknown
+operation must not silently become a new create. No live migration, deployment
+or data deletion follows from adding this source module.
 
 Legacy control-plane helpers, provider implementations and their retained state
 are not a second v2 authority. Their remaining retirement/adoption work is

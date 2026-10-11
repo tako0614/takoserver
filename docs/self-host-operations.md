@@ -324,6 +324,110 @@ forward with a source version that understands it. A cold backup restore is a
 separate recovery operation with source fencing and identity ownership
 requirements below, not a routine code rollback.
 
+## Upgrading from v1.0.0
+
+The published v1.0.0 release (tag `v1.0.0`, the Latest GitHub Release of
+2026-08-20) is a Takoform Host API v1 Host. This source is a Host API v2 Host.
+Moving from v1.0.0 to it is a breaking major upgrade: a v1.0.0 installation
+that has been used is not upgraded in place, and no tool converts its records.
+Install the new version alongside it, on its own data root, and leave the
+v1.0.0 data root as it is.
+
+At startup the Bun Host reads the control database before any migration writes
+to it. It refuses a used v1.0.0 installation: one whose database records
+wallet ledger history (any funding, hold or capture), a v1 Takoform Resource,
+or a v1 provider Deployment that was not deleted. Every v1.0.0 installation
+that created a Resource has ledger history, because the release's only
+Offering, ObjectBucket (`storage.object.standard`, 500 minor units per
+bucket-month), holds and captures funds. The refusal names the data root and
+control database, says that the database is unchanged, links to this section,
+and exits with status 1. It stops before the Host creates keys, sockets or
+runtime probes or opens a listener. A v1.0.0 database that was only booted, or
+only signed in to with Organizations and API keys, and was never funded or used
+for a Resource, keeps migrating in place. The migration keeps its
+Organizations, owner memberships and API key records.
+
+To move to the new version:
+
+1. Stop the v1.0.0 Host and every writer, then make the cold copy described in
+   [Cold snapshot](#cold-snapshot) of the complete v1.0.0 data root. v1.0.0
+   defaults to `.takoserver` relative to its working directory. Also copy
+   `TAKOSERVER_DB` if it was set outside the root. Keep the copy until the
+   v1.0.0 installation is retired.
+2. Prepare the new version in its own checkout, as in
+   [Update and code rollback](#update-and-code-rollback), and configure it as a
+   [first install](#first-install-and-first-use). Give it a new, empty
+   `TAKOSERVER_DATA_ROOT` and, if a separate database is used, a new
+   `TAKOSERVER_DB`. Never point it at the v1.0.0 root. Set the root
+   explicitly: both versions resolve the default `.takoserver` against the
+   working directory, so a shared working directory selects the v1.0.0 root.
+   To run both Hosts on one machine, give them distinct `PORT` and
+   `TAKOSERVER_WORKERD_PORT` values; both versions default to 8787 and 8788.
+3. Sign in to the new Host and create the Organizations that will own
+   Resources. Each Organization ID is a v2 Space. Mint new API keys. v1.0.0
+   sessions, API keys and wallet balances are not carried over.
+4. Recreate each v1 Resource through the v2 API, using a Form that the new
+   instance reports at
+   `GET /apis/forms.takoform.com/v2/support?form={exact-form-url}`. v1
+   Resources, Operations and provider Deployments are not converted, and the
+   new version does not serve, change or delete them. A v1.0.0 ObjectBucket was
+   reached with S3 credentials from
+   `POST /v1/organizations/{organizationId}/resources/{resourceUid}/s3-credentials`.
+   The v2 `ObjectBucket 0.2.0` is registered only in the complete local Worker
+   composition and is used through Worker bindings (see
+   [Bun self-host Form support](takoform-v2.md#bun-self-host-form-support)).
+   No tool copies objects between them. Read any data you need through v1.0.0
+   while it still runs on the old root.
+5. When nothing depends on the v1.0.0 Host, delete its Resources through the
+   v1.0.0 API so that it releases their provider state, then stop it. A v1.0.0
+   Host that was configured with a Cloudflare account kept its ObjectBuckets in
+   that account, and they stay there until they are deleted.
+
+The old release can still run on the old root. Start the v1.0.0 source (tag
+`v1.0.0`, with its own `bun install --frozen-lockfile`) with the same
+`TAKOSERVER_DATA_ROOT` and configuration as before. A refused start of the new
+version does not prevent this, because the refusal does not write.
+
+Earlier v2 source builds, made before this check existed, did write. On a used
+v1.0.0 root they recorded `0016_takos_id_organization_projection.sql` and then
+stopped with `migration 0017_wallet_credit_lots.sql failed: SQLiteError: CHECK
+constraint failed: valid = 1`. v1.0.0 then refuses that database with "this
+database has migrations this build does not know:
+0016_takos_id_organization_projection.sql". The new version still refuses it as
+a used v1 installation, and its message says that v1.0.0 refuses the file too.
+To run v1.0.0 again, restore the cold copy taken immediately before that
+start, following the fencing in [Restore boundary](#restore-boundary). The
+failed start stopped during migration, before the Host listened, and changed
+nothing but `control.sqlite`, so that copy loses only what 0016 changed.
+Without such a copy there is no supported way to make the file usable by
+v1.0.0 again. Do not delete the record or the tables by hand.
+
+Measured on 2026-10-11 with the v1.0.0 tag and this source, on the local
+self-host provider:
+
+- A v1.0.0 Host was driven over its HTTP API through operator sign-in, an
+  Organization, operator-signed funding, an API key and one ObjectBucket. Its
+  database recorded 0001 to 0015 and three ledger rows (funding, hold and
+  capture). The new version refused it. Every file's bytes and every file and
+  directory mode in the data root were unchanged, and nothing was added.
+- v1.0.0 restarted on that same root and served its Organization, the
+  ObjectBucket and the wallet balance.
+- The new version started on a new, empty root while v1.0.0 ran on the old one,
+  on distinct ports.
+- A booted-only and a signed-in-only v1.0.0 database migrated to the current
+  head.
+- A source build from before this check (commit `4d0d0450`) changed only
+  `control.sqlite` in the used root, recording 0016, and v1.0.0 then refused
+  it.
+- `tests/v1-installation-upgrade-boundary.test.ts` repeats the refusal, the
+  unchanged files and the in-place migration with the committed v1.0.0
+  fixtures.
+
+Not measured: a v1.0.0 Host that used a Cloudflare account or Stripe funding;
+an external `TAKOSERVER_DB` (it goes through the same check); whether v1.0.0
+sessions and API keys still authenticate after an unused database migrates in
+place; and copying object data to a v2 ObjectBucket.
+
 ## Backup and restore preparation
 
 This procedure prepares a cold copy of one Bun self-host installation. It is
