@@ -85,6 +85,11 @@ import {
   discardSelfhostReadinessProbeBody,
   type SelfhostStartupRestoreOutcome,
 } from "./selfhost-health.ts";
+import {
+  formatSelfhostListenAddress,
+  parseSelfhostListenHost,
+  SELFHOST_LISTEN_HOST_VARIABLE,
+} from "./selfhost-listen-address.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
 import {
@@ -92,7 +97,13 @@ import {
   selfhostPrivateSocketRoot,
 } from "./selfhost-socket-layout.ts";
 import { prepareSelfhostSocketRoot, sweepSelfhostSocketRoot } from "./selfhost-socket-root.ts";
-import { renderSelfhostOperatorSignInInstructions } from "./selfhost-startup-instructions.ts";
+import {
+  parseSelfhostOperatorAssertionPrint,
+  renderSelfhostOperatorSignInInstructions,
+  SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE,
+  SELFHOST_OPERATOR_SIGN_IN_IDENTITY,
+  selfhostOperatorAssertionDue,
+} from "./selfhost-startup-instructions.ts";
 import { createSelfhostTakoformV2Ingress } from "./selfhost-takoform-v2-ingress.ts";
 import {
   assertActiveSelfhostTenantRunCredentialSigningKey,
@@ -212,6 +223,13 @@ if (!publicOrigin || !runtimeInputCanonicalOriginSupported(publicOrigin)) {
   throw new Error("TAKOSERVER_PUBLIC_ORIGIN must be a canonical HTTPS bare origin");
 }
 const port = Number(process.env.PORT ?? 8787);
+// Loopback unless the operator names an interface: see selfhost-listen-address.
+// Read before any state opens, so a mistyped address refuses to start rather
+// than serving on an interface nobody chose.
+const listenHost = parseSelfhostListenHost(process.env[SELFHOST_LISTEN_HOST_VARIABLE]);
+const forceOperatorAssertionPrint = parseSelfhostOperatorAssertionPrint(
+  process.env[SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE],
+);
 
 /**
  * Everything this machine keeps lives under one directory, resolved once to an
@@ -1466,6 +1484,7 @@ process.on("exit", () => {
 try {
   bunServer = Bun.serve({
     port,
+    hostname: listenHost,
     // Longer than the default, because publishing a site means uploading its
     // files and a request that is doing real work is not an idle one.
     idleTimeout: 120,
@@ -1561,37 +1580,51 @@ if (dataPlanes) {
 }
 console.log(
   `takoserver listening on :${port} as ${publicOrigin} ` +
+    // The bound interface is named because a loopback-only listener behind a
+    // proxy elsewhere is unreachable, and this line is where that shows.
+    `(address: ${formatSelfhostListenAddress(listenHost, bunServer?.port ?? port)}; ` +
     // Named from what is actually configured. A banner that says Cloudflare on
     // a machine with no account is the first thing an operator reads and the
     // first thing that misleads them.
-    `(provisioning: ${providers.map((provider) => provider.id).join(", ") || "none"})`,
+    `provisioning: ${providers.map((provider) => provider.id).join(", ") || "none"})`,
 );
 
 // Having minted the way in, say what it is. A machine that generates a key and
 // leaves the operator to discover how to present it has automated the easy half.
+// The assertion is a credential written wherever stdout goes, so it is minted
+// only until the operator has signed in (or when explicitly asked), and the
+// session exchange refuses it a second time.
 if (identity.providers.some((provider) => provider.method === "operator-assertion")) {
   const stored = await readFile(operatorKeyPath, "utf8").catch(() => null);
   if (stored) {
-    const assertion = await signOperatorAssertion({
-      privateJwk: stored,
-      claims: {
-        purpose: "sign-in",
-        aud: publicOrigin,
-        provider: "google",
-        subject: "operator",
-        email: "operator@localhost",
-        displayName: "Operator",
-      },
-      nowSeconds: Math.floor(Date.now() / 1_000),
-      lifetimeSeconds: 600,
-    });
+    const assertion = (await selfhostOperatorAssertionDue({
+      sql,
+      forced: forceOperatorAssertionPrint,
+    }))
+      ? await signOperatorAssertion({
+          privateJwk: stored,
+          claims: {
+            purpose: "sign-in",
+            aud: publicOrigin,
+            provider: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.provider,
+            subject: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.subject,
+            email: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.email,
+            displayName: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.displayName,
+            // Two boots within one second must not mint byte-identical
+            // assertions, or the second would read as a replay of the first.
+            jti: crypto.randomUUID(),
+          },
+          nowSeconds: Math.floor(Date.now() / 1_000),
+          lifetimeSeconds: 600,
+        })
+      : undefined;
     console.log(
       renderSelfhostOperatorSignInInstructions({
         publicOrigin,
         ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
           ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
           : {}),
-        assertion,
+        ...(assertion === undefined ? {} : { assertion }),
         operatorKeyPath,
       }),
     );

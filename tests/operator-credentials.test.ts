@@ -13,6 +13,7 @@ import {
   OPERATOR_PROVIDERS,
   OperatorAssertionError,
 } from "../src/operator-credentials.ts";
+import type { Sql } from "../src/ports.ts";
 import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 let signingKey: CryptoKey;
@@ -67,10 +68,29 @@ describe("operator sign-in", () => {
       assertion: await assert(SIGN_IN),
       audience: OPERATOR_AUDIENCE,
     });
-    expect(verified).toEqual({
+    expect(verified).toMatchObject({
       providerSubject: "operator-1",
       email: "owner@example.com",
       displayName: "Owner",
+    });
+  });
+
+  test("names the signed payload as the single-use key the session exchange spends", async () => {
+    const identity = createOperatorIdentity({ publicKeyJwk, audience: OPERATOR_AUDIENCE, clock });
+    const assertion = await assert(SIGN_IN);
+    const [payload] = assertion.split(".");
+    const digest = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(payload ?? "")),
+    );
+    const verified = await identity.verify({
+      provider: "google",
+      assertion,
+      audience: OPERATOR_AUDIENCE,
+    });
+    expect(verified.singleUse).toEqual({
+      namespace: "operator-sign-in",
+      digest: `sha256:${Buffer.from(digest).toString("hex")}`,
+      expiresAtEpochSeconds: Math.floor(now / 1_000) + 300,
     });
   });
 
@@ -197,7 +217,7 @@ describe("operator funding", () => {
 describe("operator sign-in over HTTP", () => {
   const ORIGIN = "https://api.takoserver.test";
 
-  function newApp() {
+  function newApp(sql: Sql = createEphemeralSql()) {
     const setup = resolveIdentity({
       operatorPublicKeyJwk: publicKeyJwk,
       operatorAudience: ORIGIN,
@@ -205,7 +225,8 @@ describe("operator sign-in over HTTP", () => {
     });
     return buildApp({
       v2: TEST_TAKOFORM_V2_CONFIG,
-      sql: createEphemeralSql(),
+      sql,
+      clock,
       objects: createMemoryObjectStore(),
       identity: setup.verifier,
       identityProviders: setup.providers,
@@ -285,5 +306,172 @@ describe("operator sign-in over HTTP", () => {
     });
     expect(refused.status).toBe(400);
     expect(refused.body).toMatchObject({ error: { code: "invalid" } });
+  });
+
+  /**
+   * The printed first-boot assertion lands in journald, container logs and
+   * terminal scrollback. Once the operator has exchanged it, anybody who can
+   * read those logs must not be able to exchange it again for a second
+   * twelve-hour operator session while it is still inside its lifetime.
+   */
+  describe("single use", () => {
+    const signInWith = (assertion: string) => ({
+      provider: "google",
+      method: "operator-assertion",
+      assertion,
+    });
+
+    test("opens exactly one session and refuses the replay without a bearer", async () => {
+      const app = newApp();
+      const assertion = await assert(SIGN_IN);
+      const first = await call(app, "POST", "/v1/sessions", signInWith(assertion));
+      expect(first.status).toBe(200);
+      expect(typeof first.body.sessionToken).toBe("string");
+
+      const replay = await call(app, "POST", "/v1/sessions", signInWith(assertion));
+      expect(replay.status).toBe(401);
+      expect(replay.body).toMatchObject({ error: { code: "unauthenticated" } });
+      expect(replay.body.sessionToken).toBeUndefined();
+
+      // A fresh assertion for the same operator is still a way in.
+      now += 1_000;
+      const fresh = await call(app, "POST", "/v1/sessions", signInWith(await assert(SIGN_IN)));
+      expect(fresh.status).toBe(200);
+    });
+
+    test("concurrent exchanges of one assertion issue exactly one session", async () => {
+      const app = newApp();
+      const assertion = await assert(SIGN_IN);
+      const results = await Promise.all(
+        Array.from({ length: 4 }, () => call(app, "POST", "/v1/sessions", signInWith(assertion))),
+      );
+      expect(results.map((result) => result.status).sort()).toEqual([200, 401, 401, 401]);
+    });
+
+    test("an owner proof does not spend the assertion its session exchange then redeems", async () => {
+      const app = newApp();
+      const owner = await call(app, "POST", "/v1/sessions", signInWith(await assert(SIGN_IN)));
+      const organization = await call(
+        app,
+        "POST",
+        "/v1/organizations",
+        { name: "Owned" },
+        { authorization: `Bearer ${String(owner.body.sessionToken)}` },
+      );
+      const organizationId = String((organization.body.organization as { id: string }).id);
+
+      now += 1_000;
+      const assertion = await assert(SIGN_IN);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const proof = await call(app, "POST", "/v1/operator-owner-proof", {
+          ...signInWith(assertion),
+          organizationId,
+        });
+        expect(proof.status).toBe(200);
+      }
+      expect((await call(app, "POST", "/v1/sessions", signInWith(assertion))).status).toBe(200);
+      expect((await call(app, "POST", "/v1/sessions", signInWith(assertion))).status).toBe(401);
+    });
+
+    test("an assertion refused for another reason is not spent", async () => {
+      const app = newApp();
+      const assertion = await assert(SIGN_IN);
+      const wrongProvider = await call(app, "POST", "/v1/sessions", {
+        ...signInWith(assertion),
+        provider: "github",
+      });
+      expect(wrongProvider.status).toBe(401);
+      expect((await call(app, "POST", "/v1/sessions", signInWith(assertion))).status).toBe(200);
+    });
+
+    test("forgets a spent assertion only well after it can no longer be presented", async () => {
+      const sql = createEphemeralSql();
+      const app = newApp(sql);
+      const spent = async () =>
+        (
+          await sql.query(
+            "SELECT grant_id FROM runtime_grant_replays WHERE grant_id LIKE 'operator-sign-in:%'",
+          )
+        ).length;
+      const assertion = await assert(SIGN_IN);
+      expect((await call(app, "POST", "/v1/sessions", signInWith(assertion))).status).toBe(200);
+      expect(await spent()).toBe(1);
+
+      // Inside its lifetime the replay is refused by the spent entry.
+      now += 299_000;
+      expect((await call(app, "POST", "/v1/sessions", signInWith(assertion))).status).toBe(401);
+      expect(await spent()).toBe(1);
+
+      // Just past expiry the entry is kept: a verifier clock running behind
+      // this store's must not find it gone.
+      now += 2_000;
+      expect(
+        (await call(app, "POST", "/v1/sessions", signInWith(await assert(SIGN_IN)))).status,
+      ).toBe(200);
+      expect(await spent()).toBe(2);
+
+      // Past the skew margin, the next exchange prunes it and nothing younger.
+      const [first] = (
+        await sql.query(
+          "SELECT grant_id FROM runtime_grant_replays ORDER BY consumed_at_epoch_seconds",
+        )
+      ).map((row) => String(row.grant_id));
+      now += 301_000;
+      expect(
+        (await call(app, "POST", "/v1/sessions", signInWith(await assert(SIGN_IN)))).status,
+      ).toBe(200);
+      const remaining = (await sql.query("SELECT grant_id FROM runtime_grant_replays")).map((row) =>
+        String(row.grant_id),
+      );
+      expect(remaining).toHaveLength(2);
+      expect(remaining).not.toContain(first);
+    });
+
+    test("pruning touches only spent sign-in assertions, never another key space", async () => {
+      const sql = createEphemeralSql();
+      const app = newApp(sql);
+      // An expired entry of another owner of the replay cache.
+      await sql.run(
+        `INSERT INTO runtime_grant_replays
+           (grant_id, expires_at_epoch_seconds, consumed_at_epoch_seconds)
+         VALUES ('runtime-grant-jti-1', 2, 1)`,
+      );
+      expect(
+        (await call(app, "POST", "/v1/sessions", signInWith(await assert(SIGN_IN)))).status,
+      ).toBe(200);
+      const ids = (await sql.query("SELECT grant_id FROM runtime_grant_replays")).map((row) =>
+        String(row.grant_id),
+      );
+      expect(ids).toContain("runtime-grant-jti-1");
+      expect(ids.filter((id) => id.startsWith("operator-sign-in:sha256:"))).toHaveLength(1);
+    });
+
+    test("a store clock ahead of the verifier's still spends the assertion once", async () => {
+      // The verifier decides expiry on its own clock; the store must not
+      // refuse a credential the verifier accepted, nor record one it cannot
+      // keep for the verifier's remaining lifetime.
+      const setup = resolveIdentity({
+        operatorPublicKeyJwk: publicKeyJwk,
+        operatorAudience: ORIGIN,
+        clock,
+      });
+      const app = buildApp({
+        v2: TEST_TAKOFORM_V2_CONFIG,
+        sql: createEphemeralSql(),
+        clock: () => new Date(now + 3_600_000),
+        objects: createMemoryObjectStore(),
+        identity: setup.verifier,
+        identityProviders: setup.providers,
+        settlement: createOperatorSettlement({ publicKeyJwk, clock }),
+        publicOrigin: ORIGIN,
+        forms: [],
+        hostForms: [],
+        driver: new InMemoryTakoformResourceDriver(),
+        offerings: [],
+      });
+      const assertion = await assert(SIGN_IN);
+      expect((await call(app, "POST", "/v1/sessions", signInWith(assertion))).status).toBe(200);
+      expect((await call(app, "POST", "/v1/sessions", signInWith(assertion))).status).toBe(401);
+    });
   });
 });

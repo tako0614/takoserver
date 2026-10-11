@@ -488,7 +488,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "adapter",
     match:
-      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-object-store|selfhost-data-root|selfhost-socket-root|selfhost-endpoint-https-tls|selfhost-v2-worker-endpoint-upstream-websocket|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-object-store|selfhost-data-root|selfhost-listen-address|selfhost-socket-root|selfhost-endpoint-https-tls|selfhost-v2-worker-endpoint-upstream-websocket|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
     may: ["core", "adapter", "native-contract"],
   },
   {
@@ -675,6 +675,8 @@ const HOST_ONLY = [
   // than at the gate, and only for the requests that touched it.
   "src/objects-fs.ts",
   "src/selfhost-data-root.ts",
+  // The Bun API listener's bind address; a Worker binds nothing.
+  "src/selfhost-listen-address.ts",
   "src/selfhost-socket-root.ts",
   // Writing files and starting processes: a Worker can do neither.
   "src/workerd-runtime.ts",
