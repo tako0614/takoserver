@@ -24,23 +24,53 @@ claim GA status.
    resolves `TAKOSERVER_DATA_ROOT` once to an absolute, canonical path: a
    relative value, including the default, is relative to the working
    directory, and symlinks in the existing part of the path are resolved. When
-   the result differs from the configured value, the process prints it. A
-   data root that does not exist yet is created with mode 0700, together with
-   any missing parent directories. An existing directory keeps its permissions.
-   The v2 private planes require it to be mode 0700 and owned by the Host's
-   user, and refuse otherwise with the path, mode, and owner. Actor
-   and Workflow runtimes bind private Unix sockets in `<data root>/s`, and a
-   Unix socket path is limited to about 100 bytes. The resolved data root
-   therefore may be at most 61 bytes whenever Actors or Workflows run. The
-   native Actor processes also bind sockets below `TMPDIR`, which may be at
-   most 73 bytes. If `TAKOSERVER_V2_WORKER_RUNTIME_BOOT` selects `actor` or
-   `workflow` and the root is longer, startup stops with a message that names
-   the variable, its length, and the maximum. Otherwise the Host starts, prints
-   that Actor admission is unavailable and why, and serves its other Forms. The
-   directories in `s/` are recreated at each start. Builds before this layout
-   used `actor-forward-sockets/` and the `*-private-sockets/` and
-   `workflow-temporary/` directories in `v2-runtime/` for the same purpose; a
-   stopped Host may delete them.
+   the result differs from the configured value, the process prints it.
+   SQLite databases created under an earlier relative or symlinked setting stay
+   bound to their Workers. A data root that does not exist yet is created with
+   mode 0700, together with any missing parent directories. An existing
+   directory keeps its permissions. The v2 private planes require it to be mode
+   0700 and owned by the Host's user, and refuse otherwise with the path, mode,
+   and owner.
+
+   Actor and Workflow runtimes bind private Unix sockets in `<data root>/s`,
+   and a Unix socket path is limited to about 100 bytes. The resolved data root
+   therefore may be at most 61 bytes whenever Actors or Workflows run. Native
+   Actor processes, for both the v2 Actor runtime and the implied Actor
+   runtime, also bind sockets below `TMPDIR`, which may be at most 73 bytes.
+   `s/` must be mode 0700 and owned by the Host's user, and no other user may
+   be able to write to the data root or any directory above it, except a
+   sticky root-owned one such as `/tmp`.
+
+   If `TAKOSERVER_V2_WORKER_RUNTIME_BOOT` selects `actor` or `workflow` and one
+   of these requirements is not met, startup stops with a message that names
+   the variable or directory, its length or mode, and what is required. The
+   implied Actor runtime opens only when a workerd binary is selected and the
+   ActorNamespace Form is installed. If a requirement is not met in that case,
+   the Host prints that Actor admission is unavailable and why, and serves its
+   other Forms. The Form admission CLI makes the same decision, so it never
+   admits Actor support that the Host withholds.
+
+   `s/` holds only listener directories that each start recreates. It does not
+   need to be backed up, and a stopped Host may delete it. At startup, the Host
+   removes the broker directories that a killed Host left behind. It removes
+   only directories it can prove abandoned: those holding only sockets that
+   refuse connections, or empty ones last written before the machine booted.
+   Anything else stays until a stopped Host deletes it, for example a Workflow
+   execution directory, which also holds configuration and modules. Builds
+   before this layout used `actor-forward-sockets/`, and the
+   `*-private-sockets/` and `workflow-temporary/` directories in
+   `v2-runtime/`, for the same purpose. A stopped Host may delete them too.
+
+   The v2 Worker runtime keeps each Worker incarnation's private Service
+   sockets in `/tmp/tw-<hash>`. This is always `/tmp`, not `TMPDIR`, because a
+   socket path must stay short. Each directory belongs to the Host's user and
+   is removed only when its incarnation retires. It is kept across a restart,
+   so that no other local user can create that name in a shared `/tmp` and
+   make the next start refuse it. Deleting a data root does not remove these
+   directories. Run the Host with its own private `/tmp`, for example with
+   systemd `PrivateTmp=yes`: other users cannot reach it, recovery recreates
+   any namespace that is missing, and the directories go away with the
+   service.
 
    Install locked dependencies and start the Bun entrypoint:
 
