@@ -37,6 +37,7 @@ import {
   WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import { removeOwnerPrivateSocketDirectories } from "./helpers/owner-private-sockets.ts";
 
 const OPT_IN = process.env.TAKOSERVER_V2_ENTRY_NATIVE;
 const PUBLIC_ORIGIN = "https://journey.takoserver.test";
@@ -1195,8 +1196,12 @@ test.skipIf(OPT_IN !== "1")(
       completed = true;
     } finally {
       await Promise.allSettled([stopHost(host)]);
-      if (completed) await rm(root, { recursive: true, force: true });
-      else {
+      if (completed) {
+        // A killed Host's /tmp socket namespaces are crash custody recorded in
+        // this root; remove exactly those before discarding the root itself.
+        await removeOwnerPrivateSocketDirectories(root);
+        await rm(root, { recursive: true, force: true });
+      } else {
         for (const [index, started] of startedHosts.entries()) {
           await writeFile(join(root, `host-${index}.log`), started.output()).catch(() => undefined);
         }
@@ -1336,8 +1341,12 @@ test.skipIf(OPT_IN !== "1")(
         started.child.kill("SIGKILL");
         await Promise.race([started.child.exited, Bun.sleep(5_000)]);
       }
-      if (completed) await rm(root, { recursive: true, force: true });
-      else {
+      if (completed) {
+        // A killed Host's /tmp socket namespaces are crash custody recorded in
+        // this root; remove exactly those before discarding the root itself.
+        await removeOwnerPrivateSocketDirectories(root);
+        await rm(root, { recursive: true, force: true });
+      } else {
         for (const [index, started] of startedHosts.entries()) {
           await writeFile(join(root, `host-${index}.log`), started.output()).catch(() => undefined);
         }
