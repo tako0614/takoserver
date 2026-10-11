@@ -308,6 +308,67 @@ export function loadTarget(path: string, environment: DeployEnvironment): Deploy
   return parseDeployTarget(parsed, path, environment);
 }
 
+/** Top-level keys every complete deploy target carries. */
+const DEPLOY_TARGET_REQUIRED_KEYS: readonly string[] = [
+  "kind",
+  "environment",
+  "accountId",
+  "workerName",
+  "d1",
+  "r2",
+  "publicOrigin",
+  "signing",
+];
+
+/** Top-level keys a complete deploy target may carry; anything else is refused. */
+const DEPLOY_TARGET_OPTIONAL_KEYS: readonly string[] = [
+  "aliases",
+  "consoleOrigin",
+  "googleClientId",
+  "takosId",
+  "stripeCheckout",
+  "zones",
+  "aiModels",
+  "objectBucketSupplies",
+  "edgeSupplies",
+  "cloudflareProviderExecutor",
+  "sponsorshipAuthority",
+  "formAuthority",
+  "exactArtifactRecovery",
+  "operatorIdentity",
+  "integrationE2eCredentialAuthority",
+  "artifactBlobIoMode",
+  "schemaMaintenanceMode",
+  "protected0058Custody",
+  "takoformV2",
+];
+
+/** Every key of the complete target vocabulary, in one place. */
+export const DEPLOY_TARGET_KEYS: readonly string[] = [
+  ...DEPLOY_TARGET_REQUIRED_KEYS,
+  ...DEPLOY_TARGET_OPTIONAL_KEYS,
+];
+
+/** The only top-level keys the namespace bootstrap projection reads and validates. */
+const NAMESPACE_PROJECTION_KEYS: readonly string[] = [
+  "kind",
+  "environment",
+  "accountId",
+  "cloudflareProviderExecutor",
+];
+
+/**
+ * Loads the narrow namespace bootstrap projection.
+ *
+ * Only `kind`, `environment`, `accountId` and the executor's namespace name/id
+ * are read and validated here. Every other key of the complete target
+ * vocabulary is tolerated unvalidated, so the same operator-private file can be
+ * read before the complete target exists and again after it is filled in (for
+ * example after the namespace id pin and the v2 `takoformV2` composition). A
+ * key outside that vocabulary is still refused. Complete-target validation
+ * remains the job of {@link loadTarget}, which gateway and executor
+ * publication require.
+ */
 export function loadManagedWorkerDispatchNamespaceTarget(
   path: string,
   environment: DeployEnvironment,
@@ -345,29 +406,8 @@ export function loadManagedWorkerDispatchNamespaceTarget(
   }
   assertExactKeys(
     value,
-    ["kind", "environment", "accountId", "cloudflareProviderExecutor"],
-    [
-      "workerName",
-      "d1",
-      "r2",
-      "publicOrigin",
-      "signing",
-      "aliases",
-      "consoleOrigin",
-      "googleClientId",
-      "takosId",
-      "stripeCheckout",
-      "zones",
-      "aiModels",
-      "objectBucketSupplies",
-      "edgeSupplies",
-      "sponsorshipAuthority",
-      "formAuthority",
-      "exactArtifactRecovery",
-      "operatorIdentity",
-      "integrationE2eCredentialAuthority",
-      "artifactBlobIoMode",
-    ],
+    NAMESPACE_PROJECTION_KEYS,
+    DEPLOY_TARGET_KEYS.filter((key) => !NAMESPACE_PROJECTION_KEYS.includes(key)),
   );
   if (value.kind !== DEPLOY_TARGET_KIND || value.environment !== environment) {
     throw preflightError("dispatch namespace target kind or environment is invalid");
@@ -420,31 +460,7 @@ export function parseDeployTarget(
   if (!isRecord(value)) {
     throw preflightError(`deploy target descriptor must be an object: ${source}`);
   }
-  assertExactKeys(
-    value,
-    ["kind", "environment", "accountId", "workerName", "d1", "r2", "publicOrigin", "signing"],
-    [
-      "aliases",
-      "consoleOrigin",
-      "googleClientId",
-      "takosId",
-      "stripeCheckout",
-      "zones",
-      "aiModels",
-      "objectBucketSupplies",
-      "edgeSupplies",
-      "cloudflareProviderExecutor",
-      "sponsorshipAuthority",
-      "formAuthority",
-      "exactArtifactRecovery",
-      "operatorIdentity",
-      "integrationE2eCredentialAuthority",
-      "artifactBlobIoMode",
-      "schemaMaintenanceMode",
-      "protected0058Custody",
-      "takoformV2",
-    ],
-  );
+  assertExactKeys(value, DEPLOY_TARGET_REQUIRED_KEYS, DEPLOY_TARGET_OPTIONAL_KEYS);
 
   if (value.kind !== DEPLOY_TARGET_KIND) {
     throw preflightError(`deploy target kind must be ${DEPLOY_TARGET_KIND}`);

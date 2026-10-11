@@ -107,6 +107,12 @@ never changed. Apply creates one new D1, proves it empty, applies the fixed
 audited 0001–0066 lineage and verifies its canonical schema, then creates the
 new R2 bucket. Creating the bucket last means older object operations cannot
 reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
+Apply refuses a target whose D1 or R2 already names the generated pair (current
+storage is never adopted), so the target must name some other pair while the
+generation is created. Status reads only the generated names and keeps working
+after the target is pointed at the new pair: it reports `targetSelection`
+(`d1`, `r2`, and `databaseIdExact` against the read-back UUID) and then
+`readyForApply: false`.
 
 For a **new, empty integration generation only**, the same sole writer has one
 fixed v2 artifact payload. The selector is required on both the diagnostic
