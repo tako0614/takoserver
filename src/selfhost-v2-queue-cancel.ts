@@ -110,9 +110,40 @@ export async function cancelQueueReservationBeforeSend(input: {
   }
 }
 
-const BOOT_PAGE = 64;
 const DB_NOW_MS =
   "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
+
+/**
+ * Every never-authorized reservation written up to a database time.
+ *
+ * The execution table only grows (rows are never deleted), so this must not
+ * walk it. It is a loose index scan over
+ * `queue_v2_batch_executions_open_consumer (consumer_uid, state)`: one seek
+ * per Consumer UID that ever had an execution, then an exact search for its
+ * `reserved` and `registered` rows, of which the reserve guard allows at most
+ * 250 per Consumer. `CROSS JOIN` fixes that order, which statistics would
+ * otherwise turn into a scan of every execution; `+reserved_at_ms` keeps the
+ * time bound out of the index choice; `INDEXED BY` turns a missing index into
+ * an error rather than a silent full scan. A test pins the plan with and
+ * without planner statistics, like the backlog sampler's.
+ */
+export const SELFHOST_QUEUE_BOOT_REFUSAL_QUERY = `WITH RECURSIVE consumer(uid) AS (
+    SELECT MIN(consumer_uid)
+      FROM queue_v2_batch_executions INDEXED BY queue_v2_batch_executions_open_consumer
+    UNION ALL
+    SELECT (SELECT MIN(next.consumer_uid)
+              FROM queue_v2_batch_executions AS next
+                INDEXED BY queue_v2_batch_executions_open_consumer
+              WHERE next.consumer_uid > consumer.uid)
+      FROM consumer WHERE consumer.uid IS NOT NULL
+  )
+  SELECT execution.batch_id, execution.reservation_token
+  FROM consumer
+  CROSS JOIN queue_v2_batch_executions AS execution
+    INDEXED BY queue_v2_batch_executions_open_consumer
+  WHERE execution.consumer_uid = consumer.uid
+    AND execution.state IN ('reserved','registered')
+    AND +execution.reserved_at_ms <= ?`;
 
 /**
  * Refuse, at Host start, every v2 Queue reservation that was never authorized.
@@ -131,8 +162,10 @@ const DB_NOW_MS =
  * nothing is sent twice. Rows reserved after this call started are left to
  * their own claimer.
  *
- * Returns how many rows this call refused. A row whose refusal gives up falls
- * back to its expiry, exactly as before.
+ * Returns how many rows this call refused. The first refusal that gives up
+ * (a lock that outlasted the busy timeout, or retries out of budget) ends the
+ * pass: it already cost that wait, the Host is not listening yet, and every
+ * row left falls back to its expiry, exactly as before.
  */
 export async function refuseQueueReservationsBeforeFirstDelivery(input: {
   readonly sql: Sql;
@@ -144,29 +177,25 @@ export async function refuseQueueReservationsBeforeFirstDelivery(input: {
   const startedAt = clock?.now;
   if (typeof startedAt !== "number" || !Number.isSafeInteger(startedAt) || startedAt <= 0)
     throw new Error("Queue boot refusal could not read the database clock");
-  let after = "";
+  const rows = await sql.query(SELFHOST_QUEUE_BOOT_REFUSAL_QUERY, [startedAt]);
+  let gaveUp = false;
+  const report = (cause: unknown): void => {
+    gaveUp = true;
+    input.report?.(cause);
+  };
   let refused = 0;
-  for (;;) {
-    const rows = await sql.query(
-      `SELECT batch_id, reservation_token FROM queue_v2_batch_executions
-       WHERE state IN ('reserved','registered') AND reserved_at_ms <= ? AND batch_id > ?
-       ORDER BY batch_id LIMIT ${BOOT_PAGE}`,
-      [startedAt, after],
-    );
-    for (const row of rows) {
-      if (typeof row.batch_id !== "string" || typeof row.reservation_token !== "string") continue;
-      if (
-        await cancelQueueReservationBeforeSend({
-          sql,
-          batch: { batchId: row.batch_id, reservationToken: row.reservation_token },
-          ...(input.cancel ? { cancel: input.cancel } : {}),
-          ...(input.report ? { report: input.report } : {}),
-        })
-      )
-        refused += 1;
-    }
-    const last = rows.at(-1)?.batch_id;
-    if (rows.length < BOOT_PAGE || typeof last !== "string") return refused;
-    after = last;
+  for (const row of rows) {
+    if (typeof row.batch_id !== "string" || typeof row.reservation_token !== "string") continue;
+    if (
+      await cancelQueueReservationBeforeSend({
+        sql,
+        batch: { batchId: row.batch_id, reservationToken: row.reservation_token },
+        ...(input.cancel ? { cancel: input.cancel } : {}),
+        report,
+      })
+    )
+      refused += 1;
+    else if (gaveUp) break;
   }
+  return refused;
 }
