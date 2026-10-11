@@ -920,6 +920,10 @@ try {
         process.stderr.write(
           `self-host Queue reservation could not be refunded before send and will expire: ${describeBackgroundFailure(cause)}\n`,
         ),
+      onClaimFailure: (cause) =>
+        process.stderr.write(
+          `self-host Queue batch selection failed: ${describeBackgroundFailure(cause)}\n`,
+        ),
       ownerForWorkerUid: async (uid) => {
         if (!ownersRestored || !workers) {
           throw new Error("v2 Queue owner is not restored");

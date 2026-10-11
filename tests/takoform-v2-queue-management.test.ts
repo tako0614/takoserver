@@ -1193,6 +1193,76 @@ test("a pre-send batch left by a dead Host is refunded and redelivered after its
   }
 });
 
+test("a batch selection that throws is reported instead of vanishing into unknown", async () => {
+  const f = fixture();
+  let composition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+  try {
+    const queue = await f.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "reported-queue", {
+      messageRetentionSeconds: 3600,
+    });
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "reported-worker", {});
+    const version = await f.create(WORKER_VERSION_FORM_URL, "reported-version", {
+      queueUid: queue.resourceUid,
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingVersion(version.resourceUid);
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "reported-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    f.setServingSource(deployment.id);
+    const consumer = await f.create(
+      QUEUE_CONSUMER_FORM_URL,
+      "reported-consumer",
+      consumerSpec(queue.resourceUid, worker.resourceUid),
+    );
+    const custody = createQueueCustody({ sql: f.sql });
+    await custody.admit(
+      {
+        queueId: v2QueueId(queue.resourceUid),
+        messageRetentionSeconds: 3600,
+        deliveryDelaySeconds: 0,
+      },
+      { messageId: "reported-message", body: new Uint8Array([5]) },
+    );
+    const failing: typeof custody = {
+      ...custody,
+      async claim() {
+        throw new Error("incomplete input");
+      },
+    };
+    const reported: unknown[] = [];
+    const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+    const privatePort = Number(reservation.port);
+    await reservation.stop(true);
+    composition = createSelfhostV2QueueComposition({
+      sql: f.sql,
+      custody: failing,
+      capability: f.capability,
+      settlementKey: new Uint8Array(32).fill(9),
+      privatePort,
+      onClaimFailure: (cause) => {
+        reported.push(cause);
+        throw new Error("a failing reporter is contained");
+      },
+      ownerForWorkerUid: async () => {
+        throw new Error("no batch was selected, so no owner is needed");
+      },
+    });
+    expect(
+      await composition.deliverOnce({
+        consumerUid: consumer.resourceUid,
+        principal,
+        space,
+        targetKey,
+      }),
+    ).toEqual({ kind: "unknown" });
+    expect(reported.map((cause) => (cause as Error).message)).toEqual(["incomplete input"]);
+  } finally {
+    await composition?.close();
+    f.database.close();
+  }
+});
+
 test("a pending Deployment DELETE fences the old source before native Queue send", async () => {
   const f = fixture();
   try {
