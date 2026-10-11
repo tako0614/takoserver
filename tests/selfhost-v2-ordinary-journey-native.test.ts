@@ -698,6 +698,13 @@ async function firstBoot(environment: Environment): Promise<{
   expect(await readdir(root)).not.toContain("control.sqlite");
   const host = await startHost(root, port, journeyConfig([], []), {});
   try {
+    // The Host prints its sign-in notes after it starts listening, so
+    // readiness can answer before the pipe has delivered them.
+    const notesDeadline = Date.now() + 5_000;
+    while (!host.output().includes("bun scripts/operator-key.ts sign-in google operator")) {
+      if (Date.now() > notesDeadline) break;
+      await Bun.sleep(50);
+    }
     const output = host.output();
     expect(output).toContain("applied ");
     expect(output).toContain("generated an operator key at ");
@@ -1069,6 +1076,7 @@ test.skipIf(OPT_IN !== "1")(
       expect(children.length).toBeGreaterThan(0);
       await killHost(host);
       host = null;
+      const killedAt = Date.now();
       // The Host is gone, so its database can be read without disturbing it.
       const atCrash = withControl(
         root,
@@ -1097,6 +1105,18 @@ test.skipIf(OPT_IN !== "1")(
 
       host = await startHost(root, port, configV2, fullBoot);
       expect(host.child.pid).not.toBe(hostPid);
+      // A batch the killed Host reserved but never sent is refused before the
+      // new one listens, so its messages do not wait out the 120 s reservation.
+      withControl(root, (control) =>
+        expect(
+          control
+            .query(
+              `SELECT count(*) AS n FROM queue_v2_batch_executions
+               WHERE state IN ('reserved','registered') AND reserved_at_ms <= ?`,
+            )
+            .get(killedAt),
+        ).toEqual({ n: 0 }),
+      );
       // Same key, same body: the replay answers with the original Operation.
       const replay = await requestAt(port, `${V2}/resources`, {
         method: "POST",
@@ -1156,8 +1176,9 @@ test.skipIf(OPT_IN !== "1")(
         status: 200,
         body: "journey-v2",
       });
-      // A batch reserved but not yet sent at the crash is held by its 120 s
-      // reservation before redelivery, so allow for it.
+      // A batch sent at the crash is retired once its old child is proven
+      // gone, and its messages then wait for their lease (up to 120 s), so
+      // allow for it.
       for (const value of inFlight) await handled(value, 240_000);
       for (const id of flightIds) await waitForQueueReceipt(root, id, "retired", 240_000);
       const receipts = JSON.parse((await get("/receipts")).body) as {

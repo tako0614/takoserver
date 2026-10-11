@@ -1234,18 +1234,28 @@ export function createV2QueueDelivery(options: {
         return { kind: "unknown" };
       }
       if (reserved.changes !== 1) return { kind: "unknown" };
-      const claims = await custody.claim({
-        queueId,
-        consumerId: identity.consumerUid,
-        generation,
-        limit: spec.maxBatchSize,
-        v2Attachment: {
-          principal: identity.principal,
-          space: identity.space,
-          targetKey: identity.targetKey,
-        },
-        v2Reservation: { batchId, reservationToken },
-      });
+      let claims: readonly QueueCustodyClaimedMessage[];
+      try {
+        claims = await custody.claim({
+          queueId,
+          consumerId: identity.consumerUid,
+          generation,
+          limit: spec.maxBatchSize,
+          v2Attachment: {
+            principal: identity.principal,
+            space: identity.space,
+            targetKey: identity.targetKey,
+          },
+          v2Reservation: { batchId, reservationToken },
+        });
+      } catch (error) {
+        // Nothing was handed to a sender, so the reservation is provably
+        // unsent; do not let it hold the Consumer for 120 seconds. If the
+        // claim committed before its ACK was lost, the cancel refunds those
+        // messages by the lease token it bound. The caller still sees why.
+        await cancelV2QueueBatchBeforeSend(sql, { batchId, reservationToken }).catch(() => false);
+        throw error;
+      }
       if (claims.length === 0) {
         await cancelV2QueueBatchBeforeSend(sql, { batchId, reservationToken });
         return { kind: "idle" };
