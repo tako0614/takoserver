@@ -211,11 +211,12 @@ configuration:
   It needs Bun and the three required settings below.
 - **Complete local Worker profile.** Adds the Worker lifecycle Forms and their
   SQLite, KV, ObjectBucket and Queue Bindings, run on Linux x86-64 by the
-  pinned closed-graph [workerd](workerd/README.md). The Host advertises them
-  only when every setting in the second table is present and the existing
-  Worker owners restore at startup; a partial setup advertises no reduced
-  Worker profile. `WorkerEndpoint` also needs the HTTPS listener on TCP 443
-  described below.
+  pinned closed-graph [workerd](workerd/README.md) (a release attaches the
+  binary with its notices; see [release assets](docs/release-assets.md)). The
+  Host advertises them only when every setting in the second table is present
+  and the existing Worker owners restore at startup; a partial setup advertises
+  no reduced Worker profile. `WorkerEndpoint` also needs the HTTPS listener on
+  TCP 443 described below.
 
 Neither profile needs publisher-set admission: the v2 Host serves the Forms
 its configuration composes. `scripts/selfhost-form-admission.ts` and

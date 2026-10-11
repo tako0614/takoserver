@@ -74,8 +74,13 @@ A self-host runs one of two profiles, selected by configuration:
   outside the checkout, where only an administrator can replace them, for
   example in `/usr/local/libexec/takoserver` (`install -d -m 0755
   /usr/local/libexec/takoserver` as root):
-  - The pinned closed-graph `workerd` artifact. Build it with
-    `bun run build:workerd` as described in
+  - The pinned closed-graph `workerd` artifact. A release that attaches it
+    (the file `workerd-closed-graph-2026-08-11-linux-x64` on the GitHub
+    Release, with `SHA256SUMS` and the notices bundle) is the easiest source:
+    download the files into an empty directory, run `sha256sum --check
+    SHA256SUMS`, and follow
+    [What an operator verifies](release-assets.md#what-an-operator-verifies).
+    Otherwise build it with `bun run build:workerd` as described in
     [the closed-graph workerd artifact](../workerd/README.md); the build needs
     Bazel and a pinned clang and takes hours. The manual
     `workerd-closed-graph-build` workflow can build it on GitHub, but its
@@ -589,13 +594,21 @@ create() { # create <form> <name> <spec-json>
 }
 WORKER=$(create ModuleWorker/0.3.0 hello '{}') &&
 BUNDLE=$(create WorkerBundle/0.2.0 hello-bundle-v1 "$(jq -c '{artifact}' "$WORK/hello-v1.json")") &&
-VERSION=$(create WorkerVersion/0.5.0 hello-version-v1 "$(jq -nc --arg w "$WORKER" --arg b "$BUNDLE" \
-  '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"]}')") &&
-DEPLOYMENT=$(create WorkerDeployment/0.4.0 hello-deployment "$(jq -nc --arg w "$WORKER" --arg v "$VERSION" \
-  '{worker: {resourceUid: $w}, versions: [{workerVersion: {resourceUid: $v}, weight: 10000}]}')") &&
-ENDPOINT=$(create WorkerEndpoint/0.3.0 hello-endpoint "$(jq -nc --arg w "$WORKER" \
-  '{worker: {resourceUid: $w}}')")
+spec=$(jq -nc --arg w "$WORKER" --arg b "$BUNDLE" \
+  '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"]}') &&
+VERSION=$(create WorkerVersion/0.5.0 hello-version-v1 "$spec") &&
+spec=$(jq -nc --arg w "$WORKER" --arg v "$VERSION" \
+  '{worker: {resourceUid: $w}, versions: [{workerVersion: {resourceUid: $v}, weight: 10000}]}') &&
+DEPLOYMENT=$(create WorkerDeployment/0.4.0 hello-deployment "$spec") &&
+spec=$(jq -nc --arg w "$WORKER" '{worker: {resourceUid: $w}}') &&
+ENDPOINT=$(create WorkerEndpoint/0.3.0 hello-endpoint "$spec")
 ```
+
+Each spec is built in `spec` before the create that uses it. Do the same in
+your own commands: pasted into an interactive Bash 5.2 with history (the
+default shell on Ubuntu 24.04), a command substitution that is nested in
+another and continues onto the next line prints `unexpected EOF while looking
+for matching` errors even though the command runs.
 
 The `&&` chain stops at the first create that does not succeed, so no later
 Resource is created with an empty reference. What to do next depends on where
@@ -660,8 +673,9 @@ from `GET /resources/{resourceUid}`:
 
 ```sh
 BUNDLE_V2=$(create WorkerBundle/0.2.0 hello-bundle-v2 "$(jq -c '{artifact}' "$WORK/hello-v2.json")") &&
-VERSION_V2=$(create WorkerVersion/0.5.0 hello-version-v2 "$(jq -nc --arg w "$WORKER" --arg b "$BUNDLE_V2" \
-  '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"]}')") &&
+spec=$(jq -nc --arg w "$WORKER" --arg b "$BUNDLE_V2" \
+  '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"]}') &&
+VERSION_V2=$(create WorkerVersion/0.5.0 hello-version-v2 "$spec") &&
 GENERATION=$(curl -sS --fail-with-body "$V2/resources/$DEPLOYMENT" \
   -H "authorization: Bearer $KEY" | jq -r .generation) &&
 updated=$(jq -nc --arg w "$WORKER" --arg v "$VERSION_V2" \
@@ -791,14 +805,14 @@ step 9 with the Binding in the new Version's spec:
 DATABASE=$(create SQLiteDatabase/0.2.0 hello-db '{}') &&
 MIGRATIONS=$(create SQLiteMigrationSet/0.2.0 hello-migrations-v1 \
   "$(jq -c '{artifact}' "$WORK/migrations-v1.json")") &&
-APPLICATION=$(create SQLiteMigrationApplication/0.2.0 hello-migration-application \
-  "$(jq -nc --arg d "$DATABASE" --arg m "$MIGRATIONS" \
-    '{database: {resourceUid: $d}, migrationSet: {resourceUid: $m}}')") &&
+spec=$(jq -nc --arg d "$DATABASE" --arg m "$MIGRATIONS" \
+  '{database: {resourceUid: $d}, migrationSet: {resourceUid: $m}}') &&
+APPLICATION=$(create SQLiteMigrationApplication/0.2.0 hello-migration-application "$spec") &&
 BUNDLE_V3=$(create WorkerBundle/0.2.0 hello-bundle-v3 "$(jq -c '{artifact}' "$WORK/hello-v3.json")") &&
-VERSION_V3=$(create WorkerVersion/0.5.0 hello-version-v3 "$(jq -nc --arg w "$WORKER" \
-  --arg b "$BUNDLE_V3" --arg d "$DATABASE" \
+spec=$(jq -nc --arg w "$WORKER" --arg b "$BUNDLE_V3" --arg d "$DATABASE" \
   '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"],
-    sqliteBindings: [{name: "DB", resource: {resourceUid: $d}}]}')") &&
+    sqliteBindings: [{name: "DB", resource: {resourceUid: $d}}]}') &&
+VERSION_V3=$(create WorkerVersion/0.5.0 hello-version-v3 "$spec") &&
 GENERATION=$(curl -sS --fail-with-body "$V2/resources/$DEPLOYMENT" \
   -H "authorization: Bearer $KEY" | jq -r .generation) &&
 updated=$(jq -nc --arg w "$WORKER" --arg v "$VERSION_V3" \
@@ -1246,8 +1260,10 @@ Some paths exist only while a Host runs and are not part of the backup set:
   per v2 Worker incarnation, named by a hash of the owner directory's path, the
   Worker UID and the Operation ID. It holds only sockets. A suspended or killed
   incarnation keeps its directory until recovery reuses it, and recovery
-  creates it again when it is missing (the code handles a restore onto a
-  machine without it; that case is not exercised natively). Do not copy or
+  creates it again when it is missing. No native test exercises that; a
+  clean-room install on 2026-10-11 restarted a restored root after moving its
+  `/tmp/tw-*` directory away, as `PrivateTmp=yes` does at every stop, and the
+  Host recreated it and served the Worker again. Do not copy or
   restore these directories. On a shared machine leave a live installation's
   ones in place: if another local user creates the same name, recovery refuses
   it with `ownership_uncertain`. Deleting a data root leaves its `/tmp/tw-*`
@@ -1377,7 +1393,9 @@ rather than through a TLS front end, and so does not exercise a dedicated
 service user or a shared `/tmp`. A clean-room install on 2026-10-11, in a
 fresh Ubuntu 24.04 container as a dedicated user and following this guide,
 found that every WorkerVersion stayed `reconciling` there because module
-inspection tried to chmod `/tmp`; that is fixed. Its restore is to the same
+inspection tried to chmod `/tmp`; that is fixed. A second clean-room run on
+the fixed source, with no `TMPDIR` set, settled every WorkerVersion at once and
+left `/tmp` at mode 1777. The test's restore is to the same
 path on the same machine. Its TLS files, signing and operator keys are inside the root and
 are lost and restored with it; the environment (paths, port, keyring, v2
 configuration) and the workerd and guard binaries outside the root are
