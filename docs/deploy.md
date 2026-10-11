@@ -790,6 +790,50 @@ status code:
 - an assertion-capable identity that is simply not the owner is told so, with
   the organization named, instead of arriving as a malformed readback.
 
+### Advancing a Core verifier source change
+
+`TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST` is code-derived: it is the
+digest of every byte under `services/takoform-core-verifier`, so a Go module
+bump, a `go.sum` change or a `Dockerfile` edit changes the value the target
+derives. The 2026-10 Go advisory upgrade (#283, `ddafe9a0`) and its follow-up
+are such changes. A released-Core Form authority Version published from an
+earlier commit still binds the old value, so the routine
+`takoserver-form-authority-worker` apply refuses it as neither an exact target
+nor a declared forward transition. `--status` reports
+`publicWorkerBindingProfile: unclassified`, names the binding in
+`descriptorDrift` and its `--refresh-var` remedy in `unadoptableFromLive`, and
+shows the derived `coreVerifierArtifactDigest` next to the live
+`coreVerifierObservedArtifactDigest`. The value is never adopted from live
+state; the selected commit is the truth.
+
+Publish it as a value-only transition from the exact live authority Version:
+
+```sh
+bun run deploy -- takoserver-form-authority-worker --status \
+  --environment=<environment> --commit=<sha> \
+  --closure-predecessor-version=<live-authority-version-id> \
+  --refresh-var=TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST
+
+bun run deploy -- takoserver-form-authority-worker --apply \
+  --environment=<environment> --commit=<sha> \
+  --closure-predecessor-version=<live-authority-version-id> \
+  --refresh-var=TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST
+```
+
+Status must report `bindingTransitionProfile: declared-delta-predecessor` and
+`ready: true` before the apply; as for every authority apply, `ready` also
+requires the public Worker to serve the selected commit. The apply must read
+back `bindingTransitionProfile: none`. If the same advance also changes another
+code-derived value, such as the capability manifest, repeat `--refresh-var` for
+it in the same declaration. The running verifier image reports the old digest,
+so the apply cannot reuse it: it takes the normal image-build path and needs
+Docker on the operator machine. Its post-condition then requires the new digest
+from `GET <identityProbeOrigin>/v1/core-verifier-identity`.
+
+`takoserver-existing-space-operator-worker` requires the authority's live
+verifier identity to equal the digest its own commit derives, so it refuses at
+preflight until the authority has advanced. Advance the authority first.
+
 ## Descriptor drift and adopting a live value
 
 A steady target descriptor and the live Worker can legitimately disagree, and
