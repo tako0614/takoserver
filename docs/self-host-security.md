@@ -142,11 +142,11 @@ behaviour exactly.
    Group=takoserver
    # The checkout stays read-only; all state goes to /var/lib/takoserver.
    WorkingDirectory=/opt/takoserver
-   ExecStart=/usr/local/bin/bun src/entry-bun.ts
+   # Sources /etc/takoserver/takoserver.env and passes the v2 config file.
+   ExecStart=/usr/local/bin/takoserver-run
    StateDirectory=takoserver
    StateDirectoryMode=0700
    Environment=TAKOSERVER_DATA_ROOT=/var/lib/takoserver
-   EnvironmentFile=/etc/takoserver/env
    UMask=0077
    NoNewPrivileges=yes
    PrivateTmp=yes
@@ -169,19 +169,27 @@ behaviour exactly.
    AmbientCapabilities=
    ```
 
-   `TAKOSERVER_DATA_ROOT` must be set: with `ProtectSystem=strict` the
-   checkout is read-only, so the default data root `.takoserver` under the
-   working directory cannot be created and startup fails. `StateDirectory=`
-   creates `/var/lib/takoserver` owned by the service user with mode 0700, and
-   keeps it writable. If the environment file sets `TAKOSERVER_DATA_ROOT`, it
-   overrides the `Environment=` line; keep it under the state directory.
+   `ExecStart` is the wrapper script of
+   [Self-host operations step 3](self-host-operations.md#3-configuration). It
+   reads the environment file and passes the v2 config file's contents as
+   `TAKOSERVER_TAKOFORM_V2_CONFIG`, which an `EnvironmentFile=` cannot do for a
+   file that step 6 rewrites. `TAKOSERVER_DATA_ROOT` must be set: with
+   `ProtectSystem=strict` the checkout is read-only, so the default data root
+   `.takoserver` under the working directory cannot be created and startup
+   fails. `StateDirectory=` creates `/var/lib/takoserver` owned by the service
+   user with mode 0700, and keeps it writable. If the environment file sets
+   `TAKOSERVER_DATA_ROOT`, it overrides the `Environment=` line; keep it under
+   the state directory.
    `PrivateTmp=yes` also keeps the v2 socket directories in `/tmp/tw-<hash>`
    away from other users, and removes them when the service stops. Do not add
    `MemoryDenyWriteExecute=yes`: V8 needs writable and executable memory for
    its JIT. To serve Workers on 443 without root, grant only
    `AmbientCapabilities=CAP_NET_BIND_SERVICE` and
-   `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`. You can also keep the ports
-   above 1024 and let the proxy listen on 443. If you configure the container
+   `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`. The complete local Worker
+   profile with `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` always binds 443, so
+   it needs these two lines instead of the empty ones above. Without that
+   selection you can also keep the ports above 1024 and let the proxy listen
+   on 443. If you configure the container
    runtime, the Docker socket must be reachable, and that undoes most of this
    isolation. Use it only on a machine whose operator accepts that.
 3. **Set file permissions.** Keep the data root at mode 0700, owned by the
@@ -189,9 +197,10 @@ behaviour exactly.
    and not be writable by others. With the v2 Actor or Workflow runtime
    enabled, the Host refuses to start otherwise (see
    [Self-host operations](self-host-operations.md)). Keep the environment file
-   (`EnvironmentFile`) at mode 0600 and owned by root. Keep backups of the data
-   root as private as the data root itself: they contain the operator key and
-   the signing keys.
+   at mode 0600, readable only by the Host's user: it holds the cursor key, and
+   the operator commands of Self-host operations source it as that user. Keep
+   backups of the data root as private as the data root itself: they contain
+   the operator key and the signing keys.
 4. **Limit network exposure.** Expose only the reverse proxy and the Worker
    listeners. Firewall the API port if `TAKOSERVER_LISTEN_HOST` is not
    loopback. Do not expose the data-plane ports. Block egress for the Host's

@@ -328,8 +328,9 @@ the Host with the updated config, then create the `ModuleWorker`,
 `WorkerBundle`, `WorkerVersion`, `WorkerDeployment` and `WorkerEndpoint`
 Resources through `/apis/forms.takoform.com/v2/resources`. Steps 6 to 9 of the
 [install path](docs/self-host-operations.md#first-install-and-first-use) give
-the complete commands. `scripts/selfhost-artifact.ts verify` rechecks every
-configured entry read-only, including while the Host runs.
+the complete commands; steps 10 and 11 add a SQLite Binding and delete
+everything in reference order. `scripts/selfhost-artifact.ts verify` rechecks
+every configured entry read-only, including while the Host runs.
 
 ### HTTPS and TCP 443
 
@@ -419,7 +420,10 @@ serves them on its own socket. It simply cannot mint a `WorkerEndpoint`, and it
 says which of the two remedies to apply: at boot, and again in the refusal a
 `takoform_worker_endpoint` create answers with. The loopback development default
 is included: `http://<script>.localhost` is exactly as unpublishable as any
-other plain-HTTP address.
+other plain-HTTP address. The boot line is not printed when
+`TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` selects the v2 listener: both remedies
+put 443 on a port that startup then refuses beside it, and `WorkerEndpoint
+0.3.0` does not use this socket.
 
 For a self-host `QueueConsumer`, changing the source queue or receiving Worker
 requires replacing the attachment, as its Form declares. In-place updates may
