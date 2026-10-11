@@ -956,6 +956,28 @@ Namespaces' owned leases. This does not prove public-CA WSS or delivery of a
 terminal callback for a connection lost with its Host. Recursive calls to the
 same Actor ID remain unqualified.
 
+A running Namespace carrier is selected from one accepted graph. That graph
+changes when a new Worker generation is published, the Namespace Resource is
+revised, its Deployment is replaced, or the Resource is deleted. The next
+selection for that Namespace then retires the old carrier, but only once the
+carrier is idle. A carrier is busy while any turn holds it: an HTTP request,
+a response body that is still streaming, an admitted alarm, or an accepted
+socket. The Host does not wait for that turn. The selecting request is
+refused at once as retryable unavailability, and an Actor Binding call answers
+HTTP 503. The old carrier keeps serving the work already admitted to it. When
+the carrier goes idle, the Host selects the latest accepted graph again on its
+own. A request that arrives during that retirement is refused the same way.
+The refusal exists because waiting can deadlock: the selecting request may be
+a nested call from the active turn into its own Namespace. Callers should
+retry these refusals. Because of this rule, a long-lived socket or a slow
+streaming response delays the rotation until it ends, and fresh requests to
+that Namespace are refused for that whole time. A deletion that lands while
+the carrier is still busy is seen by that scheduled selection, which retires
+the old carrier and opens nothing in its place. The pinned-workerd tests
+`selfhost-actor-execution-host` and `selfhost-v2-actor-composition-native`
+cover the refusal, the in-flight body and alarm that continue to completion,
+the selection after idle, and the deletion fence.
+
 The normal Bun entry can now opt in to its existing private v2 Actor and
 Workflow boot ports with `TAKOSERVER_V2_WORKER_RUNTIME_BOOT`, for example
 `{"actor":true,"workflow":{"maximumRegistrations":4}}`. The exact JSON
