@@ -17,7 +17,8 @@ export function renderSelfhostOperatorSignInInstructions(
       `For manual onboarding, send POST ${options.publicOrigin}/v1/sessions ` +
       `with provider=google and method=operator-assertion. Use its sessionToken with /v1/me, ` +
       `/v1/organizations, and /v1/organizations/{organizationId}/api-keys.\n` +
-      `For publisher admission, follow docs/self-host-operations.md.\n\n` +
+      `To seed held artifacts and create v2 Resources, follow "First install and first use" ` +
+      `in docs/self-host-operations.md; no publisher admission is needed.\n\n` +
       `Operator sign-in assertion (valid 10 minutes):\n\n${options.assertion}`;
 
   return (
