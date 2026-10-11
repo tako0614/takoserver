@@ -88,9 +88,10 @@ import {
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
 import {
-  selfhostActorSocketDiagnostic,
+  selfhostImplicitActorRuntime,
   selfhostPrivateSocketRoot,
 } from "./selfhost-socket-layout.ts";
+import { prepareSelfhostSocketRoot, sweepSelfhostSocketRoot } from "./selfhost-socket-root.ts";
 import { renderSelfhostOperatorSignInInstructions } from "./selfhost-startup-instructions.ts";
 import { createSelfhostTakoformV2Ingress } from "./selfhost-takoform-v2-ingress.ts";
 import {
@@ -642,45 +643,57 @@ let actorRuntime: SelfhostActorPublicRuntime | undefined;
 const installedActorForm = currentCandidates.forms.find(
   (form) => form.identity.formRef.kind === "ActorNamespace",
 );
-if (
+const implicitActorConfigured =
   providerMode !== RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN &&
-  workerdBinary &&
-  installedActorForm
-) {
-  // The released Forms always include ActorNamespace, so this runtime is
-  // implied rather than selected: a data root or TMPDIR its sockets cannot fit
-  // below leaves Actor admission unavailable, said here by name, and every
-  // other Form serving.
-  const socketDiagnostic =
-    dataRoot === ":memory:"
-      ? undefined
-      : selfhostActorSocketDiagnostic({
-          dataRoot,
-          temporaryDirectory: tmpdir(),
-          feature: "the Actor runtime",
-        });
-  if (socketDiagnostic) {
-    process.stderr.write(`${socketDiagnostic}; Actor admission remains unavailable.\n`);
-  } else {
-    try {
-      actorRuntime = await openSelfhostActorPublicRuntime({
-        dataRoot,
-        runtimeRoot: dataRoot,
-        socketParent: selfhostPrivateSocketRoot(dataRoot),
-        binary: workerdBinary,
-        graph: createActorResourceGraphReader({
-          store: resourceStores.inventory,
-          form: installedActorForm,
-        }),
-        deployments: resourceStores.deployments,
-        providerPackRef: "local",
-        providerInstallationRef: "local.primary",
-      });
-    } catch (error) {
-      process.stderr.write(
-        `the Actor owner could not restore: ${error instanceof Error ? error.message : "unknown error"}; Actor admission remains unavailable.\n`,
+  workerdBinary !== null &&
+  installedActorForm !== undefined;
+// Every Actor and Workflow listener directory lives in `<data root>/s`. Check
+// it once, before any of this process's listeners exist: an explicitly
+// selected v2 capability cannot start without it, and what a killed Host left
+// there is removed where its abandonment is proved.
+let socketRootProblem: string | undefined;
+if (dataRoot !== ":memory:" && (v2RuntimeSelection || implicitActorConfigured)) {
+  socketRootProblem = prepareSelfhostSocketRoot(dataRoot);
+  if (socketRootProblem && v2RuntimeSelection) {
+    throw new TypeError(`${socketRootProblem} (required by TAKOSERVER_V2_WORKER_RUNTIME_BOOT)`);
+  }
+  if (!socketRootProblem) {
+    const swept = await sweepSelfhostSocketRoot(dataRoot);
+    if (swept.removed.length > 0) {
+      process.stdout.write(
+        `removed ${swept.removed.length} abandoned socket director${
+          swept.removed.length === 1 ? "y" : "ies"
+        } in ${selfhostPrivateSocketRoot(dataRoot)}\n`,
       );
     }
+  }
+}
+const implicitActor = selfhostImplicitActorRuntime({
+  configured: implicitActorConfigured,
+  dataRoot,
+  temporaryDirectory: tmpdir(),
+  ...(socketRootProblem ? { socketRootProblem } : {}),
+});
+if (implicitActor.diagnostic) process.stderr.write(`${implicitActor.diagnostic}\n`);
+if (implicitActor.open && workerdBinary && installedActorForm) {
+  try {
+    actorRuntime = await openSelfhostActorPublicRuntime({
+      dataRoot,
+      runtimeRoot: dataRoot,
+      socketParent: selfhostPrivateSocketRoot(dataRoot),
+      binary: workerdBinary,
+      graph: createActorResourceGraphReader({
+        store: resourceStores.inventory,
+        form: installedActorForm,
+      }),
+      deployments: resourceStores.deployments,
+      providerPackRef: "local",
+      providerInstallationRef: "local.primary",
+    });
+  } catch (error) {
+    process.stderr.write(
+      `the Actor owner could not restore: ${error instanceof Error ? error.message : "unknown error"}; Actor admission remains unavailable.\n`,
+    );
   }
 }
 const workerdRuntime = createWorkerdRuntime({

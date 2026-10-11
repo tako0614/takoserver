@@ -155,3 +155,37 @@ export function selfhostWorkflowSocketDiagnostic(input: {
     feature: input.feature,
   });
 }
+
+/**
+ * Whether the implied public Actor runtime should open, and what to say when
+ * it should not.
+ *
+ * The released Forms always include ActorNamespace, so whenever a workerd
+ * binary is selected (outside the retired ObjectBucket drain) the runtime is
+ * implied rather than chosen. A data root, TMPDIR or socket directory its
+ * sockets cannot use then leaves Actor admission unavailable, said once by
+ * name, while every other Form serves. The Host entry and the Form admission
+ * CLI share this so the CLI never admits Actor support the Host withholds.
+ */
+export function selfhostImplicitActorRuntime(input: {
+  /** A workerd binary is selected, ActorNamespace is installed, and this is not the drain. */
+  readonly configured: boolean;
+  readonly dataRoot: string;
+  readonly temporaryDirectory: string;
+  /** From the socket directory check, when it failed. */
+  readonly socketRootProblem?: string;
+}): { readonly open: boolean; readonly diagnostic?: string } {
+  if (!input.configured) return { open: false };
+  // Memory control state keeps its earlier behavior: the owner itself refuses
+  // a non-durable root and the entry reports that refusal.
+  if (input.dataRoot === ":memory:") return { open: true };
+  const problem =
+    selfhostActorSocketDiagnostic({
+      dataRoot: input.dataRoot,
+      temporaryDirectory: input.temporaryDirectory,
+      feature: "the Actor runtime",
+    }) ?? input.socketRootProblem;
+  return problem
+    ? { open: false, diagnostic: `${problem}; Actor admission remains unavailable.` }
+    : { open: true };
+}

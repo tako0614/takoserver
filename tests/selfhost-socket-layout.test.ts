@@ -8,6 +8,7 @@ import {
   SELFHOST_UNIX_SOCKET_PATH_MAX_BYTES,
   SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES,
   selfhostActorSocketDiagnostic,
+  selfhostImplicitActorRuntime,
   selfhostPrivateSocketRoot,
   selfhostSocketBudgetDiagnostic,
   selfhostWorkflowSocketDiagnostic,
@@ -18,35 +19,26 @@ function pathOf(bytes: number): string {
   return `/${"r".repeat(bytes - 1)}`;
 }
 
-function worstCase(dataRoot: string, prefix: string, leaf: string): string {
-  return `${selfhostPrivateSocketRoot(dataRoot)}/${prefix}XXXXXX/${leaf}`;
-}
-
-test("each budget leaves its worst-case socket exactly at the validator bound", () => {
+test("each budget leaves the layout's literal worst-case socket at the validator bound", () => {
+  // Written out independently of the layout constants: a renamed directory or
+  // prefix must fail here rather than move the limit silently.
+  const actor = `${pathOf(SELFHOST_DATA_ROOT_SOCKET_BUDGET.actorBrokers)}/s/aXXXXXX/${"0".repeat(20)}.u.sock`;
   // The brokers refuse `>= 100`; their worst case at the budget is 99 bytes.
-  const actor = worstCase(
-    pathOf(SELFHOST_DATA_ROOT_SOCKET_BUDGET.actorBrokers),
-    SELFHOST_SOCKET_DIRECTORY_PREFIX.actorBrokers,
-    `${"0".repeat(20)}.u.sock`,
-  );
-  expect(Buffer.byteLength(actor)).toBe(SELFHOST_UNIX_SOCKET_PATH_MAX_BYTES - 1);
-  const workflow = worstCase(
-    pathOf(SELFHOST_DATA_ROOT_SOCKET_BUDGET.workflowBrokers),
-    SELFHOST_SOCKET_DIRECTORY_PREFIX.workflowBrokers,
-    `${"0".repeat(22)}.sock`,
-  );
-  expect(Buffer.byteLength(workflow)).toBe(SELFHOST_UNIX_SOCKET_PATH_MAX_BYTES - 1);
+  expect(Buffer.byteLength(actor)).toBe(99);
+  const workflow = `${pathOf(SELFHOST_DATA_ROOT_SOCKET_BUDGET.workflowBrokers)}/s/wXXXXXX/${"0".repeat(22)}.sock`;
+  expect(Buffer.byteLength(workflow)).toBe(99);
   // The execution guard and execution config refuse `> 100`.
-  const execution = worstCase(
-    pathOf(SELFHOST_DATA_ROOT_SOCKET_BUDGET.workflowExecution),
-    SELFHOST_SOCKET_DIRECTORY_PREFIX.workflowExecution,
-    "run.sock",
-  );
-  expect(Buffer.byteLength(execution)).toBe(SELFHOST_UNIX_SOCKET_PATH_MAX_BYTES);
-  const native = `${pathOf(SELFHOST_TMPDIR_SOCKET_BUDGET.actorNamespace)}/${
-    SELFHOST_SOCKET_DIRECTORY_PREFIX.actorNamespace
-  }XXXXXX/upgrade.sock`;
-  expect(Buffer.byteLength(native)).toBe(SELFHOST_UNIX_SOCKET_PATH_MAX_BYTES);
+  const execution = `${pathOf(SELFHOST_DATA_ROOT_SOCKET_BUDGET.workflowExecution)}/s/twf-XXXXXX/run.sock`;
+  expect(Buffer.byteLength(execution)).toBe(100);
+  const native = `${pathOf(SELFHOST_TMPDIR_SOCKET_BUDGET.actorNamespace)}/tactor-XXXXXX/upgrade.sock`;
+  expect(Buffer.byteLength(native)).toBe(100);
+  expect(SELFHOST_UNIX_SOCKET_PATH_MAX_BYTES).toBe(100);
+  expect(SELFHOST_SOCKET_DIRECTORY_PREFIX).toEqual({
+    actorBrokers: "a",
+    workflowBrokers: "w",
+    workflowExecution: "twf-",
+    actorNamespace: "tactor-",
+  });
 });
 
 test("the published limits are the layout's, well above the former 26-byte data root", () => {
@@ -98,4 +90,33 @@ test("an Actor runtime checks the data root first and then TMPDIR", () => {
   expect(
     selfhostActorSocketDiagnostic({ dataRoot: root, temporaryDirectory: `${tmp}t`, feature }),
   ).toStartWith(`TMPDIR is ${tmp}t (74 bytes), but the Actor runtime`);
+});
+
+test("the implied Actor runtime opens only when configured and every directory fits", () => {
+  const fits = {
+    dataRoot: pathOf(SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES),
+    temporaryDirectory: pathOf(SELFHOST_ACTOR_TMPDIR_MAX_BYTES),
+  };
+  expect(selfhostImplicitActorRuntime({ configured: false, ...fits })).toEqual({ open: false });
+  expect(selfhostImplicitActorRuntime({ configured: true, ...fits })).toEqual({ open: true });
+  // Memory control state keeps the owner's own refusal.
+  expect(selfhostImplicitActorRuntime({ configured: true, ...fits, dataRoot: ":memory:" })).toEqual(
+    { open: true },
+  );
+  const longRoot = pathOf(SELFHOST_ACTOR_DATA_ROOT_MAX_BYTES + 1);
+  expect(selfhostImplicitActorRuntime({ configured: true, ...fits, dataRoot: longRoot })).toEqual({
+    open: false,
+    diagnostic: `TAKOSERVER_DATA_ROOT is ${longRoot} (62 bytes), but the Actor runtime places Unix sockets below it and allows at most 61 bytes; choose a shorter TAKOSERVER_DATA_ROOT; Actor admission remains unavailable.`,
+  });
+  expect(
+    selfhostImplicitActorRuntime({ configured: true, ...fits, temporaryDirectory: "tmp" })
+      .diagnostic,
+  ).toStartWith('TMPDIR must be an absolute directory for the Actor runtime; it is "tmp"');
+  expect(
+    selfhostImplicitActorRuntime({ configured: true, ...fits, socketRootProblem: "unsafe s" }),
+  ).toEqual({ open: false, diagnostic: "unsafe s; Actor admission remains unavailable." });
+  // Not configured means silent, whatever the directories are.
+  expect(selfhostImplicitActorRuntime({ configured: false, ...fits, dataRoot: longRoot })).toEqual({
+    open: false,
+  });
 });

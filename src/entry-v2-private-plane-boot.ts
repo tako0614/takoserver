@@ -9,6 +9,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { privateDirectoryChainProblem } from "./selfhost-data-root.ts";
 
 const CONFIG_NAME = "TAKOSERVER_V2_WORKER_PRIVATE_PLANES";
 /** Raw operator-created key files are bounded; no unbounded secret file reads. */
@@ -53,48 +54,8 @@ function exactFields(
 }
 
 function checkedPrivateDirectory(path: string, name: string): string {
-  if (!isAbsolute(path) || resolve(path) !== path) {
-    throw new TypeError(`${name} must be an absolute canonical private directory`);
-  }
-  const uid = process.getuid?.();
-  if (uid === undefined) throw new TypeError(`${name} requires local owner identity`);
-  let current = path;
-  let leaf = true;
-  while (true) {
-    let metadata: ReturnType<typeof lstatSync>;
-    try {
-      metadata = lstatSync(current);
-      if (
-        !metadata.isDirectory() ||
-        metadata.isSymbolicLink() ||
-        realpathSync(current) !== current
-      ) {
-        throw new Error("not a real directory");
-      }
-    } catch {
-      throw new TypeError(`${name} must use real directories: ${current} is not one`);
-    }
-    const mode = (metadata.mode & 0o7777).toString(8).padStart(4, "0");
-    if (leaf) {
-      if (metadata.uid !== uid || (metadata.mode & 0o077) !== 0) {
-        throw new TypeError(
-          `${name} must be owned and private: ${current} has mode ${mode} and owner uid ` +
-            `${metadata.uid}, but needs mode 0700 and owner uid ${uid}`,
-        );
-      }
-      leaf = false;
-    } else if (
-      (metadata.mode & 0o022) !== 0 &&
-      !((metadata.mode & 0o1000) !== 0 && metadata.uid === 0)
-    ) {
-      throw new TypeError(
-        `${name} has an unsafe writable ancestor: ${current} has mode ${mode} and owner uid ${metadata.uid}`,
-      );
-    }
-    const parent = dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
+  const problem = privateDirectoryChainProblem(path, name);
+  if (problem) throw new TypeError(problem);
   return path;
 }
 

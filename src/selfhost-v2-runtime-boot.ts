@@ -101,7 +101,7 @@ export function assertSelfhostV2RuntimeSocketBudget(
   if (diagnostic) throw new TypeError(diagnostic);
 }
 
-function privateDirectory(path: string): string {
+function privateDirectory(path: string, note = ""): string {
   mkdirSync(path, { recursive: true, mode: 0o700 });
   const stat = lstatSync(path);
   if (
@@ -111,7 +111,10 @@ function privateDirectory(path: string): string {
     (process.getuid?.() !== undefined && stat.uid !== process.getuid?.()) ||
     (stat.mode & 0o077) !== 0
   )
-    throw new TypeError("v2 runtime root must be an owned private real directory");
+    throw new TypeError(
+      `v2 runtime directory ${path} must be a real directory owned by this user with mode 0700` +
+        ` (it is mode ${(stat.mode & 0o7777).toString(8).padStart(4, "0")}, owner uid ${stat.uid})${note}`,
+    );
   return path;
 }
 
@@ -155,7 +158,11 @@ export function createSelfhostV2RuntimeBoot(options: {
   // Listener directories are per incarnation and short-lived; they share the
   // data root's one short private socket root instead of nesting under
   // `v2-runtime`, which left room for only a 26-byte data root.
-  const socketRoot = () => privateDirectory(selfhostPrivateSocketRoot(resolve(options.dataRoot)));
+  const socketRoot = () =>
+    privateDirectory(
+      selfhostPrivateSocketRoot(resolve(options.dataRoot)),
+      "; it holds only per-start listener directories and may be deleted while the Host is stopped",
+    );
   const actor = options.selection.actor
     ? (() => {
         const graph = createV2ActorNamespaceGraphAuthority({

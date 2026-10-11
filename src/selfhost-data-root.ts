@@ -1,5 +1,5 @@
 import { chmodSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 /** The variable an operator sets; named by every data-root diagnostic. */
 export const SELFHOST_DATA_ROOT_VARIABLE = "TAKOSERVER_DATA_ROOT";
@@ -71,4 +71,57 @@ export function createSelfhostDataRootIfAbsent(dataRoot: string): boolean {
   // The mode above is filtered by umask; the root itself is exactly 0700.
   chmodSync(dataRoot, 0o700);
   return true;
+}
+
+/**
+ * Why `path` is not a directory this user can trust with private state, or
+ * `undefined` when it is.
+ *
+ * The leaf must be a real directory owned by this user and closed to group and
+ * other (0700). Every ancestor must be a real directory that no other user can
+ * write, except a sticky root-owned one such as `/tmp`: otherwise another user
+ * could rename the leaf away and put their own directory in its place. The
+ * same rule guards the v2 private planes and the socket directory.
+ */
+export function privateDirectoryChainProblem(path: string, name: string): string | undefined {
+  if (!isAbsolute(path) || resolve(path) !== path) {
+    return `${name} must be an absolute canonical private directory`;
+  }
+  const uid = process.getuid?.();
+  if (uid === undefined) return `${name} requires local owner identity`;
+  let current = path;
+  let leaf = true;
+  while (true) {
+    let metadata: ReturnType<typeof lstatSync>;
+    try {
+      metadata = lstatSync(current);
+      if (
+        !metadata.isDirectory() ||
+        metadata.isSymbolicLink() ||
+        realpathSync(current) !== current
+      ) {
+        throw new Error("not a real directory");
+      }
+    } catch {
+      return `${name} must use real directories: ${current} is not one`;
+    }
+    const mode = (metadata.mode & 0o7777).toString(8).padStart(4, "0");
+    if (leaf) {
+      if (metadata.uid !== uid || (metadata.mode & 0o077) !== 0) {
+        return (
+          `${name} must be owned and private: ${current} has mode ${mode} and owner uid ` +
+          `${metadata.uid}, but needs mode 0700 and owner uid ${uid}`
+        );
+      }
+      leaf = false;
+    } else if (
+      (metadata.mode & 0o022) !== 0 &&
+      !((metadata.mode & 0o1000) !== 0 && metadata.uid === 0)
+    ) {
+      return `${name} has an unsafe writable ancestor: ${current} has mode ${mode} and owner uid ${metadata.uid}`;
+    }
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
 }

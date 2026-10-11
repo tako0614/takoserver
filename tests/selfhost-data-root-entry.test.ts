@@ -5,7 +5,7 @@
  */
 import { expect, test } from "bun:test";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { base64UrlEncode } from "../src/json.ts";
@@ -240,6 +240,65 @@ test("an existing shared data root keeps its mode and private planes name what t
     );
     // The Host never changes an existing root's permissions.
     expect(statSync(dataRoot).mode & 0o777).toBe(0o755);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("boot removes a killed Host's abandoned broker directory and refuses an untrusted socket directory", async () => {
+  const base = await mkdtempForSockets("dre-sweep-", SELFHOST_WORKFLOW_DATA_ROOT_MAX_BYTES - 6);
+  const dataRoot = join(base, "data");
+  const socketRoot = join(dataRoot, "s");
+  const abandoned = join(socketRoot, "aDead01");
+  try {
+    await mkdir(abandoned, { recursive: true, mode: 0o700 });
+    const listener = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        `require("node:net").createServer().listen(${JSON.stringify(join(abandoned, "0.u.sock"))}); setInterval(() => {}, 1000);`,
+      ],
+      { stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+    );
+    while (!existsSync(join(abandoned, "0.u.sock"))) await Bun.sleep(20);
+    listener.kill("SIGKILL");
+    await listener.exited;
+    const old = (Date.now() - 3_600_000) / 1_000;
+    await utimes(abandoned, old, old);
+    const boot = async () => {
+      const child = Bun.spawn([process.execPath, "--no-env-file", ENTRY], {
+        cwd: base,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: {
+          ...baseEnvironment(base, await unusedPort()),
+          TAKOSERVER_DATA_ROOT: dataRoot,
+          TAKOSERVER_V2_WORKER_RUNTIME_BOOT: JSON.stringify({
+            workflow: { maximumRegistrations: 1 },
+          }),
+        },
+      });
+      // This fixture has no held WorkerBundle backend, which is checked after
+      // the socket directory; the boot stops there either way.
+      const code = await exited(child);
+      return {
+        code,
+        stdout: await new Response(child.stdout as ReadableStream).text(),
+        stderr: await new Response(child.stderr as ReadableStream).text(),
+      };
+    };
+    const swept = await boot();
+    expect(swept.code).not.toBe(0);
+    expect(swept.stdout).toContain(`removed 1 abandoned socket directory in ${socketRoot}\n`);
+    expect(existsSync(abandoned)).toBe(false);
+    await chmod(socketRoot, 0o755);
+    const refused = await boot();
+    expect(refused.code).not.toBe(0);
+    expect(refused.stderr).toContain(
+      `the socket directory (TAKOSERVER_DATA_ROOT/s) must be owned and private: ${socketRoot} has mode 0755`,
+    );
+    expect(refused.stderr).toContain("(required by TAKOSERVER_V2_WORKER_RUNTIME_BOOT)");
   } finally {
     await rm(base, { recursive: true, force: true });
   }

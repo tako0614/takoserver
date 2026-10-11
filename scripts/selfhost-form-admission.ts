@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { createActorResourceGraphReader } from "../src/actor-resource-graph.ts";
 import { createAppResourceStoreBundle } from "../src/app.ts";
@@ -23,7 +24,11 @@ import {
   createSelfhostProductionFormAuthorityComposition,
   deriveSelfhostFormAuthorityCatalog,
 } from "../src/selfhost-form-authority-composition.ts";
-import { selfhostPrivateSocketRoot } from "../src/selfhost-socket-layout.ts";
+import {
+  selfhostImplicitActorRuntime,
+  selfhostPrivateSocketRoot,
+} from "../src/selfhost-socket-layout.ts";
+import { prepareSelfhostSocketRoot } from "../src/selfhost-socket-root.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
   createStandaloneProviderComposition,
@@ -324,7 +329,18 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
     })
       ? candidates.forms.find((form) => form.identity.formRef.kind === "ActorNamespace")
       : undefined;
-    if (workerdSelection.binary && actorForm) {
+    // The Host's own decision: a root, TMPDIR or socket directory that would
+    // leave the Host without Actor admission leaves this plan without it too.
+    const actorConfigured = workerdSelection.binary !== null && actorForm !== undefined;
+    const socketRootProblem = actorConfigured ? prepareSelfhostSocketRoot(dataRoot) : undefined;
+    const implicitActor = selfhostImplicitActorRuntime({
+      configured: actorConfigured,
+      dataRoot,
+      temporaryDirectory: tmpdir(),
+      ...(socketRootProblem ? { socketRootProblem } : {}),
+    });
+    if (implicitActor.diagnostic) process.stderr.write(`${implicitActor.diagnostic}\n`);
+    if (implicitActor.open && workerdSelection.binary && actorForm) {
       try {
         actorRuntime = await openSelfhostActorPublicRuntime({
           dataRoot,
