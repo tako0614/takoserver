@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createActorResourceGraphReader } from "./actor-resource-graph.ts";
 import { buildApp, createAppResourceStoreBundle } from "./app.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
@@ -12,7 +12,12 @@ import {
 } from "./entry-v2-private-plane-boot.ts";
 import { parseSelfhostV2WorkerEndpointHttpsSelection } from "./entry-v2-worker-endpoint-boot.ts";
 import { resolveIdentity } from "./identity-setup.ts";
-import { migrateSqlite } from "./migrate-sqlite.ts";
+import {
+  type MigrationOptions,
+  migrateSqlite,
+  refuseUsedV1Installation,
+  UsedV1InstallationError,
+} from "./migrate-sqlite.ts";
 import { createFileObjectStore } from "./objects-fs.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
@@ -146,6 +151,15 @@ import { createWorkerdSupervisor } from "./workerd-supervisor.ts";
  * Cloudflare account credentials may back the explicitly selected provider
  * pack; they never create a separate storage-retail surface.
  */
+
+/**
+ * A used v1.0.0 installation is refused before anything was written to it, and
+ * the message is the whole explanation; a stack trace would only bury it.
+ */
+function exitWithUsedV1Refusal(error: UsedV1InstallationError): never {
+  process.stderr.write(`${error.message}\n`);
+  process.exit(1);
+}
 
 function required(name: string): string {
   const value = process.env[name];
@@ -332,6 +346,43 @@ const providerMode = resolveStandaloneProviderMode({
   workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
 });
 const currentCandidates = selectPublicHostFormSource(process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE);
+
+// Organizations, keys, and the ledger are as durable as the files are: a
+// machine that forgets who its customers are, and what they are owed, on
+// restart is not a platform. Memory is kept for tests, which say so by
+// asking for it.
+const databasePath =
+  process.env.TAKOSERVER_DB ??
+  (dataRoot === ":memory:" ? ":memory:" : `${dataRoot}/control.sqlite`);
+const controlInstallation: MigrationOptions = {
+  installation: {
+    dataRoot,
+    databasePath,
+    externalDatabase:
+      databasePath !== ":memory:" && resolve(databasePath) !== join(dataRoot, "control.sqlite"),
+  },
+};
+// A used v1.0.0 installation is refused before this process writes anything:
+// before it creates a missing data root and before it opens the database for
+// writing, so neither an external TAKOSERVER_DB nor a new root is touched. The
+// probe only reads; whatever it cannot read (a missing file, a lock, a hot
+// journal a read-only handle may not roll back) is left to the ordinary open
+// below, whose migration repeats the same check.
+if (databasePath !== ":memory:" && existsSync(databasePath)) {
+  let refusal: UsedV1InstallationError | undefined;
+  let probe: Database | undefined;
+  try {
+    probe = new Database(databasePath, { readonly: true });
+    probe.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
+    refuseUsedV1Installation(probe, controlInstallation);
+  } catch (error) {
+    if (error instanceof UsedV1InstallationError) refusal = error;
+  } finally {
+    probe?.close();
+  }
+  if (refusal) exitWithUsedV1Refusal(refusal);
+}
+
 // Configuration is validated above without touching the filesystem. Keys,
 // tenant data and sockets live here: a new root starts private, while an
 // existing one keeps the permissions its operator gave it.
@@ -362,13 +413,6 @@ const selfhostContainer = createSelfhostContainerBootstrap({
   providerMode,
 });
 
-// Organizations, keys, and the ledger are as durable as the files are: a
-// machine that forgets who its customers are, and what they are owed, on
-// restart is not a platform. Memory is kept for tests, which say so by
-// asking for it.
-const databasePath =
-  process.env.TAKOSERVER_DB ??
-  (dataRoot === ":memory:" ? ":memory:" : `${dataRoot}/control.sqlite`);
 if (databasePath !== ":memory:") mkdirSync(dirname(databasePath), { recursive: true });
 
 // The Bun control plane always uses local SQLite. Shared D1 is not accepted
@@ -382,7 +426,15 @@ controlDatabase.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
 // to this build's schema here. Forward only and recorded, so running it
 // again applies nothing and a database from a newer build is refused
 // rather than repaired.
-const migrated = migrateSqlite(controlDatabase);
+const migrated = (() => {
+  try {
+    return migrateSqlite(controlDatabase, controlInstallation);
+  } catch (error) {
+    if (!(error instanceof UsedV1InstallationError)) throw error;
+    controlDatabase.close();
+    exitWithUsedV1Refusal(error);
+  }
+})();
 if (migrated.applied.length > 0) {
   process.stdout.write(
     `applied ${migrated.applied.length} migration(s): ${migrated.applied.join(", ")}\n`,
