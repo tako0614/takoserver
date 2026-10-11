@@ -6,7 +6,7 @@ released in lockstep with other Takos products. Numbers in parentheses are pull
 requests in `tako0614/takoserver`. Each section is published verbatim as the
 GitHub Release notes of its tag (see [docs/release.md](docs/release.md)).
 
-## [2.0.0-rc.1] - Unreleased
+## [2.0.0-rc.1] - 2026-10-11
 
 The first release candidate of Takoserver 2.0.0, published as a GitHub
 pre-release so that operators can try the v2 install path before 2.0.0 is
@@ -277,11 +277,19 @@ before use.
 
 ### Known limitations
 
-- **Hosted / Workers for Platforms is not live-qualified.** The managed
+- **Hosted / Workers for Platforms is only partly live-qualified.** The managed
   backend is composed in the private `takoserver-private` repository. The v2
   canonical Hosted path became runnable on a fresh integration environment in
-  source (#289), but it has not been run live, and this release does not imply
-  a production rollout.
+  source (#289). On 2026-10-11 it was run on a new non-production Cloudflare
+  environment: storage, signing key, dispatch namespace, receipt authority,
+  gateway, provider executor, Host bootstrap, operator sign-in, organization
+  and API key, hostname topology, module inspector and artifact preparation
+  completed, and the run found and fixed several defects that only a live
+  readback shows (the gateway's compatibility flags and the platform's default
+  observability fields were refused by the owners' own checks). The trusted
+  Tail, the canonical Host publication and the create, serve, update and delete
+  smoke have not been observed live, and this release does not imply a
+  production rollout.
 - **The attached closed-graph workerd is not built by CI.** All five
   `workerd-closed-graph-build` workflow runs failed (toolchain prerequisites,
   time limits, and one completed build whose digest was not the pinned one).
