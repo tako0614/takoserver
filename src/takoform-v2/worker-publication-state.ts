@@ -90,12 +90,24 @@ export type V2WorkerPublicationResolution =
     }
   | {
       readonly kind: "unresolved";
+      /**
+       * For a live publication, `deployment_missing` (an Endpoint create or
+       * update finds no active Deployment) and `fetch_unavailable` (an Endpoint
+       * is attached and a weighted Version declares neither `fetch` nor
+       * assets) refuse the Operation itself, and only under its current claim.
+       * While it is the Worker's oldest pending publication no other Operation
+       * can settle a change to either fact, and `ready` (the only way to a
+       * native send) is never returned while one holds, so no earlier attempt
+       * of the same Operation reached the owner. Other codes may clear later.
+       */
       readonly code:
         | "stale_claim"
         | "graph_unresolved"
         | "publication_conflict"
         | "incumbent_unresolved"
-        | "source_unsettled";
+        | "source_unsettled"
+        | "deployment_missing"
+        | "fetch_unavailable";
       readonly message: string;
     };
 
@@ -1972,7 +1984,7 @@ export function createV2WorkerPublicationState(options: {
       };
     }
     if (endpoint && !deployment && action !== "delete") {
-      return unresolved("graph_unresolved", "Endpoint has no active Deployment");
+      return unresolved("deployment_missing", "Endpoint has no active Deployment");
     }
     if (
       endpoint &&
@@ -1980,7 +1992,7 @@ export function createV2WorkerPublicationState(options: {
         (version) => !version.spec.handlers.includes("fetch") && !version.spec.assets,
       )
     ) {
-      return unresolved("graph_unresolved", "Endpoint requires HTTP-capable weighted Versions");
+      return unresolved("fetch_unavailable", "Endpoint requires HTTP-capable weighted Versions");
     }
     const acceptedEndpointOutput = form === WORKER_ENDPOINT_FORM_URL ? outputHostname(own) : null;
     if (form === WORKER_ENDPOINT_FORM_URL && !acceptedEndpointOutput) {

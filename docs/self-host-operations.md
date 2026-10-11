@@ -1285,14 +1285,26 @@ What this test and its neighbours record:
   recorded, a dispatched Operation the owner cannot vouch for, and more than
   eight consecutive failed Operations of one attachment (the fence refusal is
   measured; the resulting boot refusal is not). By reading the backends (not
-  measured), a Deployment or Endpoint backend answers `unknown` for every
-  refusal before it reaches the owner (an unresolved graph, a
+  measured), a Deployment or Endpoint backend answers `unknown` for a refusal
+  before it reaches the owner that may still clear (an unresolved graph, a
   `publication_conflict`), so such an Operation stays `reconciling` and keeps
   retrying: boot is not blocked, because the owner vouches it never served,
   but the Worker's Endpoint is not served until the Operation is settled.
   Once it has been pending for ten minutes of Host uptime, readiness counts it
   under `backlog.operations.reconciling` and reports `degraded` (see
-  [Monitoring](#monitoring)).
+  [Monitoring](#monitoring)). A refusal of the Operation's own precondition
+  settles instead, `failed` with effect `none` (engine tests with the real
+  Deployment and Endpoint backends pin this). An Endpoint create or update
+  whose Worker has no active Deployment fails with `worker_deployment_missing`.
+  One whose weighted Versions declare neither `fetch` nor assets, or a
+  Deployment change that would leave an attached Endpoint with such a Version,
+  fails with `worker_fetch_handler_missing`. Later Operations for the Worker
+  then no longer wait behind it, and the failed Resource can be deleted or
+  re-applied.
+  An Endpoint without such a Deployment is now refused at acceptance with
+  `409 dependency_conflict` and a `detail` that names the missing Deployment
+  (measured on the native Endpoint lane), so an Endpoint reaches this path
+  only if an earlier Host accepted it.
 
 Three other gaps this test first recorded have since been fixed, each with its own
 test:

@@ -463,6 +463,13 @@ before their maximum-size journey can be claimed.
 Publication must read through its own live Operation and the exact selected,
 settled Version. An Endpoint reaches a Version through the confirmed Deployment
 in the SQL graph; its own Worker reference is not a grant to arbitrary Versions.
+An Endpoint create or update is therefore accepted only while the Worker has an
+active Deployment, not being deleted, whose weighted Versions all declare
+`fetch` or assets, and no other Endpoint. Otherwise it is refused with
+`409 dependency_conflict` before acceptance. An Endpoint that an earlier Host
+accepted without one settles `failed` with effect `none`
+(`worker_deployment_missing`), so it does not hold the Worker's later
+publications behind it.
 The reader must recheck the graph and artifact digests after asynchronous reads.
 It must neither impersonate a completed Version Operation nor reacquire source
 URLs when held bytes are missing. Missing or changed custody remains unresolved.

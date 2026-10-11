@@ -27,8 +27,8 @@ import {
 const tokenPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u;
 const namePattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 
-function fail(code: string, status: number, operationId?: string): never {
-  throw new TakoformV2Error(code, status, code, operationId);
+function fail(code: string, status: number, operationId?: string, detail?: string): never {
+  throw new TakoformV2Error(code, status, code, operationId, detail);
 }
 
 function validName(value: string): boolean {
@@ -120,8 +120,18 @@ function snapshotAdmission(value: V2AdmissionPredicate | null): V2AdmissionPredi
   if (value === null) return null;
   const sql = value.sql;
   const conflictCode = value.conflictCode;
+  const detail = value.detail;
   if (typeof sql !== "string" || !sql.trim() || sql.includes(";") || !Array.isArray(value.params)) {
     throw new TypeError("invalid trusted Form admission predicate");
+  }
+  if (
+    detail !== undefined &&
+    (typeof detail !== "string" ||
+      !detail ||
+      detail.length > 1_024 ||
+      (conflictCode ?? "dependency_conflict") !== "dependency_conflict")
+  ) {
+    throw new TypeError("invalid trusted Form admission refusal detail");
   }
   if (
     conflictCode !== undefined &&
@@ -144,6 +154,7 @@ function snapshotAdmission(value: V2AdmissionPredicate | null): V2AdmissionPredi
     sql,
     params: Object.freeze(params),
     ...(conflictCode === undefined ? {} : { conflictCode }),
+    ...(detail === undefined ? {} : { detail }),
   });
 }
 
@@ -576,7 +587,9 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           initialOutputJson,
           admission,
         );
-        if (result === "dependency_conflict") fail("dependency_conflict", 409);
+        // Only the Form's admission predicate refuses CREATE this way.
+        if (result === "dependency_conflict")
+          fail("dependency_conflict", 409, undefined, admission?.detail);
         if (result === "resource_busy") fail("resource_busy", 409);
       } catch (error) {
         const winner = await winnerAfterRace(principal, key, fingerprint, privateInputs);
@@ -702,7 +715,14 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       }
       const winner = await winnerAfterRace(input.principal, input.key, fingerprint, privateInputs);
       if (winner) return winner;
-      if (result === "dependency_conflict") fail("dependency_conflict", 409);
+      // The admission predicate, or the pending-referrer serialization guard.
+      if (result === "dependency_conflict")
+        fail(
+          "dependency_conflict",
+          409,
+          undefined,
+          serializeUpdatesWithPendingReferrers ? undefined : admission?.detail,
+        );
       if (result === "resource_busy") fail("resource_busy", 409);
       const latest = await ownedResource(input.principal, input.uid, "write");
       if (latest.busy_operation) fail("resource_busy", 409);

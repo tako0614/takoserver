@@ -642,3 +642,67 @@ test("a candidate the owner retired before activation settles its Deployment Ope
   fenceCurrent = false;
   expect(await form.backend.reconcile(execution)).toMatchObject({ kind: "unknown" });
 });
+
+test("a Deployment change the reader refuses for an attached Endpoint settles with no effect", async () => {
+  const workerUid = "worker-backend-fetchless";
+  const spec = parseWorkerDeploymentSpec({
+    worker: { resourceUid: workerUid },
+    versions: [{ workerVersion: { resourceUid: "version-backend-fetchless" }, weight: 10_000 }],
+  });
+  let code = "fetch_unavailable";
+  let ownerCalls = 0;
+  const form = createWorkerDeploymentForm({
+    targetKey: TARGET_KEY,
+    publicationState: {
+      resolve: async () => ({ kind: "unresolved", code, message: "fixture" }) as never,
+    },
+    scheduledAttachments: {
+      async requiresScheduledHandler() {
+        return {
+          kind: "ready" as const,
+          required: false,
+          attachmentUids: [],
+          stillCurrent: async () => true,
+        };
+      },
+    },
+    ownerForWorker: () => ({
+      workerResourceUid: workerUid,
+      async execute() {
+        ownerCalls += 1;
+        return { kind: "unknown" as const };
+      },
+    }),
+  });
+  const execution = (action: "create" | "update" | "delete"): V2Execution => ({
+    operationId: "8f0f3c1e-8a2b-4c7d-9e6f-1a2b3c4d5e6f",
+    leaseToken: "lease-backend-fetchless",
+    backendKey: "backend-key-backend-fetchless",
+    backendId: "selfhost-v2-worker-deployment-owner-v1",
+    targetKey: TARGET_KEY,
+    resourceUid: "deployment-backend-fetchless",
+    principal: "org-fixture",
+    action,
+    generation: action === "create" ? 1 : 2,
+    form: WORKER_DEPLOYMENT_FORM_URL,
+    space: "prod",
+    name: "deployment",
+    spec: spec as unknown as JsonObject,
+    previousObserved: {},
+    previousOutput: {},
+  });
+  for (const action of ["create", "update"] as const) {
+    code = "fetch_unavailable";
+    expect(await form.backend.reconcile(execution(action))).toMatchObject({
+      kind: "no_effect",
+      code: "worker_fetch_handler_missing",
+    });
+    for (const transient of ["graph_unresolved", "publication_conflict", "deployment_missing"]) {
+      code = transient;
+      expect(await form.backend.reconcile(execution(action))).toMatchObject({ kind: "unknown" });
+    }
+  }
+  code = "fetch_unavailable";
+  expect(await form.backend.reconcile(execution("delete"))).toMatchObject({ kind: "unknown" });
+  expect(ownerCalls).toBe(0);
+});

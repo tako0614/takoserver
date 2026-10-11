@@ -406,6 +406,24 @@ test.skipIf(configuredBinary === null)(
         vars: {},
         requiredSensitiveVars: [],
       });
+      // An Endpoint before its Deployment is refused before acceptance, so it
+      // can neither stay reconciling nor queue the Deployment behind it.
+      const early = await http(
+        "/resources",
+        "POST",
+        {
+          form: WORKER_ENDPOINT_FORM_URL,
+          space: organization.id,
+          name: "endpoint",
+          spec: { worker: { resourceUid: workerUid } },
+        },
+        "create-endpoint-native-endpoint",
+      );
+      expect(early.status).toBe(409);
+      const earlyProblem = (await early.json()) as { code: string; detail?: string };
+      expect(earlyProblem.code).toBe("dependency_conflict");
+      expect(earlyProblem.detail).toContain("active WorkerDeployment");
+      expect(await app.tickTakoformV2()).toBeNull();
       const deploymentUid = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
         worker: { resourceUid: workerUid },
         versions: [{ workerVersion: { resourceUid: versionUid }, weight: 10_000 }],

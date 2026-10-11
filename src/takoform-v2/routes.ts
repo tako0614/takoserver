@@ -376,6 +376,11 @@ function asProblem(error: unknown, options: TakoformV2HttpOptions): Response {
       ID.test(candidate.operationId)
         ? { operationId: candidate.operationId }
         : {}),
+      ...(error instanceof TakoformV2Error &&
+      typeof candidate.detail === "string" &&
+      candidate.detail.length > 0
+        ? { detail: candidate.detail }
+        : {}),
     });
   }
   return problem(500, "internal_error");
@@ -384,7 +389,7 @@ function asProblem(error: unknown, options: TakoformV2HttpOptions): Response {
 function problem(
   status: number,
   code: string,
-  headers: { allow?: string; wwwAuthenticate?: string; operationId?: string } = {},
+  headers: { allow?: string; wwwAuthenticate?: string; operationId?: string; detail?: string } = {},
 ): Response {
   const title = statusTitle(status);
   const responseHeaders = new Headers({
@@ -399,6 +404,7 @@ function problem(
       title,
       status,
       code,
+      ...(headers.detail ? { detail: headers.detail } : {}),
       ...(headers.operationId ? { operationId: headers.operationId } : {}),
     }),
     {
