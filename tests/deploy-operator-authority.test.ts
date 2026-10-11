@@ -562,30 +562,65 @@ describe("operator authority", () => {
         }),
       );
       expect(crossHostReplay.status).toBe(401);
-      const otherHostProof = await otherApp.fetch(
-        new Request(`${OTHER_ORIGIN}/v1/operator-owner-proof`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            provider: IDENTITY.provider,
-            method: "operator-assertion",
-            assertion: otherAssertion,
-            organizationId: otherOrganizationBody.organization.id,
+      // Each sign-in assertion above opened a session, so it is spent and
+      // proves nothing more; a proof needs an unspent assertion.
+      const proofAt = async (
+        target: typeof app,
+        origin: string,
+        proofAssertion: string,
+        organizationId: string,
+      ) =>
+        await target.fetch(
+          new Request(`${origin}/v1/operator-owner-proof`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              provider: IDENTITY.provider,
+              method: "operator-assertion",
+              assertion: proofAssertion,
+              organizationId,
+            }),
           }),
-        }),
+        );
+      const freshAssertion = async (aud: string) =>
+        await signOperatorAssertion({
+          privateJwk: JSON.stringify(privateInput.jwk),
+          claims: {
+            purpose: "sign-in",
+            aud,
+            provider: IDENTITY.provider,
+            subject: IDENTITY.subject,
+            email: IDENTITY.email,
+            displayName: IDENTITY.displayName,
+          },
+          nowSeconds: Math.floor(now.getTime() / 1_000),
+          lifetimeSeconds: 60,
+        });
+      expect(
+        (
+          await proofAt(
+            otherApp,
+            OTHER_ORIGIN,
+            otherAssertion,
+            otherOrganizationBody.organization.id,
+          )
+        ).status,
+      ).toBe(401);
+      const otherHostProof = await proofAt(
+        otherApp,
+        OTHER_ORIGIN,
+        await freshAssertion(OTHER_ORIGIN),
+        otherOrganizationBody.organization.id,
       );
       expect(otherHostProof.status).toBe(200);
-      const readOnlyProof = await app.fetch(
-        new Request(`${ORIGIN}/v1/operator-owner-proof`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            provider: IDENTITY.provider,
-            method: "operator-assertion",
-            assertion,
-            organizationId: organizationBody.organization.id,
-          }),
-        }),
+      expect((await proofAt(app, ORIGIN, assertion, organizationBody.organization.id)).status).toBe(
+        401,
+      );
+      const readOnlyProof = await proofAt(
+        app,
+        ORIGIN,
+        await freshAssertion(ORIGIN),
+        organizationBody.organization.id,
       );
       expect(readOnlyProof.status).toBe(200);
       expect(Number((await sql.query("SELECT COUNT(*) AS count FROM principals"))[0]?.count)).toBe(

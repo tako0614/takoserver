@@ -178,6 +178,40 @@ describe("the assertion a first run prints", () => {
     expect(verified.displayName).toBe("Operator");
   });
 
+  test("gives every sign-in a nonce and leaves other purposes' claims exactly as given", async () => {
+    const store = memoryFiles();
+    await ensureOperatorKey({
+      hasIdentityProvider: false,
+      path: "/data/operator-key.jwk",
+      readFile: store.readFile,
+      writeFile: store.writeFile,
+    });
+    const privateJwk = store.files.get("/data/operator-key.jwk") ?? "";
+    const claimsOf = (assertion: string) =>
+      JSON.parse(
+        Buffer.from(assertion.split(".")[0] ?? "", "base64url").toString("utf8"),
+      ) as Record<string, unknown>;
+    const sign = (claims: Record<string, unknown>) =>
+      signOperatorAssertion({ privateJwk, claims, nowSeconds: 1_700_000_000, lifetimeSeconds: 60 });
+    const signIn = { purpose: "sign-in", aud: "http://localhost:8787", subject: "operator" };
+
+    // Same claims, same second: still two different single-use assertions.
+    const first = await sign(signIn);
+    const second = await sign(signIn);
+    expect(first).not.toBe(second);
+    expect(typeof claimsOf(first).jti).toBe("string");
+    expect(claimsOf(first).jti).not.toBe(claimsOf(second).jti);
+    // A caller's own nonce is kept.
+    expect(claimsOf(await sign({ ...signIn, jti: "caller-nonce" })).jti).toBe("caller-nonce");
+
+    const funding = { purpose: "funding", organizationId: "org_a", fundingRef: "f-1" };
+    expect(claimsOf(await sign(funding))).toEqual({
+      ...funding,
+      iat: 1_700_000_000,
+      exp: 1_700_000_060,
+    });
+  });
+
   test("expires, so a banner left in scrollback is not a standing key", async () => {
     const store = memoryFiles();
     const publicKeyJwk = await ensureOperatorKey({

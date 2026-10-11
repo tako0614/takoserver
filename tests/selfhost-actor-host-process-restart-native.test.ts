@@ -826,7 +826,7 @@ function observeHostOutput(
           if (line.includes(`generated an operator key at ${expectedKeyPath}`)) {
             state.operatorKeyGeneratedAtExpectedPath = true;
           }
-          if (line.includes(`takoserver listening on :${hostPort}`)) {
+          if (line.includes(`takoserver listening on 127.0.0.1:${hostPort} `)) {
             state.listeningAtConfiguredPort = true;
           }
         } else {
