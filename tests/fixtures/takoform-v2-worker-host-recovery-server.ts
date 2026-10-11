@@ -189,6 +189,13 @@ async function main(): Promise<void> {
       workerResourceUid: uid,
       targetKey: TARGET_KEY,
       publicationState,
+      // The fixture observes serving through the owner's Service Binding
+      // dispatch entry, which is rendered only with this capability. No
+      // Version declares a Service Binding, so neither callback is reached.
+      v2ServiceBinding: {
+        authority: { resolveCurrentBinding: async () => null },
+        ownerForResourceUid: async () => null,
+      },
       ...(configuredInputs ? { configuredInputs } : {}),
       workerdBinary: binary,
       ...(inspector ? { inspectModule: inspector.inspect.bind(inspector) } : {}),
