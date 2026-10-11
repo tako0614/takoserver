@@ -88,6 +88,19 @@ function installation(options: { organizations?: readonly string[] } = {}): Inst
   return { parent, root, fakeProc };
 }
 
+/**
+ * The kernel's own process table, showing only `pids`. Each entry is the real
+ * `/proc/<pid>`, so descriptor tables are read exactly as in `/proc`; the
+ * machine's other processes (a CI runner's non-dumpable helpers, other work)
+ * are left out because the CLI rightly refuses to vouch for them.
+ */
+function realProcessTable(parent: string, pids: readonly number[]): string {
+  const table = join(parent, "real-proc");
+  mkdirSync(table);
+  for (const pid of pids) symlinkSync(`/proc/${pid}`, join(table, String(pid)));
+  return table;
+}
+
 function sourceTree(parent: string, name: string, files: Record<string, string | Uint8Array>) {
   const directory = join(parent, "sources", name);
   for (const [path, contents] of Object.entries(files)) {
@@ -690,23 +703,27 @@ describe("self-host held artifact seeding", () => {
     const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
     const first = await reader.read();
     expect(new TextDecoder().decode(first.value)).toContain("ready");
-    const refused = await run(
-      [
-        "seed",
-        "worker-bundle",
-        source,
-        "--base-url",
-        "https://artifacts.example.test/hello/v1/",
-        "--organization",
-        ORG,
-      ],
-      install,
-      {},
-      "/proc",
-    );
+    const table = realProcessTable(install.parent, [process.pid, child.pid]);
+    const args = [
+      "seed",
+      "worker-bundle",
+      source,
+      "--base-url",
+      "https://artifacts.example.test/hello/v1/",
+      "--organization",
+      ORG,
+    ];
+    const refused = await run(args, install, {}, table);
     expect(refused.code).toBe(1);
-    expect(refused.stderr).toContain(`pid ${child.pid}`);
+    expect(refused.stderr).toContain(
+      `pid ${child.pid} has ${realpathSync(install.root)}/control.sqlite open`,
+    );
     expect(heldObjectKeys(install.root)).toEqual([]);
+
+    // Once that process has exited, the same kernel table proves the root unused.
+    child.kill("SIGKILL");
+    await child.exited;
+    expect((await run(args, install, {}, table)).code).toBe(0);
   });
 
   test("refuses an installation it cannot trust or an organization it does not know", async () => {
@@ -925,48 +942,54 @@ describe("self-host held artifact seeding", () => {
     const source = sourceTree(install.parent, "hello", {
       "worker.js": "export default {};\n",
     });
-    const child = Bun.spawn(
-      [
-        process.execPath,
-        "--no-env-file",
-        join(import.meta.dir, "..", "scripts", "selfhost-artifact.ts"),
-        "seed",
-        "worker-bundle",
-        source,
-        "--base-url",
-        "https://artifacts.example.test/hello/v1/",
-        "--organization",
-        ORG,
-      ],
-      {
-        cwd: install.parent,
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", TAKOSERVER_DATA_ROOT: install.root },
-      },
-    );
-    const [code, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-    ]);
-    if (process.platform === "linux") {
-      expect(code).toBe(0);
-      expect(JSON.parse(stdout).configBlock).toBe("workerBundle");
-      expect(stderr).toContain("restart the Host");
-    } else {
-      expect(code).toBe(1);
-      expect(stderr).toContain("cannot prove");
-    }
-    const usage = Bun.spawn(
-      [
-        process.execPath,
-        "--no-env-file",
-        join(import.meta.dir, "..", "scripts", "selfhost-artifact.ts"),
-      ],
-      { stdin: "ignore", stdout: "ignore", stderr: "pipe" },
-    );
-    expect(await usage.exited).toBe(2);
+    const configPath = join(install.parent, "takoform-v2.json");
+    writeFileSync(configPath, JSON.stringify(DOCS));
+    const seedArgs = [
+      "seed",
+      "worker-bundle",
+      source,
+      "--base-url",
+      "https://artifacts.example.test/hello/v1/",
+      "--organization",
+      ORG,
+    ];
+    result(await run([...seedArgs, "--config", configPath], install));
+    const command = async (argv: readonly string[]) => {
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          "--no-env-file",
+          join(import.meta.dir, "..", "scripts", "selfhost-artifact.ts"),
+          ...argv,
+        ],
+        {
+          cwd: install.parent,
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+          env: { PATH: process.env.PATH ?? "/usr/bin:/bin", TAKOSERVER_DATA_ROOT: install.root },
+        },
+      );
+      const [code, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      return { code, stdout, stderr };
+    };
+    // The entry reads its argv and environment and reports through stdout,
+    // stderr and its exit code. These paths do not read the machine's process
+    // table, so their outcome is the same on every host.
+    const verified = await command(["verify", "--config", configPath]);
+    expect(verified.code).toBe(0);
+    expect(JSON.parse(verified.stdout)).toMatchObject({ checked: 2, failures: [] });
+    expect(verified.stderr).toContain("present with their exact bytes");
+    chmodSync(install.root, 0o755);
+    const refused = await command(seedArgs);
+    chmodSync(install.root, 0o700);
+    expect(refused.code).toBe(1);
+    expect(refused.stdout).toBe("");
+    expect(refused.stderr).toContain("needs mode 0700");
+    expect((await command([])).code).toBe(2);
   });
 });
