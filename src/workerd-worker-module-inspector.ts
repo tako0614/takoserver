@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { ACTOR_NATIVE_BOOTSTRAP_SOURCE } from "./generated/actor-native-bootstrap.ts";
@@ -148,8 +148,10 @@ async function privateInspectionDirectory(
   temporaryRoot: string | undefined,
   prefix: string,
 ): Promise<string> {
-  let parent = tmpdir();
-  if (temporaryRoot !== undefined) {
+  let parent: string;
+  if (temporaryRoot === undefined) {
+    parent = await trustedSystemTemporaryParent();
+  } else {
     await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
     await chmod(temporaryRoot, 0o700);
     parent = temporaryRoot;
@@ -157,6 +159,26 @@ async function privateInspectionDirectory(
   const root = await mkdtemp(join(parent, prefix));
   await chmod(root, 0o700);
   return root;
+}
+
+/**
+ * `os.tmpdir()`, resolved, only when no other local user can rename or replace
+ * what this process creates below it: it is owned by root or by this user, and
+ * group and others cannot write it unless it is sticky, like `/tmp`. `TMPDIR`
+ * is environment input, not a trusted location.
+ */
+async function trustedSystemTemporaryParent(): Promise<string> {
+  const parent = await realpath(tmpdir());
+  const info = await stat(parent);
+  const uid = process.getuid?.();
+  if (
+    !info.isDirectory() ||
+    (uid !== undefined && info.uid !== 0 && info.uid !== uid) ||
+    ((info.mode & 0o022) !== 0 && (info.mode & 0o1000) === 0)
+  ) {
+    throw new Error("the system temporary directory is writable by other users");
+  }
+  return parent;
 }
 
 interface AdmittedSnapshot {

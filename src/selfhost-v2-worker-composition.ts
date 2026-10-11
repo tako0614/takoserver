@@ -163,6 +163,13 @@ export interface SelfhostV2WorkerCompositionOptions {
   readonly config: V2ApplicationConfig;
   /** Private 0700 root, separate from the legacy shared Workerd graph. */
   readonly rootDirectory: string;
+  /**
+   * Private parent of one-shot module inspection directories, under the data
+   * root. The normal entry passes `<data root>/selfhost/module-inspection`;
+   * without it the inspector uses the system temporary directory only when no
+   * other user can write it (or it is sticky).
+   */
+  readonly moduleInspectionRoot?: string;
   readonly targetKey: string;
   /** Already selected and pinned by the normal Bun entry. */
   readonly workerdBinary: string | null;
@@ -519,6 +526,9 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   });
   const moduleInspector = createWorkerdWorkerModuleInspector({
     binary: options.workerdBinary,
+    ...(options.moduleInspectionRoot === undefined
+      ? {}
+      : { temporaryRoot: options.moduleInspectionRoot }),
   });
   const inspectModule = moduleInspector.inspect;
   const owners = new Map<string, Promise<WorkerdWorkerRuntimeOwner>>();

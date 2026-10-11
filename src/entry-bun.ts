@@ -936,6 +936,8 @@ try {
     clock,
     config: takoformV2Config,
     rootDirectory: join(durableRoot, "v2-worker-owners"),
+    // Not below `v2-worker-owners`: boot refuses a namespace SQL cannot explain.
+    moduleInspectionRoot: join(durableRoot, "selfhost", "module-inspection"),
     targetKey: v2WorkerTargetKey,
     workerdBinary,
     ...(v2RuntimeBoot?.v2Actor ? { v2Actor: v2RuntimeBoot.v2Actor } : {}),
