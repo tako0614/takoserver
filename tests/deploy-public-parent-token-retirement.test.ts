@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { CommandResult } from "../scripts/deploy/process.ts";
 import {
   type PublicParentTokenRetirementState,
   runPublicParentTokenRetirement,
@@ -371,6 +372,48 @@ describe("public Cloudflare parent-token retirement", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("integration apply resolves the OAuth bearer again after the owner gate", async () => {
+    // The complete owner gate can outlive a Wrangler OAuth access token.
+    await withApplyingFixture({}, async ({ fixture, root }) => {
+      const events: string[] = [];
+      const oauth = expiringOAuth(events);
+      const run = async (
+        command: readonly string[],
+        commandOptions?: { readonly env?: Readonly<Record<string, string>> },
+      ): Promise<CommandResult> => {
+        const token = oauth.answer(command);
+        if (token !== undefined) return token;
+        const completed = await fixture.run(command, commandOptions);
+        oauth.afterCommand(command);
+        return completed;
+      };
+      const result = await withCloudflareApi(fixture.state, oauth.live, events, () =>
+        runPublicParentTokenRetirement(applyInvocation(), target, {
+          run,
+          providerExecutorQualification: readyExecutorQualification(),
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          publicationLease: fixture.lease,
+          executorPublicationLease: fixture.executorLease,
+          cloudflareEnvironment: {},
+        }).catch((error: unknown) => error),
+      );
+      expect(timeline(events)).toEqual([
+        "token:oauth-access-1",
+        "GET:Bearer oauth-access-1",
+        "gate",
+        "token:oauth-access-2",
+        "GET:Bearer oauth-access-2",
+      ]);
+      expect(result).toMatchObject({
+        kind: "takoserver.public-parent-token-retirement-apply@v1",
+        state: "complete",
+        versionId: RETIRED_VERSION,
+      });
+      expect(fixture.mutations).toHaveLength(2);
+    });
   });
 
   test("closes integration apply provenance with source paths and distinct identities", async () => {
@@ -1267,4 +1310,126 @@ function readyExecutorQualification(
       return value;
     },
   };
+}
+
+/**
+ * A Wrangler OAuth access token lives about one hour and `auth token --json`
+ * refreshes it only once it has already expired. This models one expiry while
+ * the owner gate runs: the gate invalidates the issued token, and the next
+ * `auth token` call mints `oauth-access-2`.
+ */
+function expiringOAuth(events: string[], gate = "bun run check") {
+  let issued = 0;
+  let live = "";
+  return {
+    live: () => live,
+    /** Answers `auth token --json`; every other command returns undefined. */
+    answer(command: readonly string[]): CommandResult | undefined {
+      if (command.slice(-3).join(" ") !== "auth token --json") return undefined;
+      if (live === "") {
+        issued += 1;
+        live = `oauth-access-${issued}`;
+      }
+      events.push(`token:${live}`);
+      return {
+        exitCode: 0,
+        stdout: `${JSON.stringify({ type: "oauth", token: live })}\n`,
+        stderr: "",
+      };
+    },
+    afterCommand(command: readonly string[]): void {
+      if (command.join(" ") !== gate) return;
+      events.push("gate");
+      live = "";
+    },
+  };
+}
+
+interface CloudflareApiState {
+  workerDomains(): Promise<readonly { readonly hostname: string; readonly service: string }[]>;
+  workerDeployments(workerName: string): Promise<readonly unknown[]>;
+  workerVersion(workerName: string, versionId: string): Promise<unknown>;
+  workerSecrets(workerName: string): Promise<readonly unknown[]>;
+  workerSubdomain?(
+    workerName: string,
+  ): Promise<{ readonly enabled: boolean; readonly previewsEnabled: boolean }>;
+  workerAccountSubdomain?(): Promise<string>;
+}
+
+/**
+ * Serves one portable Worker state as the Cloudflare REST API on the global
+ * fetch, which never reaches the network. Only the live OAuth access token is
+ * authorized; any other bearer receives the provider's 401.
+ */
+async function withCloudflareApi<T>(
+  state: CloudflareApiState,
+  live: () => string,
+  events: string[],
+  body: () => Promise<T>,
+): Promise<T> {
+  const original = globalThis.fetch;
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = new Request(input, init);
+      const bearer = request.headers.get("authorization");
+      events.push(`${request.method}:${bearer}`);
+      const url = new URL(request.url);
+      if (url.origin !== "https://api.cloudflare.com" || bearer !== `Bearer ${live()}`) {
+        return Response.json(
+          { success: false, result: null, errors: [{ code: 10000, message: "denied" }] },
+          { status: 401 },
+        );
+      }
+      return await cloudflareApiResponse(state, url);
+    },
+    { preconnect: original.preconnect },
+  );
+  try {
+    return await body();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+async function cloudflareApiResponse(state: CloudflareApiState, url: URL): Promise<Response> {
+  const ok = (result: unknown, extra: Record<string, unknown> = {}) =>
+    Response.json({ success: true, errors: [], messages: [], result, ...extra });
+  const path = url.pathname.replace(/^\/client\/v4\/accounts\/[0-9a-f]{32}\/workers/u, "");
+  const [collection, name, resource, id] = path.split("/").slice(1).map(decodeURIComponent);
+  if (path === "/domains") {
+    const domains = await state.workerDomains();
+    const perPage = Number(url.searchParams.get("per_page"));
+    return ok(domains, {
+      result_info: {
+        page: 1,
+        per_page: perPage,
+        count: domains.length,
+        total_count: domains.length,
+        total_pages: Math.ceil(domains.length / perPage),
+      },
+    });
+  }
+  if (path === "/subdomain" && state.workerAccountSubdomain !== undefined) {
+    return ok({ subdomain: await state.workerAccountSubdomain() });
+  }
+  if (collection === "scripts" && name !== undefined) {
+    if (resource === "deployments" && id === undefined) {
+      return ok({ deployments: await state.workerDeployments(name) });
+    }
+    if (resource === "versions" && id !== undefined) return ok(await state.workerVersion(name, id));
+    if (resource === "secrets") return ok(await state.workerSecrets(name));
+    if (resource === "subdomain" && state.workerSubdomain !== undefined) {
+      const subdomain = await state.workerSubdomain(name);
+      return ok({ enabled: subdomain.enabled, previews_enabled: subdomain.previewsEnabled });
+    }
+  }
+  return Response.json(
+    { success: false, result: null, errors: [{ code: 7003, message: `unmodelled ${path}` }] },
+    { status: 404 },
+  );
+}
+
+/** Events with consecutive repeats collapsed. */
+function timeline(events: readonly string[]): readonly string[] {
+  return events.filter((event, index) => event !== events[index - 1]);
 }

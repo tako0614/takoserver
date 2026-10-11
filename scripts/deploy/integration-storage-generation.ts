@@ -394,6 +394,8 @@ async function verifyGeneratedStorageTarget(
 interface StorageNames {
   readonly databaseName: string;
   readonly bucketName: string;
+  /** Whether the selected target already names this generation's D1 / R2. */
+  readonly selectedByTarget: { readonly d1: boolean; readonly r2: boolean };
 }
 
 interface GeneratedStorageTarget {
@@ -474,20 +476,25 @@ function validateInvocation(
   if (!ACCOUNT_ID.test(target.accountId)) {
     throw preflightError("integration storage generation requires one exact account id");
   }
-  const names = {
-    databaseName: `takoserver-i-${invocation.generation}`,
-    bucketName: `takoserver-i-${invocation.generation}`,
-  } satisfies StorageNames;
-  if (!RESOURCE_NAME.test(names.databaseName) || !RESOURCE_NAME.test(names.bucketName)) {
+  const databaseName = `takoserver-i-${invocation.generation}`;
+  const bucketName = `takoserver-i-${invocation.generation}`;
+  if (!RESOURCE_NAME.test(databaseName) || !RESOURCE_NAME.test(bucketName)) {
     throw preflightError("integration storage generation derived an invalid provider name");
   }
-  if (target.d1.databaseName === names.databaseName || target.r2.bucketName === names.bucketName) {
+  const selectedByTarget = {
+    d1: target.d1.databaseName === databaseName,
+    r2: target.r2.bucketName === bucketName,
+  };
+  // Apply creates a new pair and must never create into, or adopt, storage the
+  // selected target already names. Status only reads the generated names; it
+  // must keep diagnosing the pair after the operator points the target at it.
+  if (invocation.action === "apply" && (selectedByTarget.d1 || selectedByTarget.r2)) {
     throw preflightError(
       "integration storage generation name collides with the selected target; " +
         "current storage is never adopted",
     );
   }
-  return names;
+  return { databaseName, bucketName, selectedByTarget };
 }
 
 async function statusStorageGeneration(
@@ -531,7 +538,17 @@ async function statusStorageGeneration(
       present: r2 !== null,
     },
     presence,
-    readyForApply: d1 === null && r2 === null,
+    // Read-only correlation with the selected target. The target never
+    // selects, widens or adopts what this status reads.
+    targetSelection: {
+      d1: names.selectedByTarget.d1,
+      r2: names.selectedByTarget.r2,
+      databaseIdExact: names.selectedByTarget.d1
+        ? d1 !== null && target.d1.databaseId === d1.uuid
+        : null,
+    },
+    readyForApply:
+      d1 === null && r2 === null && !names.selectedByTarget.d1 && !names.selectedByTarget.r2,
     rollback: "old active target remains unchanged; repair forward from any known aftermath",
   };
   if (invocation.freshLineage === undefined) return result;

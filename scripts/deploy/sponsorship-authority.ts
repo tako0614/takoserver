@@ -345,22 +345,21 @@ export async function runSponsorshipAuthority(
   assertManagedSpaceAdmissionTransition("preflight", target, invocation.transition);
   const selected = requireAuthorityTarget(target);
   const run = options.run ?? runCommand;
+  const resolveCredential = async () =>
+    await resolveCloudflareCredential(invocation.environment, {
+      cloudflareEnvironment: options.cloudflareEnvironment,
+      run,
+    });
   const credential =
     invocation.environment === "integration" &&
     options.state !== undefined &&
     invocation.action === "status"
       ? undefined
-      : await resolveCloudflareCredential(invocation.environment, {
-          cloudflareEnvironment: options.cloudflareEnvironment,
-          run,
-        });
+      : await resolveCredential();
   const environment = credential?.childEnvironment ?? {};
-  const state =
-    options.state ??
-    new CloudflareState({
-      accountId: target.accountId,
-      token: credential?.token ?? exactToken(environment),
-    });
+  const createState = (token: string | undefined): CloudflareState =>
+    new CloudflareState({ accountId: target.accountId, token: token ?? exactToken(environment) });
+  let state: SponsorshipAuthorityDeployState = options.state ?? createState(credential?.token);
   const dependencyBefore = await inspectManagedSpaceAdmissionDependency("preflight", target, state);
   const before = await inspectSponsorshipAuthority(
     "preflight",
@@ -528,6 +527,11 @@ export async function runSponsorshipAuthority(
     }
 
     await checked(run, "sponsorship authority owner gate", ["bun", "run", "check"]);
+    // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+    // Wrangler refreshes only an already expired token). No Cloudflare read or
+    // write after the gate reuses a bearer resolved before it. An injected state
+    // keeps its own credential.
+    if (options.state === undefined) state = createState((await resolveCredential()).token);
 
     const prepared = await prepareWorkerArtifact({
       root,

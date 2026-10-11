@@ -221,21 +221,24 @@ export async function runIntegrationWorkerBootstrap(
 ): Promise<Record<string, unknown>> {
   validateInvocation(invocation, target);
   const run = options.run ?? runCommand;
+  const resolveCredential = async () =>
+    await resolveCloudflareCredential("integration", {
+      cloudflareEnvironment: options.cloudflareEnvironment,
+      run,
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+    });
   const credential =
     invocation.action === "status" && options.state !== undefined
       ? undefined
-      : await resolveCloudflareCredential("integration", {
-          cloudflareEnvironment: options.cloudflareEnvironment,
-          run,
-          ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
-        });
+      : await resolveCredential();
   const environment = credential?.childEnvironment ?? {};
-  const state =
+  const createState = (resolved: typeof credential): IntegrationWorkerBootstrapState =>
     options.state ??
     new CloudflareState({
       accountId: target.accountId,
-      token: credential?.token ?? exactToken(environment),
+      token: resolved?.token ?? exactToken(resolved?.childEnvironment ?? {}),
     });
+  let state = createState(credential);
 
   // No source, provider qualification or secret directory is touched before
   // all four exhaustive native inventories prove exact absence.
@@ -365,7 +368,7 @@ export async function runIntegrationWorkerBootstrap(
       );
     const signingBefore = await readSigning("preflight", target, signingDatabase);
     assertDistinctJit(target, signingBefore);
-    const r2Identity = resolveR2IdentityReader(options, target, credential?.token);
+    let r2Identity = resolveR2IdentityReader(options, target, credential?.token);
     await assertR2Identity("preflight", target, r2Identity);
 
     const source = await qualifySource({
@@ -373,51 +376,66 @@ export async function runIntegrationWorkerBootstrap(
       commit: invocation.commit,
       run,
     });
-    await checkedGate(run);
-
     const expectedSecrets = expectedWorkerSecrets(target);
-    if (target.edgeSupplies !== undefined) {
-      if (options.expectedRuntimeInputSealKeyring === undefined) {
-        throw preflightError("runtime input seal keyring qualification is unavailable");
-      }
-      await parseRuntimeInputSealKeyRing(options.expectedRuntimeInputSealKeyring);
-    }
     const secretDirectory =
       options.secretDirectory ?? requireEnvironment(CLOSURE_SECRET_DIRECTORY_ENV);
-    let secretValues: Readonly<Record<string, string>>;
-    try {
-      secretValues = readClosureSecretInputs(secretDirectory, expectedSecrets);
-    } catch (error) {
-      throw valueFree(error, "initial Worker secret inputs are unavailable");
-    }
-    const privateRaw = await readVerifiedPrivateSigningJwk(
-      join(secretDirectory, "TAKOSERVER_SIGNING_KEY"),
-      signingBefore.row,
-      signingBefore.keyId,
-    );
-    if (privateRaw !== secretValues.TAKOSERVER_SIGNING_KEY) {
-      throw preflightError("active runtime signing private key changed during qualification");
-    }
-    if (target.edgeSupplies !== undefined) {
-      const localKeyring = secretValues.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING;
-      if (localKeyring === undefined || options.expectedRuntimeInputSealKeyring === undefined) {
-        throw preflightError("runtime input seal keyring input is unavailable");
+    const readQualifiedSecretInputs = async (): Promise<Readonly<Record<string, string>>> => {
+      if (target.edgeSupplies !== undefined) {
+        if (options.expectedRuntimeInputSealKeyring === undefined) {
+          throw preflightError("runtime input seal keyring qualification is unavailable");
+        }
+        await parseRuntimeInputSealKeyRing(options.expectedRuntimeInputSealKeyring);
       }
-      await parseRuntimeInputSealKeyRing(localKeyring);
-      if (canonicalJson(localKeyring) !== canonicalJson(options.expectedRuntimeInputSealKeyring)) {
-        throw preflightError("runtime input seal keyring differs from qualified CPE input");
-      }
-    }
-    if (target.takoformV2 !== undefined) {
+      let values: Readonly<Record<string, string>>;
       try {
-        parseTakoformV2ApplicationConfig({
-          TAKOSERVER_TAKOFORM_V2_CONFIG: target.takoformV2.config,
-          TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: secretValues.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY,
-        });
-      } catch {
-        throw preflightError("v2 Host cursor secret does not satisfy the selected configuration");
+        values = readClosureSecretInputs(secretDirectory, expectedSecrets);
+      } catch (error) {
+        throw valueFree(error, "initial Worker secret inputs are unavailable");
       }
-    }
+      const privateRaw = await readVerifiedPrivateSigningJwk(
+        join(secretDirectory, "TAKOSERVER_SIGNING_KEY"),
+        signingBefore.row,
+        signingBefore.keyId,
+      );
+      if (privateRaw !== values.TAKOSERVER_SIGNING_KEY) {
+        throw preflightError("active runtime signing private key changed during qualification");
+      }
+      if (target.edgeSupplies !== undefined) {
+        const localKeyring = values.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING;
+        if (localKeyring === undefined || options.expectedRuntimeInputSealKeyring === undefined) {
+          throw preflightError("runtime input seal keyring input is unavailable");
+        }
+        await parseRuntimeInputSealKeyRing(localKeyring);
+        if (
+          canonicalJson(localKeyring) !== canonicalJson(options.expectedRuntimeInputSealKeyring)
+        ) {
+          throw preflightError("runtime input seal keyring differs from qualified CPE input");
+        }
+      }
+      if (target.takoformV2 !== undefined) {
+        try {
+          parseTakoformV2ApplicationConfig({
+            TAKOSERVER_TAKOFORM_V2_CONFIG: target.takoformV2.config,
+            TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: values.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY,
+          });
+        } catch {
+          throw preflightError("v2 Host cursor secret does not satisfy the selected configuration");
+        }
+      }
+      return values;
+    };
+    // Fail a missing, unsafe or mismatched secret input before the long Host
+    // bootstrap gate. The read after the gate stays the authoritative one.
+    await readQualifiedSecretInputs();
+    await checkedGate(run);
+    // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+    // Wrangler refreshes only an already expired token). No Cloudflare read or
+    // write after the gate reuses a bearer resolved before it.
+    const gatedCredential = await resolveCredential();
+    state = createState(gatedCredential);
+    r2Identity = resolveR2IdentityReader(options, target, gatedCredential.token);
+
+    const secretValues = await readQualifiedSecretInputs();
 
     const prepared = await prepareBootstrapArtifact(
       root,

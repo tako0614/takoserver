@@ -107,6 +107,12 @@ never changed. Apply creates one new D1, proves it empty, applies the fixed
 audited 0001–0066 lineage and verifies its canonical schema, then creates the
 new R2 bucket. Creating the bucket last means older object operations cannot
 reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
+Apply refuses a target whose D1 or R2 already names the generated pair (current
+storage is never adopted), so the target must name some other pair while the
+generation is created. Status reads only the generated names and keeps working
+after the target is pointed at the new pair: it reports `targetSelection`
+(`d1`, `r2`, and `databaseIdExact` against the read-back UUID) and then
+`readyForApply: false`.
 
 For a **new, empty integration generation only**, the same sole writer has one
 fixed v2 artifact payload. The selector is required on both the diagnostic
@@ -977,7 +983,16 @@ logged or serialized, and Wrangler children receive no token environment and
 use their stored OAuth profile. The OAuth extractor explicitly sets
 `WRANGLER_WRITE_LOGS=false`, so Wrangler's mode-0644 debug log cannot persist
 the bearer; its credential child-environment overlay contains no competing API
-key, email, token variant, or unrelated secret. `rehearsal` and `production`
+key, email, token variant, or unrelated secret. The OAuth access token lives
+about one hour and Wrangler refreshes it only once it has expired, while an
+owner gate such as `bun run check` can run for a large part of that. A surface
+with an owner gate therefore resolves the credential again right after the gate
+and rebuilds every client that carries the bearer; no Cloudflare read or write
+after the gate reuses a bearer resolved before it. An explicit token simply
+resolves to the same value again. Operator inputs that a gated apply reads
+(secret directories, private JWKs, rehearsal receipts, lost-ack records) are
+also checked before the gate, so a malformed input fails at once; the read after
+the gate stays authoritative. `rehearsal` and `production`
 still require the explicit API token. Private WfP surfaces use a separate
 contract and credential boundary; they are not rows in this public matrix.
 The conservative `requiresEnv` union remains unchanged.

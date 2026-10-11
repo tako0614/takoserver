@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
+  DEPLOY_TARGET_KEYS,
   isArtifactBlobIoQuiescedTarget,
   loadManagedWorkerDispatchNamespaceTarget,
   loadTarget,
@@ -380,6 +381,76 @@ describe("environment-exact deploy target", () => {
       expect(loadManagedWorkerDispatchNamespaceTarget(path, "rehearsal")).toEqual(minimal);
       expect(() => loadTarget(path, "rehearsal")).toThrow("unexpected keys");
     });
+  });
+
+  test("reads the pinned namespace projection from the complete fresh v2 target", () => {
+    // After the namespace pin, the runbook adds takoformV2 to the same file.
+    // `--status` must read that exact file, not a copy without takoformV2.
+    const config = JSON.stringify({
+      documentation: "https://docs.example.test/v2",
+      authenticationDocumentation: "https://docs.example.test/v2/authentication",
+    });
+    const executor = {
+      ...cloudflareProviderExecutorTarget(),
+      dispatchNamespaceId: "00000000-0000-4000-8000-0000000000aa",
+    };
+    const complete = descriptor({
+      environment: "integration",
+      objectBucketSupplies: objectBucketSuppliesFixture(),
+      cloudflareProviderExecutor: executor,
+      takoformV2: { config, storageLineage: "v2-0088" },
+    });
+    withTarget(complete, (path) => {
+      expect(loadTarget(path, "integration").takoformV2).toEqual({
+        config,
+        storageLineage: "v2-0088",
+      });
+      expect(loadManagedWorkerDispatchNamespaceTarget(path, "integration")).toEqual({
+        kind: "takoserver.deploy-target@v2",
+        environment: "integration",
+        accountId: "a".repeat(32),
+        cloudflareProviderExecutor: {
+          dispatchNamespace: executor.dispatchNamespace,
+          dispatchNamespaceId: executor.dispatchNamespaceId,
+        },
+      });
+    });
+  });
+
+  test("the namespace projection tolerates exactly the complete-target key vocabulary", () => {
+    const projection = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "integration",
+      accountId: "a".repeat(32),
+      cloudflareProviderExecutor: { dispatchNamespace: "takoserver-customers-integration" },
+    } as const;
+    // The projection validates only its own keys; every other key of the
+    // complete vocabulary is tolerated without validation, so a new target key
+    // cannot silently break the namespace surface again.
+    for (const key of DEPLOY_TARGET_KEYS) {
+      if (key in projection) continue;
+      withTarget({ ...projection, [key]: { unvalidated: true } }, (path) => {
+        expect(loadManagedWorkerDispatchNamespaceTarget(path, "integration")).toEqual(projection);
+      });
+    }
+    for (const unknown of ["takoformV3", "dispatchNamespaceId", "storageLineage"]) {
+      withTarget({ ...projection, [unknown]: true }, (path) => {
+        expect(() => loadManagedWorkerDispatchNamespaceTarget(path, "integration")).toThrow(
+          "unexpected keys",
+        );
+      });
+    }
+    withTarget(
+      {
+        ...projection,
+        cloudflareProviderExecutor: { dispatchNamespace: "x", dispatchNamespaceId: "not-a-uuid" },
+      },
+      (path) => {
+        expect(() => loadManagedWorkerDispatchNamespaceTarget(path, "integration")).toThrow(
+          "is invalid",
+        );
+      },
+    );
   });
 
   test("refuses a descriptor for another environment", () => {

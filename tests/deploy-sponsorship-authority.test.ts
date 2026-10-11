@@ -6,6 +6,7 @@ import {
   buildReleasedCoreFormAuthorityArtifactDigest,
   takoformCoreVerifierArtifactDigest,
 } from "../scripts/deploy/form-authority.ts";
+import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { SigningDatabase } from "../scripts/deploy/signing.ts";
 import {
   assertDedicatedSponsorshipKeys,
@@ -744,6 +745,119 @@ describe("route-less sponsorship authority deploy", () => {
     }
   });
 
+  test("integration apply resolves the OAuth bearer again after the owner gate", async () => {
+    // The complete owner gate can outlive a Wrangler OAuth access token.
+    const fixture = await sponsorshipSigningFixture(managedTarget);
+    const root = mkdtempSync(join(tmpdir(), "takoserver-sponsorship-oauth-refresh-"));
+    const auditPath = join(root, "topology-audit.json");
+    writeFileSync(
+      auditPath,
+      JSON.stringify({
+        kind: "takoserver.cloudflare-topology-audit-credential@v1",
+        deploymentTokenOwner: "user",
+        token: TOPOLOGY_AUDIT_TOKEN,
+      }),
+      { mode: 0o600 },
+    );
+    const previousAuditPath = process.env.TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL;
+    process.env.TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL = auditPath;
+    try {
+      writeSigningFixtures(root, fixture);
+      let uploaded = false;
+      let uploadedArtifactDigest: `sha256:${string}` | null = null;
+      let credentialRow: Awaited<ReturnType<SigningDatabase["readKey"]>> = null;
+      const database: SigningDatabase = {
+        async readKey(keyId) {
+          if (keyId === fixture.target.signing.currentKeyId) return ordinarySigningRow();
+          if (keyId === fixture.target.sponsorshipAuthority?.credentialKeyId) return credentialRow;
+          return null;
+        },
+        async insertPublicKey(keyId, publicJwk) {
+          credentialRow = {
+            keyId,
+            publicJwk,
+            createdAtEpochSeconds: 2,
+            revokedAtEpochSeconds: null,
+          };
+        },
+      };
+      const state = managedAuthorityState({
+        inspectedTarget: fixture.target,
+        sponsorshipIdentity: () =>
+          uploaded
+            ? {
+                versionId: UPLOADED_VERSION,
+                previousVersionId: VERSION,
+                commit: COMMIT,
+                artifactDigest: uploadedArtifactDigest ?? DIGEST,
+              }
+            : {
+                versionId: VERSION,
+                previousVersionId: null,
+                commit: COMMIT,
+                artifactDigest: DIGEST,
+              },
+      });
+      const events: string[] = [];
+      const oauth = expiringOAuth(events);
+      const gated = applyRunner([], {
+        onUpload(command) {
+          const configPath = command[command.indexOf("--config") + 1];
+          if (configPath === undefined) throw new Error("missing sponsorship config path");
+          const config = JSON.parse(readFileSync(configPath, "utf8")) as {
+            readonly vars?: Readonly<Record<string, unknown>>;
+          };
+          uploadedArtifactDigest = config.vars?.TAKOSERVER_SPONSORSHIP_AUTHORITY_ARTIFACT_SHA256 as
+            | `sha256:${string}`
+            | null;
+          uploaded = true;
+        },
+      });
+      const run: SponsorshipAuthorityDeployProcess = async (command, options) => {
+        const token = oauth.answer(command);
+        if (token !== undefined) return token;
+        const completed = await gated(command, options);
+        oauth.afterCommand(command);
+        return completed;
+      };
+      const result = await withCloudflareApi(state, oauth.live, events, () =>
+        runSponsorshipAuthority(
+          {
+            surface: "takoserver-sponsorship-authority-worker",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          fixture.target,
+          {
+            database,
+            privateJwkPath: join(root, "credential.jwk"),
+            receiptPrivateJwkPath: join(root, "receipt.jwk"),
+            outputDirectory: join(root, "work"),
+            review: "reviewer@example.test",
+            cloudflareEnvironment: {},
+            run,
+          },
+        ).catch((error: unknown) => error),
+      );
+      expect(timeline(events)).toEqual([
+        "token:oauth-access-token-1",
+        "GET:Bearer oauth-access-token-1",
+        "gate",
+        "token:oauth-access-token-2",
+        "GET:Bearer oauth-access-token-2",
+      ]);
+      expect(result).toMatchObject({ kind: "takoserver.sponsorship-authority-worker-apply@v1" });
+    } finally {
+      if (previousAuditPath === undefined) {
+        delete process.env.TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL;
+      } else {
+        process.env.TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL = previousAuditPath;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects a different served Form artifact before registration or upload", async () => {
     const fixture = await sponsorshipSigningFixture(managedTarget);
     const root = mkdtempSync(join(tmpdir(), "takoserver-sponsorship-form-proof-mismatch-"));
@@ -1429,4 +1543,170 @@ function applyRunner(
     }
     throw new Error(`unexpected command: ${rendered}`);
   };
+}
+
+/**
+ * A Wrangler OAuth access token lives about one hour and `auth token --json`
+ * refreshes it only once it has already expired. This models one expiry while
+ * the owner gate runs: the gate invalidates the issued token, and the next
+ * `auth token` call mints `oauth-access-token-2`.
+ */
+function expiringOAuth(events: string[], gate = "bun run check") {
+  let issued = 0;
+  let live = "";
+  return {
+    live: () => live,
+    /** Answers `auth token --json`; every other command returns undefined. */
+    answer(command: readonly string[]): CommandResult | undefined {
+      if (command.slice(-3).join(" ") !== "auth token --json") return undefined;
+      if (live === "") {
+        issued += 1;
+        // The topology audit admits only bearer-shaped tokens of 16+ bytes.
+        live = `oauth-access-token-${issued}`;
+      }
+      events.push(`token:${live}`);
+      return {
+        exitCode: 0,
+        stdout: `${JSON.stringify({ type: "oauth", token: live })}\n`,
+        stderr: "",
+      };
+    },
+    afterCommand(command: readonly string[]): void {
+      if (command.join(" ") !== gate) return;
+      events.push("gate");
+      live = "";
+    },
+  };
+}
+
+const API = "https://api.cloudflare.com/client/v4";
+const TOPOLOGY_AUDIT_TOKEN = "topology-audit-token-0123456789";
+const DEPLOYMENT_TOKEN_ID = "d".repeat(32);
+const PERMISSION_GROUPS = {
+  "Zone Read": "1".repeat(32),
+  "Workers Routes Read": "2".repeat(32),
+  "Workers Routes Write": "3".repeat(32),
+} as const;
+
+/**
+ * Serves one portable sponsorship state as the Cloudflare REST API on the
+ * global fetch, which never reaches the network. Only the live OAuth access
+ * token is authorized as the deployment bearer; the separate topology-audit
+ * credential reads token metadata and is not recorded.
+ */
+async function withCloudflareApi<T>(
+  state: SponsorshipAuthorityDeployState,
+  live: () => string,
+  events: string[],
+  body: () => Promise<T>,
+): Promise<T> {
+  const original = globalThis.fetch;
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = new Request(input, init);
+      const bearer = request.headers.get("authorization");
+      const url = new URL(request.url);
+      if (bearer === `Bearer ${TOPOLOGY_AUDIT_TOKEN}`) return topologyAuditResponse(url);
+      events.push(`${request.method}:${bearer}`);
+      if (url.origin !== "https://api.cloudflare.com" || bearer !== `Bearer ${live()}`) {
+        return Response.json(
+          { success: false, result: null, errors: [{ code: 10000, message: "denied" }] },
+          { status: 401 },
+        );
+      }
+      return await cloudflareApiResponse(state, url);
+    },
+    { preconnect: original.preconnect },
+  );
+  try {
+    return await body();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+function topologyAuditResponse(url: URL): Response {
+  const ok = (result: unknown) => Response.json({ success: true, errors: [], result });
+  if (url.href === `${API}/user/tokens/verify`) {
+    return ok({ id: "a".repeat(32), status: "active" });
+  }
+  if (url.href === `${API}/user/tokens/${DEPLOYMENT_TOKEN_ID}`) {
+    return ok({
+      id: DEPLOYMENT_TOKEN_ID,
+      status: "active",
+      policies: [
+        {
+          effect: "allow",
+          resources: {
+            [`com.cloudflare.api.account.${managedTarget.accountId}`]: {
+              "com.cloudflare.api.account.zone.*": "*",
+            },
+          },
+          permission_groups: [
+            { id: PERMISSION_GROUPS["Zone Read"] },
+            { id: PERMISSION_GROUPS["Workers Routes Read"] },
+          ],
+        },
+      ],
+    });
+  }
+  if (url.href === `${API}/user/tokens/permission_groups`) {
+    return ok(
+      Object.entries(PERMISSION_GROUPS).map(([name, id]) => ({
+        id,
+        name,
+        scopes: ["com.cloudflare.api.account.zone"],
+      })),
+    );
+  }
+  return Response.json({ success: false, errors: [] }, { status: 404 });
+}
+
+async function cloudflareApiResponse(
+  state: SponsorshipAuthorityDeployState,
+  url: URL,
+): Promise<Response> {
+  const ok = (result: unknown, extra: Record<string, unknown> = {}) =>
+    Response.json({ success: true, errors: [], messages: [], result, ...extra });
+  const perPage = Number(url.searchParams.get("per_page"));
+  const list = (entries: readonly unknown[]) =>
+    ok(entries, {
+      result_info: {
+        page: 1,
+        per_page: perPage,
+        count: entries.length,
+        total_count: entries.length,
+        total_pages: Math.ceil(entries.length / perPage),
+      },
+    });
+  if (url.href === `${API}/user/tokens/verify`) {
+    return ok({ id: DEPLOYMENT_TOKEN_ID, status: "active" });
+  }
+  // The modelled account has no zones, so it has no Worker routes either.
+  if (url.pathname === "/client/v4/zones") return list([]);
+  const path = url.pathname.replace(/^\/client\/v4\/accounts\/[0-9a-f]{32}\/workers/u, "");
+  const [collection, name, resource, id] = path.split("/").slice(1).map(decodeURIComponent);
+  if (path === "/domains") return list(await state.workerDomains());
+  if (path === "/scripts")
+    return ok((await state.workerScripts()).map((script) => ({ id: script })));
+  if (collection === "scripts" && name !== undefined) {
+    if (resource === "deployments" && id === undefined) {
+      return ok({ deployments: await state.workerDeployments(name) });
+    }
+    if (resource === "versions" && id !== undefined) return ok(await state.workerVersion(name, id));
+    if (resource === "secrets") return ok(await state.workerSecrets(name));
+    if (resource === "subdomain") {
+      const subdomain = await state.workerSubdomain(name);
+      return ok({ enabled: subdomain.enabled, previews_enabled: subdomain.previewsEnabled });
+    }
+  }
+  return Response.json(
+    { success: false, result: null, errors: [{ code: 7003, message: `unmodelled ${path}` }] },
+    { status: 404 },
+  );
+}
+
+/** Events with consecutive repeats collapsed. */
+function timeline(events: readonly string[]): readonly string[] {
+  return events.filter((event, index) => event !== events[index - 1]);
 }

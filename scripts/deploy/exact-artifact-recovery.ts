@@ -26,7 +26,9 @@ import {
   type SelectedFormAuthorityTarget,
   writeFormAuthorityConfig,
 } from "./form-authority.ts";
+import { readPrivateJwk } from "./identity.ts";
 import {
+  type CloudflareCredential,
   REPOSITORY,
   requireEnvironment,
   resolveCloudflareCredential,
@@ -206,15 +208,19 @@ export async function runExactArtifactRecoveryDeployment(
     throw preflightError("exact artifact recovery requires provider-executor qualification");
   }
   const providerExecutorBefore = await providerExecutorQualification.read("preflight");
-  const ownsRuntime = options.runtime === undefined;
-  const runtime =
-    options.runtime ??
-    (await createExactArtifactRecoveryDeployRuntime(
+  let ownedRuntime: OwnedExactArtifactRecoveryDeployRuntime | null = null;
+  let runtime: ExactArtifactRecoveryDeployRuntime;
+  if (options.runtime === undefined) {
+    ownedRuntime = await createExactArtifactRecoveryDeployRuntime(
       invocation,
       target,
       options,
       providerExecutorBefore,
-    ));
+    );
+    runtime = ownedRuntime;
+  } else {
+    runtime = options.runtime;
+  }
   try {
     const before = await runtime.inspect();
     const planned = planExactArtifactRecoveryDeployment(before);
@@ -253,7 +259,10 @@ export async function runExactArtifactRecoveryDeployment(
     if (source.commit !== before.selectedCommit) {
       throw preflightError("exact artifact recovery selected source changed after inspection");
     }
-    if (ownsRuntime) {
+    if (ownedRuntime !== null) {
+      // Refuse an unusable operator input before the long owner gate. The apply
+      // after the gate still re-reads and re-checks the same input.
+      await ownedRuntime.assertBeforeOwnerGate(planned.action, before);
       const gate = await (options.run ?? runCommand)(["bun", "run", "check"]);
       if (gate.exitCode !== 0) {
         throw preflightError(
@@ -261,6 +270,10 @@ export async function runExactArtifactRecoveryDeployment(
           `${gate.stdout}${gate.stderr}`.trim(),
         );
       }
+      // The owner gate can outlive a Wrangler OAuth access token (about one
+      // hour; Wrangler refreshes only an already expired token). No Cloudflare
+      // read or write after the gate reuses a bearer resolved before it.
+      await ownedRuntime.refreshCredential();
     }
     const providerExecutorAtMutation = await providerExecutorQualification.read("preflight");
     assertProviderExecutorUnchanged(providerExecutorBefore, providerExecutorAtMutation);
@@ -281,8 +294,44 @@ export async function runExactArtifactRecoveryDeployment(
       effect: redactEffect(effect),
     };
   } finally {
-    if (ownsRuntime) await runtime.dispose?.();
+    ownedRuntime?.dispose();
   }
+}
+
+type ExactArtifactRecoveryMutation = Exclude<
+  ExactArtifactRecoveryDeploymentAction,
+  "refuse" | "wait" | "wait_retention" | "none"
+>;
+
+/**
+ * Mutations whose apply, or the readback right after it, signs gateway
+ * requests with the operator private key.
+ */
+const OPERATOR_KEY_MUTATIONS: ReadonlySet<ExactArtifactRecoveryMutation> = new Set([
+  "publish_gateway",
+  "invoke",
+  "purge_details",
+  "retire_gateway_for_handoff",
+  "retire_gateway",
+]);
+
+/** The runtime an apply creates for itself when none is injected. */
+export interface OwnedExactArtifactRecoveryDeployRuntime
+  extends ExactArtifactRecoveryDeployRuntime {
+  /** Side-effect-free operator input checks for one planned mutation, run before the owner gate. */
+  assertBeforeOwnerGate(
+    action: ExactArtifactRecoveryMutation,
+    before: ExactArtifactRecoveryDeploymentSnapshot,
+  ): Promise<void>;
+  /** Re-resolves the Cloudflare credential and rebinds every client built from it. */
+  refreshCredential(): Promise<void>;
+  dispose(): void;
+}
+
+interface ExactRecoveryCredentialBinding {
+  readonly state: ExactArtifactRecoveryCloudflareState;
+  readonly sql: Pick<SqlAccess, "query">;
+  readonly childEnvironment: Readonly<Record<string, string>>;
 }
 
 interface ExactRecoveryPublicIdentity {
@@ -313,12 +362,17 @@ interface ExactRecoveryRuntimeContext {
   readonly providerReady: () => Promise<boolean>;
 }
 
-async function createExactArtifactRecoveryDeployRuntime(
+/**
+ * Creates the runtime `runExactArtifactRecoveryDeployment` owns when no runtime
+ * is injected. Exported for focused credential and operator-input tests; the
+ * deploy surface is its only production caller.
+ */
+export async function createExactArtifactRecoveryDeployRuntime(
   invocation: ExactArtifactRecoveryDeployInvocation,
   target: DeployTarget,
   options: ExactArtifactRecoveryDeployOptions,
   providerExecutor: ProviderExecutorInspection,
-): Promise<ExactArtifactRecoveryDeployRuntime> {
+): Promise<OwnedExactArtifactRecoveryDeployRuntime> {
   requiredRecoveryTarget(target);
   requiredOperatorTarget(target);
   if (!target.cloudflareProviderExecutor) {
@@ -338,48 +392,50 @@ async function createExactArtifactRecoveryDeployRuntime(
     requestDigest: loaded.requestDigest,
     commit: invocation.commit,
   });
-  if (options.cloudflareEnvironment === undefined) {
+  const cloudflareEnvironment = options.cloudflareEnvironment;
+  if (cloudflareEnvironment === undefined) {
     throw preflightError(
       "exact artifact recovery requires owner-injected Cloudflare credential scope",
     );
   }
   const run = options.run ?? runCommand;
-  const credential = await resolveCloudflareCredential(invocation.environment, {
-    cloudflareEnvironment: options.cloudflareEnvironment,
-    run,
-    ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
-  });
-  const apiToken = credential.token;
-  const childEnvironment = credential.childEnvironment;
-  const state =
-    options.state ??
-    new CloudflareState({
-      accountId: target.accountId,
-      token: apiToken,
-      ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+  const resolveCredential = async (): Promise<CloudflareCredential> =>
+    await resolveCloudflareCredential(invocation.environment, {
+      cloudflareEnvironment,
+      run,
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
     });
   const fetcher = options.fetcher ?? fetch;
-  const sql = createD1HttpSql({
-    accountId: target.accountId,
-    databaseId: target.d1.databaseId,
-    authorize: () => `Bearer ${apiToken}`,
-    fetch: async (request) => await fetcher(request),
+  // Every client that carries the bearer is rebuilt together from one credential.
+  const bind = (credential: CloudflareCredential): ExactRecoveryCredentialBinding => ({
+    state:
+      options.state ??
+      new CloudflareState({
+        accountId: target.accountId,
+        token: credential.token,
+        ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+      }),
+    sql: createD1HttpSql({
+      accountId: target.accountId,
+      databaseId: target.d1.databaseId,
+      authorize: () => `Bearer ${credential.token}`,
+      fetch: async (request) => await fetcher(request),
+    }),
+    childEnvironment: credential.childEnvironment,
   });
+  let bound = bind(await resolveCredential());
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-exact-recovery-deploy-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const providerReady = async (): Promise<boolean> => {
-    return providerExecutor.ready && (await recoveryMigrationApplied(sql));
+    return providerExecutor.ready && (await recoveryMigrationApplied(bound.sql));
   };
-  const context: ExactRecoveryRuntimeContext = {
+  const unbound: Omit<ExactRecoveryRuntimeContext, keyof ExactRecoveryCredentialBinding> = {
     invocation,
     target,
     requestPath,
     operatorPrivateJwkPath,
     loaded,
-    state,
-    sql,
-    childEnvironment,
     root,
     run,
     sourceRepositoryRoot: resolve(options.sourceRepositoryRoot ?? REPOSITORY),
@@ -393,13 +449,22 @@ async function createExactArtifactRecoveryDeployRuntime(
     ...(options.lostAckPath === undefined ? {} : { lostAckPath: options.lostAckPath }),
     providerReady,
   };
+  // Each call reads the current binding, never one captured before a refresh.
+  const context = (): ExactRecoveryRuntimeContext => ({ ...unbound, ...bound });
 
   return {
     async inspect() {
-      return await inspectExactArtifactRecoveryDeployment(context);
+      return await inspectExactArtifactRecoveryDeployment(context());
     },
     async apply(action) {
-      return await applyExactArtifactRecoveryDeployment(context, action);
+      return await applyExactArtifactRecoveryDeployment(context(), action);
+    },
+    async assertBeforeOwnerGate(action, before) {
+      if (action === "publish_handoff_worker") await selectedLostAckHandoff(context(), before);
+      if (OPERATOR_KEY_MUTATIONS.has(action)) readPrivateJwk(operatorPrivateJwkPath);
+    },
+    async refreshCredential() {
+      bound = bind(await resolveCredential());
     },
     dispose() {
       unsealDirectory(root);

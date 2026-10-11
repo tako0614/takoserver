@@ -112,6 +112,12 @@ export interface RetirementOptions {
   readonly cutoverConsumptionDatabase?: SponsorshipCutoverConsumptionDatabase;
   /** Portable test seam; production uses the shared default publication-lease root. */
   readonly publicationLeaseRoot?: string;
+  /**
+   * Rebuilds the Cloudflare state its composing owner built, from a credential
+   * resolved again. Every sub-runner calls it right after its owner gate.
+   * Absent for an injected state, which keeps its own credential.
+   */
+  readonly refreshStateAfterGate?: () => Promise<RetirementState>;
 }
 
 /**
@@ -157,25 +163,27 @@ async function runRetirementWithLease(
 ): Promise<Record<string, unknown>> {
   validateInvocation(invocation, target);
   const run = options.run ?? runCommand;
+  const resolveCredential = async () =>
+    await resolveCloudflareCredential(invocation.environment, {
+      cloudflareEnvironment: options.cloudflareEnvironment,
+      run,
+    });
   const credential =
     invocation.environment === "integration" &&
     options.state !== undefined &&
     invocation.action === "status"
       ? undefined
-      : await resolveCloudflareCredential(invocation.environment, {
-          cloudflareEnvironment: options.cloudflareEnvironment,
-          run,
-        });
+      : await resolveCredential();
   const environment = credential?.childEnvironment ?? {};
-  const state =
-    options.state ??
-    new CloudflareState({
-      accountId: target.accountId,
-      token: credential?.token ?? exactToken(environment),
-    });
+  const createState = (token: string | undefined): CloudflareState =>
+    new CloudflareState({ accountId: target.accountId, token: token ?? exactToken(environment) });
+  const state = options.state ?? createState(credential?.token);
   const runtimeOptions: RetirementOptions = {
     ...options,
     cloudflareEnvironment: environment,
+    ...(options.state === undefined
+      ? { refreshStateAfterGate: async () => createState((await resolveCredential()).token) }
+      : {}),
   };
   if (
     invocation.surface === "takoserver-worker-authority-cutover" ||
@@ -378,7 +386,7 @@ async function runAuthorityTransitionWithLease(
         options,
       );
     }
-    const proofGate = requiredProofGate(invocation, target, state, options, root, run);
+    let proofGate = requiredProofGate(invocation, target, state, options, root, run);
     const proof = await proofGate.authorize("public-route-removal");
     const legacy = await inspectRetirementVersionAt(
       "preflight",
@@ -402,6 +410,14 @@ async function runAuthorityTransitionWithLease(
         `scoped owner gate \`bun run check\` failed (exit ${gate.exitCode})`,
         `${gate.stdout}${gate.stderr}`.trim(),
       );
+    }
+    // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+    // Wrangler refreshes only an already expired token). No Cloudflare read or
+    // write after the gate reuses a bearer resolved before it.
+    if (options.refreshStateAfterGate !== undefined) {
+      state = await options.refreshStateAfterGate();
+      // A built proof gate reads through the state it was built with.
+      proofGate = requiredProofGate(invocation, target, state, options, root, run);
     }
     const prepared = await prepareWorkerArtifact({
       root,
@@ -558,7 +574,7 @@ async function runPost0043RouteSettlement(
       "preexisting route removal has no provider effect to reverse after the 0043 compatibility exit",
     );
   }
-  const proofGate = requiredProofGate(invocation, target, state, options, root, run);
+  let proofGate = requiredProofGate(invocation, target, state, options, root, run);
   if (invocation.action === "status") {
     const proofSha256 = await proofGate.settlePreexistingRouteRemoval(before.parentVersionId);
     return {
@@ -601,6 +617,14 @@ async function runPost0043RouteSettlement(
       `scoped owner gate \`bun run check\` failed (exit ${gate.exitCode})`,
       `${gate.stdout}${gate.stderr}`.trim(),
     );
+  }
+  // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+  // Wrangler refreshes only an already expired token). No Cloudflare read or
+  // write after the gate reuses a bearer resolved before it.
+  if (options.refreshStateAfterGate !== undefined) {
+    state = await options.refreshStateAfterGate();
+    // A built proof gate reads through the state it was built with.
+    proofGate = requiredProofGate(invocation, target, state, options, root, run);
   }
   const prepared = await prepareWorkerArtifact({
     root,
@@ -1146,6 +1170,10 @@ async function runTopologyRetirement(
         `${gate.stdout}${gate.stderr}`.trim(),
       );
     }
+    // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+    // Wrangler refreshes only an already expired token). No Cloudflare read or
+    // write after the gate reuses a bearer resolved before it.
+    if (options.refreshStateAfterGate !== undefined) state = await options.refreshStateAfterGate();
     const prepared = await prepareWorkerArtifact({
       root,
       target,
@@ -1501,6 +1529,10 @@ async function runAttributionRepair(
         `${gate.stdout}${gate.stderr}`.trim(),
       );
     }
+    // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+    // Wrangler refreshes only an already expired token). No Cloudflare read or
+    // write after the gate reuses a bearer resolved before it.
+    if (options.refreshStateAfterGate !== undefined) state = await options.refreshStateAfterGate();
     const prepared = await prepareWorkerArtifact({
       root,
       target,
@@ -1671,7 +1703,7 @@ async function runPost0043AttributionRepair(
   ) {
     throw preflightError("post-0043 attribution repair selector is not the exact H Version");
   }
-  const proofGate = requiredProofGate(invocation, target, state, options, root, run);
+  let proofGate = requiredProofGate(invocation, target, state, options, root, run);
   const receiptProofSha256 = await requirePost0043LegacySecretReceipt(
     "preflight",
     proofGate,
@@ -1726,6 +1758,14 @@ async function runPost0043AttributionRepair(
       `scoped owner gate \`bun run check\` failed (exit ${gate.exitCode})`,
       `${gate.stdout}${gate.stderr}`.trim(),
     );
+  }
+  // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+  // Wrangler refreshes only an already expired token). No Cloudflare read or
+  // write after the gate reuses a bearer resolved before it.
+  if (options.refreshStateAfterGate !== undefined) {
+    state = await options.refreshStateAfterGate();
+    // A built proof gate reads through the state it was built with.
+    proofGate = requiredProofGate(invocation, target, state, options, root, run);
   }
   const prepared = await prepareWorkerArtifact({
     root,

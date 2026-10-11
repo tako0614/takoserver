@@ -1023,6 +1023,76 @@ describe("integration storage generation bootstrap", () => {
     expect(fixture.calls.some((call) => call.startsWith("create"))).toBe(false);
   });
 
+  test("status reads a generation the target already selects; apply still refuses the collision", async () => {
+    // After apply the runbook points the target at the new pair; `--status`
+    // must keep diagnosing it instead of refusing it as a name collision.
+    const selectingTarget = {
+      ...target,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    } satisfies DeployTarget;
+    const fixture = providerFixture({
+      existingD1: { name: GENERATED_NAME, uuid: DATABASE_ID },
+      existingR2: { name: GENERATED_NAME },
+    });
+    const process = processFixture();
+    const status = await runIntegrationStorageGeneration(
+      { ...invocation, action: "status", freshLineage: "v2-artifacts-0075" },
+      selectingTarget,
+      options(fixture.provider, [completeV2ArtifactState], process),
+    );
+    expect(status).toMatchObject({
+      presence: "both",
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID, present: true },
+      r2: { bucketName: GENERATED_NAME, present: true },
+      targetSelection: { d1: true, r2: true, databaseIdExact: true },
+      readyForApply: false,
+      schemaReadback: "complete-0075",
+    });
+    const foreignId = await runIntegrationStorageGeneration(
+      { ...invocation, action: "status" },
+      {
+        ...selectingTarget,
+        d1: { databaseName: GENERATED_NAME, databaseId: target.d1.databaseId },
+      },
+      options(fixture.provider),
+    );
+    expect(foreignId).toMatchObject({
+      targetSelection: { d1: true, r2: true, databaseIdExact: false },
+      readyForApply: false,
+    });
+    expect(process.commands.some((command) => command.includes("execute"))).toBe(false);
+    expect(fixture.calls.some((call) => call.startsWith("create"))).toBe(false);
+
+    const unselected = await runIntegrationStorageGeneration(
+      { ...invocation, action: "status" },
+      target,
+      options(providerFixture().provider),
+    );
+    expect(unselected).toMatchObject({
+      targetSelection: { d1: false, r2: false, databaseIdExact: null },
+      readyForApply: true,
+    });
+
+    for (const colliding of [
+      selectingTarget,
+      { ...target, d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID } },
+      { ...target, r2: { bucketName: GENERATED_NAME } },
+    ]) {
+      const refused = providerFixture();
+      const applyProcess = processFixture();
+      await expect(
+        runIntegrationStorageGeneration(
+          invocation,
+          colliding,
+          options(refused.provider, [emptyState], applyProcess),
+        ),
+      ).rejects.toThrow("collides with the selected target");
+      expect(refused.calls).toEqual([]);
+      expect(applyProcess.commands).toEqual([]);
+    }
+  });
+
   test("fresh-v2 unknown or partial import halts with exact generation evidence and no R2", async () => {
     const process = processFixture({ exitCode: 1, stdout: "private", stderr: "private" });
     const fixture = providerFixture();

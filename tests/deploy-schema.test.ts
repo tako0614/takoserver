@@ -698,6 +698,270 @@ describe("forward-only D1 schema surface", () => {
     }
   });
 
+  test("integration pending-0043 dispatch resolves the OAuth bearer again after the migration gate", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-oauth-refresh-"));
+    const requests: string[] = [];
+    const originalFetch = globalThis.fetch;
+    const previousToken = process.env.CLOUDFLARE_API_TOKEN;
+    delete process.env.CLOUDFLARE_API_TOKEN;
+    // No request may reach the network, whichever client the source builds.
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      requests.push(input instanceof Request ? input.url : String(input));
+      return new Response(JSON.stringify({ success: false, result: null, errors: [] }), {
+        status: 401,
+      });
+    }) as typeof globalThis.fetch;
+    try {
+      const fixture = processFixture("rehearsal");
+      const events: string[] = [];
+      let gated = false;
+      const run: SchemaProcess = async (command, options) => {
+        if (command.slice(-3).join(" ") === "auth token --json") {
+          // The access token expires while the long migration gate runs.
+          const token = gated ? "oauth-after-gate" : "oauth-before-gate";
+          events.push(`token:${token}`);
+          return ok(JSON.stringify({ type: "oauth", token }));
+        }
+        const completed = await fixture.run(command, options);
+        if (command.join(" ") === "bun run check:migrations") {
+          events.push("gate");
+          gated = true;
+        }
+        return completed;
+      };
+      const compatibilityReads: string[] = [];
+      const pre = migrationStateThrough(36, "oauth-refresh-pre");
+      const post = migrationStateThrough(43, "oauth-refresh-post");
+      await runD1Schema(
+        {
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          throughMigration: "0043",
+        },
+        integration0043Target,
+        {
+          run,
+          reader: integration0043Reader([pre, pre, pre, post]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "work"),
+          leaseRoot: join(root, "leases"),
+          review: "reviewer@example.test",
+          artifactBlobIoCompatibilityReader: async (phase, context) => {
+            compatibilityReads.push(
+              `${gated ? "after" : "before"}:${phase}:${context.bearerToken}`,
+            );
+            return {
+              status: "ready",
+              currentCompatibilityDeploymentId: "10000000-0000-4000-8000-000000000043",
+              rollbackCompatibilityDeploymentId: "10000000-0000-4000-8000-000000000042",
+              currentCompatibilityVersionId: "00000000-0000-4000-8000-000000000043",
+              rollbackCompatibilityVersionId: "00000000-0000-4000-8000-000000000042",
+              unsafePredecessorInvocations: "drained-or-cancelled",
+            };
+          },
+          cloudflareEnvironment: {},
+        },
+      );
+      const gate = events.indexOf("gate");
+      expect(gate).toBeGreaterThan(0);
+      expect(events.slice(gate + 1)).toEqual(["token:oauth-after-gate"]);
+      expect(compatibilityReads).toEqual([
+        "before:preflight:oauth-before-gate",
+        "after:preflight:oauth-after-gate",
+        "after:preflight:oauth-after-gate",
+        "after:mutation:oauth-after-gate",
+      ]);
+      expect(requests).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN;
+      else process.env.CLOUDFLARE_API_TOKEN = previousToken;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("production refuses an unusable rehearsal receipt before the migration gate", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-early-receipt-"));
+    const requests: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      requests.push(input instanceof Request ? input.url : String(input));
+      return new Response("{}", { status: 401 });
+    }) as typeof globalThis.fetch;
+    try {
+      chmodSync(root, 0o700);
+      const receiptPath = join(root, "receipt.json");
+      const pre = { ...PRE, applied: MIGRATIONS.slice(0, 22).map(({ name }) => name) };
+      const post = { ...POST, applied: MIGRATIONS.slice(0, 28).map(({ name }) => name) };
+      await runD1Schema(
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0028" },
+        target,
+        {
+          run: processFixture("rehearsal").run,
+          reader: readerSequence([pre, pre, pre, post]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "rehearsal-work"),
+          leaseRoot: join(root, "leases"),
+          receiptPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      const exact = JSON.parse(readFileSync(receiptPath, "utf8"));
+      const drifted = { ...structuredClone(exact), migrationDigest: `sha256:${"e".repeat(64)}` };
+      for (const [index, [write, message]] of (
+        [
+          // Exact names and values; only the closed canonical encoding is wrong.
+          [(path: string) => writeFileSync(path, `${JSON.stringify(exact)}\n`), "canonical"],
+          [
+            (path: string) => writeFileSync(path, `${JSON.stringify(drifted, null, 2)}\n`),
+            "rehearsal receipt",
+          ],
+          [(_path: string) => undefined, "rehearsal receipt"],
+        ] as const
+      ).entries()) {
+        const candidate = join(root, `production-receipt-${index}.json`);
+        write(candidate);
+        if (existsSync(candidate)) chmodSync(candidate, 0o600);
+        const production = processFixture("production");
+        const refused = await runD1Schema(
+          { action: "apply", environment: "production", commit: COMMIT, throughMigration: "0028" },
+          { ...target, environment: "production" },
+          {
+            run: production.run,
+            reader: readerSequence([pre, pre, pre, post]),
+            migrationDirectory: currentMigrations,
+            outputDirectory: join(root, `production-work-${index}`),
+            leaseRoot: join(root, "leases"),
+            receiptPath: candidate,
+            review: "second-reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ).catch((error) => error);
+        expect(refused).toBeInstanceOf(DeployError);
+        expect(refused.phase).toBe("preflight");
+        expect(refused.message).toContain(message);
+        expect(production.calls.some((call) => call.join(" ") === "bun run check:migrations")).toBe(
+          false,
+        );
+        expect(production.calls.some((call) => call[0] === "bun" && call[1] === "test")).toBe(
+          false,
+        );
+      }
+      expect(requests).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rehearsal refuses an unusable predecessor receipt before the migration gate", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-early-predecessor-"));
+    const requests: string[] = [];
+    const originalFetch = globalThis.fetch;
+    const previousPredecessor = process.env.TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH;
+    delete process.env.TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      requests.push(input instanceof Request ? input.url : String(input));
+      return new Response("{}", { status: 401 });
+    }) as typeof globalThis.fetch;
+    try {
+      chmodSync(root, 0o700);
+      const firstPath = join(root, "0028.receipt.json");
+      const firstPre = { ...PRE, applied: MIGRATIONS.slice(0, 22).map(({ name }) => name) };
+      const firstPost = { ...POST, applied: MIGRATIONS.slice(0, 28).map(({ name }) => name) };
+      await runD1Schema(
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0028" },
+        target,
+        {
+          run: processFixture("rehearsal").run,
+          reader: readerSequence([firstPre, firstPre, firstPre, firstPost]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "first-work"),
+          leaseRoot: join(root, "leases"),
+          receiptPath: firstPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      const compactPredecessor = join(root, "0028.compact.receipt.json");
+      writeFileSync(
+        compactPredecessor,
+        `${JSON.stringify(JSON.parse(readFileSync(firstPath, "utf8")))}\n`,
+        { mode: 0o600 },
+      );
+      const zeroCounts = (states: readonly D1SchemaState[]): SchemaReader => ({
+        read: readerSequence(states).read,
+        async resourceDeletionAttestationBackfillCounts() {
+          return { malformedFormRefCount: 0, duplicateLiveResourceUidCount: 0 };
+        },
+      });
+      for (const [index, selection] of (
+        [
+          {
+            throughMigration: "0028",
+            reader: readerSequence([firstPre, firstPre, firstPre, firstPost]),
+            predecessorReceiptPath: firstPath,
+            message: "first D1 wave refuses a predecessor rehearsal receipt",
+          },
+          {
+            throughMigration: "0033",
+            reader: zeroCounts([firstPost, firstPost, firstPost]),
+            message: "requires its exact predecessor rehearsal receipt",
+          },
+          {
+            throughMigration: "0033",
+            reader: zeroCounts([firstPost, firstPost, firstPost]),
+            predecessorReceiptPath: compactPredecessor,
+            message: "canonical",
+          },
+        ] as const
+      ).entries()) {
+        const rehearsal = processFixture("rehearsal");
+        const refused = await runD1Schema(
+          {
+            action: "apply",
+            environment: "rehearsal",
+            commit: COMMIT,
+            throughMigration: selection.throughMigration,
+          },
+          target,
+          {
+            run: rehearsal.run,
+            reader: selection.reader,
+            migrationDirectory: currentMigrations,
+            outputDirectory: join(root, `refused-work-${index}`),
+            leaseRoot: join(root, "leases"),
+            receiptPath: join(root, `refused-${index}.receipt.json`),
+            ...("predecessorReceiptPath" in selection
+              ? { predecessorReceiptPath: selection.predecessorReceiptPath }
+              : {}),
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ).catch((error) => error);
+        expect(refused).toBeInstanceOf(DeployError);
+        expect(refused.phase).toBe("preflight");
+        expect(refused.message).toContain(selection.message);
+        expect(rehearsal.calls.some((call) => call.join(" ") === "bun run check:migrations")).toBe(
+          false,
+        );
+        expect(rehearsal.calls.some((call) => call[0] === "bun" && call[1] === "test")).toBe(false);
+        expect(existsSync(join(root, `refused-${index}.receipt.json`))).toBe(false);
+      }
+      expect(requests).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousPredecessor === undefined) {
+        delete process.env.TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH;
+      } else {
+        process.env.TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH = previousPredecessor;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("production requires the exact rehearsal digest and shape before its one apply", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-production-"));
     try {

@@ -474,15 +474,17 @@ async function runFormAuthorityWithLease(
   const capabilityManifestJson = canonicalJson(capabilityManifest);
   const capabilityDigest = await canonicalDigest(capabilityManifest);
   const run = options.run ?? runCommand;
-  const credential =
+  const resolveCredential = async () =>
+    await resolveCloudflareCredential(invocation.environment, {
+      cloudflareEnvironment: options.cloudflareEnvironment,
+      run,
+    });
+  let credential =
     invocation.environment === "integration" &&
     options.state !== undefined &&
     invocation.action === "status"
       ? undefined
-      : await resolveCloudflareCredential(invocation.environment, {
-          cloudflareEnvironment: options.cloudflareEnvironment,
-          run,
-        });
+      : await resolveCredential();
   const environment = credential?.childEnvironment ?? {};
   const initialStorageProof =
     transitionDelta?.storageRebind === undefined
@@ -497,12 +499,13 @@ async function runFormAuthorityWithLease(
   let routineIntegrationStorageProof: Awaited<
     ReturnType<typeof verifyIntegrationStorageGenerationTarget>
   > | null = null;
-  const state =
+  const createState = (resolved: typeof credential): FormAuthorityDeployState =>
     options.state ??
     new CloudflareState({
       accountId: target.accountId,
-      token: credential?.token ?? exactToken(environment),
+      token: resolved?.token ?? exactToken(resolved?.childEnvironment ?? {}),
     });
+  let state = createState(credential);
   const publicBefore = await inspectPublicWorker("preflight", target, state);
   const publicIdentityReadback = await readPublicHostIdentityProbe(
     target,
@@ -965,6 +968,13 @@ async function runFormAuthorityWithLease(
     await runFormAuthorityCodeGate(run, invocation.surface);
   } else {
     await checked(run, "scoped Form authority owner gate `bun run check`", ["bun", "run", "check"]);
+  }
+  // The owner gate can outlive a Wrangler OAuth access token (about one hour;
+  // Wrangler refreshes only an already expired token). No Cloudflare read or
+  // write after the gate reuses a bearer resolved before it.
+  if (credential !== undefined) {
+    credential = await resolveCredential();
+    state = createState(credential);
   }
 
   const temporary = options.outputDirectory === undefined;

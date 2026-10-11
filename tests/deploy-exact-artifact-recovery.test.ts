@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as exactArtifactRecoveryDeploy from "../scripts/deploy/exact-artifact-recovery.ts";
 import {
+  type ExactArtifactRecoveryDeploymentSnapshot,
   type ExactArtifactRecoveryDeployRuntime,
   planExactArtifactRecoveryDeployment,
   runExactArtifactRecoveryDeployment,
@@ -12,11 +14,20 @@ import {
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { WorkerProviderExecutorQualification } from "../scripts/deploy/worker.ts";
 import {
+  ARTIFACT_RECOVERY_LINEAGE_DIGEST,
+  ARTIFACT_RECOVERY_LINEAGE_MIGRATION,
+  ARTIFACT_RECOVERY_LOST_ACK_FORMAT,
   ARTIFACT_RECOVERY_REQUEST_FORMAT,
   ARTIFACT_RECOVERY_RETENTION_FORMAT,
   type ArtifactRecoveryRequest,
+  canonicalArtifactRecoveryRequest,
 } from "../src/artifact-recovery.ts";
-import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
+import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
+import {
+  deterministicIntegrationE2eApiKeyIds,
+  INTEGRATION_E2E_ORGANIZATION_ID,
+} from "../src/integration-e2e-credential-authority.ts";
+import { canonicalDigest, canonicalJson } from "../src/json.ts";
 
 const COMMIT = "b".repeat(40);
 const REQUEST_DIGEST = `sha256:${"1".repeat(64)}` as const;
@@ -594,6 +605,409 @@ describe("exact artifact recovery deploy lifecycle", () => {
     expect(repeated.quiescenceEvidenceDigest).toBe(result.quiescenceEvidenceDigest);
   });
 });
+
+describe("exact artifact recovery owned runtime around the owner gate", () => {
+  test("re-resolves the OAuth bearer for every Cloudflare and D1 read after the gate", async () => {
+    const fixture = await ownedRecoveryFixture();
+    const tokens = { current: "oauth-access-before-gate" };
+    const observed: { readonly url: string; readonly authorization: string | null }[] = [];
+    await withoutNetwork(async (network) => {
+      const runtime = await createOwnedRuntime(fixture, {
+        cloudflareEnvironment: {},
+        run: oauthRun(tokens, fixture.commands),
+        fetcher: recordingFetcher(observed),
+      });
+      try {
+        await runtime.inspect().catch(() => undefined);
+        await settle();
+        const beforeGate = observed.splice(0);
+        expectCloudflareAndD1Reads(beforeGate);
+        expect(bearers(beforeGate)).toEqual(["Bearer oauth-access-before-gate"]);
+
+        // The access token expires while the long owner gate runs.
+        tokens.current = "oauth-access-after-gate";
+        await runtime.refreshCredential();
+        await runtime.inspect().catch(() => undefined);
+        await settle();
+        const afterGate = observed.splice(0);
+        expectCloudflareAndD1Reads(afterGate);
+        expect(bearers(afterGate)).toEqual(["Bearer oauth-access-after-gate"]);
+        expect(
+          fixture.commands.filter((command) => command.endsWith("auth token --json")),
+        ).toHaveLength(2);
+      } finally {
+        await runtime.dispose?.();
+      }
+      expect(network).toEqual([]);
+    }).finally(() => rmSync(fixture.root, { recursive: true, force: true }));
+  });
+
+  test("refuses an unusable lost-ack successor authority before the owner gate", async () => {
+    const fixture = await ownedRecoveryFixture();
+    const before = quiescedHandoffSnapshot(fixture.requestDigest);
+    const status = await runExactArtifactRecoveryDeployment(
+      {
+        surface: "takoserver-exact-artifact-recovery",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      target,
+      {
+        providerExecutorQualification: readyExecutorQualification(),
+        runtime: {
+          async inspect() {
+            return before;
+          },
+          async apply() {
+            throw new Error("status must be read-only");
+          },
+        },
+      },
+    );
+    const lostAck = {
+      kind: ARTIFACT_RECOVERY_LOST_ACK_FORMAT,
+      candidateOrdinal: 3,
+      predecessorWorkerVersionId: WORKER_VERSION,
+      quiescenceEvidenceDigest: status.quiescenceEvidenceDigest,
+      resolution: { kind: "confirm-head-absent" },
+    };
+    const lostAckPath = join(fixture.root, "lost-ack.json");
+    const observed: { readonly url: string; readonly authorization: string | null }[] = [];
+    await withoutNetwork(async (network) => {
+      const runtime = await createOwnedRuntime(fixture, {
+        cloudflareEnvironment: {},
+        run: oauthRun({ current: "oauth-access-before-gate" }, fixture.commands),
+        fetcher: recordingFetcher(observed),
+        lostAckPath,
+      });
+      try {
+        writeFileSync(lostAckPath, JSON.stringify(lostAck, null, 2), { mode: 0o600 });
+        await expect(
+          runtime.assertBeforeOwnerGate("publish_handoff_worker", before),
+        ).rejects.toThrow("not canonical JSON");
+        writeFileSync(
+          lostAckPath,
+          canonicalJson({ ...lostAck, quiescenceEvidenceDigest: `sha256:${"0".repeat(64)}` }),
+        );
+        await expect(
+          runtime.assertBeforeOwnerGate("publish_handoff_worker", before),
+        ).rejects.toThrow("does not match quiesced state");
+        writeFileSync(lostAckPath, canonicalJson(lostAck));
+        await runtime.assertBeforeOwnerGate("publish_handoff_worker", before);
+        // Only the successor publication consumes the lost-ack authority.
+        rmSync(lostAckPath);
+        await runtime.assertBeforeOwnerGate("publish_worker", {
+          ...before,
+          worker: { state: "absent" },
+          receipt: null,
+        });
+      } finally {
+        await runtime.dispose?.();
+      }
+      expect(fixture.commands.some((command) => command === "bun run check")).toBe(false);
+      expect(observed).toEqual([]);
+      expect(network).toEqual([]);
+    }).finally(() => rmSync(fixture.root, { recursive: true, force: true }));
+  });
+
+  test("refuses an unusable operator key before a gate whose readback signs with it", async () => {
+    const fixture = await ownedRecoveryFixture();
+    const before = {
+      ...quiescedHandoffSnapshot(fixture.requestDigest),
+      receipt: null,
+    } satisfies ExactArtifactRecoveryDeploymentSnapshot;
+    expect(planExactArtifactRecoveryDeployment(before).action).toBe("publish_gateway");
+    const observed: { readonly url: string; readonly authorization: string | null }[] = [];
+    await withoutNetwork(async (network) => {
+      const runtime = await createOwnedRuntime(fixture, {
+        cloudflareEnvironment: {},
+        run: oauthRun({ current: "oauth-access-before-gate" }, fixture.commands),
+        fetcher: recordingFetcher(observed),
+      });
+      try {
+        writeFileSync(fixture.operatorPrivateJwkPath, "{}\n", { mode: 0o600 });
+        await expect(runtime.assertBeforeOwnerGate("publish_gateway", before)).rejects.toThrow(
+          "operator private JWK must be one exact Ed25519 signing key",
+        );
+        const pair = (await crypto.subtle.generateKey("Ed25519", true, [
+          "sign",
+          "verify",
+        ])) as CryptoKeyPair;
+        writeFileSync(
+          fixture.operatorPrivateJwkPath,
+          JSON.stringify(
+            normalizeGeneratedEd25519PrivateJwk(
+              await crypto.subtle.exportKey("jwk", pair.privateKey),
+            ),
+          ),
+        );
+        await runtime.assertBeforeOwnerGate("publish_gateway", before);
+        // A first route-less publication never signs with the operator key.
+        rmSync(fixture.operatorPrivateJwkPath);
+        await runtime.assertBeforeOwnerGate("publish_worker", {
+          ...before,
+          worker: { state: "absent" },
+        });
+      } finally {
+        await runtime.dispose?.();
+      }
+      expect(observed).toEqual([]);
+      expect(network).toEqual([]);
+    }).finally(() => rmSync(fixture.root, { recursive: true, force: true }));
+  });
+});
+
+interface OwnedRecoveryFixture {
+  readonly root: string;
+  readonly requestPath: string;
+  readonly requestDigest: `sha256:${string}`;
+  readonly operatorPrivateJwkPath: string;
+  readonly commands: string[];
+}
+
+async function ownedRecoveryFixture(): Promise<OwnedRecoveryFixture> {
+  const root = mkdtempSync(join(tmpdir(), "takoserver-recovery-owned-"));
+  chmodSync(root, 0o700);
+  const canonical = await canonicalArtifactRecoveryRequest(await exactRecoveryRequest());
+  const requestPath = join(root, "request.json");
+  writeFileSync(requestPath, canonical.canonicalJson, { mode: 0o600 });
+  return {
+    root,
+    requestPath,
+    requestDigest: canonical.requestDigest,
+    operatorPrivateJwkPath: join(root, "operator-private.jwk"),
+    commands: [],
+  };
+}
+
+async function createOwnedRuntime(
+  fixture: OwnedRecoveryFixture,
+  options: Pick<
+    exactArtifactRecoveryDeploy.ExactArtifactRecoveryDeployOptions,
+    "cloudflareEnvironment" | "run" | "fetcher" | "lostAckPath"
+  >,
+) {
+  const inspection = await readyExecutorQualification().read("preflight");
+  return await exactArtifactRecoveryDeploy.createExactArtifactRecoveryDeployRuntime(
+    {
+      surface: "takoserver-exact-artifact-recovery",
+      action: "apply",
+      environment: "integration",
+      commit: COMMIT,
+    },
+    target,
+    {
+      ...options,
+      requestPath: fixture.requestPath,
+      operatorPrivateJwkPath: fixture.operatorPrivateJwkPath,
+      outputDirectory: join(fixture.root, "work"),
+    },
+    inspection,
+  );
+}
+
+function quiescedHandoffSnapshot(
+  requestDigest: `sha256:${string}`,
+): ExactArtifactRecoveryDeploymentSnapshot {
+  return {
+    executorReady: true,
+    requestDigest,
+    selectedCommit: COMMIT,
+    worker: {
+      state: "ready",
+      versionId: WORKER_VERSION,
+      requestDigest,
+      commit: COMMIT,
+      handoff: null,
+    },
+    gateway: { state: "ordinary", versionId: GATEWAY_VERSION },
+    receipt: {
+      phase: "settling",
+      detailState: "active",
+      activeWorkerVersionId: WORKER_VERSION,
+      purgeAfter: null,
+      resultSetDigest: null,
+      nextCandidate: { ordinal: 3, fence: 7, state: "delete_started" },
+    },
+    recoveryStatus: null,
+    now: 1,
+  };
+}
+
+function oauthRun(
+  tokens: { current: string },
+  commands: string[],
+): NonNullable<exactArtifactRecoveryDeploy.ExactArtifactRecoveryDeployOptions["run"]> {
+  return async (command) => {
+    const key = command.join(" ");
+    commands.push(key);
+    if (command.slice(-3).join(" ") === "auth token --json") {
+      return {
+        exitCode: 0,
+        stdout: `${JSON.stringify({ type: "oauth", token: tokens.current })}\n`,
+        stderr: "",
+      };
+    }
+    throw new Error(`unexpected command: ${key}`);
+  };
+}
+
+function unauthorized(): Response {
+  return Response.json(
+    { success: false, result: null, errors: [{ code: 10000, message: "Authentication error" }] },
+    { status: 401 },
+  );
+}
+
+/** Every injected request is recorded and refused; nothing here can reach a network. */
+function recordingFetcher(
+  observed: { readonly url: string; readonly authorization: string | null }[],
+): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    observed.push({ url: request.url, authorization: request.headers.get("authorization") });
+    return unauthorized();
+  }) as typeof fetch;
+}
+
+/** Replaces the global fetch for the whole body so no client the source builds can escape. */
+async function withoutNetwork(body: (network: string[]) => Promise<void>): Promise<void> {
+  const network: string[] = [];
+  const originalFetch = globalThis.fetch;
+  const previousToken = process.env.CLOUDFLARE_API_TOKEN;
+  delete process.env.CLOUDFLARE_API_TOKEN;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    network.push(input instanceof Request ? input.url : String(input));
+    return unauthorized();
+  }) as typeof fetch;
+  try {
+    await body(network);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN;
+    else process.env.CLOUDFLARE_API_TOKEN = previousToken;
+  }
+}
+
+async function settle(): Promise<void> {
+  // Promise.all rejects on the first refusal; let its sibling reads record too.
+  await new Promise((resolve) => setTimeout(resolve, 25));
+}
+
+function bearers(
+  observed: readonly { readonly authorization: string | null }[],
+): readonly string[] {
+  return [
+    ...new Set(
+      observed.flatMap(({ authorization }) => (authorization === null ? [] : [authorization])),
+    ),
+  ];
+}
+
+function expectCloudflareAndD1Reads(observed: readonly { readonly url: string }[]): void {
+  expect(
+    observed.some(({ url }) => url.endsWith(`/d1/database/${target.d1.databaseId}/query`)),
+  ).toBe(true);
+  expect(observed.some(({ url }) => url.includes(`/accounts/${target.accountId}/workers/`))).toBe(
+    true,
+  );
+}
+
+async function exactRecoveryRequest(): Promise<ArtifactRecoveryRequest> {
+  const operationIds = [
+    "operation-artifact-a",
+    "operation-artifact-b",
+    "operation-artifact-c",
+    "operation-artifact-d",
+  ];
+  const owners = await Promise.all(
+    operationIds.map(async (operationId) => ({
+      operationId,
+      principalId: `api-key:${(await deterministicIntegrationE2eApiKeyIds(operationId)).writer}`,
+    })),
+  );
+  owners.sort((left, right) => left.principalId.localeCompare(right.principalId));
+  const uploads = owners
+    .flatMap((owner, index) => [
+      {
+        principalId: owner.principalId,
+        uploadId: `up_exact_${index}_a`,
+        uploadFence: 2,
+        rootFence: 2,
+      },
+      ...(index === 0
+        ? [
+            {
+              principalId: owner.principalId,
+              uploadId: `up_exact_${index}_b`,
+              uploadFence: 2,
+              rootFence: 2,
+            },
+          ]
+        : []),
+    ])
+    .sort((left, right) =>
+      `${left.principalId}\u0000${left.uploadId}`.localeCompare(
+        `${right.principalId}\u0000${right.uploadId}`,
+      ),
+    );
+  const memberDigests = Array.from(
+    { length: 28 },
+    (_, index) => `sha256:${index.toString(16).padStart(64, "0")}` as const,
+  );
+  const manifestDigest = `sha256:${"f".repeat(64)}` as const;
+  const holds = [
+    { kind: "manifest" as const, digest: manifestDigest },
+    ...memberDigests.map((memberDigest) => ({ kind: "blob" as const, digest: memberDigest })),
+  ];
+  const replayKeys = [
+    `${INTEGRATION_E2E_ORGANIZATION_ID}\u0000${owners[0]?.principalId}\u0000commit-a`,
+    `${INTEGRATION_E2E_ORGANIZATION_ID}\u0000${owners[1]?.principalId}\u0000commit-b`,
+  ].sort();
+  return {
+    kind: ARTIFACT_RECOVERY_REQUEST_FORMAT,
+    tenantId: INTEGRATION_E2E_ORGANIZATION_ID,
+    logicalTargetDigest: await canonicalDigest({
+      kind: "takoserver.exact-artifact-logical-target@v1",
+      tenantId: INTEGRATION_E2E_ORGANIZATION_ID,
+      manifestDigest,
+      memberSetDigest: await canonicalDigest(memberDigests),
+    }),
+    owners,
+    ownerSetDigest: await canonicalDigest(owners),
+    uploads,
+    uploadSetDigest: await canonicalDigest(uploads),
+    manifestDigest,
+    memberDigests,
+    memberSetDigest: await canonicalDigest(memberDigests),
+    expectedHolds: { entries: holds, count: holds.length, setDigest: await canonicalDigest(holds) },
+    expectedReplays: {
+      keys: replayKeys,
+      count: replayKeys.length,
+      setDigest: await canonicalDigest(replayKeys),
+    },
+    settlementEvidence: {
+      kind: "takosumi.apply-run-failure@v1",
+      digest: `sha256:${"e".repeat(64)}`,
+    },
+    lineage: {
+      migration: ARTIFACT_RECOVERY_LINEAGE_MIGRATION,
+      digest: ARTIFACT_RECOVERY_LINEAGE_DIGEST,
+    },
+    r2: {
+      accountId: target.accountId,
+      bucketName: target.r2.bucketName,
+      identityDigest: await canonicalDigest({
+        kind: "takoserver.r2-artifact-target@v1",
+        accountId: target.accountId,
+        bucketName: target.r2.bucketName,
+      }),
+    },
+    source: { repository: "takoserver", commit: COMMIT, version: "exact-recovery-test-v1" },
+    retentionPolicy: RETENTION,
+  };
+}
 
 function readyExecutorQualification(): WorkerProviderExecutorQualification {
   return {

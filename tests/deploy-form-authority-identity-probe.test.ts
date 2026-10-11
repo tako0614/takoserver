@@ -514,6 +514,100 @@ describe("integration Host-only identity probe bootstrap profile", () => {
     expect(uploads.some((command) => command.join(" ") === "bun run typecheck")).toBe(false);
   });
 
+  test("resolves the integration OAuth bearer again after the owner gate", async () => {
+    const uploaded = { value: false };
+    const events: string[] = [];
+    let issued = 0;
+    let current = "";
+    const rest = cloudflareRestFromState(
+      hostOnlyState(uploaded),
+      integrationHostOnlyTarget.accountId,
+    );
+    const previousToken = process.env.CLOUDFLARE_API_TOKEN;
+    delete process.env.CLOUDFLARE_API_TOKEN;
+    // No request may reach the network, whichever client the source builds.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const bearer = request.headers.get("authorization");
+      events.push(`${events.includes("check") ? "after" : "before"}:${bearer}`);
+      if (current === "" || bearer !== `Bearer ${current}`) {
+        return Response.json(
+          { success: false, result: null, errors: [{ code: 10000 }], messages: [] },
+          { status: 401 },
+        );
+      }
+      return await rest(request);
+    }) as typeof globalThis.fetch;
+    try {
+      const result = await runFormAuthorityIdentityProbe(
+        {
+          surface: "takoserver-form-authority-identity-probe",
+          action: "apply",
+          environment: "integration",
+          commit: PROFILE_COMMIT,
+        },
+        integrationHostOnlyTarget,
+        {
+          fetcher: hostOnlyFetcher(),
+          review: "independent-reviewer",
+          cloudflareEnvironment: {},
+          run: async (command) => {
+            const key = command.join(" ");
+            if (command.slice(-3).join(" ") === "auth token --json") {
+              if (current === "") {
+                issued += 1;
+                current = `oauth-access-${issued}`;
+              }
+              events.push(`token:${current}`);
+              return ok(`${JSON.stringify({ type: "oauth", token: current })}\n`);
+            }
+            if (key === "git rev-parse HEAD") return ok(`${PROFILE_COMMIT}\n`);
+            if (key === "git branch --show-current") return ok("fix/integration-host-only\n");
+            if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
+            if (key === "bun run check") {
+              events.push("check");
+              // The access token expires while the long owner gate runs.
+              current = "";
+              return ok("green\n");
+            }
+            if (command.includes("--dry-run")) {
+              const out = command[command.indexOf("--outdir") + 1];
+              if (!out) throw new Error("dry-run outdir missing");
+              mkdirSync(out, { recursive: true });
+              writeFileSync(
+                join(out, "worker.js"),
+                out.includes("public-worker-proof") ? PUBLIC_BUNDLE : PROBE_BUNDLE,
+              );
+              writeFileSync(join(out, "worker.js.map"), "{}\n");
+              return ok("built\n");
+            }
+            if (command.includes("--no-bundle")) {
+              uploaded.value = true;
+              return ok("uploaded\n");
+            }
+            throw new Error(`unexpected command: ${key}`);
+          },
+        },
+      );
+
+      expect(result).toMatchObject({ probeProfile: "integration-host-only", ready: true });
+      expect(uploaded.value).toBe(true);
+      const gate = events.indexOf("check");
+      expect(gate).toBeGreaterThan(0);
+      expect(events.slice(0, gate)).toContain("before:Bearer oauth-access-1");
+      const afterGate = events.slice(gate + 1);
+      expect(afterGate[0]).toBe("token:oauth-access-2");
+      const afterReads = afterGate.filter((event) => event.startsWith("after:"));
+      expect(afterReads.length).toBeGreaterThan(0);
+      expect(afterReads.every((event) => event === "after:Bearer oauth-access-2")).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN;
+      else process.env.CLOUDFLARE_API_TOKEN = previousToken;
+    }
+  });
+
   test("status recognizes the emitted Host-only profile without inventing Core readiness", async () => {
     const uploaded = { value: true };
     const result = await runFormAuthorityIdentityProbe(
@@ -2015,3 +2109,68 @@ describe("Form authority identity probe forward transition apply", () => {
     return { exitCode: 0, stdout, stderr: "" };
   }
 });
+
+/**
+ * Serves the typed fake state as the Cloudflare REST API, so the deploy builds
+ * its own CloudflareState and every read carries the bearer it was built with.
+ */
+function cloudflareRestFromState(
+  state: FormAuthorityIdentityProbeState,
+  accountId: string,
+): (request: Request) => Promise<Response> {
+  const envelope = (result: unknown, extra: Record<string, unknown> = {}): Response =>
+    Response.json({ success: true, errors: [], messages: [], result, ...extra });
+  return async (request) => {
+    const url = new URL(request.url);
+    const page = (entries: readonly unknown[]): Response =>
+      envelope(entries, {
+        result_info: {
+          page: Number(url.searchParams.get("page")),
+          per_page: Number(url.searchParams.get("per_page")),
+          count: entries.length,
+          total_count: entries.length,
+        },
+      });
+    const account = `/client/v4/accounts/${accountId}`;
+    const path = url.pathname;
+    if (path === `${account}/workers/scripts`) {
+      return envelope((await state.workerScripts()).map((id) => ({ id })));
+    }
+    if (path === `${account}/workers/domains`) return page(await state.workerDomains());
+    if (path === "/client/v4/zones") {
+      const zones =
+        url.searchParams.get("type") === "internal"
+          ? []
+          : [...new Set((await state.workerRoutes()).map(({ zoneId }) => zoneId))];
+      return page(zones.map((id) => ({ id })));
+    }
+    const zoneRoutes = /^\/client\/v4\/zones\/([^/]+)\/workers\/routes$/u.exec(path);
+    if (zoneRoutes) {
+      return envelope(
+        (await state.workerRoutes())
+          .filter(({ zoneId }) => zoneId === decodeURIComponent(zoneRoutes[1] as string))
+          .map(({ id, pattern, script }) => ({ id, pattern, script })),
+      );
+    }
+    const script = new RegExp(
+      `^${account}/workers/scripts/([^/]+)/(deployments|secrets|subdomain|versions/([^/]+))$`,
+      "u",
+    ).exec(path);
+    if (script) {
+      const name = decodeURIComponent(script[1] as string);
+      if (script[2] === "deployments") {
+        return envelope({ deployments: await state.workerDeployments(name) });
+      }
+      if (script[2] === "secrets") return envelope(await state.workerSecrets(name));
+      if (script[2] === "subdomain") {
+        const subdomain = await state.workerSubdomain(name);
+        return envelope({
+          enabled: subdomain.enabled,
+          previews_enabled: subdomain.previewsEnabled,
+        });
+      }
+      return envelope(await state.workerVersion(name, decodeURIComponent(script[3] as string)));
+    }
+    throw new Error(`unexpected Cloudflare REST path: ${path}`);
+  };
+}
