@@ -190,9 +190,10 @@ requests #13 to #289 merged since 1.0.0 (2026-08-20).
   `provider` and `services/takoform-core-verifier`. CI now runs govulncheck on
   every Go module. GO-2026-5932 (x/crypto/openpgp) has no fix and is not
   reachable. (#283, #288)
-- npm advisories: drizzle-orm moved to 0.45.2 or later, and `undici` and
-  `sharp` are overridden to patched versions; a separate dependency-audit
-  workflow fails on findings. (#28, #82, #122)
+- npm advisories: the runtime dependency drizzle-orm moved to 0.45.2 or
+  later (#28). In the development toolchain, `undici` (GHSA-3wwx-pv8p-q78v,
+  through miniflare) and `sharp` are overridden to patched versions. A
+  separate dependency-audit workflow fails on findings. (#82, #122)
 - Self-host defaults: loopback listener, single-use operator sign-in
   assertions, and a documented trust boundary
   ([docs/self-host-security.md](docs/self-host-security.md)). (#286)
@@ -212,10 +213,11 @@ requests #13 to #289 merged since 1.0.0 (2026-08-20).
   canonical Hosted path became runnable on a fresh integration environment in
   source (#289), but it has not been run live, and this release does not imply
   a production rollout.
-- **The closed-graph workerd binary is not built by CI.** Every
-  `workerd-closed-graph-build` workflow run has failed (a 120-minute timeout,
-  and one completed build whose digest was not the pinned one), so the pin has
-  been reproduced only on an operator host. Build it from source or obtain it
+- **The closed-graph workerd binary is not built by CI.** All five
+  `workerd-closed-graph-build` workflow runs failed (toolchain prerequisites,
+  time limits, and one completed build whose digest was not the pinned one),
+  so the pin has been reproduced only outside CI and no prebuilt binary is
+  published. Build it from source or obtain it
   out of band and verify its SHA-256
   ([docs/release-assets.md](docs/release-assets.md)). It runs only on Linux
   x86-64 with glibc 2.38 or newer, and it is pinned to upstream workerd

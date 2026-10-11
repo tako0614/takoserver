@@ -17,7 +17,8 @@ const changelog = readFileSync(resolve(ROOT, "CHANGELOG.md"), "utf8");
 
 test("package.json, the OpenAPI document and its artifact carry one release version", () => {
   expect(isReleaseVersion(manifest.version)).toBe(true);
-  expect(openApiDocument.info.version).toBe(manifest.version);
+  const servedVersion: string = openApiDocument.info.version;
+  expect(servedVersion).toBe(manifest.version);
   const artifact = JSON.parse(
     readFileSync(resolve(ROOT, "openapi/takoserver.openapi.json"), "utf8"),
   ) as { readonly info: { readonly version: string } };

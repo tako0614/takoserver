@@ -46,9 +46,9 @@ has a different digest and is refused.
 [`workerd/README.md`](../workerd/README.md) is the build reference. In short,
 on Linux x86-64:
 
-1. Install or extract the exact compiler: clang 20.1.8 `2ubuntu8` with its
+1. Install or extract the exact compiler: clang 20.1.8 `2ubuntu8` with the
    matching `libc++-20-dev`, `libc++abi-20-dev`, `lld-20` and
-   `libclang-common-20-dev` packages. `WORKERD_LLVM_ROOT` is the absolute root
+   `libclang-common-20-dev` packages and their dependencies. `WORKERD_LLVM_ROOT` is the absolute root
    that holds them under `usr/bin` and `usr/lib` (`/` when installed system
    wide). [`scripts/workerd-toolchain-prerequisites.sh`](../scripts/workerd-toolchain-prerequisites.sh)
    is what CI uses on an `ubuntu-26.04` runner.

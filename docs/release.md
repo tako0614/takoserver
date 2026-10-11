@@ -48,12 +48,14 @@ Record each result with the commit it was run on. Every item refers to the
 `package.json` says the version and the CHANGELOG heading has its date.
 
 Use a dedicated clean checkout and a private run directory outside it, as the
-Host's user, with the shell's `NODE_ENV` removed:
+Host's user, with the shell's `NODE_ENV` removed. Keep `$RUN` short: the native
+Actor tests bind Unix sockets under `TMPDIR`, which may be at most 73 bytes.
 
 ```sh
 export REL=/absolute/path/takoserver-release      # a clean clone, not a working tree
-export RUN=/absolute/path/takoserver-release-run  # private, outside $REL
+export RUN=/var/tmp/tsr-run                         # private, outside $REL, and short
 export V=2.0.0
+mkdir -p -m 0700 "$RUN/tmp"
 git -C "$REL" fetch origin main --tags
 export X="$(git -C "$REL" rev-parse origin/main)"  # or an ancestor the owner chose
 git -C "$REL" switch --detach "$X"
