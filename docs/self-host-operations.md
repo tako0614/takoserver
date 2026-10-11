@@ -46,11 +46,9 @@ A self-host runs one of two profiles, selected by configuration:
 - For the complete local Worker profile, two native binaries:
   - The pinned closed-graph `workerd` artifact. Build it with
     `bun run build:workerd` as described in
-    [the closed-graph workerd artifact](../workerd/README.md), or obtain the
-    pinned binary out of band as described in
-    [release assets](release-assets.md); no run of the manual
-    `workerd-closed-graph-build` workflow has produced it yet. `sha256sum` must
-    print
+    [the closed-graph workerd artifact](../workerd/README.md), or download the
+    artifact of the manual `workerd-closed-graph-build` workflow run for the
+    reviewed commit. `sha256sum` must print
     `c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52`.
     Install it where only an administrator can replace it and set
     `TAKOSERVER_WORKERD_BINARY` to its absolute path. At startup the Host
