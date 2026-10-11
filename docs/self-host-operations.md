@@ -173,37 +173,43 @@ outside the Host API v1 and the shared OpenAPI route table:
   responding. It does not query SQLite or the Worker runtime.
 - `GET /_takoserver/health/ready` performs one read-only `SELECT 1` query with
   a one-second response deadline, then makes one bounded, read-only listener
-  observation of the accepted legacy workerd child. It returns `200` only when
-  SQLite answered and the legacy runtime's listener is currently reachable or
-  that runtime is not required; otherwise it returns `503`. v2 Worker owners
-  are reported separately (below) and, on their own, only mark the response
-  `degraded`.
+  observation of the accepted legacy workerd child and, when the Host has a v2
+  Worker composition, one bounded read of the v2 owners' state. It runs no
+  other SQL: the backlog counts it reports are the latest sample a background
+  pass took (see [Monitoring](#monitoring)). It returns `200` only when SQLite
+  answered and the legacy runtime's listener is currently reachable or that
+  runtime is not required; otherwise it returns `503`. v2 Worker owners, the
+  backlog and background passes are reported separately (below) and, on their
+  own, only mark the response `degraded`.
 
-The readiness body contains only fixed state labels: `database` is `readable`
-or `unavailable`; `workerRuntime` is `not-required`, `starting`, `serving`,
-`recovering`, `restore-failed`, or `unavailable`; and `supervisor` is the
-current child lifecycle state (`idle`, `starting`, `serving`, `recovering`, or
-`unavailable`). If the accepted child is still alive but its listener probe
-fails, `workerRuntime` is `unavailable` while `supervisor` remains `serving`;
-the fields distinguish observed service availability from process lifecycle.
-v2 Worker owners supervise their own workerd children outside that
-supervisor, so when the Host has a v2 Worker composition the body also carries
-`v2Workers: { owners, serving, unavailable }`: counts of opened owners, of
-owners whose recorded active incarnation's child group is ready, and of owners
-that recorded an active incarnation whose child is not ready (crashed or being
-replaced). For v2, "serving" means the owner's supervised child holds its
-listener port; the probe does not send an HTTP request to a tenant Worker, so
-it is not the listener reachability check described above. An owner whose
-Deployment is being deleted counts as neither serving nor unavailable.
+The readiness body contains fixed state labels and Host-wide counts, never an
+identifier: `database` is `readable` or `unavailable`; `workerRuntime` is
+`not-required`, `starting`, `serving`, `recovering`, `restore-failed`, or
+`unavailable`; and `supervisor` is the current child lifecycle state (`idle`,
+`starting`, `serving`, `recovering`, or `unavailable`). If the accepted child is
+still alive but its listener probe fails, `workerRuntime` is `unavailable` while
+`supervisor` remains `serving`; the fields distinguish observed service
+availability from process lifecycle. v2 Worker owners supervise their own
+workerd children outside that supervisor, so when the Host has a v2 Worker
+composition the body also carries `v2Workers: { owners, serving, unavailable }`:
+counts of opened owners, of owners whose recorded active incarnation's child
+group is ready, and of owners that recorded an active incarnation whose child is
+not ready (crashed or being replaced). For v2, "serving" means the owner's
+supervised child holds its listener port; the probe does not send an HTTP
+request to a tenant Worker, so it is not the listener reachability check
+described above. An owner whose Deployment is being deleted counts as neither
+serving nor unavailable.
 
 Serving owners turn a would-be `not-required` into `serving`. One or more
 unavailable owners add `degraded: true` but keep the response `200` when SQLite
-answered: this probe shares its port with the control API, and one broken
-tenant Worker must not make a load balancer withdraw the operator API. Read
-`degraded` and the counts to alert on tenant Workers. The response is `503`
-only when SQLite did not answer, the boot restore failed, the legacy runtime
-is unavailable, or the v2 owner state could not be read within the deadline.
-The counts carry no Worker UID or hostname. An empty successful boot restore with no published Workers is
+answered: this probe shares its port with the control API, and one broken tenant
+Worker must not make a load balancer withdraw the operator API. The `backlog`
+and `backgroundPasses` sections described in [Monitoring](#monitoring) set
+`degraded` the same way. Read `degraded` and the counts to alert on tenant
+Workers and stuck work. The response is `503` only when SQLite did not answer,
+the boot restore failed, the legacy runtime is unavailable, or the v2 owner
+state could not be read within the deadline. The counts carry no Worker UID or
+hostname. An empty successful boot restore with no published Workers is
 `not-required`, not a failure. A failed boot restore remains `restore-failed`
 for this process even if a later child passes its listener check: that check
 does not prove the entire durable published graph was restored. A process
@@ -213,15 +219,16 @@ These probes are observational only: they do not call restore, spawn or ensure
 workerd, stop the child, or run a product/provisioner route. The ready probe
 checks the exact accepted listener around one loopback HTTP request (250 ms
 request bound, 500 ms total observation bound); it does not schedule recovery.
-The response contains no raw errors, paths, organization or Resource
-identifiers, workload counts, or secrets. A `serving` result means this Host's
-current workerd child passed the Host-owned listener readiness check; it is
-not a claim that every Form,
-provider, or tenant Worker application is ready. In particular,
-Host/control-plane readiness and application-level health remain distinct.
-`GET /healthz` on the Cloudflare Worker entry is a separate runtime surface;
-these Bun-only diagnostics do not change that entry or the shared OpenAPI
-contract.
+The response contains no raw errors, paths, organization, Resource, Operation or
+Worker identifiers, background pass names, or secrets. It does carry Host-wide
+counts (v2 owners, stalled work, failing passes); see [Monitoring](#monitoring)
+before exposing `/_takoserver/` beyond the Host. A `serving` result means this
+Host's current workerd child passed the Host-owned listener readiness check; it
+is not a claim that every Form, provider, or tenant Worker application is ready.
+In particular, Host/control-plane readiness and application-level health remain
+distinct. `GET /healthz` on the Cloudflare Worker entry is a separate runtime
+surface; these Bun-only diagnostics do not change that entry or the shared
+OpenAPI contract.
 
 ### Container Endpoint HTTPS listener
 
@@ -324,6 +331,81 @@ forward with a source version that understands it. A cold backup restore is a
 separate recovery operation with source fencing and identity ownership
 requirements below, not a routine code rollback.
 
+## Monitoring
+
+Poll `GET /_takoserver/health/ready` on the Host's own port (`PORT`, default
+`8787`) every 10 to 30 seconds, from the machine itself or another trusted
+network position. Treat its two answers differently:
+
+- `503`, or no answer within a few seconds, means the Host cannot serve: SQLite
+  did not answer, the boot restore failed, the legacy runtime is unavailable,
+  or the v2 owner state could not be read. `database` and `workerRuntime` say
+  which.
+- `200` with `degraded: true` means the control plane serves but something
+  needs an operator. The probe never withdraws the shared API port for these.
+
+The degraded causes are reported as counts only, with no Resource, Operation,
+organization, Worker or batch identifier, no pass name and no error text:
+
+- `v2Workers.unavailable`: v2 Worker owners whose active incarnation's child
+  is not ready.
+- `backlog.operations`: v2 Operations that are still `queued`, `running` or
+  `reconciling` and have been pending for more than `backlog.olderThanSeconds`
+  (600) of this Host process's uptime: accepted that long ago, with the
+  process up at least that long. Work that waited out a stopped Host is
+  therefore not counted the moment the Host returns, and nothing counts during
+  the first ten minutes after a start. `waitingInput` counts Operations waiting
+  for their client to resupply private inputs; it is shown but does not
+  degrade the Host.
+- `backlog.queueExecutions.sendAuthorized`: Queue batches sent to a Worker more
+  than 600 seconds ago (by the same uptime rule) and still not retired; their
+  Consumer stays occupied. A Consumer whose handler, or the work it hands to
+  `waitUntil`, legitimately runs longer than ten minutes is counted too.
+- `backlog: "unavailable"`: no fresh sample exists. This degrades; it is not a
+  503.
+- `backgroundPasses.failing`: background passes (settlement, Takoform v2,
+  Queue delivery, Cron, the backlog sampler and others) whose most recent run
+  failed. A pass stops counting once it completes again. `stalled` counts
+  passes whose current run has lasted more than 600 seconds. Which pass failed,
+  and why, is only in stderr:
+  `self-host background pass failed: <name>: <bounded cause>`.
+
+The backlog counts are not read per request. A background pass samples them
+every 20 seconds (the first sample is taken before the listener opens), and the
+probe returns the latest sample from memory with its age in
+`backlog.sampledSecondsAgo`. A sample older than 60 seconds, which means the
+sampling pass has failed or stopped, is reported as `unavailable`. Each sample
+reads only the unsettled Operations (settled history is never read) and does
+one index seek per Queue Consumer that ever ran a batch, with query plans that
+stay on those indexes after `ANALYZE` or `PRAGMA optimize`.
+
+For example, a cron job or timer can alert on any non-zero exit of:
+
+```sh
+curl -fsS --max-time 5 http://127.0.0.1:8787/_takoserver/health/ready \
+  | jq -e '.status == "ready" and (.degraded | not)'
+```
+
+There is no metrics endpoint. The probe shares the public port and is
+unauthenticated, and a loopback check is not a privacy boundary behind a local
+reverse proxy, so a private metrics surface would need its own listener or
+operator authentication. Derive metrics from the ready body with an existing
+prober instead (for example a JSON exporter).
+
+Block `/_takoserver/` at the reverse proxy by default and poll it on the Host's
+own port. The probe carries no identifiers or secrets, but its Host-wide
+counts show how much work the Host has and whether it is keeping up; forward
+the path only to a load balancer or monitor that needs it.
+
+The serving supervisor writes bounded child-exit, automatic-restart attempt and
+delay, and recovery-success diagnostics through its existing log callback (the
+Bun entry forwards these to stdout). New recovery messages contain no config
+path or arbitrary child error text; deliberate stops and stale children are
+not reported as crashes. A failure to write these diagnostics does not stop
+runtime recovery. Collect stdout and stderr and configure alerts on them as
+well: these messages and the probe are not a monitoring service or proof of
+operator recovery.
+
 ## Backup and restore preparation
 
 This procedure prepares a cold copy of one Bun self-host installation. It is
@@ -416,12 +498,12 @@ Some paths exist only while a Host runs and are not part of the backup set:
    any external `TAKOSERVER_DB`. Use a destination that is not served by the
    source host.
 2. Stop the Takoserver service through its actual supervisor and wait until
-   `entry-bun.ts`, all of its `workerd` children (the legacy runtime and each
-   v2 Worker owner's), any Workflow execution guard, and any other process
-   configured to write this data have exited. A graceful stop is not enough until all writers
-   are gone. The Bun entry starts queue delivery and cron timers and restores
-   published Workers automatically at startup; there is no read-only boot
-   switch for a copy.
+   `entry-bun.ts`, all of its `workerd` children (the legacy runtime and each v2
+   Worker owner's), any Workflow execution guard, and any other process
+   configured to write this data have exited. A graceful stop is not enough
+   until all writers are gone. The Bun entry starts queue delivery and cron
+   timers and restores published Workers automatically at startup; there is no
+   read-only boot switch for a copy.
 3. With the installation quiescent, make a filesystem copy of the complete
    data root to the protected destination, preserving file contents,
    directories, hard links, ownership, and restrictive permissions (for
@@ -453,88 +535,24 @@ endpoint, external services, or tenant traffic.
 
 For an actual recovery, first fence the source instance and all its writers and
 confirm they cannot return. Restore the complete root and any external database
-to the intended replacement, reinstate its protected configuration and
-required secrets (including the exact v2 configuration, the cursor key, the
-private-plane key files at their configured paths, and an existing private
-`stagingRoot`), and verify that only the replacement owns the installation's
-network identity before starting it. Keep the same `TAKOSERVER_DATA_ROOT`
-value: SQLite database records carry the configured root, and the v2 owners'
-socket namespaces are derived from the owner directory's path. Only a restore
-to the same path on the same machine is exercised. Use a product build that
-understands the database's recorded migration history: SQLite upgrades are
-forward-only, and a build that does not know a recorded migration refuses the
-database rather than downgrading it. A restart may deliver queued work; treat that as resuming the
-installation, not as a no-write restore check. If source fencing, ownership of
-the public identity, or the fate of pending operations is uncertain, leave the
-restored copy stopped and resolve that uncertainty before activation.
+to the intended replacement, reinstate its protected configuration and required
+secrets (including the exact v2 configuration, the cursor key, the private-plane
+key files at their configured paths, and an existing private `stagingRoot`), and
+verify that only the replacement owns the installation's network identity before
+starting it. Keep the same `TAKOSERVER_DATA_ROOT` value: SQLite database records
+carry the configured root, and the v2 owners' socket namespaces are derived from
+the owner directory's path. Only a restore to the same path on the same machine
+is exercised. Use a product build that understands the database's recorded
+migration history: SQLite upgrades are forward-only, and a build that does not
+know a recorded migration refuses the database rather than downgrading it. A
+restart may deliver queued work; treat that as resuming the installation, not as
+a no-write restore check. If source fencing, ownership of the public identity,
+or the fate of pending operations is uncertain, leave the restored copy stopped
+and resolve that uncertainty before activation.
 
 After activation, perform the same current v2 discovery, authenticated exact
 Form-support, and known v2 Resource-readback checks described for an update.
 The legacy `/v1/forms` catalogue does not establish v2 support.
-
-## Monitoring
-
-Poll `GET /_takoserver/health/ready` on the Host's own port (`PORT`, default
-`8787`) every 10 to 30 seconds, from the machine itself or another trusted
-network position. Treat its two answers differently:
-
-- `503`, or no answer within a few seconds, means the Host cannot serve: SQLite
-  did not answer, the boot restore failed, the legacy runtime is unavailable,
-  or the v2 owner state could not be read. `database` and `workerRuntime` say
-  which.
-- `200` with `degraded: true` means the control plane serves but something
-  needs an operator. The probe never withdraws the shared API port for these.
-
-The degraded causes are reported as counts and fixed names only, with no
-Resource, Operation, organization, Worker or batch identifier and no error
-text:
-
-- `v2Workers.unavailable`: v2 Worker owners whose active incarnation's child
-  is not ready.
-- `backlog.operations`: v2 Operations accepted more than
-  `backlog.olderThanSeconds` (600) ago that are still `queued`, `running` or
-  `reconciling`. `waitingInput` counts Operations waiting for their client to
-  resupply private inputs; it is shown but does not degrade the Host.
-- `backlog.queueExecutions.sendAuthorized`: Queue batches sent to a Worker more
-  than 600 seconds ago and still not retired; their Consumer stays occupied.
-- `backlog: "unavailable"`: the backlog read failed or missed the probe's
-  one-second deadline. This degrades; it is not a 503.
-- `backgroundPasses.failing`: background passes (settlement, Takoform v2,
-  Queue delivery, Cron and others) whose most recent run failed. A pass stops
-  counting once it completes again. `stalled` counts passes whose current run
-  has lasted more than 600 seconds. `lastFailure` names the most recently
-  failed pass and its age in seconds; the matching stderr line
-  `self-host background pass failed: <name>: <bounded cause>` carries the
-  cause.
-
-The backlog reads run only after `SELECT 1` succeeded and use existing
-indexes, so their cost follows the size of the backlog and the number of Queue
-Consumers, not the Operation and execution history, which is never pruned.
-
-For example, a cron job or timer can alert on any non-zero exit of:
-
-```sh
-curl -fsS --max-time 5 http://127.0.0.1:8787/_takoserver/health/ready \
-  | jq -e '.status == "ready" and (.degraded | not)'
-```
-
-There is no metrics endpoint. The probe shares the public port and is
-unauthenticated, and a loopback check is not a privacy boundary behind a local
-reverse proxy, so a private metrics surface would need its own listener or
-operator authentication. Derive metrics from the ready body with an existing
-prober instead (for example a JSON exporter). If the reverse proxy forwards
-`/_takoserver/` from the public origin, anyone can read these Host-wide counts;
-they carry no identifiers or secrets, but do not forward the path if Host-wide
-activity should stay private.
-
-The serving supervisor writes bounded child-exit, automatic-restart attempt and
-delay, and recovery-success diagnostics through its existing log callback (the
-Bun entry forwards these to stdout). New recovery messages contain no config
-path or arbitrary child error text; deliberate stops and stale children are
-not reported as crashes. A failure to write these diagnostics does not stop
-runtime recovery. Collect stdout and stderr and configure alerts on them as
-well: these messages and the probe are not a monitoring service or proof of
-operator recovery.
 
 ## Automated proof and its limits
 
@@ -708,8 +726,9 @@ What this test and its neighbours record:
   `publication_conflict`), so such an Operation stays `reconciling` and keeps
   retrying: boot is not blocked, because the owner vouches it never served,
   but the Worker's Endpoint is not served until the Operation is settled.
-  After ten minutes readiness counts it under `backlog.operations.reconciling`
-  and reports `degraded` (see [Monitoring](#monitoring)).
+  Once it has been pending for ten minutes of Host uptime, readiness counts it
+  under `backlog.operations.reconciling` and reports `degraded` (see
+  [Monitoring](#monitoring)).
 
 Three other gaps this test first recorded have since been fixed, each with its own
 test:
