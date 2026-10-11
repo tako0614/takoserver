@@ -1222,6 +1222,16 @@ What this test and its neighbours record:
     engine's next retry (an owner and backend test). A Host killed while that
     candidate is still being retired boots and settles it the same way (a
     real-Host test).
+  - *Killed inside a state write.* The owner state and each execution group's
+    manifest and retirement receipt are written to a temporary and renamed
+    into place, so a kill that lands inside such a write leaves the temporary
+    behind (`runtime-owner.json.<uuid>.tmp`, or `.retirement-<uuid>` in a
+    group directory). It never became state. A stale-owner takeover discards
+    it before the namespace inventory; earlier releases refused that boot
+    with `ownership_uncertain` on every later start. Only that exact name as a
+    private, singly linked regular file is discarded; a symbolic link, a file
+    other users can read or any other unknown entry is still refused (tests
+    for each).
 
   A Deployment or Endpoint Operation that ends `failed` with effect `none`
   never makes a non-committed graph serve. Until a later Operation of that

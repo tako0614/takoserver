@@ -1,6 +1,16 @@
 import { expect, test } from "bun:test";
-import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  chmod,
+  lstat,
+  mkdtemp,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -181,6 +191,51 @@ async function waitForStale(identity: unknown): Promise<void> {
 function ownerDirectory(root: string): string {
   const uidHash = createHash("sha256").update(WORKER_UID, "utf8").digest("hex");
   return join(root, "owners", uidHash);
+}
+
+function groupDirectory(root: string, operationId: string): string {
+  const uidHash = createHash("sha256").update(WORKER_UID, "utf8").digest("hex");
+  return join(ownerDirectory(root), "incarnations", operationId, "groups", uidHash);
+}
+
+/**
+ * What a successor's boot decision depends on, for a failure message: the
+ * owner namespace entries, each recorded child's liveness and each recorded
+ * listener's ownership. The owner's own errors carry only their code.
+ */
+async function bootEvidence(root: string): Promise<Record<string, unknown>> {
+  const directory = ownerDirectory(root);
+  const entries = await readdir(directory).catch((error: unknown) => String(error));
+  const state: Record<string, unknown> = await ownerState(root).catch((error: unknown) => ({
+    unreadable: String(error),
+  }));
+  const records = Array.isArray(state.incarnations)
+    ? (state.incarnations as Record<string, unknown>[])
+    : [];
+  const incarnations = [];
+  for (const record of records) {
+    const operationId = String(record.operationId);
+    incarnations.push({
+      operationId,
+      status: record.status,
+      retirementOperationId: record.retirementOperationId,
+      receipt: record.receipt !== null,
+      executionCopiesCleanupStarted: record.executionCopiesCleanupStarted,
+      processIdentity: record.processIdentity,
+      liveness:
+        record.processIdentity === null
+          ? null
+          : await linuxProcessLiveness(record.processIdentity as never),
+      listenerPort: record.listenerPort,
+      listener: await workerPortOwnership(record.listenerPort as number, undefined).catch(
+        (error: unknown) => String(error),
+      ),
+      groupEntries: await readdir(groupDirectory(root, operationId)).catch((error: unknown) =>
+        String(error),
+      ),
+    });
+  }
+  return { entries, activeOperationId: state.activeOperationId, incarnations };
 }
 
 async function ownerState(root: string): Promise<Record<string, unknown>> {
@@ -1495,6 +1550,130 @@ for (const field of ["identity", "configurationSha256"] as const) {
   });
 }
 
+/**
+ * Every owner-state and execution-group write goes through a temporary that is
+ * renamed into place, so a Host killed inside one leaves that temporary behind.
+ * It never became state: the successor discards it once it holds the lock of
+ * the proven-dead owner, instead of refusing the namespace forever.
+ */
+const INTERRUPTED_WRITES = [
+  {
+    name: "owner-state",
+    path: (root: string) => join(ownerDirectory(root), `runtime-owner.json.${randomUUID()}.tmp`),
+  },
+  {
+    name: "execution-group",
+    path: (root: string) => join(groupDirectory(root, CREATE_ID), `.retirement-${randomUUID()}`),
+  },
+] as const;
+
+for (const interrupted of INTERRUPTED_WRITES)
+  test(`a successor discards the temporary of an ${interrupted.name} write its killed Host left`, async () => {
+    const owned = await fixture();
+    const port = await unusedPort();
+    let oldHost: HostProcess | undefined;
+    let successor: HostProcess | undefined;
+    try {
+      oldHost = await startHost("active-create", owned.root, owned.binary, port);
+      expect(await readJsonLine(oldHost)).toMatchObject({ kind: "active-created", port });
+      await terminateHost(oldHost);
+      oldHost = undefined;
+      await waitForVacant(port);
+      // The torn bytes of a write that never reached its rename.
+      const leftover = interrupted.path(owned.root);
+      const stateText = await readFile(
+        join(ownerDirectory(owned.root), "runtime-owner.json"),
+        "utf8",
+      );
+      await writeFile(leftover, stateText.slice(0, stateText.length >> 1), { mode: 0o600 });
+      const before = await ownerState(owned.root);
+
+      successor = await startHost("active-recover-only", owned.root, owned.binary, port);
+      const recovered = await readJsonLine(successor);
+      if (recovered.kind !== "recovered-active")
+        throw new Error(
+          `the successor did not boot: ${JSON.stringify({ recovered, evidence: await bootEvidence(owned.root) })}`,
+        );
+      expect(recovered).toMatchObject({ kind: "recovered-active", port });
+      expect(await lstat(leftover).catch(() => null)).toBeNull();
+      const after = await incarnations(owned.root);
+      expect(after.activeOperationId).toBe(CREATE_ID);
+      expect(
+        after.incarnations.map(({ operationId, status }) => ({ operationId, status })),
+      ).toEqual(
+        (before.incarnations as StoredIncarnation[]).map(({ operationId, status }) => ({
+          operationId,
+          status,
+        })),
+      );
+    } finally {
+      if (oldHost) await terminateHost(oldHost);
+      if (successor) await terminateHost(successor);
+      await owned.cleanup();
+    }
+  });
+
+/** Only the exact private temporary of an owner write is discarded; anything else is evidence. */
+const UNRECOGNIZED_LEFTOVERS = [
+  {
+    name: "a symbolic link named like an owner-state temporary",
+    async plant(root: string): Promise<string> {
+      const path = join(ownerDirectory(root), `runtime-owner.json.${randomUUID()}.tmp`);
+      await symlink(join(ownerDirectory(root), "runtime-owner.json"), path);
+      return path;
+    },
+  },
+  {
+    name: "a file whose name is not an owner-state temporary",
+    async plant(root: string): Promise<string> {
+      const path = join(ownerDirectory(root), "runtime-owner.json.tmp");
+      await writeFile(path, "", { mode: 0o600 });
+      return path;
+    },
+  },
+  {
+    name: "an execution-group temporary readable by other users",
+    async plant(root: string): Promise<string> {
+      const path = join(groupDirectory(root, CREATE_ID), `.retirement-${randomUUID()}`);
+      await writeFile(path, "", { mode: 0o600 });
+      await chmod(path, 0o644);
+      return path;
+    },
+  },
+] as const;
+
+for (const leftover of UNRECOGNIZED_LEFTOVERS)
+  test(`${leftover.name} still blocks a successor`, async () => {
+    const owned = await fixture();
+    const port = await unusedPort();
+    let oldHost: HostProcess | undefined;
+    let successor: HostProcess | undefined;
+    try {
+      oldHost = await startHost("active-create", owned.root, owned.binary, port);
+      expect(await readJsonLine(oldHost)).toMatchObject({ kind: "active-created", port });
+      await terminateHost(oldHost);
+      oldHost = undefined;
+      await waitForVacant(port);
+      const path = await leftover.plant(owned.root);
+      const statePath = join(ownerDirectory(owned.root), "runtime-owner.json");
+      const stateText = await readFile(statePath, "utf8");
+
+      successor = await startHost("active-recover-only", owned.root, owned.binary, port);
+      expect(await readJsonLine(successor)).toMatchObject({
+        kind: "error",
+        code: "ownership_uncertain",
+        phase: "open-owner",
+      });
+      expect(await lstat(path).catch(() => null)).not.toBeNull();
+      expect(await readFile(statePath, "utf8")).toBe(stateText);
+      expect(await workerPortOwnership(port, undefined)).toBe("vacant");
+    } finally {
+      if (oldHost) await terminateHost(oldHost);
+      if (successor) await terminateHost(successor);
+      await owned.cleanup();
+    }
+  });
+
 test("a Host killed while an in-process candidate failure is retiring still boots and settles it", async () => {
   const owned = await fixture();
   const port = await unusedPort();
@@ -1523,6 +1702,8 @@ test("a Host killed while an in-process candidate failure is retiring still boot
       if (!retiring) await Bun.sleep(2);
     }
     if (!retiring) throw new Error("inconclusive: the candidate retirement never started");
+    // The kill often lands inside the owner-state write that follows this
+    // first intent; its temporary is what the successor must discard.
     await terminateHost(host);
     host = undefined;
     await rm(hold, { force: true });
@@ -1542,7 +1723,13 @@ test("a Host killed while an in-process candidate failure is retiring still boot
       port,
       UPDATE_ID,
     );
-    expect(await readJsonLine(successor)).toMatchObject({
+    const recovered = await readJsonLine(successor);
+    // The owner's refusal names only its code; say what the boot saw instead.
+    if (recovered.kind !== "recovered-active")
+      throw new Error(
+        `the successor did not boot: ${JSON.stringify({ recovered, evidence: await bootEvidence(owned.root) })}`,
+      );
+    expect(recovered).toMatchObject({
       kind: "recovered-active",
       port,
       reexecuted: { kind: "abandoned_before_activation", operationId: UPDATE_ID },

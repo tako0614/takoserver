@@ -383,6 +383,8 @@ try {
   const code =
     error && typeof error === "object" && "code" in error ? String(error.code) : "fixture_failed";
   const detail = error instanceof Error ? error.message : "non-error rejection";
+  // The owner's errors name only their code; the stack names the refusing check.
+  const stack = error instanceof Error ? error.stack : undefined;
   if (mode === "active-recover-sql-unavailable") {
     await writeFile(
       join(rootDirectory as string, "sql-failure-ready.json"),
@@ -391,7 +393,7 @@ try {
     );
   }
   process.stdout.write(
-    `${JSON.stringify({ kind: "error", code, detail, phase, pid: process.pid, port })}\n`,
+    `${JSON.stringify({ kind: "error", code, detail, phase, pid: process.pid, port, stack })}\n`,
   );
   if (mode !== "active-recover-sql-unavailable") process.exitCode = 2;
 }
@@ -599,8 +601,9 @@ if (owner)
     const code =
       error && typeof error === "object" && "code" in error ? String(error.code) : "fixture_failed";
     const detail = error instanceof Error ? error.message : "non-error rejection";
+    const stack = error instanceof Error ? error.stack : undefined;
     process.stdout.write(
-      `${JSON.stringify({ kind: "error", code, detail, phase, pid: process.pid, port })}\n`,
+      `${JSON.stringify({ kind: "error", code, detail, phase, pid: process.pid, port, stack })}\n`,
     );
     process.exitCode = 2;
     await owner.close().catch(() => undefined);
