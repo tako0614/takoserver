@@ -5,7 +5,10 @@ import {
   createV2QueueSettlementEndpoint,
 } from "./providers/selfhost-v2-queue-transport.ts";
 import type { QueueCustody } from "./queue-custody.ts";
-import { cancelQueueReservationBeforeSend } from "./selfhost-v2-queue-cancel.ts";
+import {
+  cancelQueueReservationBeforeSend,
+  refuseQueueReservationsBeforeFirstDelivery,
+} from "./selfhost-v2-queue-cancel.ts";
 import type { V2QueueConsumerCapability } from "./takoform-v2/worker-queue-consumer-backend.ts";
 import {
   authorizeV2QueueBatchSend,
@@ -35,6 +38,12 @@ export interface SelfhostV2QueueCompositionOptions {
    * retries, so it will wait out its 120 second expiry. Cause only; no payload.
    */
   readonly onCancelFailure?: (cause: unknown) => void;
+  /**
+   * Called when selecting a batch threw. A reservation it wrote holds the
+   * Consumer until its 120 second expiry, so the cause must reach the log
+   * rather than vanish into an `unknown` pass. Cause only; no payload.
+   */
+  readonly onClaimFailure?: (cause: unknown) => void;
   /** Internal deterministic-test clock for retirement retries; defaults to a monotonic clock. */
   readonly now?: () => number;
 }
@@ -348,9 +357,14 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
     // handler receipt or a provably absent child; unresolved sends stay
     // occupied and are never resent here.
     await reconcileAuthorizedAbsence(scope);
-    const batch = await delivery
-      .claimRegisteredBatch(scope)
-      .catch(() => ({ kind: "unknown" as const }));
+    const batch = await delivery.claimRegisteredBatch(scope).catch((cause: unknown) => {
+      try {
+        options.onClaimFailure?.(cause);
+      } catch {
+        /* Reporting must not turn a refused selection into a pass failure. */
+      }
+      return { kind: "unknown" as const };
+    });
     if (batch.kind !== "ready") return { kind: batch.kind };
     let owner: WorkerdWorkerRuntimeOwner;
     try {
@@ -432,6 +446,17 @@ export function createSelfhostV2QueueComposition(options: SelfhostV2QueueComposi
     reconcileAuthorizedAbsence,
     reconcileWorkerAuthorizedAbsence,
     deliverOnce,
+    /**
+     * Call once at Host start, before the first delivery pass: refuses every
+     * unsent reservation an earlier process left, so its messages come back
+     * now. See refuseQueueReservationsBeforeFirstDelivery for why no proof
+     * that the earlier writer is gone is needed. Resolves to the count.
+     */
+    refuseReservationsBeforeFirstDelivery: (): Promise<number> =>
+      refuseQueueReservationsBeforeFirstDelivery({
+        sql: options.sql,
+        ...(options.onCancelFailure ? { report: options.onCancelFailure } : {}),
+      }),
     close: async () => {
       await server.stop(true);
     },

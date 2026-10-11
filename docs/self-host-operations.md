@@ -1387,8 +1387,19 @@ work, to a different path or machine, of an external `TAKOSERVER_DB`, or an
 operator disaster-recovery drill with source fencing. It does not cover a `scheduled`
 handler, Actor or Workflow use, public DNS or certificate trust, Hosted/WfP or
 a host reboot. Messages in flight at the
-crash are redelivered at least once, and a batch reserved but not yet sent is
-held for its 120 second reservation before redelivery.
+crash are redelivered at least once. A batch the killed Host reserved but never
+sent is refused when the Host starts again, before it listens, and its messages
+come back at once. That holds when the refusal succeeds: if it gives up (a lock
+that outlasted the five second busy timeout, for example), that batch and any
+not yet refused wait for their 120 second reservation as before. The refusal
+needs no proof that the old process is gone: it is the pre-send cancel, which
+can only win while the batch has not been authorized, and the owner sends only
+after winning that authorization. A batch that was already sent is different.
+It must first be retired, by its handler's completion receipt or by proof that
+its Worker child is physically gone, and only then are its messages redelivered
+once their lease (up to 120 seconds) runs out. After a Host restart the old
+child is gone and that proof is normally available; a sent batch whose
+retirement cannot be proven stays occupied, with no time limit.
 
 **`/tmp` left at mode 0700 by an earlier build.** Before that fix, a build
 that ran as root without `TMPDIR` set and without a private `/tmp` (systemd
@@ -1453,6 +1464,16 @@ What this test and its neighbours record:
     engine's next retry (an owner and backend test). A Host killed while that
     candidate is still being retired boots and settles it the same way (a
     real-Host test).
+  - *Killed inside a state write.* The owner state and each execution group's
+    manifest and retirement receipt are written to a temporary and renamed
+    into place, so a kill that lands inside such a write leaves the temporary
+    behind (`runtime-owner.json.<uuid>.tmp`, or `.retirement-<uuid>` in a
+    group directory). It never became state. A stale-owner takeover discards
+    it before the namespace inventory; earlier releases refused that boot
+    with `ownership_uncertain` on every later start. Only that exact name as a
+    private, singly linked regular file is discarded; a symbolic link, a file
+    other users can read or any other unknown entry is still refused (tests
+    for each).
 
   A Deployment or Endpoint Operation that ends `failed` with effect `none`
   never makes a non-committed graph serve. Until a later Operation of that
@@ -1526,8 +1547,9 @@ test:
   a stopped data root, and the tenant SQLite stores are deliberately
   rollback-journal. A reader that holds the lock longer than five seconds still
   fails the write; a failing background pass now logs its name and a bounded
-  cause, and a Queue reservation that was never sent is refunded with retries
-  bounded to one second in total before it falls back to its 120 second expiry.
+  cause (including a Queue batch selection that threw), and a Queue
+  reservation that was never sent is refunded with retries bounded to one
+  second in total before it falls back to its 120 second expiry.
   A refund whose lock outlasted the five second wait is not retried, because
   each attempt would block the Host for that long again. A Queue batch whose
   handler finished but whose retirement failed this way is different: its
