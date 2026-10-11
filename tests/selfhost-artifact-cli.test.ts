@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  dataRootHolders,
   runSelfhostArtifactCli,
   SELFHOST_V2_WORKER_TARGET_KEY,
 } from "../scripts/selfhost-artifact.ts";
@@ -991,5 +992,71 @@ describe("self-host held artifact seeding", () => {
     expect(refused.stdout).toBe("");
     expect(refused.stderr).toContain("needs mode 0700");
     expect((await command([])).code).toBe(2);
+  });
+});
+
+describe("the data root holder scan looks again at a process it cannot read", () => {
+  /** A process table with this process and one whose descriptor table is hidden. */
+  function hiddenProcess() {
+    const parent = mkdtempSync(join(tmpdir(), "takoserver-holder-scan-"));
+    cleanups.push(() => rmSync(parent, { recursive: true, force: true }));
+    const procRoot = join(parent, "proc");
+    mkdirSync(join(procRoot, String(process.pid), "fd"), { recursive: true });
+    const dataRoot = join(parent, "data");
+    const database = join(dataRoot, "control.sqlite");
+    const opaque = join(procRoot, "434343");
+    mkdirSync(opaque);
+    // A file where the directory should be: reading it fails like a
+    // non-dumpable (or half-exited) process's table does.
+    writeFileSync(join(opaque, "fd"), "");
+    const scan = (pause: (ms: number) => void, attempts = 4) =>
+      dataRootHolders({
+        procRoot,
+        dataRoot,
+        files: [database],
+        selfPid: process.pid,
+        selfUid: process.getuid?.(),
+        recheck: { attempts, delayMs: 7, pause },
+      });
+    return { opaque, database, scan };
+  }
+
+  test("a process that finishes exiting between two looks is not reported", () => {
+    const { opaque, scan } = hiddenProcess();
+    const pauses: number[] = [];
+    const result = scan((ms) => {
+      pauses.push(ms);
+      rmSync(opaque, { recursive: true, force: true });
+    });
+    expect(result).toEqual({ holders: [], unreadable: [] });
+    expect(pauses).toEqual([7]);
+  });
+
+  test("a process that becomes a zombie between two looks is not reported", () => {
+    const { opaque, scan } = hiddenProcess();
+    const result = scan(() => {
+      writeFileSync(join(opaque, "stat"), "434343 (bun) Z 1 434343 434343 0 -1 4194560");
+    });
+    expect(result).toEqual({ holders: [], unreadable: [] });
+  });
+
+  test("a process whose table becomes readable is judged by what it holds", () => {
+    const { opaque, database, scan } = hiddenProcess();
+    const result = scan(() => {
+      rmSync(join(opaque, "fd"));
+      mkdirSync(join(opaque, "fd"));
+      symlinkSync(database, join(opaque, "fd", "7"));
+    });
+    expect(result).toEqual({ holders: [{ pid: 434343, path: database }], unreadable: [] });
+  });
+
+  test("a process that stays unreadable is still reported, after a bounded wait", () => {
+    const { scan } = hiddenProcess();
+    let pauses = 0;
+    const result = scan(() => {
+      pauses += 1;
+    }, 5);
+    expect(result).toEqual({ holders: [], unreadable: [434343] });
+    expect(pauses).toBe(5);
   });
 });

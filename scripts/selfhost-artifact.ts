@@ -778,14 +778,32 @@ export interface DataRootHolder {
 }
 
 /**
+ * How long a process whose descriptor table cannot be read is given to finish
+ * exiting before it counts as one that hides its files. A process in the middle
+ * of exit has released its memory, so `/proc/<pid>/fd` is unreadable for a
+ * moment even to root, and then the process is gone (or a zombie).
+ */
+const UNREADABLE_RECHECK_ATTEMPTS = 25;
+const UNREADABLE_RECHECK_DELAY_MS = 20;
+
+export interface UnreadableRecheck {
+  readonly attempts: number;
+  readonly delayMs: number;
+  /** Blocks for `ms`. Replaced by tests; the default waits synchronously. */
+  readonly pause?: (ms: number) => void;
+}
+
+/**
  * Every other process with a file at or below `dataRoot`, or one of `files`,
  * open. A running Host keeps its control database open for its whole life.
  * `unreadable` lists this user's processes whose descriptor table cannot be
  * read (a non-dumpable process, such as one with file capabilities): any of
- * them could be the Host. `unprovable` when the process table does not show
- * this process's own descriptors, so an empty answer would mean nothing.
- * Another user's unreadable process is skipped: it cannot open anything in a
- * root private to this user.
+ * them could be the Host. A process that cannot be read is looked at again for
+ * a short time first, because one that is exiting is unreadable only until it
+ * is gone. `unprovable` when the process table does not show this process's
+ * own descriptors, so an empty answer would mean nothing. Another user's
+ * unreadable process is skipped: it cannot open anything in a root private to
+ * this user.
  */
 export function dataRootHolders(input: {
   readonly procRoot: string;
@@ -793,6 +811,7 @@ export function dataRootHolders(input: {
   readonly files: readonly string[];
   readonly selfPid: number;
   readonly selfUid: number | undefined;
+  readonly recheck?: UnreadableRecheck;
 }): { holders: DataRootHolder[]; unreadable: number[] } | "unprovable" {
   let processes: string[];
   try {
@@ -803,43 +822,78 @@ export function dataRootHolders(input: {
   }
   const prefix = input.dataRoot.endsWith("/") ? input.dataRoot : `${input.dataRoot}/`;
   const holders: DataRootHolder[] = [];
-  const unreadable: number[] = [];
+  let pending: string[] = [];
+  const examine = (entry: string): void => {
+    const result = examineProcess(input, entry, prefix);
+    if (result === "unreadable") pending.push(entry);
+    else if (result !== undefined) holders.push(result);
+  };
   for (const entry of processes) {
     if (!/^[0-9]+$/u.test(entry) || Number(entry) === input.selfPid) continue;
-    let descriptors: string[];
+    examine(entry);
+  }
+  const recheck = input.recheck ?? {
+    attempts: UNREADABLE_RECHECK_ATTEMPTS,
+    delayMs: UNREADABLE_RECHECK_DELAY_MS,
+  };
+  for (let attempt = 0; attempt < recheck.attempts && pending.length > 0; attempt += 1) {
+    (recheck.pause ?? pauseSynchronously)(recheck.delayMs);
+    const again = pending;
+    pending = [];
+    for (const entry of again) examine(entry);
+  }
+  return { holders, unreadable: pending.map(Number) };
+}
+
+/**
+ * One process's verdict: a holder, `undefined` when it holds nothing (or is
+ * gone, or is not this user's), or `"unreadable"` when its descriptor table
+ * hides whether it holds anything.
+ */
+function examineProcess(
+  input: {
+    readonly procRoot: string;
+    readonly dataRoot: string;
+    readonly files: readonly string[];
+    readonly selfUid: number | undefined;
+  },
+  entry: string,
+  prefix: string,
+): DataRootHolder | "unreadable" | undefined {
+  let descriptors: string[];
+  try {
+    descriptors = readdirSync(join(input.procRoot, entry, "fd"));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    // Exited while scanning.
+    if (code === "ENOENT" || code === "ESRCH") return undefined;
+    let owner: number | undefined;
     try {
-      descriptors = readdirSync(join(input.procRoot, entry, "fd"));
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException | undefined)?.code;
-      // Exited while scanning.
-      if (code === "ENOENT" || code === "ESRCH") continue;
-      let owner: number | undefined;
-      try {
-        owner = statSync(join(input.procRoot, entry)).uid;
-      } catch {
-        continue;
-      }
-      // A zombie has already closed every file, and its table is never readable.
-      if (owner === input.selfUid && !exitedProcess(input.procRoot, entry)) {
-        unreadable.push(Number(entry));
-      }
+      owner = statSync(join(input.procRoot, entry)).uid;
+    } catch {
+      return undefined;
+    }
+    // A zombie has already closed every file, and its table is never readable.
+    if (owner === input.selfUid && !exitedProcess(input.procRoot, entry)) return "unreadable";
+    return undefined;
+  }
+  for (const descriptor of descriptors) {
+    let target: string;
+    try {
+      target = readlinkSync(join(input.procRoot, entry, "fd", descriptor));
+    } catch {
       continue;
     }
-    for (const descriptor of descriptors) {
-      let target: string;
-      try {
-        target = readlinkSync(join(input.procRoot, entry, "fd", descriptor));
-      } catch {
-        continue;
-      }
-      const path = target.endsWith(" (deleted)") ? target.slice(0, -" (deleted)".length) : target;
-      if (path === input.dataRoot || path.startsWith(prefix) || input.files.includes(path)) {
-        holders.push({ pid: Number(entry), path });
-        break;
-      }
+    const path = target.endsWith(" (deleted)") ? target.slice(0, -" (deleted)".length) : target;
+    if (path === input.dataRoot || path.startsWith(prefix) || input.files.includes(path)) {
+      return { pid: Number(entry), path };
     }
   }
-  return { holders, unreadable };
+  return undefined;
+}
+
+function pauseSynchronously(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /** Whether `/proc/<pid>/stat` reports a zombie or dead process. */
