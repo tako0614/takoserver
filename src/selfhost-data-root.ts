@@ -74,6 +74,27 @@ export function createSelfhostDataRootIfAbsent(dataRoot: string): boolean {
 }
 
 /**
+ * The ancestor rule of {@link privateDirectoryChainProblem}: owned by root or
+ * by this user, and writable by no other user unless it is sticky and
+ * root-owned.
+ */
+export function unsafeAncestorProblem(
+  metadata: { readonly uid: number; readonly mode: number },
+  uid: number,
+  current: string,
+  name: string,
+): string | undefined {
+  if (metadata.uid !== 0 && metadata.uid !== uid) {
+    return `${name} has an ancestor owned by another user: ${current} has owner uid ${metadata.uid}, but needs owner uid 0 or ${uid}`;
+  }
+  if ((metadata.mode & 0o022) !== 0 && !((metadata.mode & 0o1000) !== 0 && metadata.uid === 0)) {
+    const mode = (metadata.mode & 0o7777).toString(8).padStart(4, "0");
+    return `${name} has an unsafe writable ancestor: ${current} has mode ${mode} and owner uid ${metadata.uid}`;
+  }
+  return undefined;
+}
+
+/**
  * Why `path` is not a directory this user can trust with private state, or
  * `undefined` when it is.
  *
@@ -115,13 +136,14 @@ export function privateDirectoryChainProblem(path: string, name: string): string
         );
       }
       leaf = false;
-    } else if (metadata.uid !== 0 && metadata.uid !== uid) {
-      return `${name} has an ancestor owned by another user: ${current} has owner uid ${metadata.uid}, but needs owner uid 0 or ${uid}`;
-    } else if (
-      (metadata.mode & 0o022) !== 0 &&
-      !((metadata.mode & 0o1000) !== 0 && metadata.uid === 0)
-    ) {
-      return `${name} has an unsafe writable ancestor: ${current} has mode ${mode} and owner uid ${metadata.uid}`;
+    } else {
+      const problem = unsafeAncestorProblem(
+        { uid: Number(metadata.uid), mode: Number(metadata.mode) },
+        uid,
+        current,
+        name,
+      );
+      if (problem) return problem;
     }
     const parent = dirname(current);
     if (parent === current) return undefined;

@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { chmod, chown, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createSelfhostDataRootIfAbsent,
-  privateDirectoryChainProblem,
   resolveSelfhostDataRoot,
+  unsafeAncestorProblem,
 } from "../src/selfhost-data-root.ts";
 
 async function withTemporary(run: (root: string) => Promise<void>): Promise<void> {
@@ -79,22 +79,25 @@ test("a missing data root is created 0700 whatever the umask, and an existing on
   });
 });
 
-// Only root can hand a directory to another uid, so this runs where the
-// tests run as root.
-test.skipIf(process.getuid?.() !== 0)(
-  "an ancestor owned by another user is refused even when only its owner can write it",
-  async () => {
-    await withTemporary(async (root) => {
-      const parent = join(root, "parent");
-      const leaf = join(parent, "data");
-      await mkdir(leaf, { recursive: true, mode: 0o700 });
-      await chmod(parent, 0o755);
-      await chmod(leaf, 0o700);
-      expect(privateDirectoryChainProblem(leaf, "TAKOSERVER_DATA_ROOT")).toBeUndefined();
-      await chown(parent, 65534, 65534);
-      expect(privateDirectoryChainProblem(leaf, "TAKOSERVER_DATA_ROOT")).toBe(
-        `TAKOSERVER_DATA_ROOT has an ancestor owned by another user: ${parent} has owner uid 65534, but needs owner uid 0 or 0`,
-      );
-    });
-  },
-);
+test("an ancestor must be owned by root or this user and closed to other writers", () => {
+  const name = "TAKOSERVER_DATA_ROOT";
+  const self = 1000;
+  // Owned by another non-root user: its owner could rename the leaf away.
+  expect(unsafeAncestorProblem({ uid: 1001, mode: 0o40755 }, self, "/srv/x", name)).toBe(
+    "TAKOSERVER_DATA_ROOT has an ancestor owned by another user: /srv/x has owner uid 1001, but needs owner uid 0 or 1000",
+  );
+  // Group-writable, even when this user owns it (umask 002, fsGroup 2775).
+  expect(unsafeAncestorProblem({ uid: self, mode: 0o42775 }, self, "/srv/x", name)).toBe(
+    "TAKOSERVER_DATA_ROOT has an unsafe writable ancestor: /srv/x has mode 2775 and owner uid 1000",
+  );
+  // Writable by others without being sticky and root-owned.
+  expect(unsafeAncestorProblem({ uid: 0, mode: 0o40777 }, self, "/srv", name)).toContain(
+    "unsafe writable ancestor",
+  );
+  // Accepted: root-owned or self-owned and closed, and a sticky root-owned /tmp.
+  expect(unsafeAncestorProblem({ uid: 0, mode: 0o40755 }, self, "/", name)).toBeUndefined();
+  expect(
+    unsafeAncestorProblem({ uid: self, mode: 0o40755 }, self, "/home/u", name),
+  ).toBeUndefined();
+  expect(unsafeAncestorProblem({ uid: 0, mode: 0o41777 }, self, "/tmp", name)).toBeUndefined();
+});
