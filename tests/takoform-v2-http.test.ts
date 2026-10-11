@@ -314,6 +314,40 @@ test("public v2 routes drive the durable engine without GET-triggered execution"
       }),
     );
     expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ code: "generation_conflict" });
+    // 0 is a well-formed decimal generation no Resource ever has: stale, not malformed.
+    for (const [method, generation] of [
+      ["PUT", "0"],
+      ["DELETE", "0"],
+    ] as const) {
+      const zero = await response(
+        router,
+        call(`/resources/${accepted.resourceUid}`, {
+          method,
+          headers: {
+            "idempotency-key": `zero-generation-${method.toLowerCase()}-01`,
+            "takoform-expected-generation": generation,
+          },
+          ...(method === "PUT" ? { body: JSON.stringify({ spec: { value: "stale" } }) } : {}),
+        }),
+      );
+      expect(zero.status).toBe(409);
+      expect(await zero.json()).toMatchObject({ code: "generation_conflict" });
+    }
+    for (const malformed of ["00", "01", "-1", "+2", "1.0", "9007199254740992"]) {
+      const rejected = await response(
+        router,
+        call(`/resources/${accepted.resourceUid}`, {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "malformed-generation-01",
+            "takoform-expected-generation": malformed,
+          },
+          body: JSON.stringify({ spec: { value: "stale" } }),
+        }),
+      );
+      expect(rejected.status).toBe(400);
+    }
 
     const deleted = await response(
       router,

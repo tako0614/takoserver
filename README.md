@@ -704,64 +704,51 @@ bun run fmt       # the only thing that rewrites source
 
 `bun run check` is the gate. It is read-only and it does not skip.
 
-### Self-host and OpenTofu interoperability
+### Takoform v2 conformance
 
-`bun run test:selfhost-opentofu` is a separate native integration journey. It
-starts the real Bun Host, signs in with a fresh local operator key, creates an
-organization API key, and admits the signed Form closure through the real Core
-verifier. OpenTofu then creates an EdgeKVNamespace and SQLiteDatabase, checks a
-no-change plan, compares exact Form identities and UIDs with the Host, and
-destroys both resources. Success requires empty state and Host absence.
+`tests/takoform-v2-host-api-conformance.test.ts` runs Takoform's own Host API
+v2 HTTP baseline probe against a real `bun src/entry-bun.ts` process on
+loopback, once each for `SQLiteMigrationSet`, `WorkerBundle` and
+`StaticAssetBundle`. It is part of `bun run check`. The probe is vendored
+byte-exact from Takoform and pinned by size and SHA-256 in
+[`vendor/takoform/host-api-v2-conformance/`](vendor/takoform/host-api-v2-conformance/README.md);
+drifted bytes are refused before it runs.
 
-Prepare OpenTofu **1.12.5**, an unpacked filesystem mirror containing
-`registry.terraform.io/tako0614/takoform` **4.0.0**, and a verifier binary built
-from this checkout's `services/takoform-core-verifier`. Verify those artifacts
-before use; the verifier's reported build-context digest is not a binary hash.
-From a disposable Linux network namespace with only loopback enabled, run:
-
-```sh
-bun --no-env-file run test:selfhost-opentofu \
-  --tofu /absolute/path/to/tofu \
-  --provider-mirror /absolute/path/to/provider-mirror \
-  --core-verifier /absolute/path/to/takoform-core-verifier
-```
-
-Ports 8787 and 8080 must be free in that namespace. The command refuses external
-network interfaces, uses only fresh temporary state, and neither downloads
-tools nor reads existing operator credentials. It prints phase names and a
-sanitized result, stops its children and removes temporary state on exit.
-Failed mutations are not retried.
-
-To include actual Worker execution, supply both `--workerd` and `--openssl`:
+The opt-in companion runs the same probe against the complete local Worker
+profile's Forms that need no other Resource (`ModuleWorker`, `SQLiteDatabase`,
+`EdgeKVNamespace`, `ObjectBucket`, `AtLeastOnceQueue` and the three artifact
+Forms). It needs the pinned workerd, the Workflow guard and permission to bind
+443, so run it in a disposable network namespace:
 
 ```sh
-bun --no-env-file run test:selfhost-opentofu \
-  --tofu /absolute/path/to/tofu \
-  --provider-mirror /absolute/path/to/provider-mirror \
-  --core-verifier /absolute/path/to/takoform-core-verifier \
-  --workerd /absolute/path/to/closed-graph-workerd \
-  --openssl /absolute/path/to/openssl
+unshare --net sh -c 'ip link set lo up && \
+  TAKOSERVER_V2_ENTRY_NATIVE=1 \
+  TAKOSERVER_WORKERD_BINARY=/absolute/path/to/closed-graph-workerd \
+  TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY=/absolute/path/to/workflow-execution-guard \
+  bun test tests/takoform-v2-host-api-conformance-native.test.ts'
 ```
 
-Use the exact closed-graph workerd artifact accepted by this checkout, not the
-npm development binary. This mode also needs port 443 and permission to bind it
-inside the disposable namespace. It generates a temporary `*.app.localhost`
-certificate, configures the real Host's Worker TLS socket, and creates ModuleWorker, WorkerBundle,
-WorkerVersion, WorkerDeployment and WorkerEndpoint through the same Provider.
-The bundle is uploaded by the Provider, not installed directly into the runtime.
-SQLiteMigrationSet and SQLiteMigrationApplication create the application table
-through their normal lifecycle before the Worker is activated; the command does
-not seed the database directly or let runtime bindings execute schema DDL.
-The HTTPS request checks actual KV and SQLite operations through the declared
-bindings. The client trusts only the generated certificate and connects to
-loopback with the Host-assigned hostname; it changes no machine trust or DNS.
-Ready checks use the no-change plan's refreshed `prior_state` and a separate
-Host read, not the potentially stale state saved before dependent resources existed.
-All nine resources must then be removed through OpenTofu, with empty state and
-Host absence. The former endpoint must no longer serve the application.
+A pass means only that the probe's mandatory sequence passed for those
+fixtures. The probe reports restart durability, fault injection, concurrency,
+cross-principal authority, optional features and Form-specific behavior as not
+tested, and neither lane qualifies Hosted D1, Cloudflare or a deployment.
 
-Without the two extra arguments, the command retains the storage-only journey.
-Neither mode qualifies Cloudflare, Containers or a production deployment.
+### Historical: Host API v1 interoperability
+
+> These commands target the retired Host API v1 and do not work against the
+> current entry, which serves only `forms.takoform.com/v2`. They are kept as a
+> record of earlier evidence, not as current checks. No released
+> `terraform-provider-takoform` speaks Host API v2 yet (v4.1.0 is v1-only); v2
+> provider support is that repository's work, not Takoserver's.
+
+`bun run test:selfhost-opentofu` (`scripts/selfhost-opentofu-e2e.ts`) was a
+native journey for OpenTofu 1.12.5 and provider 4.0.0 against the v1 Bun Host:
+Core-verifier Form admission, EdgeKVNamespace and SQLiteDatabase CRUD with a
+no-change plan, and optionally a nine-resource workerd Worker journey. It waits
+for `/.well-known/takoform/v1` on a plain-HTTP origin, both of which the current
+entry refuses. `bun run conformance:takoform-v1`
+(`scripts/conformance-takoform-v1.ts`) runs the frozen stable-v1 suite against
+the separate v1 conformance entry and says nothing about the v2 Host.
 
 ## Licence
 

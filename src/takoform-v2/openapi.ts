@@ -24,7 +24,8 @@ const expectedGeneration = {
   in: "header",
   name: "Takoform-Expected-Generation",
   required: true,
-  schema: { type: "string", pattern: "^[1-9][0-9]*$" },
+  description: "Current Resource generation; any other well-formed value is a generation_conflict.",
+  schema: { type: "string", pattern: "^(?:0|[1-9][0-9]*)$" },
 };
 const organization = {
   in: "header",

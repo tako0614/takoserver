@@ -59,6 +59,19 @@ protocol, Core tag, Core commit, and artifact digest. The portable
 `--containers-rollout none`; the native image build belongs to the deploy
 surface and requires Docker on the operator machine.
 
+Because the digest covers every byte under `services/takoform-core-verifier`,
+a Go dependency or toolchain change there (for example the 2026-10 advisory
+upgrade in #283) changes the value the selected commit derives. A live
+authority Version from an earlier commit then no longer matches its target
+closure, and the routine apply refuses it. Advance it with the value-only
+transition `--closure-predecessor-version=<live> --refresh-var=TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST`
+described in
+[Advancing a Core verifier source change](deploy.md#advancing-a-core-verifier-source-change);
+that apply rebuilds the image rather than reusing the running one. The
+verifier image's build stage asserts `go env GOVERSION` equals the audited
+toolchain, so a base-image digest that carries another Go release fails the
+build instead of shipping.
+
 Integration image reuse has two distinct, narrow admission shapes. A routine
 code apply may reuse the already-running verifier image only when the present
 authority Version has the exact target binding closure; this updates code
@@ -514,6 +527,9 @@ exactly that for the embedded exact publisher set:
 
 ```sh
 # 1. start the released Core verifier with the digest this checkout computes
+#    (needs Go 1.26.9 or newer, or GOTOOLCHAIN=auto so the module's
+#    `toolchain go1.26.9` directive selects it; go1.26.0 builds but ships the
+#    unpatched standard library)
 cd services/takoform-core-verifier && go build -o /tmp/takoform-core-verifier ./cmd/server
 TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST=<sha256:…> /tmp/takoform-core-verifier &
 
