@@ -1,4 +1,8 @@
 import type { Sql } from "./ports.ts";
+import type {
+  SelfhostBackgroundPassHealth,
+  SelfhostBacklogHealth,
+} from "./selfhost-health-signals.ts";
 import type { WorkerdSupervisor, WorkerdSupervisorState } from "./workerd-supervisor.ts";
 
 export const SELFHOST_HEALTH_PATHS = Object.freeze({
@@ -32,13 +36,23 @@ export interface SelfhostHealthResponse {
   readonly workerRuntime?: SelfhostRuntimeHealth;
   readonly supervisor?: WorkerdSupervisorState;
   /**
-   * Present (always `true`) when at least one v2 Worker owner is unavailable.
-   * The control plane can still be ready: one tenant Worker's failure must not
-   * make a load balancer pull the operator API that shares this port.
+   * Present (always `true`) when at least one v2 Worker owner is unavailable,
+   * work has stalled past the backlog threshold, the backlog could not be
+   * read, or a background pass is failing or stalled. The control plane can
+   * still be ready: one tenant Worker's failure, or a stuck Operation, must
+   * not make a load balancer pull the operator API that shares this port.
    */
   readonly degraded?: true;
   /** Present only when a v2 Worker composition is mounted and could be read. */
   readonly v2Workers?: SelfhostV2WorkerHealth;
+  /**
+   * Counts of unsettled v2 work older than the threshold, or `unavailable`
+   * when the bounded read failed. Present only when an observer is composed
+   * and the database answered.
+   */
+  readonly backlog?: SelfhostBacklogHealth | "unavailable";
+  /** Fixed pass names and counts only; present when a recorder is composed. */
+  readonly backgroundPasses?: SelfhostBackgroundPassHealth;
 }
 
 export type SelfhostHealthHandler = (request: Request) => Promise<Response | undefined>;
@@ -78,6 +92,76 @@ function runtimeHealth(
   if (restore === "failed") return "restore-failed";
   if (supervisor === "idle") return restore === "empty" ? "not-required" : "unavailable";
   return supervisor;
+}
+
+/**
+ * One bounded read of the backlog counts. A thrown, hung or malformed read is
+ * `unavailable`: it degrades the answer but never makes it 503.
+ */
+async function observeBacklog(
+  backlog: { observe(): Promise<SelfhostBacklogHealth> },
+  timeoutMs: number,
+): Promise<SelfhostBacklogHealth | "unavailable"> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"unavailable">((resolve) => {
+    timer = setTimeout(() => resolve("unavailable"), timeoutMs);
+  });
+  const counted = (value: unknown): value is number =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+  const observed = Promise.resolve()
+    .then(() => backlog.observe())
+    .then((value): SelfhostBacklogHealth | "unavailable" =>
+      counted(value.olderThanSeconds) &&
+      counted(value.operations.queued) &&
+      counted(value.operations.running) &&
+      counted(value.operations.reconciling) &&
+      counted(value.operations.waitingInput) &&
+      counted(value.queueExecutions.sendAuthorized)
+        ? {
+            olderThanSeconds: value.olderThanSeconds,
+            operations: {
+              queued: value.operations.queued,
+              running: value.operations.running,
+              reconciling: value.operations.reconciling,
+              waitingInput: value.operations.waitingInput,
+            },
+            queueExecutions: { sendAuthorized: value.queueExecutions.sendAuthorized },
+          }
+        : "unavailable",
+    )
+    .catch(() => "unavailable" as const);
+  try {
+    return await Promise.race([observed, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** A recorder that throws or answers nonsense is reported as one failing pass. */
+function observeBackgroundPasses(passes: {
+  snapshot(): SelfhostBackgroundPassHealth;
+}): SelfhostBackgroundPassHealth {
+  try {
+    const value = passes.snapshot();
+    const counted = (n: unknown): n is number =>
+      typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+    if (counted(value.failing) && counted(value.stalled)) {
+      const last = value.lastFailure;
+      return {
+        failing: value.failing,
+        stalled: value.stalled,
+        ...(last &&
+        typeof last.name === "string" &&
+        /^[a-z0-9][a-z0-9-]{0,63}$/u.test(last.name) &&
+        counted(last.ageSeconds)
+          ? { lastFailure: { name: last.name, ageSeconds: last.ageSeconds } }
+          : {}),
+      };
+    }
+  } catch {
+    // Fall through: the probe answers even when its recorder cannot.
+  }
+  return { failing: 1, stalled: 0 };
 }
 
 /**
@@ -122,7 +206,9 @@ function healthResponse(body: SelfhostHealthResponse, status: number): Response 
 /**
  * Read-only Bun self-host health routes. Runtime recovery remains owned by the
  * supervisor and startup restore; these requests only issue one bounded SQL
- * read and one bounded observation of the accepted child listener.
+ * read, one bounded observation of the accepted child listener, and, when
+ * composed, bounded reads of the v2 owners and the backlog counts plus an
+ * in-memory pass snapshot. Only the first three can make the answer 503.
  */
 export function createSelfhostHealthHandler(input: {
   readonly sql: Pick<Sql, "query">;
@@ -134,6 +220,14 @@ export function createSelfhostHealthHandler(input: {
    * invisible. Absent when the Host has no v2 Worker composition.
    */
   readonly v2Workers?: { observe(): Promise<SelfhostV2WorkerHealth> };
+  /**
+   * Unsettled v2 Operations and sent Queue executions past a threshold. Read
+   * only after the database answered, with the same deadline; it can mark the
+   * response `degraded` but never makes it 503.
+   */
+  readonly backlog?: { observe(): Promise<SelfhostBacklogHealth> };
+  /** In-memory background pass outcomes; never a reason for 503 either. */
+  readonly backgroundPasses?: { snapshot(): SelfhostBackgroundPassHealth };
   readonly databaseCheckTimeoutMs?: number;
 }): SelfhostHealthHandler {
   const timeoutMs = input.databaseCheckTimeoutMs ?? DEFAULT_DATABASE_CHECK_TIMEOUT_MS;
@@ -175,7 +269,27 @@ export function createSelfhostHealthHandler(input: {
           : v2 !== undefined && v2.serving > 0 && runtime === "not-required"
             ? "serving"
             : runtime;
-    const degraded = v2 !== undefined && v2 !== null && v2.unavailable > 0;
+    // Only after SQL answered: a backlog read on an unreadable database would
+    // spend a second deadline to report what `database` already says.
+    const backlog =
+      input.backlog && databaseReady ? await observeBacklog(input.backlog, timeoutMs) : undefined;
+    const passes = input.backgroundPasses
+      ? observeBackgroundPasses(input.backgroundPasses)
+      : undefined;
+    // Waiting for a client to resupply private inputs is the tenant's move,
+    // so `waitingInput` is reported but does not degrade the Host.
+    const backlogDegraded =
+      backlog === "unavailable" ||
+      (backlog !== undefined &&
+        backlog.operations.queued +
+          backlog.operations.running +
+          backlog.operations.reconciling +
+          backlog.queueExecutions.sendAuthorized >
+          0);
+    const degraded =
+      (v2 !== undefined && v2 !== null && v2.unavailable > 0) ||
+      backlogDegraded ||
+      (passes !== undefined && passes.failing + passes.stalled > 0);
     const ready =
       databaseReady && (workerRuntime === "not-required" || workerRuntime === "serving");
     return healthResponse(
@@ -188,6 +302,8 @@ export function createSelfhostHealthHandler(input: {
         supervisor: snapshot.state,
         ...(degraded ? { degraded: true as const } : {}),
         ...(v2 ? { v2Workers: v2 } : {}),
+        ...(backlog !== undefined ? { backlog } : {}),
+        ...(passes ? { backgroundPasses: passes } : {}),
       },
       ready ? 200 : 503,
     );
