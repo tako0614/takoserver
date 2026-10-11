@@ -91,6 +91,13 @@ import {
   type SelfhostStartupRestoreOutcome,
 } from "./selfhost-health.ts";
 import {
+  createSelfhostBackgroundPassRecorder,
+  createSelfhostBacklogObserver,
+  createSelfhostBacklogSampler,
+  observeSelfhostBackgroundPasses,
+  SELFHOST_BACKLOG_SAMPLE_INTERVAL_MS,
+} from "./selfhost-health-signals.ts";
+import {
   formatSelfhostListenAddress,
   parseSelfhostListenHost,
   SELFHOST_LISTEN_HOST_VARIABLE,
@@ -1396,6 +1403,27 @@ if (selfhostContainerEndpointHttps) {
   );
 }
 
+/** Name plus a bounded cause: a lock, a refused port and a bug read differently. */
+const reportBackgroundFailure = (name: string, cause?: unknown): void => {
+  process.stderr.write(
+    `self-host background pass failed: ${name}: ${describeBackgroundFailure(cause)}\n`,
+  );
+};
+// Every background pass below reports through this recorder as well as the
+// log line, so a pass that fails on every tick is visible to the probe.
+const backgroundPasses = createSelfhostBackgroundPassRecorder();
+// Stuck Operations and sent-but-unretired Queue batches answered 200 with
+// nothing to show for them. A background pass samples them; the public probe
+// only reads the latest sample from memory and never runs this SQL itself.
+const backlogSampler = createSelfhostBacklogSampler({
+  observer: createSelfhostBacklogObserver({ sql, now: clock, startedAtMs: clock().getTime() }),
+});
+// The first sample exists before the listener opens, so readiness never
+// reports a missing sample for a Host that has just started.
+await backgroundPasses
+  .observe("health-backlog", () => backlogSampler.refresh())()
+  .catch((cause: unknown) => reportBackgroundFailure("health-backlog", cause));
+
 /**
  * Bring the runtime back for the Workers this machine already published.
  *
@@ -1426,6 +1454,8 @@ const selfhostHealth = createSelfhostHealthHandler({
   ...(v2WorkerComposition
     ? { v2Workers: { observe: () => v2WorkerComposition.observeOwnerHealth() } }
     : {}),
+  backlog: backlogSampler,
+  backgroundPasses,
 });
 const takoformV2Ingress = createSelfhostTakoformV2Ingress({
   publicOrigin,
@@ -1554,16 +1584,19 @@ try {
   throw error;
 }
 
-/** Name plus a bounded cause: a lock, a refused port and a bug read differently. */
-const reportBackgroundFailure = (name: string, cause?: unknown): void => {
-  process.stderr.write(
-    `self-host background pass failed: ${name}: ${describeBackgroundFailure(cause)}\n`,
-  );
-};
+// Every pass body below is observed by the recorder; single-flight, the stop
+// fence and failure reporting stay exactly the shutdown owner's.
+const observedPasses = observeSelfhostBackgroundPasses(entryShutdown, backgroundPasses);
+observedPasses.startInterval(
+  "health-backlog",
+  SELFHOST_BACKLOG_SAMPLE_INTERVAL_MS,
+  () => backlogSampler.refresh(),
+  reportBackgroundFailure,
+);
 
 // Background settlement. The shutdown owner retains each timer and each pass
 // promise, so no new work starts past the signal fence and accepted work drains.
-entryShutdown.startInterval(
+observedPasses.startInterval(
   "settlement",
   30_000,
   async () => {
@@ -1577,7 +1610,7 @@ entryShutdown.startInterval(
   },
   reportBackgroundFailure,
 );
-entryShutdown.startInterval(
+observedPasses.startInterval(
   "takoform-v2",
   1_000,
   async () => {
@@ -1585,22 +1618,22 @@ entryShutdown.startInterval(
   },
   reportBackgroundFailure,
 );
-startSelfhostV2ScheduledDuePass(entryShutdown, v2WorkerComposition, reportBackgroundFailure);
+startSelfhostV2ScheduledDuePass(observedPasses, v2WorkerComposition, reportBackgroundFailure);
 if (v2RuntimeBoot?.v2Workflow) {
-  startSelfhostV2WorkflowDuePass(entryShutdown, v2WorkerComposition, reportBackgroundFailure);
+  startSelfhostV2WorkflowDuePass(observedPasses, v2WorkerComposition, reportBackgroundFailure);
 }
-entryShutdown.startInterval(
+observedPasses.startInterval(
   "queue-wake",
   1_000,
   () => {
     // Share only the wake timer. A blocked recovery scan must not hold the
     // other delivery lane; both named passes remain owned by shutdown.
-    void entryShutdown
+    void observedPasses
       .runPass("takoform-v2-queue-delivery", async () => {
         await v2QueueScheduler?.tick();
       })
       .catch((cause: unknown) => reportBackgroundFailure("takoform-v2-queue-delivery", cause));
-    void entryShutdown
+    void observedPasses
       .runPass("queue-pump", async () => {
         await queuePump?.tick();
       })
@@ -1608,7 +1641,7 @@ entryShutdown.startInterval(
   },
   reportBackgroundFailure,
 );
-entryShutdown.startInterval(
+observedPasses.startInterval(
   "worker-scheduler",
   5_000,
   async () => {

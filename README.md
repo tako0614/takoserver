@@ -474,8 +474,12 @@ every other configured writer before copying the complete root. Include an
 external `TAKOSERVER_DB` and any existing SQLite `-wal`, `-shm`, or
 rollback-journal sidecars from the same quiescent window. Preserve protected
 external configuration and key material needed to restore the same identity
-separately, including the `TAKOSERVER_TAKOFORM_V2_CONFIG` file and the
-`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`; do not store secrets in this repository. See the
+separately: the exact `TAKOSERVER_TAKOFORM_V2_CONFIG`, the
+`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`, the private-plane key files and the native
+binaries, among others (the full list is in
+[What belongs to one installation](docs/self-host-operations.md#what-belongs-to-one-installation)).
+Do not store secrets in this repository, and do not copy the runtime-only
+socket directories such as `/tmp/tw-*`. See the
 [self-host backup and restore preparation](docs/self-host-operations.md) for
 the procedure and its limits.
 

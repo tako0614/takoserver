@@ -20,9 +20,9 @@ import {
   verificationError,
 } from "./errors.ts";
 import {
-  type FreshV2ArtifactIntegrationStorageTargetProof,
+  type FreshV2IntegrationStorageTargetProof,
   type IntegrationStorageGenerationTargetVerificationOptions,
-  verifyFreshV2ArtifactIntegrationStorageTarget,
+  verifyFreshV2IntegrationStorageTarget,
 } from "./integration-storage-generation.ts";
 import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
 import {
@@ -43,7 +43,11 @@ import {
   type SigningDatabase,
   type SigningPublicKeyRow,
 } from "./signing.ts";
-import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
+import {
+  type DeployTarget,
+  isArtifactBlobIoQuiescedTarget,
+  takoformV2StorageLineage,
+} from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
 import { assertTargetComposes } from "./worker-composition.ts";
@@ -240,6 +244,24 @@ export function workerSchemaAllowsPending(
     return applicationSchemaMatches(
       { applied: migrations.applied, shape: migrations.shape, shapeDigest: migrations.shapeDigest },
       deriveExpectedApplicationShape(source.files.slice(0, count)),
+    );
+  }
+  if (
+    target.schemaMaintenanceMode === undefined &&
+    target.artifactBlobIoMode === undefined &&
+    target.environment === "integration" &&
+    target.takoformV2?.storageLineage !== undefined
+  ) {
+    // An explicit fresh v2 generation carries one closed audited prefix. Its
+    // separate storage proof pins the exact ledger and shape; the audited tail
+    // after that prefix has no in-place apply wave and is expected pending.
+    const source = readCurrentAuditedMigrationSourceArtifact(
+      resolve(sourceRepositoryRoot, "migrations"),
+    );
+    const count = target.takoformV2.storageLineage === "v2-0089" ? 89 : 88;
+    return (
+      JSON.stringify(migrations.local) === JSON.stringify(source.names) &&
+      JSON.stringify(migrations.applied) === JSON.stringify(source.names.slice(0, count))
     );
   }
   if (target.schemaMaintenanceMode !== "pre-0058-quiesced") {
@@ -892,34 +914,39 @@ async function readFreshV2StorageProof(
   options: WorkerOptions,
   run: WorkerProcess,
   sourceRepositoryRoot: string,
-): Promise<FreshV2ArtifactIntegrationStorageTargetProof> {
+): Promise<FreshV2IntegrationStorageTargetProof> {
   try {
-    return await verifyFreshV2ArtifactIntegrationStorageTarget(target, environment, {
-      ...options.integrationStorageVerification,
-      run,
-      ...(options.cloudflareEnvironment === undefined
-        ? {}
-        : { cloudflareEnvironment: options.cloudflareEnvironment }),
-      migrationDirectory:
-        options.integrationStorageVerification?.migrationDirectory ??
-        resolve(sourceRepositoryRoot, "migrations"),
-      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
-    });
+    return await verifyFreshV2IntegrationStorageTarget(
+      target,
+      environment,
+      takoformV2StorageLineage(target),
+      {
+        ...options.integrationStorageVerification,
+        run,
+        ...(options.cloudflareEnvironment === undefined
+          ? {}
+          : { cloudflareEnvironment: options.cloudflareEnvironment }),
+        migrationDirectory:
+          options.integrationStorageVerification?.migrationDirectory ??
+          resolve(sourceRepositoryRoot, "migrations"),
+        ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+      },
+    );
   } catch {
     throw phase === "preflight"
       ? preflightError(
-          "v2 Worker requires the exact generated integration D1/R2 and fixed 0075 schema before publication",
+          "v2 Worker requires the exact generated integration D1/R2 and its selected fixed fresh schema before publication",
         )
       : verificationError(
-          "v2 Worker storage readback no longer proves the generated D1/R2 and fixed 0075 schema",
+          "v2 Worker storage readback no longer proves the generated D1/R2 and its selected fixed fresh schema",
         );
   }
 }
 
 function assertFreshV2StorageProofUnchanged(
   phase: "preflight" | "verification",
-  before: FreshV2ArtifactIntegrationStorageTargetProof,
-  after: FreshV2ArtifactIntegrationStorageTargetProof,
+  before: FreshV2IntegrationStorageTargetProof,
+  after: FreshV2IntegrationStorageTargetProof,
 ): void {
   if (canonicalJson(before) === canonicalJson(after)) return;
   throw phase === "preflight"

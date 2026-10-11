@@ -14,11 +14,12 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
+import { assertFreshV2DataReadback, type FreshV2DataReader } from "./fresh-v2-data-readback.ts";
 import {
   CloudflareIntegrationStorageProvider,
-  type FreshV2ArtifactIntegrationStorageTargetProof,
+  type FreshV2IntegrationStorageTargetProof,
   type IntegrationStorageGenerationTargetVerificationOptions,
-  verifyFreshV2ArtifactIntegrationStorageTarget,
+  verifyFreshV2IntegrationStorageTarget,
 } from "./integration-storage-generation.ts";
 import { canonicalSchemaShape, type D1SchemaState, readD1SchemaState } from "./migrations.ts";
 import {
@@ -37,6 +38,8 @@ import {
 } from "./qualification.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
 import {
+  projectFreshProductionV2MigrationArtifact,
+  projectFreshProductionV2MigrationArtifact0089,
   projectFreshV2ArtifactMigrationArtifact,
   readAuditedMigrationArtifact,
   readCurrentAuditedMigrationSourceArtifact,
@@ -48,7 +51,7 @@ import {
   type SigningDatabase,
   type SigningPublicKeyRow,
 } from "./signing.ts";
-import type { DeployTarget } from "./target.ts";
+import { type DeployTarget, takoformV2StorageLineage } from "./target.ts";
 import {
   assertProviderExecutorUnchanged,
   type ProviderExecutorInspection,
@@ -172,6 +175,8 @@ export interface IntegrationWorkerBootstrapOptions {
   readonly r2Identity?: IntegrationWorkerBootstrapR2IdentityReader;
   /** Narrow read-only test seam; production verifies the selected generated pair remotely. */
   readonly v2StorageVerification?: IntegrationStorageGenerationTargetVerificationOptions;
+  /** Test seam for the fresh-lineage unserved-data proof; production reads remote D1. */
+  readonly freshV2DataReader?: FreshV2DataReader;
   readonly secretDirectory?: string;
   /** The exact keyring retained by the qualified CPE owner (never emitted). */
   readonly expectedRuntimeInputSealKeyring?: string;
@@ -307,6 +312,35 @@ export async function runIntegrationWorkerBootstrap(
     assertCompleteSchema(schemaBefore, artifactBefore, expectedShape);
     const v2StorageBefore =
       target.takoformV2 === undefined ? null : await readV2StorageProof(target, options);
+    // A fresh generation must still be unserved when its first Host appears:
+    // only the migration seeds and the append-only signing registration may
+    // exist. A copied or previously served database is refused, not adopted.
+    const assertUnserved = async () => {
+      const lineage = target.takoformV2?.storageLineage;
+      if (lineage === undefined) return;
+      try {
+        await assertFreshV2DataReadback(
+          "preflight",
+          lineage,
+          inspectionConfig,
+          environment,
+          expectedShape,
+          {
+            run,
+            ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+            ...(options.freshV2DataReader === undefined
+              ? {}
+              : { freshV2DataReader: options.freshV2DataReader }),
+            allowedTables: ["runtime_grant_keys"],
+          },
+        );
+      } catch {
+        throw preflightError(
+          "fresh v2 storage generation already holds data beyond its seeds and signing registration; first Host publication refused",
+        );
+      }
+    };
+    await assertUnserved();
 
     const provider = providerExecutorQualificationReader({
       target,
@@ -472,6 +506,7 @@ export async function runIntegrationWorkerBootstrap(
         if (v2StorageBefore !== null) {
           const storageFinal = await readV2StorageProof(target, options);
           assertSameV2StorageProof(v2StorageBefore, storageFinal, "preflight");
+          await assertUnserved();
         }
         const providerFinal = provider === null ? null : await provider.read("preflight");
         if (providerBefore !== null && providerFinal !== null) {
@@ -708,7 +743,7 @@ async function verifyBootstrap(input: {
   readonly artifact: ReturnType<PreparedWorkerArtifact["seal"]>;
   readonly schemaBefore: D1SchemaState;
   readonly artifactBefore: MigrationArtifact;
-  readonly v2StorageBefore: FreshV2ArtifactIntegrationStorageTargetProof | null;
+  readonly v2StorageBefore: FreshV2IntegrationStorageTargetProof | null;
   readonly expectedShape: string;
   readonly signingDatabase: Pick<SigningDatabase, "readKey">;
   readonly signingBefore: SigningEvidence;
@@ -1165,29 +1200,41 @@ function validateInvocation(
 
 function readBootstrapArtifact(sourceRoot: string, target: DeployTarget): MigrationArtifact {
   const directory = resolve(sourceRoot, "migrations");
-  return target.takoformV2 === undefined
-    ? readAuditedMigrationArtifact(directory)
-    : projectFreshV2ArtifactMigrationArtifact(readCurrentAuditedMigrationSourceArtifact(directory));
+  if (target.takoformV2 === undefined) return readAuditedMigrationArtifact(directory);
+  const source = readCurrentAuditedMigrationSourceArtifact(directory);
+  switch (takoformV2StorageLineage(target)) {
+    case "v2-artifacts-0075":
+      return projectFreshV2ArtifactMigrationArtifact(source);
+    case "v2-0088":
+      return projectFreshProductionV2MigrationArtifact(source);
+    case "v2-0089":
+      return projectFreshProductionV2MigrationArtifact0089(source);
+  }
 }
 
 async function readV2StorageProof(
   target: DeployTarget,
   options: IntegrationWorkerBootstrapOptions,
-): Promise<FreshV2ArtifactIntegrationStorageTargetProof> {
-  return await verifyFreshV2ArtifactIntegrationStorageTarget(target, "integration", {
-    ...(options.run === undefined ? {} : { run: options.run }),
-    ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
-    ...(options.cloudflareEnvironment === undefined
-      ? {}
-      : { cloudflareEnvironment: options.cloudflareEnvironment }),
-    ...options.v2StorageVerification,
-    migrationDirectory: resolve(options.sourceRepositoryRoot ?? REPOSITORY, "migrations"),
-  });
+): Promise<FreshV2IntegrationStorageTargetProof> {
+  return await verifyFreshV2IntegrationStorageTarget(
+    target,
+    "integration",
+    takoformV2StorageLineage(target),
+    {
+      ...(options.run === undefined ? {} : { run: options.run }),
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+      ...(options.cloudflareEnvironment === undefined
+        ? {}
+        : { cloudflareEnvironment: options.cloudflareEnvironment }),
+      ...options.v2StorageVerification,
+      migrationDirectory: resolve(options.sourceRepositoryRoot ?? REPOSITORY, "migrations"),
+    },
+  );
 }
 
 function assertSameV2StorageProof(
-  expected: FreshV2ArtifactIntegrationStorageTargetProof,
-  actual: FreshV2ArtifactIntegrationStorageTargetProof,
+  expected: FreshV2IntegrationStorageTargetProof,
+  actual: FreshV2IntegrationStorageTargetProof,
   phase: "preflight" | "verification",
 ): void {
   if (canonicalJson(expected) !== canonicalJson(actual)) {

@@ -61,7 +61,7 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-integration-organization-bootstrap --<status|apply> --environment=integration --commit=<sha>
   bun run deploy -- takoserver-integration-storage-generation --<status|apply> --environment=integration --commit=<sha>
     --generation=<32-lowercase-hex> (new isolated D1/R2 only; never resets an existing target)
-    [--fresh-lineage=v2-artifacts-0075] (fixed fresh v2 artifact payload; default remains 0066)
+    [--fresh-lineage=<v2-artifacts-0075|v2-0088|v2-0089>] (fixed fresh payload; default remains 0066)
   bun run deploy -- takoserver-integration-storage-disposal --<status|apply> --environment=integration --commit=<sha>
     (one exact selected D1/R2 pair only; refuses current regular/dispatch Worker bindings)
   bun run deploy -- takoserver-integration-host-retirement --<status|apply> --environment=integration --commit=<sha>
@@ -187,7 +187,7 @@ type Invocation =
       readonly surface: StorageGenerationSurface;
       readonly action: "status" | "apply";
       readonly generation: string;
-      readonly freshLineage?: "v2-artifacts-0075";
+      readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089";
     })
   | (InvocationBase & {
       readonly surface: ProductionD1FreshInitSurface;
@@ -612,7 +612,6 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   const storageGeneration = surfaceValue === "takoserver-integration-storage-generation";
   const productionFreshInit = surfaceValue === "takoserver-production-d1-fresh-init";
   if (
-    (storageGeneration && (freshLineage === "v2-0088" || freshLineage === "v2-0089")) ||
     (productionFreshInit && freshLineage === "v2-artifacts-0075") ||
     (freshLineage !== null && !storageGeneration && !productionFreshInit)
   )

@@ -539,8 +539,10 @@ curl -sS http://127.0.0.1:8787/_takoserver/health/ready
 ```
 
 The Endpoint answers with the Worker's response, and readiness reports
-`workerRuntime: serving` with the v2 Worker counts described below. A restart
-keeps serving published Workers without a client republish.
+`workerRuntime: serving` with the v2 Worker counts described below and no
+`degraded` flag; [Monitoring](#monitoring) explains its backlog and background
+pass sections. A restart keeps serving published Workers without a client
+republish.
 
 To ship new code, seed the new bytes under a new base URL (stop, seed, start),
 create a new `WorkerBundle` and `WorkerVersion`, then replace the Deployment's
@@ -573,37 +575,43 @@ outside the Host API v1 and the shared OpenAPI route table:
   responding. It does not query SQLite or the Worker runtime.
 - `GET /_takoserver/health/ready` performs one read-only `SELECT 1` query with
   a one-second response deadline, then makes one bounded, read-only listener
-  observation of the accepted legacy workerd child. It returns `200` only when
-  SQLite answered and the legacy runtime's listener is currently reachable or
-  that runtime is not required; otherwise it returns `503`. v2 Worker owners
-  are reported separately (below) and, on their own, only mark the response
-  `degraded`.
+  observation of the accepted legacy workerd child and, when the Host has a v2
+  Worker composition, one bounded read of the v2 owners' state. It runs no
+  other SQL: the backlog counts it reports are the latest sample a background
+  pass took (see [Monitoring](#monitoring)). It returns `200` only when SQLite
+  answered and the legacy runtime's listener is currently reachable or that
+  runtime is not required; otherwise it returns `503`. v2 Worker owners, the
+  backlog and background passes are reported separately (below) and, on their
+  own, only mark the response `degraded`.
 
-The readiness body contains only fixed state labels: `database` is `readable`
-or `unavailable`; `workerRuntime` is `not-required`, `starting`, `serving`,
-`recovering`, `restore-failed`, or `unavailable`; and `supervisor` is the
-current child lifecycle state (`idle`, `starting`, `serving`, `recovering`, or
-`unavailable`). If the accepted child is still alive but its listener probe
-fails, `workerRuntime` is `unavailable` while `supervisor` remains `serving`;
-the fields distinguish observed service availability from process lifecycle.
-v2 Worker owners supervise their own workerd children outside that
-supervisor, so when the Host has a v2 Worker composition the body also carries
-`v2Workers: { owners, serving, unavailable }`: counts of opened owners, of
-owners whose recorded active incarnation's child group is ready, and of owners
-that recorded an active incarnation whose child is not ready (crashed or being
-replaced). For v2, "serving" means the owner's supervised child holds its
-listener port; the probe does not send an HTTP request to a tenant Worker, so
-it is not the listener reachability check described above. An owner whose
-Deployment is being deleted counts as neither serving nor unavailable.
+The readiness body contains fixed state labels and Host-wide counts, never an
+identifier: `database` is `readable` or `unavailable`; `workerRuntime` is
+`not-required`, `starting`, `serving`, `recovering`, `restore-failed`, or
+`unavailable`; and `supervisor` is the current child lifecycle state (`idle`,
+`starting`, `serving`, `recovering`, or `unavailable`). If the accepted child is
+still alive but its listener probe fails, `workerRuntime` is `unavailable` while
+`supervisor` remains `serving`; the fields distinguish observed service
+availability from process lifecycle. v2 Worker owners supervise their own
+workerd children outside that supervisor, so when the Host has a v2 Worker
+composition the body also carries `v2Workers: { owners, serving, unavailable }`:
+counts of opened owners, of owners whose recorded active incarnation's child
+group is ready, and of owners that recorded an active incarnation whose child is
+not ready (crashed or being replaced). For v2, "serving" means the owner's
+supervised child holds its listener port; the probe does not send an HTTP
+request to a tenant Worker, so it is not the listener reachability check
+described above. An owner whose Deployment is being deleted counts as neither
+serving nor unavailable.
 
 Serving owners turn a would-be `not-required` into `serving`. One or more
 unavailable owners add `degraded: true` but keep the response `200` when SQLite
-answered: this probe shares its port with the control API, and one broken
-tenant Worker must not make a load balancer withdraw the operator API. Read
-`degraded` and the counts to alert on tenant Workers. The response is `503`
-only when SQLite did not answer, the boot restore failed, the legacy runtime
-is unavailable, or the v2 owner state could not be read within the deadline.
-The counts carry no Worker UID or hostname. An empty successful boot restore with no published Workers is
+answered: this probe shares its port with the control API, and one broken tenant
+Worker must not make a load balancer withdraw the operator API. The `backlog`
+and `backgroundPasses` sections described in [Monitoring](#monitoring) set
+`degraded` the same way. Read `degraded` and the counts to alert on tenant
+Workers and stuck work. The response is `503` only when SQLite did not answer,
+the boot restore failed, the legacy runtime is unavailable, or the v2 owner
+state could not be read within the deadline. The counts carry no Worker UID or
+hostname. An empty successful boot restore with no published Workers is
 `not-required`, not a failure. A failed boot restore remains `restore-failed`
 for this process even if a later child passes its listener check: that check
 does not prove the entire durable published graph was restored. A process
@@ -613,15 +621,16 @@ These probes are observational only: they do not call restore, spawn or ensure
 workerd, stop the child, or run a product/provisioner route. The ready probe
 checks the exact accepted listener around one loopback HTTP request (250 ms
 request bound, 500 ms total observation bound); it does not schedule recovery.
-The response contains no raw errors, paths, organization or Resource
-identifiers, workload counts, or secrets. A `serving` result means this Host's
-current workerd child passed the Host-owned listener readiness check; it is
-not a claim that every Form,
-provider, or tenant Worker application is ready. In particular,
-Host/control-plane readiness and application-level health remain distinct.
-`GET /healthz` on the Cloudflare Worker entry is a separate runtime surface;
-these Bun-only diagnostics do not change that entry or the shared OpenAPI
-contract.
+The response contains no raw errors, paths, organization, Resource, Operation or
+Worker identifiers, background pass names, or secrets. It does carry Host-wide
+counts (v2 owners, stalled work, failing passes); see [Monitoring](#monitoring)
+before exposing `/_takoserver/` beyond the Host. A `serving` result means this
+Host's current workerd child passed the Host-owned listener readiness check; it
+is not a claim that every Form, provider, or tenant Worker application is ready.
+In particular, Host/control-plane readiness and application-level health remain
+distinct. `GET /healthz` on the Cloudflare Worker entry is a separate runtime
+surface; these Bun-only diagnostics do not change that entry or the shared
+OpenAPI contract.
 
 ### Container Endpoint HTTPS listener
 
@@ -863,45 +872,168 @@ remote D1 database; whether v1.0.0 sessions and API keys still authenticate
 after an unused database migrates in place; and copying object data to a v2
 ObjectBucket.
 
+## Monitoring
+
+Poll `GET /_takoserver/health/ready` on the Host's own port (`PORT`, default
+`8787`) every 10 to 30 seconds, from the machine itself or another trusted
+network position. Treat its two answers differently:
+
+- `503`, or no answer within a few seconds, means the Host cannot serve: SQLite
+  did not answer, the boot restore failed, the legacy runtime is unavailable,
+  or the v2 owner state could not be read. `database` and `workerRuntime` say
+  which.
+- `200` with `degraded: true` means the control plane serves but something
+  needs an operator. The probe never withdraws the shared API port for these.
+
+The degraded causes are reported as counts only, with no Resource, Operation,
+organization, Worker or batch identifier, no pass name and no error text:
+
+- `v2Workers.unavailable`: v2 Worker owners whose active incarnation's child
+  is not ready.
+- `backlog.operations`: v2 Operations that are still `queued`, `running` or
+  `reconciling` and have been pending for more than `backlog.olderThanSeconds`
+  (600) of this Host process's uptime: accepted that long ago, with the
+  process up at least that long. Work that waited out a stopped Host is
+  therefore not counted the moment the Host returns, and nothing counts during
+  the first ten minutes after a start. `waitingInput` counts Operations waiting
+  for their client to resupply private inputs; it is shown but does not
+  degrade the Host.
+- `backlog.queueExecutions.sendAuthorized`: Queue batches sent to a Worker more
+  than 600 seconds ago (by the same uptime rule) and still not retired; their
+  Consumer stays occupied. A Consumer whose handler, or the work it hands to
+  `waitUntil`, legitimately runs longer than ten minutes is counted too.
+- `backlog: "unavailable"`: no fresh sample exists. This degrades; it is not a
+  503.
+- `backgroundPasses.failing`: background passes (settlement, Takoform v2,
+  Queue delivery, Cron, the backlog sampler and others) whose most recent run
+  failed. A pass stops counting once it completes again. `stalled` counts
+  passes whose current run has lasted more than 600 seconds. Which pass failed,
+  and why, is only in stderr:
+  `self-host background pass failed: <name>: <bounded cause>`.
+
+The backlog counts are not read per request. A background pass samples them
+every 20 seconds (the first sample is taken before the listener opens), and the
+probe returns the latest sample from memory with its age in
+`backlog.sampledSecondsAgo`. A sample older than 60 seconds, which means the
+sampling pass has failed or stopped, is reported as `unavailable`. Each sample
+reads only the unsettled Operations (settled history is never read) and does
+one index seek per Queue Consumer that ever ran a batch, with query plans that
+stay on those indexes after `ANALYZE` or `PRAGMA optimize`.
+
+For example, a cron job or timer can alert on any non-zero exit of:
+
+```sh
+curl -fsS --max-time 5 http://127.0.0.1:8787/_takoserver/health/ready \
+  | jq -e '.status == "ready" and (.degraded | not)'
+```
+
+There is no metrics endpoint. The probe shares the public port and is
+unauthenticated, and a loopback check is not a privacy boundary behind a local
+reverse proxy, so a private metrics surface would need its own listener or
+operator authentication. Derive metrics from the ready body with an existing
+prober instead (for example a JSON exporter).
+
+Block `/_takoserver/` at the reverse proxy by default and poll it on the Host's
+own port; with the default `TAKOSERVER_LISTEN_HOST` (`127.0.0.1`) only a local
+prober or a local reverse proxy reaches it. The probe carries no identifiers or
+secrets, but its Host-wide counts show how much work the Host has and whether
+it is keeping up; forward the path only to a load balancer or monitor that
+needs it.
+
+The serving supervisor writes bounded child-exit, automatic-restart attempt and
+delay, and recovery-success diagnostics through its existing log callback (the
+Bun entry forwards these to stdout). New recovery messages contain no config
+path or arbitrary child error text; deliberate stops and stale children are
+not reported as crashes. A failure to write these diagnostics does not stop
+runtime recovery. Collect stdout and stderr and configure alerts on them as
+well: these messages and the probe are not a monitoring service or proof of
+operator recovery.
+
 ## Backup and restore preparation
 
 This procedure prepares a cold copy of one Bun self-host installation. It is
 not a tested disaster-recovery guarantee: the repository has no operator
 snapshot/restore command, no restore mode that suppresses startup work, and no
-full live-operator restore drill. The tests below cover local readers and an
-optional isolated native Host restore, and the ordinary journey native test
-restores a cold snapshot of a v2 installation (Worker, SQLite, Queue) to the
-same root; none of them replaces an operator recovery drill.
+full live-operator restore drill. The tests below cover local readers, and the
+ordinary journey native test restores a cold snapshot of a v2 installation
+(Worker, SQLite, Queue) to the same root; neither replaces an operator recovery
+drill.
 
 ## What belongs to one installation
 
 Back up the complete configured `TAKOSERVER_DATA_ROOT` as one unit (default:
 `.takoserver`). Do not assemble a backup from a hand-picked list of files. The
 root contains the local control database by default, object bytes and their
-metadata, customer SQL databases, published Worker bundles and active
-deployment data, self-host resource and event state, runtime probes, and
-private signing keys. Paths such as `objects/`, `databases/`, `workers/`,
-`selfhost/`, and `runtime-probes/` are implementation details; retaining the
-whole root also retains paths added by later versions.
+metadata (including the held artifact bytes an operator seeded for the v2
+Forms), customer SQL databases, published Worker bundles and active deployment
+data, the v2 Worker owners' incarnation state, the v2 SQLite, KV and
+ObjectBucket custody, self-host resource and event state, runtime probes, and
+the private keys the Host generated for itself (`operator-key.jwk`,
+`signing-key.jwk`, and a tenant-run signing key when that feature is enabled).
+Paths such as `objects/`, `databases/`, `workers/`, `selfhost/`,
+`v2-worker-owners/`, `v2-sqlite-databases/`, `v2-kv-namespaces/`,
+`v2-object-buckets/` and `runtime-probes/` are implementation details;
+retaining the whole root also retains paths added by later versions.
 
 `TAKOSERVER_DB` can put `control.sqlite` outside the data root. If it is set,
 that exact database is part of the backup set too. A backup is incomplete if
 either the root or that database is missing.
 
-The running configuration may also depend on material outside the root. Record
-the exact service configuration and protect any configured external values or
-files needed to recover the same identity and capabilities, including TLS
-certificate/private-key files, `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`, the
-`TAKOSERVER_TAKOFORM_V2_CONFIG` file with its held-artifact grants, the
-`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`, operator-supplied signing keys, and
-configured provider, payment, identity, or AI credentials. Do not put secret
-values in this repository or in a backup manifest. `TAKOSERVER_WORKERD_BINARY` must still resolve to the exact accepted
-artifact for Worker execution; the selected snapshot is retained under the
-data root, but startup validates and selects from the configured input path.
-Preserve that artifact and its path/configuration through the operator's
-protected mechanism. Keep external configuration and secrets at least as
-carefully as the data root; the database and files contain customer and
-credential-bearing state.
+The running configuration also depends on material outside the root. Record
+the exact service configuration and protect, through the operator's own
+protected mechanism, every external value and file needed to recover the same
+identity and capabilities. For the current v2 entry that includes:
+
+- `TAKOSERVER_TAKOFORM_V2_CONFIG`, verbatim. It names no files, but its
+  `heldArtifacts` entries name the object keys, digests and grants of bytes
+  that were seeded into the object store under the data root: the root backup
+  carries those bytes, and only this exact JSON makes the restored Host serve
+  them. Removing a Form block or held entry that Resources or Operations still
+  use is not a restore (see [Takoform v2 operator setup](takoform-v2.md)).
+- `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`. The Host refuses to start without it. A
+  different key loses no data, but every pagination cursor a client holds stops
+  being accepted.
+- `TAKOSERVER_V2_WORKER_PRIVATE_PLANES`, verbatim, and every file and
+  directory it names. Each selected plane's `signingKeyFile` is raw key
+  material the Host never generates and may live outside the root; restore it
+  unchanged, owner-private, at the same absolute path. Published Worker
+  incarnations carry binding grants signed with these keys, and a restore with
+  different keys is not exercised. The SQLite plane's `stagingRoot` must exist
+  as an owner-private directory before start, but it holds only transient
+  per-call staging, so it needs no backup. The custody roots themselves are the
+  `v2-*` directories under the data root.
+- The other v2 selections (`TAKOSERVER_V2_WORKER_RUNTIME_BOOT`,
+  `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS`), ports, and suffixes, as recorded
+  configuration.
+- TLS certificate/private-key files, `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`,
+  operator-supplied signing keys, and configured provider, payment, identity,
+  or AI credentials.
+- The exact native binaries. `TAKOSERVER_WORKERD_BINARY` must still resolve to
+  the exact accepted artifact for Worker execution; the selected snapshot is
+  retained under the data root, but startup validates and selects from the
+  configured input path. When Workflow boot is selected,
+  `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` is likewise outside the root.
+
+Do not put secret values in this repository or in a backup manifest. Keep
+external configuration and secrets at least as carefully as the data root; the
+database and files contain customer and credential-bearing state.
+
+Some paths exist only while a Host runs and are not part of the backup set:
+
+- `/tmp/tw-*` (always `/tmp`, not `TMPDIR`): one private Unix-socket directory
+  per v2 Worker incarnation, named by a hash of the owner directory's path, the
+  Worker UID and the Operation ID. It holds only sockets. A suspended or killed
+  incarnation keeps its directory until recovery reuses it, and recovery
+  creates it again when it is missing (the code handles a restore onto a
+  machine without it; that case is not exercised natively). Do not copy or
+  restore these directories. On a shared machine leave a live installation's
+  ones in place: if another local user creates the same name, recovery refuses
+  it with `ownership_uncertain`. Deleting a data root leaves its `/tmp/tw-*`
+  directories behind.
+- `<data root>/s/`: per-incarnation listener directories for the Actor and
+  Workflow runtimes. A copy of the root may contain them; they carry no state,
+  and boot removes the ones whose abandonment it proves.
+- `$TMPDIR/tactor-*`: socket directories of native Actor namespace processes.
 
 ## Cold snapshot
 
@@ -909,11 +1041,12 @@ credential-bearing state.
    any external `TAKOSERVER_DB`. Use a destination that is not served by the
    source host.
 2. Stop the Takoserver service through its actual supervisor and wait until
-   `entry-bun.ts`, its child `workerd`, and any other process configured to
-   write this data has exited. A graceful stop is not enough until all writers
-   are gone. The Bun entry starts queue delivery and cron timers and restores
-   published Workers automatically at startup; there is no read-only boot
-   switch for a copy.
+   `entry-bun.ts`, all of its `workerd` children (the legacy runtime and each v2
+   Worker owner's), any Workflow execution guard, and any other process
+   configured to write this data have exited. A graceful stop is not enough
+   until all writers are gone. The Bun entry starts queue delivery and cron
+   timers and restores published Workers automatically at startup; there is no
+   read-only boot switch for a copy.
 3. With the installation quiescent, make a filesystem copy of the complete
    data root to the protected destination, preserving file contents,
    directories, hard links, ownership, and restrictive permissions (for
@@ -921,12 +1054,14 @@ credential-bearing state.
    root, copy its main file and any existing SQLite `-wal`, `-shm`, or rollback
    journal sidecars in the same stopped window. Do not copy a live SQLite file,
    copy only its main file while sidecars may be changing, or guess which
-   sidecars can be omitted. This procedure intentionally requires a
-   stopped-and-quiescent installation rather than promising a live snapshot.
+   sidecars can be omitted. Do not copy the runtime-only socket directories
+   listed above. This procedure intentionally requires a stopped-and-quiescent
+   installation rather than promising a live snapshot.
 4. Record outside the secret-bearing files which source instance and time the
    copy represents, the resolved data-root and database paths, the product
    commit, and the configured external dependency references needed to locate
-   recovery material. Do not record credentials themselves.
+   recovery material, including the private-plane key-file paths and the
+   `stagingRoot`. Do not record credentials themselves.
 5. Keep the source stopped until the copy has completed. Then restart only the
    original instance if it is still the active installation.
 
@@ -943,15 +1078,20 @@ endpoint, external services, or tenant traffic.
 
 For an actual recovery, first fence the source instance and all its writers and
 confirm they cannot return. Restore the complete root and any external database
-to the intended replacement, reinstate its protected configuration and
-required secrets, and verify that only the replacement owns the installation's
-network identity before starting it. Use a product build that understands the
-database's recorded migration history: SQLite upgrades are forward-only, and a
-build that does not know a recorded migration refuses the database rather than
-downgrading it. A restart may deliver queued work; treat that as resuming the
-installation, not as a no-write restore check. If source fencing, ownership of
-the public identity, or the fate of pending operations is uncertain, leave the
-restored copy stopped and resolve that uncertainty before activation.
+to the intended replacement, reinstate its protected configuration and required
+secrets (including the exact v2 configuration, the cursor key, the private-plane
+key files at their configured paths, and an existing private `stagingRoot`), and
+verify that only the replacement owns the installation's network identity before
+starting it. Keep the same `TAKOSERVER_DATA_ROOT` value: SQLite database records
+carry the configured root, and the v2 owners' socket namespaces are derived from
+the owner directory's path. Only a restore to the same path on the same machine
+is exercised. Use a product build that understands the database's recorded
+migration history: SQLite upgrades are forward-only, and a build that does not
+know a recorded migration refuses the database rather than downgrading it. A
+restart may deliver queued work; treat that as resuming the installation, not as
+a no-write restore check. If source fencing, ownership of the public identity,
+or the fate of pending operations is uncertain, leave the restored copy stopped
+and resolve that uncertainty before activation.
 
 After activation, perform the same current v2 discovery, authenticated exact
 Form-support, and known v2 Resource-readback checks described for an update.
@@ -966,89 +1106,14 @@ not boot the entrypoint, prove a complete installation restore, exercise
 external credentials or services, test a real filesystem snapshot, or replace
 an operator recovery drill.
 
-The optional native test `tests/selfhost-host-cold-restore-native.test.ts`
-is skipped when the accepted workerd artifact is unavailable and starts the
-real Bun entrypoint when it runs. It retains an earlier v1 admission stage
-before a v2 transition; those v1 assertions are historical transition evidence,
-not the current v2 support check. It creates
-resources through the Host HTTP API, uploads and publishes a Worker, and checks
-its Endpoint over certificate-validated HTTPS. It then kills only the exact
-accepted workerd child and requires a distinct replacement under the same Bun
-Host process. Within 15 seconds, that replacement must serve the same HTTPS
-marker at the old URL without a Resource read, client republish, manual child
-spawn, or Host restart. The test checks process identity throughout; TLS
-validation failures, an unexpected HTTP status, or a different marker fail
-immediately rather than being retried. After the Host and its workerd
-descendants have exited and both listeners have closed, it copies the complete
-data root, an external control database directory (including any sidecars), and
-external TLS material in the same stopped window. A new Host starts from the
-copy. The test checks the old HTTPS URL before reading the Resource graph, then
-checks that UIDs, revisions, exposed outputs, and the Endpoint URL are retained.
-The client does not republish resources during recovery.
-
-This native case requires Linux `/proc`, Bun, OpenSSL, `unshare`, `ip`, an exact
-accepted workerd artifact, and permission to create a network namespace and
-bind port 443 there. Run it from the repository root in a separate loopback-only
-network namespace; do not borrow the ports or data root of an existing Host.
-The test also builds `services/takoform-core-verifier` from this checkout into
-its mode-0700 temporary fixture using the locally installed Go toolchain and
-pre-existing Go module/build caches. It disables module-network access; a
-missing tool or cache fails the test instead of substituting a prebuilt binary.
-The build runs with `GOTOOLCHAIN=local`, so the installed `go` must be 1.26.0 or
-newer (the module's `go` line); 1.26.9 matches the audited toolchain. After any
-change to that module's `go.mod` or `go.sum`, refresh the offline cache once,
-with network access, before the next native run. Use the same `GOMODCACHE` the
-test will read (`TAKOSERVER_NATIVE_GO_MODULES` when set):
-
-```sh
-cd services/takoform-core-verifier && GOMODCACHE="${TAKOSERVER_NATIVE_GO_MODULES:-$(go env GOMODCACHE)}" go mod download
-```
-
-The Go build is bounded to two concurrent package builds and two active Go
-processors; this does not change the native Host or recovery time assertions.
-The verifier reports the current checkout's source-derived artifact digest and
-pins released Core v1.1.0. In the retained historical v1 admission stage, the
-test submits the exact 17-package publisher closure over its real loopback HTTP
-API, requires acceptance, then requires refusal of changed package bytes and a
-valid-but-wrong publisher ref at that same verification endpoint. The legacy
-self-host admission CLI then applies the unchanged closure through its existing
-`--core-verifier` interface. This verifies that historical stage, not the
-current v2 installation procedure. The native harness allows up to 120 seconds
-for that local apply process and 240 seconds for the entire native test; these
-are test budgets, not a production CLI or Host API deadline. The child-stop,
-Host-readiness, Worker-recovery, and cleanup bounds are unchanged.
-
-For example, provide Bun 1.4.0, Go, and the existing local Go caches in `PATH`
-and the two cache variables; no module download or network fallback is used:
-
-```sh
-env -i PATH="$PATH" TMPDIR=/tmp \
-  TAKOSERVER_NATIVE_GO_CACHE=/path/to/existing/go-build-cache \
-  TAKOSERVER_NATIVE_GO_MODULES=/path/to/existing/go-module-cache \
-  TAKOSERVER_WORKERD_BINARY=/absolute/path/to/accepted-workerd \
-  unshare --net sh -c \
-  'ip link set lo up && bun --no-env-file test --timeout 240000 tests/selfhost-host-cold-restore-native.test.ts'
-```
-
-An unset artifact explicitly skips this native case; a portable check therefore
-does not prove native restore or Core publisher authenticity. A configured but
-unaccepted workerd artifact fails rather than substituting a different binary.
-The Go verifier and 17-package signatures exercise the retained historical v1
-admission stage only; the operator assertion, operator key, and self-signed
-endpoint TLS certificate remain disposable local fixture identities. This
-test does not prove production deployment provenance, external credential or
-service recovery, pending event delivery, monitoring, or an operator
-disaster-recovery drill. Startup remains active as described above; there is
-no read-only restore mode.
-
-The serving supervisor writes bounded child-exit, automatic-restart attempt and
-delay, and recovery-success diagnostics through its existing log callback (the
-Bun entry forwards these to stdout). New recovery messages contain no config
-path or arbitrary child error text; deliberate stops and stale children are
-not reported as crashes. A failure to write these diagnostics does not stop
-runtime recovery. Operators still need to collect logs and configure their own
-alerts: these messages are not a health API, monitoring service, or proof of
-operator recovery.
+An earlier optional native test drove a v1 Worker graph through a cold restore
+on the retired v1 Host API. The current entry cannot start it, so it was
+removed; the ordinary journey below is the native cold-restore evidence now.
+Two things only that test measured are not measured on the current entry: a
+restore that also copies an external `TAKOSERVER_DB` and external TLS files in
+the same stopped window, and replacement of a killed Worker child without a
+Host restart (it measured the legacy runtime supervisor; no native test here
+kills a serving v2 Worker owner's child and waits for its replacement).
 
 ### Ordinary journey native test and known gaps
 
@@ -1204,6 +1269,9 @@ What this test and its neighbours record:
   `publication_conflict`), so such an Operation stays `reconciling` and keeps
   retrying: boot is not blocked, because the owner vouches it never served,
   but the Worker's Endpoint is not served until the Operation is settled.
+  Once it has been pending for ten minutes of Host uptime, readiness counts it
+  under `backlog.operations.reconciling` and reports `degraded` (see
+  [Monitoring](#monitoring)).
 
 Three other gaps this test first recorded have since been fixed, each with its own
 test:
@@ -1240,7 +1308,6 @@ Host path; the current normal Bun entry does not require it. Current v2 support
 comes from the exact versioned Form URLs composed by source and the optional
 operator configuration described in [Takoform v2 operator setup](takoform-v2.md).
 
-The optional native cold-restore test retains a v1 admission stage followed by
-a v2 transition as historical compatibility evidence. Neither that fixture nor
-the former package-admission procedure is the current v2 install path or a
-current v2 support signal.
+The former package-admission procedure is neither the current v2 install path
+nor a current v2 support signal. The native tests that drove it against the
+v1 Host API were removed once the current entry could no longer start them.
