@@ -21,6 +21,7 @@ import type {
   V2WorkerPublicationResolution,
   V2WorkerPublicationSnapshot,
 } from "./worker-publication-state.ts";
+import { MAX_FAILED_TAIL } from "./worker-publication-state.ts";
 
 /** Internal only: route publication and frontend TLS are not yet composed. */
 export const WORKER_ENDPOINT_BACKEND_ID = "selfhost-v2-worker-endpoint-owner-v1";
@@ -89,8 +90,10 @@ const admissionDetail =
 
 /**
  * WorkerEndpoint 0.3.0 verifies before any effect that the Worker's active
- * Deployment answers HTTP and that the Worker has no other Endpoint. This
- * predicate runs inside the Resource/Operation acceptance statement, so a
+ * Deployment answers HTTP and that the Worker has no other Endpoint. The
+ * serving spec comes from the successful observed-generation Operation, not
+ * from a newer desired spec left by a failed update. This predicate runs
+ * inside the Resource/Operation acceptance statement, so a
  * refused request stores nothing and an Endpoint is never queued ahead of its
  * Worker's Deployment. Execution re-checks the exact graph under its claim.
  */
@@ -103,13 +106,47 @@ function endpointAdmission(input: {
   const workerUid = parseWorkerEndpointSpec(input.spec).worker.resourceUid;
   return {
     sql: `EXISTS (SELECT 1 FROM tf_v2_resources deployment
+        JOIN tf_v2_operations serving
+          ON serving.resource_uid = deployment.uid
+          AND serving.generation = deployment.observed_generation
         WHERE deployment.form_url = ? AND deployment.principal = ? AND deployment.space = ?
           AND deployment.deleted_at IS NULL AND deployment.phase <> 'deleting'
+          AND deployment.busy_operation IS NULL
           AND deployment.observed_generation >= 1
-          AND json_extract(deployment.spec_json, '$.worker.resourceUid') = ?
+          AND serving.principal = deployment.principal
+          AND serving.backend_id = deployment.backend_id
+          AND serving.target_key = deployment.target_key
+          AND serving.status = 'succeeded' AND serving.effect = 'complete'
+          AND serving.action IN ('create', 'update')
+          AND serving.result_observed_json = deployment.observed_json
+          AND ((deployment.generation = deployment.observed_generation
+                AND deployment.phase = 'idle' AND deployment.last_operation = serving.id
+                AND deployment.spec_json = serving.accepted_spec_json)
+            OR (deployment.generation > deployment.observed_generation
+                AND deployment.phase = 'error'
+                AND EXISTS (SELECT 1 FROM tf_v2_operations last
+                  WHERE last.id = deployment.last_operation
+                    AND last.resource_uid = deployment.uid
+                    AND last.generation = deployment.generation
+                    AND last.status = 'failed' AND last.effect = 'none')
+                AND (SELECT COUNT(*) FROM tf_v2_operations tail
+                  WHERE tail.resource_uid = deployment.uid
+                    AND tail.generation > deployment.observed_generation
+                    AND tail.generation <= deployment.generation) =
+                  deployment.generation - deployment.observed_generation
+                AND deployment.generation - deployment.observed_generation <= ${MAX_FAILED_TAIL}
+                AND NOT EXISTS (SELECT 1 FROM tf_v2_operations tail
+                  WHERE tail.resource_uid = deployment.uid
+                    AND tail.generation > deployment.observed_generation
+                    AND tail.generation <= deployment.generation
+                    AND (tail.status <> 'failed' OR tail.effect <> 'none'
+                      OR tail.principal <> deployment.principal
+                      OR tail.backend_id <> deployment.backend_id
+                      OR tail.target_key <> deployment.target_key))))
+          AND json_extract(serving.accepted_spec_json, '$.worker.resourceUid') = ?
           AND json_extract(deployment.observed_json, '$.active') = 1
           AND json_extract(deployment.observed_json, '$.ready') = 1
-          AND NOT EXISTS (SELECT 1 FROM json_each(deployment.spec_json, '$.versions') selected
+          AND NOT EXISTS (SELECT 1 FROM json_each(serving.accepted_spec_json, '$.versions') selected
             WHERE NOT EXISTS (SELECT 1 FROM tf_v2_resources version
               WHERE version.uid = json_extract(selected.value, '$.workerVersion.resourceUid')
                 AND version.form_url = ? AND version.principal = deployment.principal
