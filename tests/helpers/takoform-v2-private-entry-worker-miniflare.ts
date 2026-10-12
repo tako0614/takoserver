@@ -76,6 +76,11 @@ export default {
       return new Response(null, { status: 204 });
     }
     const useOrdinary = local.pathname.startsWith("/__test/ordinary/");
+    // Model a committed acceptance whose request lifetime ended before a
+    // best-effort wake could be registered. Cron must remain sufficient.
+    const withoutRequestLifetime = request.headers.get("x-test-without-request-lifetime") === "1";
+    const headers = new Headers(request.headers);
+    headers.delete("x-test-without-request-lifetime");
     const path = useOrdinary ? local.pathname.slice("/__test/ordinary".length) : local.pathname;
     const canonical = new URL(`${path}${local.search}`, env.PUBLIC_ORIGIN);
     const body =
@@ -85,11 +90,11 @@ export default {
     return await (useOrdinary ? ordinary : selected).fetch(
       new Request(canonical, {
         method: request.method,
-        headers: request.headers,
+        headers,
         ...(body ? { body } : {}),
       }),
       env,
-      context,
+      withoutRequestLifetime ? undefined : context,
     );
   },
 };
