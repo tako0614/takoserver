@@ -27,7 +27,9 @@ export interface CreateRouterOptions {
   readonly dataAi?: DataAiRoutes;
   readonly aiAvailable?: boolean;
   /** This is the only public Takoform Host handler; legacy repair has no route. */
-  readonly takoformV2Host: { fetch(request: Request): Promise<Response | null> };
+  readonly takoformV2Host: {
+    fetch(request: Request, wake?: () => void): Promise<Response | null>;
+  };
   readonly publicOrigin: string;
   /**
    * Where this deployment's console is served, if it has one.
@@ -104,7 +106,7 @@ function crossOrigin(request: Request, consoleOrigin: string | undefined): Recor
 
 function dispatch(options: CreateRouterOptions, origin: string): Router {
   const console = options.consoleOrigin === undefined ? null : httpsOrigin(options.consoleOrigin);
-  return async (request) => {
+  return async (request, lifetime) => {
     const url = new URL(request.url);
 
     if (options.dataAi) {
@@ -112,7 +114,7 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
       if (served) return served;
     }
 
-    const handled = await options.takoformV2Host.fetch(request);
+    const handled = await options.takoformV2Host.fetch(request, lifetime?.wakeTakoformV2);
     if (handled) return handled;
 
     if (request.method === "GET" && url.pathname === "/") {

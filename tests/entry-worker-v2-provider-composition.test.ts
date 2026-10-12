@@ -108,6 +108,7 @@ const request = (
   env: WorkerEnv,
   path: string,
   init: RequestInit = {},
+  context?: { waitUntil(work: Promise<unknown>): void },
 ) =>
   entry.fetch(
     new Request(`${BASE}${path}`, {
@@ -119,6 +120,7 @@ const request = (
       },
     }),
     env,
+    context,
   );
 
 function completeForm(): V2Form {
@@ -232,6 +234,227 @@ test("selected v2 Form uses the normal Worker fetch and scheduled Host executor"
     expect((await request(entry, env, `/resources/${accepted.resourceUid}`)).status).toBe(410);
     expect(effects).toBe(3);
     expect(compositions).toBe(1);
+  } finally {
+    await runtime.dispose();
+  }
+}, 120_000);
+
+test("fresh v2 acceptance wakes durable work without Cron; replay, GET and refusal do not", async () => {
+  const { runtime, env } = await fixture("v2-entry-request-wake");
+  try {
+    let effects = 0;
+    let entered: (() => void) | undefined;
+    let release: (() => void) | undefined;
+    const executing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const entry = createWorkerEntry({
+      composeV2Forms: () => ({
+        [FORM]: {
+          validateCreate() {},
+          validateUpdate() {},
+          backend: {
+            id: "fixture-worker-entry-backend",
+            targetKey: "fixture-worker-entry-target",
+            async execute() {
+              effects += 1;
+              entered?.();
+              await held;
+              return { kind: "complete", observed: {}, output: {} };
+            },
+            async reconcile() {
+              throw new Error("an acknowledged execution must not be resent");
+            },
+          },
+        },
+      }),
+    });
+    const retained: Promise<unknown>[] = [];
+    const context = { waitUntil: (work: Promise<unknown>) => retained.push(work) };
+    const body = { form: FORM, space: ORG, name: "woken", spec: {} };
+    const key = "worker-wake-create-0001";
+    const created = await request(
+      entry,
+      env,
+      "/resources",
+      {
+        method: "POST",
+        headers: { "idempotency-key": key },
+        body: JSON.stringify(body),
+      },
+      context,
+    );
+    expect(created.status).toBe(202);
+    const accepted = (await created.json()) as { id: string; resourceUid: string };
+    expect(retained).toHaveLength(1);
+    await executing;
+    expect(effects).toBe(1);
+
+    const replay = await request(
+      entry,
+      env,
+      "/resources",
+      {
+        method: "POST",
+        headers: { "idempotency-key": key },
+        body: JSON.stringify(body),
+      },
+      context,
+    );
+    expect((await replay.json()).id).toBe(accepted.id);
+    expect(retained).toHaveLength(1);
+    expect((await request(entry, env, `/operations/${accepted.id}`, {}, context)).status).toBe(200);
+    expect(retained).toHaveLength(1);
+    expect(
+      (
+        await request(
+          entry,
+          env,
+          "/resources",
+          {
+            method: "POST",
+            headers: { "idempotency-key": "worker-wake-refusal-0001" },
+            body: JSON.stringify({ ...body, form: "https://forms.example.test/missing/1.0.0" }),
+          },
+          context,
+        )
+      ).status,
+    ).toBe(422);
+    expect(retained).toHaveLength(1);
+    const unauthorized = await entry.fetch(
+      new Request(`${BASE}/resources`, {
+        method: "POST",
+        headers: {
+          "idempotency-key": "worker-wake-unauth-0001",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      }),
+      env,
+      context,
+    );
+    expect(unauthorized.status).toBe(401);
+    expect(retained).toHaveLength(1);
+
+    // A concurrent Cron pass sees the same leased Operation, not another send.
+    await entry.scheduled({}, env);
+    expect(effects).toBe(1);
+    release?.();
+    await Promise.all(retained);
+    expect(await (await request(entry, env, `/operations/${accepted.id}`)).json()).toMatchObject({
+      status: "succeeded",
+      effect: "complete",
+    });
+    const terminalReplay = await request(
+      entry,
+      env,
+      "/resources",
+      {
+        method: "POST",
+        headers: { "idempotency-key": key },
+        body: JSON.stringify(body),
+      },
+      context,
+    );
+    expect(terminalReplay.status).toBe(200);
+    expect(retained).toHaveLength(1);
+    expect(effects).toBe(1);
+
+    const updated = await request(
+      entry,
+      env,
+      `/resources/${accepted.resourceUid}`,
+      {
+        method: "PUT",
+        headers: {
+          "idempotency-key": "worker-wake-update-0001",
+          "takoform-expected-generation": "1",
+        },
+        body: JSON.stringify({ spec: {} }),
+      },
+      context,
+    );
+    expect(updated.status).toBe(202);
+    expect(retained).toHaveLength(2);
+    await retained[1];
+    expect(effects).toBe(2);
+
+    const deleted = await request(
+      entry,
+      env,
+      `/resources/${accepted.resourceUid}`,
+      {
+        method: "DELETE",
+        headers: {
+          "idempotency-key": "worker-wake-delete-0001",
+          "takoform-expected-generation": "2",
+        },
+      },
+      context,
+    );
+    expect(deleted.status).toBe(202);
+    expect(retained).toHaveLength(3);
+    await retained[2];
+    expect(effects).toBe(3);
+  } finally {
+    await runtime.dispose();
+  }
+}, 120_000);
+
+test("failed request wake registration leaves accepted continuation for bounded Cron recovery", async () => {
+  const { runtime, env } = await fixture("v2-entry-wake-interrupted");
+  try {
+    let sends = 0;
+    let reconciles = 0;
+    const entry = createWorkerEntry({
+      composeV2Forms: () => ({
+        [FORM]: {
+          validateCreate() {},
+          validateUpdate() {},
+          backend: {
+            id: "fixture-worker-entry-backend",
+            targetKey: "fixture-worker-entry-target",
+            async execute() {
+              sends += 1;
+              return { kind: "continue" };
+            },
+            async reconcile() {
+              reconciles += 1;
+              return { kind: "complete", observed: {}, output: {} };
+            },
+          },
+        },
+      }),
+    });
+    const created = await request(
+      entry,
+      env,
+      "/resources",
+      {
+        method: "POST",
+        headers: { "idempotency-key": "worker-wake-interrupted-0001" },
+        body: JSON.stringify({ form: FORM, space: ORG, name: "resumable", spec: {} }),
+      },
+      {
+        waitUntil() {
+          throw new Error("request lifetime ended");
+        },
+      },
+    );
+    expect(created.status).toBe(202);
+    const accepted = (await created.json()) as { id: string };
+    await Bun.sleep(0);
+    expect(sends).toBe(0);
+    await entry.scheduled({}, env);
+    expect(sends).toBe(1);
+    expect(reconciles).toBe(1);
+    expect(await (await request(entry, env, `/operations/${accepted.id}`)).json()).toMatchObject({
+      status: "succeeded",
+      effect: "complete",
+    });
   } finally {
     await runtime.dispose();
   }

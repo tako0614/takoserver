@@ -31,6 +31,16 @@ function fail(code: string, status: number, operationId?: string, detail?: strin
   throw new TakoformV2Error(code, status, code, operationId, detail);
 }
 
+function wakeAfterCommit(wake?: () => void): void {
+  try {
+    wake?.();
+  } catch {
+    // A request-lifetime wake is never required to acknowledge an already
+    // durable acceptance. The scheduled pass remains its recovery path.
+    console.error("v2 Operation wake registration failed");
+  }
+}
+
 function validName(value: string): boolean {
   return namePattern.test(value);
 }
@@ -469,11 +479,14 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           : undefined,
       );
     },
-    async acceptCreate(request: {
-      principal: string;
-      key: string;
-      input: V2CreateInput;
-    }): Promise<V2Operation> {
+    async acceptCreate(
+      request: {
+        principal: string;
+        key: string;
+        input: V2CreateInput;
+      },
+      wake?: () => void,
+    ): Promise<V2Operation> {
       const input = snapshotRequest(request);
       const { principal, key } = input;
       if (!tokenPattern.test(key)) fail("invalid_request", 400);
@@ -593,23 +606,34 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         if (result === "resource_busy") fail("resource_busy", 409);
       } catch (error) {
         const winner = await winnerAfterRace(principal, key, fingerprint, privateInputs);
-        if (winner) return winner;
+        if (winner) {
+          // Some SQL adapters persist the exact row before an unreliable
+          // changes count throws. Only our newly minted ID may wake it; a
+          // concurrent idempotency winner is a replay, not this acceptance.
+          if (winner.id === record.id) wakeAfterCommit(wake);
+          return winner;
+        }
         if (await store.activeName(desired.space, desired.name)) {
           fail("name_conflict", 409);
         }
         if (referenceUnavailable(error)) fail("dependency_conflict", 409);
         throw error;
       }
-      return operation(await storedOperation(record.id));
+      const acceptedOperation = operation(await storedOperation(record.id));
+      wakeAfterCommit(wake);
+      return acceptedOperation;
     },
-    async acceptUpdate(request: {
-      principal: string;
-      key: string;
-      uid: string;
-      expectedGeneration: number;
-      spec: JsonObject;
-      privateInputs?: V2PrivateInputMap;
-    }): Promise<V2Operation> {
+    async acceptUpdate(
+      request: {
+        principal: string;
+        key: string;
+        uid: string;
+        expectedGeneration: number;
+        spec: JsonObject;
+        privateInputs?: V2PrivateInputMap;
+      },
+      wake?: () => void,
+    ): Promise<V2Operation> {
       const input = snapshotRequest(request);
       if (!tokenPattern.test(input.key) || !validName(input.uid)) fail("invalid_request", 400);
       const privateInputs = snapshotPrivateInputs(input.privateInputs);
@@ -701,7 +725,11 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           serializeUpdatesWithPendingReferrers,
           admission,
         );
-        if (result === "accepted") return operation(await storedOperation(record.id));
+        if (result === "accepted") {
+          const acceptedOperation = operation(await storedOperation(record.id));
+          wakeAfterCommit(wake);
+          return acceptedOperation;
+        }
       } catch (error) {
         const winner = await winnerAfterRace(
           input.principal,
@@ -709,12 +737,18 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           fingerprint,
           privateInputs,
         );
-        if (winner) return winner;
+        if (winner) {
+          if (winner.id === record.id) wakeAfterCommit(wake);
+          return winner;
+        }
         if (referenceUnavailable(error)) fail("dependency_conflict", 409);
         throw error;
       }
       const winner = await winnerAfterRace(input.principal, input.key, fingerprint, privateInputs);
-      if (winner) return winner;
+      if (winner) {
+        if (winner.id === record.id) wakeAfterCommit(wake);
+        return winner;
+      }
       // The admission predicate, or the pending-referrer serialization guard.
       if (result === "dependency_conflict")
         fail(
@@ -728,12 +762,15 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       if (latest.busy_operation) fail("resource_busy", 409);
       fail("generation_conflict", 409);
     },
-    async acceptDelete(request: {
-      principal: string;
-      key: string;
-      uid: string;
-      expectedGeneration: number;
-    }): Promise<V2Operation> {
+    async acceptDelete(
+      request: {
+        principal: string;
+        key: string;
+        uid: string;
+        expectedGeneration: number;
+      },
+      wake?: () => void,
+    ): Promise<V2Operation> {
       const input = snapshotRequest(request);
       if (!tokenPattern.test(input.key) || !validName(input.uid)) fail("invalid_request", 400);
       const target = await ownedResource(input.principal, input.uid, "write");
@@ -763,16 +800,25 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         formUrl: target.form_url,
       });
       try {
-        if ((await store.insertChange(record)) === "accepted")
-          return operation(await storedOperation(record.id));
+        if ((await store.insertChange(record)) === "accepted") {
+          const acceptedOperation = operation(await storedOperation(record.id));
+          wakeAfterCommit(wake);
+          return acceptedOperation;
+        }
       } catch (error) {
         const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
-        if (winner) return winner;
+        if (winner) {
+          if (winner.id === record.id) wakeAfterCommit(wake);
+          return winner;
+        }
         if (referenceUnavailable(error)) fail("dependency_conflict", 409);
         throw error;
       }
       const winner = await winnerAfterRace(input.principal, input.key, fingerprint);
-      if (winner) return winner;
+      if (winner) {
+        if (winner.id === record.id) wakeAfterCommit(wake);
+        return winner;
+      }
       if (await store.hasReferences(target.uid)) {
         fail("dependency_conflict", 409);
       }
@@ -825,11 +871,14 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       await ownedResource(input.principal, row.resource_uid, "read");
       return operation(row);
     },
-    async replenishPrivateInputs(input: {
-      principal: string;
-      id: string;
-      privateInputs: V2PrivateInputMap;
-    }): Promise<V2Operation> {
+    async replenishPrivateInputs(
+      input: {
+        principal: string;
+        id: string;
+        privateInputs: V2PrivateInputMap;
+      },
+      wake?: () => void,
+    ): Promise<V2Operation> {
       const privateInputs = snapshotPrivateInputs(input.privateInputs);
       if (privateInputs === undefined) fail("invalid_request", 400);
       const row = await store.operation(input.id);
@@ -851,8 +900,10 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         privateInputs,
         now().getTime(),
       );
-      await store.replenish(row.id, sealed, now().toISOString());
-      return operation(await storedOperation(row.id));
+      const changed = await store.replenish(row.id, sealed, now().toISOString());
+      const replenished = operation(await storedOperation(row.id));
+      if (changed) wakeAfterCommit(wake);
+      return replenished;
     },
     async runNext(): Promise<V2Operation | null> {
       const runnable = await nextRunnable();
