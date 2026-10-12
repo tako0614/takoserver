@@ -174,14 +174,26 @@ test("real Worker entry admits private inputs only with operator keys and truste
       headers,
       body: JSON.stringify(body),
     });
-    const accepted = (await replay.json()) as { id: string; resourceUid: string };
-    expect(replay.status).toBe(202);
+    const accepted = (await replay.json()) as {
+      id: string;
+      resourceUid: string;
+      status: string;
+      effect: string;
+    };
+    expect(replay.status).toBe(accepted.status === "succeeded" ? 200 : 202);
+    expect(accepted.status).not.toBe("failed");
     expect(accepted.id).toBeTruthy();
     const tick = await runtime.dispatchFetch(`${ORIGIN}/__test/run-scheduled`, { method: "POST" });
     expect(tick.status).toBe(204);
-    const operation = await request(runtime, `/operations/${accepted.id}`);
+    let operation = await request(runtime, `/operations/${accepted.id}`);
     expect(operation.status).toBe(200);
-    const publicOperation = await operation.json();
+    let publicOperation = (await operation.json()) as { status: string; effect: string };
+    for (let attempt = 0; attempt < 50 && publicOperation.status !== "succeeded"; attempt += 1) {
+      await Bun.sleep(100);
+      operation = await request(runtime, `/operations/${accepted.id}`);
+      expect(operation.status).toBe(200);
+      publicOperation = (await operation.json()) as { status: string; effect: string };
+    }
     expect(publicOperation).toMatchObject({ status: "succeeded", effect: "complete" });
     expect(JSON.stringify(publicOperation)).not.toContain(SECRET);
     const resource = await request(runtime, `/resources/${accepted.resourceUid}`);
@@ -323,11 +335,19 @@ test("retained operator keys reopen accepted private input after Worker restart;
       await seed(initial);
       const response = await request(initial, "/resources", {
         method: "POST",
-        headers,
+        headers: { ...headers, "x-test-without-request-lifetime": "1" },
         body: JSON.stringify(body),
       });
       expect(response.status).toBe(202);
       accepted = (await response.json()) as { id: string; resourceUid: string };
+      const database = await initial.getD1Database("STATE_DB");
+      const queued = await database
+        .prepare("SELECT status, dispatch_possible, lease_token FROM tf_v2_operations WHERE id = ?")
+        .bind(accepted.id)
+        .first<{ status: string; dispatch_possible: number; lease_token: string | null }>();
+      expect(queued?.status).toBe("queued");
+      expect(queued?.dispatch_possible).toBe(0);
+      expect(queued?.lease_token).toBeNull();
     } finally {
       await initial.dispose();
     }

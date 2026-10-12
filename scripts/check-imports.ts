@@ -336,6 +336,13 @@ const LAYERS: readonly Layer[] = [
     may: ["v2-contract", "v2-engine", "v2-http"],
   },
   {
+    // Request-lifetime progress belongs to the Worker entry, not the durable
+    // engine or protocol routes. It only reads the Operation contract.
+    name: "v2-worker-wake",
+    match: /^src\/takoform-v2\/worker-wake\.ts$/u,
+    may: ["v2-contract"],
+  },
+  {
     name: "v2-accounts",
     match: /^src\/takoform-v2\/accounts\.ts$/u,
     may: ["core", "domain", "v2-http"],
@@ -546,6 +553,7 @@ const LAYERS: readonly Layer[] = [
       "v2-selfhost-configured-input-sealer",
       "v2-selfhost-runtime-boot",
       "v2-selfhost-endpoint-boot",
+      "v2-worker-wake",
     ],
   },
   // The published package surface re-exports the product for an embedder. It

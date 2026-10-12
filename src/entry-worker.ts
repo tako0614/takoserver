@@ -35,6 +35,7 @@ import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
+import { drainV2Operations } from "./takoform-v2/worker-wake.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
 import {
   createWorkerEndpointOriginReservationBindingHandle,
@@ -950,7 +951,25 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       }
       return await app.fetch(
         request,
-        context ? { waitUntil: (work) => context.waitUntil(work) } : undefined,
+        context
+          ? {
+              waitUntil: (work) => context.waitUntil(work),
+              wakeTakoformV2: () => {
+                let registered = false;
+                const work = Promise.resolve()
+                  .then(() =>
+                    registered ? drainV2Operations(() => app.tickTakoformV2()) : undefined,
+                  )
+                  .catch(() => {
+                    console.error("v2 Operation wake failed");
+                  });
+                // A rejected lifetime registration must not change the
+                // already-committed HTTP acceptance or start a floating pass.
+                context.waitUntil(work);
+                registered = true;
+              },
+            }
+          : undefined,
       );
     },
 
@@ -961,7 +980,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       const app = await appFor(env, requirePublicOrigin(env));
       const results = await Promise.allSettled([
         Promise.resolve().then(() => app.tick()),
-        Promise.resolve().then(() => app.tickTakoformV2()),
+        Promise.resolve().then(() => drainV2Operations(() => app.tickTakoformV2())),
       ]);
       const failures = results.flatMap((result) =>
         result.status === "rejected" ? [result.reason] : [],

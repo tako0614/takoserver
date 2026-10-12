@@ -34,7 +34,7 @@ export interface TakoformV2HttpOptions {
 }
 
 export interface TakoformV2Router {
-  fetch(request: Request): Promise<Response | null>;
+  fetch(request: Request, wake?: () => void): Promise<Response | null>;
 }
 
 interface HttpConfig {
@@ -85,7 +85,7 @@ export function createTakoformV2Routes(
   options: TakoformV2HttpOptions,
 ): TakoformV2Router {
   const config = validateHttpOptions(options, engine);
-  return { fetch: (request) => route(request, engine, options, config) };
+  return { fetch: (request, wake) => route(request, engine, options, config, wake) };
 }
 
 async function route(
@@ -93,6 +93,7 @@ async function route(
   engine: TakoformV2Engine,
   options: TakoformV2HttpOptions,
   config: HttpConfig,
+  wake?: () => void,
 ): Promise<Response | null> {
   let url: URL;
   try {
@@ -139,7 +140,16 @@ async function route(
         wwwAuthenticate: options.authenticationSchemes.join(", "),
       });
     }
-    return await authenticatedRoute(request, url, routePath, identity, engine, options, config);
+    return await authenticatedRoute(
+      request,
+      url,
+      routePath,
+      identity,
+      engine,
+      options,
+      config,
+      wake,
+    );
   } catch (error) {
     return asProblem(error, options);
   }
@@ -165,6 +175,7 @@ async function authenticatedRoute(
   engine: TakoformV2Engine,
   options: TakoformV2HttpOptions,
   config: HttpConfig,
+  wake?: () => void,
 ): Promise<Response> {
   // Copy the authenticated grant before any body read or asynchronous engine call.
   // The stable owner may have several credentials with different permissions.
@@ -204,17 +215,20 @@ async function authenticatedRoute(
     const privateInputs = Object.hasOwn(input, "privateInputs")
       ? privateInputMap(input.privateInputs)
       : undefined;
-    const operation = await engine.acceptCreate({
-      principal,
-      key,
-      input: {
-        form: input.form,
-        space,
-        name,
-        spec,
-        ...(privateInputs === undefined ? {} : { privateInputs }),
+    const operation = await engine.acceptCreate(
+      {
+        principal,
+        key,
+        input: {
+          form: input.form,
+          space,
+          name,
+          spec,
+          ...(privateInputs === undefined ? {} : { privateInputs }),
+        },
       },
-    });
+      wake,
+    );
     return operationResponse(operation, config);
   }
   if (path === "/resources" && request.method === "GET") {
@@ -283,14 +297,17 @@ async function authenticatedRoute(
       const privateInputs = Object.hasOwn(body, "privateInputs")
         ? privateInputMap(body.privateInputs)
         : undefined;
-      const operation = await engine.acceptUpdate({
-        principal,
-        key,
-        uid,
-        expectedGeneration,
-        spec,
-        ...(privateInputs === undefined ? {} : { privateInputs }),
-      });
+      const operation = await engine.acceptUpdate(
+        {
+          principal,
+          key,
+          uid,
+          expectedGeneration,
+          spec,
+          ...(privateInputs === undefined ? {} : { privateInputs }),
+        },
+        wake,
+      );
       return operationResponse(operation, config);
     }
     if (request.method === "DELETE") {
@@ -300,7 +317,7 @@ async function authenticatedRoute(
       const key = idempotencyKey(request);
       const expectedGeneration = expectedGenerationHeader(request);
       return operationResponse(
-        await engine.acceptDelete({ principal, key, uid, expectedGeneration }),
+        await engine.acceptDelete({ principal, key, uid, expectedGeneration }, wake),
         config,
       );
     }
@@ -329,11 +346,14 @@ async function authenticatedRoute(
     const body = await readJsonObject(request, options.maxRequestBytes);
     exactKeys(body, ["privateInputs"]);
     return json(
-      await engine.replenishPrivateInputs({
-        principal,
-        id,
-        privateInputs: privateInputMap(body.privateInputs),
-      }),
+      await engine.replenishPrivateInputs(
+        {
+          principal,
+          id,
+          privateInputs: privateInputMap(body.privateInputs),
+        },
+        wake,
+      ),
     );
   }
   return problem(404, "not_found");
