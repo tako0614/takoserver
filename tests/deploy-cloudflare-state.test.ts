@@ -136,6 +136,29 @@ describe("strict paginated Cloudflare state", () => {
     expect(calls).toBe(2);
   });
 
+  test("redacts a forged DOMException name without retrying it", async () => {
+    let calls = 0;
+    let failure: unknown;
+    try {
+      await readCloudflareGetText({
+        fetcher: async () => {
+          calls += 1;
+          throw new DOMException("failed", "forged-secret-bearing-name");
+        },
+        request: (signal) =>
+          new Request("https://api.cloudflare.com/client/v4/test", { redirect: "manual", signal }),
+        maximumBytes: 1024,
+        label: "direct GET",
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(CloudflareGetTransportError);
+    expect((failure as CloudflareGetTransportError).detail).toBe("TransportError");
+    expect(JSON.stringify(failure)).not.toContain("forged-secret-bearing-name");
+    expect(calls).toBe(1);
+  });
+
   test("does not retry a locally locked response body", async () => {
     let calls = 0;
     const body = new ReadableStream<Uint8Array>();

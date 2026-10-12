@@ -244,6 +244,10 @@ function isRawTransportFailure(error: unknown): boolean {
 function safeReason(error: unknown): string {
   if (error instanceof DeadlineError) return "TimeoutError";
   if (error instanceof TypeError) return "TypeError";
-  if (error instanceof DOMException) return error.name;
+  if (error instanceof DOMException) {
+    return error.name === "AbortError" || error.name === "TimeoutError"
+      ? error.name
+      : "TransportError";
+  }
   return "TransportError";
 }
