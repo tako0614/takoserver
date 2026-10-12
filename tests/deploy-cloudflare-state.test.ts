@@ -716,6 +716,8 @@ describe("strict paginated Cloudflare state", () => {
   test("uses the Zones API limit and reads default plus internal zone routes exhaustively", async () => {
     const requests: Request[] = [];
     const defaultZones = Array.from({ length: 51 }, (_, index) => ({ id: `zone-${index}` }));
+    let inFlightRoutes = 0;
+    let maxInFlightRoutes = 0;
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "token",
@@ -733,23 +735,32 @@ describe("strict paginated Cloudflare state", () => {
         }
         const zoneId = /^\/client\/v4\/zones\/([^/]+)\/workers\/routes$/u.exec(url.pathname)?.[1];
         if (!zoneId) throw new Error(`unexpected request ${url}`);
+        inFlightRoutes += 1;
+        maxInFlightRoutes = Math.max(maxInFlightRoutes, inFlightRoutes);
+        await Bun.sleep(zoneId === "zone-internal" ? 1 : 2 + (Number(zoneId.slice(5)) % 3));
+        inFlightRoutes -= 1;
         return Response.json({
           success: true,
-          result:
-            zoneId === "zone-50" || zoneId === "zone-internal"
-              ? [
-                  {
-                    id: `route-${zoneId}`,
-                    pattern: `${zoneId}.example.test/*`,
-                    script: "takoserver-form-authority",
-                  },
-                ]
-              : [],
+          result: [
+            {
+              id: `route-${zoneId}`,
+              pattern: `${zoneId}.example.test/*`,
+              script: "takoserver-form-authority",
+            },
+          ],
         });
       },
     });
 
-    expect(await state.workerRoutes()).toHaveLength(2);
+    expect(await state.workerRoutes()).toEqual(
+      [...defaultZones.map(({ id }) => id), "zone-internal"].sort().map((zoneId) => ({
+        zoneId,
+        id: `route-${zoneId}`,
+        pattern: `${zoneId}.example.test/*`,
+        script: "takoserver-form-authority",
+      })),
+    );
+    expect(maxInFlightRoutes).toBeLessThanOrEqual(4);
     const zoneRequests = requests.filter(
       (request) => new URL(request.url).pathname === "/client/v4/zones",
     );
@@ -760,5 +771,36 @@ describe("strict paginated Cloudflare state", () => {
     expect(
       zoneRequests.some((request) => new URL(request.url).searchParams.get("type") === "internal"),
     ).toBe(true);
+  });
+
+  test("fails the whole route inventory when one zone route read fails", async () => {
+    const routeReads: string[] = [];
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "token",
+      fetcher: async (request) => {
+        const url = new URL(request.url);
+        if (url.pathname === "/client/v4/zones") {
+          return envelope(
+            url.searchParams.get("type") === "internal"
+              ? [{ id: "zone-internal" }]
+              : Array.from({ length: 4 }, (_, index) => ({ id: `zone-${index}` })),
+            1,
+            1,
+            url.searchParams.get("type") === "internal" ? 1 : 4,
+            50,
+          );
+        }
+        const zoneId = /^\/client\/v4\/zones\/([^/]+)\/workers\/routes$/u.exec(url.pathname)?.[1];
+        if (!zoneId) throw new Error(`unexpected request ${url}`);
+        routeReads.push(zoneId);
+        return zoneId === "zone-1"
+          ? Response.json({ success: false, errors: [{ code: 1 }] }, { status: 503 })
+          : Response.json({ success: true, result: [] });
+      },
+    });
+
+    await expect(state.workerRoutes()).rejects.toBeInstanceOf(DeployError);
+    expect(routeReads.filter((zoneId) => zoneId === "zone-1")).toHaveLength(1);
   });
 });
