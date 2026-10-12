@@ -10,6 +10,11 @@ export {
   applicationSchemaMatches,
   deriveExpectedApplicationShape,
 } from "./deploy/application-schema-shape.ts";
+export {
+  CloudflareGetResponseError,
+  CloudflareGetTransportError,
+  readCloudflareGetText,
+} from "./deploy/cloudflare-get.ts";
 export { CloudflareState } from "./deploy/cloudflare-state.ts";
 export { GENERIC_WORKER_DEPLOY_CONTRACT_SURFACES } from "./deploy/contract.ts";
 export type { D1Process } from "./deploy/d1.ts";
