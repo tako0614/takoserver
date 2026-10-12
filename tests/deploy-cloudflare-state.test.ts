@@ -215,6 +215,22 @@ describe("strict paginated Cloudflare state", () => {
     expect((failure as CloudflareGetResponseError).status).toBe(503);
   });
 
+  test("preserves a caller's explicit UTF-8 BOM decoding mode", async () => {
+    const bytes = new Uint8Array([0xef, 0xbb, 0xbf, 0x7b, 0x7d]);
+    const common = {
+      fetcher: async () => new Response(bytes),
+      request: (signal: AbortSignal) =>
+        new Request("https://api.cloudflare.com/client/v4/test", {
+          redirect: "manual",
+          signal,
+        }),
+      maximumBytes: 1024,
+      label: "direct GET",
+    };
+    expect((await readCloudflareGetText(common)).text).toBe("{}");
+    expect((await readCloudflareGetText({ ...common, ignoreBOM: true })).text).toBe("\ufeff{}");
+  });
+
   test("bounds a stalled body, releases it, and retries only once", async () => {
     let calls = 0;
     let cancelled = 0;

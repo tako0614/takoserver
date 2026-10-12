@@ -50,6 +50,8 @@ export async function readCloudflareGetText(input: {
   readonly request: (signal: AbortSignal) => Request;
   readonly maximumBytes: number;
   readonly label: string;
+  /** Preserve a caller's existing UTF-8 BOM handling; public state defaults to false. */
+  readonly ignoreBOM?: boolean;
 }): Promise<{ readonly response: Response; readonly text: string }> {
   if (!Number.isSafeInteger(input.maximumBytes) || input.maximumBytes < 1) {
     throw preflightError(`${input.label} response bound is invalid`);
@@ -96,6 +98,7 @@ export async function readCloudflareGetText(input: {
         input.label,
         deadline,
         controller.signal,
+        input.ignoreBOM ?? false,
       );
       if (controller.signal.aborted) throw new RetryableTransportFailure("TimeoutError");
       return { response, text };
@@ -126,6 +129,7 @@ async function readBoundedResponseText(
   label: string,
   deadline: Promise<never>,
   signal: AbortSignal,
+  ignoreBOM: boolean,
 ): Promise<string> {
   let declared: string | null;
   try {
@@ -178,7 +182,7 @@ async function readBoundedResponseText(
     }
     let text: string;
     try {
-      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      text = new TextDecoder("utf-8", { fatal: true, ignoreBOM }).decode(bytes);
     } catch {
       throw new CloudflareGetResponseError(`${label} response is not valid UTF-8`, response.status);
     }
