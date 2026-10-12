@@ -9,6 +9,7 @@ const PAGE_SIZE = 100;
 // Pages rejects the shared inventory size; retain strict pagination at 20 entries.
 const PAGES_PAGE_SIZE = 20;
 const MAX_PAGES = 10_000;
+const MAX_CONCURRENT_ZONE_ROUTE_READS = 4;
 const MAX_PROVIDER_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAX_TOPOLOGY_AUDIT_RESPONSE_BYTES = 1024 * 1024;
 
@@ -343,29 +344,36 @@ export class CloudflareState {
     if (new Set(zoneIds).size !== zoneIds.length) {
       throw preflightError("Cloudflare account zone inventory contains a duplicate id");
     }
-    const routes = await Promise.all(
-      zoneIds.sort().map(async (zoneId) => {
-        const label = `Cloudflare zone ${zoneId} Worker route inventory`;
-        const envelope = await this.#request(
-          new URL(`${API}/zones/${encodeURIComponent(zoneId)}/workers/routes`),
-          label,
-        );
-        if (!Array.isArray(envelope.result)) {
-          throw preflightError(`${label} returned a non-list result`);
-        }
-        return envelope.result.map((entry) => {
-          if (
-            !isRecord(entry) ||
-            typeof entry.id !== "string" ||
-            typeof entry.pattern !== "string" ||
-            (entry.script !== null && typeof entry.script !== "string")
-          ) {
-            throw preflightError(`${label} returned a malformed entry`);
-          }
-          return { zoneId, id: entry.id, pattern: entry.pattern, script: entry.script };
-        });
-      }),
-    );
+    const sortedZoneIds = zoneIds.sort();
+    const routes = [];
+    for (let offset = 0; offset < sortedZoneIds.length; offset += MAX_CONCURRENT_ZONE_ROUTE_READS) {
+      const batch = await Promise.all(
+        sortedZoneIds
+          .slice(offset, offset + MAX_CONCURRENT_ZONE_ROUTE_READS)
+          .map(async (zoneId) => {
+            const label = `Cloudflare zone ${zoneId} Worker route inventory`;
+            const envelope = await this.#request(
+              new URL(`${API}/zones/${encodeURIComponent(zoneId)}/workers/routes`),
+              label,
+            );
+            if (!Array.isArray(envelope.result)) {
+              throw preflightError(`${label} returned a non-list result`);
+            }
+            return envelope.result.map((entry) => {
+              if (
+                !isRecord(entry) ||
+                typeof entry.id !== "string" ||
+                typeof entry.pattern !== "string" ||
+                (entry.script !== null && typeof entry.script !== "string")
+              ) {
+                throw preflightError(`${label} returned a malformed entry`);
+              }
+              return { zoneId, id: entry.id, pattern: entry.pattern, script: entry.script };
+            });
+          }),
+      );
+      routes.push(...batch);
+    }
     const flattened = routes.flat();
     if (new Set(flattened.map(({ zoneId, id }) => `${zoneId}\0${id}`)).size !== flattened.length) {
       throw preflightError("Cloudflare Worker route inventory contains a duplicate id");
