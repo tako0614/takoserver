@@ -659,6 +659,15 @@ invocation. Selection uses the declared proportions, not declaration order,
 the largest weight, caller headers or URL affinity. A selected Version's failure
 does not trigger a retry against another Version.
 
+The self-host runtime admits only one non-deleted `WorkerDeployment` Resource UID
+per `ModuleWorker`. A second UID is refused at Resource acceptance, including
+while the first create or delete is pending. Re-applying or updating the same UID
+remains valid; after its delete completes, a replacement UID may be created.
+This is a self-host runtime capability limit, not a cardinality rule in the
+released Form or the general Takoform Host model. Deployments admitted by an
+older Host are not removed or marked `no_effect` by this admission rule; their
+existing Operations require separate reconciliation or operator-directed repair.
+
 Activation is serialized and requires authenticated readback of the exact
 serving generation. Failed activation and rollback do not make the desired
 generation the event-delivery authority: events use the proven serving

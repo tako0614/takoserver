@@ -9,7 +9,13 @@ import {
   WORKER_DEPLOYMENT_FORM_URL,
   WorkerFormValidationError,
 } from "./forms/worker-specs.ts";
-import { TakoformV2Error, type V2BackendResult, type V2Execution, type V2Form } from "./types.ts";
+import {
+  TakoformV2Error,
+  type V2AdmissionPredicate,
+  type V2BackendResult,
+  type V2Execution,
+  type V2Form,
+} from "./types.ts";
 import type {
   WorkerCronTriggerAdmissionInput,
   WorkerCronTriggerAdmissionResolution,
@@ -43,6 +49,34 @@ const unknown = (): V2BackendResult => ({
   code: "worker_publication_unconfirmed",
   message: "The Worker publication or retirement is not yet confirmed",
 });
+
+/** One self-host runtime owner can serve only one Deployment UID per Worker. */
+function deploymentAdmission(input: {
+  readonly principal: string;
+  readonly space: string;
+  readonly resourceUid: string;
+  readonly spec: unknown;
+}): V2AdmissionPredicate {
+  const workerUid = parseWorkerDeploymentSpec(input.spec).worker.resourceUid;
+  return {
+    // The Host embeds this predicate in its atomic CREATE/UPDATE statement.
+    // A deleting or failed Resource still owns its UID until DELETE settles;
+    // a same-UID update excludes itself, while a deleted UID can be replaced.
+    sql: `NOT EXISTS (SELECT 1 FROM tf_v2_resources other
+      WHERE other.form_url = ? AND other.principal = ? AND other.space = ?
+        AND other.deleted_at IS NULL AND other.uid <> ?
+        AND json_extract(other.spec_json, '$.worker.resourceUid') = ?)`,
+    params: [
+      WORKER_DEPLOYMENT_FORM_URL,
+      input.principal,
+      input.space,
+      input.resourceUid,
+      workerUid,
+    ],
+    detail:
+      "This self-host Worker already has a WorkerDeployment. Update the existing Deployment or delete it before creating a replacement.",
+  };
+}
 
 /**
  * Connect the accepted v2 Operation to the UID-owned native runtime owner.
@@ -249,6 +283,14 @@ export function createWorkerDeploymentForm(options: {
     validateUpdate(previousSpec, spec) {
       try {
         validateWorkerDeploymentUpdate(previousSpec, spec);
+      } catch (error) {
+        if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
+        throw error;
+      }
+    },
+    async prepareAdmission(input) {
+      try {
+        return deploymentAdmission(input);
       } catch (error) {
         if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
         throw error;

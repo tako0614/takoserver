@@ -262,6 +262,91 @@ async function settleAll(h: Harness, engine: Engine, ids: readonly string[]) {
   throw new Error("Operations did not settle");
 }
 
+test("self-host admits only one live or pending WorkerDeployment per Worker", async () => {
+  const h = harness();
+  try {
+    const { deploymentSpec } = await h.foundations();
+    const first = await accept(h.engine, WORKER_DEPLOYMENT_FORM_URL, "deployment", deploymentSpec);
+    const secondRequest = () =>
+      accept(h.engine, WORKER_DEPLOYMENT_FORM_URL, "deployment-second", deploymentSpec);
+
+    // The first Operation has not dispatched, but already owns this Worker.
+    await expect(secondRequest()).rejects.toMatchObject({
+      code: "dependency_conflict",
+      status: 409,
+    });
+    expect(
+      await h.engine.listResources({ principal: PRINCIPAL, name: "deployment-second", limit: 10 }),
+    ).toEqual([]);
+    expect(h.ownerCalls).toEqual([]);
+
+    expect(await h.engine.runNext()).toMatchObject({ id: first.id, status: "succeeded" });
+    await expect(secondRequest()).rejects.toMatchObject({
+      code: "dependency_conflict",
+      status: 409,
+    });
+
+    // Replays and a new generation of the same UID retain their existing authority.
+    expect(
+      await accept(h.engine, WORKER_DEPLOYMENT_FORM_URL, "deployment", deploymentSpec),
+    ).toMatchObject({
+      id: first.id,
+      resourceUid: first.resourceUid,
+      status: "succeeded",
+    });
+    const updated = await h.engine.acceptUpdate({
+      principal: PRINCIPAL,
+      key: "update-deployment-key-0001",
+      uid: first.resourceUid,
+      expectedGeneration: 1,
+      spec: deploymentSpec,
+    });
+    expect(await h.engine.runNext()).toMatchObject({ id: updated.id, status: "succeeded" });
+
+    const deleting = await h.engine.acceptDelete({
+      principal: PRINCIPAL,
+      key: "delete-deployment-key-0001",
+      uid: first.resourceUid,
+      expectedGeneration: 2,
+    });
+    await expect(secondRequest()).rejects.toMatchObject({
+      code: "dependency_conflict",
+      status: 409,
+    });
+    expect(await h.engine.runNext()).toMatchObject({ id: deleting.id, status: "succeeded" });
+    const replacement = await secondRequest();
+    expect(replacement.resourceUid).not.toBe(first.resourceUid);
+    expect(await h.engine.runNext()).toMatchObject({ id: replacement.id, status: "succeeded" });
+  } finally {
+    h.close();
+  }
+});
+
+test("concurrent self-host Deployment creates cannot both own the same Worker", async () => {
+  const h = harness();
+  try {
+    const { deploymentSpec } = await h.foundations();
+    const results = await Promise.allSettled([
+      accept(h.engine, WORKER_DEPLOYMENT_FORM_URL, "deployment-a", deploymentSpec),
+      accept(h.engine, WORKER_DEPLOYMENT_FORM_URL, "deployment-b", deploymentSpec),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toMatchObject([
+      { reason: { code: "dependency_conflict", status: 409 } },
+    ]);
+    expect(
+      await h.engine.listResources({
+        principal: PRINCIPAL,
+        form: WORKER_DEPLOYMENT_FORM_URL,
+        limit: 10,
+      }),
+    ).toHaveLength(1);
+    expect(h.ownerCalls).toEqual([]);
+  } finally {
+    h.close();
+  }
+});
+
 test("a WorkerEndpoint is refused before its Worker has an active Deployment, then accepted after it", async () => {
   const h = harness();
   try {
