@@ -1,3 +1,4 @@
+import { readCloudflareGetText } from "./cloudflare-get.ts";
 import {
   type CloudflareTopologyAuditEvidence,
   verifyCloudflareTopologyVisibility,
@@ -131,27 +132,22 @@ export class CloudflareState {
     }
     const label = `${name} dispatch namespace`;
     const url = this.#url(`/workers/dispatch/namespaces/${encodeURIComponent(name)}`);
-    let response: Response;
-    try {
-      response = await this.#fetcher(
+    const { response, text } = await readCloudflareGetText({
+      fetcher: this.#fetcher,
+      request: (signal) =>
         new Request(url, {
           method: "GET",
-          redirect: "error",
+          redirect: "manual",
           headers: {
             authorization: `Bearer ${this.#token}`,
             accept: "application/json",
             connection: "close",
           },
-          signal: AbortSignal.timeout(15_000),
+          signal,
         }),
-      );
-    } catch (error) {
-      throw preflightError(
-        `${label} transport failed`,
-        error instanceof Error ? error.name : typeof error,
-      );
-    }
-    const text = await readBoundedResponseText(response, MAX_PROVIDER_RESPONSE_BYTES, label);
+      maximumBytes: MAX_PROVIDER_RESPONSE_BYTES,
+      label,
+    });
     let body: unknown;
     try {
       body = JSON.parse(text);
@@ -394,25 +390,25 @@ export class CloudflareState {
       deploymentToken: this.#token,
       auditCredentialPath: this.#topologyAuditCredentialPath,
       get: async (url, token) => {
-        const response = await this.#fetcher(
-          new Request(url, {
-            method: "GET",
-            headers: {
-              accept: "application/json",
-              authorization: `Bearer ${token}`,
-              connection: "close",
-            },
-            signal: AbortSignal.timeout(15_000),
-          }),
-        );
+        const { response, text } = await readCloudflareGetText({
+          fetcher: this.#fetcher,
+          request: (signal) =>
+            new Request(url, {
+              method: "GET",
+              redirect: "manual",
+              headers: {
+                accept: "application/json",
+                authorization: `Bearer ${token}`,
+                connection: "close",
+              },
+              signal,
+            }),
+          maximumBytes: MAX_TOPOLOGY_AUDIT_RESPONSE_BYTES,
+          label: "Cloudflare topology audit API",
+        });
         if (!response.ok || response.redirected) {
           throw preflightError("Cloudflare topology audit API read failed");
         }
-        const text = await readBoundedResponseText(
-          response,
-          MAX_TOPOLOGY_AUDIT_RESPONSE_BYTES,
-          "Cloudflare topology audit API",
-        );
         if (text.length < 1) {
           throw preflightError("Cloudflare topology audit API response is invalid");
         }
@@ -441,26 +437,22 @@ export class CloudflareState {
     label: string,
     options: { readonly allowMissingWorkerDeployment?: boolean } = {},
   ): Promise<Envelope> {
-    let response: Response;
-    try {
-      response = await this.#fetcher(
+    const { response, text } = await readCloudflareGetText({
+      fetcher: this.#fetcher,
+      request: (signal) =>
         new Request(url, {
           method: "GET",
+          redirect: "manual",
           headers: {
             authorization: `Bearer ${this.#token}`,
             accept: "application/json",
             connection: "close",
           },
-          signal: AbortSignal.timeout(15_000),
+          signal,
         }),
-      );
-    } catch (error) {
-      throw preflightError(
-        `${label} transport failed`,
-        error instanceof Error ? `${error.name}: ${error.message}` : String(error),
-      );
-    }
-    const text = await readBoundedResponseText(response, MAX_PROVIDER_RESPONSE_BYTES, label);
+      maximumBytes: MAX_PROVIDER_RESPONSE_BYTES,
+      label,
+    });
     let body: unknown;
     try {
       body = JSON.parse(text);
@@ -481,46 +473,6 @@ export class CloudflareState {
       );
     }
     return body;
-  }
-}
-
-async function readBoundedResponseText(
-  response: Response,
-  maximumBytes: number,
-  label: string,
-): Promise<string> {
-  const declared = response.headers.get("content-length");
-  if (
-    declared !== null &&
-    (!/^(?:0|[1-9][0-9]*)$/u.test(declared) || Number(declared) > maximumBytes)
-  ) {
-    await response.body?.cancel();
-    throw preflightError(`${label} response is too large`);
-  }
-  if (response.body === null) return "";
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    length += value.byteLength;
-    if (length > maximumBytes) {
-      await reader.cancel();
-      throw preflightError(`${label} response is too large`);
-    }
-    chunks.push(value);
-  }
-  const bytes = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch {
-    throw preflightError(`${label} response is not valid UTF-8`);
   }
 }
 

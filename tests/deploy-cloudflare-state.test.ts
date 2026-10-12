@@ -2,6 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  CloudflareGetResponseError,
+  CloudflareGetTransportError,
+  readCloudflareGetText,
+} from "../scripts/deploy/cloudflare-get.ts";
 import { CloudflareState } from "../scripts/deploy/cloudflare-state.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 
@@ -30,6 +35,263 @@ function envelope(
 }
 
 describe("strict paginated Cloudflare state", () => {
+  test("retries one transient header transport failure with a fresh bounded GET", async () => {
+    const requests: Request[] = [];
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async (request) => {
+        requests.push(request);
+        if (requests.length === 1) throw new TypeError("operator-token must stay private");
+        return Response.json({ success: true, result: { enabled: true } });
+      },
+    });
+    expect(await state.read("/workers/subdomain", "subdomain read")).toEqual({ enabled: true });
+    expect(requests).toHaveLength(2);
+    expect(requests.every((request) => request.method === "GET")).toBe(true);
+    expect(requests.every((request) => request.redirect === "manual")).toBe(true);
+    expect(requests.every((request) => request.headers.get("connection") === "close")).toBe(true);
+    expect(requests[0]?.signal).not.toBe(requests[1]?.signal);
+  });
+
+  test("retries one transient body transport failure, never a third attempt", async () => {
+    let calls = 0;
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async () => {
+        calls += 1;
+        if (calls < 3) {
+          return new Response(
+            new ReadableStream({
+              pull() {
+                throw new TypeError("operator-token must stay private");
+              },
+            }),
+          );
+        }
+        return Response.json({ success: true, result: [] });
+      },
+    });
+    let failure: unknown;
+    try {
+      await state.read("/workers/scripts", "script read");
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(CloudflareGetTransportError);
+    expect((failure as CloudflareGetTransportError).status).toBe(200);
+    expect(JSON.stringify(failure)).not.toContain("operator-token");
+    expect(calls).toBe(2);
+  });
+
+  test("retries a body transport failure and accepts the second complete envelope", async () => {
+    let calls = 0;
+    let firstBody: ReadableStream<Uint8Array> | undefined;
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async () => {
+        calls += 1;
+        if (calls === 1) {
+          firstBody = new ReadableStream({
+            pull: () => {
+              throw new TypeError("broken stream");
+            },
+          });
+          return new Response(firstBody);
+        }
+        return Response.json({ success: true, result: { ready: true } });
+      },
+    });
+    expect(await state.read("/workers/scripts", "script read")).toEqual({ ready: true });
+    expect(calls).toBe(2);
+    expect(firstBody?.locked).toBe(false);
+  });
+
+  test("returns the first healthy GET without retry and does not retry arbitrary callback errors", async () => {
+    let calls = 0;
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async () => {
+        calls += 1;
+        return Response.json({ success: true, result: true });
+      },
+    });
+    expect(await state.read("/workers/scripts", "script read")).toBe(true);
+    expect(calls).toBe(1);
+    await expect(
+      readCloudflareGetText({
+        fetcher: async () => {
+          calls += 1;
+          throw new Error("semantic callback failure");
+        },
+        request: (signal) =>
+          new Request("https://api.cloudflare.com/client/v4/test", { redirect: "manual", signal }),
+        maximumBytes: 1024,
+        label: "direct GET",
+      }),
+    ).rejects.toThrow("direct GET transport failed");
+    expect(calls).toBe(2);
+  });
+
+  test("does not retry a locally locked response body", async () => {
+    let calls = 0;
+    const body = new ReadableStream<Uint8Array>();
+    const response = new Response(body);
+    const lock = body.getReader();
+    try {
+      await expect(
+        readCloudflareGetText({
+          fetcher: async () => {
+            calls += 1;
+            return response;
+          },
+          request: (signal) =>
+            new Request("https://api.cloudflare.com/client/v4/test", {
+              redirect: "manual",
+              signal,
+            }),
+          maximumBytes: 1024,
+          label: "direct GET",
+        }),
+      ).rejects.toBeInstanceOf(CloudflareGetResponseError);
+      expect(calls).toBe(1);
+    } finally {
+      await lock.cancel();
+      lock.releaseLock();
+    }
+  });
+
+  test("cancels an over-limit body and does not retry it", async () => {
+    let calls = 0;
+    let cancelled = 0;
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async () => {
+        calls += 1;
+        return new Response(
+          new ReadableStream({
+            pull(controller) {
+              controller.enqueue(new Uint8Array(32 * 1024 * 1024 + 1));
+            },
+            cancel() {
+              cancelled += 1;
+            },
+          }),
+        );
+      },
+    });
+    await expect(state.read("/workers/scripts", "script read")).rejects.toThrow(
+      "response is too large",
+    );
+    expect(calls).toBe(1);
+    expect(cancelled).toBe(1);
+  });
+
+  test("preserves safe HTTP status on semantic body-cap failures", async () => {
+    let failure: unknown;
+    try {
+      await readCloudflareGetText({
+        fetcher: async () =>
+          new Response("", {
+            status: 503,
+            headers: { "content-length": "1025" },
+          }),
+        request: (signal) =>
+          new Request("https://api.cloudflare.com/client/v4/test", {
+            redirect: "manual",
+            signal,
+          }),
+        maximumBytes: 1024,
+        label: "direct GET",
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(CloudflareGetResponseError);
+    expect((failure as CloudflareGetResponseError).status).toBe(503);
+  });
+
+  test("bounds a stalled body, releases it, and retries only once", async () => {
+    let calls = 0;
+    let cancelled = 0;
+    const started = performance.now();
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return new Response(
+            new ReadableStream({
+              pull: () => new Promise<void>(() => undefined),
+              cancel: () => {
+                cancelled += 1;
+              },
+            }),
+          );
+        }
+        return Response.json({ success: true, result: "recovered" });
+      },
+    });
+    expect(await state.read("/workers/scripts", "script read")).toBe("recovered");
+    expect(calls).toBe(2);
+    expect(cancelled).toBe(1);
+    expect(performance.now() - started).toBeLessThan(15_500);
+  }, 20_000);
+
+  test("does not retry HTTP, redirect, malformed JSON, invalid UTF-8 or oversized body", async () => {
+    const responses = [
+      Response.json({ success: false, errors: [] }, { status: 401 }),
+      Response.json({ success: false, errors: [] }, { status: 429 }),
+      Response.json({ success: false, errors: [] }, { status: 500 }),
+      Response.redirect("https://example.invalid", 302),
+      new Response("not-json"),
+      new Response(new Uint8Array([0xff])),
+      new Response("", { headers: { "content-length": String(32 * 1024 * 1024 + 1) } }),
+    ];
+    for (const response of responses) {
+      let calls = 0;
+      const state = new CloudflareState({
+        accountId: ACCOUNT,
+        token: "operator-token",
+        fetcher: async () => {
+          calls += 1;
+          return response;
+        },
+      });
+      await expect(state.read("/workers/scripts", "script read")).rejects.toBeInstanceOf(
+        DeployError,
+      );
+      expect(calls).toBe(1);
+    }
+  });
+
+  test("does not retry a failed HTTP response even if its body transport breaks", async () => {
+    let calls = 0;
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async () => {
+        calls += 1;
+        return new Response(
+          new ReadableStream({
+            pull: () => {
+              throw new TypeError("body failed");
+            },
+          }),
+          { status: 500 },
+        );
+      },
+    });
+    await expect(state.read("/workers/scripts", "script read")).rejects.toBeInstanceOf(
+      CloudflareGetTransportError,
+    );
+    expect(calls).toBe(1);
+  });
   test("uses Pages-compatible page size and reads the complete deployment history", async () => {
     const deployments = Array.from({ length: 22 }, (_, index) => ({ id: `deployment-${index}` }));
     const requests: URL[] = [];
