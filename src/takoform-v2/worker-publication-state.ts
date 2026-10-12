@@ -736,7 +736,7 @@ ORDER BY kind, key`;
 
 const MAX_UNSTARTED_SUCCESSORS = 4;
 /** Bound on consecutive failed/none Operations read behind a committed generation. */
-const MAX_FAILED_TAIL = 8;
+export const MAX_FAILED_TAIL = 8;
 /**
  * The Resource's newest Operations all ended failed with effect none, so it is
  * still the Resource of its last observed generation (see committedView).

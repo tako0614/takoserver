@@ -25,6 +25,7 @@ import {
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { createV2Store } from "../src/takoform-v2/store.ts";
 import type { V2Backend, V2Execution, V2Form } from "../src/takoform-v2/types.ts";
+import { createWorkerEndpointForm } from "../src/takoform-v2/worker-endpoint-backend.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
 
 const BUNDLE_FORM_URL = "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/";
@@ -369,6 +370,7 @@ function fixture(distinctFormBackends = false, legacySchema = false) {
     db,
     sql,
     engine,
+    forms,
     store,
     reader,
     historicalBundle: {
@@ -399,6 +401,35 @@ type ServingInput = Parameters<ReturnType<typeof fixture>["reader"]["resolveCurr
   tolerateUnstartedSuccessors?: boolean;
   neverServedOperation?: (operationId: string) => boolean;
 };
+
+function engineWithEndpointAdmission(f: ReturnType<typeof fixture>) {
+  // Keep this fixture's graph-only effect backend, but use the production
+  // Endpoint admission hook through the real Engine acceptance transaction.
+  const admission = createWorkerEndpointForm({
+    targetKey: "fixture-workerd-root",
+    publicationState: f.reader,
+    ownerForWorker: () => {
+      throw new Error("admission test must not invoke a native owner");
+    },
+    assignHostname: () => "assigned.example.test",
+    observeTls: async (input) => ({ ...input, ready: true }),
+  }).prepareAdmission;
+  if (!admission) throw new Error("Endpoint admission hook is missing");
+  return createTakoformV2Engine({
+    sql: f.sql,
+    now: () => new Date(f.currentClock()),
+    replayWindowSeconds: 3600,
+    leaseMilliseconds: 60_000,
+    authorize: async () => true,
+    forms: {
+      ...f.forms,
+      [WORKER_ENDPOINT_FORM_URL]: {
+        ...f.forms[WORKER_ENDPOINT_FORM_URL],
+        prepareAdmission: admission,
+      },
+    },
+  });
+}
 
 /**
  * Tests describe the boot-recovery tolerance as a flag; production reaches it
@@ -724,6 +755,205 @@ test("a second Deployment UID cannot replace an active one and references are sa
         input: { form: WORKER_DEPLOYMENT_FORM_URL, space: "other", name: "wrong-space", spec },
       }),
     ).rejects.toMatchObject({ code: "dependency_conflict" });
+  } finally {
+    f.close();
+  }
+});
+
+for (const servingFetch of [true, false]) {
+  test(`Endpoint admission uses the committed Deployment after a failed update (${servingFetch ? "serving fetch" : "serving queue"})`, async () => {
+    const f = fixture();
+    try {
+      const { worker, bundle, version: fetchVersion } = await f.basics();
+      const queueVersion = await f.create(WORKER_VERSION_FORM_URL, "queue-version", {
+        worker: { resourceUid: worker.resourceUid },
+        bundle: { resourceUid: bundle.resourceUid },
+        handlers: ["queue"],
+      });
+      const deploymentSpec = (versionUid: string) => ({
+        worker: { resourceUid: worker.resourceUid },
+        versions: [{ workerVersion: { resourceUid: versionUid }, weight: 10_000 }],
+      });
+      const committedVersion = servingFetch ? fetchVersion : queueVersion;
+      const desiredVersion = servingFetch ? queueVersion : fetchVersion;
+      const deployment = await f.create(
+        WORKER_DEPLOYMENT_FORM_URL,
+        "deployment",
+        deploymentSpec(committedVersion.resourceUid),
+      );
+      const failedUpdate = await f.engine.acceptUpdate({
+        principal: "org-1",
+        key: "deployment-failed-update-key-0001",
+        uid: deployment.resourceUid,
+        expectedGeneration: 1,
+        spec: deploymentSpec(desiredVersion.resourceUid),
+      });
+      f.failing.add(failedUpdate.id);
+      expect(await f.engine.runNext()).toMatchObject({
+        id: failedUpdate.id,
+        status: "failed",
+        effect: "none",
+      });
+
+      const endpointEngine = engineWithEndpointAdmission(f);
+      const request = () =>
+        endpointEngine.acceptCreate({
+          principal: "org-1",
+          key: "endpoint-after-failed-deployment-key-0001",
+          input: {
+            form: WORKER_ENDPOINT_FORM_URL,
+            space: "prod",
+            name: "endpoint-after-failure",
+            spec: { worker: { resourceUid: worker.resourceUid } },
+          },
+        });
+      if (servingFetch) {
+        const endpoint = await request();
+        expect(await endpointEngine.runNext()).toMatchObject({
+          id: endpoint.id,
+          status: "succeeded",
+        });
+      } else {
+        await expect(request()).rejects.toMatchObject({
+          code: "dependency_conflict",
+          status: 409,
+        });
+        expect(
+          await endpointEngine.listResources({
+            principal: "org-1",
+            name: "endpoint-after-failure",
+            limit: 10,
+          }),
+        ).toEqual([]);
+        const repaired = await f.engine.acceptUpdate({
+          principal: "org-1",
+          key: "deployment-repaired-update-key-0001",
+          uid: deployment.resourceUid,
+          expectedGeneration: 2,
+          spec: deploymentSpec(fetchVersion.resourceUid),
+        });
+        expect(await f.engine.runNext()).toMatchObject({ id: repaired.id, status: "succeeded" });
+        expect(await request()).toMatchObject({ status: "queued" });
+      }
+    } finally {
+      f.close();
+    }
+  });
+}
+
+for (const failedTail of [8, 9]) {
+  test(`Endpoint admission respects the serving reader's ${failedTail}-failure tail bound`, async () => {
+    const f = fixture();
+    try {
+      const { worker, version } = await f.basics();
+      const spec = {
+        worker: { resourceUid: worker.resourceUid },
+        versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+      };
+      const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", spec);
+      for (let generation = 2; generation <= failedTail + 1; generation += 1) {
+        const update = await f.engine.acceptUpdate({
+          principal: "org-1",
+          key: `deployment-failed-tail-${generation}-key`,
+          uid: deployment.resourceUid,
+          expectedGeneration: generation - 1,
+          spec,
+        });
+        f.failing.add(update.id);
+        expect(await f.engine.runNext()).toMatchObject({
+          id: update.id,
+          status: "failed",
+          effect: "none",
+        });
+      }
+      const endpointEngine = engineWithEndpointAdmission(f);
+      const request = endpointEngine.acceptCreate({
+        principal: "org-1",
+        key: "endpoint-after-failed-tail-key-0001",
+        input: {
+          form: WORKER_ENDPOINT_FORM_URL,
+          space: "prod",
+          name: "endpoint-after-tail",
+          spec: { worker: { resourceUid: worker.resourceUid } },
+        },
+      });
+      if (failedTail === 8) {
+        expect(await request).toMatchObject({ status: "queued" });
+      } else {
+        await expect(request).rejects.toMatchObject({
+          code: "dependency_conflict",
+          status: 409,
+        });
+      }
+    } finally {
+      f.close();
+    }
+  });
+}
+
+test("Endpoint admission refuses a historical failed tail with a missing generation and duplicate successor", async () => {
+  const f = fixture();
+  try {
+    const { worker, version } = await f.basics();
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    // The schema permits this historical shape even though current Engine CAS
+    // does not create it: observed gen 1, no gen 2, two failed gen 3 rows.
+    // Both rows pass the old COUNT(*) = generation-gap test independently.
+    const duplicateIds = [crypto.randomUUID(), crypto.randomUUID()] as const;
+    for (const id of duplicateIds) {
+      f.db
+        .query(
+          `INSERT INTO tf_v2_operations
+            (id, resource_uid, principal, replay_key, request_fingerprint,
+             action, generation, status, effect, created_at, updated_at,
+             retain_until, backend_id, target_key, backend_key,
+             accepted_spec_json, error_code, error_message)
+           SELECT ?, resource_uid, principal, ?, request_fingerprint,
+             'update', 3, 'failed', 'none', created_at, updated_at,
+             retain_until, backend_id, target_key, ?,
+             accepted_spec_json, 'fixture_failed', 'No effect'
+           FROM tf_v2_operations WHERE id = ?`,
+        )
+        .run(id, `historical-replay-${id}`, `historical-backend-${id}`, deployment.id);
+    }
+    f.db
+      .query(
+        `UPDATE tf_v2_resources SET generation = 3, phase = 'error',
+          last_operation = ?, busy_operation = NULL WHERE uid = ?`,
+      )
+      .run(duplicateIds[1], deployment.resourceUid);
+    expect(
+      f.db
+        .query(
+          `SELECT generation FROM tf_v2_operations
+           WHERE resource_uid = ? AND generation > 1 ORDER BY generation, id`,
+        )
+        .all(deployment.resourceUid),
+    ).toEqual([{ generation: 3 }, { generation: 3 }]);
+
+    const endpointEngine = engineWithEndpointAdmission(f);
+    await expect(
+      endpointEngine.acceptCreate({
+        principal: "org-1",
+        key: "endpoint-invalid-history-key-0001",
+        input: {
+          form: WORKER_ENDPOINT_FORM_URL,
+          space: "prod",
+          name: "endpoint-invalid-history",
+          spec: { worker: { resourceUid: worker.resourceUid } },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "dependency_conflict", status: 409 });
+    expect(
+      await endpointEngine.listResources({
+        principal: "org-1",
+        name: "endpoint-invalid-history",
+        limit: 10,
+      }),
+    ).toEqual([]);
   } finally {
     f.close();
   }

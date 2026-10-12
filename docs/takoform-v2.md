@@ -470,6 +470,9 @@ active Deployment, not being deleted, whose weighted Versions all declare
 accepted without one settles `failed` with effect `none`
 (`worker_deployment_missing`), so it does not hold the Worker's later
 publications behind it.
+After a Deployment update fails with effect `none`, Endpoint admission checks
+the last successful observed generation's accepted spec, not the failed desired
+spec. A partial or unknown update is not treated as proof of that serving graph.
 The reader must recheck the graph and artifact digests after asynchronous reads.
 It must neither impersonate a completed Version Operation nor reacquire source
 URLs when held bytes are missing. Missing or changed custody remains unresolved.
