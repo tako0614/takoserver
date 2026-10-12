@@ -137,7 +137,11 @@ export class CloudflareState {
         new Request(url, {
           method: "GET",
           redirect: "error",
-          headers: { authorization: `Bearer ${this.#token}`, accept: "application/json" },
+          headers: {
+            authorization: `Bearer ${this.#token}`,
+            accept: "application/json",
+            connection: "close",
+          },
           signal: AbortSignal.timeout(15_000),
         }),
       );
@@ -393,7 +397,11 @@ export class CloudflareState {
         const response = await this.#fetcher(
           new Request(url, {
             method: "GET",
-            headers: { accept: "application/json", authorization: `Bearer ${token}` },
+            headers: {
+              accept: "application/json",
+              authorization: `Bearer ${token}`,
+              connection: "close",
+            },
             signal: AbortSignal.timeout(15_000),
           }),
         );
@@ -438,7 +446,11 @@ export class CloudflareState {
       response = await this.#fetcher(
         new Request(url, {
           method: "GET",
-          headers: { authorization: `Bearer ${this.#token}`, accept: "application/json" },
+          headers: {
+            authorization: `Bearer ${this.#token}`,
+            accept: "application/json",
+            connection: "close",
+          },
           signal: AbortSignal.timeout(15_000),
         }),
       );

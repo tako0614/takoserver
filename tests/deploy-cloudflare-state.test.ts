@@ -173,6 +173,7 @@ describe("strict paginated Cloudflare state", () => {
       `/client/v4/accounts/${ACCOUNT}/workers/dispatch/namespaces/takoserver-customers`,
     );
     expect(requests.every((request) => request.method === "GET")).toBe(true);
+    expect(requests.every((request) => request.headers.get("connection") === "close")).toBe(true);
   });
 
   test("never converts auth, unknown, false-result or malformed namespace responses to absence", async () => {
@@ -219,11 +220,13 @@ describe("strict paginated Cloudflare state", () => {
       { mode: 0o600 },
     );
     let detailReads = 0;
+    const auditRequests: Request[] = [];
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: deploymentToken,
       topologyAuditCredentialPath: auditCredentialPath,
       fetcher: async (request) => {
+        auditRequests.push(request);
         const url = new URL(request.url);
         const token = request.headers.get("authorization")?.slice("Bearer ".length);
         if (url.pathname.endsWith("/verify")) {
@@ -285,6 +288,10 @@ describe("strict paginated Cloudflare state", () => {
         "token lacks exact all-zone visibility",
       );
       expect(detailReads).toBe(2);
+      expect(auditRequests.length).toBeGreaterThan(0);
+      expect(auditRequests.every((request) => request.headers.get("connection") === "close")).toBe(
+        true,
+      );
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -713,6 +720,23 @@ describe("strict paginated Cloudflare state", () => {
     );
   });
 
+  test("reads independent healthy account state requests without pooled connections", async () => {
+    const requests: Request[] = [];
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "token",
+      fetcher: async (request) => {
+        requests.push(request);
+        return Response.json({ success: true, result: { subdomain: "account-owner" } });
+      },
+    });
+
+    expect(await state.workerAccountSubdomain()).toBe("account-owner");
+    expect(await state.workerAccountSubdomain()).toBe("account-owner");
+    expect(requests).toHaveLength(2);
+    expect(requests.every((request) => request.headers.get("connection") === "close")).toBe(true);
+  });
+
   test("uses the Zones API limit and reads default plus internal zone routes exhaustively", async () => {
     const requests: Request[] = [];
     const defaultZones = Array.from({ length: 51 }, (_, index) => ({ id: `zone-${index}` }));
@@ -761,6 +785,7 @@ describe("strict paginated Cloudflare state", () => {
       })),
     );
     expect(maxInFlightRoutes).toBeLessThanOrEqual(4);
+    expect(requests.every((request) => request.headers.get("connection") === "close")).toBe(true);
     const zoneRequests = requests.filter(
       (request) => new URL(request.url).pathname === "/client/v4/zones",
     );
