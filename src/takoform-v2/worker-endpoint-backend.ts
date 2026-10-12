@@ -134,6 +134,11 @@ function endpointAdmission(input: {
                     AND tail.generation > deployment.observed_generation
                     AND tail.generation <= deployment.generation) =
                   deployment.generation - deployment.observed_generation
+                AND (SELECT COUNT(DISTINCT tail.generation) FROM tf_v2_operations tail
+                  WHERE tail.resource_uid = deployment.uid
+                    AND tail.generation > deployment.observed_generation
+                    AND tail.generation <= deployment.generation) =
+                  deployment.generation - deployment.observed_generation
                 AND deployment.generation - deployment.observed_generation <= ${MAX_FAILED_TAIL}
                 AND NOT EXISTS (SELECT 1 FROM tf_v2_operations tail
                   WHERE tail.resource_uid = deployment.uid

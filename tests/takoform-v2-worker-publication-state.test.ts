@@ -891,6 +891,74 @@ for (const failedTail of [8, 9]) {
   });
 }
 
+test("Endpoint admission refuses a historical failed tail with a missing generation and duplicate successor", async () => {
+  const f = fixture();
+  try {
+    const { worker, version } = await f.basics();
+    const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    });
+    // The schema permits this historical shape even though current Engine CAS
+    // does not create it: observed gen 1, no gen 2, two failed gen 3 rows.
+    // Both rows pass the old COUNT(*) = generation-gap test independently.
+    const duplicateIds = [crypto.randomUUID(), crypto.randomUUID()] as const;
+    for (const id of duplicateIds) {
+      f.db
+        .query(
+          `INSERT INTO tf_v2_operations
+            (id, resource_uid, principal, replay_key, request_fingerprint,
+             action, generation, status, effect, created_at, updated_at,
+             retain_until, backend_id, target_key, backend_key,
+             accepted_spec_json, error_code, error_message)
+           SELECT ?, resource_uid, principal, ?, request_fingerprint,
+             'update', 3, 'failed', 'none', created_at, updated_at,
+             retain_until, backend_id, target_key, ?,
+             accepted_spec_json, 'fixture_failed', 'No effect'
+           FROM tf_v2_operations WHERE id = ?`,
+        )
+        .run(id, `historical-replay-${id}`, `historical-backend-${id}`, deployment.id);
+    }
+    f.db
+      .query(
+        `UPDATE tf_v2_resources SET generation = 3, phase = 'error',
+          last_operation = ?, busy_operation = NULL WHERE uid = ?`,
+      )
+      .run(duplicateIds[1], deployment.resourceUid);
+    expect(
+      f.db
+        .query(
+          `SELECT generation FROM tf_v2_operations
+           WHERE resource_uid = ? AND generation > 1 ORDER BY generation, id`,
+        )
+        .all(deployment.resourceUid),
+    ).toEqual([{ generation: 3 }, { generation: 3 }]);
+
+    const endpointEngine = engineWithEndpointAdmission(f);
+    await expect(
+      endpointEngine.acceptCreate({
+        principal: "org-1",
+        key: "endpoint-invalid-history-key-0001",
+        input: {
+          form: WORKER_ENDPOINT_FORM_URL,
+          space: "prod",
+          name: "endpoint-invalid-history",
+          spec: { worker: { resourceUid: worker.resourceUid } },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "dependency_conflict", status: 409 });
+    expect(
+      await endpointEngine.listResources({
+        principal: "org-1",
+        name: "endpoint-invalid-history",
+        limit: 10,
+      }),
+    ).toEqual([]);
+  } finally {
+    f.close();
+  }
+});
+
 test("fresh SQLite handle preserves accepted claim and sealed graph; this is not an OS restart", async () => {
   const f = fixture();
   try {
