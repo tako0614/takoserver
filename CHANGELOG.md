@@ -6,7 +6,7 @@ released in lockstep with other Takos products. Numbers in parentheses are pull
 requests in `tako0614/takoserver`. Each section is published verbatim as the
 GitHub Release notes of its tag (see [docs/release.md](docs/release.md)).
 
-## [2.0.0-rc.1] - 2026-10-11
+## [2.0.0-rc.1] - 2026-10-12
 
 The first release candidate of Takoserver 2.0.0, published as a GitHub
 pre-release so that operators can try the v2 install path before 2.0.0 is
