@@ -38,6 +38,7 @@ export const API_KEY_SCOPES = [
   "resources:write",
   "wallet:read",
   "wallet:write",
+  "payments:write",
   "reseller:write",
   "usage:read",
   "usage:write",

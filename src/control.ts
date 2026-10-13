@@ -42,6 +42,7 @@ import {
   RuntimeInputPreparationError,
 } from "./runtime-input-preparations.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
+import { type SubscriptionPayments, stripeBillingFailure } from "./stripe-billing.ts";
 import { formSupportProfile } from "./takoform/forms.ts";
 import { isSpaceId } from "./takoform/space-id.ts";
 import type { OperationListing, ResourceListing } from "./takoform/store.ts";
@@ -188,6 +189,8 @@ export interface CreateControlRoutesOptions {
    * key to authorize one, and then the route is not served at all.
    */
   readonly operatorPaymentsReconcile?: (assertion: string) => Promise<FundingReconcileReport>;
+  readonly subscriptions?: SubscriptionPayments;
+  readonly creditFunding?: PaymentEvents["creditFunding"];
   readonly clock: Clock;
   /** Exact browser console origin allowed to carry the HttpOnly session cookie. */
   readonly consoleOrigin?: string;
@@ -784,6 +787,10 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         organizationId,
         settlementProof: text(body.settlementProof),
       });
+      if (options.creditFunding) {
+        await options.creditFunding({ ...settled, organizationId });
+        return Response.json({ wallet: wireWallet(await ledger.wallet(organizationId)) });
+      }
       const credited = await ledger.fund({
         organizationId,
         fundingRef: settled.fundingRef,
@@ -815,6 +822,47 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       // and there is nothing a caller could usefully say here anyway.
       const started = await options.checkout.begin({ organizationId, amountMinor });
       return Response.json({ checkout: started }, { status: 201 });
+    }
+
+    const subscription = /^\/v1\/organizations\/([^/]+)\/payments\/subscription$/u.exec(
+      url.pathname,
+    );
+    if (subscription && ["GET", "POST", "PATCH"].includes(request.method)) {
+      const organizationId = segment(subscription[1]);
+      await scoped(
+        request,
+        organizationId,
+        request.method === "GET" ? "wallet:read" : "payments:write",
+      );
+      if (!options.subscriptions) controlError("not_found", 404);
+      if (request.method === "GET")
+        return Response.json({
+          subscription: await options.subscriptions.read(organizationId),
+          planTable: options.subscriptions.planTable,
+        });
+      const body = await jsonObject(request);
+      if (request.method === "POST") {
+        exactKeys(body, ["reference", "planKey"]);
+        return Response.json(
+          {
+            checkout: await options.subscriptions.begin({
+              organizationId,
+              reference: text(body.reference),
+              planKey: text(body.planKey),
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      exactKeys(body, ["reference", "cancelAtPeriodEnd"]);
+      if (typeof body.cancelAtPeriodEnd !== "boolean") controlError("invalid_argument", 400);
+      return Response.json({
+        subscription: await options.subscriptions.change({
+          organizationId,
+          reference: text(body.reference),
+          cancelAtPeriodEnd: body.cancelAtPeriodEnd,
+        }),
+      });
     }
 
     if (request.method === "GET" && url.pathname === "/v1/catalog") {
@@ -1573,6 +1621,8 @@ export function controlErrorResponse(error: unknown): Response {
 }
 
 function classify(error: unknown): { code: string; status: number } {
+  const billingFailure = stripeBillingFailure(error);
+  if (billingFailure) return { code: billingFailure.code, status: billingFailure.status };
   if (error instanceof ControlError) return { code: error.code, status: error.status };
   if (error instanceof ArtifactConsumerRepairError) {
     return { code: error.code, status: error.status };
@@ -1933,6 +1983,8 @@ function wireWallet(wallet: Wallet) {
     settledMicros: String(wallet.settledMicros),
     heldMicros: String(wallet.heldMicros),
     availableMicros: String(wallet.availableMicros),
+    refundReceivableMicros: String(wallet.refundReceivableMicros),
+    frozenMicros: String(wallet.frozenMicros),
     entries: wallet.entries.map((entry) => ({
       id: entry.id,
       organizationId: entry.organizationId,

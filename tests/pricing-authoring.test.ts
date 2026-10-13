@@ -337,7 +337,7 @@ describe("pricing authoring preview", () => {
         },
       );
       expect(success.status).toBe(0);
-      expect(JSON.parse(success.stdout).mode).toBe("preview");
+      expect(JSON.parse(success.stdout)).toEqual(compilePricingAuthoring(authoring()));
 
       const invalidPath = join(directory, "invalid.json");
       const malformedWithSecret =
