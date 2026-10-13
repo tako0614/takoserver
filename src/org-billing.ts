@@ -716,7 +716,7 @@ export function createOrgBilling(options: {
         if (!decoded) orgBillingFail("invalid_cursor", 400);
         try {
           const value: unknown = JSON.parse(
-            new TextDecoder("utf-8", { fatal: true }).decode(decoded),
+            new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(decoded),
           );
           if (
             !Array.isArray(value) ||
