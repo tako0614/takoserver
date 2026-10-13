@@ -14,7 +14,13 @@ import {
   OPERATOR_PAYMENTS_RECONCILE_SINGLE_USE_NAMESPACE,
 } from "../src/operator-credentials.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
+import type {
+  FundingReconcileReport,
+  PaymentEventContext,
+  PaymentEvents,
+} from "../src/payment-events.ts";
 import { resolvePayment } from "../src/payment-setup.ts";
+import type { Sql } from "../src/ports.ts";
 import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 /**
@@ -135,10 +141,26 @@ async function host(
     readonly sessions?: readonly Session[];
     readonly stripe?: boolean;
     readonly operatorKey?: boolean;
+    /** The Bun Host shares one pass; a Worker composition leaves this unset. */
+    readonly share?: boolean;
+    /** Replaces the processor's pass, to hold one open forever. */
+    readonly paymentEvents?: (context: PaymentEventContext) => PaymentEvents;
+    /** Fails every write to the single-use replay cache. */
+    readonly replayCacheDown?: boolean;
   } = {},
 ) {
   const stripe = stripeFake(options.sessions ?? []);
-  const sql = createEphemeralSql();
+  const base = createEphemeralSql();
+  const sql: Sql = options.replayCacheDown
+    ? {
+        query: (statement, parameters) => base.query(statement, parameters),
+        batch: (statements) => base.batch(statements),
+        run: (statement, parameters) =>
+          statement.includes("runtime_grant_replays")
+            ? Promise.reject(new Error("replay cache unavailable"))
+            : base.run(statement, parameters),
+      }
+    : base;
   await sql.run("INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)", [
     ORG,
     "Funded",
@@ -168,7 +190,12 @@ async function host(
       },
     },
     ...(payment.checkout ? { checkout: payment.checkout } : {}),
-    ...(payment.events ? { paymentEvents: payment.events } : {}),
+    ...(options.paymentEvents
+      ? { paymentEvents: options.paymentEvents }
+      : payment.events
+        ? { paymentEvents: payment.events }
+        : {}),
+    ...(options.share ? { shareReconcilePass: true } : {}),
     ...(options.operatorKey === false
       ? {}
       : {
@@ -292,13 +319,14 @@ describe("operator payment reconcile route", () => {
     ]);
   });
 
-  test("a pass that cannot read Stripe fails, credits nothing and spends its assertion", async () => {
+  test("a pass that cannot read Stripe is retryable, credits nothing and spends its assertion", async () => {
     const h = await host({ sessions: [paid(ORG, "cs_route_outage", 600, 60)] });
     h.stripe.state.unavailable = true;
     const assertion = await sign();
     const failed = await h.reconcile(assertion);
-    expect(failed.status).toBe(500);
-    expect(errorCode(failed.text)).toBe("internal_error");
+    // The same retryable answer the webhook gives for the same outage.
+    expect(failed.status).toBe(503);
+    expect(errorCode(failed.text)).toBe("unavailable");
     expect(failed.text).not.toContain(STRIPE_KEY);
     expect(await h.balance(ORG)).toBe(0);
     h.stripe.state.unavailable = false;
@@ -419,8 +447,8 @@ describe("operator payment reconcile route", () => {
     }
   });
 
-  test("a request arriving mid-pass joins it instead of reading Stripe again", async () => {
-    const h = await host({ sessions: [paid(ORG, "cs_route_shared", 800, 60)] });
+  test("on the Bun Host a request arriving mid-pass joins it instead of reading Stripe again", async () => {
+    const h = await host({ share: true, sessions: [paid(ORG, "cs_route_shared", 800, 60)] });
     h.stripe.holdListings();
     // The scheduled pass is reading Stripe when both operator requests arrive.
     const scheduled = h.app.reconcilePayments();
@@ -444,6 +472,75 @@ describe("operator payment reconcile route", () => {
     // Once that pass has finished, the next request starts a new one.
     expect((await h.reconcile(await sign())).status).toBe(200);
     expect(h.stripe.listings).toHaveLength(2);
+  });
+});
+
+describe("a pass that never settles", () => {
+  const REPORT: FundingReconcileReport = {
+    examined: 0,
+    credited: 0,
+    alreadyCredited: 0,
+    unknownOrganization: 0,
+    skipped: {},
+    truncated: false,
+    creditedFundingRefs: [],
+    uncredited: [],
+  };
+
+  /** The first pass hangs forever, as one whose request was canceled mid-I/O can. */
+  function stuckFirstPass() {
+    let passes = 0;
+    return {
+      passes: () => passes,
+      paymentEvents: (): PaymentEvents => ({
+        reconcile() {
+          passes += 1;
+          return passes === 1
+            ? new Promise<FundingReconcileReport>(() => {})
+            : Promise.resolve(REPORT);
+        },
+      }),
+    };
+  }
+
+  async function settlesWithin<T>(work: Promise<T>, milliseconds = 2_000): Promise<T | "hung"> {
+    return await Promise.race([
+      work,
+      new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), milliseconds)),
+    ]);
+  }
+
+  test("does not block a later Worker invocation, from the route or the schedule", async () => {
+    const stuck = stuckFirstPass();
+    const h = await host({ paymentEvents: stuck.paymentEvents });
+    // The canceled request's pass: started, and never settling.
+    void h.app.reconcilePayments();
+    const route = await settlesWithin(h.reconcile(await sign()));
+    expect(route === "hung" ? "hung" : route.status).toBe(200);
+    expect(await settlesWithin(h.app.reconcilePayments())).toEqual(REPORT);
+    expect(stuck.passes()).toBe(3);
+  });
+
+  test("the Bun Host, which may share, still joins its own pass", async () => {
+    const stuck = stuckFirstPass();
+    const h = await host({ share: true, paymentEvents: stuck.paymentEvents });
+    void h.app.reconcilePayments();
+    expect(await settlesWithin(h.app.reconcilePayments(), 100)).toBe("hung");
+    expect(stuck.passes()).toBe(1);
+  });
+});
+
+describe("a replay cache that cannot record the assertion", () => {
+  test("fails closed and runs no pass", async () => {
+    const h = await host({
+      replayCacheDown: true,
+      sessions: [paid(ORG, "cs_route_unrecorded", 400, 60)],
+    });
+    const response = await h.reconcile(await sign());
+    expect(response.status).toBe(500);
+    expect(errorCode(response.text)).toBe("internal_error");
+    expect(h.stripe.listings).toEqual([]);
+    expect(await h.balance(ORG)).toBe(0);
   });
 });
 

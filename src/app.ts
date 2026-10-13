@@ -139,6 +139,13 @@ export interface AppPorts {
    * is not served.
    */
   readonly operatorPaymentsReconcile?: OperatorPaymentsReconcileVerifier | undefined;
+  /**
+   * Lets concurrent callers join one in-flight reconcile pass. Only a
+   * long-lived process whose pending I/O outlives the request that started it
+   * may set this (the Bun Host). A Worker leaves it unset, so no invocation
+   * ever awaits I/O begun in another request's context.
+   */
+  readonly shareReconcilePass?: boolean | undefined;
   /** What data costs here. Absent means measured and not charged. */
   readonly meteringRates?: MeteringRates | undefined;
   /** OpenAI-compatible inference backend. Absent keeps the AI route unavailable. */
@@ -250,7 +257,7 @@ export interface App {
   tickTakoformV2(): Promise<V2Operation | null>;
   /**
    * Credits recently settled payments nobody presented; null where payment is
-   * off. One pass runs at a time in a process, and a concurrent caller shares it.
+   * off. With `shareReconcilePass`, a concurrent caller joins the pass in flight.
    */
   reconcilePayments(): Promise<FundingReconcileReport | null>;
 }
@@ -391,16 +398,23 @@ export function buildApp(ports: AppPorts): App {
     }),
     creditedFunding: (fundings) => ledger.fundedReferences(fundings),
   });
-  // One pass at a time in this process: the scheduled pass and the operator
-  // route share it, and a caller arriving mid-pass joins the pass already
-  // reading the processor instead of starting a second. Passes elsewhere stay
-  // harmless, because each funding reference credits once.
+  // Where the composition allows it (the Bun Host), one pass at a time: the
+  // timer and the operator route share it, and a caller arriving mid-pass
+  // joins the pass already reading the processor instead of starting a
+  // second. A Worker never shares, because I/O started in one request's
+  // context may never settle once that request is canceled, and a later
+  // invocation that joined it would hang with it. Unshared or concurrent
+  // passes stay harmless, because each funding reference credits once.
   let reconcileInFlight: Promise<FundingReconcileReport> | null = null;
   const reconcilePayments = async (): Promise<FundingReconcileReport | null> => {
     if (!paymentEvents) return null;
-    reconcileInFlight ??= paymentEvents.reconcile().finally(() => {
-      reconcileInFlight = null;
-    });
+    if (!ports.shareReconcilePass) return await paymentEvents.reconcile();
+    if (!reconcileInFlight) {
+      const pass: Promise<FundingReconcileReport> = paymentEvents.reconcile().finally(() => {
+        if (reconcileInFlight === pass) reconcileInFlight = null;
+      });
+      reconcileInFlight = pass;
+    }
     return await reconcileInFlight;
   };
   const singleUseCredentials = createSingleUseCredentials(ports.sql, clock);

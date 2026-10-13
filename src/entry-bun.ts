@@ -1395,6 +1395,9 @@ try {
           }),
         }
       : {}),
+    // One process owns every pass here, and a pass outlives the request that
+    // started it, so the timer and the operator route may share one.
+    shareReconcilePass: true,
     publicOrigin,
     ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
       ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }

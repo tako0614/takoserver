@@ -540,8 +540,10 @@ assertion signed by the key that verifies operator sign-in
 legacy/generated operator key); an identity-only key suffices, because the
 pass credits only what Stripe reports as settled. It names this Host's
 origin, lives a minute and runs one pass; no session or API key can start it.
-A pass already running in the same process is joined rather than repeated,
-and a repeat credits nothing twice:
+A repeat credits nothing twice, and on a Bun Host a pass already running is
+joined rather than repeated (a Worker runs one pass per request). If Stripe
+cannot be read the answer is 503 `unavailable`; sign a fresh assertion to
+retry:
 
 ```
 assertion=$(TAKOSERVER_OPERATOR_KEY=… TAKOSERVER_PUBLIC_ORIGIN=https://api.example.com \

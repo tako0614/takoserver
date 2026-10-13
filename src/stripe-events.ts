@@ -420,11 +420,20 @@ export function createStripeEvents(
           truncated = true;
           break;
         }
-        const listed = await options.client.listCheckoutSessions({
-          status: "complete",
-          limit: RECONCILE_PAGE_SIZE,
-          ...(startingAfter === undefined ? {} : { startingAfter }),
-        });
+        let listed: Awaited<ReturnType<StripeClient["listCheckoutSessions"]>>;
+        try {
+          listed = await options.client.listCheckoutSessions({
+            status: "complete",
+            limit: RECONCILE_PAGE_SIZE,
+            ...(startingAfter === undefined ? {} : { startingAfter }),
+          });
+        } catch (error) {
+          // Like the webhook: a processor that cannot be read is retryable.
+          if (error instanceof StripeSettlementError && error.code === "unavailable") {
+            throw new PaymentEventError("unavailable");
+          }
+          throw error;
+        }
         const fundable: CheckoutSessionFunding[] = [];
         for (const session of listed.sessions) {
           if (typeof session.created !== "number" || typeof session.id !== "string") {

@@ -748,7 +748,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       description:
         "Runs the same pass as the scheduled reconcile and returns its report. Served only where Stripe funding is configured and an operator identity key is present. " +
         "The credential is a `payments-reconcile` assertion signed by the operator identity key: it names this Host's public origin as `aud`, carries a `jti` nonce and exactly the claims `purpose`, `aud`, `jti`, `iat` and `exp`, lives at most sixty seconds and is spent before the pass runs. " +
-        "No session or API key can run it. A repeat credits nothing twice, because every path credits through the same `stripe:<session id>` funding reference; a request arriving while a pass is already running in the same process joins that pass.",
+        "No session or API key can run it. A repeat credits nothing twice, because every path credits through the same `stripe:<session id>` funding reference. On a Bun Host a request arriving while a pass is running joins that pass; a Worker runs one pass per request.",
       security: [],
       requestBody: {
         required: true,
@@ -773,7 +773,10 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
         ),
         "404": errorResponse("Payment reconcile or an operator identity key is not configured"),
         "500": errorResponse(
-          "The pass failed, for example because Stripe could not be read; the assertion is spent",
+          "Internal failure, for example the assertion could not be recorded as spent; the pass did not run",
+        ),
+        "503": errorResponse(
+          "Stripe could not be read; retryable with a fresh assertion, because this one is spent",
         ),
       },
     },
