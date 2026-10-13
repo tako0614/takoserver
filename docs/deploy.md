@@ -153,6 +153,30 @@ a canonical Cron profile; the canonical owners read exactly 0088 otherwise.
 bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0088
 ```
 
+#### Staging D1 through 0092 (staging-only `v2-0092`)
+
+`--fresh-lineage=v2-0092` is the same staging-only profile one migration
+further: the audited 0001–0092 bytes, ending in `0092_org_wallet_lifecycle.sql`
+(the Organization wallet hold, usage, grant and tariff tables), with the fixed
+digest `sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2`.
+Choose it for a staging Host whose target sets `billingConfig`. Publication
+refuses `billingConfig` until the D1 has 0092, so on a 0091 staging D1 the
+Organization wallet API stays off. It behaves like `v2-0091` in every other
+respect:
+
+- Production fresh init refuses it.
+- It only creates a new `takoserver-i-<generation>` D1.
+- Applying it requires `TAKOSERVER_DEPLOY_TARGET_PRODUCTION`.
+- The data proof reads 92 ledger rows plus the same two seeds. 0090 to 0092
+  write no rows.
+- `takoformV2.storageLineage: "v2-0092"` selects it on a target.
+- An operator-provisioned staging pair is accepted on either staging-only
+  lineage, under the same conditions.
+
+The procedure in the next section is written for `v2-0091` and applies to
+either profile. Pass `--fresh-lineage=v2-0092` instead, and expect
+`complete-0092` where it says `complete-0091`.
+
 #### Staging D1 through 0091 (staging-only `v2-0091`)
 
 `--fresh-lineage=v2-0091` is the fourth explicit selector on this surface (its third fixed v2 D1 payload): the audited

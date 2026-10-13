@@ -267,11 +267,13 @@ export function workerSchemaAllowsPending(
       resolve(sourceRepositoryRoot, "migrations"),
     );
     const count =
-      target.takoformV2.storageLineage === "v2-0091"
-        ? 91
-        : target.takoformV2.storageLineage === "v2-0089"
-          ? 89
-          : 88;
+      target.takoformV2.storageLineage === "v2-0092"
+        ? 92
+        : target.takoformV2.storageLineage === "v2-0091"
+          ? 91
+          : target.takoformV2.storageLineage === "v2-0089"
+            ? 89
+            : 88;
     return (
       JSON.stringify(migrations.local) === JSON.stringify(source.names) &&
       JSON.stringify(migrations.applied) === JSON.stringify(source.names.slice(0, count))

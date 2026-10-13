@@ -446,8 +446,9 @@ const PRODUCTION_D1 = {
   databaseId: "85c5a15d-a80f-42fe-a907-7ec0d86e008e",
 } as const;
 
-for (const lineage of ["v2-0088", "v2-0089", "v2-0091"] as const) {
-  const count = lineage === "v2-0091" ? 91 : lineage === "v2-0089" ? 89 : 88;
+for (const lineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092"] as const) {
+  const count =
+    lineage === "v2-0092" ? 92 : lineage === "v2-0091" ? 91 : lineage === "v2-0089" ? 89 : 88;
   test(`fresh selected ${lineage} payload serves artifact Forms with no local schema closure`, async () => {
     const artifacts = await Promise.all(
       CASES.map(async ({ slug, path, mediaType, contents }) => {
@@ -649,7 +650,7 @@ for (const lineage of ["v2-0088", "v2-0089", "v2-0091"] as const) {
         d1: { databaseName: STAGING, databaseId: DATABASE_ID },
         r2: { bucketName: STAGING },
       } satisfies DeployTarget;
-      if (lineage === "v2-0091") {
+      if (lineage === "v2-0091" || lineage === "v2-0092") {
         expect(
           await verifyFreshV2IntegrationStorageTarget(stagingTarget, "integration", lineage, {
             provider: stagingProvider as never,
@@ -657,7 +658,7 @@ for (const lineage of ["v2-0088", "v2-0089", "v2-0091"] as const) {
           }),
         ).toMatchObject({
           generation: STAGING,
-          freshLineage: "v2-0091",
+          freshLineage: lineage,
           d1: { databaseName: STAGING, databaseId: DATABASE_ID },
           migrationDigest: result.migrationDigest,
         });

@@ -10,8 +10,10 @@ import {
 } from "../scripts/deploy/integration-storage-generation.ts";
 import {
   projectFreshIntegrationV2MigrationArtifact0091,
+  projectFreshIntegrationV2MigrationArtifact0092,
   readCurrentAuditedMigrationSourceArtifact,
   readSealedFreshIntegrationV2MigrationArtifact0091,
+  readSealedFreshIntegrationV2MigrationArtifact0092,
 } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 
@@ -77,7 +79,7 @@ function sourceRun(imports: string[]): IntegrationStorageGenerationProcess {
   };
 }
 
-describe("staging-only v2-0091 D1 profile", () => {
+describe("staging-only v2-0091 and v2-0092 D1 profiles", () => {
   test("projects exactly the fixed audited 0001-0091 payload", () => {
     const projected = projectFreshIntegrationV2MigrationArtifact0091(
       readCurrentAuditedMigrationSourceArtifact(MIGRATIONS),
@@ -291,13 +293,13 @@ describe("staging-only v2-0091 D1 profile", () => {
     expect(new TextDecoder().decode(missing.stderr)).toContain(missingPath);
   });
 
-  test("an operator staging pair stands in for a generated pair only on the v2-0091 lineage", () => {
+  test("an operator staging pair stands in for a generated pair only on a staging-only lineage", () => {
     const config = JSON.stringify({
       documentation: "https://docs.example.test/v2",
       authenticationDocumentation: "https://docs.example.test/v2/authentication",
     });
     const staging = "takoserver-staging-throwaway-0091-example";
-    const pair = (name: string, storageLineage?: "v2-0088" | "v2-0089" | "v2-0091") =>
+    const pair = (name: string, storageLineage?: "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092") =>
       ({
         ...target,
         d1: { databaseName: name, databaseId: "00000000-0000-4000-8000-000000000091" },
@@ -305,6 +307,7 @@ describe("staging-only v2-0091 D1 profile", () => {
         ...(storageLineage === undefined ? {} : { takoformV2: { config, storageLineage } }),
       }) satisfies DeployTarget;
     expect(isGeneratedIntegrationStorageTarget(pair(staging, "v2-0091"), "integration")).toBe(true);
+    expect(isGeneratedIntegrationStorageTarget(pair(staging, "v2-0092"), "integration")).toBe(true);
     for (const lineage of [undefined, "v2-0088", "v2-0089"] as const) {
       expect(isGeneratedIntegrationStorageTarget(pair(staging, lineage), "integration")).toBe(
         false,
@@ -326,5 +329,64 @@ describe("staging-only v2-0091 D1 profile", () => {
       ),
     ).toBe(false);
     expect(isGeneratedIntegrationStorageTarget(pair(staging, "v2-0091"), "production")).toBe(false);
+  });
+
+  test("the staging-only v2-0092 profile is exactly the fixed 0001-0092 payload", () => {
+    const projected = projectFreshIntegrationV2MigrationArtifact0092(
+      readCurrentAuditedMigrationSourceArtifact(MIGRATIONS),
+    );
+    expect(projected.names).toHaveLength(92);
+    expect(projected.names.at(-1)).toBe("0092_org_wallet_lifecycle.sql");
+    expect(projected.digest).toBe(
+      "sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2",
+    );
+    // The 0091 profile stays pinned to its own 91 files despite the newer tail.
+    expect(
+      projectFreshIntegrationV2MigrationArtifact0091(
+        readCurrentAuditedMigrationSourceArtifact(MIGRATIONS),
+      ).digest,
+    ).toBe(DIGEST);
+    const seal = (directory: string) => {
+      mkdirSync(directory, { recursive: true });
+      for (const file of projected.files) cpSync(file.path, join(directory, file.name));
+    };
+    const sealed = join(ROOT, "sealed-0092");
+    seal(sealed);
+    expect(readSealedFreshIntegrationV2MigrationArtifact0092(sealed).digest).toBe(projected.digest);
+    const extra = join(ROOT, "extra-0092");
+    seal(extra);
+    writeFileSync(join(extra, "0093_future.sql"), "CREATE TABLE future_only (id TEXT);\n");
+    expect(() => readSealedFreshIntegrationV2MigrationArtifact0092(extra)).toThrow(
+      "exactly 0001-0092",
+    );
+    const missing = join(ROOT, "missing-0092");
+    seal(missing);
+    rmSync(join(missing, "0092_org_wallet_lifecycle.sql"));
+    expect(() => readSealedFreshIntegrationV2MigrationArtifact0092(missing)).toThrow(
+      "exactly 0001-0092",
+    );
+  });
+
+  test("applying v2-0092 without the production target is refused before any provider call", async () => {
+    let providerCalls = 0;
+    const trap = async (): Promise<never> => {
+      providerCalls += 1;
+      throw new Error("no provider call is allowed");
+    };
+    await expect(
+      runIntegrationStorageGeneration({ ...invocation, freshLineage: "v2-0092" }, target, {
+        provider: {
+          listD1: trap,
+          getD1: trap,
+          createD1: trap,
+          listR2: trap,
+          getR2: trap,
+          createR2: trap,
+        },
+        run: sourceRun([]),
+        review: "test-review",
+      }),
+    ).rejects.toThrow("staging-only v2-0092 profile requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION");
+    expect(providerCalls).toBe(0);
   });
 });

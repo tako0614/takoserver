@@ -37,10 +37,10 @@ import type { DeployEnvironment } from "./qualification.ts";
  */
 /**
  * Explicit fresh integration v2 storage payloads beyond the historical 0075
- * default. Every v2 Worker target is integration-only, so `v2-0091` (through
+ * default. Every v2 Worker target is integration-only, so `v2-0091`/`v2-0092` (through
  * the Stripe event table) is a staging-only lineage.
  */
-export type TakoformV2StorageLineage = "v2-0088" | "v2-0089" | "v2-0091";
+export type TakoformV2StorageLineage = "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092";
 
 /** The exact fresh payload a v2 target's generated storage must carry. */
 export function takoformV2StorageLineage(
@@ -1450,10 +1450,11 @@ function takoformV2(value: unknown): NonNullable<DeployTarget["takoformV2"]> {
     value.storageLineage !== undefined &&
     value.storageLineage !== "v2-0088" &&
     value.storageLineage !== "v2-0089" &&
-    value.storageLineage !== "v2-0091"
+    value.storageLineage !== "v2-0091" &&
+    value.storageLineage !== "v2-0092"
   ) {
     throw preflightError(
-      "deploy target `takoformV2.storageLineage` must be v2-0088, v2-0089 or v2-0091 when set",
+      "deploy target `takoformV2.storageLineage` must be v2-0088, v2-0089, v2-0091 or v2-0092 when set",
     );
   }
   return {

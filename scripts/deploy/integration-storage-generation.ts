@@ -39,12 +39,14 @@ import {
 import {
   projectApplyQualifiedMigrationArtifact,
   projectFreshIntegrationV2MigrationArtifact0091,
+  projectFreshIntegrationV2MigrationArtifact0092,
   projectFreshProductionV2MigrationArtifact,
   projectFreshProductionV2MigrationArtifact0089,
   projectFreshV2ArtifactMigrationArtifact,
   readCurrentAuditedMigrationSourceArtifact,
   readSealedApplyQualifiedMigrationArtifact,
   readSealedFreshIntegrationV2MigrationArtifact0091,
+  readSealedFreshIntegrationV2MigrationArtifact0092,
   readSealedFreshProductionV2MigrationArtifact,
   readSealedFreshProductionV2MigrationArtifact0089,
   readSealedFreshV2ArtifactMigrationArtifact,
@@ -89,9 +91,10 @@ class MigrationApplyError extends DeployError {
  * brand-new generation that already carries 0081 private inputs and the 0088
  * drain (or 0089 Cron) schema, so a freshly bootstrapped Host never needs the
  * in-place 0066→0088 wave and its historical predecessor-source proofs.
- * `v2-0091` is the staging-only profile through the Stripe event table: no
- * production surface offers it, and its apply also requires the production
- * target so the production D1 identity is refused explicitly.
+ * `v2-0091` (through the Stripe event table) and `v2-0092` (through the
+ * Organization wallet lifecycle tables) are the staging-only profiles: no
+ * production surface offers them, and their apply also requires the
+ * production target so the production D1 identity is refused explicitly.
  */
 export type IntegrationFreshLineage = "v2-artifacts-0075" | FreshV2D1Lineage;
 
@@ -100,7 +103,14 @@ const INTEGRATION_FRESH_LINEAGES: readonly IntegrationFreshLineage[] = [
   "v2-0088",
   "v2-0089",
   "v2-0091",
+  "v2-0092",
 ];
+
+/** Profiles no production surface offers; their apply requires the production target. */
+export const STAGING_ONLY_LINEAGES: ReadonlySet<IntegrationFreshLineage> = new Set([
+  "v2-0091",
+  "v2-0092",
+]);
 
 /** The exact production D1 a staging generation must never be. */
 export interface ProductionD1Identity {
@@ -120,8 +130,8 @@ const GENERATED_D1_NAME = /^takoserver-i-[0-9a-f]{32}$/u;
 /**
  * An operator-provisioned staging pair: one D1 and one R2 bucket sharing the
  * name `takoserver-staging-<label>`. It stands in for a generated pair only on
- * a target that selects the staging-only `v2-0091` lineage, and only for the
- * read-side proofs (identity readback, the exact 0001-0091 ledger and
+ * a target that selects a staging-only lineage (`v2-0091` or `v2-0092`), and only
+ * for the read-side proofs (identity readback, that lineage's exact ledger and
  * canonical schema, and the empty-data proof at first publication). This
  * surface still creates nothing but `takoserver-i-<generation>`, and a
  * production-named database never qualifies.
@@ -240,7 +250,7 @@ export interface IntegrationStorageGenerationOptions {
   readonly freshV2DataReader?: FreshV2DataReader;
   /**
    * The production target's D1, read from `TAKOSERVER_DEPLOY_TARGET_PRODUCTION`.
-   * Optional in general, required to apply the staging-only `v2-0091` profile.
+   * Optional in general, required to apply a staging-only profile (`v2-0091`, `v2-0092`).
    */
   readonly productionD1?: ProductionD1Identity;
 }
@@ -304,11 +314,12 @@ export async function runIntegrationStorageGeneration(
   assertStagingD1NotProduction({ databaseName: names.databaseName }, options.productionD1);
   if (
     invocation.action === "apply" &&
-    invocation.freshLineage === "v2-0091" &&
+    invocation.freshLineage !== undefined &&
+    STAGING_ONLY_LINEAGES.has(invocation.freshLineage) &&
     options.productionD1 === undefined
   ) {
     throw preflightError(
-      "the staging-only v2-0091 profile requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION, " +
+      `the staging-only ${invocation.freshLineage} profile requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION, ` +
         "so the production D1 is refused by its exact identity",
     );
   }
@@ -500,7 +511,8 @@ function generatedStorageTarget(
   const generated = /^takoserver-i-([0-9a-f]{32})$/u.exec(databaseName);
   const stagingPair =
     generated === null &&
-    target.takoformV2?.storageLineage === "v2-0091" &&
+    target.takoformV2?.storageLineage !== undefined &&
+    STAGING_ONLY_LINEAGES.has(target.takoformV2.storageLineage) &&
     STAGING_PAIR_NAME.test(databaseName) &&
     !PRODUCTION_D1_NAME.test(databaseName);
   if (
@@ -759,6 +771,8 @@ function selectedSourceArtifact(
       return projectFreshProductionV2MigrationArtifact0089(source);
     case "v2-0091":
       return projectFreshIntegrationV2MigrationArtifact0091(source);
+    case "v2-0092":
+      return projectFreshIntegrationV2MigrationArtifact0092(source);
   }
 }
 
@@ -777,16 +791,23 @@ function readSealedSelectedArtifact(
       return readSealedFreshProductionV2MigrationArtifact0089(directory);
     case "v2-0091":
       return readSealedFreshIntegrationV2MigrationArtifact0091(directory);
+    case "v2-0092":
+      return readSealedFreshIntegrationV2MigrationArtifact0092(directory);
   }
 }
 
 function freshV2D1Lineage(lineage: IntegrationFreshLineage | undefined): FreshV2D1Lineage | null {
-  return lineage === "v2-0088" || lineage === "v2-0089" || lineage === "v2-0091" ? lineage : null;
+  return lineage === "v2-0088" ||
+    lineage === "v2-0089" ||
+    lineage === "v2-0091" ||
+    lineage === "v2-0092"
+    ? lineage
+    : null;
 }
 
 function lineageCeiling(
   lineage: IntegrationFreshLineage | undefined,
-): "0066" | "0075" | "0088" | "0089" | "0091" {
+): "0066" | "0075" | "0088" | "0089" | "0091" | "0092" {
   switch (lineage) {
     case undefined:
       return "0066";
@@ -798,6 +819,8 @@ function lineageCeiling(
       return "0089";
     case "v2-0091":
       return "0091";
+    case "v2-0092":
+      return "0092";
   }
 }
 

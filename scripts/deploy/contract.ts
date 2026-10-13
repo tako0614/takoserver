@@ -1069,17 +1069,17 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
           "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
           "the default fixed audited 0001-0066 names and bytes, or one explicit fixed " +
-          "--fresh-lineage=v2-artifacts-0075, v2-0088, v2-0089 or v2-0091 payload (v2-0088/v2-0089 are the " +
-          "same fixed-digest payloads as the production fresh-init profiles; v2-0091, through the Stripe event table, is " +
-          "staging-only and no production surface accepts it), are sealed before creation. A separately " +
+          "--fresh-lineage=v2-artifacts-0075, v2-0088, v2-0089, v2-0091 or v2-0092 payload (v2-0088/v2-0089 are the " +
+          "same fixed-digest payloads as the production fresh-init profiles; v2-0091 (through the Stripe event table) and v2-0092 (through the Organization wallet lifecycle tables) are " +
+          "staging-only and no production surface accepts them), are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts. " +
           "Every generated D1 must be takoserver-i-<generation> and never production-named; when " +
           "TAKOSERVER_DEPLOY_TARGET_PRODUCTION is set its exact D1 name and id are refused before creation and again once the new id " +
-          "is known, and applying v2-0091 requires that production target.",
+          "is known, and applying v2-0091 or v2-0092 requires that production target.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
-          "selected 0001-0066, 0001-0075, 0001-0088, 0001-0089 or 0001-0091 lineage and canonical schema after one Wrangler file import " +
-          "(v2-0088/v2-0089/v2-0091 also read back the exact empty seeded data and ledger count), then creates and reads back one new R2 bucket. " +
+          "selected 0001-0066, 0001-0075, 0001-0088, 0001-0089, 0001-0091 or 0001-0092 lineage and canonical schema after one Wrangler file import " +
+          "(v2-0088/v2-0089/v2-0091/v2-0092 also read back the exact empty seeded data and ledger count), then creates and reads back one new R2 bucket. " +
           "Status and apply record which production D1 identity the guard compared. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",

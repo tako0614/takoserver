@@ -1010,8 +1010,16 @@ describe("split Takoserver Worker surfaces", () => {
       takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0091" as const },
     };
     expect(workerSchemaAllowsPending(lineage0091, at(91))).toBe(true);
-    for (const count of [88, 89, 90]) {
+    for (const count of [88, 89, 90, 92]) {
       expect(workerSchemaAllowsPending(lineage0091, at(count))).toBe(false);
+    }
+    const lineage0092 = {
+      ...v2Target,
+      takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0092" as const },
+    };
+    expect(workerSchemaAllowsPending(lineage0092, at(92))).toBe(true);
+    for (const count of [88, 89, 91]) {
+      expect(workerSchemaAllowsPending(lineage0092, at(count))).toBe(false);
     }
     expect(
       workerSchemaAllowsPending(lineage0088, {

@@ -61,8 +61,8 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-integration-organization-bootstrap --<status|apply> --environment=integration --commit=<sha>
   bun run deploy -- takoserver-integration-storage-generation --<status|apply> --environment=integration --commit=<sha>
     --generation=<32-lowercase-hex> (new isolated D1/R2 only; never resets an existing target)
-    [--fresh-lineage=<v2-artifacts-0075|v2-0088|v2-0089|v2-0091>] (fixed fresh payload; default remains 0066;
-    v2-0091 is staging-only and its apply requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION to refuse the production D1)
+    [--fresh-lineage=<v2-artifacts-0075|v2-0088|v2-0089|v2-0091|v2-0092>] (fixed fresh payload; default remains 0066;
+    v2-0091/v2-0092 are staging-only and their apply requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION to refuse the production D1)
   bun run deploy -- takoserver-integration-storage-disposal --<status|apply> --environment=integration --commit=<sha>
     (one exact selected D1/R2 pair only; refuses current regular/dispatch Worker bindings)
   bun run deploy -- takoserver-integration-host-retirement --<status|apply> --environment=integration --commit=<sha>
@@ -188,7 +188,7 @@ type Invocation =
       readonly surface: StorageGenerationSurface;
       readonly action: "status" | "apply";
       readonly generation: string;
-      readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | "v2-0091";
+      readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092";
     })
   | (InvocationBase & {
       readonly surface: ProductionD1FreshInitSurface;
@@ -240,7 +240,7 @@ interface ParsedInvocation {
   readonly bootstrapVerifierBridge?: boolean;
   readonly bootstrapProbePredecessorVersionId?: string;
   readonly throughMigration?: SchemaWaveBoundary;
-  readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | "v2-0091";
+  readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092";
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly organizationId?: string;
   readonly keyName?: string;
@@ -309,7 +309,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let environment: DeployEnvironment | null = null;
   let commit: string | null = null;
   let generation: string | null = null;
-  let freshLineage: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | "v2-0091" | null = null;
+  let freshLineage: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092" | null =
+    null;
   let retiredTargetPath: string | null = null;
   let retiredDeploymentId: string | null = null;
   let retiredVersionId: string | null = null;
@@ -440,6 +441,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       else if (flag === "--fresh-lineage=v2-0088") freshLineage = "v2-0088";
       else if (flag === "--fresh-lineage=v2-0089") freshLineage = "v2-0089";
       else if (flag === "--fresh-lineage=v2-0091") freshLineage = "v2-0091";
+      else if (flag === "--fresh-lineage=v2-0092") freshLineage = "v2-0092";
       else return null;
       continue;
     }
@@ -614,9 +616,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   const storageGeneration = surfaceValue === "takoserver-integration-storage-generation";
   const productionFreshInit = surfaceValue === "takoserver-production-d1-fresh-init";
   if (
-    // v2-0091 is staging-only: production fresh init never accepts it, so it
-    // cannot fall back to that surface's default payload either.
-    (productionFreshInit && (freshLineage === "v2-artifacts-0075" || freshLineage === "v2-0091")) ||
+    // v2-0091 and v2-0092 are staging-only: production fresh init never
+    // accepts them, so they cannot fall back to its default payload either.
+    (productionFreshInit &&
+      (freshLineage === "v2-artifacts-0075" ||
+        freshLineage === "v2-0091" ||
+        freshLineage === "v2-0092")) ||
     (freshLineage !== null && !storageGeneration && !productionFreshInit)
   )
     return null;
@@ -1143,7 +1148,7 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
     case "takoserver-integration-storage-generation": {
       // The production target is read only for its D1 identity, which the
       // staging generation must never be. Set, it must load; unset, the
-      // staging-only v2-0091 apply refuses.
+      // staging-only v2-0091/v2-0092 apply refuses.
       const productionPath = process.env.TAKOSERVER_DEPLOY_TARGET_PRODUCTION?.trim();
       if (productionPath !== undefined && productionPath !== "" && !isAbsolute(productionPath)) {
         throw new DeployError(
