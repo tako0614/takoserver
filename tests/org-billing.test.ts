@@ -678,7 +678,7 @@ test("byte-hour pricing follows the configured unit without a customer product m
 
 test("lot cursor bounds expiry-ordered pages with tied timestamps and opaque legacy refs", async () => {
   const f = fixture();
-  const refs = ["legacy/" + "x".repeat(20000), "b", "c", "purchased"];
+  const refs = ["legacy/" + "x".repeat(20000), "b", "c", "purchased"] as const;
   for (const fundingRef of refs)
     await f.ledger.fund({
       organizationId: "org_a",
