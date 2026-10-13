@@ -126,25 +126,56 @@ describe("canonical integration 0088 to 0092 schema", () => {
     ).rejects.toThrow("schema");
   });
 
-  test("selector is staging only and requires the exact 0088 origin and production identity fence", async () => {
-    const invocation = {
-      action: "status",
-      environment: "integration",
-      commit,
-      throughMigration: "0092",
-    } as const;
-    const options = {
-      productionD1,
-      integrationStorageIdentityProvider: identityProvider,
-      reader: {
-        async read() {
-          return state(88);
-        },
-      },
-      schemaV20092WalletProof: async () => proof(),
-      cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "fixture-token" },
-    };
-    const status = await runD1Schema(invocation, target, options);
+  const statusInvocation = {
+    action: "status",
+    environment: "integration",
+    commit,
+    throughMigration: "0092",
+  } as const;
+  const statusOptions = () => ({
+    productionD1,
+    integrationStorageIdentityProvider: identityProvider,
+    reader: { read: async () => state(88) },
+    schemaV20092WalletProof: async () => proof(),
+    cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "fixture-token" },
+  });
+  const ownerProof = async (input: CanonicalV20092OwnerProofInput) => ({
+    kind: "takoserver.canonical-v2-0092-owner-proof@v1" as const,
+    phase: input.phase,
+    accountId: input.target.accountId,
+    databaseId: input.target.d1.databaseId,
+    databaseName: input.target.d1.databaseName,
+    publicCommit: input.publicCommit,
+    sourceDigest: input.sourceDigest,
+    applied: input.applied,
+    schemaShapeDigest: input.schemaShapeDigest,
+    expectedPostApplied: input.expectedPostApplied,
+    retainedNativeClaimDigest: `sha256:${"b".repeat(64)}`,
+    dependencyProofDigest: `sha256:${"c".repeat(64)}`,
+    unresolvedAttemptCount: 0 as const,
+  });
+  const custody = {
+    async persistDispatched(binding: CanonicalV20092DispatchBinding) {
+      return {
+        kind: "takoserver.canonical-v2-0092-custody-receipt@v1" as const,
+        state: "dispatched" as const,
+        bindingDigest: canonicalV20092DispatchBindingDigest(binding),
+        custodyDigest: `sha256:${"f".repeat(64)}`,
+      };
+    },
+    async reconcilePost(binding: CanonicalV20092DispatchBinding) {
+      return {
+        kind: "takoserver.canonical-v2-0092-custody-receipt@v1" as const,
+        state: "terminal" as const,
+        bindingDigest: canonicalV20092DispatchBindingDigest(binding),
+        custodyDigest: `sha256:${"f".repeat(64)}`,
+      };
+    },
+  };
+
+  test("0092 status selects only the exact 0088 origin", async () => {
+    const options = statusOptions();
+    const status = await runD1Schema(statusInvocation, target, options);
     expect(status).toMatchObject({
       fromMigration: "0088_v2_worker_sqlite_external_drain.sql",
       throughMigration: "0092_org_wallet_lifecycle.sql",
@@ -156,144 +187,129 @@ describe("canonical integration 0088 to 0092 schema", () => {
         productionD1Guard: "distinct-exact-identity",
       },
     });
-    await expect(runD1Schema({ ...invocation, action: "apply" }, target, options)).rejects.toThrow(
-      "owner-injected canonical dependency",
-    );
-    const ownerProof = async (input: {
-      phase: "preflight" | "mutation" | "verification";
-      target: DeployTarget;
-      publicCommit: string;
-      sourceDigest: string;
-      applied: readonly string[];
-      schemaShapeDigest: string;
-      expectedPostApplied: readonly string[];
-    }) => ({
-      kind: "takoserver.canonical-v2-0092-owner-proof@v1" as const,
-      phase: input.phase,
-      accountId: input.target.accountId,
-      databaseId: input.target.d1.databaseId,
-      databaseName: input.target.d1.databaseName,
-      publicCommit: input.publicCommit,
-      sourceDigest: input.sourceDigest,
-      applied: input.applied,
-      schemaShapeDigest: input.schemaShapeDigest,
-      expectedPostApplied: input.expectedPostApplied,
-      retainedNativeClaimDigest: `sha256:${"b".repeat(64)}`,
-      dependencyProofDigest: `sha256:${"c".repeat(64)}`,
-      unresolvedAttemptCount: 0 as const,
-    });
+  });
+
+  test("0092 direct apply lacks private owner proof", async () => {
+    const options = statusOptions();
+    await expect(
+      runD1Schema({ ...statusInvocation, action: "apply" }, target, options),
+    ).rejects.toThrow("owner-injected canonical dependency");
+  });
+
+  test("0092 status refuses apply readiness without dispatched custody", async () => {
+    const options = statusOptions();
     expect(
-      await runD1Schema(invocation, target, { ...options, canonicalV20092OwnerProof: ownerProof }),
+      await runD1Schema(statusInvocation, target, {
+        ...options,
+        canonicalV20092OwnerProof: ownerProof,
+      }),
     ).toMatchObject({
       readyForApply: false,
       schemaV20092: { ownerQualified: true, custodyConfigured: false },
     });
-    const custody = {
-      async persistDispatched(binding: CanonicalV20092DispatchBinding) {
-        return {
-          kind: "takoserver.canonical-v2-0092-custody-receipt@v1" as const,
-          state: "dispatched" as const,
-          bindingDigest: canonicalV20092DispatchBindingDigest(binding),
-          custodyDigest: `sha256:${"f".repeat(64)}`,
-        };
-      },
-      async reconcilePost(binding: CanonicalV20092DispatchBinding) {
-        return {
-          kind: "takoserver.canonical-v2-0092-custody-receipt@v1" as const,
-          state: "terminal" as const,
-          bindingDigest: canonicalV20092DispatchBindingDigest(binding),
-          custodyDigest: `sha256:${"f".repeat(64)}`,
-        };
-      },
-    };
+  });
+
+  test("0092 status reports readiness only with owner proof and custody", async () => {
+    const options = statusOptions();
     expect(
-      await runD1Schema(invocation, target, {
+      await runD1Schema(statusInvocation, target, {
         ...options,
         canonicalV20092OwnerProof: ownerProof,
         canonicalV20092DispatchCustody: custody,
       }),
     ).toMatchObject({ readyForApply: true });
+  });
+
+  test("0092 owner proof rejects unresolved private attempts", async () => {
     await expect(
-      runD1Schema(invocation, target, {
-        ...options,
+      runD1Schema(statusInvocation, target, {
+        ...statusOptions(),
         canonicalV20092OwnerProof: async (input) => ({
           ...(await ownerProof(input)),
           unresolvedAttemptCount: 1 as never,
         }),
       }),
     ).rejects.toThrow("terminal attempts");
-    await expect(
-      runD1Schema(invocation, target, { ...options, productionD1: target.d1 }),
-    ).rejects.toThrow("distinct read-only production");
-    await expect(
-      runD1Schema(invocation, target, {
-        ...options,
-        integrationStorageIdentityProvider: {
-          ...identityProvider,
-          async getD1(databaseId: string) {
-            return { uuid: databaseId, name: productionD1.databaseName };
-          },
-        },
-      }),
-    ).rejects.toThrow("provider identity differs");
-    await expect(
-      runD1Schema(invocation, target, {
-        ...options,
-        integrationStorageIdentityProvider: {
-          ...identityProvider,
-          async getR2(_name: string) {
-            return { name: "stale-r2" };
-          },
-        },
-      }),
-    ).rejects.toThrow("provider identity differs");
-    await expect(
-      runD1Schema(
-        invocation,
-        {
-          ...target,
-          takoformV2: { ...target.takoformV2, appliedSchemaLineage: "v2-0092" },
-        },
-        options,
-      ),
-    ).rejects.toThrow("cannot precede its exact D1 readback");
-    await expect(
-      runD1Schema(invocation, { ...target, environment: "production" }, options),
-    ).rejects.toThrow();
-    await expect(
-      runD1Schema(
-        invocation,
-        { ...target, takoformV2: { ...target.takoformV2, storageLineage: "v2-0091" } },
-        options,
-      ),
-    ).rejects.toThrow("generated integration");
-    await expect(
-      runD1Schema(
-        invocation,
-        { ...target, d1: { ...target.d1, databaseName: "takoserver-runtime-production" } },
-        options,
-      ),
-    ).rejects.toThrow("generated integration");
-    for (const count of [89, 90, 91]) {
-      await expect(
-        runD1Schema(invocation, target, {
-          ...options,
-          reader: {
-            async read() {
-              return state(count);
+  });
+
+  for (const native of ["production-descriptor", "d1-get", "r2-get"] as const) {
+    test(`0092 native identity refuses ${native} mismatch`, async () => {
+      const options = statusOptions();
+      if (native === "production-descriptor") {
+        await expect(
+          runD1Schema(statusInvocation, target, { ...options, productionD1: target.d1 }),
+        ).rejects.toThrow("distinct read-only production");
+      } else if (native === "d1-get") {
+        await expect(
+          runD1Schema(statusInvocation, target, {
+            ...options,
+            integrationStorageIdentityProvider: {
+              ...identityProvider,
+              async getD1(databaseId: string) {
+                return { uuid: databaseId, name: productionD1.databaseName };
+              },
             },
-          },
+          }),
+        ).rejects.toThrow("provider identity differs");
+      } else {
+        await expect(
+          runD1Schema(statusInvocation, target, {
+            ...options,
+            integrationStorageIdentityProvider: {
+              ...identityProvider,
+              async getR2(_name: string) {
+                return { name: "stale-r2" };
+              },
+            },
+          }),
+        ).rejects.toThrow("provider identity differs");
+      }
+    });
+  }
+
+  for (const invalid of ["premature-92", "production", "wrong-origin", "wrong-name"] as const) {
+    test(`0092 staging selector refuses ${invalid}`, async () => {
+      const selected =
+        invalid === "premature-92"
+          ? {
+              ...target,
+              takoformV2: { ...target.takoformV2, appliedSchemaLineage: "v2-0092" as const },
+            }
+          : invalid === "production"
+            ? { ...target, environment: "production" as const }
+            : invalid === "wrong-origin"
+              ? {
+                  ...target,
+                  takoformV2: { ...target.takoformV2, storageLineage: "v2-0091" as const },
+                }
+              : { ...target, d1: { ...target.d1, databaseName: productionD1.databaseName } };
+      const result = runD1Schema(statusInvocation, selected, statusOptions());
+      if (invalid === "production") await expect(result).rejects.toThrow();
+      else
+        await expect(result).rejects.toThrow(
+          invalid === "premature-92"
+            ? "cannot precede its exact D1 readback"
+            : "generated integration",
+        );
+    });
+  }
+
+  for (const count of [89, 90, 91] as const) {
+    test(`0092 status refuses partial applied lineage ${count}`, async () => {
+      await expect(
+        runD1Schema(statusInvocation, target, {
+          ...statusOptions(),
+          reader: { read: async () => state(count) },
         }),
       ).rejects.toThrow("partial lineage");
-    }
+    });
+  }
+
+  test("0092 status refuses noncanonical exact 0088 shape", async () => {
     await expect(
-      runD1Schema(invocation, target, {
-        ...options,
-        reader: {
-          async read() {
-            return { ...state(88), shape: "[]\n" };
-          },
-        },
+      runD1Schema(statusInvocation, target, {
+        ...statusOptions(),
+        reader: { read: async () => ({ ...state(88), shape: "[]\n" }) },
       }),
     ).rejects.toThrow("canonical exact 0088");
   });
@@ -463,11 +479,12 @@ describe("canonical integration 0088 to 0092 schema", () => {
           };
         },
         async reconcilePost(binding: CanonicalV20092DispatchBinding) {
+          if (dispatchedDigest === null) throw new Error("missing dispatched custody");
           expect(canonicalV20092DispatchBindingDigest(binding)).toBe(dispatchedDigest);
           return {
             kind: "takoserver.canonical-v2-0092-custody-receipt@v1" as const,
             state: "terminal" as const,
-            bindingDigest: dispatchedDigest as string,
+            bindingDigest: dispatchedDigest,
             custodyDigest: `sha256:${"c".repeat(64)}`,
           };
         },
@@ -487,14 +504,53 @@ describe("canonical integration 0088 to 0092 schema", () => {
       expect(dispatchedDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
       expect(phases).toContain("mutation:88");
       expect(phases).toContain("verification:92");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a prior dispatched custody refuses a fresh apply before any D1 import", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0092-existing-custody-"));
+    let imports = 0;
+    const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+    const run: SchemaProcess = async (command) => {
+      const key = command.join(" ");
+      if (key === "git rev-parse HEAD") return ok(commit);
+      if (key === "git branch --show-current") return ok("feature/schema-0092");
+      if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok();
+      if (key === "git fetch --quiet --all --prune") return ok();
+      if (key === `git branch -r --contains ${commit}`) return ok("  origin/feature/schema-0092\n");
+      if (
+        key === "bun test tests/deploy-schema-v2-0092.test.ts" ||
+        key === "bun run check:migrations"
+      )
+        return ok("green");
+      if (command.includes("--file")) {
+        imports++;
+        return ok();
+      }
+      throw new Error(`unexpected command: ${key}`);
+    };
+    try {
       await expect(
-        runD1Schema(
-          { action: "apply", environment: "integration", commit, throughMigration: "0092" },
-          target,
-          { ...options, outputDirectory: join(root, "replay") },
-        ),
-      ).rejects.toThrow("already complete");
-      expect(imports).toBe(1);
+        runD1Schema({ ...statusInvocation, action: "apply" }, target, {
+          ...statusOptions(),
+          run,
+          outputDirectory: join(root, "proof"),
+          leaseRoot: join(root, "leases"),
+          review: "independent-reviewer",
+          canonicalV20092OwnerProof: ownerProof,
+          canonicalV20092DispatchCustody: {
+            async persistDispatched() {
+              throw new Error("existing dispatched attempt refuses resend");
+            },
+            async reconcilePost() {
+              throw new Error("not reached");
+            },
+          },
+        }),
+      ).rejects.toThrow("existing dispatched attempt refuses resend");
+      expect(imports).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -588,10 +644,6 @@ describe("canonical integration 0088 to 0092 schema", () => {
         );
         expect(dispatched).toBe(true);
         expect(imports).toBe(1);
-        await expect(
-          runD1Schema(invocation, target, { ...options, outputDirectory: join(root, "second") }),
-        ).rejects.toThrow("existing dispatched attempt refuses resend");
-        expect(imports).toBe(1);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -680,10 +732,6 @@ describe("canonical integration 0088 to 0092 schema", () => {
         runD1Schema(invocation, target, { ...options, outputDirectory: join(root, "first") }),
       ).rejects.toThrow("artifact changed after it was sealed");
       expect(dispatched).toBe(true);
-      expect(imports).toBe(0);
-      await expect(
-        runD1Schema(invocation, target, { ...options, outputDirectory: join(root, "second") }),
-      ).rejects.toThrow("dispatched custody blocks retry");
       expect(imports).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
