@@ -90,6 +90,12 @@ export {
   type ObjectBucketWorkerBindingClaim,
   type ObjectBucketWorkerBindingResolution,
 } from "./forms/object-bucket-worker-binding-authority.ts";
+export {
+  createV2HeldOrPublicArtifactSource,
+  createV2PublicHttpsArtifactSource,
+  type V2PublicHttpsArtifactSourceOptions,
+  type V2PublicOnlyArtifactFetch,
+} from "./forms/public-https-artifact-source.ts";
 export { QUEUE_CONSUMER_FORM_URL } from "./forms/queue-consumer.ts";
 export {
   createQueueWorkerBindingAuthority,
