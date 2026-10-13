@@ -11,6 +11,7 @@ import {
   grants,
   type IdentityProviderDescriptor,
 } from "./auth.ts";
+import type { BillingConfig } from "./billing-config.ts";
 import { createCatalog, type Offering } from "./catalog.ts";
 import { type Checkout, createControlRoutes } from "./control.ts";
 import { createDataAiRoutes } from "./data-ai.ts";
@@ -26,6 +27,7 @@ import {
 } from "./integration-organization-bootstrap.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
+import { createOrgBilling, type OrgBilling } from "./org-billing.ts";
 import {
   createFundingCredit,
   type FundingReconcileReport,
@@ -119,6 +121,8 @@ export interface AppPorts {
   readonly objects: ObjectStoreAccess;
   readonly identity: ExternalIdentityVerifier;
   readonly settlement: FundingSettlementVerifier;
+  /** Frozen operator tariff; absent keeps the Organization billing API disabled. */
+  readonly billingConfig?: BillingConfig;
   /** Starts a payment, where this deployment can take one. */
   readonly checkout?: Checkout | undefined;
   /**
@@ -226,6 +230,8 @@ export function createAppResourceStoreBundle(sql: Sql, clock: Clock): AppResourc
 
 export interface App {
   readonly fetch: Router;
+  /** Optional lifecycle service for the Organization wallet and usage receipts. */
+  readonly orgBilling?: OrgBilling;
   /** Typed operator seam; no maintenance route is mounted on public HTTP. */
   readonly maintenance: {
     readonly artifacts: ArtifactReconciler;
@@ -240,6 +246,7 @@ export interface App {
 
 export interface TickReport {
   readonly expiredReservations: number;
+  readonly expiredWalletHolds: number;
   readonly expiredRuntimeInputPreparations: number;
   /**
    * Declarations pointing at a Form this deployment no longer installs. Any
@@ -360,6 +367,9 @@ export function buildApp(ports: AppPorts): App {
       })
     : null;
   const ledger = createLedger(ports.sql, clock);
+  const orgBilling = ports.billingConfig
+    ? createOrgBilling({ sql: ports.sql, clock, ledger, config: ports.billingConfig })
+    : undefined;
   const paymentEvents = ports.paymentEvents?.({
     sql: ports.sql,
     clock,
@@ -701,6 +711,7 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.checkout ? { checkout: ports.checkout } : {}),
     ...(paymentEvents?.receive ? { paymentNotifications: paymentEvents.receive } : {}),
     ledger,
+    ...(orgBilling ? { billing: orgBilling } : {}),
     catalog,
     reseller,
     tokens,
@@ -765,6 +776,7 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
   });
   return {
+    ...(orgBilling ? { orgBilling } : {}),
     fetch:
       integrationOrganizationBootstrapRoute || integrationE2eCredentialRoute
         ? async (request, lifetime) =>
@@ -803,6 +815,7 @@ export function buildApp(ports: AppPorts): App {
         return "pending";
       });
       const expiredReservations = await reseller.expireDue(64);
+      const expiredWalletHolds = await orgBilling?.expireDue(64);
       const expiredRuntimeInputPreparations = await ports.runtimeInputs?.maintenance.expireDue(64);
       const store = inventory;
       const installed = ports.forms.map((form) => form.identity.formRef.schemaDigest);
@@ -831,6 +844,7 @@ export function buildApp(ports: AppPorts): App {
       }
       return {
         expiredReservations,
+        expiredWalletHolds: expiredWalletHolds ?? 0,
         expiredRuntimeInputPreparations: expiredRuntimeInputPreparations ?? 0,
         orphanedResources,
         meteredRows,

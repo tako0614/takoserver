@@ -25,7 +25,9 @@ import {
   verifyFreshV2IntegrationStorageTarget,
 } from "./integration-storage-generation.ts";
 import {
+  assertOrgBillingSchema,
   assertStripeWebhookSchema,
+  orgBillingSchemaReady,
   pendingMigrations,
   readD1SchemaState,
   readMigrationArtifact,
@@ -434,6 +436,11 @@ export async function runWorker(
         "legacy Host-runtime predecessor transition requires takoserver-worker-authority-cutover",
       );
     }
+    if (target.billingConfig !== undefined && invocation.action === "apply") {
+      throw preflightError(
+        "billing-enabled authority transition requires ordinary Worker migration readback before publication",
+      );
+    }
     const transition = await runAuthorityTransition(
       {
         surface: "takoserver-worker-authority-cutover",
@@ -453,7 +460,14 @@ export async function runWorker(
         ...(refreshStateAfterGate === undefined ? {} : { refreshStateAfterGate }),
       },
     );
-    return withProviderExecutorQualification(transition, providerExecutorBefore);
+    const qualifiedTransition = withProviderExecutorQualification(
+      transition,
+      providerExecutorBefore,
+    );
+    if (target.billingConfig !== undefined && invocation.action === "status") {
+      return { ...qualifiedTransition, ready: false, billingSchemaReady: false };
+    }
+    return qualifiedTransition;
   }
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-worker-"));
@@ -531,6 +545,7 @@ export async function runWorker(
         artifactDigest: before.bundleDigestHex === null ? null : `sha256:${before.bundleDigestHex}`,
         appliedMigrations: before.migrations.applied,
         pendingMigrations: before.pending,
+        billingSchemaReady: orgBillingSchemaReady(target, before.migrations.applied),
         ...(target.schemaMaintenanceMode === undefined
           ? {}
           : { maintenance: target.schemaMaintenanceMode }),
@@ -552,6 +567,7 @@ export async function runWorker(
           target.schemaMaintenanceMode === undefined &&
           workerSchemaAllowsPending(target, before.migrations, sourceRepositoryRoot) &&
           stripeWebhookSchemaReady(target, before.migrations.applied) &&
+          orgBillingSchemaReady(target, before.migrations.applied) &&
           !legacyProfileCurrent &&
           (target.integrationE2eCredentialAuthority === undefined ||
             before.integrationE2eCredentialAuthorityConfigured) &&
@@ -593,6 +609,7 @@ export async function runWorker(
       );
     }
     assertStripeWebhookSchema(target, before.migrations.applied);
+    assertOrgBillingSchema(target, before.migrations.applied);
     const legacyBootstrap = before.legacyPredecessorProfile !== undefined;
     const changedPaths = legacyBootstrap
       ? null

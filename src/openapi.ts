@@ -45,6 +45,20 @@ const OPERATION_KEY_SCHEMA = {
   maxLength: 128,
   pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
 } as const;
+const BILLING_REFERENCE_SCHEMA = {
+  type: "string",
+  minLength: 1,
+  maxLength: 128,
+  pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+  description:
+    "Opaque, non-reusable Organization billing reference; URL-encode it as one path component.",
+} as const;
+const ORGANIZATION_ID_PARAMETER = {
+  name: "organizationId",
+  in: "path",
+  required: true,
+  schema: IDENTIFIER_SCHEMA,
+} as const;
 const CANONICAL_HTTPS_ORIGIN_SCHEMA = {
   type: "string",
   format: "uri",
@@ -504,7 +518,198 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
   deleteAttachment: described("Delete one Resource Attachment"),
   listOrganizationOperations: described("List the organization's recent Takoform operations"),
   revokeApiKey: described("Revoke an API key"),
-  readWallet: described("Read the prepaid wallet"),
+  readWallet: described("Read the prepaid wallet and expire due holds", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [ORGANIZATION_ID_PARAMETER],
+    responses: {
+      "200": {
+        description: "Current Organization wallet projection and recent ledger entries",
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/WalletResponse" } },
+        },
+      },
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks wallet:read or belongs to another Organization"),
+      "503": errorResponse("Wallet state is unavailable"),
+    },
+  }),
+  listWalletLots: described("List Organization credit lots with expiry allocation", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      {
+        name: "limit",
+        in: "query",
+        required: false,
+        schema: { type: "integer", minimum: 1, maximum: 100, default: 100 },
+      },
+      {
+        name: "cursor",
+        in: "query",
+        required: false,
+        schema: {
+          type: "string",
+          minLength: 1,
+          maxLength: 512,
+          description: "Opaque continuation cursor returned by the previous page.",
+        },
+      },
+    ],
+    responses: {
+      "200": {
+        description: "Organization credit lots",
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/WalletLotsResponse" } },
+        },
+      },
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks wallet:read or belongs to another Organization"),
+      "400": errorResponse("Malformed page size or unknown cursor"),
+      "503": errorResponse("Credit lot state is unavailable"),
+    },
+  }),
+  readWalletHold: described("Read one durable wallet hold receipt", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      { name: "reference", in: "path", required: true, schema: BILLING_REFERENCE_SCHEMA },
+    ],
+    responses: {
+      "200": {
+        description: "The exact hold receipt",
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/WalletHoldResponse" } },
+        },
+      },
+      "400": errorResponse("Malformed hold reference"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks wallet:read or belongs to another Organization"),
+      "404": errorResponse("Hold reference not found"),
+      "409": errorResponse("Hold is closed or the reference conflicts"),
+      "503": errorResponse("Hold state is unavailable"),
+    },
+  }),
+  createWalletHold: described("Reserve prepaid credit for a measured operation", {
+    "x-required-scopes": ["wallet:write"],
+    parameters: [ORGANIZATION_ID_PARAMETER],
+    requestBody: billingRequest("CreateWalletHoldRequest"),
+    responses: {
+      "201": {
+        description: "Hold accepted with an immutable server-assigned expiry",
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/WalletHoldResponse" } },
+        },
+      },
+      "400": errorResponse("Malformed amount, reference, revision, or fingerprint"),
+      "401": errorResponse("Authentication required"),
+      "402": errorResponse("Insufficient available credit"),
+      "403": errorResponse("The key lacks wallet:write or belongs to another Organization"),
+      "409": errorResponse("Reference was already used or canceled with different facts"),
+      "503": errorResponse("Hold result is unavailable or indeterminate"),
+    },
+  }),
+  captureWalletHold: described("Capture measured credit and release the unused hold", {
+    "x-required-scopes": ["wallet:write"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      { name: "reference", in: "path", required: true, schema: BILLING_REFERENCE_SCHEMA },
+    ],
+    requestBody: billingRequest("CaptureWalletHoldRequest"),
+    responses: {
+      "200": {
+        description: "Captured receipt; the unused amount is released atomically",
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/WalletHoldResponse" } },
+        },
+      },
+      "400": errorResponse("Malformed amount or measurement"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks wallet:write or belongs to another Organization"),
+      "404": errorResponse("Hold reference not found"),
+      "409": errorResponse("Hold is closed, exceeds its amount, or conflicts with prior facts"),
+      "503": errorResponse("Capture result is unavailable or indeterminate"),
+    },
+  }),
+  releaseWalletHold: described("Release a hold or durably cancel an unknown reference", {
+    "x-required-scopes": ["wallet:write"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      { name: "reference", in: "path", required: true, schema: BILLING_REFERENCE_SCHEMA },
+    ],
+    responses: {
+      "200": {
+        description: "Released or unchanged terminal receipt",
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/WalletHoldResponse" } },
+        },
+      },
+      "400": errorResponse("Malformed hold reference"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks wallet:write or belongs to another Organization"),
+      "503": errorResponse("Release result is unavailable or indeterminate"),
+    },
+  }),
+  listWalletUsageRecords: described("List recent settled or unpaid usage records", {
+    "x-required-scopes": ["usage:read"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      {
+        name: "limit",
+        in: "query",
+        required: false,
+        schema: { type: "integer", minimum: 1, maximum: 100, default: 100 },
+      },
+      {
+        name: "cursor",
+        in: "query",
+        required: false,
+        schema: {
+          type: "string",
+          minLength: 1,
+          maxLength: 512,
+          description: "Opaque continuation cursor returned by the previous page.",
+        },
+      },
+    ],
+    responses: {
+      "200": {
+        description: "Organization usage records",
+        content: {
+          "application/json": {
+            schema: { $ref: "#/components/schemas/WalletUsageRecordsResponse" },
+          },
+        },
+      },
+      "400": errorResponse("Malformed page size"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks usage:read or belongs to another Organization"),
+      "503": errorResponse("Usage records are unavailable"),
+    },
+  }),
+  createWalletUsageRecord: described("Price and settle one closed usage period", {
+    "x-required-scopes": ["usage:write"],
+    parameters: [ORGANIZATION_ID_PARAMETER],
+    description:
+      "Takoserver reprices the immutable quantity using the selected tariff. For a configured `byte-hour` meter, send `quantityUnit=byte-millisecond` and an integral byte-millisecond quantity; the server converts the exact total to byte-hours before rounding the final USD cents once. Other meters require the configured unit.",
+    requestBody: billingRequest("CreateWalletUsageRecordRequest"),
+    responses: {
+      "201": {
+        description: "Usage receipt, including durable unpaid usage after insufficient funds",
+        content: {
+          "application/json": {
+            schema: { $ref: "#/components/schemas/WalletUsageRecordResponse" },
+          },
+        },
+      },
+      "400": errorResponse(
+        "Malformed usage facts or an expected amount that does not match the tariff",
+      ),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks usage:write or belongs to another Organization"),
+      "409": errorResponse("Reference conflicts with previously recorded usage"),
+      "503": errorResponse("Usage settlement is unavailable or indeterminate"),
+    },
+  }),
   beginWalletCheckout: described("Begin a card payment for this organization"),
   creditWalletFromSettlement: described("Credit the wallet from a verified settlement proof"),
   receiveStripeWebhook: described(
@@ -704,16 +909,29 @@ function hostFormCatalogueResponse() {
 function described(
   summary: string,
   extra: {
+    readonly description?: string;
     readonly security?: readonly unknown[];
     readonly parameters?: readonly unknown[];
+    readonly requestBody?: unknown;
     readonly responses?: Record<string, unknown>;
+    readonly "x-required-scopes"?: readonly string[];
   } = {},
 ): Record<string, unknown> {
   return {
     summary,
+    ...(extra.description ? { description: extra.description } : {}),
     responses: extra.responses ?? { "200": { description: "Success" } },
     ...(extra.security ? { security: extra.security } : {}),
     ...(extra.parameters ? { parameters: extra.parameters } : {}),
+    ...(extra.requestBody ? { requestBody: extra.requestBody } : {}),
+    ...(extra["x-required-scopes"] ? { "x-required-scopes": extra["x-required-scopes"] } : {}),
+  };
+}
+
+function billingRequest(schema: string): Record<string, unknown> {
+  return {
+    required: true,
+    content: { "application/json": { schema: { $ref: `#/components/schemas/${schema}` } } },
   };
 }
 
@@ -784,6 +1002,300 @@ export const openApiDocument = {
     },
     schemas: {
       ...TAKOFORM_V2_SCHEMAS,
+      BillingReference: BILLING_REFERENCE_SCHEMA,
+      BillingRevision: {
+        type: "string",
+        minLength: 1,
+        maxLength: 128,
+        pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+      },
+      BillingFingerprint: { type: "string", minLength: 1, maxLength: 256 },
+      BillingAmountMinor: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+      BillingUnsignedDecimal: {
+        type: "string",
+        minLength: 1,
+        maxLength: 256,
+        pattern: "^(?:0|[1-9][0-9]*)(?:\\.[0-9]{0,17}[1-9])?$",
+      },
+      BillingUtcDateTime: {
+        type: "string",
+        format: "date-time",
+        pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+      },
+      CreateWalletHoldRequest: {
+        type: "object",
+        required: ["reference", "amountMinor", "pricingRevision", "measurementFingerprint"],
+        additionalProperties: false,
+        properties: {
+          reference: { $ref: "#/components/schemas/BillingReference" },
+          amountMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+          pricingRevision: { $ref: "#/components/schemas/BillingRevision" },
+          measurementFingerprint: { $ref: "#/components/schemas/BillingFingerprint" },
+        },
+      },
+      CaptureWalletHoldRequest: {
+        type: "object",
+        required: ["amountMinor", "actualMicros", "measurementFingerprint"],
+        additionalProperties: false,
+        properties: {
+          amountMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+          actualMicros: {
+            type: "string",
+            minLength: 1,
+            maxLength: 256,
+            pattern: "^(?:0|[1-9][0-9]*)$",
+          },
+          measurementFingerprint: { $ref: "#/components/schemas/BillingFingerprint" },
+        },
+      },
+      CreateWalletUsageRecordRequest: {
+        type: "object",
+        required: [
+          "reference",
+          "meter",
+          "quantityUnit",
+          "quantity",
+          "periodStart",
+          "periodEnd",
+          "pricingRevision",
+          "expectedMinor",
+          "measurementFingerprint",
+        ],
+        additionalProperties: false,
+        properties: {
+          reference: { $ref: "#/components/schemas/BillingReference" },
+          meter: {
+            type: "string",
+            minLength: 1,
+            maxLength: 128,
+            pattern: "^[a-z][a-z0-9.-]{0,127}$",
+          },
+          quantityUnit: {
+            type: "string",
+            minLength: 1,
+            maxLength: 64,
+            pattern: "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          },
+          quantity: { $ref: "#/components/schemas/BillingUnsignedDecimal" },
+          periodStart: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          periodEnd: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          pricingRevision: { $ref: "#/components/schemas/BillingRevision" },
+          expectedMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+          measurementFingerprint: { $ref: "#/components/schemas/BillingFingerprint" },
+        },
+      },
+      WalletResponse: {
+        type: "object",
+        required: ["wallet"],
+        additionalProperties: false,
+        properties: {
+          wallet: {
+            type: "object",
+            required: [
+              "organizationId",
+              "currency",
+              "settledMinor",
+              "heldMinor",
+              "availableMinor",
+              "entries",
+            ],
+            additionalProperties: false,
+            properties: {
+              organizationId: IDENTIFIER_SCHEMA,
+              currency: { const: "USD" },
+              settledMinor: { type: "integer", minimum: 0 },
+              heldMinor: { type: "integer", minimum: 0 },
+              availableMinor: { type: "integer", minimum: 0 },
+              entries: {
+                type: "array",
+                items: {
+                  type: "object",
+                  required: [
+                    "id",
+                    "organizationId",
+                    "type",
+                    "reference",
+                    "settledDeltaMinor",
+                    "heldDeltaMinor",
+                    "createdAt",
+                  ],
+                  additionalProperties: false,
+                  properties: {
+                    id: IDENTIFIER_SCHEMA,
+                    organizationId: IDENTIFIER_SCHEMA,
+                    type: {
+                      type: "string",
+                      enum: ["funding", "hold", "capture", "release", "usage_debit"],
+                    },
+                    reference: { type: "string", minLength: 1 },
+                    settledDeltaMinor: { type: "integer" },
+                    heldDeltaMinor: { type: "integer" },
+                    createdAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      WalletLotsResponse: {
+        type: "object",
+        required: ["lots", "cursor"],
+        additionalProperties: false,
+        properties: {
+          lots: {
+            type: "array",
+            items: {
+              type: "object",
+              required: [
+                "reference",
+                "kind",
+                "amountMinor",
+                "spentMinor",
+                "remainingMinor",
+                "heldMinor",
+                "availableMinor",
+                "expiresAt",
+                "createdAt",
+              ],
+              additionalProperties: false,
+              properties: {
+                reference: { type: "string", minLength: 1 },
+                kind: { type: "string", enum: ["direct", "plan-included", "purchased"] },
+                amountMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+                spentMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+                remainingMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+                heldMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+                availableMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+                expiresAt: {
+                  anyOf: [{ $ref: "#/components/schemas/BillingUtcDateTime" }, { type: "null" }],
+                },
+                createdAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+              },
+            },
+          },
+          cursor: { anyOf: [{ type: "string", minLength: 1, maxLength: 512 }, { type: "null" }] },
+        },
+      },
+      WalletHoldResponse: {
+        type: "object",
+        required: ["hold"],
+        additionalProperties: false,
+        properties: { hold: { $ref: "#/components/schemas/WalletHoldReceipt" } },
+      },
+      WalletHoldReceipt: {
+        type: "object",
+        required: [
+          "organizationId",
+          "reference",
+          "amountMinor",
+          "pricingRevision",
+          "status",
+          "capturedMinor",
+          "releasedMinor",
+          "actualMicros",
+          "createdAt",
+          "expiresAt",
+          "closedAt",
+        ],
+        additionalProperties: false,
+        properties: {
+          organizationId: IDENTIFIER_SCHEMA,
+          reference: { $ref: "#/components/schemas/BillingReference" },
+          amountMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+          pricingRevision: {
+            anyOf: [{ $ref: "#/components/schemas/BillingRevision" }, { type: "null" }],
+          },
+          status: { type: "string", enum: ["live", "captured", "released", "expired"] },
+          capturedMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+          releasedMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+          actualMicros: {
+            anyOf: [
+              { type: "string", minLength: 1, maxLength: 256, pattern: "^(?:0|[1-9][0-9]*)$" },
+              { type: "null" },
+            ],
+          },
+          createdAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          expiresAt: {
+            anyOf: [{ $ref: "#/components/schemas/BillingUtcDateTime" }, { type: "null" }],
+          },
+          closedAt: {
+            anyOf: [{ $ref: "#/components/schemas/BillingUtcDateTime" }, { type: "null" }],
+          },
+        },
+      },
+      WalletUsageRecordResponse: {
+        type: "object",
+        required: ["usageRecord"],
+        additionalProperties: false,
+        properties: { usageRecord: { $ref: "#/components/schemas/WalletUsageReceipt" } },
+      },
+      WalletUsageRecordsResponse: {
+        type: "object",
+        required: ["usageRecords", "cursor"],
+        additionalProperties: false,
+        properties: {
+          usageRecords: {
+            type: "array",
+            items: { $ref: "#/components/schemas/WalletUsageReceipt" },
+          },
+          cursor: { anyOf: [{ type: "string", minLength: 1, maxLength: 512 }, { type: "null" }] },
+        },
+      },
+      WalletUsageReceipt: {
+        type: "object",
+        required: [
+          "organizationId",
+          "reference",
+          "pricingRevision",
+          "meter",
+          "quantityUnit",
+          "quantity",
+          "periodStart",
+          "periodEnd",
+          "rate",
+          "amountMinor",
+          "status",
+          "createdAt",
+          "paidAt",
+        ],
+        additionalProperties: false,
+        properties: {
+          organizationId: IDENTIFIER_SCHEMA,
+          reference: { $ref: "#/components/schemas/BillingReference" },
+          meter: { type: "string", minLength: 1, maxLength: 128 },
+          quantityUnit: { type: "string", minLength: 1, maxLength: 64 },
+          quantity: { $ref: "#/components/schemas/BillingUnsignedDecimal" },
+          periodStart: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          periodEnd: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          pricingRevision: { $ref: "#/components/schemas/BillingRevision" },
+          rate: {
+            type: "object",
+            required: ["numeratorMicros", "denominator"],
+            additionalProperties: false,
+            properties: {
+              numeratorMicros: {
+                type: "string",
+                minLength: 1,
+                maxLength: 256,
+                pattern: "^(?:0|[1-9][0-9]*)$",
+              },
+              denominator: {
+                type: "string",
+                minLength: 1,
+                maxLength: 256,
+                pattern: "^(?:0|[1-9][0-9]*)$",
+              },
+            },
+          },
+          amountMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+          status: { type: "string", enum: ["pending", "paid"] },
+          createdAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          paidAt: {
+            anyOf: [{ $ref: "#/components/schemas/BillingUtcDateTime" }, { type: "null" }],
+          },
+        },
+      },
       Error: {
         type: "object",
         description:

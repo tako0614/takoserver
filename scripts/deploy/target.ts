@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { ARTIFACT_RECOVERY_RETENTION_FORMAT } from "../../src/artifact-recovery.ts";
+import { type BillingConfig, parseBillingConfig } from "../../src/billing-config.ts";
 import {
   type HostedEdgeSupplies,
   parseHostedEdgeSupplies,
@@ -110,6 +111,8 @@ export interface DeployTarget {
   readonly stripeWebhook?: boolean;
   /** Non-secret Stripe amounts and windows; each absent one takes its default. */
   readonly stripeSettings?: PaymentSettings;
+  /** Optional versioned, non-secret Organization billing tariff. */
+  readonly billingConfig?: BillingConfig;
   /**
    * DNS zones this deployment may attach customer Workers to.
    *
@@ -346,6 +349,7 @@ const DEPLOY_TARGET_OPTIONAL_KEYS: readonly string[] = [
   "stripeCheckout",
   "stripeWebhook",
   "stripeSettings",
+  "billingConfig",
   "zones",
   "aiModels",
   "objectBucketSupplies",
@@ -534,6 +538,9 @@ export function parseDeployTarget(
     ...(value.stripeSettings === undefined
       ? {}
       : { stripeSettings: stripeSettings(value.stripeSettings) }),
+    ...(value.billingConfig === undefined
+      ? {}
+      : { billingConfig: deployBillingConfig(value.billingConfig) }),
     ...(value.zones === undefined ? {} : { zones: zoneList(value.zones) }),
     ...(value.aiModels === undefined ? {} : { aiModels: modelList(value.aiModels) }),
     ...(value.objectBucketSupplies === undefined
@@ -1383,6 +1390,19 @@ function pattern(value: unknown, expression: RegExp, field: string): string {
     throw preflightError(`deploy target \`${field}\` is invalid`);
   }
   return value;
+}
+
+function deployBillingConfig(value: unknown): BillingConfig {
+  try {
+    if (!isRecord(value)) throw new TypeError("billing config must be an object");
+    const parsed = parseBillingConfig(JSON.stringify(value));
+    if (parsed === undefined) throw new TypeError("billing config must not be empty");
+    return parsed;
+  } catch {
+    // The private target may contain operator-authored pricing details. Keep
+    // parse diagnostics bounded to a generic refusal and never echo the value.
+    throw preflightError("deploy target billingConfig is invalid");
+  }
 }
 
 function stripeSettings(value: unknown): PaymentSettings {
