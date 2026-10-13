@@ -67,6 +67,8 @@ export interface DeployTarget {
   readonly takoformV2?: {
     readonly config: string;
     readonly storageLineage?: TakoformV2StorageLineage;
+    /** Explicit reviewed in-place successor; never changes the fresh-origin profile. */
+    readonly appliedSchemaLineage?: "v2-0092";
   };
   /** Temporary pre-0043 runtime used only by the 0043 cutover protocol. */
   readonly artifactBlobIoMode?: "pre-0043-quiesced";
@@ -612,6 +614,17 @@ export function parseDeployTarget(
       target.schemaMaintenanceMode === "pre-0058-quiesced"
     ) {
       throw preflightError("v2 Worker target cannot select a maintenance profile");
+    }
+  }
+  if (target.takoformV2?.appliedSchemaLineage === "v2-0092") {
+    if (
+      target.takoformV2.storageLineage !== "v2-0088" ||
+      target.schemaMaintenanceMode !== undefined ||
+      target.artifactBlobIoMode !== undefined
+    ) {
+      throw preflightError(
+        "applied v2-0092 requires the original fresh v2-0088 integration target without maintenance selectors",
+      );
     }
   }
   const cloudflareSupplies = [
@@ -1438,7 +1451,7 @@ function boolean(value: unknown, field: string): boolean {
 
 function takoformV2(value: unknown): NonNullable<DeployTarget["takoformV2"]> {
   if (!isRecord(value)) throw preflightError("deploy target `takoformV2` must be an object");
-  assertExactKeys(value, ["config"], ["storageLineage"]);
+  assertExactKeys(value, ["config"], ["storageLineage", "appliedSchemaLineage"]);
   if (typeof value.config !== "string") {
     throw preflightError("deploy target `takoformV2.config` must be non-secret JSON text");
   }
@@ -1458,9 +1471,17 @@ function takoformV2(value: unknown): NonNullable<DeployTarget["takoformV2"]> {
       "deploy target `takoformV2.storageLineage` must be v2-0088, v2-0089, v2-0091 or v2-0092 when set",
     );
   }
+  if (value.appliedSchemaLineage !== undefined && value.appliedSchemaLineage !== "v2-0092") {
+    throw preflightError(
+      "deploy target `takoformV2.appliedSchemaLineage` must be v2-0092 when set",
+    );
+  }
   return {
     config: value.config,
     ...(value.storageLineage === undefined ? {} : { storageLineage: value.storageLineage }),
+    ...(value.appliedSchemaLineage === undefined
+      ? {}
+      : { appliedSchemaLineage: value.appliedSchemaLineage }),
   };
 }
 

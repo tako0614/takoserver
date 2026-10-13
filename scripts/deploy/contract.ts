@@ -1401,6 +1401,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/schema.ts",
         "scripts/deploy/schema-0058-proof.ts",
         "scripts/deploy/schema-v2-existing-transition.ts",
+        "scripts/deploy/schema-v2-0092-proof.ts",
         "scripts/deploy/d1-migration-import.ts",
         "scripts/deploy/d1.ts",
         "scripts/deploy/wrangler-state.ts",
@@ -1413,6 +1414,7 @@ export const DEPLOY_CONTRACT = {
         "TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH",
         "TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH",
         "TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH",
+        "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
       ],
       triggers: ["irreversible"],
       obligations: {
@@ -1420,7 +1422,7 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056, 0057 or status-only 0058. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current audited source inventory is exactly 0001-0088; the ordinary existing-target ceiling remains 0066, the fresh-empty production path remains 0069, and the separate fresh v2 artifact generation remains 0075. An explicit integration-only 0066-to-0088 selector requires canonical intermediate shapes, a closed 0068 invocation epoch, no affected v2 data, exact non-serving public Host and private CPE publisher proof, source-compatible historical predecessors and same-owner publication leases; no other selector inherits this authority. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the apply-qualified 0001-0066 lineage. Protected mutation remains capped at 0057; 0058 inspects an exact canonical 0057 predecessor but cannot apply until real owner evidence exists. " +
+          "forward-only apply. The current audited source inventory is exactly 0001-0092; the ordinary existing-target ceiling remains 0066, the fresh-empty production path remains 0069, and the separate fresh v2 artifact generation remains 0075. An explicit integration-only 0066-to-0088 selector requires canonical intermediate shapes, a closed 0068 invocation epoch, no affected v2 data, exact non-serving public Host and private CPE publisher proof, source-compatible historical predecessors and same-owner publication leases; no other selector inherits this authority. The separate integration-only 0088-to-0092 selector requires the fixed audited 92-file digest, canonical exact 88 predecessor, an original v2-0088 generated D1/R2 target distinct from the read-only production D1 identity, and a bounded value-free preservation digest of ledger, lots and allocations. It seals 0089-0092 plus ledger inserts into one D1 file import; it does not change the fresh v2-0088 payload or enable Worker publication by marker alone. Before applying, the private canonical owner must independently prove all pending publication attempts terminal or GET-recovered, retain frozen historical Version and native settings evidence, and qualify the current 88 dependency state with 92-capable inspector, gateway, Tail, Host and CPE owner code. It must then prove actual exact 92 dependency readback after mutation. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the apply-qualified 0001-0066 lineage. Protected mutation remains capped at 0057; 0058 inspects an exact canonical 0057 predecessor but cannot apply until real owner evidence exists. " +
           "Integration may select one audited wave or a separately qualified existing-data additive " +
           "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -1428,7 +1430,7 @@ export const DEPLOY_CONTRACT = {
           "uses a separately sealed Wrangler file import containing the unchanged audited SQL plus " +
           "its migration-ledger insert; future qualified 0058 is wired for the same sealed one-file /import transport, never /query. Other selected waves keep their existing transport.",
         "post-conditions":
-          "D1 must read back the exact selected through-lineage and canonical schema shape. Status " +
+          "D1 must read back the exact selected through-lineage and canonical schema shape. The integration 0092 wave additionally requires its preserved ledger/lot/allocation row digest, valid populated lot cursor handles, empty new billing and Stripe tables, and zero foreign-key violations before an applied result is reported. Status " +
           "always names lastAppliedMigration and nextPendingMigration within the selected wave. " +
           "While 0043 is pending it also names current and rollback compatibility deployment and " +
           "Version identities, drain state, and active-root/deleting-candidate repair count. The " +
@@ -1454,7 +1456,7 @@ export const DEPLOY_CONTRACT = {
           "The standalone 0022 catch-up receipt binds the canonical 0016 application shape and critical " +
           "data digest before the exact 0017-0022 transition; it is not an ordinary receipt-chain predecessor.",
         reversal:
-          "There is no down migration. Failure is repaired forward from the authoritative D1 lineage and schema shape.",
+          "There is no down migration. Failure is repaired forward from authoritative D1 lineage, schema shape and protected wallet-row readback. The original 0088 artifact is not qualified as the 0092 successor; hold successor publication until matching private dependencies and public Worker qualify.",
         "failure-handling":
           highRiskFailure +
           inputContract(applyReviewInput, rehearsalReceiptInput) +
@@ -1465,7 +1467,7 @@ export const DEPLOY_CONTRACT = {
           "A failed provider acknowledgement performs an immediate authoritative lineage/shape " +
           "readback. A partial result can resume only under the same through selector and exact " +
           "rehearsal/attempt evidence; a boundary already reached under that attempt is reconciled " +
-          "without a second provider apply, and a later boundary cannot be skipped to. Pending 0043 " +
+          "without a second provider apply, and a later boundary cannot be skipped to. The 0092 integration wave is stricter: the private owner persists a no-overwrite dispatched record bound to the native generated D1/R2 identity, source, sealed import and pre-wallet proof before execute; an uncertain ACK with even an unchanged 88-row readback never permits a fresh apply. Only GET-only exact92 schema, wallet and native reconciliation may terminalize it; a partial 89-91 state requires manual forward repair without replay. Pending 0043 " +
           "requires the operator-private TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH; the " +
           "repository never manufactures the external drained-or-cancelled assertion. The no-selector " +
           "integration lane permits only exact audited 0058 to 0059+0060 or 0059 to 0060: canonical " +
@@ -1497,7 +1499,7 @@ export const DEPLOY_CONTRACT = {
           "A separate exact 0062 to 0063 integration transition requires the audited 0062 predecessor and canonical 0062 application shape from exact current 0001-0066 source. It needs no quiescence or data backfill because 0063 creates only new retirement objects. The migration and ledger insert remain one atomic D1 transaction, and exact all-0063 lineage plus canonical post-shape must read back before release proceeds. Roll out schema, then the matching CPE, then the Host authority cutover, and finally Form; a missing acknowledgement is reconciled only by authoritative lineage and shape readback and never by blind replay. Historical no-marker Queue state is not repaired or adopted by this schema transition. " +
           "The following exact 0063 to 0064 integration transition requires canonical all-0063 shape and only the audited 0064 suffix. It preserves existing Worker receipts, adds no Actor admission, and has no data backfill or generic quiescence claim. Its migration and ledger insert are atomic, exact all-0064 lineage and shape must read back, and unknown acknowledgement cannot authorize replay. The next exact 0064 to 0065 integration transition requires canonical all-0064 shape and only the audited 0065 suffix. Its backfill retains the nonce for live prepared/claimed rows; historical dispatched/terminal NULL remains closed. The migration and ledger insert are atomic, exact all-0065 lineage and shape must read back, and unknown acknowledgement cannot authorize replay. Both remain protected non-disposable D1 migrations, not resets or raw SQL workarounds; independent source and live-state review precedes any real release.",
         "pre-mutation-proof":
-          "Status, post-qualification recheck and the final mutation fence all run named zero-count " +
+          "For 0092 the absolute TAKOSERVER_DEPLOY_TARGET_PRODUCTION path supplies a distinct read-only production D1 descriptor. The exact 0088 predecessor shape, native GET of the generated integration D1 UUID/name and same-name R2, and bounded digest of unchanged ledger, lot and allocation rows are checked before qualification, after qualification and immediately before dispatch. Production D1 receives no provider GET. The private canonical owner must separately prove all unresolved publication attempts terminal or GET-recovered and exact 92-capable inspector, gateway, Tail, Host and CPE dependencies without rewriting frozen historical claims. Status, post-qualification recheck and the final mutation fence all run named zero-count " +
           "checks for 0029 malformed FormRef and duplicate live Resource UID, 0036 unmatched " +
           "dispatched repair saga, 0037 nonempty replaced predecessor, and 0039 duplicate live " +
           "native claim, plus the 0043 active-root/deleting-candidate conflict count. The additive " +

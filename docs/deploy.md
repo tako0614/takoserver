@@ -26,8 +26,8 @@ production require exactly one approved next-wave selector, while integration
 may use the same selector for one bounded audited wave:
 
 ```sh
-bun run deploy -- takoserver-d1-schema --status --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088>
-bun run deploy -- takoserver-d1-schema --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0088>
+bun run deploy -- takoserver-d1-schema --status --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088|0092>
+bun run deploy -- takoserver-d1-schema --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0088|0092>
 ```
 
 The fixed order is the one-time legacy production catch-up 0017–0022, then
@@ -193,14 +193,15 @@ either profile. For `v2-0092`, read it with these substitutions:
 **staging-only**:
 
 - `takoserver-production-d1-fresh-init` refuses the selector outright.
-- No in-place wave, rehearsal lane, or production surface offers it.
+- The separate reviewed integration-only 0088→0092 wave does not reinterpret
+  this fresh 0091 payload or make it available to production.
 - Like every lineage on this surface, it only ever creates a new
   `takoserver-i-<generation>` D1. It cannot reach an existing database.
 
-It exists because no existing integration D1 can be moved past 0088 in place.
-The canonical integration D1 that the WfP owners use is deliberately left at
-0001–0088: those owners require exactly that ledger and bind its schema digest
-into their retained claims, so moving it in place would break them.
+It was introduced before a qualified canonical 0092 wave existed. The canonical
+integration D1 remains at 0001–0088 until the separate owner dependency proofs
+and schema wave are reviewed and applied. Existing WfP claims bind its schema;
+the 0092 marker alone cannot make those owners accept a changed D1.
 
 Two guards refuse a production D1:
 
@@ -1664,6 +1665,58 @@ lineage must be the audited canonical 0066–0088 prefix, the 0068 epoch closed,
 and affected v2 Resource data absent. Interrupted canonical prefixes may be
 resumed only with fresh proof; a provider transport exception causes readback,
 never automatic resend. No protected production or default 0066 ceiling changes.
+
+### Canonical integration 0088→0092 billing schema wave
+
+The cross-repository sequence and ownership are recorded in
+[the 0092 task ledger](schema-v2-0092-wave.md).
+
+`--through-migration=0092` names only the generated canonical integration D1
+whose target retains `takoformV2.storageLineage: "v2-0088"`. Status requires the
+absolute `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` descriptor as a read-only D1
+identity fence. The selected D1 and R2 must be the same `takoserver-i-<32 hex>`
+name; either name or UUID matching production is refused. Rehearsal and
+production refuse the selector. The default 0066 path and fresh 0088, 0089,
+0091, and staging-only 0092 profiles remain fixed. Fresh
+`storageLineage: "v2-0092"` creates an empty staging pair; it does not select
+the wave on the existing 0088 pair.
+
+This wave accepts exactly 88 applied migration rows and the canonical 0088
+application schema before mutation. It pins the audited 92-file source digest
+`sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2`.
+It reads up to 1,000 rows each from `ledger`, `wallet_credit_lots`, and
+`wallet_credit_allocations` in stable key order and compares a value-free
+SHA-256 snapshot before qualification, after the migration gate, and at the
+immediate dispatch fence. Larger staging data requires a separately reviewed
+bounded proof implementation. Existing foreign-key violations refuse the wave.
+The generated D1 UUID is GET-checked against its native generated name, and
+the same-name R2 is GET-checked before qualification and immediately before
+mutation. No production D1 provider read is made. The unchanged 0089–0092 SQL
+and migration-ledger inserts are sealed into one Wrangler file import. The
+private owner first persists a no-overwrite, fsynced dispatched attempt bound
+to the native target, reviewed source, sealed import and pre-mutation wallet
+proof. After an acknowledged or uncertain response, only exact
+92 applied rows, canonical 0092 schema, preserved money-row digest, valid lot
+cursor handles, empty new lifecycle/tariff/Stripe tables, and zero foreign-key
+violations complete the proof. A partial or unknown result is held for
+authoritative readback and forward repair; there is no down migration or blind
+replay. An uncertain result with the old 88-row lineage still leaves the
+dispatched record in place and cannot authorize a fresh apply; the private
+entrypoint uses GET-only reconciliation or manual forward repair.
+
+The private canonical owners must first prove all unresolved publication
+attempts terminal or GET-recovered, retain historical Version/native/claim
+identity, and qualify the current exact 88 state with owner code capable of
+checking a subsequent exact 92 readback. At verification they must independently
+prove the actual 92 dependencies through inspector, gateway, Tail, Host and CPE.
+Old dependency status calls that demand 88/89 cannot be ignored or treated as
+92 evidence. The public schema status is not that private owner proof. Do not
+apply until the owning private entrypoint can provide and recheck it. After the exact schema readback, the operator may
+explicitly add `takoformV2.appliedSchemaLineage: "v2-0092"` to the private
+target. Its `storageLineage: "v2-0088"` stays unchanged. Worker publication
+requires both this selector and the complete 92-row application shape; the
+observed migration marker cannot select the successor or mutate the target.
+Selecting the successor while D1 still has only 88 rows is refused.
 
 The public Host has a source-only, optional deploy-target profile
 `"schemaMaintenanceMode": "pre-0058-quiesced"`. It projects the non-secret

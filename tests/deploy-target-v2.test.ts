@@ -274,6 +274,61 @@ describe("environment-exact deploy target", () => {
     ).toThrow("cannot select a fresh");
   });
 
+  test("applied 0092 is explicit and preserves the 0088 fresh origin", () => {
+    const config = JSON.stringify({
+      documentation: "https://docs.example.test/v2",
+      authenticationDocumentation: "https://docs.example.test/v2/authentication",
+    });
+    const chosen = parseDeployTarget(
+      descriptor({
+        environment: "integration",
+        takoformV2: { config, storageLineage: "v2-0088", appliedSchemaLineage: "v2-0092" },
+      }),
+      "canonical 0092 target",
+      "integration",
+    );
+    expect(chosen.takoformV2).toEqual({
+      config,
+      storageLineage: "v2-0088",
+      appliedSchemaLineage: "v2-0092",
+    });
+    expect(takoformV2StorageLineage(chosen)).toBe("v2-0088");
+    for (const storageLineage of [undefined, "v2-0089", "v2-0091"]) {
+      expect(() =>
+        parseDeployTarget(
+          descriptor({
+            environment: "integration",
+            takoformV2: { config, storageLineage, appliedSchemaLineage: "v2-0092" },
+          }),
+          "wrong origin",
+          "integration",
+        ),
+      ).toThrow("original fresh v2-0088");
+    }
+    for (const appliedSchemaLineage of ["v2-0091", "v2-0093", true]) {
+      expect(() =>
+        parseDeployTarget(
+          descriptor({
+            environment: "integration",
+            takoformV2: { config, storageLineage: "v2-0088", appliedSchemaLineage },
+          }),
+          "wrong applied lineage",
+          "integration",
+        ),
+      ).toThrow("appliedSchemaLineage");
+    }
+    expect(() =>
+      parseDeployTarget(
+        descriptor({
+          environment: "production",
+          takoformV2: { config, storageLineage: "v2-0088", appliedSchemaLineage: "v2-0092" },
+        }),
+        "production applied lineage",
+        "production",
+      ),
+    ).toThrow("integration-only");
+  });
+
   test("refuses the retired cross-product runtime topology", () => {
     withTarget(
       descriptor({
