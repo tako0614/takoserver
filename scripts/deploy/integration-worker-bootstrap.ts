@@ -22,10 +22,12 @@ import {
   verifyFreshV2IntegrationStorageTarget,
 } from "./integration-storage-generation.ts";
 import {
+  assertMoneyUnitSchema,
   assertOrgBillingSchema,
   assertStripeWebhookSchema,
   canonicalSchemaShape,
   type D1SchemaState,
+  moneyUnitSchemaReady,
   orgBillingSchemaReady,
   readD1SchemaState,
 } from "./migrations.ts";
@@ -332,6 +334,7 @@ export async function runIntegrationWorkerBootstrap(
     const schemaReader = resolveSchemaReader(options, inspectionConfig, target, environment, run);
     const schemaBefore = await readSchema("preflight", schemaReader);
     assertCompleteSchema(schemaBefore, artifactBefore, expectedShape);
+    assertMoneyUnitSchema(schemaBefore.applied);
     assertStripeWebhookSchema(target, schemaBefore.applied);
     assertOrgBillingSchema(target, schemaBefore.applied);
     const v2StorageBefore =
@@ -702,6 +705,7 @@ async function statusExisting(
     await assertWorkerSchedules("preflight", target, state, expectedSchedules);
     const ready =
       identity.commit === invocation.commit &&
+      moneyUnitSchemaReady(schema.applied) &&
       orgBillingSchemaReady(target, schema.applied) &&
       (providerInspection === null || providerInspection.ready);
     return {
@@ -711,6 +715,7 @@ async function statusExisting(
       artifactDigest: `sha256:${identity.bundleDigestHex}`,
       appliedMigrations: schema.applied,
       schemaShapeDigest: schema.shapeDigest,
+      moneyUnitSchemaReady: moneyUnitSchemaReady(schema.applied),
       ready,
       ...(target.takoformV2 === undefined ? {} : { storageQualified: true }),
       ...(providerInspection === null
@@ -758,8 +763,9 @@ function statusResult(
     deployedCommit: null,
     artifactDigest: null,
     signingKeyId: target.signing.currentKeyId,
+    moneyUnitSchemaReady: false,
     billingSchemaReady: orgBillingSchemaReady(target, []),
-    ready: native.absent && target.billingConfig === undefined,
+    ready: false,
     mutationApplied: false,
   };
   return target.takoformV2 === undefined

@@ -316,7 +316,12 @@ describe("prepaid vertical over HTTP", () => {
       undefined,
       owner,
     );
-    expect(paidOnce.body.wallet).toMatchObject({ settledMinor: 9_500, heldMinor: 0 });
+    expect(paidOnce.body.wallet).toMatchObject({
+      settledMicros: "95000000",
+      heldMicros: "0",
+      unit: "USD-micros",
+      moneyPolicy: "usd-micros-v2",
+    });
 
     const staleProvisionBearer = await call(fetch, "GET", resourcePath, undefined, bearer);
     expect(staleProvisionBearer.status).toBe(401);
@@ -436,7 +441,12 @@ describe("prepaid vertical over HTTP", () => {
       undefined,
       owner,
     );
-    expect(wallet.body.wallet).toMatchObject({ settledMinor: 10_000, availableMinor: 10_000 });
+    expect(wallet.body.wallet).toMatchObject({
+      settledMicros: "100000000",
+      availableMicros: "100000000",
+      unit: "USD-micros",
+      moneyPolicy: "usd-micros-v2",
+    });
 
     const catalog = await call(
       fetch,
@@ -475,7 +485,10 @@ describe("prepaid vertical over HTTP", () => {
       undefined,
       owner,
     );
-    expect(held.body.wallet).toMatchObject({ heldMinor: 1_000, availableMinor: 9_000 });
+    expect(held.body.wallet).toMatchObject({
+      heldMicros: "10000000",
+      availableMicros: "90000000",
+    });
 
     const token = await call(
       fetch,
@@ -505,7 +518,7 @@ describe("prepaid vertical over HTTP", () => {
       undefined,
       owner,
     );
-    expect(settled.body.wallet).toMatchObject({ settledMinor: 9_000, heldMinor: 0 });
+    expect(settled.body.wallet).toMatchObject({ settledMicros: "90000000", heldMicros: "0" });
 
     const statement = await call(
       fetch,
@@ -584,7 +597,7 @@ describe("prepaid vertical over HTTP", () => {
       undefined,
       owner,
     );
-    expect(wallet.body.wallet).toMatchObject({ heldMinor: 0, availableMinor: 10_000 });
+    expect(wallet.body.wallet).toMatchObject({ heldMicros: "0", availableMicros: "100000000" });
   });
 
   test("credits a repeated settlement proof exactly once", async () => {
@@ -604,7 +617,7 @@ describe("prepaid vertical over HTTP", () => {
       undefined,
       owner,
     );
-    expect(wallet.body.wallet).toMatchObject({ settledMinor: 10_000 });
+    expect(wallet.body.wallet).toMatchObject({ settledMicros: "100000000" });
   });
 
   test("returns expired holds when the background pass runs", async () => {
@@ -649,6 +662,6 @@ describe("prepaid vertical over HTTP", () => {
       undefined,
       owner,
     );
-    expect(wallet.body.wallet).toMatchObject({ heldMinor: 0, availableMinor: 10_000 });
+    expect(wallet.body.wallet).toMatchObject({ heldMicros: "0", availableMicros: "100000000" });
   });
 });

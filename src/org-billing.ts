@@ -1,12 +1,12 @@
 import {
   type BillingConfig,
   BillingConfigError,
-  computeMeterAmountMinor,
+  computeMeterAmountMicros,
   parseBillingConfig,
-  roundMicrosToMinor,
 } from "./billing-config.ts";
-import { base64UrlDecode, base64UrlEncode, bytesDigest, canonicalJson } from "./json.ts";
+import { base64UrlDecode, base64UrlEncode, canonicalJson } from "./json.ts";
 import { type Ledger, LedgerError, prepareLedgerAllocation, type Wallet } from "./ledger.ts";
+import { MoneyError, minorToMicros } from "./money.ts";
 import { type Clock, type Row, type Sql, SqlError, type SqlStatement } from "./ports.ts";
 
 export class OrgBillingError extends Error {
@@ -22,11 +22,12 @@ export class OrgBillingError extends Error {
 export interface HoldReceipt {
   readonly organizationId: string;
   readonly reference: string;
-  readonly amountMinor: number;
+  readonly moneyPolicy: MoneyPolicy;
+  readonly amountMicros: number;
   readonly pricingRevision: string | null;
   readonly status: "live" | "captured" | "released" | "expired";
-  readonly capturedMinor: number;
-  readonly releasedMinor: number;
+  readonly capturedMicros: number;
+  readonly releasedMicros: number;
   readonly actualMicros: string | null;
   readonly createdAt: string;
   readonly expiresAt: string | null;
@@ -36,6 +37,7 @@ export interface HoldReceipt {
 export interface UsageReceipt {
   readonly organizationId: string;
   readonly reference: string;
+  readonly moneyPolicy: MoneyPolicy;
   readonly pricingRevision: string;
   readonly meter: string;
   readonly quantity: string;
@@ -43,7 +45,7 @@ export interface UsageReceipt {
   readonly periodStart: string;
   readonly periodEnd: string;
   readonly rate: { readonly numeratorMicros: string; readonly denominator: string };
-  readonly amountMinor: number;
+  readonly amountMicros: number;
   readonly status: "pending" | "paid";
   readonly createdAt: string;
   readonly paidAt: string | null;
@@ -52,19 +54,22 @@ export interface UsageReceipt {
 export interface CreditLot {
   readonly reference: string;
   readonly kind: "direct" | "plan-included" | "purchased";
-  readonly amountMinor: number;
-  readonly spentMinor: number;
-  readonly remainingMinor: number;
-  readonly heldMinor: number;
-  readonly availableMinor: number;
+  readonly consumptionClass: "free" | "subscription" | "purchased";
+  readonly amountMicros: number;
+  readonly spentMicros: number;
+  readonly remainingMicros: number;
+  readonly heldMicros: number;
+  readonly availableMicros: number;
   readonly expiresAt: string | null;
   readonly createdAt: string;
 }
 
+export type MoneyPolicy = "usd-cents-v1" | "usd-micros-v2";
+
 export interface HoldInput {
   readonly organizationId: string;
   readonly reference: string;
-  readonly amountMinor: number;
+  readonly amountMicros: number;
   readonly pricingRevision: string;
   readonly measurementFingerprint: string;
 }
@@ -72,7 +77,7 @@ export interface HoldInput {
 export interface CaptureInput {
   readonly organizationId: string;
   readonly reference: string;
-  readonly amountMinor: number;
+  readonly amountMicros: number;
   readonly actualMicros: string;
   readonly measurementFingerprint: string;
 }
@@ -86,7 +91,7 @@ export interface UsageInput {
   readonly periodStart: string;
   readonly periodEnd: string;
   readonly pricingRevision: string;
-  readonly expectedMinor: number;
+  readonly expectedMicros: number;
   readonly measurementFingerprint: string;
 }
 
@@ -119,14 +124,44 @@ export async function assertOrgBillingSchema(
   clock: Clock = () => new Date(),
 ): Promise<void> {
   const rows = await sql.query(
-    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('org_wallet_holds', 'org_wallet_usage_records', 'org_wallet_grant_snapshots', 'org_wallet_pricing_revisions', 'org_wallet_monthly_tariffs')",
+    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('org_wallet_holds', 'org_wallet_usage_records', 'org_wallet_grant_snapshots', 'org_wallet_pricing_revisions', 'org_wallet_monthly_tariffs', 'money_unit_policy')",
   );
-  if (rows.length !== 5) throw new OrgBillingError("billing_schema_not_ready", 503);
+  if (rows.length !== 6) throw new OrgBillingError("billing_schema_not_ready", 503);
+  const requiredColumns: Record<string, readonly string[]> = {
+    ledger: ["settled_delta_micros", "held_delta_micros"],
+    wallet_credit_lots: ["amount_micros", "consumption_class", "cursor_handle"],
+    wallet_credit_allocations: ["amount_micros"],
+    org_wallet_holds: ["amount_micros", "captured_micros", "released_micros", "money_policy"],
+    org_wallet_usage_records: ["amount_micros", "money_policy"],
+    org_wallet_grant_snapshots: ["amount_micros", "money_policy"],
+    org_wallet_monthly_tariffs: ["amount_micros", "money_policy"],
+  };
+  for (const [table, columns] of Object.entries(requiredColumns)) {
+    const present = new Set(
+      (await sql.query(`PRAGMA table_info(${table})`)).map((row) => row.name),
+    );
+    if (columns.some((column) => !present.has(column)))
+      throw new OrgBillingError("billing_schema_not_ready", 503);
+  }
+  const unitPolicy = await sql.query(
+    "SELECT ledger_unit, historical_usage_unit, cash_unit FROM money_unit_policy WHERE singleton = 1",
+  );
+  if (
+    unitPolicy.length !== 1 ||
+    unitPolicy[0]?.ledger_unit !== "usd-micros-v2" ||
+    unitPolicy[0]?.historical_usage_unit !== "microcent-v1" ||
+    unitPolicy[0]?.cash_unit !== "usd-cents-v1"
+  )
+    throw new OrgBillingError("billing_schema_not_ready", 503);
   const cursorObjects = await sql.query(
     "SELECT name FROM sqlite_schema WHERE (type = 'index' AND name = 'wallet_credit_lots_cursor') OR (type = 'trigger' AND name IN ('wallet_credit_lots_cursor_insert', 'wallet_credit_lots_cursor_immutable'))",
   );
   if (cursorObjects.length !== 3) throw new OrgBillingError("billing_schema_not_ready", 503);
-  if (config) await registerTariffs(sql, config, clock().toISOString());
+  if (config) {
+    for (const tariff of [...(config.history ?? []), config])
+      checkedGrantMicros(tariff.freeIncludedMinor);
+    await registerTariffs(sql, config, clock().toISOString());
+  }
 }
 
 async function registerTariffs(sql: Sql, config: BillingConfig, instant: string): Promise<void> {
@@ -236,11 +271,11 @@ export function createOrgBilling(options: {
     // The first access freezes one policy for the whole month, including zero
     // eligibility. An initial mid-month tariff starts free grants next month.
     await sql.run(
-      `INSERT OR IGNORE INTO org_wallet_monthly_tariffs (month, pricing_revision, amount_minor, expires_at, created_at) VALUES (?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO org_wallet_monthly_tariffs (month, pricing_revision, amount_micros, expires_at, created_at, money_policy) VALUES (?, ?, ?, ?, ?, 'usd-micros-v2')`,
       [
         month,
         monthly?.revision ?? "unconfigured",
-        monthly?.freeIncludedMinor ?? 0,
+        monthly ? checkedGrantMicros(monthly.freeIncludedMinor) : 0,
         nextMonth.toISOString(),
         instant,
       ],
@@ -251,29 +286,30 @@ export function createOrgBilling(options: {
     if (!policy) orgBillingFail("billing_unavailable", 503);
     const ref = `free:${org}:${month}`;
     await sql.run(
-      `INSERT OR IGNORE INTO org_wallet_grant_snapshots (org_id, ref, pricing_revision, amount_minor, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO org_wallet_grant_snapshots (org_id, ref, pricing_revision, amount_micros, expires_at, created_at, money_policy) VALUES (?, ?, ?, ?, ?, ?, 'usd-micros-v2')`,
       [
         org,
         ref,
         String(policy.pricing_revision),
-        Number(policy.amount_minor),
+        Number(policy.amount_micros),
         String(policy.expires_at),
         instant,
       ],
     );
     const snapshot = (
       await sql.query(
-        "SELECT amount_minor, expires_at FROM org_wallet_grant_snapshots WHERE org_id = ? AND ref = ?",
+        "SELECT amount_micros, expires_at FROM org_wallet_grant_snapshots WHERE org_id = ? AND ref = ?",
         [org, ref],
       )
     )[0];
     if (!snapshot) orgBillingFail("billing_unavailable", 503);
-    if (Number(snapshot.amount_minor) > 0)
+    if (Number(snapshot.amount_micros) > 0)
       await ledger.fund({
         organizationId: org,
         fundingRef: ref,
-        amountMinor: Number(snapshot.amount_minor),
+        amountMicros: Number(snapshot.amount_micros),
         kind: "plan-included",
+        consumptionClass: "free",
         expiresAt: String(snapshot.expires_at),
       });
   }
@@ -288,13 +324,13 @@ export function createOrgBilling(options: {
     const org = String(row.org_id);
     const ref = String(row.ref);
     const ledgerRef = String(row.ledger_ref);
-    const amount = Number(row.amount_minor);
+    const amount = Number(row.amount_micros);
     const instant = now();
     const guards: SqlStatement[] = [];
     const guardId = `guard_${crypto.randomUUID()}`;
     guards.push(
       {
-        sql: `UPDATE org_wallet_holds SET state = ?, captured_minor = ?, released_minor = ?,
+        sql: `UPDATE org_wallet_holds SET state = ?, captured_micros = ?, released_micros = ?,
             capture_fingerprint = ?, actual_micros = ?, closed_at = ?
             WHERE org_id = ? AND ref = ? AND state = 'live'
               AND ${state === "expired" ? "expires_at <= ?" : "expires_at > ?"}`,
@@ -318,26 +354,27 @@ export function createOrgBilling(options: {
       guard(
         `${guardId}_hold`,
         `
-      (SELECT COALESCE(SUM(held_delta), 0) FROM ledger WHERE org_id = ? AND ref = ?) = ?
-      AND (SELECT COALESCE(SUM(amount_minor), 0) FROM wallet_credit_allocations
+      (SELECT COALESCE(SUM(held_delta_micros), 0) FROM ledger WHERE org_id = ? AND ref = ?) = ?
+      AND (SELECT COALESCE(SUM(amount_micros), 0) FROM wallet_credit_allocations
            WHERE org_id = ? AND debit_type = 'hold' AND debit_ref = ?) = ?
       AND NOT EXISTS (SELECT 1 FROM ledger WHERE org_id = ? AND ref = ? AND type IN ('capture', 'release'))`,
         [org, ledgerRef, amount, org, ledgerRef, amount, org, ledgerRef],
       ),
     );
     const allocations = await sql.query(
-      `SELECT a.lot_ref, a.amount_minor FROM wallet_credit_allocations a
+      `SELECT a.lot_ref, a.amount_micros FROM wallet_credit_allocations a
        JOIN wallet_credit_lots l ON l.org_id = a.org_id AND l.ref = a.lot_ref
        WHERE a.org_id = ? AND a.debit_type = 'hold' AND a.debit_ref = ?
-       ORDER BY CASE WHEN l.expires_at IS NULL THEN 1 ELSE 0 END, l.expires_at, l.created_at, l.ref`,
+       ORDER BY CASE l.consumption_class WHEN 'free' THEN 0 WHEN 'subscription' THEN 1 ELSE 2 END,
+         CASE WHEN l.expires_at IS NULL THEN 1 ELSE 0 END, l.expires_at, l.created_at, l.ref`,
       [org, ledgerRef],
     );
     let remaining = captured;
     for (const allocation of allocations) {
-      const used = Math.min(remaining, Number(allocation.amount_minor));
+      const used = Math.min(remaining, Number(allocation.amount_micros));
       if (used > 0)
         guards.push({
-          sql: `INSERT INTO wallet_credit_allocations (org_id, debit_type, debit_ref, lot_ref, amount_minor, created_at)
+          sql: `INSERT INTO wallet_credit_allocations (org_id, debit_type, debit_ref, lot_ref, amount_micros, created_at)
               VALUES (?, 'capture', ?, ?, ?, ?)`,
           params: [org, ledgerRef, String(allocation.lot_ref), used, instant],
         });
@@ -397,39 +434,39 @@ export function createOrgBilling(options: {
         // Resolve only in this Organization; the cursor never grants access.
         after = (
           await sql.query(
-            "SELECT ref, expires_at, created_at FROM wallet_credit_lots WHERE org_id = ? AND cursor_handle = ?",
+            "SELECT ref, consumption_class, expires_at, created_at FROM wallet_credit_lots WHERE org_id = ? AND cursor_handle = ?",
             [org, cursor],
           )
         )[0];
         if (!after) orgBillingFail("invalid_cursor", 400);
       }
       await prepare(org);
+      const classRank = after ? lotClassRank(String(after.consumption_class)) : 0;
       const nullableRank = after?.expires_at == null ? 1 : 0;
       const boundary = after
         ? `AND (
-        CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END > ? OR
-        (CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END = ? AND
-         (COALESCE(expires_at, '') > ? OR
-          (COALESCE(expires_at, '') = ? AND
-           (created_at > ? OR (created_at = ? AND ref > ?))))))`
+          CASE consumption_class WHEN 'free' THEN 0 WHEN 'subscription' THEN 1 ELSE 2 END,
+          CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END,
+          COALESCE(expires_at, ''), created_at, ref
+        ) > (?, ?, ?, ?, ?)`
         : "";
       const rows = await sql.query(
         `SELECT l.*,
-          COALESCE(SUM(CASE WHEN a.debit_type = 'hold' THEN a.amount_minor ELSE 0 END), 0) AS held_minor,
-          COALESCE(SUM(CASE WHEN a.debit_type IN ('capture', 'usage_debit') THEN a.amount_minor ELSE 0 END), 0) AS spent_minor
+          COALESCE(SUM(CASE WHEN a.debit_type = 'hold' THEN a.amount_micros ELSE 0 END), 0) AS held_micros,
+          COALESCE(SUM(CASE WHEN a.debit_type IN ('capture', 'usage_debit') THEN a.amount_micros ELSE 0 END), 0) AS spent_micros
          FROM (SELECT * FROM wallet_credit_lots WHERE org_id = ? ${boundary}
-           ORDER BY CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END, expires_at, created_at, ref LIMIT ?) l
+           ORDER BY CASE consumption_class WHEN 'free' THEN 0 WHEN 'subscription' THEN 1 ELSE 2 END,
+             CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END, expires_at, created_at, ref LIMIT ?) l
          LEFT JOIN wallet_credit_allocations a ON a.org_id = l.org_id AND a.lot_ref = l.ref
          GROUP BY l.org_id, l.ref
-         ORDER BY CASE WHEN l.expires_at IS NULL THEN 1 ELSE 0 END, l.expires_at, l.created_at, l.ref`,
+         ORDER BY CASE l.consumption_class WHEN 'free' THEN 0 WHEN 'subscription' THEN 1 ELSE 2 END,
+           CASE WHEN l.expires_at IS NULL THEN 1 ELSE 0 END, l.expires_at, l.created_at, l.ref`,
         after
           ? [
               org,
-              nullableRank,
+              classRank,
               nullableRank,
               String(after.expires_at ?? ""),
-              String(after.expires_at ?? ""),
-              String(after.created_at),
               String(after.created_at),
               String(after.ref),
               limit + 1,
@@ -439,20 +476,21 @@ export function createOrgBilling(options: {
       const page = rows.slice(0, limit);
       const last = page.at(-1);
       const lots = page.map((row) => {
-        const amountMinor = Number(row.amount_minor);
-        const spentMinor = Number(row.spent_minor);
-        const heldMinor = Number(row.held_minor);
-        const remainingMinor = amountMinor - spentMinor;
+        const amountMicros = Number(row.amount_micros);
+        const spentMicros = Number(row.spent_micros);
+        const heldMicros = Number(row.held_micros);
+        const remainingMicros = amountMicros - spentMicros;
         return {
           reference: String(row.ref),
           kind: row.kind as CreditLot["kind"],
-          amountMinor,
-          spentMinor,
-          remainingMinor,
-          heldMinor,
-          availableMinor:
+          consumptionClass: row.consumption_class as CreditLot["consumptionClass"],
+          amountMicros,
+          spentMicros,
+          remainingMicros,
+          heldMicros,
+          availableMicros:
             row.expires_at == null || String(row.expires_at) > now()
-              ? remainingMinor - heldMinor
+              ? remainingMicros - heldMicros
               : 0,
           expiresAt: nullable(row.expires_at),
           createdAt: String(row.created_at),
@@ -465,16 +503,17 @@ export function createOrgBilling(options: {
     },
     async hold(input) {
       reference(input.reference);
-      minor(input.amountMinor);
+      spendableMicros(input.amountMicros);
       fingerprint(input.measurementFingerprint);
       const signature = JSON.stringify([
-        input.amountMinor,
+        input.amountMicros,
         input.pricingRevision,
         input.measurementFingerprint,
       ]);
       await prepare(input.organizationId);
       const prior = await held(input.organizationId, input.reference);
       if (prior) {
+        if (prior.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
         if (prior.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
         return holdReceipt(prior);
       }
@@ -496,26 +535,26 @@ export function createOrgBilling(options: {
       const admissionGuard = `guard_${crypto.randomUUID()}`;
       try {
         const allocation =
-          input.amountMinor === 0
+          input.amountMicros === 0
             ? []
             : await prepareLedgerAllocation(sql, {
                 organizationId: input.organizationId,
                 type: "hold",
                 reference: ledgerRef,
-                amountMinor: input.amountMinor,
-                settledDeltaMinor: 0,
-                heldDeltaMinor: input.amountMinor,
+                amountMicros: input.amountMicros,
+                settledDeltaMicros: 0,
+                heldDeltaMicros: input.amountMicros,
                 now: instant,
               });
         await sql.batch([
           {
-            sql: `INSERT INTO org_wallet_holds (org_id, ref, ledger_ref, amount_minor, fingerprint, pricing_revision, created_at, expires_at, state)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'live')`,
+            sql: `INSERT INTO org_wallet_holds (org_id, ref, ledger_ref, amount_micros, fingerprint, pricing_revision, created_at, expires_at, state, money_policy)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'live', 'usd-micros-v2')`,
             params: [
               input.organizationId,
               input.reference,
               ledgerRef,
-              input.amountMinor,
+              input.amountMicros,
               signature,
               input.pricingRevision,
               instant,
@@ -533,6 +572,7 @@ export function createOrgBilling(options: {
       } catch (error) {
         const replay = await held(input.organizationId, input.reference);
         if (replay) {
+          if (replay.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
           if (replay.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
           return service.readHold(input.organizationId, input.reference);
         }
@@ -549,7 +589,7 @@ export function createOrgBilling(options: {
           (error instanceof LedgerError && error.code === "insufficient_funds") ||
           (error instanceof SqlError &&
             error.code === "constraint" &&
-            (await ledger.wallet(input.organizationId)).availableMinor < input.amountMinor)
+            (await ledger.wallet(input.organizationId)).availableMicros < input.amountMicros)
         )
           orgBillingFail("insufficient_funds", 402);
         if (error instanceof SqlError) orgBillingFail("billing_unavailable", 503);
@@ -567,36 +607,33 @@ export function createOrgBilling(options: {
     },
     async capture(input) {
       reference(input.reference);
-      minor(input.amountMinor);
+      spendableMicros(input.amountMicros);
       fingerprint(input.measurementFingerprint);
       decimalInteger(input.actualMicros);
       const signature = JSON.stringify([
-        input.amountMinor,
+        input.amountMicros,
         input.actualMicros,
         input.measurementFingerprint,
       ]);
       await prepare(input.organizationId);
       const row = await held(input.organizationId, input.reference);
       if (!row) orgBillingFail("hold_not_found", 404);
-      if (input.amountMinor > Number(row.amount_minor)) orgBillingFail("capture_exceeds_hold", 409);
+      if (row.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
+      if (input.amountMicros > Number(row.amount_micros))
+        orgBillingFail("capture_exceeds_hold", 409);
       if (row.capture_fingerprint !== null && row.state !== "live") {
         if (row.capture_fingerprint !== signature) orgBillingFail("reference_conflict", 409);
         return holdReceipt(row);
       }
       if (row.state !== "live") orgBillingFail("hold_closed", 409);
-      let actual: number;
-      try {
-        actual = roundMicrosToMinor(input.actualMicros);
-      } catch (error) {
-        if (error instanceof BillingConfigError) orgBillingFail("invalid_amount", 400);
-        throw error;
-      }
-      if (input.amountMinor !== Math.min(actual, Number(row.amount_minor)))
-        orgBillingFail("measurement_conflict", 409);
+      const actual = BigInt(input.actualMicros);
+      const cappedActual =
+        actual > BigInt(Number(row.amount_micros)) ? Number(row.amount_micros) : Number(actual);
+      if (input.amountMicros !== cappedActual) orgBillingFail("measurement_conflict", 409);
       return close(
         row,
-        input.amountMinor === 0 ? "released" : "captured",
-        input.amountMinor,
+        input.amountMicros === 0 ? "released" : "captured",
+        input.amountMicros,
         signature,
         input.actualMicros,
       );
@@ -605,18 +642,22 @@ export function createOrgBilling(options: {
       reference(ref);
       await prepare(org);
       const row = await held(org, ref);
-      if (row) return row.state === "live" ? close(row, "released", 0) : holdReceipt(row);
+      if (row) {
+        if (row.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
+        return row.state === "live" ? close(row, "released", 0) : holdReceipt(row);
+      }
       const instant = now();
       try {
         await sql.run(
-          `INSERT INTO org_wallet_holds (org_id, ref, ledger_ref, amount_minor, created_at, state, closed_at)
-                       VALUES (?, ?, ?, 0, ?, 'released', ?)`,
+          `INSERT INTO org_wallet_holds (org_id, ref, ledger_ref, amount_micros, created_at, state, closed_at, money_policy)
+                       VALUES (?, ?, ?, 0, ?, 'released', ?, 'usd-micros-v2')`,
           [org, ref, `org-hold:${ref}`, instant, instant],
         );
       } catch (error) {
         if (!(error instanceof SqlError && error.code === "constraint")) throw error;
         const winner = await held(org, ref);
         if (!winner) orgBillingFail("billing_unavailable", 503);
+        if (winner.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
         return winner.state === "live" ? close(winner, "released", 0) : holdReceipt(winner);
       }
       const tombstone = await held(org, ref);
@@ -626,7 +667,7 @@ export function createOrgBilling(options: {
     async usage(input) {
       reference(input.reference);
       fingerprint(input.measurementFingerprint);
-      minor(input.expectedMinor);
+      spendableMicros(input.expectedMicros);
       const quantity = decimalQuantity(input.quantity);
       canonicalTime(input.periodStart);
       canonicalTime(input.periodEnd);
@@ -639,11 +680,12 @@ export function createOrgBilling(options: {
         input.periodStart,
         input.periodEnd,
         input.pricingRevision,
-        input.expectedMinor,
+        input.expectedMicros,
         input.measurementFingerprint,
       ]);
       await prepare(input.organizationId);
       let row = await usageRow(input.organizationId, input.reference);
+      if (row && row.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
       if (row && row.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
       if (!row) {
         const tariff = await tariffAt(input.periodStart);
@@ -672,7 +714,7 @@ export function createOrgBilling(options: {
         const unitDenominator = byteHours ? 3600000n : 1n;
         let amount: number;
         try {
-          amount = computeMeterAmountMinor(
+          amount = computeMeterAmountMicros(
             quantity.numerator,
             meter.rate,
             quantity.denominator * unitDenominator,
@@ -681,11 +723,11 @@ export function createOrgBilling(options: {
           if (error instanceof BillingConfigError) orgBillingFail("invalid_amount", 400);
           throw error;
         }
-        if (amount !== input.expectedMinor) orgBillingFail("measurement_conflict", 409);
+        if (amount !== input.expectedMicros) orgBillingFail("measurement_conflict", 409);
         try {
           await sql.run(
-            `INSERT INTO org_wallet_usage_records (org_id, ref, fingerprint, pricing_revision, meter, quantity, quantity_unit, period_start, period_end, rate_numerator_micros, rate_denominator, amount_minor, state, created_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+            `INSERT INTO org_wallet_usage_records (org_id, ref, fingerprint, pricing_revision, meter, quantity, quantity_unit, period_start, period_end, rate_numerator_micros, rate_denominator, amount_micros, state, created_at, money_policy)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'usd-micros-v2')`,
             [
               input.organizationId,
               input.reference,
@@ -707,10 +749,11 @@ export function createOrgBilling(options: {
         }
         row = await usageRow(input.organizationId, input.reference);
         if (!row) orgBillingFail("billing_unavailable", 503);
+        if (row.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
         if (row.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
       }
       if (row.state === "paid") return usageReceipt(row);
-      const amount = Number(row.amount_minor);
+      const amount = Number(row.amount_micros);
       const instant = now();
       try {
         const allocation =
@@ -720,9 +763,9 @@ export function createOrgBilling(options: {
                 organizationId: input.organizationId,
                 type: "usage_debit",
                 reference: `org-usage:${input.reference}`,
-                amountMinor: amount,
-                settledDeltaMinor: -amount,
-                heldDeltaMinor: 0,
+                amountMicros: amount,
+                settledDeltaMicros: -amount,
+                heldDeltaMicros: 0,
                 now: instant,
               });
         const guardId = `guard_${crypto.randomUUID()}`;
@@ -745,7 +788,7 @@ export function createOrgBilling(options: {
         if (
           error instanceof SqlError &&
           error.code === "constraint" &&
-          (await ledger.wallet(input.organizationId)).availableMinor < amount
+          (await ledger.wallet(input.organizationId)).availableMicros < amount
         ) {
           if (!replay) orgBillingFail("billing_unavailable", 503);
           return usageReceipt(replay);
@@ -831,7 +874,7 @@ function entry(
   instant: string,
 ): SqlStatement {
   return {
-    sql: "INSERT INTO ledger (id, org_id, type, ref, settled_delta, held_delta, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    sql: "INSERT INTO ledger (id, org_id, type, ref, settled_delta_micros, held_delta_micros, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     params: [`led_${crypto.randomUUID()}`, org, type, ref, settled, held, instant],
   };
 }
@@ -839,11 +882,12 @@ function holdReceipt(row: Row): HoldReceipt {
   return {
     organizationId: String(row.org_id),
     reference: String(row.ref),
-    amountMinor: Number(row.amount_minor),
+    moneyPolicy: row.money_policy as MoneyPolicy,
+    amountMicros: Number(row.amount_micros),
     pricingRevision: nullable(row.pricing_revision),
     status: row.state as HoldReceipt["status"],
-    capturedMinor: Number(row.captured_minor),
-    releasedMinor: Number(row.released_minor),
+    capturedMicros: Number(row.captured_micros),
+    releasedMicros: Number(row.released_micros),
     actualMicros: nullable(row.actual_micros),
     createdAt: String(row.created_at),
     expiresAt: nullable(row.expires_at),
@@ -854,6 +898,7 @@ function usageReceipt(row: Row): UsageReceipt {
   return {
     organizationId: String(row.org_id),
     reference: String(row.ref),
+    moneyPolicy: row.money_policy as MoneyPolicy,
     pricingRevision: String(row.pricing_revision),
     meter: String(row.meter),
     quantity: String(row.quantity),
@@ -864,7 +909,7 @@ function usageReceipt(row: Row): UsageReceipt {
       numeratorMicros: String(row.rate_numerator_micros),
       denominator: String(row.rate_denominator),
     },
-    amountMinor: Number(row.amount_minor),
+    amountMicros: Number(row.amount_micros),
     status: row.state as UsageReceipt["status"],
     createdAt: String(row.created_at),
     paidAt: nullable(row.paid_at),
@@ -876,8 +921,22 @@ function nullable(value: unknown): string | null {
 function orgBillingFail(code: string, status: number): never {
   throw new OrgBillingError(code, status);
 }
-function minor(value: number): void {
+function spendableMicros(value: number): void {
   if (!Number.isSafeInteger(value) || value < 0) orgBillingFail("invalid_amount", 400);
+}
+function checkedGrantMicros(cents: number): number {
+  try {
+    return minorToMicros(cents);
+  } catch (error) {
+    if (error instanceof MoneyError) orgBillingFail("billing_unavailable", 503);
+    throw error;
+  }
+}
+function lotClassRank(value: string): number {
+  if (value === "free") return 0;
+  if (value === "subscription") return 1;
+  if (value === "purchased") return 2;
+  orgBillingFail("billing_unavailable", 503);
 }
 function reference(value: string): void {
   if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value))

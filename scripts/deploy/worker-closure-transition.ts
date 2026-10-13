@@ -14,7 +14,13 @@ import {
   verifyFreshV2IntegrationStorageTarget,
   verifyIntegrationStorageGenerationTarget,
 } from "./integration-storage-generation.ts";
-import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
+import {
+  moneyUnitSchemaReady,
+  pendingMigrations,
+  readD1SchemaState,
+  readMigrationArtifact,
+  readMoneyUnitPolicy,
+} from "./migrations.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -32,6 +38,7 @@ import {
 } from "./target.ts";
 import {
   assertProviderExecutorUnchanged,
+  assertWorkerMoneyUnitSchema,
   probeProduct,
   probeSchemaMaintenance,
   providerExecutorAllowsPublication,
@@ -39,6 +46,7 @@ import {
   type WorkerMigrationReader,
   type WorkerProviderExecutorQualification,
   withProviderExecutorQualification,
+  workerMoneyUnitSchemaReady,
   workerSchemaAllowsPending,
 } from "./worker.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
@@ -222,6 +230,7 @@ export async function runWorkerClosureTransition(
       ? null
       : await selectedStorageVerifier(target)(target, invocation.environment, {
           ...options.integrationStorageVerification,
+          allowCurrentAuditedSuccessor: closureRequiresMoneyUnitSchema(target),
           run,
           ...(options.cloudflareEnvironment === undefined
             ? {}
@@ -349,6 +358,8 @@ export async function runWorkerClosureTransition(
           ready:
             target.schemaMaintenanceMode === undefined &&
             workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot) &&
+            (!closureRequiresMoneyUnitSchema(target) ||
+              workerMoneyUnitSchemaReady(migrationState, sourceRepositoryRoot)) &&
             (providerExecutorBefore === null || providerExecutorBefore.ready),
         },
         providerExecutorBefore,
@@ -360,6 +371,9 @@ export async function runWorkerClosureTransition(
         "closure transition refuses pending D1 migrations; apply takoserver-d1-schema first",
         JSON.stringify(pending),
       );
+    }
+    if (closureRequiresMoneyUnitSchema(target)) {
+      assertWorkerMoneyUnitSchema(migrationState, sourceRepositoryRoot, "preflight");
     }
     const reviewer = exactReviewer(
       options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
@@ -523,6 +537,9 @@ export async function runWorkerClosureTransition(
         JSON.stringify(finalPending),
       );
     }
+    if (closureRequiresMoneyUnitSchema(target)) {
+      assertWorkerMoneyUnitSchema(finalMigrationState, sourceRepositoryRoot, "preflight");
+    }
     if (
       JSON.stringify(finalMigrationState.local) !== JSON.stringify(migrationState.local) ||
       JSON.stringify(finalMigrationState.applied) !== JSON.stringify(migrationState.applied) ||
@@ -536,6 +553,7 @@ export async function runWorkerClosureTransition(
         invocation.environment,
         {
           ...options.integrationStorageVerification,
+          allowCurrentAuditedSuccessor: closureRequiresMoneyUnitSchema(target),
           run,
           ...(options.cloudflareEnvironment === undefined
             ? {}
@@ -598,6 +616,9 @@ export async function runWorkerClosureTransition(
     if (!workerSchemaAllowsPending(target, afterMigrations, sourceRepositoryRoot)) {
       throw verificationError("closure transition left pending D1 migrations");
     }
+    if (closureRequiresMoneyUnitSchema(target)) {
+      assertWorkerMoneyUnitSchema(afterMigrations, sourceRepositoryRoot, "verification");
+    }
     const providerExecutorAfter =
       providerExecutorQualification === null
         ? null
@@ -616,6 +637,7 @@ export async function runWorkerClosureTransition(
         invocation.environment,
         {
           ...options.integrationStorageVerification,
+          allowCurrentAuditedSuccessor: closureRequiresMoneyUnitSchema(target),
           run,
           ...(options.cloudflareEnvironment === undefined
             ? {}
@@ -774,6 +796,8 @@ async function appliedClosureTransitionStatus(
     ready:
       target.schemaMaintenanceMode === undefined &&
       workerSchemaAllowsPending(target, migrationState) &&
+      (!closureRequiresMoneyUnitSchema(target) ||
+        workerMoneyUnitSchemaReady(migrationState, sourceRepositoryRoot)) &&
       successor.commit === invocation.commit,
   };
 }
@@ -877,6 +901,11 @@ function assertIntegrationStorageProofUnchanged(
       "generated integration storage target or schema changed before publication",
     );
   }
+}
+
+/** Both explicit modes return before app composition and never serve traffic. */
+function closureRequiresMoneyUnitSchema(target: DeployTarget): boolean {
+  return target.schemaMaintenanceMode === undefined && target.artifactBlobIoMode === undefined;
 }
 
 function selectedStorageVerifier(target: DeployTarget) {
@@ -1051,18 +1080,20 @@ function remoteMigrationReader(
   return {
     async read() {
       const local = readMigrationArtifact(resolve(sourceRepositoryRoot, "migrations"));
-      const remote = await readD1SchemaState(
-        new RemoteD1(configPath, {
-          environment,
-          run,
-          wranglerCommand: (args) => deployWranglerCommand(wranglerPath, args),
-        }),
-      );
+      const database = new RemoteD1(configPath, {
+        environment,
+        run,
+        wranglerCommand: (args) => deployWranglerCommand(wranglerPath, args),
+      });
+      const remote = await readD1SchemaState(database);
       return {
         local: local.names,
         applied: remote.applied,
         shape: remote.shape,
         shapeDigest: remote.shapeDigest,
+        ...(moneyUnitSchemaReady(remote.applied)
+          ? { moneyUnitPolicy: await readMoneyUnitPolicy(database) }
+          : {}),
       };
     },
   };

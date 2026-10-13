@@ -61,6 +61,63 @@ const V1_RELEASE_LAST_MIGRATION = "0015_takoform_resource_relations.sql";
  */
 const WALLET_CREDIT_LOTS_MIGRATION = "0017_wallet_credit_lots.sql";
 
+const WALLET_USD_MICROS_MIGRATION = "0094_wallet_usd_micros.sql";
+
+/** Existing money requires a separately reviewed, stopped-writer cutover. */
+export class MoneyUnitCutoverRequiredError extends Error {
+  constructor() {
+    super(
+      "Existing billing history requires an independently qualified 0093 classification preparation " +
+        "and 0094 USD-micros cutover. Automatic startup migration is refused before any write. " +
+        "Keep the cents artifact stopped during that owner procedure; do not reset balances, " +
+        "seed an unqualified 0092 schema, or bypass this guard. See docs/org-billing-micros.md.",
+    );
+    this.name = "MoneyUnitCutoverRequiredError";
+  }
+}
+
+function moneyCutoverAlreadyApplied(database: MigratableDatabase): boolean {
+  return (
+    hasTable(database, "applied_migrations") &&
+    (database.query("SELECT name FROM applied_migrations").all() as { name: string }[]).some(
+      (row) => row.name === WALLET_USD_MICROS_MIGRATION,
+    )
+  );
+}
+
+function refuseAutomaticMoneyCutover(database: MigratableDatabase): void {
+  if (moneyCutoverAlreadyApplied(database)) return;
+  // A partial predecessor may not have these tables yet. Schema history alone
+  // is not money history, and never permits a populated cents wallet to pass.
+  for (const table of [
+    "ledger",
+    "wallet_credit_lots",
+    "wallet_credit_allocations",
+    "org_wallet_holds",
+    "org_wallet_usage_records",
+    "org_wallet_grant_snapshots",
+    "org_wallet_monthly_tariffs",
+    "usage_events",
+    "stripe_events",
+    "reseller_settlement_intents",
+    "reservations",
+    "quotes",
+    "usage_statements",
+    "wallet_credit_lot_classification_proofs",
+  ]) {
+    if (
+      hasTable(database, table) &&
+      database.query(`SELECT 1 FROM ${table} LIMIT 1`).all().length > 0
+    )
+      throw new MoneyUnitCutoverRequiredError();
+  }
+  if (
+    hasTable(database, "idempotency") &&
+    database.query("SELECT 1 FROM idempotency WHERE scope_key LIKE 'ai:%' LIMIT 1").all().length > 0
+  )
+    throw new MoneyUnitCutoverRequiredError();
+}
+
 /** The v1 state that identifies a control database as a used installation. */
 export interface UsedV1Installation {
   /** The newest recorded migration, at or before 0016. */
@@ -166,10 +223,25 @@ function migrateExistingDatabase(
   // Reads only, and first: a used v1 installation is refused while the file is
   // still byte-for-byte what v1.0.0 wrote.
   refuseUsedV1Installation(database, options);
+  refuseAutomaticMoneyCutover(database);
 
   // Existing, partial, and otherwise non-empty databases retain the historic
   // per-migration checkpoint behavior.
-  createMigrationLedger(database);
+  // The already-qualified micros restart stays read-only, including without
+  // a write lock. Before the cutover, acquire the lock and repeat the money
+  // history proof before even creating the checkpoint table.
+  if (!moneyCutoverAlreadyApplied(database)) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      refuseUsedV1Installation(database, options);
+      refuseAutomaticMoneyCutover(database);
+      createMigrationLedger(database);
+      database.exec("COMMIT");
+    } catch (error) {
+      rollbackQuietly(database);
+      throw error;
+    }
+  }
 
   const rows = database.query("SELECT name FROM applied_migrations").all() as {
     name: string;
@@ -196,13 +268,25 @@ function migrateExistingDatabase(
       // a v1 write that landed in between is refused, not migrated over. Once
       // that migration commits, the file is no longer what v1.0.0 wrote; a v1
       // writer still running after it is outside the stopped-writers premise.
-      if (applied.length === 0) refuseUsedV1Installation(database, options);
+      if (applied.length === 0) {
+        refuseUsedV1Installation(database, options);
+        refuseAutomaticMoneyCutover(database);
+      }
+      if (
+        migration.name === "0093_wallet_credit_classification_proofs.sql" ||
+        migration.name === WALLET_USD_MICROS_MIGRATION
+      )
+        refuseAutomaticMoneyCutover(database);
       executeStatements(database, migration.sql);
       recordMigration(database, migration.name);
       database.exec("COMMIT");
     } catch (error) {
       database.exec("ROLLBACK");
-      if (error instanceof UsedV1InstallationError) throw error;
+      if (
+        error instanceof UsedV1InstallationError ||
+        error instanceof MoneyUnitCutoverRequiredError
+      )
+        throw error;
       throw new Error(`migration ${migration.name} failed: ${String(error)}`);
     }
     applied.push(migration.name);

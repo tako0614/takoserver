@@ -172,7 +172,14 @@ test("confirmed ready:false is NotReady and visible in overview attention", asyn
       const path = new URL(String(input)).pathname;
       if (path.endsWith("/wallet"))
         return Response.json({
-          wallet: { availableMinor: 0, heldMinor: 0, settledMinor: 0, currency: "USD" },
+          wallet: {
+            availableMicros: "0",
+            heldMicros: "0",
+            settledMicros: "0",
+            currency: "USD",
+            unit: "USD-micros",
+            moneyPolicy: "usd-micros-v2",
+          },
         });
       if (path.endsWith("/operations")) return Response.json({ operations: [] });
       return Response.json({ items: [item], nextCursor: null });

@@ -1,6 +1,6 @@
-import type { LedgerEntry } from "../api.ts";
+import { formatMicrosCurrency, type LedgerEntry } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
-import { tr } from "../i18n.ts";
+import { consoleLocale, tr } from "../i18n.ts";
 import { resource, signal } from "../reactive.ts";
 import { api } from "../state.ts";
 import {
@@ -11,7 +11,6 @@ import {
   explain,
   ICON,
   icon,
-  money,
   openModal,
   stat,
   toast,
@@ -77,17 +76,17 @@ export function billingPage(organizationId: string): Child {
               { class: "grid" },
               stat(
                 tr("利用可能", "Available"),
-                money(held.availableMinor, held.currency),
+                formatMicrosCurrency(held.availableMicros, held.currency, uiLocale()),
                 tr("確定残高 − 確保中", "settled − held"),
               ),
               stat(
                 tr("確保中", "Held"),
-                money(held.heldMinor, held.currency),
+                formatMicrosCurrency(held.heldMicros, held.currency, uiLocale()),
                 tr("処理中の操作に予約済み", "reserved against live work"),
               ),
               stat(
                 tr("確定残高", "Settled"),
-                money(held.settledMinor, held.currency),
+                formatMicrosCurrency(held.settledMicros, held.currency, uiLocale()),
                 tr("入金と確定済み請求", "funded and captured"),
               ),
             ),
@@ -136,8 +135,8 @@ function ledgerTable(entries: readonly LedgerEntry[], currency: string): Child {
           null,
           h("td", null, badge(entryTypeLabel(entry.type), tone(entry.type))),
           h("td", null, copyable(entry.reference)),
-          h("td", { class: "num mono" }, delta(entry.settledDeltaMinor, currency)),
-          h("td", { class: "num mono" }, delta(entry.heldDeltaMinor, currency)),
+          h("td", { class: "num mono" }, delta(entry.settledDeltaMicros, currency)),
+          h("td", { class: "num mono" }, delta(entry.heldDeltaMicros, currency)),
           h("td", { class: "dim" }, when(entry.createdAt)),
         ),
       ),
@@ -165,9 +164,15 @@ function tone(type: string): "ok" | "warn" | "bad" | "accent" | "idle" {
 }
 
 /** A zero shows as an em dash: the eye should land on the entries that moved. */
-function delta(minor: number, currency: string): string {
-  if (minor === 0) return "—";
-  return `${minor > 0 ? "+" : "−"}${money(Math.abs(minor), currency)}`;
+function delta(micros: string, currency: string): string {
+  if (micros === "0") return "—";
+  const negative = micros.startsWith("-");
+  const magnitude = negative ? micros.slice(1) : micros;
+  return (negative ? "−" : "+") + formatMicrosCurrency(magnitude, currency, uiLocale());
+}
+
+function uiLocale(): "en-US" | "ja-JP" {
+  return consoleLocale() === "ja" ? "ja-JP" : "en-US";
 }
 
 /**

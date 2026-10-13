@@ -1,4 +1,5 @@
 import { canonicalJson, isJsonObject, type JsonObject } from "./json.ts";
+import { minorToMicros } from "./money.ts";
 import type { Clock, Sql } from "./ports.ts";
 
 const RETENTION_MS = 24 * 60 * 60 * 1_000;
@@ -7,15 +8,34 @@ export interface AiPendingRequest {
   readonly kind: "pending";
   readonly phase: "claimed" | "ready" | "dispatched";
   readonly requestId: string;
-  readonly ceilingMinor: number;
+  readonly moneyPolicy: "usd-micros-v2";
+  readonly ceilingMicros: number;
 }
 
 export interface AiSettledRequest {
   readonly kind: "result";
   readonly phase: "staged" | "completed";
   readonly requestId: string;
+  readonly moneyPolicy: "usd-micros-v2";
+  readonly ceilingMicros: number;
+  readonly actualMicros: number;
+  readonly responseStatus: number;
+  readonly responseBody: JsonObject;
+  readonly usageModel: string | null;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+}
+
+/** A completed v1 receipt is read-only evidence in its original cents unit. */
+export interface AiLegacySettledRequest {
+  readonly kind: "result";
+  readonly phase: "completed";
+  readonly moneyPolicy: "usd-cents-v1";
+  readonly requestId: string;
   readonly ceilingMinor: number;
   readonly actualMinor: number;
+  readonly ceilingMicros: number;
+  readonly actualMicros: number;
   readonly responseStatus: number;
   readonly responseBody: JsonObject;
   readonly usageModel: string | null;
@@ -30,7 +50,11 @@ export interface AiRejectedRequest {
   readonly responseBody: JsonObject;
 }
 
-export type AiRequestRecord = AiPendingRequest | AiSettledRequest | AiRejectedRequest;
+export type AiRequestRecord =
+  | AiPendingRequest
+  | AiSettledRequest
+  | AiLegacySettledRequest
+  | AiRejectedRequest;
 
 export interface ClaimedAiRequest {
   readonly scope: string;
@@ -81,19 +105,48 @@ export function createAiRequestStore(sql: Sql, clock: Clock) {
   };
 
   return {
+    async lookupCompletedLegacy(input: {
+      readonly organizationId: string;
+      readonly idempotencyKey: string;
+      readonly fingerprint: string;
+    }): Promise<AiLegacySettledRequest | null> {
+      const scope = `ai:${input.organizationId}:${input.idempotencyKey}`;
+      const rows = await sql.query(
+        "SELECT fingerprint, status, body_json, expires_at FROM idempotency WHERE scope_key = ?",
+        [scope],
+      );
+      if (rows.length === 0) return null;
+      const row = rows[0];
+      if (
+        rows.length !== 1 ||
+        row === undefined ||
+        typeof row.body_json !== "string" ||
+        typeof row.expires_at !== "number" ||
+        row.expires_at <= clock().getTime()
+      ) {
+        throw new AiRequestStoreError("state_unavailable");
+      }
+      if (row.fingerprint !== input.fingerprint) {
+        throw new AiRequestStoreError("fingerprint_conflict");
+      }
+      const record = parseRecord(Number(row.status), row.body_json);
+      return record.kind === "result" && record.moneyPolicy === "usd-cents-v1" ? record : null;
+    },
+
     async claim(input: {
       readonly organizationId: string;
       readonly idempotencyKey: string;
       readonly fingerprint: string;
       readonly requestId: string;
-      readonly ceilingMinor: number;
+      readonly ceilingMicros: number;
     }): Promise<ClaimedAiRequest> {
       const scope = `ai:${input.organizationId}:${input.idempotencyKey}`;
       const record: AiPendingRequest = {
         kind: "pending",
         phase: "claimed",
         requestId: input.requestId,
-        ceilingMinor: input.ceilingMinor,
+        moneyPolicy: "usd-micros-v2",
+        ceilingMicros: input.ceilingMicros,
       };
       const inserted = await sql.run(
         `INSERT OR IGNORE INTO idempotency
@@ -178,7 +231,8 @@ function parseRecord(status: number, body: string): AiRequestRecord {
       (status === 101 && value.phase === "ready") ||
       (status === 102 && value.phase === "dispatched")) &&
     typeof value.requestId === "string" &&
-    nonNegativeInteger(value.ceilingMinor)
+    value.moneyPolicy === "usd-micros-v2" &&
+    nonNegativeInteger(value.ceilingMicros)
   ) {
     return value as unknown as AiPendingRequest;
   }
@@ -186,6 +240,23 @@ function parseRecord(status: number, body: string): AiRequestRecord {
     value.kind === "result" &&
     ((status === 202 && value.phase === "staged") ||
       (status === value.responseStatus && value.phase === "completed")) &&
+    typeof value.requestId === "string" &&
+    value.moneyPolicy === "usd-micros-v2" &&
+    nonNegativeInteger(value.ceilingMicros) &&
+    nonNegativeInteger(value.actualMicros) &&
+    positiveStatus(value.responseStatus) &&
+    isJsonObject(value.responseBody) &&
+    (value.usageModel === null || typeof value.usageModel === "string") &&
+    nonNegativeInteger(value.inputTokens) &&
+    nonNegativeInteger(value.outputTokens)
+  ) {
+    return value as unknown as AiSettledRequest;
+  }
+  if (
+    value.kind === "result" &&
+    value.phase === "completed" &&
+    status === value.responseStatus &&
+    value.moneyPolicy === undefined &&
     typeof value.requestId === "string" &&
     nonNegativeInteger(value.ceilingMinor) &&
     nonNegativeInteger(value.actualMinor) &&
@@ -195,7 +266,19 @@ function parseRecord(status: number, body: string): AiRequestRecord {
     nonNegativeInteger(value.inputTokens) &&
     nonNegativeInteger(value.outputTokens)
   ) {
-    return value as unknown as AiSettledRequest;
+    try {
+      return {
+        ...(value as unknown as Omit<
+          AiLegacySettledRequest,
+          "moneyPolicy" | "ceilingMicros" | "actualMicros"
+        >),
+        moneyPolicy: "usd-cents-v1",
+        ceilingMicros: minorToMicros(value.ceilingMinor),
+        actualMicros: minorToMicros(value.actualMinor),
+      };
+    } catch {
+      throw new AiRequestStoreError("state_unavailable");
+    }
   }
   if (
     value.kind === "rejected" &&

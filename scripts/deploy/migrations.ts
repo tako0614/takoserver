@@ -74,6 +74,43 @@ export function readMigrationArtifact(
 export const STRIPE_EVENTS_MIGRATION = "0091_stripe_events.sql";
 /** Durable Organization hold, usage, grant, and tariff lifecycle. */
 export const ORG_BILLING_MIGRATION = "0092_org_wallet_lifecycle.sql";
+/** The cash and wallet ledger stored by this Worker uses USD micros, even without billingConfig. */
+export const MONEY_UNIT_MIGRATION = "0094_wallet_usd_micros.sql";
+
+export function moneyUnitSchemaReady(applied: readonly string[]): boolean {
+  return applied.includes(MONEY_UNIT_MIGRATION);
+}
+
+export function assertMoneyUnitSchema(applied: readonly string[]): void {
+  if (!moneyUnitSchemaReady(applied)) {
+    throw preflightError(
+      `this Worker needs ${MONEY_UNIT_MIGRATION} applied to its D1 before publication`,
+      `applied=${applied.length}`,
+    );
+  }
+}
+
+export type MoneyUnitPolicyRow = Readonly<Record<string, unknown>>;
+
+export function moneyUnitPolicyReady(rows: readonly MoneyUnitPolicyRow[] | undefined): boolean {
+  return (
+    rows?.length === 1 &&
+    rows[0]?.ledger_unit === "usd-micros-v2" &&
+    rows[0]?.historical_usage_unit === "microcent-v1" &&
+    rows[0]?.cash_unit === "usd-cents-v1"
+  );
+}
+
+export async function readMoneyUnitPolicy(
+  database: RemoteD1,
+  phase: DeployPhase = "preflight",
+): Promise<readonly MoneyUnitPolicyRow[]> {
+  return await database.query(
+    phase,
+    "D1 money-unit policy",
+    "SELECT ledger_unit, historical_usage_unit, cash_unit FROM money_unit_policy WHERE singleton = 1",
+  );
+}
 
 /**
  * A target that asks for the Stripe webhook must already hold the table the

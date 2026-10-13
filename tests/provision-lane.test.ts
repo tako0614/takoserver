@@ -9,6 +9,7 @@ import {
   type TakoformResourceDriver,
 } from "../src/index.ts";
 import { createLedger } from "../src/ledger.ts";
+import { minorToMicros } from "../src/money.ts";
 import type { Sql } from "../src/ports.ts";
 import { createReseller } from "../src/reseller.ts";
 import type { TakoformStandardServiceResolver } from "../src/takoform/types.ts";
@@ -121,7 +122,13 @@ async function fundedLane(
     provision: { tokens, catalog },
   });
 
-  await ledger.fund({ organizationId: ORG, fundingRef: "pay_1", amountMinor: 10_000 });
+  await ledger.fund({
+    organizationId: ORG,
+    fundingRef: "pay_1",
+    amountMicros: minorToMicros(10_000),
+    kind: "purchased",
+    consumptionClass: "purchased",
+  });
   const quote = await reseller.quote({
     organizationId: ORG,
     tenantRef: TENANT,
@@ -390,7 +397,13 @@ describe("Takoform run-token lane", () => {
     const catalog = createCatalog([stableOffering]);
     const ledger = createLedger(sql, clock);
     const reseller = createReseller({ sql, ledger, catalog, clock });
-    await ledger.fund({ organizationId: ORG, fundingRef: "pay_run", amountMinor: 10_000 });
+    await ledger.fund({
+      organizationId: ORG,
+      fundingRef: "pay_run",
+      amountMicros: minorToMicros(10_000),
+      kind: "purchased",
+      consumptionClass: "purchased",
+    });
     const quote = await reseller.quote({
       organizationId: ORG,
       tenantRef: TENANT,
@@ -568,7 +581,13 @@ describe("Takoform run-token lane", () => {
     const catalog = createCatalog([standardOffering]);
     const ledger = createLedger(sql, clock);
     const reseller = createReseller({ sql, ledger, catalog, clock });
-    await ledger.fund({ organizationId: ORG, fundingRef: "pay_standard", amountMinor: 10_000 });
+    await ledger.fund({
+      organizationId: ORG,
+      fundingRef: "pay_standard",
+      amountMicros: minorToMicros(10_000),
+      kind: "purchased",
+      consumptionClass: "purchased",
+    });
     const quote = await reseller.quote({
       organizationId: ORG,
       tenantRef: TENANT,

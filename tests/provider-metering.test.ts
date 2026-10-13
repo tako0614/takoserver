@@ -3,6 +3,7 @@ import { createCatalog, type Offering } from "../src/catalog.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createLedger } from "../src/ledger.ts";
 import { createMetering } from "../src/metering.ts";
+import { minorToMicros } from "../src/money.ts";
 import { createProviderMetering } from "../src/provider-metering.ts";
 import { createProviderPack, type MeterSource } from "../src/provider-pack.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
@@ -108,7 +109,13 @@ describe("provider usage reconciliation", () => {
       costEstimators: [],
     });
     const ledger = createLedger(sql, clock);
-    await ledger.fund({ organizationId: "org_1", fundingRef: "seed", amountMinor: 1_000 });
+    await ledger.fund({
+      organizationId: "org_1",
+      fundingRef: "seed",
+      amountMicros: minorToMicros(1_000),
+      kind: "purchased",
+      consumptionClass: "purchased",
+    });
     const metering = createMetering({ sql, ledger, clock, randomId: () => "rollup" });
     const providerMetering = createProviderMetering({
       sql,
@@ -131,7 +138,7 @@ describe("provider usage reconciliation", () => {
       { meter: "compute.requests", quantity: 3 },
     ]);
     expect(await metering.rollUp(100)).toBe(2);
-    expect((await ledger.wallet("org_1")).availableMinor).toBe(974);
+    expect((await ledger.wallet("org_1")).availableMicros).toBe(9_740_000);
     expect(await sql.query("SELECT cursor_at FROM provider_meter_checkpoints")).toEqual([
       { cursor_at: now.getTime() - 3_600_000 },
     ]);

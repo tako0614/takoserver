@@ -8,6 +8,7 @@ import {
   type InstalledTakoformForm,
   type Offering,
 } from "../src/index.ts";
+import { minorToMicros } from "../src/money.ts";
 import { createProviderDriver } from "../src/provider-driver.ts";
 import {
   type ApplyInput,
@@ -320,7 +321,9 @@ async function fixture(input: {
     await ledger.fund({
       organizationId: tenantId,
       fundingRef: "funding-endpoint-release",
-      amountMinor: 5_000,
+      amountMicros: minorToMicros(5_000),
+      kind: "purchased",
+      consumptionClass: "purchased",
     });
   }
   const driver = createProviderDriver({
