@@ -593,7 +593,7 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(accepted.exitCode).toBe(2);
       expect(accepted.stderr).toContain("deploy target descriptor not found");
       expect(accepted.stderr).not.toContain("no target was touched");
-      for (const lineage of ["v2-artifacts-0075", "v2-0088", "v2-0089", "v2-0091"]) {
+      for (const lineage of ["v2-artifacts-0075", "v2-0088", "v2-0089", "v2-0091", "v2-0092"]) {
         const selected = await deploy([
           surface,
           action,

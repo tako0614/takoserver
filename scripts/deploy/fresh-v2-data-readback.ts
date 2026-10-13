@@ -5,15 +5,17 @@ import { type CommandResult, runCommand, wranglerCommand } from "./process.ts";
 /**
  * The closed fresh v2 D1 profiles. Each names one reviewed, fixed-digest
  * payload; a later audited source migration never widens any selector.
- * `v2-0091` is staging-only: only the integration generation surface offers it.
+ * `v2-0091` and `v2-0092` are staging-only: only the integration generation
+ * surface offers them.
  */
-export type FreshV2D1Lineage = "v2-0088" | "v2-0089" | "v2-0091";
+export type FreshV2D1Lineage = "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092";
 
 /** The exact migration-ledger row count each fresh profile leaves behind. */
 const FRESH_V2_LEDGER_ROWS: Readonly<Record<FreshV2D1Lineage, number>> = {
   "v2-0088": 88,
   "v2-0089": 89,
   "v2-0091": 91,
+  "v2-0092": 92,
 };
 
 export interface FreshV2DataReadback {

@@ -224,12 +224,12 @@ describe("environment-exact deploy target", () => {
     ).toThrow("maintenance profile");
   });
 
-  test("selects an explicit fresh v2 storage lineage only as v2-0088, v2-0089 or v2-0091", () => {
+  test("selects an explicit fresh v2 storage lineage only as v2-0088, v2-0089, v2-0091 or v2-0092", () => {
     const config = JSON.stringify({
       documentation: "https://docs.example.test/v2",
       authenticationDocumentation: "https://docs.example.test/v2/authentication",
     });
-    for (const storageLineage of ["v2-0088", "v2-0089", "v2-0091"] as const) {
+    for (const storageLineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092"] as const) {
       const selected = parseDeployTarget(
         descriptor({ environment: "integration", takoformV2: { config, storageLineage } }),
         "fresh v2 target",
