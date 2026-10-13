@@ -10,12 +10,14 @@ All money is **USD**. The canonical ledger uses integer **USD micros**;
 `1 USD = 1,000,000 micros`, and `1 cent = 10,000 micros`. Convert payable
 micros to Stripe cents once at invoicing, rounding every positive remainder up.
 
-This document changes the target contract, not runtime money or a live target.
-The [first Organization API](org-billing-api.md) in main still uses cents and
-expiry-first allocation. A separate API/ledger implementation PR and guarded
-forward migration must replace those behaviors before the revised lane is
-enabled. The [0092 schema wave PR](https://github.com/tako0614/takoserver/pull/322)
-stays separate from the subsequent micros cutover.
+The design revision in #323 changed the target contract. The separate
+[micros API/ledger implementation](org-billing-micros.md) replaces the
+[first Organization API](org-billing-api.md)'s cents and expiry-first behavior
+in source. It includes OpenAPI, class-priority allocation and forward migrations
+0093/0094, but does not apply them to a live target. A guarded, independently
+qualified money cutover is required before publication. The
+[0092 schema wave PR](https://github.com/tako0614/takoserver/pull/322)
+stays separate from that cutover.
 
 Related work: [Takosumi Hosted PR #54](https://github.com/tako0614/takosumi-hosted/pull/54)
 (reviewed head `ed44946e15037a74dfd532e9dada28616a8cda69`), merged
@@ -23,13 +25,13 @@ Related work: [Takosumi Hosted PR #54](https://github.com/tako0614/takosumi-host
 and merged [shared price authoring #319](https://github.com/tako0614/takoserver/pull/319).
 The original PR #54 review found no review/discussion comments; its body lists
 the four questions decided below. The implementation baseline for this revision
-is main `b5f5a038`. Source merge does not establish staging or billing GA.
+was main `b5f5a038`. Source merge does not establish staging or billing GA.
 
-| Area | CTO target | Main baseline / next implementation |
+| Area | CTO target | Implementation / remaining acceptance |
 | --- | --- | --- |
-| Ledger and scoped money wire | Integer USD micros; explicit `*Micros` fields | #318 stores/accepts cents; a separate forward migration and API/ledger PR are required |
-| Allocation | Free allowance → subscription credit → purchased credit → consented capped postpaid | #318 sorts all lots by expiry; replace allocation, settlement and pagination order together |
-| Invoicing | Aggregate payable micros, then ceiling to cents once | Remove #318 capture/usage ties-to-even conversion; invoice settlement is a later Stripe wave |
+| Ledger and scoped money wire | Integer USD micros; explicit `*Micros` fields | Micros source and forward 0093/0094 migrations replace #318; live cutover remains separately qualified |
+| Allocation | Free allowance → subscription credit → purchased credit → consented capped postpaid | Prepaid allocation, settlement and pagination share class priority; postpaid remains disabled pending its separate cap reservation and invoice implementation |
+| Invoicing | Aggregate payable micros, then ceiling to cents once | Capture/usage retain micros; the arithmetic helper is available, while Stripe invoice settlement remains a later wave |
 | Holds and scopes | Immutable TTL, capture ≤ hold, automatic release; exact Organization/scopes | #318 supplies this lifecycle; preserve its transactional fences when changing units |
 | Hosted plans | Three shared configurable tiers and one Organization wallet | #319 emits free/subscription/usage plan configuration; subscription/refund handlers and Hosted cutover remain GA-required |
 
@@ -256,12 +258,12 @@ its measured facts and idempotency receipt without a positive debit.
 
 ### (d) Publish an Organization-scoped wallet API
 
-The following is the decided target OpenAPI surface. #318 implements the first
-eight wallet/read/hold/usage operations in cents; the separate micros API/ledger
-PR must ship the updated wire contract together with generated
+The following is the decided target OpenAPI surface. The separate
+[micros implementation](org-billing-micros.md) updates #318's first eight
+wallet/read/hold/usage operations together with generated
 [`openapi/takoserver.openapi.json`](../openapi/takoserver.openapi.json).
 Checkout/payment scopes and subscription operations below remain
-later GA implementation work. This documentation-only revision adds no routes.
+later GA implementation work. They are not exposed by the micros source wave.
 
 All paths below begin `/v1/organizations/{organizationId}`. Hold references are
 URL-encoded as one path component, with bounded length and namespace validation.
@@ -548,7 +550,9 @@ lost-acknowledgement readback.
 
 ## Forward money-unit and allocation cutover
 
-The micros API/ledger change is a separate implementation PR. Frozen migrations
+The [micros API/ledger change](org-billing-micros.md) is a separate implementation
+wave with classification preparation 0093 and guarded unit conversion 0094.
+Frozen migrations
 0003, 0017, 0018, 0091 and 0092 retain their original bytes. Add a forward
 migration after the independently reviewed, applied and qualified 0092 baseline;
 do not mix that new migration into #322's exact 0001–0092 source inventory or
@@ -604,7 +608,9 @@ changed repository: **takoserver**, documentation only. This design records
 billing/authority decisions but changes no schema, live balance, credential,
 price, or runtime behavior. The directly supplied CTO decision is authoritative;
 PR #54 and merged #313/#318/#319 are read-only baseline inputs. The required
-micros API/ledger corrections are an explicit, separate implementation PR.
+micros API/ledger corrections are tracked in their explicit, separate
+[implementation ledger](org-billing-micros.md). This historical design ledger
+does not establish acceptance of live conversion or the remaining GA waves.
 No numbered cross-repository task is claimed;
 the unregistered TASK-0100 handoff is implementation planning input only.
 

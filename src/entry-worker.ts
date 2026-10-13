@@ -803,15 +803,26 @@ async function composeApp(
     parseBillingConfig(env.TAKOSERVER_BILLING_CONFIG),
   );
   // File-backed tariff loading can be designed separately; this release accepts inline JSON only.
-  const signingKey = await loadSigningKey(
-    env.TAKOSERVER_SIGNING_KEY_ID,
-    env.TAKOSERVER_SIGNING_KEY,
-  );
   const integrationE2eCredentialAuthority = workerIntegrationE2eCredentialAuthority(env);
   const integrationOrganizationBootstrap = workerIntegrationOrganizationBootstrap(
     env,
     origin,
     integrationE2eCredentialAuthority,
+  );
+  const sql = createD1Sql(env.STATE_DB);
+  try {
+    // The wallet and ledger use USD micros even when tariff billing is disabled.
+    // This read-only proof precedes every normal serving composition and tariff write.
+    await assertOrgBillingSchema(sql, billingConfig);
+  } catch {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("Worker requires the complete 0094 USD-micros D1 schema and money-unit policy"),
+    );
+  }
+  const signingKey = await loadSigningKey(
+    env.TAKOSERVER_SIGNING_KEY_ID,
+    env.TAKOSERVER_SIGNING_KEY,
   );
   if (integrationE2eCredentialAuthority) {
     if (!signingKey || !env.TAKOSERVER_SIGNING_KEY) {
@@ -830,19 +841,6 @@ async function composeApp(
     env,
     origin,
   );
-  const sql = createD1Sql(env.STATE_DB);
-  if (billingConfig) {
-    try {
-      await assertOrgBillingSchema(sql, billingConfig);
-    } catch {
-      throw new WorkerStartupError(
-        "runtime-configuration",
-        new TypeError(
-          "Organization billing is enabled but its complete 0092 D1 schema is unavailable",
-        ),
-      );
-    }
-  }
   if (
     v2Config.sqliteMigrationSet !== undefined ||
     v2Config.workerBundle !== undefined ||

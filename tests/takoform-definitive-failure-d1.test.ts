@@ -113,15 +113,15 @@ test("native D1 settles whole-operation apply abort with an atomic exact hold re
         expect(initial.status).toBe(202);
         const operationId = operationIdFrom(initial.body);
         expect(await walletAt(app.fetch, tenant.organizationId, tenant.owner)).toMatchObject({
-          heldMinor: 500,
+          heldMicros: "5000000",
         });
         const recovered = (await app.tick()).providerRepairs;
         expect(recovered).toMatchObject(
           injectReleaseConstraint ? { settled: 0, pending: 1 } : { settled: 1, pending: 0 },
         );
         expect(await walletAt(app.fetch, tenant.organizationId, tenant.owner)).toMatchObject({
-          settledMinor: 2_000,
-          heldMinor: injectReleaseConstraint ? 500 : 0,
+          settledMicros: "20000000",
+          heldMicros: injectReleaseConstraint ? "5000000" : "0",
         });
         expect(
           await sql.query(
@@ -154,14 +154,18 @@ test("native D1 terminalizes a definitive refusal and releases its exact hold", 
 
     const operationId = await latestDeferredOperationId(sql, tenant.organizationId);
     const wallet = await walletAt(app.fetch, tenant.organizationId, tenant.owner);
-    expect(wallet).toMatchObject({ settledMinor: 2_000, heldMinor: 0, availableMinor: 2_000 });
+    expect(wallet).toMatchObject({
+      settledMicros: "20000000",
+      heldMicros: "0",
+      availableMicros: "20000000",
+    });
     expect(wallet.entries).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           type: "release",
           reference: operationId,
-          settledDeltaMinor: 0,
-          heldDeltaMinor: -500,
+          settledDeltaMicros: "0",
+          heldDeltaMicros: "-5000000",
         }),
       ]),
     );
@@ -231,16 +235,16 @@ test("native D1 rolls back the whole definitive-failure batch on an exact releas
 
       const wallet = await walletAt(app.fetch, tenant.organizationId, tenant.owner);
       expect(wallet).toMatchObject({
-        settledMinor: 2_000,
-        heldMinor: 500,
-        availableMinor: 1_500,
+        settledMicros: "20000000",
+        heldMicros: "5000000",
+        availableMicros: "15000000",
       });
       expect(wallet.entries).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             type: "hold",
             reference: operationId,
-            heldDeltaMinor: 500,
+            heldDeltaMicros: "5000000",
           }),
         ]),
       );
@@ -528,7 +532,7 @@ function observeSql(
 ): Sql {
   const releaseSql = normalize(
     `INSERT INTO ledger
-      (id, org_id, type, ref, settled_delta, held_delta, created_at)
+      (id, org_id, type, ref, settled_delta_micros, held_delta_micros, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   );
   return {
@@ -545,7 +549,7 @@ function observeSql(
           normalize(statement.sql) === releaseSql &&
           params[2] === "release" &&
           params[4] === 0 &&
-          params[5] === -500;
+          params[5] === -5_000_000;
         if (!isRelease) return statement;
         observe.releaseIntercepts += 1;
         if (typeof params[3] !== "string") throw new Error("release reference was not a string");

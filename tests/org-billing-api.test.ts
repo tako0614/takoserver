@@ -24,9 +24,9 @@ function fixture() {
       return {
         organizationId,
         currency: "USD",
-        settledMinor: 0,
-        heldMinor: 0,
-        availableMinor: 0,
+        settledMicros: 0,
+        heldMicros: 0,
+        availableMicros: 0,
         entries: [],
       };
     },
@@ -35,41 +35,45 @@ function fixture() {
       if (nextError) throw nextError;
       if (limit !== undefined && limit > 100) throw new OrgBillingError("invalid_limit", 400);
       return cursor === "next"
-        ? { lots: [{ reference: "lot-2" }], cursor: null }
-        : { lots: [{ reference: "lot-1" }], cursor: "next" };
+        ? { lots: [fakeLot("lot-2")], cursor: null }
+        : { lots: [fakeLot("lot-1")], cursor: "next" };
     },
-    async hold(input: { reference: string; amountMinor: number }) {
-      seen.push(`hold:${input.reference}:${input.amountMinor}`);
+    async hold(input: { reference: string; amountMicros: number }) {
+      seen.push(`hold:${input.reference}:${input.amountMicros}`);
       if (nextError) throw nextError;
-      return {};
+      return fakeHold(input.reference, input.amountMicros);
     },
     async readHold(organizationId: string, reference: string) {
       seen.push(`readHold:${organizationId}:${reference}`);
       if (nextError) throw nextError;
-      return {};
+      return fakeHold(reference, 0);
     },
-    async capture(input: { reference: string; amountMinor: number; actualMicros: string }) {
-      seen.push(`capture:${input.reference}:${input.amountMinor}:${input.actualMicros}`);
+    async capture(input: { reference: string; amountMicros: number; actualMicros: string }) {
+      seen.push(`capture:${input.reference}:${input.amountMicros}:${input.actualMicros}`);
       if (nextError) throw nextError;
-      return { status: input.amountMinor === 0 ? "released" : "captured" };
+      return fakeHold(
+        input.reference,
+        input.amountMicros,
+        input.amountMicros === 0 ? "released" : "captured",
+      );
     },
     async release(organizationId: string, reference: string) {
       seen.push(`release:${organizationId}:${reference}`);
       if (nextError) throw nextError;
-      return {};
+      return fakeHold(reference, 0, "released");
     },
     async usage(input: { reference: string; quantity: string; quantityUnit: string }) {
       seen.push(`usage:${input.reference}:${input.quantityUnit}:${input.quantity}`);
       if (nextError) throw nextError;
-      return {};
+      return fakeUsage(input.reference, 0);
     },
     async listUsage(organizationId: string, limit?: number, cursor?: string) {
       seen.push(`listUsage:${organizationId}:${limit}:${cursor ?? ""}`);
       if (nextError) throw nextError;
       if (limit !== undefined && limit > 100) throw new OrgBillingError("invalid_limit", 400);
       return cursor === "next"
-        ? { usageRecords: [{ reference: "usage-2" }], cursor: null }
-        : { usageRecords: [{ reference: "usage-1" }], cursor: "next" };
+        ? { usageRecords: [fakeUsage("usage-2", 0)], cursor: null }
+        : { usageRecords: [fakeUsage("usage-1", 0)], cursor: "next" };
     },
     async expireDue() {
       return 0;
@@ -131,6 +135,61 @@ function fixture() {
   };
 }
 
+function fakeLot(reference: string) {
+  return {
+    reference,
+    kind: "purchased" as const,
+    consumptionClass: "purchased" as const,
+    amountMicros: 0,
+    spentMicros: 0,
+    remainingMicros: 0,
+    heldMicros: 0,
+    availableMicros: 0,
+    expiresAt: null,
+    createdAt: "2026-10-13T00:00:00.000Z",
+  };
+}
+
+function fakeHold(
+  reference: string,
+  amountMicros: number,
+  status: "live" | "captured" | "released" = "live",
+) {
+  return {
+    organizationId: ORG,
+    reference,
+    moneyPolicy: "usd-micros-v2" as const,
+    amountMicros,
+    pricingRevision: "test.1",
+    status,
+    capturedMicros: status === "captured" ? amountMicros : 0,
+    releasedMicros: status === "released" ? amountMicros : 0,
+    actualMicros: null,
+    createdAt: "2026-10-13T00:00:00.000Z",
+    expiresAt: null,
+    closedAt: null,
+  };
+}
+
+function fakeUsage(reference: string, amountMicros: number) {
+  return {
+    organizationId: ORG,
+    reference,
+    moneyPolicy: "usd-micros-v2" as const,
+    pricingRevision: "test.1",
+    meter: "requests",
+    quantity: "0",
+    quantityUnit: "request",
+    periodStart: "2026-10-12T00:00:00.000Z",
+    periodEnd: "2026-10-12T01:00:00.000Z",
+    rate: { numeratorMicros: "0", denominator: "1" },
+    amountMicros,
+    status: "paid" as const,
+    createdAt: "2026-10-13T00:00:00.000Z",
+    paidAt: "2026-10-13T00:00:00.000Z",
+  };
+}
+
 test("Organization and exact scopes are checked before hold body parsing or lookup", async () => {
   const { request, seen } = fixture();
   const malformed = { method: "POST", body: "{" };
@@ -165,22 +224,73 @@ test("hold request rejects unknown keys and encoded path references cannot escap
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       reference: "run:one",
-      amountMinor: 5,
+      amountMicros: "5",
       pricingRevision: "test.1",
       measurementFingerprint: "sha256:test",
       fundingMinor: 100,
     }),
   });
   expect(extraField.status).toBe(400);
+  const legacyCents = await request(`/v1/organizations/${ORG}/wallet/holds`, "writer", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      reference: "run:one",
+      amountMinor: 5,
+      pricingRevision: "test.1",
+      measurementFingerprint: "sha256:test",
+    }),
+  });
+  expect(legacyCents.status).toBe(400);
   expect((await request(`/v1/organizations/${ORG}/wallet/holds/a%2Fb`, "reader")).status).toBe(400);
   expect(seen).toEqual([]);
+});
+
+test("wallet money is published as canonical USD-micros decimal strings", async () => {
+  const { request } = fixture();
+  const walletResponse = await request(`/v1/organizations/${ORG}/wallet`, "reader");
+  expect(await walletResponse.json()).toMatchObject({
+    wallet: {
+      currency: "USD",
+      unit: "USD-micros",
+      moneyPolicy: "usd-micros-v2",
+      settledMicros: "0",
+      heldMicros: "0",
+      availableMicros: "0",
+    },
+  });
+  const holdResponse = await request(`/v1/organizations/${ORG}/wallet/holds`, "writer", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      reference: "run:wire",
+      amountMicros: "5",
+      pricingRevision: "test.1",
+      measurementFingerprint: "sha256:test",
+    }),
+  });
+  expect(holdResponse.status).toBe(201);
+  expect(await holdResponse.json()).toMatchObject({
+    hold: { moneyPolicy: "usd-micros-v2", amountMicros: "5", capturedMicros: "0" },
+  });
+  const numericMicros = await request(`/v1/organizations/${ORG}/wallet/holds`, "writer", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      reference: "run:numeric",
+      amountMicros: 5,
+      pricingRevision: "test.1",
+      measurementFingerprint: "sha256:test",
+    }),
+  });
+  expect(numericMicros.status).toBe(400);
 });
 
 test("billing lifecycle errors retain their 402 and 409 public statuses", async () => {
   const { request, setError, seen } = fixture();
   const body = {
     reference: "run:one",
-    amountMinor: 5,
+    amountMicros: "5",
     pricingRevision: "test.1",
     measurementFingerprint: "sha256:test",
   };
@@ -201,7 +311,7 @@ test("billing lifecycle errors retain their 402 and 409 public statuses", async 
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          amountMinor: 6,
+          amountMicros: "6",
           actualMicros: "60000",
           measurementFingerprint: "sha256:test",
         }),
@@ -220,7 +330,7 @@ test("zero-cost capture is accepted and returns the service's closed receipt", a
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        amountMinor: 0,
+        amountMicros: "0",
         actualMicros: "0",
         measurementFingerprint: "measured-zero",
       }),
@@ -244,7 +354,7 @@ test("usage quantity is passed as canonical decimal text and API scope schemas a
       periodStart: "2026-10-13T10:00:00.000Z",
       periodEnd: "2026-10-13T11:00:00.000Z",
       pricingRevision: "test.1",
-      expectedMinor: 1,
+      expectedMicros: "1",
       measurementFingerprint: "sha256:test",
     }),
   });
@@ -263,6 +373,21 @@ test("usage quantity is passed as canonical decimal text and API scope schemas a
   expect(schemas.WalletLotsResponse).toBeDefined();
   expect(schemas.CreateWalletUsageRecordRequest).toBeDefined();
   expect(schemas.WalletUsageReceipt).toBeDefined();
+  const holdRequest = schemas.CreateWalletHoldRequest as {
+    required: string[];
+    properties: Record<string, unknown>;
+  };
+  expect(holdRequest.required).toContain("amountMicros");
+  expect(holdRequest.required).not.toContain("amountMinor");
+  const walletResponse = schemas.WalletResponse as {
+    properties: { wallet: { properties: Record<string, unknown> } };
+  };
+  expect(walletResponse.properties.wallet.properties).toMatchObject({
+    currency: { const: "USD" },
+    unit: { const: "USD-micros" },
+    moneyPolicy: { const: "usd-micros-v2" },
+  });
+  expect(schemas.AiModelsResponse).toBeDefined();
   const lotsResponse = schemas.WalletLotsResponse as {
     required: string[];
     properties: {
@@ -273,8 +398,8 @@ test("usage quantity is passed as canonical decimal text and API scope schemas a
   expect(lotsResponse.required).toContain("cursor");
   expect(lotsResponse.properties.cursor).toBeDefined();
   const lot = lotsResponse.properties.lots.items;
-  expect(lot.required).toContain("remainingMinor");
-  expect(lot.required).toContain("availableMinor");
+  expect(lot.required).toContain("remainingMicros");
+  expect(lot.required).toContain("availableMicros");
   expect(lot.properties).not.toHaveProperty("allocatedMinor");
   expect(lot.properties.reference).toEqual({ type: "string", minLength: 1 });
   const wallet = schemas.WalletResponse as {
@@ -304,7 +429,9 @@ test("wallet lot pagination forwards opaque cursors and returns distinct pages",
     lots: { reference: string }[];
     cursor: string | null;
   };
-  expect(first).toEqual({ lots: [{ reference: "lot-1" }], cursor: "next" });
+  expect(first.lots.map((lot) => lot.reference)).toEqual(["lot-1"]);
+  expect(first.lots[0]).toMatchObject({ amountMicros: "0", consumptionClass: "purchased" });
+  expect(first.cursor).toBe("next");
 
   const secondResponse = await request(
     `/v1/organizations/${ORG}/wallet/lots?limit=1&cursor=${first.cursor}`,
@@ -315,7 +442,8 @@ test("wallet lot pagination forwards opaque cursors and returns distinct pages",
     lots: { reference: string }[];
     cursor: string | null;
   };
-  expect(second).toEqual({ lots: [{ reference: "lot-2" }], cursor: null });
+  expect(second.lots.map((lot) => lot.reference)).toEqual(["lot-2"]);
+  expect(second.cursor).toBeNull();
   expect(new Set([...first.lots, ...second.lots].map((lot) => lot.reference)).size).toBe(2);
   expect(seen).toEqual([`lots:${ORG}:1:`, `lots:${ORG}:1:next`]);
 });
@@ -338,7 +466,9 @@ test("usage pagination forwards the opaque cursor and returns a non-overlapping 
     usageRecords: { reference: string }[];
     cursor: string | null;
   };
-  expect(first).toEqual({ usageRecords: [{ reference: "usage-1" }], cursor: "next" });
+  expect(first.usageRecords.map((record) => record.reference)).toEqual(["usage-1"]);
+  expect(first.usageRecords[0]).toMatchObject({ amountMicros: "0", moneyPolicy: "usd-micros-v2" });
+  expect(first.cursor).toBe("next");
 
   const secondResponse = await request(
     `/v1/organizations/${ORG}/wallet/usage-records?limit=1&cursor=${first.cursor}`,
@@ -349,7 +479,8 @@ test("usage pagination forwards the opaque cursor and returns a non-overlapping 
     usageRecords: { reference: string }[];
     cursor: string | null;
   };
-  expect(second).toEqual({ usageRecords: [{ reference: "usage-2" }], cursor: null });
+  expect(second.usageRecords.map((record) => record.reference)).toEqual(["usage-2"]);
+  expect(second.cursor).toBeNull();
   expect(
     new Set([...first.usageRecords, ...second.usageRecords].map((record) => record.reference)).size,
   ).toBe(2);

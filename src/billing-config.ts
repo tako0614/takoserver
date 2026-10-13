@@ -35,7 +35,6 @@ export const BILLING_CONFIG_SCHEMA_VERSION = 1;
 export const MIN_HOLD_TTL_SECONDS = 60;
 export const MAX_HOLD_TTL_SECONDS = 7 * 24 * 60 * 60;
 export const DEFAULT_HOLD_TTL_SECONDS = 24 * 60 * 60;
-const MICROS_PER_MINOR = 10_000n;
 const BASIS_POINT_DENOMINATOR = 10_000n;
 const MAX_CONFIG_STRING_LENGTH = 512;
 const MAX_RATE_INTEGER_DIGITS = 256;
@@ -223,33 +222,24 @@ function validateConfigHistory(configs: readonly BillingConfigRevision[]): void 
   }
 }
 
-/**
- * Converts summed nonnegative micros to cents once with nearest, ties-to-even.
- * The result is a wire-safe integer suitable for `amountMinor`.
- */
-export function roundMicrosToMinor(micros: string): number {
-  const amount = canonicalUnsignedInteger(micros, "micros");
-  return bigintToSafeInteger(roundRatioTiesToEven(amount, MICROS_PER_MINOR), "rounded amountMinor");
-}
-
 /** Computes a final hold directly from estimate micros and basis-point headroom. */
-export function ceilHoldMinor(estimatedMicros: string, headroomBasisPoints: number): number {
+export function ceilHoldMicros(estimatedMicros: string, headroomBasisPoints: number): number {
   const estimate = canonicalUnsignedInteger(estimatedMicros, "estimatedMicros");
   if (!Number.isSafeInteger(headroomBasisPoints) || headroomBasisPoints < 0) {
     throw new BillingConfigError("headroomBasisPoints", "must be a nonnegative safe integer");
   }
   const numerator = estimate * (10_000n + BigInt(headroomBasisPoints));
-  const denominator = BASIS_POINT_DENOMINATOR * MICROS_PER_MINOR;
-  const amountMinor = numerator === 0n ? 0n : (numerator + denominator - 1n) / denominator;
-  return bigintToSafeInteger(amountMinor, "hold amountMinor");
+  const amountMicros =
+    numerator === 0n ? 0n : (numerator + BASIS_POINT_DENOMINATOR - 1n) / BASIS_POINT_DENOMINATOR;
+  return bigintToSafeInteger(amountMicros, "hold amountMicros");
 }
 
 /**
  * Prices an integer quantity at an exact micros-per-unit rational rate and
- * rounds directly to cents once. No intermediate micros rounding can bias the
- * result. Persist the quantity, rate, revision, and returned cents together.
+ * quantizes upward once at the whole measured Run or closed-period boundary.
+ * Callers aggregate samples exactly before invoking this function.
  */
-export function computeMeterAmountMinor(
+export function computeMeterAmountMicros(
   quantity: bigint,
   rate: BillingRate,
   quantityDenominator = 1n,
@@ -264,10 +254,10 @@ export function computeMeterAmountMinor(
     throw new BillingConfigError("rate.numeratorMicros", "must be positive");
   if (denominator === 0n) throw new BillingConfigError("rate.denominator", "must be positive");
   const microsNumerator = quantity * numeratorMicros;
-  const minorDenominator = denominator * quantityDenominator * MICROS_PER_MINOR;
+  const microsDenominator = denominator * quantityDenominator;
   return bigintToSafeInteger(
-    roundRatioTiesToEven(microsNumerator, minorDenominator),
-    "meter amountMinor",
+    (microsNumerator + microsDenominator - 1n) / microsDenominator,
+    "meter amountMicros",
   );
 }
 
@@ -424,15 +414,6 @@ function canonicalIsoDateTime(value: unknown, path: string): string {
     throw new BillingConfigError(path, "must be a valid canonical UTC ISO date-time");
   }
   return value;
-}
-
-function roundRatioTiesToEven(numerator: bigint, denominator: bigint): bigint {
-  const quotient = numerator / denominator;
-  const remainder = numerator % denominator;
-  const comparison = remainder * 2n - denominator;
-  if (comparison < 0n) return quotient;
-  if (comparison > 0n) return quotient + 1n;
-  return quotient % 2n === 0n ? quotient : quotient + 1n;
 }
 
 function bigintToSafeInteger(value: bigint, path: string): number {

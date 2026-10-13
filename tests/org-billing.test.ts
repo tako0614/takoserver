@@ -55,15 +55,15 @@ function fixture(tariff = config()) {
 const hold = {
   organizationId: "org_a",
   reference: "run_1",
-  amountMinor: 10,
+  amountMicros: 10,
   pricingRevision: "r1",
   measurementFingerprint: "estimate-v1",
 };
 const capture = {
   organizationId: "org_a",
   reference: "run_1",
-  amountMinor: 4,
-  actualMicros: "40000",
+  amountMicros: 4,
+  actualMicros: "4",
   measurementFingerprint: "actual-v1",
 };
 const usage: UsageInput = {
@@ -75,7 +75,7 @@ const usage: UsageInput = {
   periodStart: "2026-10-12T00:00:00.000Z",
   periodEnd: "2026-10-12T01:00:00.000Z",
   pricingRevision: "r1",
-  expectedMinor: 1,
+  expectedMicros: 10000,
   measurementFingerprint: "closed-period",
 };
 
@@ -92,24 +92,29 @@ async function errorCode(promise: Promise<unknown>, code: string, status: number
 describe("Organization wallet lifecycle", () => {
   test("one batch captures actual and releases unused budget; semantic retries conserve", async () => {
     const f = fixture();
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 15 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 15,
+      consumptionClass: "purchased",
+    });
     const admitted = await f.billing.hold(hold);
     const settled = await f.billing.capture(capture);
     expect(settled).toMatchObject({
       status: "captured",
-      amountMinor: 10,
-      capturedMinor: 4,
-      releasedMinor: 6,
+      amountMicros: 10,
+      capturedMicros: 4,
+      releasedMicros: 6,
       expiresAt: admitted.expiresAt,
-      actualMicros: "40000",
+      actualMicros: "4",
     });
     expect(await f.billing.capture(capture)).toEqual(settled);
     expect(await f.billing.hold(hold)).toEqual(settled);
     expect(await f.billing.release("org_a", "run_1")).toEqual(settled);
     expect(await f.billing.wallet("org_a")).toMatchObject({
-      settledMinor: 11,
-      heldMinor: 0,
-      availableMinor: 11,
+      settledMicros: 11,
+      heldMicros: 0,
+      availableMicros: 11,
     });
     await errorCode(
       f.billing.capture({ ...capture, actualMicros: "44999" }),
@@ -125,30 +130,49 @@ describe("Organization wallet lifecycle", () => {
 
   test("capture above hold and wrong rounded amount leave the live hold intact", async () => {
     const f = fixture();
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 10,
+      consumptionClass: "purchased",
+    });
     await f.billing.hold(hold);
     await errorCode(
-      f.billing.capture({ ...capture, amountMinor: 11, actualMicros: "110000" }),
+      f.billing.capture({ ...capture, amountMicros: 11, actualMicros: "11" }),
       "capture_exceeds_hold",
       409,
     );
-    await errorCode(f.billing.capture({ ...capture, amountMinor: 5 }), "measurement_conflict", 409);
+    await errorCode(
+      f.billing.capture({ ...capture, amountMicros: 5 }),
+      "measurement_conflict",
+      409,
+    );
     expect(await f.billing.readHold("org_a", "run_1")).toMatchObject({
       status: "live",
-      capturedMinor: 0,
+      capturedMicros: 0,
     });
-    expect(await f.billing.wallet("org_a")).toMatchObject({ heldMinor: 10, availableMinor: 0 });
+    expect(await f.billing.wallet("org_a")).toMatchObject({ heldMicros: 10, availableMicros: 0 });
   });
 
   test("actual exceeding hold is capped and full actual remains in the receipt fingerprint", async () => {
     const f = fixture();
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 10,
+      consumptionClass: "purchased",
+    });
     await f.billing.hold(hold);
+    const fullActual = "9".repeat(256);
     expect(
-      await f.billing.capture({ ...capture, amountMinor: 10, actualMicros: "1000000" }),
-    ).toMatchObject({ capturedMinor: 10, actualMicros: "1000000" });
+      await f.billing.capture({ ...capture, amountMicros: 10, actualMicros: fullActual }),
+    ).toMatchObject({ capturedMicros: 10, actualMicros: fullActual });
     await errorCode(
-      f.billing.capture({ ...capture, amountMinor: 10, actualMicros: "1000001" }),
+      f.billing.capture({
+        ...capture,
+        amountMicros: 10,
+        actualMicros: `${"8"}${fullActual.slice(1)}`,
+      }),
       "reference_conflict",
       409,
     );
@@ -156,22 +180,27 @@ describe("Organization wallet lifecycle", () => {
 
   test("zero capture is full release without a zero ledger capture and exact replay", async () => {
     const f = fixture();
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 10,
+      consumptionClass: "purchased",
+    });
     await f.billing.hold(hold);
-    const zero = { ...capture, amountMinor: 0, actualMicros: "5000" };
+    const zero = { ...capture, amountMicros: 0, actualMicros: "0" };
     const result = await f.billing.capture(zero);
-    expect(result).toMatchObject({ status: "released", capturedMinor: 0, releasedMinor: 10 });
+    expect(result).toMatchObject({ status: "released", capturedMicros: 0, releasedMicros: 10 });
     expect(await f.billing.capture(zero)).toEqual(result);
     expect((await f.sql.query("SELECT 1 FROM ledger WHERE type = 'capture'")).length).toBe(0);
-    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMinor: 10, heldMinor: 0 });
+    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMicros: 10, heldMicros: 0 });
   });
 
   test("zero hold still has durable TTL and closes without ledger rows", async () => {
     const f = fixture();
-    await f.billing.hold({ ...hold, amountMinor: 0 });
+    await f.billing.hold({ ...hold, amountMicros: 0 });
     expect(
-      await f.billing.capture({ ...capture, amountMinor: 0, actualMicros: "0" }),
-    ).toMatchObject({ status: "released", releasedMinor: 0 });
+      await f.billing.capture({ ...capture, amountMicros: 0, actualMicros: "0" }),
+    ).toMatchObject({ status: "released", releasedMicros: 0 });
     expect((await f.sql.query("SELECT 1 FROM ledger")).length).toBe(0);
   });
 
@@ -179,27 +208,42 @@ describe("Organization wallet lifecycle", () => {
     const f = fixture();
     await errorCode(f.billing.hold(hold), "insufficient_funds", 402);
     expect((await f.sql.query("SELECT 1 FROM org_wallet_holds")).length).toBe(0);
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 10,
+      consumptionClass: "purchased",
+    });
     expect(await f.billing.hold(hold)).toMatchObject({ status: "live" });
   });
 
   test("release before a delayed hold leaves a permanent tombstone", async () => {
     const f = fixture();
     const tombstone = await f.billing.release("org_a", "never-admitted");
-    expect(tombstone).toMatchObject({ status: "released", amountMinor: 0, expiresAt: null });
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
+    expect(tombstone).toMatchObject({ status: "released", amountMicros: 0, expiresAt: null });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 10,
+      consumptionClass: "purchased",
+    });
     await errorCode(
       f.billing.hold({ ...hold, reference: "never-admitted" }),
       "reference_conflict",
       409,
     );
     expect(await f.billing.release("org_a", "never-admitted")).toEqual(tombstone);
-    expect(await f.billing.wallet("org_a")).toMatchObject({ heldMinor: 0, availableMinor: 10 });
+    expect(await f.billing.wallet("org_a")).toMatchObject({ heldMicros: 0, availableMicros: 10 });
   });
 
   test("deadline is exclusive and capture auto-releases without cron", async () => {
     const f = fixture();
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 10,
+      consumptionClass: "purchased",
+    });
     await f.billing.hold(hold);
     f.setTime("2026-10-13T00:00:59.999Z");
     expect(await f.billing.readHold("org_a", "run_1")).toMatchObject({ status: "live" });
@@ -207,9 +251,9 @@ describe("Organization wallet lifecycle", () => {
     await errorCode(f.billing.capture(capture), "hold_closed", 409);
     expect(await f.billing.readHold("org_a", "run_1")).toMatchObject({
       status: "expired",
-      releasedMinor: 10,
+      releasedMicros: 10,
     });
-    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMinor: 10, heldMinor: 0 });
+    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMicros: 10, heldMicros: 0 });
   });
 
   test("expired lot stays pinned until settlement and never revives on release", async () => {
@@ -217,38 +261,55 @@ describe("Organization wallet lifecycle", () => {
     await f.ledger.fund({
       organizationId: "org_a",
       fundingRef: "included",
-      amountMinor: 10,
+      consumptionClass: "free",
+      amountMicros: 10,
       kind: "plan-included",
       expiresAt: "2026-10-13T00:00:30.000Z",
     });
     await f.billing.hold(hold);
     f.setTime("2026-10-13T00:00:40.000Z");
-    expect(await f.ledger.wallet("org_a")).toMatchObject({ settledMinor: 10, availableMinor: 0 });
+    expect(await f.ledger.wallet("org_a")).toMatchObject({ settledMicros: 10, availableMicros: 0 });
     await f.billing.capture(capture);
     expect(await f.billing.wallet("org_a")).toMatchObject({
-      settledMinor: 0,
-      heldMinor: 0,
-      availableMinor: 0,
+      settledMicros: 0,
+      heldMicros: 0,
+      availableMicros: 0,
     });
     expect((await f.billing.lots("org_a")).lots).toMatchObject([
-      { reference: "included", spentMinor: 4, remainingMinor: 6, heldMinor: 0, availableMinor: 0 },
+      {
+        reference: "included",
+        spentMicros: 4,
+        remainingMicros: 6,
+        heldMicros: 0,
+        availableMicros: 0,
+      },
     ]);
   });
 
-  test("uses nearer expiry first and nonexpiring purchased credit last", async () => {
+  test("consumes free before earlier-expiring subscription and purchased credit", async () => {
     const f = fixture();
     await f.ledger.fund({
       organizationId: "org_a",
       fundingRef: "purchased",
-      amountMinor: 10,
+      consumptionClass: "purchased",
+      amountMicros: 10,
       kind: "purchased",
     });
     await f.ledger.fund({
       organizationId: "org_a",
       fundingRef: "included",
-      amountMinor: 10,
+      consumptionClass: "free",
+      amountMicros: 10,
       kind: "plan-included",
       expiresAt: "2026-11-01T00:00:00.000Z",
+    });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "subscription",
+      consumptionClass: "subscription",
+      amountMicros: 10,
+      kind: "plan-included",
+      expiresAt: "2026-10-20T00:00:00.000Z",
     });
     await f.billing.hold(hold);
     expect(
@@ -258,19 +319,29 @@ describe("Organization wallet lifecycle", () => {
 
   test("simultaneous reservations cannot allocate the same money twice", async () => {
     const f = fixture();
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 10,
+      consumptionClass: "purchased",
+    });
     const results = await Promise.allSettled([
       f.billing.hold(hold),
       f.billing.hold({ ...hold, reference: "run_2" }),
     ]);
     expect(results.filter((x) => x.status === "fulfilled").length).toBe(1);
-    expect(await f.billing.wallet("org_a")).toMatchObject({ heldMinor: 10, availableMinor: 0 });
+    expect(await f.billing.wallet("org_a")).toMatchObject({ heldMicros: 10, availableMicros: 0 });
     expect((await f.sql.query("SELECT 1 FROM wallet_allocation_guards")).length).toBe(0);
   });
 
   test("capture/release races have one terminal receipt and no extra debit", async () => {
     const f = fixture();
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 10,
+      consumptionClass: "purchased",
+    });
     await f.billing.hold(hold);
     await Promise.allSettled([
       f.billing.capture(capture),
@@ -278,10 +349,10 @@ describe("Organization wallet lifecycle", () => {
       f.billing.capture(capture),
     ]);
     const terminal = await f.billing.readHold("org_a", "run_1");
-    expect(terminal.capturedMinor + terminal.releasedMinor).toBe(10);
+    expect(terminal.capturedMicros + terminal.releasedMicros).toBe(10);
     expect(await f.billing.wallet("org_a")).toMatchObject({
-      heldMinor: 0,
-      availableMinor: 10 - terminal.capturedMinor,
+      heldMicros: 0,
+      availableMicros: 10 - terminal.capturedMicros,
     });
     expect((await f.sql.query("SELECT 1 FROM wallet_allocation_guards")).length).toBe(0);
   });
@@ -289,16 +360,26 @@ describe("Organization wallet lifecycle", () => {
   test("two Organizations can use the same opaque reference independently", async () => {
     const f = fixture();
     for (const org of ["org_a", "org_b"])
-      await f.ledger.fund({ organizationId: org, fundingRef: "pay", amountMinor: 10 });
+      await f.ledger.fund({
+        organizationId: org,
+        fundingRef: "pay",
+        amountMicros: 10,
+        consumptionClass: "purchased",
+      });
     await f.billing.hold(hold);
     await f.billing.hold({ ...hold, organizationId: "org_b" });
     await f.billing.capture(capture);
-    expect(await f.billing.wallet("org_b")).toMatchObject({ heldMinor: 10, settledMinor: 10 });
+    expect(await f.billing.wallet("org_b")).toMatchObject({ heldMicros: 10, settledMicros: 10 });
   });
 
   test("interrupted closure batch rolls back allocation, ledger and state together", async () => {
     const f = fixture();
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 10,
+      consumptionClass: "purchased",
+    });
     await f.billing.hold(hold);
     let failBatch = true;
     const sql: Sql = {
@@ -318,17 +399,17 @@ describe("Organization wallet lifecycle", () => {
     await errorCode(billing.capture(capture), "billing_unavailable", 503);
     expect(await f.billing.readHold("org_a", "run_1")).toMatchObject({
       status: "live",
-      capturedMinor: 0,
+      capturedMicros: 0,
     });
-    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMinor: 0, heldMinor: 10 });
+    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMicros: 0, heldMicros: 10 });
     failBatch = false;
-    expect(await billing.capture(capture)).toMatchObject({ capturedMinor: 4, releasedMinor: 6 });
+    expect(await billing.capture(capture)).toMatchObject({ capturedMicros: 4, releasedMicros: 6 });
   });
 
   test("expired backlog is bounded and durable sweep resumes after restart", async () => {
     const f = fixture();
     for (let n = 0; n < 12; n++)
-      await f.billing.hold({ ...hold, reference: `zero_${n}`, amountMinor: 0 });
+      await f.billing.hold({ ...hold, reference: `zero_${n}`, amountMicros: 0 });
     f.setTime("2026-10-13T00:01:00.000Z");
     await errorCode(f.billing.wallet("org_a"), "billing_maintenance_pending", 503);
     const restarted = createOrgBilling({
@@ -339,14 +420,14 @@ describe("Organization wallet lifecycle", () => {
     });
     expect(await restarted.expireDue(3)).toBe(3);
     expect(await restarted.expireDue(3)).toBe(1);
-    expect(await restarted.wallet("org_a")).toMatchObject({ heldMinor: 0 });
+    expect(await restarted.wallet("org_a")).toMatchObject({ heldMicros: 0 });
   });
 });
 
 describe("monthly grants and frozen usage tariffs", () => {
   test("one UTC monthly lot across Organizations is frozen even after a price revision", async () => {
     const f = fixture(config({ freeIncludedMinor: 10 }));
-    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMinor: 10 });
+    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMicros: 100000 });
     const revised = createOrgBilling({
       sql: f.sql,
       clock: f.clock,
@@ -357,10 +438,10 @@ describe("monthly grants and frozen usage tariffs", () => {
         freeIncludedMinor: 20,
       }),
     });
-    expect(await revised.wallet("org_b")).toMatchObject({ availableMinor: 10 });
-    expect(await revised.wallet("org_a")).toMatchObject({ availableMinor: 10 });
+    expect(await revised.wallet("org_b")).toMatchObject({ availableMicros: 100000 });
+    expect(await revised.wallet("org_a")).toMatchObject({ availableMicros: 100000 });
     f.setTime("2026-11-01T00:00:00.000Z");
-    expect(await revised.wallet("org_a")).toMatchObject({ availableMinor: 20 });
+    expect(await revised.wallet("org_a")).toMatchObject({ availableMicros: 200000 });
     expect((await revised.lots("org_a")).lots.map((l) => l.reference)).toEqual([
       "free:org_a:2026-10",
       "free:org_a:2026-11",
@@ -369,53 +450,66 @@ describe("monthly grants and frozen usage tariffs", () => {
 
   test("zero allowance and mid-month first tariff pin eligibility without backfill", async () => {
     const f = fixture(config({ effectiveAt: "2026-10-13T00:00:00.000Z", freeIncludedMinor: 10 }));
-    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMinor: 0 });
-    expect(await f.sql.query("SELECT amount_minor FROM org_wallet_grant_snapshots")).toEqual([
-      { amount_minor: 0 },
+    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMicros: 0 });
+    expect(await f.sql.query("SELECT amount_micros FROM org_wallet_grant_snapshots")).toEqual([
+      { amount_micros: 0 },
     ]);
     expect((await f.sql.query("SELECT 1 FROM ledger")).length).toBe(0);
     f.setTime("2026-11-01T00:00:00.000Z");
-    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMinor: 10 });
+    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMicros: 100000 });
   });
 
   test("already-consumed usage persists pending then pays once after topup", async () => {
     const f = fixture();
     expect(await f.billing.usage(usage)).toMatchObject({
       status: "pending",
-      amountMinor: 1,
+      amountMicros: 10000,
       quantityUnit: "byte-millisecond",
     });
-    await errorCode(f.billing.hold({ ...hold, amountMinor: 0 }), "outstanding_usage", 409);
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 2 });
+    await errorCode(f.billing.hold({ ...hold, amountMicros: 0 }), "outstanding_usage", 409);
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 20000,
+      consumptionClass: "purchased",
+    });
     const result = await f.billing.usage(usage);
-    expect(result).toMatchObject({ status: "paid", amountMinor: 1 });
+    expect(result).toMatchObject({ status: "paid", amountMicros: 10000 });
     expect(await f.billing.usage(usage)).toEqual(result);
-    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMinor: 1, heldMinor: 0 });
+    expect(await f.billing.wallet("org_a")).toMatchObject({
+      availableMicros: 10000,
+      heldMicros: 0,
+    });
     await errorCode(
-      f.billing.usage({ ...usage, quantity: "7200000", expectedMinor: 2 }),
+      f.billing.usage({ ...usage, quantity: "7200000", expectedMicros: 20000 }),
       "reference_conflict",
       409,
     );
   });
 
-  test("storage integral byte-ms converts exactly and rounds once at cents", async () => {
+  test("storage integral byte-ms converts exactly and rounds once to whole micros", async () => {
     const f = fixture();
-    expect(await f.billing.usage({ ...usage, quantity: "1", expectedMinor: 0 })).toMatchObject({
-      status: "paid",
-      amountMinor: 0,
+    expect(await f.billing.usage({ ...usage, quantity: "1", expectedMicros: 1 })).toMatchObject({
+      status: "pending",
+      amountMicros: 1,
     });
     expect((await f.sql.query("SELECT 1 FROM ledger")).length).toBe(0);
     expect(
-      await f.billing.usage({ ...usage, reference: "tie", quantity: "1800000", expectedMinor: 0 }),
-    ).toMatchObject({ amountMinor: 0 });
+      await f.billing.usage({
+        ...usage,
+        reference: "tie",
+        quantity: "1800000",
+        expectedMicros: 5000,
+      }),
+    ).toMatchObject({ amountMicros: 5000 });
     expect(
       await f.billing.usage({
         ...usage,
         reference: "above",
         quantity: "1800001",
-        expectedMinor: 1,
+        expectedMicros: 5001,
       }),
-    ).toMatchObject({ amountMinor: 1, status: "pending" });
+    ).toMatchObject({ amountMicros: 5001, status: "pending" });
     await errorCode(
       f.billing.usage({ ...usage, reference: "wrong-unit", quantityUnit: "byte-hour" }),
       "invalid_quantity",
@@ -444,11 +538,16 @@ describe("monthly grants and frozen usage tariffs", () => {
     expect(await updated.usage(usage)).toMatchObject({
       status: "pending",
       pricingRevision: "r1",
-      amountMinor: 1,
+      amountMicros: 10000,
       rate: { numeratorMicros: "10000" },
     });
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 1 });
-    expect(await updated.usage(usage)).toMatchObject({ status: "paid", amountMinor: 1 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 10000,
+      consumptionClass: "purchased",
+    });
+    expect(await updated.usage(usage)).toMatchObject({ status: "paid", amountMicros: 10000 });
     await errorCode(
       updated.usage({
         ...usage,
@@ -466,7 +565,10 @@ describe("monthly grants and frozen usage tariffs", () => {
     const f = fixture(
       config({ revision: "r2", effectiveAt: "2026-10-13T00:00:00.000Z", history: [old] }),
     );
-    expect(await f.billing.usage(usage)).toMatchObject({ pricingRevision: "r1", amountMinor: 1 });
+    expect(await f.billing.usage(usage)).toMatchObject({
+      pricingRevision: "r1",
+      amountMicros: 10000,
+    });
     f.setTime("2026-10-13T02:00:00.000Z");
     await errorCode(
       f.billing.usage({
@@ -487,19 +589,24 @@ describe("monthly grants and frozen usage tariffs", () => {
       meter: "requests",
       quantity: "3",
       quantityUnit: "request",
-      expectedMinor: 2,
+      expectedMicros: 15000,
     };
-    expect(await f.billing.usage(input)).toMatchObject({ amountMinor: 2 });
+    expect(await f.billing.usage(input)).toMatchObject({ amountMicros: 15000 });
     expect(
-      await f.billing.usage({ ...input, reference: "fraction", quantity: "1.5", expectedMinor: 1 }),
-    ).toMatchObject({ amountMinor: 1 });
+      await f.billing.usage({
+        ...input,
+        reference: "fraction",
+        quantity: "1.5",
+        expectedMicros: 7500,
+      }),
+    ).toMatchObject({ amountMicros: 7500 });
     await errorCode(
       f.billing.usage({ ...input, reference: "wrong", quantity: "1.0" }),
       "invalid_quantity",
       400,
     );
     await errorCode(
-      f.billing.usage({ ...input, reference: "wrong-price", expectedMinor: 1 }),
+      f.billing.usage({ ...input, reference: "wrong-price", expectedMicros: 1 }),
       "measurement_conflict",
       409,
     );
@@ -517,78 +624,97 @@ describe("monthly grants and frozen usage tariffs", () => {
 
   test("same paid usage concurrent retries debit once", async () => {
     const f = fixture();
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 2 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 20000,
+      consumptionClass: "purchased",
+    });
     const receipts = await Promise.all([f.billing.usage(usage), f.billing.usage(usage)]);
     expect(receipts[0]).toEqual(receipts[1]);
-    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMinor: 1 });
+    expect(await f.billing.wallet("org_a")).toMatchObject({ availableMicros: 10000 });
     expect((await f.sql.query("SELECT 1 FROM ledger WHERE type = 'usage_debit'")).length).toBe(1);
   });
 });
 
-test("funded 0091 history migrates forward without rewriting wallet money", async () => {
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS.filter((m) => m.name < "0092")) database.exec(migration.sql);
-  const sql = createSqliteSql(database);
-  const clock = () => new Date("2026-10-13T00:00:00.000Z");
-  const ledger = createLedger(sql, clock);
-  await ledger.fund({
-    organizationId: "org_a",
-    fundingRef: "old-purchase",
-    kind: "purchased",
-    amountMinor: 100,
+test("historical cents receipts remain readable and reject new micros mutations", async () => {
+  const f = fixture();
+  await f.sql.run("DROP TRIGGER org_wallet_holds_new_money_policy");
+  await f.sql.run("DROP TRIGGER org_wallet_usage_records_new_money_policy");
+  await f.sql.run(
+    `INSERT INTO org_wallet_holds
+      (org_id, ref, ledger_ref, amount_micros, fingerprint, pricing_revision, created_at,
+       expires_at, state, captured_micros, released_micros, actual_micros, closed_at, money_policy)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'released', 0, ?, NULL, ?, 'usd-cents-v1')`,
+    [
+      "org_a",
+      "legacy-hold",
+      "org-hold:legacy-hold",
+      10000,
+      "legacy-fingerprint",
+      "r1",
+      "2026-10-12T00:00:00.000Z",
+      10000,
+      "2026-10-12T00:00:01.000Z",
+    ],
+  );
+  await f.sql.run(
+    `INSERT INTO org_wallet_usage_records
+      (org_id, ref, fingerprint, pricing_revision, meter, quantity, quantity_unit,
+       period_start, period_end, rate_numerator_micros, rate_denominator, amount_micros,
+       state, created_at, paid_at, money_policy)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?, ?, 'usd-cents-v1')`,
+    [
+      "org_a",
+      "legacy-usage",
+      "legacy-fingerprint",
+      "r1",
+      "requests",
+      "1",
+      "request",
+      "2026-10-11T00:00:00.000Z",
+      "2026-10-11T01:00:00.000Z",
+      "10000",
+      "1",
+      10000,
+      "2026-10-12T00:00:00.000Z",
+      "2026-10-12T00:00:01.000Z",
+    ],
+  );
+  expect(await f.billing.readHold("org_a", "legacy-hold")).toMatchObject({
+    moneyPolicy: "usd-cents-v1",
+    amountMicros: 10000,
+    status: "released",
   });
-  await ledger.hold({ organizationId: "org_a", reference: "legacy-hold", amountMinor: 30 });
-  const before = await ledger.wallet("org_a");
-  const oldLots = await sql.query(
-    "SELECT org_id, ref, kind, amount_minor, expires_at, created_at FROM wallet_credit_lots",
+  await errorCode(
+    f.billing.capture({ ...capture, reference: "legacy-hold", amountMicros: 0, actualMicros: "0" }),
+    "reference_conflict",
+    409,
   );
-  const oldAllocations = await sql.query("SELECT * FROM wallet_credit_allocations");
-  const oldLedger = await sql.query("SELECT * FROM ledger");
-  const migration = MIGRATIONS.find((m) => m.name.startsWith("0092"));
-  if (!migration) throw new Error("missing 0092");
-  database.exec(migration.sql);
-  await assertOrgBillingSchema(sql, config());
-  expect(await ledger.wallet("org_a")).toEqual(before);
-  expect(
-    await sql.query(
-      "SELECT org_id, ref, kind, amount_minor, expires_at, created_at FROM wallet_credit_lots",
-    ),
-  ).toEqual(oldLots);
-  expect(await sql.query("SELECT * FROM wallet_credit_allocations")).toEqual(oldAllocations);
-  expect(await sql.query("SELECT * FROM ledger")).toEqual(oldLedger);
-  const cursor = (await sql.query("SELECT cursor_handle FROM wallet_credit_lots"))[0]
-    ?.cursor_handle;
-  expect(cursor).toMatch(/^[a-f0-9]{32}$/u);
-  expect(() => database.exec("UPDATE wallet_credit_lots SET cursor_handle = NULL")).toThrow(
-    "wallet lot cursor is immutable",
-  );
-  expect((await sql.query("SELECT cursor_handle FROM wallet_credit_lots"))[0]?.cursor_handle).toBe(
-    cursor,
-  );
-  expect(await sql.query("SELECT amount_minor FROM wallet_credit_lots")).toEqual([
-    { amount_minor: 100 },
-  ]);
-  const billing = createOrgBilling({ sql, clock, ledger, config: config() });
-  await billing.hold({ ...hold, amountMinor: 10 });
-  await billing.capture(capture);
-  expect(await ledger.wallet("org_a")).toMatchObject({
-    availableMinor: 66,
-    heldMinor: 30,
-    settledMinor: 96,
+  await errorCode(f.billing.release("org_a", "legacy-hold"), "reference_conflict", 409);
+  const oldUsage = await f.billing.listUsage("org_a");
+  expect(oldUsage.usageRecords[0]).toMatchObject({
+    reference: "legacy-usage",
+    moneyPolicy: "usd-cents-v1",
+    amountMicros: 10000,
   });
-  database.close();
+  await errorCode(
+    f.billing.usage({ ...usage, reference: "legacy-usage", expectedMicros: 0 }),
+    "reference_conflict",
+    409,
+  );
 });
 
 test("usage cursor includes equal timestamps once and never crosses Organizations", async () => {
   const f = fixture();
   for (const reference of ["a", "b", "c"])
-    await f.billing.usage({ ...usage, reference, quantity: "0", expectedMinor: 0 });
+    await f.billing.usage({ ...usage, reference, quantity: "0", expectedMicros: 0 });
   await f.billing.usage({
     ...usage,
     organizationId: "org_b",
     reference: "z",
     quantity: "0",
-    expectedMinor: 0,
+    expectedMicros: 0,
   });
   const first = await f.billing.listUsage("org_a", 2);
   expect(first.usageRecords.map((r) => r.reference)).toEqual(["c", "b"]);
@@ -611,7 +737,12 @@ test("canonical dates cannot misclassify an extended-year future period as close
 
 test("lost write acknowledgement reads committed hold/capture/usage receipts without double debit", async () => {
   const f = fixture();
-  await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 20 });
+  await f.ledger.fund({
+    organizationId: "org_a",
+    fundingRef: "pay",
+    amountMicros: 10020,
+    consumptionClass: "purchased",
+  });
   const sql: Sql = {
     query: (query, params) => f.sql.query(query, params),
     run: (query, params) => f.sql.run(query, params),
@@ -627,7 +758,7 @@ test("lost write acknowledgement reads committed hold/capture/usage receipts wit
   const paid = await billing.usage(usage);
   expect(paid).toMatchObject({ status: "paid" });
   expect(await billing.usage(usage)).toEqual(paid);
-  expect(await f.ledger.wallet("org_a")).toMatchObject({ availableMinor: 15, heldMinor: 0 });
+  expect(await f.ledger.wallet("org_a")).toMatchObject({ availableMicros: 16, heldMicros: 0 });
 });
 
 test("new tariff cannot backdate and reprice an already consumed period", async () => {
@@ -642,7 +773,10 @@ test("new tariff cannot backdate and reprice an already consumed period", async 
   expect(
     (await f.sql.query("SELECT revision FROM org_wallet_pricing_revisions")).map((r) => r.revision),
   ).toEqual(["r1"]);
-  expect(await f.billing.usage(usage)).toMatchObject({ pricingRevision: "r1", amountMinor: 1 });
+  expect(await f.billing.usage(usage)).toMatchObject({
+    pricingRevision: "r1",
+    amountMicros: 10000,
+  });
 });
 
 test("byte-hour pricing follows the configured unit without a customer product meter name", async () => {
@@ -656,11 +790,21 @@ test("byte-hour pricing follows the configured unit without a customer product m
       },
     }),
   );
-  await f.ledger.fund({ organizationId: "org_a", fundingRef: "unit-test", amountMinor: 10 });
+  await f.ledger.fund({
+    organizationId: "org_a",
+    fundingRef: "unit-test",
+    amountMicros: 10000,
+    consumptionClass: "purchased",
+  });
   const input = { ...usage, meter: "operator.storage" };
-  expect(await f.billing.usage(input)).toMatchObject({ amountMinor: 1, status: "paid" });
+  expect(await f.billing.usage(input)).toMatchObject({ amountMicros: 10000, status: "paid" });
   await errorCode(
-    f.billing.usage({ ...input, reference: "decimal-integral", quantity: "1.5", expectedMinor: 0 }),
+    f.billing.usage({
+      ...input,
+      reference: "decimal-integral",
+      quantity: "1.5",
+      expectedMicros: 0,
+    }),
     "invalid_quantity",
     400,
   );
@@ -678,17 +822,32 @@ test("byte-hour pricing follows the configured unit without a customer product m
 
 test("lot cursor bounds expiry-ordered pages with tied timestamps and opaque legacy refs", async () => {
   const f = fixture();
-  const refs = ["legacy/" + "x".repeat(20000), "b", "c", "purchased"] as const;
-  for (const fundingRef of refs)
+  const refs = [`legacy/${"x".repeat(2000)}`, "b", "c", "purchased"] as const;
+  for (const fundingRef of refs.slice(1))
     await f.ledger.fund({
       organizationId: "org_a",
       fundingRef,
-      amountMinor: 10,
+      amountMicros: 10,
       ...(fundingRef === "purchased"
-        ? { kind: "purchased" as const }
-        : { kind: "plan-included" as const, expiresAt: "2026-10-14T00:00:00.000Z" }),
+        ? { kind: "purchased" as const, consumptionClass: "purchased" as const }
+        : {
+            kind: "plan-included" as const,
+            consumptionClass: "free" as const,
+            expiresAt: "2026-10-14T00:00:00.000Z",
+          }),
     });
-  await f.ledger.fund({ organizationId: "org_other", fundingRef: "other", amountMinor: 10 });
+  await f.sql.run(
+    `INSERT INTO wallet_credit_lots
+      (org_id, ref, kind, consumption_class, amount_micros, expires_at, created_at)
+     VALUES (?, ?, 'plan-included', 'free', 10, ?, ?)`,
+    ["org_a", refs[0], "2026-10-14T00:00:00.000Z", "2026-10-13T00:00:00.000Z"],
+  );
+  await f.ledger.fund({
+    organizationId: "org_other",
+    fundingRef: "other",
+    amountMicros: 10,
+    consumptionClass: "purchased",
+  });
   const first = await f.billing.lots("org_a", 2);
   expect(first.lots.map((l) => l.reference)).toEqual(["b", "c"]);
   expect(first.cursor).not.toBeNull();
@@ -719,4 +878,15 @@ test("billing startup refuses missing lot cursor migration objects", async () =>
   await assertOrgBillingSchema(f.sql);
   await f.sql.run("DROP TRIGGER wallet_credit_lots_cursor_insert");
   await errorCode(assertOrgBillingSchema(f.sql), "billing_schema_not_ready", 503);
+});
+
+test("billing startup refuses the cents schema before writing tariffs", async () => {
+  const database = new Database(":memory:");
+  for (const migration of MIGRATIONS.filter((migration) => migration.name < "0094"))
+    database.exec(migration.sql);
+  const sql = createSqliteSql(database);
+  await errorCode(assertOrgBillingSchema(sql, config()), "billing_schema_not_ready", 503);
+  expect(await sql.query("SELECT * FROM org_wallet_pricing_revisions")).toEqual([]);
+  expect(await sql.query("SELECT * FROM org_wallet_monthly_tariffs")).toEqual([]);
+  database.close();
 });

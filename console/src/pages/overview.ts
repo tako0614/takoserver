@@ -1,11 +1,11 @@
-import type { Organization } from "../api.ts";
+import { formatMicrosCurrency, type Organization } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
-import { tr } from "../i18n.ts";
+import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
 import { byForm, health } from "../resource-state.ts";
 import { linkProps, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
-import { ago, badge, card, copyable, empty, ICON, icon, money, stat, whenReady } from "../ui.ts";
+import { ago, badge, card, copyable, empty, ICON, icon, stat, whenReady } from "../ui.ts";
 
 /**
  * The first screen, answering the two questions someone signs in with: is
@@ -51,17 +51,17 @@ export function overviewPage(organization: Organization): Child {
               { style: { display: "contents" } },
               stat(
                 tr("利用可能", "Available"),
-                money(held.availableMinor, held.currency),
-                held.heldMinor > 0
+                formatMicrosCurrency(held.availableMicros, held.currency, uiLocale()),
+                BigInt(held.heldMicros) > 0n
                   ? tr(
-                      `${money(held.heldMinor, held.currency)}を処理中の操作に確保中`,
-                      `${money(held.heldMinor, held.currency)} held against live work`,
+                      `${formatMicrosCurrency(held.heldMicros, held.currency, uiLocale())}を処理中の操作に確保中`,
+                      `${formatMicrosCurrency(held.heldMicros, held.currency, uiLocale())} held against live work`,
                     )
                   : tr("確保中の金額はありません", "nothing held"),
               ),
               stat(
                 tr("確定残高", "Settled"),
-                money(held.settledMinor, held.currency),
+                formatMicrosCurrency(held.settledMicros, held.currency, uiLocale()),
                 tr("入金と確定済み請求", "credited and captured"),
               ),
             ),
@@ -282,6 +282,10 @@ export function overviewPage(organization: Organization): Child {
       ),
     ),
   );
+}
+
+function uiLocale(): "en-US" | "ja-JP" {
+  return consoleLocale() === "ja" ? "ja-JP" : "en-US";
 }
 
 function phaseLabel(phase: ReturnType<typeof health>["phase"]): string {

@@ -1,4 +1,5 @@
 import type { Ledger } from "./ledger.ts";
+import { minorToMicros } from "./money.ts";
 import type { Clock, Sql } from "./ports.ts";
 
 /**
@@ -110,7 +111,12 @@ export function createFundingCredit(input: {
     if (await input.ledger.hasFunding(reference)) return "already_credited";
     // A concurrent path may credit between the check and here; the ledger's
     // unique funding reference turns that race into a no-op, not a second credit.
-    await input.ledger.fund({ ...reference, amountMinor: funding.amountMinor });
+    await input.ledger.fund({
+      ...reference,
+      amountMicros: minorToMicros(funding.amountMinor),
+      kind: "purchased",
+      consumptionClass: "purchased",
+    });
     return "credited";
   };
 }

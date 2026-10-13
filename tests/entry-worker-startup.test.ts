@@ -1,4 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterAll, describe, expect, test } from "bun:test";
+import { MIGRATIONS } from "../src/db-schema.ts";
 import worker, {
   resolvePublicWorkerImplementationIdentity,
   workerIntegrationOrganizationBootstrap,
@@ -7,6 +9,7 @@ import {
   INTEGRATION_E2E_ORGANIZATION_ID,
   type IntegrationE2eCredentialAuthorityConfig,
 } from "../src/integration-e2e-credential-authority.ts";
+import type { SqlParam } from "../src/ports.ts";
 import {
   EDGE_ONLY_RESOURCE_CLASSES,
   edgeSuppliesFixture,
@@ -14,6 +17,42 @@ import {
 } from "./helpers/hosted-supply-fixtures.ts";
 
 const ORIGIN = "https://api.integration.example.test";
+const readyDatabase = databaseThrough(94);
+afterAll(() => readyDatabase.close());
+
+function databaseThrough(count: number): Database {
+  const database = new Database(":memory:");
+  for (const migration of MIGRATIONS.slice(0, count)) database.exec(migration.sql);
+  return database;
+}
+
+function d1(database: Database) {
+  return {
+    prepare(sql: string) {
+      let values: SqlParam[] = [];
+      return {
+        bind(...params: SqlParam[]) {
+          values = params;
+          return this;
+        },
+        async all() {
+          return {
+            results: database
+              .query(sql)
+              .all(
+                ...values.map((value) =>
+                  value instanceof ArrayBuffer ? new Uint8Array(value) : value,
+                ),
+              ),
+          };
+        },
+      };
+    },
+    async batch(statements: readonly { all(): Promise<unknown> }[]) {
+      return await Promise.all(statements.map((statement) => statement.all()));
+    },
+  };
+}
 
 /** Enough of a binding surface to reach composition, and nothing more. */
 function workerEnv(
@@ -21,7 +60,7 @@ function workerEnv(
 ): Parameters<typeof worker.fetch>[1] {
   return {
     PUBLIC_ORIGIN: ORIGIN,
-    STATE_DB: { prepare: () => ({}), batch: () => [] },
+    STATE_DB: d1(readyDatabase),
     OBJECTS: {
       put: () => null,
       get: () => null,
@@ -50,6 +89,35 @@ async function envelope(response: Response) {
 }
 
 describe("Worker startup diagnostics", () => {
+  test("normal serving refuses 0092 with no billing configuration", async () => {
+    const oldDatabase = databaseThrough(92);
+    try {
+      const env = workerEnv({ STATE_DB: d1(oldDatabase) });
+      const response = await worker.fetch(new Request(`${ORIGIN}/healthz`), env);
+      expect(response.status).toBe(503);
+      expect((await envelope(response)).error.details?.reason).toBe("runtime-configuration");
+      await expect(worker.scheduled({}, env)).rejects.toThrow("0094 USD-micros D1 schema");
+    } finally {
+      oldDatabase.close();
+    }
+  });
+
+  test("normal serving refuses a tampered USD-micros money-unit policy", async () => {
+    const database = databaseThrough(94);
+    try {
+      database.exec("DROP TRIGGER money_unit_policy_no_delete");
+      database.exec("DELETE FROM money_unit_policy");
+      const response = await worker.fetch(
+        new Request(`${ORIGIN}/healthz`),
+        workerEnv({ STATE_DB: d1(database) }),
+      );
+      expect(response.status).toBe(503);
+      expect((await envelope(response)).error.details?.reason).toBe("runtime-configuration");
+    } finally {
+      database.close();
+    }
+  });
+
   test("requires explicit v2 startup config before touching durable bindings", async () => {
     const env = workerEnv({ TAKOSERVER_TAKOFORM_V2_CONFIG: undefined });
     let storageReads = 0;
