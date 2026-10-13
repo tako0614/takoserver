@@ -866,6 +866,9 @@ each recorded incarnation to be retired. An uncertain proof stops shutdown befor
 the dependent data planes and SQL are closed. A failed suspend never falls back to
 destructive closure. Native owner/entry tests cover this dependency order;
 normal-entry advertisement separately requires the complete boot selection.
+When that stop reports failure, the Bun Host exits with status 1 even if its
+dependent listeners remain open. This is an unclean process exit, not a custody
+release; the next Host must recover the retained owner state before serving.
 
 A separate normal-`buildApp` local journey composes the
 existing SQLiteDatabase, held SQLiteMigrationSet/Application, and this private
