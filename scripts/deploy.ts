@@ -1152,9 +1152,7 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         );
       }
       const production =
-        invocation.throughMigration !== "0092" ||
-        productionPath === undefined ||
-        productionPath === ""
+        productionPath === undefined || productionPath === ""
           ? undefined
           : loadTarget(productionPath, "production");
       return await runIntegrationStorageGeneration(
