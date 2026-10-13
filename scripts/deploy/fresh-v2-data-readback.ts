@@ -4,9 +4,17 @@ import { type CommandResult, runCommand, wranglerCommand } from "./process.ts";
 
 /**
  * The closed fresh v2 D1 profiles. Each names one reviewed, fixed-digest
- * payload; a later audited source migration never widens either selector.
+ * payload; a later audited source migration never widens any selector.
+ * `v2-0091` is staging-only: only the integration generation surface offers it.
  */
-export type FreshV2D1Lineage = "v2-0088" | "v2-0089";
+export type FreshV2D1Lineage = "v2-0088" | "v2-0089" | "v2-0091";
+
+/** The exact migration-ledger row count each fresh profile leaves behind. */
+const FRESH_V2_LEDGER_ROWS: Readonly<Record<FreshV2D1Lineage, number>> = {
+  "v2-0088": 88,
+  "v2-0089": 89,
+  "v2-0091": 91,
+};
 
 export interface FreshV2DataReadback {
   readonly tableCounts: Readonly<Record<string, number>>;
@@ -82,7 +90,7 @@ export async function assertFreshV2DataReadback(
   if ([...allowed].some((name) => !tables.includes(name)))
     throw new DeployError(phase, "fresh v2 allowed table is not part of the audited schema");
   if (
-    readback.ledgerRows !== (lineage === "v2-0089" ? 89 : 88) ||
+    readback.ledgerRows !== FRESH_V2_LEDGER_ROWS[lineage] ||
     readback.foreignKeyViolations !== 0 ||
     Object.keys(readback.tableCounts).length !== tables.length ||
     FRESH_V2_SEED_TABLES.some((name) => !tables.includes(name)) ||
@@ -106,9 +114,7 @@ export async function assertFreshV2DataReadback(
   ) {
     throw new DeployError(
       phase,
-      lineage === "v2-0089"
-        ? "fresh v2 D1 is not the exact empty 0089 database"
-        : "fresh v2 D1 is not the exact empty 0088 database",
+      `fresh v2 D1 is not the exact empty ${String(FRESH_V2_LEDGER_ROWS[lineage]).padStart(4, "0")} database`,
     );
   }
 }

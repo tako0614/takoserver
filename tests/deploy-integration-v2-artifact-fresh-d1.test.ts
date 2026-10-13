@@ -440,8 +440,14 @@ test("partial real D1 import remains quarantined: status diagnoses, apply cannot
   }
 }, 120_000);
 
-for (const lineage of ["v2-0088", "v2-0089"] as const) {
-  const count = lineage === "v2-0089" ? 89 : 88;
+/** A production D1 identity the staging guard compares against; never touched. */
+const PRODUCTION_D1 = {
+  databaseName: "takoserver-runtime",
+  databaseId: "85c5a15d-a80f-42fe-a907-7ec0d86e008e",
+} as const;
+
+for (const lineage of ["v2-0088", "v2-0089", "v2-0091"] as const) {
+  const count = lineage === "v2-0091" ? 91 : lineage === "v2-0089" ? 89 : 88;
   test(`fresh selected ${lineage} payload serves artifact Forms with no local schema closure`, async () => {
     const artifacts = await Promise.all(
       CASES.map(async ({ slug, path, mediaType, contents }) => {
@@ -587,8 +593,16 @@ for (const lineage of ["v2-0088", "v2-0089"] as const) {
         review: "test-review",
         reader,
         freshV2DataReader,
+        productionD1: PRODUCTION_D1,
       });
-      expect(result).toMatchObject({ freshLineage: lineage });
+      expect(result).toMatchObject({
+        freshLineage: lineage,
+        productionD1Guard: {
+          compared: "naming-and-production-target",
+          productionDatabaseName: PRODUCTION_D1.databaseName,
+          productionDatabaseId: PRODUCTION_D1.databaseId,
+        },
+      });
       expect((result.appliedMigrations as string[]).length).toBe(count);
       expect((result.appliedMigrations as string[]).at(-1)).toBe(MIGRATIONS[count - 1]?.name);
       expect(importCount).toBe(1);

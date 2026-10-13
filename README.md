@@ -511,9 +511,10 @@ this Host lacks, an unreadable payment) are logged by funding reference as
 The webhook records every delivery in `stripe_events`, so it needs migration
 `0091_stripe_events.sql` applied first. A Bun Host migrates its own SQLite. On
 Cloudflare, publication refuses `"stripeWebhook": true` until the target's D1
-has 0091 applied, and no reviewed D1 wave through 0091 exists yet; until one
-does, a hosted deployment relies on the console's return and the reconcile
-pass.
+has 0091 applied. No existing D1 can be moved to 0091 in place. A new staging
+D1 can be created with the staging-only `--fresh-lineage=v2-0091` profile
+([deploy guide](docs/deploy.md)); production has no 0091 path yet, and relies
+on the console's return and the reconcile pass.
 
 ### Data root and backups
 

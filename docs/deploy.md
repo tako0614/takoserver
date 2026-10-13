@@ -153,8 +153,102 @@ a canonical Cron profile; the canonical owners read exactly 0088 otherwise.
 bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0088
 ```
 
+#### Staging D1 through 0091 (staging-only `v2-0091`)
+
+`--fresh-lineage=v2-0091` is the third fixed fresh payload: the audited
+0001–0091 bytes, ending in `0091_stripe_events.sql`, with the fixed digest
+`sha256:152aefa3c0577809d419d95be2bc8878aa9a390a4ee40bfbf5501c32bf058bef`. It is
+**staging-only**:
+
+- `takoserver-production-d1-fresh-init` refuses the selector outright.
+- No in-place wave, rehearsal lane, or production surface offers it.
+- Like every lineage on this surface, it only ever creates a new
+  `takoserver-i-<generation>` D1. It cannot reach an existing database.
+
+It exists because no existing integration D1 can be moved past 0088 in place.
+The current canonical integration D1 is deliberately left untouched:
+`takoserver-i-9b02176262d90b0c414fc97bf7188ffd`,
+id `f079f16e-d4d7-4a51-8383-c4466c99bc53`, at 0001–0088. The canonical WfP
+owners require exactly that ledger and bind its schema digest into their
+retained claims, so moving it in place would break them.
+
+Two guards refuse a production D1:
+
+- **Naming.** A generated name must match `takoserver-i-<32 hex>` and is
+  never `takoserver-runtime…`.
+- **Identity.** `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` is read only for its
+  D1 identity. The exact production D1 name and id are refused before
+  creation, and again once the new id is known, before any SQL runs.
+
+Applying `v2-0091` without `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` is refused.
+Status and apply both print `productionD1Guard` with the production name and
+id they compared. That output is the pre-apply record of which database is
+which.
+
+**1. Set up the inputs.** Use operator-private inputs, from a clean checkout of
+the exact `main` commit:
+
+```sh
+export TAKOSERVER_DEPLOY_TARGET_INTEGRATION=/abs/path/integration-target.json   # account only; never edited
+export TAKOSERVER_DEPLOY_TARGET_PRODUCTION=/abs/path/production-target.json     # read for its D1 identity only
+export TAKOSERVER_INDEPENDENT_REVIEW='<reviewer who is not the operator>'
+export CLOUDFLARE_API_TOKEN='<integration-scoped token>'   # or integration Wrangler OAuth
+COMMIT=$(git rev-parse HEAD)          # must equal the reviewed main commit
+GEN=$(openssl rand -hex 16)           # one new generation; never reuse a failed one
+```
+
+**2. Run status and record it.** Status is read-only:
+
+```sh
+bun run deploy -- takoserver-integration-storage-generation --status --environment=integration --commit="$COMMIT" --generation="$GEN" --fresh-lineage=v2-0091
+```
+
+Proceed only when all of these hold:
+
+- `d1.databaseName` is `takoserver-i-$GEN`.
+- `presence` is `absent` and `readyForApply` is `true`.
+- `productionD1Guard.compared` is `naming-and-production-target`.
+- Its production name and id are the production D1, and differ from the
+  generated name.
+
+Keep the output as operator-private provenance.
+
+**3. Apply once.** Apply is one-way:
+
+```sh
+bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit="$COMMIT" --generation="$GEN" --fresh-lineage=v2-0091
+```
+
+Record the output:
+
+- the new `d1.databaseId`
+- `migrationDigest`, which must be the fixed digest above
+- `appliedMigrations`: 91 entries, ending in `0091_stripe_events.sql`
+- `schemaShapeDigest` and `productionD1Guard`
+
+After any failure or lost acknowledgement, do not rerun `--apply` and do not
+mint a new generation as a retry. Run step 4 and repair forward under owner
+review.
+
+**4. Verify.** Run status again with the same flags. Expect:
+
+- `schemaReadback: complete-0091`
+- `dataReadback: empty-seeded`
+
+**5. Serve it, separately.** Serving the new storage is a separate, reviewed
+step and is not part of this procedure:
+
+1. Create a new staging target descriptor naming the generated pair with
+   `takoformV2.storageLineage: "v2-0091"`. Never edit the canonical WfP
+   target.
+2. Run `takoserver-integration-worker-bootstrap` for its first Host.
+
+Routine `takoserver-worker` publication then accepts exactly that 0001–0091
+ledger. A target with `"stripeWebhook": true` is accepted only on such a D1.
+
 A target that uses such a generation names it explicitly with
-`takoformV2.storageLineage: "v2-0088"` (or `"v2-0089"`). Absent keeps the
+`takoformV2.storageLineage: "v2-0088"` (or `"v2-0089"`, or the staging-only
+`"v2-0091"`). Absent keeps the
 historical `v2-artifacts-0075` expectation; the lineage cannot be combined with
 `schemaMaintenanceMode: pre-v2-0088-quiesced`, because a fresh generation has
 no wave to quiesce for. The first bootstrap publication on such a target also
@@ -173,8 +267,8 @@ failing with 503 after traffic moved.
 After a lost import acknowledgement or partial failure, never rerun `--apply`
 or mint a different generation as a retry. Selected `--status` reads the exact
 generated name/UUID and reports whether its ledger and canonical schema are
-complete (`complete-0075`, `complete-0088` or `complete-0089`) or
-incomplete/divergent. For v2-0088/v2-0089 a complete schema also reports
+complete (`complete-0075`, `complete-0088`, `complete-0089` or `complete-0091`) or
+incomplete/divergent. For v2-0088/v2-0089/v2-0091 a complete schema also reports
 `dataReadback`: `empty-seeded` for an untouched generation, or `present` once
 the signing registration or a Host has written rows; the latter is a generation
 in use, not a reason to quarantine it. It is diagnosis, not proof that the

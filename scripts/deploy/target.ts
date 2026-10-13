@@ -34,8 +34,12 @@ import type { DeployEnvironment } from "./qualification.ts";
  * resources this repository may publish onto. It is operator-private and is
  * never committed: the repository stays account-neutral.
  */
-/** Explicit fresh integration v2 storage payloads beyond the historical 0075 default. */
-export type TakoformV2StorageLineage = "v2-0088" | "v2-0089";
+/**
+ * Explicit fresh integration v2 storage payloads beyond the historical 0075
+ * default. Every v2 Worker target is integration-only, so `v2-0091` (through
+ * the Stripe event table) is a staging-only lineage.
+ */
+export type TakoformV2StorageLineage = "v2-0088" | "v2-0089" | "v2-0091";
 
 /** The exact fresh payload a v2 target's generated storage must carry. */
 export function takoformV2StorageLineage(
@@ -1425,10 +1429,11 @@ function takoformV2(value: unknown): NonNullable<DeployTarget["takoformV2"]> {
   if (
     value.storageLineage !== undefined &&
     value.storageLineage !== "v2-0088" &&
-    value.storageLineage !== "v2-0089"
+    value.storageLineage !== "v2-0089" &&
+    value.storageLineage !== "v2-0091"
   ) {
     throw preflightError(
-      "deploy target `takoformV2.storageLineage` must be v2-0088 or v2-0089 when set",
+      "deploy target `takoformV2.storageLineage` must be v2-0088, v2-0089 or v2-0091 when set",
     );
   }
   return {
