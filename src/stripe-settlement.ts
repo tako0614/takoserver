@@ -161,9 +161,8 @@ export function checkoutSessionFunding(
   assertPaymentStillHeld(session.payment_intent);
   return {
     organizationId,
-    // Stripe's minor units are the ledger's minor units, so nothing is
-    // converted here — a conversion is a place for a factor of a hundred
-    // to go missing.
+    // Keep the verified Stripe cash receipt in cents. Funding callers perform
+    // the checked x10,000 conversion at the USD-micros ledger boundary.
     amountMinor: session.amount_total,
     fundingRef: `stripe:${session.id}`,
     currency: "USD",
