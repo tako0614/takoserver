@@ -61,6 +61,7 @@ const EXPECTED_BOOTSTRAP_TEST_COMMAND = [
   "test",
   "--timeout",
   "60000",
+  "--bail=1",
   "tests/deploy-integration-worker-bootstrap.test.ts",
   "tests/deploy-integration-storage-generation.test.ts",
   "tests/deploy-signing.test.ts",
@@ -560,7 +561,7 @@ describe("Takoserver integration Worker bootstrap", () => {
         message:
           gateFailureAt === "typecheck"
             ? "scoped Host bootstrap typecheck `bun run typecheck:worker` failed (exit 17)"
-            : "scoped Host bootstrap tests `bun test <fixed Host bootstrap test set>` failed (exit 17)",
+            : "scoped Host bootstrap tests `bun test --timeout 60000 --bail=1 <fixed Host bootstrap test set>` failed (exit 17)",
         detail: "gate stdout\ngate stderr",
       });
       expect(fixture.commands).toContainEqual(["bun", "run", "typecheck:worker"]);
