@@ -1677,7 +1677,9 @@ absolute `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` descriptor as a read-only D1
 identity fence. The selected D1 and R2 must be the same `takoserver-i-<32 hex>`
 name; either name or UUID matching production is refused. Rehearsal and
 production refuse the selector. The default 0066 path and fresh 0088, 0089,
-and 0091 profiles remain fixed.
+0091, and staging-only 0092 profiles remain fixed. Fresh
+`storageLineage: "v2-0092"` creates an empty staging pair; it does not select
+the wave on the existing 0088 pair.
 
 This wave accepts exactly 88 applied migration rows and the canonical 0088
 application schema before mutation. It pins the audited 92-file source digest

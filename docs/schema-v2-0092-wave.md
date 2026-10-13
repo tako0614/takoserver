@@ -5,6 +5,15 @@ transition and its private canonical dependency qualification. Production D1,
 production settings, production deployment, and historical migration bytes are
 outside this work.
 
+Source integration (2026-10-14): this is the successor to draft PR #322,
+rebased after the separate fresh integration `storageLineage: "v2-0092"`
+profile from PR #320 entered main. That profile creates an empty staging D1;
+this ledger instead governs the existing generated `storageLineage: "v2-0088"`
+pair and its explicit `appliedSchemaLineage: "v2-0092"` successor. Both pin the
+same immutable 0001–0092 migration source, but neither selector confers the
+other's authority. The original draft stays untouched until the successor is
+reviewed. No schema application or target selection occurred during rebase.
+
 | Order | Owner | Required evidence |
 | --- | --- | --- |
 | 1 | takoserver | Pin the existing 0092 source, implement exact integration 0088→0092 selector, bounded wallet preservation proof, Worker applied-schema selector, local gate and independent review. |
