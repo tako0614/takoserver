@@ -92,6 +92,16 @@ function workerModule(label: string): string {
       const result = await env.DB.query("SELECT value, handler FROM receipt ORDER BY id");
       return Response.json(result.rows);
     }
+    if (path === "/kv-put") {
+      const value = url.searchParams.get("value");
+      if (value === null) return new Response("missing value", { status: 400 });
+      await env.CACHE.put("journey-key", value);
+      return new Response("stored:" + value);
+    }
+    if (path === "/kv-get") {
+      const value = await env.CACHE.get("journey-key");
+      return new Response(value === null ? "missing" : new TextDecoder().decode(value));
+    }
     if (path === "/send") {
       const id = await env.TASKS.send(url.searchParams.get("value") || "unnamed");
       return Response.json({ id });
@@ -1309,6 +1319,7 @@ test.skipIf(OPT_IN !== "1")(
       };
       const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
       const database = await create(SQLITE_DATABASE_FORM_URL, "database", {});
+      const namespace = await create(EDGE_KV_NAMESPACE_FORM_URL, "kv-namespace", {});
       const databaseDirectory = join(root, "v2-sqlite-databases", "resources", database.uid);
       expect((await stat(join(databaseDirectory, "database.sqlite"))).isFile()).toBe(true);
       const migrationSet = await create(SQLITE_MIGRATION_SET_FORM_URL, "migration-set", {
@@ -1337,6 +1348,7 @@ test.skipIf(OPT_IN !== "1")(
         bundle: { resourceUid: bundleUid },
         handlers: ["fetch", "queue"],
         sqliteBindings: [{ name: "DB", resource: { resourceUid: database.uid } }],
+        kvBindings: [{ name: "CACHE", resource: { resourceUid: namespace.uid } }],
         queueProducerBindings: [{ name: "TASKS", resource: { resourceUid: queue.uid } }],
       });
       const version1 = await create(
@@ -1379,6 +1391,11 @@ test.skipIf(OPT_IN !== "1")(
         body: "journey-v1",
       });
       expect(await get("/rows")).toEqual({ status: 200, body: '[{"value":"seed"}]' });
+      expect(await get("/kv-put?value=before-update")).toEqual({
+        status: 200,
+        body: "stored:before-update",
+      });
+      expect(await get("/kv-get")).toEqual({ status: 200, body: "before-update" });
       const sent = async (value: string) => {
         const response = await get(`/send?value=${value}`, (r) => r.status === 200);
         return String((JSON.parse(response.body) as Json).id);
@@ -1453,6 +1470,11 @@ test.skipIf(OPT_IN !== "1")(
       expect(await get("/version", (r) => r.body === "journey-v2")).toEqual({
         status: 200,
         body: "journey-v2",
+      });
+      expect(await get("/kv-get")).toEqual({ status: 200, body: "before-update" });
+      expect(await get("/kv-put?value=before-sigkill")).toEqual({
+        status: 200,
+        body: "stored:before-sigkill",
       });
       const secondMessage = await sent("m-second");
       await handled("m-second");
@@ -1599,6 +1621,7 @@ test.skipIf(OPT_IN !== "1")(
         status: 200,
         body: "journey-v2",
       });
+      expect(await get("/kv-get")).toEqual({ status: 200, body: "before-sigkill" });
       // A batch sent at the crash is retired once its old child is proven
       // gone, and its messages then wait for their lease (up to 120 s), so
       // allow for it.
@@ -1656,6 +1679,11 @@ test.skipIf(OPT_IN !== "1")(
         r.status === 200 && r.body.startsWith("[{");
       const rowsAtBackup = (await get("/rows", nonEmpty)).body;
       const receiptsAtBackup = (await get("/receipts", nonEmpty)).body;
+      expect(await get("/kv-put?value=before-cold-restore")).toEqual({
+        status: 200,
+        body: "stored:before-cold-restore",
+      });
+      expect(await get("/kv-get")).toEqual({ status: 200, body: "before-cold-restore" });
       const deploymentAtBackup = await jsonAt(
         port,
         "GET",
@@ -1693,6 +1721,7 @@ test.skipIf(OPT_IN !== "1")(
         status: 200,
         body: "journey-v2",
       });
+      expect(await get("/kv-get")).toEqual({ status: 200, body: "before-cold-restore" });
       expect((await get("/rows", nonEmpty)).body).toBe(rowsAtBackup);
       expect((await get("/receipts", nonEmpty)).body).toBe(receiptsAtBackup);
       expect(
@@ -1750,6 +1779,7 @@ test.skipIf(OPT_IN !== "1")(
       await remove(application.uid, 1, "migration-application");
       await remove(migrationSet.uid, 1, "migration-set");
       await remove(queue.uid, 1, "queue");
+      await remove(namespace.uid, 1, "kv-namespace");
       await remove(database.uid, 1, "database");
       await expect(stat(databaseDirectory)).rejects.toMatchObject({ code: "ENOENT" });
       await remove(worker.uid, 1, "worker");
@@ -1767,6 +1797,7 @@ test.skipIf(OPT_IN !== "1")(
         application.uid,
         migrationSet.uid,
         queue.uid,
+        namespace.uid,
         database.uid,
         worker.uid,
       ];
@@ -1776,6 +1807,9 @@ test.skipIf(OPT_IN !== "1")(
         expect(read.status).toBe(410);
       }
       withControl(root, (control) => {
+        expect(control.query("SELECT count(*) AS n FROM selfhost_kv_entries").get()).toEqual({
+          n: 0,
+        });
         for (const table of [
           "tf_v2_artifact_owners",
           "tf_v2_artifact_chunks",
