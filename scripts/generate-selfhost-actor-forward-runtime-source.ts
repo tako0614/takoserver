@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { canonicalBunNodeModulesLabels } from "./canonical-bun-module-labels.ts";
 
 const args = process.argv.slice(2);
 if (args.length !== 1 || (args[0] !== "--check" && args[0] !== "--write"))
@@ -18,7 +19,7 @@ const built = await Bun.build({
 });
 if (!built.success || built.outputs.length !== 1 || !built.outputs[0])
   throw new Error("Selfhost Actor forward runtime source build failed");
-const source = await built.outputs[0].text();
+const source = canonicalBunNodeModulesLabels(await built.outputs[0].text(), root);
 if (/^\s*(?:import\s|export\s+.+\s+from\s)/mu.test(source))
   throw new Error("Selfhost Actor forward runtime must be a closed bundle");
 const digest = `sha256:${createHash("sha256").update(source).digest("hex")}`;
