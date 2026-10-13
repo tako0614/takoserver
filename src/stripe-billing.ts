@@ -982,21 +982,31 @@ export function createStripeBilling(options: {
       }
       return result;
     }
-    const retry = await sql.query(
-      "SELECT event_type, object_id FROM stripe_billing_reconcile_failures ORDER BY attempt_sequence, event_type, object_id LIMIT 100",
-    );
-    for (const row of retry) {
-      examined++;
-      const result = await attempt({
-        id: `retry:${String(row.object_id)}`,
-        type: String(row.event_type),
-        objectId: String(row.object_id),
-        objectType: null,
-        created: 1,
-        livemode: false,
-        account: null,
-      });
-      if (result.outcome === "applied" || result.outcome === "credited") applied++;
+    try {
+      const retry = await sql.query(
+        "SELECT event_type, object_id FROM stripe_billing_reconcile_failures ORDER BY attempt_sequence, event_type, object_id LIMIT 100",
+      );
+      for (const row of retry) {
+        examined++;
+        try {
+          const result = await attempt({
+            id: `retry:${String(row.object_id)}`,
+            type: String(row.event_type),
+            objectId: String(row.object_id),
+            objectType: null,
+            created: 1,
+            livemode: false,
+            account: null,
+          });
+          if (result.outcome === "applied" || result.outcome === "credited") applied++;
+        } catch {
+          failedStreams++;
+          truncated = true;
+        }
+      }
+    } catch {
+      failedStreams++;
+      truncated = true;
     }
     for (const stream of ["invoices", "subscriptions", "refunds", "replay"] as const) {
       let pageUnresolved = 0;

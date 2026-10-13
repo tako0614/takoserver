@@ -819,6 +819,44 @@ describe("Hosted Stripe billing service", () => {
     ).toEqual([{ cursor: null }]);
   });
 
+  test("queued retry bookkeeping failures remain unresolved without starving refunds", async () => {
+    const h = await fixture();
+    await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"));
+    const badId = "in_retry_bookkeeping_failure";
+    h.state.invoices.set(badId, invoice(badId, { currency: "jpy" }));
+    await h.sql.run(
+      "INSERT INTO stripe_billing_reconcile_failures (event_type, object_id, error_code, attempt_sequence, updated_at) VALUES (?, ?, ?, 1, ?)",
+      ["invoice.paid", badId, "wrong_currency", NOW.toISOString()],
+    );
+    const originalRun = h.sql.run.bind(h.sql);
+    h.sql.run = async (statement, params) => {
+      if (
+        statement.includes("INSERT INTO stripe_billing_reconcile_failures") &&
+        params?.[1] === badId
+      )
+        throw new SqlError("unavailable", "injected retry bookkeeping failure");
+      return originalRun(statement, params);
+    };
+    h.state.refunds.set(
+      "re_retry_independent",
+      object("re_retry_independent", "refund", {
+        charge: "ch_billing_test",
+        currency: "usd",
+        amount: MONTHLY_MINOR,
+        created: 1_791_871_200,
+        status: "succeeded",
+      }),
+    );
+    h.state.charges.set("ch_billing_test", charge({ amount_refunded: MONTHLY_MINOR }));
+    const report = await h.reconcile();
+    expect(report.billing?.unresolved).toBeGreaterThan(0);
+    expect(report.billing?.truncated).toBe(true);
+    expect(await h.sql.query("SELECT refund_id FROM stripe_billing_refunds")).toEqual([
+      { refund_id: "re_retry_independent" },
+    ]);
+    expect((await h.ledger.wallet(ORG)).settledMinor).toBe(0);
+  });
+
   test("rejects noncanonical invoice, customer, account and period facts without funding", async () => {
     const cases: readonly [string, ObjectRecord][] = [
       ["currency", invoice("in_billing_test", { currency: "jpy" })],
