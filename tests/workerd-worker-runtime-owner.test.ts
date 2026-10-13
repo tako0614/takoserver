@@ -2408,3 +2408,84 @@ test("scheduled port delivers the exact match through the current private Versio
     await owned.cleanup();
   }
 });
+
+test("a crashed child's port held briefly by a foreign process delays automatic recovery without stopping it", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-foreign-listener-recovery";
+  const createId = "1a38df97-47c2-4763-8ad1-af53eccf02f9";
+  const deleteId = "7adb927b-35d6-40b2-93ce-9c0048b7fef1";
+  const publication = staticPublicationState(workerUid);
+  const port = await unusedPort();
+  const statePath = join(
+    owned.root,
+    "owners",
+    createHash("sha256").update(workerUid, "utf8").digest("hex"),
+    "runtime-owner.json",
+  );
+  const ownerState = async () =>
+    JSON.parse(await readFile(statePath, "utf8")) as {
+      incarnations: Array<{ operationId: string; processIdentity: { pid: number } | null }>;
+      physicalAbsences: Array<{ processIdentity: { pid: number } }>;
+    };
+  const pinnedPid = async () =>
+    (await ownerState()).incarnations.find((item) => item.operationId === createId)?.processIdentity
+      ?.pid;
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: join(owned.root, "owners"),
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: owned.binary,
+    listenerPortForOperation: async () => port,
+    spawn: owned.spawn,
+  });
+  let foreign: ReturnType<typeof Bun.serve> | undefined;
+  try {
+    expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
+      kind: "confirmed",
+    });
+    publication.setCurrent(createId);
+    const accepted = owned.children[0];
+    if (!accepted) throw new Error("accepted child missing");
+    expect(await pinnedPid()).toBe(accepted.pid);
+    expect(owner.health()).toBe("serving");
+
+    // As observed in staging: the accepted child is killed and another
+    // process binds its listener before the first automatic restart.
+    accepted.kill("SIGKILL");
+    await accepted.exited;
+    foreign = Bun.serve({ hostname: "127.0.0.1", port, fetch: () => new Response("foreign") });
+    await until(() => owned.children.length > 1);
+    const blocked = owned.children[1];
+    await until(() => blocked?.exitCode !== null || blocked?.signalCode !== null);
+    await Bun.sleep(500);
+    expect(owner.health()).toBe("unavailable");
+    expect(await pinnedPid()).toBe(accepted.pid);
+    expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toBe("foreign");
+
+    await foreign.stop(true);
+    foreign = undefined;
+    await until(() => owner.health() === "serving", 15_000);
+    const replacement = owned.children.at(-1);
+    expect(replacement?.exitCode).toBeNull();
+    expect(await pinnedPid()).toBe(replacement?.pid);
+    // Only the crashed child's absence is recorded; a blocked replacement was
+    // retired before anything about it was written.
+    const absences = (await ownerState()).physicalAbsences.map((item) => item.processIdentity.pid);
+    expect(absences).toContain(accepted.pid);
+    expect(absences).not.toContain(blocked?.pid);
+    expect(
+      await (await owner.fetch(new Request(`https://${workerUid}.example.test/`))).text(),
+    ).toBeTruthy();
+
+    expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
+      kind: "confirmed",
+      identity: null,
+    });
+    await owner.close();
+  } finally {
+    await foreign?.stop(true);
+    await owner.close().catch(() => undefined);
+    await owned.cleanup();
+  }
+});

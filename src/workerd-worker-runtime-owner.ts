@@ -112,7 +112,7 @@ import {
   workerdServiceBindingRouterName,
   workerdV2ServiceBindingBrokerSocketPath,
 } from "./workerd-runtime.ts";
-import type { WorkerdProcess } from "./workerd-supervisor.ts";
+import { WorkerdListenerOccupiedError, type WorkerdProcess } from "./workerd-supervisor.ts";
 import { workerdVersionServiceBindingName } from "./workerd-version-graph.ts";
 import {
   inspectWorkerdWorkerExecutionCopies,
@@ -2708,9 +2708,18 @@ export async function openWorkerdWorkerRuntimeOwner(
       listener !== "vacant" &&
       (!successorIdentity ||
         (await linuxProcessLiveness(successorIdentity)) !== "live" ||
-        (await workerPortOwnership(record.listenerPort, successorIdentity.pid)) !== "owned")
-    )
+        // A successor that exits during this read has not proven it holds the port.
+        (await workerPortOwnership(record.listenerPort, successorIdentity.pid).catch(
+          () => "foreign" as const,
+        )) !== "owned")
+    ) {
+      // The old child is proven stale, so a held listener its successor is
+      // not proven to hold is another process's occupancy. Nothing is written
+      // yet: the supervisor retires that successor and spawns again only after
+      // its exit and a vacant listener, never touching the other process.
+      if (successorIdentity) throw new WorkerdListenerOccupiedError();
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
     const receipt = physicalAbsenceFor(record);
     await transitionState((current) => {
       const exact = current.incarnations.find((item) => item.operationId === record.operationId);
