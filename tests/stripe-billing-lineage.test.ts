@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import {
   projectApplyQualifiedMigrationArtifact,
+  projectCanonicalIntegrationV2MigrationArtifact0092,
   projectFreshIntegrationV2MigrationArtifact0091,
+  projectFreshIntegrationV2MigrationArtifact0092,
   projectFreshProductionMigrationArtifact,
   projectFreshProductionV2MigrationArtifact,
   projectFreshProductionV2MigrationArtifact0089,
@@ -24,6 +26,8 @@ test("0095 source audit preserves every existing deployment apply ceiling", () =
     [projectFreshProductionV2MigrationArtifact(source), 88],
     [projectFreshProductionV2MigrationArtifact0089(source), 89],
     [projectFreshIntegrationV2MigrationArtifact0091(source), 91],
+    [projectFreshIntegrationV2MigrationArtifact0092(source), 92],
+    [projectCanonicalIntegrationV2MigrationArtifact0092(source), 92],
   ] as const;
   for (const [artifact, ceiling] of projections) {
     expect(artifact.names).toEqual(source.names.slice(0, ceiling));
