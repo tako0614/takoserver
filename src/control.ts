@@ -2004,6 +2004,8 @@ function wireLot(lot: CreditLot) {
     consumptionClass: lot.consumptionClass,
     amountMicros: String(lot.amountMicros),
     spentMicros: String(lot.spentMicros),
+    revokedMicros: String(lot.revokedMicros ?? 0),
+    frozen: lot.frozen ?? false,
     remainingMicros: String(lot.remainingMicros),
     heldMicros: String(lot.heldMicros),
     availableMicros: String(lot.availableMicros),

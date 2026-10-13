@@ -154,7 +154,8 @@ export function createStripeBillingStore(options: { readonly sql: Sql; readonly 
       return rows[0] ?? null;
     },
     async grant(input: BillingGrant): Promise<void> {
-      if (!Number.isSafeInteger(input.amountMicros) || input.amountMicros < 0) fail("invalid_amount");
+      if (!Number.isSafeInteger(input.amountMicros) || input.amountMicros < 0)
+        fail("invalid_amount");
       positive(input.considerationMicros);
       if (input.kind === "purchased" && input.amountMicros !== input.considerationMicros)
         fail("invalid_purchase_consideration");
@@ -283,8 +284,11 @@ export function createStripeBillingStore(options: { readonly sql: Sql; readonly 
               now,
             ],
           },
-          ...(input.amountMicros > 0 && !legacyLot ? [guard(moneyGuard,
-            `EXISTS (SELECT 1 FROM wallet_credit_lots l JOIN ledger e
+          ...(input.amountMicros > 0 && !legacyLot
+            ? [
+                guard(
+                  moneyGuard,
+                  `EXISTS (SELECT 1 FROM wallet_credit_lots l JOIN ledger e
               ON e.org_id = l.org_id AND e.ref = l.ref AND e.type = 'funding'
               WHERE l.org_id = ? AND l.ref = ? AND l.kind = ?
                 AND l.consumption_class = ? AND l.amount_micros = ? AND l.expires_at IS ?
@@ -307,11 +311,24 @@ export function createStripeBillingStore(options: { readonly sql: Sql; readonly 
                FROM wallet_credit_lots l WHERE l.org_id = ?)
                  BETWEEN (SELECT COALESCE(SUM(held_delta_micros), 0) FROM ledger WHERE org_id = ?)
                      AND 9007199254740991`,
-            [input.organizationId, input.fundingRef, input.kind,
-              input.kind === "purchased" ? "purchased" : "subscription",
-              input.amountMicros, input.expiresAt, input.amountMicros,
-              input.organizationId, input.organizationId, input.organizationId,
-              now, input.organizationId, input.organizationId])] : []),
+                  [
+                    input.organizationId,
+                    input.fundingRef,
+                    input.kind,
+                    input.kind === "purchased" ? "purchased" : "subscription",
+                    input.amountMicros,
+                    input.expiresAt,
+                    input.amountMicros,
+                    input.organizationId,
+                    input.organizationId,
+                    input.organizationId,
+                    now,
+                    input.organizationId,
+                    input.organizationId,
+                  ],
+                ),
+              ]
+            : []),
           ...(legacyLot
             ? [
                 {
@@ -320,10 +337,14 @@ export function createStripeBillingStore(options: { readonly sql: Sql; readonly 
                 },
               ]
             : []),
-          ...(input.amountMicros > 0 && !legacyLot ? [{
-            sql: "DELETE FROM wallet_allocation_guards WHERE id = ?",
-            params: [moneyGuard],
-          }] : []),
+          ...(input.amountMicros > 0 && !legacyLot
+            ? [
+                {
+                  sql: "DELETE FROM wallet_allocation_guards WHERE id = ?",
+                  params: [moneyGuard],
+                },
+              ]
+            : []),
         ]);
       } catch (error) {
         const committed = await source(input.sourceType, input.sourceId);
@@ -556,7 +577,10 @@ export function createStripeBillingStore(options: { readonly sql: Sql; readonly 
         [org, ref],
       );
       const lot = lotRows[0];
-      if (expected.amountMicros > 0 && (!lot || Number(lot.amount_micros) !== expected.amountMicros))
+      if (
+        expected.amountMicros > 0 &&
+        (!lot || Number(lot.amount_micros) !== expected.amountMicros)
+      )
         fail("grant_conflict");
       if (expected.amountMicros === 0 && lot) fail("grant_conflict");
       const spent = Number(lot?.spent ?? 0);

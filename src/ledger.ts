@@ -23,7 +23,15 @@ import type { Clock, Sql, SqlParam, SqlStatement } from "./ports.ts";
  * construction rather than by a check someone has to remember to write.
  */
 
-export type LedgerEntryType = "funding" | "hold" | "capture" | "release" | "usage_debit" | "refund_debit" | "refund_receivable" | "revoked_after_expiry";
+export type LedgerEntryType =
+  | "funding"
+  | "hold"
+  | "capture"
+  | "release"
+  | "usage_debit"
+  | "refund_debit"
+  | "refund_receivable"
+  | "revoked_after_expiry";
 export type CreditConsumptionClass = "free" | "subscription" | "purchased";
 
 export interface LedgerEntry {
@@ -78,12 +86,15 @@ const stripeRefundSchemaCache = new WeakMap<Sql, Promise<boolean>>();
 export function stripeRefundSchemaReady(sql: Sql): Promise<boolean> {
   let ready = stripeRefundSchemaCache.get(sql);
   if (!ready) {
-    ready = sql.query(
-      "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('stripe_billing_refunds', 'stripe_billing_fences')",
-    ).then((rows) => rows.length === 2).catch((error: unknown) => {
-      stripeRefundSchemaCache.delete(sql);
-      throw error;
-    });
+    ready = sql
+      .query(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('stripe_billing_refunds', 'stripe_billing_fences')",
+      )
+      .then((rows) => rows.length === 2)
+      .catch((error: unknown) => {
+        stripeRefundSchemaCache.delete(sql);
+        throw error;
+      });
     stripeRefundSchemaCache.set(sql, ready);
   }
   return ready;
@@ -237,9 +248,13 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
                    FROM wallet_credit_allocations a
                    WHERE a.org_id = l.org_id AND a.lot_ref = l.ref
                      AND a.debit_type IN ('capture', 'usage_debit')
-                 ), 0) - ${refundsReady ? `COALESCE((SELECT SUM(r.debit_micros)
+                 ), 0) - ${
+                   refundsReady
+                     ? `COALESCE((SELECT SUM(r.debit_micros)
                    FROM stripe_billing_refunds r WHERE r.org_id = l.org_id
-                     AND r.funding_ref = l.ref), 0)` : "0"}
+                     AND r.funding_ref = l.ref), 0)`
+                     : "0"
+}
                ELSE COALESCE((
                  SELECT SUM(a.amount_micros)
                  FROM wallet_credit_allocations a
@@ -257,19 +272,34 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
              SELECT SUM(amount_micros) FROM wallet_credit_allocations
              WHERE org_id = ? AND debit_type = 'hold'
            ), 0) AS allocated_held,
-           ${refundsReady ? `COALESCE((SELECT SUM(receivable_micros) FROM stripe_billing_refunds
-                         WHERE org_id = ?), 0)` : "0"} AS receivable,
-           ${refundsReady ? `COALESCE((SELECT SUM(MAX(0, l.amount_micros
+           ${
+             refundsReady
+               ? `COALESCE((SELECT SUM(receivable_micros) FROM stripe_billing_refunds
+                         WHERE org_id = ?), 0)`
+               : "0"
+} AS receivable,
+           ${
+             refundsReady
+               ? `COALESCE((SELECT SUM(MAX(0, l.amount_micros
              - COALESCE((SELECT SUM(a.amount_micros) FROM wallet_credit_allocations a
                          WHERE a.org_id = l.org_id AND a.lot_ref = l.ref), 0)
              - COALESCE((SELECT SUM(r.debit_micros) FROM stripe_billing_refunds r
                          WHERE r.org_id = l.org_id AND r.funding_ref = l.ref), 0)))
              FROM wallet_credit_lots l JOIN stripe_billing_fences f
                ON f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1
-             WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)), 0)` : "0"} AS frozen`,
+             WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)), 0)`
+               : "0"
+} AS frozen`,
         refundsReady
-          ? [clock().toISOString(), organizationId, organizationId, organizationId,
-             organizationId, organizationId, clock().toISOString()]
+          ? [
+              clock().toISOString(),
+              organizationId,
+              organizationId,
+              organizationId,
+              organizationId,
+              organizationId,
+              clock().toISOString(),
+            ]
           : [clock().toISOString(), organizationId, organizationId, organizationId],
       );
       const settledMicros = sqlMicros(totals[0]?.settled ?? 0);
@@ -297,7 +327,8 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
         throw new LedgerError("conservation_violated");
       }
       const rows = await sql.query(
-        refundsReady ? `SELECT * FROM (
+        refundsReady
+          ? `SELECT * FROM (
           SELECT id, type, ref, settled_delta_micros, held_delta_micros, created_at
             FROM ledger WHERE org_id = ?
           UNION ALL SELECT 'refund:debit:' || refund_id, 'refund_debit', refund_id,
@@ -437,9 +468,13 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
                           SELECT SUM(a.amount_micros) FROM wallet_credit_allocations a
                           WHERE a.org_id = l.org_id AND a.lot_ref = l.ref
                             AND a.debit_type IN ('capture', 'usage_debit')
-                        ), 0) - ${refundsReady ? `COALESCE((SELECT SUM(r.debit_micros)
+                        ), 0) - ${
+                          refundsReady
+                            ? `COALESCE((SELECT SUM(r.debit_micros)
                           FROM stripe_billing_refunds r WHERE r.org_id = l.org_id
-                            AND r.funding_ref = l.ref), 0)` : "0"}
+                            AND r.funding_ref = l.ref), 0)`
+                            : "0"
+                        }
                       ELSE COALESCE((
                         SELECT SUM(a.amount_micros) FROM wallet_credit_allocations a
                         WHERE a.org_id = l.org_id AND a.lot_ref = l.ref
@@ -670,12 +705,20 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
       `SELECT COALESCE(SUM(l.amount_micros - COALESCE((
          SELECT SUM(a.amount_micros) FROM wallet_credit_allocations a
          WHERE a.org_id = l.org_id AND a.lot_ref = l.ref
-       ), 0) - ${refundsReady ? `COALESCE((SELECT SUM(r.debit_micros)
-         FROM stripe_billing_refunds r WHERE r.org_id = l.org_id AND r.funding_ref = l.ref), 0)` : "0"}), 0) AS available
+       ), 0) - ${
+         refundsReady
+           ? `COALESCE((SELECT SUM(r.debit_micros)
+         FROM stripe_billing_refunds r WHERE r.org_id = l.org_id AND r.funding_ref = l.ref), 0)`
+           : "0"
+}), 0) AS available
        FROM wallet_credit_lots l
        WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)
-       ${refundsReady ? `AND NOT EXISTS (SELECT 1 FROM stripe_billing_fences f
-          WHERE f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1)` : ""}`,
+       ${
+         refundsReady
+           ? `AND NOT EXISTS (SELECT 1 FROM stripe_billing_fences f
+          WHERE f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1)`
+           : ""
+}`,
       [organizationId, now],
     );
     return sqlMicros(rows[0]?.available ?? 0);
@@ -719,12 +762,19 @@ async function planHoldSettlement(
   );
   const capturedBefore = sqlMicros(captureRows[0]?.captured ?? 0);
   if (remainingHold < amountMicros) throw new LedgerError("conservation_violated");
-  if (refundsReady && type === "capture" && (await sql.query(
-    `SELECT 1 FROM wallet_credit_allocations a JOIN stripe_billing_fences f
+  if (
+    refundsReady &&
+    type === "capture" &&
+    (
+      await sql.query(
+        `SELECT 1 FROM wallet_credit_allocations a JOIN stripe_billing_fences f
        ON f.org_id = a.org_id AND f.funding_ref = a.lot_ref AND f.active = 1
        WHERE a.org_id = ? AND a.debit_type = 'hold' AND a.debit_ref = ? LIMIT 1`,
-    [organizationId, reference],
-  )).length) throw new LedgerError("conservation_violated");
+        [organizationId, reference],
+      )
+    ).length
+  )
+    throw new LedgerError("conservation_violated");
   if (allocatedHold !== remainingHold) throw new LedgerError("conservation_violated");
   if (type === "release" && remainingHold !== amountMicros) {
     throw new LedgerError("conservation_violated");
@@ -779,14 +829,18 @@ async function planHoldSettlement(
     ];
   });
   return [
-    ...(refundsReady && type === "capture" ? [{
-      sql: `INSERT INTO wallet_allocation_guards (id, valid) VALUES (?, CASE WHEN
+    ...(refundsReady && type === "capture"
+      ? [
+          {
+            sql: `INSERT INTO wallet_allocation_guards (id, valid) VALUES (?, CASE WHEN
         NOT EXISTS (SELECT 1 FROM wallet_credit_allocations a JOIN stripe_billing_fences f
           ON f.org_id = a.org_id AND f.funding_ref = a.lot_ref AND f.active = 1
           WHERE a.org_id = ? AND a.debit_type = 'hold' AND a.debit_ref = ?)
         THEN 1 ELSE 0 END)`,
-      params: [`${guardId}_freeze`, organizationId, reference],
-    }] : []),
+            params: [`${guardId}_freeze`, organizationId, reference],
+          },
+        ]
+      : []),
     ...moveStatements,
     {
       sql: `INSERT INTO wallet_allocation_guards (id, valid)
@@ -822,7 +876,10 @@ async function planHoldSettlement(
         now,
       ],
     },
-    { sql: "DELETE FROM wallet_allocation_guards WHERE id IN (?, ?)", params: [guardId, `${guardId}_freeze`] },
+    {
+      sql: "DELETE FROM wallet_allocation_guards WHERE id IN (?, ?)",
+      params: [guardId, `${guardId}_freeze`],
+    },
   ];
 }
 
@@ -883,22 +940,36 @@ export async function prepareLedgerAllocation(
   ) {
     throw new LedgerError("invalid_amount");
   }
-  if (refundsReady && (await sql.query(
-    "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
-    [organizationId],
-  )).length) throw new LedgerError("insufficient_funds");
+  if (
+    refundsReady &&
+    (
+      await sql.query(
+        "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
+        [organizationId],
+      )
+    ).length
+  )
+    throw new LedgerError("insufficient_funds");
   const lots = await sql.query(
     `SELECT l.ref,
               l.amount_micros - COALESCE(SUM(a.amount_micros), 0)
-                - ${refundsReady ? `COALESCE((SELECT SUM(r.debit_micros)
+                - ${
+                  refundsReady
+                    ? `COALESCE((SELECT SUM(r.debit_micros)
                     FROM stripe_billing_refunds r WHERE r.org_id = l.org_id
-                      AND r.funding_ref = l.ref), 0)` : "0"} AS remaining
+                      AND r.funding_ref = l.ref), 0)`
+                    : "0"
+                } AS remaining
        FROM wallet_credit_lots l
        LEFT JOIN wallet_credit_allocations a
          ON a.org_id = l.org_id AND a.lot_ref = l.ref
        WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)
-         ${refundsReady ? `AND NOT EXISTS (SELECT 1 FROM stripe_billing_fences f
-           WHERE f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1)` : ""}
+         ${
+           refundsReady
+             ? `AND NOT EXISTS (SELECT 1 FROM stripe_billing_fences f
+           WHERE f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1)`
+             : ""
+}
        GROUP BY l.org_id, l.ref, l.amount_micros, l.expires_at, l.created_at
        HAVING remaining > 0
        ORDER BY CASE l.consumption_class WHEN 'free' THEN 0 WHEN 'subscription' THEN 1 ELSE 2 END,
@@ -925,11 +996,19 @@ export async function prepareLedgerAllocation(
               SELECT amount_micros - COALESCE((
                 SELECT SUM(amount_micros) FROM wallet_credit_allocations
                 WHERE org_id = ? AND lot_ref = ?
-              ), 0) - ${refundsReady ? `COALESCE((SELECT SUM(debit_micros)
-                   FROM stripe_billing_refunds WHERE org_id = ? AND funding_ref = ?), 0)` : "0"}
+              ), 0) - ${
+                refundsReady
+                  ? `COALESCE((SELECT SUM(debit_micros)
+                   FROM stripe_billing_refunds WHERE org_id = ? AND funding_ref = ?), 0)`
+                  : "0"
+              }
               FROM wallet_credit_lots WHERE org_id = ? AND ref = ?
-                ${refundsReady ? `AND NOT EXISTS (SELECT 1 FROM stripe_billing_fences
-                  WHERE org_id = ? AND funding_ref = ? AND active = 1)` : ""}
+                ${
+                  refundsReady
+                    ? `AND NOT EXISTS (SELECT 1 FROM stripe_billing_fences
+                  WHERE org_id = ? AND funding_ref = ? AND active = 1)`
+                    : ""
+                }
             ) >= ?`,
     params: [
       organizationId,
@@ -948,13 +1027,17 @@ export async function prepareLedgerAllocation(
     ],
   }));
   return [
-    ...(refundsReady ? [{
-      sql: `INSERT INTO wallet_allocation_guards (id, valid) VALUES (?, CASE WHEN
+    ...(refundsReady
+      ? [
+          {
+            sql: `INSERT INTO wallet_allocation_guards (id, valid) VALUES (?, CASE WHEN
               NOT EXISTS (SELECT 1 FROM stripe_billing_refunds
                 WHERE org_id = ? AND receivable_micros > 0)
               THEN 1 ELSE 0 END)`,
-      params: [debtGuardId, organizationId],
-    }] : []),
+            params: [debtGuardId, organizationId],
+          },
+        ]
+      : []),
     ...statements,
     {
       sql: `INSERT INTO wallet_allocation_guards (id, valid)
@@ -979,6 +1062,9 @@ export async function prepareLedgerAllocation(
         now,
       ],
     },
-    { sql: "DELETE FROM wallet_allocation_guards WHERE id IN (?, ?)", params: [guardId, debtGuardId] },
+    {
+      sql: "DELETE FROM wallet_allocation_guards WHERE id IN (?, ?)",
+      params: [guardId, debtGuardId],
+    },
   ];
 }

@@ -101,7 +101,8 @@ describe("Stripe billing store", () => {
         amountMicros: 60,
       }),
     ).toBe(true);
-    await ledger.fund({ consumptionClass: "purchased",
+    await ledger.fund({
+      consumptionClass: "purchased",
       organizationId: grant.organizationId,
       fundingRef: "other",
       amountMicros: 50,
@@ -159,7 +160,8 @@ describe("Stripe billing store", () => {
   test("refund closes a held reservation and returns unrelated lot allocation", async () => {
     const { ledger, store, grant, sql } = await fixture();
     await store.grant(grant);
-    await ledger.fund({ consumptionClass: "purchased",
+    await ledger.fund({
+      consumptionClass: "purchased",
       organizationId: grant.organizationId,
       fundingRef: "other",
       amountMicros: 50,
@@ -533,7 +535,8 @@ describe("Stripe billing store", () => {
 
   test("exact verified Checkout proof attaches to legacy direct lot without changing it", async () => {
     const { ledger, store, grant, sql } = await fixture();
-    await ledger.fund({ consumptionClass: "purchased",
+    await ledger.fund({
+      consumptionClass: "purchased",
       organizationId: grant.organizationId,
       fundingRef: grant.fundingRef,
       amountMicros: grant.amountMicros,
@@ -570,12 +573,18 @@ describe("Stripe billing store", () => {
   test("used refund blocks admission without drawing another Organization or lot", async () => {
     const { store, grant, ledger, sql } = await fixture();
     await store.grant(grant);
-    await ledger.fund({ consumptionClass: "purchased",
+    await ledger.fund({
+      consumptionClass: "purchased",
       organizationId: grant.organizationId,
       fundingRef: "other",
       amountMicros: 40,
     });
-    await ledger.fund({ consumptionClass: "purchased", organizationId: "org_other", fundingRef: "other", amountMicros: 40 });
+    await ledger.fund({
+      consumptionClass: "purchased",
+      organizationId: "org_other",
+      fundingRef: "other",
+      amountMicros: 40,
+    });
     expect(
       await ledger.debitUsage({
         organizationId: grant.organizationId,
@@ -594,7 +603,11 @@ describe("Stripe billing store", () => {
     expect(receipt).toMatchObject({ debitMicros: 20, receivableMicros: 80 });
     expect((await ledger.wallet(grant.organizationId)).availableMicros).toBe(40);
     expect(
-      await ledger.hold({ organizationId: grant.organizationId, reference: "new", amountMicros: 1 }),
+      await ledger.hold({
+        organizationId: grant.organizationId,
+        reference: "new",
+        amountMicros: 1,
+      }),
     ).toBe(false);
     expect(
       await ledger.debitUsage({
@@ -650,41 +663,81 @@ describe("Stripe billing store", () => {
   test("one-micro spent subscription credit becomes one-micro receivable", async () => {
     const { store, grant, ledger } = await fixture();
     const included: BillingGrant = {
-      ...grant, sourceType: "invoice", sourceId: "in_micro",
-      fundingRef: "stripe:invoice:in_micro", chargeId: "ch_micro",
-      kind: "plan-included", amountMicros: 2, considerationMicros: 3,
-      subscriptionId: "sub_micro", planKey: "configured-plan",
-      pricingRevision: "configured-revision", stripePriceId: "price_configured",
-      periodStart: "2026-10-01T00:00:00.000Z", periodEnd: "2026-11-01T00:00:00.000Z",
+      ...grant,
+      sourceType: "invoice",
+      sourceId: "in_micro",
+      fundingRef: "stripe:invoice:in_micro",
+      chargeId: "ch_micro",
+      kind: "plan-included",
+      amountMicros: 2,
+      considerationMicros: 3,
+      subscriptionId: "sub_micro",
+      planKey: "configured-plan",
+      pricingRevision: "configured-revision",
+      stripePriceId: "price_configured",
+      periodStart: "2026-10-01T00:00:00.000Z",
+      periodEnd: "2026-11-01T00:00:00.000Z",
     };
     await store.grant(included);
-    expect(await ledger.debitUsage({ organizationId: included.organizationId,
-      reference: "one-micro", amountMicros: 1 })).toBe(true);
+    expect(
+      await ledger.debitUsage({
+        organizationId: included.organizationId,
+        reference: "one-micro",
+        amountMicros: 1,
+      }),
+    ).toBe(true);
     const generation = await store.freezeFunding(included.organizationId, included.fundingRef);
-    const receipt = await store.refund({ refundId: "re_micro", grant: included,
-      amountMicros: 3, cumulativeRefundedMicros: 3, fenceGeneration: generation });
-    expect(receipt).toMatchObject({ targetRevokedMicros: 2, debitMicros: 1,
-      receivableMicros: 1, expiredMicros: 0 });
+    const receipt = await store.refund({
+      refundId: "re_micro",
+      grant: included,
+      amountMicros: 3,
+      cumulativeRefundedMicros: 3,
+      fenceGeneration: generation,
+    });
+    expect(receipt).toMatchObject({
+      targetRevokedMicros: 2,
+      debitMicros: 1,
+      receivableMicros: 1,
+      expiredMicros: 0,
+    });
     expect((await ledger.wallet(included.organizationId)).availableMicros).toBe(0);
   });
 
   test("free credit is consumed before subscription and purchased lots under a refund freeze", async () => {
     const { store, grant, ledger, sql } = await fixture();
-    await ledger.fund({ organizationId: grant.organizationId, fundingRef: "free",
-      kind: "plan-included", consumptionClass: "free", amountMicros: 1 });
+    await ledger.fund({
+      organizationId: grant.organizationId,
+      fundingRef: "free",
+      kind: "plan-included",
+      consumptionClass: "free",
+      amountMicros: 1,
+    });
     const included: BillingGrant = {
-      ...grant, sourceType: "invoice", sourceId: "in_priority",
-      fundingRef: "stripe:invoice:in_priority", chargeId: "ch_priority",
-      kind: "plan-included", amountMicros: 2, considerationMicros: 2,
-      subscriptionId: "sub_priority", planKey: "configured-plan",
-      pricingRevision: "configured-revision", stripePriceId: "price_configured",
-      periodStart: "2026-10-01T00:00:00.000Z", periodEnd: "2026-11-01T00:00:00.000Z",
+      ...grant,
+      sourceType: "invoice",
+      sourceId: "in_priority",
+      fundingRef: "stripe:invoice:in_priority",
+      chargeId: "ch_priority",
+      kind: "plan-included",
+      amountMicros: 2,
+      considerationMicros: 2,
+      subscriptionId: "sub_priority",
+      planKey: "configured-plan",
+      pricingRevision: "configured-revision",
+      stripePriceId: "price_configured",
+      periodStart: "2026-10-01T00:00:00.000Z",
+      periodEnd: "2026-11-01T00:00:00.000Z",
     };
     await store.grant(included);
     await store.grant(grant);
     const generation = await store.freezeFunding(grant.organizationId, grant.fundingRef);
-    expect(await ledger.debitUsage({ organizationId: grant.organizationId,
-      reference: "priority", amountMicros: 2 })).toBe(true);
+    expect(
+      await ledger.debitUsage({
+        organizationId: grant.organizationId,
+        reference: "priority",
+        amountMicros: 2,
+      }),
+    ).toBe(true);
     const allocation = await sql.query(
       "SELECT lot_ref, amount_micros FROM wallet_credit_allocations WHERE debit_type = 'usage_debit' AND debit_ref = 'priority' ORDER BY lot_ref",
     );
@@ -693,22 +746,41 @@ describe("Stripe billing store", () => {
       { lot_ref: "stripe:invoice:in_priority", amount_micros: 1 },
     ]);
     expect((await ledger.wallet(grant.organizationId)).frozenMicros).toBe(100);
-    await store.unfreezeFunding({ organizationId: grant.organizationId,
-      fundingRef: grant.fundingRef, fenceGeneration: generation,
-      cumulativeRefundedMicros: 0 });
+    await store.unfreezeFunding({
+      organizationId: grant.organizationId,
+      fundingRef: grant.fundingRef,
+      fenceGeneration: generation,
+      cumulativeRefundedMicros: 0,
+    });
   });
 
   test("grant batch rolls back proof and lot when aggregate wallet exceeds safe micros", async () => {
     const { store, grant, ledger, sql } = await fixture();
-    await ledger.fund({ organizationId: grant.organizationId, fundingRef: "existing",
-      kind: "purchased", consumptionClass: "purchased",
-      amountMicros: Number.MAX_SAFE_INTEGER - 1 });
-    const overflow: BillingGrant = { ...grant, fundingRef: "stripe:cs_overflow",
-      sourceId: "cs_overflow", chargeId: "ch_overflow",
-      amountMicros: 2, considerationMicros: 2 };
+    await ledger.fund({
+      organizationId: grant.organizationId,
+      fundingRef: "existing",
+      kind: "purchased",
+      consumptionClass: "purchased",
+      amountMicros: Number.MAX_SAFE_INTEGER - 1,
+    });
+    const overflow: BillingGrant = {
+      ...grant,
+      fundingRef: "stripe:cs_overflow",
+      sourceId: "cs_overflow",
+      chargeId: "ch_overflow",
+      amountMicros: 2,
+      considerationMicros: 2,
+    };
     await expect(store.grant(overflow)).rejects.toThrow();
-    expect((await sql.query("SELECT 1 FROM stripe_billing_grants WHERE source_id = 'cs_overflow'")).length).toBe(0);
-    expect((await sql.query("SELECT 1 FROM wallet_credit_lots WHERE ref = 'stripe:cs_overflow'")).length).toBe(0);
-    expect((await ledger.wallet(grant.organizationId)).settledMicros).toBe(Number.MAX_SAFE_INTEGER - 1);
+    expect(
+      (await sql.query("SELECT 1 FROM stripe_billing_grants WHERE source_id = 'cs_overflow'"))
+        .length,
+    ).toBe(0);
+    expect(
+      (await sql.query("SELECT 1 FROM wallet_credit_lots WHERE ref = 'stripe:cs_overflow'")).length,
+    ).toBe(0);
+    expect((await ledger.wallet(grant.organizationId)).settledMicros).toBe(
+      Number.MAX_SAFE_INTEGER - 1,
+    );
   });
 });

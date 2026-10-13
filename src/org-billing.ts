@@ -5,7 +5,13 @@ import {
   parseBillingConfig,
 } from "./billing-config.ts";
 import { base64UrlDecode, base64UrlEncode, canonicalJson } from "./json.ts";
-import { type Ledger, LedgerError, prepareLedgerAllocation, stripeRefundSchemaReady, type Wallet } from "./ledger.ts";
+import {
+  type Ledger,
+  LedgerError,
+  prepareLedgerAllocation,
+  stripeRefundSchemaReady,
+  type Wallet,
+} from "./ledger.ts";
 import { MoneyError, minorToMicros } from "./money.ts";
 import { type Clock, type Row, type Sql, SqlError, type SqlStatement } from "./ports.ts";
 
@@ -366,13 +372,17 @@ export function createOrgBilling(options: {
       },
       guard(guardId, "changes() = 1"),
     );
-    if (captured > 0 && refundSchema) guards.push(
-      guard(`${guardId}_freeze`, `NOT EXISTS (SELECT 1 FROM wallet_credit_allocations a
+    if (captured > 0 && refundSchema)
+      guards.push(
+        guard(
+          `${guardId}_freeze`,
+          `NOT EXISTS (SELECT 1 FROM wallet_credit_allocations a
         JOIN stripe_billing_fences f ON f.org_id = a.org_id AND f.funding_ref = a.lot_ref
           AND f.active = 1
         WHERE a.org_id = ? AND a.debit_type = 'hold' AND a.debit_ref = ?)`,
-        [org, ledgerRef]),
-    );
+          [org, ledgerRef],
+        ),
+      );
     // Also fence the precise original hold. Other internal ledger callers may
     // not partially settle a public lifecycle behind its durable state row.
     guards.push(
@@ -415,9 +425,10 @@ export function createOrgBilling(options: {
       guards.push(entry(org, "release", ledgerRef, 0, captured - amount, instant));
     guards.push({
       sql: `DELETE FROM wallet_allocation_guards WHERE id IN (${captured > 0 && refundSchema ? "?, ?, ?" : "?, ?"})`,
-      params: captured > 0 && refundSchema
-        ? [guardId, `${guardId}_hold`, `${guardId}_freeze`]
-        : [guardId, `${guardId}_hold`],
+      params:
+        captured > 0 && refundSchema
+          ? [guardId, `${guardId}_hold`, `${guardId}_freeze`]
+          : [guardId, `${guardId}_hold`],
     });
     try {
       await sql.batch(guards);
@@ -489,10 +500,18 @@ export function createOrgBilling(options: {
         `SELECT l.*,
           COALESCE(SUM(CASE WHEN a.debit_type = 'hold' THEN a.amount_micros ELSE 0 END), 0) AS held_micros,
           COALESCE(SUM(CASE WHEN a.debit_type IN ('capture', 'usage_debit') THEN a.amount_micros ELSE 0 END), 0) AS spent_micros,
-          ${refundSchema ? `COALESCE((SELECT SUM(r.debit_micros + r.expired_micros)
-             FROM stripe_billing_refunds r WHERE r.org_id = l.org_id AND r.funding_ref = l.ref), 0)` : "0"} AS revoked_micros,
-          ${refundSchema ? `EXISTS (SELECT 1 FROM stripe_billing_fences f
-             WHERE f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1)` : "0"} AS frozen
+          ${
+            refundSchema
+              ? `COALESCE((SELECT SUM(r.debit_micros + r.expired_micros)
+             FROM stripe_billing_refunds r WHERE r.org_id = l.org_id AND r.funding_ref = l.ref), 0)`
+              : "0"
+          } AS revoked_micros,
+          ${
+            refundSchema
+              ? `EXISTS (SELECT 1 FROM stripe_billing_fences f
+             WHERE f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1)`
+              : "0"
+          } AS frozen
          FROM (SELECT * FROM wallet_credit_lots WHERE org_id = ? ${boundary}
            ORDER BY CASE consumption_class WHEN 'free' THEN 0 WHEN 'subscription' THEN 1 ELSE 2 END,
              CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END, expires_at, created_at, ref LIMIT ?) l
@@ -572,10 +591,16 @@ export function createOrgBilling(options: {
         ).length
       )
         orgBillingFail("outstanding_usage", 409);
-      if (refundSchema && (await sql.query(
-        "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
-        [input.organizationId],
-      )).length) orgBillingFail("refund_receivable", 409);
+      if (
+        refundSchema &&
+        (
+          await sql.query(
+            "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
+            [input.organizationId],
+          )
+        ).length
+      )
+        orgBillingFail("refund_receivable", 409);
       const instant = now();
       const expiresAt = new Date(Date.parse(instant) + tariff.holdTtlSeconds * 1000).toISOString();
       const ledgerRef = `org-hold:${input.reference}`;
@@ -739,10 +764,16 @@ export function createOrgBilling(options: {
       if (row && row.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
       if (row && row.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
       if (!row) {
-        if (refundSchema && (await sql.query(
-          "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
-          [input.organizationId],
-        )).length) orgBillingFail("refund_receivable", 409);
+        if (
+          refundSchema &&
+          (
+            await sql.query(
+              "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
+              [input.organizationId],
+            )
+          ).length
+        )
+          orgBillingFail("refund_receivable", 409);
         const tariff = await tariffAt(input.periodStart);
         const meter =
           tariff && Object.hasOwn(tariff.meters, input.meter)
@@ -805,19 +836,32 @@ export function createOrgBilling(options: {
           if (!(error instanceof SqlError && error.code === "constraint")) throw error;
         }
         row = await usageRow(input.organizationId, input.reference);
-        if (!row && refundSchema && (await sql.query(
-          "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
-          [input.organizationId],
-        )).length) orgBillingFail("refund_receivable", 409);
+        if (
+          !row &&
+          refundSchema &&
+          (
+            await sql.query(
+              "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
+              [input.organizationId],
+            )
+          ).length
+        )
+          orgBillingFail("refund_receivable", 409);
         if (!row) orgBillingFail("billing_unavailable", 503);
         if (row.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
         if (row.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
       }
       if (row.state === "paid") return usageReceipt(row);
-      if (refundSchema && (await sql.query(
-        "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
-        [input.organizationId],
-      )).length) orgBillingFail("refund_receivable", 409);
+      if (
+        refundSchema &&
+        (
+          await sql.query(
+            "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
+            [input.organizationId],
+          )
+        ).length
+      )
+        orgBillingFail("refund_receivable", 409);
       const amount = Number(row.amount_micros);
       const instant = now();
       try {
@@ -839,8 +883,11 @@ export function createOrgBilling(options: {
             sql: "UPDATE org_wallet_usage_records SET state = 'paid', paid_at = ? WHERE org_id = ? AND ref = ? AND state = 'pending'",
             params: [instant, input.organizationId, input.reference],
           },
-          guard(guardId, `changes() = 1 ${refundSchema ? "AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0)" : ""}`,
-            refundSchema ? [input.organizationId] : []),
+          guard(
+            guardId,
+            `changes() = 1 ${refundSchema ? "AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0)" : ""}`,
+            refundSchema ? [input.organizationId] : [],
+          ),
           ...allocation,
           { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [guardId] },
         ]);

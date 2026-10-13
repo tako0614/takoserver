@@ -1,6 +1,7 @@
 import { parseBillingConfig } from "./billing-config.ts";
 import { type HostedPricing, parseHostedPricing } from "./hosted-pricing.ts";
 import { bytesDigest, canonicalJson } from "./json.ts";
+import { MoneyError, minorToMicros } from "./money.ts";
 import type { FundingCredit, PaymentEventContext } from "./payment-events.ts";
 import { type Row, type Sql, SqlError } from "./ports.ts";
 import {
@@ -75,6 +76,14 @@ function minor(value: unknown, positive = false): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < (positive ? 1 : 0))
     refuse("invalid_amount");
   return value;
+}
+function cashMicros(value: number): number {
+  try {
+    return minorToMicros(value);
+  } catch (error) {
+    if (error instanceof MoneyError) refuse("invalid_amount");
+    throw error;
+  }
 }
 function timestamp(value: unknown): string {
   const seconds = minor(value, true);
@@ -256,7 +265,7 @@ export function createStripeBilling(options: {
     if (!object) refuse("unknown_subscription");
     const facts = await subscriptionFacts(object);
     const paid = await sql.query(
-      "SELECT MAX(period_end) AS paid_through FROM stripe_billing_grants g WHERE org_id = ? AND subscription_id = ? AND source_type = 'invoice' AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds r WHERE r.org_id = g.org_id AND r.funding_ref = g.funding_ref AND r.cumulative_refunded_minor >= g.consideration_minor)",
+      "SELECT MAX(period_end) AS paid_through FROM stripe_billing_grants g WHERE org_id = ? AND subscription_id = ? AND source_type = 'invoice' AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds r WHERE r.org_id = g.org_id AND r.funding_ref = g.funding_ref AND r.cumulative_refunded_micros >= g.consideration_micros)",
       [facts.org, id],
     );
     await sql.run(
@@ -373,7 +382,7 @@ export function createStripeBilling(options: {
       organizationId: org,
       fundingRef: `stripe:invoice:${id}`,
       kind: "plan-included",
-      amountMinor: plan.includedCreditMinor,
+      amountMicros: cashMicros(plan.includedCreditMinor),
       expiresAt: periodEnd,
       sourceType: "invoice",
       sourceId: id,
@@ -385,7 +394,7 @@ export function createStripeBilling(options: {
       stripePriceId: plan.stripePriceId,
       periodStart,
       periodEnd,
-      considerationMinor: consideration,
+      considerationMicros: cashMicros(consideration),
     };
   }
   function validateCharge(charge: StripeBillingObject, amount: number): void {
@@ -452,7 +461,7 @@ export function createStripeBilling(options: {
       organizationId: org,
       fundingRef: `stripe:${id}`,
       kind: "purchased",
-      amountMinor: amount,
+      amountMicros: cashMicros(amount),
       expiresAt,
       sourceType: "checkout",
       sourceId: id,
@@ -464,7 +473,7 @@ export function createStripeBilling(options: {
       stripePriceId: null,
       periodStart: null,
       periodEnd: null,
-      considerationMinor: amount,
+      considerationMicros: cashMicros(amount),
     };
   }
 
@@ -534,7 +543,10 @@ export function createStripeBilling(options: {
         grant = await checkoutGrant(sessions.data[0]?.id ?? "");
       }
     }
-    if (grant.chargeId !== chargeId || grant.considerationMinor !== minor(charge.amount, true))
+    if (
+      grant.chargeId !== chargeId ||
+      grant.considerationMicros !== cashMicros(minor(charge.amount, true))
+    )
       refuse("ambiguous_refund_allocation");
     fenceGeneration ??= await store.freezeFunding(grant.organizationId, grant.fundingRef);
     const all = await refunds(chargeId);
@@ -554,18 +566,19 @@ export function createStripeBilling(options: {
         organizationId: grant.organizationId,
         fundingRef: grant.fundingRef,
         fenceGeneration,
-        cumulativeRefundedMinor: 0,
+        cumulativeRefundedMicros: 0,
       });
       return { outcome: "applied", detail: "refund_status_recorded" };
     }
     const recorded = await sql.query(
-      "SELECT refund_id, amount_minor, cumulative_refunded_minor FROM stripe_billing_refunds WHERE org_id = ? AND funding_ref = ? ORDER BY cumulative_refunded_minor",
+      "SELECT refund_id, amount_micros, cumulative_refunded_micros FROM stripe_billing_refunds WHERE org_id = ? AND funding_ref = ? ORDER BY cumulative_refunded_micros",
       [grant.organizationId, grant.fundingRef],
     );
     const recordedIds = new Set(recorded.map((row) => String(row.refund_id)));
     const prefix = recorded.map((row) => {
       const actual = successful.find((item) => item.id === row.refund_id);
-      if (!actual || actual.amount !== Number(row.amount_minor)) refuse("refund_total_unresolved");
+      if (!actual || cashMicros(minor(actual.amount, true)) !== Number(row.amount_micros))
+        refuse("refund_total_unresolved");
       return actual;
     });
     successful = [...prefix, ...successful.filter((item) => !recordedIds.has(item.id))];
@@ -577,8 +590,8 @@ export function createStripeBilling(options: {
       await store.refund({
         refundId: refund.id,
         grant,
-        amountMinor: minor(refund.amount, true),
-        cumulativeRefundedMinor: amount,
+        amountMicros: cashMicros(minor(refund.amount, true)),
+        cumulativeRefundedMicros: cashMicros(amount),
         fenceGeneration,
         releaseFreeze: !pending && i === successful.length - 1,
       });
@@ -666,7 +679,7 @@ export function createStripeBilling(options: {
     const grant = await checkoutGrant(identifier(id, "cs"));
     if (
       grant.organizationId !== funding.organizationId ||
-      grant.amountMinor !== funding.amountMinor ||
+      grant.amountMicros !== cashMicros(funding.amountMinor) ||
       funding.currency !== "USD"
     )
       throw new StripeBillingError("settlement_conflict");
@@ -766,8 +779,8 @@ export function createStripeBilling(options: {
                 AND g.source_type = 'invoice'
                 AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds r
                   WHERE r.org_id = g.org_id AND r.funding_ref = g.funding_ref
-                    AND r.cumulative_refunded_minor >= g.consideration_minor)) AS paid_coverage,
-             (SELECT COALESCE(SUM(r.receivable_minor), 0) FROM stripe_billing_refunds r
+                    AND r.cumulative_refunded_micros >= g.consideration_micros)) AS paid_coverage,
+             (SELECT COALESCE(SUM(r.receivable_micros), 0) FROM stripe_billing_refunds r
               WHERE r.org_id = s.org_id) AS refund_debt
            FROM stripe_billing_subscriptions s WHERE s.org_id = ?`,
           [org],
@@ -1185,6 +1198,23 @@ export async function assertStripeBillingSchema(sql: Sql): Promise<void> {
     )
   )
     throw new StripeBillingError("stripe_billing_schema_not_ready");
+  const moneyColumns: Readonly<Record<string, readonly string[]>> = {
+    stripe_billing_grants: ["amount_micros", "consideration_micros", "consumption_class"],
+    stripe_billing_refunds: [
+      "amount_micros",
+      "cumulative_refunded_micros",
+      "target_revoked_micros",
+      "debit_micros",
+      "receivable_micros",
+      "expired_micros",
+    ],
+    org_wallet_holds: ["amount_micros", "money_policy", "closure_reason"],
+  };
+  for (const [table, required] of Object.entries(moneyColumns)) {
+    const actual = await sql.query(`PRAGMA table_info(${table})`);
+    if (!required.every((name) => actual.some((row) => row.name === name)))
+      throw new StripeBillingError("stripe_billing_schema_not_ready");
+  }
 }
 
 export function stripeBillingFailure(error: unknown): StripeBillingError | null {

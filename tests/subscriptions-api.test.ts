@@ -1,11 +1,18 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import type { Accounts, Actor, ApiKeyScope } from "../src/auth.ts";
 import { AuthError } from "../src/auth.ts";
 import { controlErrorResponse, createControlRoutes } from "../src/control.ts";
+import { MIGRATIONS } from "../src/db-schema.ts";
 import { compilePricingAuthoring } from "../src/hosted-pricing.ts";
 import { openApiDocument } from "../src/openapi.ts";
 import { resolvePayment } from "../src/payment-setup.ts";
-import { StripeBillingError, type SubscriptionPayments } from "../src/stripe-billing.ts";
+import { createSqliteSql } from "../src/sql-sqlite.ts";
+import {
+  assertStripeBillingSchema,
+  StripeBillingError,
+  type SubscriptionPayments,
+} from "../src/stripe-billing.ts";
 
 const ORG = "org_subscriptions";
 const pricing = compilePricingAuthoring({
@@ -174,6 +181,27 @@ test("hosted activation requires explicit test-mode credentials", () => {
     resolvePayment({ hostedPricing: pricing, stripeSecretKey: "sk_test_fake" }).events,
   ).toBeFunction();
   expect(resolvePayment({})).toEqual({});
+});
+
+test("hosted startup rejects a complete table inventory with obsolete Stripe credit units", async () => {
+  const database = new Database(":memory:");
+  try {
+    for (const migration of MIGRATIONS)
+      database.exec(
+        migration.name === "0095_stripe_billing.sql"
+          ? migration.sql.replaceAll("amount_micros", "amount_minor")
+          : migration.sql,
+      );
+    const sql = createSqliteSql(database);
+    await expect(assertStripeBillingSchema(sql)).rejects.toMatchObject({
+      code: "stripe_billing_schema_not_ready",
+    });
+    expect(await sql.query("SELECT COUNT(*) AS count FROM stripe_billing_pricing")).toEqual([
+      { count: 0 },
+    ]);
+  } finally {
+    database.close();
+  }
 });
 
 test("OpenAPI publishes subscription scope, request and refund projection contracts", () => {

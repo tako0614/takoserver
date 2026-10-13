@@ -1498,8 +1498,15 @@ export const openApiDocument = {
               settledMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
               heldMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
               availableMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
-              refundReceivableMicros: { $ref: "#/components/schemas/BillingUnsignedMicros", description: "Non-spendable refund debt; blocks new billable admission" },
-              frozenMicros: { $ref: "#/components/schemas/BillingUnsignedMicros", description: "Original-lot credit unavailable while refund settlement is pending or unresolved" },
+              refundReceivableMicros: {
+                $ref: "#/components/schemas/BillingUnsignedMicros",
+                description: "Non-spendable refund debt; blocks new billable admission",
+              },
+              frozenMicros: {
+                $ref: "#/components/schemas/BillingUnsignedMicros",
+                description:
+                  "Original-lot credit unavailable while refund settlement is pending or unresolved",
+              },
               entries: {
                 type: "array",
                 items: {

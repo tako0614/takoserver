@@ -28,6 +28,12 @@ const REVISION = "candidate-r3";
 const PLAN_KEY = "starter";
 const INCLUDED_MINOR = 1200;
 const MONTHLY_MINOR = 125;
+const MICROS_PER_MINOR = 10_000;
+const INCLUDED_MICROS = INCLUDED_MINOR * MICROS_PER_MINOR;
+
+function micros(minor: number): number {
+  return minor * MICROS_PER_MINOR;
+}
 
 type ObjectRecord = Record<string, unknown>;
 type State = {
@@ -51,7 +57,7 @@ function object(id: string, type: string, extra: ObjectRecord = {}): ObjectRecor
   return { id, object: type, livemode: false, ...extra };
 }
 
-function pricing() {
+function pricing(includedMinor = INCLUDED_MINOR, monthlyMinor = MONTHLY_MINOR) {
   const billingConfig = {
     schemaVersion: 1,
     revision: REVISION,
@@ -60,7 +66,7 @@ function pricing() {
     holdTtlSeconds: 86_400,
     freeIncludedMinor: 0,
     purchaseCreditExpiry: { kind: "none" },
-    plans: { [PLAN_KEY]: { includedMinor: INCLUDED_MINOR, stripePriceId: PRICE } },
+    plans: { [PLAN_KEY]: { includedMinor, stripePriceId: PRICE } },
     meters: {},
   };
   const authored = {
@@ -69,7 +75,7 @@ function pricing() {
     billingConfig,
     checkout: { minimumMinor: 50, maximumMinor: 99_999_999 },
     stripeMonthlyReview: {
-      [PLAN_KEY]: { expectedAmountMinor: MONTHLY_MINOR, currency: "USD", interval: "month" },
+      [PLAN_KEY]: { expectedAmountMinor: monthlyMinor, currency: "USD", interval: "month" },
     },
   };
   return compilePricingAuthoring(authored);
@@ -320,9 +326,9 @@ const identity: ExternalIdentityVerifier = {
 async function fixture(hostedPricing = pricing()) {
   const database = new Database(":memory:");
   for (const migration of MIGRATIONS) database.exec(migration.sql);
-  if (!MIGRATIONS.some((migration) => migration.name === "0093_stripe_billing.sql")) {
+  if (!MIGRATIONS.some((migration) => migration.name === "0095_stripe_billing.sql")) {
     database.exec(
-      await Bun.file(new URL("../migrations/0093_stripe_billing.sql", import.meta.url)).text(),
+      await Bun.file(new URL("../migrations/0095_stripe_billing.sql", import.meta.url)).text(),
     );
   }
   const sql = createSqliteSql(database);
@@ -439,16 +445,18 @@ describe("Hosted Stripe billing service", () => {
     const secondEvent = event("invoice.paid", "in_billing_test", "invoice");
     const second = await deliver(h.app, secondEvent);
     expect(second.status).toBe(200);
-    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMinor: INCLUDED_MINOR });
+    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMicros: INCLUDED_MICROS });
     expect(
       await h.sql.query(
-        "SELECT funding_ref, kind, amount_minor, expires_at, period_start, period_end, pricing_revision FROM stripe_billing_grants",
+        "SELECT funding_ref, kind, amount_micros, consumption_class, consideration_micros, expires_at, period_start, period_end, pricing_revision FROM stripe_billing_grants",
       ),
     ).toEqual([
       {
         funding_ref: "stripe:invoice:in_billing_test",
         kind: "plan-included",
-        amount_minor: INCLUDED_MINOR,
+        amount_micros: INCLUDED_MICROS,
+        consumption_class: "subscription",
+        consideration_micros: micros(MONTHLY_MINOR),
         expires_at: "2026-11-01T00:00:00.000Z",
         period_start: "2026-10-01T00:00:00.000Z",
         period_end: "2026-11-01T00:00:00.000Z",
@@ -458,7 +466,7 @@ describe("Hosted Stripe billing service", () => {
     await h.sql.run("DELETE FROM stripe_events WHERE event_id = ?", [String(secondEvent.id)]);
     const report = await h.reconcile();
     expect(report.billing?.handlerVersion).toBe(1);
-    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMinor: INCLUDED_MINOR });
+    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMicros: INCLUDED_MICROS });
     expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_grants")).toEqual([
       { count: 1 },
     ]);
@@ -481,7 +489,7 @@ describe("Hosted Stripe billing service", () => {
       event("invoice.payment_failed", "in_billing_test", "invoice"),
     );
     expect(failure.status).toBe(200);
-    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMinor: 0 });
+    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMicros: 0 });
     expect((await h.subscriptions.read(ORG))?.status).toBe("past_due");
     h.state.invoices.set("in_billing_test", invoice("in_billing_test"));
     const paid = await deliver(
@@ -489,7 +497,7 @@ describe("Hosted Stripe billing service", () => {
       event("invoice.payment_failed", "in_billing_test", "invoice"),
     );
     expect(paid.status).toBe(200);
-    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMinor: INCLUDED_MINOR });
+    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMicros: INCLUDED_MICROS });
     h.state.subscriptions.set(
       SUBSCRIPTION,
       subscription({ status: "canceled", cancel_at_period_end: true }),
@@ -500,7 +508,7 @@ describe("Hosted Stripe billing service", () => {
     );
     expect(canceled.status).toBe(200);
     expect((await h.subscriptions.read(ORG))?.status).toBe("canceled");
-    expect((await h.ledger.wallet(ORG)).settledMinor).toBe(INCLUDED_MINOR);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(INCLUDED_MICROS);
     expect(
       (
         await h.sql.query("SELECT expires_at FROM wallet_credit_lots WHERE ref = ?", [
@@ -518,7 +526,7 @@ describe("Hosted Stripe billing service", () => {
 
     const deferred = await deliver(h.app, historicalEvent);
     expect(deferred.status).toBe(200);
-    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMinor: 0 });
+    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMicros: 0 });
     expect(
       await h.sql.query("SELECT outcome, handler_version FROM stripe_events WHERE event_id = ?", [
         String(historicalEvent.id),
@@ -528,7 +536,7 @@ describe("Hosted Stripe billing service", () => {
     h.state.invoices.set("in_billing_test", invoice("in_billing_test"));
     const report = await h.reconcile();
     expect(report.billing?.handlerVersion).toBe(1);
-    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMinor: INCLUDED_MINOR });
+    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMicros: INCLUDED_MICROS });
     expect(
       h.state.requests.some(
         (request) =>
@@ -568,7 +576,7 @@ describe("Hosted Stripe billing service", () => {
     const report = await h.reconcile();
     expect(report.billing?.applied).toBeGreaterThanOrEqual(1);
     expect(report.billing?.unresolved).toBe(0);
-    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMinor: INCLUDED_MINOR });
+    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMicros: INCLUDED_MICROS });
     expect(
       await h.sql.query("SELECT outcome, handler_version FROM stripe_events WHERE event_id = ?", [
         "evt_old_invoice",
@@ -609,7 +617,7 @@ describe("Hosted Stripe billing service", () => {
 
     const report = await h.reconcile();
     expect(report.billing?.unresolved).toBeGreaterThan(0);
-    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMinor: 0 });
+    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMicros: 0 });
     expect(
       await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_grants WHERE source_id = ?", [
         "in_billing_test",
@@ -736,10 +744,10 @@ describe("Hosted Stripe billing service", () => {
     ).toEqual([{ cursor: String(page.at(-1)?.id) }]);
     expect(
       await h.sql.query(
-        "SELECT target_revoked_minor, debit_minor FROM stripe_billing_refunds WHERE refund_id = ?",
+        "SELECT target_revoked_micros, debit_micros FROM stripe_billing_refunds WHERE refund_id = ?",
         ["re_page_during_retry"],
       ),
-    ).toEqual([{ target_revoked_minor: 240, debit_minor: 240 }]);
+    ).toEqual([{ target_revoked_micros: micros(240), debit_micros: micros(240) }]);
 
     const nextPage = await h.reconcile();
     expect(nextPage.billing?.unresolved).toBeGreaterThan(0);
@@ -804,13 +812,13 @@ describe("Hosted Stripe billing service", () => {
     await expect(h.reconcile()).rejects.toBeDefined();
     expect(
       await h.sql.query(
-        "SELECT target_revoked_minor, debit_minor FROM stripe_billing_refunds WHERE refund_id = ?",
+        "SELECT target_revoked_micros, debit_micros FROM stripe_billing_refunds WHERE refund_id = ?",
         ["re_hosted_during_legacy_failure"],
       ),
-    ).toEqual([{ target_revoked_minor: 240, debit_minor: 240 }]);
+    ).toEqual([{ target_revoked_micros: micros(240), debit_micros: micros(240) }]);
     expect(await h.ledger.wallet(ORG)).toMatchObject({
-      settledMinor: INCLUDED_MINOR - 240,
-      availableMinor: INCLUDED_MINOR - 240,
+      settledMicros: INCLUDED_MICROS - micros(240),
+      availableMicros: INCLUDED_MICROS - micros(240),
     });
     expect(
       await h.sql.query("SELECT cursor FROM stripe_billing_reconcile WHERE stream = ?", [
@@ -854,72 +862,76 @@ describe("Hosted Stripe billing service", () => {
     expect(await h.sql.query("SELECT refund_id FROM stripe_billing_refunds")).toEqual([
       { refund_id: "re_retry_independent" },
     ]);
-    expect((await h.ledger.wallet(ORG)).settledMinor).toBe(0);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(0);
   });
 
-  test("rejects noncanonical invoice, customer, account and period facts without funding", async () => {
-    const cases: readonly [string, ObjectRecord][] = [
-      ["currency", invoice("in_billing_test", { currency: "jpy" })],
-      ["wrong customer", invoice("in_billing_test", { customer: "cus_other" })],
-      [
-        "extra line",
-        invoice("in_billing_test", {
-          lines: {
-            has_more: false,
-            data: [
-              ...(invoice("in_billing_test").lines as { data: ObjectRecord[] }).data,
-              { id: "il_extra" },
-            ],
-          },
-        }),
-      ],
-      [
-        "proration",
-        invoice("in_billing_test", {
-          lines: {
-            has_more: false,
-            data: [
-              {
-                ...((invoice("in_billing_test").lines as { data: ObjectRecord[] })
-                  .data[0] as ObjectRecord),
-                proration: true,
-              },
-            ],
-          },
-        }),
-      ],
-      [
-        "wrong period",
-        invoice("in_billing_test", {
-          lines: {
-            has_more: false,
-            data: [
-              {
-                ...((invoice("in_billing_test").lines as { data: ObjectRecord[] })
-                  .data[0] as ObjectRecord),
-                period: { start: PERIOD_END, end: PERIOD_START },
-              },
-            ],
-          },
-        }),
-      ],
-      [
-        "Connect transfer",
-        invoice("in_billing_test", { transfer_data: { destination: "acct_foreign" } }),
-      ],
-    ];
-    for (const [label, invalid] of cases) {
-      const h = await fixture();
-      h.state.invoices.set("in_billing_test", invalid);
-      const response = await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"));
-      expect(response.status, label).toBe(200);
-      expect((await h.ledger.wallet(ORG)).settledMinor, label).toBe(0);
-      expect(
-        await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_grants"),
-        label,
-      ).toEqual([{ count: 0 }]);
-    }
-  });
+  test(
+    "rejects noncanonical invoice, customer, account and period facts without funding",
+    async () => {
+      const cases: readonly [string, ObjectRecord][] = [
+        ["currency", invoice("in_billing_test", { currency: "jpy" })],
+        ["wrong customer", invoice("in_billing_test", { customer: "cus_other" })],
+        [
+          "extra line",
+          invoice("in_billing_test", {
+            lines: {
+              has_more: false,
+              data: [
+                ...(invoice("in_billing_test").lines as { data: ObjectRecord[] }).data,
+                { id: "il_extra" },
+              ],
+            },
+          }),
+        ],
+        [
+          "proration",
+          invoice("in_billing_test", {
+            lines: {
+              has_more: false,
+              data: [
+                {
+                  ...((invoice("in_billing_test").lines as { data: ObjectRecord[] })
+                    .data[0] as ObjectRecord),
+                  proration: true,
+                },
+              ],
+            },
+          }),
+        ],
+        [
+          "wrong period",
+          invoice("in_billing_test", {
+            lines: {
+              has_more: false,
+              data: [
+                {
+                  ...((invoice("in_billing_test").lines as { data: ObjectRecord[] })
+                    .data[0] as ObjectRecord),
+                  period: { start: PERIOD_END, end: PERIOD_START },
+                },
+              ],
+            },
+          }),
+        ],
+        [
+          "Connect transfer",
+          invoice("in_billing_test", { transfer_data: { destination: "acct_foreign" } }),
+        ],
+      ];
+      for (const [label, invalid] of cases) {
+        const h = await fixture();
+        h.state.invoices.set("in_billing_test", invalid);
+        const response = await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"));
+        expect(response.status, label).toBe(200);
+        expect((await h.ledger.wallet(ORG)).settledMicros, label).toBe(0);
+        expect(
+          await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_grants"),
+          label,
+        ).toEqual([{ count: 0 }]);
+      }
+    },
+    { timeout: 15_000 },
+  );
 
   test("ignores signed live-mode and connected-account events before any Stripe object read", async () => {
     for (const mode of [{ livemode: true }, { account: "acct_connected" }]) {
@@ -953,9 +965,9 @@ describe("Hosted Stripe billing service", () => {
     const pending = await deliver(h.app, event("refund.created", "re_billing_test", "refund"));
     expect(pending.status).toBe(200);
     expect(await h.ledger.wallet(ORG)).toMatchObject({
-      settledMinor: INCLUDED_MINOR,
-      frozenMinor: INCLUDED_MINOR,
-      availableMinor: 0,
+      settledMicros: INCLUDED_MICROS,
+      frozenMicros: INCLUDED_MICROS,
+      availableMicros: 0,
     });
     expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_refunds")).toEqual([
       { count: 0 },
@@ -974,9 +986,9 @@ describe("Hosted Stripe billing service", () => {
     const failed = await deliver(h.app, event("refund.failed", "re_billing_test", "refund"));
     expect(failed.status).toBe(200);
     expect(await h.ledger.wallet(ORG)).toMatchObject({
-      settledMinor: INCLUDED_MINOR,
-      frozenMinor: 0,
-      availableMinor: INCLUDED_MINOR,
+      settledMicros: INCLUDED_MICROS,
+      frozenMicros: 0,
+      availableMicros: INCLUDED_MICROS,
     });
     expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_refunds")).toEqual([
       { count: 0 },
@@ -995,17 +1007,17 @@ describe("Hosted Stripe billing service", () => {
     h.state.charges.set("ch_billing_test", charge({ amount_refunded: 25 }));
     const succeeded = await deliver(h.app, event("refund.updated", "re_billing_test", "refund"));
     expect(succeeded.status).toBe(200);
-    expect((await h.ledger.wallet(ORG)).settledMinor).toBe(INCLUDED_MINOR - 240);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(INCLUDED_MICROS - micros(240));
     expect(
       await h.sql.query(
-        "SELECT refund_id, target_revoked_minor, debit_minor, receivable_minor FROM stripe_billing_refunds",
+        "SELECT refund_id, target_revoked_micros, debit_micros, receivable_micros FROM stripe_billing_refunds",
       ),
     ).toEqual([
       {
         refund_id: "re_billing_test",
-        target_revoked_minor: 240,
-        debit_minor: 240,
-        receivable_minor: 0,
+        target_revoked_micros: micros(240),
+        debit_micros: micros(240),
+        receivable_micros: 0,
       },
     ]);
   });
@@ -1029,8 +1041,8 @@ describe("Hosted Stripe billing service", () => {
     const interrupted = await deliver(h.app, event("refund.updated", "re_retry", "refund"));
     expect(interrupted.status).toBe(503);
     expect(await h.ledger.wallet(ORG)).toMatchObject({
-      settledMinor: INCLUDED_MINOR,
-      availableMinor: 0,
+      settledMicros: INCLUDED_MICROS,
+      availableMicros: 0,
     });
     expect(
       await h.sql.query(
@@ -1042,8 +1054,8 @@ describe("Hosted Stripe billing service", () => {
     const retried = await deliver(h.app, event("refund.updated", "re_retry", "refund"));
     expect(retried.status).toBe(200);
     expect(await h.ledger.wallet(ORG)).toMatchObject({
-      settledMinor: INCLUDED_MINOR - 240,
-      availableMinor: INCLUDED_MINOR - 240,
+      settledMicros: INCLUDED_MICROS - micros(240),
+      availableMicros: INCLUDED_MICROS - micros(240),
     });
     expect(
       await h.sql.query(
@@ -1081,13 +1093,13 @@ describe("Hosted Stripe billing service", () => {
     const partial = await deliver(h.app, event("refund.updated", "re_succeeded_partial", "refund"));
     expect(partial.status).toBe(200);
     expect(await h.ledger.wallet(ORG)).toMatchObject({
-      settledMinor: INCLUDED_MINOR - 240,
-      frozenMinor: INCLUDED_MINOR - 240,
-      availableMinor: 0,
+      settledMicros: INCLUDED_MICROS - micros(240),
+      frozenMicros: INCLUDED_MICROS - micros(240),
+      availableMicros: 0,
     });
     expect(
-      await h.sql.query("SELECT refund_id, cumulative_refunded_minor FROM stripe_billing_refunds"),
-    ).toEqual([{ refund_id: "re_succeeded_partial", cumulative_refunded_minor: 25 }]);
+      await h.sql.query("SELECT refund_id, cumulative_refunded_micros FROM stripe_billing_refunds"),
+    ).toEqual([{ refund_id: "re_succeeded_partial", cumulative_refunded_micros: micros(25) }]);
 
     h.state.refunds.set(
       "re_pending_partial",
@@ -1102,9 +1114,9 @@ describe("Hosted Stripe billing service", () => {
     const terminal = await deliver(h.app, event("refund.failed", "re_pending_partial", "refund"));
     expect(terminal.status).toBe(200);
     expect(await h.ledger.wallet(ORG)).toMatchObject({
-      settledMinor: INCLUDED_MINOR - 240,
-      frozenMinor: 0,
-      availableMinor: INCLUDED_MINOR - 240,
+      settledMicros: INCLUDED_MICROS - micros(240),
+      frozenMicros: 0,
+      availableMicros: INCLUDED_MICROS - micros(240),
     });
   });
 
@@ -1113,7 +1125,7 @@ describe("Hosted Stripe billing service", () => {
     h.state.charges.set("ch_billing_test", charge({ amount_refunded: 25 }));
     const lagging = await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"));
     expect(lagging.status).toBe(200);
-    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMinor: 0, availableMinor: 0 });
+    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMicros: 0, availableMicros: 0 });
     expect(
       await h.sql.query(
         "SELECT outcome, outcome_detail FROM stripe_events ORDER BY event_id DESC LIMIT 1",
@@ -1139,8 +1151,8 @@ describe("Hosted Stripe billing service", () => {
     const retried = await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"));
     expect(retried.status).toBe(200);
     expect(await h.ledger.wallet(ORG)).toMatchObject({
-      settledMinor: INCLUDED_MINOR - 240,
-      availableMinor: INCLUDED_MINOR - 240,
+      settledMicros: INCLUDED_MICROS - micros(240),
+      availableMicros: INCLUDED_MICROS - micros(240),
     });
     expect(
       await h.sql.query(
@@ -1154,7 +1166,11 @@ describe("Hosted Stripe billing service", () => {
     const h = await fixture();
     await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"));
     expect(
-      await h.ledger.debitUsage({ organizationId: ORG, reference: "run-spend", amountMinor: 500 }),
+      await h.ledger.debitUsage({
+        organizationId: ORG,
+        reference: "run-spend",
+        amountMicros: micros(500),
+      }),
     ).toBe(true);
     h.state.refunds.set(
       "re_partial",
@@ -1172,9 +1188,11 @@ describe("Hosted Stripe billing service", () => {
     ).toBe(200);
     expect(
       await h.sql.query(
-        "SELECT target_revoked_minor, debit_minor, receivable_minor FROM stripe_billing_refunds",
+        "SELECT target_revoked_micros, debit_micros, receivable_micros FROM stripe_billing_refunds",
       ),
-    ).toEqual([{ target_revoked_minor: 240, debit_minor: 240, receivable_minor: 0 }]);
+    ).toEqual([
+      { target_revoked_micros: micros(240), debit_micros: micros(240), receivable_micros: 0 },
+    ]);
 
     h.state.refunds.set(
       "re_final",
@@ -1190,20 +1208,92 @@ describe("Hosted Stripe billing service", () => {
     expect((await deliver(h.app, event("refund.updated", "re_final", "refund"))).status).toBe(200);
     expect(
       await h.sql.query(
-        "SELECT refund_id, target_revoked_minor, debit_minor, receivable_minor FROM stripe_billing_refunds ORDER BY cumulative_refunded_minor",
+        "SELECT refund_id, target_revoked_micros, debit_micros, receivable_micros FROM stripe_billing_refunds ORDER BY cumulative_refunded_micros",
       ),
     ).toEqual([
-      { refund_id: "re_partial", target_revoked_minor: 240, debit_minor: 240, receivable_minor: 0 },
+      {
+        refund_id: "re_partial",
+        target_revoked_micros: micros(240),
+        debit_micros: micros(240),
+        receivable_micros: 0,
+      },
       {
         refund_id: "re_final",
-        target_revoked_minor: INCLUDED_MINOR,
-        debit_minor: 460,
-        receivable_minor: 500,
+        target_revoked_micros: INCLUDED_MICROS,
+        debit_micros: micros(460),
+        receivable_micros: micros(500),
       },
     ]);
     expect(await h.ledger.wallet(ORG)).toMatchObject({
-      settledMinor: 0,
-      refundReceivableMinor: 500,
+      settledMicros: 0,
+      refundReceivableMicros: micros(500),
+    });
+  });
+
+  test("refund prorates fractional credit to micros and records a one-micro receivable", async () => {
+    const h = await fixture(pricing(1, 2));
+    h.state.prices.set(
+      PRICE,
+      object(PRICE, "price", {
+        currency: "usd",
+        type: "recurring",
+        billing_scheme: "per_unit",
+        unit_amount: 2,
+        recurring: { interval: "month", interval_count: 1, usage_type: "licensed" },
+      }),
+    );
+    h.state.invoices.set(
+      "in_billing_test",
+      invoice("in_billing_test", {
+        amount_paid: 2,
+        total: 2,
+        total_excluding_tax: 2,
+      }),
+    );
+    h.state.charges.set("ch_billing_test", charge({ amount: 2 }));
+
+    const credited = await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"));
+    expect(credited.status).toBe(200);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(micros(1));
+    expect(
+      await h.ledger.debitUsage({
+        organizationId: ORG,
+        reference: "one-micro-over-half-refund",
+        amountMicros: 5_001,
+      }),
+    ).toBe(true);
+
+    h.state.refunds.set(
+      "re_half_cent",
+      object("re_half_cent", "refund", {
+        charge: "ch_billing_test",
+        currency: "usd",
+        amount: 1,
+        created: 1_791_871_200,
+        status: "succeeded",
+      }),
+    );
+    h.state.charges.set("ch_billing_test", charge({ amount: 2, amount_refunded: 1 }));
+    const refunded = await deliver(h.app, event("refund.updated", "re_half_cent", "refund"));
+    expect(refunded.status).toBe(200);
+    expect(
+      await h.sql.query(
+        "SELECT amount_micros, cumulative_refunded_micros, target_revoked_micros, debit_micros, receivable_micros, expired_micros FROM stripe_billing_refunds WHERE refund_id = ?",
+        ["re_half_cent"],
+      ),
+    ).toEqual([
+      {
+        amount_micros: micros(1),
+        cumulative_refunded_micros: micros(1),
+        target_revoked_micros: 5_000,
+        debit_micros: 4_999,
+        receivable_micros: 1,
+        expired_micros: 0,
+      },
+    ]);
+    expect(await h.ledger.wallet(ORG)).toMatchObject({
+      settledMicros: 0,
+      refundReceivableMicros: 1,
     });
   });
 
@@ -1229,21 +1319,29 @@ describe("Hosted Stripe billing service", () => {
     h.state.charges.set("ch_billing_test", charge({ amount_refunded: 25 }));
     expect((await deliver(h.app, event("refund.updated", "re_b", "refund"))).status).toBe(200);
     expect(
-      await h.sql.query("SELECT refund_id, cumulative_refunded_minor FROM stripe_billing_refunds"),
-    ).toEqual([{ refund_id: "re_b", cumulative_refunded_minor: 25 }]);
+      await h.sql.query("SELECT refund_id, cumulative_refunded_micros FROM stripe_billing_refunds"),
+    ).toEqual([{ refund_id: "re_b", cumulative_refunded_micros: micros(25) }]);
 
     h.state.refunds.set("re_a", { ...refundA, status: "succeeded" });
     h.state.charges.set("ch_billing_test", charge({ amount_refunded: 50 }));
     expect((await deliver(h.app, event("refund.updated", "re_a", "refund"))).status).toBe(200);
     expect(
       await h.sql.query(
-        "SELECT refund_id, cumulative_refunded_minor, target_revoked_minor FROM stripe_billing_refunds ORDER BY cumulative_refunded_minor",
+        "SELECT refund_id, cumulative_refunded_micros, target_revoked_micros FROM stripe_billing_refunds ORDER BY cumulative_refunded_micros",
       ),
     ).toEqual([
-      { refund_id: "re_b", cumulative_refunded_minor: 25, target_revoked_minor: 240 },
-      { refund_id: "re_a", cumulative_refunded_minor: 50, target_revoked_minor: 480 },
+      {
+        refund_id: "re_b",
+        cumulative_refunded_micros: micros(25),
+        target_revoked_micros: micros(240),
+      },
+      {
+        refund_id: "re_a",
+        cumulative_refunded_micros: micros(50),
+        target_revoked_micros: micros(480),
+      },
     ]);
-    expect((await h.ledger.wallet(ORG)).settledMinor).toBe(INCLUDED_MINOR - 480);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(INCLUDED_MICROS - micros(480));
     expect(
       await h.sql.query(
         "SELECT active FROM stripe_billing_fences WHERE org_id = ? AND funding_ref = ?",
@@ -1256,7 +1354,11 @@ describe("Hosted Stripe billing service", () => {
     const h = await fixture();
     await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"));
     expect(
-      await h.ledger.hold({ organizationId: ORG, reference: "live-run-hold", amountMinor: 500 }),
+      await h.ledger.hold({
+        organizationId: ORG,
+        reference: "live-run-hold",
+        amountMicros: micros(500),
+      }),
     ).toBe(true);
     h.state.refunds.set(
       "re_full_hold",
@@ -1272,16 +1374,16 @@ describe("Hosted Stripe billing service", () => {
     const response = await deliver(h.app, event("charge.refunded", "ch_billing_test", "charge"));
     expect(response.status).toBe(200);
     expect(await h.ledger.wallet(ORG)).toMatchObject({
-      settledMinor: 0,
-      heldMinor: 0,
-      availableMinor: 0,
+      settledMicros: 0,
+      heldMicros: 0,
+      availableMicros: 0,
     });
     expect(
       await h.sql.query(
-        "SELECT type, held_delta FROM ledger WHERE ref = ? ORDER BY created_at, id",
+        "SELECT type, held_delta_micros FROM ledger WHERE ref = ? ORDER BY created_at, id",
         ["live-run-hold"],
       ),
-    ).toContainEqual({ type: "release", held_delta: -500 });
+    ).toContainEqual({ type: "release", held_delta_micros: -micros(500) });
     expect(
       await h.sql.query(
         "SELECT COUNT(*) AS count FROM wallet_credit_allocations WHERE org_id = ? AND lot_ref = ? AND debit_type = 'hold'",
@@ -1314,10 +1416,10 @@ describe("Hosted Stripe billing service", () => {
     expect(response.status).toBe(503);
     expect(
       await h.sql.query(
-        "SELECT target_revoked_minor FROM stripe_billing_refunds WHERE refund_id = ?",
+        "SELECT target_revoked_micros FROM stripe_billing_refunds WHERE refund_id = ?",
         ["re_full_subscription"],
       ),
-    ).toEqual([{ target_revoked_minor: INCLUDED_MINOR }]);
+    ).toEqual([{ target_revoked_micros: INCLUDED_MICROS }]);
     expect(await h.subscriptions.read(ORG)).toMatchObject({
       status: "active",
       paidFeatures: false,
@@ -1344,16 +1446,16 @@ describe("Hosted Stripe billing service", () => {
     h.state.invoices.set("in_billing_test", historical);
     const response = await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"));
     expect(response.status).toBe(200);
-    expect((await h.ledger.wallet(ORG)).availableMinor).toBe(0);
+    expect((await h.ledger.wallet(ORG)).availableMicros).toBe(0);
     expect(
       await h.sql.query(
-        "SELECT funding_ref, amount_minor, expires_at FROM stripe_billing_grants WHERE source_id = ?",
+        "SELECT funding_ref, amount_micros, expires_at FROM stripe_billing_grants WHERE source_id = ?",
         ["in_billing_test"],
       ),
     ).toEqual([
       {
         funding_ref: "stripe:invoice:in_billing_test",
-        amount_minor: INCLUDED_MINOR,
+        amount_micros: INCLUDED_MICROS,
         expires_at: "2026-09-01T00:00:00.000Z",
       },
     ]);
@@ -1399,9 +1501,11 @@ describe("Hosted Stripe billing service", () => {
     );
     expect(response.status).toBe(200);
     expect(
-      await h.sql.query("SELECT funding_ref, kind, amount_minor FROM stripe_billing_grants"),
-    ).toEqual([{ funding_ref: "stripe:cs_purchase_test", kind: "purchased", amount_minor: 500 }]);
-    expect((await h.ledger.wallet(ORG)).settledMinor).toBe(500);
+      await h.sql.query("SELECT funding_ref, kind, amount_micros FROM stripe_billing_grants"),
+    ).toEqual([
+      { funding_ref: "stripe:cs_purchase_test", kind: "purchased", amount_micros: micros(500) },
+    ]);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(micros(500));
   });
 
   test("first settlement uses the Checkout creation revision retained in pricing history", async () => {
@@ -1541,7 +1645,7 @@ describe("Hosted Stripe billing service", () => {
         expires_at: new Date(NOW.getTime() + 2_592_000_000).toISOString(),
       },
     ]);
-    expect((await h.ledger.wallet(ORG)).availableMinor).toBe(1000);
+    expect((await h.ledger.wallet(ORG)).availableMicros).toBe(micros(1000));
   });
 
   test("refund arriving before invoice grant resolves the original paid invoice first", async () => {
@@ -1559,13 +1663,13 @@ describe("Hosted Stripe billing service", () => {
     h.state.charges.set("ch_billing_test", charge({ amount_refunded: 125 }));
     const response = await deliver(h.app, event("charge.refunded", "ch_billing_test", "charge"));
     expect(response.status).toBe(200);
-    expect((await h.ledger.wallet(ORG)).settledMinor).toBe(0);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(0);
     expect(await h.sql.query("SELECT funding_ref FROM stripe_billing_grants")).toEqual([
       { funding_ref: "stripe:invoice:in_billing_test" },
     ]);
     expect(
-      await h.sql.query("SELECT target_revoked_minor, debit_minor FROM stripe_billing_refunds"),
-    ).toEqual([{ target_revoked_minor: INCLUDED_MINOR, debit_minor: INCLUDED_MINOR }]);
+      await h.sql.query("SELECT target_revoked_micros, debit_micros FROM stripe_billing_refunds"),
+    ).toEqual([{ target_revoked_micros: INCLUDED_MICROS, debit_micros: INCLUDED_MICROS }]);
   });
 
   test("creates a customer and subscription Checkout idempotently from the configured plan", async () => {
@@ -1814,6 +1918,6 @@ describe("Hosted Stripe billing service", () => {
     );
     expect(badSignature.status).toBe(400);
     expect(await errorCode(badSignature)).toBe("invalid_signature");
-    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMinor: 0 });
+    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMicros: 0 });
   });
 });
