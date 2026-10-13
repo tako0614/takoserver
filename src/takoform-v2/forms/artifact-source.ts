@@ -1,12 +1,13 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import type { ObjectStoreAccess, StoredObjectBody } from "../../ports.ts";
+import type { ObjectStoreAccess } from "../../ports.ts";
 import { isV2HttpsUrl } from "../identity.ts";
 import { ARTIFACT_URL_MAX_ASCII_BYTES } from "./artifact-validation.ts";
 
 const SHA256 = /^[0-9a-f]{64}$/u;
 /** Generic reader ceiling; each Form supplies its own stricter artifact bound. */
-const MAX_HOST_HELD_ARTIFACT_READ_BYTES = 134_217_728;
+/** Shared ceiling for both held and explicitly selected public artifact sources. */
+export const V2_ARTIFACT_SOURCE_MAX_BYTES = 134_217_728;
 const DEFAULT_READ_TIMEOUT_MILLISECONDS = 30_000;
 const MAX_READ_TIMEOUT_MILLISECONDS = 120_000;
 const READ_YIELD_INTERVAL = 1_024;
@@ -138,7 +139,7 @@ export function createV2HeldArtifactSource(options: V2HeldArtifactSourceOptions)
         typeof input.sha256 !== "string" ||
         !Number.isSafeInteger(input.maxBytes) ||
         input.maxBytes < 0 ||
-        input.maxBytes > MAX_HOST_HELD_ARTIFACT_READ_BYTES
+        input.maxBytes > V2_ARTIFACT_SOURCE_MAX_BYTES
       ) {
         throw new V2ArtifactSourceError("unavailable");
       }
@@ -148,9 +149,8 @@ export function createV2HeldArtifactSource(options: V2HeldArtifactSourceOptions)
         throw new V2ArtifactSourceError("unavailable");
       }
 
-      return await readHeldBytes({
-        objects,
-        objectKey: entry.objectKey,
+      return await readV2BoundedArtifactBytes({
+        open: () => objects.get(entry.objectKey),
         expectedSha256: input.sha256,
         maxBytes: input.maxBytes,
         timeoutMilliseconds,
@@ -159,41 +159,46 @@ export function createV2HeldArtifactSource(options: V2HeldArtifactSourceOptions)
   };
 }
 
-async function readHeldBytes(input: {
-  readonly objects: Pick<ObjectStoreAccess, "get">;
-  readonly objectKey: string;
+/** Internal shared byte reader; source adapters remain responsible for admission. */
+export async function readV2BoundedArtifactBytes(input: {
+  readonly open: () => Promise<{ readonly body: ReadableStream<Uint8Array> } | null>;
   readonly expectedSha256: string;
   readonly maxBytes: number;
   readonly timeoutMilliseconds: number;
+  readonly onTimeout?: () => void;
 }): Promise<Uint8Array> {
   let timedOut = false;
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-  let storedPromise: Promise<StoredObjectBody | null> | undefined;
+  let bodyPromise: Promise<{ readonly body: ReadableStream<Uint8Array> } | null> | undefined;
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const deadline = Date.now() + input.timeoutMilliseconds;
   const expire = (): V2ArtifactSourceError => {
     timedOut = true;
+    try {
+      input.onTimeout?.();
+    } catch {
+      // Cleanup must not replace the safe source error.
+    }
     if (reader) cancelReader(reader);
     return new V2ArtifactSourceError("timeout");
   };
 
   const work = async (): Promise<Uint8Array> => {
-    let stored: StoredObjectBody | null;
+    let opened: { readonly body: ReadableStream<Uint8Array> } | null;
     try {
-      storedPromise = input.objects.get(input.objectKey);
-      stored = await storedPromise;
+      bodyPromise = input.open();
+      opened = await bodyPromise;
     } catch {
       throw new V2ArtifactSourceError("unavailable");
     }
     if (timedOut || Date.now() >= deadline) {
-      timedOut = true;
-      if (stored) cancelBody(stored.body);
-      throw new V2ArtifactSourceError("timeout");
+      if (opened) cancelBody(opened.body);
+      throw expire();
     }
-    if (!stored) throw new V2ArtifactSourceError("unavailable");
+    if (!opened) throw new V2ArtifactSourceError("unavailable");
 
     try {
-      reader = stored.body.getReader();
+      reader = opened.body.getReader();
     } catch {
       throw new V2ArtifactSourceError("unavailable");
     }
@@ -274,10 +279,10 @@ async function readHeldBytes(input: {
       }
     }
     // Observe a late rejection and dispose a body that arrives after timeout.
-    if (timedOut && storedPromise) {
-      void storedPromise.then(
-        (stored) => {
-          if (stored) cancelBody(stored.body);
+    if (timedOut && bodyPromise) {
+      void bodyPromise.then(
+        (opened) => {
+          if (opened) cancelBody(opened.body);
         },
         () => undefined,
       );

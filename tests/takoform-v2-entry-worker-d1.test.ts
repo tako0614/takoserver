@@ -406,9 +406,216 @@ test("configured artifact Forms refuse incomplete 0075 or 0081 before accepting 
   }
 }, 120_000);
 
-async function entryRuntime(config: string, name: string): Promise<Miniflare> {
+test("code-selected Worker entry source acquires a new StaticAssetBundle into D1 custody", async () => {
+  const fileUrl = "https://artifact-publisher.example.org/public/site.css";
+  const manifestUrl = "https://artifact-publisher.example.org/public/manifest.json";
+  const file = "body { color: #126; }\n";
+  const fileSha256 = (await bytesDigest(new TextEncoder().encode(file))).slice(7);
+  const manifest = JSON.stringify({
+    files: [{ path: "site.css", url: fileUrl, sha256: fileSha256, mediaType: "text/css" }],
+  });
+  const manifestSha256 = (await bytesDigest(new TextEncoder().encode(manifest))).slice(7);
+  const config = JSON.stringify({
+    documentation: "https://docs.example.test/v2",
+    authenticationDocumentation: "https://docs.example.test/v2/authentication",
+    staticAssetBundle: { targetKey: "entry-public-assets-v1", heldArtifacts: [] },
+  });
+  const runtime = await entryRuntime(config, "artifact-entry-public-source-test", {
+    selectedSource: true,
+    payloads: { [manifestUrl]: manifest, [fileUrl]: file },
+  });
+  try {
+    const database = await runtime.getD1Database("STATE_DB");
+    for (const migration of MIGRATIONS) {
+      for (const statement of splitMigration(migration.sql)) {
+        await database.prepare(statement).run();
+      }
+    }
+    const sql = createD1Sql(database);
+    const now = new Date().toISOString();
+    await sql.run(
+      "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
+      [ORGANIZATION, "Public artifact entry test", "principal-artifact-entry", now],
+    );
+    await sql.run(
+      "INSERT INTO auth_tokens (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at, revoked_at) VALUES (?, ?, 'api_key', ?, ?, ?, ?, ?, ?, NULL)",
+      [
+        await bytesDigest(new TextEncoder().encode(TOKEN)),
+        "key-artifact-public-entry",
+        "principal-artifact-entry",
+        ORGANIZATION,
+        "public-artifact-entry",
+        JSON.stringify(["resources:write"]),
+        now,
+        new Date(Date.now() + 3_600_000).toISOString(),
+      ],
+    );
+    const created = await runtime.dispatchFetch(`${BASE}/resources`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+        "idempotency-key": "artifact-entry-public-source-create-0001",
+      },
+      body: JSON.stringify({
+        form: STATIC_ASSET_BUNDLE_FORM_URL,
+        space: ORGANIZATION,
+        name: "public-source-assets",
+        spec: { artifact: { url: manifestUrl, sha256: manifestSha256 } },
+      }),
+    });
+    expect(created.status).toBe(202);
+    const accepted = (await created.json()) as { id: string; resourceUid: string };
+    await settle(runtime, accepted.id);
+    const resource = await runtime.dispatchFetch(`${BASE}/resources/${accepted.resourceUid}`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    expect(resource.status).toBe(200);
+    expect(await resource.json()).toMatchObject({
+      observedGeneration: 1,
+      observed: { manifestSha256, files: [{ sha256: fileSha256 }] },
+    });
+    expect(
+      await sql.query(
+        "SELECT state, manifest_sha256 FROM tf_v2_artifact_owners WHERE resource_uid = ?",
+        [accepted.resourceUid],
+      ),
+    ).toEqual([{ state: "verified", manifest_sha256: manifestSha256 }]);
+    expect(
+      await sql.query(
+        "SELECT count(*) AS count FROM tf_v2_artifact_chunks WHERE resource_uid = ?",
+        [accepted.resourceUid],
+      ),
+    ).toEqual([{ count: 1 }]);
+  } finally {
+    await runtime.dispose();
+  }
+}, 120_000);
+
+test("ordinary Worker entry does not fetch an unheld public StaticAssetBundle URL", async () => {
+  const runtime = await entryRuntime(
+    JSON.stringify({
+      documentation: "https://docs.example.test/v2",
+      authenticationDocumentation: "https://docs.example.test/v2/authentication",
+      staticAssetBundle: { targetKey: "entry-held-only-assets-v1", heldArtifacts: [] },
+    }),
+    "artifact-entry-held-only-test",
+  );
+  try {
+    const database = await runtime.getD1Database("STATE_DB");
+    for (const migration of MIGRATIONS) {
+      for (const statement of splitMigration(migration.sql)) {
+        await database.prepare(statement).run();
+      }
+    }
+    const sql = createD1Sql(database);
+    const now = new Date().toISOString();
+    await sql.run(
+      "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
+      [ORGANIZATION, "Held-only artifact entry test", "principal-artifact-entry", now],
+    );
+    await sql.run(
+      "INSERT INTO auth_tokens (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at, revoked_at) VALUES (?, ?, 'api_key', ?, ?, ?, ?, ?, ?, NULL)",
+      [
+        await bytesDigest(new TextEncoder().encode(TOKEN)),
+        "key-artifact-held-only-entry",
+        "principal-artifact-entry",
+        ORGANIZATION,
+        "held-only-artifact-entry",
+        JSON.stringify(["resources:write"]),
+        now,
+        new Date(Date.now() + 3_600_000).toISOString(),
+      ],
+    );
+    const created = await runtime.dispatchFetch(`${BASE}/resources`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+        "idempotency-key": "artifact-entry-held-only-create-0001",
+      },
+      body: JSON.stringify({
+        form: STATIC_ASSET_BUNDLE_FORM_URL,
+        space: ORGANIZATION,
+        name: "unheld-public-url",
+        spec: {
+          artifact: {
+            url: "https://artifact-publisher.example.org/never-held/manifest.json",
+            sha256: "a".repeat(64),
+          },
+        },
+      }),
+    });
+    expect(created.status).toBe(202);
+    const accepted = (await created.json()) as { id: string };
+    const tick = await runtime.dispatchFetch(`${ORIGIN}/__test/run-scheduled`, { method: "POST" });
+    expect(tick.status).toBe(204);
+    const operation = await runtime.dispatchFetch(`${BASE}/operations/${accepted.id}`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    expect(operation.status).toBe(200);
+    expect(await operation.json()).toMatchObject({
+      status: "failed",
+      effect: "none",
+      error: { code: "artifact_unavailable" },
+    });
+    expect(await sql.query("SELECT count(*) AS count FROM tf_v2_artifact_owners")).toEqual([
+      { count: 0 },
+    ]);
+  } finally {
+    await runtime.dispose();
+  }
+}, 120_000);
+
+test("private artifact hook failures have payload-free Worker startup refusals", async () => {
+  const config = JSON.stringify({
+    documentation: "https://docs.example.test/v2",
+    authenticationDocumentation: "https://docs.example.test/v2/authentication",
+    staticAssetBundle: { targetKey: "entry-public-assets-v1", heldArtifacts: [] },
+  });
+  for (const fault of ["throw", "invalid"] as const) {
+    const runtime = await entryRuntime(config, `artifact-entry-public-fault-${fault}`, {
+      selectedSource: true,
+      hookFault: fault,
+    });
+    try {
+      const database = await runtime.getD1Database("STATE_DB");
+      for (const migration of MIGRATIONS) {
+        for (const statement of splitMigration(migration.sql)) {
+          await database.prepare(statement).run();
+        }
+      }
+      const response = await runtime.dispatchFetch(
+        `${BASE}/support?form=${encodeURIComponent(STATIC_ASSET_BUNDLE_FORM_URL)}`,
+      );
+      expect(response.status).toBe(503);
+      const body = await response.text();
+      expect(body).toContain("runtime-configuration");
+      expect(body).not.toContain("private transport credential");
+    } finally {
+      await runtime.dispose();
+    }
+  }
+}, 120_000);
+
+async function entryRuntime(
+  config: string,
+  name: string,
+  source?: {
+    readonly selectedSource: true;
+    readonly payloads?: Readonly<Record<string, string>>;
+    readonly hookFault?: string;
+  },
+): Promise<Miniflare> {
   const build = await Bun.build({
-    entrypoints: [resolve(import.meta.dir, "helpers/takoform-v2-entry-worker-miniflare.ts")],
+    entrypoints: [
+      resolve(
+        import.meta.dir,
+        source?.selectedSource
+          ? "helpers/takoform-v2-public-source-entry-worker-miniflare.ts"
+          : "helpers/takoform-v2-entry-worker-miniflare.ts",
+      ),
+    ],
     target: "browser",
     format: "esm",
   });
@@ -437,6 +644,12 @@ async function entryRuntime(config: string, name: string): Promise<Miniflare> {
             },
             TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: { type: "text", value: "A".repeat(43) },
             TAKOSERVER_TAKOFORM_V2_CONFIG: { type: "text", value: config },
+            ...(source?.payloads
+              ? { TEST_ARTIFACT_PAYLOADS: { type: "text", value: JSON.stringify(source.payloads) } }
+              : {}),
+            ...(source?.hookFault
+              ? { TEST_ARTIFACT_HOOK_FAULT: { type: "text", value: source.hookFault } }
+              : {}),
           },
           triggers: [],
         },
