@@ -1246,8 +1246,19 @@ The routine surfaces are:
   for the canonical workflow.
 - `takoserver-site`: one Pages upload and byte-exact immutable URL readback;
   production also requires byte-exact `https://takoserver.com/` readback.
-- `takoserver-console`: one Console Worker upload. Exhaustive domain state must
-  already name `takoserver-console` as owner and must be unchanged afterward.
+- `takoserver-console`: one Console Worker upload.
+  - **Production and rehearsal:** uploads `takoserver-console`. Exhaustive domain state must
+    already name it as owner and must be unchanged afterward.
+  - **Integration:** shares the Cloudflare account with production, so it uploads its own Worker
+    named by the target's `consoleOrigin`. The origin must be exactly
+    `https://takoserver-console-<label>.<account subdomain>.workers.dev`.
+  - **Refused for integration:** the production name, a custom domain, the API Worker's name, any
+    other account's subdomain, and adopting a same-named Worker this surface did not publish. All
+    are refused before upload.
+  - **Integration checks:** no domain is read or written. The Worker must end up served on
+    workers.dev with previews off.
+  - The API Worker allows that same `consoleOrigin` (CORS, session cookie and the Checkout return
+    page), so the target names it once.
 
 "Authority-sensitive Worker code" is not a hand-kept list of filenames.
 `scripts/deploy/worker-authority-paths.ts` answers it from three sources: the

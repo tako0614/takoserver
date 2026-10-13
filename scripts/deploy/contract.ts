@@ -1021,12 +1021,22 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} The scoped Console build runs once and the sealed link-free assets are ` +
-          "sent by one Worker upload whose configuration contains no route or domain mutation.",
+          "sent by one Worker upload whose configuration contains no route or domain mutation. " +
+          "Production and rehearsal upload the takoserver-console Worker served on its custom domain. " +
+          "Integration shares the account with production, so it derives its own " +
+          "takoserver-console-<label> Worker from the target's consoleOrigin, which must be exactly " +
+          "https://<that worker>.<account subdomain>.workers.dev; the production Console name, any custom " +
+          "domain, and the API Worker's name are refused before any credential or provider read.",
         "post-conditions":
-          "Exhaustive paginated domain state must name the same pre-existing Console owner before " +
-          "and after upload, and the public console.js must be byte-exact.",
+          "Production and rehearsal: exhaustive paginated domain state must name the same pre-existing " +
+          "takoserver-console owner before and after upload. Integration reads no domain at all: the " +
+          "account's workers.dev subdomain must equal the origin's before and after upload, an existing " +
+          "Worker of that name must already carry a Console publication message (a foreign Worker is " +
+          "never adopted), and the Worker must be served on workers.dev with previews off. In every " +
+          "environment the public console.js must be byte-exact.",
         reversal:
-          "The previous Console Worker version is printed; the command never changes its domain owner.",
+          "The previous Console Worker version of the selected Worker is printed; the command never " +
+          "changes a domain owner. A first integration Console has no previous version and is repaired forward.",
         "failure-handling": routineFailure + inputContract(),
       },
     },
