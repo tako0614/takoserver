@@ -104,13 +104,16 @@ export function createV2PublicHttpsArtifactSource(
       const abort = new AbortController();
       return await readV2BoundedArtifactBytes({
         open: async () => {
-          const request = new Request(url, {
+          // Keep anonymous Fetch semantics for runtimes which support credentials;
+          // Workers' RequestInit is narrower and has no cookie-jar option.
+          const anonymousRequest = {
             method: "GET",
             headers: new Headers(),
-            credentials: "omit",
-            redirect: "manual",
+            credentials: "omit" as const,
+            redirect: "manual" as const,
             signal: abort.signal,
-          });
+          };
+          const request = new Request(url, anonymousRequest);
           const response = await fetchPublic(request);
           if (
             response.status !== 200 ||
