@@ -97,6 +97,45 @@ function missingOrUnusable(
   return null;
 }
 
+function inspectPublicUrlJourney(
+  configured: string | undefined,
+  environment: Readonly<Record<string, string | undefined>>,
+  probe: NativeEvidenceProbe,
+  optIn: "TAKOSERVER_V2_PUBLIC_URL_NATIVE" | "TAKOSERVER_V2_PUBLIC_URL_FULL_NATIVE",
+): NativeEvidenceStatus {
+  if (configured === undefined || configured.trim() === "") {
+    return { state: "unconfigured", detail: `${optIn} is not configured` };
+  }
+  if (configured !== "1") return { state: "invalid", detail: `${optIn} must be exactly 1` };
+  if (environment.TAKOSERVER_V2_ENTRY_NATIVE !== "1") {
+    return { state: "invalid", detail: `${optIn} also requires TAKOSERVER_V2_ENTRY_NATIVE=1` };
+  }
+  if (optIn === "TAKOSERVER_V2_PUBLIC_URL_FULL_NATIVE") {
+    const workerd = NATIVE_EVIDENCE_CAPABILITIES.find((entry) => entry.id === "workerd-artifact");
+    if (!workerd)
+      return { state: "invalid", detail: "the pinned workerd capability is unavailable" };
+    const status = workerd.inspect(environment.TAKOSERVER_WORKERD_BINARY, environment, probe);
+    if (status.state !== "ready") {
+      return {
+        state: "invalid",
+        detail: `the full journey requires pinned workerd: ${status.detail}`,
+      };
+    }
+    const guard = environment.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY;
+    if (!guard) {
+      return { state: "invalid", detail: "the full journey requires the Workflow execution guard" };
+    }
+    const unusable = missingOrUnusable(guard, probe);
+    if (unusable) return unusable;
+  }
+  return {
+    state: "ready",
+    detail:
+      "the opt-in and bounded prerequisites are configured; only the gated journey can establish runtime evidence",
+    readinessOnly: true,
+  };
+}
+
 export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] = [
   {
     id: "workerd-artifact",
@@ -213,6 +252,39 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
         readinessOnly: true,
       };
     },
+  },
+  {
+    id: "selfhost-v2-public-url-management",
+    label: "ordinary self-host public-URL WorkerBundle management journey",
+    environment: "TAKOSERVER_V2_PUBLIC_URL_NATIVE",
+    companionEnvironment: ["TAKOSERVER_V2_ENTRY_NATIVE"],
+    proves:
+      "anonymous public DNS/TLS WorkerBundle acquisition with no held artifacts, organization-authenticated Host API create/read/update/delete, discarded create response from client custody, same-key replay after actual Host PID SIGKILL and new process on the same durable root; it does not serve an Endpoint and is not an OS reboot, Cloud runtime, or unfinished-effect orphan recovery proof",
+    enable:
+      "TAKOSERVER_V2_PUBLIC_URL_NATIVE=1 and TAKOSERVER_V2_ENTRY_NATIVE=1 with Bun, public artifact access, and isolated local test state",
+    inspect: (configured, environment, probe) =>
+      inspectPublicUrlJourney(configured, environment, probe, "TAKOSERVER_V2_PUBLIC_URL_NATIVE"),
+  },
+  {
+    id: "selfhost-v2-public-url-local-endpoint",
+    label: "ordinary self-host public-URL Worker and local Endpoint journey",
+    environment: "TAKOSERVER_V2_PUBLIC_URL_FULL_NATIVE",
+    companionEnvironment: [
+      "TAKOSERVER_V2_ENTRY_NATIVE",
+      "TAKOSERVER_WORKERD_BINARY",
+      "TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY",
+    ],
+    proves:
+      "anonymous public DNS/TLS WorkerBundle acquisition with no held artifacts, organization-authenticated Host API Worker/Version/Deployment/Endpoint create, v1-to-v2 serving through pinned workerd with local fixture TLS, actual Host PID SIGKILL and new process on the same durable root, same-key replay after a relay omits the accepted HTTP response, and reverse-reference deletion; this is not public Endpoint trust, an OS reboot, Cloud runtime, unfinished-effect orphan recovery, or TCP acknowledgement loss",
+    enable:
+      "TAKOSERVER_V2_PUBLIC_URL_FULL_NATIVE=1 and TAKOSERVER_V2_ENTRY_NATIVE=1 with Bun, public artifact access, isolated local test state, exact pinned workerd and executable Workflow guard",
+    inspect: (configured, environment, probe) =>
+      inspectPublicUrlJourney(
+        configured,
+        environment,
+        probe,
+        "TAKOSERVER_V2_PUBLIC_URL_FULL_NATIVE",
+      ),
   },
   {
     id: "queue-https-diagnostic",
