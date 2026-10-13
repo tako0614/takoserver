@@ -68,9 +68,11 @@ class ChildIdentityPersistenceError extends Error {
 }
 
 /**
- * An `onSpawned` hook reports that another process holds the listener before
- * it has persisted anything. This is temporary occupancy, not a failed
- * identity write, so automatic recovery keeps its retry pending.
+ * An `onSpawned` hook reports, before it has persisted anything, that another
+ * process holds the listener or that the child already exited without
+ * recording an identity, as one that cannot bind does. This is temporary
+ * occupancy, not a failed identity write, so automatic recovery keeps its
+ * retry pending.
  */
 export class WorkerdListenerOccupiedError extends Error {
   constructor() {
