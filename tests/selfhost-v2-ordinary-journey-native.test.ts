@@ -7,10 +7,11 @@
  * cold snapshot of the stopped root and restore it after losing the original,
  * and delete everything in reference order.
  *
- * Everything runs as real `bun src/entry-bun.ts` processes and real workerd
- * children. The only fixtures are the held artifact bytes the operator seeds
- * with `scripts/selfhost-artifact.ts` and the self-signed endpoint certificate. It is a local, loopback-only
- * proof: no public DNS/TLS trust, no Cloudflare, no host reboot.
+ * Native cases run real `bun src/entry-bun.ts` processes. Worker/Endpoint cases
+ * additionally run real workerd children with held artifact bytes and a local
+ * self-signed Endpoint certificate. The explicit public-URL opt-in instead
+ * fetches immutable Bundle bytes over public DNS/TLS, but serves no Endpoint.
+ * None of these cases proves public Endpoint trust or a host OS reboot.
  */
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
@@ -688,7 +689,7 @@ async function prepareEnvironment(): Promise<Environment> {
  * Documented first boot: an empty data root, the printed operator assertion,
  * a session, an organization and an organization API key (guide steps 1-2).
  */
-async function firstBoot(environment: Environment): Promise<{
+async function firstBoot(environment: Pick<Environment, "root" | "port">): Promise<{
   space: string;
   token: string;
   auth: Record<string, string>;
@@ -761,6 +762,148 @@ async function firstBoot(environment: Environment): Promise<{
 function endpointFixture(label: string): Uint8Array {
   return utf8(`export default { fetch() { return new Response("${label}"); } };\n`);
 }
+
+test.skipIf(OPT_IN !== "1" || process.env.TAKOSERVER_V2_PUBLIC_URL_NATIVE !== "1")(
+  "ordinary self-host journey: public WorkerBundle survives discarded create response and Host SIGKILL",
+  async () => {
+    startedHosts.length = 0;
+    const root = await mkdtemp(join(tmpdir(), "jr-public-bundle-"));
+    const port = await reservePort(new Set<number>());
+    const config = journeyConfig([], []);
+    const publisher =
+      "https://raw.githubusercontent.com/tako0614/takoserver/28c529a39b1d9117f0096910d182ab90d78299b3/tests/fixtures/v2-public-worker-bundle";
+    const v1 = {
+      url: `${publisher}/v1.json`,
+      sha256: "b5edfba17233833d2318d90d5f7831fe5981dc23822e5e79614721576d9c1d77",
+    };
+    const v2 = {
+      url: `${publisher}/v2.json`,
+      sha256: "91c2b157b13d0e9efcbafc30a71f607643dfb35614471f8b3a6deab1669b6503",
+    };
+    let host: Host | null = null;
+    let completed = false;
+    try {
+      const { space, token, auth } = await firstBoot({ root, port });
+      host = await startHost(root, port, config, {});
+      const body = {
+        form: WORKER_BUNDLE_FORM_URL,
+        space,
+        name: "public-bundle-v1",
+        spec: { artifact: v1 },
+      };
+      const headers = { ...auth, "idempotency-key": "journey-public-bundle-v1-create" };
+      // Discard the accepted response from client custody. Keep its identity
+      // only as the test oracle; make no read before killing the Host.
+      const acceptedBeforeLoss = await jsonAt(port, "POST", `${V2}/resources`, 202, body, headers);
+      const oldPid = host.child.pid;
+      await killHost(host);
+      host = null;
+      host = await startHost(root, port, config, {});
+      expect(host.child.pid).not.toBe(oldPid);
+      const replayResponse = await requestAt(port, `${V2}/resources`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      // A resumed pump may complete before the same-key replay reaches the
+      // router; Core returns 200 for terminal and 202 for pending Operations.
+      expect([200, 202]).toContain(replayResponse.status);
+      const replay = (await replayResponse.json()) as Json;
+      expect(replay.id).toBe(acceptedBeforeLoss.id);
+      expect(replay.resourceUid).toBe(acceptedBeforeLoss.resourceUid);
+      expect(await terminal(port, token, String(replay.id))).toMatchObject({ effect: "complete" });
+      const bundleV1Uid = String(replay.resourceUid);
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${bundleV1Uid}`, 200, undefined, auth),
+      ).toMatchObject({
+        generation: 1,
+        observed: {
+          manifestSha256: v1.sha256,
+          fileCount: 1,
+          files: [{ sha256: "51119092dfdf5ce76cb28ad8db9fb3792bf043972b2661304efdac1ce2e5927f" }],
+        },
+      });
+
+      // WorkerBundle 0.2.0 permits re-verification of the same artifact, but
+      // replacement bytes require a distinct Resource identity.
+      const updateHeaders = {
+        ...auth,
+        "idempotency-key": "journey-public-bundle-v1-same-artifact-update",
+        "takoform-expected-generation": "1",
+      };
+      const sameArtifact = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${bundleV1Uid}`,
+        202,
+        { spec: { artifact: v1 } },
+        updateHeaders,
+      );
+      expect(await settled(port, token, String(sameArtifact.id))).toMatchObject({
+        effect: "complete",
+      });
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${bundleV1Uid}`, 200, undefined, auth),
+      ).toMatchObject({ generation: 2, observedGeneration: 2 });
+      expect(
+        await jsonAt(
+          port,
+          "PUT",
+          `${V2}/resources/${bundleV1Uid}`,
+          422,
+          { spec: { artifact: v2 } },
+          {
+            ...auth,
+            "idempotency-key": "journey-public-bundle-v1-replacement-refused",
+            "takoform-expected-generation": "2",
+          },
+        ),
+      ).toMatchObject({ code: "invalid_spec" });
+      const second = await jsonAt(
+        port,
+        "POST",
+        `${V2}/resources`,
+        202,
+        { ...body, name: "public-bundle-v2", spec: { artifact: v2 } },
+        { ...auth, "idempotency-key": "journey-public-bundle-v2-create" },
+      );
+      expect(await settled(port, token, String(second.id))).toMatchObject({ effect: "complete" });
+      const bundleV2Uid = String(second.resourceUid);
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${bundleV2Uid}`, 200, undefined, auth),
+      ).toMatchObject({ observed: { manifestSha256: v2.sha256, fileCount: 1 } });
+
+      for (const [uid, generation, name] of [
+        [bundleV2Uid, 1, "v2"],
+        [bundleV1Uid, 2, "v1"],
+      ] as const) {
+        const deletion = await jsonAt(port, "DELETE", `${V2}/resources/${uid}`, 202, undefined, {
+          ...auth,
+          "idempotency-key": `journey-public-bundle-${name}-delete`,
+          "takoform-expected-generation": String(generation),
+        });
+        expect(await settled(port, token, String(deletion.id))).toMatchObject({
+          effect: "complete",
+        });
+        const absent = await requestAt(port, `${V2}/resources/${uid}`, { headers: auth });
+        await absent.arrayBuffer();
+        expect(absent.status).toBe(410);
+      }
+      await stopHost(host);
+      host = null;
+      completed = true;
+    } finally {
+      await stopHost(host);
+      if (completed) {
+        await removeOwnerPrivateSocketDirectories(root);
+        await rm(root, { recursive: true, force: true });
+      } else {
+        process.stderr.write(`journey: public Bundle data root retained at ${root}\n`);
+      }
+    }
+  },
+  240_000,
+);
 
 test.skipIf(OPT_IN !== "1")(
   "ordinary self-host journey: install, serve, update, SIGKILL mid-Operation, recover, cold restore, delete",
