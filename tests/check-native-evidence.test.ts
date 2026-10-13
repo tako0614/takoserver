@@ -19,6 +19,8 @@ const DOCKER_LIFECYCLE_ENV = "TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE";
 const QUEUE_HTTPS_DIAGNOSTIC_ENV = "TAKOSERVER_SELFHOST_QUEUE_HTTPS_DIAGNOSTIC_NATIVE";
 const WORKERD_PARENT_LIFETIME_ENV = "TAKOSERVER_NATIVE_WORKERD_PARENT_LIFETIME";
 const V2_ENTRY_ENV = "TAKOSERVER_V2_ENTRY_NATIVE";
+const V2_PUBLIC_URL_ENV = "TAKOSERVER_V2_PUBLIC_URL_NATIVE";
+const V2_PUBLIC_URL_FULL_ENV = "TAKOSERVER_V2_PUBLIC_URL_FULL_NATIVE";
 
 test("classifies the normal Bun v2 entry journey as readiness, not execution", () => {
   const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));
@@ -76,6 +78,66 @@ test("classifies the normal Bun v2 entry journey as readiness, not execution", (
       gates: own,
     }),
   ).toBe(1);
+});
+
+test("classifies public-URL self-host management and full local Endpoint journeys separately", () => {
+  const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));
+  const own = gates.filter(
+    (gate) => gate.file === "tests/selfhost-v2-ordinary-journey-native.test.ts",
+  );
+  const management = own.find((gate) => gate.environments.includes(V2_PUBLIC_URL_ENV));
+  const full = own.find((gate) => gate.environments.includes(V2_PUBLIC_URL_FULL_ENV));
+  expect(management).toMatchObject({
+    capability: "selfhost-v2-public-url-management",
+    environments: [V2_PUBLIC_URL_ENV, V2_ENTRY_ENV],
+  });
+  expect(full).toMatchObject({
+    capability: "selfhost-v2-public-url-local-endpoint",
+    environments: [V2_PUBLIC_URL_FULL_ENV, V2_ENTRY_ENV],
+  });
+
+  const managementCapability = NATIVE_EVIDENCE_CAPABILITIES.find(
+    (entry) => entry.id === management?.capability,
+  );
+  const fullCapability = NATIVE_EVIDENCE_CAPABILITIES.find(
+    (entry) => entry.id === full?.capability,
+  );
+  if (!managementCapability || !fullCapability) throw new Error("public-URL capability missing");
+  expect(managementCapability.inspect(undefined, {}, probe()).state).toBe("unconfigured");
+  expect(managementCapability.inspect("0", { [V2_ENTRY_ENV]: "1" }, probe()).state).toBe("invalid");
+  expect(managementCapability.inspect("1", {}, probe()).state).toBe("invalid");
+  expect(managementCapability.inspect("1", { [V2_ENTRY_ENV]: "1" }, probe())).toMatchObject({
+    state: "ready",
+    readinessOnly: true,
+  });
+  expect(managementCapability.proves).toContain("public DNS/TLS");
+  expect(managementCapability.proves).toContain("does not serve an Endpoint");
+  expect(managementCapability.proves).toContain("not an OS reboot");
+
+  expect(fullCapability.inspect(undefined, {}, probe()).state).toBe("unconfigured");
+  expect(fullCapability.inspect("1", { [V2_ENTRY_ENV]: "1" }, probe()).state).toBe("invalid");
+  expect(
+    fullCapability.inspect(
+      "1",
+      { [V2_ENTRY_ENV]: "1", TAKOSERVER_WORKERD_BINARY: "/native/workerd" },
+      probe({ digests: { "/native/workerd": WORKERD_DIGEST } }),
+    ).state,
+  ).toBe("invalid");
+  expect(
+    fullCapability.inspect(
+      "1",
+      {
+        [V2_ENTRY_ENV]: "1",
+        TAKOSERVER_WORKERD_BINARY: "/native/workerd",
+        TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY: "/native/guard",
+      },
+      probe({ digests: { "/native/workerd": WORKERD_DIGEST } }),
+    ),
+  ).toMatchObject({ state: "ready", readinessOnly: true });
+  expect(fullCapability.proves).toContain("local fixture TLS");
+  expect(fullCapability.proves).toContain(
+    "this is not public Endpoint trust, an OS reboot, Cloud runtime, unfinished-effect orphan recovery, or TCP acknowledgement loss",
+  );
 });
 
 test("classifies the opt-in Linux parent lifetime suite and rejects invalid enablement", () => {
