@@ -303,9 +303,20 @@ export async function runConsole(
       })();
     } catch (error) {
       if (error instanceof DeployError && error.phase === "verification") throw error;
+      // Keep the provider's own diagnostics (a DeployError carries them in
+      // `detail`): raw evidence, never a paraphrase.
+      const detail =
+        error instanceof Error
+          ? [
+              `${error.name}: ${error.message}`,
+              error instanceof DeployError && error.detail ? error.detail : "",
+            ]
+              .filter(Boolean)
+              .join("\n")
+          : String(error);
       throw verificationError(
         "Console post-upload verification failed after the upload was acknowledged; run --status",
-        error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+        detail,
       );
     }
     const { ownerAfter, after, readback } = verified;

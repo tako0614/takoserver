@@ -1036,7 +1036,8 @@ export const DEPLOY_CONTRACT = {
           "environment the public console.js must be byte-exact.",
         reversal:
           "The previous Console Worker version of the selected Worker is printed; the command never " +
-          "changes a domain owner. A first integration Console has no previous version and is repaired forward.",
+          "changes a domain owner. A first integration Console has no previous version; " +
+          "`wrangler delete --name takoserver-console-<label>` removes it and never touches the production Console.",
         "failure-handling": routineFailure + inputContract(),
       },
     },

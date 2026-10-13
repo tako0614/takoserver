@@ -403,7 +403,13 @@ describe("routine Takoserver Console surface: integration Console", () => {
       { accountSubdomains: [ACCOUNT_SUBDOMAIN, "moved-account"] },
       // A provider read that fails after the upload reports preflight by
       // itself; the surface must not pass that on as "nothing was touched".
-      { servedFailure: new DeployError("preflight", "subdomain state returned HTTP 500") },
+      {
+        servedFailure: new DeployError(
+          "preflight",
+          "subdomain state returned HTTP 500",
+          "cloudflare error 10013: provider detail",
+        ),
+      },
       { servedFailure: new Error("socket hang up") },
     ];
     for (const options of cases) {
@@ -423,6 +429,10 @@ describe("routine Takoserver Console surface: integration Console", () => {
         ).catch((error) => error);
         expect(failure).toBeInstanceOf(DeployError);
         expect((failure as DeployError).phase).toBe("verification");
+        if (options.servedFailure instanceof DeployError) {
+          // The provider's own diagnostics survive the re-classification.
+          expect((failure as DeployError).detail).toContain("cloudflare error 10013");
+        }
         expect(
           process.calls.filter((call) => call.includes("deploy") && call.includes("--strict")),
         ).toHaveLength(1);
