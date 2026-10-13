@@ -174,7 +174,9 @@ async function parseResponse(response: Response): Promise<unknown> {
   const bytes = await readLimited(response);
   if (!response.ok) throw new StripeBillingClientError("unavailable");
   try {
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+    return JSON.parse(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
+    ) as unknown;
   } catch {
     throw new StripeBillingClientError("unavailable");
   }
