@@ -103,6 +103,7 @@ import {
   parseSelfhostListenHost,
   SELFHOST_LISTEN_HOST_VARIABLE,
 } from "./selfhost-listen-address.ts";
+import { createSelfhostPublicArtifactSource } from "./selfhost-public-artifact-source-composition.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
 import {
@@ -1360,6 +1361,7 @@ try {
         ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
         : unconfigured),
     v2: takoformV2Config,
+    v2ArtifactSourceFactory: createSelfhostPublicArtifactSource,
     ...(v2FormFactory ? { v2FormFactory } : {}),
     ...(v2FormFactory && runtimeInputKeyAuthority
       ? { v2PrivateInputCustody: runtimeInputKeyAuthority.privateInputCustody }

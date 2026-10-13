@@ -434,11 +434,19 @@ The readiness probe goes to the listener directly; use the address in the
 
 ### 6. Seed held artifacts
 
-The artifact Forms never upload or fetch bytes. A create names an exact HTTPS
-URL and SHA-256, and the Host serves it only from bytes already in its object
-store, to the organizations that `TAKOSERVER_TAKOFORM_V2_CONFIG` grants it to.
-The Host reads those grants only at startup, so each new bundle takes the same
-three steps: stop the Host, seed the bundle, start the Host again.
+The artifact Forms never accept uploaded bytes. A create names an exact HTTPS
+URL and SHA-256. For an unheld URL, the ordinary Bun Host acquires the manifest
+and each file through anonymous public HTTPS and retains verified bytes in SQL
+custody. Every DNS answer must be globally reachable; one vetted address is
+pinned for a certificate-validated TLS GET to the original hostname. No proxy,
+redirect, retry or connection reuse is used. Public acquisition cannot reach
+private or special-purpose addresses, even after a DNS rebind.
+
+Seeding remains an option for private or operator-controlled publishers. A held
+URL is exclusive: a wrong digest or missing organization/Space grant fails,
+without public fallback. The Host reads held grants only at startup, so each
+new held bundle takes the same three steps: stop the Host, seed the bundle,
+start the Host again.
 
 `scripts/selfhost-artifact.ts seed` is that operator step. Stop the Host
 through its supervisor first. Then run the command from the checkout as the

@@ -6,6 +6,7 @@ import { bytesDigest } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { Sql } from "../src/ports.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
+import { createV2HeldOrPublicArtifactSource } from "../src/takoform-v2/forms/public-https-artifact-source.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 
 const ORIGIN = "https://api.takoserver.test";
@@ -109,6 +110,98 @@ test("normal app serves one v2 Host and dispatches a held SQLite Migration Set i
   });
   expect(resource.status).toBe(200);
   expect(await resource.json()).toMatchObject({ observed: { manifestSha256, fileCount: 1 } });
+});
+
+test("ordinary app composes public acquisition for an unheld migration set and retains custody", async () => {
+  const publicManifestUrl = "https://publisher.example.com/migrations/manifest.json";
+  const publicFileUrl = "https://publisher.example.com/migrations/0001.sql";
+  const sql = createEphemeralSql();
+  const objects = createMemoryObjectStore();
+  const accounts = createAccounts({ sql, identity });
+  const signedIn = await accounts.signIn({ provider: "google", assertion: "owner" });
+  const actor = await accounts.authenticate(`Bearer ${signedIn.sessionToken}`);
+  if (!actor) throw new Error("owner did not authenticate");
+  const organization = await accounts.createOrganization({ actor, name: "Public source owner" });
+  const key = await accounts.createApiKey({
+    actor,
+    organizationId: organization.id,
+    name: "public source writer",
+    scopes: ["resources:write"],
+    expiresInSeconds: 3_600,
+  });
+  const file = new TextEncoder().encode("CREATE TABLE retained (id INTEGER);\n");
+  const fileDigest = (await bytesDigest(file)).slice(7);
+  const manifest = new TextEncoder().encode(
+    JSON.stringify({
+      files: [
+        { path: "0001.sql", url: publicFileUrl, sha256: fileDigest, mediaType: "application/sql" },
+      ],
+    }),
+  );
+  const manifestDigest = (await bytesDigest(manifest)).slice(7);
+  const blobs = new Map([
+    [publicManifestUrl, manifest],
+    [publicFileUrl, file],
+  ]);
+  const requests: string[] = [];
+  const app = buildApp({
+    sql,
+    objects,
+    identity,
+    settlement,
+    publicOrigin: ORIGIN,
+    forms: [],
+    hostForms: [],
+    driver: new InMemoryTakoformResourceDriver(),
+    offerings: [],
+    v2: {
+      cursorSigningKey: new Uint8Array(32).fill(0x5a),
+      documentation: "https://docs.example.test/takoform-v2",
+      authenticationDocumentation: "https://docs.example.test/takoform-v2/authentication",
+      sqliteMigrationSet: { targetKey: "public-migration-target", heldArtifacts: [] },
+    },
+    v2ArtifactSourceFactory: ({ objects: sourceObjects, heldArtifacts }) =>
+      createV2HeldOrPublicArtifactSource({
+        objects: sourceObjects,
+        entries: heldArtifacts,
+        async fetchPublic(request) {
+          requests.push(request.url);
+          const found = blobs.get(request.url);
+          return found ? new Response(found) : new Response(null, { status: 404 });
+        },
+      }),
+  });
+  const created = await app.fetch(
+    new Request(`${ORIGIN}/apis/forms.takoform.com/v2/resources`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${key.secret}`,
+        "content-type": "application/json",
+        "idempotency-key": "normal-app-public-migration-create-0001",
+      },
+      body: JSON.stringify({
+        form: SQLITE_MIGRATION_SET_FORM_URL,
+        space: organization.id,
+        name: "public-migrations",
+        spec: { artifact: { url: publicManifestUrl, sha256: manifestDigest } },
+      }),
+    }),
+  );
+  expect(created.status).toBe(202);
+  const accepted = (await created.json()) as { id: string; resourceUid: string };
+  expect(await app.tickTakoformV2()).toMatchObject({ id: accepted.id, status: "succeeded" });
+  expect(requests).toEqual([publicManifestUrl, publicFileUrl]);
+  blobs.clear();
+  const resource = await app.fetch(
+    new Request(`${ORIGIN}/apis/forms.takoform.com/v2/resources/${accepted.resourceUid}`, {
+      headers: { authorization: `Bearer ${key.secret}` },
+    }),
+  );
+  expect(resource.status).toBe(200);
+  expect(await resource.json()).toMatchObject({
+    observed: { manifestSha256: manifestDigest, fileCount: 1 },
+  });
+  expect(requests).toHaveLength(2);
 });
 
 test("v2 executor failure does not prevent the independent legacy repair tick", async () => {

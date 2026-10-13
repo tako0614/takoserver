@@ -187,15 +187,15 @@ lowercase hex `sha256`, `objectKey`, and explicit `grants: [{ principal, space }
 For ordinary organization use those grants name `org:<organizationId>` and that
 exact organization ID. Seed each exact manifest and payload byte sequence in the
 Host's object store through operator-owned tooling before relying on those
-grants. The API does not upload artifacts and never fetches their URLs. An
-explicit empty list denies new acquisition while preserving the ability to
-manage existing custody; omitting a Form block instead removes that
-implementation. Do not remove an implementation with unresolved Resources or
-Operations.
+grants. The API does not upload artifacts or fetch during request acceptance;
+the asynchronous executor acquires source bytes. In the ordinary Bun entry an
+empty list means no held URLs, so eligible public HTTPS URLs can still be
+acquired. An entry without a code-selected public transport remains held-only.
+Omitting a Form block removes that implementation. Do not remove one with
+unresolved Resources or Operations.
 
-To explicitly compose the WorkerBundle Form while denying all new artifact
-acquisition, include an empty `heldArtifacts` list (this does not create or
-execute a Worker):
+To compose WorkerBundle with no held artifacts, include an empty
+`heldArtifacts` list (this does not create or execute a Worker):
 
 ```json
 {
@@ -208,8 +208,8 @@ execute a Worker):
 }
 ```
 
-To compose StaticAssetBundle while denying all new artifact acquisition, use
-its own independent block (this does not serve or publish the asset bytes):
+To compose StaticAssetBundle with no held artifacts, use its own independent
+block (this does not serve or publish the asset bytes):
 
 ```json
 {
@@ -381,12 +381,17 @@ place; the SDK gap requires an owning successor contract decision.
 An artifact-only Form such as
 [`SQLiteMigrationSet 0.2.0`](https://edge.forms.takoform.com/forms/SQLiteMigrationSet/0.2.0/)
 can form a smaller first real-resource journey without requiring a Worker
-runtime. Its implementation uses the Form's Host-held artifact acquisition
-option: an operator explicitly maps an exact URL and digest to an existing
-object and grants access to an exact principal/Space pair. A digest match alone
-never grants access. The resolver does not fetch arbitrary URLs or reuse v1
-artifact holds, and stops at finite time and actual-byte limits. Outbound public
-HTTPS acquisition is not implemented by this resolver.
+runtime. The ordinary Bun self-host entry can acquire an exact manifest and
+files from anonymous public HTTPS, or from a Host-held artifact: an operator
+explicitly maps an exact URL and digest to an existing object and grants access
+to an exact principal/Space pair. A digest match alone never grants held access.
+A held URL remains exclusive even when its digest or grant does not match; it
+never falls back to public HTTPS. Public acquisition requires wholly public DNS
+answers on every request, one pinned IP, validated TLS for the original host,
+and a non-pooled GET without redirects, credentials or retry. The shared bounded
+reader imposes a whole-read deadline, actual-byte ceiling and SHA-256 check.
+Private, special-purpose and ambiguous DNS answers fail closed. Neither path
+reuses v1 artifact holds.
 
 The migration-set backend verifies the manifest and files, then keeps its own
 Resource-scoped bytes in SQL custody. The accepted Operation and current lease
