@@ -59,6 +59,8 @@ const SCHEDULES = ["*/5 * * * *"] as const;
 const EXPECTED_BOOTSTRAP_TEST_COMMAND = [
   "bun",
   "test",
+  "--timeout",
+  "60000",
   "tests/deploy-integration-worker-bootstrap.test.ts",
   "tests/deploy-integration-storage-generation.test.ts",
   "tests/deploy-signing.test.ts",
