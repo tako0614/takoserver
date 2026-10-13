@@ -174,8 +174,16 @@ respect:
   lineage, under the same conditions.
 
 The procedure in the next section is written for `v2-0091` and applies to
-either profile. Pass `--fresh-lineage=v2-0092` instead, and expect
-`complete-0092` where it says `complete-0091`.
+either profile. For `v2-0092`, read it with these substitutions:
+
+- Pass `--fresh-lineage=v2-0092`.
+- Expect the digest above instead of the 0091 digest.
+- Expect `appliedMigrations` with 92 entries, ending in
+  `0092_org_wallet_lifecycle.sql`.
+- Expect `schemaReadback: complete-0092`.
+- Set `takoformV2.storageLineage: "v2-0092"` on the serving target.
+- Bootstrap and the routine Worker then accept exactly the 0001–0092 ledger.
+  `billingConfig` and `stripeWebhook` are both publishable on such a D1.
 
 #### Staging D1 through 0091 (staging-only `v2-0091`)
 

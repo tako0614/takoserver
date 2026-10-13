@@ -365,6 +365,11 @@ describe("staging-only v2-0091 and v2-0092 D1 profiles", () => {
     expect(() => readSealedFreshIntegrationV2MigrationArtifact0092(missing)).toThrow(
       "exactly 0001-0092",
     );
+    const drifted = join(ROOT, "drifted-0092");
+    seal(drifted);
+    const tail = join(drifted, "0092_org_wallet_lifecycle.sql");
+    writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- drift\n`);
+    expect(() => readSealedFreshIntegrationV2MigrationArtifact0092(drifted)).toThrow();
   });
 
   test("applying v2-0092 without the production target is refused before any provider call", async () => {

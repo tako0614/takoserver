@@ -107,10 +107,7 @@ const INTEGRATION_FRESH_LINEAGES: readonly IntegrationFreshLineage[] = [
 ];
 
 /** Profiles no production surface offers; their apply requires the production target. */
-export const STAGING_ONLY_LINEAGES: ReadonlySet<IntegrationFreshLineage> = new Set([
-  "v2-0091",
-  "v2-0092",
-]);
+const STAGING_ONLY_LINEAGES: ReadonlySet<IntegrationFreshLineage> = new Set(["v2-0091", "v2-0092"]);
 
 /** The exact production D1 a staging generation must never be. */
 export interface ProductionD1Identity {
@@ -246,7 +243,7 @@ export interface IntegrationStorageGenerationOptions {
     },
   ) => Promise<D1SchemaState>;
   readonly wranglerCommand?: (args: readonly string[]) => readonly string[];
-  /** Test seam for the fresh v2-0088/0089/0091 empty-data proof; deploy uses remote D1. */
+  /** Test seam for the fresh v2-0088/0089/0091/0092 empty-data proof; deploy uses remote D1. */
   readonly freshV2DataReader?: FreshV2DataReader;
   /**
    * The production target's D1, read from `TAKOSERVER_DEPLOY_TARGET_PRODUCTION`.
