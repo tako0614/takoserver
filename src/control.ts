@@ -616,7 +616,9 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       if (request.method === "GET" && lots) {
         const organizationId = segment(lots[1]);
         await scoped(request, organizationId, "wallet:read");
-        return Response.json({ lots: await options.billing.lots(organizationId) });
+        const limit = billingPageSize(url);
+        const cursor = billingCursor(url);
+        return Response.json(await options.billing.lots(organizationId, limit, cursor));
       }
 
       const hold = /^\/v1\/organizations\/([^/]+)\/wallet\/holds\/([^/]+)$/u.exec(url.pathname);
@@ -685,8 +687,8 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       if (usageRecords && request.method === "GET") {
         const organizationId = segment(usageRecords[1]);
         await scoped(request, organizationId, "usage:read");
-        const limit = billingUsagePageSize(url);
-        const cursor = billingUsageCursor(url);
+        const limit = billingPageSize(url);
+        const cursor = billingCursor(url);
         return Response.json(await options.billing.listUsage(organizationId, limit, cursor));
       }
       if (usageRecords && request.method === "POST") {
@@ -1451,7 +1453,7 @@ function pageSize(url: URL): number {
 }
 
 /** Preserve billing's stricter ceiling so the service can reject values above 100. */
-function billingUsagePageSize(url: URL): number | undefined {
+function billingPageSize(url: URL): number | undefined {
   const values = url.searchParams.getAll("limit");
   if (values.length === 0) return undefined;
   if (values.length !== 1 || !/^(?:0|[1-9][0-9]*)$/u.test(values[0] ?? "")) {
@@ -1463,7 +1465,7 @@ function billingUsagePageSize(url: URL): number | undefined {
 }
 
 /** The cursor stays opaque to the route and is bounded before reaching storage. */
-function billingUsageCursor(url: URL): string | undefined {
+function billingCursor(url: URL): string | undefined {
   const values = url.searchParams.getAll("cursor");
   if (values.length === 0) return undefined;
   const cursor = values[0];

@@ -1,4 +1,24 @@
 -- Additive lifecycle; existing wallet history and credit lots stay intact.
+-- Stable opaque pagination handles cover arbitrarily long legacy references
+-- without publishing SQLite rowids or counters shared across Organizations.
+ALTER TABLE wallet_credit_lots ADD COLUMN cursor_handle TEXT
+  CHECK (cursor_handle IS NULL OR
+    (length(cursor_handle) = 32 AND cursor_handle NOT GLOB '*[^0-9a-f]*'));
+UPDATE wallet_credit_lots SET cursor_handle = lower(hex(randomblob(16)));
+CREATE UNIQUE INDEX wallet_credit_lots_cursor
+  ON wallet_credit_lots (org_id, cursor_handle);
+CREATE TRIGGER wallet_credit_lots_cursor_insert AFTER INSERT ON wallet_credit_lots
+WHEN NEW.cursor_handle IS NULL
+BEGIN
+  UPDATE wallet_credit_lots SET cursor_handle = lower(hex(randomblob(16)))
+    WHERE org_id = NEW.org_id AND ref = NEW.ref;
+END;
+CREATE TRIGGER wallet_credit_lots_cursor_immutable BEFORE UPDATE OF cursor_handle ON wallet_credit_lots
+WHEN OLD.cursor_handle IS NOT NULL AND NEW.cursor_handle IS NOT OLD.cursor_handle
+BEGIN
+  SELECT RAISE(ABORT, 'wallet lot cursor is immutable');
+END;
+
 CREATE TABLE org_wallet_holds (
   org_id TEXT NOT NULL,
   ref TEXT NOT NULL,

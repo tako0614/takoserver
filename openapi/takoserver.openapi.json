@@ -447,8 +447,7 @@
                     },
                     "reference": {
                       "type": "string",
-                      "minLength": 1,
-                      "maxLength": 256
+                      "minLength": 1
                     },
                     "settledDeltaMinor": {
                       "type": "integer"
@@ -469,7 +468,8 @@
       "WalletLotsResponse": {
         "type": "object",
         "required": [
-          "lots"
+          "lots",
+          "cursor"
         ],
         "additionalProperties": false,
         "properties": {
@@ -492,8 +492,7 @@
               "properties": {
                 "reference": {
                   "type": "string",
-                  "minLength": 1,
-                  "maxLength": 256
+                  "minLength": 1
                 },
                 "kind": {
                   "type": "string",
@@ -533,6 +532,18 @@
                 }
               }
             }
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -3607,7 +3618,7 @@
     },
     "/v1/organizations/{organizationId}/wallet/lots": {
       "get": {
-        "summary": "List current credit lots and their expiry allocation",
+        "summary": "List Organization credit lots with expiry allocation",
         "responses": {
           "200": {
             "description": "Organization credit lots",
@@ -3615,6 +3626,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/WalletLotsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed page size or unknown cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -3659,6 +3680,28 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 128
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 100
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "description": "Opaque continuation cursor returned by the previous page."
             }
           }
         ],

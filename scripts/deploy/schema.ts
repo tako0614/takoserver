@@ -360,7 +360,7 @@ const AUDITED_MIGRATION_SHA256: Readonly<
   "0091_stripe_events.sql":
     "sha256:e32149261d1025e4fa375c944fb4299ab3bc140fade37832f8e0d3a394f96b6e",
   "0092_org_wallet_lifecycle.sql":
-    "sha256:d5ab03f2cc8cc08c79fd393165d41b1cc422053ef64ea231bb96160f68d4343b",
+    "sha256:315fb662a48c013ed3299fb6f23e648e03bda5f4cabc0d03dcaf8777d048712f",
 };
 // 0067-0092 are part of the exact source inventory only. None has an in-place apply wave.
 const INTEGRATION_APPLY_CEILING_COUNT = 66;

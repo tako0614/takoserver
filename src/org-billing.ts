@@ -5,7 +5,7 @@ import {
   parseBillingConfig,
   roundMicrosToMinor,
 } from "./billing-config.ts";
-import { base64UrlDecode, base64UrlEncode, canonicalJson } from "./json.ts";
+import { base64UrlDecode, base64UrlEncode, bytesDigest, canonicalJson } from "./json.ts";
 import { type Ledger, LedgerError, prepareLedgerAllocation, type Wallet } from "./ledger.ts";
 import { type Clock, type Row, type Sql, SqlError, type SqlStatement } from "./ports.ts";
 
@@ -95,9 +95,14 @@ export interface UsagePage {
   readonly cursor: string | null;
 }
 
+export interface LotPage {
+  readonly lots: readonly CreditLot[];
+  readonly cursor: string | null;
+}
+
 export interface OrgBilling {
   wallet(organizationId: string): Promise<Wallet>;
-  lots(organizationId: string): Promise<readonly CreditLot[]>;
+  lots(organizationId: string, limit?: number, cursor?: string): Promise<LotPage>;
   hold(input: HoldInput): Promise<HoldReceipt>;
   readHold(organizationId: string, reference: string): Promise<HoldReceipt>;
   capture(input: CaptureInput): Promise<HoldReceipt>;
@@ -117,6 +122,10 @@ export async function assertOrgBillingSchema(
     "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('org_wallet_holds', 'org_wallet_usage_records', 'org_wallet_grant_snapshots', 'org_wallet_pricing_revisions', 'org_wallet_monthly_tariffs')",
   );
   if (rows.length !== 5) throw new OrgBillingError("billing_schema_not_ready", 503);
+  const cursorObjects = await sql.query(
+    "SELECT name FROM sqlite_schema WHERE (type = 'index' AND name = 'wallet_credit_lots_cursor') OR (type = 'trigger' AND name IN ('wallet_credit_lots_cursor_insert', 'wallet_credit_lots_cursor_immutable'))",
+  );
+  if (cursorObjects.length !== 3) throw new OrgBillingError("billing_schema_not_ready", 503);
   if (config) await registerTariffs(sql, config, clock().toISOString());
 }
 
@@ -378,18 +387,58 @@ export function createOrgBilling(options: {
       await prepare(org);
       return ledger.wallet(org);
     },
-    async lots(org) {
+    async lots(org, limit = 100, cursor) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+        orgBillingFail("invalid_limit", 400);
+      let after: Row | undefined;
+      if (cursor !== undefined) {
+        if (!/^[a-f0-9]{32}$/u.test(cursor)) orgBillingFail("invalid_cursor", 400);
+        // A random stable handle supports arbitrarily long pre-existing refs.
+        // Resolve only in this Organization; the cursor never grants access.
+        after = (
+          await sql.query(
+            "SELECT ref, expires_at, created_at FROM wallet_credit_lots WHERE org_id = ? AND cursor_handle = ?",
+            [org, cursor],
+          )
+        )[0];
+        if (!after) orgBillingFail("invalid_cursor", 400);
+      }
       await prepare(org);
+      const nullableRank = after?.expires_at == null ? 1 : 0;
+      const boundary = after
+        ? `AND (
+        CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END > ? OR
+        (CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END = ? AND
+         (COALESCE(expires_at, '') > ? OR
+          (COALESCE(expires_at, '') = ? AND
+           (created_at > ? OR (created_at = ? AND ref > ?))))))`
+        : "";
       const rows = await sql.query(
         `SELECT l.*,
           COALESCE(SUM(CASE WHEN a.debit_type = 'hold' THEN a.amount_minor ELSE 0 END), 0) AS held_minor,
           COALESCE(SUM(CASE WHEN a.debit_type IN ('capture', 'usage_debit') THEN a.amount_minor ELSE 0 END), 0) AS spent_minor
-         FROM wallet_credit_lots l LEFT JOIN wallet_credit_allocations a ON a.org_id = l.org_id AND a.lot_ref = l.ref
-         WHERE l.org_id = ? GROUP BY l.org_id, l.ref
+         FROM (SELECT * FROM wallet_credit_lots WHERE org_id = ? ${boundary}
+           ORDER BY CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END, expires_at, created_at, ref LIMIT ?) l
+         LEFT JOIN wallet_credit_allocations a ON a.org_id = l.org_id AND a.lot_ref = l.ref
+         GROUP BY l.org_id, l.ref
          ORDER BY CASE WHEN l.expires_at IS NULL THEN 1 ELSE 0 END, l.expires_at, l.created_at, l.ref`,
-        [org],
+        after
+          ? [
+              org,
+              nullableRank,
+              nullableRank,
+              String(after.expires_at ?? ""),
+              String(after.expires_at ?? ""),
+              String(after.created_at),
+              String(after.created_at),
+              String(after.ref),
+              limit + 1,
+            ]
+          : [org, limit + 1],
       );
-      return rows.map((row) => {
+      const page = rows.slice(0, limit);
+      const last = page.at(-1);
+      const lots = page.map((row) => {
         const amountMinor = Number(row.amount_minor);
         const spentMinor = Number(row.spent_minor);
         const heldMinor = Number(row.held_minor);
@@ -409,6 +458,10 @@ export function createOrgBilling(options: {
           createdAt: String(row.created_at),
         };
       });
+      return {
+        lots,
+        cursor: rows.length > limit && last ? String(last.cursor_handle) : null,
+      };
     },
     async hold(input) {
       reference(input.reference);

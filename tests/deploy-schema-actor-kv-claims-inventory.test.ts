@@ -52,7 +52,7 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
   });
   expect(source.files.at(-1)).toMatchObject({
     name: CURRENT_SOURCE_TAIL,
-    digest: "sha256:d5ab03f2cc8cc08c79fd393165d41b1cc422053ef64ea231bb96160f68d4343b",
+    digest: "sha256:315fb662a48c013ed3299fb6f23e648e03bda5f4cabc0d03dcaf8777d048712f",
   });
   expect(source.files.at(-2)).toMatchObject({
     name: "0091_stripe_events.sql",

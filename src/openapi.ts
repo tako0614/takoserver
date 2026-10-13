@@ -533,9 +533,28 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       "503": errorResponse("Wallet state is unavailable"),
     },
   }),
-  listWalletLots: described("List current credit lots and their expiry allocation", {
+  listWalletLots: described("List Organization credit lots with expiry allocation", {
     "x-required-scopes": ["wallet:read"],
-    parameters: [ORGANIZATION_ID_PARAMETER],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      {
+        name: "limit",
+        in: "query",
+        required: false,
+        schema: { type: "integer", minimum: 1, maximum: 100, default: 100 },
+      },
+      {
+        name: "cursor",
+        in: "query",
+        required: false,
+        schema: {
+          type: "string",
+          minLength: 1,
+          maxLength: 512,
+          description: "Opaque continuation cursor returned by the previous page.",
+        },
+      },
+    ],
     responses: {
       "200": {
         description: "Organization credit lots",
@@ -545,6 +564,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       },
       "401": errorResponse("Authentication required"),
       "403": errorResponse("The key lacks wallet:read or belongs to another Organization"),
+      "400": errorResponse("Malformed page size or unknown cursor"),
       "503": errorResponse("Credit lot state is unavailable"),
     },
   }),
@@ -1107,7 +1127,7 @@ export const openApiDocument = {
                       type: "string",
                       enum: ["funding", "hold", "capture", "release", "usage_debit"],
                     },
-                    reference: { type: "string", minLength: 1, maxLength: 256 },
+                    reference: { type: "string", minLength: 1 },
                     settledDeltaMinor: { type: "integer" },
                     heldDeltaMinor: { type: "integer" },
                     createdAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
@@ -1120,7 +1140,7 @@ export const openApiDocument = {
       },
       WalletLotsResponse: {
         type: "object",
-        required: ["lots"],
+        required: ["lots", "cursor"],
         additionalProperties: false,
         properties: {
           lots: {
@@ -1140,7 +1160,7 @@ export const openApiDocument = {
               ],
               additionalProperties: false,
               properties: {
-                reference: { type: "string", minLength: 1, maxLength: 256 },
+                reference: { type: "string", minLength: 1 },
                 kind: { type: "string", enum: ["direct", "plan-included", "purchased"] },
                 amountMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
                 spentMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
@@ -1154,6 +1174,7 @@ export const openApiDocument = {
               },
             },
           },
+          cursor: { anyOf: [{ type: "string", minLength: 1, maxLength: 512 }, { type: "null" }] },
         },
       },
       WalletHoldResponse: {

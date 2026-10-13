@@ -230,7 +230,7 @@ describe("Organization wallet lifecycle", () => {
       heldMinor: 0,
       availableMinor: 0,
     });
-    expect(await f.billing.lots("org_a")).toMatchObject([
+    expect((await f.billing.lots("org_a")).lots).toMatchObject([
       { reference: "included", spentMinor: 4, remainingMinor: 6, heldMinor: 0, availableMinor: 0 },
     ]);
   });
@@ -361,7 +361,7 @@ describe("monthly grants and frozen usage tariffs", () => {
     expect(await revised.wallet("org_a")).toMatchObject({ availableMinor: 10 });
     f.setTime("2026-11-01T00:00:00.000Z");
     expect(await revised.wallet("org_a")).toMatchObject({ availableMinor: 20 });
-    expect((await revised.lots("org_a")).map((l) => l.reference)).toEqual([
+    expect((await revised.lots("org_a")).lots.map((l) => l.reference)).toEqual([
       "free:org_a:2026-10",
       "free:org_a:2026-11",
     ]);
@@ -539,11 +539,32 @@ test("funded 0091 history migrates forward without rewriting wallet money", asyn
   });
   await ledger.hold({ organizationId: "org_a", reference: "legacy-hold", amountMinor: 30 });
   const before = await ledger.wallet("org_a");
+  const oldLots = await sql.query(
+    "SELECT org_id, ref, kind, amount_minor, expires_at, created_at FROM wallet_credit_lots",
+  );
+  const oldAllocations = await sql.query("SELECT * FROM wallet_credit_allocations");
+  const oldLedger = await sql.query("SELECT * FROM ledger");
   const migration = MIGRATIONS.find((m) => m.name.startsWith("0092"));
   if (!migration) throw new Error("missing 0092");
   database.exec(migration.sql);
   await assertOrgBillingSchema(sql, config());
   expect(await ledger.wallet("org_a")).toEqual(before);
+  expect(
+    await sql.query(
+      "SELECT org_id, ref, kind, amount_minor, expires_at, created_at FROM wallet_credit_lots",
+    ),
+  ).toEqual(oldLots);
+  expect(await sql.query("SELECT * FROM wallet_credit_allocations")).toEqual(oldAllocations);
+  expect(await sql.query("SELECT * FROM ledger")).toEqual(oldLedger);
+  const cursor = (await sql.query("SELECT cursor_handle FROM wallet_credit_lots"))[0]
+    ?.cursor_handle;
+  expect(cursor).toMatch(/^[a-f0-9]{32}$/u);
+  expect(() => database.exec("UPDATE wallet_credit_lots SET cursor_handle = NULL")).toThrow(
+    "wallet lot cursor is immutable",
+  );
+  expect((await sql.query("SELECT cursor_handle FROM wallet_credit_lots"))[0]?.cursor_handle).toBe(
+    cursor,
+  );
   expect(await sql.query("SELECT amount_minor FROM wallet_credit_lots")).toEqual([
     { amount_minor: 100 },
   ]);
@@ -653,4 +674,49 @@ test("byte-hour pricing follows the configured unit without a customer product m
     "invalid_quantity",
     400,
   );
+});
+
+test("lot cursor bounds expiry-ordered pages with tied timestamps and opaque legacy refs", async () => {
+  const f = fixture();
+  const refs = ["legacy/" + "x".repeat(20000), "b", "c", "purchased"];
+  for (const fundingRef of refs)
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef,
+      amountMinor: 10,
+      ...(fundingRef === "purchased"
+        ? { kind: "purchased" as const }
+        : { kind: "plan-included" as const, expiresAt: "2026-10-14T00:00:00.000Z" }),
+    });
+  await f.ledger.fund({ organizationId: "org_other", fundingRef: "other", amountMinor: 10 });
+  const first = await f.billing.lots("org_a", 2);
+  expect(first.lots.map((l) => l.reference)).toEqual(["b", "c"]);
+  expect(first.cursor).not.toBeNull();
+  const second = await f.billing.lots("org_a", 2, first.cursor ?? undefined);
+  expect(second.lots.map((l) => l.reference)).toEqual([refs[0], "purchased"]);
+  expect(second.cursor).toBeNull();
+  const legacy = await f.billing.lots("org_a", 1, first.cursor ?? undefined);
+  expect(legacy.lots[0]?.reference).toBe(refs[0]);
+  expect(legacy.cursor).toMatch(/^[a-f0-9]{32}$/u);
+  expect((await f.billing.lots("org_a", 1, legacy.cursor ?? undefined)).lots[0]?.reference).toBe(
+    "purchased",
+  );
+  await errorCode(f.billing.lots("org_other", 2, first.cursor ?? undefined), "invalid_cursor", 400);
+  await errorCode(f.billing.lots("org_a", 101), "invalid_limit", 400);
+  await errorCode(f.billing.lots("org_a", 1, "bad"), "invalid_cursor", 400);
+  await errorCode(f.billing.lots("org_a", 1, "f".repeat(32)), "invalid_cursor", 400);
+  const handles = await f.sql.query("SELECT cursor_handle FROM wallet_credit_lots");
+  expect(new Set(handles.map((row) => row.cursor_handle)).size).toBe(5);
+  expect(
+    handles.every(
+      (row) => typeof row.cursor_handle === "string" && /^[a-f0-9]{32}$/u.test(row.cursor_handle),
+    ),
+  ).toBe(true);
+});
+
+test("billing startup refuses missing lot cursor migration objects", async () => {
+  const f = fixture();
+  await assertOrgBillingSchema(f.sql);
+  await f.sql.run("DROP TRIGGER wallet_credit_lots_cursor_insert");
+  await errorCode(assertOrgBillingSchema(f.sql), "billing_schema_not_ready", 503);
 });

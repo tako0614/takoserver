@@ -32,7 +32,7 @@ neither read access nor funding, owner administration, or another write scope.
 | Method and suffix | Required scope | Result |
 | --- | --- | --- |
 | `GET /wallet` | `wallet:read` | Current USD wallet; lazily expires public holds when billing is enabled |
-| `GET /wallet/lots` | `wallet:read` | Lots in expiry consumption order with separate spent/remaining/held/available amounts |
+| `GET /wallet/lots` | `wallet:read` | Cursor-paged lots in expiry consumption order with separate spent/remaining/held/available amounts |
 | `POST /wallet/holds` | `wallet:write` | Durable admission receipt; final integer `amountMinor`, original tariff revision and measurement fingerprint |
 | `GET /wallet/holds/{reference}` | `wallet:read` | Original amount, deadline and terminal receipt |
 | `POST /wallet/holds/{reference}/capture` | `wallet:write` | Final cents, full `actualMicros` and immutable measurement fingerprint; capture and remainder release commit together |
@@ -47,6 +47,14 @@ and usage submission return 201, including exact replay; terminal hold operation
 return 200. Lookup never grants access through possession of a reference. Usage listing
 returns `usageRecords` and a nullable opaque `cursor`; pass `limit` and `cursor`
 on the next GET to traverse older receipts without duplicating equal timestamps.
+Lot listing likewise returns `lots` and `cursor`, in expiry consumption order,
+with `limit` from 1 to 100. Continuations are Organization-bound, retain tied
+expiry/timestamp rows, and accept pre-existing opaque funding references. A
+missing or replaced cursor position is refused with 400 instead of silently
+skipping credit. Allocations are aggregated for only the bounded page of lots.
+Migration 0092 assigns stable random handles to existing and future lots. These
+handles expose neither internal row counters nor Organization identifiers;
+pagination itself never updates them.
 
 A capture must equal `min(round(actualMicros), originalHoldMinor)`. Rounded
 actual above the hold is retained in the fingerprint and receipt without a

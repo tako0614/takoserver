@@ -30,10 +30,13 @@ function fixture() {
         entries: [],
       };
     },
-    async lots(organizationId: string) {
-      seen.push(`lots:${organizationId}`);
+    async lots(organizationId: string, limit?: number, cursor?: string) {
+      seen.push(`lots:${organizationId}:${limit}:${cursor ?? ""}`);
       if (nextError) throw nextError;
-      return [];
+      if (limit !== undefined && limit > 100) throw new OrgBillingError("invalid_limit", 400);
+      return cursor === "next"
+        ? { lots: [{ reference: "lot-2" }], cursor: null }
+        : { lots: [{ reference: "lot-1" }], cursor: "next" };
     },
     async hold(input: { reference: string; amountMinor: number }) {
       seen.push(`hold:${input.reference}:${input.amountMinor}`);
@@ -145,6 +148,9 @@ test("Organization and exact scopes are checked before hold body parsing or look
 test("wallet and usage write scopes do not grant read access", async () => {
   const { request, seen } = fixture();
   expect((await request(`/v1/organizations/${ORG}/wallet`, "writer")).status).toBe(403);
+  expect((await request(`/v1/organizations/${ORG}/wallet/lots?limit=bad`, "wrongOrg")).status).toBe(
+    403,
+  );
   expect((await request(`/v1/organizations/${ORG}/wallet/holds/ref-1`, "writer")).status).toBe(403);
   expect(
     (await request(`/v1/organizations/${ORG}/wallet/usage-records`, "usageWriter")).status,
@@ -254,20 +260,71 @@ test("usage quantity is passed as canonical decimal text and API scope schemas a
   const schemas = openApiDocument.components.schemas as Record<string, unknown>;
   expect(schemas.CreateWalletHoldRequest).toBeDefined();
   expect(schemas.WalletHoldReceipt).toBeDefined();
+  expect(schemas.WalletLotsResponse).toBeDefined();
   expect(schemas.CreateWalletUsageRecordRequest).toBeDefined();
   expect(schemas.WalletUsageReceipt).toBeDefined();
-  const lot = (
-    schemas.WalletLotsResponse as {
-      properties: { lots: { items: { required: string[]; properties: Record<string, unknown> } } };
-    }
-  ).properties.lots.items;
+  const lotsResponse = schemas.WalletLotsResponse as {
+    required: string[];
+    properties: {
+      lots: { items: { required: string[]; properties: Record<string, unknown> } };
+      cursor: unknown;
+    };
+  };
+  expect(lotsResponse.required).toContain("cursor");
+  expect(lotsResponse.properties.cursor).toBeDefined();
+  const lot = lotsResponse.properties.lots.items;
   expect(lot.required).toContain("remainingMinor");
   expect(lot.required).toContain("availableMinor");
   expect(lot.properties).not.toHaveProperty("allocatedMinor");
+  expect(lot.properties.reference).toEqual({ type: "string", minLength: 1 });
+  const wallet = schemas.WalletResponse as {
+    properties: {
+      wallet: {
+        properties: {
+          entries: { items: { properties: { reference: Record<string, unknown> } } };
+        };
+      };
+    };
+  };
+  expect(wallet.properties.wallet.properties.entries.items.properties.reference).toEqual({
+    type: "string",
+    minLength: 1,
+  });
   expect(
     (schemas.WalletUsageReceipt as { properties: { meter: { maxLength: number } } }).properties
       .meter.maxLength,
   ).toBe(128);
+});
+
+test("wallet lot pagination forwards opaque cursors and returns distinct pages", async () => {
+  const { request, seen } = fixture();
+  const firstResponse = await request(`/v1/organizations/${ORG}/wallet/lots?limit=1`, "reader");
+  expect(firstResponse.status).toBe(200);
+  const first = (await firstResponse.json()) as {
+    lots: { reference: string }[];
+    cursor: string | null;
+  };
+  expect(first).toEqual({ lots: [{ reference: "lot-1" }], cursor: "next" });
+
+  const secondResponse = await request(
+    `/v1/organizations/${ORG}/wallet/lots?limit=1&cursor=${first.cursor}`,
+    "reader",
+  );
+  expect(secondResponse.status).toBe(200);
+  const second = (await secondResponse.json()) as {
+    lots: { reference: string }[];
+    cursor: string | null;
+  };
+  expect(second).toEqual({ lots: [{ reference: "lot-2" }], cursor: null });
+  expect(new Set([...first.lots, ...second.lots].map((lot) => lot.reference)).size).toBe(2);
+  expect(seen).toEqual([`lots:${ORG}:1:`, `lots:${ORG}:1:next`]);
+});
+
+test("wallet lot route does not clamp a limit above the service ceiling", async () => {
+  const { request, seen } = fixture();
+  const response = await request(`/v1/organizations/${ORG}/wallet/lots?limit=101`, "reader");
+  expect(response.status).toBe(400);
+  expect(seen).toEqual([`lots:${ORG}:101:`]);
 });
 
 test("usage pagination forwards the opaque cursor and returns a non-overlapping next page", async () => {
