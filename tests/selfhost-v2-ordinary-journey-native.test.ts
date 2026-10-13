@@ -9,14 +9,16 @@
  *
  * Native cases run real `bun src/entry-bun.ts` processes. Worker/Endpoint cases
  * additionally run real workerd children with held artifact bytes and a local
- * self-signed Endpoint certificate. The explicit public-URL opt-in instead
- * fetches immutable Bundle bytes over public DNS/TLS, but serves no Endpoint.
- * None of these cases proves public Endpoint trust or a host OS reboot.
+ * self-signed Endpoint certificate. Public-URL opt-ins fetch immutable Bundle
+ * bytes over public DNS/TLS; the management case has no Endpoint, while the
+ * full case serves one with only local fixture TLS. None proves public Endpoint
+ * trust or a host OS reboot.
  */
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -903,6 +905,284 @@ test.skipIf(OPT_IN !== "1" || process.env.TAKOSERVER_V2_PUBLIC_URL_NATIVE !== "1
     }
   },
   240_000,
+);
+
+test.skipIf(OPT_IN !== "1" || process.env.TAKOSERVER_V2_PUBLIC_URL_FULL_NATIVE !== "1")(
+  "ordinary self-host journey: public URL Worker survives dropped create response and Host SIGKILL",
+  async () => {
+    startedHosts.length = 0;
+    const environment = await prepareEnvironment();
+    const { root, port, certificate, fullBoot } = environment;
+    const config = journeyConfig([], []);
+    const publisher =
+      "https://raw.githubusercontent.com/tako0614/takoserver/28c529a39b1d9117f0096910d182ab90d78299b3/tests/fixtures/v2-public-worker-bundle";
+    const v1 = {
+      url: `${publisher}/v1.json`,
+      sha256: "b5edfba17233833d2318d90d5f7831fe5981dc23822e5e79614721576d9c1d77",
+    };
+    const v2 = {
+      url: `${publisher}/v2.json`,
+      sha256: "91c2b157b13d0e9efcbafc30a71f607643dfb35614471f8b3a6deab1669b6503",
+    };
+    let host: Host | null = null;
+    let completed = false;
+    try {
+      const { space, token, auth } = await firstBoot(environment);
+      host = await startHost(root, port, config, fullBoot);
+      const create = async (form: string, name: string, spec: Json) => {
+        const body = { form, space, name, spec };
+        const headers = { ...auth, "idempotency-key": `journey-public-runtime-${name}-create` };
+        const accepted = await jsonAt(port, "POST", `${V2}/resources`, 202, body, headers);
+        expect(await settled(port, token, String(accepted.id))).toMatchObject({
+          effect: "complete",
+        });
+        return { body, headers, id: String(accepted.id), uid: String(accepted.resourceUid) };
+      };
+      const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
+      const bundleBody = {
+        form: WORKER_BUNDLE_FORM_URL,
+        space,
+        name: "bundle-v1",
+        spec: { artifact: v1 },
+      };
+      const bundleHeaders: Record<string, string> = {
+        ...auth,
+        "idempotency-key": "journey-public-runtime-bundle-v1-create",
+        "content-type": "application/json",
+      };
+      let acceptedByHost!: Json;
+      let relayDroppedAfterAccept = false;
+      let resolveOracle!: (value: Json) => void;
+      let rejectOracle!: (cause: unknown) => void;
+      const oracle = new Promise<Json>((resolve, reject) => {
+        resolveOracle = resolve;
+        rejectOracle = reject;
+      });
+      const relay = createServer((incoming) => {
+        void (async () => {
+          try {
+            if (incoming.method !== "POST" || incoming.url !== `${V2}/resources`) {
+              throw new Error("journey relay received the wrong request");
+            }
+            const chunks: Buffer[] = [];
+            let size = 0;
+            for await (const chunk of incoming) {
+              const bytes = Buffer.from(chunk);
+              size += bytes.length;
+              if (size > 8_192) throw new Error("journey relay request is too large");
+              chunks.push(bytes);
+            }
+            const wireBody = Buffer.concat(chunks).toString("utf8");
+            if (
+              wireBody !== JSON.stringify(bundleBody) ||
+              incoming.headers.authorization !== bundleHeaders.authorization ||
+              incoming.headers["idempotency-key"] !== bundleHeaders["idempotency-key"]
+            ) {
+              throw new Error("journey relay changed the create request");
+            }
+            const upstream = await requestAt(port, `${V2}/resources`, {
+              method: "POST",
+              headers: bundleHeaders,
+              body: wireBody,
+            });
+            if (upstream.status !== 202) {
+              throw new Error(`journey relay upstream create returned ${upstream.status}`);
+            }
+            const accepted = (await upstream.json()) as Json;
+            relayDroppedAfterAccept = true;
+            resolveOracle(accepted);
+          } catch (error) {
+            rejectOracle(error);
+          } finally {
+            // No status line or headers reach the client after Host acceptance.
+            incoming.socket.destroy();
+          }
+        })();
+      });
+      await new Promise<void>((resolve, reject) => {
+        relay.once("error", reject);
+        relay.listen(0, "127.0.0.1", () => {
+          relay.off("error", reject);
+          resolve();
+        });
+      });
+      const relayAddress = relay.address();
+      if (!relayAddress || typeof relayAddress === "string") {
+        throw new Error("journey relay did not bind loopback TCP");
+      }
+      try {
+        const clientGotResponse = await requestAt(relayAddress.port, `${V2}/resources`, {
+          method: "POST",
+          headers: bundleHeaders,
+          body: JSON.stringify(bundleBody),
+        }).then(
+          async (response) => {
+            await response.arrayBuffer();
+            return true;
+          },
+          () => false,
+        );
+        const relayHadDroppedResponse = relayDroppedAfterAccept;
+        let oracleTimeout!: ReturnType<typeof setTimeout>;
+        try {
+          acceptedByHost = await Promise.race([
+            oracle,
+            new Promise<never>((_resolve, reject) => {
+              oracleTimeout = setTimeout(
+                () => reject(new Error("journey relay acceptance deadline exceeded")),
+                15_000,
+              );
+            }),
+          ]);
+        } finally {
+          clearTimeout(oracleTimeout);
+        }
+        expect(clientGotResponse).toBe(false);
+        expect(relayHadDroppedResponse).toBe(true);
+      } finally {
+        await new Promise<void>((resolve) => relay.close(() => resolve()));
+      }
+      const bundle1 = {
+        body: bundleBody,
+        headers: bundleHeaders,
+        id: String(acceptedByHost.id),
+        uid: String(acceptedByHost.resourceUid),
+      };
+      expect(await settled(port, token, bundle1.id)).toMatchObject({ effect: "complete" });
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${bundle1.uid}`, 200, undefined, auth),
+      ).toMatchObject({ observed: { manifestSha256: v1.sha256, fileCount: 1 } });
+      const versionSpec = (bundleUid: string): Json => ({
+        worker: { resourceUid: worker.uid },
+        bundle: { resourceUid: bundleUid },
+        handlers: ["fetch"],
+      });
+      const version1 = await create(
+        WORKER_VERSION_FORM_URL,
+        "version-v1",
+        versionSpec(bundle1.uid),
+      );
+      const deploymentSpec = (versionUid: string): Json => ({
+        worker: { resourceUid: worker.uid },
+        versions: [{ workerVersion: { resourceUid: versionUid }, weight: 10_000 }],
+      });
+      const deployment = await create(
+        WORKER_DEPLOYMENT_FORM_URL,
+        "deployment",
+        deploymentSpec(version1.uid),
+      );
+      const endpoint = await create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
+        worker: { resourceUid: worker.uid },
+      });
+      const endpointRead = await jsonAt(
+        port,
+        "GET",
+        `${V2}/resources/${endpoint.uid}`,
+        200,
+        undefined,
+        auth,
+      );
+      const hostname = String((endpointRead.output as Json).hostname);
+      expect(hostname.endsWith(`.${WORKER_SUFFIX}`)).toBe(true);
+      const serving = async (body: string) =>
+        await endpointEventually(
+          hostname,
+          certificate,
+          "/",
+          (response) => response.status === 200 && response.body === body,
+        );
+      expect(await serving("public-worker-bundle-v1\n")).toEqual({
+        status: 200,
+        body: "public-worker-bundle-v1\n",
+      });
+
+      const oldPid = host.child.pid;
+      await killHost(host);
+      host = null;
+      host = await startHost(root, port, config, fullBoot);
+      expect(host.child.pid).not.toBe(oldPid);
+      // The relay withheld the accepted create response, so the client saw a
+      // network error. Only the test oracle retained its identity to build the
+      // graph; after the crash the client replays the exact Bundle body/key.
+      const replayResponse = await requestAt(port, `${V2}/resources`, {
+        method: "POST",
+        headers: { ...bundle1.headers, "content-type": "application/json" },
+        body: JSON.stringify(bundle1.body),
+      });
+      expect([200, 202]).toContain(replayResponse.status);
+      const replay = (await replayResponse.json()) as Json;
+      expect(replay.id).toBe(bundle1.id);
+      expect(replay.resourceUid).toBe(bundle1.uid);
+      expect(await terminal(port, token, String(replay.id))).toMatchObject({ effect: "complete" });
+      expect(await serving("public-worker-bundle-v1\n")).toEqual({
+        status: 200,
+        body: "public-worker-bundle-v1\n",
+      });
+
+      const bundle2 = await create(WORKER_BUNDLE_FORM_URL, "bundle-v2", { artifact: v2 });
+      expect(
+        await jsonAt(port, "GET", `${V2}/resources/${bundle2.uid}`, 200, undefined, auth),
+      ).toMatchObject({ observed: { manifestSha256: v2.sha256, fileCount: 1 } });
+      const version2 = await create(
+        WORKER_VERSION_FORM_URL,
+        "version-v2",
+        versionSpec(bundle2.uid),
+      );
+      const update = await jsonAt(
+        port,
+        "PUT",
+        `${V2}/resources/${deployment.uid}`,
+        202,
+        { spec: deploymentSpec(version2.uid) },
+        {
+          ...auth,
+          "idempotency-key": "journey-public-runtime-deployment-v2",
+          "takoform-expected-generation": "1",
+        },
+      );
+      expect(await settled(port, token, String(update.id))).toMatchObject({ effect: "complete" });
+      expect(await serving("public-worker-bundle-v2\n")).toEqual({
+        status: 200,
+        body: "public-worker-bundle-v2\n",
+      });
+
+      for (const [uid, generation, name] of [
+        [endpoint.uid, 1, "endpoint"],
+        [deployment.uid, 2, "deployment"],
+        [version2.uid, 1, "version-v2"],
+        [version1.uid, 1, "version-v1"],
+        [bundle2.uid, 1, "bundle-v2"],
+        [bundle1.uid, 1, "bundle-v1"],
+        [worker.uid, 1, "worker"],
+      ] as const) {
+        const deletion = await jsonAt(port, "DELETE", `${V2}/resources/${uid}`, 202, undefined, {
+          ...auth,
+          "idempotency-key": `journey-public-runtime-${name}-delete`,
+          "takoform-expected-generation": String(generation),
+        });
+        expect(await settled(port, token, String(deletion.id))).toMatchObject({
+          effect: "complete",
+        });
+        const absent = await requestAt(port, `${V2}/resources/${uid}`, { headers: auth });
+        await absent.arrayBuffer();
+        expect(absent.status).toBe(410);
+      }
+      const deletedEndpoint = await endpointGet(hostname, certificate, "/").catch(() => null);
+      expect(deletedEndpoint === null || deletedEndpoint.status === 503).toBe(true);
+      await stopHost(host);
+      host = null;
+      completed = true;
+    } finally {
+      await stopHost(host);
+      if (completed) {
+        await removeOwnerPrivateSocketDirectories(root);
+        await rm(root, { recursive: true, force: true });
+      } else {
+        process.stderr.write(`journey: public Worker data root retained at ${root}\n`);
+      }
+    }
+  },
+  480_000,
 );
 
 test.skipIf(OPT_IN !== "1")(
