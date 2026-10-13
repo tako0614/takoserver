@@ -160,10 +160,17 @@ describe("payment setup", () => {
     expect(resolvePayment({ consoleOrigin: "https://console.example.test" })).toEqual({});
   });
 
-  test("offers nothing without somewhere to return to", async () => {
+  test("starts no Checkout without somewhere to return to, but still verifies and reconciles", async () => {
     const { resolvePayment } = await import("../src/payment-setup.ts");
-    // A payment that completes and lands nowhere is worse than no payment.
-    expect(resolvePayment({ stripeSecretKey: "sk_test_pretend" })).toEqual({});
+    // A payment that completes and lands nowhere is worse than no payment, so
+    // the route that begins one is not served. Crediting what Stripe already
+    // collected needs no console: the return check, webhook and reconcile do.
+    for (const consoleOrigin of [undefined, ""]) {
+      const payment = resolvePayment({ stripeSecretKey: "sk_test_pretend", consoleOrigin });
+      expect(payment.checkout).toBeUndefined();
+      expect(payment.settlement).toBeDefined();
+      expect(payment.events).toBeDefined();
+    }
   });
 
   test("sends the payer back to the console with the session id", async () => {

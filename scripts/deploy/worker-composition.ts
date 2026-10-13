@@ -96,7 +96,7 @@ export async function assertTargetComposes(
           v2.staticAssetBundle !== undefined)
       ) {
         throw new TypeError(
-          "configured v2 artifact Forms require the complete 0081 schema; select takoformV2.storageLineage v2-0088 or v2-0089 storage",
+          "configured v2 artifact Forms require the complete 0081 schema; select takoformV2.storageLineage v2-0088, v2-0089 or v2-0091 storage",
         );
       }
     }

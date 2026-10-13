@@ -441,6 +441,16 @@ A restarted deployment brings its published Workers back by itself. The runtime
 is started at boot for whatever this machine had already published, before the
 API begins answering; a machine that has published nothing starts no runtime.
 
+An accepted workerd child that crashes is restarted automatically with backoff
+from 100 ms up to 5 seconds. If a replacement fails readiness, recovery waits
+for that exact child to exit and its listener to become vacant before spawning
+again. A delayed exit, temporary port occupancy, or failed listener observation
+keeps the retry pending; recovery never stops or replaces a foreign process.
+Serving is reported only after recovery passes readiness, and health requests
+only observe recovery. Deliberate shutdown cancels it. A failed first
+start, an unconfirmable child exit, or failed child-identity persistence requires
+operator intervention rather than automatic retries.
+
 ### Operator sign-in and funding
 
 Sign-in and money are the two facts a server cannot determine for itself. With
@@ -480,6 +490,11 @@ absent. The webhook is gated the same way: `"stripeWebhook": true` (only with
 `checkoutMinimumMinor`, `checkoutMaximumMinor`, `webhookToleranceSeconds` and
 `reconcileLookbackSeconds`, validated before deploy.
 
+Starting a Checkout needs a console to send the payer back to: without a
+console origin the Checkout route is not served, while the key still verifies
+a presented session and runs the webhook (where configured) and the reconcile
+pass.
+
 A payment is credited however the Host learns of it, and only once. The
 console's return presents the Checkout Session id; the Stripe webhook
 (`checkout.session.completed` and `checkout.session.async_payment_succeeded`)
@@ -511,9 +526,10 @@ this Host lacks, an unreadable payment) are logged by funding reference as
 The webhook records every delivery in `stripe_events`, so it needs migration
 `0091_stripe_events.sql` applied first. A Bun Host migrates its own SQLite. On
 Cloudflare, publication refuses `"stripeWebhook": true` until the target's D1
-has 0091 applied, and no reviewed D1 wave through 0091 exists yet; until one
-does, a hosted deployment relies on the console's return and the reconcile
-pass.
+has 0091 applied. No existing D1 can be moved to 0091 in place. A new staging
+D1 can be created with the staging-only `--fresh-lineage=v2-0091` profile
+([deploy guide](docs/deploy.md)); production has no 0091 path yet, and relies
+on the console's return and the reconcile pass.
 
 ### Data root and backups
 

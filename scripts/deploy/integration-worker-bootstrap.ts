@@ -45,6 +45,7 @@ import {
 } from "./qualification.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
 import {
+  projectFreshIntegrationV2MigrationArtifact0091,
   projectFreshProductionV2MigrationArtifact,
   projectFreshProductionV2MigrationArtifact0089,
   projectFreshV2ArtifactMigrationArtifact,
@@ -1238,6 +1239,8 @@ function readBootstrapArtifact(sourceRoot: string, target: DeployTarget): Migrat
       return projectFreshProductionV2MigrationArtifact(source);
     case "v2-0089":
       return projectFreshProductionV2MigrationArtifact0089(source);
+    case "v2-0091":
+      return projectFreshIntegrationV2MigrationArtifact0091(source);
   }
 }
 

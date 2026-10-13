@@ -1396,6 +1396,48 @@ describe("reviewed Worker closure transition", () => {
     }
   });
 
+  test("storage rebind refuses an operator staging pair before provider or Worker reads", async () => {
+    let processCalls = 0;
+    const STAGING = "takoserver-staging-throwaway-0091-example";
+    const parts = await withRoot("takoserver-closure-storage-rebind-staging-", async (root) => {
+      const selected = {
+        ...v2Target,
+        d1: { databaseName: STAGING, databaseId: STORAGE_DATABASE_ID },
+        r2: { bucketName: STAGING },
+        takoformV2: { config: V2_PUBLIC_CONFIG, storageLineage: "v2-0091" as const },
+      } satisfies DeployTarget;
+      const base = fixture(root, { selected });
+      return { selected, base };
+    });
+    const failure = await runWorkerClosureTransition(
+      {
+        surface: "takoserver-worker-authority-cutover",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+        closurePredecessorVersionId: PREDECESSOR,
+        delta: { ...INTEGRATION_DELTA, storageRebind: STORAGE_REBIND },
+      },
+      parts.selected,
+      {
+        run: async () => {
+          processCalls += 1;
+          throw new Error("provider/process call must not happen");
+        },
+        state: parts.base.state,
+        providerExecutorQualification: parts.base.providerExecutorQualification,
+        migrations: parts.base.migrations,
+        integrationStorageVerification: integrationStorageVerificationOptions(parts.selected),
+      },
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(DeployError);
+    expect((failure as DeployError).message).toContain(
+      "storage rebind refuses an operator-provisioned staging pair",
+    );
+    expect(processCalls).toBe(0);
+    expect(parts.base.stateCalls).toEqual([]);
+  });
+
   test("storage rebind stops at the immediate schema fence and on a failed gate before upload", async () => {
     await withRoot("takoserver-closure-storage-rebind-fence-", async (root) => {
       const complete = applyQualifiedSchemaState();

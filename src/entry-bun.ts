@@ -1189,6 +1189,13 @@ const payment = resolvePayment({
   consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN,
   settings: paymentSettingsFromEnvironment(process.env),
 });
+if (payment.settlement && !payment.checkout) {
+  // Said once at startup: a key with no console still decides funding.
+  console.warn(
+    "takoserver: Stripe funding is on without TAKOSERVER_CONSOLE_ORIGIN; Checkout is not served, " +
+      "and Stripe verification, the webhook and the reconcile pass replace operator-signed funding",
+  );
+}
 
 const identity = resolveIdentity({
   ...(process.env.TAKOS_ID_ISSUER && process.env.TAKOS_ID_CLIENT_ID
