@@ -1368,11 +1368,11 @@ describe("Hosted Stripe billing service", () => {
 
   test("first settlement uses the Checkout creation revision retained in pricing history", async () => {
     const current = pricing();
-    const authored = JSON.parse(current.environment.TAKOSERVER_HOSTED_PRICING) as Record<
+    const authored = JSON.parse(current.environment.TAKOSERVER_HOSTED_PRICING ?? "") as Record<
       string,
       unknown
     >;
-    const currentConfig = JSON.parse(current.environment.TAKOSERVER_BILLING_CONFIG) as Record<
+    const currentConfig = JSON.parse(current.environment.TAKOSERVER_BILLING_CONFIG ?? "") as Record<
       string,
       unknown
     >;
