@@ -37,8 +37,10 @@ export const API_KEY_SCOPES = [
   "resources:read",
   "resources:write",
   "wallet:read",
+  "wallet:write",
   "reseller:write",
   "usage:read",
+  "usage:write",
 ] as const;
 
 export type ApiKeyScope = (typeof API_KEY_SCOPES)[number];

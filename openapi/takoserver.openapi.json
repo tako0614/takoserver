@@ -240,6 +240,541 @@
           }
         }
       },
+      "BillingReference": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+        "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+      },
+      "BillingRevision": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+      },
+      "BillingFingerprint": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      },
+      "BillingAmountMinor": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "BillingUnsignedDecimal": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]{0,17}[1-9])?$"
+      },
+      "BillingUtcDateTime": {
+        "type": "string",
+        "format": "date-time",
+        "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+      },
+      "CreateWalletHoldRequest": {
+        "type": "object",
+        "required": [
+          "reference",
+          "amountMinor",
+          "pricingRevision",
+          "measurementFingerprint"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "reference": {
+            "$ref": "#/components/schemas/BillingReference"
+          },
+          "amountMinor": {
+            "$ref": "#/components/schemas/BillingAmountMinor"
+          },
+          "pricingRevision": {
+            "$ref": "#/components/schemas/BillingRevision"
+          },
+          "measurementFingerprint": {
+            "$ref": "#/components/schemas/BillingFingerprint"
+          }
+        }
+      },
+      "CaptureWalletHoldRequest": {
+        "type": "object",
+        "required": [
+          "amountMinor",
+          "actualMicros",
+          "measurementFingerprint"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "amountMinor": {
+            "$ref": "#/components/schemas/BillingAmountMinor"
+          },
+          "actualMicros": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^(?:0|[1-9][0-9]*)$"
+          },
+          "measurementFingerprint": {
+            "$ref": "#/components/schemas/BillingFingerprint"
+          }
+        }
+      },
+      "CreateWalletUsageRecordRequest": {
+        "type": "object",
+        "required": [
+          "reference",
+          "meter",
+          "quantityUnit",
+          "quantity",
+          "periodStart",
+          "periodEnd",
+          "pricingRevision",
+          "expectedMinor",
+          "measurementFingerprint"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "reference": {
+            "$ref": "#/components/schemas/BillingReference"
+          },
+          "meter": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9.-]{0,127}$"
+          },
+          "quantityUnit": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
+          },
+          "quantity": {
+            "$ref": "#/components/schemas/BillingUnsignedDecimal"
+          },
+          "periodStart": {
+            "$ref": "#/components/schemas/BillingUtcDateTime"
+          },
+          "periodEnd": {
+            "$ref": "#/components/schemas/BillingUtcDateTime"
+          },
+          "pricingRevision": {
+            "$ref": "#/components/schemas/BillingRevision"
+          },
+          "expectedMinor": {
+            "$ref": "#/components/schemas/BillingAmountMinor"
+          },
+          "measurementFingerprint": {
+            "$ref": "#/components/schemas/BillingFingerprint"
+          }
+        }
+      },
+      "WalletResponse": {
+        "type": "object",
+        "required": [
+          "wallet"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "wallet": {
+            "type": "object",
+            "required": [
+              "organizationId",
+              "currency",
+              "settledMinor",
+              "heldMinor",
+              "availableMinor",
+              "entries"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "organizationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "currency": {
+                "const": "USD"
+              },
+              "settledMinor": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "heldMinor": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "availableMinor": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "entries": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "organizationId",
+                    "type",
+                    "reference",
+                    "settledDeltaMinor",
+                    "heldDeltaMinor",
+                    "createdAt"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "organizationId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "funding",
+                        "hold",
+                        "capture",
+                        "release",
+                        "usage_debit"
+                      ]
+                    },
+                    "reference": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "settledDeltaMinor": {
+                      "type": "integer"
+                    },
+                    "heldDeltaMinor": {
+                      "type": "integer"
+                    },
+                    "createdAt": {
+                      "$ref": "#/components/schemas/BillingUtcDateTime"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "WalletLotsResponse": {
+        "type": "object",
+        "required": [
+          "lots"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "lots": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "reference",
+                "kind",
+                "amountMinor",
+                "spentMinor",
+                "remainingMinor",
+                "heldMinor",
+                "availableMinor",
+                "expiresAt",
+                "createdAt"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "reference": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "direct",
+                    "plan-included",
+                    "purchased"
+                  ]
+                },
+                "amountMinor": {
+                  "$ref": "#/components/schemas/BillingAmountMinor"
+                },
+                "spentMinor": {
+                  "$ref": "#/components/schemas/BillingAmountMinor"
+                },
+                "remainingMinor": {
+                  "$ref": "#/components/schemas/BillingAmountMinor"
+                },
+                "heldMinor": {
+                  "$ref": "#/components/schemas/BillingAmountMinor"
+                },
+                "availableMinor": {
+                  "$ref": "#/components/schemas/BillingAmountMinor"
+                },
+                "expiresAt": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/BillingUtcDateTime"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "createdAt": {
+                  "$ref": "#/components/schemas/BillingUtcDateTime"
+                }
+              }
+            }
+          }
+        }
+      },
+      "WalletHoldResponse": {
+        "type": "object",
+        "required": [
+          "hold"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "hold": {
+            "$ref": "#/components/schemas/WalletHoldReceipt"
+          }
+        }
+      },
+      "WalletHoldReceipt": {
+        "type": "object",
+        "required": [
+          "organizationId",
+          "reference",
+          "amountMinor",
+          "pricingRevision",
+          "status",
+          "capturedMinor",
+          "releasedMinor",
+          "actualMicros",
+          "createdAt",
+          "expiresAt",
+          "closedAt"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "organizationId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "reference": {
+            "$ref": "#/components/schemas/BillingReference"
+          },
+          "amountMinor": {
+            "$ref": "#/components/schemas/BillingAmountMinor"
+          },
+          "pricingRevision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BillingRevision"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "live",
+              "captured",
+              "released",
+              "expired"
+            ]
+          },
+          "capturedMinor": {
+            "$ref": "#/components/schemas/BillingAmountMinor"
+          },
+          "releasedMinor": {
+            "$ref": "#/components/schemas/BillingAmountMinor"
+          },
+          "actualMicros": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^(?:0|[1-9][0-9]*)$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/BillingUtcDateTime"
+          },
+          "expiresAt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BillingUtcDateTime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "closedAt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BillingUtcDateTime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "WalletUsageRecordResponse": {
+        "type": "object",
+        "required": [
+          "usageRecord"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "usageRecord": {
+            "$ref": "#/components/schemas/WalletUsageReceipt"
+          }
+        }
+      },
+      "WalletUsageRecordsResponse": {
+        "type": "object",
+        "required": [
+          "usageRecords",
+          "cursor"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "usageRecords": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WalletUsageReceipt"
+            }
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "WalletUsageReceipt": {
+        "type": "object",
+        "required": [
+          "organizationId",
+          "reference",
+          "pricingRevision",
+          "meter",
+          "quantityUnit",
+          "quantity",
+          "periodStart",
+          "periodEnd",
+          "rate",
+          "amountMinor",
+          "status",
+          "createdAt",
+          "paidAt"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "organizationId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "reference": {
+            "$ref": "#/components/schemas/BillingReference"
+          },
+          "meter": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "quantityUnit": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "quantity": {
+            "$ref": "#/components/schemas/BillingUnsignedDecimal"
+          },
+          "periodStart": {
+            "$ref": "#/components/schemas/BillingUtcDateTime"
+          },
+          "periodEnd": {
+            "$ref": "#/components/schemas/BillingUtcDateTime"
+          },
+          "pricingRevision": {
+            "$ref": "#/components/schemas/BillingRevision"
+          },
+          "rate": {
+            "type": "object",
+            "required": [
+              "numeratorMicros",
+              "denominator"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "numeratorMicros": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^(?:0|[1-9][0-9]*)$"
+              },
+              "denominator": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^(?:0|[1-9][0-9]*)$"
+              }
+            }
+          },
+          "amountMinor": {
+            "$ref": "#/components/schemas/BillingAmountMinor"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "paid"
+            ]
+          },
+          "createdAt": {
+            "$ref": "#/components/schemas/BillingUtcDateTime"
+          },
+          "paidAt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BillingUtcDateTime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
       "Error": {
         "type": "object",
         "description": "The /v1/* control lane's error envelope. Takoform v2 uses application/problem+json and TakoformV2Problem instead. The OpenAI-compatible /v1/ai/* lane answers that API's own error shape and is documented separately.",
@@ -3010,12 +3545,715 @@
     },
     "/v1/organizations/{organizationId}/wallet": {
       "get": {
-        "summary": "Read the prepaid wallet",
+        "summary": "Read the prepaid wallet and expire due holds",
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Current Organization wallet projection and recent ledger entries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks wallet:read or belongs to another Organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Wallet state is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        ],
+        "x-required-scopes": [
+          "wallet:read"
+        ]
+      }
+    },
+    "/v1/organizations/{organizationId}/wallet/lots": {
+      "get": {
+        "summary": "List current credit lots and their expiry allocation",
+        "responses": {
+          "200": {
+            "description": "Organization credit lots",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletLotsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks wallet:read or belongs to another Organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Credit lot state is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        ],
+        "x-required-scopes": [
+          "wallet:read"
+        ]
+      }
+    },
+    "/v1/organizations/{organizationId}/wallet/holds/{reference}": {
+      "get": {
+        "summary": "Read one durable wallet hold receipt",
+        "responses": {
+          "200": {
+            "description": "The exact hold receipt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletHoldResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed hold reference",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks wallet:read or belongs to another Organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Hold reference not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Hold is closed or the reference conflicts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Hold state is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "reference",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+              "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+            }
+          }
+        ],
+        "x-required-scopes": [
+          "wallet:read"
+        ]
+      }
+    },
+    "/v1/organizations/{organizationId}/wallet/holds": {
+      "post": {
+        "summary": "Reserve prepaid credit for a measured operation",
+        "responses": {
+          "201": {
+            "description": "Hold accepted with an immutable server-assigned expiry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletHoldResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed amount, reference, revision, or fingerprint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient available credit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks wallet:write or belongs to another Organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Reference was already used or canceled with different facts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Hold result is unavailable or indeterminate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWalletHoldRequest"
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "wallet:write"
+        ]
+      }
+    },
+    "/v1/organizations/{organizationId}/wallet/holds/{reference}/capture": {
+      "post": {
+        "summary": "Capture measured credit and release the unused hold",
+        "responses": {
+          "200": {
+            "description": "Captured receipt; the unused amount is released atomically",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletHoldResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed amount or measurement",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks wallet:write or belongs to another Organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Hold reference not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Hold is closed, exceeds its amount, or conflicts with prior facts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Capture result is unavailable or indeterminate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "reference",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+              "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CaptureWalletHoldRequest"
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "wallet:write"
+        ]
+      }
+    },
+    "/v1/organizations/{organizationId}/wallet/holds/{reference}/release": {
+      "post": {
+        "summary": "Release a hold or durably cancel an unknown reference",
+        "responses": {
+          "200": {
+            "description": "Released or unchanged terminal receipt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletHoldResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed hold reference",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks wallet:write or belongs to another Organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Release result is unavailable or indeterminate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "reference",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+              "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+            }
+          }
+        ],
+        "x-required-scopes": [
+          "wallet:write"
+        ]
+      }
+    },
+    "/v1/organizations/{organizationId}/wallet/usage-records": {
+      "get": {
+        "summary": "List recent settled or unpaid usage records",
+        "responses": {
+          "200": {
+            "description": "Organization usage records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletUsageRecordsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed page size",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks usage:read or belongs to another Organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Usage records are unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 100
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "description": "Opaque continuation cursor returned by the previous page."
+            }
+          }
+        ],
+        "x-required-scopes": [
+          "usage:read"
+        ]
+      },
+      "post": {
+        "summary": "Price and settle one closed usage period",
+        "description": "Takoserver reprices the immutable quantity using the selected tariff. For `takosumi.storage.byte-hours`, send `quantityUnit=byte-millisecond` and an integral byte-millisecond quantity; the server converts the exact total to byte-hours before rounding the final USD cents once. Other meters require the configured unit.",
+        "responses": {
+          "201": {
+            "description": "Usage receipt, including durable unpaid usage after insufficient funds",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletUsageRecordResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed usage facts or an expected amount that does not match the tariff",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks usage:write or belongs to another Organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Reference conflicts with previously recorded usage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Usage settlement is unavailable or indeterminate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWalletUsageRecordRequest"
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "usage:write"
+        ]
       }
     },
     "/v1/organizations/{organizationId}/wallet/checkout": {

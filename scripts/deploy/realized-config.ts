@@ -222,6 +222,9 @@ export function deploymentVariables(
   }
   if (target.stripeCheckout === true) vars.TAKOSERVER_STRIPE_CHECKOUT_ENABLED = "1";
   if (target.stripeWebhook === true) vars.TAKOSERVER_STRIPE_WEBHOOK_ENABLED = "1";
+  if (target.billingConfig !== undefined) {
+    vars.TAKOSERVER_BILLING_CONFIG = JSON.stringify(target.billingConfig);
+  }
   for (const [setting, variable] of Object.entries(PAYMENT_SETTING_VARIABLES)) {
     const value = target.stripeSettings?.[setting as keyof typeof PAYMENT_SETTING_VARIABLES];
     if (value !== undefined) vars[variable] = String(value);

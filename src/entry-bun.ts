@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createActorResourceGraphReader } from "./actor-resource-graph.ts";
 import { buildApp, createAppResourceStoreBundle } from "./app.ts";
+import { parseBillingConfig } from "./billing-config.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import {
   parseSelfhostV2PrivatePlaneBoot,
@@ -26,6 +27,7 @@ import {
   parseOperatorPublicKey,
   signOperatorAssertion,
 } from "./operator-key.ts";
+import { assertOrgBillingSchema } from "./org-billing.ts";
 import { paymentSettingsFromEnvironment } from "./payment-settings.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
@@ -239,6 +241,8 @@ const takoformV2Config = parseTakoformV2ApplicationConfig({
   TAKOSERVER_TAKOFORM_V2_CONFIG: process.env.TAKOSERVER_TAKOFORM_V2_CONFIG,
   TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: process.env.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY,
 });
+// File-backed tariff loading can be designed separately; this release accepts inline JSON only.
+const billingConfig = parseBillingConfig(process.env.TAKOSERVER_BILLING_CONFIG);
 const v2RuntimeSelection = parseSelfhostV2RuntimeBoot(
   process.env.TAKOSERVER_V2_WORKER_RUNTIME_BOOT,
 );
@@ -469,6 +473,7 @@ if (migrated.applied.length > 0) {
   );
 }
 const sql = createSqliteSql(controlDatabase);
+if (billingConfig) await assertOrgBillingSchema(sql, billingConfig);
 /**
  * The port a published Worker endpoint address carries.
  *
@@ -1364,6 +1369,7 @@ try {
         ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
         : unconfigured),
     v2: takoformV2Config,
+    ...(billingConfig ? { billingConfig } : {}),
     v2ArtifactSourceFactory: createSelfhostPublicArtifactSource,
     ...(v2FormFactory ? { v2FormFactory } : {}),
     ...(v2FormFactory && runtimeInputKeyAuthority

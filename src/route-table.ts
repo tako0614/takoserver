@@ -215,6 +215,41 @@ export const ROUTES: readonly RouteDeclaration[] = [
     operation: "readWallet",
   },
   {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/lots",
+    operation: "listWalletLots",
+  },
+  {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/holds/{reference}",
+    operation: "readWalletHold",
+  },
+  {
+    method: "post",
+    pattern: "/v1/organizations/{organizationId}/wallet/holds",
+    operation: "createWalletHold",
+  },
+  {
+    method: "post",
+    pattern: "/v1/organizations/{organizationId}/wallet/holds/{reference}/capture",
+    operation: "captureWalletHold",
+  },
+  {
+    method: "post",
+    pattern: "/v1/organizations/{organizationId}/wallet/holds/{reference}/release",
+    operation: "releaseWalletHold",
+  },
+  {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/usage-records",
+    operation: "listWalletUsageRecords",
+  },
+  {
+    method: "post",
+    pattern: "/v1/organizations/{organizationId}/wallet/usage-records",
+    operation: "createWalletUsageRecord",
+  },
+  {
     method: "post",
     pattern: "/v1/organizations/{organizationId}/wallet/checkout",
     operation: "beginWalletCheckout",

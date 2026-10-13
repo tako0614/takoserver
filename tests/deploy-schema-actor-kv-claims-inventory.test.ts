@@ -9,7 +9,7 @@ import {
 } from "../scripts/deploy/schema.ts";
 
 const MIGRATION = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
-const CURRENT_SOURCE_TAIL = "0091_stripe_events.sql";
+const CURRENT_SOURCE_TAIL = "0092_org_wallet_lifecycle.sql";
 const ROOT = mkdtempSync(
   join(process.env.TMPDIR ?? "/tmp", "takoserver-actor-kv-schema-inventory-"),
 );
@@ -18,45 +18,45 @@ afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 test("the current source closure projects to an explicit 0066 apply artifact", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
   const artifact = projectApplyQualifiedMigrationArtifact(source);
-  expect(source.names.at(-8)).toBe("0084_v2_worker_invocation_no_native_dispatch.sql");
-  expect(source.names.at(-7)).toBe("0085_v2_edge_kv_native_custody.sql");
-  expect(source.names.at(-6)).toBe("0086_v2_worker_service_invocation_custody.sql");
-  expect(source.names.at(-5)).toBe("0087_v2_worker_cron_invocation_custody.sql");
-  expect(source.names.at(-4)).toBe("0088_v2_worker_sqlite_external_drain.sql");
-  expect(source.names.at(-3)).toBe("0089_v2_worker_cron_match_guard_depth.sql");
-  expect(source.names.at(-2)).toBe("0090_v2_queue_sqlite_external_drain.sql");
+  expect(source.names.at(-8)).toBe("0085_v2_edge_kv_native_custody.sql");
+  expect(source.names.at(-7)).toBe("0086_v2_worker_service_invocation_custody.sql");
+  expect(source.names.at(-6)).toBe("0087_v2_worker_cron_invocation_custody.sql");
+  expect(source.names.at(-5)).toBe("0088_v2_worker_sqlite_external_drain.sql");
+  expect(source.names.at(-4)).toBe("0089_v2_worker_cron_match_guard_depth.sql");
+  expect(source.names.at(-3)).toBe("0090_v2_queue_sqlite_external_drain.sql");
+  expect(source.names.at(-2)).toBe("0091_stripe_events.sql");
   expect(source.names.at(-1)).toBe(CURRENT_SOURCE_TAIL);
   expect(source.files.at(-8)).toMatchObject({
-    name: "0084_v2_worker_invocation_no_native_dispatch.sql",
-    digest: "sha256:5e269f789b45883845c79561b248e7145ac146251af54b93b5ba16f9567ac43e",
-  });
-  expect(source.files.at(-7)).toMatchObject({
     name: "0085_v2_edge_kv_native_custody.sql",
     digest: "sha256:1a123aa756178762b45dd67949f36bea12a8be2f62b32e451480d0ce7f40fa11",
   });
-  expect(source.files.at(-6)).toMatchObject({
+  expect(source.files.at(-7)).toMatchObject({
     name: "0086_v2_worker_service_invocation_custody.sql",
     digest: "sha256:4bacc1b2d8d3d78a7736ccc66257d2e8c8a077ec82a0fc1a208038266b28a0d5",
   });
-  expect(source.files.at(-5)).toMatchObject({
+  expect(source.files.at(-6)).toMatchObject({
     name: "0087_v2_worker_cron_invocation_custody.sql",
     digest: "sha256:0375e932701b6596363468a784cdef91d56846f9e4a49cc65ff5890c0f2d0b7e",
   });
-  expect(source.files.at(-1)).toMatchObject({
-    name: CURRENT_SOURCE_TAIL,
-    digest: "sha256:e32149261d1025e4fa375c944fb4299ab3bc140fade37832f8e0d3a394f96b6e",
-  });
-  expect(source.files.at(-4)).toMatchObject({
+  expect(source.files.at(-5)).toMatchObject({
     name: "0088_v2_worker_sqlite_external_drain.sql",
     digest: "sha256:88bf294753e8bd43809634410c4a8648cb3e0500e7400d53ec4c8f17fae46c84",
   });
-  expect(source.files.at(-3)).toMatchObject({
+  expect(source.files.at(-4)).toMatchObject({
     name: "0089_v2_worker_cron_match_guard_depth.sql",
     digest: "sha256:eaed1f01e78de59c4488e5c882e984d6c5e5f9010e8e8bab51dac3a74f0fca7b",
   });
-  expect(source.files.at(-2)).toMatchObject({
+  expect(source.files.at(-3)).toMatchObject({
     name: "0090_v2_queue_sqlite_external_drain.sql",
     digest: "sha256:9a2590842a6986dbc9e0b906a3b0efdae2da7d1244c24a5cf2be81a8f11ab802",
+  });
+  expect(source.files.at(-1)).toMatchObject({
+    name: CURRENT_SOURCE_TAIL,
+    digest: "sha256:d5ab03f2cc8cc08c79fd393165d41b1cc422053ef64ea231bb96160f68d4343b",
+  });
+  expect(source.files.at(-2)).toMatchObject({
+    name: "0091_stripe_events.sql",
+    digest: "sha256:e32149261d1025e4fa375c944fb4299ab3bc140fade37832f8e0d3a394f96b6e",
   });
   expect(artifact.names).toHaveLength(66);
   expect(artifact.names.at(-1)).toBe(MIGRATION);
@@ -99,12 +99,12 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
     cpSync(resolve(import.meta.dir, "../migrations"), directory, { recursive: true });
     if (drift === "missing") rmSync(join(directory, CURRENT_SOURCE_TAIL));
     else
-      writeFileSync(join(directory, "0092_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+      writeFileSync(join(directory, "0093_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     expect(() => readCurrentAuditedMigrationSourceArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0091",
+      "audited migration lineage must contain exactly 0001-0092",
     );
     expect(() => readAuditedMigrationArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0091",
+      "audited migration lineage must contain exactly 0001-0092",
     );
   }
 });

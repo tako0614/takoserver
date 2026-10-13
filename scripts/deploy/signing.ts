@@ -6,6 +6,13 @@ import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import {
+  assertOrgBillingSchema,
+  assertStripeWebhookSchema,
+  pendingMigrations,
+  readD1SchemaState,
+  readMigrationArtifact,
+} from "./migrations.ts";
+import {
   type CommandResult,
   REPOSITORY,
   requireEnvironment,
@@ -80,8 +87,14 @@ export interface SigningOptions {
   readonly review?: string;
   readonly outputDirectory?: string;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
+  /** Optional migration snapshot seam for portable signing-rotation checks. */
+  readonly migrations?: SigningMigrationReader;
   /** Portable test seam; production uses the shared default publication-lease root. */
   readonly publicationLeaseRoot?: string;
+}
+
+export interface SigningMigrationReader {
+  read(): Promise<{ readonly local: readonly string[]; readonly applied: readonly string[] }>;
 }
 
 interface PrivateKeyInput {
@@ -212,6 +225,7 @@ async function runSigningWithLease(
       target,
       database,
       state,
+      configPath,
       environment,
       run,
       root,
@@ -461,6 +475,7 @@ async function rotateSigningKey(
   target: DeployTarget,
   database: SigningDatabase,
   state: WorkerState,
+  configPath: string,
   environment: Readonly<Record<string, string>>,
   run: SigningProcess,
   root: string,
@@ -502,6 +517,7 @@ async function rotateSigningKey(
       noOverwrite: true,
     };
   }
+  await assertSigningRotationSchema(target, configPath, environment, run, options.migrations);
   const before = await inspectRotationPredecessor("preflight", target, state, currentKeyId);
   const source = await qualifySource({
     environment: invocation.environment === "integration" ? "integration" : "production",
@@ -656,6 +672,34 @@ async function rotateSigningKey(
     keyPairProof: { keyId: nextKeyId, publicJwkDigest: sha256(next.publicJwk) },
     rollback:
       "run a separately reviewed inverse takoserver-signing-rotation while both public ids remain registered",
+  };
+}
+
+async function assertSigningRotationSchema(
+  target: DeployTarget,
+  configPath: string,
+  environment: Readonly<Record<string, string>>,
+  run: SigningProcess,
+  injected?: SigningMigrationReader,
+): Promise<void> {
+  if (target.billingConfig === undefined && target.stripeWebhook !== true) return;
+  const snapshot = await (injected ?? signingMigrationReader(configPath, environment, run)).read();
+  pendingMigrations(snapshot.local, snapshot.applied);
+  assertStripeWebhookSchema(target, snapshot.applied);
+  assertOrgBillingSchema(target, snapshot.applied);
+}
+
+function signingMigrationReader(
+  configPath: string,
+  environment: Readonly<Record<string, string>>,
+  run: SigningProcess,
+): SigningMigrationReader {
+  return {
+    async read() {
+      const local = readMigrationArtifact();
+      const remote = await readD1SchemaState(new RemoteD1(configPath, { environment, run }));
+      return { local: local.names, applied: remote.applied };
+    },
   };
 }
 

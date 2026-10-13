@@ -22,9 +22,11 @@ import {
   verifyFreshV2IntegrationStorageTarget,
 } from "./integration-storage-generation.ts";
 import {
+  assertOrgBillingSchema,
   assertStripeWebhookSchema,
   canonicalSchemaShape,
   type D1SchemaState,
+  orgBillingSchemaReady,
   readD1SchemaState,
 } from "./migrations.ts";
 import {
@@ -319,6 +321,7 @@ export async function runIntegrationWorkerBootstrap(
     const schemaBefore = await readSchema("preflight", schemaReader);
     assertCompleteSchema(schemaBefore, artifactBefore, expectedShape);
     assertStripeWebhookSchema(target, schemaBefore.applied);
+    assertOrgBillingSchema(target, schemaBefore.applied);
     const v2StorageBefore =
       target.takoformV2 === undefined ? null : await readV2StorageProof(target, options);
     // A fresh generation must still be unserved when its first Host appears:
@@ -687,6 +690,7 @@ async function statusExisting(
     await assertWorkerSchedules("preflight", target, state, expectedSchedules);
     const ready =
       identity.commit === invocation.commit &&
+      orgBillingSchemaReady(target, schema.applied) &&
       (providerInspection === null || providerInspection.ready);
     return {
       ...statusResult(invocation, target, initial),
@@ -742,7 +746,8 @@ function statusResult(
     deployedCommit: null,
     artifactDigest: null,
     signingKeyId: target.signing.currentKeyId,
-    ready: native.absent,
+    billingSchemaReady: orgBillingSchemaReady(target, []),
+    ready: native.absent && target.billingConfig === undefined,
     mutationApplied: false,
   };
   return target.takoformV2 === undefined

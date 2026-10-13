@@ -1,8 +1,8 @@
 # Unified Organization billing for Takoserver and Takosumi Hosted
 
-Status: design decisions for implementation review, 2026-10-13. This document
-does not publish endpoints, apply migrations, enable billing, or qualify a live
-deployment. All money is **USD**; wallet amounts and Stripe charges use integer
+Status: design decisions merged in #314. The first scoped API implementation
+is tracked in [Organization billing API](org-billing-api.md). This document
+does not apply migrations, enable billing, or qualify a live deployment. All money is **USD**; wallet amounts and Stripe charges use integer
 USD cents (`amountMinor`).
 
 Related work: [Takosumi Hosted PR #54](https://github.com/tako0614/takosumi-hosted/pull/54)
@@ -245,9 +245,10 @@ That candidate already verifies the raw signature, records `stripe_events` with
 settlement function and `stripe:<sessionId>` ledger reference. It currently
 records `invoice.paid`, `invoice.payment_failed`, `customer.subscription.updated`,
 `customer.subscription.deleted`, and `charge.refunded` as **deferred** and
-returns 2xx without applying them. `received` is retryable; `credited`, `ignored`,
-`deferred`, and `unsupported` are terminal. Do not claim those terminal deferred
-events will automatically retry when a handler is added.
+returns 2xx without applying them. `received` is retryable; `credited` and
+`ignored` are terminal. `deferred` and `unsupported` records can be reprocessed
+on redelivery when a handler becomes available (#313). Historical objects still
+need explicit backfill; installing a handler does not itself cause Stripe redelivery.
 
 Activate each handler by removing its type from the deferred set. Re-fetch the
 invoice/subscription/charge and necessary related objects using this deployment's

@@ -1,4 +1,5 @@
 import { type App, buildApp } from "./app.ts";
+import { parseBillingConfig } from "./billing-config.ts";
 import { createCatalog } from "./catalog.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { errorEnvelopeResponse } from "./error-envelope.ts";
@@ -14,6 +15,7 @@ import {
 } from "./integration-organization-bootstrap.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
+import { assertOrgBillingSchema } from "./org-billing.ts";
 import { paymentSettingsFromEnvironment } from "./payment-settings.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
@@ -79,6 +81,8 @@ export interface WorkerEnv {
   readonly TAKOSERVER_SCHEMA_MAINTENANCE_MODE?: string;
   /** Where this deployment's console is served, if it has one. */
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
+  /** Versioned JSON Organization billing tariff; absent disables the new wallet API. */
+  readonly TAKOSERVER_BILLING_CONFIG?: string;
   /** Public half of the operator key, as an Ed25519 JWK. */
   readonly OPERATOR_PUBLIC_JWK?: string;
   /**
@@ -795,6 +799,10 @@ async function composeApp(
   const v2Config = startupStage("runtime-configuration", () =>
     parseTakoformV2ApplicationConfig(env),
   );
+  const billingConfig = startupStage("runtime-configuration", () =>
+    parseBillingConfig(env.TAKOSERVER_BILLING_CONFIG),
+  );
+  // File-backed tariff loading can be designed separately; this release accepts inline JSON only.
   const signingKey = await loadSigningKey(
     env.TAKOSERVER_SIGNING_KEY_ID,
     env.TAKOSERVER_SIGNING_KEY,
@@ -823,6 +831,18 @@ async function composeApp(
     origin,
   );
   const sql = createD1Sql(env.STATE_DB);
+  if (billingConfig) {
+    try {
+      await assertOrgBillingSchema(sql, billingConfig);
+    } catch {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError(
+          "Organization billing is enabled but its complete 0092 D1 schema is unavailable",
+        ),
+      );
+    }
+  }
   if (
     v2Config.sqliteMigrationSet !== undefined ||
     v2Config.workerBundle !== undefined ||
@@ -918,6 +938,7 @@ async function composeApp(
       identity,
       identityProviders,
       settlement,
+      ...(billingConfig ? { billingConfig } : {}),
       ...(checkout ? { checkout } : {}),
       ...(paymentEvents ? { paymentEvents } : {}),
       ...dataServices,

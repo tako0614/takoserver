@@ -238,6 +238,10 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
       // Any of these going negative means entries were written that the rules
       // above forbid. Reporting a wrong balance would be worse than failing.
       if (
+        !Number.isSafeInteger(settledMinor) ||
+        !Number.isSafeInteger(heldMinor) ||
+        !Number.isSafeInteger(allocatedHeldMinor) ||
+        !Number.isSafeInteger(availableMinor) ||
         settledMinor < 0 ||
         heldMinor < 0 ||
         availableMinor < 0 ||
@@ -457,81 +461,17 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
     heldDeltaMinor: number,
     now: string,
   ): Promise<void> {
-    const lots = await sql.query(
-      `SELECT l.ref,
-              l.amount_minor - COALESCE(SUM(a.amount_minor), 0) AS remaining
-       FROM wallet_credit_lots l
-       LEFT JOIN wallet_credit_allocations a
-         ON a.org_id = l.org_id AND a.lot_ref = l.ref
-       WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)
-       GROUP BY l.org_id, l.ref, l.amount_minor, l.expires_at, l.created_at
-       HAVING remaining > 0
-       ORDER BY CASE WHEN l.expires_at IS NULL THEN 1 ELSE 0 END,
-                l.expires_at, l.created_at, l.ref`,
-      [organizationId, now],
-    );
-    let remaining = amountMinor;
-    const allocations: Array<{ readonly lotRef: string; readonly amount: number }> = [];
-    for (const lot of lots) {
-      const amount = Math.min(remaining, Number(lot.remaining));
-      if (amount > 0) allocations.push({ lotRef: String(lot.ref), amount });
-      remaining -= amount;
-      if (remaining === 0) break;
-    }
-    if (remaining !== 0) throw new LedgerError("insufficient_funds");
-    const guardId = `guard_${crypto.randomUUID()}`;
-    const statements = allocations.map((allocation) => ({
-      sql: `INSERT OR IGNORE INTO wallet_credit_allocations
-              (org_id, debit_type, debit_ref, lot_ref, amount_minor, created_at)
-            SELECT ?, ?, ?, ?, ?, ?
-            WHERE (
-              SELECT amount_minor - COALESCE((
-                SELECT SUM(amount_minor) FROM wallet_credit_allocations
-                WHERE org_id = ? AND lot_ref = ?
-              ), 0)
-              FROM wallet_credit_lots WHERE org_id = ? AND ref = ?
-            ) >= ?`,
-      params: [
+    await sql.batch(
+      await prepareLedgerAllocation(sql, {
         organizationId,
         type,
         reference,
-        allocation.lotRef,
-        allocation.amount,
+        amountMinor,
+        settledDeltaMinor,
+        heldDeltaMinor,
         now,
-        organizationId,
-        allocation.lotRef,
-        organizationId,
-        allocation.lotRef,
-        allocation.amount,
-      ],
-    }));
-    await sql.batch([
-      ...statements,
-      {
-        sql: `INSERT INTO wallet_allocation_guards (id, valid)
-              VALUES (?, CASE WHEN (
-                SELECT COALESCE(SUM(amount_minor), 0)
-                FROM wallet_credit_allocations
-                WHERE org_id = ? AND debit_type = ? AND debit_ref = ?
-              ) = ? THEN 1 ELSE 0 END)`,
-        params: [guardId, organizationId, type, reference, amountMinor],
-      },
-      {
-        sql: `INSERT OR IGNORE INTO ledger
-                (id, org_id, type, ref, settled_delta, held_delta, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        params: [
-          `led_${crypto.randomUUID()}`,
-          organizationId,
-          type,
-          reference,
-          settledDeltaMinor,
-          heldDeltaMinor,
-          now,
-        ],
-      },
-      { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [guardId] },
-    ]);
+      }),
+    );
   }
 
   async function settleHold(
@@ -688,4 +628,97 @@ async function planHoldSettlement(
 function positiveAmount(value: number): number {
   if (!Number.isSafeInteger(value) || value <= 0) throw new LedgerError("invalid_amount");
   return value;
+}
+
+/** Plans a lot allocation for an enclosing durable lifecycle batch. */
+export async function prepareLedgerAllocation(
+  sql: Sql,
+  input: {
+    readonly organizationId: string;
+    readonly type: "hold" | "usage_debit";
+    readonly reference: string;
+    readonly amountMinor: number;
+    readonly settledDeltaMinor: number;
+    readonly heldDeltaMinor: number;
+    readonly now: string;
+  },
+): Promise<readonly SqlStatement[]> {
+  const { organizationId, type, reference, amountMinor, settledDeltaMinor, heldDeltaMinor, now } =
+    input;
+  positiveAmount(amountMinor);
+  const lots = await sql.query(
+    `SELECT l.ref,
+              l.amount_minor - COALESCE(SUM(a.amount_minor), 0) AS remaining
+       FROM wallet_credit_lots l
+       LEFT JOIN wallet_credit_allocations a
+         ON a.org_id = l.org_id AND a.lot_ref = l.ref
+       WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)
+       GROUP BY l.org_id, l.ref, l.amount_minor, l.expires_at, l.created_at
+       HAVING remaining > 0
+       ORDER BY CASE WHEN l.expires_at IS NULL THEN 1 ELSE 0 END,
+                l.expires_at, l.created_at, l.ref`,
+    [organizationId, now],
+  );
+  let remaining = amountMinor;
+  const allocations: Array<{ readonly lotRef: string; readonly amount: number }> = [];
+  for (const lot of lots) {
+    const amount = Math.min(remaining, Number(lot.remaining));
+    if (amount > 0) allocations.push({ lotRef: String(lot.ref), amount });
+    remaining -= amount;
+    if (remaining === 0) break;
+  }
+  if (remaining !== 0) throw new LedgerError("insufficient_funds");
+  const guardId = `guard_${crypto.randomUUID()}`;
+  const statements = allocations.map((allocation) => ({
+    sql: `INSERT OR IGNORE INTO wallet_credit_allocations
+              (org_id, debit_type, debit_ref, lot_ref, amount_minor, created_at)
+            SELECT ?, ?, ?, ?, ?, ?
+            WHERE (
+              SELECT amount_minor - COALESCE((
+                SELECT SUM(amount_minor) FROM wallet_credit_allocations
+                WHERE org_id = ? AND lot_ref = ?
+              ), 0)
+              FROM wallet_credit_lots WHERE org_id = ? AND ref = ?
+            ) >= ?`,
+    params: [
+      organizationId,
+      type,
+      reference,
+      allocation.lotRef,
+      allocation.amount,
+      now,
+      organizationId,
+      allocation.lotRef,
+      organizationId,
+      allocation.lotRef,
+      allocation.amount,
+    ],
+  }));
+  return [
+    ...statements,
+    {
+      sql: `INSERT INTO wallet_allocation_guards (id, valid)
+              VALUES (?, CASE WHEN (
+                SELECT COALESCE(SUM(amount_minor), 0)
+                FROM wallet_credit_allocations
+                WHERE org_id = ? AND debit_type = ? AND debit_ref = ?
+              ) = ? THEN 1 ELSE 0 END)`,
+      params: [guardId, organizationId, type, reference, amountMinor],
+    },
+    {
+      sql: `INSERT OR IGNORE INTO ledger
+                (id, org_id, type, ref, settled_delta, held_delta, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      params: [
+        `led_${crypto.randomUUID()}`,
+        organizationId,
+        type,
+        reference,
+        settledDeltaMinor,
+        heldDeltaMinor,
+        now,
+      ],
+    },
+    { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [guardId] },
+  ];
 }

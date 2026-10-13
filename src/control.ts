@@ -18,6 +18,7 @@ import { errorEnvelope } from "./error-envelope.ts";
 import { GoogleIdentityError } from "./google-identity.ts";
 import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledger.ts";
 import { OperatorAssertionError } from "./operator-credentials.ts";
+import { type OrgBilling, OrgBillingError } from "./org-billing.ts";
 import { PaymentEventError, type PaymentEvents } from "./payment-events.ts";
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
@@ -152,6 +153,8 @@ export interface CreateControlRoutesOptions {
   /** How a caller may sign in to this deployment. */
   readonly identityProviders: readonly IdentityProviderDescriptor[];
   readonly ledger: Ledger;
+  /** Optional Organization wallet lifecycle and usage service. */
+  readonly billing?: OrgBilling;
   readonly catalog: Catalog;
   readonly reseller: Reseller;
   readonly tokens: TokenService;
@@ -601,7 +604,124 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     if (request.method === "GET" && wallet) {
       const organizationId = segment(wallet[1]);
       await scoped(request, organizationId, "wallet:read");
-      return Response.json({ wallet: await ledger.wallet(organizationId) });
+      return Response.json({
+        wallet: options.billing
+          ? await options.billing.wallet(organizationId)
+          : await ledger.wallet(organizationId),
+      });
+    }
+
+    if (options.billing) {
+      const lots = /^\/v1\/organizations\/([^/]+)\/wallet\/lots$/u.exec(url.pathname);
+      if (request.method === "GET" && lots) {
+        const organizationId = segment(lots[1]);
+        await scoped(request, organizationId, "wallet:read");
+        return Response.json({ lots: await options.billing.lots(organizationId) });
+      }
+
+      const hold = /^\/v1\/organizations\/([^/]+)\/wallet\/holds\/([^/]+)$/u.exec(url.pathname);
+      if (request.method === "GET" && hold) {
+        const organizationId = segment(hold[1]);
+        await scoped(request, organizationId, "wallet:read");
+        return Response.json({
+          hold: await options.billing.readHold(organizationId, billingPathReference(hold[2])),
+        });
+      }
+
+      const holds = /^\/v1\/organizations\/([^/]+)\/wallet\/holds$/u.exec(url.pathname);
+      if (request.method === "POST" && holds) {
+        const organizationId = segment(holds[1]);
+        await scoped(request, organizationId, "wallet:write");
+        const body = await jsonObject(request);
+        exactKeys(body, ["reference", "amountMinor", "pricingRevision", "measurementFingerprint"]);
+        return Response.json(
+          {
+            hold: await options.billing.hold({
+              organizationId,
+              reference: billingReference(text(body.reference)),
+              amountMinor: integer(body.amountMinor),
+              pricingRevision: billingRevision(body.pricingRevision),
+              measurementFingerprint: billingFingerprint(body.measurementFingerprint),
+            }),
+          },
+          { status: 201 },
+        );
+      }
+
+      const capture = /^\/v1\/organizations\/([^/]+)\/wallet\/holds\/([^/]+)\/capture$/u.exec(
+        url.pathname,
+      );
+      if (request.method === "POST" && capture) {
+        const organizationId = segment(capture[1]);
+        await scoped(request, organizationId, "wallet:write");
+        const reference = billingPathReference(capture[2]);
+        const body = await jsonObject(request);
+        exactKeys(body, ["amountMinor", "actualMicros", "measurementFingerprint"]);
+        return Response.json({
+          hold: await options.billing.capture({
+            organizationId,
+            reference,
+            amountMinor: integer(body.amountMinor),
+            actualMicros: unsignedIntegerText(body.actualMicros),
+            measurementFingerprint: billingFingerprint(body.measurementFingerprint),
+          }),
+        });
+      }
+
+      const release = /^\/v1\/organizations\/([^/]+)\/wallet\/holds\/([^/]+)\/release$/u.exec(
+        url.pathname,
+      );
+      if (request.method === "POST" && release) {
+        const organizationId = segment(release[1]);
+        await scoped(request, organizationId, "wallet:write");
+        const reference = billingPathReference(release[2]);
+        if (request.body !== null) controlError("invalid_argument", 400);
+        return Response.json({ hold: await options.billing.release(organizationId, reference) });
+      }
+
+      const usageRecords = /^\/v1\/organizations\/([^/]+)\/wallet\/usage-records$/u.exec(
+        url.pathname,
+      );
+      if (usageRecords && request.method === "GET") {
+        const organizationId = segment(usageRecords[1]);
+        await scoped(request, organizationId, "usage:read");
+        const limit = billingUsagePageSize(url);
+        const cursor = billingUsageCursor(url);
+        return Response.json(await options.billing.listUsage(organizationId, limit, cursor));
+      }
+      if (usageRecords && request.method === "POST") {
+        const organizationId = segment(usageRecords[1]);
+        await scoped(request, organizationId, "usage:write");
+        const body = await jsonObject(request);
+        exactKeys(body, [
+          "reference",
+          "meter",
+          "quantityUnit",
+          "quantity",
+          "periodStart",
+          "periodEnd",
+          "pricingRevision",
+          "expectedMinor",
+          "measurementFingerprint",
+        ]);
+        return Response.json(
+          {
+            usageRecord: await options.billing.usage({
+              organizationId,
+              reference: billingReference(text(body.reference)),
+              meter: billingMeter(body.meter),
+              quantityUnit: billingUnit(body.quantityUnit),
+              quantity: unsignedDecimal(body.quantity),
+              periodStart: canonicalDateTime(body.periodStart),
+              periodEnd: canonicalDateTime(body.periodEnd),
+              pricingRevision: billingRevision(body.pricingRevision),
+              expectedMinor: integer(body.expectedMinor),
+              measurementFingerprint: billingFingerprint(body.measurementFingerprint),
+            }),
+          },
+          { status: 201 },
+        );
+      }
     }
 
     const funding = /^\/v1\/organizations\/([^/]+)\/wallet\/funding$/u.exec(url.pathname);
@@ -1330,6 +1450,29 @@ function pageSize(url: URL): number {
   return Math.min(value, 200);
 }
 
+/** Preserve billing's stricter ceiling so the service can reject values above 100. */
+function billingUsagePageSize(url: URL): number | undefined {
+  const values = url.searchParams.getAll("limit");
+  if (values.length === 0) return undefined;
+  if (values.length !== 1 || !/^(?:0|[1-9][0-9]*)$/u.test(values[0] ?? "")) {
+    controlError("invalid_argument", 400);
+  }
+  const value = Number(values[0]);
+  if (!Number.isSafeInteger(value)) controlError("invalid_argument", 400);
+  return value;
+}
+
+/** The cursor stays opaque to the route and is bounded before reaching storage. */
+function billingUsageCursor(url: URL): string | undefined {
+  const values = url.searchParams.getAll("cursor");
+  if (values.length === 0) return undefined;
+  const cursor = values[0];
+  if (values.length !== 1 || cursor === undefined || cursor === "" || cursor.length > 512) {
+    controlError("invalid_argument", 400);
+  }
+  return values[0];
+}
+
 /** Closed decimal grammar for the immutable Resource evidence contract. */
 function resourceExecutionEvidencePageSize(url: URL): number {
   const values = url.searchParams.getAll("limit");
@@ -1409,6 +1552,7 @@ function classify(error: unknown): { code: string; status: number } {
         error.code === "insufficient_funds" ? 402 : error.code === "invalid_amount" ? 400 : 500,
     };
   }
+  if (error instanceof OrgBillingError) return { code: error.code, status: error.status };
   if (error instanceof TokenError) return { code: error.code, status: 400 };
   if (error instanceof PaymentEventError) {
     // `unavailable` is the one a processor should retry; the rest are final.
@@ -1614,6 +1758,86 @@ function credentialReference(value: unknown): string {
 function resourceName(value: unknown): string {
   const parsed = text(value);
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
+function billingReference(value: unknown): string {
+  const parsed = bounded(value, 128);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
+function billingPathReference(value: string | undefined): string {
+  if (value === undefined || value.length > 384) controlError("invalid_argument", 400);
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    controlError("invalid_argument", 400);
+  }
+  return billingReference(decoded);
+}
+
+function billingFingerprint(value: unknown): string {
+  const parsed = bounded(value, 256);
+  if (
+    Array.from(parsed).some((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code <= 0x1f || code === 0x7f;
+    })
+  ) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
+function billingRevision(value: unknown): string {
+  const parsed = bounded(value, 128);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
+function billingMeter(value: unknown): string {
+  const parsed = bounded(value, 128);
+  if (!/^[a-z][a-z0-9.-]{0,127}$/u.test(parsed) || parsed.includes("..")) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
+function billingUnit(value: unknown): string {
+  const parsed = bounded(value, 64);
+  if (!/^[A-Za-z][A-Za-z0-9._-]{0,63}$/u.test(parsed)) controlError("invalid_argument", 400);
+  return parsed;
+}
+
+function unsignedDecimal(value: unknown): string {
+  const parsed = bounded(value, 256);
+  if (!/^(?:0|[1-9][0-9]*)(?:\.[0-9]{0,17}[1-9])?$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
+function unsignedIntegerText(value: unknown): string {
+  const parsed = bounded(value, 256);
+  if (!/^(?:0|[1-9][0-9]*)$/u.test(parsed)) controlError("invalid_argument", 400);
+  return parsed;
+}
+
+function canonicalDateTime(value: unknown): string {
+  const parsed = bounded(value, 32);
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
+  const timestamp = Date.parse(parsed);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== parsed) {
     controlError("invalid_argument", 400);
   }
   return parsed;
