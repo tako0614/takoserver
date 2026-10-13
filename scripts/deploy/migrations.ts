@@ -78,11 +78,18 @@ export const STRIPE_EVENTS_MIGRATION = "0091_stripe_events.sql";
  * webhook records into. Without it every delivery fails until Stripe disables
  * the endpoint, so publication is refused before anything is uploaded.
  */
+export function stripeWebhookSchemaReady(
+  target: { readonly stripeWebhook?: boolean },
+  applied: readonly string[],
+): boolean {
+  return target.stripeWebhook !== true || applied.includes(STRIPE_EVENTS_MIGRATION);
+}
+
 export function assertStripeWebhookSchema(
   target: { readonly stripeWebhook?: boolean },
   applied: readonly string[],
 ): void {
-  if (target.stripeWebhook === true && !applied.includes(STRIPE_EVENTS_MIGRATION)) {
+  if (!stripeWebhookSchemaReady(target, applied)) {
     throw preflightError(
       `the Stripe webhook needs ${STRIPE_EVENTS_MIGRATION} applied to this D1 before publication`,
       `applied=${applied.length}`,

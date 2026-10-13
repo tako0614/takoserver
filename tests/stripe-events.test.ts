@@ -773,6 +773,11 @@ describe("independent review guards", () => {
       sessions: {
         cs_test_yen: paid({ currency: "jpy", amount_total: 77_777 }),
         cs_test_foreign: paid({ metadata: { organizationId: UNKNOWN_ORG } }),
+        // A Payment Link with neither marker nor organization: not ours, not an alarm.
+        cs_test_link: paid({
+          currency: "eur",
+          metadata: { organizationId: undefined, takoserverPurpose: undefined },
+        }),
       },
     });
     const warnings: string[] = [];

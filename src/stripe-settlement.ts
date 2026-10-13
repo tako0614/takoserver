@@ -29,6 +29,11 @@ import type { FundingSettlementVerifier } from "./ledger.ts";
  */
 
 const STRIPE_API = "https://api.stripe.com/v1";
+/**
+ * Pinned, so the fields read here (`latest_charge` and its refund and dispute
+ * state) do not depend on whatever default version the account carries.
+ */
+export const STRIPE_API_VERSION = "2024-06-20";
 
 /** Stripe Checkout Session ids; short enough that `stripe:<id>` fits a ledger reference. */
 const CHECKOUT_SESSION_ID = /^cs_[A-Za-z0-9_]{1,240}$/u;
@@ -123,6 +128,14 @@ export function checkoutSessionFunding(
   if (typeof session.id !== "string" || !CHECKOUT_SESSION_ID.test(session.id)) {
     throw new StripeSettlementError("unknown_session");
   }
+  // Decided first where nobody presented the session: a payment this Host did
+  // not create is not a failed top-up, and must not read as money left behind.
+  if (
+    options.requireHostMarker === true &&
+    (session.mode !== "payment" || session.metadata?.takoserverPurpose !== WALLET_FUNDING_PURPOSE)
+  ) {
+    throw new StripeSettlementError("not_wallet_funding");
+  }
   if (session.payment_status !== "paid") throw new StripeSettlementError("not_paid");
   const organizationId = session.metadata?.organizationId;
   if (
@@ -144,13 +157,7 @@ export function checkoutSessionFunding(
   ) {
     throw new StripeSettlementError("not_paid");
   }
-  if (
-    session.mode !== "payment" ||
-    (options.requireHostMarker === true &&
-      session.metadata?.takoserverPurpose !== WALLET_FUNDING_PURPOSE)
-  ) {
-    throw new StripeSettlementError("not_wallet_funding");
-  }
+  if (session.mode !== "payment") throw new StripeSettlementError("not_wallet_funding");
   assertPaymentStillHeld(session.payment_intent);
   return {
     organizationId,
@@ -240,6 +247,7 @@ export function createStripeClient(options: StripeOptions): StripeClient {
           method,
           headers: {
             authorization: `Bearer ${options.secretKey}`,
+            "stripe-version": STRIPE_API_VERSION,
             ...(form ? { "content-type": "application/x-www-form-urlencoded" } : {}),
           },
           ...(form ? { body: new URLSearchParams(form).toString() } : {}),

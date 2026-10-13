@@ -17,8 +17,9 @@ function stripe(session: Record<string, unknown> | null) {
     secretKey: "sk_test_pretend",
     async fetch(request) {
       calls.push(new URL(request.url).pathname);
-      // The secret must travel, and only to Stripe.
+      // The secret must travel, and only to Stripe, on the pinned API version.
       expect(request.headers.get("authorization")).toBe("Bearer sk_test_pretend");
+      expect(request.headers.get("stripe-version")).toBe("2024-06-20");
       return session === null
         ? new Response("", { status: 404 })
         : Response.json({ id: "cs_test_123", ...session });

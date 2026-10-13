@@ -29,6 +29,7 @@ import {
   pendingMigrations,
   readD1SchemaState,
   readMigrationArtifact,
+  stripeWebhookSchemaReady,
 } from "./migrations.ts";
 import {
   type CommandResult,
@@ -545,6 +546,7 @@ export async function runWorker(
         ready:
           target.schemaMaintenanceMode === undefined &&
           workerSchemaAllowsPending(target, before.migrations, sourceRepositoryRoot) &&
+          stripeWebhookSchemaReady(target, before.migrations.applied) &&
           !legacyProfileCurrent &&
           (target.integrationE2eCredentialAuthority === undefined ||
             before.integrationE2eCredentialAuthorityConfigured) &&
