@@ -267,7 +267,13 @@ describe("canonical integration 0088 to 0092 schema", () => {
     });
   }
 
-  for (const invalid of ["premature-92", "production", "wrong-origin", "wrong-name"] as const) {
+  for (const invalid of [
+    "premature-92",
+    "production",
+    "rehearsal",
+    "wrong-origin",
+    "wrong-name",
+  ] as const) {
     test(`0092 staging selector refuses ${invalid}`, async () => {
       const selected =
         invalid === "premature-92"
@@ -275,16 +281,21 @@ describe("canonical integration 0088 to 0092 schema", () => {
               ...target,
               takoformV2: { ...target.takoformV2, appliedSchemaLineage: "v2-0092" as const },
             }
-          : invalid === "production"
-            ? { ...target, environment: "production" as const }
+          : invalid === "production" || invalid === "rehearsal"
+            ? { ...target, environment: invalid }
             : invalid === "wrong-origin"
               ? {
                   ...target,
                   takoformV2: { ...target.takoformV2, storageLineage: "v2-0091" as const },
                 }
               : { ...target, d1: { ...target.d1, databaseName: productionD1.databaseName } };
-      const result = runD1Schema(statusInvocation, selected, statusOptions());
-      if (invalid === "production") await expect(result).rejects.toThrow();
+      const invocation =
+        invalid === "production" || invalid === "rehearsal"
+          ? { ...statusInvocation, environment: invalid }
+          : statusInvocation;
+      const result = runD1Schema(invocation, selected, statusOptions());
+      if (invalid === "production" || invalid === "rehearsal")
+        await expect(result).rejects.toThrow("exact generated integration");
       else
         await expect(result).rejects.toThrow(
           invalid === "premature-92"
