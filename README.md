@@ -480,6 +480,11 @@ absent. The webhook is gated the same way: `"stripeWebhook": true` (only with
 `checkoutMinimumMinor`, `checkoutMaximumMinor`, `webhookToleranceSeconds` and
 `reconcileLookbackSeconds`, validated before deploy.
 
+Starting a Checkout needs a console to send the payer back to: without a
+console origin the Checkout route is not served, while the key still verifies
+a presented session and runs the webhook (where configured) and the reconcile
+pass.
+
 A payment is credited however the Host learns of it, and only once. The
 console's return presents the Checkout Session id; the Stripe webhook
 (`checkout.session.completed` and `checkout.session.async_payment_succeeded`)

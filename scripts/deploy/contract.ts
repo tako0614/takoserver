@@ -1047,7 +1047,11 @@ export const DEPLOY_CONTRACT = {
       ],
       requiresScripts: ["check:migrations"],
       requiresTools: ["bun", "wrangler"],
-      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
+      ],
       triggers: ["irreversible", "authority"],
       obligations: {
         provenance:

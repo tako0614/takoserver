@@ -155,7 +155,7 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
 
 #### Staging D1 through 0091 (staging-only `v2-0091`)
 
-`--fresh-lineage=v2-0091` is the third fixed fresh payload: the audited
+`--fresh-lineage=v2-0091` is the fourth explicit selector on this surface (its third fixed v2 D1 payload): the audited
 0001–0091 bytes, ending in `0091_stripe_events.sql`, with the fixed digest
 `sha256:152aefa3c0577809d419d95be2bc8878aa9a390a4ee40bfbf5501c32bf058bef`. It is
 **staging-only**:
@@ -166,11 +166,9 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
   `takoserver-i-<generation>` D1. It cannot reach an existing database.
 
 It exists because no existing integration D1 can be moved past 0088 in place.
-The current canonical integration D1 is deliberately left untouched:
-`takoserver-i-9b02176262d90b0c414fc97bf7188ffd`,
-id `f079f16e-d4d7-4a51-8383-c4466c99bc53`, at 0001–0088. The canonical WfP
-owners require exactly that ledger and bind its schema digest into their
-retained claims, so moving it in place would break them.
+The canonical integration D1 that the WfP owners use is deliberately left at
+0001–0088: those owners require exactly that ledger and bind its schema digest
+into their retained claims, so moving it in place would break them.
 
 Two guards refuse a production D1:
 
@@ -190,17 +188,22 @@ the exact `main` commit:
 
 ```sh
 export TAKOSERVER_DEPLOY_TARGET_INTEGRATION=/abs/path/integration-target.json   # account only; never edited
-export TAKOSERVER_DEPLOY_TARGET_PRODUCTION=/abs/path/production-target.json     # read for its D1 identity only
+PRODUCTION_TARGET=/abs/path/production-target.json   # D1 identity only; never exported
 export TAKOSERVER_INDEPENDENT_REVIEW='<reviewer who is not the operator>'
 export CLOUDFLARE_API_TOKEN='<integration-scoped token>'   # or integration Wrangler OAuth
 COMMIT=$(git rev-parse HEAD)          # must equal the reviewed main commit
 GEN=$(openssl rand -hex 16)           # one new generation; never reuse a failed one
 ```
 
+`TAKOSERVER_DEPLOY_TARGET_PRODUCTION` is also how every production surface
+selects its mutation target, so pass it on each command below only, never in
+the shell environment. Any set value must name a loadable absolute production
+descriptor; a relative or broken one refuses every lineage of this surface.
+
 **2. Run status and record it.** Status is read-only:
 
 ```sh
-bun run deploy -- takoserver-integration-storage-generation --status --environment=integration --commit="$COMMIT" --generation="$GEN" --fresh-lineage=v2-0091
+TAKOSERVER_DEPLOY_TARGET_PRODUCTION="$PRODUCTION_TARGET" bun run deploy -- takoserver-integration-storage-generation --status --environment=integration --commit="$COMMIT" --generation="$GEN" --fresh-lineage=v2-0091
 ```
 
 Proceed only when all of these hold:
@@ -216,7 +219,7 @@ Keep the output as operator-private provenance.
 **3. Apply once.** Apply is one-way:
 
 ```sh
-bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit="$COMMIT" --generation="$GEN" --fresh-lineage=v2-0091
+TAKOSERVER_DEPLOY_TARGET_PRODUCTION="$PRODUCTION_TARGET" bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit="$COMMIT" --generation="$GEN" --fresh-lineage=v2-0091
 ```
 
 Record the output:
@@ -230,7 +233,8 @@ After any failure or lost acknowledgement, do not rerun `--apply` and do not
 mint a new generation as a retry. Run step 4 and repair forward under owner
 review.
 
-**4. Verify.** Run status again with the same flags. Expect:
+**4. Verify.** Run the step 2 status command again, with the same
+production target. Expect:
 
 - `schemaReadback: complete-0091`
 - `dataReadback: empty-seeded`

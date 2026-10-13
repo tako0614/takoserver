@@ -108,8 +108,13 @@ export interface ProductionD1Identity {
   readonly databaseId: string;
 }
 
-/** Every production D1 this deployment has used is named `takoserver-runtime…`. */
-const PRODUCTION_D1_NAME = /^takoserver-runtime(?:$|-)/u;
+/**
+ * Production D1 names: the original `takoserver-runtime…` databases and the
+ * `takoserver-p-<generation>` ones production fresh init creates. The
+ * generated-name allowlist below already excludes both; this names them so a
+ * future change to that allowlist cannot silently admit one.
+ */
+const PRODUCTION_D1_NAME = /^takoserver-(?:runtime(?:$|-)|p-)/u;
 const GENERATED_D1_NAME = /^takoserver-i-[0-9a-f]{32}$/u;
 
 /**

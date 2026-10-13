@@ -38,11 +38,12 @@ const target = {
   environment: "integration",
   accountId: "b".repeat(32),
   workerName: "takoserver-api-integration",
+  // The selected target's current pair: never the generated one, never touched.
   d1: {
-    databaseName: "takoserver-i-9b02176262d90b0c414fc97bf7188ffd",
-    databaseId: "f079f16e-d4d7-4a51-8383-c4466c99bc53",
+    databaseName: `takoserver-i-${"e".repeat(32)}`,
+    databaseId: "00000000-0000-4000-8000-000000000088",
   },
-  r2: { bucketName: "takoserver-i-9b02176262d90b0c414fc97bf7188ffd" },
+  r2: { bucketName: `takoserver-i-${"e".repeat(32)}` },
   publicOrigin: "https://takoserver-api-integration.example.workers.dev",
   signing: { currentKeyId: "integration-current" },
 } satisfies DeployTarget;
@@ -116,6 +117,7 @@ describe("staging-only v2-0091 D1 profile", () => {
       "takoserver-runtime",
       "takoserver-runtime-ga-20260820",
       "takoserver-runtime-integration",
+      `takoserver-p-${"a".repeat(32)}`,
       "takoserver-i-short",
       `takoserver-i-${"D".repeat(32)}`,
     ]) {
@@ -240,5 +242,41 @@ describe("staging-only v2-0091 D1 profile", () => {
     expect(created).toBe(true);
     expect(imports).toEqual([]);
     expect(r2Created).toBe(false);
+  });
+
+  test("the CLI reads the production target only from an absolute path, before any provider read", () => {
+    const integrationPath = join(ROOT, "integration-target.json");
+    writeFileSync(integrationPath, JSON.stringify(target), { mode: 0o600 });
+    const run = (production: string) =>
+      Bun.spawnSync(
+        [
+          process.execPath,
+          "--no-env-file",
+          "scripts/deploy.ts",
+          "takoserver-integration-storage-generation",
+          "--status",
+          "--environment=integration",
+          `--commit=${"c".repeat(40)}`,
+          `--generation=${GENERATION}`,
+          "--fresh-lineage=v2-0091",
+        ],
+        {
+          cwd: resolve(import.meta.dir, ".."),
+          env: {
+            PATH: process.env.PATH ?? "",
+            TAKOSERVER_DEPLOY_TARGET_INTEGRATION: integrationPath,
+            TAKOSERVER_DEPLOY_TARGET_PRODUCTION: production,
+          },
+        },
+      );
+    const relative = run("relative/production-target.json");
+    expect(relative.exitCode).toBe(2);
+    expect(new TextDecoder().decode(relative.stderr)).toContain(
+      "TAKOSERVER_DEPLOY_TARGET_PRODUCTION must be an absolute path",
+    );
+    const missingPath = join(ROOT, "missing-production-target.json");
+    const missing = run(missingPath);
+    expect(missing.exitCode).toBe(2);
+    expect(new TextDecoder().decode(missing.stderr)).toContain(missingPath);
   });
 });
