@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { parseBillingConfig } from "../src/billing-config.ts";
 import {
   buildApp,
   createEphemeralSql,
@@ -104,6 +105,19 @@ function paymentEventsStub() {
 }
 
 function completeHandler() {
+  const billingConfig = parseBillingConfig(
+    JSON.stringify({
+      schemaVersion: 1,
+      revision: "surface-probe.1",
+      effectiveAt: "2026-10-01T00:00:00.000Z",
+      currency: "USD",
+      freeIncludedMinor: 0,
+      purchaseCreditExpiry: { kind: "none" },
+      plans: {},
+      meters: {},
+    }),
+  );
+  if (!billingConfig) throw new Error("missing surface-probe billing configuration");
   const publicWorkerVersionId = "00000000-0000-4000-8000-000000000001";
   return buildApp({
     v2: TEST_TAKOFORM_V2_CONFIG,
@@ -125,6 +139,7 @@ function completeHandler() {
     hostForms: [],
     driver: new InMemoryTakoformResourceDriver(),
     offerings: [],
+    billingConfig,
     originReservations: reservationStub(),
     paymentEvents: paymentEventsStub,
   }).fetch;
@@ -132,6 +147,7 @@ function completeHandler() {
 
 const PATH_SAMPLES: Readonly<Record<string, string>> = {
   organizationId: "org_probe",
+  reference: "run:probe",
   deploymentId: "dep_probe",
   resourceUid: "uid_probe",
   uid: "uid_probe",
@@ -238,6 +254,15 @@ describe("published API description", () => {
       }
     }
     expect(unknown).toEqual([]);
+  });
+
+  test("billing routes require explicit tariff configuration", async () => {
+    const fetch = handler();
+    const response = await fetch(
+      new Request("https://api.takoserver.com/v1/organizations/org_probe/wallet/holds/run:probe"),
+    );
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ error: { code: "not_found" } });
   });
 
   test("names one server and one bearer scheme", () => {

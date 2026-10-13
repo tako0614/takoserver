@@ -135,12 +135,12 @@ Run/closed meter period, then round final cents once using nearest, ties to even
 including basis-point headroom, and rejects unsafe final cents. There is no
 fractional balance carried into another period.
 
-For `takosumi.storage.byte-hours`, configure `unit: "byte-hour"`, but submit
-`quantityUnit: "byte-millisecond"` and an **integer integral of byte-milliseconds**.
+For any `byte-hour` meter, including Hosted's `takosumi.storage.byte-hours`,
+submit `quantityUnit: "byte-millisecond"` and an **integer integral of byte-milliseconds**.
 The server divides by exactly 3,600,000 before applying the rational hourly rate
 and rounding final cents. It never converts to a floating or truncated decimal
-byte-hour quantity. Other meters accept their configured unit and canonical
-nonnegative decimal quantity with at most 18 fractional digits and no trailing
+byte-hour quantity. Meters with other units accept their configured unit and
+canonical nonnegative decimal quantity with at most 18 fractional digits and no trailing
 fractional zero. Receipts retain original quantity, unit, period, revision,
 configured rational rate, cents, and payment status.
 

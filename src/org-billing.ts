@@ -609,16 +609,14 @@ export function createOrgBilling(options: {
           ).length
         )
           orgBillingFail("usage_period_crosses_tariff", 409);
-        const storage = input.meter === "takosumi.storage.byte-hours";
+        const byteHours = meter.unit === "byte-hour";
         if (
-          storage
-            ? input.quantityUnit !== "byte-millisecond" ||
-              meter.unit !== "byte-hour" ||
-              quantity.denominator !== 1n
+          byteHours
+            ? input.quantityUnit !== "byte-millisecond" || quantity.denominator !== 1n
             : input.quantityUnit !== meter.unit
         )
           orgBillingFail("invalid_quantity", 400);
-        const unitDenominator = storage ? 3600000n : 1n;
+        const unitDenominator = byteHours ? 3600000n : 1n;
         let amount: number;
         try {
           amount = computeMeterAmountMinor(

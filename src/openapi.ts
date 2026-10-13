@@ -670,7 +670,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
     "x-required-scopes": ["usage:write"],
     parameters: [ORGANIZATION_ID_PARAMETER],
     description:
-      "Takoserver reprices the immutable quantity using the selected tariff. For `takosumi.storage.byte-hours`, send `quantityUnit=byte-millisecond` and an integral byte-millisecond quantity; the server converts the exact total to byte-hours before rounding the final USD cents once. Other meters require the configured unit.",
+      "Takoserver reprices the immutable quantity using the selected tariff. For a configured `byte-hour` meter, send `quantityUnit=byte-millisecond` and an integral byte-millisecond quantity; the server converts the exact total to byte-hours before rounding the final USD cents once. Other meters require the configured unit.",
     requestBody: billingRequest("CreateWalletUsageRecordRequest"),
     responses: {
       "201": {

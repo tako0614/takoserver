@@ -4166,7 +4166,7 @@
       },
       "post": {
         "summary": "Price and settle one closed usage period",
-        "description": "Takoserver reprices the immutable quantity using the selected tariff. For `takosumi.storage.byte-hours`, send `quantityUnit=byte-millisecond` and an integral byte-millisecond quantity; the server converts the exact total to byte-hours before rounding the final USD cents once. Other meters require the configured unit.",
+        "description": "Takoserver reprices the immutable quantity using the selected tariff. For a configured `byte-hour` meter, send `quantityUnit=byte-millisecond` and an integral byte-millisecond quantity; the server converts the exact total to byte-hours before rounding the final USD cents once. Other meters require the configured unit.",
         "responses": {
           "201": {
             "description": "Usage receipt, including durable unpaid usage after insufficient funds",

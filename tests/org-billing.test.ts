@@ -623,3 +623,34 @@ test("new tariff cannot backdate and reprice an already consumed period", async 
   ).toEqual(["r1"]);
   expect(await f.billing.usage(usage)).toMatchObject({ pricingRevision: "r1", amountMinor: 1 });
 });
+
+test("byte-hour pricing follows the configured unit without a customer product meter name", async () => {
+  const f = fixture(
+    config({
+      meters: {
+        "operator.storage": {
+          unit: "byte-hour",
+          rate: { numeratorMicros: "10000", denominator: "1" },
+        },
+      },
+    }),
+  );
+  await f.ledger.fund({ organizationId: "org_a", fundingRef: "unit-test", amountMinor: 10 });
+  const input = { ...usage, meter: "operator.storage" };
+  expect(await f.billing.usage(input)).toMatchObject({ amountMinor: 1, status: "paid" });
+  await errorCode(
+    f.billing.usage({ ...input, reference: "decimal-integral", quantity: "1.5", expectedMinor: 0 }),
+    "invalid_quantity",
+    400,
+  );
+  await errorCode(
+    f.billing.usage({
+      ...input,
+      reference: "wrong-unit",
+      quantityUnit: "byte-hour",
+      quantity: "1",
+    }),
+    "invalid_quantity",
+    400,
+  );
+});
