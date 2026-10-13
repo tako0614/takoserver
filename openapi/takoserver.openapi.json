@@ -3038,6 +3038,78 @@
         }
       }
     },
+    "/v1/payments/stripe/webhook": {
+      "post": {
+        "summary": "Receive one signed Stripe event. Served only where Stripe funding and a webhook signing secret are configured; the Stripe-Signature header over the raw body is the credential, and amounts are re-read from Stripe",
+        "responses": {
+          "200": {
+            "description": "Verified and recorded, including an already-settled redelivery",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "received",
+                    "duplicate"
+                  ],
+                  "properties": {
+                    "received": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "duplicate": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing, malformed, mismatched or out-of-tolerance signature, or a malformed event",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Stripe webhooks are not configured on this deployment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Event body exceeds 256 KiB",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Stripe could not be read; the event stays retryable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
     "/v1/catalog": {
       "get": {
         "summary": "List purchasable offerings",

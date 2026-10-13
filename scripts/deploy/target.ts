@@ -12,6 +12,12 @@ import {
 } from "../../src/hosted-object-bucket-supplies.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../../src/integration-e2e-credential-authority.ts";
 import { canonicalJson } from "../../src/json.ts";
+import {
+  PAYMENT_SETTING_VARIABLES,
+  type PaymentSettings,
+  PaymentSettingsError,
+  validatePaymentSettings,
+} from "../../src/payment-settings.ts";
 import { isCloudflareWorkersAiModelReference } from "../../src/providers/cloudflare-workers-ai.ts";
 import { parseOpenAiModelConfig } from "../../src/providers/openai.ts";
 import {
@@ -93,6 +99,13 @@ export interface DeployTarget {
   readonly takosId?: { readonly issuer: string; readonly clientId: string };
   /** Requires the deployed Worker to offer customer Stripe Checkout funding. */
   readonly stripeCheckout?: boolean;
+  /**
+   * Requires the deployed Worker to receive Stripe webhooks, and the Worker to
+   * hold a `STRIPE_WEBHOOK_SECRET`. Only with `stripeCheckout`.
+   */
+  readonly stripeWebhook?: boolean;
+  /** Non-secret Stripe amounts and windows; each absent one takes its default. */
+  readonly stripeSettings?: PaymentSettings;
   /**
    * DNS zones this deployment may attach customer Workers to.
    *
@@ -327,6 +340,8 @@ const DEPLOY_TARGET_OPTIONAL_KEYS: readonly string[] = [
   "googleClientId",
   "takosId",
   "stripeCheckout",
+  "stripeWebhook",
+  "stripeSettings",
   "zones",
   "aiModels",
   "objectBucketSupplies",
@@ -509,6 +524,12 @@ export function parseDeployTarget(
     ...(value.stripeCheckout === undefined
       ? {}
       : { stripeCheckout: boolean(value.stripeCheckout, "stripeCheckout") }),
+    ...(value.stripeWebhook === undefined
+      ? {}
+      : { stripeWebhook: boolean(value.stripeWebhook, "stripeWebhook") }),
+    ...(value.stripeSettings === undefined
+      ? {}
+      : { stripeSettings: stripeSettings(value.stripeSettings) }),
     ...(value.zones === undefined ? {} : { zones: zoneList(value.zones) }),
     ...(value.aiModels === undefined ? {} : { aiModels: modelList(value.aiModels) }),
     ...(value.objectBucketSupplies === undefined
@@ -547,6 +568,14 @@ export function parseDeployTarget(
         }),
     signing: signing(value.signing),
   };
+  if (
+    (target.stripeWebhook === true || target.stripeSettings !== undefined) &&
+    target.stripeCheckout !== true
+  ) {
+    // A webhook or a payment setting on a deployment that takes no payment is
+    // a target that says something different from what it will do.
+    throw preflightError("deploy target Stripe webhook and settings require `stripeCheckout`");
+  }
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && environment !== "integration") {
     throw preflightError("v2 0088 schema maintenance is integration-only");
   }
@@ -1350,6 +1379,29 @@ function pattern(value: unknown, expression: RegExp, field: string): string {
     throw preflightError(`deploy target \`${field}\` is invalid`);
   }
   return value;
+}
+
+function stripeSettings(value: unknown): PaymentSettings {
+  if (!isRecord(value)) throw preflightError("deploy target `stripeSettings` must be an object");
+  const names = Object.keys(PAYMENT_SETTING_VARIABLES) as (keyof PaymentSettings)[];
+  assertExactKeys(value, [], names);
+  const settings: { -readonly [Key in keyof PaymentSettings]: number } = {};
+  for (const name of names) {
+    const setting = value[name];
+    if (setting === undefined) continue;
+    if (typeof setting !== "number" || !Number.isSafeInteger(setting)) {
+      throw preflightError(`deploy target \`stripeSettings.${name}\` is invalid`);
+    }
+    settings[name] = setting;
+  }
+  try {
+    return validatePaymentSettings(settings, (name) => `stripeSettings.${name}`);
+  } catch (error) {
+    if (error instanceof PaymentSettingsError) {
+      throw preflightError(`deploy target \`${error.setting}\` is invalid`);
+    }
+    throw error;
+  }
 }
 
 function boolean(value: unknown, field: string): boolean {

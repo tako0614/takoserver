@@ -26,6 +26,7 @@ import {
   parseOperatorPublicKey,
   signOperatorAssertion,
 } from "./operator-key.ts";
+import { paymentSettingsFromEnvironment } from "./payment-settings.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
 import {
@@ -1179,7 +1180,9 @@ const identityPublicKeyJwk = identityOnlyPublicKeyJwk ?? legacyPublicKeyJwk;
 
 const payment = resolvePayment({
   stripeSecretKey: process.env.STRIPE_SECRET_KEY,
+  stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
   consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN,
+  settings: paymentSettingsFromEnvironment(process.env),
 });
 
 const identity = resolveIdentity({
@@ -1367,6 +1370,7 @@ try {
       ? { v2PrivateInputCustody: runtimeInputKeyAuthority.privateInputCustody }
       : {}),
     ...(payment.checkout ? { checkout: payment.checkout } : {}),
+    ...(payment.events ? { paymentEvents: payment.events } : {}),
     publicOrigin,
     ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
       ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
@@ -1638,6 +1642,18 @@ observedPasses.startInterval(
   },
   reportBackgroundFailure,
 );
+if (payment.events) {
+  // The same cadence as the Worker's cron: payments whose payer never came
+  // back and whose webhook never arrived are credited within minutes.
+  observedPasses.startInterval(
+    "payment-reconcile",
+    5 * 60_000,
+    async () => {
+      await app.reconcilePayments();
+    },
+    reportBackgroundFailure,
+  );
+}
 observedPasses.startInterval(
   "takoform-v2",
   1_000,

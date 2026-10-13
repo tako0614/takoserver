@@ -78,6 +78,11 @@ export interface Ledger {
     readonly kind?: "direct" | "plan-included" | "purchased";
     readonly expiresAt?: string | null;
   }): Promise<Wallet>;
+  /** Whether this funding reference has already credited the organization. */
+  hasFunding(input: {
+    readonly organizationId: string;
+    readonly fundingRef: string;
+  }): Promise<boolean>;
   /**
    * Earmarks funds. Returns false when the balance cannot cover the amount —
    * the decision is made by the insert itself, so two concurrent holds can
@@ -301,6 +306,14 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
         throw new LedgerError("conservation_violated");
       }
       return await this.wallet(organizationId);
+    },
+
+    async hasFunding({ organizationId, fundingRef }): Promise<boolean> {
+      const rows = await sql.query(
+        `SELECT 1 FROM ledger WHERE org_id = ? AND type = 'funding' AND ref = ?`,
+        [organizationId, fundingRef],
+      );
+      return rows.length === 1;
     },
 
     async hold({ organizationId, reference, amountMinor }): Promise<boolean> {

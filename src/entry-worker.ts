@@ -14,6 +14,7 @@ import {
 } from "./integration-organization-bootstrap.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
+import { paymentSettingsFromEnvironment } from "./payment-settings.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
 import type { CloudflareProviderExecutorRpc } from "./providers/cloudflare-provider-executor-port.ts";
@@ -96,6 +97,15 @@ export interface WorkerEnv {
   readonly STRIPE_SECRET_KEY?: string;
   /** Exact operator intent to expose Stripe Checkout on this deployment. */
   readonly TAKOSERVER_STRIPE_CHECKOUT_ENABLED?: string;
+  /** Signing secret of the Stripe webhook endpoint. The target must separately authorize it. */
+  readonly STRIPE_WEBHOOK_SECRET?: string;
+  /** Exact operator intent to receive Stripe webhooks on this deployment. */
+  readonly TAKOSERVER_STRIPE_WEBHOOK_ENABLED?: string;
+  /** Non-secret payment settings; absent ones take their documented defaults. */
+  readonly TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR?: string;
+  readonly TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR?: string;
+  readonly TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS?: string;
+  readonly TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS?: string;
   /** Key id whose public half is registered for verification. */
   readonly TAKOSERVER_SIGNING_KEY_ID?: string;
   /** Private half, as an Ed25519 JWK. A secret. */
@@ -158,6 +168,12 @@ export function workerCredentials(
     | "GOOGLE_CLIENT_ID"
     | "STRIPE_SECRET_KEY"
     | "TAKOSERVER_STRIPE_CHECKOUT_ENABLED"
+    | "STRIPE_WEBHOOK_SECRET"
+    | "TAKOSERVER_STRIPE_WEBHOOK_ENABLED"
+    | "TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR"
+    | "TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR"
+    | "TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS"
+    | "TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS"
     | "TAKOSERVER_CONSOLE_ORIGIN"
   >,
   operatorAudience: string,
@@ -179,13 +195,24 @@ export function workerCredentials(
   const payment = resolvePayment({
     stripeSecretKey:
       env.TAKOSERVER_STRIPE_CHECKOUT_ENABLED === "1" ? env.STRIPE_SECRET_KEY : undefined,
+    // Like Checkout, a lingering secret alone never exposes the webhook.
+    stripeWebhookSecret:
+      env.TAKOSERVER_STRIPE_WEBHOOK_ENABLED === "1" ? env.STRIPE_WEBHOOK_SECRET : undefined,
     consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+    settings: paymentSettingsFromEnvironment({
+      TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR: env.TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR,
+      TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR: env.TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR,
+      TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS: env.TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS,
+      TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS:
+        env.TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS,
+    }),
   });
 
   return {
     identity: identity.verifier,
     identityProviders: identity.providers,
     ...(payment.checkout ? { checkout: payment.checkout } : {}),
+    ...(payment.events ? { paymentEvents: payment.events } : {}),
     // Stripe where a customer can pay; the operator's signature where they
     // cannot; and a refusal where neither exists, because a stub that said yes
     // would credit any amount while looking exactly like a finished product.
@@ -791,7 +818,10 @@ async function composeApp(
   const formSource = startupStage("runtime-configuration", () =>
     selectPublicHostFormSource(env.TAKOSERVER_FORM_SOURCE_CANDIDATE, implementationIdentity),
   );
-  const { identity, identityProviders, settlement, checkout } = workerCredentials(env, origin);
+  const { identity, identityProviders, settlement, checkout, paymentEvents } = workerCredentials(
+    env,
+    origin,
+  );
   const sql = createD1Sql(env.STATE_DB);
   if (
     v2Config.sqliteMigrationSet !== undefined ||
@@ -889,6 +919,7 @@ async function composeApp(
       identityProviders,
       settlement,
       ...(checkout ? { checkout } : {}),
+      ...(paymentEvents ? { paymentEvents } : {}),
       ...dataServices,
       publicOrigin: origin,
       v2: v2Config,
@@ -1016,6 +1047,8 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       const results = await Promise.allSettled([
         Promise.resolve().then(() => app.tick()),
         Promise.resolve().then(() => drainV2Operations(() => app.tickTakoformV2())),
+        // Every cron tick: payments nobody presented and no webhook delivered.
+        Promise.resolve().then(() => app.reconcilePayments()),
       ]);
       const failures = results.flatMap((result) =>
         result.status === "rejected" ? [result.reason] : [],

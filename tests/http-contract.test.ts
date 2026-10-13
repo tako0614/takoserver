@@ -91,6 +91,18 @@ function reservationStub(): WorkerEndpointOriginReservations {
 }
 
 /** The whole surface composed, so no route is missing merely for want of a port. */
+/**
+ * The payment notification route is served only where a processor's signing
+ * secret is configured, so the stub mounts it. A body-less probe is refused
+ * before the processor is ever asked.
+ */
+function paymentEventsStub() {
+  const refuse = async (): Promise<never> => {
+    throw new Error("not reached by a surface probe");
+  };
+  return { receive: refuse, reconcile: refuse };
+}
+
 function completeHandler() {
   const publicWorkerVersionId = "00000000-0000-4000-8000-000000000001";
   return buildApp({
@@ -114,6 +126,7 @@ function completeHandler() {
     driver: new InMemoryTakoformResourceDriver(),
     offerings: [],
     originReservations: reservationStub(),
+    paymentEvents: paymentEventsStub,
   }).fetch;
 }
 

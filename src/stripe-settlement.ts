@@ -30,6 +30,9 @@ import type { FundingSettlementVerifier } from "./ledger.ts";
 
 const STRIPE_API = "https://api.stripe.com/v1";
 
+/** Stripe Checkout Session ids; short enough that `stripe:<id>` fits a ledger reference. */
+const CHECKOUT_SESSION_ID = /^cs_[A-Za-z0-9_]{1,240}$/u;
+
 export type StripeSettlementErrorCode =
   | "unknown_session"
   | "not_paid"
@@ -52,48 +55,108 @@ export interface StripeOptions {
   readonly fetch?: (request: Request) => Promise<Response>;
 }
 
-interface CheckoutSession {
+/** Stripe's record of one Checkout Session, as far as funding reads it. */
+export interface CheckoutSession {
   readonly id?: unknown;
   readonly payment_status?: unknown;
   readonly amount_total?: unknown;
   readonly currency?: unknown;
+  /** Unix seconds; ordering for the reconcile window. */
+  readonly created?: unknown;
   readonly metadata?: { readonly organizationId?: unknown } | null;
+}
+
+/** What a paid Checkout Session credits, decided only from Stripe's record of it. */
+export interface CheckoutSessionFunding {
+  readonly organizationId: string;
+  readonly fundingRef: string;
+  readonly amountMinor: number;
+  readonly currency: "USD";
+}
+
+/**
+ * The one decision about whether a Checkout Session credits a wallet.
+ *
+ * The console's return, the webhook and the reconcile pass all reach it with
+ * a session Stripe itself returned — never with an event body or a caller's
+ * claim — so there is one set of checks to keep correct, not three. With an
+ * expected organization the session must name exactly that one; without one
+ * (a webhook or a reconcile, where nobody presented it) it must name some
+ * organization, and the caller decides whether that organization is real.
+ */
+export function checkoutSessionFunding(
+  session: CheckoutSession,
+  options: { readonly currency?: "USD"; readonly expectedOrganizationId?: string } = {},
+): CheckoutSessionFunding {
+  const currency = (options.currency ?? "USD").toLowerCase();
+  if (typeof session.id !== "string" || !CHECKOUT_SESSION_ID.test(session.id)) {
+    throw new StripeSettlementError("unknown_session");
+  }
+  if (session.payment_status !== "paid") throw new StripeSettlementError("not_paid");
+  const organizationId = session.metadata?.organizationId;
+  if (
+    typeof organizationId !== "string" ||
+    organizationId.length === 0 ||
+    organizationId.length > 128 ||
+    (options.expectedOrganizationId !== undefined &&
+      organizationId !== options.expectedOrganizationId)
+  ) {
+    throw new StripeSettlementError("wrong_organization");
+  }
+  if (typeof session.currency !== "string" || session.currency.toLowerCase() !== currency) {
+    throw new StripeSettlementError("wrong_currency");
+  }
+  if (
+    typeof session.amount_total !== "number" ||
+    !Number.isSafeInteger(session.amount_total) ||
+    session.amount_total <= 0
+  ) {
+    throw new StripeSettlementError("not_paid");
+  }
+  return {
+    organizationId,
+    // Stripe's minor units are the ledger's minor units, so nothing is
+    // converted here — a conversion is a place for a factor of a hundred
+    // to go missing.
+    amountMinor: session.amount_total,
+    fundingRef: `stripe:${session.id}`,
+    currency: "USD",
+  };
 }
 
 export function createStripeSettlement(options: StripeOptions): FundingSettlementVerifier {
   const stripe = createStripeClient(options);
-  const currency = (options.currency ?? "USD").toLowerCase();
 
   return {
     async verify({ organizationId, settlementProof }) {
       const session = await stripe.checkoutSession(settlementProof);
       if (!session) throw new StripeSettlementError("unknown_session");
-
-      if (session.payment_status !== "paid") throw new StripeSettlementError("not_paid");
-      if (session.metadata?.organizationId !== organizationId) {
-        throw new StripeSettlementError("wrong_organization");
-      }
-      if (typeof session.currency !== "string" || session.currency.toLowerCase() !== currency) {
-        throw new StripeSettlementError("wrong_currency");
-      }
-      if (typeof session.amount_total !== "number" || session.amount_total <= 0) {
-        throw new StripeSettlementError("not_paid");
-      }
-
+      const funding = checkoutSessionFunding(session, {
+        ...(options.currency ? { currency: options.currency } : {}),
+        expectedOrganizationId: organizationId,
+      });
       return {
-        // Stripe's minor units are the ledger's minor units, so nothing is
-        // converted here — a conversion is a place for a factor of a hundred
-        // to go missing.
-        amountMinor: session.amount_total,
-        fundingRef: `stripe:${String(session.id)}`,
-        currency: "USD",
+        amountMinor: funding.amountMinor,
+        fundingRef: funding.fundingRef,
+        currency: funding.currency,
       };
     },
   };
 }
 
+export interface CheckoutSessionPage {
+  readonly sessions: readonly CheckoutSession[];
+  readonly hasMore: boolean;
+}
+
 export interface StripeClient {
   checkoutSession(id: string): Promise<CheckoutSession | null>;
+  /** Newest first, as Stripe lists them; `startingAfter` continues a listing. */
+  listCheckoutSessions(input: {
+    readonly status: "complete";
+    readonly limit: number;
+    readonly startingAfter?: string;
+  }): Promise<CheckoutSessionPage>;
   createCheckoutSession(input: {
     readonly organizationId: string;
     readonly amountMinor: number;
@@ -147,8 +210,31 @@ export function createStripeClient(options: StripeOptions): StripeClient {
 
   return {
     async checkoutSession(id) {
-      if (!/^cs_[A-Za-z0-9_]{1,255}$/u.test(id)) return null;
+      if (!CHECKOUT_SESSION_ID.test(id)) return null;
       return (await call("GET", `/checkout/sessions/${id}`)) as CheckoutSession | null;
+    },
+
+    async listCheckoutSessions({ status, limit, startingAfter }) {
+      if (
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        limit > 100 ||
+        (startingAfter !== undefined && !CHECKOUT_SESSION_ID.test(startingAfter))
+      ) {
+        throw new StripeSettlementError("unavailable");
+      }
+      const query = new URLSearchParams({ status, limit: String(limit) });
+      if (startingAfter !== undefined) query.set("starting_after", startingAfter);
+      const listed = await call("GET", `/checkout/sessions?${query.toString()}`);
+      if (
+        !listed ||
+        !Array.isArray(listed.data) ||
+        typeof listed.has_more !== "boolean" ||
+        !listed.data.every((item) => typeof item === "object" && item !== null)
+      ) {
+        throw new StripeSettlementError("unavailable");
+      }
+      return { sessions: listed.data as CheckoutSession[], hasMore: listed.has_more };
     },
 
     async createCheckoutSession({ organizationId, amountMinor, successUrl, cancelUrl }) {

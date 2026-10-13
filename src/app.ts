@@ -26,6 +26,12 @@ import {
 } from "./integration-organization-bootstrap.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
+import {
+  createFundingCredit,
+  type FundingReconcileReport,
+  type PaymentEventContext,
+  type PaymentEvents,
+} from "./payment-events.ts";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
 import { createProviderDriver, createProviderFormAvailability } from "./provider-driver.ts";
 import { createProviderMetering } from "./provider-metering.ts";
@@ -115,6 +121,12 @@ export interface AppPorts {
   readonly settlement: FundingSettlementVerifier;
   /** Starts a payment, where this deployment can take one. */
   readonly checkout?: Checkout | undefined;
+  /**
+   * Payments learned without the payer returning: the processor's webhook and
+   * the reconcile pass. Built here because only this composition owns the
+   * ledger and the organizations they credit.
+   */
+  readonly paymentEvents?: ((context: PaymentEventContext) => PaymentEvents) | undefined;
   /** What data costs here. Absent means measured and not charged. */
   readonly meteringRates?: MeteringRates | undefined;
   /** OpenAI-compatible inference backend. Absent keeps the AI route unavailable. */
@@ -222,6 +234,8 @@ export interface App {
   tick(): Promise<TickReport>;
   /** Independently scheduled v2 executor; one Operation at most per call. */
   tickTakoformV2(): Promise<V2Operation | null>;
+  /** Credits recently settled payments nobody presented; null where payment is off. */
+  reconcilePayments(): Promise<FundingReconcileReport | null>;
 }
 
 export interface TickReport {
@@ -346,6 +360,15 @@ export function buildApp(ports: AppPorts): App {
       })
     : null;
   const ledger = createLedger(ports.sql, clock);
+  const paymentEvents = ports.paymentEvents?.({
+    sql: ports.sql,
+    clock,
+    credit: createFundingCredit({
+      ledger,
+      organizationExists: async (organizationId) =>
+        (await accounts.organization(organizationId)) !== null,
+    }),
+  });
   const catalog = createCatalog(ports.offerings);
   const { deployments, inventory } = resourceStores;
   const originReservations =
@@ -675,6 +698,7 @@ export function buildApp(ports: AppPorts): App {
     ...(availability?.catalogue ? { formAvailability: availability } : {}),
     identityProviders: ports.identityProviders ?? [],
     ...(ports.checkout ? { checkout: ports.checkout } : {}),
+    ...(paymentEvents?.receive ? { paymentNotifications: paymentEvents.receive } : {}),
     ledger,
     catalog,
     reseller,
@@ -749,6 +773,7 @@ export function buildApp(ports: AppPorts): App {
         : router,
     maintenance: { artifacts: artifactReconciler },
     tickTakoformV2: () => takoformV2Host.runNext(),
+    reconcilePayments: async () => (paymentEvents ? await paymentEvents.reconcile() : null),
     async tick(): Promise<TickReport> {
       // Legacy recovery remains independent of potentially slow v2 effects.
       let drainFailed = false;
