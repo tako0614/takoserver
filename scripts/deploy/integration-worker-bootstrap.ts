@@ -126,8 +126,19 @@ const INTEGRATION_WORKER_BOOTSTRAP_GATES = [
     command: ["bun", "run", "typecheck:worker"],
   },
   {
-    label: "Host bootstrap tests `bun test <fixed Host bootstrap test set>`",
-    command: ["bun", "test", ...INTEGRATION_WORKER_BOOTSTRAP_GATE_TESTS],
+    label:
+      "Host bootstrap tests `bun test --timeout 60000 --bail=1 <fixed Host bootstrap test set>`",
+    // The repository gate's own flags (`bun run test`): these tests pass
+    // there, and a shared, loaded operator machine must not fail the
+    // bootstrap on the 5-second default alone.
+    command: [
+      "bun",
+      "test",
+      "--timeout",
+      "60000",
+      "--bail=1",
+      ...INTEGRATION_WORKER_BOOTSTRAP_GATE_TESTS,
+    ],
   },
 ] as const;
 
