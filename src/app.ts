@@ -70,6 +70,7 @@ import type {
 import { TakoformHostError } from "./takoform/types.ts";
 import {
   createTakoformV2Application,
+  type V2OperatorArtifactSourceFactory,
   type V2OperatorFormFactory,
   type V2OperatorFormSelectionFactory,
 } from "./takoform-v2/application.ts";
@@ -125,6 +126,8 @@ export interface AppPorts {
   readonly v2FormFactory?: V2OperatorFormFactory;
   /** Code-selected full and retained-only maps; exclusive with v2FormFactory. */
   readonly v2FormSelectionFactory?: V2OperatorFormSelectionFactory;
+  /** Code-selected source for configured v2 artifact Forms; absent remains held-only. */
+  readonly v2ArtifactSourceFactory?: V2OperatorArtifactSourceFactory;
   /** Explicit operator-private v2 keyring; absent disables privateInputs. */
   readonly v2PrivateInputCustody?: V2PrivateInputCustody;
   /** Current Cloudflare Worker Version, retained only as operation and audit provenance. */
@@ -321,6 +324,9 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.v2FormSelectionFactory === undefined
       ? {}
       : { formSelectionFactory: ports.v2FormSelectionFactory }),
+    ...(ports.v2ArtifactSourceFactory === undefined
+      ? {}
+      : { artifactSourceFactory: ports.v2ArtifactSourceFactory }),
     ...(ports.v2PrivateInputCustody === undefined
       ? {}
       : { privateInputCustody: ports.v2PrivateInputCustody }),

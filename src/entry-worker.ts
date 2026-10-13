@@ -217,6 +217,15 @@ export type WorkerEntryV2FormComposer = (context: {
   readonly clock: Clock;
 }) => WorkerEntryV2FormSelection | Promise<WorkerEntryV2FormSelection>;
 
+type WorkerEntryV2ArtifactSourceContext = Parameters<
+  NonNullable<Parameters<typeof buildApp>[0]["v2ArtifactSourceFactory"]>
+>[0];
+
+/** Synchronous code-selected source composition; no environment value enables it. */
+export type WorkerEntryV2ArtifactSourceComposer = (
+  context: WorkerEntryV2ArtifactSourceContext & { readonly env: WorkerEnv },
+) => ReturnType<NonNullable<Parameters<typeof buildApp>[0]["v2ArtifactSourceFactory"]>>;
+
 /** Only an explicit operator-selected Form hook can activate generic custody. */
 function hasDataMethod(policy: object, name: "validateCreate" | "validateUpdate"): boolean {
   for (let owner: object | null = policy; owner !== null; owner = Object.getPrototypeOf(owner)) {
@@ -261,6 +270,8 @@ function hasSelectedV2PrivateInputHooks(
 export interface WorkerEntryOptions {
   /** Operator code only; no request or environment field selects the composer. */
   readonly composeV2Forms?: WorkerEntryV2FormComposer;
+  /** Operator code only; absent means every configured artifact Form remains held-only. */
+  readonly composeV2ArtifactSource?: WorkerEntryV2ArtifactSourceComposer;
 }
 
 /**
@@ -740,11 +751,18 @@ async function composeApp(
   env: WorkerEnv,
   origin: string,
   composeV2Forms: WorkerEntryV2FormComposer | undefined,
+  composeV2ArtifactSource: WorkerEntryV2ArtifactSourceComposer | undefined,
 ): Promise<App> {
   if (composeV2Forms !== undefined && typeof composeV2Forms !== "function") {
     throw new WorkerStartupError(
       "runtime-configuration",
       new TypeError("v2 Worker entry Form composer must be a function"),
+    );
+  }
+  if (composeV2ArtifactSource !== undefined && typeof composeV2ArtifactSource !== "function") {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("v2 Worker entry artifact source composer must be a function"),
     );
   }
   const v2Config = startupStage("runtime-configuration", () =>
@@ -886,6 +904,12 @@ async function composeApp(
               Object.hasOwn(selectedV2Forms, "retainedForms"))
           ? { v2FormSelectionFactory: () => selectedV2Forms as WorkerEntryV2FormMaps }
           : { v2FormFactory: () => selectedV2Forms as WorkerEntryV2FormMap }),
+      ...(composeV2ArtifactSource === undefined
+        ? {}
+        : {
+            v2ArtifactSourceFactory: (context: WorkerEntryV2ArtifactSourceContext) =>
+              composeV2ArtifactSource({ ...context, env }),
+          }),
       ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
       forms: formSource.forms,
       bindings: formSource.bindings,
@@ -896,7 +920,15 @@ async function composeApp(
       offerings: deployment.offerings,
     });
   } catch (error) {
-    if (composeV2Forms === undefined) throw error;
+    if (composeV2Forms === undefined && composeV2ArtifactSource === undefined) throw error;
+    if (composeV2ArtifactSource !== undefined) {
+      // A selected source constructor can throw private transport diagnostics.
+      // Do not attach its cause to a public startup refusal.
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("operator v2 artifact source application construction failed"),
+      );
+    }
     // The selected map is inspected by the canonical application only here.
     // Getters and backend constructors can throw private text after the async
     // callback has returned, so this boundary must classify them too.
@@ -911,14 +943,17 @@ async function composeApp(
 /** A separate startup cache for each code-selected Worker entry. */
 export function createWorkerEntry(options: WorkerEntryOptions = {}) {
   const composeV2Forms = options.composeV2Forms;
+  const composeV2ArtifactSource = options.composeV2ArtifactSource;
   const starts = new WeakMap<WorkerEnv, Promise<App>>();
   const appFor = (env: WorkerEnv, origin: string): Promise<App> => {
     const existing = starts.get(env);
     if (existing) return existing;
-    const started = composeApp(env, origin, composeV2Forms).catch((error: unknown) => {
-      if (starts.get(env) === started) starts.delete(env);
-      throw error;
-    });
+    const started = composeApp(env, origin, composeV2Forms, composeV2ArtifactSource).catch(
+      (error: unknown) => {
+        if (starts.get(env) === started) starts.delete(env);
+        throw error;
+      },
+    );
     starts.set(env, started);
     return started;
   };

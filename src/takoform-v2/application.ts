@@ -2,7 +2,11 @@ import type { Accounts } from "../auth.ts";
 import type { Clock, ObjectStoreAccess, Sql } from "../ports.ts";
 import { createTakoformV2AccountAccess } from "./accounts.ts";
 import type { V2ApplicationConfig } from "./config.ts";
-import { createV2HeldArtifactSource } from "./forms/artifact-source.ts";
+import {
+  createV2HeldArtifactSource,
+  type V2ArtifactSource,
+  type V2HeldArtifactEntry,
+} from "./forms/artifact-source.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "./forms/sqlite-migration-set.ts";
 import { createSQLiteMigrationSetForm } from "./forms/sqlite-migration-set-backend.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "./forms/static-asset-bundle.ts";
@@ -29,6 +33,13 @@ export type V2OperatorFormFactory = (context: {
 export type V2OperatorFormSelectionFactory = (
   context: Parameters<V2OperatorFormFactory>[0],
 ) => V2OperatorFormMaps;
+
+/** Code-selected source for one configured artifact Form, never request-selected. */
+export type V2OperatorArtifactSourceFactory = (context: {
+  readonly formUrl: string;
+  readonly objects: ObjectStoreAccess;
+  readonly heldArtifacts: readonly V2HeldArtifactEntry[];
+}) => V2ArtifactSource;
 
 function plainMap(value: unknown): value is Record<string, unknown> {
   return (
@@ -84,6 +95,8 @@ export function createTakoformV2Application(options: {
   readonly formFactory?: V2OperatorFormFactory;
   /** Code-only full plus retained maps; mutually exclusive with formFactory. */
   readonly formSelectionFactory?: V2OperatorFormSelectionFactory;
+  /** Operator code only; absence preserves the held-only source for every Form. */
+  readonly artifactSourceFactory?: V2OperatorArtifactSourceFactory;
   /** Operator-private composition only; never parsed from public config. */
   readonly privateInputCustody?: V2PrivateInputCustody;
 }) {
@@ -95,15 +108,39 @@ export function createTakoformV2Application(options: {
   ) {
     throw new TypeError("v2 Form factory must be a function");
   }
+  if (
+    options.artifactSourceFactory !== undefined &&
+    typeof options.artifactSourceFactory !== "function"
+  ) {
+    throw new TypeError("v2 artifact source factory must be a function");
+  }
   const { sql, objects, accounts, publicOrigin, config, clock } = options;
   const access = createTakoformV2AccountAccess(accounts);
   const forms: Record<string, V2Form> = Object.create(null) as Record<string, V2Form>;
   const retainedForms: Record<string, V2Form> = Object.create(null) as Record<string, V2Form>;
-  if (config.sqliteMigrationSet) {
-    const source = createV2HeldArtifactSource({
+  const artifactSource = (formUrl: string, heldArtifacts: readonly V2HeldArtifactEntry[]) => {
+    if (options.artifactSourceFactory === undefined) {
+      return createV2HeldArtifactSource({ objects, entries: heldArtifacts });
+    }
+    const source = options.artifactSourceFactory({
+      formUrl,
       objects,
-      entries: config.sqliteMigrationSet.heldArtifacts,
+      heldArtifacts: Object.freeze([...heldArtifacts]),
     });
+    if (
+      source === null ||
+      (typeof source !== "object" && typeof source !== "function") ||
+      typeof source.read !== "function"
+    ) {
+      throw new TypeError("v2 artifact source factory must return a readable source");
+    }
+    return source;
+  };
+  if (config.sqliteMigrationSet) {
+    const source = artifactSource(
+      SQLITE_MIGRATION_SET_FORM_URL,
+      config.sqliteMigrationSet.heldArtifacts,
+    );
     forms[SQLITE_MIGRATION_SET_FORM_URL] = createSQLiteMigrationSetForm({
       sql,
       source,
@@ -111,10 +148,7 @@ export function createTakoformV2Application(options: {
     });
   }
   if (config.workerBundle) {
-    const source = createV2HeldArtifactSource({
-      objects,
-      entries: config.workerBundle.heldArtifacts,
-    });
+    const source = artifactSource(WORKER_BUNDLE_FORM_URL, config.workerBundle.heldArtifacts);
     forms[WORKER_BUNDLE_FORM_URL] = createWorkerBundleForm({
       sql,
       source,
@@ -122,10 +156,10 @@ export function createTakoformV2Application(options: {
     });
   }
   if (config.staticAssetBundle) {
-    const source = createV2HeldArtifactSource({
-      objects,
-      entries: config.staticAssetBundle.heldArtifacts,
-    });
+    const source = artifactSource(
+      STATIC_ASSET_BUNDLE_FORM_URL,
+      config.staticAssetBundle.heldArtifacts,
+    );
     forms[STATIC_ASSET_BUNDLE_FORM_URL] = createStaticAssetBundleForm({
       sql,
       source,
