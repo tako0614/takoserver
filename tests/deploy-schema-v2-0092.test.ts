@@ -500,94 +500,103 @@ describe("canonical integration 0088 to 0092 schema", () => {
     }
   });
 
-  test("unknown acknowledgement at 0088 leaves durable dispatch and cannot resend", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0092-unknown-"));
-    let imports = 0;
-    let dispatched = false;
-    const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
-    const run: SchemaProcess = async (command) => {
-      const key = command.join(" ");
-      if (key === "git rev-parse HEAD") return ok(commit);
-      if (key === "git branch --show-current") return ok("feature/schema-0092");
-      if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok();
-      if (key === "git fetch --quiet --all --prune") return ok();
-      if (key === `git branch -r --contains ${commit}`) return ok("  origin/feature/schema-0092\n");
-      if (
-        key === "bun test tests/deploy-schema-v2-0092.test.ts" ||
-        key === "bun run check:migrations"
-      )
-        return ok("green");
-      if (command.includes("--file")) {
-        imports++;
-        return { exitCode: 1, stdout: "", stderr: "transport outcome unknown" };
+  for (const acknowledgement of ["unknown", "acknowledged"] as const) {
+    test(`${acknowledgement} acknowledgement at 0088 leaves durable dispatch and cannot resend`, async () => {
+      const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0092-unknown-"));
+      let imports = 0;
+      let dispatched = false;
+      const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+      const run: SchemaProcess = async (command) => {
+        const key = command.join(" ");
+        if (key === "git rev-parse HEAD") return ok(commit);
+        if (key === "git branch --show-current") return ok("feature/schema-0092");
+        if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok();
+        if (key === "git fetch --quiet --all --prune") return ok();
+        if (key === `git branch -r --contains ${commit}`)
+          return ok("  origin/feature/schema-0092\n");
+        if (
+          key === "bun test tests/deploy-schema-v2-0092.test.ts" ||
+          key === "bun run check:migrations"
+        )
+          return ok("green");
+        if (command.includes("--file")) {
+          imports++;
+          return acknowledgement === "acknowledged"
+            ? ok()
+            : { exitCode: 1, stdout: "", stderr: "transport outcome unknown" };
+        }
+        throw new Error(`unexpected command: ${key}`);
+      };
+      const ownerProof = async (input: CanonicalV20092OwnerProofInput) => ({
+        kind: "takoserver.canonical-v2-0092-owner-proof@v1" as const,
+        phase: input.phase,
+        accountId: input.target.accountId,
+        databaseId: input.target.d1.databaseId,
+        databaseName: input.target.d1.databaseName,
+        publicCommit: input.publicCommit,
+        sourceDigest: input.sourceDigest,
+        applied: input.applied,
+        schemaShapeDigest: input.schemaShapeDigest,
+        expectedPostApplied: input.expectedPostApplied,
+        retainedNativeClaimDigest: `sha256:${"d".repeat(64)}`,
+        dependencyProofDigest: `sha256:${"e".repeat(64)}`,
+        unresolvedAttemptCount: 0 as const,
+      });
+      const options = {
+        run,
+        leaseRoot: join(root, "leases"),
+        review: "independent-reviewer",
+        productionD1,
+        integrationStorageIdentityProvider: identityProvider,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "fixture-token" },
+        reader: {
+          async read() {
+            return state(88);
+          },
+        },
+        schemaV20092WalletProof: async () => proof(),
+        canonicalV20092OwnerProof: ownerProof,
+        canonicalV20092DispatchCustody: {
+          async persistDispatched(binding: CanonicalV20092DispatchBinding) {
+            if (dispatched) throw new Error("existing dispatched attempt refuses resend");
+            dispatched = true;
+            return {
+              kind: "takoserver.canonical-v2-0092-custody-receipt@v1" as const,
+              state: "dispatched" as const,
+              bindingDigest: canonicalV20092DispatchBindingDigest(binding),
+              custodyDigest: `sha256:${"a".repeat(64)}`,
+            };
+          },
+          async reconcilePost() {
+            throw new Error("0088 cannot terminalize custody");
+          },
+        },
+      };
+      try {
+        const invocation = {
+          action: "apply",
+          environment: "integration",
+          commit,
+          throughMigration: "0092",
+        } as const;
+        await expect(
+          runD1Schema(invocation, target, { ...options, outputDirectory: join(root, "first") }),
+        ).rejects.toThrow(
+          acknowledgement === "acknowledged"
+            ? "not the exact complete lineage"
+            : "GET-only recovery",
+        );
+        expect(dispatched).toBe(true);
+        expect(imports).toBe(1);
+        await expect(
+          runD1Schema(invocation, target, { ...options, outputDirectory: join(root, "second") }),
+        ).rejects.toThrow("existing dispatched attempt refuses resend");
+        expect(imports).toBe(1);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
       }
-      throw new Error(`unexpected command: ${key}`);
-    };
-    const ownerProof = async (input: CanonicalV20092OwnerProofInput) => ({
-      kind: "takoserver.canonical-v2-0092-owner-proof@v1" as const,
-      phase: input.phase,
-      accountId: input.target.accountId,
-      databaseId: input.target.d1.databaseId,
-      databaseName: input.target.d1.databaseName,
-      publicCommit: input.publicCommit,
-      sourceDigest: input.sourceDigest,
-      applied: input.applied,
-      schemaShapeDigest: input.schemaShapeDigest,
-      expectedPostApplied: input.expectedPostApplied,
-      retainedNativeClaimDigest: `sha256:${"d".repeat(64)}`,
-      dependencyProofDigest: `sha256:${"e".repeat(64)}`,
-      unresolvedAttemptCount: 0 as const,
     });
-    const options = {
-      run,
-      leaseRoot: join(root, "leases"),
-      review: "independent-reviewer",
-      productionD1,
-      integrationStorageIdentityProvider: identityProvider,
-      cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "fixture-token" },
-      reader: {
-        async read() {
-          return state(88);
-        },
-      },
-      schemaV20092WalletProof: async () => proof(),
-      canonicalV20092OwnerProof: ownerProof,
-      canonicalV20092DispatchCustody: {
-        async persistDispatched(binding: CanonicalV20092DispatchBinding) {
-          if (dispatched) throw new Error("existing dispatched attempt refuses resend");
-          dispatched = true;
-          return {
-            kind: "takoserver.canonical-v2-0092-custody-receipt@v1" as const,
-            state: "dispatched" as const,
-            bindingDigest: canonicalV20092DispatchBindingDigest(binding),
-            custodyDigest: `sha256:${"a".repeat(64)}`,
-          };
-        },
-        async reconcilePost() {
-          throw new Error("0088 cannot terminalize custody");
-        },
-      },
-    };
-    try {
-      const invocation = {
-        action: "apply",
-        environment: "integration",
-        commit,
-        throughMigration: "0092",
-      } as const;
-      await expect(
-        runD1Schema(invocation, target, { ...options, outputDirectory: join(root, "first") }),
-      ).rejects.toThrow("GET-only recovery");
-      expect(dispatched).toBe(true);
-      expect(imports).toBe(1);
-      await expect(
-        runD1Schema(invocation, target, { ...options, outputDirectory: join(root, "second") }),
-      ).rejects.toThrow("existing dispatched attempt refuses resend");
-      expect(imports).toBe(1);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
+  }
 
   test("custody callback cannot change sealed import after dispatch without stopping remote execution", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0092-tamper-"));
