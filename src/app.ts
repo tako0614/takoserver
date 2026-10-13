@@ -7,6 +7,7 @@ import { createAttachmentService, createAttachmentStore } from "./attachments.ts
 import {
   createAccounts,
   createApiKeyAdministration,
+  createSingleUseCredentials,
   type ExternalIdentityVerifier,
   grants,
   type IdentityProviderDescriptor,
@@ -27,6 +28,7 @@ import {
 } from "./integration-organization-bootstrap.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
+import type { OperatorPaymentsReconcileVerifier } from "./operator-credentials.ts";
 import { createOrgBilling, type OrgBilling } from "./org-billing.ts";
 import {
   createFundingCredit,
@@ -131,6 +133,12 @@ export interface AppPorts {
    * ledger and the organizations they credit.
    */
   readonly paymentEvents?: ((context: PaymentEventContext) => PaymentEvents) | undefined;
+  /**
+   * Verifies the operator's single-use request to run the reconcile pass now.
+   * The route is served only together with `paymentEvents`; either absent, it
+   * is not served.
+   */
+  readonly operatorPaymentsReconcile?: OperatorPaymentsReconcileVerifier | undefined;
   /** What data costs here. Absent means measured and not charged. */
   readonly meteringRates?: MeteringRates | undefined;
   /** OpenAI-compatible inference backend. Absent keeps the AI route unavailable. */
@@ -240,7 +248,10 @@ export interface App {
   tick(): Promise<TickReport>;
   /** Independently scheduled v2 executor; one Operation at most per call. */
   tickTakoformV2(): Promise<V2Operation | null>;
-  /** Credits recently settled payments nobody presented; null where payment is off. */
+  /**
+   * Credits recently settled payments nobody presented; null where payment is
+   * off. One pass runs at a time in a process, and a concurrent caller shares it.
+   */
   reconcilePayments(): Promise<FundingReconcileReport | null>;
 }
 
@@ -380,6 +391,32 @@ export function buildApp(ports: AppPorts): App {
     }),
     creditedFunding: (fundings) => ledger.fundedReferences(fundings),
   });
+  // One pass at a time in this process: the scheduled pass and the operator
+  // route share it, and a caller arriving mid-pass joins the pass already
+  // reading the processor instead of starting a second. Passes elsewhere stay
+  // harmless, because each funding reference credits once.
+  let reconcileInFlight: Promise<FundingReconcileReport> | null = null;
+  const reconcilePayments = async (): Promise<FundingReconcileReport | null> => {
+    if (!paymentEvents) return null;
+    reconcileInFlight ??= paymentEvents.reconcile().finally(() => {
+      reconcileInFlight = null;
+    });
+    return await reconcileInFlight;
+  };
+  const singleUseCredentials = createSingleUseCredentials(ports.sql, clock);
+  const operatorReconcileVerifier = ports.operatorPaymentsReconcile;
+  const operatorPaymentsReconcile =
+    paymentEvents && operatorReconcileVerifier
+      ? async (assertion: string): Promise<FundingReconcileReport> => {
+          const credential = await operatorReconcileVerifier.verify(assertion);
+          // Spent before the pass: a replay runs nothing, and a pass that fails
+          // burns the assertion rather than leaving it usable twice.
+          await singleUseCredentials.spend(credential);
+          const report = await reconcilePayments();
+          if (!report) throw new Error("payment reconcile is not configured");
+          return report;
+        }
+      : undefined;
   const catalog = createCatalog(ports.offerings);
   const { deployments, inventory } = resourceStores;
   const originReservations =
@@ -710,6 +747,7 @@ export function buildApp(ports: AppPorts): App {
     identityProviders: ports.identityProviders ?? [],
     ...(ports.checkout ? { checkout: ports.checkout } : {}),
     ...(paymentEvents?.receive ? { paymentNotifications: paymentEvents.receive } : {}),
+    ...(operatorPaymentsReconcile ? { operatorPaymentsReconcile } : {}),
     ledger,
     ...(orgBilling ? { billing: orgBilling } : {}),
     catalog,
@@ -786,7 +824,7 @@ export function buildApp(ports: AppPorts): App {
         : router,
     maintenance: { artifacts: artifactReconciler },
     tickTakoformV2: () => takoformV2Host.runNext(),
-    reconcilePayments: async () => (paymentEvents ? await paymentEvents.reconcile() : null),
+    reconcilePayments,
     async tick(): Promise<TickReport> {
       // Legacy recovery remains independent of potentially slow v2 effects.
       let drainFailed = false;

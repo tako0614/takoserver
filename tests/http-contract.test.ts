@@ -104,6 +104,13 @@ function paymentEventsStub() {
   return { receive: refuse, reconcile: refuse };
 }
 
+/** The operator reconcile route is served only beside the pass and an operator key. */
+const operatorPaymentsReconcileStub = {
+  async verify(): Promise<never> {
+    throw new Error("not reached by a surface probe");
+  },
+};
+
 function completeHandler() {
   const billingConfig = parseBillingConfig(
     JSON.stringify({
@@ -142,6 +149,7 @@ function completeHandler() {
     billingConfig,
     originReservations: reservationStub(),
     paymentEvents: paymentEventsStub,
+    operatorPaymentsReconcile: operatorPaymentsReconcileStub,
   }).fetch;
 }
 

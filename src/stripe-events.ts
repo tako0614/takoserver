@@ -44,7 +44,8 @@ export const DEFAULT_STRIPE_RECONCILE_LOOKBACK_SECONDS = 7 * 24 * 60 * 60;
 
 /**
  * Reasons a paid, Host-marked session was not credited. Each one is money
- * collected and not in a wallet, so it is logged rather than left in a report.
+ * collected and not in a wallet, so it is logged, not only left in a report:
+ * nobody reads the scheduled pass's report.
  */
 const UNCREDITED_PAID_REASONS: ReadonlySet<string> = new Set([
   "wrong_currency",
@@ -486,7 +487,16 @@ export function createStripeEvents(
           }),
         );
       }
-      return { examined, credited, alreadyCredited, unknownOrganization, skipped, truncated };
+      return {
+        examined,
+        credited,
+        alreadyCredited,
+        unknownOrganization,
+        skipped,
+        truncated,
+        creditedFundingRefs: creditedRefs,
+        uncredited,
+      };
     },
   };
 }
