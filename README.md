@@ -454,6 +454,13 @@ unconfirmable child exit, or child-identity persistence that fails for any
 other reason, including unreadable process state, requires operator
 intervention rather than automatic retries.
 
+SIGINT, SIGTERM and SIGHUP fence new work and drain accepted requests and
+background passes before stopping owned resources in order. A proved clean
+stop exits with status 0. A reported shutdown-stage failure prints its stage
+and exits with status 1, even when dependent listeners remain open. Shutdown
+does not close dependents below an unproved owner or discard its durable
+custody; the next Host must recover that retained ownership before serving.
+
 ### Operator sign-in and funding
 
 Sign-in and money are the two facts a server cannot determine for itself. With
