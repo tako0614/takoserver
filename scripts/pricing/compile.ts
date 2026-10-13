@@ -1,3 +1,4 @@
+import { BillingConfigError, parseBillingConfig } from "../../src/billing-config.ts";
 import {
   PAYMENT_SETTING_VARIABLES,
   PaymentSettingsError,
@@ -8,8 +9,9 @@ export const PRICING_AUTHORING_MAX_BYTES = 1_048_576;
 
 export interface PricingPreview {
   readonly kind: "takoserver.pricing-preview@v1";
-  readonly validation: "requires-host-billing-config-validation";
+  readonly validation: "host-billing-config-valid";
   readonly mode: "preview";
+  readonly activation: "pending-unified-billing-runtime-alignment";
   readonly environment: Readonly<Record<string, string>>;
   readonly stripeMonthlyReview: readonly {
     readonly planKey: string;
@@ -18,6 +20,35 @@ export interface PricingPreview {
     readonly currency: "USD";
     readonly interval: "month";
   }[];
+  readonly hostedPlanTable: {
+    readonly scope: "hosted";
+    readonly products: readonly ["takosumi-hosted", "takoserver"];
+    readonly balanceScope: "organization";
+    readonly plans: readonly [
+      {
+        readonly planId: string;
+        readonly tier: "free";
+        readonly resourceScope: "edge";
+        readonly configuredMonthlyCreditMinor: number;
+        readonly edgeAllowance: "pending-owner-runtime-policy";
+      },
+      {
+        readonly planId: string;
+        readonly tier: "subscription";
+        readonly monthlyAmountMinor: number;
+        readonly includedCreditMinor: number;
+        readonly stripePriceId: string;
+      },
+      {
+        readonly planId: string;
+        readonly tier: "usage";
+        readonly checkoutMinimumMinor: number;
+        readonly checkoutMaximumMinor: number;
+        readonly meters: Readonly<Record<string, unknown>>;
+      },
+    ];
+    readonly consumptionOrder: readonly ["free", "subscription", "purchased", "postpaid"];
+  };
 }
 
 export class PricingAuthoringError extends Error {
@@ -27,40 +58,36 @@ export class PricingAuthoringError extends Error {
   }
 }
 
-/**
- * Projects an authoring document without interpreting the Host's tariff policy.
- * billingConfig is carried through unchanged as a JSON value; the
- * Host billing-config validator remains the authority for its meaning.
- */
+/** Projects one shared hosted-plan table from operator-selected configuration. */
 export function compilePricingAuthoring(input: unknown): PricingPreview {
   const root = objectAt(input, "$");
-  exactKeys(root, ["authoringVersion", "billingConfig", "checkout", "stripeMonthlyReview"], "$");
+  exactKeys(
+    root,
+    ["authoringVersion", "billingConfig", "checkout", "planIds", "stripeMonthlyReview"],
+    "$",
+  );
   if (root.authoringVersion !== 1) fail("authoringVersion must be 1");
-
   rejectPlaceholders(root);
 
-  const billingConfig = objectAt(root.billingConfig, "billingConfig");
-  if (billingConfig.currency !== "USD") fail("billingConfig.currency must be USD");
-  if (!Object.hasOwn(billingConfig, "freeIncludedMinor")) {
-    fail("billingConfig.freeIncludedMinor is required");
-  }
-  safeNonnegativeInteger(billingConfig.freeIncludedMinor, "billingConfig.freeIncludedMinor");
-  const plans = objectAt(billingConfig.plans, "billingConfig.plans");
-  const planEntries = Object.entries(plans);
-  for (const [planKey, rawPlan] of planEntries) {
-    if (!/^[a-z][a-z0-9_-]{0,63}$/u.test(planKey))
-      fail("billingConfig.plans contains an invalid plan key");
-    const planPath = `billingConfig.plans.${planKey}`;
-    const plan = objectAt(rawPlan, planPath);
-    exactKeys(plan, ["includedMinor", "stripePriceId"], planPath);
-    safeNonnegativeInteger(plan.includedMinor, `billingConfig.plans.${planKey}.includedMinor`);
-    if (
-      typeof plan.stripePriceId !== "string" ||
-      !/^price_[A-Za-z0-9]+$/u.test(plan.stripePriceId)
-    ) {
-      fail(`billingConfig.plans.${planKey}.stripePriceId must be a Stripe price ID`);
+  const rawBillingConfig = objectAt(root.billingConfig, "billingConfig");
+  let billingConfig: ReturnType<typeof parseBillingConfig>;
+  try {
+    billingConfig = parseBillingConfig(JSON.stringify(rawBillingConfig));
+  } catch (error) {
+    if (error instanceof BillingConfigError) {
+      fail("billingConfig is invalid under Host billing configuration rules");
     }
+    fail("billingConfig could not be validated by the Host billing configuration parser");
   }
+  if (!billingConfig) fail("billingConfig is required");
+
+  const planIds = parsePlanIds(root.planIds);
+  const configuredPlanKeys = Object.keys(billingConfig.plans).sort();
+  if (configuredPlanKeys.length !== 1 || configuredPlanKeys[0] !== planIds.subscription) {
+    fail("billingConfig.plans must contain exactly the planIds.subscription key");
+  }
+  const subscriptionPlan = billingConfig.plans[planIds.subscription];
+  if (!subscriptionPlan) fail("billingConfig.plans is missing planIds.subscription");
 
   const checkout = objectAt(root.checkout, "checkout");
   exactKeys(checkout, ["minimumMinor", "maximumMinor"], "checkout");
@@ -81,44 +108,90 @@ export function compilePricingAuthoring(input: unknown): PricingPreview {
   }
 
   const review = objectAt(root.stripeMonthlyReview, "stripeMonthlyReview");
-  const reviewKeys = Object.keys(review).sort();
-  const planKeys = planEntries.map(([key]) => key).sort();
-  if (JSON.stringify(reviewKeys) !== JSON.stringify(planKeys)) {
-    fail("stripeMonthlyReview must contain exactly one row for every billingConfig.plans key");
+  exactKeys(review, [planIds.subscription], "stripeMonthlyReview");
+  const row = objectAt(review[planIds.subscription], `stripeMonthlyReview.${planIds.subscription}`);
+  exactKeys(
+    row,
+    ["expectedAmountMinor", "currency", "interval"],
+    `stripeMonthlyReview.${planIds.subscription}`,
+  );
+  const expectedAmountMinor = safePositiveInteger(
+    row.expectedAmountMinor,
+    `stripeMonthlyReview.${planIds.subscription}.expectedAmountMinor`,
+  );
+  if (row.currency !== "USD") {
+    fail(`stripeMonthlyReview.${planIds.subscription}.currency must be USD`);
   }
-  const stripeMonthlyReview = planEntries.map(([planKey, rawPlan]) => {
-    const row = objectAt(review[planKey], `stripeMonthlyReview.${planKey}`);
-    exactKeys(
-      row,
-      ["expectedAmountMinor", "currency", "interval"],
-      `stripeMonthlyReview.${planKey}`,
-    );
-    const expectedAmountMinor = safePositiveInteger(
-      row.expectedAmountMinor,
-      `stripeMonthlyReview.${planKey}.expectedAmountMinor`,
-    );
-    if (row.currency !== "USD") fail(`stripeMonthlyReview.${planKey}.currency must be USD`);
-    if (row.interval !== "month") fail(`stripeMonthlyReview.${planKey}.interval must be month`);
-    return {
-      planKey,
-      stripePriceId: (rawPlan as Record<string, unknown>).stripePriceId as string,
-      expectedAmountMinor,
-      currency: "USD" as const,
-      interval: "month" as const,
-    };
-  });
+  if (row.interval !== "month") {
+    fail(`stripeMonthlyReview.${planIds.subscription}.interval must be month`);
+  }
 
-  const canonicalBillingConfig = JSON.stringify(root.billingConfig);
+  const canonicalBillingConfig = JSON.stringify(rawBillingConfig);
   return {
     kind: "takoserver.pricing-preview@v1",
-    validation: "requires-host-billing-config-validation",
+    validation: "host-billing-config-valid",
     mode: "preview",
+    activation: "pending-unified-billing-runtime-alignment",
     environment: {
       TAKOSERVER_BILLING_CONFIG: canonicalBillingConfig,
       [PAYMENT_SETTING_VARIABLES.checkoutMinimumMinor]: String(minimumMinor),
       [PAYMENT_SETTING_VARIABLES.checkoutMaximumMinor]: String(maximumMinor),
     },
-    stripeMonthlyReview,
+    stripeMonthlyReview: [
+      {
+        planKey: planIds.subscription,
+        stripePriceId: subscriptionPlan.stripePriceId,
+        expectedAmountMinor,
+        currency: "USD",
+        interval: "month",
+      },
+    ],
+    hostedPlanTable: {
+      scope: "hosted",
+      products: ["takosumi-hosted", "takoserver"],
+      balanceScope: "organization",
+      plans: [
+        {
+          planId: planIds.free,
+          tier: "free",
+          resourceScope: "edge",
+          configuredMonthlyCreditMinor: billingConfig.freeIncludedMinor,
+          edgeAllowance: "pending-owner-runtime-policy",
+        },
+        {
+          planId: planIds.subscription,
+          tier: "subscription",
+          monthlyAmountMinor: expectedAmountMinor,
+          includedCreditMinor: subscriptionPlan.includedMinor,
+          stripePriceId: subscriptionPlan.stripePriceId,
+        },
+        {
+          planId: planIds.usage,
+          tier: "usage",
+          checkoutMinimumMinor: minimumMinor,
+          checkoutMaximumMinor: maximumMinor,
+          meters: billingConfig.meters,
+        },
+      ],
+      consumptionOrder: ["free", "subscription", "purchased", "postpaid"],
+    },
+  };
+}
+
+function parsePlanIds(value: unknown): { free: string; subscription: string; usage: string } {
+  const ids = objectAt(value, "planIds");
+  exactKeys(ids, ["free", "subscription", "usage"], "planIds");
+  const values = [ids.free, ids.subscription, ids.usage];
+  for (const id of values) {
+    if (typeof id !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/u.test(id)) {
+      fail("planIds values must be valid lowercase plan IDs");
+    }
+  }
+  if (new Set(values).size !== values.length) fail("planIds values must be unique");
+  return {
+    free: ids.free as string,
+    subscription: ids.subscription as string,
+    usage: ids.usage as string,
   };
 }
 
@@ -141,13 +214,6 @@ function exactKeys(
   for (const key of expected) {
     if (!Object.hasOwn(value, key)) fail(`${path}.${key} is required`);
   }
-}
-
-function safeNonnegativeInteger(value: unknown, path: string): number {
-  if (!Number.isSafeInteger(value) || (value as number) < 0) {
-    fail(`${path} must be a nonnegative safe integer`);
-  }
-  return value as number;
 }
 
 function safePositiveInteger(value: unknown, path: string): number {

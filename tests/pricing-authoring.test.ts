@@ -8,6 +8,7 @@ import { compilePricingAuthoring, PricingAuthoringError } from "../scripts/prici
 function authoring() {
   return {
     authoringVersion: 1,
+    planIds: { free: "free", subscription: "starter", usage: "usage" },
     billingConfig: {
       schemaVersion: 1,
       revision: "candidate-r3",
@@ -52,14 +53,18 @@ function authoring() {
 describe("pricing authoring preview", () => {
   test("projects replaceable values and preserves canonical tariff history verbatim", () => {
     const first = authoring();
-    (first.billingConfig as Record<string, unknown>).operatorNote = "preserved for Host validation";
+    delete (first.billingConfig as Partial<typeof first.billingConfig>).holdTtlSeconds;
     const output = compilePricingAuthoring(first);
     expect(output.kind).toBe("takoserver.pricing-preview@v1");
     expect(output.mode).toBe("preview");
-    expect(output.validation).toBe("requires-host-billing-config-validation");
+    expect(output.validation).toBe("host-billing-config-valid");
+    expect(output.activation).toBe("pending-unified-billing-runtime-alignment");
     expect(JSON.parse(output.environment.TAKOSERVER_BILLING_CONFIG ?? "null")).toEqual(
       first.billingConfig,
     );
+    expect(
+      JSON.parse(output.environment.TAKOSERVER_BILLING_CONFIG ?? "null").holdTtlSeconds,
+    ).toBeUndefined();
     expect(output.stripeMonthlyReview).toEqual([
       {
         planKey: "starter",
@@ -85,12 +90,92 @@ describe("pricing authoring preview", () => {
     expect(
       JSON.parse(changedOutput.environment.TAKOSERVER_BILLING_CONFIG ?? "null").meters,
     ).toEqual(first.billingConfig.meters);
+
+    const table = output.hostedPlanTable;
+    expect(table).toEqual({
+      scope: "hosted",
+      products: ["takosumi-hosted", "takoserver"],
+      balanceScope: "organization",
+      plans: [
+        {
+          planId: "free",
+          tier: "free",
+          resourceScope: "edge",
+          configuredMonthlyCreditMinor: 300,
+          edgeAllowance: "pending-owner-runtime-policy",
+        },
+        {
+          planId: "starter",
+          tier: "subscription",
+          monthlyAmountMinor: 125,
+          includedCreditMinor: 1200,
+          stripePriceId: "price_month123",
+        },
+        {
+          planId: "usage",
+          tier: "usage",
+          checkoutMinimumMinor: 50,
+          checkoutMaximumMinor: 99_999_999,
+          meters: first.billingConfig.meters,
+        },
+      ],
+      consumptionOrder: ["free", "subscription", "purchased", "postpaid"],
+    });
+    expect(table.products).toEqual(["takosumi-hosted", "takoserver"]);
+
+    const renamed = authoring();
+    renamed.planIds = { free: "basic", subscription: "team-monthly", usage: "metered" };
+    renamed.billingConfig.plans = {
+      "team-monthly": { includedMinor: 1200, stripePriceId: "price_month123" },
+    } as unknown as typeof renamed.billingConfig.plans;
+    renamed.stripeMonthlyReview = {
+      "team-monthly": { expectedAmountMinor: 300, currency: "USD", interval: "month" },
+    } as unknown as typeof renamed.stripeMonthlyReview;
+    const renamedOutput = compilePricingAuthoring(renamed);
+    expect(renamedOutput.hostedPlanTable.plans.map((plan) => plan.planId)).toEqual([
+      "basic",
+      "team-monthly",
+      "metered",
+    ]);
+    expect(renamedOutput.hostedPlanTable.plans[1]).toMatchObject({ monthlyAmountMinor: 300 });
+
+    const expiryChanged = authoring();
+    (expiryChanged.billingConfig as Record<string, unknown>).purchaseCreditExpiry = {
+      kind: "fixed-duration",
+      seconds: 7200,
+    };
+    expect(compilePricingAuthoring(expiryChanged).hostedPlanTable.consumptionOrder).toEqual(
+      table.consumptionOrder,
+    );
   });
 
   test("requires exact input, plan and review fields and explicit safe amounts", () => {
     const unknown = authoring() as ReturnType<typeof authoring> & Record<string, unknown>;
     unknown.extra = true;
     expect(() => compilePricingAuthoring(unknown)).toThrow(PricingAuthoringError);
+
+    const unknownOrder = authoring() as ReturnType<typeof authoring> & Record<string, unknown>;
+    unknownOrder.consumptionOrder = ["subscription", "free"];
+    expect(() => compilePricingAuthoring(unknownOrder)).toThrow("unknown field");
+
+    const missingIds = authoring();
+    delete (missingIds as unknown as Record<string, unknown>).planIds;
+    expect(() => compilePricingAuthoring(missingIds)).toThrow("planIds is required");
+
+    for (const planIds of [
+      { free: "free", subscription: "starter", usage: "starter" },
+      { free: "bad ID", subscription: "starter", usage: "usage" },
+    ]) {
+      const invalidIds = authoring();
+      invalidIds.planIds = planIds;
+      expect(() => compilePricingAuthoring(invalidIds)).toThrow("planIds");
+    }
+
+    const mismatchedPlanId = authoring();
+    mismatchedPlanId.planIds.subscription = "different";
+    expect(() => compilePricingAuthoring(mismatchedPlanId)).toThrow(
+      "billingConfig.plans must contain exactly the planIds.subscription key",
+    );
 
     const missingBound = authoring();
     delete (missingBound.checkout as Partial<typeof missingBound.checkout>).maximumMinor;
@@ -102,22 +187,20 @@ describe("pricing authoring preview", () => {
     delete (
       mismatchedReview.stripeMonthlyReview as Partial<typeof mismatchedReview.stripeMonthlyReview>
     ).starter;
-    expect(() => compilePricingAuthoring(mismatchedReview)).toThrow("exactly one row");
+    expect(() => compilePricingAuthoring(mismatchedReview)).toThrow(
+      "stripeMonthlyReview.starter is required",
+    );
 
     const invalidPlan = authoring();
     invalidPlan.billingConfig.plans.starter.includedMinor = Number.MAX_SAFE_INTEGER + 1;
     expect(() => compilePricingAuthoring(invalidPlan)).toThrow(
-      "includedMinor must be a nonnegative safe integer",
+      "billingConfig is invalid under Host billing configuration rules",
     );
-
-    const invalidPlanField = authoring();
-    (invalidPlanField.billingConfig.plans.starter as Record<string, unknown>).freeIncludedMinor = 1;
-    expect(() => compilePricingAuthoring(invalidPlanField)).toThrow("unknown field");
 
     const freeOnly = authoring();
     freeOnly.billingConfig.plans = {} as typeof freeOnly.billingConfig.plans;
     freeOnly.stripeMonthlyReview = {} as typeof freeOnly.stripeMonthlyReview;
-    expect(compilePricingAuthoring(freeOnly).stripeMonthlyReview).toEqual([]);
+    expect(() => compilePricingAuthoring(freeOnly)).toThrow("planIds.subscription key");
   });
 
   test("validates root free credit, plan credit and monthly review amounts independently", () => {
@@ -125,7 +208,7 @@ describe("pricing authoring preview", () => {
     delete (missingFree.billingConfig as Partial<typeof missingFree.billingConfig>)
       .freeIncludedMinor;
     expect(() => compilePricingAuthoring(missingFree)).toThrow(
-      "billingConfig.freeIncludedMinor is required",
+      "billingConfig is invalid under Host billing configuration rules",
     );
 
     const missingPlanAmount = authoring();
@@ -135,19 +218,19 @@ describe("pricing authoring preview", () => {
       >
     ).includedMinor;
     expect(() => compilePricingAuthoring(missingPlanAmount)).toThrow(
-      "billingConfig.plans.starter.includedMinor is required",
+      "billingConfig is invalid under Host billing configuration rules",
     );
 
     for (const amount of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
       const free = authoring();
       free.billingConfig.freeIncludedMinor = amount;
       expect(() => compilePricingAuthoring(free)).toThrow(
-        "freeIncludedMinor must be a nonnegative safe integer",
+        "billingConfig is invalid under Host billing configuration rules",
       );
       const included = authoring();
       included.billingConfig.plans.starter.includedMinor = amount;
       expect(() => compilePricingAuthoring(included)).toThrow(
-        "includedMinor must be a nonnegative safe integer",
+        "billingConfig is invalid under Host billing configuration rules",
       );
     }
 
@@ -188,7 +271,9 @@ describe("pricing authoring preview", () => {
 
     const invalidPrice = authoring();
     invalidPrice.billingConfig.plans.starter.stripePriceId = "price_looks-valid-but-has-dash";
-    expect(() => compilePricingAuthoring(invalidPrice)).toThrow("must be a Stripe price ID");
+    expect(() => compilePricingAuthoring(invalidPrice)).toThrow(
+      "billingConfig is invalid under Host billing configuration rules",
+    );
 
     const placeholder = authoring();
     placeholder.billingConfig.meters["takosumi.storage.byte-hours"].unit = "REPLACE_ME";
@@ -200,19 +285,13 @@ describe("pricing authoring preview", () => {
     unresolved.billingConfig.history[0] = null as never;
     expect(() => compilePricingAuthoring(unresolved)).toThrow("unresolved null placeholder");
 
-    const invalidCurrency = authoring();
-    invalidCurrency.billingConfig.currency = "EUR" as "USD";
-    expect(() => compilePricingAuthoring(invalidCurrency)).toThrow(
-      "billingConfig.currency must be USD",
-    );
-
     const extraReview = authoring();
     (extraReview.stripeMonthlyReview as Record<string, unknown>).unexpected = {
       expectedAmountMinor: 1,
       currency: "USD",
       interval: "month",
     };
-    expect(() => compilePricingAuthoring(extraReview)).toThrow("exactly one row");
+    expect(() => compilePricingAuthoring(extraReview)).toThrow("unknown field");
 
     const unknownReviewField = authoring();
     (unknownReviewField.stripeMonthlyReview.starter as Record<string, unknown>).comment =
@@ -226,6 +305,22 @@ describe("pricing authoring preview", () => {
     const wrongReviewInterval = authoring();
     wrongReviewInterval.stripeMonthlyReview.starter.interval = "year" as "month";
     expect(() => compilePricingAuthoring(wrongReviewInterval)).toThrow("interval must be month");
+  });
+
+  test("delegates tariff schema and historical validation to the Host parser safely", () => {
+    const unknownBillingField = authoring();
+    (unknownBillingField.billingConfig as Record<string, unknown>).BAD_SECRET_FIELD = "value";
+    expect(() => compilePricingAuthoring(unknownBillingField)).toThrow(
+      "billingConfig is invalid under Host billing configuration rules",
+    );
+
+    const invalidHistory = authoring();
+    const invalidSnapshot = invalidHistory.billingConfig.history[0];
+    if (!invalidSnapshot) throw new Error("test fixture must include a history snapshot");
+    invalidSnapshot.effectiveAt = "2026-10-13T00:00:00.000Z";
+    expect(() => compilePricingAuthoring(invalidHistory)).toThrow(
+      "billingConfig is invalid under Host billing configuration rules",
+    );
   });
 
   test("CLI emits JSON on success and no output or input contents on rejected files", async () => {
@@ -260,6 +355,27 @@ describe("pricing authoring preview", () => {
       expect(failure.stdout).toBe("");
       expect(failure.stderr).toContain("valid UTF-8 JSON");
       expect(failure.stderr).not.toContain("DO_NOT_LEAK");
+
+      const rawParserKeyPath = join(directory, "raw-parser-key.json");
+      const invalidMeterKey = authoring();
+      invalidMeterKey.billingConfig.meters = {
+        SECRET_KEY_PATH: {
+          unit: "byte-hour",
+          rate: { numeratorMicros: "1", denominator: "1000" },
+        },
+      } as unknown as typeof invalidMeterKey.billingConfig.meters;
+      await writeFile(rawParserKeyPath, JSON.stringify(invalidMeterKey));
+      const rawParserKey = spawnSync(
+        process.execPath,
+        ["--no-env-file", "scripts/pricing/preview.ts", rawParserKeyPath],
+        { cwd: process.cwd(), encoding: "utf8" },
+      );
+      expect(rawParserKey.status).toBe(1);
+      expect(rawParserKey.stdout).toBe("");
+      expect(rawParserKey.stderr).toContain(
+        "billingConfig is invalid under Host billing configuration rules",
+      );
+      expect(rawParserKey.stderr).not.toContain("SECRET_KEY_PATH");
 
       const invalidUtf8Path = join(directory, "invalid-utf8.json");
       await writeFile(invalidUtf8Path, new Uint8Array([0xff, 0xfe]));

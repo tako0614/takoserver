@@ -1,5 +1,10 @@
 {
   "authoringVersion": 1,
+  "planIds": {
+    "free": "REPLACE_ME",
+    "subscription": "REPLACE_ME",
+    "usage": "REPLACE_ME"
+  },
   "billingConfig": {
     "schemaVersion": 1,
     "revision": "REPLACE_ME",
@@ -11,7 +16,7 @@
       "kind": "REPLACE_ME"
     },
     "plans": {
-      "starter": {
+      "subscription-plan-key": {
         "includedMinor": null,
         "stripePriceId": "REPLACE_ME"
       }
@@ -46,7 +51,7 @@
     "maximumMinor": null
   },
   "stripeMonthlyReview": {
-    "starter": {
+    "subscription-plan-key": {
       "expectedAmountMinor": null,
       "currency": "USD",
       "interval": "month"
