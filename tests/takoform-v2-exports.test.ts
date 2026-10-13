@@ -149,6 +149,8 @@ const RUNTIME_EXPORTS = [
   "createWorkerCronTriggerAdmissionReader",
   "createWorkerCronTriggerForm",
   "createV2HeldArtifactSource",
+  "createV2HeldOrPublicArtifactSource",
+  "createV2PublicHttpsArtifactSource",
   "createV2NativeEffectCustody",
   "createV2NativeDeletionCustody",
   "createV2ServiceBindingAuthority",
