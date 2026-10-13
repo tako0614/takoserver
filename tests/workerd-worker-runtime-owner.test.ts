@@ -41,7 +41,12 @@ import {
 } from "../src/takoform-v2/worker-endpoint-backend.ts";
 import type { V2WorkerPublicationResolution } from "../src/takoform-v2/worker-publication-state.ts";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
-import { spawnWorkerdWithParentDeath, workerPortOwnership } from "../src/workerd-linux-process.ts";
+import {
+  type LinuxProcessIdentity,
+  type LinuxProcessLiveness,
+  spawnWorkerdWithParentDeath,
+  workerPortOwnership,
+} from "../src/workerd-linux-process.ts";
 import type { WorkerdPublicationIdentity } from "../src/workerd-runtime.ts";
 import type { WorkerdProcess } from "../src/workerd-supervisor.ts";
 import {
@@ -51,6 +56,7 @@ import {
 import {
   createSerializedWorkerdOwnerStateWriter,
   openWorkerdWorkerRuntimeOwner,
+  workerdSuccessorHoldsListener,
 } from "../src/workerd-worker-runtime-owner.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
@@ -2407,4 +2413,152 @@ test("scheduled port delivers the exact match through the current private Versio
     await owner.close().catch(() => undefined);
     await owned.cleanup();
   }
+});
+
+for (const exitsBeforeIdentity of [false, true]) {
+  test(`a crashed child's port held briefly by a foreign process delays automatic recovery without stopping it${exitsBeforeIdentity ? ", even when its replacement exits before its identity is read" : ""}`, async () => {
+    const owned = await fixture();
+    const workerUid = exitsBeforeIdentity
+      ? "worker-foreign-listener-early-exit"
+      : "worker-foreign-listener-recovery";
+    const createId = "1a38df97-47c2-4763-8ad1-af53eccf02f9";
+    const deleteId = "7adb927b-35d6-40b2-93ce-9c0048b7fef1";
+    const publication = staticPublicationState(workerUid);
+    const port = await unusedPort();
+    const statePath = join(
+      owned.root,
+      "owners",
+      createHash("sha256").update(workerUid, "utf8").digest("hex"),
+      "runtime-owner.json",
+    );
+    const ownerState = async () =>
+      JSON.parse(await readFile(statePath, "utf8")) as {
+        incarnations: Array<{ operationId: string; processIdentity: { pid: number } | null }>;
+        physicalAbsences: Array<{ processIdentity: { pid: number } }>;
+      };
+    const pinnedPid = async () =>
+      (await ownerState()).incarnations.find((item) => item.operationId === createId)
+        ?.processIdentity?.pid;
+    const spawned: WorkerdProcess[] = [];
+    // The PID of a process that has already exited and been reaped, so the
+    // replacement's identity can no longer be read when the hook runs.
+    let exitedReplacementPid: number | undefined;
+    const owner = await openWorkerdWorkerRuntimeOwner({
+      rootDirectory: join(owned.root, "owners"),
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      publicationState: publication.source,
+      workerdBinary: owned.binary,
+      listenerPortForOperation: async () => port,
+      spawn: (command) => {
+        const pid = exitedReplacementPid;
+        exitedReplacementPid = undefined;
+        // Its exit is reported only after the persistence hook has started, as
+        // for a child that exits while its identity is being read.
+        const child =
+          pid === undefined
+            ? owned.spawn(command)
+            : { pid, exited: Bun.sleep(10).then(() => 0), kill() {} };
+        spawned.push(child);
+        return child;
+      },
+    });
+    let foreign: ReturnType<typeof Bun.serve> | undefined;
+    try {
+      expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
+        kind: "confirmed",
+      });
+      publication.setCurrent(createId);
+      const accepted = owned.children[0];
+      if (!accepted) throw new Error("accepted child missing");
+      expect(await pinnedPid()).toBe(accepted.pid);
+      expect(owner.health()).toBe("serving");
+      if (exitsBeforeIdentity) {
+        const gone = Bun.spawn([process.execPath, "-e", ""], {
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        await gone.exited;
+        exitedReplacementPid = gone.pid;
+      }
+
+      // As observed in staging: the accepted child is killed and another
+      // process binds its listener before the first automatic restart.
+      accepted.kill("SIGKILL");
+      await accepted.exited;
+      foreign = Bun.serve({ hostname: "127.0.0.1", port, fetch: () => new Response("foreign") });
+      await until(() => spawned.length > 1);
+      const blocked = spawned[1];
+      await blocked?.exited;
+      await Bun.sleep(500);
+      expect(owner.health()).toBe("unavailable");
+      expect(await pinnedPid()).toBe(accepted.pid);
+      expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toBe("foreign");
+
+      await foreign.stop(true);
+      foreign = undefined;
+      await until(() => owner.health() === "serving", 15_000);
+      const replacement = owned.children.at(-1);
+      expect(replacement?.exitCode).toBeNull();
+      expect(replacement?.pid).not.toBe(accepted.pid);
+      expect(await pinnedPid()).toBe(replacement?.pid);
+      // Only the crashed child's absence is recorded; a blocked replacement was
+      // retired before anything about it was written.
+      const absences = (await ownerState()).physicalAbsences.map(
+        (item) => item.processIdentity.pid,
+      );
+      expect(absences).toContain(accepted.pid);
+      expect(absences).not.toContain(blocked?.pid);
+      expect(
+        await (await owner.fetch(new Request(`https://${workerUid}.example.test/`))).text(),
+      ).toBeTruthy();
+
+      expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
+        kind: "confirmed",
+        identity: null,
+      });
+      await owner.close();
+    } finally {
+      await foreign?.stop(true);
+      await owner.close().catch(() => undefined);
+      await owned.cleanup();
+    }
+  });
+}
+
+test("only a vanished successor turns an unreadable listener observation into occupancy", async () => {
+  const successor: LinuxProcessIdentity = {
+    pid: 4242,
+    bootId: "00000000-0000-4000-8000-000000000000",
+    pidNamespace: "4:4026531836",
+    startTimeTicks: "100",
+  };
+  const errno = (code: string) => Object.assign(new Error(`proc read ${code}`), { code });
+  const classify = (liveness: LinuxProcessLiveness[], ownership: () => Promise<string>) =>
+    workerdSuccessorHoldsListener(28793, successor, {
+      liveness: async () => liveness.shift() ?? "unknown",
+      ownership: ownership as typeof workerPortOwnership,
+    });
+  const unexpected = () => Promise.reject(new Error("ownership must not be read"));
+
+  expect(await classify(["live"], async () => "owned")).toBe(true);
+  expect(await classify(["live"], async () => "foreign")).toBe(false);
+  expect(await classify(["live"], async () => "vacant")).toBe(false);
+  expect(await classify(["stale"], unexpected)).toBe(false);
+  // The successor exiting during its descriptor read is the expected race.
+  expect(await classify(["live", "stale"], () => Promise.reject(errno("ENOENT")))).toBe(false);
+  expect(await classify(["live", "stale"], () => Promise.reject(errno("ESRCH")))).toBe(false);
+  // Anything else is not occupancy evidence and stays terminal.
+  await expect(classify(["unknown"], unexpected)).rejects.toMatchObject({
+    code: "ownership_uncertain",
+  });
+  await expect(
+    classify(["live", "live"], () => Promise.reject(errno("ENOENT"))),
+  ).rejects.toMatchObject({ code: "ownership_uncertain" });
+  await expect(
+    classify(["live", "stale"], () => Promise.reject(errno("EACCES"))),
+  ).rejects.toMatchObject({ code: "ownership_uncertain" });
+  await expect(
+    classify(["live", "stale"], () => Promise.reject(new Error("procfs unavailable"))),
+  ).rejects.toMatchObject({ code: "ownership_uncertain" });
 });

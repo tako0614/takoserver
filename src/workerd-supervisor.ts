@@ -67,6 +67,20 @@ class ChildIdentityPersistenceError extends Error {
   }
 }
 
+/**
+ * An `onSpawned` hook reports, before it has persisted anything, that another
+ * process holds the listener or that the child already exited without
+ * recording an identity, as one that cannot bind does. This is temporary
+ * occupancy, not a failed identity write, so automatic recovery keeps its
+ * retry pending.
+ */
+export class WorkerdListenerOccupiedError extends Error {
+  constructor() {
+    super("workerd listener port is occupied before child identity persistence");
+    this.name = "WorkerdListenerOccupiedError";
+  }
+}
+
 /** A missing or rejected exit promise cannot become proof on a later retry. */
 class ChildExitUnconfirmedError extends Error {
   constructor() {
@@ -119,6 +133,8 @@ export function createWorkerdSupervisor(options: {
    * Persist the exact spawned child identity before readiness can admit it.
    * If this fails, startup is refused and the child remains under the
    * supervisor's retirement custody; automatic restart is not scheduled.
+   * The exception is `WorkerdListenerOccupiedError`: the child is still
+   * retired, but automatic recovery keeps its retry pending.
    */
   readonly onSpawned?: (child: WorkerdProcess) => Promise<void> | void;
   readonly listenerPort?: number;
@@ -369,7 +385,11 @@ export function createWorkerdSupervisor(options: {
       }
       try {
         await options.onSpawned?.(child);
-      } catch {
+      } catch (error) {
+        // Occupancy is not a failed write. The catch below retires this exact
+        // child, so a recovery retry still waits for its exit and a vacant
+        // listener; a first start still schedules no retry.
+        if (error instanceof WorkerdListenerOccupiedError) throw new WorkerdListenerOccupiedError();
         throw new ChildIdentityPersistenceError();
       }
       if (running !== entry || shutdownRequested || nextEpoch !== epoch) {
