@@ -18,6 +18,7 @@ import { errorEnvelope } from "./error-envelope.ts";
 import { GoogleIdentityError } from "./google-identity.ts";
 import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledger.ts";
 import { OperatorAssertionError } from "./operator-credentials.ts";
+import { PaymentEventError, type PaymentEvents } from "./payment-events.ts";
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
@@ -67,6 +68,8 @@ import {
  */
 
 const MAX_BODY_BYTES = 64 * 1_024;
+const PAYMENT_NOTIFICATION_PATH = "/v1/payments/stripe/webhook";
+const PAYMENT_NOTIFICATION_MAX_BYTES = 256 * 1_024;
 /**
  * The runtime-input handoff carries the exact public apply body it authorizes
  * plus every sensitive value, so it is the one control route whose request is
@@ -159,6 +162,11 @@ export interface CreateControlRoutesOptions {
    * would begin a checkout is simply not served.
    */
   readonly checkout?: Checkout | undefined;
+  /**
+   * Receives the payment processor's signed notifications. Absent where no
+   * signing secret is configured, and then the route is not served at all.
+   */
+  readonly paymentNotifications?: PaymentEvents["receive"];
   readonly clock: Clock;
   /** Exact browser console origin allowed to carry the HttpOnly session cookie. */
   readonly consoleOrigin?: string;
@@ -200,6 +208,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     reseller,
     tokens,
     settlement,
+    paymentNotifications,
     clock,
     consoleOrigin,
     nativeResidual,
@@ -575,6 +584,17 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         apiKeyId: segment(orgKey[2]),
       });
       return Response.json({ apiKey });
+    }
+
+    if (url.pathname === PAYMENT_NOTIFICATION_PATH) {
+      if (request.method !== "POST" || !paymentNotifications) controlError("not_found", 404);
+      // No session or key: the processor's signature over these exact bytes is
+      // the credential, so the body is read raw and never parsed before it.
+      const receipt = await paymentNotifications({
+        payload: await rawBody(request, PAYMENT_NOTIFICATION_MAX_BYTES),
+        signature: request.headers.get("stripe-signature"),
+      });
+      return Response.json({ received: true, duplicate: receipt.duplicate });
     }
 
     const wallet = /^\/v1\/organizations\/([^/]+)\/wallet$/u.exec(url.pathname);
@@ -1390,6 +1410,12 @@ function classify(error: unknown): { code: string; status: number } {
     };
   }
   if (error instanceof TokenError) return { code: error.code, status: 400 };
+  if (error instanceof PaymentEventError) {
+    // `unavailable` is the one a processor should retry; the rest are final.
+    const status =
+      error.code === "unavailable" ? 503 : error.code === "payload_too_large" ? 413 : 400;
+    return { code: error.code, status };
+  }
   if (error instanceof AttachmentError) {
     const status =
       error.code === "resource_not_found"
@@ -1488,6 +1514,43 @@ async function jsonObject(
     if (error instanceof StrictJsonError) controlError("invalid_argument", 400);
     throw error;
   }
+}
+
+/**
+ * The exact request bytes, refused past `limit` without buffering the rest.
+ * A signature covers bytes, not a parsed value, so nothing here decodes them.
+ */
+async function rawBody(request: Request, limit: number): Promise<Uint8Array> {
+  const declared = request.headers.get("content-length");
+  if (declared !== null && (!/^[0-9]{1,12}$/u.test(declared) || Number(declared) > limit)) {
+    throw new PaymentEventError("payload_too_large");
+  }
+  if (!request.body) controlError("invalid_argument", 400);
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      if (!(part.value instanceof Uint8Array) || part.value.byteLength > limit - total) {
+        await reader.cancel().catch(() => undefined);
+        throw new PaymentEventError("payload_too_large");
+      }
+      chunks.push(part.value);
+      total += part.value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (total === 0) controlError("invalid_argument", 400);
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 /**

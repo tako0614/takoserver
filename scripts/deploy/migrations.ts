@@ -70,6 +70,33 @@ export function readMigrationArtifact(
 }
 
 /** Applied rows must be exactly the prefix Wrangler would extend. */
+/** The migration that creates `stripe_events`, which every webhook delivery writes. */
+export const STRIPE_EVENTS_MIGRATION = "0091_stripe_events.sql";
+
+/**
+ * A target that asks for the Stripe webhook must already hold the table the
+ * webhook records into. Without it every delivery fails until Stripe disables
+ * the endpoint, so publication is refused before anything is uploaded.
+ */
+export function stripeWebhookSchemaReady(
+  target: { readonly stripeWebhook?: boolean },
+  applied: readonly string[],
+): boolean {
+  return target.stripeWebhook !== true || applied.includes(STRIPE_EVENTS_MIGRATION);
+}
+
+export function assertStripeWebhookSchema(
+  target: { readonly stripeWebhook?: boolean },
+  applied: readonly string[],
+): void {
+  if (!stripeWebhookSchemaReady(target, applied)) {
+    throw preflightError(
+      `the Stripe webhook needs ${STRIPE_EVENTS_MIGRATION} applied to this D1 before publication`,
+      `applied=${applied.length}`,
+    );
+  }
+}
+
 export function pendingMigrations(
   local: readonly string[],
   applied: readonly string[],

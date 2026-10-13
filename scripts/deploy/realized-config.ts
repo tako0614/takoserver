@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { PAYMENT_SETTING_VARIABLES } from "../../src/payment-settings.ts";
 import type { PublicFormImplementationIdentity } from "../../src/public-worker-implementation.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
@@ -220,6 +221,11 @@ export function deploymentVariables(
     vars.TAKOS_ID_CLIENT_ID = target.takosId.clientId;
   }
   if (target.stripeCheckout === true) vars.TAKOSERVER_STRIPE_CHECKOUT_ENABLED = "1";
+  if (target.stripeWebhook === true) vars.TAKOSERVER_STRIPE_WEBHOOK_ENABLED = "1";
+  for (const [setting, variable] of Object.entries(PAYMENT_SETTING_VARIABLES)) {
+    const value = target.stripeSettings?.[setting as keyof typeof PAYMENT_SETTING_VARIABLES];
+    if (value !== undefined) vars[variable] = String(value);
+  }
   if (target.aiModels !== undefined) vars.TAKOSERVER_AI_MODELS = JSON.stringify(target.aiModels);
   if (target.objectBucketSupplies !== undefined) {
     vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES = JSON.stringify(target.objectBucketSupplies);
@@ -287,6 +293,7 @@ export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
     names.add("TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING");
   }
   if (target.stripeCheckout === true) names.add("STRIPE_SECRET_KEY");
+  if (target.stripeWebhook === true) names.add("STRIPE_WEBHOOK_SECRET");
   return [...names].sort();
 }
 

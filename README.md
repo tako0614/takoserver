@@ -278,6 +278,10 @@ configured service dependencies may use protected files outside it.
 | `TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` | Optional identity-only operator key. It overrides the login key without granting wallet-funding authority. |
 | `GOOGLE_CLIENT_ID` | Turns on Google sign-in. Its absence leaves the operator path. |
 | `STRIPE_SECRET_KEY` | Turns on card payment. Its absence leaves operator-signed funding. |
+| `STRIPE_WEBHOOK_SECRET` | Signing secret (`whsec_…`) of this deployment's Stripe webhook endpoint. With card payment on, it serves `POST /v1/payments/stripe/webhook`; without it the route is 404 and only the reconcile pass credits payments nobody presented. |
+| `TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR` / `TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR` | Smallest and largest single Checkout payment, in cents (defaults 500 and 1000000; bounded by Stripe's 50 to 99999999). |
+| `TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS` | How far a webhook's signed timestamp may be from this Host's clock (default 300, at most 3600). |
+| `TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS` | How far back the reconcile pass reads completed Checkout Sessions (default 604800, seven days; 3600 to 2592000). |
 | `TAKOSERVER_AI_BASE_URL` | HTTPS base path of an OpenAI-compatible upstream. |
 | `TAKOSERVER_AI_MODELS` | JSON allowlist mapping public model IDs to upstream IDs, limits, and retail token prices. |
 | `TAKOSERVER_AI_TOKEN_FILE` | Preferred rotatable upstream bearer secret file. |
@@ -470,7 +474,46 @@ private deploy target explicitly sets `"stripeCheckout": true` **and** the
 Worker already has a `STRIPE_SECRET_KEY` secret. The target contains no secret
 value: the owner preflight fails if the named capability has no secret, while a
 lingering secret alone cannot expose Checkout when the target capability is
-absent.
+absent. The webhook is gated the same way: `"stripeWebhook": true` (only with
+`stripeCheckout`) requires a `STRIPE_WEBHOOK_SECRET` secret, and
+`"stripeSettings"` carries the four amounts and windows above as
+`checkoutMinimumMinor`, `checkoutMaximumMinor`, `webhookToleranceSeconds` and
+`reconcileLookbackSeconds`, validated before deploy.
+
+A payment is credited however the Host learns of it, and only once. The
+console's return presents the Checkout Session id; the Stripe webhook
+(`checkout.session.completed` and `checkout.session.async_payment_succeeded`)
+names it; and a reconcile pass, every five minutes on both the Bun Host and the
+Worker cron, lists completed sessions inside the lookback window. Each path
+re-reads the session from the Stripe API — whether it is paid, the amount, the
+currency, and the organization written into its metadata at creation — and
+credits through the same `stripe:<session id>` funding reference, so the
+ledger's uniqueness makes every path and every redelivery credit once. A
+session naming an organization this deployment does not have credits nothing.
+Webhook events are deduplicated by Stripe event id in `stripe_events`; types
+reserved for subscriptions, invoices and refunds (`invoice.paid`,
+`invoice.payment_failed`, `customer.subscription.updated`,
+`customer.subscription.deleted`, `charge.refunded`) and any other type are
+recorded and acknowledged without acting on them. Point the Stripe endpoint at
+`https://<public origin>/v1/payments/stripe/webhook`; one Stripe account and
+mode should serve one deployment.
+
+No path credits a payment that is no longer there: the session is read with its
+PaymentIntent and latest charge, and a refunded (in any part) or disputed
+charge, or one that cannot be read, credits nothing. The webhook and the
+reconcile pass credit only one-off (`mode=payment`) sessions this Host created,
+which carry `metadata[takoserverPurpose]=wallet_funding`; sessions created
+before that marker existed are credited only when the console presents them.
+Paid sessions that could not be credited (another currency, an organization
+this Host lacks, an unreadable payment) are logged by funding reference as
+`takoserver.stripe.uncredited_payments`.
+
+The webhook records every delivery in `stripe_events`, so it needs migration
+`0091_stripe_events.sql` applied first. A Bun Host migrates its own SQLite. On
+Cloudflare, publication refuses `"stripeWebhook": true` until the target's D1
+has 0091 applied, and no reviewed D1 wave through 0091 exists yet; until one
+does, a hosted deployment relies on the console's return and the reconcile
+pass.
 
 ### Data root and backups
 
@@ -706,7 +749,7 @@ operator reconciliation rather than being reported as a successful cancellation.
 
 ## How it is built
 
-Six provider-neutral ports; the SQL port is shown at both capability levels
+Seven provider-neutral ports; the SQL port is shown at both capability levels
 below, and everything above them remains provider-neutral.
 
 | Port | Implementations |
@@ -717,6 +760,7 @@ below, and everything above them remains provider-neutral.
 | `Provider Pack` | provisioning, Attachment, transfer, credential, meter, and cost capabilities |
 | `ExternalIdentityVerifier` | Google ID tokens, operator signature |
 | `FundingSettlementVerifier` | Stripe, operator signature |
+| `PaymentEvents` | Stripe webhook and reconcile pass |
 | `AiGateway` | any OpenAI-compatible upstream; the Worker entry uses its native Workers AI binding |
 
 `scripts/check-imports.ts` enforces the layering as a gate rather than a

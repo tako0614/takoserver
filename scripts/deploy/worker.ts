@@ -24,7 +24,13 @@ import {
   type IntegrationStorageGenerationTargetVerificationOptions,
   verifyFreshV2IntegrationStorageTarget,
 } from "./integration-storage-generation.ts";
-import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
+import {
+  assertStripeWebhookSchema,
+  pendingMigrations,
+  readD1SchemaState,
+  readMigrationArtifact,
+  stripeWebhookSchemaReady,
+} from "./migrations.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -540,6 +546,7 @@ export async function runWorker(
         ready:
           target.schemaMaintenanceMode === undefined &&
           workerSchemaAllowsPending(target, before.migrations, sourceRepositoryRoot) &&
+          stripeWebhookSchemaReady(target, before.migrations.applied) &&
           !legacyProfileCurrent &&
           (target.integrationE2eCredentialAuthority === undefined ||
             before.integrationE2eCredentialAuthorityConfigured) &&
@@ -580,6 +587,7 @@ export async function runWorker(
         JSON.stringify(before.pending),
       );
     }
+    assertStripeWebhookSchema(target, before.migrations.applied);
     const legacyBootstrap = before.legacyPredecessorProfile !== undefined;
     const changedPaths = legacyBootstrap
       ? null

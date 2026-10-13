@@ -224,6 +224,7 @@ export const ROUTES: readonly RouteDeclaration[] = [
     pattern: "/v1/organizations/{organizationId}/wallet/funding",
     operation: "creditWalletFromSettlement",
   },
+  { method: "post", pattern: "/v1/payments/stripe/webhook", operation: "receiveStripeWebhook" },
   { method: "get", pattern: "/v1/catalog", operation: "listOfferings" },
   { method: "post", pattern: "/v1/reseller/quotes", operation: "createResellerQuote" },
   { method: "post", pattern: "/v1/reseller/reservations", operation: "createResellerReservation" },

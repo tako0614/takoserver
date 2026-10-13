@@ -507,6 +507,36 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
   readWallet: described("Read the prepaid wallet"),
   beginWalletCheckout: described("Begin a card payment for this organization"),
   creditWalletFromSettlement: described("Credit the wallet from a verified settlement proof"),
+  receiveStripeWebhook: described(
+    "Receive one signed Stripe event. Served only where Stripe funding and a webhook signing secret are configured; the Stripe-Signature header over the raw body is the credential, and amounts are re-read from Stripe",
+    {
+      security: [],
+      responses: {
+        "200": {
+          description: "Verified and recorded, including an already-settled redelivery",
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                required: ["received", "duplicate"],
+                properties: {
+                  received: { type: "boolean", const: true },
+                  duplicate: { type: "boolean" },
+                },
+              },
+            },
+          },
+        },
+        "400": errorResponse(
+          "Missing, malformed, mismatched or out-of-tolerance signature, or a malformed event",
+        ),
+        "404": errorResponse("Stripe webhooks are not configured on this deployment"),
+        "413": errorResponse("Event body exceeds 256 KiB"),
+        "503": errorResponse("Stripe could not be read; the event stays retryable"),
+      },
+    },
+  ),
   listOfferings: described("List purchasable offerings"),
   createResellerQuote: described("Price an offering for a tenant"),
   createResellerReservation: described("Reserve a quote, holding funds"),

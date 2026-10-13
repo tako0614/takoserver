@@ -17,8 +17,9 @@ function stripe(session: Record<string, unknown> | null) {
     secretKey: "sk_test_pretend",
     async fetch(request) {
       calls.push(new URL(request.url).pathname);
-      // The secret must travel, and only to Stripe.
+      // The secret must travel, and only to Stripe, on the pinned API version.
       expect(request.headers.get("authorization")).toBe("Bearer sk_test_pretend");
+      expect(request.headers.get("stripe-version")).toBe("2024-06-20");
       return session === null
         ? new Response("", { status: 404 })
         : Response.json({ id: "cs_test_123", ...session });
@@ -28,10 +29,15 @@ function stripe(session: Record<string, unknown> | null) {
 }
 
 const paid = {
+  mode: "payment",
   payment_status: "paid",
   amount_total: 5_000,
   currency: "usd",
   metadata: { organizationId: ORG },
+  payment_intent: {
+    status: "succeeded",
+    latest_charge: { refunded: false, amount_refunded: 0, disputed: false },
+  },
 };
 
 describe("Stripe settlement", () => {
@@ -92,6 +98,53 @@ describe("Stripe settlement", () => {
     expect(calls).toEqual([]);
   });
 
+  test("refuses a payment that was refunded, partly refunded or disputed after it was paid", async () => {
+    for (const charge of [
+      { refunded: true, amount_refunded: 5_000, disputed: false },
+      { refunded: false, amount_refunded: 1, disputed: false },
+      { refunded: false, amount_refunded: 0, disputed: true },
+    ]) {
+      const { verifier } = stripe({
+        ...paid,
+        payment_intent: { status: "succeeded", latest_charge: charge },
+      });
+      await expect(
+        verifier.verify({ organizationId: ORG, settlementProof: "cs_test_123" }),
+      ).rejects.toMatchObject({ code: "refunded" });
+    }
+  });
+
+  test("refuses a session whose payment it cannot read, or that is not a one-off payment", async () => {
+    for (const [session, code] of [
+      [{ ...paid, payment_intent: "pi_not_expanded" }, "unverifiable_payment"],
+      [
+        { ...paid, payment_intent: { status: "processing", latest_charge: null } },
+        "unverifiable_payment",
+      ],
+      [{ ...paid, mode: "subscription" }, "not_wallet_funding"],
+    ] as const) {
+      const { verifier } = stripe(session);
+      await expect(
+        verifier.verify({ organizationId: ORG, settlementProof: "cs_test_123" }),
+      ).rejects.toMatchObject({ code });
+    }
+  });
+
+  test("reads the session with its payment expanded", async () => {
+    const urls: string[] = [];
+    const verifier = createStripeSettlement({
+      secretKey: "sk_test_pretend",
+      async fetch(request) {
+        urls.push(request.url);
+        return Response.json({ id: "cs_test_123", ...paid });
+      },
+    });
+    await verifier.verify({ organizationId: ORG, settlementProof: "cs_test_123" });
+    expect(new URL(urls[0] ?? "").searchParams.getAll("expand[]")).toEqual([
+      "payment_intent.latest_charge",
+    ]);
+  });
+
   test("uses the session id as the funding reference, so a replay credits once", async () => {
     const { verifier } = stripe(paid);
     const first = await verifier.verify({ organizationId: ORG, settlementProof: "cs_test_123" });
@@ -131,6 +184,9 @@ describe("payment setup", () => {
     expect(started?.url).toContain("checkout.stripe.com");
     const form = sent as unknown as URLSearchParams;
     expect(form.get("metadata[organizationId]")).toBe(ORG);
+    // The marker the webhook and the reconcile pass require before crediting.
+    expect(form.get("metadata[takoserverPurpose]")).toBe("wallet_funding");
+    expect(form.get("payment_intent_data[metadata][takoserverPurpose]")).toBe("wallet_funding");
     expect(form.get("line_items[0][price_data][unit_amount]")).toBe("5000");
     expect(form.get("success_url")).toBe(
       "https://console.example.test/billing?checkout={CHECKOUT_SESSION_ID}",

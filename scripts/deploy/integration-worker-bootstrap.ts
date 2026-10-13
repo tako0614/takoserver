@@ -21,7 +21,12 @@ import {
   type IntegrationStorageGenerationTargetVerificationOptions,
   verifyFreshV2IntegrationStorageTarget,
 } from "./integration-storage-generation.ts";
-import { canonicalSchemaShape, type D1SchemaState, readD1SchemaState } from "./migrations.ts";
+import {
+  assertStripeWebhookSchema,
+  canonicalSchemaShape,
+  type D1SchemaState,
+  readD1SchemaState,
+} from "./migrations.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -313,6 +318,7 @@ export async function runIntegrationWorkerBootstrap(
     const schemaReader = resolveSchemaReader(options, inspectionConfig, target, environment, run);
     const schemaBefore = await readSchema("preflight", schemaReader);
     assertCompleteSchema(schemaBefore, artifactBefore, expectedShape);
+    assertStripeWebhookSchema(target, schemaBefore.applied);
     const v2StorageBefore =
       target.takoformV2 === undefined ? null : await readV2StorageProof(target, options);
     // A fresh generation must still be unserved when its first Host appears:

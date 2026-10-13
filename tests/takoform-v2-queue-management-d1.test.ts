@@ -95,7 +95,12 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
   });
   try {
     const database = await runtime.getD1Database("STATE_DB");
-    for (const migration of MIGRATIONS.slice(0, -1)) {
+    // Everything before the Queue SQLite migration; later, unrelated tables
+    // (Stripe events) do not take part in this guard.
+    const queueIndex = MIGRATIONS.findIndex(
+      (migration) => migration.name === "0090_v2_queue_sqlite_external_drain.sql",
+    );
+    for (const migration of MIGRATIONS.slice(0, queueIndex)) {
       for (const [index, statement] of splitMigration(migration.sql).entries()) {
         try {
           await database.prepare(statement).run();
@@ -104,7 +109,7 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
         }
       }
     }
-    const queueMigration = MIGRATIONS.at(-1);
+    const queueMigration = MIGRATIONS[queueIndex];
     expect(queueMigration?.name).toBe("0090_v2_queue_sqlite_external_drain.sql");
     if (!queueMigration) throw new Error("missing Queue SQLite migration");
     const sql = createD1Sql(database);
