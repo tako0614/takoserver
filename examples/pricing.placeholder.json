@@ -1,0 +1,60 @@
+{
+  "authoringVersion": 1,
+  "planIds": {
+    "free": "REPLACE_ME",
+    "subscription": "REPLACE_ME",
+    "usage": "REPLACE_ME"
+  },
+  "billingConfig": {
+    "schemaVersion": 1,
+    "revision": "REPLACE_ME",
+    "effectiveAt": "REPLACE_ME",
+    "currency": "USD",
+    "holdTtlSeconds": null,
+    "freeIncludedMinor": null,
+    "purchaseCreditExpiry": {
+      "kind": "REPLACE_ME"
+    },
+    "plans": {
+      "subscription-plan-key": {
+        "includedMinor": null,
+        "stripePriceId": "REPLACE_ME"
+      }
+    },
+    "meters": {
+      "takosumi.storage.byte-hours": {
+        "unit": "REPLACE_ME",
+        "rate": {
+          "numeratorMicros": "REPLACE_ME",
+          "denominator": "REPLACE_ME"
+        }
+      }
+    },
+    "history": [
+      {
+        "schemaVersion": 1,
+        "revision": "REPLACE_ME",
+        "effectiveAt": "REPLACE_ME",
+        "currency": "USD",
+        "holdTtlSeconds": null,
+        "freeIncludedMinor": null,
+        "purchaseCreditExpiry": {
+          "kind": "REPLACE_ME"
+        },
+        "plans": {},
+        "meters": {}
+      }
+    ]
+  },
+  "checkout": {
+    "minimumMinor": null,
+    "maximumMinor": null
+  },
+  "stripeMonthlyReview": {
+    "subscription-plan-key": {
+      "expectedAmountMinor": null,
+      "currency": "USD",
+      "interval": "month"
+    }
+  }
+}
