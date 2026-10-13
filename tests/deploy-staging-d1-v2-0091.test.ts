@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import {
   assertStagingD1NotProduction,
   type IntegrationStorageGenerationProcess,
+  isGeneratedIntegrationStorageTarget,
   runIntegrationStorageGeneration,
 } from "../scripts/deploy/integration-storage-generation.ts";
 import {
@@ -278,5 +279,42 @@ describe("staging-only v2-0091 D1 profile", () => {
     const missing = run(missingPath);
     expect(missing.exitCode).toBe(2);
     expect(new TextDecoder().decode(missing.stderr)).toContain(missingPath);
+  });
+
+  test("an operator staging pair stands in for a generated pair only on the v2-0091 lineage", () => {
+    const config = JSON.stringify({
+      documentation: "https://docs.example.test/v2",
+      authenticationDocumentation: "https://docs.example.test/v2/authentication",
+    });
+    const staging = "takoserver-staging-throwaway-0091-202610131602";
+    const pair = (name: string, storageLineage?: "v2-0088" | "v2-0089" | "v2-0091") =>
+      ({
+        ...target,
+        d1: { databaseName: name, databaseId: "2639c9be-259e-4099-9133-090620079925" },
+        r2: { bucketName: name },
+        ...(storageLineage === undefined ? {} : { takoformV2: { config, storageLineage } }),
+      }) satisfies DeployTarget;
+    expect(isGeneratedIntegrationStorageTarget(pair(staging, "v2-0091"), "integration")).toBe(true);
+    for (const lineage of [undefined, "v2-0088", "v2-0089"] as const) {
+      expect(isGeneratedIntegrationStorageTarget(pair(staging, lineage), "integration")).toBe(
+        false,
+      );
+    }
+    for (const name of [
+      "takoserver-runtime-staging",
+      "takoserver-staging-",
+      "takoserver-staging-UPPER",
+      "takoserver-staging-ends-with-dash-",
+      `takoserver-staging-${"a".repeat(60)}`,
+    ]) {
+      expect(isGeneratedIntegrationStorageTarget(pair(name, "v2-0091"), "integration")).toBe(false);
+    }
+    expect(
+      isGeneratedIntegrationStorageTarget(
+        { ...pair(staging, "v2-0091"), r2: { bucketName: `${staging}-other` } },
+        "integration",
+      ),
+    ).toBe(false);
+    expect(isGeneratedIntegrationStorageTarget(pair(staging, "v2-0091"), "production")).toBe(false);
   });
 });

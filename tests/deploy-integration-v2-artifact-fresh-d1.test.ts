@@ -633,6 +633,42 @@ for (const lineage of ["v2-0088", "v2-0089", "v2-0091"] as const) {
         freshLineage: lineage,
         migrationDigest: result.migrationDigest,
       });
+      // An operator-provisioned staging pair over the same exact database
+      // passes the same content proofs, but only on the staging-only lineage.
+      const STAGING = "takoserver-staging-throwaway-0091-test";
+      const stagingProvider = {
+        async getD1() {
+          return { name: STAGING, uuid: DATABASE_ID };
+        },
+        async getR2(name: string) {
+          return { name };
+        },
+      };
+      const stagingTarget = {
+        ...generatedTarget,
+        d1: { databaseName: STAGING, databaseId: DATABASE_ID },
+        r2: { bucketName: STAGING },
+      } satisfies DeployTarget;
+      if (lineage === "v2-0091") {
+        expect(
+          await verifyFreshV2IntegrationStorageTarget(stagingTarget, "integration", lineage, {
+            provider: stagingProvider as never,
+            reader,
+          }),
+        ).toMatchObject({
+          generation: STAGING,
+          freshLineage: "v2-0091",
+          d1: { databaseName: STAGING, databaseId: DATABASE_ID },
+          migrationDigest: result.migrationDigest,
+        });
+      } else {
+        await expect(
+          verifyFreshV2IntegrationStorageTarget(stagingTarget, "integration", lineage, {
+            provider: stagingProvider as never,
+            reader,
+          }),
+        ).rejects.toThrow("generated D1/R2 storage pair");
+      }
       // The historical selectors never qualify this generation.
       await expect(
         verifyFreshV2ArtifactIntegrationStorageTarget(generatedTarget, "integration", {

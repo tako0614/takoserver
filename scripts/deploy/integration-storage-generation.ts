@@ -118,6 +118,17 @@ const PRODUCTION_D1_NAME = /^takoserver-(?:runtime(?:$|-)|p-)/u;
 const GENERATED_D1_NAME = /^takoserver-i-[0-9a-f]{32}$/u;
 
 /**
+ * An operator-provisioned staging pair: one D1 and one R2 bucket sharing the
+ * name `takoserver-staging-<label>`. It stands in for a generated pair only on
+ * a target that selects the staging-only `v2-0091` lineage, and only for the
+ * read-side proofs (identity readback, the exact 0001-0091 ledger and
+ * canonical schema, and the empty-data proof at first publication). This
+ * surface still creates nothing but `takoserver-i-<generation>`, and a
+ * production-named database never qualifies.
+ */
+const STAGING_PAIR_NAME = /^takoserver-staging-[a-z0-9](?:[a-z0-9-]{0,50}[a-z0-9])?$/u;
+
+/**
  * Staging storage is never production storage. The generated name can only be
  * `takoserver-i-<generation>`, so a production database cannot be selected by
  * construction; this checks it anyway, against the production naming and,
@@ -487,13 +498,23 @@ function generatedStorageTarget(
   const databaseName = target.d1.databaseName;
   const bucketName = target.r2.bucketName;
   const generated = /^takoserver-i-([0-9a-f]{32})$/u.exec(databaseName);
-  if (generated === null || bucketName !== databaseName || !UUID.test(target.d1.databaseId)) {
+  const stagingPair =
+    generated === null &&
+    target.takoformV2?.storageLineage === "v2-0091" &&
+    STAGING_PAIR_NAME.test(databaseName) &&
+    !PRODUCTION_D1_NAME.test(databaseName);
+  if (
+    (generated === null && !stagingPair) ||
+    bucketName !== databaseName ||
+    !UUID.test(target.d1.databaseId)
+  ) {
     throw preflightError(
       "integration target must select one exact matching generated D1/R2 storage pair",
     );
   }
   return {
-    generation: generated[1] as string,
+    // A staging pair has no generation; its exact name is its identity.
+    generation: generated?.[1] ?? databaseName,
     accountId: target.accountId,
     databaseName,
     databaseId: target.d1.databaseId,

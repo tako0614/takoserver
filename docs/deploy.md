@@ -250,6 +250,40 @@ step and is not part of this procedure:
 Routine `takoserver-worker` publication then accepts exactly that 0001–0091
 ledger. A target with `"stripeWebhook": true` is accepted only on such a D1.
 
+**Operator-provisioned staging pair.** A staging D1 that infra prepared some
+other way can stand in for a generated pair, under all of these conditions:
+
+- The target selects `takoformV2.storageLineage: "v2-0091"`.
+- The D1 and the R2 bucket share one name, `takoserver-staging-<label>`, where
+  the label is lowercase letters, digits and inner hyphens. Production names
+  never qualify.
+
+Everything else is unchanged, and the bootstrap and routine publication refuse
+anything less:
+
+- the identity readback by exact id and name
+- the exact 0001–0091 ledger and canonical schema
+- at first publication, the empty-data proof (only migration seeds and the
+  signing registration)
+
+First publication (`takoserver-integration-worker-bootstrap`) of such a target
+needs the following inputs:
+
+- **Target fields:**
+  - `takoformV2: { "config": "<v2 startup JSON>", "storageLineage": "v2-0091" }`
+  - the signing identity registered in that D1
+  - for Stripe, `stripeCheckout`, `stripeWebhook` and `consoleOrigin`
+- **Files in `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY`**, one per secret,
+  named exactly as these Worker secrets:
+  - `TAKOSERVER_SIGNING_KEY`: the private JWK for the target's current signing
+    key
+  - `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`: at least 32 random bytes as unpadded
+    base64url
+  - `STRIPE_SECRET_KEY`
+  - `STRIPE_WEBHOOK_SECRET`
+
+  Secrets are never set with `wrangler secret put`.
+
 A target that uses such a generation names it explicitly with
 `takoformV2.storageLineage: "v2-0088"` (or `"v2-0089"`, or the staging-only
 `"v2-0091"`). Absent keeps the
