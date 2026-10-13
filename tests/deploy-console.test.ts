@@ -90,7 +90,10 @@ function recordingState(
     readonly existing?: boolean;
     readonly previousMessage?: string;
     readonly accountSubdomain?: string;
+    /** Subdomains read in order, for a change between the two reads. */
+    readonly accountSubdomains?: readonly string[];
     readonly served?: { readonly enabled: boolean; readonly previewsEnabled: boolean };
+    readonly servedFailure?: Error;
   } = {},
 ) {
   const workerName = options.workerName ?? CONSOLE_WORKER;
@@ -99,6 +102,7 @@ function recordingState(
   const hostnames: string[] = [];
   let ownerRead = 0;
   let historyRead = 0;
+  let subdomainRead = 0;
   const state: ConsoleState = {
     async workerDomainOwner(hostname) {
       hostnames.push(hostname);
@@ -129,10 +133,15 @@ function recordingState(
       };
     },
     async workerAccountSubdomain() {
+      const sequence = options.accountSubdomains;
+      if (sequence !== undefined) {
+        return sequence[Math.min(subdomainRead++, sequence.length - 1)] ?? ACCOUNT_SUBDOMAIN;
+      }
       return options.accountSubdomain ?? ACCOUNT_SUBDOMAIN;
     },
     async workerSubdomain(name) {
       workerNames.push(name);
+      if (options.servedFailure) throw options.servedFailure;
       return options.served ?? { enabled: true, previewsEnabled: false };
     },
   };
@@ -302,7 +311,10 @@ describe("routine Takoserver Console surface: integration Console", () => {
             workerAccountSubdomain: trap,
             workerSubdomain: trap,
           },
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          // No explicit token: integration credential resolution would ask
+          // Wrangler through `run`, so an empty process log proves the
+          // refusal precedes it.
+          cloudflareEnvironment: {},
         },
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
@@ -344,7 +356,7 @@ describe("routine Takoserver Console surface: integration Console", () => {
         expect(result.rollback).toBe(
           existing
             ? `wrangler rollback version-previous --name ${INTEGRATION_CONSOLE} --yes --message "rollback ${COMMIT}"`
-            : "forward repair only: no previous Console version exists",
+            : `no previous Console version; to remove this first integration Console: wrangler delete --name ${INTEGRATION_CONSOLE} (never the production Console)`,
         );
         // The production Console and every custom domain stay untouched.
         expect(recorded.hostnames).toEqual([]);
@@ -384,32 +396,76 @@ describe("routine Takoserver Console surface: integration Console", () => {
     }
   });
 
-  test("fails verification when the uploaded Console is not served on workers.dev", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-console-served-"));
-    try {
-      const failure = await runConsole(
-        { action: "apply", environment: "integration", commit: COMMIT },
-        integration,
-        {
-          run: fakeProcess().run,
-          state: recordingState({
-            workerName: INTEGRATION_CONSOLE,
-            served: { enabled: false, previewsEnabled: false },
-          }).state,
-          outputDirectory: root,
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-          fetcher: async () => new Response(CONSOLE_JS, { status: 200 }),
-        },
-      ).catch((error) => error);
-      expect(failure).toBeInstanceOf(DeployError);
-      expect((failure as DeployError).phase).toBe("verification");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
+  test("after an acknowledged upload, every failure is a verification failure, never preflight", async () => {
+    const cases = [
+      { served: { enabled: false, previewsEnabled: false } },
+      { served: { enabled: true, previewsEnabled: true } },
+      { accountSubdomains: [ACCOUNT_SUBDOMAIN, "moved-account"] },
+      // A provider read that fails after the upload reports preflight by
+      // itself; the surface must not pass that on as "nothing was touched".
+      { servedFailure: new DeployError("preflight", "subdomain state returned HTTP 500") },
+      { servedFailure: new Error("socket hang up") },
+    ];
+    for (const options of cases) {
+      const root = mkdtempSync(join(tmpdir(), "takoserver-console-served-"));
+      try {
+        const process = fakeProcess();
+        const failure = await runConsole(
+          { action: "apply", environment: "integration", commit: COMMIT },
+          integration,
+          {
+            run: process.run,
+            state: recordingState({ workerName: INTEGRATION_CONSOLE, ...options }).state,
+            outputDirectory: root,
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+            fetcher: async () => new Response(CONSOLE_JS, { status: 200 }),
+          },
+        ).catch((error) => error);
+        expect(failure).toBeInstanceOf(DeployError);
+        expect((failure as DeployError).phase).toBe("verification");
+        expect(
+          process.calls.filter((call) => call.includes("deploy") && call.includes("--strict")),
+        ).toHaveLength(1);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   });
 
-  test("status reports the integration Console without reading any domain", async () => {
-    const recorded = recordingState({ workerName: INTEGRATION_CONSOLE });
+  test("refuses an origin that names the API Worker, and adopting a production-style Console", async () => {
+    expect(() =>
+      consolePlacement({ ...integration, workerName: INTEGRATION_CONSOLE }, "integration"),
+    ).toThrow("differ from the API Worker");
+    const process = fakeProcess();
+    const recorded = recordingState({
+      workerName: INTEGRATION_CONSOLE,
+      previousMessage: `${CONSOLE_WORKER} ${"b".repeat(40)}`,
+    });
+    const failure = await runConsole(
+      { action: "apply", environment: "integration", commit: COMMIT },
+      integration,
+      {
+        run: process.run,
+        state: recorded.state,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+      },
+    ).catch((error) => error);
+    expect(failure).toBeInstanceOf(DeployError);
+    expect((failure as DeployError).message).toContain("never adopted");
+    expect(process.calls.some((call) => call.includes("deploy"))).toBe(false);
+  });
+
+  test("has no placement for an unknown environment", () => {
+    expect(() => consolePlacement(integration, "staging" as unknown as "integration")).toThrow(
+      "no placement",
+    );
+  });
+
+  test("status reports the integration Console and whether it is served, without reading any domain", async () => {
+    const recorded = recordingState({
+      workerName: INTEGRATION_CONSOLE,
+      served: { enabled: true, previewsEnabled: true },
+    });
     const status = await runConsole(
       { action: "status", environment: "integration", commit: COMMIT },
       integration,
@@ -421,9 +477,39 @@ describe("routine Takoserver Console surface: integration Console", () => {
       origin: INTEGRATION_ORIGIN,
       versionId: "version-previous",
       commitMatches: false,
+      workersDev: { enabled: true, previewsEnabled: true },
     });
     expect(status).not.toHaveProperty("domainOwner");
     expect(recorded.hostnames).toEqual([]);
+    const absent = await runConsole(
+      { action: "status", environment: "integration", commit: COMMIT },
+      integration,
+      {
+        run: fakeProcess().run,
+        state: recordingState({ workerName: INTEGRATION_CONSOLE, existing: false }).state,
+      },
+    );
+    expect(absent).toMatchObject({ versionId: null, workersDev: null });
+  });
+
+  test("production status still reads the one custom-domain Console", async () => {
+    const recorded = recordingState();
+    const status = await runConsole(
+      { action: "status", environment: "production", commit: COMMIT },
+      { ...rehearsal, environment: "production" },
+      {
+        run: fakeProcess().run,
+        state: recorded.state,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+      },
+    );
+    expect(status).toMatchObject({
+      workerName: CONSOLE_WORKER,
+      topology: "custom-domain",
+      domainOwner: CONSOLE_WORKER,
+    });
+    expect(recorded.hostnames).toEqual(["console.rehearsal.example.test"]);
+    expect(new Set(recorded.workerNames)).toEqual(new Set([CONSOLE_WORKER]));
   });
 
   test("refuses an invocation whose environment differs from the target's", async () => {

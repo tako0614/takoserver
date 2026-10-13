@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { CloudflareState } from "./cloudflare-state.ts";
-import { mutationError, preflightError, verificationError } from "./errors.ts";
+import { DeployError, mutationError, preflightError, verificationError } from "./errors.ts";
 import {
   type CommandResult,
   resolveCloudflareCredential,
@@ -60,8 +60,11 @@ export function consolePlacement(
 ): ConsolePlacement {
   if (!target.consoleOrigin) throw preflightError("selected target has no consoleOrigin");
   const origin = new URL(target.consoleOrigin);
-  if (environment !== "integration") {
+  if (environment === "production" || environment === "rehearsal") {
     return { topology: "custom-domain", workerName: CONSOLE_WORKER, hostname: origin.hostname };
+  }
+  if (environment !== "integration") {
+    throw preflightError("the Console surface has no placement for this environment");
   }
   const match = WORKERS_DEV_HOSTNAME.exec(origin.hostname);
   if (
@@ -177,6 +180,12 @@ export async function runConsole(
     );
   }
   if (invocation.action === "status") {
+    // After an indeterminate upload the operator comes here: say whether the
+    // integration Console is actually served, not only which commit it names.
+    const served =
+      placement.topology === "workers-dev" && before !== null
+        ? await state.workerSubdomain(workerName)
+        : null;
     return {
       kind: "takoserver.console-status@v2",
       surface: "takoserver-console",
@@ -186,6 +195,14 @@ export async function runConsole(
       topology: placement.topology,
       origin: target.consoleOrigin,
       ...(placement.topology === "custom-domain" ? { domainOwner: ownerBefore } : {}),
+      ...(placement.topology === "workers-dev"
+        ? {
+            workersDev:
+              served === null
+                ? null
+                : { enabled: served.enabled, previewsEnabled: served.previewsEnabled },
+          }
+        : {}),
       deploymentId: before?.deploymentId ?? null,
       versionId: before?.versionId ?? null,
       previousVersionId: before?.previousVersionId ?? null,
@@ -241,37 +258,57 @@ export async function runConsole(
         `${upload.stdout}${upload.stderr}`.trim(),
       );
     }
-    let ownerAfter: string | null = null;
-    if (placement.topology === "custom-domain") {
-      ownerAfter = await state.workerDomainOwner(placement.hostname);
-      if (ownerAfter !== ownerBefore) {
-        throw verificationError(
-          `Console domain owner changed from ${ownerBefore} to ${JSON.stringify(ownerAfter)}`,
+    // From here the upload was acknowledged: any failure, including a failed
+    // provider read, is a verification failure of a published Console, never
+    // a preflight "nothing was touched".
+    let verified: {
+      readonly ownerAfter: string | null;
+      readonly after: NonNullable<ReturnType<typeof parseWorkerDeploymentHistory>>;
+      readonly readback: Awaited<ReturnType<typeof readConsoleOnce>>;
+    };
+    try {
+      verified = await (async () => {
+        let ownerAfter: string | null = null;
+        if (placement.topology === "custom-domain") {
+          ownerAfter = await state.workerDomainOwner(placement.hostname);
+          if (ownerAfter !== ownerBefore) {
+            throw verificationError(
+              `Console domain owner changed from ${ownerBefore} to ${JSON.stringify(ownerAfter)}`,
+            );
+          }
+        } else {
+          await assertAccountSubdomain(state, placement.accountSubdomain, "verification");
+          const served = await state.workerSubdomain(workerName);
+          if (!served.enabled || served.previewsEnabled) {
+            throw verificationError(
+              `integration Console ${workerName} is not served on workers.dev with previews disabled`,
+            );
+          }
+        }
+        const after = parseWorkerDeploymentHistory(await state.workerDeployments(workerName));
+        if (!after || after.versionId === before?.versionId) {
+          throw verificationError("Console authoritative history contains no new served version");
+        }
+        const version = await state.workerVersion(workerName, after.versionId);
+        if (versionCommit(version, workerName) !== source.commit) {
+          throw verificationError("Console served version does not name the selected commit");
+        }
+        const local = readFileSync(join(assets, "console.js"));
+        const readback = await readConsoleOnce(
+          `${target.consoleOrigin}/console.js`,
+          local,
+          options.fetcher ?? ((input, init) => fetch(input, init)),
         );
-      }
-    } else {
-      await assertAccountSubdomain(state, placement.accountSubdomain, "verification");
-      const served = await state.workerSubdomain(workerName);
-      if (!served.enabled || served.previewsEnabled) {
-        throw verificationError(
-          `integration Console ${workerName} is not served on workers.dev with previews disabled`,
-        );
-      }
+        return { ownerAfter, after, readback };
+      })();
+    } catch (error) {
+      if (error instanceof DeployError && error.phase === "verification") throw error;
+      throw verificationError(
+        "Console post-upload verification failed after the upload was acknowledged; run --status",
+        error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      );
     }
-    const after = parseWorkerDeploymentHistory(await state.workerDeployments(workerName));
-    if (!after || after.versionId === before?.versionId) {
-      throw verificationError("Console authoritative history contains no new served version");
-    }
-    const version = await state.workerVersion(workerName, after.versionId);
-    if (versionCommit(version, workerName) !== source.commit) {
-      throw verificationError("Console served version does not name the selected commit");
-    }
-    const local = readFileSync(join(assets, "console.js"));
-    const readback = await readConsoleOnce(
-      `${target.consoleOrigin}/console.js`,
-      local,
-      options.fetcher ?? ((input, init) => fetch(input, init)),
-    );
+    const { ownerAfter, after, readback } = verified;
     return {
       kind: "takoserver.console-apply@v2",
       surface: "takoserver-console",
@@ -290,7 +327,9 @@ export async function runConsole(
       readback,
       rollback: before
         ? `wrangler rollback ${before.versionId} --name ${workerName} --yes --message "rollback ${source.commit}"`
-        : "forward repair only: no previous Console version exists",
+        : placement.topology === "workers-dev"
+          ? `no previous Console version; to remove this first integration Console: wrangler delete --name ${workerName} (never the production Console)`
+          : "forward repair only: no previous Console version exists",
     };
   } finally {
     unsealDirectory(root);

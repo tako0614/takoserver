@@ -1258,7 +1258,13 @@ The routine surfaces are:
   - **Integration checks:** no domain is read or written. The Worker must end up served on
     workers.dev with previews off.
   - The API Worker allows that same `consoleOrigin` (CORS, session cookie and the Checkout return
-    page), so the target names it once.
+    page), so the target names it once. The API Worker reads it only when it is published from that
+    target, so after a target's `consoleOrigin` changes, publish `takoserver-worker` too, or sign-in
+    and CORS from the Console will fail.
+  - A first integration Console has no previous version. `wrangler delete --name
+    takoserver-console-<label>` removes it, and never touches the production Console.
+  - Rehearsal still uploads `takoserver-console`, guarded by the domain-owner fence. A rehearsal
+    target in production's account must not name a domain the production Console owns.
 
 "Authority-sensitive Worker code" is not a hand-kept list of filenames.
 `scripts/deploy/worker-authority-paths.ts` answers it from three sources: the
