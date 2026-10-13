@@ -1,0 +1,23 @@
+# Pricing authoring preview
+
+This preview takes operator-selected plan identifiers and tariff values and produces one shared hosted plan table for Takosumi Hosted and Takoserver. The free, subscription, and usage plan IDs are mandatory authoring inputs. The CTO has not chosen their common identifiers; Shouta chooses the final prices. This tool has no plan-ID or price defaults and does not activate billing, write configuration, call Stripe, or change a ledger.
+
+The strict JSON input has top-level `authoringVersion`, `planIds`, `billingConfig`, `checkout`, and `stripeMonthlyReview` fields. `planIds` requires three distinct, lowercase IDs: `free`, `subscription`, and `usage`. The Host `billingConfig.plans` object must contain exactly one key, equal to `planIds.subscription`; its monthly Stripe review row must use that same key. The free and usage rows come from the same authoring input: the free row carries `billingConfig.freeIncludedMinor`, and the usage row carries the configured meters and Checkout bounds. No product-specific price or plan override is accepted.
+
+Use the intentionally non-compilable [`examples/pricing.placeholder.json`](../examples/pricing.placeholder.json) as a field checklist. Replace all null and `REPLACE_ME` values. Choose all three IDs, then change the example's `subscription-plan-key` object key under both `billingConfig.plans` and `stripeMonthlyReview` to exactly the chosen `planIds.subscription`. The CLI rejects duplicate JSON members, invalid or duplicate IDs, plan/review mismatches, unresolved placeholders, and unknown authoring fields. It validates the full `billingConfig` with the canonical `src/billing-config.ts` parser and uses `src/payment-settings.ts` for Checkout bounds. Billing parser errors are sanitized so arbitrary input keys and values are not printed.
+
+For a first tariff revision, remove the illustrative `history` entry or use an empty array. For an existing Host, retain accepted historical snapshots unchanged and give the new tariff a new revision and effective time. Amounts use USD minor units; meter rates retain the exact micros ratios defined by the Host tariff contract. The authoring file's `billingConfig` JSON string is preserved in the preview output as supplied, including omitted optional fields that the runtime parser may normalize while validating it.
+
+Run the read-only preview with one private input file:
+
+```sh
+bun --no-env-file scripts/pricing/preview.ts /private/path/pricing.json
+```
+
+The input file is limited to 1 MiB and read with a bounded stream. Keep it out of source control if it contains operator pricing or unreleased Stripe IDs. Successful stdout contains `mode: "preview"`, `validation: "host-billing-config-valid"`, `activation: "pending-unified-billing-runtime-alignment"`, the canonical billing environment string, the Checkout environment strings, a Stripe review manifest, and one `hostedPlanTable`. The table names both products and a shared Organization balance, and emits the fixed consumption order free, subscription, purchased, then postpaid. The order is not configurable. Purchased credit remains the existing verified-payment 1:1 amount; the preview does not create purchased-credit packages or grant postpaid service.
+
+The table's free row exposes `configuredMonthlyCreditMinor` as the existing tariff compatibility field and marks `edgeAllowance` as `pending-owner-runtime-policy`. That monetary field does not claim an implemented edge-resource quota. The table's usage row carries configured meters and Checkout bounds as data only; the preview does not change charge calculation or ledger cents/micros priority. The current billing runtime does not yet consume this hosted table, so activation stays pending runtime alignment.
+
+The Stripe monthly review manifest is an operator checklist, not a Stripe read or live validation. It joins the expected USD monthly amount to the subscription plan's configured Stripe price ID. Before activation, independently confirm in Stripe that the referenced Price is active, USD, recurring monthly with interval count 1, licensed, per-unit, has the exact unit amount, and has no tiers, transforms, or customer-entered amount. See Stripe's [Price object](https://docs.stripe.com/api/prices/object) and [Create a Price API](https://docs.stripe.com/api/prices/create) for the fields to verify.
+
+The Console's displayed billing defaults remain hardcoded until a separate UI change makes them reflect validated configuration. This preview is not an activation command.
