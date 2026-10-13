@@ -1,0 +1,24 @@
+{
+  "decisionVersion": 1,
+  "products": ["takoserver", "takosumi-hosted"],
+  "currency": "USD",
+  "interval": "month",
+  "moneyUnit": "USD-micros",
+  "freeIncludedCreditMicros": null,
+  "plans": [
+    {
+      "planId": null,
+      "monthlyPriceMicros": "10000000",
+      "includedCreditMicros": null,
+      "stripePriceId": null
+    },
+    {
+      "planId": null,
+      "monthlyPriceMicros": "50000000",
+      "includedCreditMicros": null,
+      "stripePriceId": null
+    }
+  ],
+  "compilerStatus": "pending-multiple-subscription-plans",
+  "activationStatus": "not-active"
+}
