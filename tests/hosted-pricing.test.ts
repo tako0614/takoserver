@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { parseBillingConfig } from "../src/billing-config.ts";
 import {
   assertHostedPricingMatchesBilling,
+  compilePricingAuthoring,
   HostedPricingError,
   parseHostedPricing,
 } from "../src/hosted-pricing.ts";
@@ -35,6 +36,36 @@ function authoring() {
 }
 
 describe("hosted pricing runtime policy", () => {
+  test("rejects unrepresentable current and historical grants before activating Checkout", () => {
+    const tooLarge = Math.floor(Number.MAX_SAFE_INTEGER / 10_000) + 1;
+    const current = authoring();
+    current.billingConfig.plans.starter.includedMinor = tooLarge;
+    expect(() => compilePricingAuthoring(current)).toThrow(
+      "grant amounts must fit the USD-micros ledger",
+    );
+    expect(() => parseHostedPricing(JSON.stringify(current))).toThrow(HostedPricingError);
+    const history = authoring();
+    const old = {
+      ...history.billingConfig,
+      revision: "old",
+      effectiveAt: "2026-09-01T00:00:00.000Z",
+      plans: { starter: { includedMinor: tooLarge, stripePriceId: "price_old" } },
+    };
+    const { history: ignored, ...snapshot } = old;
+    void ignored;
+    expect(() =>
+      parseHostedPricing(
+        JSON.stringify({
+          ...history,
+          billingConfig: { ...history.billingConfig, history: [snapshot] },
+        }),
+      ),
+    ).toThrow(HostedPricingError);
+    const valid = authoring();
+    valid.billingConfig.plans.starter.includedMinor = tooLarge - 1;
+    expect(() => parseHostedPricing(JSON.stringify(valid))).not.toThrow();
+  });
+
   test("parses shared authored pricing and binds exactly the input to its environment", () => {
     const input = authoring();
     const parsed = parseHostedPricing(JSON.stringify(input));

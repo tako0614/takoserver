@@ -1,5 +1,6 @@
 import { type BillingConfig, BillingConfigError, parseBillingConfig } from "./billing-config.ts";
 import { canonicalJson } from "./json.ts";
+import { MoneyError, minorToMicros } from "./money.ts";
 import {
   PAYMENT_SETTING_VARIABLES,
   PaymentSettingsError,
@@ -90,6 +91,16 @@ export function compilePricingAuthoring(input: unknown): PricingPreview {
     fail("billingConfig could not be validated by the Host billing configuration parser");
   }
   if (!billingConfig) fail("billingConfig is required");
+  try {
+    for (const snapshot of [billingConfig, ...(billingConfig.history ?? [])]) {
+      minorToMicros(snapshot.freeIncludedMinor);
+      for (const plan of Object.values(snapshot.plans)) minorToMicros(plan.includedMinor);
+    }
+  } catch (error) {
+    if (error instanceof MoneyError)
+      fail("billingConfig grant amounts must fit the USD-micros ledger");
+    throw error;
+  }
 
   const planIds = parsePlanIds(root.planIds);
   const configuredPlanKeys = Object.keys(billingConfig.plans).sort();
@@ -129,6 +140,12 @@ export function compilePricingAuthoring(input: unknown): PricingPreview {
     row.expectedAmountMinor,
     `stripeMonthlyReview.${planIds.subscription}.expectedAmountMinor`,
   );
+  try {
+    minorToMicros(expectedAmountMinor);
+  } catch (error) {
+    if (error instanceof MoneyError) fail("monthly consideration must fit the USD-micros ledger");
+    throw error;
+  }
   if (row.currency !== "USD") {
     fail(`stripeMonthlyReview.${planIds.subscription}.currency must be USD`);
   }
