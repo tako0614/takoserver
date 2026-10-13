@@ -30,6 +30,8 @@ const WIRE_REFUSAL_SOURCES = [
   "RuntimeInputPreparationError",
   "WorkerEndpointOriginReservationError",
   "ResellerError",
+  "OrgBillingError",
+  "orgBillingFail",
 ];
 
 interface EmittedPair {

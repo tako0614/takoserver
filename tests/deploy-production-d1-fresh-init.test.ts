@@ -321,6 +321,7 @@ describe("production D1 fresh init", () => {
     rmSync(join(sealed88, "0089_v2_worker_cron_match_guard_depth.sql"));
     rmSync(join(sealed88, "0090_v2_queue_sqlite_external_drain.sql"));
     rmSync(join(sealed88, "0091_stripe_events.sql"));
+    rmSync(join(sealed88, "0092_org_wallet_lifecycle.sql"));
     expect(readSealedFreshProductionV2MigrationArtifact(sealed88).digest).toBe(projected.digest);
     expect(() => readSealedFreshProductionV2MigrationArtifact(currentMigrations)).toThrow(
       "exactly 0001-0088",
@@ -333,6 +334,7 @@ describe("production D1 fresh init", () => {
     rmSync(join(missing, "0089_v2_worker_cron_match_guard_depth.sql"));
     rmSync(join(missing, "0090_v2_queue_sqlite_external_drain.sql"));
     rmSync(join(missing, "0091_stripe_events.sql"));
+    rmSync(join(missing, "0092_org_wallet_lifecycle.sql"));
     rmSync(join(missing, "0088_v2_worker_sqlite_external_drain.sql"));
     expect(() => projectFreshProductionV2MigrationArtifact(readMigrationArtifact(missing))).toThrow(
       "fixed audited 0001-0088 prefix",
@@ -346,6 +348,7 @@ describe("production D1 fresh init", () => {
     rmSync(join(drifted, "0089_v2_worker_cron_match_guard_depth.sql"));
     rmSync(join(drifted, "0090_v2_queue_sqlite_external_drain.sql"));
     rmSync(join(drifted, "0091_stripe_events.sql"));
+    rmSync(join(drifted, "0092_org_wallet_lifecycle.sql"));
     const tail = join(drifted, "0088_v2_worker_sqlite_external_drain.sql");
     writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- synthetic drift\n`);
     expect(() => projectFreshProductionV2MigrationArtifact(readMigrationArtifact(drifted))).toThrow(
@@ -367,12 +370,14 @@ describe("production D1 fresh init", () => {
     cpSync(currentMigrations, sealed89, { recursive: true });
     rmSync(join(sealed89, "0090_v2_queue_sqlite_external_drain.sql"));
     rmSync(join(sealed89, "0091_stripe_events.sql"));
+    rmSync(join(sealed89, "0092_org_wallet_lifecycle.sql"));
     expect(readSealedFreshProductionV2MigrationArtifact0089(sealed89).digest).toBe(selected.digest);
 
     const future = join(fixtureRoot, "future-v2-0090");
     cpSync(currentMigrations, future, { recursive: true });
     rmSync(join(future, "0090_v2_queue_sqlite_external_drain.sql"));
     rmSync(join(future, "0091_stripe_events.sql"));
+    rmSync(join(future, "0092_org_wallet_lifecycle.sql"));
     writeFileSync(join(future, "0090_future.sql"), "CREATE TABLE future_only (id TEXT);\n");
     expect(
       projectFreshProductionV2MigrationArtifact0089(readMigrationArtifact(future)).digest,
@@ -386,6 +391,7 @@ describe("production D1 fresh init", () => {
     rmSync(join(missing, "0089_v2_worker_cron_match_guard_depth.sql"));
     rmSync(join(missing, "0090_v2_queue_sqlite_external_drain.sql"));
     rmSync(join(missing, "0091_stripe_events.sql"));
+    rmSync(join(missing, "0092_org_wallet_lifecycle.sql"));
     expect(() =>
       projectFreshProductionV2MigrationArtifact0089(readMigrationArtifact(missing)),
     ).toThrow("fixed audited 0001-0089 prefix");
@@ -397,6 +403,7 @@ describe("production D1 fresh init", () => {
     cpSync(currentMigrations, drifted, { recursive: true });
     rmSync(join(drifted, "0090_v2_queue_sqlite_external_drain.sql"));
     rmSync(join(drifted, "0091_stripe_events.sql"));
+    rmSync(join(drifted, "0092_org_wallet_lifecycle.sql"));
     const tail = join(drifted, "0089_v2_worker_cron_match_guard_depth.sql");
     writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- synthetic drift\n`);
     expect(() =>
@@ -1282,13 +1289,13 @@ describe("production D1 fresh init", () => {
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const tail = join(migrationDirectory, "0091_stripe_events.sql");
+        const tail = join(migrationDirectory, "0092_org_wallet_lifecycle.sql");
         if (drift === "missing") rmSync(tail);
         else if (drift === "changed") {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0092_unreviewed.sql"),
+            join(migrationDirectory, "0093_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }

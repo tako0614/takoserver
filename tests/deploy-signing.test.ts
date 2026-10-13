@@ -4,12 +4,14 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
+import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import {
   activePublicJwk,
   createRemoteSigningDatabase,
   runSigning,
   type SigningDatabase,
+  type SigningMigrationReader,
   type SigningProcess,
   type SigningPublicKeyRow,
 } from "../scripts/deploy/signing.ts";
@@ -25,6 +27,22 @@ const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
 const BUNDLE_DIGEST = createHash("sha256").update(BUNDLE).digest("hex");
 const VERSION_C = "11111111-1111-4111-8111-111111111111";
 const VERSION_S = "33333333-3333-4333-8333-333333333333";
+const BILLING_CONFIG = {
+  schemaVersion: 1,
+  revision: "2026-10-13.1",
+  effectiveAt: "2026-10-13T00:00:00.000Z",
+  currency: "USD",
+  holdTtlSeconds: 86_400,
+  freeIncludedMinor: 0,
+  purchaseCreditExpiry: { kind: "none" },
+  plans: { starter: { includedMinor: 0, stripePriceId: "price_plan001" } },
+  meters: {
+    "takosumi.storage.byte-hours": {
+      unit: "byte-hour",
+      rate: { numeratorMicros: "1", denominator: "1000" },
+    },
+  },
+} as const;
 
 const baseTarget = {
   kind: "takoserver.deploy-target@v2",
@@ -762,6 +780,112 @@ describe("split signing authority surfaces", () => {
       expect(
         applyProcess.calls.filter(({ command }) => command.includes("--secrets-file")),
       ).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("billing-enabled signing rotation refuses a missing 0092 before build or secret input", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-billing-rotation-schema-"));
+    try {
+      const current = await keyPair("key-current");
+      const next = await keyPair("key-next");
+      const target = {
+        ...baseTarget,
+        billingConfig: BILLING_CONFIG,
+        signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
+      } satisfies DeployTarget;
+      const database = new FakeDatabase();
+      database.rows.set("key-current", row("key-current", current.publicJwk));
+      database.rows.set("key-next", row("key-next", next.publicJwk));
+      const process = processFixture();
+      const local = readMigrationArtifact().names;
+      let migrationReads = 0;
+      const migrations: SigningMigrationReader = {
+        async read() {
+          migrationReads += 1;
+          return { local, applied: local.slice(0, -1) };
+        },
+      };
+
+      await expect(
+        runSigning(
+          {
+            surface: "takoserver-signing-rotation",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          target,
+          {
+            database,
+            state: workerState({ target, beforeSigning: "key-current", deploymentMode: "before" }),
+            run: process.run,
+            migrations,
+            review: "reviewer@example.test",
+            nextPrivateJwkPath: join(root, "missing-private-key.jwk"),
+            outputDirectory: join(root, "work"),
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+          },
+        ),
+      ).rejects.toThrow("needs 0092_org_wallet_lifecycle.sql applied");
+
+      expect(migrationReads).toBe(1);
+      expect(process.calls.some(({ command }) => command.includes("--dry-run"))).toBe(false);
+      expect(process.calls.some(({ command }) => command.includes("deploy"))).toBe(false);
+      expect(process.calls.some(({ command }) => command.includes("secret"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("Stripe-enabled signing rotation also refuses a missing 0091 before publication", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-stripe-rotation-schema-"));
+    try {
+      const current = await keyPair("key-current");
+      const next = await keyPair("key-next");
+      const target = {
+        ...baseTarget,
+        stripeCheckout: true,
+        stripeWebhook: true,
+        signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
+      } satisfies DeployTarget;
+      const database = new FakeDatabase();
+      database.rows.set("key-current", row("key-current", current.publicJwk));
+      database.rows.set("key-next", row("key-next", next.publicJwk));
+      const process = processFixture();
+      const local = readMigrationArtifact().names;
+      const migrations: SigningMigrationReader = {
+        async read() {
+          return { local, applied: local.slice(0, -2) };
+        },
+      };
+
+      await expect(
+        runSigning(
+          {
+            surface: "takoserver-signing-rotation",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          target,
+          {
+            database,
+            state: workerState({ target, beforeSigning: "key-current", deploymentMode: "before" }),
+            run: process.run,
+            migrations,
+            review: "reviewer@example.test",
+            nextPrivateJwkPath: join(root, "missing-private-key.jwk"),
+            outputDirectory: join(root, "work"),
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+          },
+        ),
+      ).rejects.toThrow("needs 0091_stripe_events.sql applied");
+
+      expect(process.calls.some(({ command }) => command.includes("--dry-run"))).toBe(false);
+      expect(process.calls.some(({ command }) => command.includes("deploy"))).toBe(false);
+      expect(process.calls.some(({ command }) => command.includes("secret"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

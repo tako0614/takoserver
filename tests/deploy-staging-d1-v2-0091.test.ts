@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -88,26 +88,36 @@ describe("staging-only v2-0091 D1 profile", () => {
   });
 
   test("a sealed import is exactly 0001-0091: missing, extra or drifted bytes are refused", () => {
+    const projected = projectFreshIntegrationV2MigrationArtifact0091(
+      readCurrentAuditedMigrationSourceArtifact(MIGRATIONS),
+    );
+    const seal = (directory: string) => {
+      mkdirSync(directory, { recursive: true });
+      for (const file of projected.files) cpSync(file.path, join(directory, file.name));
+    };
     const sealed = join(ROOT, "sealed");
-    cpSync(MIGRATIONS, sealed, { recursive: true });
+    seal(sealed);
     expect(readSealedFreshIntegrationV2MigrationArtifact0091(sealed).digest).toBe(DIGEST);
+    expect(() => readSealedFreshIntegrationV2MigrationArtifact0091(MIGRATIONS)).toThrow(
+      "exactly 0001-0091",
+    );
 
     const missing = join(ROOT, "missing");
-    cpSync(MIGRATIONS, missing, { recursive: true });
+    seal(missing);
     rmSync(join(missing, "0091_stripe_events.sql"));
     expect(() => readSealedFreshIntegrationV2MigrationArtifact0091(missing)).toThrow(
       "exactly 0001-0091",
     );
 
     const extra = join(ROOT, "extra");
-    cpSync(MIGRATIONS, extra, { recursive: true });
+    seal(extra);
     writeFileSync(join(extra, "0092_future.sql"), "CREATE TABLE future_only (id TEXT);\n");
     expect(() => readSealedFreshIntegrationV2MigrationArtifact0091(extra)).toThrow(
       "exactly 0001-0091",
     );
 
     const drifted = join(ROOT, "drifted");
-    cpSync(MIGRATIONS, drifted, { recursive: true });
+    seal(drifted);
     const tail = join(drifted, "0091_stripe_events.sql");
     writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- drift\n`);
     expect(() => readSealedFreshIntegrationV2MigrationArtifact0091(drifted)).toThrow();

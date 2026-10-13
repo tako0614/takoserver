@@ -72,6 +72,8 @@ export function readMigrationArtifact(
 /** Applied rows must be exactly the prefix Wrangler would extend. */
 /** The migration that creates `stripe_events`, which every webhook delivery writes. */
 export const STRIPE_EVENTS_MIGRATION = "0091_stripe_events.sql";
+/** Durable Organization hold, usage, grant, and tariff lifecycle. */
+export const ORG_BILLING_MIGRATION = "0092_org_wallet_lifecycle.sql";
 
 /**
  * A target that asks for the Stripe webhook must already hold the table the
@@ -92,6 +94,26 @@ export function assertStripeWebhookSchema(
   if (!stripeWebhookSchemaReady(target, applied)) {
     throw preflightError(
       `the Stripe webhook needs ${STRIPE_EVENTS_MIGRATION} applied to this D1 before publication`,
+      `applied=${applied.length}`,
+    );
+  }
+}
+
+/** Billing is opt-in in the realized Worker target and requires its full lineage first. */
+export function orgBillingSchemaReady(
+  target: { readonly billingConfig?: unknown },
+  applied: readonly string[],
+): boolean {
+  return target.billingConfig === undefined || applied.includes(ORG_BILLING_MIGRATION);
+}
+
+export function assertOrgBillingSchema(
+  target: { readonly billingConfig?: unknown },
+  applied: readonly string[],
+): void {
+  if (!orgBillingSchemaReady(target, applied)) {
+    throw preflightError(
+      `Organization billing needs ${ORG_BILLING_MIGRATION} applied to this D1 before publication`,
       `applied=${applied.length}`,
     );
   }

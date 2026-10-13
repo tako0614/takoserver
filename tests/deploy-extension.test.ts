@@ -117,9 +117,9 @@ describe("curated deploy extension schema readback", () => {
     const legacy = deployExtension.readAuditedMigrationArtifact();
     const current = deployExtension.readCurrentAuditedMigrationSourceArtifact();
     expect(legacy.names).toHaveLength(66);
-    expect(current.names).toHaveLength(91);
+    expect(current.names).toHaveLength(92);
     expect(current.names.slice(0, legacy.names.length)).toEqual([...legacy.names]);
-    expect(current.files.at(-1)?.name).toBe("0091_stripe_events.sql");
+    expect(current.files.at(-1)?.name).toBe("0092_org_wallet_lifecycle.sql");
   });
 
   test("reads a 0057 schema through the curated read-only database port", async () => {
