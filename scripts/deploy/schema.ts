@@ -386,6 +386,18 @@ const FRESH_PRODUCTION_V2_0089_APPLY_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
   0,
   FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT,
 );
+// Staging-only fresh profile through the Stripe event table. It exists only
+// for a brand-new integration generation: production fresh init, rehearsal and
+// every in-place wave refuse it, so it can never reach a production D1 or an
+// existing database. Like the others, a later audited tail never widens it.
+const FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT = 91;
+const FRESH_INTEGRATION_V2_0091_APPLY_END = "0091_stripe_events.sql";
+const FRESH_INTEGRATION_V2_0091_APPLY_DIGEST =
+  "sha256:152aefa3c0577809d419d95be2bc8878aa9a390a4ee40bfbf5501c32bf058bef";
+const FRESH_INTEGRATION_V2_0091_APPLY_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
+  0,
+  FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT,
+);
 const APPLY_QUALIFIED_MIGRATION_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
   0,
   INTEGRATION_APPLY_CEILING_COUNT,
@@ -2886,6 +2898,49 @@ export function readSealedFreshProductionV2MigrationArtifact0089(
   assertAuditedMigrationHashes(artifact.files, FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT);
   if (artifact.digest !== FRESH_PRODUCTION_V2_0089_APPLY_DIGEST) {
     throw preflightError("sealed fresh production v2-0089 payload differs from its fixed digest");
+  }
+  return artifact;
+}
+
+/** Closed staging-only 0091 profile for a new integration generation. */
+export function projectFreshIntegrationV2MigrationArtifact0091(
+  source: ReturnType<typeof readMigrationArtifact>,
+): ReturnType<typeof readMigrationArtifact> {
+  if (
+    FRESH_INTEGRATION_V2_0091_APPLY_LINEAGE.length !==
+      FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT ||
+    FRESH_INTEGRATION_V2_0091_APPLY_LINEAGE.at(-1) !== FRESH_INTEGRATION_V2_0091_APPLY_END ||
+    JSON.stringify(source.names.slice(0, FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT)) !==
+      JSON.stringify(FRESH_INTEGRATION_V2_0091_APPLY_LINEAGE)
+  ) {
+    throw preflightError(
+      "fresh integration v2-0091 projection requires the fixed audited 0001-0091 prefix",
+    );
+  }
+  const files = source.files.slice(0, FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT);
+  assertAuditedMigrationHashes(files, FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT);
+  const artifact = createMigrationArtifact(files);
+  if (artifact.digest !== FRESH_INTEGRATION_V2_0091_APPLY_DIGEST) {
+    throw preflightError("fresh integration v2-0091 payload differs from its fixed digest");
+  }
+  return artifact;
+}
+
+/** A sealed v2-0091 import contains exactly 91 files, never a future tail. */
+export function readSealedFreshIntegrationV2MigrationArtifact0091(
+  directory: string,
+): ReturnType<typeof readMigrationArtifact> {
+  const artifact = readMigrationArtifact(directory);
+  if (
+    JSON.stringify(artifact.names) !== JSON.stringify(FRESH_INTEGRATION_V2_0091_APPLY_LINEAGE) ||
+    artifact.names.length !== FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT ||
+    artifact.names.at(-1) !== FRESH_INTEGRATION_V2_0091_APPLY_END
+  ) {
+    throw preflightError("sealed fresh integration v2-0091 lineage must contain exactly 0001-0091");
+  }
+  assertAuditedMigrationHashes(artifact.files, FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT);
+  if (artifact.digest !== FRESH_INTEGRATION_V2_0091_APPLY_DIGEST) {
+    throw preflightError("sealed fresh integration v2-0091 payload differs from its fixed digest");
   }
   return artifact;
 }

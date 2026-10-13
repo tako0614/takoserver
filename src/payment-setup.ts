@@ -28,6 +28,11 @@ import { createStripeClient, createStripeSettlement } from "./stripe-settlement.
  * take money and credit nothing. The reconcile pass comes with them, so a
  * payment whose payer never returned is still credited; the webhook is added
  * only where its signing secret is configured.
+ *
+ * Starting a Checkout needs somewhere to send the payer back to, so without a
+ * console origin the route that begins one is not served. Verifying and
+ * crediting payments does not: the key alone serves the console's return
+ * verification, the webhook and the reconcile pass.
  */
 
 export interface PaymentSetupOptions {
@@ -54,7 +59,7 @@ export function resolvePayment(options: PaymentSetupOptions): PaymentSetup {
   // startup instead of on the day Stripe is turned on.
   const settings = validatePaymentSettings(options.settings ?? {});
   const key = options.stripeSecretKey;
-  if (!key || !options.consoleOrigin) return {};
+  if (!key) return {};
 
   const stripeOptions = { secretKey: key, ...(options.fetch ? { fetch: options.fetch } : {}) };
   const client = createStripeClient(stripeOptions);
@@ -63,24 +68,9 @@ export function resolvePayment(options: PaymentSetupOptions): PaymentSetup {
 
   return {
     settlement: createStripeSettlement(stripeOptions),
-    checkout: {
-      bounds: {
-        minimumMinor: settings.checkoutMinimumMinor ?? DEFAULT_CHECKOUT_MINIMUM_MINOR,
-        maximumMinor: settings.checkoutMaximumMinor ?? DEFAULT_CHECKOUT_MAXIMUM_MINOR,
-      },
-      async begin({ organizationId, amountMinor }) {
-        const session = await client.createCheckoutSession({
-          organizationId,
-          amountMinor,
-          // The session id travels back in the URL, which is what the console
-          // presents as the proof. Nothing about the amount comes back with
-          // it: the amount is asked of Stripe.
-          successUrl: `${consoleOrigin}/billing?checkout={CHECKOUT_SESSION_ID}`,
-          cancelUrl: `${consoleOrigin}/billing?checkout=cancelled`,
-        });
-        return { url: session.url };
-      },
-    },
+    ...(consoleOrigin === undefined || consoleOrigin === ""
+      ? {}
+      : { checkout: createCheckout(client, consoleOrigin, settings) }),
     events: (context) =>
       createStripeEvents(
         {
@@ -99,5 +89,30 @@ export function resolvePayment(options: PaymentSetupOptions): PaymentSetup {
         },
         context,
       ),
+  };
+}
+
+function createCheckout(
+  client: ReturnType<typeof createStripeClient>,
+  consoleOrigin: string,
+  settings: PaymentSettings,
+): Checkout {
+  return {
+    bounds: {
+      minimumMinor: settings.checkoutMinimumMinor ?? DEFAULT_CHECKOUT_MINIMUM_MINOR,
+      maximumMinor: settings.checkoutMaximumMinor ?? DEFAULT_CHECKOUT_MAXIMUM_MINOR,
+    },
+    async begin({ organizationId, amountMinor }) {
+      const session = await client.createCheckoutSession({
+        organizationId,
+        amountMinor,
+        // The session id travels back in the URL, which is what the console
+        // presents as the proof. Nothing about the amount comes back with
+        // it: the amount is asked of Stripe.
+        successUrl: `${consoleOrigin}/billing?checkout={CHECKOUT_SESSION_ID}`,
+        cancelUrl: `${consoleOrigin}/billing?checkout=cancelled`,
+      });
+      return { url: session.url };
+    },
   };
 }

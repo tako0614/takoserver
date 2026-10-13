@@ -8,6 +8,7 @@ import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import {
+  assertStorageRebindNotOperatorStagingPair,
   type IntegrationStorageGenerationTargetProof,
   type IntegrationStorageGenerationTargetVerificationOptions,
   verifyFreshV2IntegrationStorageTarget,
@@ -190,6 +191,7 @@ export async function runWorkerClosureTransition(
     }
   }
   assertStorageRebindIntegrationOnly("preflight", invocation.environment, delta);
+  assertStorageRebindNotOperatorStagingPair(target, delta.storageRebind);
   assertServiceBindingRefreshIntegrationOnly("preflight", invocation.environment, delta);
   if (workerClosureDeltaIsEmpty(delta)) {
     throw preflightError(
