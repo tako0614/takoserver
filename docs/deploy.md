@@ -716,9 +716,13 @@ These flags name only the predecessor's old `STATE_DB` UUID and `OBJECTS`
 bucket name. Both must be strict lowercase identities and differ from the
 successor. The successor is never a CLI operand: it comes only from the selected
 target, whose D1 and R2 names must be the same exact
-`takoserver-i-<32-lowercase-hex>` generation name. A read-only fence verifies the
-D1 UUID-to-name mapping, R2 existence, exact audited 0001–0066 migration lineage,
-and canonical migrated schema before preparation and immediately before upload.
+`takoserver-i-<32-lowercase-hex>` generation name. An operator-provisioned
+`takoserver-staging-<label>` pair is refused here: it has no creation record
+proving it empty, so it enters service only through first publication. A
+read-only fence verifies the D1 UUID-to-name mapping, R2 existence, the exact
+audited migration lineage the target selects (0001–0066, or its
+`takoformV2.storageLineage`), and canonical migrated schema before preparation
+and immediately before upload.
 Every other binding name, type, and field must still match the target exactly;
 this does not alter migrations, runtime code, or the ordinary strict path.
 Production and rehearsal reject the rebind before provider effects. The

@@ -286,11 +286,11 @@ describe("staging-only v2-0091 D1 profile", () => {
       documentation: "https://docs.example.test/v2",
       authenticationDocumentation: "https://docs.example.test/v2/authentication",
     });
-    const staging = "takoserver-staging-throwaway-0091-202610131602";
+    const staging = "takoserver-staging-throwaway-0091-example";
     const pair = (name: string, storageLineage?: "v2-0088" | "v2-0089" | "v2-0091") =>
       ({
         ...target,
-        d1: { databaseName: name, databaseId: "2639c9be-259e-4099-9133-090620079925" },
+        d1: { databaseName: name, databaseId: "00000000-0000-4000-8000-000000000091" },
         r2: { bucketName: name },
         ...(storageLineage === undefined ? {} : { takoformV2: { config, storageLineage } }),
       }) satisfies DeployTarget;

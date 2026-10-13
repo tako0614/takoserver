@@ -522,6 +522,28 @@ function generatedStorageTarget(
   };
 }
 
+/** Whether the target names an operator-provisioned staging pair rather than a generated one. */
+export function isOperatorStagingPair(target: Pick<DeployTarget, "d1">): boolean {
+  return STAGING_PAIR_NAME.test(target.d1.databaseName);
+}
+
+/**
+ * A staging pair has no creation record proving it was empty; first
+ * publication proves that, a storage rebind does not. So a staging pair enters
+ * service only through first publication, never by rebinding a running Host.
+ */
+export function assertStorageRebindNotOperatorStagingPair(
+  target: Pick<DeployTarget, "d1">,
+  storageRebind: unknown,
+): void {
+  if (storageRebind !== undefined && isOperatorStagingPair(target)) {
+    throw preflightError(
+      "storage rebind refuses an operator-provisioned staging pair; it enters service only " +
+        "through first publication, which proves it empty",
+    );
+  }
+}
+
 /** Purely identifies whether a selected environment target is this surface's generated pair. */
 export function isGeneratedIntegrationStorageTarget(
   target: DeployTarget,
