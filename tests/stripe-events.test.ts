@@ -8,6 +8,7 @@ import {
   InMemoryTakoformResourceDriver,
 } from "../src/index.ts";
 import { createLedger } from "../src/ledger.ts";
+import type { PaymentEventContext } from "../src/payment-events.ts";
 import {
   DEFAULT_CHECKOUT_MAXIMUM_MINOR,
   DEFAULT_CHECKOUT_MINIMUM_MINOR,
@@ -16,12 +17,15 @@ import {
   paymentSettingsFromEnvironment,
 } from "../src/payment-settings.ts";
 import { resolvePayment } from "../src/payment-setup.ts";
+import type { Sql } from "../src/ports.ts";
 import {
+  createStripeEvents,
   STRIPE_DEFERRED_EVENT_TYPES,
   StripeSignatureError,
   type StripeSignatureFailure,
   verifyStripeSignature,
 } from "../src/stripe-events.ts";
+import { createStripeClient } from "../src/stripe-settlement.ts";
 import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 /**
@@ -50,15 +54,30 @@ const identity: ExternalIdentityVerifier = {
 
 type Session = Record<string, unknown>;
 
+/** A succeeded payment whose charge is neither refunded nor disputed. */
+const HELD_PAYMENT = {
+  object: "payment_intent",
+  status: "succeeded",
+  latest_charge: { object: "charge", refunded: false, amount_refunded: 0, disputed: false },
+};
+
+/** A paid wallet top-up this Host created; `metadata` overrides merge into its marker. */
 function paid(overrides: Session = {}): Session {
+  const { metadata, ...rest } = overrides;
   return {
     status: "complete",
+    mode: "payment",
     payment_status: "paid",
     amount_total: 5_000,
     currency: "usd",
     created: NOW_SECONDS - 60,
-    metadata: { organizationId: ORG },
-    ...overrides,
+    payment_intent: HELD_PAYMENT,
+    metadata: {
+      organizationId: ORG,
+      takoserverPurpose: "wallet_funding",
+      ...(metadata as Record<string, unknown> | undefined),
+    },
+    ...rest,
   };
 }
 
@@ -108,7 +127,23 @@ async function host(
   } = {},
 ) {
   const stripe = stripeFake(options.sessions ?? {});
-  const sql = createEphemeralSql();
+  const base = createEphemeralSql();
+  // Counts every statement, so a pass can be held to its query budget.
+  const queries = { count: 0 };
+  const sql: Sql = {
+    query: (statement, parameters) => {
+      queries.count += 1;
+      return base.query(statement, parameters);
+    },
+    run: (statement, parameters) => {
+      queries.count += 1;
+      return base.run(statement, parameters);
+    },
+    batch: (statements) => {
+      queries.count += 1;
+      return base.batch(statements);
+    },
+  };
   for (const organizationId of [ORG, OTHER_ORG]) {
     await sql.run(
       "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
@@ -146,6 +181,7 @@ async function host(
   const ledger = createLedger(sql, () => NOW);
   return {
     app,
+    queries,
     stripe,
     payment,
     balance: async (organizationId: string) => (await ledger.wallet(organizationId)).settledMinor,
@@ -333,7 +369,9 @@ describe("Stripe webhook route", () => {
     const again = await deliver(h.app, body);
     expect(again.status).toBe(200);
     expect(await again.json()).toEqual({ received: true, duplicate: true });
-    expect(h.stripe.calls).toEqual(["GET /v1/checkout/sessions/cs_test_paid"]);
+    expect(h.stripe.calls).toEqual([
+      "GET /v1/checkout/sessions/cs_test_paid?expand%5B%5D=payment_intent.latest_charge",
+    ]);
     expect(await h.balance(ORG)).toBe(5_000);
   });
 
@@ -364,7 +402,7 @@ describe("Stripe webhook route", () => {
       sessions: {
         cs_test_other: paid({ metadata: { organizationId: OTHER_ORG }, amount_total: 1_200 }),
         cs_test_unknown: paid({ metadata: { organizationId: UNKNOWN_ORG } }),
-        cs_test_none: paid({ metadata: {} }),
+        cs_test_none: paid({ metadata: { organizationId: undefined } }),
       },
     });
     for (const id of ["cs_test_other", "cs_test_unknown", "cs_test_none"]) {
@@ -655,5 +693,166 @@ describe("payment settings", () => {
     expect(() => resolvePayment({ settings: { webhookToleranceSeconds: 0 } })).toThrow(
       PaymentSettingsError,
     );
+  });
+});
+
+describe("independent review guards", () => {
+  const refundedCharge = (charge: Record<string, unknown>) => ({
+    payment_intent: {
+      ...HELD_PAYMENT,
+      latest_charge: { ...HELD_PAYMENT.latest_charge, ...charge },
+    },
+  });
+
+  test("never credits a session whose payment was refunded, partly refunded or disputed", async () => {
+    const h = await host({
+      sessions: {
+        cs_test_refunded: paid(refundedCharge({ refunded: true, amount_refunded: 5_000 })),
+        cs_test_partial: paid(refundedCharge({ amount_refunded: 1 })),
+        cs_test_disputed: paid(refundedCharge({ disputed: true })),
+        cs_test_unexpanded: paid({ payment_intent: "pi_not_expanded" }),
+      },
+    });
+    for (const id of [
+      "cs_test_refunded",
+      "cs_test_partial",
+      "cs_test_disputed",
+      "cs_test_unexpanded",
+    ]) {
+      expect(
+        (await deliver(h.app, event("checkout.session.completed", claimedSession(id)))).status,
+      ).toBe(200);
+    }
+    expect((await h.events()).map((row) => row.outcome_detail)).toEqual([
+      "refunded",
+      "refunded",
+      "refunded",
+      "unverifiable_payment",
+    ]);
+    expect(await h.app.reconcilePayments()).toMatchObject({
+      credited: 0,
+      skipped: { refunded: 3, unverifiable_payment: 1 },
+    });
+    await expect(
+      h.payment.settlement?.verify({ organizationId: ORG, settlementProof: "cs_test_partial" }),
+    ).rejects.toMatchObject({ code: "refunded" });
+    expect(await h.fundingRows()).toEqual([]);
+  });
+
+  test("credits automatically only one-off top-ups this Host marked, while the console's return still works", async () => {
+    const h = await host({
+      sessions: {
+        cs_test_unmarked: paid({ metadata: { takoserverPurpose: undefined } }),
+        cs_test_link: paid({ metadata: { takoserverPurpose: "payment_link" } }),
+        cs_test_subscription: paid({ mode: "subscription" }),
+      },
+    });
+    for (const id of ["cs_test_unmarked", "cs_test_link", "cs_test_subscription"]) {
+      await deliver(h.app, event("checkout.session.completed", claimedSession(id)));
+    }
+    expect(await h.app.reconcilePayments()).toMatchObject({
+      credited: 0,
+      skipped: { not_wallet_funding: 3 },
+    });
+    expect(await h.fundingRows()).toEqual([]);
+    const presented = await h.payment.settlement?.verify({
+      organizationId: ORG,
+      settlementProof: "cs_test_unmarked",
+    });
+    expect(presented?.fundingRef).toBe("stripe:cs_test_unmarked");
+    await expect(
+      h.payment.settlement?.verify({
+        organizationId: ORG,
+        settlementProof: "cs_test_subscription",
+      }),
+    ).rejects.toMatchObject({ code: "not_wallet_funding" });
+  });
+
+  test("logs paid sessions it could not credit, by reference only", async () => {
+    const h = await host({
+      sessions: {
+        cs_test_yen: paid({ currency: "jpy", amount_total: 77_777 }),
+        cs_test_foreign: paid({ metadata: { organizationId: UNKNOWN_ORG } }),
+      },
+    });
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (line: unknown) => warnings.push(String(line));
+    try {
+      await h.app.reconcilePayments();
+      await deliver(h.app, event("checkout.session.completed", claimedSession("cs_test_yen")));
+    } finally {
+      console.warn = original;
+    }
+    const logged = warnings
+      .map((line) => JSON.parse(line) as { event: string; payments?: unknown })
+      .filter((line) => line.event === "takoserver.stripe.uncredited_payments");
+    expect(logged.map((line) => line.payments)).toEqual([
+      [
+        { fundingRef: "stripe:cs_test_yen", reason: "wrong_currency" },
+        { fundingRef: "stripe:cs_test_foreign", reason: "unknown_organization" },
+      ],
+      [{ fundingRef: "stripe:cs_test_yen", reason: "wrong_currency" }],
+    ]);
+    expect(JSON.stringify(logged)).not.toContain("77777");
+    expect(JSON.stringify(logged)).not.toContain(UNKNOWN_ORG);
+  });
+
+  test("a quiet pass costs one ledger read per page, not one per payment", async () => {
+    const sessions: Record<string, Session> = {};
+    for (let index = 0; index < 150; index += 1) {
+      sessions[`cs_quiet_${String(index).padStart(3, "0")}`] = paid({
+        amount_total: 500,
+        created: NOW_SECONDS - index,
+      });
+    }
+    const h = await host({ sessions });
+    expect(await h.app.reconcilePayments()).toMatchObject({ credited: 150 });
+    h.queries.count = 0;
+    expect(await h.app.reconcilePayments()).toMatchObject({ credited: 0, alreadyCredited: 150 });
+    expect(h.queries.count).toBe(2);
+    expect(await h.balance(ORG)).toBe(150 * 500);
+  });
+
+  test("a deferred event is handled when it arrives again after its handler exists", async () => {
+    const stripe = stripeFake({});
+    const sql = createEphemeralSql();
+    const handled: string[] = [];
+    const context: PaymentEventContext = {
+      sql,
+      clock: () => NOW,
+      credit: async () => "credited",
+      creditedFunding: async () => new Set(),
+    };
+    const client = createStripeClient({ secretKey: KEY, fetch: stripe.fetch });
+    const before = createStripeEvents({ client, webhook: { secret: SECRET } }, context);
+    const after = createStripeEvents(
+      {
+        client,
+        webhook: { secret: SECRET },
+        handlers: {
+          "charge.refunded": async (refund) => {
+            handled.push(String(refund.objectId));
+            return { outcome: "ignored", detail: "refund_recorded" };
+          },
+        },
+      },
+      context,
+    );
+    const body = event("charge.refunded", { id: "ch_test_1", object: "charge" });
+    const payload = new TextEncoder().encode(body);
+    const signature = sign(body);
+    expect(await before.receive?.({ payload, signature })).toMatchObject({
+      outcome: "deferred",
+      duplicate: false,
+    });
+    expect(await before.receive?.({ payload, signature })).toMatchObject({ duplicate: true });
+    expect(await after.receive?.({ payload, signature })).toMatchObject({
+      outcome: "ignored",
+      detail: "refund_recorded",
+      duplicate: false,
+    });
+    expect(await after.receive?.({ payload, signature })).toMatchObject({ duplicate: true });
+    expect(handled).toEqual(["ch_test_1"]);
   });
 });

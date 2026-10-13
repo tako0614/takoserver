@@ -368,6 +368,7 @@ export function buildApp(ports: AppPorts): App {
       organizationExists: async (organizationId) =>
         (await accounts.organization(organizationId)) !== null,
     }),
+    creditedFunding: (fundings) => ledger.fundedReferences(fundings),
   });
   const catalog = createCatalog(ports.offerings);
   const { deployments, inventory } = resourceStores;

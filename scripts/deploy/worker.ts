@@ -24,7 +24,12 @@ import {
   type IntegrationStorageGenerationTargetVerificationOptions,
   verifyFreshV2IntegrationStorageTarget,
 } from "./integration-storage-generation.ts";
-import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
+import {
+  assertStripeWebhookSchema,
+  pendingMigrations,
+  readD1SchemaState,
+  readMigrationArtifact,
+} from "./migrations.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -580,6 +585,7 @@ export async function runWorker(
         JSON.stringify(before.pending),
       );
     }
+    assertStripeWebhookSchema(target, before.migrations.applied);
     const legacyBootstrap = before.legacyPredecessorProfile !== undefined;
     const changedPaths = legacyBootstrap
       ? null

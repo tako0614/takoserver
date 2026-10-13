@@ -498,6 +498,23 @@ recorded and acknowledged without acting on them. Point the Stripe endpoint at
 `https://<public origin>/v1/payments/stripe/webhook`; one Stripe account and
 mode should serve one deployment.
 
+No path credits a payment that is no longer there: the session is read with its
+PaymentIntent and latest charge, and a refunded (in any part) or disputed
+charge, or one that cannot be read, credits nothing. The webhook and the
+reconcile pass credit only one-off (`mode=payment`) sessions this Host created,
+which carry `metadata[takoserverPurpose]=wallet_funding`; sessions created
+before that marker existed are credited only when the console presents them.
+Paid sessions that could not be credited (another currency, an organization
+this Host lacks, an unreadable payment) are logged by funding reference as
+`takoserver.stripe.uncredited_payments`.
+
+The webhook records every delivery in `stripe_events`, so it needs migration
+`0091_stripe_events.sql` applied first. A Bun Host migrates its own SQLite. On
+Cloudflare, publication refuses `"stripeWebhook": true` until the target's D1
+has 0091 applied, and no reviewed D1 wave through 0091 exists yet; until one
+does, a hosted deployment relies on the console's return and the reconcile
+pass.
+
 ### Data root and backups
 
 By default, durable state is rooted under `.takoserver`, but that directory is

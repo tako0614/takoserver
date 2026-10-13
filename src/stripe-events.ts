@@ -11,6 +11,7 @@ import {
 import type { Clock, Sql } from "./ports.ts";
 import {
   type CheckoutSession,
+  type CheckoutSessionFunding,
   checkoutSessionFunding,
   type StripeClient,
   StripeSettlementError,
@@ -40,6 +41,17 @@ export const STRIPE_WEBHOOK_MAX_BYTES = 256 * 1_024;
 export const DEFAULT_STRIPE_WEBHOOK_TOLERANCE_SECONDS = 300;
 /** Long enough for delayed payment methods to settle after Checkout completes. */
 export const DEFAULT_STRIPE_RECONCILE_LOOKBACK_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * Reasons a paid, Host-marked session was not credited. Each one is money
+ * collected and not in a wallet, so it is logged rather than left in a report.
+ */
+const UNCREDITED_PAID_REASONS: ReadonlySet<string> = new Set([
+  "wrong_currency",
+  "wrong_organization",
+  "unknown_organization",
+  "unverifiable_payment",
+]);
 
 const RECONCILE_PAGE_SIZE = 100;
 const RECONCILE_MAX_PAGES = 10;
@@ -234,17 +246,33 @@ async function creditSession(
   session: CheckoutSession,
   context: Pick<StripeEventHandlerContext, "currency" | "credit">,
 ): Promise<StripeEventHandling> {
-  let funding: ReturnType<typeof checkoutSessionFunding>;
+  let funding: CheckoutSessionFunding;
   try {
-    funding = checkoutSessionFunding(session, { currency: context.currency });
+    funding = checkoutSessionFunding(session, {
+      currency: context.currency,
+      requireHostMarker: true,
+    });
   } catch (error) {
-    if (error instanceof StripeSettlementError) return { outcome: "ignored", detail: error.code };
-    throw error;
+    if (!(error instanceof StripeSettlementError)) throw error;
+    if (UNCREDITED_PAID_REASONS.has(error.code)) {
+      logUncredited([{ fundingRef: `stripe:${String(session.id)}`, reason: error.code }]);
+    }
+    return { outcome: "ignored", detail: error.code };
   }
   const credited = await context.credit(funding);
-  return credited === "unknown_organization"
-    ? { outcome: "ignored", detail: credited }
-    : { outcome: "credited", detail: credited };
+  if (credited === "unknown_organization") {
+    logUncredited([{ fundingRef: funding.fundingRef, reason: credited }]);
+    return { outcome: "ignored", detail: credited };
+  }
+  return { outcome: "credited", detail: credited };
+}
+
+/** References only: never an amount, an organization or a processor message. */
+function logUncredited(
+  payments: readonly { readonly fundingRef: string; readonly reason: string }[],
+): void {
+  if (payments.length === 0) return;
+  console.warn(JSON.stringify({ event: "takoserver.stripe.uncredited_payments", payments }));
 }
 
 /** Event types this Host acts on, and the one place a new one is added. */
@@ -255,8 +283,11 @@ export const STRIPE_EVENT_HANDLERS: Readonly<Record<string, StripeEventHandler>>
 
 /**
  * Recognised for subscription credit lots, invoice settlement and refunds,
- * which are not built yet. Moving a type from here into the handler table is
- * the whole change: its recorded rows keep the object id a handler re-reads.
+ * which are not built yet. A type moves from here into the handler table.
+ * Stripe does not redeliver an event it saw acknowledged, so that change
+ * must also backfill the rows already recorded as `deferred` (each keeps the
+ * object id the handler re-reads); a delivery that does arrive again, such as
+ * one resent from the Stripe dashboard, is handled by the new handler.
  */
 export const STRIPE_DEFERRED_EVENT_TYPES: ReadonlySet<string> = Object.freeze(
   new Set([
@@ -338,7 +369,11 @@ export function createStripeEvents(
             }
             const event = parseStripeEventEnvelope(payload);
             const settled = await ledger.settled(event.id);
-            if (settled !== null) {
+            const nowHandled =
+              settled !== null &&
+              (settled.outcome === "deferred" || settled.outcome === "unsupported") &&
+              Object.hasOwn(handlers, event.type);
+            if (settled !== null && !nowHandled) {
               return {
                 eventId: event.id,
                 type: event.type,
@@ -375,9 +410,11 @@ export function createStripeEvents(
       let unknownOrganization = 0;
       const skipped: Record<string, number> = {};
       const creditedRefs: string[] = [];
+      const uncredited: { readonly fundingRef: string; readonly reason: string }[] = [];
       let truncated = false;
+      let windowEnded = false;
       let startingAfter: string | undefined;
-      pages: for (let page = 0; ; page += 1) {
+      for (let page = 0; !windowEnded; page += 1) {
         if (page === RECONCILE_MAX_PAGES) {
           truncated = true;
           break;
@@ -387,28 +424,46 @@ export function createStripeEvents(
           limit: RECONCILE_PAGE_SIZE,
           ...(startingAfter === undefined ? {} : { startingAfter }),
         });
+        const fundable: CheckoutSessionFunding[] = [];
         for (const session of listed.sessions) {
           if (typeof session.created !== "number" || typeof session.id !== "string") {
             skipped.malformed = (skipped.malformed ?? 0) + 1;
             continue;
           }
           // Stripe lists newest first: the first one older than the window ends it.
-          if (session.created < cutoff) break pages;
+          if (session.created < cutoff) {
+            windowEnded = true;
+            break;
+          }
           examined += 1;
-          let funding: ReturnType<typeof checkoutSessionFunding>;
           try {
-            funding = checkoutSessionFunding(session, { currency });
+            fundable.push(checkoutSessionFunding(session, { currency, requireHostMarker: true }));
           } catch (error) {
             if (!(error instanceof StripeSettlementError)) throw error;
             skipped[error.code] = (skipped[error.code] ?? 0) + 1;
+            if (UNCREDITED_PAID_REASONS.has(error.code)) {
+              uncredited.push({ fundingRef: `stripe:${session.id}`, reason: error.code });
+            }
+          }
+        }
+        // One read for the whole page; only payments not yet credited go on
+        // to the per-payment credit, so a quiet window costs a query a page.
+        const seen = await context.creditedFunding(fundable);
+        for (const funding of fundable) {
+          if (seen.has(funding.fundingRef)) {
+            alreadyCredited += 1;
             continue;
           }
           const outcome: FundingCreditOutcome = await context.credit(funding);
           if (outcome === "credited") {
             credited += 1;
             creditedRefs.push(funding.fundingRef);
-          } else if (outcome === "already_credited") alreadyCredited += 1;
-          else unknownOrganization += 1;
+          } else if (outcome === "already_credited") {
+            alreadyCredited += 1;
+          } else {
+            unknownOrganization += 1;
+            uncredited.push({ fundingRef: funding.fundingRef, reason: outcome });
+          }
         }
         const last = listed.sessions.at(-1);
         if (!listed.hasMore || typeof last?.id !== "string") break;
@@ -421,6 +476,7 @@ export function createStripeEvents(
           JSON.stringify({ event: "takoserver.stripe.reconciled", fundingRefs: creditedRefs }),
         );
       }
+      logUncredited(uncredited);
       if (truncated) {
         console.warn(
           JSON.stringify({
@@ -480,10 +536,12 @@ function createStripeEventLedger(sql: Sql, clock: Clock): StripeEventLedger {
       );
     },
     async settle(eventId, outcome, detail) {
-      // Guarded: a concurrent delivery that already settled keeps its answer.
+      // Guarded: a delivery that already credited or ignored keeps its answer.
+      // Only an unfinished row, or one recorded before its type had a handler,
+      // is settled again.
       await sql.run(
         `UPDATE stripe_events SET outcome = ?, outcome_detail = ?, settled_at = ?
-         WHERE event_id = ? AND outcome = 'received'`,
+         WHERE event_id = ? AND outcome IN ('received', 'deferred', 'unsupported')`,
         [outcome, detail, clock().toISOString(), eventId],
       );
     },

@@ -34,6 +34,8 @@ export interface PaymentEventContext {
   readonly sql: Sql;
   readonly clock: Clock;
   readonly credit: FundingCredit;
+  /** Of these payments, the funding references already credited, in one read. */
+  readonly creditedFunding: (fundings: readonly SettledFunding[]) => Promise<ReadonlySet<string>>;
 }
 
 /** `received` never leaves the processor; a receipt states a settled outcome. */

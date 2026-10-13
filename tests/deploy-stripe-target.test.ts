@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { assertStripeWebhookSchema } from "../scripts/deploy/migrations.ts";
 import { deploymentVariables, expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
 import { loadTarget } from "../scripts/deploy/target.ts";
 
@@ -113,5 +114,23 @@ describe("deploy target Stripe webhook and settings", () => {
         expect(() => loadTarget(path, "production")).toThrow(message);
       });
     }
+  });
+
+  test("refuses to publish a webhook onto a D1 without stripe_events", () => {
+    const through0090 = [
+      "0089_v2_worker_cron_match_guard_depth.sql",
+      "0090_v2_queue_sqlite_external_drain.sql",
+    ];
+    expect(() => assertStripeWebhookSchema({ stripeWebhook: true }, through0090)).toThrow(
+      "needs 0091_stripe_events.sql applied",
+    );
+    expect(() =>
+      assertStripeWebhookSchema({ stripeWebhook: true }, [
+        ...through0090,
+        "0091_stripe_events.sql",
+      ]),
+    ).not.toThrow();
+    expect(() => assertStripeWebhookSchema({ stripeWebhook: false }, through0090)).not.toThrow();
+    expect(() => assertStripeWebhookSchema({}, through0090)).not.toThrow();
   });
 });

@@ -38,7 +38,23 @@ export type StripeSettlementErrorCode =
   | "not_paid"
   | "wrong_organization"
   | "wrong_currency"
+  /** Paid, then refunded in whole or part, or disputed: there is nothing to credit. */
+  | "refunded"
+  /** Not a one-off wallet top-up this Host created (another mode, or no Host marker). */
+  | "not_wallet_funding"
+  /** Stripe's record did not carry the payment it must be checked against. */
+  | "unverifiable_payment"
   | "unavailable";
+
+/** Written into every Checkout Session this Host creates, and read back before crediting. */
+export const WALLET_FUNDING_PURPOSE = "wallet_funding";
+
+/**
+ * The payment behind a session is read with it. Stripe leaves a session
+ * `paid` after a refund or a dispute, so the charge is the record that says
+ * whether the money is still there.
+ */
+const SESSION_EXPANSION = "payment_intent.latest_charge";
 
 export class StripeSettlementError extends Error {
   constructor(readonly code: StripeSettlementErrorCode) {
@@ -58,12 +74,18 @@ export interface StripeOptions {
 /** Stripe's record of one Checkout Session, as far as funding reads it. */
 export interface CheckoutSession {
   readonly id?: unknown;
+  readonly mode?: unknown;
   readonly payment_status?: unknown;
   readonly amount_total?: unknown;
   readonly currency?: unknown;
   /** Unix seconds; ordering for the reconcile window. */
   readonly created?: unknown;
-  readonly metadata?: { readonly organizationId?: unknown } | null;
+  readonly metadata?: {
+    readonly organizationId?: unknown;
+    readonly takoserverPurpose?: unknown;
+  } | null;
+  /** Expanded with its latest charge by every read this client makes. */
+  readonly payment_intent?: unknown;
 }
 
 /** What a paid Checkout Session credits, decided only from Stripe's record of it. */
@@ -86,7 +108,16 @@ export interface CheckoutSessionFunding {
  */
 export function checkoutSessionFunding(
   session: CheckoutSession,
-  options: { readonly currency?: "USD"; readonly expectedOrganizationId?: string } = {},
+  options: {
+    readonly currency?: "USD";
+    readonly expectedOrganizationId?: string;
+    /**
+     * Paths nobody presented (webhook, reconcile) credit only sessions this
+     * Host marked at creation, so a Payment Link, a dashboard session or a
+     * later subscription Checkout in the same account is never a top-up.
+     */
+    readonly requireHostMarker?: boolean;
+  } = {},
 ): CheckoutSessionFunding {
   const currency = (options.currency ?? "USD").toLowerCase();
   if (typeof session.id !== "string" || !CHECKOUT_SESSION_ID.test(session.id)) {
@@ -113,6 +144,14 @@ export function checkoutSessionFunding(
   ) {
     throw new StripeSettlementError("not_paid");
   }
+  if (
+    session.mode !== "payment" ||
+    (options.requireHostMarker === true &&
+      session.metadata?.takoserverPurpose !== WALLET_FUNDING_PURPOSE)
+  ) {
+    throw new StripeSettlementError("not_wallet_funding");
+  }
+  assertPaymentStillHeld(session.payment_intent);
   return {
     organizationId,
     // Stripe's minor units are the ledger's minor units, so nothing is
@@ -122,6 +161,25 @@ export function checkoutSessionFunding(
     fundingRef: `stripe:${session.id}`,
     currency: "USD",
   };
+}
+
+/**
+ * The money is still there: the payment succeeded and its charge is neither
+ * refunded (in any part) nor disputed. A session whose payment cannot be read
+ * is not credited on trust.
+ */
+function assertPaymentStillHeld(intent: unknown): void {
+  if (typeof intent !== "object" || intent === null) {
+    throw new StripeSettlementError("unverifiable_payment");
+  }
+  const { status, latest_charge: charge } = intent as Record<string, unknown>;
+  if (status !== "succeeded" || typeof charge !== "object" || charge === null) {
+    throw new StripeSettlementError("unverifiable_payment");
+  }
+  const { refunded, amount_refunded: amountRefunded, disputed } = charge as Record<string, unknown>;
+  if (refunded !== false || amountRefunded !== 0 || disputed !== false) {
+    throw new StripeSettlementError("refunded");
+  }
 }
 
 export function createStripeSettlement(options: StripeOptions): FundingSettlementVerifier {
@@ -211,7 +269,11 @@ export function createStripeClient(options: StripeOptions): StripeClient {
   return {
     async checkoutSession(id) {
       if (!CHECKOUT_SESSION_ID.test(id)) return null;
-      return (await call("GET", `/checkout/sessions/${id}`)) as CheckoutSession | null;
+      const query = new URLSearchParams({ "expand[]": SESSION_EXPANSION });
+      return (await call(
+        "GET",
+        `/checkout/sessions/${id}?${query.toString()}`,
+      )) as CheckoutSession | null;
     },
 
     async listCheckoutSessions({ status, limit, startingAfter }) {
@@ -223,7 +285,11 @@ export function createStripeClient(options: StripeOptions): StripeClient {
       ) {
         throw new StripeSettlementError("unavailable");
       }
-      const query = new URLSearchParams({ status, limit: String(limit) });
+      const query = new URLSearchParams({
+        status,
+        limit: String(limit),
+        "expand[]": `data.${SESSION_EXPANSION}`,
+      });
       if (startingAfter !== undefined) query.set("starting_after", startingAfter);
       const listed = await call("GET", `/checkout/sessions?${query.toString()}`);
       if (
@@ -250,7 +316,9 @@ export function createStripeClient(options: StripeOptions): StripeClient {
         // verification. It is what stops one customer's payment from crediting
         // another customer's wallet.
         "metadata[organizationId]": organizationId,
+        "metadata[takoserverPurpose]": WALLET_FUNDING_PURPOSE,
         "payment_intent_data[metadata][organizationId]": organizationId,
+        "payment_intent_data[metadata][takoserverPurpose]": WALLET_FUNDING_PURPOSE,
       });
       const id = created?.id;
       const url = created?.url;

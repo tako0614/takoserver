@@ -84,6 +84,14 @@ export interface Ledger {
     readonly fundingRef: string;
   }): Promise<boolean>;
   /**
+   * The funding references, of those given, that already credited their
+   * organization: one query for a whole batch, so a periodic pass does not
+   * cost a query per payment it has already seen.
+   */
+  fundedReferences(
+    entries: readonly { readonly organizationId: string; readonly fundingRef: string }[],
+  ): Promise<ReadonlySet<string>>;
+  /**
    * Earmarks funds. Returns false when the balance cannot cover the amount —
    * the decision is made by the insert itself, so two concurrent holds can
    * never both succeed against the same funds.
@@ -314,6 +322,22 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
         [organizationId, fundingRef],
       );
       return rows.length === 1;
+    },
+
+    async fundedReferences(entries): Promise<ReadonlySet<string>> {
+      if (entries.length === 0) return new Set();
+      // One bound parameter however long the batch: D1 caps parameters per
+      // statement, and the join still uses the (org_id, type, ref) index.
+      const rows = await sql.query(
+        `SELECT ledger.ref AS ref
+         FROM json_each(?) AS wanted
+         JOIN ledger
+           ON ledger.org_id = json_extract(wanted.value, '$[0]')
+          AND ledger.type = 'funding'
+          AND ledger.ref = json_extract(wanted.value, '$[1]')`,
+        [JSON.stringify(entries.map((entry) => [entry.organizationId, entry.fundingRef]))],
+      );
+      return new Set(rows.map((row) => String(row.ref)));
     },
 
     async hold({ organizationId, reference, amountMinor }): Promise<boolean> {
