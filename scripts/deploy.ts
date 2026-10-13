@@ -76,7 +76,7 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
   D1 schema status/apply may select one fixed next-wave boundary:
-    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088>
+    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088|0092>
   Integration without a selector keeps its disposable suffix path; selected integration applies
   only the audited wave and emits integration-protected-wave evidence, never a rehearsal receipt.
   Rehearsal and production still require the selector and their receipt chain.
@@ -1152,7 +1152,9 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         );
       }
       const production =
-        productionPath === undefined || productionPath === ""
+        invocation.throughMigration !== "0092" ||
+        productionPath === undefined ||
+        productionPath === ""
           ? undefined
           : loadTarget(productionPath, "production");
       return await runIntegrationStorageGeneration(
@@ -1183,7 +1185,23 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         { ...invocation, surface: "takoserver-integration-worker-bootstrap" },
         target,
       );
-    case "takoserver-d1-schema":
+    case "takoserver-d1-schema": {
+      const productionPath = process.env.TAKOSERVER_DEPLOY_TARGET_PRODUCTION?.trim();
+      if (
+        invocation.throughMigration === "0092" &&
+        (!productionPath || !isAbsolute(productionPath))
+      ) {
+        throw new DeployError(
+          "preflight",
+          "0092 requires an absolute TAKOSERVER_DEPLOY_TARGET_PRODUCTION for read-only D1 identity fencing",
+        );
+      }
+      const production =
+        invocation.throughMigration !== "0092" ||
+        productionPath === undefined ||
+        productionPath === ""
+          ? undefined
+          : loadTarget(productionPath, "production");
       return await runD1Schema(
         {
           action: invocation.action,
@@ -1194,7 +1212,9 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
             : { throughMigration: invocation.throughMigration }),
         },
         target,
+        production === undefined ? {} : { productionD1: production.d1 },
       );
+    }
     case "takoserver-signing-key-register":
     case "takoserver-signing-repair":
     case "takoserver-signing-rotation":

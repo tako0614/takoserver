@@ -38,6 +38,7 @@ import {
 } from "./qualification.ts";
 import {
   projectApplyQualifiedMigrationArtifact,
+  projectCanonicalIntegrationV2MigrationArtifact0092,
   projectFreshIntegrationV2MigrationArtifact0091,
   projectFreshProductionV2MigrationArtifact,
   projectFreshProductionV2MigrationArtifact0089,
@@ -264,6 +265,18 @@ export interface FreshV2IntegrationStorageTargetProof
   readonly freshLineage: IntegrationFreshLineage;
 }
 
+export interface CanonicalV20092IntegrationStorageTargetProof
+  extends IntegrationStorageGenerationTargetProof {
+  readonly appliedSchemaLineage: "v2-0092";
+}
+
+export interface CanonicalV20092IntegrationStorageIdentityProof {
+  readonly accountId: string;
+  readonly d1: { readonly databaseId: string; readonly databaseName: string };
+  readonly r2: { readonly bucketName: string };
+  readonly productionD1: ProductionD1Identity;
+}
+
 /**
  * Narrow read-only seam for proving that the selected integration Worker
  * target names one existing generated storage pair with the exact audited D1
@@ -370,11 +383,81 @@ export async function verifyFreshV2IntegrationStorageTarget(
   return { ...proof, freshLineage: lineage };
 }
 
+/** Read-only proof selected after the reviewed in-place 0088→0092 wave. */
+export async function verifyCanonicalV20092IntegrationStorageTarget(
+  target: DeployTarget,
+  environment: DeployEnvironment,
+  options: IntegrationStorageGenerationTargetVerificationOptions = {},
+): Promise<CanonicalV20092IntegrationStorageTargetProof> {
+  if (
+    environment !== "integration" ||
+    target.takoformV2?.storageLineage !== "v2-0088" ||
+    target.takoformV2.appliedSchemaLineage !== "v2-0092"
+  ) {
+    throw preflightError(
+      "canonical 0092 storage proof requires explicit applied lineage on the original 0088 integration target",
+    );
+  }
+  const proof = await verifyGeneratedStorageTarget(target, environment, options, "applied-v2-0092");
+  return { ...proof, appliedSchemaLineage: "v2-0092" };
+}
+
+/** Provider GET identity fence before the schema mutation, independent of its applied lineage. */
+export async function verifyCanonicalV20092IntegrationStorageIdentity(
+  target: DeployTarget,
+  productionD1: ProductionD1Identity,
+  options: IntegrationStorageGenerationTargetVerificationOptions = {},
+): Promise<CanonicalV20092IntegrationStorageIdentityProof> {
+  if (target.takoformV2?.storageLineage !== "v2-0088") {
+    throw preflightError("canonical 0092 identity proof requires the original v2-0088 target");
+  }
+  const generated = generatedStorageTarget(target, "integration");
+  const productionDescriptor = validateD1Summary(
+    { uuid: productionD1.databaseId, name: productionD1.databaseName },
+    "canonical 0092 read-only production descriptor",
+  );
+  assertStagingD1NotProduction(
+    { databaseName: generated.databaseName, databaseId: generated.databaseId },
+    { databaseId: productionDescriptor.uuid, databaseName: productionDescriptor.name },
+  );
+  const { provider } = await resolveTargetReadProvider(target, "integration", options);
+  const selectedD1 = validateD1Summary(
+    await providerCall("preflight", "canonical 0092 D1 identity GET failed", () =>
+      provider.getD1(generated.databaseId),
+    ),
+    "canonical 0092 D1 identity GET",
+  );
+  const selectedR2 = validateR2Summary(
+    await providerCall("preflight", "canonical 0092 R2 identity GET failed", () =>
+      provider.getR2(generated.bucketName),
+    ),
+    "canonical 0092 R2 identity GET",
+  );
+  if (
+    selectedD1.uuid !== generated.databaseId ||
+    selectedD1.name !== generated.databaseName ||
+    selectedR2.name !== generated.bucketName
+  ) {
+    throw preflightError(
+      "canonical 0092 provider identity differs from the exact generated pair or production descriptor",
+    );
+  }
+  return {
+    accountId: generated.accountId,
+    d1: { databaseId: selectedD1.uuid, databaseName: selectedD1.name },
+    r2: { bucketName: selectedR2.name },
+    productionD1: {
+      databaseId: productionDescriptor.uuid,
+      databaseName: productionDescriptor.name,
+    },
+  };
+}
+
 async function verifyGeneratedStorageTarget(
   target: DeployTarget,
   environment: DeployEnvironment,
   options: IntegrationStorageGenerationTargetVerificationOptions,
-  lineage: "apply-0066" | IntegrationFreshLineage,
+  lineage: "apply-0066" | IntegrationFreshLineage | "applied-v2-0092",
 ): Promise<IntegrationStorageGenerationTargetProof> {
   const generated = generatedStorageTarget(target, environment);
   const providerContext = await resolveTargetReadProvider(target, environment, options);
@@ -745,7 +828,7 @@ async function statusStorageGeneration(
 
 function selectedSourceArtifact(
   directory: string,
-  lineage: "apply-0066" | IntegrationFreshLineage,
+  lineage: "apply-0066" | IntegrationFreshLineage | "applied-v2-0092",
 ): ReturnType<typeof readCurrentAuditedMigrationSourceArtifact> {
   const source = readCurrentAuditedMigrationSourceArtifact(directory);
   switch (lineage) {
@@ -759,6 +842,8 @@ function selectedSourceArtifact(
       return projectFreshProductionV2MigrationArtifact0089(source);
     case "v2-0091":
       return projectFreshIntegrationV2MigrationArtifact0091(source);
+    case "applied-v2-0092":
+      return projectCanonicalIntegrationV2MigrationArtifact0092(source);
   }
 }
 

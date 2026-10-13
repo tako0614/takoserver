@@ -1013,6 +1013,29 @@ describe("split Takoserver Worker surfaces", () => {
     for (const count of [88, 89, 90]) {
       expect(workerSchemaAllowsPending(lineage0091, at(count))).toBe(false);
     }
+    const applied0092 = {
+      ...lineage0088,
+      takoformV2: { ...lineage0088.takoformV2, appliedSchemaLineage: "v2-0092" as const },
+    };
+    const source = readMigrationArtifact();
+    const shape0092 = deriveExpectedApplicationShape(source.files);
+    const exact0092 = {
+      ...at(92),
+      shape: shape0092,
+      shapeDigest: `sha256:${createHash("sha256").update(shape0092).digest("hex")}`,
+    };
+    expect(workerSchemaAllowsPending(applied0092, exact0092)).toBe(true);
+    expect(workerSchemaAllowsPending(lineage0088, exact0092)).toBe(false);
+    expect(
+      workerSchemaAllowsPending(applied0092, { ...exact0092, applied: source.names.slice(0, 91) }),
+    ).toBe(false);
+    expect(workerSchemaAllowsPending(applied0092, { ...exact0092, shape: "[]\n" })).toBe(false);
+    expect(
+      workerSchemaAllowsPending(applied0092, {
+        ...exact0092,
+        shapeDigest: `sha256:${"0".repeat(64)}`,
+      }),
+    ).toBe(false);
     expect(
       workerSchemaAllowsPending(lineage0088, {
         ...at(88),

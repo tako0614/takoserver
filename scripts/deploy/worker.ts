@@ -20,8 +20,10 @@ import {
   verificationError,
 } from "./errors.ts";
 import {
+  type CanonicalV20092IntegrationStorageTargetProof,
   type FreshV2IntegrationStorageTargetProof,
   type IntegrationStorageGenerationTargetVerificationOptions,
+  verifyCanonicalV20092IntegrationStorageTarget,
   verifyFreshV2IntegrationStorageTarget,
 } from "./integration-storage-generation.ts";
 import {
@@ -44,7 +46,10 @@ import {
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import { writeWorkerConfig } from "./realized-config.ts";
 import { runAuthorityTransition } from "./retirement.ts";
-import { readCurrentAuditedMigrationSourceArtifact } from "./schema.ts";
+import {
+  canonicalIntegrationV2Schema0092Matches,
+  readCurrentAuditedMigrationSourceArtifact,
+} from "./schema.ts";
 import {
   activePublicJwk,
   createRemoteSigningDatabase,
@@ -220,7 +225,7 @@ interface WorkerInspection {
 
 const SCHEMA_0058_NAME = "0058_cloudflare_managed_worker_domain_receipts.sql";
 
-/** Non-serving source profiles only; neither is authority to apply a pending migration. */
+/** Explicit source profiles only; this check never grants D1 apply authority. */
 export function workerSchemaAllowsPending(
   target: DeployTarget,
   migrations: {
@@ -266,6 +271,22 @@ export function workerSchemaAllowsPending(
     const source = readCurrentAuditedMigrationSourceArtifact(
       resolve(sourceRepositoryRoot, "migrations"),
     );
+    if (target.takoformV2.appliedSchemaLineage === "v2-0092") {
+      return (
+        target.takoformV2.storageLineage === "v2-0088" &&
+        JSON.stringify(migrations.local) === JSON.stringify(source.names) &&
+        migrations.shape !== undefined &&
+        migrations.shapeDigest !== undefined &&
+        canonicalIntegrationV2Schema0092Matches(
+          {
+            applied: migrations.applied,
+            shape: migrations.shape,
+            shapeDigest: migrations.shapeDigest,
+          },
+          source,
+        )
+      );
+    }
     const count =
       target.takoformV2.storageLineage === "v2-0091"
         ? 91
@@ -960,8 +981,21 @@ async function readFreshV2StorageProof(
   options: WorkerOptions,
   run: WorkerProcess,
   sourceRepositoryRoot: string,
-): Promise<FreshV2IntegrationStorageTargetProof> {
+): Promise<FreshV2IntegrationStorageTargetProof | CanonicalV20092IntegrationStorageTargetProof> {
   try {
+    if (target.takoformV2?.appliedSchemaLineage === "v2-0092") {
+      return await verifyCanonicalV20092IntegrationStorageTarget(target, environment, {
+        ...options.integrationStorageVerification,
+        run,
+        ...(options.cloudflareEnvironment === undefined
+          ? {}
+          : { cloudflareEnvironment: options.cloudflareEnvironment }),
+        migrationDirectory:
+          options.integrationStorageVerification?.migrationDirectory ??
+          resolve(sourceRepositoryRoot, "migrations"),
+        ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+      });
+    }
     return await verifyFreshV2IntegrationStorageTarget(
       target,
       environment,
@@ -991,8 +1025,8 @@ async function readFreshV2StorageProof(
 
 function assertFreshV2StorageProofUnchanged(
   phase: "preflight" | "verification",
-  before: FreshV2IntegrationStorageTargetProof,
-  after: FreshV2IntegrationStorageTargetProof,
+  before: FreshV2IntegrationStorageTargetProof | CanonicalV20092IntegrationStorageTargetProof,
+  after: FreshV2IntegrationStorageTargetProof | CanonicalV20092IntegrationStorageTargetProof,
 ): void {
   if (canonicalJson(before) === canonicalJson(after)) return;
   throw phase === "preflight"
