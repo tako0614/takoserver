@@ -1,5 +1,12 @@
 # Organization billing API implementation
 
+This file records the cents implementation merged in #318. The CTO revision
+in [unified billing](unified-billing.md) supersedes its cents, ties-to-even and
+global expiry-order decisions with a micros ledger, one invoice ceiling and
+free/subscription/purchased priority. Those changes require the separate
+API/ledger implementation PR and forward migration described there; this
+documentation revision does not change the current runtime.
+
 Ledger key: `org-billing-api-20261014`; status: implementation and local review.
 This is the first implementation wave of [unified billing](unified-billing.md),
 after [#313](https://github.com/tako0614/takoserver/pull/313) and
