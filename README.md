@@ -441,6 +441,16 @@ A restarted deployment brings its published Workers back by itself. The runtime
 is started at boot for whatever this machine had already published, before the
 API begins answering; a machine that has published nothing starts no runtime.
 
+An accepted workerd child that crashes is restarted automatically with backoff
+from 100 ms up to 5 seconds. If a replacement fails readiness, recovery waits
+for that exact child to exit and its listener to become vacant before spawning
+again. A delayed exit, temporary port occupancy, or failed listener observation
+keeps the retry pending; recovery never stops or replaces a foreign process.
+Serving is reported only after recovery passes readiness, and health requests
+only observe recovery. Deliberate shutdown cancels it. A failed first
+start, an unconfirmable child exit, or failed child-identity persistence requires
+operator intervention rather than automatic retries.
+
 ### Operator sign-in and funding
 
 Sign-in and money are the two facts a server cannot determine for itself. With
