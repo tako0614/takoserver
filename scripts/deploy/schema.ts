@@ -2724,6 +2724,14 @@ export async function runD1Schema(
       );
     }
     if (wave.selector === "0092") {
+      // A provider success response is not a postcondition. Keep custody
+      // dispatched until the full selected lineage and schema read back; an
+      // unchanged 0088 state must never reach reconcilePost as terminal.
+      if (JSON.stringify(post.applied) !== JSON.stringify(sourceMigrations.names)) {
+        throw verificationError(
+          "0092 post-readback is not the exact complete lineage; repair forward",
+        );
+      }
       assertCanonicalIntegrationV20092State(post, sealedMigrationArtifact.files, "verification");
       const postWalletProof = await read0092Proof("verification", 92);
       assertSchemaV20092PostProof(schemaV20092PreProof as SchemaV20092WalletProof, postWalletProof);
