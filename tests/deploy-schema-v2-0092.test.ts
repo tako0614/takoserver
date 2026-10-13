@@ -26,6 +26,7 @@ import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { integrationStorageVerificationOptions } from "./helpers/integration-storage-generation-verification.ts";
 
 const source = readCurrentAuditedMigrationSourceArtifact();
+const canonical92 = projectCanonicalIntegrationV2MigrationArtifact0092(source);
 const commit = "a".repeat(40);
 const generation = "1".repeat(32);
 const databaseName = `takoserver-i-${generation}`;
@@ -106,7 +107,7 @@ describe("canonical integration 0088 to 0092 schema", () => {
       await verifyCanonicalV20092IntegrationStorageTarget(selected, "integration", options),
     ).toMatchObject({
       appliedSchemaLineage: "v2-0092",
-      appliedMigrations: source.names,
+      appliedMigrations: canonical92.names,
       d1: target.d1,
     });
     await expect(
@@ -179,7 +180,7 @@ describe("canonical integration 0088 to 0092 schema", () => {
     expect(status).toMatchObject({
       fromMigration: "0088_v2_worker_sqlite_external_drain.sql",
       throughMigration: "0092_org_wallet_lifecycle.sql",
-      pendingMigrations: source.names.slice(88),
+      pendingMigrations: canonical92.names.slice(88),
       readyForApply: false,
       schemaV20092: {
         qualified: true,
@@ -343,7 +344,9 @@ describe("canonical integration 0088 to 0092 schema", () => {
       };
       const before = await inspectSchemaV20092WalletProof(remote, "preflight", 88);
       db.exec("CREATE TABLE d1_migrations (name TEXT UNIQUE NOT NULL)");
-      const importSql = buildD1MigrationImport(source.files.slice(88), { freshLedger: false }).sql;
+      const importSql = buildD1MigrationImport(canonical92.files.slice(88), {
+        freshLedger: false,
+      }).sql;
       expect(() =>
         db.transaction(() => db.exec(`${importSql}\nINSERT INTO missing_0092_abort VALUES (1);`))(),
       ).toThrow();
@@ -358,7 +361,7 @@ describe("canonical integration 0088 to 0092 schema", () => {
           .get(),
       ).toMatchObject({ rows: 0 });
       expect(await inspectSchemaV20092WalletProof(remote, "preflight", 88)).toEqual(before);
-      for (const file of source.files.slice(88)) db.exec(readFileSync(file.path, "utf8"));
+      for (const file of canonical92.files.slice(88)) db.exec(readFileSync(file.path, "utf8"));
       const after = await inspectSchemaV20092WalletProof(remote, "verification", 92);
       expect(() => assertSchemaV20092PostProof(before, after)).not.toThrow();
       expect(db.query("SELECT cursor_handle FROM wallet_credit_lots").get()).toMatchObject({
@@ -419,6 +422,8 @@ describe("canonical integration 0088 to 0092 schema", () => {
       },
     };
     const ownerProof = async (input: CanonicalV20092OwnerProofInput) => {
+      expect(input.sourceDigest).toBe(canonical92.digest);
+      expect(input.expectedPostApplied).toEqual(canonical92.names);
       phases.push(`${input.phase}:${input.applied.length}`);
       return {
         kind: "takoserver.canonical-v2-0092-owner-proof@v1" as const,
@@ -481,6 +486,9 @@ describe("canonical integration 0088 to 0092 schema", () => {
         async persistDispatched(binding: CanonicalV20092DispatchBinding) {
           if (dispatchedDigest !== null)
             throw new Error("existing dispatched custody refuses replay");
+          expect(binding.source.digest).toBe(canonical92.digest);
+          expect(binding.source.files.map(({ name }) => name)).toEqual([...canonical92.names]);
+          expect(binding.expectedPost.applied).toEqual(canonical92.names);
           dispatchedDigest = canonicalV20092DispatchBindingDigest(binding);
           return {
             kind: "takoserver.canonical-v2-0092-custody-receipt@v1" as const,
@@ -509,7 +517,7 @@ describe("canonical integration 0088 to 0092 schema", () => {
       );
       expect(result).toMatchObject({
         providerAcknowledgement: "provider-error-recovered-by-authoritative-readback",
-        appliedMigrations: source.names,
+        appliedMigrations: canonical92.names,
       });
       expect(imports).toBe(1);
       expect(dispatchedDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);

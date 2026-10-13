@@ -159,10 +159,11 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
 further: the audited 0001–0092 bytes, ending in `0092_org_wallet_lifecycle.sql`
 (the Organization wallet hold, usage, grant and tariff tables), with the fixed
 digest `sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2`.
-Choose it for a staging Host whose target sets `billingConfig`. Publication
-refuses `billingConfig` until the D1 has 0092, so on a 0091 staging D1 the
-Organization wallet API stays off. It behaves like `v2-0091` in every other
-respect:
+Choose it only to prepare an isolated staging D1 with the frozen 0092 schema.
+The current USD-micros Worker requires a separately qualified 0093/0094 cutover
+and the complete 0094 schema even when `billingConfig` is absent. The 0092
+payload alone cannot serve the current Worker. It behaves like `v2-0091` in
+every other generation respect:
 
 - Production fresh init refuses it.
 - It only creates a new `takoserver-i-<generation>` D1.
@@ -181,9 +182,11 @@ either profile. For `v2-0092`, read it with these substitutions:
 - Expect `appliedMigrations` with 92 entries, ending in
   `0092_org_wallet_lifecycle.sql`.
 - Expect `schemaReadback: complete-0092`.
-- Set `takoformV2.storageLineage: "v2-0092"` on the serving target.
-- Bootstrap and the routine Worker then accept exactly the 0001–0092 ledger.
-  `billingConfig` and `stripeWebhook` are both publishable on such a D1.
+- Retain `takoformV2.storageLineage: "v2-0092"` as the eventual target's
+  immutable creation selector. It does not authorize serving on a 0092 D1.
+- Do not bootstrap or routinely publish the current Worker on this D1. Both
+  refuse before upload until an independently qualified 0093/0094 cutover has
+  produced the exact audited 0094 schema and money-unit policy.
 
 #### Staging D1 through 0091 (staging-only `v2-0091`)
 
@@ -272,16 +275,14 @@ production target. Expect:
 - `schemaReadback: complete-0091`
 - `dataReadback: empty-seeded`
 
-**5. Serve it, separately.** Serving the new storage is a separate, reviewed
-step and is not part of this procedure:
-
-1. Create a new staging target descriptor naming the generated pair with
-   `takoformV2.storageLineage: "v2-0091"`. Never edit the canonical WfP
-   target.
-2. Run `takoserver-integration-worker-bootstrap` for its first Host.
-
-Routine `takoserver-worker` publication then accepts exactly that 0001–0091
-ledger. A target with `"stripeWebhook": true` is accepted only on such a D1.
+**5. Hold publication.** Generation prepares storage only. A target descriptor
+may retain `takoformV2.storageLineage: "v2-0091"` as its immutable origin, but
+the current USD-micros Worker and closure cannot serve its 0091 schema. They
+require a separately qualified complete 0094 lineage, canonical application
+shape and singleton money-unit policy before normal publication, even with no
+billing configuration. The frozen first-Host bootstrap supports historical
+payloads only and refuses to publish the current artifact on this 0091 D1.
+Never edit the canonical WfP target to bypass this boundary.
 
 **Operator-provisioned staging pair.** A staging D1 that infra prepared some
 other way can stand in for a generated pair, under all of these conditions:
@@ -291,16 +292,15 @@ other way can stand in for a generated pair, under all of these conditions:
   the label is lowercase letters, digits and inner hyphens. Production names
   never qualify.
 
-Everything else is unchanged, and the bootstrap and routine publication refuse
-anything less:
+The historical generated-pair proof still requires:
 
 - the identity readback by exact id and name
 - the exact 0001–0091 ledger and canonical schema
 - at first publication, the empty-data proof (only migration seeds and the
   signing registration)
 
-First publication (`takoserver-integration-worker-bootstrap`) of such a target
-needs the following inputs:
+The historical first-publication contract names these inputs. They do not
+authorize first publication of the current USD-micros artifact on a 0091 D1:
 
 - **Target fields:**
   - `takoformV2: { "config": "<v2 startup JSON>", "storageLineage": "v2-0091" }`
@@ -322,15 +322,15 @@ A target that uses such a generation names it explicitly with
 `"v2-0091"`). Absent keeps the
 historical `v2-artifacts-0075` expectation; the lineage cannot be combined with
 `schemaMaintenanceMode: pre-v2-0088-quiesced`, because a fresh generation has
-no wave to quiesce for. The first bootstrap publication on such a target also
+no wave to quiesce for. The historical first-bootstrap proof also
 re-reads the data before upload and at the final pre-deploy fence: only the two
 migration seeds and the append-only signing registration in
 `runtime_grant_keys` may exist, so a copied or already served database is
 refused rather than adopted. The observed ledger never selects
 its own expectation: the bootstrap, routine Worker and closure-transition
-storage proofs all read the selected lineage, and the routine pending-schema
-rule accepts exactly that closed prefix (the audited tail after it has no
-in-place wave). A normal Host whose `takoformV2.config` declares artifact
+storage proofs read the selected lineage, while normal publication additionally
+requires the audited 0094 schema and money-unit policy. A normal Host whose
+`takoformV2.config` declares artifact
 Forms needs 0081 at startup; such a target on the historical 0075 lineage is
 now refused by target composition before any read or upload, instead of
 failing with 503 after traffic moved.
@@ -1711,12 +1711,14 @@ checking a subsequent exact 92 readback. At verification they must independently
 prove the actual 92 dependencies through inspector, gateway, Tail, Host and CPE.
 Old dependency status calls that demand 88/89 cannot be ignored or treated as
 92 evidence. The public schema status is not that private owner proof. Do not
-apply until the owning private entrypoint can provide and recheck it. After the exact schema readback, the operator may
-explicitly add `takoformV2.appliedSchemaLineage: "v2-0092"` to the private
-target. Its `storageLineage: "v2-0088"` stays unchanged. Worker publication
-requires both this selector and the complete 92-row application shape; the
-observed migration marker cannot select the successor or mutate the target.
-Selecting the successor while D1 still has only 88 rows is refused.
+apply until the owning private entrypoint can provide and recheck it. After the
+exact schema readback, the private owner may explicitly record
+`takoformV2.appliedSchemaLineage: "v2-0092"` on the original
+`storageLineage: "v2-0088"` target. This records the reviewed 0092 schema
+successor; it cannot authorize publication of the current USD-micros Worker.
+That Worker requires the complete audited 0094 schema, canonical shape and
+singleton money-unit policy independently of this selector. The 0093/0094
+conversion and publication procedure need separate qualification.
 
 The public Host has a source-only, optional deploy-target profile
 `"schemaMaintenanceMode": "pre-0058-quiesced"`. It projects the non-secret

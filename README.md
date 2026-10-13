@@ -528,12 +528,11 @@ this Host lacks, an unreadable payment) are logged by funding reference as
 
 The webhook records every delivery in `stripe_events`, so it needs migration
 `0091_stripe_events.sql` applied first. A Bun Host migrates its own SQLite. On
-Cloudflare, publication refuses `"stripeWebhook": true` until the target's D1
-has 0091 applied. No existing D1 can be moved to 0091 in place. A new staging
-D1 can be created with the staging-only `--fresh-lineage=v2-0091` profile, or
-with `--fresh-lineage=v2-0092` when the target also sets `billingConfig`
-([deploy guide](docs/deploy.md)); production has no 0091 path yet, and relies
-on the console's return and the reconcile pass.
+Cloudflare, the current USD-micros Worker requires the complete 0094 schema and
+money-unit policy even when the webhook and billing options are disabled. The
+staging-only `--fresh-lineage=v2-0091` and `v2-0092` profiles prepare fixed
+historical D1 payloads; neither can serve this Worker ([deploy guide](docs/deploy.md)).
+No qualified staging 0094 generation or existing-D1 cutover exists yet.
 
 ### Data root and backups
 

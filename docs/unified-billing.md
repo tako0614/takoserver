@@ -16,7 +16,7 @@ The design revision in #323 changed the target contract. The separate
 in source. It includes OpenAPI, class-priority allocation and forward migrations
 0093/0094, but does not apply them to a live target. A guarded, independently
 qualified money cutover is required before publication. The
-[0092 schema wave PR](https://github.com/tako0614/takoserver/pull/322)
+[0092 schema wave PR](https://github.com/tako0614/takoserver/pull/327)
 stays separate from that cutover.
 
 Related work: [Takosumi Hosted PR #54](https://github.com/tako0614/takosumi-hosted/pull/54)

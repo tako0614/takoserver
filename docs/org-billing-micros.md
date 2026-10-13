@@ -11,10 +11,11 @@ steps. This document does not establish staging deployment or billing GA.
 | Sequence | Repository / owner | Work and acceptance |
 | --- | --- | --- |
 | 1 | takoserver | Revised design in #323; separate micros API/ledger PR, OpenAPI, migration and regression tests, independent review and complete local gate |
-| 2 | takoserver / takoserver-private | #322 qualifies only the frozen 0088→0092 wave; adopt its exact reviewed source in private composition without extending that proof to 0093/0094 |
-| 3 | takoserver-private / operator | Separately qualify 0093 classification preparation, protected original money/provenance snapshots and reviewed dispositions, then the stopped-writer 0094 unit cutover and matching artifact |
-| 4 | terminal 4d7bccc3 / infrastructure | Recreate disposable staging D1 with canonical SQL comments, apply the qualified schema and deploy/test through the owning entrypoint; this session does not perform these mutations |
-| 5 | takoserver / takosumi-hosted | Subscription invoice grants, subscription projection, refunds, capped postpaid, server-only scoped Hosted client and single-writer wallet cutover remain separate GA implementation waves |
+| 2 | takoserver / takoserver-private | Merged #327 qualifies only the frozen 0088→0092 wave; adopt its exact reviewed 0092 projection in private composition without extending that proof to 0093/0094 |
+| 3 | takoserver | In a separate future source PR, qualify staging-only verified-empty disposable fresh `v2-0094` D1 generation and its first Worker bootstrap against the fixed 0094 source/digest, canonical shape and money-unit row. Guard production identity, read overflow, no-overwrite and unknown acknowledgement; do not widen the frozen 0092 or older payloads. This path is not implemented here. |
+| 4 | takoserver-private / operator | Separately qualify existing-data 0093 classification preparation, protected original money/provenance snapshots and reviewed dispositions, then the stopped-writer 0094 unit cutover and matching artifact. The existing 0092 wave is no authority for this step. |
+| 5 | terminal 4d7bccc3 / infrastructure | Once the separate source authority exists, recreate disposable staging D1 with canonical SQL comments, apply the qualified schema and deploy/test through the owning entrypoint; this session does not perform these mutations |
+| 6 | takoserver / takosumi-hosted | Subscription invoice grants, subscription projection, refunds, capped postpaid, server-only scoped Hosted client and single-writer wallet cutover remain separate GA implementation waves |
 
 No task number is reserved here. No production D1, production configuration,
 live tariff, credential, or provider state is changed by this source work.

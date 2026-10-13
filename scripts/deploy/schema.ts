@@ -2268,7 +2268,7 @@ export async function runD1Schema(
             dependencyProofDigest: owner.dependencyProofDigest,
           },
           expectedPost: {
-            applied: sourceMigrations.names,
+            applied: canonicalV20092Source.names,
             applicationShapeDigest: `sha256:${createHash("sha256").update(additiveCutoverPostShape).digest("hex")}`,
           },
         };
