@@ -100,6 +100,11 @@ row from the expiry index. A request sweeps at most eight of its Organization's
 expired holds. If a backlog remains it returns `billing_maintenance_pending`
 (503), preserving committed cleanup and refusing new admission until catch-up.
 It does not spend unlimited request time draining a long maintenance outage.
+The sweep and its backlog check read one request instant, so a deadline that
+passes later in the same request is not backlog. That hold is still never
+captured or reported live: capture and release fence on the deadline inside
+their SQL batch and close it as `expired`, and a read or exact replay closes it
+first.
 
 An unpaid, already-consumed usage record persists as `pending` without ledger
 entries or an implicit invoice. It blocks additional billable hold admission;

@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import type { Accounts, ApiKeyScope } from "../src/auth.ts";
 import { createControlRoutes } from "../src/control.ts";
+import { HOST_ERROR_HTTP_STATUS, STABLE_ERROR_HTTP_STATUS } from "../src/error-envelope.ts";
 import { openApiDocument } from "../src/openapi.ts";
 import { type OrgBilling, OrgBillingError } from "../src/org-billing.ts";
 
@@ -294,6 +295,59 @@ test("usage quantity is passed as canonical decimal text and API scope schemas a
     (schemas.WalletUsageReceipt as { properties: { meter: { maxLength: number } } }).properties
       .meter.maxLength,
   ).toBe(128);
+});
+
+test("published wallet refusals name each billing code under the status it is answered with", () => {
+  const prefix = "/v1/organizations/{organizationId}/wallet";
+  const paths = openApiDocument.paths as Record<
+    string,
+    Record<string, { readonly responses?: Record<string, { readonly description: string }> }>
+  >;
+  const named = (description: string) =>
+    [...description.matchAll(/`([a-z0-9_]+)`/gu)].map((match) => match[1] ?? "");
+  const responses = (path: string, method: string) =>
+    paths[`${prefix}${path}`]?.[method]?.responses;
+  const codes = (path: string, method: string, status: string) =>
+    named(responses(path, method)?.[status]?.description ?? "");
+
+  // Staging main-c048: a mismatched expectedMinor is a 409, never a 400.
+  expect(codes("/usage-records", "post", "409")).toEqual([
+    "measurement_conflict",
+    "reference_conflict",
+    "pricing_revision_unavailable",
+    "usage_period_crosses_tariff",
+  ]);
+  expect(responses("/usage-records", "post")?.["400"]?.description).not.toMatch(/tariff|match/u);
+  expect(codes("/holds/{reference}/capture", "post", "409")).toEqual([
+    "hold_closed",
+    "capture_exceeds_hold",
+    "measurement_conflict",
+    "reference_conflict",
+  ]);
+  expect(codes("/holds", "post", "409")).toEqual([
+    "reference_conflict",
+    "pricing_revision_unavailable",
+    "outstanding_usage",
+  ]);
+  expect(responses("/holds/{reference}", "get")).not.toHaveProperty("409");
+
+  let checked = 0;
+  for (const [path, item] of Object.entries(paths)) {
+    if (path !== prefix && !path.startsWith(`${prefix}/`)) continue;
+    for (const operation of Object.values(item)) {
+      for (const [status, response] of Object.entries(operation.responses ?? {})) {
+        for (const code of named(response.description)) {
+          const declared = HOST_ERROR_HTTP_STATUS[code] ?? [STABLE_ERROR_HTTP_STATUS[code]];
+          expect({ code, statuses: declared }).toEqual({
+            code,
+            statuses: expect.arrayContaining([Number(status)]),
+          });
+          checked++;
+        }
+      }
+    }
+  }
+  expect(checked).toBe(11);
 });
 
 test("wallet lot pagination forwards opaque cursors and returns distinct pages", async () => {
