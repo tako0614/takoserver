@@ -3485,7 +3485,7 @@ function inspectRuntimeInputLeaseGenerationCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "runtime-input lease generation cutover requires the exact audited source inventory 0001-0089",
+      "runtime-input lease generation cutover requires the exact audited source inventory 0001-0094",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -3527,7 +3527,7 @@ function inspectActorKvCapabilityCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "Actor KV capability claim cutover requires the exact audited source inventory 0001-0089",
+      "Actor KV capability claim cutover requires the exact audited source inventory 0001-0094",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -3604,7 +3604,7 @@ async function inspectApplyProviderSelectionCutover(input: {
     }
     if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
       throw preflightError(
-        "accepted-authority cutover requires the exact audited source inventory 0001-0089",
+        "accepted-authority cutover requires the exact audited source inventory 0001-0094",
       );
     }
     assertAuditedMigrationHashes(input.artifact.files);
@@ -3646,7 +3646,7 @@ async function inspectApplyProviderSelectionCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "operation-generation cutover requires the exact audited source inventory 0001-0089",
+      "operation-generation cutover requires the exact audited source inventory 0001-0094",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
