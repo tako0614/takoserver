@@ -2,7 +2,6 @@ import { lookup as systemLookup } from "node:dns/promises";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { Readable } from "node:stream";
-import type { V2PublicOnlyArtifactFetch } from "./takoform-v2/forms/public-https-artifact-source.ts";
 
 type Address = { address: string; family: number };
 
@@ -123,7 +122,7 @@ async function resolveWhileNotAborted(
 /** One fresh resolution and one non-pooled, certificate-validated TLS GET. */
 export function createSelfhostPublicHttpsArtifactFetch(
   options: SelfhostPublicHttpsTransportOptions = {},
-): V2PublicOnlyArtifactFetch {
+): (request: Request) => Promise<Response> {
   const resolve = options.resolve ?? ((hostname: string) => systemLookup(hostname, { all: true }));
   const port = options.port ?? 443;
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new TypeError("invalid TLS port");

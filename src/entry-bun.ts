@@ -103,7 +103,7 @@ import {
   parseSelfhostListenHost,
   SELFHOST_LISTEN_HOST_VARIABLE,
 } from "./selfhost-listen-address.ts";
-import { createSelfhostPublicHttpsArtifactFetch } from "./selfhost-public-https-artifact-fetch.ts";
+import { createSelfhostPublicArtifactSource } from "./selfhost-public-artifact-source-composition.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
 import {
@@ -149,7 +149,6 @@ import {
 } from "./standalone-provider-composition.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
-import { createV2HeldOrPublicArtifactSource } from "./takoform-v2/forms/public-https-artifact-source.ts";
 import { selectClosedGraphWorkerd } from "./workerd-artifact.ts";
 import { spawnWorkerdWithParentDeath, workerPortOwnership } from "./workerd-linux-process.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
@@ -1362,12 +1361,7 @@ try {
         ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
         : unconfigured),
     v2: takoformV2Config,
-    v2ArtifactSourceFactory: ({ objects, heldArtifacts }) =>
-      createV2HeldOrPublicArtifactSource({
-        objects,
-        entries: heldArtifacts,
-        fetchPublic: createSelfhostPublicHttpsArtifactFetch(),
-      }),
+    v2ArtifactSourceFactory: createSelfhostPublicArtifactSource,
     ...(v2FormFactory ? { v2FormFactory } : {}),
     ...(v2FormFactory && runtimeInputKeyAuthority
       ? { v2PrivateInputCustody: runtimeInputKeyAuthority.privateInputCustody }

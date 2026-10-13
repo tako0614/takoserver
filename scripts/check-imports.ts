@@ -398,6 +398,18 @@ const LAYERS: readonly Layer[] = [
     may: ["v2-contract"],
   },
   {
+    // The native HTTPS dialer has no portable product dependency. Only its
+    // self-host composition may pair it with the portable artifact Form.
+    name: "selfhost-public-https-artifact-transport",
+    match: /^src\/selfhost-public-https-artifact-fetch\.ts$/u,
+    may: [],
+  },
+  {
+    name: "v2-selfhost-public-artifact-source-composition",
+    match: /^src\/selfhost-public-artifact-source-composition\.ts$/u,
+    may: ["core", "v2-form", "selfhost-public-https-artifact-transport"],
+  },
+  {
     name: "v2-selfhost-composition",
     match: /^src\/selfhost-v2-worker-composition\.ts$/u,
     may: [
@@ -553,6 +565,7 @@ const LAYERS: readonly Layer[] = [
       "v2-selfhost-configured-input-sealer",
       "v2-selfhost-runtime-boot",
       "v2-selfhost-endpoint-boot",
+      "v2-selfhost-public-artifact-source-composition",
       "v2-worker-wake",
     ],
   },
@@ -683,6 +696,8 @@ const HOST_ONLY = [
   // than at the gate, and only for the requests that touched it.
   "src/objects-fs.ts",
   "src/selfhost-data-root.ts",
+  "src/selfhost-public-https-artifact-fetch.ts",
+  "src/selfhost-public-artifact-source-composition.ts",
   // The Bun API listener's bind address; a Worker binds nothing.
   "src/selfhost-listen-address.ts",
   "src/selfhost-socket-root.ts",
