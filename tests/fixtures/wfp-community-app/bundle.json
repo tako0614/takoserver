@@ -1,0 +1,11 @@
+{
+  "entrypoint": "worker.mjs",
+  "files": [
+    {
+      "path": "worker.mjs",
+      "url": "https://raw.githubusercontent.com/tako0614/takoserver/bfbc9aaa688008f15b2c4539635764200dace963/tests/fixtures/wfp-community-app/worker.mjs",
+      "sha256": "448d8180e9a4004f7d4b461d7345f24630c31ce0a1adac6980e04b5a9fb1af20",
+      "mediaType": "application/javascript+module"
+    }
+  ]
+}
