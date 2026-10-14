@@ -579,7 +579,8 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "adapter", "domain", "routes", "app", "package-surface"],
   },
   {
-    // The shared monetary source is domain data; it has no runtime authority.
+    // The shared monetary source is domain data; the hosted runtime pins its
+    // commercial terms while Price identities are resolved separately.
     name: "domain",
     match: /^src\/shared-hosted-pricing\.ts$/u,
     may: ["core", "domain", "release-data"],
@@ -587,6 +588,9 @@ const LAYERS: readonly Layer[] = [
 ];
 
 function layerOf(path: string): Layer | undefined {
+  if (path === "config/shared-hosted-pricing.json") {
+    return LAYERS.find((layer) => layer.name === "domain");
+  }
   // Unpublished source projections are domain inputs, not released data or
   // authority bundles. Their presence cannot confer publisher verification.
   if (path === "src/generated/takoform-forward-candidate-catalog.ts") {

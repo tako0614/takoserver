@@ -32,7 +32,8 @@ prices exist, match the selected cash amount, or activate the subscriptions.
 Runtime activation additionally needs the strict operator tariff and verified
 TEST-mode Stripe bindings. An authoring version 2 document binds a copy of this
 source, with both actual Price IDs filled in, to the tariff; a null Price ID
-fails closed. The activated runtime resolves Checkout requests and pinned paid
+fails closed. Every other field must match this checked-in source, including
+both monthly cash prices. The activated runtime resolves Checkout requests and pinned paid
 invoices by plan ID, checks the remote TEST Price and amount, and grants the
 matching included USD-micros. The committed source remains a preview with null
 Price IDs; syntactic IDs in a private authoring file are not proof of Stripe

@@ -7,7 +7,10 @@ tariff. Its top-level fields are `authoringVersion: 2`, `sharedPricing` (a copy 
 Price IDs for preview. For a private runtime candidate, supply both real TEST
 Price IDs in `sharedPricing.plans` and the same IDs in
 `billingConfig.plans.hosted-10` and `.hosted-50`. The parser rejects null or
-duplicate Price IDs, a plan or Free amount different from the shared source,
+duplicate Price IDs. Every other `sharedPricing` field must equal the
+checked-in source: a self-consistent private edit to the monthly cash price,
+plan identity, allowance, markup, meter cost, or warning threshold fails
+activation. It also rejects a plan or Free amount different from that source,
 and any nonzero meter missing or priced differently from the source's exact 3x
 Cloudflare rate. The zero-rated egress entry is omitted from the strict tariff
 because its meter parser accepts positive rates only. Set the tariff revision
@@ -20,7 +23,11 @@ TEST mode and verify the USD monthly amount. The preview never calls Stripe or
 proves an ID belongs to this operator.
 
 The version 1 authoring format below remains available for historical tariff
-snapshots and existing one-plan configurations.
+snapshots and existing one-plan configurations. A future approved version 2
+price revision must update the reviewed shared source and retain its previous
+version as a reviewed archive so pinned invoices and refunds can still resolve
+their original terms. Changing only the private authoring copy cannot roll out
+a new commercial price.
 
 Version 1 takes operator-selected plan identifiers and tariff values and produces one shared hosted plan table for Takosumi Hosted and Takoserver. The free, subscription, and usage plan IDs are mandatory authoring inputs. The tool has no plan-ID or price defaults and does not activate billing, write configuration, call Stripe, or change a ledger.
 

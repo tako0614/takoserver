@@ -84,6 +84,54 @@ function authoring() {
 }
 
 describe("hosted pricing runtime policy", () => {
+  test("rejects self-consistent v2 cash, allowance, identity, markup, meter, and warning drift", () => {
+    const changedCash = sharedAuthoring();
+    changedCash.sharedPricing.plans[0].monthlyPriceMicros = "1000000";
+    expect(() => compilePricingAuthoring(changedCash)).toThrow(/reviewed source/u);
+    expect(() => parseHostedPricing(JSON.stringify(changedCash))).toThrow(HostedPricingError);
+
+    const changedAllowance = sharedAuthoring();
+    changedAllowance.sharedPricing.plans[0].includedMicros = "21000000";
+    changedAllowance.billingConfig.plans["hosted-10"].includedMinor = 2100;
+    expect(() => compilePricingAuthoring(changedAllowance)).toThrow(/reviewed source/u);
+
+    const changedFree = sharedAuthoring();
+    changedFree.sharedPricing.freeIncludedMicros = "1000000";
+    changedFree.billingConfig.freeIncludedMinor = 100;
+    expect(() => compilePricingAuthoring(changedFree)).toThrow(/reviewed source/u);
+
+    const changedId = sharedAuthoring();
+    changedId.sharedPricing.plans[0].planId = "hosted-1";
+    const plans = changedId.billingConfig.plans as Record<
+      string,
+      {
+        includedMinor: number;
+        stripePriceId: string;
+      }
+    >;
+    plans["hosted-1"] = { includedMinor: 2000, stripePriceId: "price_final10" };
+    delete plans["hosted-10"];
+    expect(() => compilePricingAuthoring(changedId)).toThrow(/reviewed source/u);
+
+    const changedMarkup = sharedAuthoring();
+    changedMarkup.sharedPricing.markupMultiplier = 2;
+    for (const meter of Object.values(changedMarkup.billingConfig.meters)) {
+      meter.rate.numeratorMicros = ((BigInt(meter.rate.numeratorMicros) / 3n) * 2n).toString();
+    }
+    expect(() => compilePricingAuthoring(changedMarkup)).toThrow(/reviewed source/u);
+
+    const changedMeter = sharedAuthoring();
+    changedMeter.sharedPricing.meters["wfp.requests"].cloudflareCostMicros = "400000";
+    const requestMeter = changedMeter.billingConfig.meters["wfp.requests"];
+    if (!requestMeter) throw new Error("missing request meter fixture");
+    requestMeter.rate.numeratorMicros = "1200000";
+    expect(() => compilePricingAuthoring(changedMeter)).toThrow(/reviewed source/u);
+
+    const changedWarning = sharedAuthoring();
+    changedWarning.sharedPricing.warningBasisPoints = [7000, 9500];
+    expect(() => compilePricingAuthoring(changedWarning)).toThrow(/reviewed source/u);
+  });
+
   test("binds both finalized plans, exact 3x meters, and Free allowance to the tariff", () => {
     const authored = sharedAuthoring();
     const pricing = compilePricingAuthoring(authored);

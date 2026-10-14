@@ -1,3 +1,6 @@
+import committedSharedHostedPricing from "../config/shared-hosted-pricing.json" with {
+  type: "json",
+};
 import { type BillingConfig, BillingConfigError, parseBillingConfig } from "./billing-config.ts";
 import { canonicalJson } from "./json.ts";
 import { MoneyError, minorToMicros } from "./money.ts";
@@ -8,6 +11,20 @@ import {
 } from "./payment-settings.ts";
 import { parseSharedHostedPricing, SharedHostedPricingError } from "./shared-hosted-pricing.ts";
 import { parseStrictJson } from "./strict-json.ts";
+
+const committedSharedPricing = parseSharedHostedPricing(committedSharedHostedPricing);
+const committedSharedTerms = sharedTermsWithoutStripeIds(committedSharedPricing);
+
+function sharedTermsWithoutStripeIds(pricing: ReturnType<typeof parseSharedHostedPricing>): string {
+  return canonicalJson({
+    ...pricing,
+    plans: pricing.plans.map((plan) => {
+      const terms: Record<string, unknown> = { ...plan };
+      delete terms.stripePriceId;
+      return terms;
+    }),
+  });
+}
 
 export const PRICING_AUTHORING_MAX_BYTES = 1_048_576;
 export const HOSTED_PRICING_MAX_BYTES = 262_144;
@@ -227,6 +244,11 @@ function compileSharedRuntimePricing(root: Record<string, unknown>): PricingPrev
     if (error instanceof SharedHostedPricingError) fail("sharedPricing is invalid");
     throw error;
   }
+  if (
+    committedSharedPricing.plans.some((plan) => plan.stripePriceId !== null) ||
+    sharedTermsWithoutStripeIds(shared) !== committedSharedTerms
+  )
+    fail("sharedPricing differs from the reviewed source");
   const plans = shared.plans.map((plan) => {
     if (plan.stripePriceId === null)
       fail(`sharedPricing plan ${plan.planId} requires a Stripe Price ID`);
