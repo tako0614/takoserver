@@ -44,6 +44,7 @@ import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import {
   type LinuxProcessIdentity,
   type LinuxProcessLiveness,
+  linuxProcessLiveness,
   spawnWorkerdWithParentDeath,
   workerPortOwnership,
 } from "../src/workerd-linux-process.ts";
@@ -2526,7 +2527,194 @@ for (const exitsBeforeIdentity of [false, true]) {
   });
 }
 
-test("only a vanished successor turns an unreadable listener observation into occupancy", async () => {
+// A replacement that cannot bind exits on its own within milliseconds, racing
+// the persistence hook. The first three cases inject the observations that race
+// produced on a real Host, so none depends on scheduling or a wall-clock
+// window; the last keeps an unreadable listener table terminal.
+const UNREADABLE_REPLACEMENTS = [
+  {
+    unreadable: "refused-descriptors",
+    name: "a crashed child's replacement whose descriptor read is refused while it reads live keeps automatic recovery pending",
+  },
+  {
+    unreadable: "unknown-liveness",
+    name: "a crashed child's replacement whose liveness reads unknown while it is reaped keeps automatic recovery pending",
+  },
+  {
+    unreadable: "late-exit",
+    name: "a crashed child's replacement with an unreadable identity keeps automatic recovery pending without waiting for its exit",
+  },
+  {
+    unreadable: "listener-table",
+    name: "a crashed child's unreadable replacement still stops automatic recovery when the listener table cannot be read",
+  },
+] as const;
+
+for (const { unreadable, name } of UNREADABLE_REPLACEMENTS) {
+  const terminal = unreadable === "listener-table";
+  test(name, async () => {
+    const owned = await fixture();
+    const workerUid = `worker-unreadable-replacement-${unreadable}`;
+    const createId = "5f0c2b8e-3d1a-4c6b-9e7f-2a4d6c8e0b13";
+    const deleteId = "8b3e5d7f-1a2c-4e6b-8d0f-3c5e7a9b1d24";
+    const publication = staticPublicationState(workerUid);
+    const port = await unusedPort();
+    const statePath = join(
+      owned.root,
+      "owners",
+      createHash("sha256").update(workerUid, "utf8").digest("hex"),
+      "runtime-owner.json",
+    );
+    const ownerState = async () =>
+      JSON.parse(await readFile(statePath, "utf8")) as {
+        incarnations: Array<{ operationId: string; processIdentity: { pid: number } | null }>;
+        physicalAbsences: Array<{ processIdentity: { pid: number } }>;
+      };
+    const pinnedPid = async () =>
+      (await ownerState()).incarnations.find((item) => item.operationId === createId)
+        ?.processIdentity?.pid;
+    const errno = (code: string, path: string) =>
+      Object.assign(new Error(`${code}: ${path}`), { code });
+    const spawned: WorkerdProcess[] = [];
+    const observed: string[] = [];
+    let foreign: ReturnType<typeof Bun.serve> | undefined;
+    let blocked: WorkerdProcess | undefined;
+    let blockedProcess: ReturnType<typeof Bun.spawn> | undefined;
+    let reapedPid: number | undefined;
+    const owner = await openWorkerdWorkerRuntimeOwner({
+      rootDirectory: join(owned.root, "owners"),
+      workerResourceUid: workerUid,
+      targetKey: TARGET_KEY,
+      publicationState: publication.source,
+      workerdBinary: owned.binary,
+      listenerPortForOperation: async () => port,
+      spawn: (command) => {
+        if (spawned.length !== 1) {
+          const child = owned.spawn(command);
+          spawned.push(child);
+          return child;
+        }
+        // The first automatic restart. Another process has already bound the
+        // crashed child's listener, so this replacement cannot serve.
+        foreign = Bun.serve({ hostname: "127.0.0.1", port, fetch: () => new Response("foreign") });
+        let child: WorkerdProcess;
+        if (unreadable === "late-exit") {
+          // Its PID is already reaped, and its exit is only reported once the
+          // supervisor signals it, as on a stalled event loop.
+          if (reapedPid === undefined) throw new Error("reaped replacement PID missing");
+          let reportExit: (code: number) => void = () => undefined;
+          const exited = new Promise<number>((resolve) => {
+            reportExit = resolve;
+          });
+          child = { pid: reapedPid, exited, kill: () => reportExit(137) };
+        } else {
+          const live = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 60_000)"], {
+            stdout: "ignore",
+            stderr: "ignore",
+          });
+          blockedProcess = live;
+          child = { pid: live.pid, exited: live.exited, kill: () => live.kill(9) };
+        }
+        blocked = child;
+        spawned.push(child);
+        return child;
+      },
+      successorObservation: {
+        liveness: async (identity) => {
+          if (identity.pid !== blocked?.pid) return linuxProcessLiveness(identity);
+          observed.push("liveness");
+          return unreadable === "unknown-liveness" ? "unknown" : "live";
+        },
+        ownership: async (listenerPort, pid) => {
+          if (blocked !== undefined && pid === blocked.pid) {
+            observed.push("descriptors");
+            throw errno("EACCES", `/proc/${pid}/fd`);
+          }
+          if (blocked !== undefined && pid === undefined && unreadable === "listener-table") {
+            observed.push("listener table");
+            throw errno("EACCES", "/proc/net/tcp");
+          }
+          return workerPortOwnership(listenerPort, pid);
+        },
+      },
+    });
+    try {
+      expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
+        kind: "confirmed",
+      });
+      publication.setCurrent(createId);
+      const accepted = owned.children[0];
+      if (!accepted) throw new Error("accepted child missing");
+      expect(await pinnedPid()).toBe(accepted.pid);
+      expect(owner.health()).toBe("serving");
+      if (unreadable === "late-exit") {
+        const gone = Bun.spawn([process.execPath, "-e", ""], {
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        await gone.exited;
+        reapedPid = gone.pid;
+      }
+
+      accepted.kill("SIGKILL");
+      await accepted.exited;
+      await until(() => spawned.length > 1);
+      // Only the supervisor's own retirement signals the replacement.
+      await blocked?.exited;
+      await Bun.sleep(500);
+      expect(owner.health()).toBe("unavailable");
+      expect(spawned).toHaveLength(2);
+      expect(await pinnedPid()).toBe(accepted.pid);
+      expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toBe("foreign");
+      // The hook decided through the injected observation, not by chance.
+      expect(observed).toEqual(
+        {
+          "refused-descriptors": ["liveness", "descriptors"],
+          "unknown-liveness": ["liveness"],
+          "late-exit": [],
+          "listener-table": ["liveness", "descriptors", "listener table"],
+        }[unreadable],
+      );
+
+      await foreign?.stop(true);
+      foreign = undefined;
+      if (terminal) {
+        // A failed listener-table read is not occupancy: no retry follows.
+        await expect(until(() => spawned.length > 2, 3_000)).rejects.toThrow("timed out");
+        expect(owner.health()).toBe("unavailable");
+        expect(await pinnedPid()).toBe(accepted.pid);
+      } else {
+        await until(() => owner.health() === "serving", 15_000);
+        const replacement = owned.children.at(-1);
+        expect(replacement?.exitCode).toBeNull();
+        expect(replacement?.pid).not.toBe(accepted.pid);
+        expect(await pinnedPid()).toBe(replacement?.pid);
+        const absences = (await ownerState()).physicalAbsences.map(
+          (item) => item.processIdentity.pid,
+        );
+        expect(absences).toContain(accepted.pid);
+        expect(absences).not.toContain(blocked?.pid);
+        expect(
+          await (await owner.fetch(new Request(`https://${workerUid}.example.test/`))).text(),
+        ).toBeTruthy();
+      }
+
+      expect(await owner.execute(execution(workerUid, deleteId, "delete"))).toMatchObject({
+        kind: "confirmed",
+        identity: null,
+      });
+      await owner.close();
+    } finally {
+      await foreign?.stop(true);
+      await owner.close().catch(() => undefined);
+      blockedProcess?.kill(9);
+      await blockedProcess?.exited;
+      await owned.cleanup();
+    }
+  });
+}
+
+test("a successor holds the listener only when proven to; only an unreadable listener table is terminal", async () => {
   const successor: LinuxProcessIdentity = {
     pid: 4242,
     bootId: "00000000-0000-4000-8000-000000000000",
@@ -2534,31 +2722,43 @@ test("only a vanished successor turns an unreadable listener observation into oc
     startTimeTicks: "100",
   };
   const errno = (code: string) => Object.assign(new Error(`proc read ${code}`), { code });
-  const classify = (liveness: LinuxProcessLiveness[], ownership: () => Promise<string>) =>
+  const classify = (
+    liveness: LinuxProcessLiveness,
+    ownership: (pid: number | undefined) => Promise<string>,
+  ) =>
     workerdSuccessorHoldsListener(28793, successor, {
-      liveness: async () => liveness.shift() ?? "unknown",
-      ownership: ownership as typeof workerPortOwnership,
+      liveness: async () => liveness,
+      ownership: (async (_port: number, pid: number | undefined) =>
+        ownership(pid)) as typeof workerPortOwnership,
     });
   const unexpected = () => Promise.reject(new Error("ownership must not be read"));
+  const descriptorsFail = (failure: Error) => async (pid: number | undefined) => {
+    if (pid === successor.pid) throw failure;
+    return "foreign";
+  };
 
-  expect(await classify(["live"], async () => "owned")).toBe(true);
-  expect(await classify(["live"], async () => "foreign")).toBe(false);
-  expect(await classify(["live"], async () => "vacant")).toBe(false);
-  expect(await classify(["stale"], unexpected)).toBe(false);
-  // The successor exiting during its descriptor read is the expected race.
-  expect(await classify(["live", "stale"], () => Promise.reject(errno("ENOENT")))).toBe(false);
-  expect(await classify(["live", "stale"], () => Promise.reject(errno("ESRCH")))).toBe(false);
-  // Anything else is not occupancy evidence and stays terminal.
-  await expect(classify(["unknown"], unexpected)).rejects.toMatchObject({
+  expect(await classify("live", async () => "owned")).toBe(true);
+  expect(await classify("live", async () => "foreign")).toBe(false);
+  expect(await classify("live", async () => "vacant")).toBe(false);
+  // A successor that is not proven live is not proven to hold the listener,
+  // including one whose stat read fails (ESRCH) while it is being reaped.
+  expect(await classify("stale", unexpected)).toBe(false);
+  expect(await classify("unknown", unexpected)).toBe(false);
+  // Nor is one whose own descriptors cannot be read, for any reason: an
+  // exiting task's /proc/<pid>/fd is refused (EACCES) under a user namespace.
+  for (const failure of [
+    errno("EACCES"),
+    errno("ENOENT"),
+    errno("ESRCH"),
+    new Error("descriptor read failed"),
+  ]) {
+    expect(await classify("live", descriptorsFail(failure))).toBe(false);
+  }
+  // A listener table that cannot be read is not about the successor.
+  await expect(classify("live", () => Promise.reject(errno("EACCES")))).rejects.toMatchObject({
     code: "ownership_uncertain",
   });
   await expect(
-    classify(["live", "live"], () => Promise.reject(errno("ENOENT"))),
-  ).rejects.toMatchObject({ code: "ownership_uncertain" });
-  await expect(
-    classify(["live", "stale"], () => Promise.reject(errno("EACCES"))),
-  ).rejects.toMatchObject({ code: "ownership_uncertain" });
-  await expect(
-    classify(["live", "stale"], () => Promise.reject(new Error("procfs unavailable"))),
+    classify("live", () => Promise.reject(new Error("procfs unavailable"))),
   ).rejects.toMatchObject({ code: "ownership_uncertain" });
 });

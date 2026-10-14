@@ -507,13 +507,13 @@ const LAYERS: readonly Layer[] = [
   {
     name: "adapter",
     match:
-      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-object-store|selfhost-data-root|selfhost-listen-address|selfhost-socket-root|selfhost-endpoint-https-tls|selfhost-v2-worker-endpoint-upstream-websocket|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|money-cutover-sql|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-object-store|selfhost-data-root|selfhost-listen-address|selfhost-socket-root|selfhost-endpoint-https-tls|selfhost-v2-worker-endpoint-upstream-websocket|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
     may: ["core", "adapter", "native-contract"],
   },
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|money|meter-pricing|org-billing|billing-config|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|queue-custody|actor-class-execution|actor-class-candidate-inspection|actor-resource-graph|worker-endpoint-origin-reservations|selfhost-actor-contract-closure|workflow-instances|workflow-resource-graph|workflow-resource-lifecycle|workflow-data|workflow-driver|workflow-execution|workflow-due-scheduler|workflow-class-execution|workflow-execution-host|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|integration-organization-bootstrap|sponsorship-authority|sponsorship-credential|sponsorship-issuance-receipt|tenant-run-credential|tenant-run-principal|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|stripe-events|payment-events|payment-settings|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$|integration-actor-(?:host|form-authority)\.ts$)/u,
+      /^src\/(?:token|auth|ledger|money|meter-pricing|org-billing|billing-config|hosted-pricing|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|queue-custody|actor-class-execution|actor-class-candidate-inspection|actor-resource-graph|worker-endpoint-origin-reservations|selfhost-actor-contract-closure|workflow-instances|workflow-resource-graph|workflow-resource-lifecycle|workflow-data|workflow-driver|workflow-execution|workflow-due-scheduler|workflow-class-execution|workflow-execution-host|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|integration-organization-bootstrap|sponsorship-authority|sponsorship-credential|sponsorship-issuance-receipt|tenant-run-credential|tenant-run-principal|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|stripe-events|stripe-billing|stripe-billing-client|stripe-billing-store|payment-events|payment-settings|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$|integration-actor-(?:host|form-authority)\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {
@@ -578,9 +578,19 @@ const LAYERS: readonly Layer[] = [
       /^src\/(?:index|provider-extension|workflow-runtime|workflow-runtime-transport|workflow-runtime-workerd)\.ts$|^src\/takoform\/integration-actor-(?:host|form-authority)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "package-surface"],
   },
+  {
+    // The shared monetary source is domain data; the hosted runtime pins its
+    // commercial terms while Price identities are resolved separately.
+    name: "domain",
+    match: /^src\/shared-hosted-pricing\.ts$/u,
+    may: ["core", "domain", "release-data"],
+  },
 ];
 
 function layerOf(path: string): Layer | undefined {
+  if (path === "config/shared-hosted-pricing.json") {
+    return LAYERS.find((layer) => layer.name === "domain");
+  }
   // Unpublished source projections are domain inputs, not released data or
   // authority bundles. Their presence cannot confer publisher verification.
   if (path === "src/generated/takoform-forward-candidate-catalog.ts") {

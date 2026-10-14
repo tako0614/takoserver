@@ -10,6 +10,7 @@ import {
   type D1SchemaState,
   readMigrationArtifact,
 } from "../scripts/deploy/migrations.ts";
+import { runD1Schema } from "../scripts/deploy/schema.ts";
 import {
   assertMoneyLiveBackupCompleteness,
   assertMoneyNativeForeignKeys,
@@ -29,10 +30,13 @@ import {
   reconcileMoneyCutoverDispatched,
   runIntegrationMoneyUnitCutover,
 } from "../scripts/deploy/schema-money-unit-cutover.ts";
+import { createMoneyCutoverSql, inspectMoneyCutoverGuard } from "../src/money-cutover-sql.ts";
+import { createSqliteSql } from "../src/sql-sqlite.ts";
 
 const files = readMigrationArtifact().files;
 const sha = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
 const marker = sha("local money cutover proof");
+const writerEpoch = sha("reviewed writer generation");
 
 function fixture() {
   const database = new Database(":memory:");
@@ -75,6 +79,7 @@ function sql(
     originDigest: marker,
     backupDigest: marker,
     writerDigest: marker,
+    writerEpoch,
     classifications: classifications as never,
     ...(abandonFrom === undefined ? {} : { abandonFrom }),
   });
@@ -87,10 +92,27 @@ const reader = (database: Database) => ({
 });
 
 describe("fixed money cutover SQL", () => {
+  test("selected transaction-fenced target cannot use generic 0095 schema lane", async () => {
+    await expect(
+      runD1Schema(
+        { action: "status", environment: "integration", commit: "a".repeat(40) },
+        {
+          environment: "integration",
+          moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1",
+        } as never,
+        {
+          run: async () => {
+            throw new Error("provider read");
+          },
+        },
+      ),
+    ).rejects.toThrow("reviewed 0095 suffix");
+  });
   test("expected-shape cache still rejects changed migration bytes after warm-up", () => {
     const phases = ["0092", "0092-fenced", "0093", "0093-fenced", "0094", "0094-fenced"] as const;
     const shapes = phases.map((phase) => moneyUnitCutoverExpectedShape(files, phase));
-    expect(new Set(shapes).size).toBe(6);
+    expect(new Set(shapes).size).toBe(5);
+    expect(shapes[4]).toBe(shapes[5]); // 0094 freeze is a row-state distinction.
     for (const [index, phase] of phases.entries()) {
       expect(moneyUnitCutoverExpectedShape(files, phase)).toBe(
         shapes[index] ?? "missing expected shape",
@@ -194,6 +216,8 @@ describe("fixed money cutover SQL", () => {
         d1: { databaseId, databaseName },
         r2: { bucketName: databaseName },
         workerName: databaseName,
+        moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1",
+        moneyCutoverWriterEpoch: writerEpoch,
       } as never;
       const liveIdentity = { accountId, databaseId, databaseName, bucketName: databaseName };
       const origin: MoneyStageOriginProof = {
@@ -218,6 +242,7 @@ describe("fixed money cutover SQL", () => {
         moduleDigest: marker,
         trafficPercent: 100,
         privateMoneyWriters: 0,
+        writerEpoch,
         privateScopeDigest: marker,
         privateSourceInventoryDigest: marker,
         privateDependencyClosureDigest: marker,
@@ -277,6 +302,7 @@ describe("fixed money cutover SQL", () => {
           aggregateDigest,
           financialDigest,
           writerDigest,
+          writerEpoch,
           sourceDigest: origin.sourceDigest,
         }),
       );
@@ -288,6 +314,7 @@ describe("fixed money cutover SQL", () => {
         originDigest,
         backupDigest: normalized.digest,
         writerDigest,
+        writerEpoch,
       });
       const sealedImportPath = join(importDirectory, "import.sql");
       writeFileSync(sealedImportPath, importSql, { mode: 0o600 });
@@ -308,6 +335,7 @@ describe("fixed money cutover SQL", () => {
         classificationDigest: sha("[]\n"),
         writerDigest,
         resumeDigest: sha("no-resume-worker"),
+        writerEpoch,
       };
       const review = {
         kind: "takoserver.money-independent-review@v1",
@@ -333,6 +361,7 @@ describe("fixed money cutover SQL", () => {
         classificationDigest: reviewBinding.classificationDigest,
         writerDigest,
         resumeDigest: reviewBinding.resumeDigest,
+        writerEpoch,
         reviewDigest: sha(JSON.stringify(review)),
         beforeShapeDigest,
         afterSchemaPhase: "0092-fenced",
@@ -350,6 +379,7 @@ describe("fixed money cutover SQL", () => {
       const options = {
         phase: "freeze",
         maintenanceCommit: writer.sourceCommit,
+        writerEpoch,
         backupPath,
         outputDirectory,
         stageOriginProof: async () => origin,
@@ -439,6 +469,7 @@ describe("fixed money cutover SQL", () => {
       expect(await readMoneyPreimageDigest(reader(database), "preflight")).toBe(before);
       apply(database, sql("convert", classifications));
       expect(moneyUnitCutoverSchemaMatches(state(database), files, "0094-fenced")).toBe(true);
+      expect(await inspectMoneyCutoverGuard(createSqliteSql(database), writerEpoch)).toBe("frozen");
       expect(await readMoneyPreimageDigest(reader(database), "verification", true)).toBe(before);
       expect(await readMoneyAggregateDigest(reader(database), "verification", true)).toBe(
         aggregates,
@@ -455,8 +486,91 @@ describe("fixed money cutover SQL", () => {
           "INSERT INTO ledger (id,org_id,type,ref,settled_delta_micros,held_delta_micros,created_at) VALUES ('x','org-1','funding','x',1,0,'now')",
         ),
       ).toThrow();
+      database.exec("SAVEPOINT missing_freeze");
+      database.exec("DELETE FROM money_cutover_freeze");
+      expect(
+        (database.query("SELECT COUNT(*) AS n FROM money_cutover_freeze").get() as { n: number }).n,
+      ).toBe(0);
+      expect(sql("resume")).toContain("invalid-resume-epoch");
+      const resumeAssertion = sql("resume").split(";\n")[0] ?? "";
+      expect(() => database.query(resumeAssertion).run()).toThrow();
+      database.exec("ROLLBACK TO missing_freeze; RELEASE missing_freeze");
+      database.exec(
+        `INSERT INTO money_cutover_writer_permit VALUES (1, 'usd-micros-v2', '${writerEpoch}')`,
+      );
+      expect(() => database.query(resumeAssertion).run()).toThrow();
+      const resumeDelete = sql("resume").split(";\n")[1] ?? "";
+      expect(database.query(resumeDelete).run().changes).toBe(0);
+      expect(
+        (database.query("SELECT COUNT(*) AS n FROM money_cutover_freeze").get() as { n: number }).n,
+      ).toBe(1);
+      database.exec("DELETE FROM money_cutover_writer_permit");
       apply(database, sql("resume"));
       expect(moneyUnitCutoverSchemaMatches(state(database), files, "0094")).toBe(true);
+      const bare = createSqliteSql(database);
+      expect(await inspectMoneyCutoverGuard(bare, writerEpoch)).toBe("ready");
+      const oldStripeInsert =
+        "INSERT INTO stripe_events (event_id,type,livemode,event_created_at,received_at,outcome) VALUES ('evt_legacy','checkout.session.completed',0,'now','now','received')";
+      expect(() => database.exec(oldStripeInsert)).toThrow("money cutover writer permit required");
+      const current = createMoneyCutoverSql(bare, writerEpoch);
+      await expect(current.run("DELETE FROM money_cutover_freeze")).rejects.toThrow(
+        "outside the guarded surface",
+      );
+      await expect(current.run("/* comment */ DROP TABLE stripe_events")).rejects.toThrow(
+        "outside the guarded surface",
+      );
+      await expect(
+        current.run("UPDATE stripe_events SET outcome = 'x'; DELETE FROM stripe_events"),
+      ).rejects.toThrow("outside the guarded surface");
+      expect((await current.run(oldStripeInsert)).changes).toBe(1);
+      expect(() =>
+        database.exec(
+          "UPDATE stripe_events SET outcome = 'ignored', settled_at = 'now' WHERE event_id = 'evt_legacy'",
+        ),
+      ).toThrow("money cutover writer permit required");
+      expect(
+        (
+          await current.run(
+            "UPDATE stripe_events SET outcome = 'ignored', settled_at = 'now' WHERE event_id = 'evt_legacy'",
+          )
+        ).changes,
+      ).toBe(1);
+      await expect(
+        current.batch([
+          { sql: oldStripeInsert },
+          { sql: "UPDATE stripe_events SET outcome = 'credited' WHERE event_id = 'evt_legacy'" },
+        ]),
+      ).rejects.toThrow();
+      expect(await bare.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+      await expect(
+        current.query(
+          "UPDATE stripe_events SET outcome = 'ignored' WHERE event_id = 'evt_legacy' RETURNING event_id",
+        ),
+      ).rejects.toThrow();
+      expect(
+        await current.query(
+          "WITH selected AS (SELECT 'evt_legacy' AS id) UPDATE stripe_events SET outcome = 'credited' WHERE event_id = (SELECT id FROM selected) RETURNING event_id",
+        ),
+      ).toEqual([{ event_id: "evt_legacy" }]);
+      const concurrent = await Promise.allSettled([
+        current.run(
+          "INSERT INTO stripe_events (event_id,type,livemode,event_created_at,received_at,outcome) VALUES ('evt_new_a','checkout.session.completed',0,'now','now','received')",
+        ),
+        current.run(
+          "INSERT INTO stripe_events (event_id,type,livemode,event_created_at,received_at,outcome) VALUES ('evt_new_b','checkout.session.completed',0,'now','now','received')",
+        ),
+      ]);
+      expect(concurrent.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(await bare.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+      const nextWriterEpoch = sha("next reviewed Writer generation");
+      database
+        .query("UPDATE money_cutover_authorized_epoch SET writer_epoch = ? WHERE singleton = 1")
+        .run(nextWriterEpoch);
+      await expect(inspectMoneyCutoverGuard(bare, writerEpoch)).rejects.toThrow(
+        "permit or policy differs",
+      );
+      await expect(current.run("SELECT 1")).rejects.toThrow("Writer epoch revoked");
+      expect(await bare.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
     } finally {
       database.close();
     }
@@ -535,6 +649,7 @@ describe("fixed money cutover SQL", () => {
         {
           phase: "freeze",
           maintenanceCommit: "b".repeat(40),
+          writerEpoch,
           backupPath: "/dev/null",
           outputDirectory: "/dev/shm/t",
           stageOriginProof: async () => {
@@ -587,6 +702,7 @@ describe("fixed money cutover SQL", () => {
         {
           phase: "freeze",
           maintenanceCommit: "b".repeat(40),
+          writerEpoch,
           backupPath: "/dev/null",
           stageOriginProof: async () => {
             reads += 1;

@@ -39,6 +39,7 @@ import {
 import {
   assertProviderExecutorUnchanged,
   assertWorkerMoneyUnitSchema,
+  probeMoneyCutoverProductOrFrozen,
   probeProduct,
   probeSchemaMaintenance,
   providerExecutorAllowsPublication,
@@ -683,10 +684,16 @@ export async function runWorkerClosureTransition(
               target.publicOrigin,
               options.fetcher ?? ((input, init) => fetch(input, init)),
             )
-          : await probeProduct(
-              target.publicOrigin,
-              options.fetcher ?? ((input, init) => fetch(input, init)),
-            );
+          : target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
+              afterMigrations.applied.length === 94
+            ? await probeMoneyCutoverProductOrFrozen(
+                target.publicOrigin,
+                options.fetcher ?? ((input, init) => fetch(input, init)),
+              )
+            : await probeProduct(
+                target.publicOrigin,
+                options.fetcher ?? ((input, init) => fetch(input, init)),
+              );
     const rollbackVersionId = after.history.previousVersionId;
     if (rollbackVersionId === null) {
       throw verificationError(
@@ -720,6 +727,7 @@ export async function runWorkerClosureTransition(
           ? {}
           : { maintenance: target.schemaMaintenanceMode }),
         probe,
+        servingReady: !("traffic" in probe),
         mutationApplied: true,
         rollback:
           `wrangler versions deploy ${rollbackVersionId}@100% --yes ` +

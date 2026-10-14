@@ -125,6 +125,8 @@ export interface AppPorts {
   readonly settlement: FundingSettlementVerifier;
   /** Frozen operator tariff; absent keeps the Organization billing API disabled. */
   readonly billingConfig?: BillingConfig;
+  /** Set only by an entry with validated Hosted pricing and Stripe schema. */
+  readonly hostedPaidFreeExclusion?: boolean;
   /** Starts a payment, where this deployment can take one. */
   readonly checkout?: Checkout | undefined;
   /**
@@ -384,9 +386,17 @@ export function buildApp(ports: AppPorts): App {
         clock,
       })
     : null;
-  const ledger = createLedger(ports.sql, clock);
+  const ledger = createLedger(ports.sql, clock, {
+    hostedPaidFreeExclusion: ports.hostedPaidFreeExclusion === true,
+  });
   const orgBilling = ports.billingConfig
-    ? createOrgBilling({ sql: ports.sql, clock, ledger, config: ports.billingConfig })
+    ? createOrgBilling({
+        sql: ports.sql,
+        clock,
+        ledger,
+        config: ports.billingConfig,
+        hostedPaidFreeExclusion: ports.hostedPaidFreeExclusion === true,
+      })
     : undefined;
   const paymentEvents = ports.paymentEvents?.({
     sql: ports.sql,
@@ -762,6 +772,8 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.checkout ? { checkout: ports.checkout } : {}),
     ...(paymentEvents?.receive ? { paymentNotifications: paymentEvents.receive } : {}),
     ...(operatorPaymentsReconcile ? { operatorPaymentsReconcile } : {}),
+    ...(paymentEvents?.subscriptions ? { subscriptions: paymentEvents.subscriptions } : {}),
+    ...(paymentEvents?.creditFunding ? { creditFunding: paymentEvents.creditFunding } : {}),
     ledger,
     ...(orgBilling ? { billing: orgBilling } : {}),
     catalog,

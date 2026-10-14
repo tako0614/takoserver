@@ -16,6 +16,18 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
+  MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE,
+  MONEY_CUTOVER_FINANCIAL_TABLES,
+  MONEY_CUTOVER_FREEZE_DDL,
+  MONEY_CUTOVER_PERMIT_DDL,
+  MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
+  MONEY_CUTOVER_PERMIT_TABLE,
+  MONEY_CUTOVER_WRITER_EPOCH_PATTERN,
+  moneyCutoverClassificationTriggerSql,
+  moneyCutoverFinancialTriggerSql,
+} from "../../src/money-cutover-sql.ts";
 import { applicationSchemaMatches } from "./application-schema-shape.ts";
 import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
@@ -51,31 +63,10 @@ const SOURCE_0094_SHA = "sha256:7ce85b52626f6cbef6e06484e9cddb5052fab76f9718fea2
 const MAX_CLASSIFICATIONS = 1000;
 
 /** Every predecessor table through which the public Host can start or finish a financial mutation. */
-export const MONEY_FENCE_TABLES_0092 = [
-  "ledger",
-  "wallet_credit_lots",
-  "wallet_credit_allocations",
-  "wallet_allocation_guards",
-  "quotes",
-  "reservations",
-  "usage_statements",
-  "usage_events",
-  "idempotency",
-  "reseller_settlement_intents",
-  "reseller_settlement_guards",
-  "stripe_events",
-  "org_wallet_holds",
-  "org_wallet_usage_records",
-  "org_wallet_grant_snapshots",
-  "org_wallet_pricing_revisions",
-  "org_wallet_monthly_tariffs",
-  "sponsorship_tenants",
-  "sponsorship_resources",
-  "sponsorship_credential_issuance_operations",
-] as const;
+export const MONEY_FENCE_TABLES_0092 = MONEY_CUTOVER_FINANCIAL_TABLES;
 const CLASSIFICATION_TABLE = "wallet_credit_lot_classification_proofs";
 const FENCE_TABLE = "money_cutover_freeze";
-const FENCE_DDL = `CREATE TABLE ${FENCE_TABLE} (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), binding_digest TEXT NOT NULL, origin_digest TEXT NOT NULL, backup_digest TEXT NOT NULL, writer_digest TEXT NOT NULL, source_digest TEXT NOT NULL)`;
+const FENCE_DDL = MONEY_CUTOVER_FREEZE_DDL;
 const verbs = ["INSERT", "UPDATE", "DELETE"] as const;
 
 export type MoneyCutoverPhase =
@@ -124,6 +115,7 @@ export interface MoneyWriterProof {
   readonly moduleDigest: string;
   readonly trafficPercent: 100;
   readonly privateMoneyWriters: 0;
+  readonly writerEpoch: string;
   readonly privateScopeDigest: string;
   readonly privateSourceInventoryDigest: string;
   readonly privateDependencyClosureDigest: string;
@@ -142,8 +134,9 @@ export interface MoneyResumeProof {
   readonly deploymentId: string;
   readonly versionId: string;
   readonly trafficPercent: 100;
-  readonly nativeHealth: "healthy";
-  readonly oldMoneyWriters: 0;
+  /** Stable native Version policy; phase health is checked separately. */
+  readonly writerContainmentPolicy: "transaction-fenced-usd-micros-v1";
+  readonly writerEpoch: string;
   readonly privateScopeDigest: string;
   readonly privateSourceInventoryDigest: string;
   readonly privateDependencyClosureDigest: string;
@@ -168,6 +161,7 @@ export interface MoneyReviewBinding {
   readonly classificationDigest: string;
   readonly writerDigest: string;
   readonly resumeDigest: string;
+  readonly writerEpoch: string;
 }
 
 export interface MoneyReviewProof {
@@ -195,6 +189,7 @@ export interface MoneyCutoverDispatchBinding {
   readonly classificationDigest: string;
   readonly writerDigest: string;
   readonly resumeDigest: string;
+  readonly writerEpoch: string;
   readonly reviewDigest: string;
   readonly beforeShapeDigest: string;
   readonly afterSchemaPhase: MoneySchemaPhase;
@@ -230,6 +225,7 @@ export interface MoneyStorageIdentity {
 export interface MoneyUnitCutoverOptions {
   readonly phase: MoneyCutoverPhase;
   readonly maintenanceCommit: string;
+  readonly writerEpoch: string;
   readonly resumeCommit?: string;
   readonly stageOriginProof: () => Promise<MoneyStageOriginProof>;
   /** Native GET implementation is supplied by the owning deploy adapter, never by declaration data. */
@@ -237,6 +233,8 @@ export interface MoneyUnitCutoverOptions {
   /** Must inspect the published native Version, selected source bytes, bindings and 100% deployment. */
   readonly maintenanceProof: () => Promise<MoneyWriterProof>;
   readonly resumeProof?: () => Promise<MoneyResumeProof>;
+  /** Exact staged 503 before row deletion, exact healthy product after it. */
+  readonly resumeHealthRead?: (expected: "guarded" | "healthy") => Promise<void>;
   readonly independentReview?: (binding: MoneyReviewBinding) => Promise<MoneyReviewProof | null>;
   readonly custody: MoneyCutoverCustody;
   readonly backupPath: string;
@@ -304,7 +302,9 @@ export function moneyFenceTriggerName(table: string, verb: (typeof verbs)[number
 }
 
 function fenceTriggerSql(table: string, verb: (typeof verbs)[number]): string {
-  return `CREATE TRIGGER ${moneyFenceTriggerName(table, verb)} BEFORE ${verb} ON ${table} BEGIN SELECT RAISE(ABORT, 'money cutover frozen'); END`;
+  return table === CLASSIFICATION_TABLE
+    ? moneyCutoverClassificationTriggerSql(verb)
+    : moneyCutoverFinancialTriggerSql(table, verb);
 }
 
 export function moneyFenceInstallSql(phase: MoneySchemaPhase): string {
@@ -352,9 +352,18 @@ export function moneyUnitCutoverExpectedShape(
       if (count !== 92 && count !== 93 && count !== 94) continue;
       const plain = `00${count}` as MoneySchemaPhase;
       const fenced = `${plain}-fenced` as MoneySchemaPhase;
+      if (count === 94) {
+        database.exec(
+          `${FENCE_DDL};\n${MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL};\n${MONEY_CUTOVER_PERMIT_DDL};\n${MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL};\n${moneyFenceInstallSql("0094-fenced")}`,
+        );
+      }
       shapes.set(plain, shape());
       database.exec("SAVEPOINT money_cutover_expected_fence");
-      database.exec(`${FENCE_DDL};\n${moneyFenceInstallSql(fenced)}`);
+      if (count !== 94) {
+        database.exec(
+          `${FENCE_DDL};\n${MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL};\n${MONEY_CUTOVER_PERMIT_DDL};\n${MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL};\n${moneyFenceInstallSql(fenced)}`,
+        );
+      }
       shapes.set(fenced, shape());
       database.exec(
         "ROLLBACK TO money_cutover_expected_fence; RELEASE money_cutover_expected_fence",
@@ -707,6 +716,7 @@ function assertMaintenanceProof(
     !SHA256.test(proof.moduleDigest) ||
     proof.trafficPercent !== 100 ||
     proof.privateMoneyWriters !== 0 ||
+    proof.writerEpoch !== target.moneyCutoverWriterEpoch ||
     !SHA256.test(proof.privateScopeDigest) ||
     !SHA256.test(proof.privateSourceInventoryDigest) ||
     !SHA256.test(proof.privateDependencyClosureDigest) ||
@@ -732,8 +742,9 @@ function assertResumeProof(target: DeployTarget, proof: MoneyResumeProof, commit
     !UUID.test(proof.versionId) ||
     !SHA256.test(proof.moduleDigest) ||
     proof.trafficPercent !== 100 ||
-    proof.nativeHealth !== "healthy" ||
-    proof.oldMoneyWriters !== 0 ||
+    proof.writerContainmentPolicy !== "transaction-fenced-usd-micros-v1" ||
+    target.moneyCutoverWriterPolicy !== proof.writerContainmentPolicy ||
+    proof.writerEpoch !== target.moneyCutoverWriterEpoch ||
     !SHA256.test(proof.privateScopeDigest) ||
     !SHA256.test(proof.privateSourceInventoryDigest) ||
     !SHA256.test(proof.privateDependencyClosureDigest) ||
@@ -742,7 +753,7 @@ function assertResumeProof(target: DeployTarget, proof: MoneyResumeProof, commit
     !SHA256.test(proof.publicSourceArtifactDigest)
   ) {
     throw preflightError(
-      "money resume requires healthy native USD-micros Worker and zero old writers",
+      "money resume requires native USD-micros Writer with transaction containment policy",
     );
   }
 }
@@ -768,10 +779,12 @@ function phaseSchemas(phase: MoneyCutoverPhase): {
   }
 }
 
-function exactStatus(
+async function exactStatus(
+  database: PreimageReader,
   state: D1SchemaState,
   files: readonly MigrationFile[],
-): MoneySchemaPhase | null {
+  writerEpoch: string,
+): Promise<MoneySchemaPhase | null> {
   for (const phase of [
     "0092",
     "0092-fenced",
@@ -780,7 +793,26 @@ function exactStatus(
     "0094",
     "0094-fenced",
   ] as const) {
-    if (moneyUnitCutoverSchemaMatches(state, files, phase)) return phase;
+    if (!moneyUnitCutoverSchemaMatches(state, files, phase)) continue;
+    if (phase.endsWith("-fenced") || phase === "0094") {
+      const permit = await database.query(
+        "preflight",
+        "money writer permit",
+        `SELECT singleton, epoch, writer_epoch FROM ${MONEY_CUTOVER_PERMIT_TABLE}`,
+      );
+      if (permit.length !== 0) return null;
+      const epoch = await database.query(
+        "preflight",
+        "authorized money writer epoch",
+        `SELECT singleton, writer_epoch FROM ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE}`,
+      );
+      if (epoch.length !== 1 || epoch[0]?.singleton !== 1 || epoch[0]?.writer_epoch !== writerEpoch)
+        return null;
+      const frozen = await readFreezeRow(database, "preflight");
+      if (phase === "0094") return frozen.length === 0 ? phase : "0094-fenced";
+      if (frozen.length !== 1) return null;
+    }
+    return phase;
   }
   return null;
 }
@@ -794,6 +826,41 @@ function readFreezeRow(
     "money freeze anchor",
     `SELECT binding_digest, origin_digest, backup_digest, writer_digest, source_digest FROM ${FENCE_TABLE} WHERE singleton = 1`,
   );
+}
+
+async function assertPermitEmpty(
+  database: PreimageReader,
+  phase: DeployPhase,
+  writerEpoch: string,
+): Promise<void> {
+  const rows = await database.query(
+    phase,
+    "money writer permit",
+    `SELECT singleton, epoch, writer_epoch FROM ${MONEY_CUTOVER_PERMIT_TABLE}`,
+  );
+  if (rows.length !== 0) throw proofError(phase, "money writer permit is not empty at rest");
+  const authorized = await database.query(
+    phase,
+    "authorized money writer epoch",
+    `SELECT singleton, writer_epoch FROM ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE}`,
+  );
+  if (
+    authorized.length !== 1 ||
+    authorized[0]?.singleton !== 1 ||
+    authorized[0]?.writer_epoch !== writerEpoch
+  )
+    throw proofError(phase, "money authorized Writer epoch differs");
+}
+
+async function assertResumedFreezeEmpty(
+  database: PreimageReader,
+  phase: DeployPhase,
+  writerEpoch: string,
+): Promise<void> {
+  if ((await readFreezeRow(database, phase)).length !== 0) {
+    throw proofError(phase, "money freeze row remains after resume");
+  }
+  await assertPermitEmpty(database, phase, writerEpoch);
 }
 
 function assertFreezeRow(
@@ -907,12 +974,13 @@ function phaseImportSql(
   originDigest: string,
   backupDigest: string,
   writerDigest: string,
+  writerEpoch: string,
   classifications: readonly ClassificationRow[],
   abandonFrom?: "0092-fenced" | "0093-fenced",
 ): string {
   switch (phase) {
     case "freeze":
-      return `${FENCE_DDL};\nINSERT INTO ${FENCE_TABLE} VALUES (1, ${sqlLiteral(anchor)}, ${sqlLiteral(originDigest)}, ${sqlLiteral(backupDigest)}, ${sqlLiteral(writerDigest)}, ${sqlLiteral(SOURCE_0092)});\n${moneyFenceInstallSql("0092-fenced")}\n`;
+      return `${FENCE_DDL};\n${MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL};\nINSERT INTO ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE} (singleton, writer_epoch) VALUES (1, ${sqlLiteral(writerEpoch)});\n${MONEY_CUTOVER_PERMIT_DDL};\n${MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL};\nINSERT INTO ${FENCE_TABLE} VALUES (1, ${sqlLiteral(anchor)}, ${sqlLiteral(originDigest)}, ${sqlLiteral(backupDigest)}, ${sqlLiteral(writerDigest)}, ${sqlLiteral(SOURCE_0092)});\n${moneyFenceInstallSql("0092-fenced")}\n`;
     case "prepare": {
       const migration = buildD1MigrationImport([files[92] as MigrationFile], {
         freshLedger: false,
@@ -937,12 +1005,17 @@ function phaseImportSql(
       });
       return `${moneyFenceDropSql("0093-fenced")}\n${migration.sql}\n${moneyFenceInstallSql("0094-fenced")}\n`;
     }
-    case "resume":
-      return `${moneyFenceDropSql("0094-fenced")}\nDROP TABLE ${FENCE_TABLE};\n`;
+    case "resume": {
+      const matchingFreeze = `SELECT 1 FROM ${FENCE_TABLE} WHERE singleton = 1 AND binding_digest = ${sqlLiteral(anchor)} AND origin_digest = ${sqlLiteral(originDigest)} AND backup_digest = ${sqlLiteral(backupDigest)} AND writer_digest = ${sqlLiteral(writerDigest)} AND source_digest = ${sqlLiteral(SOURCE_0092)}`;
+      // A deliberately invalid epoch aborts the entire /import if the exact
+      // row disappeared or a permit appeared between preflight and dispatch.
+      const matchingEpoch = `SELECT 1 FROM ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE} WHERE singleton = 1 AND writer_epoch = ${sqlLiteral(writerEpoch)}`;
+      return `INSERT INTO ${MONEY_CUTOVER_PERMIT_TABLE} (singleton, epoch, writer_epoch) SELECT 1, 'invalid-resume-epoch', ${sqlLiteral(writerEpoch)} WHERE NOT EXISTS (${matchingFreeze}) OR NOT EXISTS (${matchingEpoch}) OR EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_PERMIT_TABLE});\nDELETE FROM ${FENCE_TABLE} WHERE singleton = 1 AND binding_digest = ${sqlLiteral(anchor)} AND origin_digest = ${sqlLiteral(originDigest)} AND backup_digest = ${sqlLiteral(backupDigest)} AND writer_digest = ${sqlLiteral(writerDigest)} AND source_digest = ${sqlLiteral(SOURCE_0092)} AND EXISTS (${matchingEpoch}) AND NOT EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_PERMIT_TABLE});\n`;
+    }
     case "abandon": {
       if (abandonFrom !== "0092-fenced" && abandonFrom !== "0093-fenced")
         throw preflightError("money abandon requires exact preconversion fenced schema");
-      return `${moneyFenceDropSql(abandonFrom)}\nDROP TABLE ${FENCE_TABLE};\n`;
+      return `${moneyFenceDropSql(abandonFrom)}\nDROP TABLE ${MONEY_CUTOVER_PERMIT_TABLE};\nDROP TABLE ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE};\nDROP TABLE ${FENCE_TABLE};\n`;
     }
   }
 }
@@ -955,6 +1028,7 @@ export function buildMoneyCutoverImportSql(input: {
   readonly originDigest: string;
   readonly backupDigest: string;
   readonly writerDigest: string;
+  readonly writerEpoch: string;
   readonly classifications?: readonly ClassificationRow[];
   readonly abandonFrom?: "0092-fenced" | "0093-fenced";
 }): string {
@@ -963,6 +1037,8 @@ export function buildMoneyCutoverImportSql(input: {
     if (!SHA256.test(value))
       throw preflightError("money cutover SQL requires exact evidence digests");
   }
+  if (!MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(input.writerEpoch))
+    throw preflightError("money cutover SQL requires a pinned Writer epoch");
   return phaseImportSql(
     input.phase,
     input.files,
@@ -970,6 +1046,7 @@ export function buildMoneyCutoverImportSql(input: {
     input.originDigest,
     input.backupDigest,
     input.writerDigest,
+    input.writerEpoch,
     input.classifications ?? [],
     input.abandonFrom,
   );
@@ -1507,6 +1584,11 @@ export async function reconcileMoneyCutoverDispatched(input: {
   }
   if (resumeDigest !== binding.resumeDigest)
     throw mutationError("money dispatched resume native version changed");
+  if (
+    binding.writerEpoch !== options.writerEpoch ||
+    binding.writerEpoch !== target.moneyCutoverWriterEpoch
+  )
+    throw mutationError("money dispatched Writer epoch changed");
   const classifications =
     options.phase === "classify" || options.phase === "convert" || options.phase === "resume"
       ? readProtectedClassifications(
@@ -1527,6 +1609,7 @@ export async function reconcileMoneyCutoverDispatched(input: {
       aggregateDigest: backup.aggregateDigest,
       financialDigest: backup.financialDigest,
       writerDigest,
+      writerEpoch: options.writerEpoch,
       sourceDigest: SOURCE_0092,
     }),
   );
@@ -1537,6 +1620,7 @@ export async function reconcileMoneyCutoverDispatched(input: {
     originDigest,
     backupDigest: backup.digest,
     writerDigest,
+    writerEpoch: options.writerEpoch,
     classifications,
     ...(options.phase === "abandon"
       ? { abandonFrom: beforePhase as "0092-fenced" | "0093-fenced" }
@@ -1564,6 +1648,7 @@ export async function reconcileMoneyCutoverDispatched(input: {
     classificationDigest,
     writerDigest,
     resumeDigest,
+    writerEpoch: options.writerEpoch,
   };
   if (options.independentReview === undefined)
     throw mutationError("money dispatch independent review is unavailable");
@@ -1580,6 +1665,17 @@ export async function reconcileMoneyCutoverDispatched(input: {
       writerDigest,
       "verification",
     );
+    await assertPermitEmpty(database, "verification", options.writerEpoch);
+  } else if (afterPhase === "0094") {
+    await assertResumedFreezeEmpty(database, "verification", options.writerEpoch);
+    if (options.resumeHealthRead === undefined)
+      throw mutationError("money resume healthy native readback is unavailable");
+    await options.resumeHealthRead("healthy");
+    if (
+      options.resumeProof === undefined ||
+      digest(JSON.stringify(await options.resumeProof())) !== binding.resumeDigest
+    )
+      throw mutationError("money resumed native Version changed after D1 transition");
   }
   if (
     options.phase === "freeze" ||
@@ -1723,6 +1819,11 @@ export async function runIntegrationMoneyUnitCutover(
   const origin = await options.stageOriginProof();
   const liveIdentity = await options.storageIdentityRead();
   assertStageTarget(target, origin, liveIdentity);
+  if (
+    !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(options.writerEpoch) ||
+    options.writerEpoch !== target.moneyCutoverWriterEpoch
+  )
+    throw preflightError("money cutover requires the exact target-pinned Writer epoch");
   const originDigest = digest(JSON.stringify(origin));
   const writer = options.phase === "resume" ? null : await options.maintenanceProof();
   if (writer !== null) assertMaintenanceProof(target, writer, options.maintenanceCommit);
@@ -1740,7 +1841,7 @@ export async function runIntegrationMoneyUnitCutover(
     writeFileSync(configPath, configJson(target), { flag: "wx", mode: 0o600 });
     const database = new RemoteD1(configPath, { environment, run });
     const initial = await readD1SchemaState(database);
-    const actualPhase = exactStatus(initial, files);
+    const actualPhase = await exactStatus(database, initial, files, options.writerEpoch);
     if (existing?.state === "dispatched" && invocation.action === "status") {
       return reconcileMoneyCutoverDispatched({
         invocation,
@@ -1838,6 +1939,9 @@ export async function runIntegrationMoneyUnitCutover(
       const resumeProof = await options.resumeProof();
       assertResumeProof(target, resumeProof, options.resumeCommit);
       resumeDigest = digest(JSON.stringify(resumeProof));
+      if (options.resumeHealthRead === undefined)
+        throw preflightError("money resume guarded native probe is unavailable");
+      await options.resumeHealthRead("guarded");
     }
     const anchor = digest(
       JSON.stringify({
@@ -1849,6 +1953,7 @@ export async function runIntegrationMoneyUnitCutover(
         aggregateDigest: backup.aggregateDigest,
         financialDigest: backup.financialDigest,
         writerDigest,
+        writerEpoch: options.writerEpoch,
         sourceDigest: SOURCE_0092,
       }),
     );
@@ -1861,6 +1966,7 @@ export async function runIntegrationMoneyUnitCutover(
         writerDigest,
         "preflight",
       );
+      await assertPermitEmpty(database, "preflight", options.writerEpoch);
     }
     if (actualPhase === "0092" || actualPhase === "0092-fenced" || actualPhase === "0093-fenced") {
       if (
@@ -1930,6 +2036,7 @@ export async function runIntegrationMoneyUnitCutover(
       originDigest,
       backupDigest: backup.digest,
       writerDigest,
+      writerEpoch: options.writerEpoch,
       classifications,
       ...(abandonBefore ? { abandonFrom: actualPhase as "0092-fenced" | "0093-fenced" } : {}),
     });
@@ -1962,6 +2069,7 @@ export async function runIntegrationMoneyUnitCutover(
       classificationDigest: options.classificationManifestDigest ?? digest("[]\n"),
       writerDigest,
       resumeDigest,
+      writerEpoch: options.writerEpoch,
     };
     const reviewProof =
       options.independentReview === undefined
@@ -2047,6 +2155,9 @@ export async function runIntegrationMoneyUnitCutover(
       assertResumeProof(target, resumeNow, options.resumeCommit as string);
       if (digest(JSON.stringify(resumeNow)) !== resumeDigest)
         throw preflightError("money resume native Version changed before dispatch");
+      if (options.resumeHealthRead === undefined)
+        throw preflightError("money resume guarded native probe is unavailable");
+      await options.resumeHealthRead("guarded");
     }
     if (
       options.phase === "freeze" ||
@@ -2106,6 +2217,7 @@ export async function runIntegrationMoneyUnitCutover(
       classificationDigest: reviewBinding.classificationDigest,
       writerDigest,
       resumeDigest,
+      writerEpoch: options.writerEpoch,
       reviewDigest,
       beforeShapeDigest: initial.shapeDigest,
       afterSchemaPhase: expectedAfter,
@@ -2126,6 +2238,18 @@ export async function runIntegrationMoneyUnitCutover(
         "money cutover import was acknowledged but exact terminal schema failed; keep freeze and repair forward",
       );
     }
+    if (expectedAfter === "0094") {
+      await assertResumedFreezeEmpty(database, "verification", options.writerEpoch);
+      if (options.resumeHealthRead === undefined)
+        throw verificationError("money resume healthy native readback is unavailable");
+      await options.resumeHealthRead("healthy");
+      if (
+        options.resumeProof === undefined ||
+        digest(JSON.stringify(await options.resumeProof())) !== resumeDigest
+      )
+        throw verificationError("money resumed native Version changed after D1 transition");
+    } else if (expectedAfter.endsWith("-fenced"))
+      await assertPermitEmpty(database, "verification", options.writerEpoch);
     if (
       options.phase === "freeze" ||
       options.phase === "prepare" ||

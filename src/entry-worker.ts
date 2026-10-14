@@ -3,6 +3,7 @@ import { parseBillingConfig } from "./billing-config.ts";
 import { createCatalog } from "./catalog.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { errorEnvelopeResponse } from "./error-envelope.ts";
+import { assertHostedPricingMatchesBilling, parseHostedPricing } from "./hosted-pricing.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import {
   INTEGRATION_E2E_ORGANIZATION_ID,
@@ -13,6 +14,11 @@ import {
   type IntegrationOrganizationBootstrapConfig,
   resolveIntegrationOrganizationBootstrapConfig,
 } from "./integration-organization-bootstrap.ts";
+import {
+  createMoneyCutoverSql,
+  inspectMoneyCutoverGuard,
+  MONEY_CUTOVER_WRITER_POLICY,
+} from "./money-cutover-sql.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
 import {
   createOperatorPaymentsReconcileVerifier,
@@ -38,6 +44,7 @@ import {
 } from "./runtime-input-seal-keyring.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
+import { assertStripeBillingSchema } from "./stripe-billing.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
@@ -82,10 +89,14 @@ export interface WorkerEnv {
   readonly TAKOSERVER_ARTIFACT_BLOB_IO_MODE?: string;
   /** Whole-Host schema maintenance; never a serving runtime mode. */
   readonly TAKOSERVER_SCHEMA_MAINTENANCE_MODE?: string;
+  readonly TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY?: string;
+  readonly TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH?: string;
   /** Where this deployment's console is served, if it has one. */
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
   /** Versioned JSON Organization billing tariff; absent disables the new wallet API. */
   readonly TAKOSERVER_BILLING_CONFIG?: string;
+  /** Explicit hosted-only pricing authoring JSON; subscriptions require Stripe test mode. */
+  readonly TAKOSERVER_HOSTED_PRICING?: string;
   /** Public half of the operator key, as an Ed25519 JWK. */
   readonly OPERATOR_PUBLIC_JWK?: string;
   /**
@@ -182,6 +193,8 @@ export function workerCredentials(
     | "TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS"
     | "TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS"
     | "TAKOSERVER_CONSOLE_ORIGIN"
+    | "TAKOSERVER_HOSTED_PRICING"
+    | "TAKOSERVER_BILLING_CONFIG"
   >,
   operatorAudience: string,
 ) {
@@ -200,6 +213,7 @@ export function workerCredentials(
     operatorAudience,
   });
   const payment = resolvePayment({
+    hostedPricing: parseHostedPricing(env.TAKOSERVER_HOSTED_PRICING),
     stripeSecretKey:
       env.TAKOSERVER_STRIPE_CHECKOUT_ENABLED === "1" ? env.STRIPE_SECRET_KEY : undefined,
     // Like Checkout, a lingering secret alone never exposes the webhook.
@@ -416,6 +430,29 @@ function schemaMaintenanceMode(
     throw new TypeError("schema maintenance and artifact blob I/O modes conflict");
   }
   return value;
+}
+
+function moneyCutoverWriterPolicy(env: WorkerEnv): string | null {
+  const value = env.TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY;
+  const epoch = env.TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH;
+  if (value === undefined && epoch === undefined) return null;
+  if (value !== MONEY_CUTOVER_WRITER_POLICY || env.TAKOSERVER_ENVIRONMENT !== "integration") {
+    throw new TypeError("money cutover writer policy is invalid");
+  }
+  if (typeof epoch !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(epoch)) {
+    throw new TypeError("money cutover Writer epoch is invalid");
+  }
+  return epoch;
+}
+
+function moneyCutoverFrozenResponse(): Response {
+  return errorEnvelopeResponse(
+    "backend_unavailable",
+    503,
+    { reason: "money-cutover-freeze" },
+    { headers: { "cache-control": "no-store", "retry-after": "60" } },
+    "Host is frozen for the wallet USD-micros writer transition",
+  );
 }
 
 function schemaMaintenanceResponse(
@@ -823,6 +860,11 @@ async function composeApp(
   const billingConfig = startupStage("runtime-configuration", () =>
     parseBillingConfig(env.TAKOSERVER_BILLING_CONFIG),
   );
+  const hostedPricing = startupStage("runtime-configuration", () => {
+    const pricing = parseHostedPricing(env.TAKOSERVER_HOSTED_PRICING);
+    if (pricing) assertHostedPricingMatchesBilling(pricing, billingConfig);
+    return pricing;
+  });
   // File-backed tariff loading can be designed separately; this release accepts inline JSON only.
   const integrationE2eCredentialAuthority = workerIntegrationE2eCredentialAuthority(env);
   const integrationOrganizationBootstrap = workerIntegrationOrganizationBootstrap(
@@ -830,7 +872,9 @@ async function composeApp(
     origin,
     integrationE2eCredentialAuthority,
   );
-  const sql = createD1Sql(env.STATE_DB);
+  const rawSql = createD1Sql(env.STATE_DB);
+  const writerEpoch = moneyCutoverWriterPolicy(env);
+  const sql = writerEpoch === null ? rawSql : createMoneyCutoverSql(rawSql, writerEpoch);
   try {
     // The wallet and ledger use USD micros even when tariff billing is disabled.
     // This read-only proof precedes every normal serving composition and tariff write.
@@ -866,6 +910,16 @@ async function composeApp(
     paymentEvents,
     operatorPaymentsReconcile,
   } = workerCredentials(env, origin);
+  if (hostedPricing) {
+    try {
+      await assertStripeBillingSchema(sql);
+    } catch {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("Hosted subscriptions require the complete 0095 schema"),
+      );
+    }
+  }
   if (
     v2Config.sqliteMigrationSet !== undefined ||
     v2Config.workerBundle !== undefined ||
@@ -962,6 +1016,7 @@ async function composeApp(
       identityProviders,
       settlement,
       ...(billingConfig ? { billingConfig } : {}),
+      hostedPaidFreeExclusion: Boolean(hostedPricing),
       ...(checkout ? { checkout } : {}),
       ...(paymentEvents ? { paymentEvents } : {}),
       ...(operatorPaymentsReconcile ? { operatorPaymentsReconcile } : {}),
@@ -1049,9 +1104,16 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       try {
         const schemaMode = startupStage("runtime-configuration", () => schemaMaintenanceMode(env));
         const mode = startupStage("runtime-configuration", () => artifactBlobIoMode(env));
+        const moneyPolicy = startupStage("runtime-configuration", () =>
+          moneyCutoverWriterPolicy(env),
+        );
         if (schemaMode !== "normal") return schemaMaintenanceResponse(schemaMode);
         if (mode === "pre-0043-quiesced") {
           return artifactBlobIoQuiescenceResponse();
+        }
+        if (moneyPolicy !== null) {
+          const guard = await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), moneyPolicy);
+          if (guard === "frozen") return moneyCutoverFrozenResponse();
         }
         app = await appFor(
           env,
@@ -1088,6 +1150,11 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
     async scheduled(_event: unknown, env: WorkerEnv): Promise<void> {
       if (schemaMaintenanceMode(env) !== "normal") return;
       if (artifactBlobIoMode(env) === "pre-0043-quiesced") return;
+      const writerEpoch = moneyCutoverWriterPolicy(env);
+      if (writerEpoch !== null) {
+        if ((await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), writerEpoch)) === "frozen")
+          return;
+      }
       const app = await appFor(env, requirePublicOrigin(env));
       const results = await Promise.allSettled([
         Promise.resolve().then(() => app.tick()),

@@ -96,7 +96,12 @@ describe("automatic USD-micros startup boundary", () => {
 
   test("fresh and never-billed predecessors initialize micros; converted restart writes nothing", () => {
     for (const db of [new Database(":memory:"), predecessor()]) {
-      expect(migrateSqlite(db).applied.at(-1)).toBe("0094_wallet_usd_micros.sql");
+      expect(migrateSqlite(db).applied.at(-1)).toBe("0095_stripe_billing.sql");
+      expect(
+        db
+          .query("SELECT name FROM applied_migrations WHERE name = ?")
+          .get("0094_wallet_usd_micros.sql"),
+      ).toEqual({ name: "0094_wallet_usd_micros.sql" });
       const before = schema(db);
       const readOnlyRestart = {
         query: (query: string) => db.query(query),
@@ -104,7 +109,7 @@ describe("automatic USD-micros startup boundary", () => {
           throw new Error("restart attempted a write");
         },
       };
-      expect(migrateSqlite(readOnlyRestart)).toEqual({ applied: [], alreadyApplied: 94 });
+      expect(migrateSqlite(readOnlyRestart)).toEqual({ applied: [], alreadyApplied: 95 });
       expect(schema(db)).toEqual(before);
       db.close();
     }

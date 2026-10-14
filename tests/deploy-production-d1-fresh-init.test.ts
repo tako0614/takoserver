@@ -1281,12 +1281,12 @@ describe("production D1 fresh init", () => {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
         const tail = join(migrationDirectory, "0094_wallet_usd_micros.sql");
-        if (drift === "missing") rmSync(tail);
+        if (drift === "missing") rmSync(join(migrationDirectory, "0095_stripe_billing.sql"));
         else if (drift === "changed") {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0095_unreviewed.sql"),
+            join(migrationDirectory, "0096_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }
@@ -1299,7 +1299,7 @@ describe("production D1 fresh init", () => {
         ).rejects.toThrow(
           drift === "changed"
             ? "exact audited migration SHA-256"
-            : "audited migration lineage must contain exactly 0001-0094",
+            : "audited migration lineage must contain exactly 0001-0095",
         );
         expect(fixture.calls).toEqual([]);
       } finally {
