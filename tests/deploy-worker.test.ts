@@ -338,7 +338,7 @@ describe("split Takoserver Worker surfaces", () => {
     ).toBe(false);
   });
 
-  test("0094 marker with corrupt schema or missing unit policy refuses before upload", async () => {
+  test("current audited schema with corrupt shape or missing 0094 unit policy refuses before upload", async () => {
     for (const defect of ["shape", "policy"] as const) {
       const current = fixture();
       const canonical = await current.migrations.read();
@@ -375,7 +375,49 @@ describe("split Takoserver Worker surfaces", () => {
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
       expect((failure as DeployError).phase).toBe("preflight");
-      expect((failure as Error).message).toContain("exact complete 0094 D1 schema");
+      expect((failure as Error).message).toContain("exact current audited D1 schema");
+      expect(
+        current.calls.some((call) => call.includes("upload") || call.includes("--no-bundle")),
+      ).toBe(false);
+    }
+  });
+
+  test("exact current audited schema requires 0094 policy and rejects 94-only or foreign tails before upload", async () => {
+    for (const applied of [
+      canonicalMigrations.slice(0, -1),
+      [...canonicalMigrations, "0096_foreign.sql"],
+    ]) {
+      const current = fixture({ applied });
+      const status = await runWorker(
+        {
+          surface: "takoserver-worker",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        current,
+      ).catch((error: unknown) => error);
+      if (status instanceof DeployError) {
+        expect(status.phase).toBe("preflight");
+      } else {
+        expect(status).toMatchObject({ ready: false, moneyUnitSchemaReady: false });
+      }
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        { ...current, cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" } },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("preflight");
+      expect((failure as Error).message).toMatch(
+        /exact current audited D1 schema|more applied migrations/,
+      );
       expect(
         current.calls.some((call) => call.includes("upload") || call.includes("--no-bundle")),
       ).toBe(false);
@@ -1078,7 +1120,7 @@ describe("split Takoserver Worker surfaces", () => {
     ).toBe(false);
   }, 20_000);
 
-  test("fresh and canonical 0088/0089/0091/0092 lineages require complete 0094 for serving", () => {
+  test("fresh and canonical 0088/0089/0091/0092 lineages require exact current audited schema for serving", () => {
     const at = (count: number) => ({
       local: canonicalMigrations,
       applied: canonicalMigrations.slice(0, count),

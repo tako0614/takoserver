@@ -12,6 +12,7 @@ import {
   prepareSelfhostV2PrivatePlaneRoots,
 } from "./entry-v2-private-plane-boot.ts";
 import { parseSelfhostV2WorkerEndpointHttpsSelection } from "./entry-v2-worker-endpoint-boot.ts";
+import { assertHostedPricingMatchesBilling, parseHostedPricing } from "./hosted-pricing.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import {
   type MigrationOptions,
@@ -153,6 +154,7 @@ import {
   RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN,
   resolveStandaloneProviderMode,
 } from "./standalone-provider-composition.ts";
+import { assertStripeBillingSchema } from "./stripe-billing.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
 import { selectClosedGraphWorkerd } from "./workerd-artifact.ts";
@@ -246,6 +248,8 @@ const takoformV2Config = parseTakoformV2ApplicationConfig({
 });
 // File-backed tariff loading can be designed separately; this release accepts inline JSON only.
 const billingConfig = parseBillingConfig(process.env.TAKOSERVER_BILLING_CONFIG);
+const hostedPricing = parseHostedPricing(process.env.TAKOSERVER_HOSTED_PRICING);
+if (hostedPricing) assertHostedPricingMatchesBilling(hostedPricing, billingConfig);
 const v2RuntimeSelection = parseSelfhostV2RuntimeBoot(
   process.env.TAKOSERVER_V2_WORKER_RUNTIME_BOOT,
 );
@@ -478,6 +482,7 @@ if (migrated.applied.length > 0) {
 const sql = createSqliteSql(controlDatabase);
 // Wallet reads use the micros ledger even when optional billing is disabled.
 await assertOrgBillingSchema(sql, billingConfig);
+if (hostedPricing) await assertStripeBillingSchema(sql);
 /**
  * The port a published Worker endpoint address carries.
  *
@@ -1188,6 +1193,7 @@ const legacyPublicKeyJwk = await ensureOperatorKey({
 const identityPublicKeyJwk = identityOnlyPublicKeyJwk ?? legacyPublicKeyJwk;
 
 const payment = resolvePayment({
+  hostedPricing,
   stripeSecretKey: process.env.STRIPE_SECRET_KEY,
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
   consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN,

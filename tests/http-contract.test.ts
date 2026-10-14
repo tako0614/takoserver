@@ -536,9 +536,16 @@ describe("published API description", () => {
     );
   });
 
-  test("mentions no other product and keeps upstream identity vocabulary off customer routes", () => {
+  test("bounds shared product metadata and keeps upstream identity vocabulary off customer routes", () => {
     const serialized = JSON.stringify(openApiDocument);
-    expect(serialized).not.toMatch(/takosumi/i);
+    expect(
+      openApiDocument.components.schemas.HostedPlanTable.properties.products.prefixItems,
+    ).toEqual([{ const: "takosumi-hosted" }, { const: "takoserver" }]);
+    // The shared plan table identifies its two products. Only that exact
+    // product tag is allowed; other surfaces cannot import Hosted identity.
+    expect(
+      serialized.replace('"const":"takosumi-hosted"', '"const":"shared-hosted-product"'),
+    ).not.toMatch(/takosumi/i);
     // The reseller lane speaks only in opaque tenant references.
     const customerPaths = Object.fromEntries(
       Object.entries(openApiDocument.paths).filter(

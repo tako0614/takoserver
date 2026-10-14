@@ -3,6 +3,7 @@ import { parseBillingConfig } from "./billing-config.ts";
 import { createCatalog } from "./catalog.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { errorEnvelopeResponse } from "./error-envelope.ts";
+import { assertHostedPricingMatchesBilling, parseHostedPricing } from "./hosted-pricing.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import {
   INTEGRATION_E2E_ORGANIZATION_ID,
@@ -38,6 +39,7 @@ import {
 } from "./runtime-input-seal-keyring.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
+import { assertStripeBillingSchema } from "./stripe-billing.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
@@ -86,6 +88,8 @@ export interface WorkerEnv {
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
   /** Versioned JSON Organization billing tariff; absent disables the new wallet API. */
   readonly TAKOSERVER_BILLING_CONFIG?: string;
+  /** Explicit hosted-only pricing authoring JSON; subscriptions require Stripe test mode. */
+  readonly TAKOSERVER_HOSTED_PRICING?: string;
   /** Public half of the operator key, as an Ed25519 JWK. */
   readonly OPERATOR_PUBLIC_JWK?: string;
   /**
@@ -182,6 +186,8 @@ export function workerCredentials(
     | "TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS"
     | "TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS"
     | "TAKOSERVER_CONSOLE_ORIGIN"
+    | "TAKOSERVER_HOSTED_PRICING"
+    | "TAKOSERVER_BILLING_CONFIG"
   >,
   operatorAudience: string,
 ) {
@@ -200,6 +206,7 @@ export function workerCredentials(
     operatorAudience,
   });
   const payment = resolvePayment({
+    hostedPricing: parseHostedPricing(env.TAKOSERVER_HOSTED_PRICING),
     stripeSecretKey:
       env.TAKOSERVER_STRIPE_CHECKOUT_ENABLED === "1" ? env.STRIPE_SECRET_KEY : undefined,
     // Like Checkout, a lingering secret alone never exposes the webhook.
@@ -815,6 +822,11 @@ async function composeApp(
   const billingConfig = startupStage("runtime-configuration", () =>
     parseBillingConfig(env.TAKOSERVER_BILLING_CONFIG),
   );
+  const hostedPricing = startupStage("runtime-configuration", () => {
+    const pricing = parseHostedPricing(env.TAKOSERVER_HOSTED_PRICING);
+    if (pricing) assertHostedPricingMatchesBilling(pricing, billingConfig);
+    return pricing;
+  });
   // File-backed tariff loading can be designed separately; this release accepts inline JSON only.
   const integrationE2eCredentialAuthority = workerIntegrationE2eCredentialAuthority(env);
   const integrationOrganizationBootstrap = workerIntegrationOrganizationBootstrap(
@@ -858,6 +870,16 @@ async function composeApp(
     paymentEvents,
     operatorPaymentsReconcile,
   } = workerCredentials(env, origin);
+  if (hostedPricing) {
+    try {
+      await assertStripeBillingSchema(sql);
+    } catch {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("Hosted subscriptions require the complete 0095 schema"),
+      );
+    }
+  }
   if (
     v2Config.sqliteMigrationSet !== undefined ||
     v2Config.workerBundle !== undefined ||
