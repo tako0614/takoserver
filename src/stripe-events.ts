@@ -149,6 +149,7 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
 
 /** The two facts a verified body is trusted for, plus what is recorded about it. */
 export interface StripeEventEnvelope {
+  readonly account?: string | null;
   readonly id: string;
   readonly type: string;
   readonly livemode: boolean;
@@ -200,6 +201,9 @@ export function parseStripeEventEnvelope(payload: Uint8Array): StripeEventEnvelo
   return {
     id: event.id,
     type: event.type,
+    ...(event.account === undefined
+      ? {}
+      : { account: typeof event.account === "string" ? event.account : "invalid" }),
     livemode: event.livemode,
     created: event.created,
     objectId: typeof fields.id === "string" ? fields.id : null,
@@ -215,7 +219,7 @@ export interface StripeEventHandlerContext {
 }
 
 export interface StripeEventHandling {
-  readonly outcome: Extract<PaymentEventOutcome, "credited" | "ignored">;
+  readonly outcome: Extract<PaymentEventOutcome, "credited" | "applied" | "ignored" | "deferred">;
   readonly detail: string;
 }
 
@@ -312,6 +316,7 @@ export interface StripeEventsOptions {
   /** Override for tests and for a later capability; defaults to the table above. */
   readonly handlers?: Readonly<Record<string, StripeEventHandler>>;
   readonly deferredTypes?: ReadonlySet<string>;
+  readonly handlerVersion?: number;
 }
 
 export function createStripeEvents(
@@ -397,7 +402,7 @@ export function createStripeEvents(
             const outcome: PaymentEventOutcome =
               typeof routed === "string" ? routed : routed.outcome;
             const detail = typeof routed === "string" ? null : routed.detail;
-            await ledger.settle(event.id, outcome, detail);
+            await ledger.settle(event.id, outcome, detail, options.handlerVersion);
             return { eventId: event.id, type: event.type, outcome, detail, duplicate: false };
           },
         }
@@ -515,10 +520,16 @@ interface StripeEventLedger {
     eventId: string,
   ): Promise<{ readonly outcome: PaymentEventOutcome; readonly detail: string | null } | null>;
   record(event: StripeEventEnvelope): Promise<void>;
-  settle(eventId: string, outcome: PaymentEventOutcome, detail: string | null): Promise<void>;
+  settle(
+    eventId: string,
+    outcome: PaymentEventOutcome,
+    detail: string | null,
+    handlerVersion?: number,
+  ): Promise<void>;
 }
 
 const SETTLED_OUTCOMES: ReadonlySet<string> = new Set([
+  "applied",
   "credited",
   "ignored",
   "deferred",
@@ -554,14 +565,20 @@ function createStripeEventLedger(sql: Sql, clock: Clock): StripeEventLedger {
         ],
       );
     },
-    async settle(eventId, outcome, detail) {
+    async settle(eventId, outcome, detail, handlerVersion) {
       // Guarded: a delivery that already credited or ignored keeps its answer.
       // Only an unfinished row, or one recorded before its type had a handler,
       // is settled again.
       await sql.run(
-        `UPDATE stripe_events SET outcome = ?, outcome_detail = ?, settled_at = ?
+        `UPDATE stripe_events SET outcome = ?, outcome_detail = ?, settled_at = ?${handlerVersion === undefined ? "" : ", handler_version = ?"}
          WHERE event_id = ? AND outcome IN ('received', 'deferred', 'unsupported')`,
-        [outcome, detail, clock().toISOString(), eventId],
+        [
+          outcome,
+          detail,
+          clock().toISOString(),
+          ...(handlerVersion === undefined ? [] : [outcome === "deferred" ? 0 : handlerVersion]),
+          eventId,
+        ],
       );
     },
   };

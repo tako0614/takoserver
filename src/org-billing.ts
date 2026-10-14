@@ -5,7 +5,13 @@ import {
   parseBillingConfig,
 } from "./billing-config.ts";
 import { base64UrlDecode, base64UrlEncode, canonicalJson } from "./json.ts";
-import { type Ledger, LedgerError, prepareLedgerAllocation, type Wallet } from "./ledger.ts";
+import {
+  type Ledger,
+  LedgerError,
+  prepareLedgerAllocation,
+  stripeRefundSchemaReady,
+  type Wallet,
+} from "./ledger.ts";
 import { MoneyError, minorToMicros } from "./money.ts";
 import { type Clock, type Row, type Sql, SqlError, type SqlStatement } from "./ports.ts";
 
@@ -32,6 +38,7 @@ export interface HoldReceipt {
   readonly createdAt: string;
   readonly expiresAt: string | null;
   readonly closedAt: string | null;
+  readonly closureReason?: string | null;
 }
 
 export interface UsageReceipt {
@@ -60,6 +67,8 @@ export interface CreditLot {
   readonly remainingMicros: number;
   readonly heldMicros: number;
   readonly availableMicros: number;
+  readonly revokedMicros?: number;
+  readonly frozen?: boolean;
   readonly expiresAt: string | null;
   readonly createdAt: string;
 }
@@ -229,6 +238,7 @@ export function createOrgBilling(options: {
   readonly config: BillingConfig;
 }): OrgBilling {
   const { sql, clock, ledger, config } = options;
+  const refundsReady = () => stripeRefundSchemaReady(sql);
   const now = () => clock().toISOString();
   const held = async (org: string, ref: string) =>
     (await sql.query("SELECT * FROM org_wallet_holds WHERE org_id = ? AND ref = ?", [org, ref]))[0];
@@ -250,14 +260,27 @@ export function createOrgBilling(options: {
     return row ? parseBillingConfig(String(row.config_json)) : undefined;
   }
 
+  async function sweep(limit: number, cutoff: string, org?: string): Promise<number> {
+    const rows = await sql.query(
+      `SELECT * FROM org_wallet_holds WHERE state = 'live' AND expires_at <= ? ${org === undefined ? "" : "AND org_id = ?"} ORDER BY expires_at, org_id, ref LIMIT ?`,
+      org === undefined ? [cutoff, limit] : [cutoff, org, limit],
+    );
+    for (const row of rows) await close(row, "expired", 0);
+    return rows.length;
+  }
+
   async function prepare(org: string): Promise<void> {
     await registerTariffs(sql, config, now());
-    await service.expireDue(8, org);
+    // The bounded sweep and its backlog check read one instant. A deadline that
+    // passes after it is not backlog: every terminal write fences on its own
+    // deadline, and `current` closes such a row as expired before reporting it.
+    const cutoff = now();
+    await sweep(8, cutoff, org);
     if (
       (
         await sql.query(
           "SELECT 1 FROM org_wallet_holds WHERE org_id = ? AND state = 'live' AND expires_at <= ? LIMIT 1",
-          [org, now()],
+          [org, cutoff],
         )
       ).length
     )
@@ -321,6 +344,7 @@ export function createOrgBilling(options: {
     captureFingerprint: string | null = null,
     actualMicros: string | null = null,
   ): Promise<HoldReceipt> {
+    const refundSchema = await refundsReady();
     const org = String(row.org_id);
     const ref = String(row.ref);
     const ledgerRef = String(row.ledger_ref);
@@ -348,6 +372,17 @@ export function createOrgBilling(options: {
       },
       guard(guardId, "changes() = 1"),
     );
+    if (captured > 0 && refundSchema)
+      guards.push(
+        guard(
+          `${guardId}_freeze`,
+          `NOT EXISTS (SELECT 1 FROM wallet_credit_allocations a
+        JOIN stripe_billing_fences f ON f.org_id = a.org_id AND f.funding_ref = a.lot_ref
+          AND f.active = 1
+        WHERE a.org_id = ? AND a.debit_type = 'hold' AND a.debit_ref = ?)`,
+          [org, ledgerRef],
+        ),
+      );
     // Also fence the precise original hold. Other internal ledger callers may
     // not partially settle a public lifecycle behind its durable state row.
     guards.push(
@@ -389,8 +424,11 @@ export function createOrgBilling(options: {
     if (amount > captured)
       guards.push(entry(org, "release", ledgerRef, 0, captured - amount, instant));
     guards.push({
-      sql: "DELETE FROM wallet_allocation_guards WHERE id IN (?, ?)",
-      params: [guardId, `${guardId}_hold`],
+      sql: `DELETE FROM wallet_allocation_guards WHERE id IN (${captured > 0 && refundSchema ? "?, ?, ?" : "?, ?"})`,
+      params:
+        captured > 0 && refundSchema
+          ? [guardId, `${guardId}_hold`, `${guardId}_freeze`]
+          : [guardId, `${guardId}_hold`],
     });
     try {
       await sql.batch(guards);
@@ -419,12 +457,20 @@ export function createOrgBilling(options: {
     return holdReceipt(receipt);
   }
 
+  /** A live row past its deadline closes as expired; it is never reported live. */
+  async function current(row: Row): Promise<HoldReceipt> {
+    return row.state === "live" && String(row.expires_at) <= now()
+      ? close(row, "expired", 0)
+      : holdReceipt(row);
+  }
+
   const service: OrgBilling = {
     async wallet(org) {
       await prepare(org);
       return ledger.wallet(org);
     },
     async lots(org, limit = 100, cursor) {
+      const refundSchema = await refundsReady();
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
         orgBillingFail("invalid_limit", 400);
       let after: Row | undefined;
@@ -453,7 +499,19 @@ export function createOrgBilling(options: {
       const rows = await sql.query(
         `SELECT l.*,
           COALESCE(SUM(CASE WHEN a.debit_type = 'hold' THEN a.amount_micros ELSE 0 END), 0) AS held_micros,
-          COALESCE(SUM(CASE WHEN a.debit_type IN ('capture', 'usage_debit') THEN a.amount_micros ELSE 0 END), 0) AS spent_micros
+          COALESCE(SUM(CASE WHEN a.debit_type IN ('capture', 'usage_debit') THEN a.amount_micros ELSE 0 END), 0) AS spent_micros,
+          ${
+            refundSchema
+              ? `COALESCE((SELECT SUM(r.debit_micros + r.expired_micros)
+             FROM stripe_billing_refunds r WHERE r.org_id = l.org_id AND r.funding_ref = l.ref), 0)`
+              : "0"
+          } AS revoked_micros,
+          ${
+            refundSchema
+              ? `EXISTS (SELECT 1 FROM stripe_billing_fences f
+             WHERE f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1)`
+              : "0"
+          } AS frozen
          FROM (SELECT * FROM wallet_credit_lots WHERE org_id = ? ${boundary}
            ORDER BY CASE consumption_class WHEN 'free' THEN 0 WHEN 'subscription' THEN 1 ELSE 2 END,
              CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END, expires_at, created_at, ref LIMIT ?) l
@@ -479,7 +537,8 @@ export function createOrgBilling(options: {
         const amountMicros = Number(row.amount_micros);
         const spentMicros = Number(row.spent_micros);
         const heldMicros = Number(row.held_micros);
-        const remainingMicros = amountMicros - spentMicros;
+        const revokedMicros = Number(row.revoked_micros);
+        const remainingMicros = amountMicros - spentMicros - revokedMicros;
         return {
           reference: String(row.ref),
           kind: row.kind as CreditLot["kind"],
@@ -488,8 +547,10 @@ export function createOrgBilling(options: {
           spentMicros,
           remainingMicros,
           heldMicros,
+          revokedMicros,
+          frozen: Number(row.frozen) === 1,
           availableMicros:
-            row.expires_at == null || String(row.expires_at) > now()
+            !Number(row.frozen) && (row.expires_at == null || String(row.expires_at) > now())
               ? remainingMicros - heldMicros
               : 0,
           expiresAt: nullable(row.expires_at),
@@ -502,6 +563,7 @@ export function createOrgBilling(options: {
       };
     },
     async hold(input) {
+      const refundSchema = await refundsReady();
       reference(input.reference);
       spendableMicros(input.amountMicros);
       fingerprint(input.measurementFingerprint);
@@ -515,7 +577,7 @@ export function createOrgBilling(options: {
       if (prior) {
         if (prior.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
         if (prior.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
-        return holdReceipt(prior);
+        return current(prior);
       }
       const tariff = await tariffAt(now());
       if (!tariff || input.pricingRevision !== tariff.revision)
@@ -529,6 +591,16 @@ export function createOrgBilling(options: {
         ).length
       )
         orgBillingFail("outstanding_usage", 409);
+      if (
+        refundSchema &&
+        (
+          await sql.query(
+            "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
+            [input.organizationId],
+          )
+        ).length
+      )
+        orgBillingFail("refund_receivable", 409);
       const instant = now();
       const expiresAt = new Date(Date.parse(instant) + tariff.holdTtlSeconds * 1000).toISOString();
       const ledgerRef = `org-hold:${input.reference}`;
@@ -563,8 +635,12 @@ export function createOrgBilling(options: {
           },
           guard(
             admissionGuard,
-            "NOT EXISTS (SELECT 1 FROM org_wallet_usage_records WHERE org_id = ? AND state = 'pending') AND NOT EXISTS (SELECT 1 FROM ledger WHERE org_id = ? AND ref = ? AND type IN ('hold', 'capture', 'release'))",
-            [input.organizationId, input.organizationId, ledgerRef],
+            `NOT EXISTS (SELECT 1 FROM org_wallet_usage_records WHERE org_id = ? AND state = 'pending')
+             ${refundSchema ? "AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0)" : ""}
+             AND NOT EXISTS (SELECT 1 FROM ledger WHERE org_id = ? AND ref = ? AND type IN ('hold', 'capture', 'release'))`,
+            refundSchema
+              ? [input.organizationId, input.organizationId, input.organizationId, ledgerRef]
+              : [input.organizationId, input.organizationId, ledgerRef],
           ),
           ...allocation,
           { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [admissionGuard] },
@@ -602,8 +678,7 @@ export function createOrgBilling(options: {
       await prepare(org);
       const row = await held(org, ref);
       if (!row) orgBillingFail("hold_not_found", 404);
-      if (row.state === "live" && String(row.expires_at) <= now()) return close(row, "expired", 0);
-      return holdReceipt(row);
+      return current(row);
     },
     async capture(input) {
       reference(input.reference);
@@ -665,6 +740,7 @@ export function createOrgBilling(options: {
       return holdReceipt(tombstone);
     },
     async usage(input) {
+      const refundSchema = await refundsReady();
       reference(input.reference);
       fingerprint(input.measurementFingerprint);
       spendableMicros(input.expectedMicros);
@@ -688,6 +764,16 @@ export function createOrgBilling(options: {
       if (row && row.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
       if (row && row.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
       if (!row) {
+        if (
+          refundSchema &&
+          (
+            await sql.query(
+              "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
+              [input.organizationId],
+            )
+          ).length
+        )
+          orgBillingFail("refund_receivable", 409);
         const tariff = await tariffAt(input.periodStart);
         const meter =
           tariff && Object.hasOwn(tariff.meters, input.meter)
@@ -727,7 +813,8 @@ export function createOrgBilling(options: {
         try {
           await sql.run(
             `INSERT INTO org_wallet_usage_records (org_id, ref, fingerprint, pricing_revision, meter, quantity, quantity_unit, period_start, period_end, rate_numerator_micros, rate_denominator, amount_micros, state, created_at, money_policy)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'usd-micros-v2')`,
+                         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'usd-micros-v2'
+                         ${refundSchema ? "WHERE NOT EXISTS (SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0)" : ""}`,
             [
               input.organizationId,
               input.reference,
@@ -742,17 +829,39 @@ export function createOrgBilling(options: {
               meter.rate.denominator,
               amount,
               now(),
+              ...(refundSchema ? [input.organizationId] : []),
             ],
           );
         } catch (error) {
           if (!(error instanceof SqlError && error.code === "constraint")) throw error;
         }
         row = await usageRow(input.organizationId, input.reference);
+        if (
+          !row &&
+          refundSchema &&
+          (
+            await sql.query(
+              "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
+              [input.organizationId],
+            )
+          ).length
+        )
+          orgBillingFail("refund_receivable", 409);
         if (!row) orgBillingFail("billing_unavailable", 503);
         if (row.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
         if (row.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
       }
       if (row.state === "paid") return usageReceipt(row);
+      if (
+        refundSchema &&
+        (
+          await sql.query(
+            "SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0 LIMIT 1",
+            [input.organizationId],
+          )
+        ).length
+      )
+        orgBillingFail("refund_receivable", 409);
       const amount = Number(row.amount_micros);
       const instant = now();
       try {
@@ -774,7 +883,11 @@ export function createOrgBilling(options: {
             sql: "UPDATE org_wallet_usage_records SET state = 'paid', paid_at = ? WHERE org_id = ? AND ref = ? AND state = 'pending'",
             params: [instant, input.organizationId, input.reference],
           },
-          guard(guardId, "changes() = 1"),
+          guard(
+            guardId,
+            `changes() = 1 ${refundSchema ? "AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0)" : ""}`,
+            refundSchema ? [input.organizationId] : [],
+          ),
           ...allocation,
           { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [guardId] },
         ]);
@@ -844,12 +957,7 @@ export function createOrgBilling(options: {
     async expireDue(limit, org) {
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
         orgBillingFail("invalid_limit", 400);
-      const rows = await sql.query(
-        `SELECT * FROM org_wallet_holds WHERE state = 'live' AND expires_at <= ? ${org === undefined ? "" : "AND org_id = ?"} ORDER BY expires_at, org_id, ref LIMIT ?`,
-        org === undefined ? [now(), limit] : [now(), org, limit],
-      );
-      for (const row of rows) await close(row, "expired", 0);
-      return rows.length;
+      return sweep(limit, now(), org);
     },
   };
   return service;
@@ -892,6 +1000,7 @@ function holdReceipt(row: Row): HoldReceipt {
     createdAt: String(row.created_at),
     expiresAt: nullable(row.expires_at),
     closedAt: nullable(row.closed_at),
+    closureReason: nullable(row.closure_reason),
   };
 }
 function usageReceipt(row: Row): UsageReceipt {

@@ -625,7 +625,6 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       "401": errorResponse("Authentication required"),
       "403": errorResponse("The key lacks wallet:read or belongs to another Organization"),
       "404": errorResponse("Hold reference not found"),
-      "409": errorResponse("Hold is closed or the reference conflicts"),
       "503": errorResponse("Hold state is unavailable"),
     },
   }),
@@ -644,7 +643,9 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       "401": errorResponse("Authentication required"),
       "402": errorResponse("Insufficient available credit"),
       "403": errorResponse("The key lacks wallet:write or belongs to another Organization"),
-      "409": errorResponse("Reference was already used or canceled with different facts"),
+      "409": errorResponse(
+        "`reference_conflict`: the reference was already used or canceled with different facts; `pricing_revision_unavailable`: the revision is not the active admission tariff; `outstanding_usage`: an unpaid usage record blocks new admission",
+      ),
       "503": errorResponse("Hold result is unavailable or indeterminate"),
     },
   }),
@@ -666,7 +667,9 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       "401": errorResponse("Authentication required"),
       "403": errorResponse("The key lacks wallet:write or belongs to another Organization"),
       "404": errorResponse("Hold reference not found"),
-      "409": errorResponse("Hold is closed, exceeds its amount, or conflicts with prior facts"),
+      "409": errorResponse(
+        "`hold_closed`: the hold is no longer live; `capture_exceeds_hold`: amountMicros exceeds the hold; `measurement_conflict`: amountMicros is not the exact min(actualMicros, original held amount) in USD micros; `reference_conflict`: a capture with different facts was already recorded",
+      ),
       "503": errorResponse("Capture result is unavailable or indeterminate"),
     },
   }),
@@ -720,7 +723,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
           },
         },
       },
-      "400": errorResponse("Malformed page size"),
+      "400": errorResponse("Malformed page size or cursor"),
       "401": errorResponse("Authentication required"),
       "403": errorResponse("The key lacks usage:read or belongs to another Organization"),
       "503": errorResponse("Usage records are unavailable"),
@@ -741,16 +744,107 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
           },
         },
       },
-      "400": errorResponse(
-        "Malformed usage facts or an expected amount that does not match the tariff",
-      ),
+      "400": errorResponse("Malformed usage facts, unit, quantity, period, or amount"),
       "401": errorResponse("Authentication required"),
       "403": errorResponse("The key lacks usage:write or belongs to another Organization"),
-      "409": errorResponse("Reference conflicts with previously recorded usage"),
+      "409": errorResponse(
+        "`measurement_conflict`: expectedMicros differs from the integer USD-micros amount the pinned tariff computes; `reference_conflict`: the reference was recorded with different facts; `pricing_revision_unavailable`: the revision or meter is not the tariff effective at periodStart; `usage_period_crosses_tariff`: the period spans another tariff's effective time",
+      ),
       "503": errorResponse("Usage settlement is unavailable or indeterminate"),
     },
   }),
   beginWalletCheckout: described("Begin a card payment for this organization"),
+  readSubscription: described(
+    "Read hosted subscription coverage and the shared configured plan table",
+    {
+      "x-required-scopes": ["wallet:read"],
+      parameters: [ORGANIZATION_ID_PARAMETER],
+      responses: {
+        "200": {
+          description:
+            "Subscription projection; paidFeatures requires a verified paid billing period",
+          content: {
+            "application/json": { schema: { $ref: "#/components/schemas/SubscriptionResponse" } },
+          },
+        },
+        "401": errorResponse("Authentication required"),
+        "403": errorResponse("Wrong Organization or scope"),
+        "404": errorResponse("Hosted test-mode billing is disabled"),
+        "503": errorResponse("Billing schema or processor unavailable"),
+      },
+    },
+  ),
+  beginSubscription: described(
+    "Begin test-mode monthly subscription Checkout using a configured plan key",
+    {
+      "x-required-scopes": ["payments:write"],
+      parameters: [ORGANIZATION_ID_PARAMETER],
+      description:
+        "Host sets Stripe Price, Organization/customer binding, tariff revision and return URLs. This operation grants no credit. Replay the same reference; an unresolved processor acknowledgement must retain that reference.",
+      requestBody: billingRequest("BeginSubscriptionRequest"),
+      responses: {
+        "201": {
+          description: "Stripe Checkout redirect",
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["checkout"],
+                additionalProperties: false,
+                properties: {
+                  checkout: {
+                    type: "object",
+                    required: ["url"],
+                    additionalProperties: false,
+                    properties: { url: { type: "string", format: "uri" } },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "400": errorResponse("Invalid reference or configured plan key"),
+        "401": errorResponse("Authentication required"),
+        "403": errorResponse("Wrong Organization or payments:write scope"),
+        "404": errorResponse("Hosted test-mode billing is disabled"),
+        "409": errorResponse("Subscription exists or payment command needs reconciliation"),
+        "503": errorResponse("Processor unavailable"),
+      },
+    },
+  ),
+  changeSubscription: described(
+    "Schedule or withdraw cancellation at the current paid period end",
+    {
+      "x-required-scopes": ["payments:write"],
+      parameters: [ORGANIZATION_ID_PARAMETER],
+      description:
+        "Does not grant/revoke wallet credit or prorate a period. The configured catalog currently has one monthly plan; changing prices/plan versions is an operator tariff rollout.",
+      requestBody: billingRequest("ChangeSubscriptionRequest"),
+      responses: {
+        "200": {
+          description: "Updated subscription projection",
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["subscription"],
+                additionalProperties: false,
+                properties: {
+                  subscription: { $ref: "#/components/schemas/SubscriptionProjection" },
+                },
+              },
+            },
+          },
+        },
+        "400": errorResponse("Invalid request"),
+        "401": errorResponse("Authentication required"),
+        "403": errorResponse("Wrong Organization or payments:write scope"),
+        "404": errorResponse("Subscription or capability absent"),
+        "409": errorResponse("Conflicting or unresolved command"),
+        "503": errorResponse("Processor unavailable"),
+      },
+    },
+  ),
   creditWalletFromSettlement: described("Credit the wallet from a verified settlement proof"),
   receiveStripeWebhook: described(
     "Receive one signed Stripe event. Served only where Stripe funding and a webhook signing secret are configured; the Stripe-Signature header over the raw body is the credential, and amounts are re-read from Stripe",
@@ -1216,6 +1310,168 @@ export const openApiDocument = {
           measurementFingerprint: { $ref: "#/components/schemas/BillingFingerprint" },
         },
       },
+      BeginSubscriptionRequest: {
+        type: "object",
+        required: ["reference", "planKey"],
+        additionalProperties: false,
+        properties: {
+          reference: BILLING_REFERENCE_SCHEMA,
+          planKey: {
+            type: "string",
+            minLength: 1,
+            maxLength: 64,
+            description: "Subscription tier planId from the shared configured table",
+          },
+        },
+      },
+      ChangeSubscriptionRequest: {
+        type: "object",
+        required: ["reference", "cancelAtPeriodEnd"],
+        additionalProperties: false,
+        properties: { reference: BILLING_REFERENCE_SCHEMA, cancelAtPeriodEnd: { type: "boolean" } },
+      },
+      SubscriptionProjection: {
+        type: "object",
+        required: [
+          "organizationId",
+          "subscriptionId",
+          "planKey",
+          "pricingRevision",
+          "status",
+          "cancelAtPeriodEnd",
+          "periodStart",
+          "periodEnd",
+          "paidThrough",
+          "paidFeatures",
+          "updatedAt",
+        ],
+        additionalProperties: false,
+        properties: {
+          organizationId: IDENTIFIER_SCHEMA,
+          subscriptionId: { type: "string" },
+          planKey: { type: "string" },
+          pricingRevision: { type: "string" },
+          status: {
+            type: "string",
+            enum: [
+              "incomplete",
+              "incomplete_expired",
+              "trialing",
+              "active",
+              "past_due",
+              "canceled",
+              "unpaid",
+              "paused",
+            ],
+          },
+          cancelAtPeriodEnd: { type: "boolean" },
+          periodStart: { type: "string", format: "date-time" },
+          periodEnd: { type: "string", format: "date-time" },
+          paidThrough: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
+          paidFeatures: { type: "boolean" },
+          updatedAt: { type: "string", format: "date-time" },
+        },
+      },
+      SubscriptionResponse: {
+        type: "object",
+        required: ["subscription", "planTable"],
+        additionalProperties: false,
+        properties: {
+          subscription: {
+            anyOf: [{ $ref: "#/components/schemas/SubscriptionProjection" }, { type: "null" }],
+          },
+          planTable: { $ref: "#/components/schemas/HostedPlanTable" },
+        },
+      },
+      HostedPlanTable: {
+        type: "object",
+        required: ["scope", "products", "balanceScope", "plans", "consumptionOrder"],
+        additionalProperties: false,
+        properties: {
+          scope: { const: "hosted" },
+          products: {
+            type: "array",
+            prefixItems: [{ const: "takosumi-hosted" }, { const: "takoserver" }],
+            minItems: 2,
+            maxItems: 2,
+          },
+          balanceScope: { const: "organization" },
+          consumptionOrder: {
+            type: "array",
+            prefixItems: [
+              { const: "free" },
+              { const: "subscription" },
+              { const: "purchased" },
+              { const: "postpaid" },
+            ],
+            minItems: 4,
+            maxItems: 4,
+          },
+          plans: {
+            type: "array",
+            minItems: 3,
+            maxItems: 3,
+            items: {
+              oneOf: [
+                {
+                  type: "object",
+                  required: [
+                    "planId",
+                    "tier",
+                    "resourceScope",
+                    "configuredMonthlyCreditMinor",
+                    "edgeAllowance",
+                  ],
+                  additionalProperties: false,
+                  properties: {
+                    planId: { type: "string" },
+                    tier: { const: "free" },
+                    resourceScope: { const: "edge" },
+                    configuredMonthlyCreditMinor: { type: "integer", minimum: 0 },
+                    edgeAllowance: { const: "pending-owner-runtime-policy" },
+                  },
+                },
+                {
+                  type: "object",
+                  required: [
+                    "planId",
+                    "tier",
+                    "monthlyAmountMinor",
+                    "includedCreditMinor",
+                    "stripePriceId",
+                  ],
+                  additionalProperties: false,
+                  properties: {
+                    planId: { type: "string" },
+                    tier: { const: "subscription" },
+                    monthlyAmountMinor: { type: "integer", minimum: 1 },
+                    includedCreditMinor: { type: "integer", minimum: 0 },
+                    stripePriceId: { type: "string" },
+                  },
+                },
+                {
+                  type: "object",
+                  required: [
+                    "planId",
+                    "tier",
+                    "checkoutMinimumMinor",
+                    "checkoutMaximumMinor",
+                    "meters",
+                  ],
+                  additionalProperties: false,
+                  properties: {
+                    planId: { type: "string" },
+                    tier: { const: "usage" },
+                    checkoutMinimumMinor: { type: "integer", minimum: 1 },
+                    checkoutMaximumMinor: { type: "integer", minimum: 1 },
+                    meters: { type: "object", additionalProperties: { type: "object" } },
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
       WalletResponse: {
         type: "object",
         required: ["wallet"],
@@ -1242,6 +1498,15 @@ export const openApiDocument = {
               settledMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
               heldMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
               availableMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+              refundReceivableMicros: {
+                $ref: "#/components/schemas/BillingUnsignedMicros",
+                description: "Non-spendable refund debt; blocks new billable admission",
+              },
+              frozenMicros: {
+                $ref: "#/components/schemas/BillingUnsignedMicros",
+                description:
+                  "Original-lot credit unavailable while refund settlement is pending or unresolved",
+              },
               entries: {
                 type: "array",
                 items: {
@@ -1261,7 +1526,16 @@ export const openApiDocument = {
                     organizationId: IDENTIFIER_SCHEMA,
                     type: {
                       type: "string",
-                      enum: ["funding", "hold", "capture", "release", "usage_debit"],
+                      enum: [
+                        "funding",
+                        "hold",
+                        "capture",
+                        "release",
+                        "usage_debit",
+                        "refund_debit",
+                        "refund_receivable",
+                        "revoked_after_expiry",
+                      ],
                     },
                     reference: { type: "string", minLength: 1 },
                     settledDeltaMicros: { $ref: "#/components/schemas/BillingSignedMicros" },
@@ -1302,6 +1576,8 @@ export const openApiDocument = {
                 consumptionClass: { type: "string", enum: ["free", "subscription", "purchased"] },
                 amountMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
                 spentMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                revokedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                frozen: { type: "boolean" },
                 remainingMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
                 heldMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
                 availableMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
@@ -1347,6 +1623,7 @@ export const openApiDocument = {
             anyOf: [{ $ref: "#/components/schemas/BillingRevision" }, { type: "null" }],
           },
           status: { type: "string", enum: ["live", "captured", "released", "expired"] },
+          closureReason: { anyOf: [{ type: "string", enum: ["refund"] }, { type: "null" }] },
           capturedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
           releasedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
           actualMicros: {
@@ -1573,6 +1850,7 @@ export const openApiDocument = {
         ],
         additionalProperties: false,
         properties: {
+          billing: { $ref: "#/components/schemas/StripeBillingReconcileReport" },
           examined: { type: "integer", minimum: 0 },
           credited: { type: "integer", minimum: 0 },
           alreadyCredited: { type: "integer", minimum: 0 },
@@ -1603,6 +1881,20 @@ export const openApiDocument = {
               },
             },
           },
+        },
+      },
+      StripeBillingReconcileReport: {
+        type: "object",
+        description:
+          "Optional hosted subscription/refund reconciliation summary; no monetary or customer data",
+        required: ["examined", "applied", "unresolved", "truncated", "handlerVersion"],
+        additionalProperties: false,
+        properties: {
+          examined: { type: "integer", minimum: 0 },
+          applied: { type: "integer", minimum: 0 },
+          unresolved: { type: "integer", minimum: 0 },
+          truncated: { type: "boolean" },
+          handlerVersion: { type: "integer", const: 1 },
         },
       },
       IntegrationOrganizationBootstrapStatusRequest: {
