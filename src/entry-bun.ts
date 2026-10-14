@@ -1387,6 +1387,7 @@ try {
         : unconfigured),
     v2: takoformV2Config,
     ...(billingConfig ? { billingConfig } : {}),
+    hostedPaidFreeExclusion: Boolean(hostedPricing),
     v2ArtifactSourceFactory: createSelfhostPublicArtifactSource,
     ...(v2FormFactory ? { v2FormFactory } : {}),
     ...(v2FormFactory && runtimeInputKeyAuthority
