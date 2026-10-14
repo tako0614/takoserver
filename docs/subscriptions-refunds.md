@@ -1,7 +1,7 @@
 # Hosted subscriptions and refunds in Stripe test mode
 
 This is the implementation guide for the monthly invoice and refund handlers
-specified in [unified-billing.md](unified-billing.md). It builds on #326's Organization wallet with integer USD micros and free →
+specified in [unified-billing.md](unified-billing.md). It builds on #330's Organization wallet with integer USD micros and free →
 subscription → purchased class priority. Stripe cash and the authored price
 configuration stay in cents; verified cash and configured grant amounts convert
 exactly once by multiplying by 10,000 before entering wallet accounting. Public
@@ -28,8 +28,8 @@ from `GET /v1/organizations/{organizationId}/payments/subscription`.
 
 Hosted pricing is optional. Its presence requires a matching billing config,
 a Stripe **test** key, and the complete additive **0095** schema after #330's
-0093 classification proofs and 0094 micros cutover. Schema lineage remains
-owned by Takoserver at commit `04360c33`.
+0093 classification proofs and 0094 micros cutover. Staging schema qualification and
+application are owned by operator session `04360c33`.
 Live keys, live objects and connected-account events are refused. No default
 commercial price is selected. Source migrations and generated SQLite schema
 ship here; D1 qualification/application and deployment remain separate work.
