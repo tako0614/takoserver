@@ -578,6 +578,12 @@ const LAYERS: readonly Layer[] = [
       /^src\/(?:index|provider-extension|workflow-runtime|workflow-runtime-transport|workflow-runtime-workerd)\.ts$|^src\/takoform\/integration-actor-(?:host|form-authority)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "package-surface"],
   },
+  {
+    // The shared monetary source is domain data; it has no runtime authority.
+    name: "domain",
+    match: /^src\/shared-hosted-pricing\.ts$/u,
+    may: ["core", "domain", "release-data"],
+  },
 ];
 
 function layerOf(path: string): Layer | undefined {
