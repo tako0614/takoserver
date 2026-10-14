@@ -856,6 +856,109 @@
           }
         }
       },
+      "WalletUsageSummaryResponse": {
+        "type": "object",
+        "required": [
+          "usageSummary"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "usageSummary": {
+            "type": "object",
+            "required": [
+              "organizationId",
+              "currency",
+              "unit",
+              "periodKind",
+              "periodStart",
+              "periodEnd",
+              "nextResetAt",
+              "originalIncludedMicros",
+              "effectiveIncludedMicros",
+              "usedMicros",
+              "heldMicros",
+              "availableMicros",
+              "revokedMicros",
+              "utilizationBasisPoints",
+              "reached80Percent",
+              "reached95Percent",
+              "limitReached",
+              "purchasedAvailableMicros",
+              "directAvailableMicros"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "organizationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "currency": {
+                "const": "USD"
+              },
+              "unit": {
+                "const": "USD-micros"
+              },
+              "periodKind": {
+                "type": "string",
+                "enum": [
+                  "free",
+                  "paid"
+                ]
+              },
+              "periodStart": {
+                "$ref": "#/components/schemas/BillingUtcDateTime"
+              },
+              "periodEnd": {
+                "$ref": "#/components/schemas/BillingUtcDateTime"
+              },
+              "nextResetAt": {
+                "$ref": "#/components/schemas/BillingUtcDateTime",
+                "description": "Current grant end; the next period is not enabled by this response."
+              },
+              "originalIncludedMicros": {
+                "$ref": "#/components/schemas/BillingUnsignedMicros"
+              },
+              "effectiveIncludedMicros": {
+                "$ref": "#/components/schemas/BillingUnsignedMicros",
+                "description": "Original included allowance less verified refund revocation."
+              },
+              "usedMicros": {
+                "$ref": "#/components/schemas/BillingUnsignedMicros"
+              },
+              "heldMicros": {
+                "$ref": "#/components/schemas/BillingUnsignedMicros"
+              },
+              "availableMicros": {
+                "$ref": "#/components/schemas/BillingUnsignedMicros"
+              },
+              "revokedMicros": {
+                "$ref": "#/components/schemas/BillingUnsignedMicros"
+              },
+              "utilizationBasisPoints": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 10000
+              },
+              "reached80Percent": {
+                "type": "boolean"
+              },
+              "reached95Percent": {
+                "type": "boolean"
+              },
+              "limitReached": {
+                "type": "boolean"
+              },
+              "purchasedAvailableMicros": {
+                "$ref": "#/components/schemas/BillingUnsignedMicros"
+              },
+              "directAvailableMicros": {
+                "$ref": "#/components/schemas/BillingUnsignedMicros"
+              }
+            }
+          }
+        }
+      },
       "WalletLotsResponse": {
         "type": "object",
         "required": [
@@ -4318,6 +4421,68 @@
               "minLength": 1,
               "maxLength": 512,
               "description": "Opaque continuation cursor returned by the previous page."
+            }
+          }
+        ],
+        "x-required-scopes": [
+          "wallet:read"
+        ]
+      }
+    },
+    "/v1/organizations/{organizationId}/wallet/usage-summary": {
+      "get": {
+        "summary": "Read current Organization included-credit usage",
+        "responses": {
+          "200": {
+            "description": "Current verified paid service period or frozen UTC Free month",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletUsageSummaryResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks wallet:read or belongs to another Organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Entitlement, refund, or wallet snapshot is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
             }
           }
         ],

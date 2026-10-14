@@ -352,6 +352,7 @@ URL-encoded as one path component, with bounded length and namespace validation.
 | --- | --- | --- |
 | `GET /wallet` | `wallet:read` (existing) | Current balance and recent ledger entries |
 | `GET /wallet/lots` | `wallet:read` | Cursor-paged credits, expiry, remaining and held amounts |
+| `GET /wallet/usage-summary` | `wallet:read` | One read snapshot of the current included-credit period, utilization, reset date and separate purchased-class/direct non-purchased availability |
 | `POST /wallet/holds` | `wallet:write` | `reference`, final decimal-string `amountMicros`, pricing/measurement fingerprint; returns deadline and receipt |
 | `GET /wallet/holds/{reference}` | `wallet:read` | Exact receipt independent of the wallet's last-100-entry window |
 | `POST /wallet/holds/{reference}/capture` | `wallet:write` | Bounded capture and atomic remainder release; includes full actual/fingerprint |
@@ -416,6 +417,7 @@ a view with its fetch time, but cannot maintain or write a second balance.
 | Frozen / 返金処理中の凍結額 | `/wallet.frozenMicros`: original-lot credit unavailable while refund settlement is pending or unresolved; never available or an extra balance |
 | Refund receivable / 返金未回収額 | `/wallet.refundReceivableMicros`: non-spendable debt from refunded credit already used; separate from current credit and blocks new billable admission even when available credit is positive |
 | Free / Subscription / Purchased | Lot `consumptionClass`, original grant/purchase, remaining, held, available and expiry; display in the fixed consumption order |
+| Included usage / 当期の無料・有料枠 | `/wallet/usage-summary`: verified paid invoice service period or frozen UTC Free month, effective allowance after refunds, this period's used/held/available micros, capped basis-point utilization, 80%/95% flags and grant-end `nextResetAt`; purchased/direct credit is separate |
 | Edge-resource allowance | Configured quota units, period, used and remaining resources; separate from monetary credit and never added to the wallet |
 | Postpaid usage | Confirmed payable usage, pending cap reservation, cash cap and invoiced/uncollected amounts; separate from the nonnegative prepaid wallet |
 
@@ -480,14 +482,26 @@ expiry is disclosed before Checkout. Postpaid is shown as disabled until an
 implemented, explicitly consented cap exists; its unused cap is never a wallet
 credit or part of the available/held identity.
 
+The usage summary selects the current paid invoice proof or monthly Free
+snapshot and its exact lot in one database read. During an active invoice
+refund fence, or if that proof or snapshot is inconsistent, it returns 503
+instead of a Free or zero-balance guess. `nextResetAt` is the current grant's
+end, not a promise that the next paid period will be enabled. A zero first-month
+Free snapshot reports zero allowance and `limitReached` with zero basis points.
+The 80% and 95% flags use the same current-period ratio of used plus held to
+effective allowance; at zero allowance both flags are false while
+`limitReached` is true. Purchased-class credit, including legacy direct-origin
+Checkout credit, never lowers that ratio. Historical
+Free holds and usage remain in their original Free period after a paid grant.
+
 The existing `/wallet/lots` API is paged and its pages are independent reads.
 Show a loaded-lot list as partial until all relevant pages are fetched; do not
 call a first-page sum the complete class balance. Even a complete traversal
 can race a new hold, expiry or funding, so do not present it as an atomic
-class summary or override the authoritative `/wallet` total. A future complete
-class-summary UI requires an authoritative same-snapshot projection. Until
-that exists, expose per-lot details and a refresh time instead of inventing
-reconciled totals from unrelated reads.
+class summary or override the authoritative `/wallet` total. The usage summary
+is the authoritative current included-credit view and separately reports
+purchased-class and direct non-purchased availability; it does not claim a complete historical
+per-class rollup or replace the `/wallet` total.
 
 Hold details include opaque operation reference, original micros, immutable
 deadline, terminal state and captured/released micros. Expired is distinct

@@ -221,6 +221,11 @@ export const ROUTES: readonly RouteDeclaration[] = [
   },
   {
     method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/usage-summary",
+    operation: "readWalletUsageSummary",
+  },
+  {
+    method: "get",
     pattern: "/v1/organizations/{organizationId}/wallet/holds/{reference}",
     operation: "readWalletHold",
   },

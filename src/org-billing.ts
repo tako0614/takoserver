@@ -15,6 +15,11 @@ import {
   type Wallet,
 } from "./ledger.ts";
 import { MoneyError, minorToMicros } from "./money.ts";
+import {
+  type OrgUsageSummary,
+  OrgUsageSummaryUnavailable,
+  readOrgUsageSummary,
+} from "./org-usage-summary.ts";
 import { type Clock, type Row, type Sql, SqlError, type SqlStatement } from "./ports.ts";
 
 export class OrgBillingError extends Error {
@@ -118,6 +123,7 @@ export interface LotPage {
 
 export interface OrgBilling {
   wallet(organizationId: string): Promise<Wallet>;
+  usageSummary(organizationId: string): Promise<OrgUsageSummary>;
   lots(organizationId: string, limit?: number, cursor?: string): Promise<LotPage>;
   hold(input: HoldInput): Promise<HoldReceipt>;
   readHold(organizationId: string, reference: string): Promise<HoldReceipt>;
@@ -472,6 +478,26 @@ export function createOrgBilling(options: {
     async wallet(org) {
       await prepare(org);
       return ledger.wallet(org);
+    },
+    async usageSummary(org) {
+      try {
+        await prepare(org);
+        return await readOrgUsageSummary({
+          sql,
+          organizationId: org,
+          instant: now(),
+          hostedPaidFreeExclusion,
+        });
+      } catch (error) {
+        if (
+          error instanceof OrgUsageSummaryUnavailable ||
+          error instanceof LedgerError ||
+          error instanceof MoneyError ||
+          error instanceof SqlError
+        )
+          orgBillingFail("billing_unavailable", 503);
+        throw error;
+      }
     },
     async lots(org, limit = 100, cursor) {
       const refundSchema = await refundsReady();
