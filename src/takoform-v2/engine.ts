@@ -1,6 +1,7 @@
 import { bytesDigest, canonicalJson } from "../json.ts";
 import { type JsonObject, SqlError, type SqlParam } from "../ports.ts";
 import { readV2ConfiguredPrivateInputs } from "./configured-private-inputs.ts";
+import { captureV2HostAcceptance, type V2HostAcceptance } from "./host-acceptance.ts";
 import { isV2FormUrl } from "./identity.ts";
 import {
   hasPrivateComparisonMaterial,
@@ -186,7 +187,10 @@ function replayBodyWithoutPrivateValues(body: Readonly<Record<string, unknown>>)
   ) as JsonObject;
 }
 
-export function createTakoformV2Engine(options: V2EngineOptions) {
+export function createTakoformV2Engine(
+  options: V2EngineOptions,
+  hostAcceptance?: V2HostAcceptance,
+) {
   const configuredFreshAdmission = options.allowFreshCreateAndUpdate;
   if (configuredFreshAdmission !== undefined && typeof configuredFreshAdmission !== "boolean") {
     throw new TypeError("allowFreshCreateAndUpdate must be a boolean");
@@ -202,7 +206,9 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
   }
   const now = options.now ?? (() => new Date());
   const retryMs = Math.max(1_000, leaseMs);
-  const store = createV2Store(options.sql);
+  const sql = options.sql;
+  const acceptance = captureV2HostAcceptance(hostAcceptance, sql);
+  const store = createV2Store(sql, acceptance);
   const formUrls = Object.freeze(Object.keys(options.forms));
   const retainedForms = options.retainedForms ?? {};
   for (const url of Object.keys(retainedForms)) {
@@ -594,14 +600,24 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           )
         : undefined;
       if (admission === null) fail("dependency_conflict", 409);
-      const output = selected.initialOutput
-        ? selected.initialOutput({
-            resourceUid: record.resourceUid,
-            space: desired.space,
-            name: desired.name,
-            spec: JSON.parse(record.specJson) as JsonObject,
-          })
-        : {};
+      const assignedOutput = acceptance?.initialOutput(
+        Object.freeze({
+          form: desired.form,
+          backendId: record.backendId,
+          targetKey: record.targetKey,
+          name: desired.name,
+        }),
+      );
+      const output =
+        assignedOutput ??
+        (selected.initialOutput
+          ? selected.initialOutput({
+              resourceUid: record.resourceUid,
+              space: desired.space,
+              name: desired.name,
+              spec: JSON.parse(record.specJson) as JsonObject,
+            })
+          : {});
       if (typeof output !== "object" || output === null || Array.isArray(output)) {
         throw new TypeError("Form initial output must be a public JSON object");
       }
@@ -695,7 +711,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         privateInputs,
       );
       if (selectedForm.privateInputs?.prepareUpdate) {
-        const configuredRow = await readV2ConfiguredPrivateInputs(options.sql, {
+        const configuredRow = await readV2ConfiguredPrivateInputs(acceptance ? sql : options.sql, {
           principal: input.principal,
           space: target.space,
           name: target.name,
@@ -738,6 +754,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           referencesJson,
           serializeUpdatesWithPendingReferrers,
           admission,
+          acceptance ? target : undefined,
         );
         if (result === "accepted") {
           const acceptedOperation = operation(await storedOperation(record.id));

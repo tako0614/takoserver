@@ -14,6 +14,7 @@ const roots = ["src", "scripts", "tests"];
 for (const root of roots) {
   for (const path of walk(root)) {
     if (!path.endsWith(".ts")) continue;
+    checkHostAcceptanceImports(path);
     for (const specifier of importsOf(path)) {
       if (forbidden.test(specifier)) violations.push(`${path}: ${specifier}`);
     }
@@ -52,6 +53,16 @@ interface Layer {
 }
 
 const LAYERS: readonly Layer[] = [
+  {
+    name: "v2-host-acceptance-contract",
+    match: /^src\/takoform-v2\/host-acceptance\.ts$/u,
+    may: ["core", "v2-private"],
+  },
+  {
+    name: "worker-endpoint-origin-v2-acceptance-composition",
+    match: /^src\/worker-endpoint-origin-v2-acceptance\.ts$/u,
+    may: ["core", "domain", "v2-contract"],
+  },
   // v2 shares neutral primitives, not the v1 package/admission domain. The
   // Queue and Durable Workflow Resource/Operation managers are exposed as
   // source-extension factories, but this does not register them in the normal
@@ -635,6 +646,15 @@ for (const path of walk("src")) {
       violations.push(`${path} (${layer.name}) imports unclassified module ${target}`);
       continue;
     }
+    const exactHostAcceptanceEdge =
+      target === "src/takoform-v2/host-acceptance.ts" &&
+      [
+        "src/takoform-v2/engine.ts",
+        "src/takoform-v2/store.ts",
+        "src/takoform-v2/host.ts",
+        "src/takoform-v2/application.ts",
+        "src/worker-endpoint-origin-v2-acceptance.ts",
+      ].includes(path);
     // This Host-only callback carries the exact accepted execution into
     // private lifecycle readbacks. Permit only this single type-only edge;
     // do not widen the general self-host composition layer to v2-contract.
@@ -697,6 +717,7 @@ for (const path of walk("src")) {
         );
     if (
       !layer.may.includes(targetLayer.name) &&
+      !exactHostAcceptanceEdge &&
       !exactExecutionTypeEdge &&
       !exactQueueProviderExtensionEdge &&
       !exactSchedulerProviderExtensionEdge
@@ -1046,6 +1067,44 @@ function importsOf(path: string): readonly string[] {
   return [...source.matchAll(/(?:from\s+|import\s*\(|import\s+)(["'])([^"']+)\1/gu)]
     .map((match) => match[2])
     .filter((specifier): specifier is string => specifier !== undefined);
+}
+
+/** The SQL mint has one concrete source owner; it is not a Host/Form writer hook. */
+function checkHostAcceptanceImports(path: string): void {
+  const source = readFileSync(path, "utf8");
+  const owners = [
+    "src/takoform-v2/host-acceptance.ts",
+    "src/worker-endpoint-origin-v2-acceptance.ts",
+  ];
+  if (
+    path !== "scripts/check-imports.ts" &&
+    /\bprepareV2HostAcceptance\b/u.test(source) &&
+    !owners.includes(path)
+  ) {
+    violations.push(
+      `${path}: prepared Host acceptance mint belongs only to the fixed origin compiler`,
+    );
+  }
+  const target = "src/takoform-v2/host-acceptance.ts";
+  const references = localImportsOf(path).filter((value) => value === target);
+  if (references.length === 0) return;
+  const named = [
+    ...source.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+(["'])([^"']+)\2/gu),
+  ].filter(
+    (value) => normalize(relative(resolve("."), resolve(dirname(path), value[3] ?? ""))) === target,
+  );
+  if (
+    !owners.includes(path) &&
+    named.some((value) => /\bprepareV2HostAcceptance\b/u.test(value[1] ?? ""))
+  )
+    violations.push(
+      `${path}: prepared Host acceptance mint import is private to its fixed compiler`,
+    );
+  if (named.length !== references.length) {
+    violations.push(
+      `${path}: Host acceptance contract permits named imports only, no re-export or namespace/dynamic access`,
+    );
+  }
 }
 
 /** Repository-relative paths of the in-repo modules a file imports. */
