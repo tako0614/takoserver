@@ -28,10 +28,12 @@ Related work: [Takosumi Hosted PR #54](https://github.com/tako0614/takosumi-host
 and merged [shared price authoring #319](https://github.com/tako0614/takoserver/pull/319).
 The original PR #54 review found no review/discussion comments; its body lists
 the four questions decided below. The implementation baseline for this revision
-is main `5106f2036cfedfefb19e6af377e141953c380529` (#330), with the subsequent
-[#328](https://github.com/tako0614/takoserver/pull/328) single-cutoff expiry and
-OpenAPI status correction included. Source merge does not establish staging or
-billing GA.
+is main `bf90a9f86e970f5fb93e24ac1765131fd6cc01f9` (#325), including #330 and
+[#328](https://github.com/tako0614/takoserver/pull/328) single-cutoff expiry.
+The shared two-choice table follows [#336](https://github.com/tako0614/takoserver/pull/336)
+candidate `b18af4708c1c5b1071476975178bd76fb886f7b7`; its source qualification
+and runtime activation remain separate from this API contract correction.
+Source merge does not establish staging or billing GA.
 
 | Area | CTO target | Implementation / remaining acceptance |
 | --- | --- | --- |
@@ -39,7 +41,7 @@ billing GA.
 | Allocation | Free allowance → subscription credit → purchased credit → consented capped postpaid | Prepaid allocation, settlement and pagination share class priority; postpaid remains disabled pending its separate cap reservation and invoice implementation |
 | Invoicing | Aggregate payable micros, then ceiling to cents once | Capture/usage retain micros; the arithmetic helper is available, while Stripe invoice settlement remains a later wave |
 | Holds and scopes | Immutable TTL, capture ≤ hold, automatic release; four routine writes with exact Organization/scopes | #330 preserves #318's transactional lifecycle and supplies the four micros commands and scoped reads |
-| Hosted plans | Edge allowance, monthly included credit, additional credit/usage; the same three configured IDs and table | #319 is a shared-table preview, not an activated catalog; configuration/subscription/refund alignment is owned by #325 / `106603b4` |
+| Hosted plans | Edge allowance, monthly included credit, additional credit/usage; the same configured role IDs, subscription choices and table | #325 supplies subscriptions/refunds; #336 supplies the shared USD-micros source and two-choice compiler; TEST Price and live target acceptance remain required |
 | Screens | USD cents presentation, exact micros details; shared balance/held/lot semantics | Common contract below; current Console shows exact micros and no lot breakdown, so screen adoption remains an explicit acceptance step |
 
 ## One wallet authority, separate product identities
@@ -69,17 +71,24 @@ literal plan IDs or another price table:
 | Shared role | ID from the one configuration | Entitlement and charging |
 | --- | --- | --- |
 | Free | `planIds.free` | Configured edge-resource free allowance; optional monthly free-credit entitlement is separate from the resource quota |
-| Monthly subscription | `planIds.subscription` | One monthly Organization subscription with configured included credit; grants follow verified paid invoice periods |
+| Monthly subscription | `sharedPricing.plans[].planId` in authoring v2; legacy v1 uses `planIds.subscription` | Choose one configured monthly Organization subscription; grants follow its verified paid invoice period and pinned included credit |
 | Additional credit / metered usage | `planIds.usage` | Purchased prepaid credit, then optional explicitly consented, capped postpaid usage; no implicit second subscription or credit line |
 
 Both products consume the same configured IDs, revision, display labels,
 entitlements and price rows. Neither adds a product prefix, hardcodes a local
 price, nor mints a second subscription or allowance when the user switches
-products or adds a Workspace. These are three plan roles, not two independent
-product catalogs. A subscription customer can also buy additional credit;
+products or adds a Workspace. These are three commercial roles. Authoring v2 has two monthly subscription
+choices, so its public table has four rows: Free, monthly choice 1, monthly
+choice 2, usage. Legacy authoring v1 retains its three-row table for compatible
+configuration and historical snapshots. Both tables describe one shared
+Organization wallet; choosing a monthly offer does not create another wallet. A subscription customer can also buy additional credit;
 credit sources and the consumption classes below do not become extra plans.
 
-All advertised amounts are provisional configuration, including monthly price,
+The CTO reference values are Free credit of USD 1.50/month (not a card charge),
+USD 10/month with USD 20 credit, USD 50/month with USD 100 credit, and metering
+at three times the configured Cloudflare overage rate. These values live in the
+shared USD-micros source; this document does not create runtime defaults.
+All advertised amounts remain replaceable configuration, including monthly price,
 included/free credit, edge-resource allowance and metered rates. The same
 validated table supplies both product screens and server admission. An edge
 quota is a resource entitlement, not dollars or a spendable credit lot: its
@@ -88,12 +97,12 @@ Do not advertise an unimplemented quota as available merely because a preview
 contains a free-credit amount. A missing entitlement or plan ID stays pending
 activation; the client does not invent it.
 
-#319's authoring/preview supplies the shared-table contract but is not runtime
-activation. The inactive decision input
+#319's authoring v1 remains compatible. #336 adds the authoring v2 shared
+source/compiler; compiling a table is not runtime activation. The decision input
 [`config/shared-hosted-pricing.json`](../config/shared-hosted-pricing.json)
-contains provisional USD amounts and unresolved IDs/allowances; it is not a
-second active tariff. Configuration/runtime alignment and final placeholders
-are owned by `106603b4` in [#325](https://github.com/tako0614/takoserver/pull/325).
+contains the reference USD-micros amounts and unresolved Stripe IDs/allowances;
+it is not a second active tariff. #325 owns the subscription/refund service,
+and #336 owns the shared source/compiler and TEST Price alignment.
 This revision changes none of those configuration or compiler files. Configured
 IDs stay stable across price revisions; changing an ID requires a separately
 reviewed binding migration, not a product-specific alias.
@@ -518,12 +527,13 @@ therefore survive a missing event row or two event ids for one object.
 
 For `invoice.paid`, grant the configured included-credit entitlement once using
 `stripe:invoice:<id>`, expiring at the verified recurring line period end. Use
-the invoice's pinned plan/price revision, not current catalog prices or invoice
-total (which may include tax, discounts, or overage). Require one recognized
-monthly credit-bearing subscription line and a verified paid invoice. A paid
-invoice containing only overage grants no new included lot. A zero-dollar
-invoice grants only an explicitly configured complimentary entitlement; it
-does not impersonate a purchased payment. A late paid invoice retains its
+the invoice's pinned plan/price revision, not current catalog prices or the
+invoice total as an entitlement. #336's fixed-cash path requires one recognized
+monthly credit-bearing line and verified paid cash equal to its configured
+monthly price. Tax, shipping, balance offsets, credit notes, discounted cash
+below that price, zero-dollar and overage-only invoices do not establish this
+monthly grant. A future complimentary or promotion entitlement needs separate
+explicit authority; it is not implemented by this path. A late paid invoice retains its
 original expiry, even if it has already passed.
 
 For this version, subscriptions are monthly; changes take effect on the next
@@ -684,17 +694,25 @@ integer cents. At creation of a grant snapshot, convert those entitlements
 exactly to checked USD micros by multiplying by 10,000. Its meter rate
 `numeratorMicros` already means USD micros. Retain the original configuration
 revision and explicit unit in the snapshot; do not relabel historical cents
-values or add another price table. #319 owns configurable plan ids, Stripe
-price mappings, and its free/subscription/usage output. This revision leaves
-its authoring, compiler, preview, examples, and tests unchanged. Preserve the
+values or add another price table. #336 authoring v2 supplies the two
+configured subscription IDs from
+`sharedPricing.plans`, with `planIds.free` and `planIds.usage` for the other roles.
+Its exact conversion at the existing cents configuration boundary does not
+change the canonical micros ledger or introduce another usage rounding step.
+Nonrepresentable values and unresolved runtime Stripe IDs are rejected; IDs
+may remain null only in the inactive source/preview. The public subscription
+read returns this validated four-row table; OpenAPI also admits the compatible
+three-row v1 table. This revision changes neither owner's source, compiler,
+preview, configuration, nor pricing-service tests. Preserve the
 existing validated `holdTtlSeconds` and `purchaseCreditExpiry` fields. Future
 consent/cap configuration requires its own validated versioned extension rather
 than guessed commercial defaults.
 
 Validate unique mappings, nonnegative safe amounts, TTL bounds, month periods,
 and Stripe price currency/recurrence before activation. Secrets stay in existing
-secret bindings, never JSON or this repo. Actual commercial prices, Supply
-Contracts, provider accounts, and realized targets remain operator-private.
+secret bindings, never JSON or this repo. Deployment-specific Stripe bindings, Supply Contracts, provider accounts and
+realized targets remain operator-composed; public shared cash/credit amounts
+are supplied by the reviewed configuration.
 Keep #313's existing Checkout limits and webhook/reconcile settings
 in `src/payment-settings.ts`; do not invent a parallel parser for those fields.
 Current AI and supply tariff configuration retain their own owners and must
@@ -794,8 +812,10 @@ that the four routine writes, exact units, allocation priority, capture bound,
 TTL and release already match this decision. #328 retained old `amountMinor`,
 `expectedMinor` and rounded-actual wording in two OpenAPI error descriptions;
 this revision fixes those descriptions and regenerates the public artifact,
-without changing handlers, scopes or money math. Price configuration/subscriptions/refunds remain owned by
-`106603b4` / #325; this work edits none of their files. Shared screen adoption
+without changing handlers, scopes or money math. #325 subscription/refund
+alignment is merged; #336 owns the shared source/compiler and two paid choices.
+This follow-up fixes only the subscription table OpenAPI row bound, its public
+route regression and this document; none of either owner's files change. Shared screen adoption
 and complete same-snapshot class summaries remain explicit UI acceptance.
 This design ledger does not establish acceptance of live conversion or the
 remaining GA waves. The previous #323 documentation and #320/#327 0092 work
@@ -808,7 +828,7 @@ the unregistered TASK-0100 handoff is implementation planning input only.
 | 1 | takoserver | This reviewed CTO revision, local `bun run check`, PR publication/merge; documentation publication changes no live money |
 | 2 | takos-control | Register implementation ledger, amend wallet ownership policy, regenerate instructions; no shared identity grant |
 | 3 | takoserver | Completed in merged #330: canonical-micros API/ledger, class-priority allocation, checked cash adapters, forward unit migration, generated OpenAPI and contract/conservation tests; live 0093/0094 qualification remains separate |
-| 4 | takoserver / `106603b4` | #325 configuration/subscription/refund alignment and its gate; separate capped postpaid acceptance. This revision does not modify that owner's config, compiler, pricing or runtime files |
+| 4 | takoserver / `106603b4`, `04360c33` | #325 subscriptions/refunds merged; #336 shared source/compiler and two paid choices with separate gate and TEST/live qualification. OpenAPI admits legacy three-row and v2 four-row tables; no price/handler files are changed here |
 | 5 | takosumi-hosted | Adapt PR #54 fake/port to micros receipts, unpaid usage, real scoped HTTP client, durable local mapping, and single-writer retail retirement; retain draft isolation until wire exists |
 | 6 | takosumi / takosumi-hosted | Bridge OSS Seam B through authenticated server RPC, discard `billingSubjectId`, use measured actual cost rather than OSS's current estimate-as-capture, wire cancellation/deadline checks; keep Run authority in OSS and self-host outside Hosted billing |
 | 7 | takoserver-private / takosumi-hosted | Owner consumes reviewed schema/CPE prerequisites, composes private tariffs/Stripe settings, and snapshots/rehearses cutover; operator session `04360c33` owns qualified staging 0093/0094/0095 application following the CTO 2026-10-14 12:00 JST handoff; `4d7bccc3` remains the staging target/deploy/test coordination contact |
