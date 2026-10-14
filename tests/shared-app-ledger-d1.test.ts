@@ -2,13 +2,13 @@ import { expect, test } from "bun:test";
 import { Miniflare } from "miniflare";
 import {
   planSharedAppLegacyAdoption,
-  SHARED_APP_COOLDOWN_MILLISECONDS,
   type SharedAppLegacyProjection,
 } from "../src/shared-app-ledger.ts";
 import { createSharedAppLedgerD1, type SharedAppPrimaryD1 } from "../src/shared-app-ledger-d1.ts";
 import { createD1Sql, type D1DatabaseLike } from "../src/sql-d1.ts";
 
 const START = Date.parse("2026-10-15T00:00:00Z");
+const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1_000; // A refusal boundary, not a reuse policy.
 const SERVER = { organizationId: "org-server", product: "takoserver" as const };
 const HOSTED = { organizationId: "org-hosted", product: "takosumi-hosted" as const };
 
@@ -202,7 +202,7 @@ test("one original command cannot claim two names, or be borrowed by another pro
   }
 });
 
-test("release retains its first tombstone, fences old scripts and permits a new incarnation after 30 days", async () => {
+test("release retains its permanent tombstone and never permits another incarnation", async () => {
   const h = await harness();
   try {
     const owner = h.ledger.forTrustedOwner(SERVER);
@@ -213,33 +213,47 @@ test("release retains its first tombstone, fences old scripts and permits a new 
     if (!selected) throw new Error("selection missing");
     expect(await h.ledger.isCurrentBeforeDispatch(selected)).toBe(true);
     const released = await owner.release(active);
-    h.setNow(START + SHARED_APP_COOLDOWN_MILLISECONDS - 1);
-    expect(await owner.release(active)).toEqual(released);
-    for (const writer of [owner, other])
+    for (const at of [
+      START,
+      START + THIRTY_DAYS - 1,
+      START + THIRTY_DAYS,
+      START + 31 * 24 * 60 * 60 * 1_000,
+      Date.parse("9999-01-01T00:00:00Z"),
+    ]) {
+      h.setNow(at);
+      expect(await owner.release(active)).toEqual(released);
+      for (const writer of [owner, other])
+        await expect(
+          writer.reserve({ reservationId: `never-${at}`, name: active.name }),
+        ).rejects.toMatchObject({ code: "conflict" });
       await expect(
-        writer.reserve({ reservationId: "too-soon", name: active.name }),
+        owner.reserve({ reservationId: "old", name: active.name }),
       ).rejects.toMatchObject({ code: "conflict" });
+    }
     expect(await h.ledger.readCurrent(active.name)).toBeNull();
     expect(await h.ledger.isCurrentAfterDispatch(selected)).toBe(false);
-    h.setNow(START + SHARED_APP_COOLDOWN_MILLISECONDS);
-    const next = await other.reserve({ reservationId: "new", name: active.name });
-    expect(next.incarnation).not.toBe(active.incarnation);
-    expect(next.generation).toBeGreaterThan(released.generation);
-    const newActive = await other.activate(next, "new-script");
-    h.setNow(START + 31 * 24 * 60 * 60 * 1_000);
-    expect(await h.ledger.readCurrent(active.name)).toMatchObject({
-      script: "new-script",
-      incarnation: next.incarnation,
-    });
     expect(await h.ledger.isCurrentBeforeDispatch(selected)).toBe(false);
     expect(await h.ledger.isCurrentAfterDispatch(selected)).toBe(false);
     await expect(owner.activate(reserved, "old-script")).rejects.toMatchObject({
       code: "conflict",
     });
-    await expect(owner.release(newActive)).rejects.toMatchObject({ code: "conflict" });
+    await expect(other.release(released)).rejects.toMatchObject({ code: "conflict" });
     expect(await owner.readOriginal("old")).toEqual(released);
+    expect(
+      await h.sql.query(
+        "SELECT incarnation, generation, state, released_at FROM shared_app_staging_names WHERE normalized_name = ?",
+        [active.name],
+      ),
+    ).toEqual([
+      {
+        incarnation: released.incarnation,
+        generation: released.generation,
+        state: "released",
+        released_at: released.releasedAt,
+      },
+    ]);
     expect(await h.sql.query("SELECT COUNT(*) AS n FROM shared_app_staging_assignments")).toEqual([
-      { n: 2 },
+      { n: 1 },
     ]);
   } finally {
     await h.close();
@@ -267,15 +281,20 @@ test("fresh primary pre/post fences reject a late old response and do not preser
     });
     const oldResponse = response.then(() => h.ledger.isCurrentAfterDispatch(selected));
     await owner.release(active);
-    h.setNow(START + SHARED_APP_COOLDOWN_MILLISECONDS);
+    h.setNow(START + THIRTY_DAYS);
     const next = h.ledger.forTrustedOwner(HOSTED);
+    await expect(
+      next.reserve({ reservationId: "blocked", name: active.name }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    expect(await h.ledger.readCurrent("fresh-response")).toBeNull();
     await next.activate(
-      await next.reserve({ reservationId: "next", name: active.name }),
+      await next.reserve({ reservationId: "next", name: "fresh-response" }),
       "new-script",
     );
     deliver?.();
     expect(await oldResponse).toBe(false);
-    const fresh = await h.ledger.readCurrent(active.name);
+    expect(await h.ledger.readCurrent(active.name)).toBeNull();
+    const fresh = await h.ledger.readCurrent("fresh-response");
     if (!fresh) throw new Error("current assignment missing");
     expect(await h.ledger.isCurrentAfterDispatch(fresh)).toBe(true);
     expect(h.sessions.every((constraint) => constraint === "first-primary")).toBe(true);

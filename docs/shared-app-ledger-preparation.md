@@ -18,10 +18,13 @@ results retain the original reference as indeterminate.
 The proposed shape has separate literal staging/production name and assignment
 tables, one globally unique normalized name per realm, monotonically advancing
 name generations and retained original assignment/incarnation history. Release
-retains its first timestamp. Reassignment is blocked for 30 full days, including
-the original owner; an operator recovery procedure remains separate reviewed
-authority. Activation is immutable for a given script/incarnation: no arbitrary
-script replacement or caller recovery bypass exists here.
+retains its first timestamp and creates a permanent name tombstone. The name
+never becomes eligible for another reservation, even for the original owner or
+after any elapsed interval. Reserve checks both the global name head and all
+retained assignment history in its one atomic batch; it never overwrites a
+released head. An exact unreleased original reservation may replay normally.
+Activation is immutable for a given script/incarnation: no arbitrary script
+replacement or caller recovery bypass exists here.
 
 Gateway integration must read current primary status even after a negative cache
 hint, compare every selected tuple field immediately before dispatch, and call
@@ -31,11 +34,13 @@ a current assignment. A failed read is a failure, never an absent-name result.
 The ledger cannot itself cancel an already streaming response or running old
 JavaScript. Gateway admission/drain and response handling remain owner work.
 
-Thirty-day name reuse and incarnation cookies do not establish browser origin
-isolation. Old documents, active JavaScript, service workers, local storage,
-IndexedDB, Authorization and logical `document.cookie` behavior require an
-owner-qualified browser reuse/drain policy before activation. The prepared
-staging driver and cookie helper are not that proof.
+The selected browser-origin policy permanently prohibits released-name reuse
+while preserving the fixed application origin and same-incarnation updates.
+Incarnation cookies do not themselves isolate old documents, active JavaScript,
+service workers, storage, Authorization or logical `document.cookie` behavior.
+Existing origin inventory, old-writer fences and owner-qualified drain remain
+required before activation. The prepared driver and cookie helper are not that
+proof, and no browser data-clearing guarantee is introduced.
 
 DDL in the native D1 test is an **unallocated test fixture**, not a real migration
 or an adopted durable schema. Existing 0035 rows, current schema, release hooks,
@@ -44,8 +49,10 @@ compose name acceptance with existing reservation/resource acceptance in the
 same guarded D1 batch, reserve an additive schema number, and rehearse legacy
 adoption without deleting or rewriting original rows. NFKC aliases must refuse
 ambiguous adoption; invalid historical labels need explicit read/drain handling.
-Released rows retain their historical timestamps and cannot silently become new
-claims. No staging label makes a durable database disposable.
+Released rows retain their historical timestamps and can never become new
+claims. Legacy expiry/reclaim paths still require the same authority cutover;
+this unmounted source does not change those writers. No staging label makes a
+durable database disposable.
 
 Owner coordination remains TASK-0108/TASK-0110 and private issue 132. Actual
 shared wildcard route, dispatch namespace, current schema/closure, cookie

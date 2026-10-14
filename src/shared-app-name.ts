@@ -81,7 +81,8 @@ export function sharedAppStagingOrigin(name: unknown): string {
  * Parse the raw Host authority before URL/IDNA processing. A single DNS root dot
  * and ASCII case aliases are accepted; ports and every non-ASCII byte refuse.
  * Null deliberately combines malformed, reserved and outside-suffix inputs.
- * Allocation status and cooldown still require the authoritative ledger read.
+ * Allocation status and permanent released-name tombstones still require
+ * the authoritative ledger read.
  */
 export function sharedAppStagingNameFromHost(host: unknown): string | null {
   if (typeof host !== "string" || !/^[A-Za-z0-9.-]+$/u.test(host)) return null;

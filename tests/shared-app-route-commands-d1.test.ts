@@ -654,7 +654,7 @@ test("native D1 concurrent release and normal update CAS fence an old route proj
   }
 });
 
-test("native D1 original history survives explicit cooldown release/reassignment and refuses foreign recovery", async () => {
+test("native D1 original history and permanent release refuse reassignment and foreign recovery", async () => {
   const h = await harness();
   try {
     const { owner, active, plan } = await start(h);
@@ -663,18 +663,31 @@ test("native D1 original history survives explicit cooldown release/reassignment
     const retire = owner.prepareRetire(retireCommand, guards(retireCommand));
     await h.sql.batch(batch(retire));
     const held = (await owner.settleRoute(retire.original, "acknowledged")).assignment;
-    await owner.release(held);
+    const released = await owner.release(held);
+    const history = await h.sql.query(
+      "SELECT * FROM shared_app_staging_route_commands ORDER BY next_generation",
+    );
     h.setNow(START + 31 * 24 * 60 * 60 * 1000);
     const foreign = h.ledger.forTrustedOwner({
       organizationId: "org-hosted",
       product: "takosumi-hosted",
     });
-    const reassigned = await foreign.reserve({
-      reservationId: "foreign-original",
-      name: "route-update",
-    });
-    expect(reassigned.incarnation).not.toBe(active.incarnation);
-    expect(reassigned.generation).toBe(5);
+    await expect(
+      foreign.reserve({
+        reservationId: "foreign-original",
+        name: "route-update",
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    await expect(
+      owner.reserve({ reservationId: "replacement", name: active.name }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    expect(await owner.readOriginal(active.reservationId)).toEqual(released);
+    expect(await h.sql.query("SELECT COUNT(*) n FROM shared_app_staging_assignments")).toEqual([
+      { n: 1 },
+    ]);
+    expect(
+      await h.sql.query("SELECT * FROM shared_app_staging_route_commands ORDER BY next_generation"),
+    ).toEqual(history);
     expect((await owner.settleRoute(plan.original, "unknown")).assignment).toEqual(active);
     expect(await foreign.readRouteCommand(plan.original.commandRef)).toBeNull();
     await expect(foreign.settleRoute(plan.original, "unknown")).rejects.toMatchObject({
