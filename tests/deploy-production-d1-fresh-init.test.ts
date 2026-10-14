@@ -385,6 +385,7 @@ describe("production D1 fresh init", () => {
 
     const missing = join(fixtureRoot, "missing-v2-0089-tail");
     copyMigrationFiles(selected.files, missing);
+    rmSync(join(missing, "0089_v2_worker_cron_match_guard_depth.sql"));
     expect(() =>
       projectFreshProductionV2MigrationArtifact0089(readMigrationArtifact(missing)),
     ).toThrow("fixed audited 0001-0089 prefix");
