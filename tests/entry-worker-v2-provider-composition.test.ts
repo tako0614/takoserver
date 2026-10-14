@@ -409,6 +409,7 @@ test("failed request wake registration leaves accepted continuation for bounded 
   try {
     let sends = 0;
     let reconciles = 0;
+    let rejectedWake: Promise<unknown> | undefined;
     const entry = createWorkerEntry({
       composeV2Forms: () => ({
         [FORM]: {
@@ -439,14 +440,16 @@ test("failed request wake registration leaves accepted continuation for bounded 
         body: JSON.stringify({ form: FORM, space: ORG, name: "resumable", spec: {} }),
       },
       {
-        waitUntil() {
+        waitUntil(work) {
+          rejectedWake = work;
           throw new Error("request lifetime ended");
         },
       },
     );
     expect(created.status).toBe(202);
     const accepted = (await created.json()) as { id: string };
-    await Bun.sleep(0);
+    if (!rejectedWake) throw new Error("expected the request wake promise to be registered");
+    await rejectedWake;
     expect(sends).toBe(0);
     await entry.scheduled({}, env);
     expect(sends).toBe(1);
@@ -545,28 +548,49 @@ test("Worker entry factories do not share Form maps for the same Env", async () 
 
 test("concurrent fetch and scheduled startup share one Form snapshot", async () => {
   const { runtime, env } = await fixture("v2-entry-concurrent-startup");
+  let fetchPromise: Promise<Response> | undefined;
+  let scheduledPromise: Promise<void> | undefined;
+  let release: (() => void) | undefined;
   try {
-    let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
+    });
+    let signalComposerEntered!: () => void;
+    const composerEntered = new Promise<void>((resolve) => {
+      signalComposerEntered = resolve;
     });
     let calls = 0;
     const entry = createWorkerEntry({
       async composeV2Forms() {
         calls += 1;
+        signalComposerEntered();
         await gate;
         return { [FORM]: completeForm() };
       },
     });
-    const fetchPromise = request(entry, env, `/support?form=${encodeURIComponent(FORM)}`);
-    const scheduledPromise = entry.scheduled({}, env);
-    await Bun.sleep(0);
+    const fetchOperation = request(entry, env, `/support?form=${encodeURIComponent(FORM)}`);
+    const scheduledOperation = entry.scheduled({}, env);
+    fetchPromise = fetchOperation;
+    scheduledPromise = scheduledOperation;
+    const completedBeforeComposition = (promise: Promise<unknown>) =>
+      promise.then(() => {
+        throw new Error("Worker startup completed before Form composition entered");
+      });
+    await Promise.race([
+      composerEntered,
+      completedBeforeComposition(fetchOperation),
+      completedBeforeComposition(scheduledOperation),
+    ]);
     expect(calls).toBe(1);
     release?.();
-    const [support] = await Promise.all([fetchPromise, scheduledPromise]);
+    const [support] = await Promise.all([fetchOperation, scheduledOperation]);
     expect(await support.json()).toMatchObject({ supported: true });
     expect(calls).toBe(1);
   } finally {
+    release?.();
+    await Promise.allSettled(
+      [fetchPromise, scheduledPromise].filter((promise) => promise !== undefined),
+    );
     await runtime.dispose();
   }
 }, 120_000);
