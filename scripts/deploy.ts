@@ -16,6 +16,10 @@ import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
 import { runIntegrationHostRetirement } from "./deploy/integration-host-retirement.ts";
+import {
+  type IntegrationMoneyShadowCreateDeclaration,
+  runIntegrationMoneyShadowCreate,
+} from "./deploy/integration-money-shadow-create.ts";
 import { runIntegrationOrganizationBootstrap } from "./deploy/integration-organization-bootstrap.ts";
 import { runIntegrationStorageDisposal } from "./deploy/integration-storage-disposal.ts";
 import { runIntegrationStorageGeneration } from "./deploy/integration-storage-generation.ts";
@@ -39,6 +43,12 @@ import {
   type SchemaWaveBoundary,
 } from "./deploy/schema.ts";
 import { runD1Schema0058Rehearsal } from "./deploy/schema-0058-rehearsal.ts";
+import {
+  type IntegrationMoneyShadowRehearsalDeclaration,
+  type MoneyRehearsalDeclaration,
+  runIntegrationMoneyShadowRehearsal,
+  runMoneyUnitRehearsal,
+} from "./deploy/schema-money-unit-rehearsal.ts";
 import { runSigning } from "./deploy/signing.ts";
 import { runSponsorshipAuthority } from "./deploy/sponsorship-authority.ts";
 import { runStaticSite } from "./deploy/static.ts";
@@ -92,6 +102,12 @@ const USAGE = `takoserver deploy
     writer-drain plus target-bound volume/import qualification are implemented; apply refuses.
   takoserver-rehearsal-d1-create creates one empty rehearsal D1 from a separate owned declaration;
     no target descriptor, schema import, binding change, or production mode is accepted.
+  takoserver-d1-money-cutover-rehearsal exercises synthetic 0092/0093/0094 imports on that
+    explicit rehearsal D1 only; each reviewed phase uses protected no-overwrite custody.
+  takoserver-integration-money-shadow-create creates one fresh synthetic-only integration D1
+    from a reviewed staging-0092 origin and canonical Wrangler OAuth, with no target adoption.
+  takoserver-integration-money-shadow-rehearsal runs the same reviewed synthetic import phases
+    on that exact terminal shadow D1, never on the staging D1 or ordinary rehearsal target.
   takoserver-d1-snapshot-restore restores one pinned export dump into one declared empty
     rehearsal D1; the dump is NUL-normalized and the result is verified by readback, so a partial
     application is never reported as success.
@@ -141,6 +157,9 @@ type StorageGenerationSurface = "takoserver-integration-storage-generation";
 type StorageDisposalSurface = "takoserver-integration-storage-disposal";
 type HostRetirementSurface = "takoserver-integration-host-retirement";
 type RehearsalD1CreateSurface = "takoserver-rehearsal-d1-create";
+type MoneyRehearsalSurface = "takoserver-d1-money-cutover-rehearsal";
+type MoneyShadowCreateSurface = "takoserver-integration-money-shadow-create";
+type MoneyShadowRehearsalSurface = "takoserver-integration-money-shadow-rehearsal";
 type ProductionD1FreshInitSurface = "takoserver-production-d1-fresh-init";
 type D1SnapshotRestoreSurface = "takoserver-d1-snapshot-restore";
 type StandardSurface = Exclude<
@@ -151,6 +170,9 @@ type StandardSurface = Exclude<
   | StorageDisposalSurface
   | HostRetirementSurface
   | RehearsalD1CreateSurface
+  | MoneyRehearsalSurface
+  | MoneyShadowCreateSurface
+  | MoneyShadowRehearsalSurface
   | ProductionD1FreshInitSurface
   | D1SnapshotRestoreSurface
 >;
@@ -174,6 +196,16 @@ interface InvocationBase {
 }
 
 type Invocation =
+  | (InvocationBase & {
+      readonly surface: MoneyShadowCreateSurface | MoneyShadowRehearsalSurface;
+      readonly action: "status" | "apply";
+      readonly environment: "integration";
+    })
+  | (InvocationBase & {
+      readonly surface: MoneyRehearsalSurface;
+      readonly action: "status" | "apply";
+      readonly environment: "rehearsal";
+    })
   | (InvocationBase & {
       readonly surface: RehearsalD1CreateSurface;
       readonly action: "status" | "apply";
@@ -762,6 +794,23 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       ? { surface: surfaceValue, action, environment, commit }
       : null;
   }
+  if (surfaceValue === "takoserver-d1-money-cutover-rehearsal") {
+    return environment === "rehearsal" &&
+      (action === "status" || action === "apply") &&
+      args.length === 4
+      ? { surface: surfaceValue, action, environment, commit }
+      : null;
+  }
+  if (
+    surfaceValue === "takoserver-integration-money-shadow-create" ||
+    surfaceValue === "takoserver-integration-money-shadow-rehearsal"
+  ) {
+    return environment === "integration" &&
+      (action === "status" || action === "apply") &&
+      args.length === 4
+      ? { surface: surfaceValue, action, environment, commit }
+      : null;
+  }
   if (surfaceValue === "takoserver-d1-snapshot-restore") {
     return environment === "rehearsal" &&
       (action === "status" || action === "apply") &&
@@ -1070,7 +1119,40 @@ function loadD1SnapshotRestoreDeclaration(): D1SnapshotRestoreDeclaration {
   );
 }
 
+function loadMoneyRehearsalDeclaration(): MoneyRehearsalDeclaration {
+  return loadOwnedDeclaration<MoneyRehearsalDeclaration>(
+    "TAKOSERVER_D1_MONEY_REHEARSAL_DECLARATION_PATH",
+    "money cutover rehearsal declaration",
+  );
+}
+
+function loadMoneyShadowCreateDeclaration(): IntegrationMoneyShadowCreateDeclaration {
+  return loadOwnedDeclaration<IntegrationMoneyShadowCreateDeclaration>(
+    "TAKOSERVER_INTEGRATION_MONEY_SHADOW_CREATE_DECLARATION_PATH",
+    "integration money shadow create declaration",
+  );
+}
+
+function loadMoneyShadowRehearsalDeclaration(): IntegrationMoneyShadowRehearsalDeclaration {
+  return loadOwnedDeclaration<IntegrationMoneyShadowRehearsalDeclaration>(
+    "TAKOSERVER_INTEGRATION_MONEY_SHADOW_REHEARSAL_DECLARATION_PATH",
+    "integration money shadow rehearsal declaration",
+  );
+}
+
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
+  if (invocation.surface === "takoserver-integration-money-shadow-create") {
+    return await runIntegrationMoneyShadowCreate(loadMoneyShadowCreateDeclaration(), invocation);
+  }
+  if (invocation.surface === "takoserver-integration-money-shadow-rehearsal") {
+    return await runIntegrationMoneyShadowRehearsal(
+      loadMoneyShadowRehearsalDeclaration(),
+      invocation,
+    );
+  }
+  if (invocation.surface === "takoserver-d1-money-cutover-rehearsal") {
+    return await runMoneyUnitRehearsal(loadMoneyRehearsalDeclaration(), invocation);
+  }
   if (invocation.surface === "takoserver-rehearsal-d1-create") {
     return await runRehearsalD1Create(loadRehearsalD1CreateDeclaration(), invocation);
   }

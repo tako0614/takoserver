@@ -1272,6 +1272,88 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-integration-money-shadow-create",
+      target: "cloudflare-d1:one-fresh-integration-synthetic-money-shadow-only",
+      covers: [
+        "scripts/deploy/integration-money-shadow-create.ts",
+        "scripts/deploy/schema-money-unit-rehearsal.ts",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["TAKOSERVER_INTEGRATION_MONEY_SHADOW_CREATE_DECLARATION_PATH"],
+      triggers: ["irreversible", "authority", "published-identity"],
+      obligations: {
+        provenance: `${exactSource} An owned 0600 TAKOSERVER_INTEGRATION_MONEY_SHADOW_CREATE_DECLARATION_PATH binds a reviewed positive staging 0092 origin certificate, exact account, fresh takoserver-ms generation name, source digest and canonical Wrangler OAuth credential provenance. No ordinary target descriptor, production descriptor or production resource is read.`,
+        "post-conditions":
+          "A native GET and exact-name list prove the newly created UUID/name; an authenticated D1 query proves zero application schema objects. Its protected terminal receipt grants only synthetic rehearsal authority.",
+        reversal:
+          "No delete, reset, adoption or automatic cleanup is offered. If creation is uncertain, retain the dispatch and inspect by status; repair forward under a separate review.",
+        "failure-handling": `${highRiskFailure} Only the canonical integration Wrangler OAuth profile is accepted; an explicit API token or OAuth-as-API_TOKEN surrogate is refused. Create is sent once after no-overwrite dispatch. Unknown acknowledgement is quarantined without retry.`,
+        "pre-mutation-proof":
+          "The reviewed staging 0092 origin is a positive account/UUID/source certificate. Native exact-name absence is checked twice, the selected source commit is clean and remotely reachable, and an independent reviewer approves the exact binding before dispatch.",
+        "independent-review":
+          "A protected 0600 review record must approve the hash of the account, fresh name, staging origin, audited source and OAuth-source binding.",
+        "no-overwrite":
+          "One owned 0600 dispatch record precedes the sole create and one terminal record follows exact empty-schema readback. Existing or dispatched names are never reused.",
+      },
+    },
+    {
+      surface: "takoserver-integration-money-shadow-rehearsal",
+      target: "cloudflare-d1:one-terminal-created-integration-synthetic-money-shadow",
+      covers: [
+        "scripts/deploy/integration-money-shadow-create.ts",
+        "scripts/deploy/schema-money-unit-rehearsal.ts",
+        "scripts/deploy/schema-money-unit-cutover.ts",
+        "migrations/0093_wallet_credit_classification_proofs.sql",
+        "migrations/0094_wallet_usd_micros.sql",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["TAKOSERVER_INTEGRATION_MONEY_SHADOW_REHEARSAL_DECLARATION_PATH"],
+      triggers: ["irreversible", "authority", "published-identity"],
+      obligations: {
+        provenance: `${exactSource} The owned 0600 TAKOSERVER_INTEGRATION_MONEY_SHADOW_REHEARSAL_DECLARATION_PATH binds the exact integration shadow create declaration and terminal receipt, staging 0092 origin, native UUID/name, OAuth source, audited 0092-0094 SQL, pinned Wrangler executable module, sealed import bytes and account/D1 import endpoint into phase custody. No ordinary staging or production target is imported.`,
+        "post-conditions":
+          "The independently reviewed 14-phase synthetic sequence proves exact native schema, complete application typed-byte digests, financial preimage and aggregate conservation, empty writer permits and foreign keys. Its late 0094 failure probe and false-CHECK resume probe require structured authenticated D1 import faults with exact predecessor state unchanged; the successful conversion and resume require sealed one-file Wrangler imports. After resume, raw legacy Stripe INSERT, UPDATE and DELETE and a stale writer epoch must fail, a permitted late-fault import must roll back, and permitted success must change the seeded Stripe outcome with exact new financial and application typed-byte digests. This importer receipt does not prove native Worker D1.batch or authorize the real staging cutover.",
+        reversal:
+          "No old-cents rollback, reset or delete exists; an uncertain ACK or changed native state quarantines the disposable shadow and requires separately reviewed forward repair.",
+        "failure-handling": `${highRiskFailure} Canonical integration OAuth is required; an explicit API token and any ordinary rehearsal or staging D1 name are rejected. Every import has no-overwrite dispatch, no blind retry and status-only readback after an uncertain ACK.`,
+        "pre-mutation-proof":
+          "The shadow create terminal and native identity are exact; each phase requires its previous terminal, expected schema and complete synthetic application preimage. Before import, the protected independent review binds the phase, source, SQL, target and transport.",
+        "independent-review":
+          "Each phase needs its own protected binding-specific review and evidence digest before apply.",
+        "no-overwrite":
+          "Every phase dispatch and terminal receipt is an immutable protected 0600 file; no phase can be replayed after dispatch, including unknown acknowledgements.",
+      },
+    },
+    {
+      surface: "takoserver-d1-money-cutover-rehearsal",
+      target: "cloudflare-d1:one-explicit-created-synthetic-rehearsal-database",
+      covers: [
+        "scripts/deploy/schema-money-unit-rehearsal.ts",
+        "scripts/deploy/schema-money-unit-cutover.ts",
+        "migrations/0093_wallet_credit_classification_proofs.sql",
+        "migrations/0094_wallet_usd_micros.sql",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["TAKOSERVER_D1_MONEY_REHEARSAL_DECLARATION_PATH", "CLOUDFLARE_API_TOKEN"],
+      triggers: ["irreversible", "authority", "published-identity"],
+      obligations: {
+        provenance: `${exactSource} The owned 0600 TAKOSERVER_D1_MONEY_REHEARSAL_DECLARATION_PATH binds the terminal one-D1 rehearsal-create receipt, original create declaration, exact account/name/UUID, audited 0092-0094 source, pinned Wrangler 4.123.0 launcher and executable dist-module digests, sealed SQL, exact account/D1 import endpoint and phase-specific protected independent review evidence. Synthetic rows only; no ordinary target descriptor or production/staging resource is read.`,
+        "post-conditions":
+          "Each step of the 14-phase sequence reads exact native migration lineage/schema, all application table typed-byte digests, financial preimage/aggregate and foreign-key state. The late 0094 missing-table and false-CHECK resume probes require structured authenticated D1 import faults with complete predecessor state unchanged; the observer follows pinned Wrangler's same init/upload/ingest/poll protocol but does not claim a Wrangler CLI failure observation. Successful 0094 and resume use sealed one-file Wrangler --file imports. After resume, raw legacy Stripe INSERT, UPDATE and DELETE and a stale writer epoch must fail, a permitted late-fault import must roll back its event and permit, and permitted success must visibly change the seeded Stripe outcome with exact new financial and application typed-byte digests and an empty permit. The terminal receipt records a value-free Cloudflare R2 host class and presigned-URI digest. These importer receipts do not prove native Worker D1.batch or grant integration or production apply authority.",
+        reversal:
+          "No reset, delete or cents rollback is offered. An unknown ACK, partial schema, changed typed rows or foreign-key error quarantines the rehearsal D1 for separate forward repair.",
+        "failure-handling": `${highRiskFailure} This original rehearsal route requires explicit CLOUDFLARE_API_TOKEN. No import is retried after no-overwrite dispatch. Status is GET/readback only and cannot infer a failed-probe acknowledgement from unchanged data alone. Source, target, review and transport mismatches refuse before a D1 write; post-import verification failures retain the D1 and custody for investigation.`,
+        "pre-mutation-proof":
+          "The terminal create receipt and native D1 identity select a generated rehearsal-only D1. First seed requires an empty application schema. Each later phase requires its predecessor terminal receipt, exact fenced schema and complete synthetic application-row digest, with zero pending financial work before the 0094 probe and conversion. The reviewed import bytes and target are rechecked immediately before dispatch.",
+        "independent-review": review,
+        "no-overwrite":
+          "Each phase writes one immutable protected dispatch binding before the single D1 import and one terminal receipt only after exact readback; a dispatched phase cannot be replayed, even when acknowledgement is unknown. The failure probe's authenticated structured import observer and the other phases' Wrangler --file transport are identified separately in the binding.",
+      },
+    },
+    {
       surface: "takoserver-rehearsal-d1-create",
       target: "cloudflare-d1:one-explicit-new-rehearsal-database",
       covers: [

@@ -227,7 +227,7 @@ function createCloudflareProvider(
   };
 }
 
-async function readSchemaObjectCount(
+export async function readSchemaObjectCount(
   fetcher: IntegrationStorageFetcher,
   accountId: string,
   token: string,
